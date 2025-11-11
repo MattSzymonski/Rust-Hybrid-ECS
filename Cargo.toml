@@ -9,7 +9,3 @@ parking_lot = "0.12"
 [[bin]]
 name = "ecs_hybrid"
 path = "src/main.rs"
-
-[[example]]
-name = "advanced"
-path = "examples/advanced.rs"

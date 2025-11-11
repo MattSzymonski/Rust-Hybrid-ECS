@@ -45,7 +45,7 @@ fn main() {
         .add_component(Transform::new(50.0, 0.0, 0.0));
 
     // Add multiple box colliders to the obstacle
-    let obstacle_entity_id = obstacle_entity.entity;
+    let obstacle_entity_id = obstacle_entity.id;
     scene.apply_commands();
 
     obstacle_entity.add_component(BoxCollider::new((0.0, 0.0, 0.0), (5.0, 5.0, 5.0)));
@@ -83,7 +83,7 @@ fn main() {
         let mut world = world_lock.write();
 
         // Get all entities (Unity-style: iterate entities, then get components)
-        let entities: Vec<Entity> = world.entities().collect();
+        let entities: Vec<u64> = world.entities().collect();
 
         // Get obstacle transform and colliders
         let obstacle_transform = world

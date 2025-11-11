@@ -1,44 +1,38 @@
 use crate::command_buffer::CommandBuffer;
-/// Unity-like GameObject wrapper - provides familiar OOP API
-/// This is the "hybrid" solution that wraps ECS with object-oriented interface
+/// Unity-like Entity API - provides familiar OOP interface over ECS
 use crate::ecs_core::World;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
-/// Entity ID
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Entity(pub u64);
-
-/// GameObject - Unity-like wrapper around an Entity
-/// Now stores the world and command buffer pointers directly
+/// Entity - combines ID with world/command buffer pointers for convenient API
 #[derive(Clone)]
-pub struct GameObject {
-    pub entity: Entity,
+pub struct Entity {
+    pub id: u64,
     world: Arc<RwLock<World>>,
     command_buffer: Arc<RwLock<CommandBuffer>>,
 }
 
-impl GameObject {
-    /// Create from existing entity
-    pub fn from_entity(
-        entity: Entity,
+impl Entity {
+    /// Create from existing entity ID
+    pub fn from_id(
+        id: u64,
         world: Arc<RwLock<World>>,
         command_buffer: Arc<RwLock<CommandBuffer>>,
     ) -> Self {
         Self {
-            entity,
+            id,
             world,
             command_buffer,
         }
     }
 
-    /// Create new GameObject
+    /// Create new Entity
     pub fn new(world: Arc<RwLock<World>>, command_buffer: Arc<RwLock<CommandBuffer>>) -> Self {
-        let entity = Entity(world.write().create_entity_id());
-        world.write().register_entity(entity);
+        let id = world.write().create_entity_id();
+        world.write().register_entity(id);
 
         Self {
-            entity,
+            id,
             world,
             command_buffer,
         }
@@ -52,7 +46,7 @@ impl GameObject {
     /// // Component is immediately accessible
     /// ```
     pub fn add_component<T: Send + Sync + 'static>(&self, component: T) -> &Self {
-        self.world.write().add_component(self.entity, component);
+        self.world.write().add_component(self.id, component);
         self
     }
 
@@ -68,59 +62,78 @@ impl GameObject {
     pub fn add_component_deferred<T: Send + Sync + 'static>(&self, component: T) {
         self.command_buffer
             .write()
-            .add_component(self.entity, component);
+            .add_component(self.id, component);
     }
 
-    /// Get a component - Unity-like API: gameObject.get_component::<Transform>()
+    /// Get a component - Unity-like API: entity.get_component::<Transform>()
     pub fn get_component<T: 'static>(&self) -> Option<ComponentRef<T>> {
-        Some(ComponentRef::<T>::new(self.world.clone(), self.entity))
+        Some(ComponentRef::<T>::new(self.world.clone(), self.id))
     }
 
     /// Get a mutable component reference
     pub fn get_component_mut<T: 'static>(&self) -> Option<ComponentRefMut<T>> {
-        Some(ComponentRefMut::new(self.world.clone(), self.entity))
+        Some(ComponentRefMut::new(self.world.clone(), self.id))
     }
 
     /// Remove a component immediately
     pub fn remove_component<T: 'static>(&self) {
-        self.world.write().remove_component::<T>(self.entity);
+        self.world.write().remove_component::<T>(self.id);
     }
 
     /// Remove a component deferred - queued until apply_commands()
     pub fn remove_component_deferred<T: 'static>(&self) {
-        self.command_buffer
-            .write()
-            .remove_component::<T>(self.entity);
+        self.command_buffer.write().remove_component::<T>(self.id);
     }
 
-    /// Destroy this GameObject immediately
+    /// Destroy this Entity immediately
     pub fn destroy(&self) {
-        self.world.write().destroy_entity(self.entity);
+        self.world.write().destroy_entity(self.id);
     }
 
-    /// Destroy this GameObject deferred - queued until apply_commands()
+    /// Destroy this Entity deferred - queued until apply_commands()
     pub fn destroy_deferred(&self) {
-        self.command_buffer.write().destroy_entity(self.entity);
+        self.command_buffer.write().destroy_entity(self.id);
     }
 
     /// Check if component exists
     pub fn has_component<T: 'static>(&self) -> bool {
-        self.world.read().get_component::<T>(self.entity).is_some()
+        self.world.read().get_component::<T>(self.id).is_some()
+    }
+}
+
+// Implement PartialEq and Eq based on ID only
+impl PartialEq for Entity {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Entity {}
+
+impl std::hash::Hash for Entity {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+impl std::fmt::Debug for Entity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Entity").field(&self.id).finish()
     }
 }
 
 /// Smart reference to a component - automatically manages read lock
 pub struct ComponentRef<T: 'static> {
     world: Arc<RwLock<World>>,
-    entity: Entity,
+    entity_id: u64,
     _phantom: std::marker::PhantomData<T>,
 }
 
 impl<T: 'static> ComponentRef<T> {
-    fn new(world: Arc<RwLock<World>>, entity: Entity) -> Self {
+    fn new(world: Arc<RwLock<World>>, entity_id: u64) -> Self {
         Self {
             world,
-            entity,
+            entity_id,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -128,22 +141,22 @@ impl<T: 'static> ComponentRef<T> {
     /// Access the component through a closure
     pub fn with<R, F: FnOnce(&T) -> R>(&self, f: F) -> Option<R> {
         let world = self.world.read();
-        world.get_component::<T>(self.entity).map(f)
+        world.get_component::<T>(self.entity_id).map(f)
     }
 }
 
 /// Smart mutable reference to a component - automatically manages write lock
 pub struct ComponentRefMut<T: 'static> {
     world: Arc<RwLock<World>>,
-    entity: Entity,
+    entity_id: u64,
     _phantom: std::marker::PhantomData<T>,
 }
 
 impl<T: 'static> ComponentRefMut<T> {
-    fn new(world: Arc<RwLock<World>>, entity: Entity) -> Self {
+    fn new(world: Arc<RwLock<World>>, entity_id: u64) -> Self {
         Self {
             world,
-            entity,
+            entity_id,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -151,11 +164,11 @@ impl<T: 'static> ComponentRefMut<T> {
     /// Access the component mutably through a closure
     pub fn with<R, F: FnOnce(&mut T) -> R>(&mut self, f: F) -> Option<R> {
         let mut world = self.world.write();
-        world.get_component_mut::<T>(self.entity).map(f)
+        world.get_component_mut::<T>(self.entity_id).map(f)
     }
 }
 
-/// Scene - manages GameObjects like Unity's scene
+/// Scene - manages Entities like Unity's scene
 pub struct Scene {
     world: Arc<RwLock<World>>,
     command_buffer: Arc<RwLock<CommandBuffer>>,
@@ -169,14 +182,14 @@ impl Scene {
         }
     }
 
-    /// Instantiate a new GameObject - Unity-like API
-    pub fn instantiate(&self) -> GameObject {
-        GameObject::new(self.world.clone(), self.command_buffer.clone())
+    /// Instantiate a new Entity - Unity-like API
+    pub fn instantiate(&self) -> Entity {
+        Entity::new(self.world.clone(), self.command_buffer.clone())
     }
 
-    /// Get GameObject from entity ID
-    pub fn get_game_object(&self, entity: Entity) -> GameObject {
-        GameObject::from_entity(entity, self.world.clone(), self.command_buffer.clone())
+    /// Get Entity from entity ID
+    pub fn get_entity(&self, id: u64) -> Entity {
+        Entity::from_id(id, self.world.clone(), self.command_buffer.clone())
     }
 
     /// Access the world directly for system execution

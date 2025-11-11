@@ -1,5 +1,4 @@
 /// Core ECS implementation - the performance-critical parallel system
-use crate::game_object::Entity;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 
@@ -7,12 +6,12 @@ use std::collections::HashMap;
 pub trait ComponentStorage: Send + Sync {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
-    fn remove(&mut self, entity: Entity);
+    fn remove(&mut self, entity: u64);
 }
 
 /// Concrete storage for a specific component type
 pub struct TypedStorage<T: 'static> {
-    components: HashMap<Entity, Vec<T>>, // Support multiple components per entity
+    components: HashMap<u64, Vec<T>>, // Support multiple components per entity
 }
 
 impl<T: 'static> TypedStorage<T> {
@@ -22,35 +21,35 @@ impl<T: 'static> TypedStorage<T> {
         }
     }
 
-    pub fn insert(&mut self, entity: Entity, component: T) {
+    pub fn insert(&mut self, entity: u64, component: T) {
         self.components
             .entry(entity)
             .or_insert_with(Vec::new)
             .push(component);
     }
 
-    pub fn get(&self, entity: Entity) -> Option<&T> {
+    pub fn get(&self, entity: u64) -> Option<&T> {
         self.components.get(&entity).and_then(|v| v.first())
     }
 
-    pub fn get_mut(&mut self, entity: Entity) -> Option<&mut T> {
+    pub fn get_mut(&mut self, entity: u64) -> Option<&mut T> {
         self.components.get_mut(&entity).and_then(|v| v.first_mut())
     }
 
-    pub fn get_all(&self, entity: Entity) -> Vec<T>
+    pub fn get_all(&self, entity: u64) -> Vec<T>
     where
         T: Clone,
     {
         self.components.get(&entity).cloned().unwrap_or_default()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (Entity, &T)> {
+    pub fn iter(&self) -> impl Iterator<Item = (u64, &T)> {
         self.components
             .iter()
             .filter_map(|(e, v)| v.first().map(|c| (*e, c)))
     }
 
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (Entity, &mut T)> {
+    pub fn iter_mut(&mut self) -> impl Iterator<Item = (u64, &mut T)> {
         self.components
             .iter_mut()
             .filter_map(|(e, v)| v.first_mut().map(|c| (*e, c)))
@@ -66,7 +65,7 @@ impl<T: Send + Sync + 'static> ComponentStorage for TypedStorage<T> {
         self
     }
 
-    fn remove(&mut self, entity: Entity) {
+    fn remove(&mut self, entity: u64) {
         self.components.remove(&entity);
     }
 }
@@ -75,7 +74,7 @@ impl<T: Send + Sync + 'static> ComponentStorage for TypedStorage<T> {
 pub struct World {
     next_entity_id: u64,
     storages: HashMap<TypeId, Box<dyn ComponentStorage>>,
-    entities: Vec<Entity>,
+    entities: Vec<u64>,
 }
 
 impl World {
@@ -87,8 +86,8 @@ impl World {
         }
     }
 
-    pub fn create_entity(&mut self) -> Entity {
-        let entity = Entity(self.next_entity_id);
+    pub fn create_entity(&mut self) -> u64 {
+        let entity = self.next_entity_id;
         self.next_entity_id += 1;
         self.entities.push(entity);
         entity
@@ -102,13 +101,13 @@ impl World {
     }
 
     /// Register an entity in the world
-    pub fn register_entity(&mut self, entity: Entity) {
+    pub fn register_entity(&mut self, entity: u64) {
         if !self.entities.contains(&entity) {
             self.entities.push(entity);
         }
     }
 
-    pub fn add_component<T: Send + Sync + 'static>(&mut self, entity: Entity, component: T) {
+    pub fn add_component<T: Send + Sync + 'static>(&mut self, entity: u64, component: T) {
         let type_id = TypeId::of::<T>();
 
         let storage = self
@@ -123,7 +122,7 @@ impl World {
             .insert(entity, component);
     }
 
-    pub fn get_component<T: 'static>(&self, entity: Entity) -> Option<&T> {
+    pub fn get_component<T: 'static>(&self, entity: u64) -> Option<&T> {
         let type_id = TypeId::of::<T>();
         self.storages
             .get(&type_id)?
@@ -132,7 +131,7 @@ impl World {
             .and_then(|storage| storage.get(entity))
     }
 
-    pub fn get_component_mut<T: 'static>(&mut self, entity: Entity) -> Option<&mut T> {
+    pub fn get_component_mut<T: 'static>(&mut self, entity: u64) -> Option<&mut T> {
         let type_id = TypeId::of::<T>();
         self.storages
             .get_mut(&type_id)?
@@ -141,14 +140,14 @@ impl World {
             .and_then(|storage| storage.get_mut(entity))
     }
 
-    pub fn remove_component<T: 'static>(&mut self, entity: Entity) {
+    pub fn remove_component<T: 'static>(&mut self, entity: u64) {
         let type_id = TypeId::of::<T>();
         if let Some(storage) = self.storages.get_mut(&type_id) {
             storage.remove(entity);
         }
     }
 
-    pub fn query<T: 'static>(&self) -> Option<impl Iterator<Item = (Entity, &T)>> {
+    pub fn query<T: 'static>(&self) -> Option<impl Iterator<Item = (u64, &T)>> {
         let type_id = TypeId::of::<T>();
         self.storages
             .get(&type_id)
@@ -156,7 +155,7 @@ impl World {
             .map(|storage| storage.iter())
     }
 
-    pub fn query_mut<T: 'static>(&mut self) -> Option<impl Iterator<Item = (Entity, &mut T)>> {
+    pub fn query_mut<T: 'static>(&mut self) -> Option<impl Iterator<Item = (u64, &mut T)>> {
         let type_id = TypeId::of::<T>();
         self.storages
             .get_mut(&type_id)
@@ -164,7 +163,7 @@ impl World {
             .map(|storage| storage.iter_mut())
     }
 
-    pub fn destroy_entity(&mut self, entity: Entity) {
+    pub fn destroy_entity(&mut self, entity: u64) {
         // Remove from all storages
         for storage in self.storages.values_mut() {
             storage.remove(entity);
@@ -174,12 +173,12 @@ impl World {
     }
 
     /// Get all entities
-    pub fn entities(&self) -> impl Iterator<Item = Entity> + '_ {
+    pub fn entities(&self) -> impl Iterator<Item = u64> + '_ {
         self.entities.iter().copied()
     }
 
     /// Get all components of a specific type for an entity (for multiple instances)
-    pub fn get_components<T: Clone + 'static>(&self, entity: Entity) -> Vec<T> {
+    pub fn get_components<T: Clone + 'static>(&self, entity: u64) -> Vec<T> {
         let type_id = TypeId::of::<T>();
         if let Some(storage) = self.storages.get(&type_id) {
             if let Some(typed_storage) = storage.as_any().downcast_ref::<TypedStorage<T>>() {

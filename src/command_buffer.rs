@@ -1,14 +1,13 @@
 /// Command buffer - deferred operations for thread-safe entity manipulation
 /// This solves the "inconsistent state" problem mentioned in the conversation
 use crate::ecs_core::World;
-use crate::game_object::Entity;
 
 /// Commands that can be deferred and executed later
 pub enum Command {
-    CreateEntity(Box<dyn FnOnce(&mut World) -> Entity + Send>),
-    AddComponent(Entity, Box<dyn FnOnce(&mut World, Entity) + Send>),
-    RemoveComponent(Entity, Box<dyn FnOnce(&mut World, Entity) + Send>),
-    DestroyEntity(Entity),
+    CreateEntity(Box<dyn FnOnce(&mut World) -> u64 + Send>),
+    AddComponent(u64, Box<dyn FnOnce(&mut World, u64) + Send>),
+    RemoveComponent(u64, Box<dyn FnOnce(&mut World, u64) + Send>),
+    DestroyEntity(u64),
 }
 
 /// Buffer for deferred commands - allows "Unity-like" immediate operations
@@ -27,13 +26,13 @@ impl CommandBuffer {
     /// Schedule entity creation - returns a "future" entity ID
     pub fn create_entity<F>(&mut self, setup: F)
     where
-        F: FnOnce(&mut World) -> Entity + Send + 'static,
+        F: FnOnce(&mut World) -> u64 + Send + 'static,
     {
         self.commands.push(Command::CreateEntity(Box::new(setup)));
     }
 
     /// Schedule adding a component
-    pub fn add_component<T: Send + Sync + 'static>(&mut self, entity: Entity, component: T) {
+    pub fn add_component<T: Send + Sync + 'static>(&mut self, entity: u64, component: T) {
         self.commands.push(Command::AddComponent(
             entity,
             Box::new(move |world, entity| {
@@ -43,7 +42,7 @@ impl CommandBuffer {
     }
 
     /// Schedule removing a component
-    pub fn remove_component<T: 'static>(&mut self, entity: Entity) {
+    pub fn remove_component<T: 'static>(&mut self, entity: u64) {
         self.commands.push(Command::RemoveComponent(
             entity,
             Box::new(|world, entity| {
@@ -53,7 +52,7 @@ impl CommandBuffer {
     }
 
     /// Schedule entity destruction
-    pub fn destroy_entity(&mut self, entity: Entity) {
+    pub fn destroy_entity(&mut self, entity: u64) {
         self.commands.push(Command::DestroyEntity(entity));
     }
 
