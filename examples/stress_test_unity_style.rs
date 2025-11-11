@@ -41,18 +41,18 @@ fn main() {
     // Create obstacle entity with multiple box colliders
     let obstacle_entity = scene.instantiate();
     obstacle_entity
-        .add(Name::new("Obstacle"))
-        .add(Transform::new(50.0, 0.0, 0.0));
+        .add_component(Name::new("Obstacle"))
+        .add_component(Transform::new(50.0, 0.0, 0.0));
 
     // Add multiple box colliders to the obstacle
     let obstacle_entity_id = obstacle_entity.entity;
     scene.apply_commands();
 
-    obstacle_entity.add(BoxCollider::new((0.0, 0.0, 0.0), (5.0, 5.0, 5.0)));
-    obstacle_entity.add(BoxCollider::new((6.0, 0.0, 0.0), (4.0, 4.0, 4.0)));
-    obstacle_entity.add(BoxCollider::new((-6.0, 0.0, 0.0), (4.0, 4.0, 4.0)));
-    obstacle_entity.add(BoxCollider::new((0.0, 6.0, 0.0), (3.0, 3.0, 3.0)));
-    obstacle_entity.add(BoxCollider::new((0.0, -6.0, 0.0), (3.0, 3.0, 3.0)));
+    obstacle_entity.add_component(BoxCollider::new((0.0, 0.0, 0.0), (5.0, 5.0, 5.0)));
+    obstacle_entity.add_component(BoxCollider::new((6.0, 0.0, 0.0), (4.0, 4.0, 4.0)));
+    obstacle_entity.add_component(BoxCollider::new((-6.0, 0.0, 0.0), (4.0, 4.0, 4.0)));
+    obstacle_entity.add_component(BoxCollider::new((0.0, 6.0, 0.0), (3.0, 3.0, 3.0)));
+    obstacle_entity.add_component(BoxCollider::new((0.0, -6.0, 0.0), (3.0, 3.0, 3.0)));
 
     println!("✓ Created obstacle with 5 box colliders");
 
@@ -62,9 +62,9 @@ fn main() {
         let moving_entity = scene.instantiate();
         let angle = (i as f32 / entity_count as f32) * std::f32::consts::PI * 2.0;
         moving_entity
-            .add(Name::new(format!("Entity_{}", i)))
-            .add(Transform::new(angle.cos() * 20.0, angle.sin() * 20.0, 0.0))
-            .add(Velocity::new(angle.cos() * 2.0, angle.sin() * 2.0, 0.0));
+            .add_component(Name::new(format!("Entity_{}", i)))
+            .add_component(Transform::new(angle.cos() * 20.0, angle.sin() * 20.0, 0.0))
+            .add_component(Velocity::new(angle.cos() * 2.0, angle.sin() * 2.0, 0.0));
     }
 
     scene.apply_commands();

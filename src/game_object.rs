@@ -18,130 +18,6 @@ pub struct GameObject {
     command_buffer: Arc<RwLock<CommandBuffer>>,
 }
 
-/// Builder for deferred component addition
-pub struct AddComponentCall<'a, T: Send + Sync + 'static> {
-    game_object: &'a GameObject,
-    component: Option<T>,
-    delayed: bool,
-}
-
-impl<'a, T: Send + Sync + 'static> AddComponentCall<'a, T> {
-    fn new(game_object: &'a GameObject, component: T) -> Self {
-        Self {
-            game_object,
-            component: Some(component),
-            delayed: false,
-        }
-    }
-
-    /// Mark this operation as delayed (won't execute until apply_commands)
-    pub fn delay(mut self) -> Self {
-        self.delayed = true;
-        self
-    }
-}
-
-impl<'a, T: Send + Sync + 'static> Drop for AddComponentCall<'a, T> {
-    fn drop(&mut self) {
-        if let Some(component) = self.component.take() {
-            if self.delayed {
-                // Deferred: queue command
-                self.game_object
-                    .command_buffer
-                    .write()
-                    .add_component(self.game_object.entity, component);
-            } else {
-                // Immediate: add directly (executes at semicolon)
-                self.game_object
-                    .world
-                    .write()
-                    .add_component(self.game_object.entity, component);
-            }
-        }
-    }
-}
-
-/// Builder for deferred component removal
-pub struct RemoveComponentCall<'a, T: 'static> {
-    game_object: &'a GameObject,
-    delayed: bool,
-    _phantom: std::marker::PhantomData<T>,
-}
-
-impl<'a, T: 'static> RemoveComponentCall<'a, T> {
-    fn new(game_object: &'a GameObject) -> Self {
-        Self {
-            game_object,
-            delayed: false,
-            _phantom: std::marker::PhantomData,
-        }
-    }
-
-    /// Mark this operation as delayed
-    pub fn delay(mut self) -> Self {
-        self.delayed = true;
-        self
-    }
-}
-
-impl<'a, T: 'static> Drop for RemoveComponentCall<'a, T> {
-    fn drop(&mut self) {
-        if self.delayed {
-            self.game_object
-                .command_buffer
-                .write()
-                .remove_component::<T>(self.game_object.entity);
-        } else {
-            self.game_object
-                .world
-                .write()
-                .remove_component::<T>(self.game_object.entity);
-        }
-    }
-}
-
-/// Builder for deferred entity destruction
-pub struct DestroyCall<'a> {
-    game_object: &'a GameObject,
-    delayed: bool,
-    executed: bool,
-}
-
-impl<'a> DestroyCall<'a> {
-    fn new(game_object: &'a GameObject) -> Self {
-        Self {
-            game_object,
-            delayed: false,
-            executed: false,
-        }
-    }
-
-    /// Mark this operation as delayed
-    pub fn delay(mut self) -> Self {
-        self.delayed = true;
-        self
-    }
-}
-
-impl<'a> Drop for DestroyCall<'a> {
-    fn drop(&mut self) {
-        if !self.executed {
-            if self.delayed {
-                self.game_object
-                    .command_buffer
-                    .write()
-                    .destroy_entity(self.game_object.entity);
-            } else {
-                self.game_object
-                    .world
-                    .write()
-                    .destroy_entity(self.game_object.entity);
-            }
-            self.executed = true;
-        }
-    }
-}
-
 impl GameObject {
     /// Create from existing entity
     pub fn from_entity(
@@ -168,27 +44,31 @@ impl GameObject {
         }
     }
 
-    /// Add a component - returns a builder that executes immediately unless .delay() is called
-    ///
-    /// Usage:
-    /// - `entity.add_component(Transform::new(0.0, 0.0, 0.0));` - immediate
-    /// - `entity.add_component(Transform::new(0.0, 0.0, 0.0)).delay();` - deferred
-    pub fn add_component<T: Send + Sync + 'static>(&self, component: T) -> AddComponentCall<'_, T> {
-        AddComponentCall::new(self, component)
-    }
-
-    /// Add a component immediately (for chaining) - Unity-like fluent API
+    /// Add a component immediately - executes right away
     ///
     /// Usage:
     /// ```
-    /// entity
-    ///     .add(Transform::new(0.0, 0.0, 0.0))
-    ///     .add(Velocity::new(1.0, 0.0, 0.0))
-    ///     .add(Health::new(100.0));
+    /// entity.add_component(Transform::new(0.0, 0.0, 0.0));
+    /// // Component is immediately accessible
     /// ```
-    pub fn add<T: Send + Sync + 'static>(&self, component: T) -> &Self {
+    pub fn add_component<T: Send + Sync + 'static>(&self, component: T) -> &Self {
         self.world.write().add_component(self.entity, component);
         self
+    }
+
+    /// Add a component deferred - queued until apply_commands()
+    ///
+    /// Usage:
+    /// ```
+    /// entity.add_component_deferred(Transform::new(0.0, 0.0, 0.0));
+    /// // Component NOT accessible yet
+    /// scene.apply_commands();
+    /// // NOW component is accessible
+    /// ```
+    pub fn add_component_deferred<T: Send + Sync + 'static>(&self, component: T) {
+        self.command_buffer
+            .write()
+            .add_component(self.entity, component);
     }
 
     /// Get a component - Unity-like API: gameObject.get_component::<Transform>()
@@ -201,14 +81,26 @@ impl GameObject {
         Some(ComponentRefMut::new(self.world.clone(), self.entity))
     }
 
-    /// Remove a component - returns a builder that executes immediately unless .delay() is called
-    pub fn remove_component<T: 'static>(&self) -> RemoveComponentCall<'_, T> {
-        RemoveComponentCall::new(self)
+    /// Remove a component immediately
+    pub fn remove_component<T: 'static>(&self) {
+        self.world.write().remove_component::<T>(self.entity);
     }
 
-    /// Destroy this GameObject - returns a builder that executes immediately unless .delay() is called
-    pub fn destroy(&self) -> DestroyCall<'_> {
-        DestroyCall::new(self)
+    /// Remove a component deferred - queued until apply_commands()
+    pub fn remove_component_deferred<T: 'static>(&self) {
+        self.command_buffer
+            .write()
+            .remove_component::<T>(self.entity);
+    }
+
+    /// Destroy this GameObject immediately
+    pub fn destroy(&self) {
+        self.world.write().destroy_entity(self.entity);
+    }
+
+    /// Destroy this GameObject deferred - queued until apply_commands()
+    pub fn destroy_deferred(&self) {
+        self.command_buffer.write().destroy_entity(self.entity);
     }
 
     /// Check if component exists
