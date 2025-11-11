@@ -1,10 +1,7 @@
 /// Core ECS implementation - the performance-critical parallel system
+use crate::game_object::Entity;
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
-
-/// Entity is just an ID
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Entity(pub u64);
 
 /// Component storage - type-erased for flexibility
 pub trait ComponentStorage: Send + Sync {
@@ -95,6 +92,20 @@ impl World {
         self.next_entity_id += 1;
         self.entities.push(entity);
         entity
+    }
+
+    /// Create a new entity ID without registering it yet
+    pub fn create_entity_id(&mut self) -> u64 {
+        let id = self.next_entity_id;
+        self.next_entity_id += 1;
+        id
+    }
+
+    /// Register an entity in the world
+    pub fn register_entity(&mut self, entity: Entity) {
+        if !self.entities.contains(&entity) {
+            self.entities.push(entity);
+        }
     }
 
     pub fn add_component<T: Send + Sync + 'static>(&mut self, entity: Entity, component: T) {

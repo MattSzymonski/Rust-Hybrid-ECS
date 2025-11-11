@@ -187,9 +187,7 @@ fn main() {
     println!(
         "│ Create Entity   │ Instantiate()        │ commands.spawn()     │ scene.instantiate()  │"
     );
-    println!(
-        "│ Add Component   │ AddComponent<T>()    │ .insert(Component)   │ .add_component(T)    │"
-    );
+    println!("│ Add Component   │ AddComponent<T>()    │ .insert(Component)   │ .add(T)    │");
     println!(
         "│ Access Comp     │ GetComponent<T>()    │ Query<&T>            │ .get_component<T>()  │"
     );

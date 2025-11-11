@@ -39,53 +39,32 @@ fn main() {
     let scene = Scene::new();
 
     // Create obstacle entity with multiple box colliders
-    let obstacle = scene.instantiate();
-    obstacle
-        .add_component(Name::new("Obstacle"))
-        .add_component(Transform::new(50.0, 0.0, 0.0));
+    let obstacle_entity = scene.instantiate();
+    obstacle_entity
+        .add(Name::new("Obstacle"))
+        .add(Transform::new(50.0, 0.0, 0.0));
 
     // Add multiple box colliders to the obstacle
-    let obstacle_entity = obstacle.entity();
+    let obstacle_entity_id = obstacle_entity.entity;
     scene.apply_commands();
 
-    {
-        let world_lock = scene.world();
-        let mut world = world_lock.write();
-
-        // Add 5 box colliders in different positions
-        world.add_component(
-            obstacle_entity,
-            BoxCollider::new((0.0, 0.0, 0.0), (5.0, 5.0, 5.0)),
-        );
-        world.add_component(
-            obstacle_entity,
-            BoxCollider::new((6.0, 0.0, 0.0), (4.0, 4.0, 4.0)),
-        );
-        world.add_component(
-            obstacle_entity,
-            BoxCollider::new((-6.0, 0.0, 0.0), (4.0, 4.0, 4.0)),
-        );
-        world.add_component(
-            obstacle_entity,
-            BoxCollider::new((0.0, 6.0, 0.0), (3.0, 3.0, 3.0)),
-        );
-        world.add_component(
-            obstacle_entity,
-            BoxCollider::new((0.0, -6.0, 0.0), (3.0, 3.0, 3.0)),
-        );
-    }
+    obstacle_entity.add(BoxCollider::new((0.0, 0.0, 0.0), (5.0, 5.0, 5.0)));
+    obstacle_entity.add(BoxCollider::new((6.0, 0.0, 0.0), (4.0, 4.0, 4.0)));
+    obstacle_entity.add(BoxCollider::new((-6.0, 0.0, 0.0), (4.0, 4.0, 4.0)));
+    obstacle_entity.add(BoxCollider::new((0.0, 6.0, 0.0), (3.0, 3.0, 3.0)));
+    obstacle_entity.add(BoxCollider::new((0.0, -6.0, 0.0), (3.0, 3.0, 3.0)));
 
     println!("✓ Created obstacle with 5 box colliders");
 
     // Create moving entities
     let entity_count = 10_000;
     for i in 0..entity_count {
-        let entity = scene.instantiate();
+        let moving_entity = scene.instantiate();
         let angle = (i as f32 / entity_count as f32) * std::f32::consts::PI * 2.0;
-        entity
-            .add_component(Name::new(format!("Entity_{}", i)))
-            .add_component(Transform::new(angle.cos() * 20.0, angle.sin() * 20.0, 0.0))
-            .add_component(Velocity::new(angle.cos() * 2.0, angle.sin() * 2.0, 0.0));
+        moving_entity
+            .add(Name::new(format!("Entity_{}", i)))
+            .add(Transform::new(angle.cos() * 20.0, angle.sin() * 20.0, 0.0))
+            .add(Velocity::new(angle.cos() * 2.0, angle.sin() * 2.0, 0.0));
     }
 
     scene.apply_commands();
@@ -107,13 +86,15 @@ fn main() {
         let entities: Vec<Entity> = world.entities().collect();
 
         // Get obstacle transform and colliders
-        let obstacle_transform = world.get_component::<Transform>(obstacle_entity).cloned();
+        let obstacle_transform = world
+            .get_component::<Transform>(obstacle_entity_id)
+            .cloned();
         let obstacle_colliders: Vec<BoxCollider> =
-            world.get_components::<BoxCollider>(obstacle_entity);
+            world.get_components::<BoxCollider>(obstacle_entity_id);
 
         // Process each entity
         for entity in entities {
-            if entity == obstacle_entity {
+            if entity == obstacle_entity_id {
                 continue;
             }
 
@@ -177,7 +158,7 @@ fn main() {
         .query::<Transform>()
         .map(|iter| {
             iter.filter(|(entity, transform)| {
-                if *entity == obstacle_entity {
+                if *entity == obstacle_entity_id {
                     return false;
                 }
                 let dx = transform.x - 50.0;

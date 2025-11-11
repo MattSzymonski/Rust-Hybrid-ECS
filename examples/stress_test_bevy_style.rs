@@ -45,7 +45,7 @@ fn main() {
         .add_component(Transform::new(50.0, 0.0, 0.0));
 
     // Add multiple box colliders to the obstacle
-    let obstacle_entity = obstacle.entity();
+    let obstacle_entity = obstacle.entity;
     scene.apply_commands();
 
     {

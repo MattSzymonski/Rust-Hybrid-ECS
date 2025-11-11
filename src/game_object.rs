@@ -1,22 +1,149 @@
 use crate::command_buffer::CommandBuffer;
 /// Unity-like GameObject wrapper - provides familiar OOP API
 /// This is the "hybrid" solution that wraps ECS with object-oriented interface
-use crate::ecs_core::{Entity, World};
+use crate::ecs_core::World;
 use parking_lot::RwLock;
 use std::sync::Arc;
 
+/// Entity ID
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Entity(pub u64);
+
 /// GameObject - Unity-like wrapper around an Entity
-/// Provides immediate-mode API that feels natural to use
+/// Now stores the world and command buffer pointers directly
 #[derive(Clone)]
 pub struct GameObject {
-    entity: Entity,
+    pub entity: Entity,
     world: Arc<RwLock<World>>,
     command_buffer: Arc<RwLock<CommandBuffer>>,
-    is_pending: bool, // True if entity creation is deferred
+}
+
+/// Builder for deferred component addition
+pub struct AddComponentCall<'a, T: Send + Sync + 'static> {
+    game_object: &'a GameObject,
+    component: Option<T>,
+    delayed: bool,
+}
+
+impl<'a, T: Send + Sync + 'static> AddComponentCall<'a, T> {
+    fn new(game_object: &'a GameObject, component: T) -> Self {
+        Self {
+            game_object,
+            component: Some(component),
+            delayed: false,
+        }
+    }
+
+    /// Mark this operation as delayed (won't execute until apply_commands)
+    pub fn delay(mut self) -> Self {
+        self.delayed = true;
+        self
+    }
+}
+
+impl<'a, T: Send + Sync + 'static> Drop for AddComponentCall<'a, T> {
+    fn drop(&mut self) {
+        if let Some(component) = self.component.take() {
+            if self.delayed {
+                // Deferred: queue command
+                self.game_object
+                    .command_buffer
+                    .write()
+                    .add_component(self.game_object.entity, component);
+            } else {
+                // Immediate: add directly (executes at semicolon)
+                self.game_object
+                    .world
+                    .write()
+                    .add_component(self.game_object.entity, component);
+            }
+        }
+    }
+}
+
+/// Builder for deferred component removal
+pub struct RemoveComponentCall<'a, T: 'static> {
+    game_object: &'a GameObject,
+    delayed: bool,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<'a, T: 'static> RemoveComponentCall<'a, T> {
+    fn new(game_object: &'a GameObject) -> Self {
+        Self {
+            game_object,
+            delayed: false,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Mark this operation as delayed
+    pub fn delay(mut self) -> Self {
+        self.delayed = true;
+        self
+    }
+}
+
+impl<'a, T: 'static> Drop for RemoveComponentCall<'a, T> {
+    fn drop(&mut self) {
+        if self.delayed {
+            self.game_object
+                .command_buffer
+                .write()
+                .remove_component::<T>(self.game_object.entity);
+        } else {
+            self.game_object
+                .world
+                .write()
+                .remove_component::<T>(self.game_object.entity);
+        }
+    }
+}
+
+/// Builder for deferred entity destruction
+pub struct DestroyCall<'a> {
+    game_object: &'a GameObject,
+    delayed: bool,
+    executed: bool,
+}
+
+impl<'a> DestroyCall<'a> {
+    fn new(game_object: &'a GameObject) -> Self {
+        Self {
+            game_object,
+            delayed: false,
+            executed: false,
+        }
+    }
+
+    /// Mark this operation as delayed
+    pub fn delay(mut self) -> Self {
+        self.delayed = true;
+        self
+    }
+}
+
+impl<'a> Drop for DestroyCall<'a> {
+    fn drop(&mut self) {
+        if !self.executed {
+            if self.delayed {
+                self.game_object
+                    .command_buffer
+                    .write()
+                    .destroy_entity(self.game_object.entity);
+            } else {
+                self.game_object
+                    .world
+                    .write()
+                    .destroy_entity(self.game_object.entity);
+            }
+            self.executed = true;
+        }
+    }
 }
 
 impl GameObject {
-    /// Create from existing entity (direct mode)
+    /// Create from existing entity
     pub fn from_entity(
         entity: Entity,
         world: Arc<RwLock<World>>,
@@ -26,102 +153,67 @@ impl GameObject {
             entity,
             world,
             command_buffer,
-            is_pending: false,
         }
     }
 
-    /// Create new GameObject (deferred mode - queued in command buffer)
+    /// Create new GameObject
     pub fn new(world: Arc<RwLock<World>>, command_buffer: Arc<RwLock<CommandBuffer>>) -> Self {
-        // Create entity immediately for simple case
-        let entity = world.write().create_entity();
+        let entity = Entity(world.write().create_entity_id());
+        world.write().register_entity(entity);
 
         Self {
             entity,
             world,
             command_buffer,
-            is_pending: false,
         }
     }
 
-    /// Get the underlying entity ID
-    pub fn entity(&self) -> Entity {
-        self.entity
+    /// Add a component - returns a builder that executes immediately unless .delay() is called
+    ///
+    /// Usage:
+    /// - `entity.add_component(Transform::new(0.0, 0.0, 0.0));` - immediate
+    /// - `entity.add_component(Transform::new(0.0, 0.0, 0.0)).delay();` - deferred
+    pub fn add_component<T: Send + Sync + 'static>(&self, component: T) -> AddComponentCall<'_, T> {
+        AddComponentCall::new(self, component)
     }
 
-    /// Add a component - Unity-like API: gameObject.add_component(transform)
-    pub fn add_component<T: Send + Sync + 'static>(&self, component: T) -> &Self {
-        if self.is_pending {
-            // Deferred: queue command
-            self.command_buffer
-                .write()
-                .add_component(self.entity, component);
-        } else {
-            // Immediate: add directly
-            self.world.write().add_component(self.entity, component);
-        }
+    /// Add a component immediately (for chaining) - Unity-like fluent API
+    ///
+    /// Usage:
+    /// ```
+    /// entity
+    ///     .add(Transform::new(0.0, 0.0, 0.0))
+    ///     .add(Velocity::new(1.0, 0.0, 0.0))
+    ///     .add(Health::new(100.0));
+    /// ```
+    pub fn add<T: Send + Sync + 'static>(&self, component: T) -> &Self {
+        self.world.write().add_component(self.entity, component);
         self
     }
 
     /// Get a component - Unity-like API: gameObject.get_component::<Transform>()
     pub fn get_component<T: 'static>(&self) -> Option<ComponentRef<T>> {
-        if self.is_pending {
-            // Can't access components of pending entities
-            None
-        } else {
-            // Return a smart reference that holds the lock
-            Some(ComponentRef::<T>::new(self.world.clone(), self.entity))
-        }
+        Some(ComponentRef::<T>::new(self.world.clone(), self.entity))
     }
 
     /// Get a mutable component reference
     pub fn get_component_mut<T: 'static>(&self) -> Option<ComponentRefMut<T>> {
-        if self.is_pending {
-            None
-        } else {
-            Some(ComponentRefMut::new(self.world.clone(), self.entity))
-        }
+        Some(ComponentRefMut::new(self.world.clone(), self.entity))
     }
 
-    // pub fn get_component_raw_mut<T: 'static>(&self) -> Result<&mut T, ()> {
-    //     if self.is_pending {
-    //         Err(())
-    //     } else {
-    //         let mut world = self.world.write();
-    //         let comp = world.get_component_mut::<T>(self.entity);
-    //         match comp {
-    //             Some(v) => Ok(v),
-    //             None => Err(()),
-    //         }
-    //     }
-    // }
-
-    /// Remove a component - Unity-like API
-    pub fn remove_component<T: 'static>(&self) {
-        if self.is_pending {
-            self.command_buffer
-                .write()
-                .remove_component::<T>(self.entity);
-        } else {
-            self.world.write().remove_component::<T>(self.entity);
-        }
+    /// Remove a component - returns a builder that executes immediately unless .delay() is called
+    pub fn remove_component<T: 'static>(&self) -> RemoveComponentCall<'_, T> {
+        RemoveComponentCall::new(self)
     }
 
-    /// Destroy this GameObject - Unity-like API
-    pub fn destroy(&self) {
-        if self.is_pending {
-            // Can't destroy what doesn't exist yet
-            return;
-        }
-        self.command_buffer.write().destroy_entity(self.entity);
+    /// Destroy this GameObject - returns a builder that executes immediately unless .delay() is called
+    pub fn destroy(&self) -> DestroyCall<'_> {
+        DestroyCall::new(self)
     }
 
     /// Check if component exists
     pub fn has_component<T: 'static>(&self) -> bool {
-        if self.is_pending {
-            false
-        } else {
-            self.world.read().get_component::<T>(self.entity).is_some()
-        }
+        self.world.read().get_component::<T>(self.entity).is_some()
     }
 }
 

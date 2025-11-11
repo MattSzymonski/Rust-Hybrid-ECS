@@ -1,6 +1,7 @@
 /// Command buffer - deferred operations for thread-safe entity manipulation
 /// This solves the "inconsistent state" problem mentioned in the conversation
-use crate::ecs_core::{Entity, World};
+use crate::ecs_core::World;
+use crate::game_object::Entity;
 
 /// Commands that can be deferred and executed later
 pub enum Command {

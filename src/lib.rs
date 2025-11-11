@@ -6,8 +6,8 @@ mod game_object;
 mod systems;
 
 pub use command_buffer::CommandBuffer;
-pub use ecs_core::{Entity, World};
-pub use game_object::{ComponentRef, ComponentRefMut, GameObject, Scene};
+pub use ecs_core::World;
+pub use game_object::{ComponentRef, ComponentRefMut, Entity, GameObject, Scene};
 pub use systems::{GameSystem, System, SystemExecutor};
 
 // Re-export common components
