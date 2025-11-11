@@ -1,0 +1,15 @@
+[package]
+name = "ecs_hybrid"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+parking_lot = "0.12"
+
+[[bin]]
+name = "ecs_hybrid"
+path = "src/main.rs"
+
+[[example]]
+name = "advanced"
+path = "examples/advanced.rs"
