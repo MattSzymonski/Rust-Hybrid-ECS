@@ -15,7 +15,7 @@ pub trait ComponentStorage: Send + Sync {
 
 /// Concrete storage for a specific component type
 pub struct TypedStorage<T: 'static> {
-    components: HashMap<Entity, T>,
+    components: HashMap<Entity, Vec<T>>, // Support multiple components per entity
 }
 
 impl<T: 'static> TypedStorage<T> {
@@ -26,23 +26,37 @@ impl<T: 'static> TypedStorage<T> {
     }
 
     pub fn insert(&mut self, entity: Entity, component: T) {
-        self.components.insert(entity, component);
+        self.components
+            .entry(entity)
+            .or_insert_with(Vec::new)
+            .push(component);
     }
 
     pub fn get(&self, entity: Entity) -> Option<&T> {
-        self.components.get(&entity)
+        self.components.get(&entity).and_then(|v| v.first())
     }
 
     pub fn get_mut(&mut self, entity: Entity) -> Option<&mut T> {
-        self.components.get_mut(&entity)
+        self.components.get_mut(&entity).and_then(|v| v.first_mut())
+    }
+
+    pub fn get_all(&self, entity: Entity) -> Vec<T>
+    where
+        T: Clone,
+    {
+        self.components.get(&entity).cloned().unwrap_or_default()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (Entity, &T)> {
-        self.components.iter().map(|(e, c)| (*e, c))
+        self.components
+            .iter()
+            .filter_map(|(e, v)| v.first().map(|c| (*e, c)))
     }
 
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (Entity, &mut T)> {
-        self.components.iter_mut().map(|(e, c)| (*e, c))
+        self.components
+            .iter_mut()
+            .filter_map(|(e, v)| v.first_mut().map(|c| (*e, c)))
     }
 }
 
@@ -146,6 +160,22 @@ impl World {
         }
         // Remove from entity list
         self.entities.retain(|e| *e != entity);
+    }
+
+    /// Get all entities
+    pub fn entities(&self) -> impl Iterator<Item = Entity> + '_ {
+        self.entities.iter().copied()
+    }
+
+    /// Get all components of a specific type for an entity (for multiple instances)
+    pub fn get_components<T: Clone + 'static>(&self, entity: Entity) -> Vec<T> {
+        let type_id = TypeId::of::<T>();
+        if let Some(storage) = self.storages.get(&type_id) {
+            if let Some(typed_storage) = storage.as_any().downcast_ref::<TypedStorage<T>>() {
+                return typed_storage.get_all(entity);
+            }
+        }
+        Vec::new()
     }
 
     /// Query two components - read-only for both
