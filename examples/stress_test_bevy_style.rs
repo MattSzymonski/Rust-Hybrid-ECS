@@ -101,35 +101,56 @@ fn main() {
     // Bevy-style system execution
     for _frame in 0..frame_count {
         let world_lock = scene.world();
-        let mut world = world_lock.write();
+        let world = world_lock.read();
 
-        // Get obstacle data once
-        let obstacle_transform = world.get_component::<Transform>(obstacle_entity).cloned();
-        let obstacle_colliders: Vec<BoxCollider> =
-            world.get_components::<BoxCollider>(obstacle_entity);
+        // Pre-collect obstacle data once per frame (no cloning - just position values)
+        let obs_pos = world
+            .get_component::<Transform>(obstacle_entity)
+            .map(|t| (t.x, t.y, t.z));
 
-        // Bevy-style: Query for components directly
-        for (transform, velocity) in world.query2_mut::<Transform, Velocity>() {
+        // Collect collision info: (entity_id, new_position, should_collide)
+        let mut collision_checks: Vec<(usize, f32, f32, f32, bool)> = Vec::new();
+
+        // First pass: calculate new positions and check collisions (read-only)
+        for (idx, (transform, velocity)) in world.query2::<Transform, Velocity>().enumerate() {
             let new_x = transform.x + velocity.x * 0.016;
             let new_y = transform.y + velocity.y * 0.016;
             let new_z = transform.z + velocity.z * 0.016;
 
-            // Check collision with obstacle
             let mut collided = false;
-            if let Some(ref obs_transform) = obstacle_transform {
-                for collider in &obstacle_colliders {
-                    if collider.intersects(obs_transform, (new_x, new_y, new_z)) {
-                        collided = true;
-                        break;
+            if let Some((obs_x, obs_y, obs_z)) = obs_pos {
+                let obs_transform = Transform::new(obs_x, obs_y, obs_z);
+
+                // Check collisions through closure (no clone!)
+                world.with_components::<BoxCollider, _, _>(obstacle_entity, |colliders| {
+                    for collider in colliders {
+                        if collider.intersects(&obs_transform, (new_x, new_y, new_z)) {
+                            collided = true;
+                            break;
+                        }
                     }
-                }
+                });
             }
 
-            // Only move if not colliding
-            if !collided {
-                transform.x = new_x;
-                transform.y = new_y;
-                transform.z = new_z;
+            collision_checks.push((idx, new_x, new_y, new_z, collided));
+        }
+
+        drop(world);
+
+        // Second pass: apply movement (write lock)
+        let mut world = world_lock.write();
+
+        // Bevy-style: Query for mutable components
+        if let Some(mut idx) = Some(0) {
+            for (transform, _velocity) in world.query2_mut_mut::<Transform, Velocity>() {
+                if let Some(&(_, new_x, new_y, new_z, collided)) = collision_checks.get(idx) {
+                    if !collided {
+                        transform.x = new_x;
+                        transform.y = new_y;
+                        transform.z = new_z;
+                    }
+                    idx += 1;
+                }
             }
         }
     }

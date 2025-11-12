@@ -7,9 +7,8 @@ mod systems;
 
 pub use command_buffer::CommandBuffer;
 pub use ecs_core::World;
-pub use game_object::{ComponentRef, ComponentRefMut, Entity, Scene};
+pub use game_object::{ComponentRef, ComponentRefMut, Entity, RawComponentRef, Scene};
 pub use systems::{GameSystem, System, SystemExecutor};
-
 // Re-export common components
 #[derive(Debug, Clone)]
 pub struct Transform {

@@ -1,8 +1,42 @@
-use crate::command_buffer::CommandBuffer;
 /// Unity-like Entity API - provides familiar OOP interface over ECS
 use crate::ecs_core::World;
-use parking_lot::RwLock;
+use crate::{command_buffer::CommandBuffer, Transform};
+use parking_lot::{
+    MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+
+// ---------------------------------------------------------------------------------------------------------------------
+pub type RawComponentRef<'a, T> = MappedRwLockReadGuard<'a, T>;
+
+pub struct ComponentRefer<'a, T>(MappedRwLockReadGuard<'a, T>);
+pub struct ComponentReferMut<'a, T>(MappedRwLockWriteGuard<'a, T>);
+
+impl<'a, T> Deref for ComponentRefer<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<'a, T> Deref for ComponentReferMut<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+impl<'a, T> DerefMut for ComponentReferMut<'a, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+impl<'a, T: Clone> ComponentRefer<'a, T> {
+    pub fn cloned(&self) -> T {
+        self.0.clone()
+    }
+}
 
 /// Entity - combines ID with world/command buffer pointers for convenient API
 #[derive(Clone)]
@@ -70,9 +104,59 @@ impl Entity {
         Some(ComponentRef::<T>::new(self.world.clone(), self.id))
     }
 
+    // pub fn get_component_raw<T: 'static>(&self) -> Option<RawComponentRef<'_, T>> {
+    //     let guard = self.world.read();
+    //     RwLockReadGuard::try_map(guard, |world| world.get_component::<T>(self.id)).ok()
+    // }
+
+    // pub fn get_component_raww<T: 'static>(&self) -> Option<ComponentRefer<'_, T>> {
+    //     let guard = self.world.read();
+    //     RwLockReadGuard::try_map(guard, |world| world.get_component::<T>(self.id)).ok()
+    // }
+
+    pub fn get_component_raw<T: 'static>(&self) -> Option<ComponentRefer<'_, T>> {
+        let guard = self.world.read();
+        RwLockReadGuard::try_map(guard, |world| world.get_component::<T>(self.id))
+            .ok()
+            .map(ComponentRefer)
+    }
+
+    pub fn get_component_raw_mut<T: 'static>(&self) -> Option<ComponentReferMut<'_, T>> {
+        let guard = self.world.write(); // acquire a write lock
+        RwLockWriteGuard::try_map(guard, |world| world.get_component_mut::<T>(self.id))
+            .ok()
+            .map(ComponentReferMut)
+    }
+
+    pub fn with_component<T: 'static, R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
+        let world = self.world.read(); // or .unwrap() if you prefer
+        let comp = world.get_component::<T>(self.id)?;
+        Some(f(comp))
+    }
+
+    // pub fn get_component_raw<T: 'static>(&self) -> Option<&T> {
+    //     let world = self.world.read();
+    //     world.get_component(self.id)
+    // }
+    //Some(ComponentRef::<T>::new(self.world.clone(), self.id))
+    // pub fn get_component_raw<T: 'static>(&self) -> Option<&T> {
+    //     let world = self.world.read();
+    //     world.get_component::<T>(self.id);
+    // }
+
     /// Get a mutable component reference
     pub fn get_component_mut<T: 'static>(&self) -> Option<ComponentRefMut<T>> {
         Some(ComponentRefMut::new(self.world.clone(), self.id))
+    }
+
+    /// Access all components of a specific type through a closure (no cloning)
+    /// Useful when entity has multiple components of the same type
+    pub fn with_components<T: 'static, R, F>(&self, f: F) -> Option<R>
+    where
+        F: FnOnce(&[T]) -> R,
+    {
+        let world = self.world.read();
+        world.with_components::<T, R, F>(self.id, f)
     }
 
     /// Remove a component immediately
@@ -197,6 +281,13 @@ impl Scene {
         self.world.clone()
     }
 
+    pub fn get_world(&self) -> Option<ComponentRefer<'_, World>> {
+        let guard = self.world.read();
+        RwLockReadGuard::try_map(guard, |world| Some(world))
+            .ok()
+            .map(ComponentRefer)
+    }
+
     /// Access command buffer
     pub fn command_buffer(&self) -> Arc<RwLock<CommandBuffer>> {
         self.command_buffer.clone()
@@ -213,5 +304,18 @@ impl Scene {
 impl Default for Scene {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+trait HasComponentRef<T> {
+    fn get_component_raw(&self) -> Option<ComponentRefer<'_, T>>;
+}
+
+impl HasComponentRef<Transform> for Entity {
+    fn get_component_raw(&self) -> Option<ComponentRefer<'_, Transform>> {
+        let guard = self.world.read();
+        RwLockReadGuard::try_map(guard, |world| world.get_component::<Transform>(self.id))
+            .ok()
+            .map(ComponentRefer)
     }
 }

@@ -1,5 +1,6 @@
 /// Stress test using Unity-style iteration (get_component)
 use ecs_hybrid::*;
+use parking_lot::MappedRwLockReadGuard;
 use std::time::Instant;
 
 #[derive(Debug, Clone)]
@@ -79,51 +80,88 @@ fn main() {
 
     // Unity-style system execution
     for _frame in 0..frame_count {
-        let world_lock = scene.world();
-        let mut world = world_lock.write();
+        let world = scene.get_world().unwrap();
 
-        // Get all entities (Unity-style: iterate entities, then get components)
-        let entities: Vec<u64> = world.entities().collect();
+        // let world_lock = scene.world();
+        // let world = world_lock.read();
 
-        // Get obstacle transform and colliders
-        let obstacle_transform = world
+        // Get all entity IDs (Unity-style: iterate entities, then get components)
+        let entity_ids: Vec<u64> = world.entities().collect();
+
+        // Pre-fetch obstacle transform position (copy just 3 floats, not cloning component)
+        let obs_pos = world
             .get_component::<Transform>(obstacle_entity_id)
-            .cloned();
-        let obstacle_colliders: Vec<BoxCollider> =
-            world.get_components::<BoxCollider>(obstacle_entity_id);
+            .map(|t| (t.x, t.y, t.z));
 
-        // Process each entity
-        for entity in entities {
-            if entity == obstacle_entity_id {
+        drop(world);
+        //  drop(world_lock);
+
+        // Process each entity using Unity-style Entity API
+        for entity_id in entity_ids {
+            if entity_id == obstacle_entity_id {
                 continue;
             }
 
-            // Get velocity first (immutable borrow)
-            let velocity = world.get_component::<Velocity>(entity).cloned();
+            let entity = scene.get_entity(entity_id);
 
-            if let (Some(transform), Some(velocity)) =
-                (world.get_component_mut::<Transform>(entity), velocity)
-            {
-                let new_x = transform.x + velocity.x * 0.016;
-                let new_y = transform.y + velocity.y * 0.016;
-                let new_z = transform.z + velocity.z * 0.016;
+            // Unity-style: Get velocity (read-only), then get transform (mutable)
+            // Store velocity values to avoid borrow issues
+            let (vx, vy, vz) = if let Some(velocity_ref) = entity.get_component::<Velocity>() {
+                if let Some(vel) = velocity_ref.with(|v| (v.x, v.y, v.z)) {
+                    vel
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
 
-                // Check collision with obstacle
-                let mut collided = false;
-                if let Some(ref obs_transform) = obstacle_transform {
-                    for collider in &obstacle_colliders {
-                        if collider.intersects(obs_transform, (new_x, new_y, new_z)) {
+            // let entity = scene.get_entity(entity_id);
+            // let transform = entity.get_component_raw::<Transform>().unwrap();
+            // println!("Entity position: {:?}", transform.x);
+
+            let transform = entity.get_component_raw::<Transform>().unwrap();
+
+            let mut transform_mut = entity.get_component_raw_mut::<Transform>().unwrap();
+
+            if let Some(pos) = entity.with_component::<Transform, _>(|t| (t.x, t.y, t.z)) {
+                println!("Entity position: {:?}", pos.0);
+            }
+
+            // Calculate new position
+            let current_pos = entity
+                .get_component::<Transform>()
+                .and_then(|t| t.with(|tr| (tr.x, tr.y, tr.z)))
+                .unwrap_or((0.0, 0.0, 0.0));
+
+            let new_x = current_pos.0 + vx * 0.016;
+            let new_y = current_pos.1 + vy * 0.016;
+            let new_z = current_pos.2 + vz * 0.016;
+
+            // Check collision with obstacle - NO CLONING using with_components
+            let mut collided = false;
+            if let Some((obs_x, obs_y, obs_z)) = obs_pos {
+                let obs_transform = Transform::new(obs_x, obs_y, obs_z);
+
+                // Access all colliders through closure (no clone!)
+                obstacle_entity.with_components::<BoxCollider, _, _>(|colliders| {
+                    for collider in colliders {
+                        if collider.intersects(&obs_transform, (new_x, new_y, new_z)) {
                             collided = true;
                             break;
                         }
                     }
-                }
+                });
+            }
 
-                // Only move if not colliding
-                if !collided {
-                    transform.x = new_x;
-                    transform.y = new_y;
-                    transform.z = new_z;
+            // Apply movement if not colliding
+            if !collided {
+                if let Some(mut transform_ref) = entity.get_component_mut::<Transform>() {
+                    transform_ref.with(|transform| {
+                        transform.x = new_x;
+                        transform.y = new_y;
+                        transform.z = new_z;
+                    });
                 }
             }
         }
