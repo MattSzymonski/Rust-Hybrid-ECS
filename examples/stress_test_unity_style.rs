@@ -72,7 +72,8 @@ fn main() {
 
     println!("✓ Created {} moving entities", entity_count);
     println!("\nScenario: Entities move toward obstacle with 5 box colliders");
-    println!("Collision check: Unity-style iteration with get_component");
+    println!("API Style:      Raw getters (get_component_raw/get_component_raw_mut)");
+    println!("Borrow Check:   Runtime tracking with BorrowTracker");
     println!("\nRunning 10,000 frame simulation...\n");
 
     let frame_count = 10_000;
@@ -81,9 +82,6 @@ fn main() {
     // Unity-style system execution
     for _frame in 0..frame_count {
         let world = scene.get_world().unwrap();
-
-        // let world_lock = scene.world();
-        // let world = world_lock.read();
 
         // Get all entity IDs (Unity-style: iterate entities, then get components)
         let entity_ids: Vec<u64> = world.entities().collect();
@@ -94,9 +92,8 @@ fn main() {
             .map(|t| (t.x, t.y, t.z));
 
         drop(world);
-        //  drop(world_lock);
 
-        // Process each entity using Unity-style Entity API
+        // Process each entity using Unity-style Entity API with raw getters
         for entity_id in entity_ids {
             if entity_id == obstacle_entity_id {
                 continue;
@@ -104,39 +101,23 @@ fn main() {
 
             let entity = scene.get_entity(entity_id);
 
-            // Unity-style: Get velocity (read-only), then get transform (mutable)
-            // Store velocity values to avoid borrow issues
-            let (vx, vy, vz) = if let Some(velocity_ref) = entity.get_component::<Velocity>() {
-                if let Some(vel) = velocity_ref.with(|v| (v.x, v.y, v.z)) {
-                    vel
-                } else {
-                    continue;
-                }
-            } else {
+            // Get velocity using raw getter - borrow tracked automatically
+            let Some(v) = entity.get_component_raw::<Velocity>() else {
                 continue;
             };
+            let (vx, vy, vz) = (v.x, v.y, v.z);
+            drop(v); // Explicitly release read lock and borrow
 
-            // let entity = scene.get_entity(entity_id);
-            // let transform = entity.get_component_raw::<Transform>().unwrap();
-            // println!("Entity position: {:?}", transform.x);
+            // Get current transform position using raw getter
+            let Some(t) = entity.get_component_raw::<Transform>() else {
+                continue;
+            };
+            let (current_x, current_y, current_z) = (t.x, t.y, t.z);
+            drop(t); // Explicitly release read lock and borrow
 
-            let transform = entity.get_component_raw::<Transform>().unwrap();
-
-            let mut transform_mut = entity.get_component_raw_mut::<Transform>().unwrap();
-
-            if let Some(pos) = entity.with_component::<Transform, _>(|t| (t.x, t.y, t.z)) {
-                println!("Entity position: {:?}", pos.0);
-            }
-
-            // Calculate new position
-            let current_pos = entity
-                .get_component::<Transform>()
-                .and_then(|t| t.with(|tr| (tr.x, tr.y, tr.z)))
-                .unwrap_or((0.0, 0.0, 0.0));
-
-            let new_x = current_pos.0 + vx * 0.016;
-            let new_y = current_pos.1 + vy * 0.016;
-            let new_z = current_pos.2 + vz * 0.016;
+            let new_x = current_x + vx * 0.016;
+            let new_y = current_y + vy * 0.016;
+            let new_z = current_z + vz * 0.016;
 
             // Check collision with obstacle - NO CLONING using with_components
             let mut collided = false;
@@ -154,15 +135,13 @@ fn main() {
                 });
             }
 
-            // Apply movement if not colliding
+            // Apply movement if not colliding - using raw mutable getter
             if !collided {
-                if let Some(mut transform_ref) = entity.get_component_mut::<Transform>() {
-                    transform_ref.with(|transform| {
-                        transform.x = new_x;
-                        transform.y = new_y;
-                        transform.z = new_z;
-                    });
-                }
+                if let Some(mut transform) = entity.get_component_raw_mut::<Transform>() {
+                    transform.x = new_x;
+                    transform.y = new_y;
+                    transform.z = new_z;
+                } // Write lock and borrow released here
             }
         }
     }
@@ -175,7 +154,8 @@ fn main() {
     let total_checks = entity_count * frame_count * 5; // 5 colliders
 
     println!("=== Results ===");
-    println!("Iteration Style:    Unity (get_component)");
+    println!("Iteration Style:    Unity (raw getters)");
+    println!("Borrow Check:       Runtime tracking");
     println!("Entities:           {}", entity_count);
     println!("Frames:             {}", frame_count);
     println!("Colliders:          5 box colliders on obstacle");

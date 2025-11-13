@@ -4,37 +4,114 @@ use crate::{command_buffer::CommandBuffer, Transform};
 use parking_lot::{
     MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
+use std::cell::Cell;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------------------------------------------------
+
+/// Runtime borrow tracking for detecting deadlocks at runtime
+#[derive(Default)]
+struct BorrowTracker {
+    read_count: Cell<usize>,
+    write_count: Cell<usize>,
+}
+
+impl BorrowTracker {
+    fn new() -> Self {
+        Self {
+            read_count: Cell::new(0),
+            write_count: Cell::new(0),
+        }
+    }
+
+    fn borrow_read(&self) -> BorrowGuard<'_> {
+        if self.write_count.get() > 0 {
+            panic!(
+                "Cannot borrow component immutably: already borrowed mutably ({} active write borrows)",
+                self.write_count.get()
+            );
+        }
+        self.read_count.set(self.read_count.get() + 1);
+        BorrowGuard {
+            tracker: self,
+            is_write: false,
+        }
+    }
+
+    fn borrow_write(&self) -> BorrowGuard<'_> {
+        if self.read_count.get() > 0 {
+            panic!(
+                "Cannot borrow component mutably: already borrowed immutably ({} active read borrows)",
+                self.read_count.get()
+            );
+        }
+        if self.write_count.get() > 0 {
+            panic!(
+                "Cannot borrow component mutably: already borrowed mutably ({} active write borrows)",
+                self.write_count.get()
+            );
+        }
+        self.write_count.set(1);
+        BorrowGuard {
+            tracker: self,
+            is_write: true,
+        }
+    }
+}
+
+struct BorrowGuard<'a> {
+    tracker: &'a BorrowTracker,
+    is_write: bool,
+}
+
+impl Drop for BorrowGuard<'_> {
+    fn drop(&mut self) {
+        if self.is_write {
+            self.tracker.write_count.set(0);
+        } else {
+            self.tracker
+                .read_count
+                .set(self.tracker.read_count.get() - 1);
+        }
+    }
+}
+
 pub type RawComponentRef<'a, T> = MappedRwLockReadGuard<'a, T>;
 
-pub struct ComponentRefer<'a, T>(MappedRwLockReadGuard<'a, T>);
-pub struct ComponentReferMut<'a, T>(MappedRwLockWriteGuard<'a, T>);
+pub struct ComponentRefer<'a, T> {
+    inner: MappedRwLockReadGuard<'a, T>,
+    _borrow_guard: BorrowGuard<'a>,
+}
+
+pub struct ComponentReferMut<'a, T> {
+    inner: MappedRwLockWriteGuard<'a, T>,
+    _borrow_guard: BorrowGuard<'a>,
+}
 
 impl<'a, T> Deref for ComponentRefer<'a, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        &self.0
+        &self.inner
     }
 }
 
 impl<'a, T> Deref for ComponentReferMut<'a, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        &self.0
+        &self.inner
     }
 }
+
 impl<'a, T> DerefMut for ComponentReferMut<'a, T> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut self.0
+        &mut self.inner
     }
 }
 
 impl<'a, T: Clone> ComponentRefer<'a, T> {
     pub fn cloned(&self) -> T {
-        self.0.clone()
+        self.inner.clone()
     }
 }
 
@@ -44,6 +121,7 @@ pub struct Entity {
     pub id: u64,
     world: Arc<RwLock<World>>,
     command_buffer: Arc<RwLock<CommandBuffer>>,
+    borrow_tracker: Arc<BorrowTracker>,
 }
 
 impl Entity {
@@ -57,6 +135,7 @@ impl Entity {
             id,
             world,
             command_buffer,
+            borrow_tracker: Arc::new(BorrowTracker::new()),
         }
     }
 
@@ -69,6 +148,7 @@ impl Entity {
             id,
             world,
             command_buffer,
+            borrow_tracker: Arc::new(BorrowTracker::new()),
         }
     }
 
@@ -115,22 +195,42 @@ impl Entity {
     // }
 
     pub fn get_component_raw<T: 'static>(&self) -> Option<ComponentRefer<'_, T>> {
+        // Acquire read borrow (panics if already borrowed mutably)
+        let borrow_guard = self.borrow_tracker.borrow_read();
+
         let guard = self.world.read();
-        RwLockReadGuard::try_map(guard, |world| world.get_component::<T>(self.id))
-            .ok()
-            .map(ComponentRefer)
+        let mapped =
+            RwLockReadGuard::try_map(guard, |world| world.get_component::<T>(self.id)).ok()?;
+
+        Some(ComponentRefer {
+            inner: mapped,
+            _borrow_guard: borrow_guard,
+        })
     }
 
     pub fn get_component_raw_mut<T: 'static>(&self) -> Option<ComponentReferMut<'_, T>> {
-        let guard = self.world.write(); // acquire a write lock
-        RwLockWriteGuard::try_map(guard, |world| world.get_component_mut::<T>(self.id))
-            .ok()
-            .map(ComponentReferMut)
+        // Acquire write borrow (panics if already borrowed)
+        let borrow_guard = self.borrow_tracker.borrow_write();
+
+        let guard = self.world.write();
+        let mapped =
+            RwLockWriteGuard::try_map(guard, |world| world.get_component_mut::<T>(self.id)).ok()?;
+
+        Some(ComponentReferMut {
+            inner: mapped,
+            _borrow_guard: borrow_guard,
+        })
     }
 
     pub fn with_component<T: 'static, R>(&self, f: impl FnOnce(&T) -> R) -> Option<R> {
-        let world = self.world.read(); // or .unwrap() if you prefer
+        let world = self.world.read();
         let comp = world.get_component::<T>(self.id)?;
+        Some(f(comp))
+    }
+
+    pub fn with_component_mut<T: 'static, R>(&self, f: impl FnOnce(&mut T) -> R) -> Option<R> {
+        let mut world = self.world.write();
+        let comp = world.get_component_mut::<T>(self.id)?;
         Some(f(comp))
     }
 
@@ -281,11 +381,9 @@ impl Scene {
         self.world.clone()
     }
 
-    pub fn get_world(&self) -> Option<ComponentRefer<'_, World>> {
+    pub fn get_world(&self) -> Option<WorldRef<'_>> {
         let guard = self.world.read();
-        RwLockReadGuard::try_map(guard, |world| Some(world))
-            .ok()
-            .map(ComponentRefer)
+        Some(WorldRef(guard))
     }
 
     /// Access command buffer
@@ -301,21 +399,17 @@ impl Scene {
     }
 }
 
-impl Default for Scene {
-    fn default() -> Self {
-        Self::new()
+pub struct WorldRef<'a>(RwLockReadGuard<'a, World>);
+
+impl<'a> Deref for WorldRef<'a> {
+    type Target = World;
+    fn deref(&self) -> &World {
+        &self.0
     }
 }
 
-trait HasComponentRef<T> {
-    fn get_component_raw(&self) -> Option<ComponentRefer<'_, T>>;
-}
-
-impl HasComponentRef<Transform> for Entity {
-    fn get_component_raw(&self) -> Option<ComponentRefer<'_, Transform>> {
-        let guard = self.world.read();
-        RwLockReadGuard::try_map(guard, |world| world.get_component::<Transform>(self.id))
-            .ok()
-            .map(ComponentRefer)
+impl Default for Scene {
+    fn default() -> Self {
+        Self::new()
     }
 }
