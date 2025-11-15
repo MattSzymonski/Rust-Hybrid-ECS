@@ -345,10 +345,10 @@ pub fn run_rendering_example() {
     }
 }
 
-pub fn run_performance_test() {
+pub fn run_performance_test_scripts() {
     use std::time::Instant;
 
-    println!("\n=== ECS Performance Test ===\n");
+    println!("\n=== Scripts ECS Performance Test ===\n");
     println!("Running 10 tests with increasing entity counts...\n");
     println!("Each test: 100 warmup frames + 60 timed frames\n");
     println!(
@@ -440,4 +440,167 @@ pub fn run_performance_test() {
     }
 
     println!("\n=== Test Complete ===\n");
+}
+
+// Profiling test to find bottlenecks
+pub fn run_bottleneck_analysis() {
+    use std::time::Instant;
+
+    println!("\n=== ECS Bottleneck Analysis ===\n");
+
+    let num_movers = 1000;
+    let num_colliders = 5;
+
+    println!("Test Configuration:");
+    println!("  Movers: {}", num_movers);
+    println!("  Colliders: {}", num_colliders);
+    println!(
+        "  Collision checks per frame: {} × {} = {}",
+        num_movers,
+        num_colliders,
+        num_movers * num_colliders
+    );
+    println!("\nRunning detailed profiling...\n");
+
+    let mut world = World::new();
+
+    // Store entity IDs for later reference
+    let mut mover_entities = Vec::new();
+
+    // Create collision walls
+    for i in 0..num_colliders {
+        let entity = world.create_entity();
+        world.add_component(entity, Name(format!("Collider {}", i)));
+        world.add_component(
+            entity,
+            Position {
+                x: (i as f32 * 100.0) - 200.0,
+                y: 0.0,
+            },
+        );
+        world.add_component(entity, BoxCollider::new(40.0, 400.0));
+    }
+
+    // Create moving entities
+    for i in 0..num_movers {
+        let entity = world.create_entity();
+        mover_entities.push(entity);
+        world.add_component(entity, Name(format!("Mover {}", i)));
+        world.add_component(
+            entity,
+            Position {
+                x: (i as f32 * 10.0) - 100.0,
+                y: (i as f32 * 5.0) - 50.0,
+            },
+        );
+        world.add_component(
+            entity,
+            Velocity {
+                dx: ((i % 3) as f32 - 1.0) * 2.0,
+                dy: ((i % 5) as f32 - 2.0) * 1.5,
+            },
+        );
+        world.add_script_component(entity, SilentCollisionMoverScript { speed: 1.0 });
+    }
+
+    // Warmup
+    for _ in 0..10 {
+        world.update_scripts();
+    }
+
+    // Profile individual operations
+    let frames = 100;
+
+    // Test 1: Just script iteration overhead
+    println!("Test 1: Measuring query overhead...");
+    let start = Instant::now();
+    for _ in 0..frames {
+        let _ = world.query::<Position>();
+    }
+    let query_time = start.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+    println!("  Query overhead: {:.4} ms/frame\n", query_time);
+
+    // Test 2: Full update with collision detection
+    println!("Test 2: Full update_scripts() with collision detection...");
+    let start = Instant::now();
+    for _ in 0..frames {
+        world.update_scripts();
+    }
+    let full_update_time = start.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+    println!("  Full update: {:.4} ms/frame\n", full_update_time);
+
+    // Test 3: Count collision checks manually
+    println!("Test 3: Analyzing collision detection cost...");
+    let collider_query_start = Instant::now();
+    let mut total_checks = 0;
+    for _ in 0..frames {
+        let colliders = world.query2::<Position, BoxCollider>();
+        total_checks += num_movers * colliders.len();
+    }
+    let collider_query_time = collider_query_start.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+    let checks_per_frame = total_checks / frames;
+    println!("  Collision checks per frame: {}", checks_per_frame);
+    println!("  Collider query time: {:.4} ms/frame", collider_query_time);
+    println!(
+        "  Time per collision check: {:.6} ms\n",
+        full_update_time / checks_per_frame as f64
+    );
+
+    // Test 4: Measure position updates (mutation application)
+    println!("Test 4: Component mutation overhead...");
+    let mutation_start = Instant::now();
+    for _ in 0..frames {
+        for &entity in &mover_entities {
+            if let Some(pos) = world.get_component_mut::<Position>(entity) {
+                pos.x += 1.0;
+                pos.y += 1.0;
+            }
+        }
+    }
+    let mutation_time = mutation_start.elapsed().as_secs_f64() * 1000.0 / frames as f64;
+    println!("  Mutation time: {:.4} ms/frame\n", mutation_time);
+
+    // Summary
+    println!("=== Bottleneck Analysis ===");
+    println!("Per-frame breakdown:");
+    println!(
+        "  1. Query overhead:          {:.4} ms ({:.1}%)",
+        query_time,
+        (query_time / full_update_time) * 100.0
+    );
+    println!(
+        "  2. Collision detection:     {:.4} ms ({:.1}%)",
+        full_update_time - mutation_time,
+        ((full_update_time - mutation_time) / full_update_time) * 100.0
+    );
+    println!(
+        "  3. Mutation application:    {:.4} ms ({:.1}%)",
+        mutation_time,
+        (mutation_time / full_update_time) * 100.0
+    );
+    println!("  4. TOTAL:                   {:.4} ms", full_update_time);
+
+    println!("\n=== Recommendations ===");
+    let collision_percent = ((full_update_time - mutation_time) / full_update_time) * 100.0;
+    if collision_percent > 60.0 {
+        println!(
+            "⚠ Collision detection is the bottleneck ({:.1}%)",
+            collision_percent
+        );
+        println!("  Suggested optimizations:");
+        println!("  - Implement spatial partitioning (quadtree/grid)");
+        println!("  - Cache nearby colliders");
+        println!("  - Use broad-phase collision detection");
+    } else if (mutation_time / full_update_time) * 100.0 > 60.0 {
+        println!("⚠ Component mutations are the bottleneck");
+        println!("  Suggested optimizations:");
+        println!("  - Use arena allocators");
+        println!("  - Batch mutations");
+        println!("  - Consider archetype-based storage");
+    } else {
+        println!("✓ Performance is well-balanced");
+        println!("  Consider parallel processing for further gains");
+    }
+
+    println!("\n=== Analysis Complete ===\n");
 }

@@ -11,9 +11,12 @@ fn main() {
         flo_draw::with_2d_graphics(|| {
             example::run_rendering_example();
         });
-    } else if args.len() > 1 && args[1] == "perf" {
+    } else if args.len() > 1 && args[1] == "perfscripts" {
         // Run the performance test
-        example::run_performance_test();
+        example::run_performance_test_scripts();
+    } else if args.len() > 1 && args[1] == "bottleneck" {
+        // Run the bottleneck analysis
+        example::run_bottleneck_analysis();
     } else {
         // Run the basic console example
         example::run_example();
@@ -22,7 +25,9 @@ fn main() {
         println!("To see the sprite rendering demo, run:");
         println!("  cargo run -- render");
         println!("\nTo run the performance test, run:");
-        println!("  cargo run -- perf");
+        println!("  cargo run -- perfscripts");
+        println!("\nTo run bottleneck analysis, run:");
+        println!("  cargo run -- bottleneck");
         println!("==========\n");
     }
 }
