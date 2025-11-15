@@ -92,7 +92,7 @@ pub struct Name(pub String);
 
 impl Component for Name {}
 
-// -------------------------------- Silent Collision Mover ------------------------------
+// -------------------------------- Mover ------------------------------
 
 // Silent collision mover for performance testing
 #[derive(Debug, Default)]

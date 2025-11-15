@@ -1,7 +1,6 @@
 mod components;
 mod ecs_core;
 mod example;
-mod renderer;
 
 fn main() {
     // Check command line arguments
