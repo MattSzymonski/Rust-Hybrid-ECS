@@ -1,471 +1,340 @@
-/// Core ECS implementation - the performance-critical parallel system
+// ECS-like Storage Architecture MVP
+//
+// This implementation provides a minimal Entity Component System with:
+// - Entity: Unique identifiers for game objects
+// - Component: Data containers (Position, Velocity, Name, etc.)
+// - World: Manages all entities and their components
+//
+// Key Features:
+// - Type-safe component storage using TypeId
+// - Entity creation and management
+// - Component add/remove/query operations
+// - Query system for filtering entities by components
+// - Systems can be implemented as functions that query and modify components
+
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 
-/// Component storage - type-erased for flexibility
-pub trait ComponentStorage: Send + Sync {
-    fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
-    fn remove(&mut self, entity: u64);
+// Entity is just a unique ID
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Entity(u64);
+
+// Component trait marker - all components must implement this
+pub trait Component: Any + Send + Sync {}
+
+// ScriptComponent trait - for components that have update logic
+pub trait ScriptComponent: Component {
+    fn update(&mut self, entity: Entity, world: &World, ctx: &mut UpdateContext);
 }
 
-// ---------------------------------------------------------------------------------------------------------------------
-
-/// Concrete storage for a specific component type
-pub struct TypedStorage<T: 'static> {
-    components: HashMap<u64, Vec<T>>, // Support multiple components per entity
+// Context for script updates that allows mutations
+pub struct UpdateContext {
+    // Store component mutations to apply after all scripts run
+    position_updates: HashMap<Entity, Position>,
 }
 
-impl<T: 'static> TypedStorage<T> {
-    pub fn new() -> Self {
+impl UpdateContext {
+    fn new() -> Self {
         Self {
-            components: HashMap::new(),
+            position_updates: HashMap::new(),
         }
     }
 
-    pub fn insert(&mut self, entity: u64, component: T) {
-        self.components
-            .entry(entity)
-            .or_insert_with(Vec::new)
-            .push(component);
+    pub fn set_position(&mut self, entity: Entity, x: f32, y: f32) {
+        self.position_updates.insert(entity, Position { x, y });
     }
 
-    pub fn get(&self, entity: u64) -> Option<&T> {
-        self.components.get(&entity).and_then(|v| v.first())
+    pub fn move_position(&mut self, entity: Entity, dx: f32, dy: f32, world: &World) {
+        if let Some(pos) = world.get_component::<Position>(entity) {
+            self.position_updates.insert(
+                entity,
+                Position {
+                    x: pos.x + dx,
+                    y: pos.y + dy,
+                },
+            );
+        }
+    }
+}
+
+// Position component needs to be public here for UpdateContext
+#[derive(Debug, Clone)]
+pub struct Position {
+    pub x: f32,
+    pub y: f32,
+}
+
+impl Component for Position {}
+
+// Trait object wrapper for script storage that can be updated
+trait ScriptStorageUpdater: Send + Sync {
+    fn update_all(&mut self, world: &World, ctx: &mut UpdateContext);
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+// Concrete implementation for a specific script component type
+struct TypedScriptStorage<T: ScriptComponent> {
+    data: HashMap<Entity, T>,
+}
+
+impl<T: ScriptComponent + 'static> TypedScriptStorage<T> {
+    fn new() -> Self {
+        Self {
+            data: HashMap::new(),
+        }
     }
 
-    pub fn get_mut(&mut self, entity: u64) -> Option<&mut T> {
-        self.components.get_mut(&entity).and_then(|v| v.first_mut())
+    fn insert(&mut self, entity: Entity, component: T) {
+        self.data.insert(entity, component);
     }
+}
 
-    pub fn get_all(&self, entity: u64) -> Vec<T>
-    where
-        T: Clone,
-    {
-        self.components.get(&entity).cloned().unwrap_or_default()
-    }
+impl<T: ScriptComponent + 'static> ScriptStorageUpdater for TypedScriptStorage<T> {
+    fn update_all(&mut self, world: &World, ctx: &mut UpdateContext) {
+        // Collect entities to avoid borrow checker issues
+        let entities: Vec<Entity> = self.data.keys().copied().collect();
 
-    pub fn iter(&self) -> impl Iterator<Item = (u64, &T)> {
-        self.components
-            .iter()
-            .filter_map(|(e, v)| v.first().map(|c| (*e, c)))
-    }
-
-    pub fn iter_mut(&mut self) -> impl Iterator<Item = (u64, &mut T)> {
-        self.components
-            .iter_mut()
-            .filter_map(|(e, v)| v.first_mut().map(|c| (*e, c)))
-    }
-
-    /// Get multiple mutable references from different entities
-    /// SAFETY: Caller must ensure entity IDs are unique
-    pub unsafe fn get_many_mut<const N: usize>(
-        &mut self,
-        entities: [u64; N],
-    ) -> [Option<&mut T>; N] {
-        let mut results: [Option<&mut T>; N] = std::array::from_fn(|_| None);
-
-        for (i, &entity) in entities.iter().enumerate() {
-            if let Some(vec) = self.components.get_mut(&entity) {
-                if let Some(component) = vec.first_mut() {
-                    // SAFETY: We're transmuting the lifetime to 'static temporarily
-                    // This is safe because we know the caller ensures unique entity IDs
-                    let ptr = component as *mut T;
-                    results[i] = Some(&mut *ptr);
-                }
+        for entity in entities {
+            if let Some(component) = self.data.get_mut(&entity) {
+                component.update(entity, world, ctx);
             }
         }
-
-        results
-    }
-}
-
-impl<T: Send + Sync + 'static> ComponentStorage for TypedStorage<T> {
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
+}
 
-    fn remove(&mut self, entity: u64) {
-        self.components.remove(&entity);
+// Type-erased storage for components
+pub struct ComponentStorage {
+    data: Box<dyn Any + Send + Sync>,
+}
+
+impl ComponentStorage {
+    pub fn new<T: Component + 'static>() -> Self {
+        Self {
+            data: Box::new(HashMap::<Entity, T>::new()),
+        }
+    }
+
+    pub fn insert<T: Component + 'static>(&mut self, entity: Entity, component: T) {
+        if let Some(map) = self.data.downcast_mut::<HashMap<Entity, T>>() {
+            map.insert(entity, component);
+        }
+    }
+
+    pub fn get<T: Component + 'static>(&self, entity: Entity) -> Option<&T> {
+        self.data
+            .downcast_ref::<HashMap<Entity, T>>()
+            .and_then(|map| map.get(&entity))
+    }
+
+    pub fn get_mut<T: Component + 'static>(&mut self, entity: Entity) -> Option<&mut T> {
+        self.data
+            .downcast_mut::<HashMap<Entity, T>>()
+            .and_then(|map| map.get_mut(&entity))
+    }
+
+    pub fn remove<T: Component + 'static>(&mut self, entity: Entity) -> Option<T> {
+        self.data
+            .downcast_mut::<HashMap<Entity, T>>()
+            .and_then(|map| map.remove(&entity))
+    }
+
+    pub fn entities<T: Component + 'static>(&self) -> Vec<Entity> {
+        self.data
+            .downcast_ref::<HashMap<Entity, T>>()
+            .map(|map| map.keys().copied().collect())
+            .unwrap_or_default()
     }
 }
 
-// ---------------------------------------------------------------------------------------------------------------------
-
-/// The core ECS world - thread-safe and parallel-friendly
+// World manages all entities and components
 pub struct World {
     next_entity_id: u64,
-    storages: HashMap<TypeId, Box<dyn ComponentStorage>>,
-    entities: Vec<u64>,
+    entities: Vec<Entity>,
+    components: HashMap<TypeId, ComponentStorage>,
+    script_components: HashMap<TypeId, Box<dyn ScriptStorageUpdater>>,
 }
 
 impl World {
     pub fn new() -> Self {
         Self {
             next_entity_id: 0,
-            storages: HashMap::new(),
             entities: Vec::new(),
+            components: HashMap::new(),
+            script_components: HashMap::new(),
         }
     }
 
-    pub fn create_entity(&mut self) -> u64 {
-        let entity = self.next_entity_id;
+    // Create a new entity
+    pub fn create_entity(&mut self) -> Entity {
+        let entity = Entity(self.next_entity_id);
         self.next_entity_id += 1;
         self.entities.push(entity);
         entity
     }
 
-    /// Create a new entity ID without registering it yet
-    pub fn create_entity_id(&mut self) -> u64 {
-        let id = self.next_entity_id;
-        self.next_entity_id += 1;
-        id
-    }
-
-    /// Register an entity in the world
-    pub fn register_entity(&mut self, entity: u64) {
-        if !self.entities.contains(&entity) {
-            self.entities.push(entity);
-        }
-    }
-
-    pub fn add_component<T: Send + Sync + 'static>(&mut self, entity: u64, component: T) {
+    // Add a component to an entity
+    pub fn add_component<T: Component + 'static>(&mut self, entity: Entity, component: T) {
         let type_id = TypeId::of::<T>();
-
-        let storage = self
-            .storages
+        self.components
             .entry(type_id)
-            .or_insert_with(|| Box::new(TypedStorage::<T>::new()));
-
-        storage
-            .as_any_mut()
-            .downcast_mut::<TypedStorage<T>>()
-            .unwrap()
+            .or_insert_with(ComponentStorage::new::<T>)
             .insert(entity, component);
     }
 
-    pub fn get_component<T: 'static>(&self, entity: u64) -> Option<&T> {
+    // Get a component from an entity
+    pub fn get_component<T: Component + 'static>(&self, entity: Entity) -> Option<&T> {
         let type_id = TypeId::of::<T>();
-        self.storages
-            .get(&type_id)?
-            .as_any()
-            .downcast_ref::<TypedStorage<T>>()
-            .and_then(|storage| storage.get(entity))
-    }
-
-    // pub fn get_component_non_st<T>(&self, entity: u64) -> Option<&T> {
-    //     let type_id = TypeId::of::<T>();
-    //     self.storages
-    //         .get(&type_id)?
-    //         .as_any()
-    //         .downcast_ref::<TypedStorage<T>>()
-    //         .and_then(|storage| storage.get(entity))
-    // }
-
-    pub fn get_component_mut<T: 'static>(&mut self, entity: u64) -> Option<&mut T> {
-        let type_id = TypeId::of::<T>();
-        self.storages
-            .get_mut(&type_id)?
-            .as_any_mut()
-            .downcast_mut::<TypedStorage<T>>()
-            .and_then(|storage| storage.get_mut(entity))
-    }
-
-    pub fn remove_component<T: 'static>(&mut self, entity: u64) {
-        let type_id = TypeId::of::<T>();
-        if let Some(storage) = self.storages.get_mut(&type_id) {
-            storage.remove(entity);
-        }
-    }
-
-    pub fn query<T: 'static>(&self) -> Option<impl Iterator<Item = (u64, &T)>> {
-        let type_id = TypeId::of::<T>();
-        self.storages
+        self.components
             .get(&type_id)
-            .and_then(|storage| storage.as_any().downcast_ref::<TypedStorage<T>>())
-            .map(|storage| storage.iter())
+            .and_then(|storage| storage.get::<T>(entity))
     }
 
-    pub fn query_mut<T: 'static>(&mut self) -> Option<impl Iterator<Item = (u64, &mut T)>> {
+    // Get a mutable component from an entity
+    pub fn get_component_mut<T: Component + 'static>(&mut self, entity: Entity) -> Option<&mut T> {
         let type_id = TypeId::of::<T>();
-        self.storages
+        self.components
             .get_mut(&type_id)
-            .and_then(|storage| storage.as_any_mut().downcast_mut::<TypedStorage<T>>())
-            .map(|storage| storage.iter_mut())
+            .and_then(|storage| storage.get_mut::<T>(entity))
     }
 
-    pub fn destroy_entity(&mut self, entity: u64) {
-        // Remove from all storages
-        for storage in self.storages.values_mut() {
-            storage.remove(entity);
-        }
-        // Remove from entity list
-        self.entities.retain(|e| *e != entity);
-    }
-
-    /// Get all entities
-    pub fn entities(&self) -> impl Iterator<Item = u64> + '_ {
-        self.entities.iter().copied()
-    }
-
-    /// Access all components of a specific type for an entity through a closure (no cloning)
-    pub fn with_components<T: 'static, R, F>(&self, entity: u64, f: F) -> Option<R>
-    where
-        F: FnOnce(&[T]) -> R,
-    {
+    // Remove a component from an entity
+    pub fn remove_component<T: Component + 'static>(&mut self, entity: Entity) -> Option<T> {
         let type_id = TypeId::of::<T>();
-        self.storages.get(&type_id).and_then(|storage| {
+        self.components
+            .get_mut(&type_id)
+            .and_then(|storage| storage.remove::<T>(entity))
+    }
+
+    // Delete an entity and all its components
+    #[allow(dead_code)]
+    pub fn delete_entity(&mut self, entity: Entity) {
+        self.entities.retain(|&e| e != entity);
+        // Note: In a complete implementation, you'd track which components each entity has
+        // and remove them from their respective storages
+    }
+
+    // Query for entities with specific components
+    pub fn query<T: Component + 'static>(&self) -> Vec<(Entity, &T)> {
+        let type_id = TypeId::of::<T>();
+        if let Some(storage) = self.components.get(&type_id) {
             storage
-                .as_any()
-                .downcast_ref::<TypedStorage<T>>()
-                .and_then(|typed_storage| {
-                    typed_storage
-                        .components
-                        .get(&entity)
-                        .map(|vec| f(vec.as_slice()))
+                .entities::<T>()
+                .into_iter()
+                .filter_map(|entity| {
+                    storage
+                        .get::<T>(entity)
+                        .map(|component| (entity, component))
                 })
-        })
-    }
-
-    /// Query two components - read-only for both
-    pub fn query2<T1: 'static, T2: 'static>(&self) -> impl Iterator<Item = (&T1, &T2)> + '_ {
-        let type_id1 = TypeId::of::<T1>();
-        let type_id2 = TypeId::of::<T2>();
-
-        let storage1 = self
-            .storages
-            .get(&type_id1)
-            .and_then(|s| s.as_any().downcast_ref::<TypedStorage<T1>>());
-
-        let storage2 = self
-            .storages
-            .get(&type_id2)
-            .and_then(|s| s.as_any().downcast_ref::<TypedStorage<T2>>());
-
-        // Iterate over entities that have both components
-        storage1
-            .into_iter()
-            .flat_map(move |s1| s1.iter())
-            .filter_map(move |(entity, comp1)| {
-                storage2.and_then(|s2| s2.get(entity).map(|comp2| (comp1, comp2)))
-            })
-    }
-
-    /// Query two components - first mutable, second read-only
-    pub fn query2_mut<T1: 'static, T2: 'static>(&mut self) -> Vec<(&mut T1, &T2)> {
-        let type_id1 = TypeId::of::<T1>();
-        let type_id2 = TypeId::of::<T2>();
-
-        // Get raw pointers to avoid borrow checker issues
-        let storage1_ptr = self
-            .storages
-            .get_mut(&type_id1)
-            .map(|s| s.as_mut() as *mut dyn ComponentStorage);
-        let storage2_ptr = self
-            .storages
-            .get(&type_id2)
-            .map(|s| s.as_ref() as *const dyn ComponentStorage);
-
-        if storage1_ptr.is_none() || storage2_ptr.is_none() {
-            return Vec::new();
-        }
-
-        let storage1_ptr = storage1_ptr.unwrap();
-        let storage2_ptr = storage2_ptr.unwrap();
-
-        unsafe {
-            let s1 = (*storage1_ptr)
-                .as_any_mut()
-                .downcast_mut::<TypedStorage<T1>>()
-                .unwrap();
-            let s2 = (*storage2_ptr)
-                .as_any()
-                .downcast_ref::<TypedStorage<T2>>()
-                .unwrap();
-
-            // Collect entities that have both components
-            let mut results = Vec::new();
-            for (entity, comp1) in s1.iter_mut() {
-                if let Some(comp2) = s2.get(entity) {
-                    results.push((comp1, comp2));
-                }
-            }
-            results
+                .collect()
+        } else {
+            Vec::new()
         }
     }
 
-    /// Query two components - both mutable
-    pub fn query2_mut_mut<T1: 'static, T2: 'static>(&mut self) -> Vec<(&mut T1, &mut T2)> {
-        let type_id1 = TypeId::of::<T1>();
-        let type_id2 = TypeId::of::<T2>();
-
-        // Get raw pointers to avoid borrow checker issues
-        let storage1_ptr = self
-            .storages
-            .get_mut(&type_id1)
-            .map(|s| s.as_mut() as *mut dyn ComponentStorage);
-        let storage2_ptr = self
-            .storages
-            .get_mut(&type_id2)
-            .map(|s| s.as_mut() as *mut dyn ComponentStorage);
-
-        if storage1_ptr.is_none() || storage2_ptr.is_none() {
-            return Vec::new();
-        }
-
-        let storage1_ptr = storage1_ptr.unwrap();
-        let storage2_ptr = storage2_ptr.unwrap();
-
-        unsafe {
-            let s1 = (*storage1_ptr)
-                .as_any_mut()
-                .downcast_mut::<TypedStorage<T1>>()
-                .unwrap();
-            let s2 = (*storage2_ptr)
-                .as_any_mut()
-                .downcast_mut::<TypedStorage<T2>>()
-                .unwrap();
-
-            // First collect entity IDs that have both components
-            let entities: Vec<u64> = s1
-                .iter()
-                .filter_map(|(entity, _)| {
-                    if s2.get(entity).is_some() {
-                        Some(entity)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            // Now get mutable references using raw pointer access
-            let mut results = Vec::new();
-            let s1_map = &mut s1.components as *mut HashMap<u64, Vec<T1>>;
-            let s2_map = &mut s2.components as *mut HashMap<u64, Vec<T2>>;
-
-            for entity in entities {
-                let comp1 = (*s1_map).get_mut(&entity).and_then(|v| v.first_mut());
-                let comp2 = (*s2_map).get_mut(&entity).and_then(|v| v.first_mut());
-
-                if let (Some(c1), Some(c2)) = (comp1, comp2) {
-                    results.push((c1, c2));
-                }
-            }
-            results
-        }
-    }
-
-    /// Query three components - all read-only
-    pub fn query3<T1: 'static, T2: 'static, T3: 'static>(
+    // Query for entities with two components
+    pub fn query2<T1: Component + 'static, T2: Component + 'static>(
         &self,
-    ) -> impl Iterator<Item = (&T1, &T2, &T3)> + '_ {
+    ) -> Vec<(Entity, &T1, &T2)> {
         let type_id1 = TypeId::of::<T1>();
         let type_id2 = TypeId::of::<T2>();
-        let type_id3 = TypeId::of::<T3>();
 
-        let storage1 = self
-            .storages
-            .get(&type_id1)
-            .and_then(|s| s.as_any().downcast_ref::<TypedStorage<T1>>());
+        if let (Some(storage1), Some(storage2)) = (
+            self.components.get(&type_id1),
+            self.components.get(&type_id2),
+        ) {
+            let entities1 = storage1.entities::<T1>();
+            let entities2 = storage2.entities::<T2>();
 
-        let storage2 = self
-            .storages
-            .get(&type_id2)
-            .and_then(|s| s.as_any().downcast_ref::<TypedStorage<T2>>());
-
-        let storage3 = self
-            .storages
-            .get(&type_id3)
-            .and_then(|s| s.as_any().downcast_ref::<TypedStorage<T3>>());
-
-        storage1
-            .into_iter()
-            .flat_map(move |s1| s1.iter())
-            .filter_map(move |(entity, comp1)| {
-                storage2.and_then(|s2| {
-                    s2.get(entity).and_then(|comp2| {
-                        storage3.and_then(|s3| s3.get(entity).map(|comp3| (comp1, comp2, comp3)))
-                    })
-                })
-            })
-    }
-
-    /// Query three components - all mutable
-    pub fn query3_mut<T1: 'static, T2: 'static, T3: 'static>(
-        &mut self,
-    ) -> Vec<(&mut T1, &mut T2, &mut T3)> {
-        let type_id1 = TypeId::of::<T1>();
-        let type_id2 = TypeId::of::<T2>();
-        let type_id3 = TypeId::of::<T3>();
-
-        // Get raw pointers to avoid borrow checker issues
-        let storage1_ptr = self
-            .storages
-            .get_mut(&type_id1)
-            .map(|s| s.as_mut() as *mut dyn ComponentStorage);
-        let storage2_ptr = self
-            .storages
-            .get_mut(&type_id2)
-            .map(|s| s.as_mut() as *mut dyn ComponentStorage);
-        let storage3_ptr = self
-            .storages
-            .get_mut(&type_id3)
-            .map(|s| s.as_mut() as *mut dyn ComponentStorage);
-
-        if storage1_ptr.is_none() || storage2_ptr.is_none() || storage3_ptr.is_none() {
-            return Vec::new();
-        }
-
-        let storage1_ptr = storage1_ptr.unwrap();
-        let storage2_ptr = storage2_ptr.unwrap();
-        let storage3_ptr = storage3_ptr.unwrap();
-
-        unsafe {
-            let s1 = (*storage1_ptr)
-                .as_any_mut()
-                .downcast_mut::<TypedStorage<T1>>()
-                .unwrap();
-            let s2 = (*storage2_ptr)
-                .as_any_mut()
-                .downcast_mut::<TypedStorage<T2>>()
-                .unwrap();
-            let s3 = (*storage3_ptr)
-                .as_any_mut()
-                .downcast_mut::<TypedStorage<T3>>()
-                .unwrap();
-
-            // First collect entity IDs that have all three components
-            let entities: Vec<u64> = s1
+            entities1
                 .iter()
-                .filter_map(|(entity, _)| {
-                    if s2.get(entity).is_some() && s3.get(entity).is_some() {
-                        Some(entity)
+                .filter(|e| entities2.contains(e))
+                .filter_map(|&entity| {
+                    if let (Some(c1), Some(c2)) =
+                        (storage1.get::<T1>(entity), storage2.get::<T2>(entity))
+                    {
+                        Some((entity, c1, c2))
                     } else {
                         None
                     }
                 })
-                .collect();
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
 
-            // Now get mutable references using raw pointer access
-            let mut results = Vec::new();
-            let s1_map = &mut s1.components as *mut HashMap<u64, Vec<T1>>;
-            let s2_map = &mut s2.components as *mut HashMap<u64, Vec<T2>>;
-            let s3_map = &mut s3.components as *mut HashMap<u64, Vec<T3>>;
+    // Mutable query for entities with specific components
+    #[allow(dead_code)]
+    pub fn query_mut<T: Component + 'static>(&mut self) -> Vec<(Entity, &mut T)> {
+        let type_id = TypeId::of::<T>();
+        if let Some(storage) = self.components.get_mut(&type_id) {
+            let entities = storage.entities::<T>();
+            // We need to handle this carefully due to borrow checker
+            // This is a simplified version - in production you'd use unsafe or interior mutability
+            let storage_ptr = storage as *mut ComponentStorage;
+            entities
+                .into_iter()
+                .filter_map(|entity| unsafe {
+                    (*storage_ptr)
+                        .get_mut::<T>(entity)
+                        .map(|component| (entity, component))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
 
-            for entity in entities {
-                let comp1 = (*s1_map).get_mut(&entity).and_then(|v| v.first_mut());
-                let comp2 = (*s2_map).get_mut(&entity).and_then(|v| v.first_mut());
-                let comp3 = (*s3_map).get_mut(&entity).and_then(|v| v.first_mut());
+    // Add a script component to an entity
+    pub fn add_script_component<T: ScriptComponent + 'static>(
+        &mut self,
+        entity: Entity,
+        component: T,
+    ) {
+        let type_id = TypeId::of::<T>();
+        let storage = self
+            .script_components
+            .entry(type_id)
+            .or_insert_with(|| Box::new(TypedScriptStorage::<T>::new()));
 
-                if let (Some(c1), Some(c2), Some(c3)) = (comp1, comp2, comp3) {
-                    results.push((c1, c2, c3));
+        // Downcast to the concrete type to insert
+        if let Some(typed_storage) = storage.as_any_mut().downcast_mut::<TypedScriptStorage<T>>() {
+            typed_storage.insert(entity, component);
+        }
+    }
+
+    // Update all script components for all entities
+    pub fn update_scripts(&mut self) {
+        // Create update context for collecting mutations
+        let mut ctx = UpdateContext::new();
+
+        // We need to iterate over script components and update them
+        // This requires some unsafe pointer magic due to the borrow checker
+        let script_type_ids: Vec<TypeId> = self.script_components.keys().copied().collect();
+
+        for type_id in script_type_ids {
+            // Get immutable reference to world for script updates
+            // and mutable reference to the specific storage
+            let world_ptr = self as *const World;
+
+            if let Some(storage) = self.script_components.get_mut(&type_id) {
+                unsafe {
+                    // Pass immutable world reference to update function
+                    storage.update_all(&*world_ptr, &mut ctx);
                 }
             }
-            results
+        }
+
+        // Apply all collected mutations
+        for (entity, pos) in ctx.position_updates {
+            if let Some(existing_pos) = self.get_component_mut::<Position>(entity) {
+                existing_pos.x = pos.x;
+                existing_pos.y = pos.y;
+            }
         }
     }
 }

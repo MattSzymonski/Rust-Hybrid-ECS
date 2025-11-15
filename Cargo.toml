@@ -1,11 +1,6 @@
 [package]
-name = "ecs_hybrid"
+name = "ecs-test"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-parking_lot = "0.12"
-
-[[bin]]
-name = "ecs_hybrid"
-path = "src/main.rs"
