@@ -110,7 +110,7 @@ impl UpdateContext {
 // ------------------------------------ Position -----------------------------------------
 
 // Position component needs to be public here for UpdateContext
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Position {
     pub x: f32,
     pub y: f32,
@@ -143,7 +143,7 @@ impl Sprite {
 // ---------------------------------- BoxCollider ----------------------------------------
 
 // Box Collider component - 2D axis-aligned bounding box
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BoxCollider {
     pub width: f32,
     pub height: f32,
@@ -191,7 +191,7 @@ impl BoxCollider {
 // ----------------------------------- Velocity -----------------------------------
 
 // Example components
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Velocity {
     pub dx: f32,
     pub dy: f32,
@@ -201,7 +201,7 @@ impl Component for Velocity {}
 
 // ------------------------------------- Name --------------------------------------------
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Name(pub String);
 
 impl Component for Name {}
@@ -211,6 +211,12 @@ impl Component for Name {}
 // Script components - these have update logic
 pub struct MoverScript {
     pub speed: f32,
+}
+
+impl Default for MoverScript {
+    fn default() -> Self {
+        Self { speed: 0.0 }
+    }
 }
 
 impl_script_component!(MoverScript);
@@ -242,6 +248,12 @@ pub struct CollisionMoverScript {
     pub speed: f32,
 }
 
+impl Default for CollisionMoverScript {
+    fn default() -> Self {
+        Self { speed: 0.0 }
+    }
+}
+
 impl_script_component!(CollisionMoverScript);
 
 impl ScriptComponent for CollisionMoverScript {
@@ -267,6 +279,7 @@ impl ScriptComponent for CollisionMoverScript {
 // -------------------------------- Silent Collision Mover ------------------------------
 
 // Silent collision mover for performance testing
+#[derive(Debug, Default)]
 pub struct SilentCollisionMoverScript {
     pub speed: f32,
 }
@@ -339,7 +352,7 @@ impl ScriptComponent for SilentCollisionMoverScript {
 }
 
 // ----------------------------------- Logger Script -------------------------------------
-
+#[derive(Debug, Default)]
 pub struct LoggerScript {
     pub message: String,
 }

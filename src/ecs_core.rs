@@ -4,8 +4,6 @@ use std::sync::{Mutex, OnceLock};
 
 use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
 
-use crate::components::{SilentCollisionMoverScript, UpdateContext};
-
 // Component ID mapping for bitmask generation (lazy initialized)
 static COMPONENT_IDS: OnceLock<Mutex<HashMap<TypeId, u32>>> = OnceLock::new();
 
@@ -73,6 +71,8 @@ pub struct World {
     next_entity_id: u64,
     entities: Vec<Entity>,
     components: TraitTypeMap<dyn Component, VecFamily>,
+    // Track which component types are scripts (TypeId -> component bit)
+    script_component_types: Vec<(TypeId, u64)>,
 }
 
 impl World {
@@ -81,14 +81,23 @@ impl World {
             next_entity_id: 0,
             entities: Vec::new(),
             components: TraitTypeMap::new(),
+            script_component_types: Vec::new(),
         }
     }
 
     pub fn register_component_type<T>(&mut self)
     where
-        T: 'static + TraitAccessible<dyn Component>,
+        T: 'static + TraitAccessible<dyn Component> + Component + Default,
     {
         self.components.register_type_storage::<T>();
+
+        // Check if this type is a script component by creating a temporary instance
+        let temp = T::default();
+        if temp.as_script().is_some() {
+            let type_id = TypeId::of::<T>();
+            let bit = get_component_bit::<T>();
+            self.script_component_types.push((type_id, bit));
+        }
     }
 
     // Create a new entity
@@ -148,54 +157,16 @@ impl World {
         let storage_b = self.components.get_storage::<B>();
 
         // // Create iterator
-        // self.entities
-        //     .iter()
-        //     .filter(move |entity| entity.bitmask & filter_bitmask == filter_bitmask)
-        //     .filter_map(move |&entity| {
-        //         match (storage_a.get(entity.index()), storage_b.get(entity.index())) {
-        //             (Some(a), Some(b)) => Some((entity, a, b)),
-        //             _ => None,
-        //         }
-        //     })
-
         self.entities
             .iter()
             .filter(move |entity| entity.bitmask & filter_bitmask == filter_bitmask)
-            .map(move |(h)| {
-                (
-                    *h,
-                    storage_a.get(h.index()).unwrap(),
-                    storage_b.get(h.index()).unwrap(),
-                )
+            .filter_map(move |&entity| {
+                match (storage_a.get(entity.index()), storage_b.get(entity.index())) {
+                    (Some(a), Some(b)) => Some((entity, a, b)),
+                    _ => None,
+                }
             })
     }
-
-    // Remove a component from an entity
-    // pub fn remove_component<T: Component + 'static>(&mut self, entity: Entity) -> Option<T> {
-    //     let type_id = TypeId::of::<T>();
-    //     let result = self
-    //         .components
-    //         .get_mut(&type_id)
-    //         .and_then(|storage| storage.remove::<T>(entity));
-
-    //     // Update entity's bitmask if component was removed
-    //     if result.is_some() {
-    //         let bit = get_component_bit::<T>();
-    //         if let Some(stored_entity) = self.entities.get_mut(entity.index()) {
-    //             stored_entity.bitmask &= !bit;
-    //         }
-    //     }
-
-    //     result
-    // }
-
-    // Delete an entity and all its components
-    // #[allow(dead_code)]
-    // pub fn delete_entity(&mut self, entity: Entity) {
-    //     self.entities.retain(|&e| e != entity);
-    //     // Note: In a complete implementation, you'd track which components each entity has
-    //     // and remove them from their respective storages
-    // }
 
     // Update all script components for all entities
     pub fn update_scripts(&mut self) {
@@ -203,22 +174,22 @@ impl World {
         // This allows us to have mutable access to components while passing immutable world reference
         let world_ptr = self as *mut World;
 
-        for entity in &self.entities {
-            if (entity.bitmask & get_component_bit::<SilentCollisionMoverScript>()) == 0 {
-                continue;
-            }
+        // Iterate over all registered script component types
+        for &(script_type_id, script_bit) in &self.script_component_types {
+            // Get storage reference for this script component type
+            if let Some(storage) = self.components.get_trait_storage_mut(script_type_id) {
+                for entity in &self.entities {
+                    // Fast bitmask check - does this entity have this script component?
+                    if (entity.bitmask & script_bit) == 0 {
+                        continue;
+                    }
 
-            // Access SilentCollisionMoverScript component
-            let script_storage = self
-                .components
-                .get_trait_storage_mut(TypeId::of::<SilentCollisionMoverScript>());
-
-            if let Some(storage) = script_storage {
-                if let Some(component) = storage.get_mut(entity.index()) {
-                    // Cast to ScriptComponent trait object and call update!
-                    if let Some(script) = component.as_script_mut() {
-                        unsafe {
-                            script.update(*entity, &mut *world_ptr);
+                    if let Some(component) = storage.get_mut(entity.index()) {
+                        // Cast to ScriptComponent trait object and call update!
+                        if let Some(script) = component.as_script_mut() {
+                            unsafe {
+                                script.update(*entity, &mut *world_ptr);
+                            }
                         }
                     }
                 }
