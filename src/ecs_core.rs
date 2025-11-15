@@ -123,12 +123,6 @@ impl World {
         }
     }
 
-    // Check if entity has a component (fast bitmask check)
-    pub fn has_component<T: Component + 'static>(&self, entity: Entity) -> bool {
-        let bit = get_component_bit::<T>();
-        (entity.bitmask & bit) != 0
-    }
-
     // Get a component from an entity
     pub fn get_component<T: Component + 'static>(&self, entity: Entity) -> Option<&T> {
         let component_storage = self.components.get_storage::<T>();
