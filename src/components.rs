@@ -108,8 +108,6 @@ impl ScriptComponent for MoverScript {
             let dx = vel.dx * self.speed;
             let dy = vel.dy * self.speed;
 
-            //ctx.move_position_with_collision(entity, dx, dy, world);
-
             if let Some(pos) = world.get_component::<Position>(entity) {
                 let mut new_x = pos.x + dx;
                 let mut new_y = pos.y + dy;
