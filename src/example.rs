@@ -203,7 +203,7 @@ pub fn run_rendering_example() {
     let red_mover = world.create_entity();
     world.add_component(red_mover, Name("Red Mover".to_string()));
     world.add_component(red_mover, Position { x: -100.0, y: 0.0 });
-    world.add_component(red_mover, Velocity { dx: 2.0, dy: 1.0 });
+    world.add_component(red_mover, Velocity { dx: 2.0, dy: 0.0 });
     world.add_component(red_mover, Sprite::new((1.0, 0.2, 0.2), 20.0));
     world.add_script_component(red_mover, MoverScript { speed: 1.0 });
 
@@ -214,30 +214,10 @@ pub fn run_rendering_example() {
     world.add_component(blue_mover, Sprite::new((0.2, 0.4, 1.0), 25.0));
     world.add_script_component(blue_mover, MoverScript { speed: 1.0 });
 
-    let green_bouncer = world.create_entity();
-    world.add_component(green_bouncer, Name("Green Bouncer".to_string()));
-    world.add_component(green_bouncer, Position { x: 0.0, y: -80.0 });
-    world.add_component(green_bouncer, Velocity { dx: 1.0, dy: 2.0 });
-    world.add_component(green_bouncer, Sprite::new((0.2, 1.0, 0.3), 15.0));
-    world.add_script_component(green_bouncer, MoverScript { speed: 1.5 });
-
     let yellow_static = world.create_entity();
     world.add_component(yellow_static, Name("Yellow Static".to_string()));
     world.add_component(yellow_static, Position { x: 0.0, y: 0.0 });
     world.add_component(yellow_static, Sprite::new((1.0, 1.0, 0.2), 30.0));
-
-    let purple_circle = world.create_entity();
-    world.add_component(purple_circle, Name("Purple Circle".to_string()));
-    world.add_component(
-        purple_circle,
-        Position {
-            x: -150.0,
-            y: 100.0,
-        },
-    );
-    world.add_component(purple_circle, Velocity { dx: 0.5, dy: -1.0 });
-    world.add_component(purple_circle, Sprite::new((0.8, 0.2, 0.9), 18.0));
-    world.add_script_component(purple_circle, MoverScript { speed: 1.2 });
 
     println!("Created 5 entities with sprites");
     println!("- 4 movers with different colors and velocities");
