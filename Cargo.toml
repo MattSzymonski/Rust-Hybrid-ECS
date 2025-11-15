@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 flo_draw = "0.3"
 flo_canvas = "0.3"
+trait_type_map = { path = "../trait_type_map" }

@@ -55,16 +55,17 @@ impl Renderer {
                 gc.stroke_color(canvas::Color::Rgba(r * 0.8, g * 0.8, b * 0.8, 1.0));
                 gc.line_width(2.0);
 
-                // Draw a square for the sprite using path
+                // Draw a rectangle for the sprite using path
                 gc.new_path();
-                let half_size = sprite.size;
+                let half_width = sprite.width / 2.0;
+                let half_height = sprite.height / 2.0;
                 let x = screen_x;
                 let y = screen_y;
 
-                gc.move_to(x - half_size, y - half_size);
-                gc.line_to(x + half_size, y - half_size);
-                gc.line_to(x + half_size, y + half_size);
-                gc.line_to(x - half_size, y + half_size);
+                gc.move_to(x - half_width, y - half_height);
+                gc.line_to(x + half_width, y - half_height);
+                gc.line_to(x + half_width, y + half_height);
+                gc.line_to(x - half_width, y + half_height);
                 gc.close_path();
                 gc.fill();
                 gc.stroke();

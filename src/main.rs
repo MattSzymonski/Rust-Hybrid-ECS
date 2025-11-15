@@ -11,6 +11,9 @@ fn main() {
         flo_draw::with_2d_graphics(|| {
             example::run_rendering_example();
         });
+    } else if args.len() > 1 && args[1] == "perf" {
+        // Run the performance test
+        example::run_performance_test();
     } else {
         // Run the basic console example
         example::run_example();
@@ -18,6 +21,8 @@ fn main() {
         println!("\n\n==========");
         println!("To see the sprite rendering demo, run:");
         println!("  cargo run -- render");
+        println!("\nTo run the performance test, run:");
+        println!("  cargo run -- perf");
         println!("==========\n");
     }
 }
