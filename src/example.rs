@@ -187,3 +187,88 @@ pub fn run_example() {
 
     println!("=== Script Components Demo Complete ===");
 }
+
+pub fn run_rendering_example() {
+    use crate::ecs_core::Sprite;
+    use crate::renderer::Renderer;
+
+    println!("\n=== Sprite Rendering Demo ===\n");
+
+    // Create renderer first (this initializes the window)
+    let renderer = Renderer::new(800.0, 600.0);
+
+    let mut world = World::new();
+
+    // Create some colored entities with sprites
+    let red_mover = world.create_entity();
+    world.add_component(red_mover, Name("Red Mover".to_string()));
+    world.add_component(red_mover, Position { x: -100.0, y: 0.0 });
+    world.add_component(red_mover, Velocity { dx: 2.0, dy: 1.0 });
+    world.add_component(red_mover, Sprite::new((1.0, 0.2, 0.2), 20.0));
+    world.add_script_component(red_mover, MoverScript { speed: 1.0 });
+
+    let blue_mover = world.create_entity();
+    world.add_component(blue_mover, Name("Blue Mover".to_string()));
+    world.add_component(blue_mover, Position { x: 100.0, y: 50.0 });
+    world.add_component(blue_mover, Velocity { dx: -1.5, dy: 0.5 });
+    world.add_component(blue_mover, Sprite::new((0.2, 0.4, 1.0), 25.0));
+    world.add_script_component(blue_mover, MoverScript { speed: 1.0 });
+
+    let green_bouncer = world.create_entity();
+    world.add_component(green_bouncer, Name("Green Bouncer".to_string()));
+    world.add_component(green_bouncer, Position { x: 0.0, y: -80.0 });
+    world.add_component(green_bouncer, Velocity { dx: 1.0, dy: 2.0 });
+    world.add_component(green_bouncer, Sprite::new((0.2, 1.0, 0.3), 15.0));
+    world.add_script_component(green_bouncer, MoverScript { speed: 1.5 });
+
+    let yellow_static = world.create_entity();
+    world.add_component(yellow_static, Name("Yellow Static".to_string()));
+    world.add_component(yellow_static, Position { x: 0.0, y: 0.0 });
+    world.add_component(yellow_static, Sprite::new((1.0, 1.0, 0.2), 30.0));
+
+    let purple_circle = world.create_entity();
+    world.add_component(purple_circle, Name("Purple Circle".to_string()));
+    world.add_component(
+        purple_circle,
+        Position {
+            x: -150.0,
+            y: 100.0,
+        },
+    );
+    world.add_component(purple_circle, Velocity { dx: 0.5, dy: -1.0 });
+    world.add_component(purple_circle, Sprite::new((0.8, 0.2, 0.9), 18.0));
+    world.add_script_component(purple_circle, MoverScript { speed: 1.2 });
+
+    println!("Created 5 entities with sprites");
+    println!("- 4 movers with different colors and velocities");
+    println!("- 1 static yellow sprite at the center");
+    println!("\nRendering loop running... (press Ctrl+C to exit)\n");
+
+    // Main rendering loop
+    let mut frame = 0;
+    loop {
+        frame += 1;
+
+        // Update all script components
+        world.update_scripts();
+
+        // Render the world
+        renderer.clear();
+        renderer.render(&world);
+        renderer.present();
+
+        // Print debug info every 2 frames (~1 second at 0.5s per frame)
+        if frame % 2 == 0 {
+            println!("Frame {}: Entities rendered", frame);
+            for (entity, pos) in world.query::<Position>() {
+                if let Some(name) = world.get_component::<Name>(entity) {
+                    println!("  {}: ({:.1}, {:.1})", name.0, pos.x, pos.y);
+                }
+            }
+            println!();
+        }
+
+        // Wait 0.5 seconds between frames
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+}

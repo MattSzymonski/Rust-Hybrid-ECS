@@ -66,6 +66,21 @@ pub struct Position {
 
 impl Component for Position {}
 
+// Sprite rendering component
+#[derive(Debug, Clone)]
+pub struct Sprite {
+    pub color: (f32, f32, f32), // RGB color (0.0-1.0)
+    pub size: f32,              // Size/radius of the sprite
+}
+
+impl Component for Sprite {}
+
+impl Sprite {
+    pub fn new(color: (f32, f32, f32), size: f32) -> Self {
+        Self { color, size }
+    }
+}
+
 // Trait object wrapper for script storage that can be updated
 trait ScriptStorageUpdater: Send + Sync {
     fn update_all(&mut self, world: &World, ctx: &mut UpdateContext);
