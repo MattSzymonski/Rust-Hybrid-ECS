@@ -34,7 +34,7 @@ impl World {
     }
 
     /// Update with unsafe - bypassing borrow checker with raw pointers
-    pub fn update_scripts_refcell(&mut self) {
+    pub fn update_scripts(&mut self) {
         for i in 0..self.components.len() {
             // SAFETY: We create a shared slice view and a mutable reference to current component.
             // This violates Stacked Borrows but works in practice because:
@@ -102,7 +102,7 @@ pub fn run_world_view_test() {
     println!("Created world with {} components", world.components.len());
 
     // Update with unsafe pointer manipulation
-    world.update_scripts_refcell();
+    world.update_scripts();
 
     for (i, component) in world.components.iter().enumerate() {
         println!("Component {}: value={}", i, component.some_value);
