@@ -4,5 +4,3 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-trait_type_map = { path = "../trait_type_map" }
-rayon = "1.10"
