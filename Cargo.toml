@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+[profile.release]
+opt-level = 3     # Maximum optimization
+lto = "fat"       # Full link-time optimization
+codegen-units = 1 # Better optimization at cost of compile time
+panic = "abort"   # Smaller binary, faster panic
+strip = true      # Strip symbols

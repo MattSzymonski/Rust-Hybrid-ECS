@@ -2,18 +2,11 @@ use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-pub struct ScriptComponent {
-    pub some_value: f32,
-}
-
-// ScriptComponent trait - for components that have update logic
-impl ScriptComponent {
-    fn update(&mut self, world: &mut World) {}
-}
+use crate::example::ScriptComponent;
 
 // World manages all entities and components
 pub struct World {
-    components: Vec<ScriptComponent>,
+    pub components: Vec<ScriptComponent>,
 }
 
 impl World {
@@ -42,14 +35,34 @@ impl World {
         self.components.iter()
     }
 
+    // Get the number of components
+    pub fn component_count(&self) -> usize {
+        self.components.len()
+    }
+
+    // Remove a component by index
+    pub fn remove_component(&mut self, index: usize) {
+        if index < self.components.len() {
+            self.components.remove(index);
+        }
+    }
+
+    // Clear all components
+    pub fn clear_components(&mut self) {
+        self.components.clear();
+    }
+
     // Update all script components for all entities
     pub fn update_scripts(&mut self) {
-        // UNSAFE: Get raw pointer to self to bypass borrow checker
-        // This allows us to have mutable access to components while passing immutable world reference
+        // SAFE FIX: Pass indices instead of raw pointers
+        // The component can get fresh pointers using the index after Vec reallocation
         let world_ptr = self as *mut World;
 
-        self.components.iter_mut().for_each(|component| unsafe {
-            component.update(&mut *world_ptr);
-        });
+        for i in 0..self.components.len() {
+            unsafe {
+                // Pass INDEX instead of pointer - allows reallocation handling
+                ScriptComponent::update(self.components.get_mut(i).unwrap(), &mut *world_ptr);
+            }
+        }
     }
 }
