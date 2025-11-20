@@ -127,6 +127,7 @@ pub struct World {
     next_archetype_id: usize,
     entity_locations: HashMap<Entity, EntityLocation>,
     archetype_lookup: HashMap<Vec<ComponentId>, ArchetypeId>,
+    global_components: HashMap<ComponentId, Box<dyn Any>>,
 }
 
 impl World {
@@ -137,7 +138,28 @@ impl World {
             next_archetype_id: 0,
             entity_locations: HashMap::new(),
             archetype_lookup: HashMap::new(),
+            global_components: HashMap::new(),
         }
+    }
+
+    /// Add or update a global component (singleton component not attached to any entity)
+    pub fn add_global_component<T: Component>(&mut self, component: T) {
+        self.global_components
+            .insert(ComponentId::of::<T>(), Box::new(component));
+    }
+
+    /// Get reference to a global component
+    pub fn get_global_component<T: Component>(&self) -> Option<&T> {
+        self.global_components
+            .get(&ComponentId::of::<T>())
+            .and_then(|boxed| boxed.downcast_ref::<T>())
+    }
+
+    /// Get mutable reference to a global component
+    pub fn get_global_component_mut<T: Component>(&mut self) -> Option<&mut T> {
+        self.global_components
+            .get_mut(&ComponentId::of::<T>())
+            .and_then(|boxed| boxed.downcast_mut::<T>())
     }
 
     fn allocate_entity(&mut self) -> Entity {
@@ -543,6 +565,35 @@ impl<'w, Q: WorldQuery> Iterator for QueryIterMut<'w, Q> {
 }
 
 // ============================================================================
+// Global Component Query
+// ============================================================================
+
+/// Query for accessing global components (singleton components stored in World, not attached to entities)
+pub struct GlobalComponentQuery<'w, T: Component> {
+    world: &'w mut World,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<'w, T: Component> GlobalComponentQuery<'w, T> {
+    pub fn new(world: &'w mut World) -> Self {
+        Self {
+            world,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Get immutable reference to the global component
+    pub fn get(&self) -> Option<&T> {
+        self.world.get_global_component::<T>()
+    }
+
+    /// Get mutable reference to the global component
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        self.world.get_global_component_mut::<T>()
+    }
+}
+
+// ============================================================================
 // Example Components and Systems
 // ============================================================================
 
@@ -581,10 +632,10 @@ impl Component for Dead {}
 fn movement_system(
     commands: &mut Commands,
     mut query: Query<(Entity, &mut Transform, &Velocity)>,
-    mut time_query: Query<&GlobalTime>,
+    time_query: GlobalComponentQuery<GlobalTime>,
 ) {
     // Get delta time from global component
-    let delta_time = if let Some(global_time) = time_query.iter_mut().next() {
+    let delta_time = if let Some(global_time) = time_query.get() {
         global_time.delta_time
     } else {
         1.0 // Default fallback
@@ -608,11 +659,11 @@ fn movement_system(
 /// System that prints dead entities every 5 seconds
 fn dead_report_system(
     mut query: Query<(&Dead, &Transform)>,
-    mut time_query: Query<&GlobalTime>,
+    time_query: GlobalComponentQuery<GlobalTime>,
     last_report_time: &mut f32,
 ) {
     // Get elapsed time from global component
-    let elapsed_time = if let Some(global_time) = time_query.iter_mut().next() {
+    let elapsed_time = if let Some(global_time) = time_query.get() {
         global_time.elapsed_time
     } else {
         0.0
@@ -655,43 +706,51 @@ trait System {
     fn run(&mut self, world: &mut World, queue: &mut CommandQueue, state: &mut SystemState);
 }
 
-/// Adapter that wraps a function with Commands, Query, and Query<&GlobalTime> parameters
+/// Adapter that wraps a function with Commands, Query, and GlobalComponentQuery<GlobalTime> parameters
 struct MovementSystemWrapper<F>
 where
-    F: FnMut(&mut Commands, Query<(Entity, &mut Transform, &Velocity)>, Query<&GlobalTime>),
+    F: FnMut(
+        &mut Commands,
+        Query<(Entity, &mut Transform, &Velocity)>,
+        GlobalComponentQuery<GlobalTime>,
+    ),
 {
     func: F,
 }
 
 impl<F> System for MovementSystemWrapper<F>
 where
-    F: FnMut(&mut Commands, Query<(Entity, &mut Transform, &Velocity)>, Query<&GlobalTime>),
+    F: FnMut(
+        &mut Commands,
+        Query<(Entity, &mut Transform, &Velocity)>,
+        GlobalComponentQuery<GlobalTime>,
+    ),
 {
     fn run(&mut self, world: &mut World, queue: &mut CommandQueue, _state: &mut SystemState) {
         let mut commands = Commands::new(queue);
         let world_ptr = world as *mut World;
         let query = Query::new(unsafe { &mut *world_ptr });
-        let time_query = Query::new(unsafe { &mut *world_ptr });
+        let time_query = GlobalComponentQuery::new(unsafe { &mut *world_ptr });
         (self.func)(&mut commands, query, time_query);
     }
 }
 
-/// Adapter that wraps a function with Query, Query<&GlobalTime>, and &mut f32 state parameters
+/// Adapter that wraps a function with Query, GlobalComponentQuery<GlobalTime>, and &mut f32 state parameters
 struct DeadReportSystemWrapper<F>
 where
-    F: FnMut(Query<(&Dead, &Transform)>, Query<&GlobalTime>, &mut f32),
+    F: FnMut(Query<(&Dead, &Transform)>, GlobalComponentQuery<GlobalTime>, &mut f32),
 {
     func: F,
 }
 
 impl<F> System for DeadReportSystemWrapper<F>
 where
-    F: FnMut(Query<(&Dead, &Transform)>, Query<&GlobalTime>, &mut f32),
+    F: FnMut(Query<(&Dead, &Transform)>, GlobalComponentQuery<GlobalTime>, &mut f32),
 {
     fn run(&mut self, world: &mut World, _queue: &mut CommandQueue, state: &mut SystemState) {
         let world_ptr = world as *mut World;
         let query = Query::new(unsafe { &mut *world_ptr });
-        let time_query = Query::new(unsafe { &mut *world_ptr });
+        let time_query = GlobalComponentQuery::new(unsafe { &mut *world_ptr });
         (self.func)(query, time_query, &mut state.last_report_time);
     }
 }
@@ -707,7 +766,11 @@ struct MovementSystemMarker;
 
 impl<F> IntoSystem<MovementSystemMarker> for F
 where
-    F: FnMut(&mut Commands, Query<(Entity, &mut Transform, &Velocity)>, Query<&GlobalTime>),
+    F: FnMut(
+        &mut Commands,
+        Query<(Entity, &mut Transform, &Velocity)>,
+        GlobalComponentQuery<GlobalTime>,
+    ),
 {
     type System = MovementSystemWrapper<F>;
     fn into_system(self) -> Self::System {
@@ -720,7 +783,7 @@ struct DeadReportSystemMarker;
 
 impl<F> IntoSystem<DeadReportSystemMarker> for F
 where
-    F: FnMut(Query<(&Dead, &Transform)>, Query<&GlobalTime>, &mut f32),
+    F: FnMut(Query<(&Dead, &Transform)>, GlobalComponentQuery<GlobalTime>, &mut f32),
 {
     type System = DeadReportSystemWrapper<F>;
     fn into_system(self) -> Self::System {
@@ -772,13 +835,10 @@ impl Engine {
     pub fn process_frame(&mut self, frame: usize) {
         self.elapsed_time += self.delta_time;
 
-        // Update GlobalTime component
-        {
-            let mut time_query: Query<&mut GlobalTime> = Query::new(&mut self.world);
-            if let Some(global_time) = time_query.iter_mut().next() {
-                global_time.elapsed_time = self.elapsed_time;
-                global_time.delta_time = self.delta_time;
-            }
+        // Update GlobalTime component (stored as a global component, not on an entity)
+        if let Some(global_time) = self.world.get_global_component_mut::<GlobalTime>() {
+            global_time.elapsed_time = self.elapsed_time;
+            global_time.delta_time = self.delta_time;
         }
 
         println!("--- Frame {} (t={:.1}s) ---", frame, self.elapsed_time);
@@ -813,15 +873,11 @@ fn main() {
     // Create engine with 1 second delta time
     let mut engine = Engine::new(1.0);
 
-    // Spawn GlobalTime entity
-    engine
-        .world_mut()
-        .spawn()
-        .with(GlobalTime {
-            delta_time: 1.0,
-            elapsed_time: 0.0,
-        })
-        .build();
+    // Add GlobalTime as a global component (not attached to any entity)
+    engine.world_mut().add_global_component(GlobalTime {
+        delta_time: 1.0,
+        elapsed_time: 0.0,
+    });
 
     // Register systems - Engine automatically resolves parameters
     engine.register_system(movement_system);
