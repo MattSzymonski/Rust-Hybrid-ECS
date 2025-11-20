@@ -630,7 +630,7 @@ impl Component for Dead {}
 
 /// Movement system that applies velocity to transform and tags entities as Dead if x > 100
 fn movement_system(
-    commands: &mut Commands,
+    mut commands: Commands,
     mut query: Query<(Entity, &mut Transform, &Velocity)>,
     time_query: GlobalComponentQuery<GlobalTime>,
 ) {
@@ -660,7 +660,7 @@ fn movement_system(
 fn dead_report_system(
     mut query: Query<(&Dead, &Transform)>,
     time_query: GlobalComponentQuery<GlobalTime>,
-    last_report_time: &mut f32,
+    State(last_report_time): State<&mut f32>,
 ) {
     // Get elapsed time from global component
     let elapsed_time = if let Some(global_time) = time_query.get() {
@@ -694,6 +694,44 @@ fn time_print_system() {
     }
 }
 
+/// NEW: System with different query pattern - demonstrates full generics
+fn velocity_report_system(mut query: Query<(Entity, &Velocity)>) {
+    println!("  [VelocityReport] Current velocities:");
+    for (entity, velocity) in query.iter_mut() {
+        println!("    Entity {:?}: velocity.x = {:.2}", entity.id, velocity.x);
+    }
+}
+
+/// NEW: System with only global component access
+fn time_info_system(time: GlobalComponentQuery<GlobalTime>) {
+    if let Some(global_time) = time.get() {
+        println!(
+            "  [TimeInfo] Delta: {:.2}s, Elapsed: {:.2}s",
+            global_time.delta_time, global_time.elapsed_time
+        );
+    }
+}
+
+/// NEW: System with complex 4-parameter combination
+fn debug_system(
+    mut query1: Query<&Transform>,
+    mut query2: Query<&Velocity>,
+    time: GlobalComponentQuery<GlobalTime>,
+    State(report_time): State<&mut f32>,
+) {
+    if let Some(global_time) = time.get() {
+        if global_time.elapsed_time - *report_time >= 3.0 {
+            let transform_count = query1.iter_mut().count();
+            let velocity_count = query2.iter_mut().count();
+            println!(
+                "  [Debug] Entities with Transform: {}, with Velocity: {}",
+                transform_count, velocity_count
+            );
+            *report_time = global_time.elapsed_time;
+        }
+    }
+}
+
 // ============================================================================
 // Engine - System Management
 // ============================================================================
@@ -713,123 +751,175 @@ impl SystemState {
     }
 }
 
+// ============================================================================
+// Advanced System Parameter Infrastructure (Bevy-style)
+// ============================================================================
+
+/// SystemParam trait - any type that can be extracted as a system parameter
+/// This is the core of Bevy's flexible system architecture
+pub trait SystemParam: Sized {
+    /// Fetch the parameter from world state
+    fn fetch(world: &mut World, queue: &mut CommandQueue, state: &mut SystemState) -> Self;
+}
+
+/// SystemParamFunction trait - functions that can be converted to systems
+/// The Input tuple contains all the parameter types
+pub trait SystemParamFunction<Input: SystemParam>: 'static {
+    fn run(&mut self, input: Input);
+}
+
 /// Trait for systems that can be executed by the Engine
 trait System {
     fn run(&mut self, world: &mut World, queue: &mut CommandQueue, state: &mut SystemState);
 }
 
-/// Adapter that wraps a function with Commands, Query, and GlobalComponentQuery<GlobalTime> parameters
-struct MovementSystemWrapper<F>
+// Implement System for any FnMut closure with the right signature
+impl<F> System for F
 where
-    F: FnMut(
-        &mut Commands,
-        Query<(Entity, &mut Transform, &Velocity)>,
-        GlobalComponentQuery<GlobalTime>,
-    ),
+    F: FnMut(&mut World, &mut CommandQueue, &mut SystemState),
 {
-    func: F,
-}
-
-impl<F> System for MovementSystemWrapper<F>
-where
-    F: FnMut(
-        &mut Commands,
-        Query<(Entity, &mut Transform, &Velocity)>,
-        GlobalComponentQuery<GlobalTime>,
-    ),
-{
-    fn run(&mut self, world: &mut World, queue: &mut CommandQueue, _state: &mut SystemState) {
-        let mut commands = Commands::new(queue);
-        let world_ptr = world as *mut World;
-        let query = Query::new(unsafe { &mut *world_ptr });
-        let time_query = GlobalComponentQuery::new(unsafe { &mut *world_ptr });
-        (self.func)(&mut commands, query, time_query);
+    fn run(&mut self, world: &mut World, queue: &mut CommandQueue, state: &mut SystemState) {
+        self(world, queue, state);
     }
 }
 
-/// Adapter that wraps a function with Query, GlobalComponentQuery<GlobalTime>, and &mut f32 state parameters
-struct DeadReportSystemWrapper<F>
-where
-    F: FnMut(Query<(&Dead, &Transform)>, GlobalComponentQuery<GlobalTime>, &mut f32),
-{
-    func: F,
-}
+// ============================================================================
+// SystemParam Implementations for Each Parameter Type
+// ============================================================================
 
-impl<F> System for DeadReportSystemWrapper<F>
-where
-    F: FnMut(Query<(&Dead, &Transform)>, GlobalComponentQuery<GlobalTime>, &mut f32),
-{
-    fn run(&mut self, world: &mut World, _queue: &mut CommandQueue, state: &mut SystemState) {
-        let world_ptr = world as *mut World;
-        let query = Query::new(unsafe { &mut *world_ptr });
-        let time_query = GlobalComponentQuery::new(unsafe { &mut *world_ptr });
-        (self.func)(query, time_query, &mut state.last_report_time);
+// Commands is a SystemParam
+impl SystemParam for Commands<'static> {
+    fn fetch(_world: &mut World, queue: &mut CommandQueue, _state: &mut SystemState) -> Self {
+        // We need to transmute the lifetime here
+        // SAFETY: The Commands will only live as long as the system execution
+        unsafe { std::mem::transmute(Commands::new(queue)) }
     }
 }
 
-/// Adapter that wraps a function with no parameters
-struct NoParamSystemWrapper<F>
-where
-    F: FnMut(),
-{
-    func: F,
-}
-
-impl<F> System for NoParamSystemWrapper<F>
-where
-    F: FnMut(),
-{
-    fn run(&mut self, _world: &mut World, _queue: &mut CommandQueue, _state: &mut SystemState) {
-        (self.func)();
+// Generic Query is a SystemParam - works for ANY WorldQuery type
+impl<Q: WorldQuery + 'static> SystemParam for Query<'static, Q> {
+    fn fetch(world: &mut World, _queue: &mut CommandQueue, _state: &mut SystemState) -> Self {
+        unsafe {
+            // Create query with actual lifetime, then transmute to 'static
+            // SAFETY: The query will only live as long as the system execution
+            let query: Query<Q> = Query::new(world);
+            std::mem::transmute(query)
+        }
     }
 }
+
+// Generic GlobalComponentQuery is a SystemParam - works for ANY Component type
+impl<T: Component> SystemParam for GlobalComponentQuery<'static, T> {
+    fn fetch(world: &mut World, _queue: &mut CommandQueue, _state: &mut SystemState) -> Self {
+        unsafe {
+            // Create query with actual lifetime, then transmute to 'static
+            // SAFETY: The query will only live as long as the system execution
+            let query: GlobalComponentQuery<T> = GlobalComponentQuery::new(world);
+            std::mem::transmute(query)
+        }
+    }
+}
+
+// State reference is a SystemParam (for persistent state like last_report_time)
+pub struct State<T>(pub T);
+
+impl SystemParam for State<&'static mut f32> {
+    fn fetch(_world: &mut World, _queue: &mut CommandQueue, state: &mut SystemState) -> Self {
+        // SAFETY: Transmuting lifetime for state access
+        unsafe { State(std::mem::transmute(&mut state.last_report_time)) }
+    }
+}
+
+// ============================================================================
+// SystemParam Tuple Implementations (macro-generated)
+// ============================================================================
+
+/// Macro to implement SystemParam for tuples
+macro_rules! impl_system_param_tuple {
+    ($($T:ident),*) => {
+        #[allow(non_snake_case)]
+        impl<$($T: SystemParam),*> SystemParam for ($($T,)*) {
+            fn fetch(world: &mut World, queue: &mut CommandQueue, state: &mut SystemState) -> Self {
+                ($($T::fetch(world, queue, state),)*)
+            }
+        }
+    };
+}
+
+// Implement for tuples of different sizes
+impl SystemParam for () {
+    fn fetch(_world: &mut World, _queue: &mut CommandQueue, _state: &mut SystemState) -> Self {
+        ()
+    }
+}
+
+impl_system_param_tuple!(A);
+impl_system_param_tuple!(A, B);
+impl_system_param_tuple!(A, B, C);
+impl_system_param_tuple!(A, B, C, D);
+impl_system_param_tuple!(A, B, C, D, E);
+impl_system_param_tuple!(A, B, C, D, E, F1);
+
+// ============================================================================
+// SystemParamFunction Implementations for Different Function Arities
+// ============================================================================
+
+/// Macro to implement SystemParamFunction for functions with different numbers of parameters
+macro_rules! impl_system_param_function {
+    ($($T:ident),*) => {
+        #[allow(non_snake_case)]
+        impl<F, $($T: SystemParam),*> SystemParamFunction<($($T,)*)> for F
+        where
+            F: FnMut($($T),*) + 'static,
+        {
+            fn run(&mut self, input: ($($T,)*)) {
+                let ($($T,)*) = input;
+                self($($T),*)
+            }
+        }
+    };
+}
+
+// Implement for different arities
+impl<F> SystemParamFunction<()> for F
+where
+    F: FnMut() + 'static,
+{
+    fn run(&mut self, _input: ()) {
+        self()
+    }
+}
+
+impl_system_param_function!(A);
+impl_system_param_function!(A, B);
+impl_system_param_function!(A, B, C);
+impl_system_param_function!(A, B, C, D);
+impl_system_param_function!(A, B, C, D, E);
+impl_system_param_function!(A, B, C, D, E, F1);
+
+// ============================================================================
+// IntoSystem - Automatic Conversion
+// ============================================================================
 
 /// Trait for converting functions into Systems
-trait IntoSystem<Marker> {
-    type System: System;
-    fn into_system(self) -> Self::System;
+/// This uses the SystemParam infrastructure to automatically resolve parameters
+trait IntoSystem<Input: SystemParam> {
+    fn into_system(self) -> Box<dyn System>;
 }
 
-/// Marker for movement system signature
-struct MovementSystemMarker;
-
-impl<F> IntoSystem<MovementSystemMarker> for F
+/// Implement IntoSystem for any function that implements SystemParamFunction
+impl<F, Input> IntoSystem<Input> for F
 where
-    F: FnMut(
-        &mut Commands,
-        Query<(Entity, &mut Transform, &Velocity)>,
-        GlobalComponentQuery<GlobalTime>,
-    ),
+    F: SystemParamFunction<Input>,
+    Input: SystemParam,
 {
-    type System = MovementSystemWrapper<F>;
-    fn into_system(self) -> Self::System {
-        MovementSystemWrapper { func: self }
-    }
-}
-
-/// Marker for dead report system signature
-struct DeadReportSystemMarker;
-
-impl<F> IntoSystem<DeadReportSystemMarker> for F
-where
-    F: FnMut(Query<(&Dead, &Transform)>, GlobalComponentQuery<GlobalTime>, &mut f32),
-{
-    type System = DeadReportSystemWrapper<F>;
-    fn into_system(self) -> Self::System {
-        DeadReportSystemWrapper { func: self }
-    }
-}
-
-/// Marker for no-parameter system signature
-struct NoParamSystemMarker;
-
-impl<F> IntoSystem<NoParamSystemMarker> for F
-where
-    F: FnMut(),
-{
-    type System = NoParamSystemWrapper<F>;
-    fn into_system(self) -> Self::System {
-        NoParamSystemWrapper { func: self }
+    fn into_system(mut self) -> Box<dyn System> {
+        Box::new(
+            move |world: &mut World, queue: &mut CommandQueue, state: &mut SystemState| {
+                let input = Input::fetch(world, queue, state);
+                self.run(input);
+            },
+        )
     }
 }
 
@@ -860,13 +950,12 @@ impl Engine {
     }
 
     /// Register any system that implements IntoSystem
-    pub fn register_system<M, S>(&mut self, name: &str, system: S)
+    pub fn register_system<Input, S>(&mut self, name: &str, system: S)
     where
-        S: IntoSystem<M>,
-        S::System: 'static,
+        S: IntoSystem<Input>,
+        Input: SystemParam,
     {
-        self.systems
-            .push((name.to_string(), Box::new(system.into_system())));
+        self.systems.push((name.to_string(), system.into_system()));
     }
 
     /// Get mutable reference to the world for entity spawning
@@ -924,9 +1013,15 @@ fn main() {
     });
 
     // Register systems - Engine automatically resolves parameters
+    // Original systems
     engine.register_system("movement_system", movement_system);
     engine.register_system("dead_report_system", dead_report_system);
     engine.register_system("time_print_system", time_print_system);
+
+    // NEW: Register completely different systems to prove full generics work
+    engine.register_system("velocity_report_system", velocity_report_system);
+    engine.register_system("time_info_system", time_info_system);
+    engine.register_system("debug_system", debug_system);
 
     // Spawn entities
     println!("Spawning entities...\n");
