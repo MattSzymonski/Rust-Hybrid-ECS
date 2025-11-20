@@ -682,6 +682,18 @@ fn dead_report_system(
     }
 }
 
+/// System that just prints current time with no parameters
+fn time_print_system() {
+    use std::time::SystemTime;
+
+    if let Ok(duration) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
+        println!(
+            "  [TimeSystem] Current Unix timestamp: {} seconds",
+            duration.as_secs()
+        );
+    }
+}
+
 // ============================================================================
 // Engine - System Management
 // ============================================================================
@@ -755,6 +767,23 @@ where
     }
 }
 
+/// Adapter that wraps a function with no parameters
+struct NoParamSystemWrapper<F>
+where
+    F: FnMut(),
+{
+    func: F,
+}
+
+impl<F> System for NoParamSystemWrapper<F>
+where
+    F: FnMut(),
+{
+    fn run(&mut self, _world: &mut World, _queue: &mut CommandQueue, _state: &mut SystemState) {
+        (self.func)();
+    }
+}
+
 /// Trait for converting functions into Systems
 trait IntoSystem<Marker> {
     type System: System;
@@ -791,6 +820,19 @@ where
     }
 }
 
+/// Marker for no-parameter system signature
+struct NoParamSystemMarker;
+
+impl<F> IntoSystem<NoParamSystemMarker> for F
+where
+    F: FnMut(),
+{
+    type System = NoParamSystemWrapper<F>;
+    fn into_system(self) -> Self::System {
+        NoParamSystemWrapper { func: self }
+    }
+}
+
 /// Engine manages the world and registered systems
 ///
 /// Each frame is processed in two phases:
@@ -798,7 +840,7 @@ where
 /// 2. Deferred Phase: Queued commands are executed (component additions, etc.)
 pub struct Engine {
     world: World,
-    systems: Vec<Box<dyn System>>,
+    systems: Vec<(String, Box<dyn System>)>,
     system_state: SystemState,
     command_queue: CommandQueue,
     elapsed_time: f32,
@@ -818,12 +860,13 @@ impl Engine {
     }
 
     /// Register any system that implements IntoSystem
-    pub fn register_system<M, S>(&mut self, system: S)
+    pub fn register_system<M, S>(&mut self, name: &str, system: S)
     where
         S: IntoSystem<M>,
         S::System: 'static,
     {
-        self.systems.push(Box::new(system.into_system()));
+        self.systems
+            .push((name.to_string(), Box::new(system.into_system())));
     }
 
     /// Get mutable reference to the world for entity spawning
@@ -844,7 +887,8 @@ impl Engine {
         println!("--- Frame {} (t={:.1}s) ---", frame, self.elapsed_time);
 
         // Phase 1: Execute all registered systems
-        for system in &mut self.systems {
+        for (name, system) in &mut self.systems {
+            println!("  Running system: {}", name);
             system.run(
                 &mut self.world,
                 &mut self.command_queue,
@@ -880,8 +924,9 @@ fn main() {
     });
 
     // Register systems - Engine automatically resolves parameters
-    engine.register_system(movement_system);
-    engine.register_system(dead_report_system);
+    engine.register_system("movement_system", movement_system);
+    engine.register_system("dead_report_system", dead_report_system);
+    engine.register_system("time_print_system", time_print_system);
 
     // Spawn entities
     println!("Spawning entities...\n");
