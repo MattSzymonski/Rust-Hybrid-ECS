@@ -28,9 +28,9 @@ pub(crate) struct EntityLocation {
 /// - Tracks entity locations
 /// - Stores global (singleton) components
 pub struct World {
-    next_entity_id: u64,
+    next_free_entity_id: u64,
     pub(crate) archetypes: HashMap<ArchetypeId, Archetype>,
-    next_archetype_id: usize,
+    next_free_archetype_id: usize,
     pub(crate) entity_locations: HashMap<Entity, EntityLocation>,
     archetype_lookup: HashMap<Vec<ComponentId>, ArchetypeId>,
     pub(crate) global_components: HashMap<ComponentId, Box<dyn Any>>,
@@ -40,9 +40,9 @@ impl World {
     /// Create a new empty World
     pub fn new() -> Self {
         Self {
-            next_entity_id: 0,
+            next_free_entity_id: 0,
             archetypes: HashMap::new(),
-            next_archetype_id: 0,
+            next_free_archetype_id: 0,
             entity_locations: HashMap::new(),
             archetype_lookup: HashMap::new(),
             global_components: HashMap::new(),
@@ -75,10 +75,10 @@ impl World {
     /// Allocate a new unique entity ID
     pub(crate) fn allocate_entity(&mut self) -> Entity {
         let entity = Entity {
-            id: self.next_entity_id,
+            id: self.next_free_entity_id,
             generation: 0,
         };
-        self.next_entity_id += 1;
+        self.next_free_entity_id += 1;
         entity
     }
 
@@ -95,14 +95,15 @@ impl World {
             return archetype_id;
         }
 
-        let archetype_id = ArchetypeId(self.next_archetype_id);
-        self.next_archetype_id += 1;
+        let new_archetype_id = ArchetypeId(self.next_free_archetype_id);
+        self.next_free_archetype_id += 1;
 
-        let archetype = Archetype::new(archetype_id, component_ids.clone());
-        self.archetypes.insert(archetype_id, archetype);
-        self.archetype_lookup.insert(component_ids, archetype_id);
+        let new_archetype = Archetype::new(new_archetype_id, component_ids.clone());
+        self.archetypes.insert(new_archetype_id, new_archetype);
+        self.archetype_lookup
+            .insert(component_ids, new_archetype_id);
 
-        archetype_id
+        new_archetype_id
     }
 
     /// Start building a new entity
@@ -129,9 +130,10 @@ impl World {
         let archetype = self.archetypes.get_mut(&archetype_id).unwrap();
         let index = archetype.entities.len();
 
+        // Add entity to archetype and its components to the appropriate archetype columns
         archetype.entities.push(entity);
-        for (comp_id, component) in components {
-            if let Some(column) = archetype.columns.get_mut(&comp_id) {
+        for (component_id, component) in components {
+            if let Some(column) = archetype.columns.get_mut(&component_id) {
                 column.data.push(component);
             }
         }
