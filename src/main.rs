@@ -1,232 +1,71 @@
 ﻿// ============================================================================
-// Archetype-based ECS - Example Usage
+// Archetype-based ECS - Example Selector
 // ============================================================================
+//! Main entry point that allows users to select which example to run.
 
-mod archetype;
-mod commands;
-mod component;
-mod engine;
-mod entity;
-mod query;
-mod system;
-mod world;
+pub mod archetype;
+pub mod commands;
+pub mod component;
+pub mod engine;
+pub mod entity;
+pub mod query;
+pub mod system;
+pub mod world;
 
-use commands::Commands;
-use component::Component;
-use engine::Engine;
-use entity::Entity;
-use query::{GlobalComponentQuery, Query};
-use system::State;
+// Re-export commonly used types
+pub use commands::{CommandQueue, Commands};
+pub use component::Component;
+pub use engine::Engine;
+pub use entity::Entity;
+pub use query::{GlobalComponentQuery, Query, WorldQuery};
+pub use system::{State, SystemState};
+pub use world::{EntityBuilder, World};
 
-// ============================================================================
-// Example Components
-// ============================================================================
+use std::io::{self, Write};
 
-#[derive(Debug)]
-struct GlobalTime {
-    delta_time: f32,
-    elapsed_time: f32,
+// Include example modules
+mod examples {
+    pub mod simple_example;
+    pub mod stress_test;
 }
-
-impl Component for GlobalTime {}
-
-#[derive(Debug)]
-struct Transform {
-    x: f32,
-    y: f32,
-    z: f32,
-}
-
-impl Component for Transform {}
-
-#[derive(Debug)]
-struct Velocity {
-    x: f32,
-}
-
-impl Component for Velocity {}
-
-#[derive(Debug)]
-struct Dead;
-
-impl Component for Dead {}
-
-// ============================================================================
-// Example Systems
-// ============================================================================
-
-fn movement_system(
-    mut commands: Commands,
-    mut query: Query<(Entity, &mut Transform, &Velocity)>,
-    time_query: GlobalComponentQuery<GlobalTime>,
-) {
-    let delta_time = if let Some(global_time) = time_query.get() {
-        global_time.delta_time
-    } else {
-        1.0
-    };
-
-    for (entity, transform, velocity) in query.iter_mut() {
-        transform.x += velocity.x * delta_time;
-
-        if transform.x > 100.0 {
-            println!(
-                "Entity {:?} exceeded x=100 (x={:.2}), queuing Dead tag",
-                entity.id, transform.x
-            );
-            commands.add_component(entity, Dead);
-        }
-    }
-}
-
-fn dead_report_system(
-    mut query: Query<(&Dead, &Transform)>,
-    time_query: GlobalComponentQuery<GlobalTime>,
-    State(last_report_time): State<&mut f32>,
-) {
-    let elapsed_time = if let Some(global_time) = time_query.get() {
-        global_time.elapsed_time
-    } else {
-        0.0
-    };
-
-    if elapsed_time - *last_report_time >= 5.0 {
-        println!("\n=== Dead Entities Report ===");
-        for (_dead, transform) in query.iter_mut() {
-            println!(
-                "dead: transform=({:.2}, {:.2}, {:.2})",
-                transform.x, transform.y, transform.z
-            );
-        }
-        println!("===========================\n");
-        *last_report_time = elapsed_time;
-    }
-}
-
-fn time_print_system() {
-    use std::time::SystemTime;
-
-    if let Ok(duration) = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH) {
-        println!(
-            "  [TimeSystem] Current Unix timestamp: {} seconds",
-            duration.as_secs()
-        );
-    }
-}
-
-fn velocity_report_system(mut query: Query<(Entity, &Velocity)>) {
-    println!("  [VelocityReport] Current velocities:");
-    for (entity, velocity) in query.iter_mut() {
-        println!("    Entity {:?}: velocity.x = {:.2}", entity.id, velocity.x);
-    }
-}
-
-fn time_info_system(time: GlobalComponentQuery<GlobalTime>) {
-    if let Some(global_time) = time.get() {
-        println!(
-            "  [TimeInfo] Delta: {:.2}s, Elapsed: {:.2}s",
-            global_time.delta_time, global_time.elapsed_time
-        );
-    }
-}
-
-fn debug_system(
-    mut query1: Query<&Transform>,
-    mut query2: Query<&Velocity>,
-    time: GlobalComponentQuery<GlobalTime>,
-    State(report_time): State<&mut f32>,
-) {
-    if let Some(global_time) = time.get() {
-        if global_time.elapsed_time - *report_time >= 3.0 {
-            let transform_count = query1.iter_mut().count();
-            let velocity_count = query2.iter_mut().count();
-            println!(
-                "  [Debug] Entities with Transform: {}, with Velocity: {}",
-                transform_count, velocity_count
-            );
-            *report_time = global_time.elapsed_time;
-        }
-    }
-}
-
-// ============================================================================
-// Main - Example Usage
-// ============================================================================
 
 fn main() {
-    println!("=== Archetype-based ECS - Engine System ===\n");
+    println!("╔════════════════════════════════════════════════════╗");
+    println!("║   Archetype-Based ECS - Example Selector          ║");
+    println!("╚════════════════════════════════════════════════════╝\n");
 
-    let mut engine = Engine::new();
-    let mut world = world::World::new();
+    println!("Available examples:");
+    println!("  1. Simple Example   - Basic ECS usage with 4 entities");
+    println!("  2. Stress Test      - Performance test with 10,000 entities");
+    println!("  0. Exit\n");
 
-    world.add_global_component(GlobalTime {
-        delta_time: 1.0,
-        elapsed_time: 0.0,
-    });
+    loop {
+        print!("Enter your choice (0-2): ");
+        io::stdout().flush().unwrap();
 
-    engine.register_system("movement_system", movement_system);
-    engine.register_system("dead_report_system", dead_report_system);
-    engine.register_system("time_print_system", time_print_system);
-    engine.register_system("velocity_report_system", velocity_report_system);
-    engine.register_system("time_info_system", time_info_system);
-    engine.register_system("debug_system", debug_system);
+        let mut input = String::new();
+        io::stdin().read_line(&mut input).unwrap();
 
-    println!("Spawning entities...\n");
-
-    let entity1 = world
-        .spawn()
-        .with(Transform {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-        })
-        .with(Velocity { x: 15.0 })
-        .build();
-
-    let entity2 = world
-        .spawn()
-        .with(Transform {
-            x: 50.0,
-            y: 5.0,
-            z: 0.0,
-        })
-        .with(Velocity { x: 25.0 })
-        .build();
-
-    let entity3 = world
-        .spawn()
-        .with(Transform {
-            x: 90.0,
-            y: 0.0,
-            z: 5.0,
-        })
-        .with(Velocity { x: 5.0 })
-        .build();
-
-    let entity4 = world
-        .spawn()
-        .with(Transform {
-            x: 150.0,
-            y: 10.0,
-            z: 0.0,
-        })
-        .with(Dead)
-        .build();
-
-    println!(
-        "Created entities: {:?}, {:?}, {:?}, {:?} (already dead)\n",
-        entity1.id, entity2.id, entity3.id, entity4.id
-    );
-
-    for frame in 0..5 {
-        if let Some(global_time) = world.get_global_component_mut::<GlobalTime>() {
-            global_time.elapsed_time += global_time.delta_time;
+        match input.trim() {
+            "1" => {
+                println!("\n{}\n", "=".repeat(60));
+                examples::simple_example::main();
+                println!("\n{}\n", "=".repeat(60));
+                break;
+            }
+            "2" => {
+                println!("\n{}\n", "=".repeat(60));
+                examples::stress_test::main();
+                println!("\n{}\n", "=".repeat(60));
+                break;
+            }
+            "0" => {
+                println!("\nExiting...");
+                break;
+            }
+            _ => {
+                println!("Invalid choice. Please enter 0, 1, or 2.\n");
+            }
         }
-
-        println!("--- Frame {} ---", frame);
-        engine.process_frame(&mut world);
-        println!();
     }
-
-    println!("=== Engine Simulation Complete ===");
 }
