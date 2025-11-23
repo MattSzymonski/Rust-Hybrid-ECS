@@ -150,10 +150,8 @@ fn collision_and_movement_system(
         let new_z = transform.z + velocity.z * 0.016;
 
         // Check collision with all colliders on the obstacle
-        let mut collided = false;
-        if obstacle_collider.check_any_collision(transform, (new_x, new_y, new_z)) {
-            collided = true;
-        }
+        let collided =
+            obstacle_collider.check_any_collision(&obstacle_transform, (new_x, new_y, new_z));
 
         collision_checks.push((new_x, new_y, new_z, collided));
     }
