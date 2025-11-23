@@ -7,7 +7,7 @@
 //! access patterns, including mutable and immutable references.
 
 use crate::archetype::{Archetype, ArchetypeId};
-use crate::component::{Component, ComponentId};
+use crate::component::{Component, ComponentId, ComponentMask};
 use crate::entity::Entity;
 use crate::world::World;
 
@@ -156,12 +156,20 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
 
     /// Create an iterator over all matching entities
     pub fn iter_mut(&mut self) -> QueryIterMut<Q> {
+        // Build component mask from query requirements
         let component_ids = Q::component_ids();
+        let mut query_mask = ComponentMask::empty();
+        for comp_id in &component_ids {
+            if let Some(bit) = crate::component::get_component_bit_by_id(comp_id) {
+                query_mask.set(bit);
+            }
+        }
+
         let matching_archetypes: Vec<ArchetypeId> = self
             .world
             .archetypes
             .iter()
-            .filter(|(_, archetype)| archetype.matches_components(&component_ids))
+            .filter(|(_, archetype)| archetype.matches_mask(&query_mask))
             .map(|(id, _)| *id)
             .collect();
 
@@ -170,6 +178,8 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             matching_archetypes,
             current_archetype_idx: 0,
             current_entity_idx: 0,
+            current_archetype_ptr: std::ptr::null_mut(),
+            current_archetype_len: 0,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -184,6 +194,9 @@ pub struct QueryIterMut<'w, Q: WorldQuery> {
     matching_archetypes: Vec<ArchetypeId>,
     current_archetype_idx: usize,
     current_entity_idx: usize,
+    // Cache the current archetype pointer and length to avoid repeated lookups
+    current_archetype_ptr: *mut Archetype,
+    current_archetype_len: usize,
     _phantom: std::marker::PhantomData<&'w mut Q>,
 }
 
@@ -192,30 +205,36 @@ impl<'w, Q: WorldQuery> Iterator for QueryIterMut<'w, Q> {
 
     fn next(&mut self) -> Option<Self::Item> {
         unsafe {
-            let world = &mut *self.world_ptr;
-
-            while self.current_archetype_idx < self.matching_archetypes.len() {
-                let archetype_id = self.matching_archetypes[self.current_archetype_idx];
-                let archetype = world.archetypes.get_mut(&archetype_id)?;
-
-                if self.current_entity_idx < archetype.len() {
+            loop {
+                // Fast path: iterate within current archetype
+                if self.current_entity_idx < self.current_archetype_len {
                     let index = self.current_entity_idx;
                     self.current_entity_idx += 1;
 
-                    // SAFETY: We're extending the lifetime here, but it's safe because:
-                    // 1. We hold exclusive access to the world through the query
-                    // 2. Each iteration produces unique references to different components
-                    // 3. The references don't outlive the query iteration
-                    let item = Q::fetch_mut(archetype, index);
-                    let item_with_lifetime: Q::Item<'w> = std::mem::transmute(item);
-                    return Some(item_with_lifetime);
+                    // SAFETY: Lifetime extension is safe because:
+                    // 1. We hold exclusive access to world through world_ptr
+                    // 2. Each iteration yields unique component references
+                    // 3. References don't outlive the Query itself
+                    return Some(Q::fetch_mut(&mut *self.current_archetype_ptr, index));
                 }
 
-                self.current_archetype_idx += 1;
-                self.current_entity_idx = 0;
-            }
+                // Move to next archetype
+                if self.current_archetype_idx >= self.matching_archetypes.len() {
+                    return None;
+                }
 
-            None
+                let world = &mut *self.world_ptr;
+                let archetype_id = self.matching_archetypes[self.current_archetype_idx];
+                let archetype = world.archetypes.get_mut(&archetype_id)?;
+
+                // Cache archetype pointer and length
+                self.current_archetype_ptr = archetype as *mut Archetype;
+                self.current_archetype_len = archetype.len();
+                self.current_entity_idx = 0;
+                self.current_archetype_idx += 1;
+
+                // Continue to next iteration (will hit fast path if archetype has entities)
+            }
         }
     }
 }

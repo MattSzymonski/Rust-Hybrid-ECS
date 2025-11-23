@@ -15,7 +15,7 @@ use crate::{Commands, Component, Engine, Entity, GlobalComponentQuery, Query, St
 // Example Components
 // ============================================================================
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct GlobalTime {
     delta_time: f32,
     elapsed_time: f32,
@@ -23,7 +23,7 @@ struct GlobalTime {
 
 impl Component for GlobalTime {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Transform {
     x: f32,
     y: f32,
@@ -32,14 +32,14 @@ struct Transform {
 
 impl Component for Transform {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Velocity {
     x: f32,
 }
 
 impl Component for Velocity {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Dead;
 
 impl Component for Dead {}

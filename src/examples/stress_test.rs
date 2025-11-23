@@ -105,7 +105,7 @@ impl BoxCollider {
 
 impl Component for BoxCollider {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Obstacle;
 
 impl Component for Obstacle {}

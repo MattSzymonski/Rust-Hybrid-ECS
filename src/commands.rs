@@ -7,17 +7,43 @@
 //! access), commands queue operations to be executed later. This allows
 //! multiple systems to run in parallel without conflicts.
 
-use std::any::Any;
+use std::sync::Arc;
 
-use crate::component::Component;
+use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
+
+use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
 use crate::world::World;
+
+/// Trait for adding a component with its concrete type preserved
+trait ComponentAdder {
+    fn component_id(&self) -> ComponentId;
+    fn add_to_storage(self: Box<Self>, new_storage: &mut TraitTypeMap<dyn Component, VecFamily>);
+}
+
+/// Typed component adder that knows the concrete type T
+struct TypedComponentAdder<T: Component + TraitAccessible<dyn Component>> {
+    component: T,
+}
+
+impl<T: Component + TraitAccessible<dyn Component> + Send> ComponentAdder
+    for TypedComponentAdder<T>
+{
+    fn component_id(&self) -> ComponentId {
+        ComponentId::of::<T>()
+    }
+
+    fn add_to_storage(self: Box<Self>, new_storage: &mut TraitTypeMap<dyn Component, VecFamily>) {
+        // Add the new component
+        new_storage.get_storage_mut::<T>().push(self.component);
+    }
+}
 
 /// Deferred command to be executed later
 enum DeferredCommand {
     AddComponent {
         entity: Entity,
-        component: Box<dyn Any>,
+        adder: Box<dyn ComponentAdder>,
     },
 }
 
@@ -37,10 +63,13 @@ impl CommandQueue {
     }
 
     /// Queue adding a component to an entity
-    pub fn add_component<T: Component>(&mut self, entity: Entity, component: T) {
+    pub fn add_component<T>(&mut self, entity: Entity, component: T)
+    where
+        T: Component + TraitAccessible<dyn Component> + Send,
+    {
         self.commands.push(DeferredCommand::AddComponent {
             entity,
-            component: Box::new(component),
+            adder: Box::new(TypedComponentAdder { component }),
         });
     }
 
@@ -50,15 +79,60 @@ impl CommandQueue {
     pub(crate) fn execute(&mut self, world: &mut World) {
         for command in self.commands.drain(..) {
             match command {
-                DeferredCommand::AddComponent {
-                    entity,
-                    component: _,
-                } => {
-                    // Note: For minimal ECS, we just acknowledge this
-                    // A full implementation would move entities between archetypes
-                    if world.entity_locations.get(&entity).is_some() {
-                        println!("  [Deferred] Would add component to entity {:?}", entity.id);
+                DeferredCommand::AddComponent { entity, adder } => {
+                    // Get current entity location and components
+                    let location = match world.entity_locations.get(&entity) {
+                        Some(loc) => *loc,
+                        None => {
+                            println!("  [Deferred] Entity {:?} not found", entity.id);
+                            continue;
+                        }
+                    };
+
+                    let old_archetype = world.archetypes.get(&location.archetype_id).unwrap();
+                    let mut new_component_ids = old_archetype.component_types.clone();
+
+                    // Add the new component ID
+                    let new_comp_id = adder.component_id();
+                    if new_component_ids.contains(&new_comp_id) {
+                        println!(
+                            "  [Deferred] Entity {:?} already has component {:?}",
+                            entity.id, new_comp_id
+                        );
+                        continue;
                     }
+
+                    new_component_ids.push(new_comp_id);
+                    new_component_ids.sort();
+
+                    println!(
+                        "  [Deferred] Adding component to entity {:?} (moving archetype)",
+                        entity.id
+                    );
+
+                    // Copy existing components using the registered copiers
+                    let old_component_ids = old_archetype.component_types.clone();
+
+                    // Collect copiers before borrowing world mutably (Arc::clone is cheap)
+                    let copiers: Vec<_> = old_component_ids
+                        .iter()
+                        .filter_map(|comp_id| world.component_copiers.get(comp_id).map(Arc::clone))
+                        .collect();
+
+                    // Move entity to new archetype with the additional component
+                    world.move_entity_to_archetype(
+                        entity,
+                        new_component_ids,
+                        |old_storage, new_storage, old_index| {
+                            // Copy all existing components from old archetype
+                            for copier in copiers.iter() {
+                                copier(old_storage, new_storage, old_index);
+                            }
+
+                            // Add the new component via the adder
+                            adder.add_to_storage(new_storage);
+                        },
+                    );
                 }
             }
         }
@@ -82,7 +156,10 @@ impl<'a> Commands<'a> {
     }
 
     /// Queue adding a component to an entity (executed later)
-    pub fn add_component<T: Component>(&mut self, entity: Entity, component: T) {
+    pub fn add_component<T>(&mut self, entity: Entity, component: T)
+    where
+        T: Component + TraitAccessible<dyn Component> + Send,
+    {
         self.queue.add_component(entity, component);
     }
 }

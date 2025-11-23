@@ -9,7 +9,7 @@
 
 use trait_type_map::{TraitTypeMap, VecFamily};
 
-use crate::component::{Component, ComponentId};
+use crate::component::{Component, ComponentId, ComponentMask};
 use crate::entity::Entity;
 
 /// Type for component storage factory functions
@@ -27,7 +27,8 @@ pub struct ArchetypeId(pub usize);
 /// contiguous memory layout and cache efficiency.
 pub struct Archetype {
     pub id: ArchetypeId,
-    pub component_types: Vec<ComponentId>,
+    pub component_types: Vec<ComponentId>, // Still needed for iteration/lookup
+    pub component_mask: ComponentMask,     // Fast bitmask for query matching
     pub component_storages: TraitTypeMap<dyn Component, VecFamily>,
     pub entities: Vec<Entity>,
 }
@@ -40,6 +41,7 @@ impl Archetype {
     pub fn new(
         id: ArchetypeId,
         component_types: Vec<ComponentId>,
+        component_mask: ComponentMask,
         storage_factories: &std::collections::HashMap<ComponentId, StorageFactory>,
     ) -> Self {
         let mut component_storages = TraitTypeMap::new();
@@ -59,6 +61,7 @@ impl Archetype {
         Self {
             id,
             component_types,
+            component_mask,
             component_storages,
             entities: Vec::new(),
         }
@@ -69,11 +72,9 @@ impl Archetype {
         self.component_types.contains(&ComponentId::of::<T>())
     }
 
-    /// Check if this archetype matches the required component set for a query
-    pub fn matches_components(&self, component_ids: &[ComponentId]) -> bool {
-        component_ids
-            .iter()
-            .all(|id| self.component_types.contains(id))
+    /// Check if this archetype matches the required component mask for a query
+    pub fn matches_mask(&self, required_mask: &ComponentMask) -> bool {
+        self.component_mask.contains_all(required_mask)
     }
 
     /// Get the number of entities in this archetype
