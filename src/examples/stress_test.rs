@@ -7,7 +7,7 @@
 //! - Collision detection system
 //! - Performance measurements
 
-use crate::{Component, Engine, Query, World};
+use crate::{Component, Query, World};
 use std::time::Instant;
 use trait_type_map::impl_trait_accessible;
 
@@ -117,11 +117,43 @@ impl_trait_accessible!(dyn Component; Transform, Velocity, BoxCollider, Obstacle
 // Systems
 // ============================================================================
 
-fn movement_system(mut query: Query<(&mut Transform, &Velocity)>) {
-    for (transform, velocity) in query.iter_mut() {
-        transform.x += velocity.x * 0.016;
-        transform.y += velocity.y * 0.016;
-        transform.z += velocity.z * 0.016;
+fn collision_and_movement_system(
+    world: &mut World,
+    obstacle_transform: Transform,
+    obstacle_collider: &BoxCollider,
+) {
+    // Collect collision info: (index, new_position, should_collide)
+    let mut collision_checks: Vec<(usize, f32, f32, f32, bool)> = Vec::new();
+
+    // First pass: calculate new positions and check collisions (read-only)
+    let mut query = Query::<(&Transform, &Velocity)>::new(world);
+    for (idx, (transform, velocity)) in query.iter_mut().enumerate() {
+        let new_x = transform.x + velocity.x * 0.016;
+        let new_y = transform.y + velocity.y * 0.016;
+        let new_z = transform.z + velocity.z * 0.016;
+
+        // Check collision with all colliders on the obstacle
+        let mut collided = false;
+        for collider in &obstacle_collider.colliders {
+            if collider.intersects(&obstacle_transform, (new_x, new_y, new_z)) {
+                collided = true;
+                break;
+            }
+        }
+
+        collision_checks.push((idx, new_x, new_y, new_z, collided));
+    }
+
+    // Second pass: apply movement only if no collision (write)
+    let mut update_query = Query::<(&mut Transform, &Velocity)>::new(world);
+    for (idx, (transform, _velocity)) in update_query.iter_mut().enumerate() {
+        if let Some(&(_, new_x, new_y, new_z, collided)) = collision_checks.get(idx) {
+            if !collided {
+                transform.x = new_x;
+                transform.y = new_y;
+                transform.z = new_z;
+            }
+        }
     }
 }
 
@@ -151,10 +183,13 @@ pub fn main() {
     box_collider.add_collider((0.0, 6.0, 0.0), (3.0, 3.0, 3.0));
     box_collider.add_collider((0.0, -6.0, 0.0), (3.0, 3.0, 3.0));
 
+    let obstacle_transform = Transform::new(50.0, 0.0, 0.0);
+    let obstacle_collider = box_collider.clone();
+
     let _obstacle = world
         .spawn()
         .with(Obstacle)
-        .with(Transform::new(50.0, 0.0, 0.0))
+        .with(obstacle_transform.clone())
         .with(box_collider)
         .build();
 
@@ -174,19 +209,16 @@ pub fn main() {
     }
 
     println!("✓ Created {} moving entities", entity_count);
-    println!("\nScenario: Entities move toward obstacle");
+    println!("\nScenario: Entities move toward obstacle with 5 box colliders");
     println!("Collision check: Query-based iteration");
     println!("\nRunning 10,000 frame simulation...\n");
 
     let frame_count = 10_000;
     let start = Instant::now();
 
-    let mut engine = Engine::new();
-    engine.register_system("movement", movement_system);
-
-    // Run simulation
+    // Run simulation with collision detection
     for _frame in 0..frame_count {
-        engine.process_frame(&mut world);
+        collision_and_movement_system(&mut world, obstacle_transform.clone(), &obstacle_collider);
     }
 
     let duration = start.elapsed();
@@ -194,7 +226,7 @@ pub fn main() {
     // Calculate results
     let fps = frame_count as f64 / duration.as_secs_f64();
     let frame_time_ms = duration.as_secs_f64() * 1000.0 / frame_count as f64;
-    let total_operations = entity_count * frame_count;
+    let total_checks = entity_count * frame_count * 5; // 5 colliders
 
     println!("=== Results ===");
     println!("Architecture:       Archetype-based");
@@ -204,10 +236,10 @@ pub fn main() {
     println!("\nTime taken:         {:.3} s", duration.as_secs_f64());
     println!("FPS:                {:.0}", fps);
     println!("Avg frame time:     {:.3} ms", frame_time_ms);
-    println!("Total operations:   {}", total_operations);
+    println!("Total collision checks: {}", total_checks);
     println!(
-        "Operations/second:  {:.0}",
-        total_operations as f64 / duration.as_secs_f64()
+        "Checks per second:  {:.0}",
+        total_checks as f64 / duration.as_secs_f64()
     );
 
     // Count entities near obstacle
