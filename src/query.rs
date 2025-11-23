@@ -11,6 +11,8 @@ use crate::component::{Component, ComponentId, ComponentMask};
 use crate::entity::Entity;
 use crate::world::World;
 
+use trait_type_map::VecOptionStorage;
+
 /// WorldQuery trait for fetching components from archetypes
 ///
 /// This trait is implemented for different query patterns:
@@ -20,9 +22,16 @@ use crate::world::World;
 /// - Tuples: Multiple components at once
 pub trait WorldQuery {
     type Item<'a>;
+    type State;
 
     /// Get the list of component IDs required by this query
     fn component_ids() -> Vec<ComponentId>;
+
+    /// Initialize state for fetching from an archetype (caches storage pointers)
+    fn init_state(archetype: &mut Archetype) -> Self::State;
+
+    /// Fetch components using cached state
+    fn fetch_mut_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a>;
 
     /// Fetch components from an archetype (immutable)
     fn fetch<'a>(archetype: &'a Archetype, index: usize) -> Self::Item<'a>;
@@ -34,9 +43,22 @@ pub trait WorldQuery {
 /// Implement WorldQuery for Entity access
 impl WorldQuery for Entity {
     type Item<'a> = Entity;
+    type State = *const Vec<Entity>;
 
     fn component_ids() -> Vec<ComponentId> {
         Vec::new()
+    }
+
+    fn init_state(archetype: &mut Archetype) -> Self::State {
+        &archetype.entities as *const Vec<Entity>
+    }
+
+    fn fetch_mut_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
+        unsafe {
+            let vec_ptr = *state;
+            let vec_ref = &*vec_ptr;
+            vec_ref.get_unchecked(index).clone()
+        }
     }
 
     fn fetch<'a>(archetype: &'a Archetype, index: usize) -> Self::Item<'a> {
@@ -51,9 +73,18 @@ impl WorldQuery for Entity {
 /// Implement WorldQuery for immutable component reference
 impl<T: Component> WorldQuery for &T {
     type Item<'a> = &'a T;
+    type State = *const VecOptionStorage<T, dyn Component>;
 
     fn component_ids() -> Vec<ComponentId> {
         vec![ComponentId::of::<T>()]
+    }
+
+    fn init_state(archetype: &mut Archetype) -> Self::State {
+        archetype.component_storages.get_storage::<T>() as *const VecOptionStorage<T, dyn Component>
+    }
+
+    fn fetch_mut_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
+        unsafe { (*(*state)).get(index).expect("Component not found") }
     }
 
     fn fetch<'a>(archetype: &'a Archetype, index: usize) -> Self::Item<'a> {
@@ -76,9 +107,19 @@ impl<T: Component> WorldQuery for &T {
 /// Implement WorldQuery for mutable component reference
 impl<T: Component> WorldQuery for &mut T {
     type Item<'a> = &'a mut T;
+    type State = *mut VecOptionStorage<T, dyn Component>;
 
     fn component_ids() -> Vec<ComponentId> {
         vec![ComponentId::of::<T>()]
+    }
+
+    fn init_state(archetype: &mut Archetype) -> Self::State {
+        archetype.component_storages.get_storage_mut::<T>()
+            as *mut VecOptionStorage<T, dyn Component>
+    }
+
+    fn fetch_mut_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
+        unsafe { (*(*state)).get_mut(index).expect("Component not found") }
     }
 
     fn fetch<'a>(_archetype: &'a Archetype, _index: usize) -> Self::Item<'a> {
@@ -101,11 +142,27 @@ macro_rules! impl_world_query_tuple {
     ($($T:ident),*) => {
         impl<$($T: WorldQuery),*> WorldQuery for ($($T,)*) {
             type Item<'a> = ($($T::Item<'a>,)*);
+            type State = ($($T::State,)*);
 
             fn component_ids() -> Vec<ComponentId> {
                 let mut ids = Vec::new();
                 $(ids.extend($T::component_ids());)*
                 ids
+            }
+
+            #[allow(non_snake_case)]
+            fn init_state(archetype: &mut Archetype) -> Self::State {
+                // Get raw pointer to allow multiple init_state calls
+                let arch_ptr = archetype as *mut Archetype;
+                unsafe {
+                    ($($T::init_state(&mut *arch_ptr),)*)
+                }
+            }
+
+            #[allow(non_snake_case)]
+            fn fetch_mut_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
+                let ($($T,)*) = state;
+                ($($T::fetch_mut_with_state($T, index),)*)
             }
 
             #[allow(non_snake_case)]
@@ -180,6 +237,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
             current_entity_idx: 0,
             current_archetype_ptr: std::ptr::null_mut(),
             current_archetype_len: 0,
+            current_state: None,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -197,6 +255,8 @@ pub struct QueryIterMut<'w, Q: WorldQuery> {
     // Cache the current archetype pointer and length to avoid repeated lookups
     current_archetype_ptr: *mut Archetype,
     current_archetype_len: usize,
+    // Cache component storage pointers
+    current_state: Option<Q::State>,
     _phantom: std::marker::PhantomData<&'w mut Q>,
 }
 
@@ -206,7 +266,7 @@ impl<'w, Q: WorldQuery> Iterator for QueryIterMut<'w, Q> {
     fn next(&mut self) -> Option<Self::Item> {
         unsafe {
             loop {
-                // Fast path: iterate within current archetype
+                // Fast path: iterate within current archetype using cached state
                 if self.current_entity_idx < self.current_archetype_len {
                     let index = self.current_entity_idx;
                     self.current_entity_idx += 1;
@@ -215,7 +275,9 @@ impl<'w, Q: WorldQuery> Iterator for QueryIterMut<'w, Q> {
                     // 1. We hold exclusive access to world through world_ptr
                     // 2. Each iteration yields unique component references
                     // 3. References don't outlive the Query itself
-                    return Some(Q::fetch_mut(&mut *self.current_archetype_ptr, index));
+                    if let Some(ref state) = self.current_state {
+                        return Some(Q::fetch_mut_with_state(state, index));
+                    }
                 }
 
                 // Move to next archetype
@@ -227,9 +289,10 @@ impl<'w, Q: WorldQuery> Iterator for QueryIterMut<'w, Q> {
                 let archetype_id = self.matching_archetypes[self.current_archetype_idx];
                 let archetype = world.archetypes.get_mut(&archetype_id)?;
 
-                // Cache archetype pointer and length
+                // Cache archetype pointer, length, and component storage pointers
                 self.current_archetype_ptr = archetype as *mut Archetype;
                 self.current_archetype_len = archetype.len();
+                self.current_state = Some(Q::init_state(archetype));
                 self.current_entity_idx = 0;
                 self.current_archetype_idx += 1;
 
@@ -238,7 +301,6 @@ impl<'w, Q: WorldQuery> Iterator for QueryIterMut<'w, Q> {
         }
     }
 }
-
 /// Query for accessing global (singleton) components
 ///
 /// Unlike regular Query which iterates over entities, GlobalComponentQuery
