@@ -7,6 +7,8 @@
 //! - Global components for singleton data
 //! - Deferred command execution
 
+use trait_type_map::impl_trait_accessible;
+
 use crate::{Commands, Component, Engine, Entity, GlobalComponentQuery, Query, State, World};
 
 // ============================================================================
@@ -41,6 +43,8 @@ impl Component for Velocity {}
 struct Dead;
 
 impl Component for Dead {}
+
+impl_trait_accessible!(dyn Component; Dead, Velocity, Transform);
 
 // ============================================================================
 // Example Systems

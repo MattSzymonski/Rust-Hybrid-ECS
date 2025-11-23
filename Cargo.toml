@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 parking_lot = "0.12"
+trait_type_map = { path = "../trait_type_map" }
 
 [[bin]]
 name = "ecs_hybrid"

@@ -133,7 +133,7 @@ impl World {
         // Add entity to archetype and its components to the appropriate archetype columns
         archetype.entities.push(entity);
         for (component_id, component) in components {
-            if let Some(column) = archetype.columns.get_mut(&component_id) {
+            if let Some(column) = archetype.component_storages.get_mut(&component_id) {
                 column.data.push(component);
             }
         }
@@ -179,3 +179,5 @@ impl<'w> EntityBuilder<'w> {
         entity
     }
 }
+
+// How i am supposed to create new archetype if I need generic types to do so (register component storages), and I have only type ids?

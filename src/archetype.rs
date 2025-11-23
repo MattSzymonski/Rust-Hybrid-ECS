@@ -10,6 +10,8 @@
 use std::any::Any;
 use std::collections::HashMap;
 
+use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
+
 use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
 
@@ -50,21 +52,22 @@ pub(crate) struct ArchetypeId(pub usize);
 pub(crate) struct Archetype {
     pub id: ArchetypeId,
     pub component_types: Vec<ComponentId>,
-    pub columns: HashMap<ComponentId, ComponentColumn>,
+    pub component_storages: TraitTypeMap<dyn Component, VecFamily>,
     pub entities: Vec<Entity>,
 }
 
 impl Archetype {
-    pub fn new(id: ArchetypeId, component_types: Vec<ComponentId>) -> Self {
-        let mut columns = HashMap::new();
-        for &comp_id in &component_types {
-            columns.insert(comp_id, ComponentColumn::new(comp_id));
-        }
+    pub fn new_with_one_component<T: Component + TraitAccessible<dyn Component>>(
+        id: ArchetypeId,
+    ) -> Self {
+        let mut component_storages = TraitTypeMap::new();
+
+        component_storages.register_type_storage::<T>();
 
         Self {
             id,
-            component_types,
-            columns,
+            component_types: vec![ComponentId::of::<T>()],
+            component_storages,
             entities: Vec::new(),
         }
     }

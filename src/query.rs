@@ -58,17 +58,17 @@ impl<T: Component> WorldQuery for &T {
 
     fn fetch<'a>(archetype: &'a Archetype, index: usize) -> Self::Item<'a> {
         archetype
-            .columns
-            .get(&ComponentId::of::<T>())
-            .and_then(|col| col.get::<T>(index))
+            .component_storages
+            .get_storage::<T>()
+            .get(index)
             .expect("Component not found in archetype")
     }
 
     fn fetch_mut<'a>(archetype: &'a mut Archetype, index: usize) -> Self::Item<'a> {
         archetype
-            .columns
-            .get(&ComponentId::of::<T>())
-            .and_then(|col| col.get::<T>(index))
+            .component_storages
+            .get_storage_mut::<T>()
+            .get_mut(index)
             .expect("Component not found in archetype")
     }
 }
@@ -87,9 +87,9 @@ impl<T: Component> WorldQuery for &mut T {
 
     fn fetch_mut<'a>(archetype: &'a mut Archetype, index: usize) -> Self::Item<'a> {
         archetype
-            .columns
-            .get_mut(&ComponentId::of::<T>())
-            .and_then(|col| col.get_mut::<T>(index))
+            .component_storages
+            .get_storage_mut::<T>()
+            .get_mut(index)
             .expect("Component not found in archetype")
     }
 }
