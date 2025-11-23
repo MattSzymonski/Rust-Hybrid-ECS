@@ -34,7 +34,7 @@ impl SystemState {
 ///
 /// Systems are functions that operate on World data. They are executed
 /// every frame and can read/write components, spawn entities, etc.
-pub(crate) trait System {
+pub trait System {
     fn run(&mut self, world: &mut World, queue: &mut CommandQueue, state: &mut SystemState);
 }
 
@@ -209,7 +209,7 @@ impl_system_param_function!(A, B, C, D, E, F1);
 /// This uses the SystemParam infrastructure to automatically resolve parameters.
 /// When you call engine.register_system(name, function), this trait handles
 /// the conversion from a plain function to a boxed System trait object.
-pub(crate) trait IntoSystem<Input: SystemParam> {
+pub trait IntoSystem<Input: SystemParam> {
     fn into_system(self) -> Box<dyn System>;
 }
 

@@ -19,11 +19,16 @@ pub trait Component: 'static {}
 /// This is used internally to track which components are present in archetypes
 /// and to perform fast lookups in component storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub(crate) struct ComponentId(TypeId);
+pub struct ComponentId(TypeId);
 
 impl ComponentId {
     /// Create a ComponentId for a given component type
     pub fn of<T: Component>() -> Self {
         ComponentId(TypeId::of::<T>())
+    }
+
+    /// Get the underlying TypeId
+    pub fn type_id(&self) -> TypeId {
+        self.0
     }
 }

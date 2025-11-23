@@ -7,49 +7,25 @@
 //! the same set of components are stored together in the same archetype for
 //! cache-friendly iteration.
 
-use std::any::Any;
-use std::collections::HashMap;
-
-use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
+use trait_type_map::{TraitTypeMap, VecFamily};
 
 use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
 
-/// Stores components in columns for cache-friendly iteration
-///
-/// Each column stores all instances of a single component type for all
-/// entities in an archetype. This layout is efficient for iteration.
-pub(crate) struct ComponentColumn {
-    pub data: Vec<Box<dyn Any>>,
-    pub component_id: ComponentId,
-}
-
-impl ComponentColumn {
-    pub fn new(component_id: ComponentId) -> Self {
-        Self {
-            data: Vec::new(),
-            component_id,
-        }
-    }
-
-    pub fn get<T: Component>(&self, index: usize) -> Option<&T> {
-        self.data.get(index)?.downcast_ref::<T>()
-    }
-
-    pub fn get_mut<T: Component>(&mut self, index: usize) -> Option<&mut T> {
-        self.data.get_mut(index)?.downcast_mut::<T>()
-    }
-}
+/// Type for component storage factory functions
+/// These create empty storage for a specific component type
+pub type StorageFactory = Box<dyn Fn(&mut TraitTypeMap<dyn Component, VecFamily>)>;
 
 /// ArchetypeId uniquely identifies an archetype (a unique combination of components)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct ArchetypeId(pub usize);
+pub struct ArchetypeId(pub usize);
 
 /// Archetype stores all entities that share the same set of components
 ///
 /// This is the core storage structure for the ECS. Components are stored in
-/// a columnar format (Structure of Arrays) for cache efficiency.
-pub(crate) struct Archetype {
+/// a columnar format (Structure of Arrays) using TraitTypeMap for true
+/// contiguous memory layout and cache efficiency.
+pub struct Archetype {
     pub id: ArchetypeId,
     pub component_types: Vec<ComponentId>,
     pub component_storages: TraitTypeMap<dyn Component, VecFamily>,
@@ -57,16 +33,32 @@ pub(crate) struct Archetype {
 }
 
 impl Archetype {
-    pub fn new_with_one_component<T: Component + TraitAccessible<dyn Component>>(
+    /// Create a new archetype with storage for the specified component types
+    ///
+    /// The storage_factories map provides a way to create storage for each component type
+    /// by ComponentId (TypeId). This allows archetype creation without knowing the concrete types.
+    pub fn new(
         id: ArchetypeId,
+        component_types: Vec<ComponentId>,
+        storage_factories: &std::collections::HashMap<ComponentId, StorageFactory>,
     ) -> Self {
         let mut component_storages = TraitTypeMap::new();
 
-        component_storages.register_type_storage::<T>();
+        // Register storage for each component type using the factory
+        for &comp_id in &component_types {
+            if let Some(factory) = storage_factories.get(&comp_id) {
+                factory(&mut component_storages);
+            } else {
+                panic!(
+                    "Component type {:?} not registered in storage factories",
+                    comp_id
+                );
+            }
+        }
 
         Self {
             id,
-            component_types: vec![ComponentId::of::<T>()],
+            component_types,
             component_storages,
             entities: Vec::new(),
         }

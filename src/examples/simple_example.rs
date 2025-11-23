@@ -44,7 +44,8 @@ struct Dead;
 
 impl Component for Dead {}
 
-impl_trait_accessible!(dyn Component; Dead, Velocity, Transform);
+// Make all components accessible via the Component trait for TraitTypeMap
+impl_trait_accessible!(dyn Component; GlobalTime, Transform, Velocity, Dead);
 
 // ============================================================================
 // Example Systems
@@ -153,6 +154,12 @@ pub fn main() {
 
     let mut engine = Engine::new();
     let mut world = World::new();
+
+    // Register all component types before use
+    world.register_component::<GlobalTime>();
+    world.register_component::<Transform>();
+    world.register_component::<Velocity>();
+    world.register_component::<Dead>();
 
     world.add_global_component(GlobalTime {
         delta_time: 1.0,

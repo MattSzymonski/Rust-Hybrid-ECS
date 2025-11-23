@@ -9,6 +9,7 @@
 
 use crate::{Component, Engine, Query, World};
 use std::time::Instant;
+use trait_type_map::impl_trait_accessible;
 
 // ============================================================================
 // Components
@@ -109,6 +110,9 @@ struct Obstacle;
 
 impl Component for Obstacle {}
 
+// Make all components accessible via the Component trait for TraitTypeMap
+impl_trait_accessible!(dyn Component; Transform, Velocity, BoxCollider, Obstacle);
+
 // ============================================================================
 // Systems
 // ============================================================================
@@ -129,6 +133,12 @@ pub fn main() {
     println!("=== Stress Test: Archetype-Based ECS ===\n");
 
     let mut world = World::new();
+
+    // Register all component types before use
+    world.register_component::<Transform>();
+    world.register_component::<Velocity>();
+    world.register_component::<BoxCollider>();
+    world.register_component::<Obstacle>();
 
     // Create obstacle entity with multiple box colliders
     println!("Creating obstacle with 5 box colliders...");
