@@ -176,21 +176,15 @@ fn simulation_tracker_system(mut stats: GlobalComponentQuery<SimulationStats>) {
             let duration = stats.start_time.elapsed();
 
             // Calculate results
-            let fps = stats.max_frames as f64 / duration.as_secs_f64();
-            let frame_time_ms = duration.as_secs_f64() * 1000.0 / stats.max_frames as f64;
             let total_checks = stats.entity_count * stats.max_frames as usize * 5; // 5 colliders
 
-            println!("\n=== Results ===");
-            println!("Architecture:       Archetype-based");
-            println!("Entities:           {}", stats.entity_count);
-            println!("Frames:             {}", stats.max_frames);
-            println!("Colliders:          5 box colliders on obstacle");
-            println!("\nTime taken:         {:.3} s", duration.as_secs_f64());
-            println!("FPS:                {:.0}", fps);
-            println!("Avg frame time:     {:.3} ms", frame_time_ms);
-            println!("Total collision checks: {}", total_checks);
             println!(
-                "Checks per second:  {:.0}",
+                "Entities: {} Frames: {}, Colliders: {}",
+                stats.entity_count, stats.max_frames, 5
+            );
+            println!(
+                "Total collision checks: {}, Checks per second: {:.0}",
+                total_checks,
                 total_checks as f64 / duration.as_secs_f64()
             );
         }
@@ -268,13 +262,6 @@ pub fn main() {
     // Run simulation with systems
     for _frame in 0..max_frames {
         engine.process_frame(&mut world);
-
-        // Check if we should stop (when simulation completes)
-        if let Some(stats) = world.get_global_component::<SimulationStats>() {
-            if stats.frame_count >= stats.max_frames {
-                break;
-            }
-        }
     }
 
     // Count entities near obstacle
@@ -289,6 +276,16 @@ pub fn main() {
         })
         .count();
 
-    println!("\nEntities near obstacle: {}", near_count);
-    println!("\n✓ Stress test completed!");
+    println!("Entities near obstacle: {}", near_count);
+
+    // Calculate average frame time
+    let stats_query = GlobalComponentQuery::<SimulationStats>::new(&mut world);
+    let frame_time_ms = if let Some(stats) = stats_query.get() {
+        let duration = stats.start_time.elapsed();
+        duration.as_millis() as f64 / stats.max_frames as f64
+    } else {
+        0.0
+    };
+
+    println!("Avg frame time: {:.3} ms", frame_time_ms);
 }
