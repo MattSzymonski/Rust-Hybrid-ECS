@@ -200,21 +200,17 @@ fn simulation_tracker(
         let duration = sim_state.start_time.elapsed();
 
         // Calculate results
-        let fps = sim_state.max_frames as f64 / duration.as_secs_f64();
         let frame_time_ms = duration.as_secs_f64() * 1000.0 / sim_state.max_frames as f64;
         let total_checks = sim_state.entity_count * sim_state.max_frames as usize * 5; // 5 colliders
 
         println!("\n=== Results ===");
-        println!("Architecture:       Bevy ECS");
-        println!("Entities:           {}", sim_state.entity_count);
-        println!("Frames:             {}", sim_state.max_frames);
-        println!("Colliders:          5 box colliders on obstacle");
-        println!("\nTime taken:         {:.3} s", duration.as_secs_f64());
-        println!("FPS:                {:.0}", fps);
-        println!("Avg frame time:     {:.3} ms", frame_time_ms);
-        println!("Total collision checks: {}", total_checks);
         println!(
-            "Checks per second:  {:.0}",
+            "Entities: {} Frames: {}, Colliders: {}",
+            sim_state.entity_count, sim_state.max_frames, 5
+        );
+        println!(
+            "Total collision checks: {}, Checks per second: {:.0}",
+            total_checks,
             total_checks as f64 / duration.as_secs_f64()
         );
 
@@ -229,8 +225,8 @@ fn simulation_tracker(
             })
             .count();
 
-        println!("\nEntities near obstacle: {}", near_count);
-        println!("\n✓ Stress test completed!");
+        println!("Entities near obstacle: {}", near_count);
+        println!("Avg frame time: {:.3} ms", frame_time_ms);
 
         // Exit the app
         app_exit.send(AppExit::Success);
