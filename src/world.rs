@@ -319,10 +319,11 @@ impl World {
         // Note: Component data remains in storage. A production implementation would
         // also remove components, but TraitTypeMap's VecOptionStorage makes this complex.
 
-        // Clean up empty archetype (optional - keep for potential reuse)
+        // Clean up empty archetype - remove it from world to prevent memory leaks
         if old_archetype.entities.is_empty() {
-            // We could remove the archetype here, but keeping it allows reuse
-            // which is more efficient if entities with this component set are spawned again
+            let old_mask = old_archetype.component_mask;
+            self.archetypes.remove(&old_archetype_id);
+            self.archetype_lookup.remove(&old_mask);
         }
     }
 
@@ -359,7 +360,7 @@ impl World {
             // Also need to swap_remove from all component storages
             // This is tricky with TraitTypeMap - we need to know the component types
             for comp_id in &archetype.component_types {
-                if let Some(copier) = self.component_copiers.get(comp_id) {
+                if let Some(_copier) = self.component_copiers.get(comp_id) {
                     // Use a special swap_remove operation
                     // For now, we'll leave components in place (memory leak)
                     // A full implementation would need swap_remove support in VecOptionStorage
@@ -367,9 +368,12 @@ impl World {
             }
         }
 
-        // Clean up empty archetype
+        // Clean up empty archetype - remove it from world to prevent memory leaks
+        let archetype_id = location.archetype_id;
         if archetype.entities.is_empty() {
-            // Keep archetype for potential reuse
+            let mask = archetype.component_mask;
+            self.archetypes.remove(&archetype_id);
+            self.archetype_lookup.remove(&mask);
         }
 
         true
@@ -712,11 +716,12 @@ mod tests {
     /// - The entity is migrated to a new archetype with the added component
     /// - Existing components on the entity are preserved during migration
     /// - The entity remains valid and tracked in the world
+    /// - The old archetype is automatically cleaned up when it becomes empty
     ///
     /// Expected results:
     /// - add_component should return true (success)
     /// - The entity should still exist in entity_locations
-    /// - The archetype count may increase if Position+Velocity+Health archetype is new
+    /// - Old archetype should be automatically removed, leaving 1 archetype
     #[test]
     fn test_add_component_to_entity() {
         let mut world = World::new();
@@ -730,8 +735,9 @@ mod tests {
             .with(Velocity { x: 1.0, y: 2.0 })
             .build();
 
-        assert!(
-            world.archetypes.len() == 1,
+        assert_eq!(
+            world.archetypes.len(),
+            1,
             "Should have 1 archetype initially"
         );
 
@@ -740,10 +746,12 @@ mod tests {
 
         assert!(result, "Should successfully add component");
         assert!(world.entity_locations.contains_key(&entity));
-        // May or may not create new archetype if Position+Velocity+Health already exists
-        assert!(
-            world.archetypes.len() == 2,
-            "Should have 2 archetypes after adding Health"
+
+        // Since this is the only entity, the old archetype should be automatically removed
+        assert_eq!(
+            world.archetypes.len(),
+            1,
+            "Should have 1 archetype after adding Health (old one auto-removed)"
         );
 
         world.print_archetypes();
@@ -802,9 +810,39 @@ mod tests {
         // Remove Velocity component
         let result = world.remove_component::<Velocity>(entity);
 
+        assert_eq!(world.archetypes.len(), 1, "Should have 1 archetype");
+
         assert!(result, "Should successfully remove component");
         assert!(world.entity_locations.contains_key(&entity));
-        // Should have moved to different archetype
+
+        let location = world.entity_locations.get(&entity).unwrap();
+        let archetype = world.archetypes.get(&location.archetype_id).unwrap();
+
+        // Archetype should now only have Position and Health
+        assert_eq!(
+            archetype.component_types.len(),
+            2,
+            "Should have 2 component types"
+        );
+
+        // Archetype should contain Position and Health, but not Velocity. Checking component IDs.
+        // Verify component IDs are as expected
+        let position_id = ComponentId::of::<Position>();
+        let health_id = ComponentId::of::<Health>();
+        let velocity_id = ComponentId::of::<Velocity>();
+
+        assert!(
+            archetype.component_types.contains(&position_id),
+            "Archetype should contain Position component"
+        );
+        assert!(
+            archetype.component_types.contains(&health_id),
+            "Archetype should contain Health component"
+        );
+        assert!(
+            !archetype.component_types.contains(&velocity_id),
+            "Archetype should not contain Velocity component"
+        );
     }
 
     /// Tests attempting to remove a component from a non-existent entity.
@@ -837,11 +875,13 @@ mod tests {
     /// - When an entity's last component is removed, the entity is automatically despawned
     /// - No entities with zero components are left in the world
     /// - The entity is properly removed from all tracking structures
+    /// - If entity count drops to zero, archetypes are cleaned up
     ///
     /// Expected results:
     /// - remove_component should return true (success)
     /// - The entity count should drop to 0
     /// - The entity should no longer exist in entity_locations
+    /// - All archetypes should be removed if no entities remain
     #[test]
     fn test_remove_last_component_despawns_entity() {
         let mut world = World::new();
@@ -861,6 +901,8 @@ mod tests {
             "Entity should be despawned"
         );
         assert!(!world.entity_locations.contains_key(&entity));
+
+        assert!(world.archetypes.is_empty(), "No archetypes should remain");
     }
 
     /// Tests despawning an entity and verifying other entities remain unaffected.
@@ -1034,6 +1076,62 @@ mod tests {
             after_add_location.archetype_id, after_remove_location.archetype_id,
             "Entity should be in different archetype after removing component"
         );
+    }
+
+    /// Tests that empty archetypes are automatically cleaned up when last entity moves.
+    ///
+    /// This test verifies that:
+    /// - When the last entity in an archetype is moved to another archetype, the empty one is removed
+    /// - The archetype is removed from both the archetypes map and the lookup table
+    /// - No manual cleanup_empty_archetypes() call is needed
+    /// - The world remains in a consistent state
+    ///
+    /// Expected results:
+    /// - Initially 1 archetype exists (Position+Velocity)
+    /// - After adding Health, 2 archetypes exist temporarily
+    /// - The old archetype is automatically removed, leaving only 1 archetype
+    /// - The entity is correctly tracked in the new archetype
+    #[test]
+    fn test_automatic_empty_archetype_cleanup() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Velocity>();
+        world.register_component::<Health>();
+
+        // Spawn single entity with Position + Velocity
+        let entity = world
+            .spawn()
+            .with(Position { x: 10.0, y: 20.0 })
+            .with(Velocity { x: 1.0, y: 2.0 })
+            .build();
+
+        assert_eq!(
+            world.archetypes.len(),
+            1,
+            "Should have 1 archetype initially"
+        );
+
+        // Add Health - this should move entity to new archetype
+        // The old archetype should be automatically removed since it becomes empty
+        world.add_component(entity, Health { hp: 100 });
+
+        assert_eq!(
+            world.archetypes.len(),
+            1,
+            "Should still have 1 archetype after migration (old one auto-removed)"
+        );
+        assert!(world.entity_locations.contains_key(&entity));
+
+        // Verify the entity is in the correct archetype with all 3 components
+        let location = world.entity_locations.get(&entity).unwrap();
+        let archetype = world.archetypes.get(&location.archetype_id).unwrap();
+        assert_eq!(
+            archetype.component_types.len(),
+            3,
+            "Entity should have 3 components"
+        );
+
+        println!("✓ Empty archetype automatically cleaned up after entity migration");
     }
 
     /// Test that archetype print_info displays component names and entity count
