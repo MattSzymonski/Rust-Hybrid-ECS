@@ -7,5 +7,5 @@
 mod examples;
 
 fn main() {
-    examples::stress_test::main();
+    examples::iterators_stress_test::main();
 }

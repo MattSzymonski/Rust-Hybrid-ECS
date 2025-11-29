@@ -14,7 +14,7 @@ pub mod system;
 pub mod world;
 
 // Re-export commonly used types
-pub use commands::{CommandQueue, Commands};
+pub use commands::Commands;
 pub use component::Component;
 pub use engine::Engine;
 pub use entity::Entity;

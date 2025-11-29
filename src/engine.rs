@@ -90,6 +90,6 @@ impl Engine {
         }
 
         // Phase 2: Execute all deferred commands
-        self.queue.execute(world);
+        self.queue.execute_queued_commands(world);
     }
 }

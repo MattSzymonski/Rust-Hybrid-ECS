@@ -183,7 +183,7 @@ impl World {
     /// Start building a new entity
     ///
     /// Returns an EntityBuilder that allows fluent API for adding components.
-    pub fn spawn(&mut self) -> EntityBuilder {
+    pub fn create_entity(&mut self) -> EntityBuilder {
         let entity = self.allocate_entity();
         EntityBuilder {
             world: self,
@@ -331,7 +331,7 @@ impl World {
     ///
     /// This removes the entity from its archetype and updates all tracking structures.
     /// Returns true if the entity was found and removed, false otherwise.
-    pub fn despawn(&mut self, entity: Entity) -> bool {
+    pub fn destroy_entity(&mut self, entity: Entity) -> bool {
         // Get current location
         let location = match self.entity_locations.remove(&entity) {
             Some(loc) => loc,
@@ -411,7 +411,7 @@ impl World {
 
         // If no components left, despawn the entity instead
         if new_component_ids.is_empty() {
-            return self.despawn(entity);
+            return self.destroy_entity(entity);
         }
 
         // Collect copiers for all components except the one being removed
@@ -643,17 +643,20 @@ mod tests {
 
         // Spawn entity with Position + Velocity
         let entity1 = world
-            .spawn()
+            .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
             .with(Velocity { x: 1.0, y: 2.0 })
             .build();
 
         // Spawn entity with Position only
-        let entity2 = world.spawn().with(Position { x: 5.0, y: 15.0 }).build();
+        let entity2 = world
+            .create_entity()
+            .with(Position { x: 5.0, y: 15.0 })
+            .build();
 
         // Spawn entity with all three components
         let entity3 = world
-            .spawn()
+            .create_entity()
             .with(Position { x: 100.0, y: 200.0 })
             .with(Velocity { x: 5.0, y: 10.0 })
             .with(Health { hp: 100 })
@@ -730,7 +733,7 @@ mod tests {
         world.register_component::<Health>();
 
         let entity = world
-            .spawn()
+            .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
             .with(Velocity { x: 1.0, y: 2.0 })
             .build();
@@ -801,7 +804,7 @@ mod tests {
         world.register_component::<Health>();
 
         let entity = world
-            .spawn()
+            .create_entity()
             .with(Position { x: 100.0, y: 200.0 })
             .with(Velocity { x: 5.0, y: 10.0 })
             .with(Health { hp: 100 })
@@ -887,7 +890,10 @@ mod tests {
         let mut world = World::new();
         world.register_component::<Position>();
 
-        let entity = world.spawn().with(Position { x: 5.0, y: 15.0 }).build();
+        let entity = world
+            .create_entity()
+            .with(Position { x: 5.0, y: 15.0 })
+            .build();
 
         assert_eq!(world.entity_locations.len(), 1);
 
@@ -924,10 +930,13 @@ mod tests {
         world.register_component::<Position>();
         world.register_component::<Velocity>();
 
-        let entity1 = world.spawn().with(Position { x: 10.0, y: 20.0 }).build();
+        let entity1 = world
+            .create_entity()
+            .with(Position { x: 10.0, y: 20.0 })
+            .build();
 
         let entity2 = world
-            .spawn()
+            .create_entity()
             .with(Position { x: 5.0, y: 15.0 })
             .with(Velocity { x: 1.0, y: 2.0 })
             .build();
@@ -935,7 +944,7 @@ mod tests {
         assert_eq!(world.entity_locations.len(), 2);
 
         // Despawn entity1
-        let result = world.despawn(entity1);
+        let result = world.destroy_entity(entity1);
 
         assert!(result, "Should successfully despawn entity");
         assert_eq!(world.entity_locations.len(), 1);
@@ -958,7 +967,7 @@ mod tests {
         let mut world = World::new();
         let fake_entity = crate::Entity::new_for_test(9999, 0);
 
-        let result = world.despawn(fake_entity);
+        let result = world.destroy_entity(fake_entity);
 
         assert!(!result, "Should fail to despawn non-existent entity");
     }
@@ -979,14 +988,17 @@ mod tests {
         let mut world = World::new();
         world.register_component::<Position>();
 
-        let entity = world.spawn().with(Position { x: 10.0, y: 20.0 }).build();
+        let entity = world
+            .create_entity()
+            .with(Position { x: 10.0, y: 20.0 })
+            .build();
 
         // First despawn should succeed
-        let result1 = world.despawn(entity);
+        let result1 = world.destroy_entity(entity);
         assert!(result1);
 
         // Second despawn should fail
-        let result2 = world.despawn(entity);
+        let result2 = world.destroy_entity(entity);
         assert!(!result2, "Should fail to despawn already-despawned entity");
     }
 
@@ -1009,10 +1021,13 @@ mod tests {
         world.register_component::<Velocity>();
 
         // Create some entities
-        let entity1 = world.spawn().with(Position { x: 10.0, y: 20.0 }).build();
+        let entity1 = world
+            .create_entity()
+            .with(Position { x: 10.0, y: 20.0 })
+            .build();
 
         let entity2 = world
-            .spawn()
+            .create_entity()
             .with(Position { x: 5.0, y: 15.0 })
             .with(Velocity { x: 1.0, y: 2.0 })
             .build();
@@ -1021,7 +1036,7 @@ mod tests {
         assert_eq!(initial_archetypes, 2);
 
         // Despawn one entity, leaving one archetype empty
-        world.despawn(entity1);
+        world.destroy_entity(entity1);
 
         // Cleanup should remove empty archetype
         world.cleanup_empty_archetypes();
@@ -1052,7 +1067,7 @@ mod tests {
 
         // Start with Position + Velocity
         let entity = world
-            .spawn()
+            .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
             .with(Velocity { x: 1.0, y: 2.0 })
             .build();
@@ -1100,7 +1115,7 @@ mod tests {
 
         // Spawn single entity with Position + Velocity
         let entity = world
-            .spawn()
+            .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
             .with(Velocity { x: 1.0, y: 2.0 })
             .build();
@@ -1143,13 +1158,13 @@ mod tests {
 
         // Spawn some entities
         world
-            .spawn()
+            .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
             .with(Velocity { x: 1.0, y: 2.0 })
             .build();
 
         world
-            .spawn()
+            .create_entity()
             .with(Position { x: 5.0, y: 15.0 })
             .with(Velocity { x: 0.5, y: 1.5 })
             .build();

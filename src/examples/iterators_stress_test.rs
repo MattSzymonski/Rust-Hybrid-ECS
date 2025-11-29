@@ -224,7 +224,7 @@ pub fn main() {
     box_collider.add_collider((0.0, -6.0, 0.0), (3.0, 3.0, 3.0));
 
     let _obstacle = world
-        .spawn()
+        .create_entity()
         .with(Obstacle)
         .with(Transform::new(50.0, 0.0, 0.0))
         .with(box_collider)
@@ -239,7 +239,7 @@ pub fn main() {
     for i in 0..entity_count {
         let angle = (i as f32 / entity_count as f32) * std::f32::consts::PI * 2.0;
         world
-            .spawn()
+            .create_entity()
             .with(Transform::new(angle.cos() * 20.0, angle.sin() * 20.0, 0.0))
             .with(Velocity::new(angle.cos() * 2.0, angle.sin() * 2.0, 0.0))
             .build();
