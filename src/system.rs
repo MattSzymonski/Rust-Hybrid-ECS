@@ -11,7 +11,7 @@
 
 use crate::commands::{CommandQueue, Commands};
 use crate::component::Component;
-use crate::query::{GlobalComponentQuery, Query, WorldQuery};
+use crate::query::{GlobalComponentQuery, Query, QueryTarget};
 use crate::world::World;
 
 /// State that persists between system calls
@@ -83,7 +83,7 @@ impl SystemParam for Commands<'static> {
 ///
 /// This implementation allows any query pattern to be used as a system parameter
 /// without needing separate implementations for each query type.
-impl<Q: WorldQuery + 'static> SystemParam for Query<'static, Q> {
+impl<Q: QueryTarget + 'static> SystemParam for Query<'static, Q> {
     fn fetch(world: &mut World, _queue: &mut CommandQueue, _state: &mut SystemState) -> Self {
         unsafe {
             // Create query with actual lifetime, then transmute to 'static

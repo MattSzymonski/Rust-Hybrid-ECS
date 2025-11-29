@@ -3,7 +3,7 @@
 // ============================================================================
 //! Queries provide efficient iteration over entities with specific components.
 //!
-//! The query system uses the WorldQuery trait to support flexible component
+//! The query system uses the QueryTarget trait to support flexible component
 //! access patterns, including mutable and immutable references.
 
 use crate::archetype::{Archetype, ArchetypeId};
@@ -13,14 +13,14 @@ use crate::world::World;
 
 use trait_type_map::VecOptionStorage;
 
-/// WorldQuery trait for fetching components from archetypes
+/// QueryTarget trait for fetching components from archetypes
 ///
 /// This trait is implemented for different query patterns:
 /// - Entity: Access to entity IDs
 /// - &T: Immutable component reference
 /// - &mut T: Mutable component reference
 /// - Tuples: Multiple components at once
-pub trait WorldQuery {
+pub trait QueryTarget {
     type Item<'a>;
     type State;
 
@@ -40,8 +40,8 @@ pub trait WorldQuery {
     fn fetch_mut<'a>(archetype: &'a mut Archetype, index: usize) -> Self::Item<'a>;
 }
 
-/// Implement WorldQuery for Entity access
-impl WorldQuery for Entity {
+/// Implement QueryTarget for Entity access
+impl QueryTarget for Entity {
     type Item<'a> = Entity;
     type State = *const Vec<Entity>;
 
@@ -70,8 +70,8 @@ impl WorldQuery for Entity {
     }
 }
 
-/// Implement WorldQuery for immutable component reference
-impl<T: Component> WorldQuery for &T {
+/// Implement QueryTarget for immutable component reference
+impl<T: Component> QueryTarget for &T {
     type Item<'a> = &'a T;
     type State = *const VecOptionStorage<T, dyn Component>;
 
@@ -104,8 +104,8 @@ impl<T: Component> WorldQuery for &T {
     }
 }
 
-/// Implement WorldQuery for mutable component reference
-impl<T: Component> WorldQuery for &mut T {
+/// Implement QueryTarget for mutable component reference
+impl<T: Component> QueryTarget for &mut T {
     type Item<'a> = &'a mut T;
     type State = *mut VecOptionStorage<T, dyn Component>;
 
@@ -135,12 +135,12 @@ impl<T: Component> WorldQuery for &mut T {
     }
 }
 
-/// Macro to implement WorldQuery for tuples of different sizes
+/// Macro to implement QueryTarget for tuples of different sizes
 ///
 /// This allows queries like Query<(Entity, &Transform, &mut Velocity)>
-macro_rules! impl_world_query_tuple {
+macro_rules! impl_query_object_tuple {
     ($($T:ident),*) => {
-        impl<$($T: WorldQuery),*> WorldQuery for ($($T,)*) {
+        impl<$($T: QueryTarget),*> QueryTarget for ($($T,)*) {
             type Item<'a> = ($($T::Item<'a>,)*);
             type State = ($($T::State,)*);
 
@@ -183,12 +183,12 @@ macro_rules! impl_world_query_tuple {
 }
 
 // Implement for tuples up to 4 elements
-impl_world_query_tuple!(A);
-impl_world_query_tuple!(A, B);
-impl_world_query_tuple!(A, B, C);
-impl_world_query_tuple!(A, B, C, D);
+impl_query_object_tuple!(A);
+impl_query_object_tuple!(A, B);
+impl_query_object_tuple!(A, B, C);
+impl_query_object_tuple!(A, B, C, D);
 
-/// Query provides iteration over entities matching a component pattern
+/// Actual query provides iteration over entities matching a component pattern
 ///
 /// Example:
 /// ```ignore
@@ -198,12 +198,12 @@ impl_world_query_tuple!(A, B, C, D);
 ///     }
 /// }
 /// ```
-pub struct Query<'w, Q: WorldQuery> {
+pub struct Query<'w, Q: QueryTarget> {
     world: &'w mut World,
     _phantom: std::marker::PhantomData<Q>,
 }
 
-impl<'w, Q: WorldQuery> Query<'w, Q> {
+impl<'w, Q: QueryTarget> Query<'w, Q> {
     pub fn new(world: &'w mut World) -> Self {
         Self {
             world,
@@ -213,7 +213,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
 
     /// Create an iterator over all matching entities
     #[inline]
-    pub fn iter_mut(&mut self) -> QueryIterMut<Q> {
+    pub fn iter_mut(&'_ mut self) -> QueryIterMut<'_, Q> {
         // Build component mask from query requirements
         let component_ids = Q::component_ids();
         let mut query_mask = ComponentMask::empty();
@@ -247,19 +247,7 @@ impl<'w, Q: WorldQuery> Query<'w, Q> {
 ///
 /// This iterator walks through all archetypes that match the query pattern
 /// and yields components for each entity.
-///
-/// Performance Optimizations Applied:
-/// 1. **Hot-path optimization**: Removed `if let Some` check using `unwrap_unchecked()`
-///    - Eliminates branch misprediction in the tight loop
-///    - ~27% performance improvement (from 0.096ms to 0.070ms avg frame time)
-/// 2. **Cold-path separation**: Moved archetype advancement to separate `#[cold]` function
-///    - Improves branch prediction by keeping hot path linear
-/// 3. **Inline hints**: Added `#[inline(always)]` to fetch methods
-///    - Ensures zero-cost abstraction for component access
-/// 4. **Memory optimization**: Removed unused `current_archetype_ptr` field
-///    - Reduces struct size and improves cache locality
-/// 5. **Iterator hints**: Added `size_hint()` for better optimizer decisions
-pub struct QueryIterMut<'w, Q: WorldQuery> {
+pub struct QueryIterMut<'w, Q: QueryTarget> {
     world_ptr: *mut World,
     matching_archetypes: Vec<ArchetypeId>,
     current_archetype_idx: usize,
@@ -271,7 +259,7 @@ pub struct QueryIterMut<'w, Q: WorldQuery> {
     _phantom: std::marker::PhantomData<&'w mut Q>,
 }
 
-impl<'w, Q: WorldQuery> Iterator for QueryIterMut<'w, Q> {
+impl<'w, Q: QueryTarget> Iterator for QueryIterMut<'w, Q> {
     type Item = Q::Item<'w>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -310,7 +298,7 @@ impl<'w, Q: WorldQuery> Iterator for QueryIterMut<'w, Q> {
     }
 }
 
-impl<'w, Q: WorldQuery> QueryIterMut<'w, Q> {
+impl<'w, Q: QueryTarget> QueryIterMut<'w, Q> {
     /// Advance to the next archetype (cold path, separated for better branch prediction)
     #[inline(never)]
     fn advance_archetype(&mut self) -> Option<()> {
@@ -344,6 +332,7 @@ impl<'w, Q: WorldQuery> QueryIterMut<'w, Q> {
         }
     }
 }
+
 /// Query for accessing global (singleton) components
 ///
 /// Unlike regular Query which iterates over entities, GlobalComponentQuery

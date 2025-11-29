@@ -17,7 +17,7 @@ pub use commands::{CommandQueue, Commands};
 pub use component::Component;
 pub use engine::Engine;
 pub use entity::Entity;
-pub use query::{GlobalComponentQuery, Query, WorldQuery};
+pub use query::{GlobalComponentQuery, Query, QueryTarget};
 pub use system::{State, SystemState};
 pub use world::{EntityBuilder, World};
 
