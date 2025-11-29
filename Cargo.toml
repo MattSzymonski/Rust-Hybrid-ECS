@@ -7,6 +7,10 @@ edition = "2021"
 parking_lot = "0.12"
 trait_type_map = { path = "../trait_type_map" }
 
+[lib]
+name = "ecs_hybrid"
+path = "src/lib.rs"
+
 [[bin]]
 name = "ecs_hybrid"
 path = "src/main.rs"

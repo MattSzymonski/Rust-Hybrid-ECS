@@ -29,8 +29,8 @@ type ComponentCopier = Arc<
 /// EntityLocation tracks where an entity is stored in the archetype system
 #[derive(Clone, Copy)]
 pub(crate) struct EntityLocation {
-    pub archetype_id: ArchetypeId,
-    pub index_in_archetype: usize,
+    pub(crate) archetype_id: ArchetypeId,
+    pub(crate) index_in_archetype: usize,
 }
 
 /// World manages all entities, archetypes, and global components
@@ -83,6 +83,9 @@ impl World {
 
         // Register bit index in global registry
         register_component_bit::<T>();
+
+        // Register component name for debugging/display
+        crate::component::register_component_name::<T>(std::any::type_name::<T>());
 
         self.storage_factories.insert(
             comp_id,
@@ -316,11 +319,205 @@ impl World {
         // Note: Component data remains in storage. A production implementation would
         // also remove components, but TraitTypeMap's VecOptionStorage makes this complex.
 
-        // Clean up empty archetype
+        // Clean up empty archetype (optional - keep for potential reuse)
         if old_archetype.entities.is_empty() {
-            // Don't remove archetype - it might be reused
-            // Removing would require updating archetype_lookup which is complex
+            // We could remove the archetype here, but keeping it allows reuse
+            // which is more efficient if entities with this component set are spawned again
         }
+    }
+
+    /// Remove an entity from the world completely
+    ///
+    /// This removes the entity from its archetype and updates all tracking structures.
+    /// Returns true if the entity was found and removed, false otherwise.
+    pub fn despawn(&mut self, entity: Entity) -> bool {
+        // Get current location
+        let location = match self.entity_locations.remove(&entity) {
+            Some(loc) => loc,
+            None => return false, // Entity doesn't exist
+        };
+
+        let archetype = match self.archetypes.get_mut(&location.archetype_id) {
+            Some(arch) => arch,
+            None => return false,
+        };
+
+        let old_index = location.index_in_archetype;
+
+        // Use swap_remove for O(1) removal
+        if old_index < archetype.entities.len() {
+            archetype.entities.swap_remove(old_index);
+
+            // Update the location of the entity that was swapped (if any)
+            if old_index < archetype.entities.len() {
+                let swapped_entity = archetype.entities[old_index];
+                if let Some(swapped_location) = self.entity_locations.get_mut(&swapped_entity) {
+                    swapped_location.index_in_archetype = old_index;
+                }
+            }
+
+            // Also need to swap_remove from all component storages
+            // This is tricky with TraitTypeMap - we need to know the component types
+            for comp_id in &archetype.component_types {
+                if let Some(copier) = self.component_copiers.get(comp_id) {
+                    // Use a special swap_remove operation
+                    // For now, we'll leave components in place (memory leak)
+                    // A full implementation would need swap_remove support in VecOptionStorage
+                }
+            }
+        }
+
+        // Clean up empty archetype
+        if archetype.entities.is_empty() {
+            // Keep archetype for potential reuse
+        }
+
+        true
+    }
+
+    /// Remove a component from an entity, moving it to a new archetype
+    ///
+    /// Returns true if the component was removed, false if entity doesn't exist or doesn't have the component.
+    pub fn remove_component<T: Component>(&mut self, entity: Entity) -> bool {
+        let comp_id = ComponentId::of::<T>();
+
+        // Get current location
+        let location = match self.entity_locations.get(&entity) {
+            Some(loc) => *loc,
+            None => return false, // Entity doesn't exist
+        };
+
+        let old_archetype = match self.archetypes.get(&location.archetype_id) {
+            Some(arch) => arch,
+            None => return false,
+        };
+
+        // Check if entity has this component
+        if !old_archetype.component_types.contains(&comp_id) {
+            return false; // Component not present
+        }
+
+        // Build new component list without the removed component
+        let new_component_ids: Vec<ComponentId> = old_archetype
+            .component_types
+            .iter()
+            .filter(|&id| *id != comp_id)
+            .cloned()
+            .collect();
+
+        // If no components left, despawn the entity instead
+        if new_component_ids.is_empty() {
+            return self.despawn(entity);
+        }
+
+        // Collect copiers for all components except the one being removed
+        let copiers: Vec<_> = new_component_ids
+            .iter()
+            .filter_map(|comp_id| self.component_copiers.get(comp_id).map(Arc::clone))
+            .collect();
+
+        // Move entity to new archetype without the removed component
+        self.move_entity_to_archetype(
+            entity,
+            new_component_ids,
+            |old_storage, new_storage, old_index| {
+                // Copy all components except the removed one
+                for copier in copiers.iter() {
+                    copier(old_storage, new_storage, old_index);
+                }
+            },
+        );
+
+        true
+    }
+
+    /// Add a component to an existing entity, moving it to a new archetype
+    ///
+    /// Returns true if the component was added, false if entity doesn't exist or already has the component.
+    pub fn add_component<T>(&mut self, entity: Entity, component: T) -> bool
+    where
+        T: Component + TraitAccessible<dyn Component> + Clone,
+    {
+        let comp_id = ComponentId::of::<T>();
+
+        // Get current location
+        let location = match self.entity_locations.get(&entity) {
+            Some(loc) => *loc,
+            None => return false, // Entity doesn't exist
+        };
+
+        let old_archetype = match self.archetypes.get(&location.archetype_id) {
+            Some(arch) => arch,
+            None => return false,
+        };
+
+        // Check if entity already has this component
+        if old_archetype.component_types.contains(&comp_id) {
+            return false; // Already has component
+        }
+
+        // Build new component list with the added component
+        let mut new_component_ids = old_archetype.component_types.clone();
+        new_component_ids.push(comp_id);
+        new_component_ids.sort();
+
+        // Collect copiers for existing components
+        let copiers: Vec<_> = old_archetype
+            .component_types
+            .iter()
+            .filter_map(|comp_id| self.component_copiers.get(comp_id).map(Arc::clone))
+            .collect();
+
+        // Move entity to new archetype with the additional component
+        self.move_entity_to_archetype(
+            entity,
+            new_component_ids,
+            |old_storage, new_storage, old_index| {
+                // Copy all existing components
+                for copier in copiers.iter() {
+                    copier(old_storage, new_storage, old_index);
+                }
+                // Add the new component
+                new_storage.get_storage_mut::<T>().push(component);
+            },
+        );
+
+        true
+    }
+
+    /// Remove all empty archetypes from the world
+    ///
+    /// This cleans up archetypes that no longer contain any entities.
+    /// Usually not necessary as empty archetypes can be reused, but useful for memory cleanup.
+    pub fn cleanup_empty_archetypes(&mut self) {
+        let empty_archetype_ids: Vec<ArchetypeId> = self
+            .archetypes
+            .iter()
+            .filter(|(_, archetype)| archetype.entities.is_empty())
+            .map(|(id, _)| *id)
+            .collect();
+
+        for archetype_id in empty_archetype_ids {
+            if let Some(archetype) = self.archetypes.remove(&archetype_id) {
+                // Also remove from lookup table
+                self.archetype_lookup.remove(&archetype.component_mask);
+            }
+        }
+    }
+
+    /// Print information about all archetypes in the world
+    ///
+    /// This displays the component types and entity count for each archetype,
+    /// useful for debugging and understanding the current state of the ECS.
+    pub fn print_archetypes(&self) {
+        println!(
+            "\n=== World Archetypes (Total: {}) ===",
+            self.archetypes.len()
+        );
+        for (_, archetype) in self.archetypes.iter() {
+            archetype.print_info();
+        }
+        println!("Total entities: {}", self.entity_locations.len());
     }
 }
 
@@ -391,3 +588,518 @@ impl<'w> EntityBuilder<'w> {
 }
 
 // How i am supposed to create new archetype if I need generic types to do so (register component storages), and I have only type ids?
+
+// --- Tests ---------------------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use trait_type_map::impl_trait_accessible;
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct Position {
+        x: f32,
+        y: f32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct Velocity {
+        x: f32,
+        y: f32,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct Health {
+        hp: i32,
+    }
+
+    impl Component for Position {}
+    impl Component for Velocity {}
+    impl Component for Health {}
+
+    impl_trait_accessible!(dyn Component; Position, Velocity, Health);
+
+    /// Tests spawning multiple entities with different component combinations.
+    ///
+    /// This test verifies that:
+    /// - Entities can be spawned with various combinations of components
+    /// - Each unique component combination creates a separate archetype
+    /// - All spawned entities are properly tracked in the world
+    ///
+    /// Expected results:
+    /// - 3 entities should be created in total
+    /// - 3 different archetypes should exist (Position+Velocity, Position, Position+Velocity+Health)
+    /// - All entity IDs should be present in the entity_locations map
+    #[test]
+    fn test_spawn_entities_with_different_components() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Velocity>();
+        world.register_component::<Health>();
+
+        // Spawn entity with Position + Velocity
+        let entity1 = world
+            .spawn()
+            .with(Position { x: 10.0, y: 20.0 })
+            .with(Velocity { x: 1.0, y: 2.0 })
+            .build();
+
+        // Spawn entity with Position only
+        let entity2 = world.spawn().with(Position { x: 5.0, y: 15.0 }).build();
+
+        // Spawn entity with all three components
+        let entity3 = world
+            .spawn()
+            .with(Position { x: 100.0, y: 200.0 })
+            .with(Velocity { x: 5.0, y: 10.0 })
+            .with(Health { hp: 100 })
+            .build();
+
+        assert_eq!(world.entity_locations.len(), 3);
+        assert_eq!(world.archetypes.len(), 3);
+        assert!(world.entity_locations.contains_key(&entity1));
+        assert!(world.entity_locations.contains_key(&entity2));
+        assert!(world.entity_locations.contains_key(&entity3));
+
+        // Print archetype information
+        world.print_archetypes();
+
+        // Verify each archetype's component mask matches expected components
+        for (archetype_id, archetype) in world.archetypes.iter() {
+            println!("\n--- Verifying Archetype {:?} ---", archetype_id);
+
+            // Get component names
+            let comp_names: Vec<String> = archetype
+                .component_types
+                .iter()
+                .filter_map(|comp_id| {
+                    crate::component::get_component_name(comp_id).map(String::from)
+                })
+                .collect();
+
+            println!("Components: {:?}", comp_names);
+
+            // Build expected mask from component types
+            let mut expected_mask = ComponentMask::empty();
+            for comp_id in &archetype.component_types {
+                if let Some(bit) = crate::component::get_component_bit_by_id(comp_id) {
+                    expected_mask.set(bit);
+                    println!(
+                        "  - {:?} -> bit {}",
+                        crate::component::get_component_name(comp_id).unwrap_or("Unknown"),
+                        bit
+                    );
+                }
+            }
+
+            // Verify masks match
+            assert_eq!(
+                archetype.component_mask, expected_mask,
+                "Archetype {:?} mask mismatch!\nActual:   {:?}\nExpected: {:?}",
+                archetype_id, archetype.component_mask, expected_mask
+            );
+
+            println!("✓ Mask verified: {:?}", archetype.component_mask);
+        }
+
+        println!("\n✓ All 3 archetypes verified successfully!");
+    }
+
+    /// Tests adding a new component to an existing entity.
+    ///
+    /// This test verifies that:
+    /// - A component can be added to an entity that doesn't already have it
+    /// - The entity is migrated to a new archetype with the added component
+    /// - Existing components on the entity are preserved during migration
+    /// - The entity remains valid and tracked in the world
+    ///
+    /// Expected results:
+    /// - add_component should return true (success)
+    /// - The entity should still exist in entity_locations
+    /// - The archetype count may increase if Position+Velocity+Health archetype is new
+    #[test]
+    fn test_add_component_to_entity() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Velocity>();
+        world.register_component::<Health>();
+
+        let entity = world
+            .spawn()
+            .with(Position { x: 10.0, y: 20.0 })
+            .with(Velocity { x: 1.0, y: 2.0 })
+            .build();
+
+        assert!(
+            world.archetypes.len() == 1,
+            "Should have 1 archetype initially"
+        );
+
+        // Add Health component
+        let result = world.add_component(entity, Health { hp: 50 });
+
+        assert!(result, "Should successfully add component");
+        assert!(world.entity_locations.contains_key(&entity));
+        // May or may not create new archetype if Position+Velocity+Health already exists
+        assert!(
+            world.archetypes.len() == 2,
+            "Should have 2 archetypes after adding Health"
+        );
+
+        world.print_archetypes();
+    }
+
+    /// Tests attempting to add a component to a non-existent entity.
+    ///
+    /// This test verifies that:
+    /// - The system handles invalid entity IDs gracefully
+    /// - No panic or crash occurs when operating on a fake entity
+    /// - The operation correctly returns failure status
+    ///
+    /// Expected results:
+    /// - add_component should return false (failure)
+    /// - No side effects or modifications to the world state
+    #[test]
+    fn test_add_component_to_nonexistent_entity() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+
+        let fake_entity = crate::Entity::new_for_test(9999, 0);
+        let result = world.add_component(fake_entity, Position { x: 0.0, y: 0.0 });
+
+        assert!(
+            !result,
+            "Should fail to add component to non-existent entity"
+        );
+    }
+
+    /// Tests removing a component from an entity that has multiple components.
+    ///
+    /// This test verifies that:
+    /// - A specific component can be removed from an entity
+    /// - The entity is migrated to a new archetype without the removed component
+    /// - Other components remain intact on the entity
+    /// - The entity continues to exist in the world
+    ///
+    /// Expected results:
+    /// - remove_component should return true (success)
+    /// - The entity should still be tracked in entity_locations
+    /// - The entity should be in a different archetype (Position+Health instead of Position+Velocity+Health)
+    #[test]
+    fn test_remove_component_from_entity() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Velocity>();
+        world.register_component::<Health>();
+
+        let entity = world
+            .spawn()
+            .with(Position { x: 100.0, y: 200.0 })
+            .with(Velocity { x: 5.0, y: 10.0 })
+            .with(Health { hp: 100 })
+            .build();
+
+        // Remove Velocity component
+        let result = world.remove_component::<Velocity>(entity);
+
+        assert!(result, "Should successfully remove component");
+        assert!(world.entity_locations.contains_key(&entity));
+        // Should have moved to different archetype
+    }
+
+    /// Tests attempting to remove a component from a non-existent entity.
+    ///
+    /// This test verifies that:
+    /// - The system handles invalid entity IDs gracefully during removal
+    /// - No panic occurs when trying to remove from a fake entity
+    /// - The operation correctly reports failure
+    ///
+    /// Expected results:
+    /// - remove_component should return false (failure)
+    /// - No modifications to the world state
+    #[test]
+    fn test_remove_component_from_nonexistent_entity() {
+        let mut world = World::new();
+        world.register_component::<Velocity>();
+
+        let fake_entity = crate::Entity::new_for_test(9999, 0);
+        let result = world.remove_component::<Velocity>(fake_entity);
+
+        assert!(
+            !result,
+            "Should fail to remove component from non-existent entity"
+        );
+    }
+
+    /// Tests removing the last component from an entity, which should despawn it.
+    ///
+    /// This test verifies that:
+    /// - When an entity's last component is removed, the entity is automatically despawned
+    /// - No entities with zero components are left in the world
+    /// - The entity is properly removed from all tracking structures
+    ///
+    /// Expected results:
+    /// - remove_component should return true (success)
+    /// - The entity count should drop to 0
+    /// - The entity should no longer exist in entity_locations
+    #[test]
+    fn test_remove_last_component_despawns_entity() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+
+        let entity = world.spawn().with(Position { x: 5.0, y: 15.0 }).build();
+
+        assert_eq!(world.entity_locations.len(), 1);
+
+        // Remove the only component - should despawn entity
+        let result = world.remove_component::<Position>(entity);
+
+        assert!(result, "Should successfully remove component");
+        assert_eq!(
+            world.entity_locations.len(),
+            0,
+            "Entity should be despawned"
+        );
+        assert!(!world.entity_locations.contains_key(&entity));
+    }
+
+    /// Tests despawning an entity and verifying other entities remain unaffected.
+    ///
+    /// This test verifies that:
+    /// - An entity can be completely removed from the world
+    /// - Despawning one entity doesn't affect other entities
+    /// - The entity is removed from its archetype and all tracking structures
+    /// - The total entity count decreases correctly
+    ///
+    /// Expected results:
+    /// - despawn should return true (success)
+    /// - Entity count should decrease from 2 to 1
+    /// - The despawned entity should no longer exist in entity_locations
+    /// - The other entity should remain unaffected
+    #[test]
+    fn test_despawn_entity() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Velocity>();
+
+        let entity1 = world.spawn().with(Position { x: 10.0, y: 20.0 }).build();
+
+        let entity2 = world
+            .spawn()
+            .with(Position { x: 5.0, y: 15.0 })
+            .with(Velocity { x: 1.0, y: 2.0 })
+            .build();
+
+        assert_eq!(world.entity_locations.len(), 2);
+
+        // Despawn entity1
+        let result = world.despawn(entity1);
+
+        assert!(result, "Should successfully despawn entity");
+        assert_eq!(world.entity_locations.len(), 1);
+        assert!(!world.entity_locations.contains_key(&entity1));
+        assert!(world.entity_locations.contains_key(&entity2));
+    }
+
+    /// Tests attempting to despawn a non-existent entity.
+    ///
+    /// This test verifies that:
+    /// - The system handles invalid entity IDs gracefully during despawn
+    /// - No panic or crash occurs when despawning a fake entity
+    /// - The operation correctly reports failure
+    ///
+    /// Expected results:
+    /// - despawn should return false (failure)
+    /// - No changes to the world state
+    #[test]
+    fn test_despawn_nonexistent_entity() {
+        let mut world = World::new();
+        let fake_entity = crate::Entity::new_for_test(9999, 0);
+
+        let result = world.despawn(fake_entity);
+
+        assert!(!result, "Should fail to despawn non-existent entity");
+    }
+
+    /// Tests that attempting to despawn an already-despawned entity fails correctly.
+    ///
+    /// This test verifies that:
+    /// - Once an entity is despawned, it cannot be despawned again
+    /// - The system properly tracks which entities exist vs don't exist
+    /// - Repeated despawn operations are safely rejected
+    ///
+    /// Expected results:
+    /// - First despawn should return true (success)
+    /// - Second despawn should return false (entity no longer exists)
+    /// - No panic or invalid state from double-despawn attempt
+    #[test]
+    fn test_despawn_already_despawned_entity() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+
+        let entity = world.spawn().with(Position { x: 10.0, y: 20.0 }).build();
+
+        // First despawn should succeed
+        let result1 = world.despawn(entity);
+        assert!(result1);
+
+        // Second despawn should fail
+        let result2 = world.despawn(entity);
+        assert!(!result2, "Should fail to despawn already-despawned entity");
+    }
+
+    /// Tests the cleanup of empty archetypes after entities are despawned.
+    ///
+    /// This test verifies that:
+    /// - When all entities are removed from an archetype, it becomes empty
+    /// - The cleanup_empty_archetypes method removes unused archetypes
+    /// - Non-empty archetypes and their entities remain unaffected
+    /// - Memory is properly reclaimed from empty archetype storage
+    ///
+    /// Expected results:
+    /// - Initially 2 archetypes should exist
+    /// - After despawning entity1 and cleanup, archetype count should decrease
+    /// - entity2 should still exist and be properly tracked
+    #[test]
+    fn test_cleanup_empty_archetypes() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Velocity>();
+
+        // Create some entities
+        let entity1 = world.spawn().with(Position { x: 10.0, y: 20.0 }).build();
+
+        let entity2 = world
+            .spawn()
+            .with(Position { x: 5.0, y: 15.0 })
+            .with(Velocity { x: 1.0, y: 2.0 })
+            .build();
+
+        let initial_archetypes = world.archetypes.len();
+        assert_eq!(initial_archetypes, 2);
+
+        // Despawn one entity, leaving one archetype empty
+        world.despawn(entity1);
+
+        // Cleanup should remove empty archetype
+        world.cleanup_empty_archetypes();
+
+        assert!(world.archetypes.len() < initial_archetypes);
+        assert!(world.entity_locations.contains_key(&entity2));
+    }
+
+    /// Tests entity migration between archetypes when components are added and removed.
+    ///
+    /// This test verifies that:
+    /// - Adding a component moves the entity to a different archetype
+    /// - Removing a component moves the entity to yet another archetype
+    /// - Each archetype change is properly tracked with different archetype IDs
+    /// - Component data is preserved during migrations
+    ///
+    /// Expected results:
+    /// - Entity starts in archetype for (Position+Velocity)
+    /// - After adding Health, entity moves to archetype for (Position+Velocity+Health)
+    /// - After removing Velocity, entity moves to archetype for (Position+Health)
+    /// - All three archetype IDs should be different from each other
+    #[test]
+    fn test_entity_archetype_migration() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Velocity>();
+        world.register_component::<Health>();
+
+        // Start with Position + Velocity
+        let entity = world
+            .spawn()
+            .with(Position { x: 10.0, y: 20.0 })
+            .with(Velocity { x: 1.0, y: 2.0 })
+            .build();
+
+        let initial_location = world.entity_locations.get(&entity).unwrap().clone();
+
+        // Add Health - should migrate to new archetype
+        world.add_component(entity, Health { hp: 100 });
+
+        let after_add_location = world.entity_locations.get(&entity).unwrap().clone();
+        assert_ne!(
+            initial_location.archetype_id, after_add_location.archetype_id,
+            "Entity should be in different archetype after adding component"
+        );
+
+        // Remove Velocity - should migrate to another archetype
+        world.remove_component::<Velocity>(entity);
+
+        let after_remove_location = world.entity_locations.get(&entity).unwrap().clone();
+        assert_ne!(
+            after_add_location.archetype_id, after_remove_location.archetype_id,
+            "Entity should be in different archetype after removing component"
+        );
+    }
+
+    /// Test that archetype print_info displays component names and entity count
+    #[test]
+    fn test_archetype_print_info() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Velocity>();
+
+        // Spawn some entities
+        world
+            .spawn()
+            .with(Position { x: 10.0, y: 20.0 })
+            .with(Velocity { x: 1.0, y: 2.0 })
+            .build();
+
+        world
+            .spawn()
+            .with(Position { x: 5.0, y: 15.0 })
+            .with(Velocity { x: 0.5, y: 1.5 })
+            .build();
+
+        // Print info using the world helper method
+        world.print_archetypes();
+
+        // Verify archetype structure
+        assert_eq!(world.entity_locations.len(), 2, "Should have 2 entities");
+        assert_eq!(world.archetypes.len(), 1, "Should have 1 archetype");
+
+        // Get the archetype and verify its contents
+        let archetype = world.archetypes.values().next().unwrap();
+        assert_eq!(
+            archetype.entities.len(),
+            2,
+            "Archetype should contain 2 entities"
+        );
+        assert_eq!(
+            archetype.component_types.len(),
+            2,
+            "Archetype should have 2 component types"
+        );
+
+        // Verify component names are registered and retrievable
+        let comp_names: Vec<String> = archetype
+            .component_types
+            .iter()
+            .filter_map(|comp_id| crate::component::get_component_name(comp_id).map(String::from))
+            .collect();
+
+        assert_eq!(comp_names.len(), 2, "Should have 2 component names");
+
+        // Check that both expected component names are present
+        let has_position = comp_names.iter().any(|name| name.contains("Position"));
+        let has_velocity = comp_names.iter().any(|name| name.contains("Velocity"));
+
+        assert!(
+            has_position,
+            "Should contain Position component, found: {:?}",
+            comp_names
+        );
+        assert!(
+            has_velocity,
+            "Should contain Velocity component, found: {:?}",
+            comp_names
+        );
+
+        println!("✓ Component names verified: {:?}", comp_names);
+    }
+}

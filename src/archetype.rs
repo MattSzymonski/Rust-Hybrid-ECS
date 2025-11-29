@@ -81,4 +81,22 @@ impl Archetype {
     pub fn len(&self) -> usize {
         self.entities.len()
     }
+
+    /// Print information about this archetype (component names and entity count)
+    pub fn print_info(&self) {
+        use crate::component::get_component_name;
+
+        let component_names: Vec<String> = self
+            .component_types
+            .iter()
+            .map(|comp_id| get_component_name(comp_id).unwrap_or("Unknown").to_string())
+            .collect();
+
+        println!(
+            "Archetype {:?}: {} entities, components: [{}]",
+            self.id,
+            self.entities.len(),
+            component_names.join(", ")
+        );
+    }
 }

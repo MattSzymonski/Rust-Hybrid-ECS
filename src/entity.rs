@@ -15,3 +15,10 @@ pub struct Entity {
     pub(crate) id: u64,
     pub(crate) generation: u32,
 }
+
+impl Entity {
+    /// Create a new entity with the given id and generation (for testing purposes)
+    pub fn new_for_test(id: u64, generation: u32) -> Self {
+        Self { id, generation }
+    }
+}

@@ -45,6 +45,13 @@ enum DeferredCommand {
         entity: Entity,
         adder: Box<dyn ComponentAdder>,
     },
+    RemoveComponent {
+        entity: Entity,
+        component_id: ComponentId,
+    },
+    DespawnEntity {
+        entity: Entity,
+    },
 }
 
 /// Commands queue for deferred operations
@@ -73,6 +80,20 @@ impl CommandQueue {
         });
     }
 
+    /// Queue removing a component from an entity
+    pub fn remove_component<T: Component>(&mut self, entity: Entity) {
+        self.commands.push(DeferredCommand::RemoveComponent {
+            entity,
+            component_id: ComponentId::of::<T>(),
+        });
+    }
+
+    /// Queue despawning (removing) an entity
+    pub fn despawn(&mut self, entity: Entity) {
+        self.commands
+            .push(DeferredCommand::DespawnEntity { entity });
+    }
+
     /// Execute all queued commands
     ///
     /// This is called by the Engine after all systems have run.
@@ -84,7 +105,10 @@ impl CommandQueue {
                     let location = match world.entity_locations.get(&entity) {
                         Some(loc) => *loc,
                         None => {
-                            println!("  [Deferred] Entity {:?} not found", entity.id);
+                            println!(
+                                "  [Deferred] Entity {:?} not found for add_component",
+                                entity.id
+                            );
                             continue;
                         }
                     };
@@ -104,11 +128,6 @@ impl CommandQueue {
 
                     new_component_ids.push(new_comp_id);
                     new_component_ids.sort();
-
-                    println!(
-                        "  [Deferred] Adding component to entity {:?} (moving archetype)",
-                        entity.id
-                    );
 
                     // Copy existing components using the registered copiers
                     let old_component_ids = old_archetype.component_types.clone();
@@ -133,6 +152,75 @@ impl CommandQueue {
                             adder.add_to_storage(new_storage);
                         },
                     );
+                }
+
+                DeferredCommand::RemoveComponent {
+                    entity,
+                    component_id,
+                } => {
+                    // Get current entity location and components
+                    let location = match world.entity_locations.get(&entity) {
+                        Some(loc) => *loc,
+                        None => {
+                            println!(
+                                "  [Deferred] Entity {:?} not found for remove_component",
+                                entity.id
+                            );
+                            continue;
+                        }
+                    };
+
+                    let old_archetype = world.archetypes.get(&location.archetype_id).unwrap();
+
+                    // Check if entity has this component
+                    if !old_archetype.component_types.contains(&component_id) {
+                        println!(
+                            "  [Deferred] Entity {:?} doesn't have component {:?}",
+                            entity.id, component_id
+                        );
+                        continue;
+                    }
+
+                    // Build new component list without the removed component
+                    let new_component_ids: Vec<ComponentId> = old_archetype
+                        .component_types
+                        .iter()
+                        .filter(|&id| *id != component_id)
+                        .cloned()
+                        .collect();
+
+                    // If no components left, despawn the entity instead
+                    if new_component_ids.is_empty() {
+                        world.despawn(entity);
+                        continue;
+                    }
+
+                    // Collect copiers for remaining components
+                    let copiers: Vec<_> = new_component_ids
+                        .iter()
+                        .filter_map(|comp_id| world.component_copiers.get(comp_id).map(Arc::clone))
+                        .collect();
+
+                    // Move entity to new archetype without the removed component
+                    world.move_entity_to_archetype(
+                        entity,
+                        new_component_ids,
+                        |old_storage, new_storage, old_index| {
+                            // Copy all components except the removed one
+                            for copier in copiers.iter() {
+                                copier(old_storage, new_storage, old_index);
+                            }
+                        },
+                    );
+                }
+
+                DeferredCommand::DespawnEntity { entity } => {
+                    if !world.despawn(entity) {
+                        println!(
+                            "  [Deferred] Failed to despawn entity {:?} (not found)",
+                            entity.id
+                        );
+                    }
                 }
             }
         }
@@ -161,5 +249,15 @@ impl<'a> Commands<'a> {
         T: Component + TraitAccessible<dyn Component> + Send,
     {
         self.queue.add_component(entity, component);
+    }
+
+    /// Queue removing a component from an entity (executed later)
+    pub fn remove_component<T: Component>(&mut self, entity: Entity) {
+        self.queue.remove_component::<T>(entity);
+    }
+
+    /// Queue despawning an entity (executed later)
+    pub fn despawn(&mut self, entity: Entity) {
+        self.queue.despawn(entity);
     }
 }

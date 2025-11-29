@@ -7,7 +7,7 @@
 //! - Collision detection system
 //! - Performance measurements
 
-use crate::{Component, Engine, GlobalComponentQuery, Query, World};
+use ecs_hybrid::{Component, Engine, GlobalComponentQuery, Query, World};
 use std::time::Instant;
 use trait_type_map::impl_trait_accessible;
 

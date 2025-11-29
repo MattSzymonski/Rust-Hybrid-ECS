@@ -89,6 +89,9 @@ impl ComponentMask {
 /// Global registry mapping ComponentId to bit indices
 static COMPONENT_REGISTRY: Mutex<Option<ComponentRegistry>> = Mutex::new(None);
 
+/// Global registry mapping ComponentId to type names
+static COMPONENT_NAMES: Mutex<Option<HashMap<ComponentId, &'static str>>> = Mutex::new(None);
+
 struct ComponentRegistry {
     id_to_bit: HashMap<ComponentId, u8>,
     next_bit: u8,
@@ -146,4 +149,20 @@ pub fn get_component_bit<T: Component>() -> u8 {
 pub fn get_component_bit_by_id(component_id: &ComponentId) -> Option<u8> {
     let registry = COMPONENT_REGISTRY.lock().unwrap();
     registry.as_ref().and_then(|r| r.get_bit(component_id))
+}
+
+/// Register a component type name for debugging/display purposes
+pub fn register_component_name<T: Component>(name: &'static str) {
+    let component_id = ComponentId::of::<T>();
+    let mut names = COMPONENT_NAMES.lock().unwrap();
+    if names.is_none() {
+        *names = Some(HashMap::new());
+    }
+    names.as_mut().unwrap().insert(component_id, name);
+}
+
+/// Get the registered name for a component type
+pub fn get_component_name(component_id: &ComponentId) -> Option<&'static str> {
+    let names = COMPONENT_NAMES.lock().unwrap();
+    names.as_ref().and_then(|n| n.get(component_id).copied())
 }
