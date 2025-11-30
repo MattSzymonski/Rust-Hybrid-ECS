@@ -13,12 +13,7 @@ impl Component for Counter {}
 
 impl ScriptComponent for Counter {
     fn update(&mut self, _entity: Entity, _world: &mut World) {
-        if self.value < self.max_value {
-            self.value += self.increment;
-            if self.value > self.max_value {
-                self.value = self.max_value;
-            }
-        }
+        self.value = (self.value + self.increment).min(self.max_value);
         println!("Counter: {} / {}", self.value, self.max_value);
     }
 }
