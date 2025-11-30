@@ -61,7 +61,8 @@ impl ComponentRegistry {
         assert!(self.next_bit < 128, "Too many component types (max 128)");
         let bit = self.next_bit;
         self.id_to_bit.insert(component_id, bit);
-        self.names.insert(component_id, std::any::type_name::<T>().to_string());
+        self.names
+            .insert(component_id, std::any::type_name::<T>().to_string());
         self.next_bit += 1;
         bit
     }

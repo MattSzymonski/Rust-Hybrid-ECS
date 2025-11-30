@@ -772,9 +772,7 @@ mod tests {
             let comp_names: Vec<String> = archetype
                 .component_types
                 .iter()
-                .filter_map(|comp_id| {
-                    world.component_registry.get_name(comp_id).map(String::from)
-                })
+                .filter_map(|comp_id| world.component_registry.get_name(comp_id).map(String::from))
                 .collect();
 
             println!("Components: {:?}", comp_names);
@@ -786,7 +784,10 @@ mod tests {
                     expected_mask.set(bit);
                     println!(
                         "  - {:?} -> bit {}",
-                        world.component_registry.get_name(comp_id).unwrap_or("Unknown"),
+                        world
+                            .component_registry
+                            .get_name(comp_id)
+                            .unwrap_or("Unknown"),
                         bit
                     );
                 }
