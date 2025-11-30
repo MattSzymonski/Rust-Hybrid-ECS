@@ -1,0 +1,77 @@
+use ecs_hybrid::*;
+use trait_type_map::impl_trait_accessible;
+
+/// A counter component that acts as a script
+#[derive(Debug, Clone)]
+struct Counter {
+    value: i32,
+    increment: i32,
+    max_value: i32,
+}
+
+impl Component for Counter {}
+
+impl ScriptComponent for Counter {
+    fn update(&mut self, _entity: Entity, _world: &mut World) {
+        if self.value < self.max_value {
+            self.value += self.increment;
+            println!("Counter: {} / {}", self.value, self.max_value);
+        } else {
+            println!("Counter: MAX REACHED!");
+        }
+    }
+}
+
+/// A position component (not a script)
+#[derive(Debug, Clone)]
+struct Position {
+    x: f32,
+    y: f32,
+}
+
+impl Component for Position {}
+
+// Make components accessible through trait objects
+impl_trait_accessible!(dyn Component; Counter, Position);
+
+fn main() {
+    println!("=== ECS Scripting Example ===\n");
+
+    let mut world = World::new();
+
+    // Register components
+    world.register_component::<Position>();
+    world.register_script_component::<Counter>();
+
+    // Create entity 1: Counter script only
+    println!("Creating entity with counter...");
+    let _entity2 = world
+        .create_entity()
+        .with(Counter {
+            value: 0,
+            increment: 7,
+            max_value: 50,
+        })
+        .build();
+
+    // Create entity 2: Position + both scripts
+    println!("Creating entity with position, and counter...\n");
+    let _entity3 = world
+        .create_entity()
+        .with(Position { x: 5.0, y: 10.0 })
+        .with(Counter {
+            value: 100,
+            increment: 3,
+            max_value: 120,
+        })
+        .build();
+
+    // Simulate several frames
+    for frame in 1..=8 {
+        println!("--- Frame {} ---", frame);
+        world.update_scripts();
+        println!();
+    }
+
+    println!("=== Scripting Example Complete ===");
+}

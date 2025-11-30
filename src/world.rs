@@ -13,8 +13,9 @@ use std::sync::Arc;
 use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
 
 use crate::archetype::{Archetype, ArchetypeId, StorageFactory};
-use crate::component::{Component, ComponentId, ComponentMask};
+use crate::component::{Component, ComponentId, ComponentMask, ComponentRegistry};
 use crate::entity::Entity;
+use crate::scripting::ScriptComponent;
 
 /// Function that copies a component from one storage to another at given indices
 type ComponentCopier = Arc<
@@ -24,6 +25,11 @@ type ComponentCopier = Arc<
             usize,
         ) + Send
         + Sync,
+>;
+
+/// Function that updates a script component
+type ScriptUpdater = Arc<
+    dyn Fn(&mut TraitTypeMap<dyn Component, VecFamily>, usize, Entity, *mut World) + Send + Sync,
 >;
 
 /// EntityLocation tracks where an entity is stored in the archetype system
@@ -46,12 +52,18 @@ pub struct World {
     pub(crate) archetypes: HashMap<ArchetypeId, Archetype>,
     next_free_archetype_id: usize,
     pub(crate) entity_locations: HashMap<Entity, EntityLocation>,
-    archetype_lookup: HashMap<ComponentMask, ArchetypeId>, // Changed from Vec<ComponentId> to ComponentMask
+    archetype_lookup: HashMap<ComponentMask, ArchetypeId>,
     pub(crate) global_components: HashMap<ComponentId, Box<dyn Any>>,
     /// Storage factories for creating component storage by TypeId
     storage_factories: HashMap<ComponentId, StorageFactory>,
     /// Component copiers for moving entities between archetypes
     pub(crate) component_copiers: HashMap<ComponentId, ComponentCopier>,
+    /// Script component types (ComponentId, component mask bit)
+    script_components: Vec<(ComponentId, u8)>,
+    /// Script updaters for calling update() on script components
+    script_updaters: HashMap<ComponentId, ScriptUpdater>,
+    /// Component registry for bit indices and names
+    pub(crate) component_registry: ComponentRegistry,
 }
 
 impl World {
@@ -66,6 +78,9 @@ impl World {
             global_components: HashMap::new(),
             storage_factories: HashMap::new(),
             component_copiers: HashMap::new(),
+            script_components: Vec::new(),
+            script_updaters: HashMap::new(),
+            component_registry: ComponentRegistry::new(),
         }
     }
 
@@ -79,7 +94,7 @@ impl World {
         let comp_id = ComponentId::of::<T>();
 
         // Register component (bit index + name)
-        crate::component::register_component::<T>();
+        self.component_registry.register::<T>();
 
         self.storage_factories.insert(
             comp_id,
@@ -101,6 +116,90 @@ impl World {
                 },
             ),
         );
+    }
+
+    /// Register a script component type with the World
+    ///
+    /// Script components have an update() method that gets called by update_scripts().
+    /// This must be called for each script component type before it can be used.
+    pub fn register_script_component<T>(&mut self)
+    where
+        T: ScriptComponent + TraitAccessible<dyn Component> + Clone,
+    {
+        // First register as a normal component
+        self.register_component::<T>();
+
+        // Then track it as a script component
+        let comp_id = ComponentId::of::<T>();
+        if let Some(bit) = self.component_registry.get_bit(&comp_id) {
+            self.script_components.push((comp_id, bit));
+
+            // Register updater callback for this script component
+            self.script_updaters.insert(
+                comp_id,
+                Arc::new(
+                    |storage: &mut TraitTypeMap<dyn Component, VecFamily>,
+                     index: usize,
+                     entity: Entity,
+                     world_ptr: *mut World| {
+                        // Get mutable reference to the component
+                        if let Some(component) = storage.get_storage_mut::<T>().get_mut(index) {
+                            // SAFETY: We're careful to only access the component and world safely
+                            // The world pointer is only used immutably during the update call
+                            unsafe {
+                                component.update(entity, &mut *world_ptr);
+                            }
+                        }
+                    },
+                ),
+            );
+        }
+    }
+
+    /// Update all script components
+    ///
+    /// Calls update() on every script component in the world.
+    /// Scripts can modify themselves and interact with the world.
+    pub fn update_scripts(&mut self) {
+        // Collect script component info to avoid borrow issues
+        let script_info: Vec<(ComponentId, u8)> = self.script_components.clone();
+
+        for (comp_id, comp_bit) in script_info {
+            // Get the updater for this component type
+            let updater = match self.script_updaters.get(&comp_id) {
+                Some(u) => Arc::clone(u),
+                None => continue,
+            };
+
+            // Collect entities that have this script component
+            let mut entities_to_update: Vec<(Entity, ArchetypeId, usize)> = Vec::new();
+
+            for (archetype_id, archetype) in &self.archetypes {
+                // Check if this archetype has the script component using bitmask
+                let mut mask = ComponentMask::empty();
+                mask.set(comp_bit);
+
+                if archetype.matches_mask(&mask) {
+                    // Collect all entities in this archetype
+                    for (index, &entity) in archetype.entities.iter().enumerate() {
+                        entities_to_update.push((entity, *archetype_id, index));
+                    }
+                }
+            }
+
+            // Now update each entity's script component
+            // SAFETY: We use raw pointer to bypass borrow checker, but we're careful:
+            // - Only one component is accessed at a time
+            // - The updater callback receives the world pointer for safe access
+            let world_ptr = self as *mut World;
+
+            for (entity, archetype_id, index) in entities_to_update {
+                if let Some(archetype) = self.archetypes.get_mut(&archetype_id) {
+                    // Call the updater with mutable storage access
+                    updater(&mut archetype.component_storages, index, entity, world_ptr);
+                }
+            }
+        }
     }
 
     /// Add or update a global component (singleton not attached to any entity)
@@ -148,7 +247,7 @@ impl World {
         // Build component mask from component IDs
         let mut component_mask = ComponentMask::empty();
         for comp_id in &component_ids {
-            if let Some(bit) = crate::component::get_component_bit(comp_id) {
+            if let Some(bit) = self.component_registry.get_bit(comp_id) {
                 component_mask.set(bit);
             }
         }
@@ -513,7 +612,7 @@ impl World {
             self.archetypes.len()
         );
         for (_, archetype) in self.archetypes.iter() {
-            archetype.print_info();
+            archetype.print_info(&self.component_registry);
         }
         println!("Total entities: {}", self.entity_locations.len());
     }
@@ -674,7 +773,7 @@ mod tests {
                 .component_types
                 .iter()
                 .filter_map(|comp_id| {
-                    crate::component::get_component_name(comp_id).map(String::from)
+                    world.component_registry.get_name(comp_id).map(String::from)
                 })
                 .collect();
 
@@ -683,11 +782,11 @@ mod tests {
             // Build expected mask from component types
             let mut expected_mask = ComponentMask::empty();
             for comp_id in &archetype.component_types {
-                if let Some(bit) = crate::component::get_component_bit(comp_id) {
+                if let Some(bit) = world.component_registry.get_bit(comp_id) {
                     expected_mask.set(bit);
                     println!(
                         "  - {:?} -> bit {}",
-                        crate::component::get_component_name(comp_id).unwrap_or("Unknown"),
+                        world.component_registry.get_name(comp_id).unwrap_or("Unknown"),
                         bit
                     );
                 }
@@ -1187,7 +1286,7 @@ mod tests {
         let comp_names: Vec<String> = archetype
             .component_types
             .iter()
-            .filter_map(|comp_id| crate::component::get_component_name(comp_id).map(String::from))
+            .filter_map(|comp_id| world.component_registry.get_name(comp_id).map(String::from))
             .collect();
 
         assert_eq!(comp_names.len(), 2, "Should have 2 component names");

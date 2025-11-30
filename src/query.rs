@@ -218,7 +218,7 @@ impl<'w, Q: QueryTarget> Query<'w, Q> {
         let component_ids = Q::component_ids();
         let mut query_mask = ComponentMask::empty();
         for component_id in &component_ids {
-            if let Some(bit) = crate::component::get_component_bit(component_id) {
+            if let Some(bit) = self.world.component_registry.get_bit(component_id) {
                 query_mask.set(bit);
             }
         }

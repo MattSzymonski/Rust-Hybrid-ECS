@@ -83,13 +83,11 @@ impl Archetype {
     }
 
     /// Print information about this archetype (component names and entity count)
-    pub fn print_info(&self) {
-        use crate::component::get_component_name;
-
+    pub fn print_info(&self, registry: &crate::component::ComponentRegistry) {
         let component_names: Vec<String> = self
             .component_types
             .iter()
-            .map(|comp_id| get_component_name(comp_id).unwrap_or("Unknown").to_string())
+            .map(|comp_id| registry.get_name(comp_id).unwrap_or("Unknown").to_string())
             .collect();
 
         println!(

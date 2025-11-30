@@ -533,7 +533,7 @@ mod tests {
             "Archetype should not contain Velocity component"
         );
 
-        archetype.print_info();
+        archetype.print_info(&world.component_registry);
     }
 
     /// Tests creating multiple entities with different component combinations through commands.

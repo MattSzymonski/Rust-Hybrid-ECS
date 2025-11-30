@@ -10,6 +10,7 @@ pub mod component;
 pub mod engine;
 pub mod entity;
 pub mod query;
+pub mod scripting;
 pub mod system;
 pub mod world;
 
@@ -19,5 +20,6 @@ pub use component::Component;
 pub use engine::Engine;
 pub use entity::Entity;
 pub use query::{GlobalComponentQuery, Query, QueryTarget};
+pub use scripting::ScriptComponent;
 pub use system::{State, SystemState};
 pub use world::{EntityBuilder, World};

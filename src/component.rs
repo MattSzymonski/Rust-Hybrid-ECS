@@ -5,7 +5,6 @@
 
 use std::any::TypeId;
 use std::collections::HashMap;
-use std::sync::Mutex;
 
 /// Component marker trait - all components must be 'static
 pub trait Component: 'static {}
@@ -38,17 +37,15 @@ impl ComponentMask {
     }
 }
 
-/// Global component registry
-static COMPONENT_REGISTRY: Mutex<Option<ComponentRegistry>> = Mutex::new(None);
-
-struct ComponentRegistry {
+/// Component registry - moved to World struct
+pub struct ComponentRegistry {
     id_to_bit: HashMap<ComponentId, u8>,
-    names: HashMap<ComponentId, &'static str>,
+    names: HashMap<ComponentId, String>,
     next_bit: u8,
 }
 
 impl ComponentRegistry {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             id_to_bit: HashMap::new(),
             names: HashMap::new(),
@@ -56,44 +53,24 @@ impl ComponentRegistry {
         }
     }
 
-    fn register(&mut self, component_id: ComponentId, name: &'static str) -> u8 {
+    pub fn register<T: Component>(&mut self) -> u8 {
+        let component_id = ComponentId::of::<T>();
         if let Some(&bit) = self.id_to_bit.get(&component_id) {
             return bit;
         }
         assert!(self.next_bit < 128, "Too many component types (max 128)");
         let bit = self.next_bit;
         self.id_to_bit.insert(component_id, bit);
-        self.names.insert(component_id, name);
+        self.names.insert(component_id, std::any::type_name::<T>().to_string());
         self.next_bit += 1;
         bit
     }
-}
 
-/// Register a component type and get its bit index
-pub fn register_component<T: Component>() -> u8 {
-    let mut registry = COMPONENT_REGISTRY.lock().unwrap();
-    let registry = registry.get_or_insert_with(ComponentRegistry::new);
-    registry.register(ComponentId::of::<T>(), std::any::type_name::<T>())
-}
+    pub fn get_bit(&self, component_id: &ComponentId) -> Option<u8> {
+        self.id_to_bit.get(component_id).copied()
+    }
 
-/// Get the bit index for a ComponentId
-pub fn get_component_bit(component_id: &ComponentId) -> Option<u8> {
-    COMPONENT_REGISTRY
-        .lock()
-        .unwrap()
-        .as_ref()?
-        .id_to_bit
-        .get(component_id)
-        .copied()
-}
-
-/// Get the registered name for a component type
-pub fn get_component_name(component_id: &ComponentId) -> Option<&'static str> {
-    COMPONENT_REGISTRY
-        .lock()
-        .unwrap()
-        .as_ref()?
-        .names
-        .get(component_id)
-        .copied()
+    pub fn get_name(&self, component_id: &ComponentId) -> Option<&str> {
+        self.names.get(component_id).map(|s| s.as_str())
+    }
 }
