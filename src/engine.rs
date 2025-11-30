@@ -89,6 +89,9 @@ impl Engine {
                 .run(world, &mut self.queue, &mut registered.state);
         }
 
+        // Update script components after systems
+        world.update_scripts();
+
         // Phase 2: Execute all deferred commands
         self.queue.execute_queued_commands(world);
     }

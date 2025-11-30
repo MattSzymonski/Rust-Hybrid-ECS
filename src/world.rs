@@ -160,7 +160,7 @@ impl World {
     ///
     /// Calls update() on every script component in the world.
     /// Scripts can modify themselves and interact with the world.
-    pub fn update_scripts(&mut self) {
+    pub(crate) fn update_scripts(&mut self) {
         // Collect script component info to avoid borrow issues
         let script_info: Vec<(ComponentId, u8)> = self.script_components.clone();
 

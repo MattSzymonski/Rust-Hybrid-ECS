@@ -33,6 +33,7 @@ impl_trait_accessible!(dyn Component; Counter, Position);
 pub fn main() {
     println!("=== ECS Scripting Example ===\n");
 
+    let mut engine = Engine::new();
     let mut world = World::new();
 
     // Register components
@@ -65,7 +66,7 @@ pub fn main() {
     // Simulate several frames
     for frame in 1..=8 {
         println!("--- Frame {} ---", frame);
-        world.update_scripts();
+        engine.process_frame(&mut world);
         println!();
     }
 
