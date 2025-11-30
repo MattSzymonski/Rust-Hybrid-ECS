@@ -217,8 +217,8 @@ impl<'w, Q: QueryTarget> Query<'w, Q> {
         // Build component mask from query requirements
         let component_ids = Q::component_ids();
         let mut query_mask = ComponentMask::empty();
-        for comp_id in &component_ids {
-            if let Some(bit) = crate::component::get_component_bit_by_id(comp_id) {
+        for component_id in &component_ids {
+            if let Some(bit) = crate::component::get_component_bit(component_id) {
                 query_mask.set(bit);
             }
         }

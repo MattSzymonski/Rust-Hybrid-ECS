@@ -13,7 +13,7 @@ use std::sync::Arc;
 use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
 
 use crate::archetype::{Archetype, ArchetypeId, StorageFactory};
-use crate::component::{register_component_bit, Component, ComponentId, ComponentMask};
+use crate::component::{Component, ComponentId, ComponentMask};
 use crate::entity::Entity;
 
 /// Function that copies a component from one storage to another at given indices
@@ -72,20 +72,14 @@ impl World {
     /// Register a component type with the World
     ///
     /// This must be called for each component type before it can be used.
-    /// The registration creates a factory function that can create storage
-    /// for this component type without needing the generic type parameter.
-    /// Also registers the component bit in the global registry.
     pub fn register_component<T>(&mut self)
     where
         T: Component + TraitAccessible<dyn Component> + Clone,
     {
         let comp_id = ComponentId::of::<T>();
 
-        // Register bit index in global registry
-        register_component_bit::<T>();
-
-        // Register component name for debugging/display
-        crate::component::register_component_name::<T>(std::any::type_name::<T>());
+        // Register component (bit index + name)
+        crate::component::register_component::<T>();
 
         self.storage_factories.insert(
             comp_id,
@@ -154,7 +148,7 @@ impl World {
         // Build component mask from component IDs
         let mut component_mask = ComponentMask::empty();
         for comp_id in &component_ids {
-            if let Some(bit) = crate::component::get_component_bit_by_id(comp_id) {
+            if let Some(bit) = crate::component::get_component_bit(comp_id) {
                 component_mask.set(bit);
             }
         }
@@ -689,7 +683,7 @@ mod tests {
             // Build expected mask from component types
             let mut expected_mask = ComponentMask::empty();
             for comp_id in &archetype.component_types {
-                if let Some(bit) = crate::component::get_component_bit_by_id(comp_id) {
+                if let Some(bit) = crate::component::get_component_bit(comp_id) {
                     expected_mask.set(bit);
                     println!(
                         "  - {:?} -> bit {}",
