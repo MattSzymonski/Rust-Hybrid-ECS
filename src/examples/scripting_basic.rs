@@ -15,10 +15,11 @@ impl ScriptComponent for Counter {
     fn update(&mut self, _entity: Entity, _world: &mut World) {
         if self.value < self.max_value {
             self.value += self.increment;
-            println!("Counter: {} / {}", self.value, self.max_value);
-        } else {
-            println!("Counter: MAX REACHED!");
+            if self.value > self.max_value {
+                self.value = self.max_value;
+            }
         }
+        println!("Counter: {} / {}", self.value, self.max_value);
     }
 }
 
@@ -34,7 +35,7 @@ impl Component for Position {}
 // Make components accessible through trait objects
 impl_trait_accessible!(dyn Component; Counter, Position);
 
-fn main() {
+pub fn main() {
     println!("=== ECS Scripting Example ===\n");
 
     let mut world = World::new();
