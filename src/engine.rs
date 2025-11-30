@@ -28,13 +28,15 @@ struct RegisteredSystem {
 /// engine.register_system("collision", collision_system);
 ///
 /// // Every frame:
-/// engine.process_frame(&mut world);
+/// engine.process_frame();
 /// ```
 pub struct Engine {
     /// All registered systems with their names and states
     systems: Vec<RegisteredSystem>,
     /// Command queue for deferred operations
     queue: CommandQueue,
+    /// The ECS world
+    world: World,
 }
 
 impl Engine {
@@ -43,7 +45,18 @@ impl Engine {
         Self {
             systems: Vec::new(),
             queue: CommandQueue::new(),
+            world: World::new(),
         }
+    }
+
+    /// Get a reference to the world
+    pub fn world(&self) -> &World {
+        &self.world
+    }
+
+    /// Get a mutable reference to the world
+    pub fn world_mut(&mut self) -> &mut World {
+        &mut self.world
     }
 
     /// Register a system with a name
@@ -81,18 +94,18 @@ impl Engine {
     ///
     /// This two-phase approach ensures structural changes don't interfere
     /// with systems that are still running.
-    pub fn process_frame(&mut self, world: &mut World) {
+    pub fn process_frame(&mut self) {
         // Phase 1: Run all systems
         for registered in &mut self.systems {
             registered
                 .system
-                .run(world, &mut self.queue, &mut registered.state);
+                .run(&mut self.world, &mut self.queue, &mut registered.state);
         }
 
         // Update script components after systems
-        world.update_scripts();
+        self.world.update_scripts();
 
         // Phase 2: Execute all deferred commands
-        self.queue.execute_queued_commands(world);
+        self.queue.execute_queued_commands(&mut self.world);
     }
 }

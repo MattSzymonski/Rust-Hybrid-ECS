@@ -7,7 +7,7 @@
 //! - Collision detection system
 //! - Performance measurements
 
-use ecs_hybrid::{Component, Engine, GlobalComponentQuery, Query, World};
+use ecs_hybrid::{Component, Engine, GlobalComponentQuery, Query};
 use std::time::Instant;
 use trait_type_map::impl_trait_accessible;
 
@@ -199,14 +199,13 @@ pub fn main() {
     println!("=== Stress Test: Archetype-Based ECS ===\n");
 
     let mut engine = Engine::new();
-    let mut world = World::new();
 
     // Register all component types before use
-    world.register_component::<SimulationStats>();
-    world.register_component::<Transform>();
-    world.register_component::<Velocity>();
-    world.register_component::<BoxCollider>();
-    world.register_component::<Obstacle>();
+    engine.world_mut().register_component::<SimulationStats>();
+    engine.world_mut().register_component::<Transform>();
+    engine.world_mut().register_component::<Velocity>();
+    engine.world_mut().register_component::<BoxCollider>();
+    engine.world_mut().register_component::<Obstacle>();
 
     // Register systems
     engine.register_system("collision_and_movement", collision_and_movement_system);
@@ -223,7 +222,8 @@ pub fn main() {
     box_collider.add_collider((0.0, 6.0, 0.0), (3.0, 3.0, 3.0));
     box_collider.add_collider((0.0, -6.0, 0.0), (3.0, 3.0, 3.0));
 
-    let _obstacle = world
+    let _obstacle = engine
+        .world_mut()
         .create_entity()
         .with(Obstacle)
         .with(Transform::new(50.0, 0.0, 0.0))
@@ -238,7 +238,8 @@ pub fn main() {
 
     for i in 0..entity_count {
         let angle = (i as f32 / entity_count as f32) * std::f32::consts::PI * 2.0;
-        world
+        engine
+            .world_mut()
             .create_entity()
             .with(Transform::new(angle.cos() * 20.0, angle.sin() * 20.0, 0.0))
             .with(Velocity::new(angle.cos() * 2.0, angle.sin() * 2.0, 0.0))
@@ -252,7 +253,7 @@ pub fn main() {
 
     // Set up simulation stats as global component
     let max_frames = 10_000;
-    world.add_global_component(SimulationStats {
+    engine.world_mut().add_global_component(SimulationStats {
         frame_count: 0,
         max_frames,
         start_time: Instant::now(),
@@ -261,11 +262,11 @@ pub fn main() {
 
     // Run simulation with systems
     for _frame in 0..max_frames {
-        engine.process_frame(&mut world);
+        engine.process_frame();
     }
 
     // Count entities near obstacle
-    let mut count_query = Query::<(&Transform,)>::new(&mut world);
+    let mut count_query = Query::<(&Transform,)>::new(engine.world_mut());
     let near_count = count_query
         .iter_mut()
         .filter(|(transform,)| {
@@ -279,7 +280,7 @@ pub fn main() {
     println!("Entities near obstacle: {}", near_count);
 
     // Calculate average frame time
-    let stats_query = GlobalComponentQuery::<SimulationStats>::new(&mut world);
+    let stats_query = GlobalComponentQuery::<SimulationStats>::new(engine.world_mut());
     let frame_time_ms = if let Some(stats) = stats_query.get() {
         let duration = stats.start_time.elapsed();
         duration.as_millis() as f64 / stats.max_frames as f64

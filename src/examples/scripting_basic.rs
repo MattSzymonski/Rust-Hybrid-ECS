@@ -34,15 +34,15 @@ pub fn main() {
     println!("=== ECS Scripting Example ===\n");
 
     let mut engine = Engine::new();
-    let mut world = World::new();
 
     // Register components
-    world.register_component::<Position>();
-    world.register_script_component::<Counter>();
+    engine.world_mut().register_component::<Position>();
+    engine.world_mut().register_script_component::<Counter>();
 
     // Create entity 1: Counter script only
     println!("Creating entity with counter...");
-    let _entity2 = world
+    let _entity2 = engine
+        .world_mut()
         .create_entity()
         .with(Counter {
             value: 0,
@@ -53,7 +53,8 @@ pub fn main() {
 
     // Create entity 2: Position + both scripts
     println!("Creating entity with position, and counter...\n");
-    let _entity3 = world
+    let _entity3 = engine
+        .world_mut()
         .create_entity()
         .with(Position { x: 5.0, y: 10.0 })
         .with(Counter {
@@ -66,7 +67,7 @@ pub fn main() {
     // Simulate several frames
     for frame in 1..=8 {
         println!("--- Frame {} ---", frame);
-        engine.process_frame(&mut world);
+        engine.process_frame();
         println!();
     }
 
