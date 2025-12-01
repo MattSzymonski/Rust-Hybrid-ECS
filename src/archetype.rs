@@ -14,7 +14,7 @@ use crate::entity::Entity;
 
 /// Type for component storage factory functions
 /// These create empty storage for a specific component type
-pub type StorageFactory = Box<dyn Fn(&mut TraitTypeMap<dyn Component, VecFamily>)>;
+pub type StorageFactory = Box<dyn Fn(&mut TraitTypeMap<dyn Component, VecFamily>) + Send + Sync>;
 
 /// ArchetypeId uniquely identifies an archetype (a unique combination of components)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

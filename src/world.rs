@@ -53,7 +53,7 @@ pub struct World {
     next_free_archetype_id: usize,
     pub(crate) entity_locations: HashMap<Entity, EntityLocation>,
     archetype_lookup: HashMap<ComponentMask, ArchetypeId>,
-    pub(crate) global_components: HashMap<ComponentId, Box<dyn Any>>,
+    pub(crate) global_components: HashMap<ComponentId, Box<dyn Any + Send>>,
     /// Storage factories for creating component storage by TypeId
     storage_factories: HashMap<ComponentId, StorageFactory>,
     /// Component copiers for moving entities between archetypes

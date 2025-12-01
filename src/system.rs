@@ -12,6 +12,7 @@
 use crate::commands::{CommandQueue, Commands};
 use crate::component::Component;
 use crate::query::{GlobalComponentQuery, Query, QueryTarget};
+use crate::scheduler::SystemAccess;
 use crate::world::World;
 
 /// State that persists between system calls
@@ -34,7 +35,9 @@ impl SystemState {
 ///
 /// Systems are functions that operate on World data. They are executed
 /// every frame and can read/write components, spawn entities, etc.
-pub trait System {
+///
+/// Must be Send to support parallel execution.
+pub trait System: Send {
     fn run(&mut self, world: &mut World, queue: &mut CommandQueue, state: &mut SystemState);
 }
 
@@ -43,7 +46,7 @@ pub trait System {
 /// This allows us to store system closures in a Vec<Box<dyn System>>.
 impl<F> System for F
 where
-    F: FnMut(&mut World, &mut CommandQueue, &mut SystemState),
+    F: FnMut(&mut World, &mut CommandQueue, &mut SystemState) + Send,
 {
     fn run(&mut self, world: &mut World, queue: &mut CommandQueue, state: &mut SystemState) {
         self(world, queue, state);
@@ -67,6 +70,14 @@ pub trait SystemParam: Sized {
     /// SAFETY: The returned value has a 'static lifetime for technical reasons,
     /// but it actually only lives as long as the system execution.
     fn fetch(world: &mut World, queue: &mut CommandQueue, state: &mut SystemState) -> Self;
+
+    /// Report component access pattern for dependency analysis
+    ///
+    /// This is called during system registration to build the execution graph.
+    /// Default implementation reports no access (for things like State).
+    fn report_access(_access: &mut SystemAccess) {
+        // Default: no component access
+    }
 }
 
 /// Commands is a SystemParam - provides deferred entity operations
@@ -76,6 +87,12 @@ impl SystemParam for Commands<'static> {
         // We transmute the lifetime to 'static for technical reasons, but
         // the system infrastructure ensures it doesn't outlive its borrow.
         unsafe { std::mem::transmute(Commands::new(queue)) }
+    }
+
+    fn report_access(access: &mut SystemAccess) {
+        // Commands can spawn/despawn entities and add/remove components
+        // This requires exclusive World access
+        access.set_uses_commands(true);
     }
 }
 
@@ -90,6 +107,16 @@ impl<Q: QueryTarget + 'static> SystemParam for Query<'static, Q> {
             // SAFETY: The query will only live as long as the system execution
             let query: Query<Q> = Query::new(world);
             std::mem::transmute(query)
+        }
+    }
+
+    fn report_access(access: &mut SystemAccess) {
+        let (reads, writes) = Q::report_component_access();
+        for comp_id in reads {
+            access.add_read(comp_id);
+        }
+        for comp_id in writes {
+            access.add_write(comp_id);
         }
     }
 }
@@ -135,6 +162,10 @@ macro_rules! impl_system_param_tuple {
             fn fetch(world: &mut World, queue: &mut CommandQueue, state: &mut SystemState) -> Self {
                 ($($T::fetch(world, queue, state),)*)
             }
+
+            fn report_access(access: &mut SystemAccess) {
+                $($T::report_access(access);)*
+            }
         }
     };
 }
@@ -143,6 +174,10 @@ macro_rules! impl_system_param_tuple {
 impl SystemParam for () {
     fn fetch(_world: &mut World, _queue: &mut CommandQueue, _state: &mut SystemState) -> Self {
         ()
+    }
+
+    fn report_access(_access: &mut SystemAccess) {
+        // Empty tuple has no access
     }
 }
 
@@ -172,7 +207,7 @@ macro_rules! impl_system_param_function {
         #[allow(non_snake_case)]
         impl<F, $($T: SystemParam),*> SystemParamFunction<($($T,)*)> for F
         where
-            F: FnMut($($T),*) + 'static,
+            F: FnMut($($T),*) + Send + 'static,
         {
             fn run(&mut self, input: ($($T,)*)) {
                 let ($($T,)*) = input;
@@ -185,7 +220,7 @@ macro_rules! impl_system_param_function {
 // Implement for functions with 0 parameters
 impl<F> SystemParamFunction<()> for F
 where
-    F: FnMut() + 'static,
+    F: FnMut() + Send + 'static,
 {
     fn run(&mut self, _input: ()) {
         self()
@@ -222,7 +257,7 @@ pub trait IntoSystem<Input: SystemParam> {
 /// 4. All wrapped in a System trait object for storage in the Engine
 impl<F, Input> IntoSystem<Input> for F
 where
-    F: SystemParamFunction<Input>,
+    F: SystemParamFunction<Input> + Send + 'static,
     Input: SystemParam,
 {
     fn into_system(mut self) -> Box<dyn System> {

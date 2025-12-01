@@ -27,6 +27,10 @@ pub trait QueryTarget {
     /// Get the list of component IDs required by this query
     fn component_ids() -> Vec<ComponentId>;
 
+    /// Report component access for dependency analysis
+    /// Returns (reads, writes) as vectors of ComponentIds
+    fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>);
+
     /// Initialize state for fetching from an archetype (caches storage pointers)
     fn init_state(archetype: &mut Archetype) -> Self::State;
 
@@ -47,6 +51,10 @@ impl QueryTarget for Entity {
 
     fn component_ids() -> Vec<ComponentId> {
         Vec::new()
+    }
+
+    fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>) {
+        (Vec::new(), Vec::new()) // Entity access doesn't read or write components
     }
 
     fn init_state(archetype: &mut Archetype) -> Self::State {
@@ -77,6 +85,11 @@ impl<T: Component> QueryTarget for &T {
 
     fn component_ids() -> Vec<ComponentId> {
         vec![ComponentId::of::<T>()]
+    }
+
+    fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>) {
+        // Immutable reference = read access
+        (vec![ComponentId::of::<T>()], Vec::new())
     }
 
     fn init_state(archetype: &mut Archetype) -> Self::State {
@@ -111,6 +124,11 @@ impl<T: Component> QueryTarget for &mut T {
 
     fn component_ids() -> Vec<ComponentId> {
         vec![ComponentId::of::<T>()]
+    }
+
+    fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>) {
+        // Mutable reference = write access
+        (Vec::new(), vec![ComponentId::of::<T>()])
     }
 
     fn init_state(archetype: &mut Archetype) -> Self::State {
@@ -148,6 +166,17 @@ macro_rules! impl_query_object_tuple {
                 let mut ids = Vec::new();
                 $(ids.extend($T::component_ids());)*
                 ids
+            }
+
+            fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>) {
+                let mut reads = Vec::new();
+                let mut writes = Vec::new();
+                $(
+                    let (r, w) = $T::report_component_access();
+                    reads.extend(r);
+                    writes.extend(w);
+                )*
+                (reads, writes)
             }
 
             #[allow(non_snake_case)]

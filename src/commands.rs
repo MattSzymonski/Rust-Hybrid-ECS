@@ -16,7 +16,9 @@ use crate::entity::Entity;
 use crate::world::World;
 
 /// Trait for adding a component with its concrete type preserved
-pub(crate) trait ComponentAdder {
+///
+/// Must be Send to support parallel execution of systems.
+pub(crate) trait ComponentAdder: Send {
     fn component_id(&self) -> ComponentId;
     fn add_component_to_storage(
         self: Box<Self>,

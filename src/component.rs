@@ -6,8 +6,8 @@
 use std::any::TypeId;
 use std::collections::HashMap;
 
-/// Component marker trait - all components must be 'static
-pub trait Component: 'static {}
+/// Component marker trait - all components must be 'static and Send
+pub trait Component: Send + 'static {}
 
 /// ComponentId uniquely identifies a component type using its TypeId
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]

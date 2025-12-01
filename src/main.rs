@@ -12,7 +12,8 @@ fn main() {
     println!("Select an example to run:");
     println!("1. Iterators Stress Test");
     println!("2. Scripting Basic");
-    print!("Enter your choice (1-2): ");
+    println!("3. Parallel Systems");
+    print!("Enter your choice (1-3): ");
 
     io::stdout().flush().unwrap();
 
@@ -21,7 +22,8 @@ fn main() {
 
     match input.trim() {
         "1" => examples::iterators_stress_test::main(),
-        "2" => examples::scripting_basic::main(),
+        "2" => examples::scripting_demo::main(),
+        "3" => examples::parallel_systems_demo::main(),
         _ => println!("Invalid choice!"),
     }
 }
