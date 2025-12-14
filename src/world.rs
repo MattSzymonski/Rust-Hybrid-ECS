@@ -49,10 +49,17 @@ pub(crate) struct EntityLocation {
 /// - Maintains component type registry for creating archetype storage
 pub struct World {
     next_free_entity_id: u64,
+    /// Free list of recycled entity IDs with their next generation. Stored as (id, next_generation) pairs
+    free_entity_ids: Vec<(u64, u32)>,
+    /// All archetypes in the world
     pub(crate) archetypes: HashMap<ArchetypeId, Archetype>,
+    /// Next available archetype ID
     next_free_archetype_id: usize,
+    /// Tracks where each entity is located in the archetype system
     pub(crate) entity_locations: HashMap<Entity, EntityLocation>,
+    /// Lookup table mapping component masks to archetype IDs
     archetype_lookup: HashMap<ComponentMask, ArchetypeId>,
+    /// Global components not attached to any entity
     pub(crate) global_components: HashMap<ComponentId, Box<dyn Any + Send>>,
     /// Storage factories for creating component storage by TypeId
     storage_factories: HashMap<ComponentId, StorageFactory>,
@@ -71,6 +78,7 @@ impl World {
     pub fn new() -> Self {
         Self {
             next_free_entity_id: 0,
+            free_entity_ids: Vec::new(),
             archetypes: HashMap::new(),
             next_free_archetype_id: 0,
             entity_locations: HashMap::new(),
@@ -225,6 +233,14 @@ impl World {
             .and_then(|boxed| boxed.downcast_mut::<T>())
     }
 
+    /// Check if an entity exists and is valid (not destroyed/recycled)
+    ///
+    /// Returns true if the entity exists in the world with the correct generation.
+    /// Returns false if the entity was destroyed or if its ID was recycled with a new generation.
+    pub fn is_entity_valid(&self, entity: Entity) -> bool {
+        self.entity_locations.contains_key(&entity)
+    }
+
     /// Get immutable reference to a component on an entity
     ///
     /// Returns None if the entity doesn't exist or doesn't have the component.
@@ -278,13 +294,22 @@ impl World {
     }
 
     /// Allocate a new unique entity ID
+    ///
+    /// Reuses IDs from the free list when available, incrementing the generation
+    /// to invalidate any stale handles. Otherwise allocates a fresh ID.
     pub(crate) fn allocate_entity(&mut self) -> Entity {
-        let entity = Entity {
-            id: self.next_free_entity_id,
-            generation: 0,
-        };
-        self.next_free_entity_id += 1;
-        entity
+        // Try to reuse an ID from the free list
+        if let Some((id, generation)) = self.free_entity_ids.pop() {
+            Entity { id, generation }
+        } else {
+            // Allocate a fresh ID
+            let entity = Entity {
+                id: self.next_free_entity_id,
+                generation: 0,
+            };
+            self.next_free_entity_id += 1;
+            entity
+        }
     }
 
     /// Get or create an archetype for a given set of components
@@ -520,6 +545,11 @@ impl World {
             self.archetypes.remove(&archetype_id);
             self.archetype_lookup.remove(&mask);
         }
+
+        // Add entity ID to free list with incremented generation for recycling
+        // This allows the ID to be reused, but with a new generation to invalidate old handles
+        self.free_entity_ids
+            .push((entity.id, entity.generation.wrapping_add(1)));
 
         true
     }
@@ -1370,5 +1400,370 @@ mod tests {
         );
 
         println!("✓ Component names verified: {:?}", comp_names);
+    }
+
+    /// Tests entity generation system for safe ID recycling.
+    ///
+    /// This test verifies that:
+    /// - Entity IDs are recycled after destruction
+    /// - Generations are incremented when IDs are reused
+    /// - Stale handles (old generation) cannot access recycled entities
+    /// - New entities with recycled IDs work correctly
+    ///
+    /// Expected results:
+    /// - Destroyed entity's ID should be reused for new entity
+    /// - New entity should have same ID but different generation
+    /// - Old handle should be invalid (is_entity_valid returns false)
+    /// - Old handle should not access new entity's components
+    #[test]
+    fn test_entity_generations() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Velocity>();
+
+        // Create first entity
+        let entity1 = world
+            .create_entity()
+            .with(Position { x: 10.0, y: 20.0 })
+            .build();
+
+        println!("Entity1: id={}, gen={}", entity1.id, entity1.generation);
+        assert_eq!(entity1.id, 0, "First entity should have ID 0");
+        assert_eq!(
+            entity1.generation, 0,
+            "First entity should have generation 0"
+        );
+
+        // Verify entity1 exists and has component
+        assert!(world.is_entity_valid(entity1), "Entity1 should be valid");
+        assert!(
+            world.get_component::<Position>(entity1).is_some(),
+            "Entity1 should have Position"
+        );
+
+        // Destroy entity1
+        let destroyed = world.destroy_entity(entity1);
+        assert!(destroyed, "Entity1 should be destroyed successfully");
+
+        // Verify entity1 is no longer valid
+        assert!(
+            !world.is_entity_valid(entity1),
+            "Entity1 should be invalid after destruction"
+        );
+        assert!(
+            world.get_component::<Position>(entity1).is_none(),
+            "Destroyed entity should not have components"
+        );
+
+        // Create a new entity - should reuse ID 0 with generation 1
+        let entity2 = world
+            .create_entity()
+            .with(Velocity { x: 5.0, y: 10.0 })
+            .build();
+
+        println!("Entity2: id={}, gen={}", entity2.id, entity2.generation);
+        assert_eq!(entity2.id, 0, "New entity should reuse ID 0");
+        assert_eq!(entity2.generation, 1, "New entity should have generation 1");
+
+        // Verify entity2 is valid
+        assert!(world.is_entity_valid(entity2), "Entity2 should be valid");
+        assert!(
+            world.get_component::<Velocity>(entity2).is_some(),
+            "Entity2 should have Velocity"
+        );
+
+        // Critical: Old handle (entity1) should NOT access entity2's data
+        assert!(
+            !world.is_entity_valid(entity1),
+            "Old handle should still be invalid"
+        );
+        assert!(
+            world.get_component::<Velocity>(entity1).is_none(),
+            "Old handle should not access new entity's components"
+        );
+        assert!(
+            world.get_component::<Position>(entity1).is_none(),
+            "Old handle should not access any components"
+        );
+
+        // Verify they are different entities (different hash/eq)
+        assert_ne!(
+            entity1, entity2,
+            "Entities with different generations should not be equal"
+        );
+
+        println!("✓ Entity generation recycling works correctly!");
+    }
+
+    /// Tests multiple rounds of entity recycling.
+    ///
+    /// This test verifies that:
+    /// - Multiple destroy/create cycles correctly increment generations
+    /// - The free list works correctly with multiple recycled IDs
+    /// - Generations wrap around safely (using wrapping_add)
+    #[test]
+    fn test_multiple_entity_recycling_rounds() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+
+        // Create and destroy the same ID multiple times
+        let mut last_entity = world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build();
+        assert_eq!(last_entity.id, 0);
+        assert_eq!(last_entity.generation, 0);
+
+        for round in 1..=5 {
+            let old_entity = last_entity;
+            world.destroy_entity(old_entity);
+
+            let new_entity = world
+                .create_entity()
+                .with(Position {
+                    x: round as f32,
+                    y: 0.0,
+                })
+                .build();
+
+            assert_eq!(new_entity.id, 0, "Should reuse ID 0 in round {}", round);
+            assert_eq!(
+                new_entity.generation, round,
+                "Generation should be {} in round {}",
+                round, round
+            );
+
+            // Old handle should be invalid
+            assert!(!world.is_entity_valid(old_entity));
+            // New handle should be valid
+            assert!(world.is_entity_valid(new_entity));
+
+            last_entity = new_entity;
+        }
+
+        println!("✓ Multiple recycling rounds work correctly!");
+    }
+
+    /// Tests that multiple entities can be recycled independently.
+    ///
+    /// This test verifies LIFO (stack) behavior of the free list.
+    #[test]
+    fn test_free_list_lifo_order() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+
+        // Create 3 entities
+        let entity0 = world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build();
+        let entity1 = world
+            .create_entity()
+            .with(Position { x: 1.0, y: 1.0 })
+            .build();
+        let entity2 = world
+            .create_entity()
+            .with(Position { x: 2.0, y: 2.0 })
+            .build();
+
+        assert_eq!(entity0.id, 0);
+        assert_eq!(entity1.id, 1);
+        assert_eq!(entity2.id, 2);
+
+        // Destroy in order: entity0, entity1, entity2
+        world.destroy_entity(entity0);
+        world.destroy_entity(entity1);
+        world.destroy_entity(entity2);
+
+        // Free list should be: [(0, 1), (1, 1), (2, 1)]
+        // Pop order (LIFO): entity2's ID first, then entity1's, then entity0's
+
+        let new_entity1 = world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build();
+        assert_eq!(new_entity1.id, 2, "Should pop ID 2 first (LIFO)");
+        assert_eq!(new_entity1.generation, 1);
+
+        let new_entity2 = world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build();
+        assert_eq!(new_entity2.id, 1, "Should pop ID 1 second");
+        assert_eq!(new_entity2.generation, 1);
+
+        let new_entity3 = world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build();
+        assert_eq!(new_entity3.id, 0, "Should pop ID 0 third");
+        assert_eq!(new_entity3.generation, 1);
+
+        // Next entity should get a fresh ID
+        let new_entity4 = world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build();
+        assert_eq!(new_entity4.id, 3, "Should allocate fresh ID 3");
+        assert_eq!(new_entity4.generation, 0);
+
+        println!("✓ Free list LIFO order works correctly!");
+    }
+
+    /// Tests entity generations with multiple archetypes and component removal.
+    ///
+    /// This test verifies that:
+    /// - Entities in different archetypes have independent generation tracking
+    /// - Removing components (which moves entity to new archetype) preserves entity identity
+    /// - Destroying entities from different archetypes correctly adds IDs to free list
+    /// - Recycled IDs work correctly regardless of which archetype the original was in
+    #[test]
+    fn test_generations_with_multiple_archetypes_and_component_removal() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Velocity>();
+        world.register_component::<Health>();
+
+        // Create 3 entities:
+        // entity1, entity2: Position + Velocity (same archetype)
+        // entity3: Position + Health (different archetype)
+        let entity1 = world
+            .create_entity()
+            .with(Position { x: 1.0, y: 1.0 })
+            .with(Velocity { x: 10.0, y: 10.0 })
+            .build();
+
+        let entity2 = world
+            .create_entity()
+            .with(Position { x: 2.0, y: 2.0 })
+            .with(Velocity { x: 20.0, y: 20.0 })
+            .build();
+
+        let entity3 = world
+            .create_entity()
+            .with(Position { x: 3.0, y: 3.0 })
+            .with(Health { hp: 100 })
+            .build();
+
+        println!(
+            "Created: entity1(id={}, gen={}), entity2(id={}, gen={}), entity3(id={}, gen={})",
+            entity1.id,
+            entity1.generation,
+            entity2.id,
+            entity2.generation,
+            entity3.id,
+            entity3.generation
+        );
+
+        assert_eq!(entity1.id, 0);
+        assert_eq!(entity2.id, 1);
+        assert_eq!(entity3.id, 2);
+        assert_eq!(world.archetypes.len(), 2, "Should have 2 archetypes");
+
+        // Remove Velocity from entity1 - moves it to Position-only archetype
+        let old_entity1 = entity1;
+        let removed = world.remove_component::<Velocity>(entity1);
+        assert!(removed, "Should remove Velocity from entity1");
+
+        // entity1 should still be valid with same id and generation (entity wasn't destroyed)
+        assert!(
+            world.is_entity_valid(entity1),
+            "entity1 should still be valid after component removal"
+        );
+        assert!(
+            world.get_component::<Position>(entity1).is_some(),
+            "entity1 should still have Position"
+        );
+        assert!(
+            world.get_component::<Velocity>(entity1).is_none(),
+            "entity1 should not have Velocity"
+        );
+
+        // Destroy entity2 (from Position+Velocity archetype)
+        let old_entity2 = entity2;
+        world.destroy_entity(entity2);
+        assert!(
+            !world.is_entity_valid(old_entity2),
+            "entity2 should be invalid after destruction"
+        );
+
+        // Destroy entity3 (from Position+Health archetype)
+        let old_entity3 = entity3;
+        world.destroy_entity(entity3);
+        assert!(
+            !world.is_entity_valid(old_entity3),
+            "entity3 should be invalid after destruction"
+        );
+
+        // Free list should now have: [(1, 1), (2, 1)] (LIFO order)
+        // entity1 (id=0) is still alive
+
+        // Create new entity - should reuse ID 2 (last destroyed)
+        let new_entity1 = world.create_entity().with(Health { hp: 50 }).build();
+
+        println!(
+            "new_entity1: id={}, gen={}",
+            new_entity1.id, new_entity1.generation
+        );
+        assert_eq!(new_entity1.id, 2, "Should reuse ID 2 (LIFO)");
+        assert_eq!(new_entity1.generation, 1, "Should have generation 1");
+
+        // Old entity3 handle should NOT access new_entity1's data
+        assert!(
+            !world.is_entity_valid(old_entity3),
+            "Old entity3 handle should be invalid"
+        );
+        assert!(
+            world.get_component::<Health>(old_entity3).is_none(),
+            "Old handle should not access new entity"
+        );
+
+        // Create another entity - should reuse ID 1
+        let new_entity2 = world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .with(Velocity { x: 0.0, y: 0.0 })
+            .build();
+
+        println!(
+            "new_entity2: id={}, gen={}",
+            new_entity2.id, new_entity2.generation
+        );
+        assert_eq!(new_entity2.id, 1, "Should reuse ID 1");
+        assert_eq!(new_entity2.generation, 1, "Should have generation 1");
+
+        // Old entity2 handle should NOT access new_entity2's data
+        assert!(
+            !world.is_entity_valid(old_entity2),
+            "Old entity2 handle should be invalid"
+        );
+
+        // Verify entity1 (never destroyed) still works with original handle
+        assert!(
+            world.is_entity_valid(old_entity1),
+            "Original entity1 should still be valid"
+        );
+        let pos = world.get_component::<Position>(old_entity1).unwrap();
+        assert_eq!(pos.x, 1.0, "entity1 Position should be preserved");
+
+        // Destroy entity1 and verify recycling
+        world.destroy_entity(entity1);
+        assert!(
+            !world.is_entity_valid(old_entity1),
+            "entity1 should be invalid after destruction"
+        );
+
+        let new_entity3 = world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build();
+        println!(
+            "new_entity3: id={}, gen={}",
+            new_entity3.id, new_entity3.generation
+        );
+        assert_eq!(new_entity3.id, 0, "Should reuse ID 0");
+        assert_eq!(new_entity3.generation, 1, "Should have generation 1");
+
+        println!("✓ Generations with multiple archetypes and component removal work correctly!");
     }
 }
