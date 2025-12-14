@@ -480,17 +480,6 @@ impl<'w, Q: QueryTarget> Iterator for QueryIterMut<'w, Q> {
             }
         }
     }
-
-    #[inline]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        // Provide size hint for better iterator optimizations
-        let remaining = self
-            .matching_archetypes
-            .get(self.current_archetype_idx..)
-            .map(|archs| archs.len())
-            .unwrap_or(0);
-        (0, Some(remaining * 64)) // Rough estimate: 64 entities per archetype average
-    }
 }
 
 impl<'w, Q: QueryTarget> QueryIterMut<'w, Q> {
@@ -561,10 +550,33 @@ where
         self.archetype_ranges.iter().map(|(_, _, len)| *len).sum()
     }
 
-    /// Execute a closure on each entity in parallel
+    /// Set the minimum batch size for parallel iteration
     ///
-    /// This is the primary way to use parallel iteration. The closure
-    /// receives the query result for each entity and can mutate components.
+    /// Larger batches reduce overhead but may cause load imbalance.
+    /// Smaller batches improve load balancing but increase overhead.
+    ///
+    /// # Guidelines
+    /// - **Small work per entity** (simple math): use larger batches (1000-10000)
+    /// - **Heavy work per entity** (complex calculations): use smaller batches (10-100)
+    /// - **Default Rayon behavior**: adaptive splitting (~entity_count / num_threads)
+    ///
+    /// # Example
+    /// ```ignore
+    /// query.par_iter_mut()
+    ///     .with_batch_size(500)
+    ///     .for_each(|(transform, velocity)| {
+    ///         transform.x += velocity.x * delta_time;
+    ///     });
+    /// ```
+    pub fn with_batch_size(self, min_batch_size: usize) -> ParQueryIterMutBatched<'w, Q> {
+        ParQueryIterMutBatched {
+            archetype_ranges: self.archetype_ranges,
+            min_batch_size,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Execute a closure on each entity in parallel
     ///
     /// # Example
     /// ```ignore
@@ -588,33 +600,65 @@ where
             });
     }
 
-    /// Execute a closure on each entity in parallel with custom batch size
+    /// Enable batch tracking for parallel iteration
     ///
-    /// The `min_batch_size` parameter controls the minimum number of entities
-    /// that will be processed by a single thread. Larger batches reduce overhead
-    /// but may cause load imbalance. Smaller batches improve load balancing but
-    /// increase overhead.
-    ///
-    /// # Guidelines
-    /// - **Small work per entity** (simple math): use larger batches (1000-10000)
-    /// - **Heavy work per entity** (complex calculations): use smaller batches (10-100)
-    /// - **Default Rayon behavior**: ~1000 items per batch
+    /// Returns a tracked iterator that will collect statistics during iteration.
     ///
     /// # Example
     /// ```ignore
-    /// // Process in batches of at least 500 entities per thread
-    /// query.par_iter_mut().for_each_batched(500, |(transform, velocity)| {
+    /// let stats = query.par_iter_mut().tracked().for_each(|(transform, velocity)| {
     ///     transform.x += velocity.x * delta_time;
     /// });
+    /// println!("{}", stats);
     /// ```
-    pub fn for_each_batched<F>(self, min_batch_size: usize, f: F)
+    pub fn tracked(self) -> ParQueryIterMutTracked<'w, Q> {
+        ParQueryIterMutTracked {
+            archetype_ranges: self.archetype_ranges,
+            min_batch_size: None,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Parallel iterator with custom batch size
+pub struct ParQueryIterMutBatched<'w, Q: QueryTarget> {
+    archetype_ranges: Vec<(ArchetypeId, Q::State, usize)>,
+    min_batch_size: usize,
+    _phantom: std::marker::PhantomData<&'w mut Q>,
+}
+
+unsafe impl<'w, Q: QueryTarget> Send for ParQueryIterMutBatched<'w, Q> where Q::State: Send {}
+unsafe impl<'w, Q: QueryTarget> Sync for ParQueryIterMutBatched<'w, Q> where Q::State: Sync {}
+
+impl<'w, Q: QueryTarget> ParQueryIterMutBatched<'w, Q>
+where
+    Q::State: Send + Sync,
+    for<'a> Q::Item<'a>: Send,
+{
+    /// Get the total number of entities that will be processed
+    pub fn entity_count(&self) -> usize {
+        self.archetype_ranges.iter().map(|(_, _, len)| *len).sum()
+    }
+
+    /// Execute a closure on each entity in parallel with the configured batch size
+    ///
+    /// # Example
+    /// ```ignore
+    /// query.par_iter_mut()
+    ///     .with_batch_size(500)
+    ///     .for_each(|(transform, velocity)| {
+    ///         transform.x += velocity.x * delta_time;
+    ///     });
+    /// ```
+    pub fn for_each<F>(self, f: F)
     where
         F: Fn(Q::Item<'_>) + Send + Sync,
     {
+        let min_batch_size = self.min_batch_size;
+
         self.archetype_ranges
             .into_par_iter()
             .for_each(|(_, state, len)| {
-                // Use with_min_len to control batch size
                 (0..len)
                     .into_par_iter()
                     .with_min_len(min_batch_size)
@@ -625,19 +669,64 @@ where
             });
     }
 
-    /// Execute a closure on each entity in parallel with batch tracking
+    /// Enable batch tracking for parallel iteration
     ///
-    /// Returns `BatchStats` containing information about how the work was
-    /// distributed across batches. This is useful for performance tuning.
+    /// Returns a tracked iterator that will collect statistics during iteration.
     ///
     /// # Example
     /// ```ignore
-    /// let stats = query.par_iter_mut().for_each_tracked(|(transform, velocity)| {
+    /// let stats = query.par_iter_mut()
+    ///     .with_batch_size(500)
+    ///     .tracked()
+    ///     .for_each(|(transform, velocity)| {
+    ///         transform.x += velocity.x * delta_time;
+    ///     });
+    /// println!("{}", stats);
+    /// ```
+    pub fn tracked(self) -> ParQueryIterMutTracked<'w, Q> {
+        ParQueryIterMutTracked {
+            archetype_ranges: self.archetype_ranges,
+            min_batch_size: Some(self.min_batch_size),
+            _phantom: std::marker::PhantomData,
+        }
+    }
+}
+
+/// Parallel iterator with tracking enabled
+///
+/// Created by calling `.tracked()` on a `ParQueryIterMut` or `ParQueryIterMutBatched`.
+/// All iteration methods return `BatchStats` with accurate tracking data.
+pub struct ParQueryIterMutTracked<'w, Q: QueryTarget> {
+    archetype_ranges: Vec<(ArchetypeId, Q::State, usize)>,
+    min_batch_size: Option<usize>,
+    _phantom: std::marker::PhantomData<&'w mut Q>,
+}
+
+unsafe impl<'w, Q: QueryTarget> Send for ParQueryIterMutTracked<'w, Q> where Q::State: Send {}
+unsafe impl<'w, Q: QueryTarget> Sync for ParQueryIterMutTracked<'w, Q> where Q::State: Sync {}
+
+impl<'w, Q: QueryTarget> ParQueryIterMutTracked<'w, Q>
+where
+    Q::State: Send + Sync,
+    for<'a> Q::Item<'a>: Send,
+{
+    /// Get the total number of entities that will be processed
+    pub fn entity_count(&self) -> usize {
+        self.archetype_ranges.iter().map(|(_, _, len)| *len).sum()
+    }
+
+    /// Execute a closure on each entity in parallel with batch tracking
+    ///
+    /// Returns `BatchStats` with accurate information about batch distribution.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let stats = query.par_iter_mut().tracked().for_each(|(transform, velocity)| {
     ///     transform.x += velocity.x * delta_time;
     /// });
     /// println!("Batches: {}, avg size: {}", stats.batch_count, stats.avg_batch_size);
     /// ```
-    pub fn for_each_tracked<F>(self, f: F) -> BatchStats
+    pub fn for_each<F>(self, f: F) -> BatchStats
     where
         F: Fn(Q::Item<'_>) + Send + Sync,
     {
@@ -646,69 +735,7 @@ where
         let min_batch = Arc::new(AtomicUsize::new(usize::MAX));
         let max_batch = Arc::new(AtomicUsize::new(0));
         let total_entities = self.entity_count();
-
-        self.archetype_ranges
-            .into_par_iter()
-            .for_each(|(_, state, len)| {
-                // Each call to fold_with creates a batch
-                let batch_count = Arc::clone(&batch_count);
-                let min_batch = Arc::clone(&min_batch);
-                let max_batch = Arc::clone(&max_batch);
-
-                (0..len)
-                    .into_par_iter()
-                    .fold_with(0usize, |count, index| {
-                        let item = Q::fetch_mut_with_state(&state, index);
-                        f(item);
-                        count + 1
-                    })
-                    .for_each(|batch_size| {
-                        // This runs once per completed batch
-                        batch_count.fetch_add(1, Ordering::Relaxed);
-                        min_batch.fetch_min(batch_size, Ordering::Relaxed);
-                        max_batch.fetch_max(batch_size, Ordering::Relaxed);
-                    });
-            });
-
-        let batch_count = batch_count.load(Ordering::Relaxed);
-        let min_batch_size = min_batch.load(Ordering::Relaxed);
-        let max_batch_size = max_batch.load(Ordering::Relaxed);
-
-        BatchStats {
-            num_threads,
-            batch_count,
-            total_entities,
-            min_batch_size: if batch_count > 0 { min_batch_size } else { 0 },
-            max_batch_size,
-            avg_batch_size: if batch_count > 0 {
-                total_entities as f64 / batch_count as f64
-            } else {
-                0.0
-            },
-        }
-    }
-
-    /// Execute a closure on each entity in parallel with batch tracking and custom batch size
-    ///
-    /// Combines batch size control with batch tracking. Returns `BatchStats`
-    /// containing information about how the work was distributed.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let stats = query.par_iter_mut().for_each_batched_tracked(500, |(transform, velocity)| {
-    ///     transform.x += velocity.x * delta_time;
-    /// });
-    /// println!("Batches: {}, min: {}, max: {}", stats.batch_count, stats.min_batch_size, stats.max_batch_size);
-    /// ```
-    pub fn for_each_batched_tracked<F>(self, min_batch_size: usize, f: F) -> BatchStats
-    where
-        F: Fn(Q::Item<'_>) + Send + Sync,
-    {
-        let num_threads = rayon::current_num_threads();
-        let batch_count = Arc::new(AtomicUsize::new(0));
-        let min_batch = Arc::new(AtomicUsize::new(usize::MAX));
-        let max_batch = Arc::new(AtomicUsize::new(0));
-        let total_entities = self.entity_count();
+        let min_batch_size = self.min_batch_size;
 
         self.archetype_ranges
             .into_par_iter()
@@ -717,19 +744,23 @@ where
                 let min_batch = Arc::clone(&min_batch);
                 let max_batch = Arc::clone(&max_batch);
 
-                (0..len)
-                    .into_par_iter()
-                    .with_min_len(min_batch_size)
-                    .fold_with(0usize, |count, index| {
-                        let item = Q::fetch_mut_with_state(&state, index);
-                        f(item);
-                        count + 1
-                    })
-                    .for_each(|batch_size| {
-                        batch_count.fetch_add(1, Ordering::Relaxed);
-                        min_batch.fetch_min(batch_size, Ordering::Relaxed);
-                        max_batch.fetch_max(batch_size, Ordering::Relaxed);
-                    });
+                let iter = (0..len).into_par_iter();
+                let iter = if let Some(batch_size) = min_batch_size {
+                    iter.with_min_len(batch_size)
+                } else {
+                    iter.with_min_len(1) // Use default Rayon behavior
+                };
+
+                iter.fold_with(0usize, |count, index| {
+                    let item = Q::fetch_mut_with_state(&state, index);
+                    f(item);
+                    count + 1
+                })
+                .for_each(|batch_size| {
+                    batch_count.fetch_add(1, Ordering::Relaxed);
+                    min_batch.fetch_min(batch_size, Ordering::Relaxed);
+                    max_batch.fetch_max(batch_size, Ordering::Relaxed);
+                });
             });
 
         let batch_count = batch_count.load(Ordering::Relaxed);
