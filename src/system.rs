@@ -112,11 +112,11 @@ impl<Q: QueryTarget + 'static> SystemParam for Query<'static, Q> {
 
     fn report_access(access: &mut SystemAccess) {
         let (reads, writes) = Q::report_component_access();
-        for comp_id in reads {
-            access.add_read(comp_id);
+        for component_id in reads {
+            access.add_read(component_id);
         }
-        for comp_id in writes {
-            access.add_write(comp_id);
+        for component_id in writes {
+            access.add_write(component_id);
         }
     }
 }

@@ -91,13 +91,13 @@ impl World {
     where
         T: Component + TraitAccessible<dyn Component> + Clone,
     {
-        let comp_id = ComponentId::of::<T>();
+        let component_id = ComponentId::of::<T>();
 
         // Register component (bit index + name)
         self.component_registry.register::<T>();
 
         self.storage_factories.insert(
-            comp_id,
+            component_id,
             Box::new(|map: &mut TraitTypeMap<dyn Component, VecFamily>| {
                 map.register_type_storage::<T>();
             }),
@@ -105,7 +105,7 @@ impl World {
 
         // Register copier function for this component type
         self.component_copiers.insert(
-            comp_id,
+            component_id,
             Arc::new(
                 |src: &TraitTypeMap<dyn Component, VecFamily>,
                  dst: &mut TraitTypeMap<dyn Component, VecFamily>,
@@ -130,13 +130,13 @@ impl World {
         self.register_component::<T>();
 
         // Then track it as a script component
-        let comp_id = ComponentId::of::<T>();
-        if let Some(bit) = self.component_registry.get_bit(&comp_id) {
-            self.script_components.push((comp_id, bit));
+        let component_id = ComponentId::of::<T>();
+        if let Some(bit) = self.component_registry.get_bit(&component_id) {
+            self.script_components.push((component_id, bit));
 
             // Register updater callback for this script component
             self.script_updaters.insert(
-                comp_id,
+                component_id,
                 Arc::new(
                     |storage: &mut TraitTypeMap<dyn Component, VecFamily>,
                      index: usize,
@@ -164,9 +164,9 @@ impl World {
         // Collect script component info to avoid borrow issues
         let script_info: Vec<(ComponentId, u8)> = self.script_components.clone();
 
-        for (comp_id, comp_bit) in script_info {
+        for (component_id, comp_bit) in script_info {
             // Get the updater for this component type
-            let updater = match self.script_updaters.get(&comp_id) {
+            let updater = match self.script_updaters.get(&component_id) {
                 Some(u) => Arc::clone(u),
                 None => continue,
             };
@@ -298,8 +298,8 @@ impl World {
 
         // Build component mask from component IDs
         let mut component_mask = ComponentMask::empty();
-        for comp_id in &component_ids {
-            if let Some(bit) = self.component_registry.get_bit(comp_id) {
+        for component_id in &component_ids {
+            if let Some(bit) = self.component_registry.get_bit(component_id) {
                 component_mask.set(bit);
             }
         }
@@ -504,8 +504,8 @@ impl World {
 
             // Also need to swap_remove from all component storages
             // This is tricky with TraitTypeMap - we need to know the component types
-            for comp_id in &archetype.component_types {
-                if let Some(_copier) = self.component_copiers.get(comp_id) {
+            for component_id in &archetype.component_types {
+                if let Some(_copier) = self.component_copiers.get(component_id) {
                     // Use a special swap_remove operation
                     // For now, we'll leave components in place (memory leak)
                     // A full implementation would need swap_remove support in VecOptionStorage
@@ -528,7 +528,7 @@ impl World {
     ///
     /// Returns true if the component was removed, false if entity doesn't exist or doesn't have the component.
     pub fn remove_component<T: Component>(&mut self, entity: Entity) -> bool {
-        let comp_id = ComponentId::of::<T>();
+        let component_id = ComponentId::of::<T>();
 
         // Get current location
         let location = match self.entity_locations.get(&entity) {
@@ -542,7 +542,7 @@ impl World {
         };
 
         // Check if entity has this component
-        if !old_archetype.component_types.contains(&comp_id) {
+        if !old_archetype.component_types.contains(&component_id) {
             return false; // Component not present
         }
 
@@ -550,7 +550,7 @@ impl World {
         let new_component_ids: Vec<ComponentId> = old_archetype
             .component_types
             .iter()
-            .filter(|&id| *id != comp_id)
+            .filter(|&id| *id != component_id)
             .cloned()
             .collect();
 
@@ -562,7 +562,7 @@ impl World {
         // Collect copiers for all components except the one being removed
         let copiers: Vec<_> = new_component_ids
             .iter()
-            .filter_map(|comp_id| self.component_copiers.get(comp_id).map(Arc::clone))
+            .filter_map(|component_id| self.component_copiers.get(component_id).map(Arc::clone))
             .collect();
 
         // Move entity to new archetype without the removed component
@@ -587,7 +587,7 @@ impl World {
     where
         T: Component + TraitAccessible<dyn Component> + Clone,
     {
-        let comp_id = ComponentId::of::<T>();
+        let component_id = ComponentId::of::<T>();
 
         // Get current location
         let location = match self.entity_locations.get(&entity) {
@@ -601,20 +601,20 @@ impl World {
         };
 
         // Check if entity already has this component
-        if old_archetype.component_types.contains(&comp_id) {
+        if old_archetype.component_types.contains(&component_id) {
             return false; // Already has component
         }
 
         // Build new component list with the added component
         let mut new_component_ids = old_archetype.component_types.clone();
-        new_component_ids.push(comp_id);
+        new_component_ids.push(component_id);
         new_component_ids.sort();
 
         // Collect copiers for existing components
         let copiers: Vec<_> = old_archetype
             .component_types
             .iter()
-            .filter_map(|comp_id| self.component_copiers.get(comp_id).map(Arc::clone))
+            .filter_map(|component_id| self.component_copiers.get(component_id).map(Arc::clone))
             .collect();
 
         // Move entity to new archetype with the additional component
@@ -824,21 +824,26 @@ mod tests {
             let comp_names: Vec<String> = archetype
                 .component_types
                 .iter()
-                .filter_map(|comp_id| world.component_registry.get_name(comp_id).map(String::from))
+                .filter_map(|component_id| {
+                    world
+                        .component_registry
+                        .get_name(component_id)
+                        .map(String::from)
+                })
                 .collect();
 
             println!("Components: {:?}", comp_names);
 
             // Build expected mask from component types
             let mut expected_mask = ComponentMask::empty();
-            for comp_id in &archetype.component_types {
-                if let Some(bit) = world.component_registry.get_bit(comp_id) {
+            for component_id in &archetype.component_types {
+                if let Some(bit) = world.component_registry.get_bit(component_id) {
                     expected_mask.set(bit);
                     println!(
                         "  - {:?} -> bit {}",
                         world
                             .component_registry
-                            .get_name(comp_id)
+                            .get_name(component_id)
                             .unwrap_or("Unknown"),
                         bit
                     );
@@ -1339,7 +1344,12 @@ mod tests {
         let comp_names: Vec<String> = archetype
             .component_types
             .iter()
-            .filter_map(|comp_id| world.component_registry.get_name(comp_id).map(String::from))
+            .filter_map(|component_id| {
+                world
+                    .component_registry
+                    .get_name(component_id)
+                    .map(String::from)
+            })
             .collect();
 
         assert_eq!(comp_names.len(), 2, "Should have 2 component names");

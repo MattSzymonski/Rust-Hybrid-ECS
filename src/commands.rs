@@ -242,7 +242,9 @@ impl CommandQueue {
                     // Collect copiers for remaining components
                     let component_copiers: Vec<_> = new_component_ids
                         .iter()
-                        .filter_map(|comp_id| world.component_copiers.get(comp_id).map(Arc::clone))
+                        .filter_map(|component_id| {
+                            world.component_copiers.get(component_id).map(Arc::clone)
+                        })
                         .collect();
 
                     // Move entity to new archetype without the removed component

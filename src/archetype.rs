@@ -47,13 +47,13 @@ impl Archetype {
         let mut component_storages = TraitTypeMap::new();
 
         // Register storage for each component type using the factory
-        for &comp_id in &component_types {
-            if let Some(factory) = storage_factories.get(&comp_id) {
+        for &component_id in &component_types {
+            if let Some(factory) = storage_factories.get(&component_id) {
                 factory(&mut component_storages);
             } else {
                 panic!(
                     "Component type {:?} not registered in storage factories",
-                    comp_id
+                    component_id
                 );
             }
         }
@@ -87,7 +87,7 @@ impl Archetype {
         let component_names: Vec<String> = self
             .component_types
             .iter()
-            .map(|comp_id| registry.get_name(comp_id).unwrap_or("Unknown").to_string())
+            .map(|component_id| registry.get_name(component_id).unwrap_or("Unknown").to_string())
             .collect();
 
         println!(
