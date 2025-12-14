@@ -476,23 +476,31 @@ impl World {
             );
         }
 
-        // Remove entity from old archetype
-        // We can't easily swap_remove without also swapping component data,
-        // so we use regular remove (O(n) but simpler for now)
+        // Remove entity from old archetype using swap_remove for O(1) removal
         let old_archetype = self.archetypes.get_mut(&old_archetype_id).unwrap();
-        old_archetype.entities.remove(old_index);
 
-        // Update indices for all entities after this one
-        for i in old_index..old_archetype.entities.len() {
-            let ent = old_archetype.entities[i];
-            self.entity_locations
-                .get_mut(&ent)
-                .unwrap()
-                .index_in_archetype = i;
+        if old_index < old_archetype.entities.len() {
+            old_archetype.entities.swap_remove(old_index);
+
+            // Update the location of the entity that was swapped (if any)
+            if old_index < old_archetype.entities.len() {
+                let swapped_entity = old_archetype.entities[old_index];
+                if let Some(swapped_location) = self.entity_locations.get_mut(&swapped_entity) {
+                    swapped_location.index_in_archetype = old_index;
+                }
+            }
+
+            // Also swap_remove from all component storages to keep them in sync
+            let component_types: Vec<ComponentId> = old_archetype.component_types.clone();
+            for component_id in component_types {
+                if let Some(storage) = old_archetype
+                    .component_storages
+                    .get_trait_storage_mut(component_id.0)
+                {
+                    storage.swap_remove(old_index);
+                }
+            }
         }
-
-        // Note: Component data remains in storage. A production implementation would
-        // also remove components, but TraitTypeMap's VecOptionStorage makes this complex.
 
         // Clean up empty archetype - remove it from world to prevent memory leaks
         if old_archetype.entities.is_empty() {
@@ -1847,5 +1855,111 @@ mod tests {
         );
 
         println!("✓ Component swap_remove works correctly!");
+    }
+
+    /// Tests that component data is properly cleaned up when an entity migrates between archetypes.
+    ///
+    /// When an entity gains or loses a component, it moves to a different archetype.
+    /// The old archetype must properly remove the entity's component data using swap_remove.
+    /// Otherwise:
+    /// 1. Memory leaks occur (orphaned component data)
+    /// 2. Other entities in the old archetype may read wrong component data
+    ///
+    /// This test verifies:
+    /// - Component data is removed from old archetype during migration
+    /// - Other entities in the old archetype still have correct component data
+    /// - The swapped entity (if any) correctly maps to its swapped component data
+    #[test]
+    fn test_component_cleanup_on_archetype_migration() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Velocity>();
+        world.register_component::<Health>();
+
+        // Create 3 entities with Position + Velocity in the same archetype
+        let entity0 = world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .with(Velocity { x: 100.0, y: 100.0 })
+            .build();
+        let entity1 = world
+            .create_entity()
+            .with(Position { x: 1.0, y: 1.0 })
+            .with(Velocity { x: 101.0, y: 101.0 })
+            .build();
+        let entity2 = world
+            .create_entity()
+            .with(Position { x: 2.0, y: 2.0 })
+            .with(Velocity { x: 102.0, y: 102.0 })
+            .build();
+
+        // Verify initial state
+        assert_eq!(
+            world.archetypes.len(),
+            1,
+            "Should have 1 archetype initially"
+        );
+
+        // Verify all entities have correct data
+        assert_eq!(world.get_component::<Position>(entity0).unwrap().x, 0.0);
+        assert_eq!(world.get_component::<Velocity>(entity0).unwrap().x, 100.0);
+        assert_eq!(world.get_component::<Position>(entity1).unwrap().x, 1.0);
+        assert_eq!(world.get_component::<Velocity>(entity1).unwrap().x, 101.0);
+        assert_eq!(world.get_component::<Position>(entity2).unwrap().x, 2.0);
+        assert_eq!(world.get_component::<Velocity>(entity2).unwrap().x, 102.0);
+
+        // Now add Health to entity0 - this moves it to a NEW archetype (Position+Velocity+Health)
+        // The old archetype (Position+Velocity) should swap_remove entity0's data
+        // entity2 should be swapped into index 0
+        world.add_component(entity0, Health { hp: 50 });
+
+        // Verify entity0 moved to new archetype and has all components
+        assert!(world.get_component::<Position>(entity0).is_some());
+        assert!(world.get_component::<Velocity>(entity0).is_some());
+        assert!(world.get_component::<Health>(entity0).is_some());
+        assert_eq!(world.get_component::<Position>(entity0).unwrap().x, 0.0);
+        assert_eq!(world.get_component::<Velocity>(entity0).unwrap().x, 100.0);
+        assert_eq!(world.get_component::<Health>(entity0).unwrap().hp, 50);
+
+        // CRITICAL: entity1 and entity2 should still have correct data in old archetype
+        // If swap_remove wasn't applied to component storage, entity2 (now at index 0)
+        // would incorrectly read entity0's old data!
+
+        let pos1 = world.get_component::<Position>(entity1).unwrap();
+        let vel1 = world.get_component::<Velocity>(entity1).unwrap();
+        assert_eq!(pos1.x, 1.0, "entity1 Position.x should be 1.0");
+        assert_eq!(vel1.x, 101.0, "entity1 Velocity.x should be 101.0");
+
+        let pos2 = world.get_component::<Position>(entity2).unwrap();
+        let vel2 = world.get_component::<Velocity>(entity2).unwrap();
+        assert_eq!(
+            pos2.x, 2.0,
+            "entity2 Position.x should be 2.0, but got {} (possible swap_remove bug)",
+            pos2.x
+        );
+        assert_eq!(
+            vel2.x, 102.0,
+            "entity2 Velocity.x should be 102.0, but got {} (possible swap_remove bug)",
+            vel2.x
+        );
+
+        // Verify archetype count (old one should still exist with entity1, entity2)
+        assert_eq!(world.archetypes.len(), 2, "Should have 2 archetypes now");
+
+        // Now remove Velocity from entity1 - moves to Position-only archetype
+        world.remove_component::<Velocity>(entity1);
+
+        // entity2 should still have correct data (it's now alone in Position+Velocity archetype)
+        let pos2 = world.get_component::<Position>(entity2).unwrap();
+        let vel2 = world.get_component::<Velocity>(entity2).unwrap();
+        assert_eq!(pos2.x, 2.0, "entity2 Position.x should still be 2.0");
+        assert_eq!(vel2.x, 102.0, "entity2 Velocity.x should still be 102.0");
+
+        // entity1 should only have Position now
+        assert!(world.get_component::<Position>(entity1).is_some());
+        assert!(world.get_component::<Velocity>(entity1).is_none());
+        assert_eq!(world.get_component::<Position>(entity1).unwrap().x, 1.0);
+
+        println!("✓ Component cleanup on archetype migration works correctly!");
     }
 }

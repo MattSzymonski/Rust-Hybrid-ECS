@@ -180,6 +180,53 @@ mod tests {
     use crate::component::ComponentId;
     use std::any::TypeId;
 
+    // Helper: Verify that no batch contains conflicting systems
+    fn assert_no_batch_conflicts(scheduler: &SystemScheduler) {
+        for (batch_idx, batch) in scheduler.execution_graph().iter().enumerate() {
+            for (i, &idx_a) in batch.iter().enumerate() {
+                let access_a = scheduler.get_access(idx_a).unwrap();
+                for &idx_b in &batch[i + 1..] {
+                    let access_b = scheduler.get_access(idx_b).unwrap();
+                    assert!(
+                        !access_a.conflicts_with(access_b),
+                        "Batch {} contains conflicting systems {} and {}!\n\
+                         System {}: reads={:?}, writes={:?}, commands={}\n\
+                         System {}: reads={:?}, writes={:?}, commands={}",
+                        batch_idx,
+                        idx_a,
+                        idx_b,
+                        idx_a,
+                        access_a.reads,
+                        access_a.writes,
+                        access_a.uses_commands,
+                        idx_b,
+                        access_b.reads,
+                        access_b.writes,
+                        access_b.uses_commands
+                    );
+                }
+            }
+        }
+    }
+
+    // Helper: Verify all systems are scheduled exactly once
+    fn assert_all_systems_scheduled(scheduler: &SystemScheduler, system_count: usize) {
+        let mut scheduled = vec![false; system_count];
+        for batch in scheduler.execution_graph() {
+            for &idx in batch {
+                assert!(
+                    !scheduled[idx],
+                    "System {} scheduled multiple times",
+                    idx
+                );
+                scheduled[idx] = true;
+            }
+        }
+        for (idx, &was_scheduled) in scheduled.iter().enumerate() {
+            assert!(was_scheduled, "System {} was not scheduled", idx);
+        }
+    }
+
     #[test]
     fn test_no_conflicts() {
         let mut scheduler = SystemScheduler::new();
@@ -195,6 +242,9 @@ mod tests {
         scheduler.register_system(access2);
 
         scheduler.build_execution_graph();
+
+        assert_no_batch_conflicts(&scheduler);
+        assert_all_systems_scheduled(&scheduler, 2);
 
         // Both systems should be in the same batch (no conflicts)
         assert_eq!(scheduler.execution_graph().len(), 1);
@@ -217,6 +267,9 @@ mod tests {
 
         scheduler.build_execution_graph();
 
+        assert_no_batch_conflicts(&scheduler);
+        assert_all_systems_scheduled(&scheduler, 2);
+
         // Systems must be in different batches (write-write conflict)
         assert_eq!(scheduler.execution_graph().len(), 2);
     }
@@ -236,6 +289,9 @@ mod tests {
         scheduler.register_system(access2);
 
         scheduler.build_execution_graph();
+
+        assert_no_batch_conflicts(&scheduler);
+        assert_all_systems_scheduled(&scheduler, 2);
 
         // Systems must be in different batches (read-write conflict)
         assert_eq!(scheduler.execution_graph().len(), 2);
@@ -257,7 +313,268 @@ mod tests {
 
         scheduler.build_execution_graph();
 
+        assert_no_batch_conflicts(&scheduler);
+        assert_all_systems_scheduled(&scheduler, 2);
+
         // Systems must be in different batches (Commands require exclusive access)
         assert_eq!(scheduler.execution_graph().len(), 2);
     }
+
+    #[test]
+    fn test_multiple_readers_parallel() {
+        let mut scheduler = SystemScheduler::new();
+
+        // 5 systems all reading the same component
+        for _ in 0..5 {
+            let mut access = SystemAccess::new();
+            access.add_read(ComponentId(TypeId::of::<i32>()));
+            scheduler.register_system(access);
+        }
+
+        scheduler.build_execution_graph();
+
+        assert_no_batch_conflicts(&scheduler);
+        assert_all_systems_scheduled(&scheduler, 5);
+
+        // All readers can run in parallel (read-read is OK)
+        assert_eq!(scheduler.execution_graph().len(), 1);
+        assert_eq!(scheduler.execution_graph()[0].len(), 5);
+    }
+
+    #[test]
+    fn test_single_writer_blocks_all() {
+        let mut scheduler = SystemScheduler::new();
+
+        // 4 readers
+        for _ in 0..4 {
+            let mut access = SystemAccess::new();
+            access.add_read(ComponentId(TypeId::of::<i32>()));
+            scheduler.register_system(access);
+        }
+
+        // 1 writer of the same component
+        let mut access = SystemAccess::new();
+        access.add_write(ComponentId(TypeId::of::<i32>()));
+        scheduler.register_system(access);
+
+        scheduler.build_execution_graph();
+
+        assert_no_batch_conflicts(&scheduler);
+        assert_all_systems_scheduled(&scheduler, 5);
+
+        // Writer must be in a separate batch from all readers
+        assert!(scheduler.execution_graph().len() >= 2);
+    }
+
+    #[test]
+    fn test_complex_dependency_graph() {
+        let mut scheduler = SystemScheduler::new();
+
+        // System 0: reads A, writes B
+        let mut access0 = SystemAccess::new();
+        access0.add_read(ComponentId(TypeId::of::<i32>()));
+        access0.add_write(ComponentId(TypeId::of::<f32>()));
+        scheduler.register_system(access0);
+
+        // System 1: reads B, writes C
+        let mut access1 = SystemAccess::new();
+        access1.add_read(ComponentId(TypeId::of::<f32>()));
+        access1.add_write(ComponentId(TypeId::of::<u32>()));
+        scheduler.register_system(access1);
+
+        // System 2: reads A (can run with system 1)
+        let mut access2 = SystemAccess::new();
+        access2.add_read(ComponentId(TypeId::of::<i32>()));
+        scheduler.register_system(access2);
+
+        // System 3: reads C (can run with systems 0 and 2)
+        let mut access3 = SystemAccess::new();
+        access3.add_read(ComponentId(TypeId::of::<u32>()));
+        scheduler.register_system(access3);
+
+        scheduler.build_execution_graph();
+
+        assert_no_batch_conflicts(&scheduler);
+        assert_all_systems_scheduled(&scheduler, 4);
+    }
+
+    #[test]
+    fn test_disjoint_component_sets() {
+        let mut scheduler = SystemScheduler::new();
+
+        // System 0: writes A
+        let mut access0 = SystemAccess::new();
+        access0.add_write(ComponentId(TypeId::of::<i32>()));
+        scheduler.register_system(access0);
+
+        // System 1: writes B
+        let mut access1 = SystemAccess::new();
+        access1.add_write(ComponentId(TypeId::of::<f32>()));
+        scheduler.register_system(access1);
+
+        // System 2: writes C
+        let mut access2 = SystemAccess::new();
+        access2.add_write(ComponentId(TypeId::of::<u32>()));
+        scheduler.register_system(access2);
+
+        scheduler.build_execution_graph();
+
+        assert_no_batch_conflicts(&scheduler);
+        assert_all_systems_scheduled(&scheduler, 3);
+
+        // All can run in parallel (disjoint writes)
+        assert_eq!(scheduler.execution_graph().len(), 1);
+        assert_eq!(scheduler.execution_graph()[0].len(), 3);
+    }
+
+    #[test]
+    fn test_multiple_commands_sequential() {
+        let mut scheduler = SystemScheduler::new();
+
+        // 3 systems all using commands
+        for _ in 0..3 {
+            let mut access = SystemAccess::new();
+            access.set_uses_commands(true);
+            scheduler.register_system(access);
+        }
+
+        scheduler.build_execution_graph();
+
+        assert_no_batch_conflicts(&scheduler);
+        assert_all_systems_scheduled(&scheduler, 3);
+
+        // Each command system must be in its own batch
+        assert_eq!(scheduler.execution_graph().len(), 3);
+    }
+
+    #[test]
+    fn test_mixed_commands_and_queries() {
+        let mut scheduler = SystemScheduler::new();
+
+        // System 0: reads A
+        let mut access0 = SystemAccess::new();
+        access0.add_read(ComponentId(TypeId::of::<i32>()));
+        scheduler.register_system(access0);
+
+        // System 1: uses commands
+        let mut access1 = SystemAccess::new();
+        access1.set_uses_commands(true);
+        scheduler.register_system(access1);
+
+        // System 2: reads B
+        let mut access2 = SystemAccess::new();
+        access2.add_read(ComponentId(TypeId::of::<f32>()));
+        scheduler.register_system(access2);
+
+        // System 3: uses commands
+        let mut access3 = SystemAccess::new();
+        access3.set_uses_commands(true);
+        scheduler.register_system(access3);
+
+        scheduler.build_execution_graph();
+
+        assert_no_batch_conflicts(&scheduler);
+        assert_all_systems_scheduled(&scheduler, 4);
+    }
+
+    #[test]
+    fn test_empty_scheduler() {
+        let mut scheduler = SystemScheduler::new();
+        scheduler.build_execution_graph();
+
+        assert_eq!(scheduler.execution_graph().len(), 0);
+    }
+
+    #[test]
+    fn test_single_system() {
+        let mut scheduler = SystemScheduler::new();
+
+        let mut access = SystemAccess::new();
+        access.add_write(ComponentId(TypeId::of::<i32>()));
+        scheduler.register_system(access);
+
+        scheduler.build_execution_graph();
+
+        assert_no_batch_conflicts(&scheduler);
+        assert_all_systems_scheduled(&scheduler, 1);
+
+        assert_eq!(scheduler.execution_graph().len(), 1);
+        assert_eq!(scheduler.execution_graph()[0].len(), 1);
+    }
+
+    #[test]
+    fn test_chain_dependencies() {
+        let mut scheduler = SystemScheduler::new();
+
+        // Chain: System0 writes A -> System1 reads A, writes B -> System2 reads B, writes C
+        let mut access0 = SystemAccess::new();
+        access0.add_write(ComponentId(TypeId::of::<i32>()));
+        scheduler.register_system(access0);
+
+        let mut access1 = SystemAccess::new();
+        access1.add_read(ComponentId(TypeId::of::<i32>()));
+        access1.add_write(ComponentId(TypeId::of::<f32>()));
+        scheduler.register_system(access1);
+
+        let mut access2 = SystemAccess::new();
+        access2.add_read(ComponentId(TypeId::of::<f32>()));
+        access2.add_write(ComponentId(TypeId::of::<u32>()));
+        scheduler.register_system(access2);
+
+        scheduler.build_execution_graph();
+
+        assert_no_batch_conflicts(&scheduler);
+        assert_all_systems_scheduled(&scheduler, 3);
+
+        // The greedy scheduler groups systems by conflict:
+        // - System0 writes A, System2 writes C - no conflict, could be batched
+        // - System1 reads A, writes B - conflicts with both
+        // The exact number of batches depends on scheduling order, 
+        // but no conflicts should exist within any batch.
+        // The greedy algorithm places them as: [0], [1], [2] = 3 batches
+        // or could optimize to [0,2], [1] = 2 batches
+        assert!(scheduler.execution_graph().len() >= 2);
+        assert!(scheduler.execution_graph().len() <= 3);
+    }
+
+    #[test]
+    fn test_large_parallel_batch() {
+        // Test with 5 systems all accessing different components
+        let mut scheduler = SystemScheduler::new();
+
+        // System 0: writes type A
+        let mut access = SystemAccess::new();
+        access.add_write(ComponentId(TypeId::of::<u8>()));
+        scheduler.register_system(access);
+
+        // System 1: writes type B
+        let mut access = SystemAccess::new();
+        access.add_write(ComponentId(TypeId::of::<u16>()));
+        scheduler.register_system(access);
+
+        // System 2: writes type C
+        let mut access = SystemAccess::new();
+        access.add_write(ComponentId(TypeId::of::<u32>()));
+        scheduler.register_system(access);
+
+        // System 3: writes type D
+        let mut access = SystemAccess::new();
+        access.add_write(ComponentId(TypeId::of::<u64>()));
+        scheduler.register_system(access);
+
+        // System 4: writes type E
+        let mut access = SystemAccess::new();
+        access.add_write(ComponentId(TypeId::of::<i8>()));
+        scheduler.register_system(access);
+
+        scheduler.build_execution_graph();
+
+        assert_no_batch_conflicts(&scheduler);
+        assert_all_systems_scheduled(&scheduler, 5);
+
+        // All can run in parallel
+        assert_eq!(scheduler.execution_graph().len(), 1);
+        assert_eq!(scheduler.execution_graph()[0].len(), 5);
+    }
 }
+
