@@ -214,11 +214,7 @@ mod tests {
         let mut scheduled = vec![false; system_count];
         for batch in scheduler.execution_graph() {
             for &idx in batch {
-                assert!(
-                    !scheduled[idx],
-                    "System {} scheduled multiple times",
-                    idx
-                );
+                assert!(!scheduled[idx], "System {} scheduled multiple times", idx);
                 scheduled[idx] = true;
             }
         }
@@ -529,7 +525,7 @@ mod tests {
         // The greedy scheduler groups systems by conflict:
         // - System0 writes A, System2 writes C - no conflict, could be batched
         // - System1 reads A, writes B - conflicts with both
-        // The exact number of batches depends on scheduling order, 
+        // The exact number of batches depends on scheduling order,
         // but no conflicts should exist within any batch.
         // The greedy algorithm places them as: [0], [1], [2] = 3 batches
         // or could optimize to [0,2], [1] = 2 batches
@@ -577,4 +573,3 @@ mod tests {
         assert_eq!(scheduler.execution_graph()[0].len(), 5);
     }
 }
-
