@@ -11,7 +11,7 @@ pub trait Component: Send + 'static {}
 
 /// ComponentId uniquely identifies a component type using its TypeId
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ComponentId(TypeId);
+pub struct ComponentId(pub TypeId);
 
 impl ComponentId {
     pub fn of<T: Component>() -> Self {

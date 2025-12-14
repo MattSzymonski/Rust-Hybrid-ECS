@@ -7,7 +7,7 @@
 //! and executes systems in parallel batches when safe to do so.
 
 use crate::component::ComponentId;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 /// Component access information for a system
 #[derive(Debug, Clone, Default)]

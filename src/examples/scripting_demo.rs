@@ -20,6 +20,7 @@ impl ScriptComponent for Counter {
 
 /// A position component (not a script)
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct Position {
     x: f32,
     y: f32,

@@ -18,7 +18,7 @@ use crate::world::World;
 /// Trait for adding a component with its concrete type preserved
 ///
 /// Must be Send to support parallel execution of systems.
-pub(crate) trait ComponentAdder: Send {
+pub trait ComponentAdder: Send {
     fn component_id(&self) -> ComponentId;
     fn add_component_to_storage(
         self: Box<Self>,
@@ -69,7 +69,7 @@ enum DeferredCommand {
 ///
 /// Systems that want to modify entities use Commands to queue changes.
 /// These changes are applied in a separate phase after all systems run.
-pub(crate) struct CommandQueue {
+pub struct CommandQueue {
     commands: Vec<DeferredCommand>,
 }
 
@@ -270,6 +270,7 @@ impl CommandQueue {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty()
     }
@@ -283,7 +284,7 @@ pub struct Commands<'a> {
 }
 
 impl<'a> Commands<'a> {
-    pub fn new(command_queue: &'a mut CommandQueue) -> Self {
+    pub(crate) fn new(command_queue: &'a mut CommandQueue) -> Self {
         Self {
             command_queue: command_queue,
         }

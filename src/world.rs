@@ -276,7 +276,7 @@ impl World {
     /// Start building a new entity
     ///
     /// Returns an EntityBuilder that allows fluent API for adding components.
-    pub fn create_entity(&mut self) -> EntityBuilder {
+    pub fn create_entity(&'_ mut self) -> EntityBuilder<'_> {
         let entity = self.allocate_entity();
         EntityBuilder {
             world: self,
@@ -300,7 +300,7 @@ impl World {
         let archetype_id = self.get_or_create_archetype(component_ids);
 
         let archetype = self.archetypes.get_mut(&archetype_id).unwrap();
-        let index = archetype.entities.len();
+        let index: usize = archetype.entities.len();
 
         // Add entity to archetype
         archetype.entities.push(entity);
