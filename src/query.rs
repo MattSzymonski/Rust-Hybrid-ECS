@@ -41,7 +41,7 @@ use crate::world::World;
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use trait_type_map::VecOptionStorage;
+use trait_type_map::VecStorage;
 
 // ============================================================================
 // Types
@@ -209,7 +209,7 @@ impl QueryTarget for Entity {
 
 impl<T: Component> QueryTarget for &T {
     type Item<'a> = &'a T;
-    type State = SendPtr<VecOptionStorage<T, dyn Component>>;
+    type State = SendPtr<VecStorage<T, dyn Component>>;
 
     fn component_ids() -> Vec<ComponentId> {
         vec![ComponentId::of::<T>()]
@@ -220,20 +220,17 @@ impl<T: Component> QueryTarget for &T {
     }
 
     fn init_state(archetype: &mut Archetype) -> Self::State {
-        SendPtr::new(archetype.component_storages.get_storage::<T>()
-            as *const VecOptionStorage<T, dyn Component>)
+        SendPtr::new(
+            archetype.component_storages.get_storage::<T>() as *const VecStorage<T, dyn Component>
+        )
     }
 
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
-        unsafe { (*state.as_ptr()).get(index).expect("Component not found") }
+        unsafe { (*state.as_ptr()).get(index) }
     }
 
     fn fetch<'a>(archetype: &'a Archetype, index: usize) -> Self::Item<'a> {
-        archetype
-            .component_storages
-            .get_storage::<T>()
-            .get(index)
-            .expect("Component not found in archetype")
+        archetype.component_storages.get_storage::<T>().get(index)
     }
 
     fn fetch_mut<'a>(archetype: &'a mut Archetype, index: usize) -> Self::Item<'a> {
@@ -241,13 +238,12 @@ impl<T: Component> QueryTarget for &T {
             .component_storages
             .get_storage_mut::<T>()
             .get_mut(index)
-            .expect("Component not found in archetype")
     }
 }
 
 impl<T: Component> QueryTarget for &mut T {
     type Item<'a> = &'a mut T;
-    type State = SendPtrMut<VecOptionStorage<T, dyn Component>>;
+    type State = SendPtrMut<VecStorage<T, dyn Component>>;
 
     fn component_ids() -> Vec<ComponentId> {
         vec![ComponentId::of::<T>()]
@@ -259,15 +255,11 @@ impl<T: Component> QueryTarget for &mut T {
 
     fn init_state(archetype: &mut Archetype) -> Self::State {
         SendPtrMut::new(archetype.component_storages.get_storage_mut::<T>()
-            as *mut VecOptionStorage<T, dyn Component>)
+            as *mut VecStorage<T, dyn Component>)
     }
 
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
-        unsafe {
-            (*state.as_ptr())
-                .get_mut(index)
-                .expect("Component not found")
-        }
+        unsafe { (*state.as_ptr()).get_mut(index) }
     }
 
     fn fetch<'a>(_archetype: &'a Archetype, _index: usize) -> Self::Item<'a> {
@@ -279,7 +271,6 @@ impl<T: Component> QueryTarget for &mut T {
             .component_storages
             .get_storage_mut::<T>()
             .get_mut(index)
-            .expect("Component not found")
     }
 }
 

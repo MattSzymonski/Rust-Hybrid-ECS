@@ -120,9 +120,8 @@ impl World {
                 |src: &TraitTypeMap<dyn Component, VecFamily>,
                  dst: &mut TraitTypeMap<dyn Component, VecFamily>,
                  index: usize| {
-                    if let Some(component) = src.get_storage::<T>().get(index) {
-                        dst.get_storage_mut::<T>().push(component.clone());
-                    }
+                    let component = src.get_storage::<T>().get(index);
+                    dst.get_storage_mut::<T>().push(component.clone());
                 },
             ),
         );
@@ -153,12 +152,11 @@ impl World {
                      entity: Entity,
                      engine_ptr: *mut Engine| {
                         // Get mutable reference to the component
-                        if let Some(component) = storage.get_storage_mut::<T>().get_mut(index) {
-                            // SAFETY: We're careful to only access the component and engine safely
-                            // The engine pointer is only used during the update call
-                            unsafe {
-                                component.update(entity, &mut *engine_ptr);
-                            }
+                        let component = storage.get_storage_mut::<T>().get_mut(index);
+                        // SAFETY: We're careful to only access the component and engine safely
+                        // The engine pointer is only used during the update call
+                        unsafe {
+                            component.update(entity, &mut *engine_ptr);
                         }
                     },
                 ),
@@ -263,10 +261,12 @@ impl World {
         }
 
         // Get component from storage
-        archetype
-            .component_storages
-            .get_storage::<T>()
-            .get(location.index_in_archetype)
+        Some(
+            archetype
+                .component_storages
+                .get_storage::<T>()
+                .get(location.index_in_archetype),
+        )
     }
 
     /// Get mutable reference to a component on an entity
@@ -290,10 +290,12 @@ impl World {
         }
 
         // Get component from storage
-        archetype
-            .component_storages
-            .get_storage_mut::<T>()
-            .get_mut(index)
+        Some(
+            archetype
+                .component_storages
+                .get_storage_mut::<T>()
+                .get_mut(index),
+        )
     }
 
     /// Allocate a new unique entity ID
