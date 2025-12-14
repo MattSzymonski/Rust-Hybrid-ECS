@@ -322,13 +322,13 @@ impl World {
     /// Get or create an archetype for a given set of components
     ///
     /// Archetypes are cached and reused for entities with the same component set.
+    /// The lookup uses ComponentMask for O(1) hash lookup, avoiding repeated sorting.
     pub(crate) fn get_or_create_archetype(
         &mut self,
-        mut component_ids: Vec<ComponentId>,
+        component_ids: Vec<ComponentId>,
     ) -> ArchetypeId {
-        component_ids.sort();
-
-        // Build component mask from component IDs
+        // Build component mask first - this is used for the fast lookup path
+        // The mask uniquely identifies the component set regardless of order
         let mut component_mask = ComponentMask::empty();
         for component_id in &component_ids {
             if let Some(bit) = self.component_registry.get_bit(component_id) {
@@ -336,9 +336,14 @@ impl World {
             }
         }
 
+        // Hot path: archetype already exists (most common case)
         if let Some(&archetype_id) = self.archetype_lookup.get(&component_mask) {
             return archetype_id;
         }
+
+        // Cold path: create new archetype (only sort when actually creating)
+        let mut sorted_ids = component_ids;
+        sorted_ids.sort();
 
         let new_archetype_id = ArchetypeId(self.next_free_archetype_id);
         self.next_free_archetype_id += 1;
@@ -346,7 +351,7 @@ impl World {
         // Create archetype with storage for all component types
         let new_archetype = Archetype::new(
             new_archetype_id,
-            component_ids.clone(),
+            sorted_ids,
             component_mask,
             &self.storage_factories,
         );

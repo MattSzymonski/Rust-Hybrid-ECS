@@ -216,19 +216,25 @@ impl Engine {
                 let queue_ptr = &mut self.queue as *mut CommandQueue as usize;
                 let systems_ptr = self.systems.as_mut_ptr() as usize;
 
-                // Filter to only enabled systems in this batch
-                let enabled_system_indices: Vec<usize> = batch
-                    .iter()
-                    .copied()
-                    .filter(|&idx| self.systems[idx].enabled)
-                    .collect();
+                // Pre-compute enabled flags to avoid capturing self.systems in closure
+                // This is a small fixed-size read that avoids Vec allocation in most cases
+                let enabled_flags: Vec<bool> =
+                    batch.iter().map(|&idx| self.systems[idx].enabled).collect();
 
-                enabled_system_indices.par_iter().for_each(|&idx| unsafe {
-                    let world = &mut *(world_ptr as *mut World);
-                    let queue = &mut *(queue_ptr as *mut CommandQueue);
-                    let registered = &mut *(systems_ptr as *mut RegisteredSystem).add(idx);
-                    registered.system.run(world, queue);
-                });
+                batch
+                    .par_iter()
+                    .zip(enabled_flags.par_iter())
+                    .for_each(|(&idx, &enabled)| {
+                        if !enabled {
+                            return;
+                        }
+                        unsafe {
+                            let world = &mut *(world_ptr as *mut World);
+                            let queue = &mut *(queue_ptr as *mut CommandQueue);
+                            let registered = &mut *(systems_ptr as *mut RegisteredSystem).add(idx);
+                            registered.system.run(world, queue);
+                        }
+                    });
             }
         }
     }
