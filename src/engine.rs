@@ -19,6 +19,7 @@ struct RegisteredSystem {
     name: &'static str,
     system: Box<dyn System>,
     state: SystemState,
+    enabled: bool,
 }
 
 /// The main Engine that drives the ECS
@@ -61,6 +62,44 @@ impl Engine {
     /// Enable or disable parallel system execution
     pub fn set_parallel_execution(&mut self, enabled: bool) {
         self.parallel_execution = enabled;
+    }
+
+    /// Enable a system by name
+    ///
+    /// Returns true if the system was found and enabled, false otherwise.
+    pub fn enable_system(&mut self, name: &str) -> bool {
+        self.set_system_enabled(name, true)
+    }
+
+    /// Disable a system by name
+    ///
+    /// Disabled systems are skipped during frame processing.
+    /// Returns true if the system was found and disabled, false otherwise.
+    pub fn disable_system(&mut self, name: &str) -> bool {
+        self.set_system_enabled(name, false)
+    }
+
+    /// Set the enabled state of a system by name
+    ///
+    /// Returns true if the system was found, false otherwise.
+    pub fn set_system_enabled(&mut self, name: &str, enabled: bool) -> bool {
+        for system in &mut self.systems {
+            if system.name == name {
+                system.enabled = enabled;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Check if a system is enabled
+    ///
+    /// Returns None if the system was not found.
+    pub fn is_system_enabled(&self, name: &str) -> Option<bool> {
+        self.systems
+            .iter()
+            .find(|s| s.name == name)
+            .map(|s| s.enabled)
     }
 
     /// Print the execution graph for debugging
@@ -110,6 +149,7 @@ impl Engine {
             name,
             system: system.into_system(),
             state: SystemState::new(),
+            enabled: true,
         });
 
         // Rebuild execution graph
@@ -134,7 +174,9 @@ impl Engine {
         }
 
         // Update script components after systems
-        self.world.update_scripts();
+        // SAFETY: We pass a pointer to self so scripts can access the engine
+        let engine_ptr = self as *mut Engine;
+        self.world.update_scripts(engine_ptr);
 
         // Phase 2: Execute all deferred commands
         self.queue.execute_queued_commands(&mut self.world);
@@ -143,6 +185,9 @@ impl Engine {
     /// Run systems sequentially (fallback or when parallel is disabled)
     fn run_systems_sequential(&mut self) {
         for registered in &mut self.systems {
+            if !registered.enabled {
+                continue;
+            }
             registered
                 .system
                 .run(&mut self.world, &mut self.queue, &mut registered.state);
@@ -162,13 +207,13 @@ impl Engine {
             if batch.len() == 1 {
                 // Single system - run directly
                 let idx = batch[0];
-                let system_ptr = self.systems.as_mut_ptr();
-                unsafe {
-                    let registered = &mut *system_ptr.add(idx);
-                    registered
-                        .system
-                        .run(&mut self.world, &mut self.queue, &mut registered.state);
+                let registered = &mut self.systems[idx];
+                if !registered.enabled {
+                    continue;
                 }
+                registered
+                    .system
+                    .run(&mut self.world, &mut self.queue, &mut registered.state);
             } else {
                 // Multiple systems - run in parallel using rayon
                 // SAFETY: The scheduler guarantees that systems in the same batch access disjoint data
@@ -177,7 +222,14 @@ impl Engine {
                 let queue_ptr = &mut self.queue as *mut CommandQueue as usize;
                 let systems_ptr = self.systems.as_mut_ptr() as usize;
 
-                batch.par_iter().for_each(|&idx| unsafe {
+                // Filter to only enabled systems in this batch
+                let enabled_system_indices: Vec<usize> = batch
+                    .iter()
+                    .copied()
+                    .filter(|&idx| self.systems[idx].enabled)
+                    .collect();
+
+                enabled_system_indices.par_iter().for_each(|&idx| unsafe {
                     let world = &mut *(world_ptr as *mut World);
                     let queue = &mut *(queue_ptr as *mut CommandQueue);
                     let registered = &mut *(systems_ptr as *mut RegisteredSystem).add(idx);

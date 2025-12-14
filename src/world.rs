@@ -28,8 +28,10 @@ type ComponentCopier = Arc<
 >;
 
 /// Function that updates a script component
+use crate::engine::Engine;
+
 type ScriptUpdater = Arc<
-    dyn Fn(&mut TraitTypeMap<dyn Component, VecFamily>, usize, Entity, *mut World) + Send + Sync,
+    dyn Fn(&mut TraitTypeMap<dyn Component, VecFamily>, usize, Entity, *mut Engine) + Send + Sync,
 >;
 
 /// EntityLocation tracks where an entity is stored in the archetype system
@@ -149,13 +151,13 @@ impl World {
                     |storage: &mut TraitTypeMap<dyn Component, VecFamily>,
                      index: usize,
                      entity: Entity,
-                     world_ptr: *mut World| {
+                     engine_ptr: *mut Engine| {
                         // Get mutable reference to the component
                         if let Some(component) = storage.get_storage_mut::<T>().get_mut(index) {
-                            // SAFETY: We're careful to only access the component and world safely
-                            // The world pointer is only used immutably during the update call
+                            // SAFETY: We're careful to only access the component and engine safely
+                            // The engine pointer is only used during the update call
                             unsafe {
-                                component.update(entity, &mut *world_ptr);
+                                component.update(entity, &mut *engine_ptr);
                             }
                         }
                     },
@@ -167,8 +169,11 @@ impl World {
     /// Update all script components
     ///
     /// Calls update() on every script component in the world.
-    /// Scripts can modify themselves and interact with the world.
-    pub(crate) fn update_scripts(&mut self) {
+    /// Scripts can modify themselves and interact with the engine.
+    ///
+    /// # Safety
+    /// The engine_ptr must be a valid pointer to the Engine that owns this World.
+    pub(crate) fn update_scripts(&mut self, engine_ptr: *mut Engine) {
         // Collect script component info to avoid borrow issues
         let script_info: Vec<(ComponentId, u8)> = self.script_components.clone();
 
@@ -198,13 +203,11 @@ impl World {
             // Now update each entity's script component
             // SAFETY: We use raw pointer to bypass borrow checker, but we're careful:
             // - Only one component is accessed at a time
-            // - The updater callback receives the world pointer for safe access
-            let world_ptr = self as *mut World;
-
+            // - The updater callback receives the engine pointer for safe access
             for (entity, archetype_id, index) in entities_to_update {
                 if let Some(archetype) = self.archetypes.get_mut(&archetype_id) {
                     // Call the updater with mutable storage access
-                    updater(&mut archetype.component_storages, index, entity, world_ptr);
+                    updater(&mut archetype.component_storages, index, entity, engine_ptr);
                 }
             }
         }
