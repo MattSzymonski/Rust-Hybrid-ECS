@@ -1,10 +1,37 @@
-// ============================================================================
-// Query System - Component Access and Iteration
-// ============================================================================
-//! Queries provide efficient iteration over entities with specific components.
+//! # Query System - Component Access and Iteration
 //!
-//! The query system uses the QueryTarget trait to support flexible component
+//! Queries provide efficient iteration over entities with specific components.
+//! The query system uses the [`QueryTarget`] trait to support flexible component
 //! access patterns, including mutable and immutable references.
+//!
+//! ## Usage Examples
+//!
+//! ```ignore
+//! // Sequential iteration
+//! fn movement_system(mut query: Query<(&mut Transform, &Velocity)>) {
+//!     for (transform, velocity) in query.iter_mut() {
+//!         transform.x += velocity.x * 0.016;
+//!     }
+//! }
+//!
+//! // Parallel iteration
+//! fn physics_system(mut query: Query<(&mut Transform, &Velocity)>) {
+//!     query.par_iter_mut().for_each(|(transform, velocity)| {
+//!         transform.x += velocity.x * 0.016;
+//!     });
+//! }
+//!
+//! // Parallel with batch size control and tracking
+//! fn tracked_system(mut query: Query<(&mut Transform, &Velocity)>) {
+//!     let stats = query.par_iter_mut()
+//!         .with_batch_size(500)
+//!         .tracked()
+//!         .for_each(|(transform, velocity)| {
+//!             transform.x += velocity.x * 0.016;
+//!         });
+//!     println!("{}", stats);
+//! }
+//! ```
 
 use crate::archetype::{Archetype, ArchetypeId};
 use crate::component::{Component, ComponentId, ComponentMask};
@@ -17,13 +44,20 @@ use std::sync::Arc;
 use trait_type_map::VecOptionStorage;
 
 // ============================================================================
+// Types
+// ============================================================================
+
+/// Cached archetype state for parallel iteration: (archetype_id, state, entity_count)
+type ArchetypeRange<S> = (ArchetypeId, S, usize);
+
+// ============================================================================
 // Batch Statistics
 // ============================================================================
 
-/// Statistics about batch distribution during parallel iteration
+/// Statistics about batch distribution during parallel iteration.
 ///
-/// This struct is returned by `for_each_tracked` and `for_each_batched_tracked`
-/// methods to provide insight into how Rayon distributed work across threads.
+/// Returned by tracked parallel iteration to provide insight into
+/// how Rayon distributed work across threads.
 #[derive(Debug, Clone)]
 pub struct BatchStats {
     /// Number of threads in the Rayon thread pool
@@ -59,10 +93,10 @@ impl std::fmt::Display for BatchStats {
 // Thread-Safe Pointer Wrappers
 // ============================================================================
 
-/// A wrapper for `*const T` that implements Send and Sync
+/// A wrapper for `*const T` that implements `Send` and `Sync`.
 ///
 /// # Safety
-/// This is safe because we guarantee that:
+/// Safe when:
 /// 1. The pointer points to valid data for the lifetime of the query
 /// 2. Different threads access different indices (no aliasing)
 /// 3. The World has exclusive access during iteration
@@ -82,10 +116,10 @@ impl<T> SendPtr<T> {
     }
 }
 
-/// A wrapper for `*mut T` that implements Send and Sync
+/// A wrapper for `*mut T` that implements `Send` and `Sync`.
 ///
 /// # Safety
-/// This is safe because we guarantee that:
+/// Safe when:
 /// 1. The pointer points to valid data for the lifetime of the query
 /// 2. Different threads access different indices (no aliasing)
 /// 3. The World has exclusive access during iteration
@@ -105,38 +139,45 @@ impl<T> SendPtrMut<T> {
     }
 }
 
-/// QueryTarget trait for fetching components from archetypes
+// ============================================================================
+// QueryTarget Trait
+// ============================================================================
+
+/// Trait for fetching components from archetypes.
 ///
-/// This trait is implemented for different query patterns:
-/// - Entity: Access to entity IDs
-/// - &T: Immutable component reference
-/// - &mut T: Mutable component reference
-/// - Tuples: Multiple components at once
+/// Implemented for:
+/// - `Entity`: Access to entity IDs
+/// - `&T`: Immutable component reference
+/// - `&mut T`: Mutable component reference
+/// - Tuples: Multiple components at once (up to 4 elements)
 pub trait QueryTarget {
     type Item<'a>;
     type State;
 
-    /// Get the list of component IDs required by this query
+    /// Get the component IDs required by this query.
     fn component_ids() -> Vec<ComponentId>;
 
-    /// Report component access for dependency analysis
-    /// Returns (reads, writes) as vectors of ComponentIds
+    /// Report component access for dependency analysis.
+    /// Returns (reads, writes) as vectors of ComponentIds.
     fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>);
 
-    /// Initialize state for fetching from an archetype (caches storage pointers)
+    /// Initialize state for fetching from an archetype (caches storage pointers).
     fn init_state(archetype: &mut Archetype) -> Self::State;
 
-    /// Fetch components using cached state
-    fn fetch_mut_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a>;
+    /// Fetch components using cached state (for parallel iteration).
+    fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a>;
 
-    /// Fetch components from an archetype (immutable)
+    /// Fetch components from an archetype (immutable access).
     fn fetch<'a>(archetype: &'a Archetype, index: usize) -> Self::Item<'a>;
 
-    /// Fetch components from an archetype (mutable)
+    /// Fetch components from an archetype (mutable access).
     fn fetch_mut<'a>(archetype: &'a mut Archetype, index: usize) -> Self::Item<'a>;
 }
 
-/// Implement QueryTarget for Entity access
+// ----------------------------------------------------------------------------
+// QueryTarget Implementations
+// ----------------------------------------------------------------------------
+
 impl QueryTarget for Entity {
     type Item<'a> = Entity;
     type State = SendPtr<Vec<Entity>>;
@@ -146,18 +187,15 @@ impl QueryTarget for Entity {
     }
 
     fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>) {
-        (Vec::new(), Vec::new()) // Entity access doesn't read or write components
+        (Vec::new(), Vec::new())
     }
 
     fn init_state(archetype: &mut Archetype) -> Self::State {
         SendPtr::new(&archetype.entities as *const Vec<Entity>)
     }
 
-    fn fetch_mut_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
-        unsafe {
-            let vec_ref = &*state.as_ptr();
-            vec_ref.get_unchecked(index).clone()
-        }
+    fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
+        unsafe { (&*state.as_ptr()).get_unchecked(index).clone() }
     }
 
     fn fetch<'a>(archetype: &'a Archetype, index: usize) -> Self::Item<'a> {
@@ -169,7 +207,6 @@ impl QueryTarget for Entity {
     }
 }
 
-/// Implement QueryTarget for immutable component reference
 impl<T: Component> QueryTarget for &T {
     type Item<'a> = &'a T;
     type State = SendPtr<VecOptionStorage<T, dyn Component>>;
@@ -179,7 +216,6 @@ impl<T: Component> QueryTarget for &T {
     }
 
     fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>) {
-        // Immutable reference = read access
         (vec![ComponentId::of::<T>()], Vec::new())
     }
 
@@ -188,7 +224,7 @@ impl<T: Component> QueryTarget for &T {
             as *const VecOptionStorage<T, dyn Component>)
     }
 
-    fn fetch_mut_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
+    fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
         unsafe { (*state.as_ptr()).get(index).expect("Component not found") }
     }
 
@@ -209,7 +245,6 @@ impl<T: Component> QueryTarget for &T {
     }
 }
 
-/// Implement QueryTarget for mutable component reference
 impl<T: Component> QueryTarget for &mut T {
     type Item<'a> = &'a mut T;
     type State = SendPtrMut<VecOptionStorage<T, dyn Component>>;
@@ -219,7 +254,6 @@ impl<T: Component> QueryTarget for &mut T {
     }
 
     fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>) {
-        // Mutable reference = write access
         (Vec::new(), vec![ComponentId::of::<T>()])
     }
 
@@ -228,7 +262,7 @@ impl<T: Component> QueryTarget for &mut T {
             as *mut VecOptionStorage<T, dyn Component>)
     }
 
-    fn fetch_mut_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
+    fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
         unsafe {
             (*state.as_ptr())
                 .get_mut(index)
@@ -245,14 +279,16 @@ impl<T: Component> QueryTarget for &mut T {
             .component_storages
             .get_storage_mut::<T>()
             .get_mut(index)
-            .expect("Component not found in archetype")
+            .expect("Component not found")
     }
 }
 
+// ----------------------------------------------------------------------------
+// Tuple Implementations (via macro)
+// ----------------------------------------------------------------------------
 /// Macro to implement QueryTarget for tuples of different sizes
-///
 /// This allows queries like Query<(Entity, &Transform, &mut Velocity)>
-macro_rules! impl_query_object_tuple {
+macro_rules! impl_query_target_tuple {
     ($($T:ident),*) => {
         impl<$($T: QueryTarget),*> QueryTarget for ($($T,)*) {
             type Item<'a> = ($($T::Item<'a>,)*);
@@ -277,17 +313,14 @@ macro_rules! impl_query_object_tuple {
 
             #[allow(non_snake_case)]
             fn init_state(archetype: &mut Archetype) -> Self::State {
-                // Get raw pointer to allow multiple init_state calls
                 let arch_ptr = archetype as *mut Archetype;
-                unsafe {
-                    ($($T::init_state(&mut *arch_ptr),)*)
-                }
+                unsafe { ($($T::init_state(&mut *arch_ptr),)*) }
             }
 
             #[allow(non_snake_case)]
-            fn fetch_mut_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
+            fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
                 let ($($T,)*) = state;
-                ($($T::fetch_mut_with_state($T, index),)*)
+                ($($T::fetch_with_state($T, index),)*)
             }
 
             #[allow(non_snake_case)]
@@ -295,31 +328,33 @@ macro_rules! impl_query_object_tuple {
                 ($($T::fetch(archetype, index),)*)
             }
 
+
             #[allow(non_snake_case)]
             fn fetch_mut<'a>(archetype: &'a mut Archetype, index: usize) -> Self::Item<'a> {
                 // SAFETY: We use raw pointers to allow multiple mutable borrows of different components
                 let arch_ptr = archetype as *mut Archetype;
-                unsafe {
-                    ($($T::fetch_mut(&mut *arch_ptr, index),)*)
-                }
+                unsafe { ($($T::fetch_mut(&mut *arch_ptr, index),)*) }
             }
         }
     };
 }
 
-// Implement for tuples up to 4 elements
-impl_query_object_tuple!(A);
-impl_query_object_tuple!(A, B);
-impl_query_object_tuple!(A, B, C);
-impl_query_object_tuple!(A, B, C, D);
+impl_query_target_tuple!(A);
+impl_query_target_tuple!(A, B);
+impl_query_target_tuple!(A, B, C);
+impl_query_target_tuple!(A, B, C, D);
 
-/// Actual query provides iteration over entities matching a component pattern
+// ============================================================================
+// Query
+// ============================================================================
+
+/// Query for iterating over entities matching a component pattern.
 ///
-/// Example:
+/// # Example
 /// ```ignore
 /// fn my_system(mut query: Query<(Entity, &Transform, &mut Velocity)>) {
 ///     for (entity, transform, velocity) in query.iter_mut() {
-///         // Process entities with Transform and Velocity components
+///         velocity.y -= 9.8 * 0.016; // gravity
 ///     }
 /// }
 /// ```
@@ -336,23 +371,27 @@ impl<'w, Q: QueryTarget> Query<'w, Q> {
         }
     }
 
-    /// Create an iterator over all matching entities
-    #[inline]
-    pub fn iter_mut(&'_ mut self) -> QueryIterMut<'_, Q> {
-        // Build component mask from query requirements
-        let component_ids = Q::component_ids();
-        let mut query_mask = ComponentMask::empty();
-        for component_id in &component_ids {
+    /// Build component mask from query requirements.
+    fn build_query_mask(&self) -> ComponentMask {
+        let mut mask = ComponentMask::empty();
+        for component_id in &Q::component_ids() {
             if let Some(bit) = self.world.component_registry.get_bit(component_id) {
-                query_mask.set(bit);
+                mask.set(bit);
             }
         }
+        mask
+    }
+
+    /// Create a sequential iterator over all matching entities.
+    #[inline]
+    pub fn iter_mut(&mut self) -> QueryIterMut<'_, Q> {
+        let query_mask = self.build_query_mask();
 
         let matching_archetypes: Vec<ArchetypeId> = self
             .world
             .archetypes
             .iter()
-            .filter(|(_, archetype)| archetype.matches_mask(&query_mask))
+            .filter(|(_, arch)| arch.matches_mask(&query_mask))
             .map(|(id, _)| *id)
             .collect();
 
@@ -367,81 +406,44 @@ impl<'w, Q: QueryTarget> Query<'w, Q> {
         }
     }
 
-    /// Get the first matching entity's components, if any exist
-    ///
-    /// This is useful when you expect only one entity or just need any matching entity.
-    ///
-    /// # Example
-    /// ```ignore
-    /// if let Some((transform, velocity)) = query.first() {
-    ///     println!("First entity at ({}, {})", transform.x, transform.y);
-    /// }
-    /// ```
+    /// Get the first matching entity's components.
     #[inline]
     pub fn first(&mut self) -> Option<Q::Item<'_>> {
         self.iter_mut().next()
     }
 
-    /// Create a parallel iterator over all matching entities using Rayon
-    ///
-    /// This method provides parallel iteration across entities, distributing
-    /// work across multiple threads. Each archetype is processed in parallel,
-    /// and entities within each archetype are also processed in parallel.
-    ///
-    /// # Example
-    /// ```ignore
-    /// fn physics_system(mut query: Query<(&mut Transform, &Velocity)>) {
-    ///     query.par_iter_mut().for_each(|(transform, velocity)| {
-    ///         transform.x += velocity.x * 0.016;
-    ///         transform.y += velocity.y * 0.016;
-    ///     });
-    /// }
-    /// ```
-    ///
-    /// # Safety
-    /// This is safe because:
-    /// - Each entity's components are accessed by exactly one thread
-    /// - Different entities have independent component data
-    /// - The query holds exclusive access to the World
+    /// Create a parallel iterator over all matching entities.
     #[inline]
-    pub fn par_iter_mut(&'_ mut self) -> ParQueryIterMut<'_, Q>
+    pub fn par_iter_mut(&mut self) -> ParQueryIter<'_, Q>
     where
         Q::State: Send + Sync,
         for<'a> Q::Item<'a>: Send,
     {
-        // Build component mask from query requirements
-        let component_ids = Q::component_ids();
-        let mut query_mask = ComponentMask::empty();
-        for component_id in &component_ids {
-            if let Some(bit) = self.world.component_registry.get_bit(component_id) {
-                query_mask.set(bit);
-            }
-        }
+        let query_mask = self.build_query_mask();
 
-        // Collect matching archetypes with their entity ranges
-        let mut archetype_ranges: Vec<(ArchetypeId, Q::State, usize)> = Vec::new();
+        let archetype_ranges: Vec<ArchetypeRange<Q::State>> = self
+            .world
+            .archetypes
+            .iter_mut()
+            .filter(|(_, arch)| arch.matches_mask(&query_mask))
+            .filter(|(_, arch)| arch.len() > 0)
+            .map(|(id, arch)| (*id, Q::init_state(arch), arch.len()))
+            .collect();
 
-        for (id, archetype) in &mut self.world.archetypes {
-            if archetype.matches_mask(&query_mask) {
-                let state = Q::init_state(archetype);
-                let len = archetype.len();
-                if len > 0 {
-                    archetype_ranges.push((*id, state, len));
-                }
-            }
-        }
-
-        ParQueryIterMut {
+        ParQueryIter {
             archetype_ranges,
+            min_batch_size: None,
+            tracked: false,
             _phantom: std::marker::PhantomData,
         }
     }
 }
 
-/// Iterator for mutable queries
-///
-/// This iterator walks through all archetypes that match the query pattern
-/// and yields components for each entity.
+// ============================================================================
+// Sequential Iterator
+// ============================================================================
+
+/// Sequential iterator for mutable queries.
 pub struct QueryIterMut<'w, Q: QueryTarget> {
     world_ptr: *mut World,
     matching_archetypes: Vec<ArchetypeId>,
@@ -458,26 +460,21 @@ impl<'w, Q: QueryTarget> Iterator for QueryIterMut<'w, Q> {
     type Item = Q::Item<'w>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        unsafe {
-            loop {
-                // Fast path: iterate within current archetype using cached state
-                // This is the hot path that gets executed millions of times
-                if self.current_entity_idx < self.current_archetype_len {
-                    let index = self.current_entity_idx;
-                    self.current_entity_idx += 1;
+        loop {
+            // Hot path: iterate within current archetype
+            if self.current_entity_idx < self.current_archetype_len {
+                let index = self.current_entity_idx;
+                self.current_entity_idx += 1;
 
-                    // SAFETY: current_state is always Some during iteration in the fast path
-                    // We use unwrap_unchecked to eliminate branch misprediction overhead
-                    // The Option check would add a testb+jne branch on every iteration
-                    let state = self.current_state.as_ref().unwrap_unchecked();
-                    return Some(Q::fetch_mut_with_state(state, index));
-                }
-
-                // Cold path: move to next archetype
-                // This happens infrequently (once per archetype)
-                // Moving to separate function gives 40% boost in overall iteration speed
-                self.advance_archetype()?;
+                // SAFETY: current_state is always Some during iteration in the hot path
+                // We use unwrap_unchecked to eliminate branch misprediction overhead
+                let state = unsafe { self.current_state.as_ref().unwrap_unchecked() };
+                return Some(Q::fetch_with_state(state, index));
             }
+
+            // Cold path: advance to next archetype
+            // This happens infrequently (once per archetype)
+            self.advance_archetype()?;
         }
     }
 }
@@ -486,6 +483,11 @@ impl<'w, Q: QueryTarget> QueryIterMut<'w, Q> {
     /// Advance to the next archetype (cold path, separated for better branch prediction)
     #[inline(never)]
     fn advance_archetype(&mut self) -> Option<()> {
+        // Check if all archetypes have been exhausted
+        if self.current_archetype_idx >= self.matching_archetypes.len() {
+            return None;
+        }
+
         // SAFETY: This function is safe because:
         // 1. world_ptr was created from a valid &mut World reference in iter_mut()
         // 2. The QueryIterMut holds exclusive access to World through its lifetime 'w
@@ -497,11 +499,6 @@ impl<'w, Q: QueryTarget> QueryIterMut<'w, Q> {
         //    - Archetypes are not moved/reallocated during iteration
         //    - Component storage vectors maintain stable addresses while we iterate
         unsafe {
-            // Check if we've exhausted all archetypes
-            if self.current_archetype_idx >= self.matching_archetypes.len() {
-                return None;
-            }
-
             let world = &mut *self.world_ptr;
             let archetype_id = self.matching_archetypes[self.current_archetype_idx];
             let archetype = world.archetypes.get_mut(&archetype_id)?;
@@ -511,19 +508,26 @@ impl<'w, Q: QueryTarget> QueryIterMut<'w, Q> {
             self.current_state = Some(Q::init_state(archetype));
             self.current_entity_idx = 0;
             self.current_archetype_idx += 1;
-
-            Some(())
         }
+
+        Some(())
     }
 }
 
-/// Parallel iterator for mutable queries using Rayon
+// ============================================================================
+// Parallel Iterator
+// ============================================================================
+
+/// Parallel iterator for queries using Rayon.
 ///
-/// This iterator distributes work across multiple threads, processing
-/// entities in parallel. Each archetype's entities are iterated in parallel.
-pub struct ParQueryIterMut<'w, Q: QueryTarget> {
-    /// (archetype_id, cached_state, entity_count)
-    archetype_ranges: Vec<(ArchetypeId, Q::State, usize)>,
+/// Supports method chaining for configuration:
+/// - `.with_batch_size(n)` - Set minimum batch size
+/// - `.tracked()` - Enable batch statistics collection
+/// - `.for_each(f)` - Execute closure on each entity
+pub struct ParQueryIter<'w, Q: QueryTarget> {
+    archetype_ranges: Vec<ArchetypeRange<Q::State>>,
+    min_batch_size: Option<usize>,
+    tracked: bool,
     _phantom: std::marker::PhantomData<&'w mut Q>,
 }
 
@@ -532,10 +536,10 @@ pub struct ParQueryIterMut<'w, Q: QueryTarget> {
 // - The raw pointers in Q::State point to component storage that remains valid
 //   for the lifetime of the query (exclusive World access)
 // - Each thread accesses different entity indices, so no data races occur
-unsafe impl<'w, Q: QueryTarget> Send for ParQueryIterMut<'w, Q> where Q::State: Send {}
-unsafe impl<'w, Q: QueryTarget> Sync for ParQueryIterMut<'w, Q> where Q::State: Sync {}
+unsafe impl<'w, Q: QueryTarget> Send for ParQueryIter<'w, Q> where Q::State: Send {}
+unsafe impl<'w, Q: QueryTarget> Sync for ParQueryIter<'w, Q> where Q::State: Sync {}
 
-impl<'w, Q: QueryTarget> ParQueryIterMut<'w, Q>
+impl<'w, Q: QueryTarget> ParQueryIter<'w, Q>
 where
     Q::State: Send + Sync,
     for<'a> Q::Item<'a>: Send,
@@ -550,192 +554,69 @@ where
         self.archetype_ranges.iter().map(|(_, _, len)| *len).sum()
     }
 
-    /// Set the minimum batch size for parallel iteration
+    /// Set minimum batch size for parallel iteration.
     ///
     /// Larger batches reduce overhead but may cause load imbalance.
     /// Smaller batches improve load balancing but increase overhead.
     ///
     /// # Guidelines
-    /// - **Small work per entity** (simple math): use larger batches (1000-10000)
-    /// - **Heavy work per entity** (complex calculations): use smaller batches (10-100)
-    /// - **Default Rayon behavior**: adaptive splitting (~entity_count / num_threads)
-    ///
-    /// # Example
-    /// ```ignore
-    /// query.par_iter_mut()
-    ///     .with_batch_size(500)
-    ///     .for_each(|(transform, velocity)| {
-    ///         transform.x += velocity.x * delta_time;
-    ///     });
-    /// ```
-    pub fn with_batch_size(self, min_batch_size: usize) -> ParQueryIterMutBatched<'w, Q> {
-        ParQueryIterMutBatched {
-            archetype_ranges: self.archetype_ranges,
-            min_batch_size,
-            _phantom: std::marker::PhantomData,
-        }
+    /// - **Light work** (simple math): larger batches (1000-10000)
+    /// - **Heavy work** (complex calculations): smaller batches (10-100)
+    pub fn with_batch_size(mut self, size: usize) -> Self {
+        self.min_batch_size = Some(size);
+        self
     }
 
-    /// Execute a closure on each entity in parallel
+    /// Enable batch statistics tracking.
+    pub fn tracked(mut self) -> Self {
+        self.tracked = true;
+        self
+    }
+
+    /// Execute closure on each entity in parallel.
     ///
-    /// # Example
-    /// ```ignore
-    /// query.par_iter_mut().for_each(|(transform, velocity)| {
-    ///     transform.x += velocity.x * delta_time;
-    /// });
-    /// ```
-    pub fn for_each<F>(self, f: F)
+    /// Returns `BatchStats` if `.tracked()` was called, otherwise `()`.
+    pub fn for_each<F>(self, f: F) -> ParForEachResult
     where
         F: Fn(Q::Item<'_>) + Send + Sync,
     {
-        // Process all archetypes in parallel
-        self.archetype_ranges
-            .into_par_iter()
-            .for_each(|(_, state, len)| {
-                // Process entities within each archetype in parallel
-                (0..len).into_par_iter().for_each(|index| {
-                    let item = Q::fetch_mut_with_state(&state, index);
-                    f(item);
-                });
-            });
-    }
-
-    /// Enable batch tracking for parallel iteration
-    ///
-    /// Returns a tracked iterator that will collect statistics during iteration.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let stats = query.par_iter_mut().tracked().for_each(|(transform, velocity)| {
-    ///     transform.x += velocity.x * delta_time;
-    /// });
-    /// println!("{}", stats);
-    /// ```
-    pub fn tracked(self) -> ParQueryIterMutTracked<'w, Q> {
-        ParQueryIterMutTracked {
-            archetype_ranges: self.archetype_ranges,
-            min_batch_size: None,
-            _phantom: std::marker::PhantomData,
+        if self.tracked {
+            ParForEachResult::Tracked(self.execute_tracked(f))
+        } else {
+            self.execute_untracked(f);
+            ParForEachResult::Untracked
         }
     }
-}
 
-/// Parallel iterator with custom batch size
-pub struct ParQueryIterMutBatched<'w, Q: QueryTarget> {
-    archetype_ranges: Vec<(ArchetypeId, Q::State, usize)>,
-    min_batch_size: usize,
-    _phantom: std::marker::PhantomData<&'w mut Q>,
-}
-
-unsafe impl<'w, Q: QueryTarget> Send for ParQueryIterMutBatched<'w, Q> where Q::State: Send {}
-unsafe impl<'w, Q: QueryTarget> Sync for ParQueryIterMutBatched<'w, Q> where Q::State: Sync {}
-
-impl<'w, Q: QueryTarget> ParQueryIterMutBatched<'w, Q>
-where
-    Q::State: Send + Sync,
-    for<'a> Q::Item<'a>: Send,
-{
-    /// Get the total number of entities that will be processed
-    pub fn entity_count(&self) -> usize {
-        self.archetype_ranges.iter().map(|(_, _, len)| *len).sum()
-    }
-
-    /// Execute a closure on each entity in parallel with the configured batch size
-    ///
-    /// # Example
-    /// ```ignore
-    /// query.par_iter_mut()
-    ///     .with_batch_size(500)
-    ///     .for_each(|(transform, velocity)| {
-    ///         transform.x += velocity.x * delta_time;
-    ///     });
-    /// ```
-    pub fn for_each<F>(self, f: F)
+    fn execute_untracked<F>(self, f: F)
     where
         F: Fn(Q::Item<'_>) + Send + Sync,
     {
-        let min_batch_size = self.min_batch_size;
+        let min_len = self.min_batch_size.unwrap_or(1);
 
         self.archetype_ranges
             .into_par_iter()
             .for_each(|(_, state, len)| {
                 (0..len)
                     .into_par_iter()
-                    .with_min_len(min_batch_size)
+                    .with_min_len(min_len)
                     .for_each(|index| {
-                        let item = Q::fetch_mut_with_state(&state, index);
-                        f(item);
+                        f(Q::fetch_with_state(&state, index));
                     });
             });
     }
 
-    /// Enable batch tracking for parallel iteration
-    ///
-    /// Returns a tracked iterator that will collect statistics during iteration.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let stats = query.par_iter_mut()
-    ///     .with_batch_size(500)
-    ///     .tracked()
-    ///     .for_each(|(transform, velocity)| {
-    ///         transform.x += velocity.x * delta_time;
-    ///     });
-    /// println!("{}", stats);
-    /// ```
-    pub fn tracked(self) -> ParQueryIterMutTracked<'w, Q> {
-        ParQueryIterMutTracked {
-            archetype_ranges: self.archetype_ranges,
-            min_batch_size: Some(self.min_batch_size),
-            _phantom: std::marker::PhantomData,
-        }
-    }
-}
-
-/// Parallel iterator with tracking enabled
-///
-/// Created by calling `.tracked()` on a `ParQueryIterMut` or `ParQueryIterMutBatched`.
-/// All iteration methods return `BatchStats` with accurate tracking data.
-pub struct ParQueryIterMutTracked<'w, Q: QueryTarget> {
-    archetype_ranges: Vec<(ArchetypeId, Q::State, usize)>,
-    min_batch_size: Option<usize>,
-    _phantom: std::marker::PhantomData<&'w mut Q>,
-}
-
-unsafe impl<'w, Q: QueryTarget> Send for ParQueryIterMutTracked<'w, Q> where Q::State: Send {}
-unsafe impl<'w, Q: QueryTarget> Sync for ParQueryIterMutTracked<'w, Q> where Q::State: Sync {}
-
-impl<'w, Q: QueryTarget> ParQueryIterMutTracked<'w, Q>
-where
-    Q::State: Send + Sync,
-    for<'a> Q::Item<'a>: Send,
-{
-    /// Get the total number of entities that will be processed
-    pub fn entity_count(&self) -> usize {
-        self.archetype_ranges.iter().map(|(_, _, len)| *len).sum()
-    }
-
-    /// Execute a closure on each entity in parallel with batch tracking
-    ///
-    /// Returns `BatchStats` with accurate information about batch distribution.
-    ///
-    /// # Example
-    /// ```ignore
-    /// let stats = query.par_iter_mut().tracked().for_each(|(transform, velocity)| {
-    ///     transform.x += velocity.x * delta_time;
-    /// });
-    /// println!("Batches: {}, avg size: {}", stats.batch_count, stats.avg_batch_size);
-    /// ```
-    pub fn for_each<F>(self, f: F) -> BatchStats
+    fn execute_tracked<F>(self, f: F) -> BatchStats
     where
         F: Fn(Q::Item<'_>) + Send + Sync,
     {
         let num_threads = rayon::current_num_threads();
+        let total_entities = self.entity_count();
+        let min_len = self.min_batch_size.unwrap_or(1);
+
         let batch_count = Arc::new(AtomicUsize::new(0));
         let min_batch = Arc::new(AtomicUsize::new(usize::MAX));
         let max_batch = Arc::new(AtomicUsize::new(0));
-        let total_entities = self.entity_count();
-        let min_batch_size = self.min_batch_size;
 
         self.archetype_ranges
             .into_par_iter()
@@ -744,38 +625,29 @@ where
                 let min_batch = Arc::clone(&min_batch);
                 let max_batch = Arc::clone(&max_batch);
 
-                let iter = (0..len).into_par_iter();
-                let iter = if let Some(batch_size) = min_batch_size {
-                    iter.with_min_len(batch_size)
-                } else {
-                    iter.with_min_len(1) // Use default Rayon behavior
-                };
-
-                iter.fold_with(0usize, |count, index| {
-                    let item = Q::fetch_mut_with_state(&state, index);
-                    f(item);
-                    count + 1
-                })
-                .for_each(|batch_size| {
-                    batch_count.fetch_add(1, Ordering::Relaxed);
-                    min_batch.fetch_min(batch_size, Ordering::Relaxed);
-                    max_batch.fetch_max(batch_size, Ordering::Relaxed);
-                });
+                (0..len)
+                    .into_par_iter()
+                    .with_min_len(min_len)
+                    .fold_with(0usize, |count, index| {
+                        f(Q::fetch_with_state(&state, index));
+                        count + 1
+                    })
+                    .for_each(|size| {
+                        batch_count.fetch_add(1, Ordering::Relaxed);
+                        min_batch.fetch_min(size, Ordering::Relaxed);
+                        max_batch.fetch_max(size, Ordering::Relaxed);
+                    });
             });
 
         let batch_count = batch_count.load(Ordering::Relaxed);
-        let min_batch_size_result = min_batch.load(Ordering::Relaxed);
+        let min_batch_size = min_batch.load(Ordering::Relaxed);
         let max_batch_size = max_batch.load(Ordering::Relaxed);
 
         BatchStats {
             num_threads,
             batch_count,
             total_entities,
-            min_batch_size: if batch_count > 0 {
-                min_batch_size_result
-            } else {
-                0
-            },
+            min_batch_size: if batch_count > 0 { min_batch_size } else { 0 },
             max_batch_size,
             avg_batch_size: if batch_count > 0 {
                 total_entities as f64 / batch_count as f64
@@ -786,16 +658,56 @@ where
     }
 }
 
-/// Query for accessing global (singleton) components
+/// Result of parallel for_each execution.
+pub enum ParForEachResult {
+    Untracked,
+    Tracked(BatchStats),
+}
+
+impl ParForEachResult {
+    /// Get batch stats if tracking was enabled.
+    pub fn stats(self) -> Option<BatchStats> {
+        match self {
+            ParForEachResult::Tracked(stats) => Some(stats),
+            ParForEachResult::Untracked => None,
+        }
+    }
+
+    /// Unwrap batch stats, panicking if not tracked.
+    pub fn unwrap(self) -> BatchStats {
+        match self {
+            ParForEachResult::Tracked(stats) => stats,
+            ParForEachResult::Untracked => panic!("for_each was not tracked"),
+        }
+    }
+}
+
+impl From<ParForEachResult> for Option<BatchStats> {
+    fn from(result: ParForEachResult) -> Self {
+        result.stats()
+    }
+}
+
+impl std::fmt::Display for ParForEachResult {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ParForEachResult::Tracked(stats) => write!(f, "{}", stats),
+            ParForEachResult::Untracked => write!(f, "Untracked"),
+        }
+    }
+}
+
+// ============================================================================
+// Global Component Query
+// ============================================================================
+
+/// Query for accessing global (singleton) components.
 ///
-/// Unlike regular Query which iterates over entities, GlobalComponentQuery
-/// provides access to singleton components stored directly in the World.
-///
-/// Example:
+/// # Example
 /// ```ignore
-/// fn my_system(time: GlobalComponentQuery<GlobalTime>) {
-///     if let Some(time) = time.get() {
-///         println!("Delta time: {}", time.delta_time);
+/// fn my_system(mut time: GlobalComponentQuery<GameTime>) {
+///     if let Some(time) = time.get_mut() {
+///         time.elapsed += time.delta;
 ///     }
 /// }
 /// ```
@@ -812,12 +724,12 @@ impl<'w, T: Component> GlobalComponentQuery<'w, T> {
         }
     }
 
-    /// Get immutable reference to the global component
+    /// Get immutable reference to the global component.
     pub fn get(&self) -> Option<&T> {
         self.world.get_global_component::<T>()
     }
 
-    /// Get mutable reference to the global component
+    /// Get mutable reference to the global component.
     pub fn get_mut(&mut self) -> Option<&mut T> {
         self.world.get_global_component_mut::<T>()
     }
