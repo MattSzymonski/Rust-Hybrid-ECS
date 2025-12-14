@@ -527,13 +527,15 @@ impl World {
                 }
             }
 
-            // Also need to swap_remove from all component storages
-            // This is tricky with TraitTypeMap - we need to know the component types
-            for component_id in &archetype.component_types {
-                if let Some(_copier) = self.component_copiers.get(component_id) {
-                    // Use a special swap_remove operation
-                    // For now, we'll leave components in place (memory leak)
-                    // A full implementation would need swap_remove support in VecOptionStorage
+            // Also swap_remove from all component storages to keep them in sync
+            // Clone the component_types to avoid borrow issues
+            let component_types: Vec<ComponentId> = archetype.component_types.clone();
+            for component_id in component_types {
+                if let Some(storage) = archetype
+                    .component_storages
+                    .get_trait_storage_mut(component_id.0)
+                {
+                    storage.swap_remove(old_index);
                 }
             }
         }
