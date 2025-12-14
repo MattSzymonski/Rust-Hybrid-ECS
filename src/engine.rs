@@ -10,15 +10,14 @@
 
 use crate::commands::CommandQueue;
 use crate::scheduler::{SystemAccess, SystemScheduler};
-use crate::system::{IntoSystem, System, SystemParam, SystemState};
+use crate::system::{IntoSystem, System, SystemParam};
 use crate::world::World;
 use rayon::prelude::*;
 
-/// Wrapper for a registered system with its name and state
+/// Wrapper for a registered system with its name
 struct RegisteredSystem {
     name: &'static str,
     system: Box<dyn System>,
-    state: SystemState,
     enabled: bool,
 }
 
@@ -148,7 +147,6 @@ impl Engine {
         self.systems.push(RegisteredSystem {
             name,
             system: system.into_system(),
-            state: SystemState::new(),
             enabled: true,
         });
 
@@ -188,9 +186,7 @@ impl Engine {
             if !registered.enabled {
                 continue;
             }
-            registered
-                .system
-                .run(&mut self.world, &mut self.queue, &mut registered.state);
+            registered.system.run(&mut self.world, &mut self.queue);
         }
     }
 
@@ -211,9 +207,7 @@ impl Engine {
                 if !registered.enabled {
                     continue;
                 }
-                registered
-                    .system
-                    .run(&mut self.world, &mut self.queue, &mut registered.state);
+                registered.system.run(&mut self.world, &mut self.queue);
             } else {
                 // Multiple systems - run in parallel using rayon
                 // SAFETY: The scheduler guarantees that systems in the same batch access disjoint data
@@ -233,7 +227,7 @@ impl Engine {
                     let world = &mut *(world_ptr as *mut World);
                     let queue = &mut *(queue_ptr as *mut CommandQueue);
                     let registered = &mut *(systems_ptr as *mut RegisteredSystem).add(idx);
-                    registered.system.run(world, queue, &mut registered.state);
+                    registered.system.run(world, queue);
                 });
             }
         }

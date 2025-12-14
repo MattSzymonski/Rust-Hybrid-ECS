@@ -23,5 +23,4 @@ pub use entity::Entity;
 pub use query::{GlobalComponentQuery, Query, QueryTarget};
 pub use scheduler::{SystemAccess, SystemScheduler};
 pub use scripting::ScriptComponent;
-pub use system::{State, SystemState};
 pub use world::{EntityBuilder, World};

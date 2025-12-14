@@ -15,22 +15,6 @@ use crate::query::{GlobalComponentQuery, Query, QueryTarget};
 use crate::scheduler::SystemAccess;
 use crate::world::World;
 
-/// State that persists between system calls
-///
-/// This stores system-local data that needs to persist across frames.
-/// Currently just used for the dead_report_system's timer.
-pub struct SystemState {
-    pub last_report_time: f32,
-}
-
-impl SystemState {
-    pub fn new() -> Self {
-        Self {
-            last_report_time: 0.0,
-        }
-    }
-}
-
 /// Trait for systems that can be executed by the Engine
 ///
 /// Systems are functions that operate on World data. They are executed
@@ -38,7 +22,7 @@ impl SystemState {
 ///
 /// Must be Send to support parallel execution.
 pub trait System: Send {
-    fn run(&mut self, world: &mut World, queue: &mut CommandQueue, state: &mut SystemState);
+    fn run(&mut self, world: &mut World, queue: &mut CommandQueue);
 }
 
 /// Implement System for any FnMut closure with the right signature
@@ -46,10 +30,10 @@ pub trait System: Send {
 /// This allows us to store system closures in a Vec<Box<dyn System>>.
 impl<F> System for F
 where
-    F: FnMut(&mut World, &mut CommandQueue, &mut SystemState) + Send,
+    F: FnMut(&mut World, &mut CommandQueue) + Send,
 {
-    fn run(&mut self, world: &mut World, queue: &mut CommandQueue, state: &mut SystemState) {
-        self(world, queue, state);
+    fn run(&mut self, world: &mut World, queue: &mut CommandQueue) {
+        self(world, queue);
     }
 }
 
@@ -69,7 +53,7 @@ pub trait SystemParam: Sized {
     ///
     /// SAFETY: The returned value has a 'static lifetime for technical reasons,
     /// but it actually only lives as long as the system execution.
-    fn fetch(world: &mut World, queue: &mut CommandQueue, state: &mut SystemState) -> Self;
+    fn fetch(world: &mut World, queue: &mut CommandQueue) -> Self;
 
     /// Report component access pattern for dependency analysis
     ///
@@ -82,7 +66,7 @@ pub trait SystemParam: Sized {
 
 /// Commands is a SystemParam - provides deferred entity operations
 impl SystemParam for Commands<'static> {
-    fn fetch(_world: &mut World, queue: &mut CommandQueue, _state: &mut SystemState) -> Self {
+    fn fetch(_world: &mut World, queue: &mut CommandQueue) -> Self {
         // SAFETY: The Commands will only live as long as the system execution.
         // We transmute the lifetime to 'static for technical reasons, but
         // the system infrastructure ensures it doesn't outlive its borrow.
@@ -101,7 +85,7 @@ impl SystemParam for Commands<'static> {
 /// This implementation allows any query pattern to be used as a system parameter
 /// without needing separate implementations for each query type.
 impl<Q: QueryTarget + 'static> SystemParam for Query<'static, Q> {
-    fn fetch(world: &mut World, _queue: &mut CommandQueue, _state: &mut SystemState) -> Self {
+    fn fetch(world: &mut World, _queue: &mut CommandQueue) -> Self {
         unsafe {
             // Create query with actual lifetime, then transmute to 'static
             // SAFETY: The query will only live as long as the system execution
@@ -125,25 +109,13 @@ impl<Q: QueryTarget + 'static> SystemParam for Query<'static, Q> {
 ///
 /// This allows accessing any global/singleton component in systems.
 impl<T: Component> SystemParam for GlobalComponentQuery<'static, T> {
-    fn fetch(world: &mut World, _queue: &mut CommandQueue, _state: &mut SystemState) -> Self {
+    fn fetch(world: &mut World, _queue: &mut CommandQueue) -> Self {
         unsafe {
             // Create query with actual lifetime, then transmute to 'static
             // SAFETY: The query will only live as long as the system execution
             let query: GlobalComponentQuery<T> = GlobalComponentQuery::new(world);
             std::mem::transmute(query)
         }
-    }
-}
-
-/// State wrapper for accessing persistent system state
-///
-/// This allows systems to maintain state between frames (like timers).
-pub struct State<T>(pub T);
-
-impl SystemParam for State<&'static mut f32> {
-    fn fetch(_world: &mut World, _queue: &mut CommandQueue, state: &mut SystemState) -> Self {
-        // SAFETY: Transmuting lifetime for state access
-        unsafe { State(std::mem::transmute(&mut state.last_report_time)) }
     }
 }
 
@@ -159,8 +131,8 @@ macro_rules! impl_system_param_tuple {
     ($($T:ident),*) => {
         #[allow(non_snake_case)]
         impl<$($T: SystemParam),*> SystemParam for ($($T,)*) {
-            fn fetch(world: &mut World, queue: &mut CommandQueue, state: &mut SystemState) -> Self {
-                ($($T::fetch(world, queue, state),)*)
+            fn fetch(world: &mut World, queue: &mut CommandQueue) -> Self {
+                ($($T::fetch(world, queue),)*)
             }
 
             fn report_access(access: &mut SystemAccess) {
@@ -172,7 +144,7 @@ macro_rules! impl_system_param_tuple {
 
 // Implement for tuples of different sizes (0 to 6 parameters)
 impl SystemParam for () {
-    fn fetch(_world: &mut World, _queue: &mut CommandQueue, _state: &mut SystemState) -> Self {
+    fn fetch(_world: &mut World, _queue: &mut CommandQueue) -> Self {
         ()
     }
 
@@ -261,11 +233,9 @@ where
     Input: SystemParam,
 {
     fn into_system(mut self) -> Box<dyn System> {
-        Box::new(
-            move |world: &mut World, queue: &mut CommandQueue, state: &mut SystemState| {
-                let input = Input::fetch(world, queue, state);
-                self.run(input);
-            },
-        )
+        Box::new(move |world: &mut World, queue: &mut CommandQueue| {
+            let input = Input::fetch(world, queue);
+            self.run(input);
+        })
     }
 }
