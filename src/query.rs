@@ -734,3 +734,411 @@ impl<'w, T: Component> GlobalComponentQuery<'w, T> {
         self.world.get_global_component_mut::<T>()
     }
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::Component;
+    use trait_type_map::impl_trait_accessible;
+
+    // Test components
+    #[derive(Debug, Clone, PartialEq)]
+    struct Position {
+        x: f32,
+        y: f32,
+    }
+    impl Component for Position {}
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Velocity {
+        x: f32,
+        y: f32,
+    }
+    impl Component for Velocity {}
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Health(i32);
+    impl Component for Health {}
+
+    impl_trait_accessible!(dyn Component; Position, Velocity, Health);
+
+    fn setup_world() -> World {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Velocity>();
+        world.register_component::<Health>();
+        world
+    }
+
+    // ------------------------------------------------------------------------
+    // Basic Query Tests
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_query_empty_world() {
+        let mut world = setup_world();
+        let mut query = Query::<(&Position,)>::new(&mut world);
+        assert_eq!(query.iter_mut().count(), 0);
+    }
+
+    #[test]
+    fn test_query_single_entity() {
+        let mut world = setup_world();
+        world
+            .create_entity()
+            .with(Position { x: 1.0, y: 2.0 })
+            .with(Velocity { x: 0.5, y: 0.5 })
+            .build();
+
+        let mut query = Query::<(&Position, &Velocity)>::new(&mut world);
+        let results: Vec<_> = query.iter_mut().collect();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.x, 1.0);
+        assert_eq!(results[0].1.x, 0.5);
+    }
+
+    #[test]
+    fn test_query_multiple_entities() {
+        let mut world = setup_world();
+
+        for i in 0..10 {
+            world
+                .create_entity()
+                .with(Position {
+                    x: i as f32,
+                    y: 0.0,
+                })
+                .build();
+        }
+
+        let mut query = Query::<(&Position,)>::new(&mut world);
+        assert_eq!(query.iter_mut().count(), 10);
+    }
+
+    #[test]
+    fn test_query_filters_by_components() {
+        let mut world = setup_world();
+
+        // Entity with Position only
+        world
+            .create_entity()
+            .with(Position { x: 1.0, y: 1.0 })
+            .build();
+
+        // Entity with Position and Velocity
+        world
+            .create_entity()
+            .with(Position { x: 2.0, y: 2.0 })
+            .with(Velocity { x: 1.0, y: 1.0 })
+            .build();
+
+        // Query for entities with both Position and Velocity
+        let mut query = Query::<(&Position, &Velocity)>::new(&mut world);
+        let results: Vec<_> = query.iter_mut().collect();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0.x, 2.0);
+    }
+
+    #[test]
+    fn test_query_mutable_modification() {
+        let mut world = setup_world();
+
+        world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .with(Velocity { x: 1.0, y: 2.0 })
+            .build();
+
+        // Modify position based on velocity
+        {
+            let mut query = Query::<(&mut Position, &Velocity)>::new(&mut world);
+            for (pos, vel) in query.iter_mut() {
+                pos.x += vel.x;
+                pos.y += vel.y;
+            }
+        }
+
+        // Verify modification
+        let mut query = Query::<(&Position,)>::new(&mut world);
+        let (pos,) = query.first().unwrap();
+        assert_eq!(pos.x, 1.0);
+        assert_eq!(pos.y, 2.0);
+    }
+
+    #[test]
+    fn test_query_first() {
+        let mut world = setup_world();
+
+        world
+            .create_entity()
+            .with(Position { x: 5.0, y: 5.0 })
+            .build();
+
+        let mut query = Query::<(&Position,)>::new(&mut world);
+        let first = query.first();
+
+        assert!(first.is_some());
+        assert_eq!(first.unwrap().0.x, 5.0);
+    }
+
+    #[test]
+    fn test_query_first_empty() {
+        let mut world = setup_world();
+        let mut query = Query::<(&Position,)>::new(&mut world);
+        assert!(query.first().is_none());
+    }
+
+    #[test]
+    fn test_query_entity_access() {
+        let mut world = setup_world();
+
+        let entity = world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build();
+
+        let mut query = Query::<(Entity, &Position)>::new(&mut world);
+        let (queried_entity, _) = query.first().unwrap();
+
+        assert_eq!(queried_entity.id, entity.id);
+    }
+
+    // ------------------------------------------------------------------------
+    // Parallel Iterator Tests
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_par_iter_basic() {
+        let mut world = setup_world();
+
+        for i in 0..100 {
+            world
+                .create_entity()
+                .with(Position {
+                    x: i as f32,
+                    y: 0.0,
+                })
+                .build();
+        }
+
+        let mut query = Query::<(&mut Position,)>::new(&mut world);
+        query.par_iter_mut().for_each(|(pos,)| {
+            pos.x += 1.0;
+        });
+
+        // Verify all were modified
+        let mut verify_query = Query::<(&Position,)>::new(&mut world);
+        for (pos,) in verify_query.iter_mut() {
+            assert!(pos.x >= 1.0);
+        }
+    }
+
+    #[test]
+    fn test_par_iter_with_batch_size() {
+        let mut world = setup_world();
+
+        for _ in 0..1000 {
+            world
+                .create_entity()
+                .with(Position { x: 0.0, y: 0.0 })
+                .build();
+        }
+
+        let mut query = Query::<(&mut Position,)>::new(&mut world);
+        let stats = query
+            .par_iter_mut()
+            .with_batch_size(100)
+            .tracked()
+            .for_each(|(pos,)| {
+                pos.x = 1.0;
+            });
+
+        let stats = stats.unwrap();
+        assert_eq!(stats.total_entities, 1000);
+        assert!(stats.batch_count > 0);
+        assert!(stats.min_batch_size >= 100 || stats.batch_count == 1);
+    }
+
+    #[test]
+    fn test_par_iter_tracked_stats() {
+        let mut world = setup_world();
+
+        for _ in 0..500 {
+            world
+                .create_entity()
+                .with(Position { x: 0.0, y: 0.0 })
+                .build();
+        }
+
+        let mut query = Query::<(&Position,)>::new(&mut world);
+        let result = query.par_iter_mut().tracked().for_each(|_| {});
+
+        match result {
+            ParForEachResult::Tracked(stats) => {
+                assert_eq!(stats.total_entities, 500);
+                assert!(stats.batch_count > 0);
+                assert!(stats.num_threads > 0);
+                assert!(stats.avg_batch_size > 0.0);
+            }
+            ParForEachResult::Untracked => panic!("Expected tracked result"),
+        }
+    }
+
+    #[test]
+    fn test_par_iter_untracked() {
+        let mut world = setup_world();
+
+        world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build();
+
+        let mut query = Query::<(&Position,)>::new(&mut world);
+        let result = query.par_iter_mut().for_each(|_| {});
+
+        assert!(matches!(result, ParForEachResult::Untracked));
+        assert!(result.stats().is_none());
+    }
+
+    #[test]
+    fn test_par_iter_entity_count() {
+        let mut world = setup_world();
+
+        for _ in 0..250 {
+            world
+                .create_entity()
+                .with(Position { x: 0.0, y: 0.0 })
+                .build();
+        }
+
+        let mut query = Query::<(&Position,)>::new(&mut world);
+        let par_iter = query.par_iter_mut();
+
+        assert_eq!(par_iter.entity_count(), 250);
+    }
+
+    // ------------------------------------------------------------------------
+    // BatchStats Tests
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_batch_stats_display() {
+        let stats = BatchStats {
+            num_threads: 8,
+            batch_count: 10,
+            total_entities: 1000,
+            min_batch_size: 90,
+            max_batch_size: 110,
+            avg_batch_size: 100.0,
+        };
+
+        let display = format!("{}", stats);
+        assert!(display.contains("threads: 8"));
+        assert!(display.contains("batches: 10"));
+        assert!(display.contains("entities: 1000"));
+    }
+
+    #[test]
+    fn test_par_for_each_result_display() {
+        let stats = BatchStats {
+            num_threads: 4,
+            batch_count: 5,
+            total_entities: 100,
+            min_batch_size: 20,
+            max_batch_size: 20,
+            avg_batch_size: 20.0,
+        };
+
+        let tracked = ParForEachResult::Tracked(stats);
+        let untracked = ParForEachResult::Untracked;
+
+        assert!(format!("{}", tracked).contains("threads: 4"));
+        assert_eq!(format!("{}", untracked), "Untracked");
+    }
+
+    // ------------------------------------------------------------------------
+    // Global Component Query Tests
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_global_component_query() {
+        let mut world = setup_world();
+
+        world.add_global_component(Health(100));
+
+        let query = GlobalComponentQuery::<Health>::new(&mut world);
+        let health = query.get().unwrap();
+
+        assert_eq!(health.0, 100);
+    }
+
+    #[test]
+    fn test_global_component_query_mut() {
+        let mut world = setup_world();
+
+        world.add_global_component(Health(100));
+
+        {
+            let mut query = GlobalComponentQuery::<Health>::new(&mut world);
+            if let Some(health) = query.get_mut() {
+                health.0 -= 25;
+            }
+        }
+
+        let query = GlobalComponentQuery::<Health>::new(&mut world);
+        assert_eq!(query.get().unwrap().0, 75);
+    }
+
+    #[test]
+    fn test_global_component_query_missing() {
+        let mut world = setup_world();
+
+        let query = GlobalComponentQuery::<Health>::new(&mut world);
+        assert!(query.get().is_none());
+    }
+
+    // ------------------------------------------------------------------------
+    // QueryTarget Trait Tests
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_component_ids() {
+        let ids = <(&Position, &Velocity)>::component_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&ComponentId::of::<Position>()));
+        assert!(ids.contains(&ComponentId::of::<Velocity>()));
+    }
+
+    #[test]
+    fn test_report_component_access_read() {
+        let (reads, writes) = <(&Position,)>::report_component_access();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(writes.len(), 0);
+    }
+
+    #[test]
+    fn test_report_component_access_write() {
+        let (reads, writes) = <(&mut Position,)>::report_component_access();
+        assert_eq!(reads.len(), 0);
+        assert_eq!(writes.len(), 1);
+    }
+
+    #[test]
+    fn test_report_component_access_mixed() {
+        let (reads, writes) = <(&Position, &mut Velocity)>::report_component_access();
+        assert_eq!(reads.len(), 1);
+        assert_eq!(writes.len(), 1);
+    }
+
+    #[test]
+    fn test_entity_has_no_component_ids() {
+        let ids = Entity::component_ids();
+        assert!(ids.is_empty());
+    }
+}

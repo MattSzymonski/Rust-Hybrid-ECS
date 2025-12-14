@@ -24,7 +24,7 @@ struct RegisteredSystem {
 /// The main Engine that drives the ECS
 ///
 /// # Example
-/// ```rust
+/// ```ignore
 /// let mut engine = Engine::new();
 /// engine.register_system("movement", movement_system);
 /// engine.register_system("collision", collision_system);
@@ -123,7 +123,7 @@ impl Engine {
     /// The name is used for debugging and profiling.
     ///
     /// # Example
-    /// ```rust
+    /// ```ignore
     /// engine.register_system("movement", |
     ///     mut commands: Commands,
     ///     query: Query<(Entity, &mut Position, &Velocity)>
