@@ -85,7 +85,12 @@ impl Archetype {
         let component_names: Vec<String> = self
             .component_types
             .iter()
-            .map(|component_id| registry.get_name(component_id).unwrap_or("Unknown").to_string())
+            .map(|component_id| {
+                registry
+                    .get_name(component_id)
+                    .unwrap_or("Unknown")
+                    .to_string()
+            })
             .collect();
 
         println!(

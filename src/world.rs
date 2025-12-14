@@ -574,8 +574,8 @@ impl World {
             self.archetype_lookup.remove(&mask);
         }
 
-        // Add entity ID to free list with incremented generation for recycling
-        // This allows the ID to be reused, but with a new generation to invalidate old handles
+        // Add entity ID to free list with incremented generation for recycling.
+        // This allows the ID to be reused, but with a new generation to invalidate old handles.
         self.free_entity_ids
             .push((entity.id, entity.generation.wrapping_add(1)));
 

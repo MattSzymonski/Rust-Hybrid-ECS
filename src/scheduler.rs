@@ -102,10 +102,37 @@ impl SystemScheduler {
     /// Algorithm:
     /// 1. Start with all systems unscheduled
     /// 2. For each batch:
-    ///    - Find all systems that don't conflict with each other
-    ///    - Add them to the batch
-    ///    - Mark them as scheduled
-    /// 3. Repeat until all systems are scheduled
+    /// Build the parallel execution graph using greedy batching.
+    ///
+    /// # Algorithm
+    ///
+    /// Uses a greedy approach that iterates through systems in registration order:
+    /// 1. Start with an empty batch
+    /// 2. For each unscheduled system:
+    ///    - If it doesn't conflict with any system in the current batch, add it
+    ///    - Otherwise, skip it for now
+    /// 3. When no more systems can be added, finalize the batch
+    /// 4. Repeat until all systems are scheduled
+    ///
+    /// # Limitations
+    ///
+    /// This greedy algorithm is O(n²) in the number of systems and may not produce
+    /// the optimal (minimum) number of batches. For example, with systems A, B, C where:
+    /// - A conflicts with B
+    /// - B conflicts with C  
+    /// - A does NOT conflict with C
+    ///
+    /// Registration order [A, B, C] produces: [[A, C], [B]] (2 batches, optimal)
+    /// Registration order [B, A, C] produces: [[B], [A, C]] (2 batches, optimal)
+    ///
+    /// However, pathological orderings could produce suboptimal results. For most
+    /// real-world system counts (<100), this is not a concern. For very large system
+    /// counts, consider using topological sort with graph coloring.
+    ///
+    /// # Correctness
+    ///
+    /// Despite potential suboptimality, the algorithm is **always correct**: systems
+    /// in the same batch are guaranteed to have non-conflicting access patterns.
     pub fn build_execution_graph(&mut self) {
         self.execution_graph.clear();
 

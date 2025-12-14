@@ -58,7 +58,12 @@ impl ComponentRegistry {
         if let Some(&bit) = self.id_to_bit.get(&component_id) {
             return bit;
         }
-        assert!(self.next_bit < 128, "Too many component types (max 128)");
+        assert!(
+            self.next_bit < 128,
+            "Component type limit exceeded: cannot register {} (max 128 component types). \
+             Consider combining related components or using a component with interior data variants.",
+            std::any::type_name::<T>()
+        );
         let bit = self.next_bit;
         self.id_to_bit.insert(component_id, bit);
         self.names
