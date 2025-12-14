@@ -1766,4 +1766,79 @@ mod tests {
 
         println!("✓ Generations with multiple archetypes and component removal work correctly!");
     }
+
+    /// Tests that component data is correctly swap-removed when an entity is destroyed.
+    ///
+    /// This test exposes the bug where component data is NOT swap-removed from storage
+    /// when an entity is destroyed, causing remaining entities to read stale/wrong data.
+    ///
+    /// Expected behavior
+    /// - After destroying entity0, entity2 should still have its original Position (2.0, 2.0)
+    /// - Currently, entity2 reads entity0's old Position (0.0, 0.0) - BUG!
+    #[test]
+    fn test_component_swap_remove_on_destroy() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+
+        // Create 3 entities in the same archetype
+        let entity0 = world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build();
+        let entity1 = world
+            .create_entity()
+            .with(Position { x: 1.0, y: 1.0 })
+            .build();
+        let entity2 = world
+            .create_entity()
+            .with(Position { x: 2.0, y: 2.0 })
+            .build();
+
+        // Verify initial state
+        assert_eq!(world.get_component::<Position>(entity0).unwrap().x, 0.0);
+        assert_eq!(world.get_component::<Position>(entity1).unwrap().x, 1.0);
+        assert_eq!(world.get_component::<Position>(entity2).unwrap().x, 2.0);
+
+        // Archetype entity list: [entity0, entity1, entity2] (indices 0, 1, 2)
+        // Component storage:     [Pos(0,0), Pos(1,1), Pos(2,2)]
+
+        // Destroy entity0 (index 0)
+        // Entity list swap_remove: entity2 moves from index 2 to index 0
+        // Entity list becomes: [entity2, entity1] (entity2 now at index 0)
+        //
+        // BUG: Component storage is NOT updated!
+        // Component storage still: [Pos(0,0), Pos(1,1), Pos(2,2)]
+        //
+        // Now entity2 has index 0, but component at index 0 is Pos(0,0) - WRONG!
+        world.destroy_entity(entity0);
+
+        // entity1 should still have its original position (index 1 unchanged)
+        let pos1 = world.get_component::<Position>(entity1).unwrap();
+        assert_eq!(pos1.x, 1.0, "entity1 Position.x should be 1.0");
+        assert_eq!(pos1.y, 1.0, "entity1 Position.y should be 1.0");
+
+        // entity2 was swapped to index 0 - it should still have Position(2.0, 2.0)
+        // BUG: It actually reads Position(0.0, 0.0) because component storage wasn't swap-removed
+        let pos2 = world.get_component::<Position>(entity2).unwrap();
+
+        println!(
+            "entity2 Position after entity0 destroyed: ({}, {})",
+            pos2.x, pos2.y
+        );
+        println!("Expected: (2.0, 2.0), Got: ({}, {})", pos2.x, pos2.y);
+
+        // This assertion FAILS because of the unimplemented component swap_remove
+        assert_eq!(
+            pos2.x, 2.0,
+            "BUG: entity2 should have Position.x = 2.0, but got {} (entity0's old data)",
+            pos2.x
+        );
+        assert_eq!(
+            pos2.y, 2.0,
+            "BUG: entity2 should have Position.y = 2.0, but got {} (entity0's old data)",
+            pos2.y
+        );
+
+        println!("✓ Component swap_remove works correctly!");
+    }
 }
