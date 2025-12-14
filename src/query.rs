@@ -263,7 +263,14 @@ impl<T: Component> QueryTarget for &mut T {
     }
 
     fn fetch<'a>(_archetype: &'a Archetype, _index: usize) -> Self::Item<'a> {
-        panic!("Cannot fetch mutable reference from immutable archetype")
+        // SAFETY: This path should never be reached in correct code.
+        // The query system ensures mutable queries use fetch_mut.
+        // If we get here, it indicates a bug in the query infrastructure.
+        unreachable!(
+            "BUG: fetch() called for &mut {} - mutable queries must use fetch_mut(). \
+             This indicates a bug in the query infrastructure.",
+            std::any::type_name::<T>()
+        )
     }
 
     fn fetch_mut<'a>(archetype: &'a mut Archetype, index: usize) -> Self::Item<'a> {

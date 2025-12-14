@@ -48,14 +48,12 @@ impl Archetype {
 
         // Register storage for each component type using the factory
         for &component_id in &component_types {
-            if let Some(factory) = storage_factories.get(&component_id) {
-                factory(&mut component_storages);
-            } else {
-                panic!(
-                    "Component type {:?} not registered in storage factories",
+            let factory = storage_factories.get(&component_id)
+                .unwrap_or_else(|| panic!(
+                    "Component type {:?} not registered. Call world.register_component::<T>() first.",
                     component_id
-                );
-            }
+                ));
+            factory(&mut component_storages);
         }
 
         Self {

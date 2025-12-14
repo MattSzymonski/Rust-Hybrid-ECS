@@ -383,7 +383,10 @@ impl World {
     {
         let archetype_id = self.get_or_create_archetype(component_ids);
 
-        let archetype = self.archetypes.get_mut(&archetype_id).unwrap();
+        let archetype = self
+            .archetypes
+            .get_mut(&archetype_id)
+            .expect("archetype must exist after get_or_create_archetype");
         let index: usize = archetype.entities.len();
 
         // Add entity to archetype
@@ -451,8 +454,16 @@ impl World {
 
         // SAFETY: We need to access two archetypes simultaneously
         // We ensure old_archetype_id != new_archetype_id above
-        let old_arch_ptr = self.archetypes.get(&old_archetype_id).unwrap() as *const Archetype;
-        let new_arch_ptr = self.archetypes.get_mut(&new_archetype_id).unwrap() as *mut Archetype;
+        let old_arch_ptr = self
+            .archetypes
+            .get(&old_archetype_id)
+            .expect("source archetype must exist during entity migration")
+            as *const Archetype;
+        let new_arch_ptr = self
+            .archetypes
+            .get_mut(&new_archetype_id)
+            .expect("destination archetype must exist after get_or_create_archetype")
+            as *mut Archetype;
 
         unsafe {
             let old_arch = &*old_arch_ptr;
