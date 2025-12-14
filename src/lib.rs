@@ -20,7 +20,7 @@ pub use commands::Commands;
 pub use component::Component;
 pub use engine::Engine;
 pub use entity::Entity;
-pub use query::{GlobalComponentQuery, Query, QueryTarget};
+pub use query::{BatchStats, GlobalComponentQuery, Query, QueryTarget};
 pub use scheduler::{SystemAccess, SystemScheduler};
 pub use scripting::ScriptComponent;
 pub use world::{EntityBuilder, World};

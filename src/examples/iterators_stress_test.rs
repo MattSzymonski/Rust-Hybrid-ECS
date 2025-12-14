@@ -8,6 +8,7 @@
 //! - Performance measurements
 
 use ecs_hybrid::{Component, Engine, GlobalComponentQuery, Query};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use trait_type_map::impl_trait_accessible;
 
@@ -130,41 +131,36 @@ fn collision_and_movement_system(
     mut obstacle_query: Query<(&Transform, &BoxCollider, &Obstacle)>,
 ) {
     // Get obstacle data
-    let mut obstacle_data = None;
-    for (obs_transform, obs_collider, _) in obstacle_query.iter_mut() {
-        obstacle_data = Some((obs_transform.clone(), obs_collider.clone()));
-        break;
-    }
-
-    let Some((obstacle_transform, obstacle_collider)) = obstacle_data else {
+    let Some((obstacle_transform, obstacle_collider, _)) = obstacle_query.first() else {
         return;
     };
 
-    // Collect collision info: (new_position, should_collide)
-    let mut collision_checks: Vec<(f32, f32, f32, bool)> = Vec::new();
+    // Parallel version with batch tracking - shows how work is distributed
+    let stats =
+        moving_query
+            .par_iter_mut()
+            .for_each_batched_tracked(500, |(transform, velocity)| {
+                let new_x = transform.x + velocity.x * 0.016;
+                let new_y = transform.y + velocity.y * 0.016;
+                let new_z = transform.z + velocity.z * 0.016;
 
-    // First pass: calculate new positions and check collisions (read-only)
-    for (transform, velocity) in moving_query.iter_mut() {
-        let new_x = transform.x + velocity.x * 0.016;
-        let new_y = transform.y + velocity.y * 0.016;
-        let new_z = transform.z + velocity.z * 0.016;
+                // Check collision with all colliders on the obstacle
+                let collided = obstacle_collider
+                    .check_any_collision(&obstacle_transform, (new_x, new_y, new_z));
 
-        // Check collision with all colliders on the obstacle
-        let collided =
-            obstacle_collider.check_any_collision(&obstacle_transform, (new_x, new_y, new_z));
+                // Apply movement only if no collision
+                if !collided {
+                    transform.x = new_x;
+                    transform.y = new_y;
+                    transform.z = new_z;
+                }
+            });
 
-        collision_checks.push((new_x, new_y, new_z, collided));
-    }
-
-    // Second pass: apply movement only if no collision (write)
-    for ((transform, _velocity), (new_x, new_y, new_z, collided)) in
-        moving_query.iter_mut().zip(collision_checks.iter())
-    {
-        if !collided {
-            transform.x = *new_x;
-            transform.y = *new_y;
-            transform.z = *new_z;
-        }
+    // Use static counter to only print once per 100 frames
+    static FRAME_COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let frame = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
+    if frame == 0 {
+        println!("Parallel batch stats: {}", stats);
     }
 }
 
@@ -199,6 +195,8 @@ pub fn main() {
     println!("=== Stress Test: Archetype-Based ECS ===\n");
 
     let mut engine = Engine::new();
+
+    println!("Rayon threads: {}", rayon::current_num_threads());
 
     // Register all component types before use
     engine.world_mut().register_component::<SimulationStats>();

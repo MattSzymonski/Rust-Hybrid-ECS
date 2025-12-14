@@ -11,7 +11,99 @@ use crate::component::{Component, ComponentId, ComponentMask};
 use crate::entity::Entity;
 use crate::world::World;
 
+use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use trait_type_map::VecOptionStorage;
+
+// ============================================================================
+// Batch Statistics
+// ============================================================================
+
+/// Statistics about batch distribution during parallel iteration
+///
+/// This struct is returned by `for_each_tracked` and `for_each_batched_tracked`
+/// methods to provide insight into how Rayon distributed work across threads.
+#[derive(Debug, Clone)]
+pub struct BatchStats {
+    /// Number of threads in the Rayon thread pool
+    pub num_threads: usize,
+    /// Total number of batches that were executed
+    pub batch_count: usize,
+    /// Total number of entities that were processed
+    pub total_entities: usize,
+    /// Size of the smallest batch
+    pub min_batch_size: usize,
+    /// Size of the largest batch
+    pub max_batch_size: usize,
+    /// Average batch size (total_entities / batch_count)
+    pub avg_batch_size: f64,
+}
+
+impl std::fmt::Display for BatchStats {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "BatchStats {{ threads: {}, batches: {}, entities: {}, min: {}, max: {}, avg: {:.1} }}",
+            self.num_threads,
+            self.batch_count,
+            self.total_entities,
+            self.min_batch_size,
+            self.max_batch_size,
+            self.avg_batch_size
+        )
+    }
+}
+
+// ============================================================================
+// Thread-Safe Pointer Wrappers
+// ============================================================================
+
+/// A wrapper for `*const T` that implements Send and Sync
+///
+/// # Safety
+/// This is safe because we guarantee that:
+/// 1. The pointer points to valid data for the lifetime of the query
+/// 2. Different threads access different indices (no aliasing)
+/// 3. The World has exclusive access during iteration
+#[derive(Clone, Copy)]
+pub struct SendPtr<T>(*const T);
+
+unsafe impl<T> Send for SendPtr<T> {}
+unsafe impl<T> Sync for SendPtr<T> {}
+
+impl<T> SendPtr<T> {
+    pub fn new(ptr: *const T) -> Self {
+        Self(ptr)
+    }
+
+    pub fn as_ptr(&self) -> *const T {
+        self.0
+    }
+}
+
+/// A wrapper for `*mut T` that implements Send and Sync
+///
+/// # Safety
+/// This is safe because we guarantee that:
+/// 1. The pointer points to valid data for the lifetime of the query
+/// 2. Different threads access different indices (no aliasing)
+/// 3. The World has exclusive access during iteration
+#[derive(Clone, Copy)]
+pub struct SendPtrMut<T>(*mut T);
+
+unsafe impl<T> Send for SendPtrMut<T> {}
+unsafe impl<T> Sync for SendPtrMut<T> {}
+
+impl<T> SendPtrMut<T> {
+    pub fn new(ptr: *mut T) -> Self {
+        Self(ptr)
+    }
+
+    pub fn as_ptr(&self) -> *mut T {
+        self.0
+    }
+}
 
 /// QueryTarget trait for fetching components from archetypes
 ///
@@ -47,7 +139,7 @@ pub trait QueryTarget {
 /// Implement QueryTarget for Entity access
 impl QueryTarget for Entity {
     type Item<'a> = Entity;
-    type State = *const Vec<Entity>;
+    type State = SendPtr<Vec<Entity>>;
 
     fn component_ids() -> Vec<ComponentId> {
         Vec::new()
@@ -58,13 +150,12 @@ impl QueryTarget for Entity {
     }
 
     fn init_state(archetype: &mut Archetype) -> Self::State {
-        &archetype.entities as *const Vec<Entity>
+        SendPtr::new(&archetype.entities as *const Vec<Entity>)
     }
 
     fn fetch_mut_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
         unsafe {
-            let vec_ptr = *state;
-            let vec_ref = &*vec_ptr;
+            let vec_ref = &*state.as_ptr();
             vec_ref.get_unchecked(index).clone()
         }
     }
@@ -81,7 +172,7 @@ impl QueryTarget for Entity {
 /// Implement QueryTarget for immutable component reference
 impl<T: Component> QueryTarget for &T {
     type Item<'a> = &'a T;
-    type State = *const VecOptionStorage<T, dyn Component>;
+    type State = SendPtr<VecOptionStorage<T, dyn Component>>;
 
     fn component_ids() -> Vec<ComponentId> {
         vec![ComponentId::of::<T>()]
@@ -93,11 +184,12 @@ impl<T: Component> QueryTarget for &T {
     }
 
     fn init_state(archetype: &mut Archetype) -> Self::State {
-        archetype.component_storages.get_storage::<T>() as *const VecOptionStorage<T, dyn Component>
+        SendPtr::new(archetype.component_storages.get_storage::<T>()
+            as *const VecOptionStorage<T, dyn Component>)
     }
 
     fn fetch_mut_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
-        unsafe { (*(*state)).get(index).expect("Component not found") }
+        unsafe { (*state.as_ptr()).get(index).expect("Component not found") }
     }
 
     fn fetch<'a>(archetype: &'a Archetype, index: usize) -> Self::Item<'a> {
@@ -120,7 +212,7 @@ impl<T: Component> QueryTarget for &T {
 /// Implement QueryTarget for mutable component reference
 impl<T: Component> QueryTarget for &mut T {
     type Item<'a> = &'a mut T;
-    type State = *mut VecOptionStorage<T, dyn Component>;
+    type State = SendPtrMut<VecOptionStorage<T, dyn Component>>;
 
     fn component_ids() -> Vec<ComponentId> {
         vec![ComponentId::of::<T>()]
@@ -132,12 +224,16 @@ impl<T: Component> QueryTarget for &mut T {
     }
 
     fn init_state(archetype: &mut Archetype) -> Self::State {
-        archetype.component_storages.get_storage_mut::<T>()
-            as *mut VecOptionStorage<T, dyn Component>
+        SendPtrMut::new(archetype.component_storages.get_storage_mut::<T>()
+            as *mut VecOptionStorage<T, dyn Component>)
     }
 
     fn fetch_mut_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
-        unsafe { (*(*state)).get_mut(index).expect("Component not found") }
+        unsafe {
+            (*state.as_ptr())
+                .get_mut(index)
+                .expect("Component not found")
+        }
     }
 
     fn fetch<'a>(_archetype: &'a Archetype, _index: usize) -> Self::Item<'a> {
@@ -270,6 +366,76 @@ impl<'w, Q: QueryTarget> Query<'w, Q> {
             _phantom: std::marker::PhantomData,
         }
     }
+
+    /// Get the first matching entity's components, if any exist
+    ///
+    /// This is useful when you expect only one entity or just need any matching entity.
+    ///
+    /// # Example
+    /// ```ignore
+    /// if let Some((transform, velocity)) = query.first() {
+    ///     println!("First entity at ({}, {})", transform.x, transform.y);
+    /// }
+    /// ```
+    #[inline]
+    pub fn first(&mut self) -> Option<Q::Item<'_>> {
+        self.iter_mut().next()
+    }
+
+    /// Create a parallel iterator over all matching entities using Rayon
+    ///
+    /// This method provides parallel iteration across entities, distributing
+    /// work across multiple threads. Each archetype is processed in parallel,
+    /// and entities within each archetype are also processed in parallel.
+    ///
+    /// # Example
+    /// ```ignore
+    /// fn physics_system(mut query: Query<(&mut Transform, &Velocity)>) {
+    ///     query.par_iter_mut().for_each(|(transform, velocity)| {
+    ///         transform.x += velocity.x * 0.016;
+    ///         transform.y += velocity.y * 0.016;
+    ///     });
+    /// }
+    /// ```
+    ///
+    /// # Safety
+    /// This is safe because:
+    /// - Each entity's components are accessed by exactly one thread
+    /// - Different entities have independent component data
+    /// - The query holds exclusive access to the World
+    #[inline]
+    pub fn par_iter_mut(&'_ mut self) -> ParQueryIterMut<'_, Q>
+    where
+        Q::State: Send + Sync,
+        for<'a> Q::Item<'a>: Send,
+    {
+        // Build component mask from query requirements
+        let component_ids = Q::component_ids();
+        let mut query_mask = ComponentMask::empty();
+        for component_id in &component_ids {
+            if let Some(bit) = self.world.component_registry.get_bit(component_id) {
+                query_mask.set(bit);
+            }
+        }
+
+        // Collect matching archetypes with their entity ranges
+        let mut archetype_ranges: Vec<(ArchetypeId, Q::State, usize)> = Vec::new();
+
+        for (id, archetype) in &mut self.world.archetypes {
+            if archetype.matches_mask(&query_mask) {
+                let state = Q::init_state(archetype);
+                let len = archetype.len();
+                if len > 0 {
+                    archetype_ranges.push((*id, state, len));
+                }
+            }
+        }
+
+        ParQueryIterMut {
+            archetype_ranges,
+            _phantom: std::marker::PhantomData,
+        }
+    }
 }
 
 /// Iterator for mutable queries
@@ -358,6 +524,233 @@ impl<'w, Q: QueryTarget> QueryIterMut<'w, Q> {
             self.current_archetype_idx += 1;
 
             Some(())
+        }
+    }
+}
+
+/// Parallel iterator for mutable queries using Rayon
+///
+/// This iterator distributes work across multiple threads, processing
+/// entities in parallel. Each archetype's entities are iterated in parallel.
+pub struct ParQueryIterMut<'w, Q: QueryTarget> {
+    /// (archetype_id, cached_state, entity_count)
+    archetype_ranges: Vec<(ArchetypeId, Q::State, usize)>,
+    _phantom: std::marker::PhantomData<&'w mut Q>,
+}
+
+// SAFETY: ParQueryIterMut can be sent between threads because:
+// - archetype_ranges contains owned data (Vec) and raw pointers in Q::State
+// - The raw pointers in Q::State point to component storage that remains valid
+//   for the lifetime of the query (exclusive World access)
+// - Each thread accesses different entity indices, so no data races occur
+unsafe impl<'w, Q: QueryTarget> Send for ParQueryIterMut<'w, Q> where Q::State: Send {}
+unsafe impl<'w, Q: QueryTarget> Sync for ParQueryIterMut<'w, Q> where Q::State: Sync {}
+
+impl<'w, Q: QueryTarget> ParQueryIterMut<'w, Q>
+where
+    Q::State: Send + Sync,
+    for<'a> Q::Item<'a>: Send,
+{
+    /// Get the number of threads available in Rayon's thread pool
+    pub fn num_threads() -> usize {
+        rayon::current_num_threads()
+    }
+
+    /// Get the total number of entities that will be processed
+    pub fn entity_count(&self) -> usize {
+        self.archetype_ranges.iter().map(|(_, _, len)| *len).sum()
+    }
+
+    /// Execute a closure on each entity in parallel
+    ///
+    /// This is the primary way to use parallel iteration. The closure
+    /// receives the query result for each entity and can mutate components.
+    ///
+    /// # Example
+    /// ```ignore
+    /// query.par_iter_mut().for_each(|(transform, velocity)| {
+    ///     transform.x += velocity.x * delta_time;
+    /// });
+    /// ```
+    pub fn for_each<F>(self, f: F)
+    where
+        F: Fn(Q::Item<'_>) + Send + Sync,
+    {
+        // Process all archetypes in parallel
+        self.archetype_ranges
+            .into_par_iter()
+            .for_each(|(_, state, len)| {
+                // Process entities within each archetype in parallel
+                (0..len).into_par_iter().for_each(|index| {
+                    let item = Q::fetch_mut_with_state(&state, index);
+                    f(item);
+                });
+            });
+    }
+
+    /// Execute a closure on each entity in parallel with custom batch size
+    ///
+    /// The `min_batch_size` parameter controls the minimum number of entities
+    /// that will be processed by a single thread. Larger batches reduce overhead
+    /// but may cause load imbalance. Smaller batches improve load balancing but
+    /// increase overhead.
+    ///
+    /// # Guidelines
+    /// - **Small work per entity** (simple math): use larger batches (1000-10000)
+    /// - **Heavy work per entity** (complex calculations): use smaller batches (10-100)
+    /// - **Default Rayon behavior**: ~1000 items per batch
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Process in batches of at least 500 entities per thread
+    /// query.par_iter_mut().for_each_batched(500, |(transform, velocity)| {
+    ///     transform.x += velocity.x * delta_time;
+    /// });
+    /// ```
+    pub fn for_each_batched<F>(self, min_batch_size: usize, f: F)
+    where
+        F: Fn(Q::Item<'_>) + Send + Sync,
+    {
+        self.archetype_ranges
+            .into_par_iter()
+            .for_each(|(_, state, len)| {
+                // Use with_min_len to control batch size
+                (0..len)
+                    .into_par_iter()
+                    .with_min_len(min_batch_size)
+                    .for_each(|index| {
+                        let item = Q::fetch_mut_with_state(&state, index);
+                        f(item);
+                    });
+            });
+    }
+
+    /// Execute a closure on each entity in parallel with batch tracking
+    ///
+    /// Returns `BatchStats` containing information about how the work was
+    /// distributed across batches. This is useful for performance tuning.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let stats = query.par_iter_mut().for_each_tracked(|(transform, velocity)| {
+    ///     transform.x += velocity.x * delta_time;
+    /// });
+    /// println!("Batches: {}, avg size: {}", stats.batch_count, stats.avg_batch_size);
+    /// ```
+    pub fn for_each_tracked<F>(self, f: F) -> BatchStats
+    where
+        F: Fn(Q::Item<'_>) + Send + Sync,
+    {
+        let num_threads = rayon::current_num_threads();
+        let batch_count = Arc::new(AtomicUsize::new(0));
+        let min_batch = Arc::new(AtomicUsize::new(usize::MAX));
+        let max_batch = Arc::new(AtomicUsize::new(0));
+        let total_entities = self.entity_count();
+
+        self.archetype_ranges
+            .into_par_iter()
+            .for_each(|(_, state, len)| {
+                // Each call to fold_with creates a batch
+                let batch_count = Arc::clone(&batch_count);
+                let min_batch = Arc::clone(&min_batch);
+                let max_batch = Arc::clone(&max_batch);
+
+                (0..len)
+                    .into_par_iter()
+                    .fold_with(0usize, |count, index| {
+                        let item = Q::fetch_mut_with_state(&state, index);
+                        f(item);
+                        count + 1
+                    })
+                    .for_each(|batch_size| {
+                        // This runs once per completed batch
+                        batch_count.fetch_add(1, Ordering::Relaxed);
+                        min_batch.fetch_min(batch_size, Ordering::Relaxed);
+                        max_batch.fetch_max(batch_size, Ordering::Relaxed);
+                    });
+            });
+
+        let batch_count = batch_count.load(Ordering::Relaxed);
+        let min_batch_size = min_batch.load(Ordering::Relaxed);
+        let max_batch_size = max_batch.load(Ordering::Relaxed);
+
+        BatchStats {
+            num_threads,
+            batch_count,
+            total_entities,
+            min_batch_size: if batch_count > 0 { min_batch_size } else { 0 },
+            max_batch_size,
+            avg_batch_size: if batch_count > 0 {
+                total_entities as f64 / batch_count as f64
+            } else {
+                0.0
+            },
+        }
+    }
+
+    /// Execute a closure on each entity in parallel with batch tracking and custom batch size
+    ///
+    /// Combines batch size control with batch tracking. Returns `BatchStats`
+    /// containing information about how the work was distributed.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let stats = query.par_iter_mut().for_each_batched_tracked(500, |(transform, velocity)| {
+    ///     transform.x += velocity.x * delta_time;
+    /// });
+    /// println!("Batches: {}, min: {}, max: {}", stats.batch_count, stats.min_batch_size, stats.max_batch_size);
+    /// ```
+    pub fn for_each_batched_tracked<F>(self, min_batch_size: usize, f: F) -> BatchStats
+    where
+        F: Fn(Q::Item<'_>) + Send + Sync,
+    {
+        let num_threads = rayon::current_num_threads();
+        let batch_count = Arc::new(AtomicUsize::new(0));
+        let min_batch = Arc::new(AtomicUsize::new(usize::MAX));
+        let max_batch = Arc::new(AtomicUsize::new(0));
+        let total_entities = self.entity_count();
+
+        self.archetype_ranges
+            .into_par_iter()
+            .for_each(|(_, state, len)| {
+                let batch_count = Arc::clone(&batch_count);
+                let min_batch = Arc::clone(&min_batch);
+                let max_batch = Arc::clone(&max_batch);
+
+                (0..len)
+                    .into_par_iter()
+                    .with_min_len(min_batch_size)
+                    .fold_with(0usize, |count, index| {
+                        let item = Q::fetch_mut_with_state(&state, index);
+                        f(item);
+                        count + 1
+                    })
+                    .for_each(|batch_size| {
+                        batch_count.fetch_add(1, Ordering::Relaxed);
+                        min_batch.fetch_min(batch_size, Ordering::Relaxed);
+                        max_batch.fetch_max(batch_size, Ordering::Relaxed);
+                    });
+            });
+
+        let batch_count = batch_count.load(Ordering::Relaxed);
+        let min_batch_size_result = min_batch.load(Ordering::Relaxed);
+        let max_batch_size = max_batch.load(Ordering::Relaxed);
+
+        BatchStats {
+            num_threads,
+            batch_count,
+            total_entities,
+            min_batch_size: if batch_count > 0 {
+                min_batch_size_result
+            } else {
+                0
+            },
+            max_batch_size,
+            avg_batch_size: if batch_count > 0 {
+                total_entities as f64 / batch_count as f64
+            } else {
+                0.0
+            },
         }
     }
 }
