@@ -136,11 +136,40 @@ fn collision_and_movement_system(
     };
 
     // Parallel version with batch tracking - shows how work is distributed
-    let stats = moving_query
-        .par_iter_mut()
-        .with_batch_size(300)
-        .tracked()
-        .for_each(|(transform, velocity)| {
+    {
+        let stats = moving_query
+            .par_iter_mut()
+            .with_batch_size(200)
+            .tracked()
+            .for_each(|(transform, velocity)| {
+                let new_x = transform.x + velocity.x * 0.016;
+                let new_y = transform.y + velocity.y * 0.016;
+                let new_z = transform.z + velocity.z * 0.016;
+
+                // Check collision with all colliders on the obstacle
+                let collided = obstacle_collider
+                    .check_any_collision(&obstacle_transform, (new_x, new_y, new_z));
+
+                // Apply movement only if no collision
+                if !collided {
+                    transform.x = new_x;
+                    transform.y = new_y;
+                    transform.z = new_z;
+                }
+            });
+
+        // Use static counter to only print once per 100 frames
+        static FRAME_COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let frame = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
+        if frame == 0 {
+            println!("Parallel batch stats: {}", stats);
+        }
+    }
+
+    // Sequential version
+    {
+        /*
+        moving_query.iter_mut().for_each(|(transform, velocity)| {
             let new_x = transform.x + velocity.x * 0.016;
             let new_y = transform.y + velocity.y * 0.016;
             let new_z = transform.z + velocity.z * 0.016;
@@ -156,12 +185,7 @@ fn collision_and_movement_system(
                 transform.z = new_z;
             }
         });
-
-    // Use static counter to only print once per 100 frames
-    static FRAME_COUNTER: AtomicUsize = AtomicUsize::new(0);
-    let frame = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
-    if frame == 0 {
-        println!("Parallel batch stats: {}", stats);
+        */
     }
 }
 
