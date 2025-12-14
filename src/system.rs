@@ -8,6 +8,62 @@
 //! 1. Each parameter type implements SystemParam to extract itself from World
 //! 2. Functions are automatically converted to systems based on their parameters
 //! 3. No manual wrapper code needed - just write functions and register them
+//!
+//! # Safety Warning: Lifetime Transmutation
+//!
+//! This module uses `std::mem::transmute` to convert references with actual
+//! lifetimes to `'static` lifetimes. This is a deliberate design choice to
+//! work around Rust's borrowing rules in the context of dynamic system execution.
+//!
+//! **This is technically undefined behavior if the reference escapes the system.**
+//!
+//! The safety of this pattern relies on these invariants being upheld:
+//!
+//! 1. **System parameters must NOT be stored** - Parameters like `Query<'static, Q>`
+//!    and `Commands<'static>` must only be used within the system function body.
+//!    Storing them in static variables, global state, or any location that outlives
+//!    the system call is **undefined behavior**.
+//!
+//! 2. **System parameters must NOT escape via closures** - Do not capture system
+//!    parameters in closures that outlive the system (e.g., spawned threads, async
+//!    tasks, or callbacks registered for later execution).
+//!
+//! 3. **System parameters must NOT be returned** - While the type system prevents
+//!    most cases, do not use unsafe code to extract and return the inner reference.
+//!
+//! ## Why This Pattern?
+//!
+//! Rust's type system cannot express "this reference lives exactly as long as
+//! this function call" without GATs (Generic Associated Types) and complex
+//! lifetime machinery. The `'static` transmutation is a pragmatic solution
+//! used by many ECS frameworks including early versions of Bevy.
+//!
+//! ## Safe Alternatives (Not Yet Implemented)
+//!
+//! - **Token type pattern**: Pass a lifetime-bound token that proves the borrow
+//!   is still valid, making misuse a compile error.
+//! - **GAT-based SystemParam**: Use Generic Associated Types to properly model
+//!   the lifetime relationship (requires more complex trait bounds).
+//!
+//! ## Example: Safe Usage
+//!
+//! ```ignore
+//! fn movement_system(query: Query<(&mut Position, &Velocity)>) {
+//!     for (pos, vel) in query.iter_mut() {
+//!         pos.x += vel.x;  // OK - using within system
+//!     }
+//! }  // query dropped here - lifetime ends safely
+//! ```
+//!
+//! ## Example: UNSAFE Usage (DO NOT DO THIS)
+//!
+//! ```ignore
+//! static mut LEAKED_QUERY: Option<Query<'static, &Position>> = None;
+//!
+//! fn bad_system(query: Query<&Position>) {
+//!     unsafe { LEAKED_QUERY = Some(query); }  // UNDEFINED BEHAVIOR!
+//! }
+//! ```
 
 use crate::commands::{CommandQueue, Commands};
 use crate::component::Component;
@@ -27,7 +83,7 @@ pub trait System: Send {
 
 /// Implement System for any FnMut closure with the right signature
 ///
-/// This allows us to store system closures in a Vec<Box<dyn System>>.
+/// This allows us to store system closures in a `Vec<Box<dyn System>>`.
 impl<F> System for F
 where
     F: FnMut(&mut World, &mut CommandQueue) + Send,
@@ -46,13 +102,25 @@ where
 /// This is the core of the flexible system architecture. Types that implement
 /// SystemParam can be used as function parameters in systems.
 ///
-/// The trait uses lifetime transmutation internally to work around Rust's
-/// borrowing rules while maintaining safety.
+/// # Safety
+///
+/// Implementations use lifetime transmutation internally. See module-level docs
+/// for the safety invariants that must be upheld.
+///
+/// **The returned parameter must not escape the system function scope.**
 pub trait SystemParam: Sized {
-    /// Fetch the parameter from world state
+    /// Fetch the parameter from world state.
     ///
-    /// SAFETY: The returned value has a 'static lifetime for technical reasons,
-    /// but it actually only lives as long as the system execution.
+    /// # Safety Contract
+    ///
+    /// The returned value has a `'static` lifetime marker but actually borrows
+    /// from `world` and `queue`. Callers must ensure:
+    ///
+    /// 1. The returned value is dropped before the system function returns
+    /// 2. The returned value is not stored in static/global state
+    /// 3. The returned value is not moved into spawned threads or async tasks
+    ///
+    /// Violating these invariants is **undefined behavior**.
     fn fetch(world: &mut World, queue: &mut CommandQueue) -> Self;
 
     /// Report component access pattern for dependency analysis
@@ -67,9 +135,18 @@ pub trait SystemParam: Sized {
 /// Commands is a SystemParam - provides deferred entity operations
 impl SystemParam for Commands<'static> {
     fn fetch(_world: &mut World, queue: &mut CommandQueue) -> Self {
-        // SAFETY: The Commands will only live as long as the system execution.
-        // We transmute the lifetime to 'static for technical reasons, but
-        // the system infrastructure ensures it doesn't outlive its borrow.
+        // SAFETY: Lifetime transmutation from actual borrow to 'static.
+        //
+        // This is sound IFF the caller upholds the SystemParam safety contract:
+        // - The Commands<'static> must not escape the system function
+        // - The Commands<'static> must not be stored in global/static state
+        // - The Commands<'static> must be dropped before system returns
+        //
+        // The Engine's system execution infrastructure ensures these invariants
+        // by calling systems as opaque functions that cannot return the parameter.
+        //
+        // UNDEFINED BEHAVIOR if Commands escapes (e.g., stored in static variable,
+        // moved to another thread, or captured in an escaping closure).
         unsafe { std::mem::transmute(Commands::new(queue)) }
     }
 
@@ -86,9 +163,19 @@ impl SystemParam for Commands<'static> {
 /// without needing separate implementations for each query type.
 impl<Q: QueryTarget + 'static> SystemParam for Query<'static, Q> {
     fn fetch(world: &mut World, _queue: &mut CommandQueue) -> Self {
+        // SAFETY: Lifetime transmutation from actual borrow to 'static.
+        //
+        // This is sound IFF the caller upholds the SystemParam safety contract:
+        // - The Query<'static, Q> must not escape the system function
+        // - The Query<'static, Q> must not be stored in global/static state
+        // - The Query<'static, Q> must be dropped before system returns
+        //
+        // The Engine's system execution infrastructure ensures these invariants
+        // by calling systems as opaque functions that cannot return the parameter.
+        //
+        // UNDEFINED BEHAVIOR if Query escapes (e.g., stored in static variable,
+        // moved to another thread, or captured in an escaping closure).
         unsafe {
-            // Create query with actual lifetime, then transmute to 'static
-            // SAFETY: The query will only live as long as the system execution
             let query: Query<Q> = Query::new(world);
             std::mem::transmute(query)
         }
@@ -110,9 +197,19 @@ impl<Q: QueryTarget + 'static> SystemParam for Query<'static, Q> {
 /// This allows accessing any global/singleton component in systems.
 impl<T: Component> SystemParam for GlobalComponentQuery<'static, T> {
     fn fetch(world: &mut World, _queue: &mut CommandQueue) -> Self {
+        // SAFETY: Lifetime transmutation from actual borrow to 'static.
+        //
+        // This is sound IFF the caller upholds the SystemParam safety contract:
+        // - The GlobalComponentQuery<'static, T> must not escape the system function
+        // - The GlobalComponentQuery<'static, T> must not be stored in global/static state
+        // - The GlobalComponentQuery<'static, T> must be dropped before system returns
+        //
+        // The Engine's system execution infrastructure ensures these invariants
+        // by calling systems as opaque functions that cannot return the parameter.
+        //
+        // UNDEFINED BEHAVIOR if GlobalComponentQuery escapes (e.g., stored in
+        // static variable, moved to another thread, or captured in an escaping closure).
         unsafe {
-            // Create query with actual lifetime, then transmute to 'static
-            // SAFETY: The query will only live as long as the system execution
             let query: GlobalComponentQuery<T> = GlobalComponentQuery::new(world);
             std::mem::transmute(query)
         }

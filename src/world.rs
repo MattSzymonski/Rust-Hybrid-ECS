@@ -202,6 +202,8 @@ impl World {
             // SAFETY: We use raw pointer to bypass borrow checker, but we're careful:
             // - Only one component is accessed at a time
             // - The updater callback receives the engine pointer for safe access
+            // RISK: In update function, component can delete itself and then reference self afterwards, what is UB
+            // TODO: Make all operations on entities and components deferred (like commands, but fakely appear immediate)
             for (entity, archetype_id, index) in entities_to_update {
                 if let Some(archetype) = self.archetypes.get_mut(&archetype_id) {
                     // Call the updater with mutable storage access
