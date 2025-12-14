@@ -12,9 +12,18 @@ struct Counter {
 impl Component for Counter {}
 
 impl ScriptComponent for Counter {
-    fn update(&mut self, _entity: Entity, _world: &mut World) {
+    fn update(&mut self, entity: Entity, world: &mut World) {
         self.value = (self.value + self.increment).min(self.max_value);
         println!("Counter: {} / {}", self.value, self.max_value);
+
+        // Only update Position if the entity has one
+        if let Some(position) = world.get_component_mut::<Position>(entity) {
+            position.y = self.value as f32;
+            println!(
+                "  Updated Position.y to {} based on counter value",
+                self.value
+            );
+        }
     }
 }
 

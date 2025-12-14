@@ -225,6 +225,58 @@ impl World {
             .and_then(|boxed| boxed.downcast_mut::<T>())
     }
 
+    /// Get immutable reference to a component on an entity
+    ///
+    /// Returns None if the entity doesn't exist or doesn't have the component.
+    pub fn get_component<T>(&self, entity: Entity) -> Option<&T>
+    where
+        T: Component + TraitAccessible<dyn Component>,
+    {
+        // Get entity location
+        let location = self.entity_locations.get(&entity)?;
+
+        // Get archetype
+        let archetype = self.archetypes.get(&location.archetype_id)?;
+
+        // Check if archetype has this component type
+        if !archetype.has_component::<T>() {
+            return None;
+        }
+
+        // Get component from storage
+        archetype
+            .component_storages
+            .get_storage::<T>()
+            .get(location.index_in_archetype)
+    }
+
+    /// Get mutable reference to a component on an entity
+    ///
+    /// Returns None if the entity doesn't exist or doesn't have the component.
+    pub fn get_component_mut<T>(&mut self, entity: Entity) -> Option<&mut T>
+    where
+        T: Component + TraitAccessible<dyn Component>,
+    {
+        // Get entity location
+        let location = self.entity_locations.get(&entity)?;
+        let archetype_id = location.archetype_id;
+        let index = location.index_in_archetype;
+
+        // Get archetype
+        let archetype = self.archetypes.get_mut(&archetype_id)?;
+
+        // Check if archetype has this component type
+        if !archetype.has_component::<T>() {
+            return None;
+        }
+
+        // Get component from storage
+        archetype
+            .component_storages
+            .get_storage_mut::<T>()
+            .get_mut(index)
+    }
+
     /// Allocate a new unique entity ID
     pub(crate) fn allocate_entity(&mut self) -> Entity {
         let entity = Entity {
