@@ -66,6 +66,17 @@ impl Archetype {
     }
 
     /// Check if this archetype contains entities with the specified component
+    ///
+    /// Uses bitmask for O(1) lookup instead of linear search through component types.
+    #[inline]
+    pub fn has_component_bit(&self, bit: u8) -> bool {
+        self.component_mask.has_bit(bit)
+    }
+
+    /// Check if this archetype contains entities with the specified component type
+    ///
+    /// Note: This uses O(n) linear search. Prefer `has_component_bit` with a
+    /// pre-looked-up bit index for hot paths.
     pub fn has_component<T: Component>(&self) -> bool {
         self.component_types.contains(&ComponentId::of::<T>())
     }

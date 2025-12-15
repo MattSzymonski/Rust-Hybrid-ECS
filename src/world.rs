@@ -251,14 +251,18 @@ impl World {
     where
         T: Component + TraitAccessible<dyn Component>,
     {
+        // Get component bit for O(1) archetype check
+        let component_id = ComponentId::of::<T>();
+        let bit = self.component_registry.get_bit(&component_id)?;
+
         // Get entity location
         let location = self.entity_locations.get(&entity)?;
 
         // Get archetype
         let archetype = self.archetypes.get(&location.archetype_id)?;
 
-        // Check if archetype has this component type
-        if !archetype.has_component::<T>() {
+        // Check if archetype has this component type (O(1) bitmask check)
+        if !archetype.has_component_bit(bit) {
             return None;
         }
 
@@ -278,6 +282,10 @@ impl World {
     where
         T: Component + TraitAccessible<dyn Component>,
     {
+        // Get component bit for O(1) archetype check
+        let component_id = ComponentId::of::<T>();
+        let bit = self.component_registry.get_bit(&component_id)?;
+
         // Get entity location
         let location = self.entity_locations.get(&entity)?;
         let archetype_id = location.archetype_id;
@@ -286,8 +294,8 @@ impl World {
         // Get archetype
         let archetype = self.archetypes.get_mut(&archetype_id)?;
 
-        // Check if archetype has this component type
-        if !archetype.has_component::<T>() {
+        // Check if archetype has this component type (O(1) bitmask check)
+        if !archetype.has_component_bit(bit) {
             return None;
         }
 

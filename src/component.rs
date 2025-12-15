@@ -32,6 +32,12 @@ impl ComponentMask {
         self.0 |= 1u128 << bit_index;
     }
 
+    /// Check if a specific bit is set (O(1) component type check)
+    #[inline]
+    pub fn has_bit(&self, bit_index: u8) -> bool {
+        (self.0 & (1u128 << bit_index)) != 0
+    }
+
     pub fn contains_all(&self, other: &ComponentMask) -> bool {
         (self.0 & other.0) == other.0
     }
