@@ -158,7 +158,7 @@ impl Engine {
     ///
     /// This is the main loop of the ECS:
     /// 1. Execute all registered systems (in parallel batches if enabled)
-    /// 2. Systems can queue commands (spawn, despawn, add component, etc.)
+    /// 2. Systems can queue commands (create, destroy, add component, etc.)
     /// 3. After all systems run, apply the queued commands
     ///
     /// This two-phase approach ensures structural changes don't interfere

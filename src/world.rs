@@ -4,7 +4,7 @@
 //! The World is the central container for all ECS data.
 //!
 //! It manages entities, archetypes, and provides the primary interface for
-//! spawning entities and managing components.
+//! creating entities and managing components.
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -688,7 +688,7 @@ impl World {
             .cloned()
             .collect();
 
-        // If no components left, despawn the entity instead
+        // If no components left, destroy the entity instead
         if new_component_ids.is_empty() {
             self.destroy_entity(entity);
             return Ok(());
@@ -838,7 +838,7 @@ impl<T: Component + TraitAccessible<dyn Component>> ComponentInserter
 ///
 /// Example:
 /// ```ignore
-/// world.spawn()
+/// world.create_entity()
 ///     .with(Transform { x: 0.0, y: 0.0, z: 0.0 })
 ///     .with(Velocity { x: 10.0 })
 ///     .build();
@@ -909,38 +909,38 @@ mod tests {
 
     impl_trait_accessible!(dyn Component; Position, Velocity, Health);
 
-    /// Tests spawning multiple entities with different component combinations.
+    /// Tests creating multiple entities with different component combinations.
     ///
     /// This test verifies that:
-    /// - Entities can be spawned with various combinations of components
+    /// - Entities can be created with various combinations of components
     /// - Each unique component combination creates a separate archetype
-    /// - All spawned entities are properly tracked in the world
+    /// - All created entities are properly tracked in the world
     ///
     /// Expected results:
     /// - 3 entities should be created in total
     /// - 3 different archetypes should exist (Position+Velocity, Position, Position+Velocity+Health)
     /// - All entity IDs should be present in the entity_locations map
     #[test]
-    fn test_spawn_entities_with_different_components() {
+    fn test_create_entities_with_different_components() {
         let mut world = World::new();
         world.register_component::<Position>();
         world.register_component::<Velocity>();
         world.register_component::<Health>();
 
-        // Spawn entity with Position + Velocity
+        // Create entity with Position + Velocity
         let entity1 = world
             .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
             .with(Velocity { x: 1.0, y: 2.0 })
             .build();
 
-        // Spawn entity with Position only
+        // Create entity with Position only
         let entity2 = world
             .create_entity()
             .with(Position { x: 5.0, y: 15.0 })
             .build();
 
-        // Spawn entity with all three components
+        // Create entity with all three components
         let entity3 = world
             .create_entity()
             .with(Position { x: 100.0, y: 200.0 })
@@ -1166,10 +1166,10 @@ mod tests {
         );
     }
 
-    /// Tests removing the last component from an entity, which should despawn it.
+    /// Tests removing the last component from an entity, which should destroy it.
     ///
     /// This test verifies that:
-    /// - When an entity's last component is removed, the entity is automatically despawned
+    /// - When an entity's last component is removed, the entity is automatically destroyed
     /// - No entities with zero components are left in the world
     /// - The entity is properly removed from all tracking structures
     /// - If entity count drops to zero, archetypes are cleaned up
@@ -1180,7 +1180,7 @@ mod tests {
     /// - The entity should no longer exist in entity_locations
     /// - All archetypes should be removed if no entities remain
     #[test]
-    fn test_remove_last_component_despawns_entity() {
+    fn test_remove_last_component_destroys_entity() {
         let mut world = World::new();
         world.register_component::<Position>();
 
@@ -1191,35 +1191,35 @@ mod tests {
 
         assert_eq!(world.entity_locations.len(), 1);
 
-        // Remove the only component - should despawn entity
+        // Remove the only component - should destroy entity
         let result = world.remove_component::<Position>(entity);
 
         assert!(result.is_ok(), "Should successfully remove component");
         assert_eq!(
             world.entity_locations.len(),
             0,
-            "Entity should be despawned"
+            "Entity should be destroyed"
         );
         assert!(!world.entity_locations.contains_key(&entity));
 
         assert!(world.archetypes.is_empty(), "No archetypes should remain");
     }
 
-    /// Tests despawning an entity and verifying other entities remain unaffected.
+    /// Tests destroying an entity and verifying other entities remain unaffected.
     ///
     /// This test verifies that:
     /// - An entity can be completely removed from the world
-    /// - Despawning one entity doesn't affect other entities
+    /// - Destroying one entity doesn't affect other entities
     /// - The entity is removed from its archetype and all tracking structures
     /// - The total entity count decreases correctly
     ///
     /// Expected results:
-    /// - despawn should return true (success)
+    /// - destroy should return true (success)
     /// - Entity count should decrease from 2 to 1
-    /// - The despawned entity should no longer exist in entity_locations
+    /// - The destroyed entity should no longer exist in entity_locations
     /// - The other entity should remain unaffected
     #[test]
-    fn test_despawn_entity() {
+    fn test_destroy_entity() {
         let mut world = World::new();
         world.register_component::<Position>();
         world.register_component::<Velocity>();
@@ -1237,48 +1237,48 @@ mod tests {
 
         assert_eq!(world.entity_locations.len(), 2);
 
-        // Despawn entity1
+        // Destroy entity1
         let result = world.destroy_entity(entity1);
 
-        assert!(result, "Should successfully despawn entity");
+        assert!(result, "Should successfully destroy entity");
         assert_eq!(world.entity_locations.len(), 1);
         assert!(!world.entity_locations.contains_key(&entity1));
         assert!(world.entity_locations.contains_key(&entity2));
     }
 
-    /// Tests attempting to despawn a non-existent entity.
+    /// Tests attempting to destroy a non-existent entity.
     ///
     /// This test verifies that:
-    /// - The system handles invalid entity IDs gracefully during despawn
-    /// - No panic or crash occurs when despawning a fake entity
+    /// - The system handles invalid entity IDs gracefully during destroy
+    /// - No panic or crash occurs when destroying a fake entity
     /// - The operation correctly reports failure
     ///
     /// Expected results:
-    /// - despawn should return false (failure)
+    /// - destroy should return false (failure)
     /// - No changes to the world state
     #[test]
-    fn test_despawn_nonexistent_entity() {
+    fn test_destroy_nonexistent_entity() {
         let mut world = World::new();
         let fake_entity = crate::Entity::new_for_test(9999, 0);
 
         let result = world.destroy_entity(fake_entity);
 
-        assert!(!result, "Should fail to despawn non-existent entity");
+        assert!(!result, "Should fail to destroy non-existent entity");
     }
 
-    /// Tests that attempting to despawn an already-despawned entity fails correctly.
+    /// Tests that attempting to destroy an already-destroyed entity fails correctly.
     ///
     /// This test verifies that:
-    /// - Once an entity is despawned, it cannot be despawned again
+    /// - Once an entity is destroyed, it cannot be destroyed again
     /// - The system properly tracks which entities exist vs don't exist
-    /// - Repeated despawn operations are safely rejected
+    /// - Repeated destroy operations are safely rejected
     ///
     /// Expected results:
-    /// - First despawn should return true (success)
-    /// - Second despawn should return false (entity no longer exists)
-    /// - No panic or invalid state from double-despawn attempt
+    /// - First destroy should return true (success)
+    /// - Second destroy should return false (entity no longer exists)
+    /// - No panic or invalid state from double-destroy attempt
     #[test]
-    fn test_despawn_already_despawned_entity() {
+    fn test_destroy_already_destroyed_entity() {
         let mut world = World::new();
         world.register_component::<Position>();
 
@@ -1287,16 +1287,16 @@ mod tests {
             .with(Position { x: 10.0, y: 20.0 })
             .build();
 
-        // First despawn should succeed
+        // First destroy should succeed
         let result1 = world.destroy_entity(entity);
         assert!(result1);
 
-        // Second despawn should fail
+        // Second destroy should fail
         let result2 = world.destroy_entity(entity);
-        assert!(!result2, "Should fail to despawn already-despawned entity");
+        assert!(!result2, "Should fail to destroy already-destroyed entity");
     }
 
-    /// Tests the cleanup of empty archetypes after entities are despawned.
+    /// Tests the cleanup of empty archetypes after entities are destroyed.
     ///
     /// This test verifies that:
     /// - When all entities are removed from an archetype, it becomes empty
@@ -1306,7 +1306,7 @@ mod tests {
     ///
     /// Expected results:
     /// - Initially 2 archetypes should exist
-    /// - After despawning entity1 and cleanup, archetype count should decrease
+    /// - After destroying entity1 and cleanup, archetype count should decrease
     /// - entity2 should still exist and be properly tracked
     #[test]
     fn test_cleanup_empty_archetypes() {
@@ -1329,7 +1329,7 @@ mod tests {
         let initial_archetypes = world.archetypes.len();
         assert_eq!(initial_archetypes, 2);
 
-        // Despawn one entity, leaving one archetype empty
+        // Destroy one entity, leaving one archetype empty
         world.destroy_entity(entity1);
 
         // Cleanup should remove empty archetype
@@ -1407,7 +1407,7 @@ mod tests {
         world.register_component::<Velocity>();
         world.register_component::<Health>();
 
-        // Spawn single entity with Position + Velocity
+        // Create single entity with Position + Velocity
         let entity = world
             .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
@@ -1450,7 +1450,7 @@ mod tests {
         world.register_component::<Position>();
         world.register_component::<Velocity>();
 
-        // Spawn some entities
+        // Create some entities
         world
             .create_entity()
             .with(Position { x: 10.0, y: 20.0 })

@@ -25,7 +25,7 @@
 //!    the system call is **undefined behavior**.
 //!
 //! 2. **System parameters must NOT escape via closures** - Do not capture system
-//!    parameters in closures that outlive the system (e.g., spawned threads, async
+//!    parameters in closures that outlive the system (e.g., background threads, async
 //!    tasks, or callbacks registered for later execution).
 //!
 //! 3. **System parameters must NOT be returned** - While the type system prevents
@@ -74,7 +74,7 @@ use crate::world::World;
 /// Trait for systems that can be executed by the Engine
 ///
 /// Systems are functions that operate on World data. They are executed
-/// every frame and can read/write components, spawn entities, etc.
+/// every frame and can read/write components, create entities, etc.
 ///
 /// Must be Send to support parallel execution.
 pub trait System: Send {
@@ -118,7 +118,7 @@ pub trait SystemParam: Sized {
     ///
     /// 1. The returned value is dropped before the system function returns
     /// 2. The returned value is not stored in static/global state
-    /// 3. The returned value is not moved into spawned threads or async tasks
+    /// 3. The returned value is not moved into background threads or async tasks
     ///
     /// Violating these invariants is **undefined behavior**.
     fn fetch(world: &mut World, queue: &mut CommandQueue) -> Self;
@@ -151,7 +151,7 @@ impl SystemParam for Commands<'static> {
     }
 
     fn report_access(access: &mut SystemAccess) {
-        // Commands can spawn/despawn entities and add/remove components
+        // Commands can create/destroy entities and add/remove components
         // This requires exclusive World access
         access.set_uses_commands(true);
     }

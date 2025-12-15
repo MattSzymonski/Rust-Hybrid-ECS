@@ -294,7 +294,7 @@ impl<'a> Commands<'a> {
 
     /// Start building a new entity to create (executed later)
     ///
-    /// Returns an EntitySpawnBuilder for fluent API to add components.
+    /// Returns an EntityBuilder for fluent API to add components.
     pub fn create_entity(&mut self) -> EntityBuilder<'_> {
         EntityBuilder {
             command_queue: self.command_queue,
