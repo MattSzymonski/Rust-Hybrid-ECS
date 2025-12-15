@@ -135,7 +135,15 @@ impl World {
             component_registry: ComponentRegistry::new(),
         }
     }
+}
 
+impl Default for World {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl World {
     /// Register a component type with the World
     ///
     /// This must be called for each component type before it can be used.
@@ -1366,12 +1374,12 @@ mod tests {
             .with(Velocity { x: 1.0, y: 2.0 })
             .build();
 
-        let initial_location = world.entity_locations.get(&entity).unwrap().clone();
+        let initial_location = *world.entity_locations.get(&entity).unwrap();
 
         // Add Health - should migrate to new archetype
         world.add_component(entity, Health { hp: 100 }).unwrap();
 
-        let after_add_location = world.entity_locations.get(&entity).unwrap().clone();
+        let after_add_location = *world.entity_locations.get(&entity).unwrap();
         assert_ne!(
             initial_location.archetype_id, after_add_location.archetype_id,
             "Entity should be in different archetype after adding component"
@@ -1380,7 +1388,7 @@ mod tests {
         // Remove Velocity - should migrate to another archetype
         world.remove_component::<Velocity>(entity).unwrap();
 
-        let after_remove_location = world.entity_locations.get(&entity).unwrap().clone();
+        let after_remove_location = *world.entity_locations.get(&entity).unwrap();
         assert_ne!(
             after_add_location.archetype_id, after_remove_location.archetype_id,
             "Entity should be in different archetype after removing component"

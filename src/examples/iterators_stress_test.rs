@@ -148,7 +148,7 @@ fn collision_and_movement_system(
 
                 // Check collision with all colliders on the obstacle
                 let collided = obstacle_collider
-                    .check_any_collision(&obstacle_transform, (new_x, new_y, new_z));
+                    .check_any_collision(obstacle_transform, (new_x, new_y, new_z));
 
                 // Apply movement only if no collision
                 if !collided {

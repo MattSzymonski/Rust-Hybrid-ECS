@@ -49,18 +49,18 @@ impl<T: Component + TraitAccessible<dyn Component> + Send> ComponentAdder
 
 /// Deferred command to be executed later
 enum DeferredCommand {
-    CreateEntity {
+    Create {
         component_adders: Vec<Box<dyn ComponentAdder>>,
     },
-    AddComponentToEntity {
+    AddComponent {
         entity: Entity,
         component_adder: Box<dyn ComponentAdder>,
     },
-    RemoveComponentFromEntity {
+    RemoveComponent {
         entity: Entity,
         component_id: ComponentId,
     },
-    DestroyEntity {
+    Destroy {
         entity: Entity,
     },
 }
@@ -79,10 +79,18 @@ impl CommandQueue {
             commands: Vec::new(),
         }
     }
+}
 
+impl Default for CommandQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CommandQueue {
     /// Queue creating a new entity with components
     pub fn create_entity(&mut self, components: Vec<Box<dyn ComponentAdder>>) {
-        self.commands.push(DeferredCommand::CreateEntity {
+        self.commands.push(DeferredCommand::Create {
             component_adders: components,
         });
     }
@@ -92,7 +100,7 @@ impl CommandQueue {
     where
         T: Component + TraitAccessible<dyn Component> + Send,
     {
-        self.commands.push(DeferredCommand::AddComponentToEntity {
+        self.commands.push(DeferredCommand::AddComponent {
             entity,
             component_adder: Box::new(TypedComponentAdder { component }),
         });
@@ -100,17 +108,15 @@ impl CommandQueue {
 
     /// Queue removing a component from an entity
     pub fn remove_component_from_entity<T: Component>(&mut self, entity: Entity) {
-        self.commands
-            .push(DeferredCommand::RemoveComponentFromEntity {
-                entity,
-                component_id: ComponentId::of::<T>(),
-            });
+        self.commands.push(DeferredCommand::RemoveComponent {
+            entity,
+            component_id: ComponentId::of::<T>(),
+        });
     }
 
     /// Queue destroying (removing) an entity
     pub fn destroy_entity(&mut self, entity: Entity) {
-        self.commands
-            .push(DeferredCommand::DestroyEntity { entity });
+        self.commands.push(DeferredCommand::Destroy { entity });
     }
 
     /// Execute all queued commands
@@ -119,7 +125,7 @@ impl CommandQueue {
     pub(crate) fn execute_queued_commands(&mut self, world: &mut World) {
         for command in self.commands.drain(..) {
             match command {
-                DeferredCommand::CreateEntity { component_adders } => {
+                DeferredCommand::Create { component_adders } => {
                     // Collect component IDs
                     let component_ids: Vec<ComponentId> = component_adders
                         .iter()
@@ -137,7 +143,7 @@ impl CommandQueue {
                     });
                 }
 
-                DeferredCommand::AddComponentToEntity {
+                DeferredCommand::AddComponent {
                     entity,
                     component_adder,
                 } => {
@@ -197,7 +203,7 @@ impl CommandQueue {
                     );
                 }
 
-                DeferredCommand::RemoveComponentFromEntity {
+                DeferredCommand::RemoveComponent {
                     entity,
                     component_id,
                 } => {
@@ -260,7 +266,7 @@ impl CommandQueue {
                     );
                 }
 
-                DeferredCommand::DestroyEntity { entity } => {
+                DeferredCommand::Destroy { entity } => {
                     if !world.destroy_entity(entity) {
                         println!(
                             "  [Deferred] Failed to destroy entity {:?} (not found)",
@@ -272,7 +278,6 @@ impl CommandQueue {
         }
     }
 
-    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty()
     }
@@ -287,9 +292,7 @@ pub struct Commands<'a> {
 
 impl<'a> Commands<'a> {
     pub(crate) fn new(command_queue: &'a mut CommandQueue) -> Self {
-        Self {
-            command_queue: command_queue,
-        }
+        Self { command_queue }
     }
 
     /// Start building a new entity to create (executed later)

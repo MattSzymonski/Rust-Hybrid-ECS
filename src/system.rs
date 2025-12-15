@@ -241,9 +241,7 @@ macro_rules! impl_system_param_tuple {
 
 // Implement for tuples of different sizes (0 to 6 parameters)
 impl SystemParam for () {
-    fn fetch(_world: &mut World, _queue: &mut CommandQueue) -> Self {
-        ()
-    }
+    fn fetch(_world: &mut World, _queue: &mut CommandQueue) -> Self {}
 
     fn report_access(_access: &mut SystemAccess) {
         // Empty tuple has no access

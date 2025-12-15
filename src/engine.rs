@@ -57,7 +57,15 @@ impl Engine {
             parallel_execution: true,
         }
     }
+}
 
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Engine {
     /// Enable or disable parallel system execution
     pub fn set_parallel_execution(&mut self, enabled: bool) {
         self.parallel_execution = enabled;

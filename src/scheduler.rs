@@ -88,7 +88,15 @@ impl SystemScheduler {
             execution_graph: Vec::new(),
         }
     }
+}
 
+impl Default for SystemScheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SystemScheduler {
     /// Register a system with its access pattern
     pub fn register_system(&mut self, access: SystemAccess) -> usize {
         let index = self.system_count;
@@ -99,9 +107,8 @@ impl SystemScheduler {
 
     /// Build the execution graph based on dependencies
     ///
-    /// Algorithm:
-    /// 1. Start with all systems unscheduled
-    /// 2. For each batch:
+    /// # Algorithm
+    ///
     /// Build the parallel execution graph using greedy batching.
     ///
     /// # Algorithm
@@ -143,23 +150,19 @@ impl SystemScheduler {
             let mut batch = Vec::new();
 
             // Try to add each unscheduled system to the current batch
-            for i in 0..self.system_count {
-                if scheduled[i] {
+            for (i, is_scheduled) in scheduled.iter_mut().enumerate() {
+                if *is_scheduled {
                     continue;
                 }
 
                 // Check if this system conflicts with any system already in the batch
-                let mut conflicts = false;
-                for &j in &batch {
-                    if self.access_patterns[i].conflicts_with(&self.access_patterns[j]) {
-                        conflicts = true;
-                        break;
-                    }
-                }
+                let conflicts = batch
+                    .iter()
+                    .any(|&j| self.access_patterns[i].conflicts_with(&self.access_patterns[j]));
 
                 if !conflicts {
                     batch.push(i);
-                    scheduled[i] = true;
+                    *is_scheduled = true;
                     scheduled_count += 1;
                 }
             }

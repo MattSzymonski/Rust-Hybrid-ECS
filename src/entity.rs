@@ -26,7 +26,7 @@
 /// world.is_entity_valid(enemy);  // false - gen 0 != gen 1
 /// world.get_component::<Health>(enemy);  // None - entity no longer exists
 /// ```
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Entity {
     pub(crate) id: u64,
     pub(crate) generation: u32,

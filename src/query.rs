@@ -58,7 +58,7 @@ type ArchetypeRange<S> = (ArchetypeId, S, usize);
 ///
 /// Returned by tracked parallel iteration to provide insight into
 /// how Rayon distributed work across threads.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct BatchStats {
     /// Number of threads in the Rayon thread pool
     pub num_threads: usize,
@@ -195,7 +195,7 @@ impl QueryTarget for Entity {
     }
 
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
-        unsafe { (&*state.as_ptr()).get_unchecked(index).clone() }
+        unsafe { *(&*state.as_ptr()).get_unchecked(index) }
     }
 
     fn fetch<'a>(archetype: &'a Archetype, index: usize) -> Self::Item<'a> {
@@ -451,7 +451,7 @@ impl<'w, Q: QueryTarget> Query<'w, Q> {
             .archetypes
             .iter_mut()
             .filter(|(_, arch)| arch.matches_mask(&query_mask))
-            .filter(|(_, arch)| arch.len() > 0)
+            .filter(|(_, arch)| !arch.is_empty())
             .map(|(id, arch)| (*id, Q::init_state(arch), arch.len()))
             .collect();
 
@@ -684,7 +684,9 @@ where
 }
 
 /// Result of parallel for_each execution.
+#[derive(Debug, Clone, Default)]
 pub enum ParForEachResult {
+    #[default]
     Untracked,
     Tracked(BatchStats),
 }

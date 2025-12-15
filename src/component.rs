@@ -20,7 +20,7 @@ impl ComponentId {
 }
 
 /// Bitmask for efficiently representing sets of components (supports up to 128 component types)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ComponentMask(u128);
 
 impl ComponentMask {
@@ -58,7 +58,15 @@ impl ComponentRegistry {
             next_bit: 0,
         }
     }
+}
 
+impl Default for ComponentRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ComponentRegistry {
     pub fn register<T: Component>(&mut self) -> u8 {
         let component_id = ComponentId::of::<T>();
         if let Some(&bit) = self.id_to_bit.get(&component_id) {
