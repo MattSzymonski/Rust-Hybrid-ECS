@@ -410,6 +410,33 @@ impl<'w, Q: QueryTarget> Query<'w, Q> {
         self.iter_mut().next()
     }
 
+    /// Check if any entity matches this query.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entity_count() == 0
+    }
+
+    /// Count the number of entities matching this query.
+    ///
+    /// This is O(n) where n is the number of archetypes, but does not
+    /// iterate over individual entities.
+    #[inline]
+    pub fn entity_count(&self) -> usize {
+        let mut mask = ComponentMask::empty();
+        for component_id in &Q::component_ids() {
+            if let Some(bit) = self.world.component_registry.get_bit(component_id) {
+                mask.set(bit);
+            }
+        }
+
+        self.world
+            .archetypes
+            .values()
+            .filter(|arch| arch.matches_mask(&mask))
+            .map(|arch| arch.entity_count())
+            .sum()
+    }
+
     /// Create a parallel iterator over all matching entities.
     #[inline]
     pub fn par_iter_mut(&mut self) -> ParQueryIter<'_, Q>

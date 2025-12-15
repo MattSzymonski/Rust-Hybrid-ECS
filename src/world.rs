@@ -236,6 +236,22 @@ impl World {
             .and_then(|boxed| boxed.downcast_mut::<T>())
     }
 
+    /// Remove a global component and return it if it existed
+    ///
+    /// Returns `Some(component)` if the global component was present,
+    /// or `None` if it wasn't registered.
+    pub fn remove_global_component<T: Component>(&mut self) -> Option<T> {
+        self.global_components
+            .remove(&ComponentId::of::<T>())
+            .and_then(|boxed| boxed.downcast::<T>().ok())
+            .map(|boxed| *boxed)
+    }
+
+    /// Check if a global component exists
+    pub fn has_global_component<T: Component>(&self) -> bool {
+        self.global_components.contains_key(&ComponentId::of::<T>())
+    }
+
     /// Check if an entity exists and is valid (not destroyed/recycled)
     ///
     /// Returns true if the entity exists in the world with the correct generation.

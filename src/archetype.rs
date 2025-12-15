@@ -91,6 +91,20 @@ impl Archetype {
         self.entities.len()
     }
 
+    /// Get the number of entities in this archetype (alias for `len`)
+    ///
+    /// Provided for API consistency with other collection types.
+    #[inline]
+    pub fn entity_count(&self) -> usize {
+        self.entities.len()
+    }
+
+    /// Check if this archetype contains no entities
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.entities.is_empty()
+    }
+
     /// Print information about this archetype (component names and entity count)
     pub fn print_info(&self, registry: &crate::component::ComponentRegistry) {
         let component_names: Vec<String> = self
