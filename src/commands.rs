@@ -80,7 +80,7 @@ impl CommandQueue {
         }
     }
 
-    /// Queue createing a new entity with components
+    /// Queue creating a new entity with components
     pub fn create_entity(&mut self, components: Vec<Box<dyn ComponentAdder>>) {
         self.commands.push(DeferredCommand::CreateEntity {
             component_adders: components,
@@ -329,7 +329,7 @@ pub struct EntityBuilder<'a> {
 }
 
 impl<'a> EntityBuilder<'a> {
-    /// Add a component to the entity being createed
+    /// Add a component to the entity being created
     pub fn with<T>(mut self, component: T) -> Self
     where
         T: Component + TraitAccessible<dyn Component> + Send,
@@ -390,7 +390,7 @@ mod tests {
         let mut queue = CommandQueue::new();
         let mut commands = Commands::new(&mut queue);
 
-        // Queue createing a new entity
+        // Queue creating a new entity
         commands
             .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
@@ -566,7 +566,7 @@ mod tests {
         let mut queue = CommandQueue::new();
         let mut commands = Commands::new(&mut queue);
 
-        // Queue createing multiple entities
+        // Queue creating multiple entities
         commands
             .create_entity()
             .with(Position { x: 1.0, y: 2.0 })

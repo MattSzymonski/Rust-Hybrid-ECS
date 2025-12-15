@@ -41,6 +41,48 @@ pub(crate) struct EntityLocation {
     pub(crate) index_in_archetype: usize,
 }
 
+/// Error type for `add_component` operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddComponentError {
+    /// The entity does not exist (was destroyed or never created)
+    EntityNotFound,
+    /// The entity already has a component of this type
+    ComponentAlreadyExists,
+}
+
+impl std::fmt::Display for AddComponentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AddComponentError::EntityNotFound => write!(f, "entity not found"),
+            AddComponentError::ComponentAlreadyExists => {
+                write!(f, "component already exists on entity")
+            }
+        }
+    }
+}
+
+impl std::error::Error for AddComponentError {}
+
+/// Error type for `remove_component` operations
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveComponentError {
+    /// The entity does not exist (was destroyed or never created)
+    EntityNotFound,
+    /// The entity does not have a component of this type
+    ComponentNotFound,
+}
+
+impl std::fmt::Display for RemoveComponentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemoveComponentError::EntityNotFound => write!(f, "entity not found"),
+            RemoveComponentError::ComponentNotFound => write!(f, "component not found on entity"),
+        }
+    }
+}
+
+impl std::error::Error for RemoveComponentError {}
+
 /// World manages all entities, archetypes, and global components
 ///
 /// This is the central hub of the ECS. It:
@@ -613,24 +655,29 @@ impl World {
 
     /// Remove a component from an entity, moving it to a new archetype
     ///
-    /// Returns true if the component was removed, false if entity doesn't exist or doesn't have the component.
-    pub fn remove_component<T: Component>(&mut self, entity: Entity) -> bool {
+    /// Returns `Ok(())` if the component was removed successfully.
+    /// Returns `Err(RemoveComponentError::EntityNotFound)` if the entity doesn't exist.
+    /// Returns `Err(RemoveComponentError::ComponentNotFound)` if the entity doesn't have the component.
+    pub fn remove_component<T: Component>(
+        &mut self,
+        entity: Entity,
+    ) -> Result<(), RemoveComponentError> {
         let component_id = ComponentId::of::<T>();
 
         // Get current location
         let location = match self.entity_locations.get(&entity) {
             Some(loc) => *loc,
-            None => return false, // Entity doesn't exist
+            None => return Err(RemoveComponentError::EntityNotFound),
         };
 
         let old_archetype = match self.archetypes.get(&location.archetype_id) {
             Some(arch) => arch,
-            None => return false,
+            None => return Err(RemoveComponentError::EntityNotFound),
         };
 
         // Check if entity has this component
         if !old_archetype.component_types.contains(&component_id) {
-            return false; // Component not present
+            return Err(RemoveComponentError::ComponentNotFound);
         }
 
         // Build new component list without the removed component
@@ -643,7 +690,8 @@ impl World {
 
         // If no components left, despawn the entity instead
         if new_component_ids.is_empty() {
-            return self.destroy_entity(entity);
+            self.destroy_entity(entity);
+            return Ok(());
         }
 
         // Collect copiers for all components except the one being removed
@@ -664,13 +712,19 @@ impl World {
             },
         );
 
-        true
+        Ok(())
     }
 
     /// Add a component to an existing entity, moving it to a new archetype
     ///
-    /// Returns true if the component was added, false if entity doesn't exist or already has the component.
-    pub fn add_component<T>(&mut self, entity: Entity, component: T) -> bool
+    /// Returns `Ok(())` if the component was added successfully.
+    /// Returns `Err(AddComponentError::EntityNotFound)` if the entity doesn't exist.
+    /// Returns `Err(AddComponentError::ComponentAlreadyExists)` if the entity already has the component.
+    pub fn add_component<T>(
+        &mut self,
+        entity: Entity,
+        component: T,
+    ) -> Result<(), AddComponentError>
     where
         T: Component + TraitAccessible<dyn Component> + Clone,
     {
@@ -679,17 +733,17 @@ impl World {
         // Get current location
         let location = match self.entity_locations.get(&entity) {
             Some(loc) => *loc,
-            None => return false, // Entity doesn't exist
+            None => return Err(AddComponentError::EntityNotFound),
         };
 
         let old_archetype = match self.archetypes.get(&location.archetype_id) {
             Some(arch) => arch,
-            None => return false,
+            None => return Err(AddComponentError::EntityNotFound),
         };
 
         // Check if entity already has this component
         if old_archetype.component_types.contains(&component_id) {
-            return false; // Already has component
+            return Err(AddComponentError::ComponentAlreadyExists);
         }
 
         // Build new component list with the added component
@@ -718,7 +772,7 @@ impl World {
             },
         );
 
-        true
+        Ok(())
     }
 
     /// Remove all empty archetypes from the world
@@ -985,7 +1039,7 @@ mod tests {
         // Add Health component
         let result = world.add_component(entity, Health { hp: 50 });
 
-        assert!(result, "Should successfully add component");
+        assert!(result.is_ok(), "Should successfully add component");
         assert!(world.entity_locations.contains_key(&entity));
 
         // Since this is the only entity, the old archetype should be automatically removed
@@ -1016,8 +1070,9 @@ mod tests {
         let fake_entity = crate::Entity::new_for_test(9999, 0);
         let result = world.add_component(fake_entity, Position { x: 0.0, y: 0.0 });
 
-        assert!(
-            !result,
+        assert_eq!(
+            result,
+            Err(AddComponentError::EntityNotFound),
             "Should fail to add component to non-existent entity"
         );
     }
@@ -1053,7 +1108,7 @@ mod tests {
 
         assert_eq!(world.archetypes.len(), 1, "Should have 1 archetype");
 
-        assert!(result, "Should successfully remove component");
+        assert!(result.is_ok(), "Should successfully remove component");
         assert!(world.entity_locations.contains_key(&entity));
 
         let location = world.entity_locations.get(&entity).unwrap();
@@ -1104,8 +1159,9 @@ mod tests {
         let fake_entity = crate::Entity::new_for_test(9999, 0);
         let result = world.remove_component::<Velocity>(fake_entity);
 
-        assert!(
-            !result,
+        assert_eq!(
+            result,
+            Err(RemoveComponentError::EntityNotFound),
             "Should fail to remove component from non-existent entity"
         );
     }
@@ -1138,7 +1194,7 @@ mod tests {
         // Remove the only component - should despawn entity
         let result = world.remove_component::<Position>(entity);
 
-        assert!(result, "Should successfully remove component");
+        assert!(result.is_ok(), "Should successfully remove component");
         assert_eq!(
             world.entity_locations.len(),
             0,
@@ -1313,7 +1369,7 @@ mod tests {
         let initial_location = world.entity_locations.get(&entity).unwrap().clone();
 
         // Add Health - should migrate to new archetype
-        world.add_component(entity, Health { hp: 100 });
+        world.add_component(entity, Health { hp: 100 }).unwrap();
 
         let after_add_location = world.entity_locations.get(&entity).unwrap().clone();
         assert_ne!(
@@ -1322,7 +1378,7 @@ mod tests {
         );
 
         // Remove Velocity - should migrate to another archetype
-        world.remove_component::<Velocity>(entity);
+        world.remove_component::<Velocity>(entity).unwrap();
 
         let after_remove_location = world.entity_locations.get(&entity).unwrap().clone();
         assert_ne!(
@@ -1366,7 +1422,7 @@ mod tests {
 
         // Add Health - this should move entity to new archetype
         // The old archetype should be automatically removed since it becomes empty
-        world.add_component(entity, Health { hp: 100 });
+        world.add_component(entity, Health { hp: 100 }).unwrap();
 
         assert_eq!(
             world.archetypes.len(),
@@ -1720,7 +1776,7 @@ mod tests {
         // Remove Velocity from entity1 - moves it to Position-only archetype
         let old_entity1 = entity1;
         let removed = world.remove_component::<Velocity>(entity1);
-        assert!(removed, "Should remove Velocity from entity1");
+        assert!(removed.is_ok(), "Should remove Velocity from entity1");
 
         // entity1 should still be valid with same id and generation (entity wasn't destroyed)
         assert!(
@@ -1953,7 +2009,7 @@ mod tests {
         // Now add Health to entity0 - this moves it to a NEW archetype (Position+Velocity+Health)
         // The old archetype (Position+Velocity) should swap_remove entity0's data
         // entity2 should be swapped into index 0
-        world.add_component(entity0, Health { hp: 50 });
+        world.add_component(entity0, Health { hp: 50 }).unwrap();
 
         // Verify entity0 moved to new archetype and has all components
         assert!(world.get_component::<Position>(entity0).is_some());
@@ -1989,7 +2045,7 @@ mod tests {
         assert_eq!(world.archetypes.len(), 2, "Should have 2 archetypes now");
 
         // Now remove Velocity from entity1 - moves to Position-only archetype
-        world.remove_component::<Velocity>(entity1);
+        world.remove_component::<Velocity>(entity1).unwrap();
 
         // entity2 should still have correct data (it's now alone in Position+Velocity archetype)
         let pos2 = world.get_component::<Position>(entity2).unwrap();
