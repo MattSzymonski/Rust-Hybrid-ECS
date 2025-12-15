@@ -6,6 +6,39 @@
 //! An archetype is a unique combination of component types. All entities with
 //! the same set of components are stored together in the same archetype for
 //! cache-friendly iteration.
+//!
+//! ## Storage Layout
+//!
+//! Archetypes use a **Structure of Arrays (SoA)** layout rather than an
+//! Array of Structures (AoS). This means components of the same type are
+//! stored contiguously in memory:
+//!
+//! ```text
+//! Archetype [Position, Velocity]
+//! ┌─────────────────────────────────────────────────┐
+//! │ Entities:    [E1,     E2,     E3,     E4    ]   │
+//! │ Positions:   [Pos1,   Pos2,   Pos3,   Pos4  ]   │
+//! │ Velocities:  [Vel1,   Vel2,   Vel3,   Vel4  ]   │
+//! └─────────────────────────────────────────────────┘
+//! ```
+//!
+//! ## Cache Efficiency
+//!
+//! When iterating over all entities with Position+Velocity:
+//! - **SoA (this design)**: Sequential memory access, excellent cache utilization
+//! - **AoS alternative**: Scattered access, poor cache performance
+//!
+//! The tradeoff is that accessing all components of a single entity requires
+//! multiple array lookups, but this is rare compared to bulk iteration.
+//!
+//! ## Entity Removal
+//!
+//! When an entity is removed, we use **swap-remove** to maintain dense storage:
+//! 1. Swap the removed entity with the last entity in each component array
+//! 2. Pop the last element (now the removed entity's data)
+//! 3. Update the swapped entity's location in the entity_locations map
+//!
+//! This keeps arrays dense without gaps, maintaining O(1) removal.
 
 use trait_type_map::{TraitTypeMap, VecFamily};
 

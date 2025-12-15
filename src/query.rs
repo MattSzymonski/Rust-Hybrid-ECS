@@ -95,11 +95,27 @@ impl std::fmt::Display for BatchStats {
 
 /// A wrapper for `*const T` that implements `Send` and `Sync`.
 ///
+/// Used internally by the query system to enable parallel iteration over
+/// archetype data. The pointer is cached during query setup and used by
+/// worker threads during parallel for_each operations.
+///
 /// # Safety
-/// Safe when:
+///
+/// This type is safe to use when:
 /// 1. The pointer points to valid data for the lifetime of the query
 /// 2. Different threads access different indices (no aliasing)
 /// 3. The World has exclusive access during iteration
+///
+/// # Example (internal usage)
+///
+/// ```ignore
+/// // During query setup, cache a pointer to the entity vector
+/// let ptr = SendPtr::new(&archetype.entities as *const Vec<Entity>);
+///
+/// // Later, in parallel iteration, access via the pointer
+/// let entities = unsafe { &*ptr.as_ptr() };
+/// let entity = entities[index];
+/// ```
 #[derive(Clone, Copy)]
 pub struct SendPtr<T>(*const T);
 
@@ -118,11 +134,27 @@ impl<T> SendPtr<T> {
 
 /// A wrapper for `*mut T` that implements `Send` and `Sync`.
 ///
+/// Used internally by the query system to enable parallel mutable iteration
+/// over archetype data. Each worker thread accesses a disjoint set of indices,
+/// ensuring no data races occur.
+///
 /// # Safety
-/// Safe when:
+///
+/// This type is safe to use when:
 /// 1. The pointer points to valid data for the lifetime of the query
 /// 2. Different threads access different indices (no aliasing)
 /// 3. The World has exclusive access during iteration
+///
+/// # Example (internal usage)
+///
+/// ```ignore
+/// // During query setup, cache a mutable pointer to component storage
+/// let ptr = SendPtrMut::new(storage.as_mut_ptr());
+///
+/// // Later, in parallel iteration, mutate via the pointer
+/// let component = unsafe { &mut *ptr.as_ptr().add(index) };
+/// component.value += 1;
+/// ```
 #[derive(Clone, Copy)]
 pub struct SendPtrMut<T>(*mut T);
 

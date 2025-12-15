@@ -885,8 +885,6 @@ impl<'w> EntityBuilder<'w> {
     }
 }
 
-// How i am supposed to create new archetype if I need generic types to do so (register component storages), and I have only type ids?
-
 // --- Tests ---------------------------------------------------------------------------------------------------------
 
 #[cfg(test)]

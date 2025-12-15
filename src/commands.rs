@@ -6,6 +6,50 @@
 //! Instead of modifying the world immediately (which would require mutable
 //! access), commands queue operations to be executed later. This allows
 //! multiple systems to run in parallel without conflicts.
+//!
+//! ## Frame Lifecycle (Two-Phase Approach)
+//!
+//! The ECS uses a two-phase execution model each frame:
+//!
+//! ```text
+//! ┌─────────────────────────────────────────────────────────────┐
+//! │                        FRAME N                              │
+//! ├─────────────────────────────────┬───────────────────────────┤
+//! │      Phase 1: System Execution  │  Phase 2: Command Apply   │
+//! │                                 │                           │
+//! │  ┌──────────┐  ┌──────────┐     │  Commands from Phase 1    │
+//! │  │System A  │  │System B  │     │  are now executed:        │
+//! │  │(parallel)│  │(parallel)│     │                           │
+//! │  └────┬─────┘  └────┬─────┘     │  - Create entities        │
+//! │       │             │           │  - Destroy entities       │
+//! │       ▼             ▼           │  - Add/remove components  │
+//! │  ┌──────────────────────┐       │                           │
+//! │  │   Command Queue      │──────►│  World is now consistent  │
+//! │  │   (deferred ops)     │       │  for next frame           │
+//! │  └──────────────────────┘       │                           │
+//! └─────────────────────────────────┴───────────────────────────┘
+//! ```
+//!
+//! ## Why Deferred?
+//!
+//! 1. **Thread Safety**: Multiple systems can queue commands without locks
+//! 2. **Consistency**: World state doesn't change mid-iteration
+//! 3. **Batching**: Commands can be optimized before execution
+//!
+//! ## Usage Example
+//!
+//! ```ignore
+//! fn combat_system(mut query: Query<(&Health, Entity)>, mut commands: Commands) {
+//!     for (health, entity) in query.iter() {
+//!         if health.current <= 0 {
+//!             // Queue for destruction - doesn't happen immediately!
+//!             commands.destroy_entity(entity);
+//!         }
+//!     }
+//! }
+//! // After ALL systems run, the engine calls commands.execute_queued_commands()
+//! // and the dead entities are actually removed.
+//! ```
 
 use std::sync::Arc;
 

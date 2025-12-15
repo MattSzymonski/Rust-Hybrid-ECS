@@ -19,7 +19,21 @@ impl ComponentId {
     }
 }
 
-/// Bitmask for efficiently representing sets of components (supports up to 128 component types)
+/// Bitmask for efficiently representing sets of components.
+///
+/// ## 128 Component Type Limit
+///
+/// Uses a `u128` internally, limiting the ECS to 128 unique component types.
+/// This is a deliberate design tradeoff:
+///
+/// - **O(1) archetype matching**: Query matching is a simple bitwise AND
+/// - **128 bits = 128 component types**: Sufficient for most games
+/// - **No heap allocation**: Masks are stack-allocated and Copy
+///
+/// If you hit the 128 limit, consider:
+/// 1. Combining related components (e.g., Transform instead of Position + Rotation + Scale)
+/// 2. Using marker components sparingly
+/// 3. Restructuring to use fewer component types with interior variants
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct ComponentMask(u128);
 

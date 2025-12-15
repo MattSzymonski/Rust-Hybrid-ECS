@@ -28,7 +28,19 @@
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Entity {
+    /// Unique numeric identifier for this entity slot.
+    ///
+    /// IDs are recycled when entities are destroyed to prevent unbounded growth.
+    /// The same ID may be reused for different entities over time, distinguished
+    /// by the `generation` field.
     pub(crate) id: u64,
+
+    /// Generation counter to distinguish reused entity IDs.
+    ///
+    /// Incremented each time an entity ID is recycled. This allows detecting
+    /// "stale" entity handles that reference a destroyed entity whose ID was
+    /// reused for a new entity. A handle is valid only if both id AND generation
+    /// match the current entity at that slot.
     pub(crate) generation: u32,
 }
 
