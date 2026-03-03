@@ -13,9 +13,10 @@ use std::sync::Arc;
 use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
 
 use crate::archetype::{Archetype, ArchetypeId, StorageFactory};
+use crate::commands::CommandQueue;
 use crate::component::{Component, ComponentId, ComponentMask, ComponentRegistry};
 use crate::entity::Entity;
-use crate::scripting::ScriptComponent;
+use crate::scripting::{ScriptComponent, ScriptContext};
 
 /// Function that copies a component from one storage to another at given indices
 type ComponentCopier = Arc<
@@ -28,10 +29,17 @@ type ComponentCopier = Arc<
 >;
 
 /// Function that updates a script component
-use crate::engine::Engine;
-
+/// Takes: (storage, index, entity, world_ptr, commands_ptr)
+/// Uses raw pointers to safely create ScriptContext within the closure
 type ScriptUpdater = Arc<
-    dyn Fn(&mut TraitTypeMap<dyn Component, VecFamily>, usize, Entity, *mut Engine) + Send + Sync,
+    dyn Fn(
+            &mut TraitTypeMap<dyn Component, VecFamily>,
+            usize,
+            Entity,
+            *mut World,
+            *mut CommandQueue,
+        ) + Send
+        + Sync,
 >;
 
 /// EntityLocation tracks where an entity is stored in the archetype system
@@ -200,13 +208,19 @@ impl World {
                     |storage: &mut TraitTypeMap<dyn Component, VecFamily>,
                      index: usize,
                      entity: Entity,
-                     engine_ptr: *mut Engine| {
+                     world_ptr: *mut World,
+                     commands_ptr: *mut CommandQueue| {
                         // Get mutable reference to the component
                         let component = storage.get_storage_mut::<T>().get_mut(index);
-                        // SAFETY: We're careful to only access the component and engine safely
-                        // The engine pointer is only used during the update call
+                        // SAFETY: We create a ScriptContext with mutable world access.
+                        // This is safe because:
+                        // - The script's own component is accessed via `storage`, not through world
+                        // - Different component types have separate storage (no aliasing)
+                        // - Structural changes are deferred through commands
                         unsafe {
-                            component.update(entity, &mut *engine_ptr);
+                            let mut ctx =
+                                ScriptContext::new(&mut *world_ptr, &mut *commands_ptr, entity);
+                            component.update(&mut ctx);
                         }
                     },
                 ),
@@ -217,11 +231,13 @@ impl World {
     /// Update all script components
     ///
     /// Calls update() on every script component in the world.
-    /// Scripts can modify themselves and interact with the engine.
+    /// Scripts receive a `ScriptContext` with:
+    /// - Read-only world access for queries
+    /// - Deferred command queue for structural changes
     ///
-    /// # Safety
-    /// The engine_ptr must be a valid pointer to the Engine that owns this World.
-    pub(crate) fn update_scripts(&mut self, engine_ptr: *mut Engine) {
+    /// This ensures all structural changes (add/remove component, destroy entity)
+    /// are automatically deferred, preventing use-after-free bugs.
+    pub(crate) fn update_scripts(&mut self, commands: &mut CommandQueue) {
         // Collect script component info to avoid borrow issues
         let script_info: Vec<(ComponentId, u8)> = self.script_components.clone();
 
@@ -249,15 +265,19 @@ impl World {
             }
 
             // Now update each entity's script component
-            // SAFETY: We use raw pointer to bypass borrow checker, but we're careful:
-            // - Only one component is accessed at a time
-            // - The updater callback receives the engine pointer for safe access
-            // RISK: In update function, component can delete itself and then reference self afterwards, what is UB
-            // TODO: Make all operations on entities and components deferred (like commands, but fakely appear immediate)
+            let world_ptr = self as *mut World;
+            let commands_ptr = commands as *mut CommandQueue;
+
             for (entity, archetype_id, index) in entities_to_update {
                 if let Some(archetype) = self.archetypes.get_mut(&archetype_id) {
                     // Call the updater with mutable storage access
-                    updater(&mut archetype.component_storages, index, entity, engine_ptr);
+                    updater(
+                        &mut archetype.component_storages,
+                        index,
+                        entity,
+                        world_ptr,
+                        commands_ptr,
+                    );
                 }
             }
         }
@@ -372,6 +392,39 @@ impl World {
                 .get_storage_mut::<T>()
                 .get_mut(index),
         )
+    }
+
+    /// Get raw mutable pointer to a component on an entity
+    ///
+    /// This is used by ScriptContext to avoid aliasing issues when a script
+    /// accesses components of its own type. By returning a raw pointer instead
+    /// of `&mut T`, we opt out of Rust's noalias optimization.
+    ///
+    /// Returns None if the entity doesn't exist or doesn't have the component.
+    pub(crate) fn get_component_ptr_mut<T>(&mut self, entity: Entity) -> Option<*mut T>
+    where
+        T: Component + TraitAccessible<dyn Component>,
+    {
+        // Get component bit for O(1) archetype check
+        let component_id = ComponentId::of::<T>();
+        let bit = self.component_registry.get_bit(&component_id)?;
+
+        // Get entity location
+        let location = self.entity_locations.get(&entity)?;
+        let archetype_id = location.archetype_id;
+        let index = location.index_in_archetype;
+
+        // Get archetype
+        let archetype = self.archetypes.get_mut(&archetype_id)?;
+
+        // Check if archetype has this component type (O(1) bitmask check)
+        if !archetype.has_component_bit(bit) {
+            return None;
+        }
+
+        // Get raw pointer to component - avoids creating intermediate &mut
+        let storage = archetype.component_storages.get_storage_mut::<T>();
+        Some(storage.get_mut(index) as *mut T)
     }
 
     /// Allocate a new unique entity ID

@@ -53,7 +53,6 @@ impl Engine {
             queue: CommandQueue::new(),
             world: World::new(),
             scheduler: SystemScheduler::new(),
-            // Parallel execution enabled now that Send bounds are in place
             parallel_execution: true,
         }
     }
@@ -180,11 +179,10 @@ impl Engine {
         }
 
         // Update script components after systems
-        // SAFETY: We pass a pointer to self so scripts can access the engine
-        let engine_ptr = self as *mut Engine;
-        self.world.update_scripts(engine_ptr);
+        // Scripts receive a ScriptContext with read-only world access and deferred commands
+        self.world.update_scripts(&mut self.queue);
 
-        // Phase 2: Execute all deferred commands
+        // Phase 2: Execute all deferred commands (including those from scripts)
         self.queue.execute_queued_commands(&mut self.world);
     }
 
@@ -207,10 +205,10 @@ impl Engine {
     /// - Systems using Commands run exclusively (not in parallel with anything)
     fn run_systems_parallel(&mut self) {
         // Execute each batch
-        for batch in self.scheduler.execution_graph() {
-            if batch.len() == 1 {
+        for systems_batch in self.scheduler.execution_graph() {
+            if systems_batch.len() == 1 {
                 // Single system - run directly
-                let idx = batch[0];
+                let idx = systems_batch[0];
                 let registered = &mut self.systems[idx];
                 if !registered.enabled {
                     continue;
@@ -226,10 +224,12 @@ impl Engine {
 
                 // Pre-compute enabled flags to avoid capturing self.systems in closure
                 // This is a small fixed-size read that avoids Vec allocation in most cases
-                let enabled_flags: Vec<bool> =
-                    batch.iter().map(|&idx| self.systems[idx].enabled).collect();
+                let enabled_flags: Vec<bool> = systems_batch
+                    .iter()
+                    .map(|&idx| self.systems[idx].enabled)
+                    .collect();
 
-                batch
+                systems_batch
                     .par_iter()
                     .zip(enabled_flags.par_iter())
                     .for_each(|(&idx, &enabled)| {
@@ -239,8 +239,9 @@ impl Engine {
                         unsafe {
                             let world = &mut *(world_ptr as *mut World);
                             let queue = &mut *(queue_ptr as *mut CommandQueue);
-                            let registered = &mut *(systems_ptr as *mut RegisteredSystem).add(idx);
-                            registered.system.run(world, queue);
+                            let registered_system =
+                                &mut *(systems_ptr as *mut RegisteredSystem).add(idx);
+                            registered_system.system.run(world, queue);
                         }
                     });
             }

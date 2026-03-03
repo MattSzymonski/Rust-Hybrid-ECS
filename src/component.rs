@@ -57,7 +57,10 @@ impl ComponentMask {
     }
 }
 
-/// Component registry - moved to World struct
+/// Registry that maps component types to bit indices in the component mask.
+///
+/// Handles registration of component types and maintains the mapping needed
+/// to convert between ComponentId and bit positions for efficient mask operations.
 pub struct ComponentRegistry {
     id_to_bit: HashMap<ComponentId, u8>,
     names: HashMap<ComponentId, String>,
@@ -81,6 +84,8 @@ impl Default for ComponentRegistry {
 }
 
 impl ComponentRegistry {
+    /// Register a component type and assign it a bit index.
+    /// Returns the bit index, or the existing index if already registered.
     pub fn register<T: Component>(&mut self) -> u8 {
         let component_id = ComponentId::of::<T>();
         if let Some(&bit) = self.id_to_bit.get(&component_id) {
@@ -100,10 +105,12 @@ impl ComponentRegistry {
         bit
     }
 
+    /// Get the bit index for a component ID, if registered.
     pub fn get_bit(&self, component_id: &ComponentId) -> Option<u8> {
         self.id_to_bit.get(component_id).copied()
     }
 
+    /// Get the type name of a registered component.
     pub fn get_name(&self, component_id: &ComponentId) -> Option<&str> {
         self.names.get(component_id).map(|s| s.as_str())
     }

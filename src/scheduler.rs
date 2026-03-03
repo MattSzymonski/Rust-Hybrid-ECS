@@ -5,6 +5,15 @@
 //!
 //! This module analyzes component access patterns to build a dependency graph
 //! and executes systems in parallel batches when safe to do so.
+//!
+//! ## How it works:
+//! - When a system is registered, it reports its access pattern (which components it reads/writes, whether it uses Commands).
+//! - The scheduler builds an execution graph that groups systems into batches that can run in
+//!   parallel without conflicts (no read-write or write-write conflicts, and Commands require exclusive access).
+//! - During frame processing and if parallel execution is enabled, the scheduler executes each batch in parallel using Rayon.
+//! - Systems that use Commands are executed sequentially to ensure safe access to the World.
+//! - The scheduler dependency analysis ensures that no two systems that access the same component in a conflicting way
+//!   are run in parallel, preventing data races and ensuring thread safety.
 
 use crate::component::ComponentId;
 use std::collections::HashSet;
@@ -60,6 +69,7 @@ impl SystemAccess {
         if !self.writes.is_disjoint(&other.reads) {
             return true;
         }
+
         if !self.reads.is_disjoint(&other.writes) {
             return true;
         }

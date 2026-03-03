@@ -5,7 +5,7 @@
 //!
 //! Instead of modifying the world immediately (which would require mutable
 //! access), commands queue operations to be executed later. This allows
-//! multiple systems to run in parallel without conflicts.
+//! component iterators and multiple systems to run in parallel without conflicts.
 //!
 //! ## Frame Lifecycle (Two-Phase Approach)
 //!
@@ -32,9 +32,9 @@
 //!
 //! ## Why Deferred?
 //!
-//! 1. **Thread Safety**: Multiple systems can queue commands without locks
-//! 2. **Consistency**: World state doesn't change mid-iteration
-//! 3. **Batching**: Commands can be optimized before execution
+//! 1. Thread Safety: Multiple systems can queue commands without locks
+//! 2. Consistency: World state doesn't change mid-iteration
+//! 3. Batching: Commands can be optimized before execution
 //!
 //! ## Usage Example
 //!
@@ -51,13 +51,11 @@
 //! // and the dead entities are actually removed.
 //! ```
 
-use std::sync::Arc;
-
-use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
-
 use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
 use crate::world::World;
+use std::sync::Arc;
+use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
 
 /// Trait for adding a component with its concrete type preserved
 ///
@@ -93,18 +91,18 @@ impl<T: Component + TraitAccessible<dyn Component> + Send> ComponentAdder
 
 /// Deferred command to be executed later
 enum DeferredCommand {
-    Create {
+    CreateEntity {
         component_adders: Vec<Box<dyn ComponentAdder>>,
     },
-    AddComponent {
+    AddComponentToEntity {
         entity: Entity,
         component_adder: Box<dyn ComponentAdder>,
     },
-    RemoveComponent {
+    RemoveComponentFromEntity {
         entity: Entity,
         component_id: ComponentId,
     },
-    Destroy {
+    DestroyEntity {
         entity: Entity,
     },
 }
@@ -134,7 +132,7 @@ impl Default for CommandQueue {
 impl CommandQueue {
     /// Queue creating a new entity with components
     pub fn create_entity(&mut self, components: Vec<Box<dyn ComponentAdder>>) {
-        self.commands.push(DeferredCommand::Create {
+        self.commands.push(DeferredCommand::CreateEntity {
             component_adders: components,
         });
     }
@@ -144,7 +142,7 @@ impl CommandQueue {
     where
         T: Component + TraitAccessible<dyn Component> + Send,
     {
-        self.commands.push(DeferredCommand::AddComponent {
+        self.commands.push(DeferredCommand::AddComponentToEntity {
             entity,
             component_adder: Box::new(TypedComponentAdder { component }),
         });
@@ -152,15 +150,17 @@ impl CommandQueue {
 
     /// Queue removing a component from an entity
     pub fn remove_component_from_entity<T: Component>(&mut self, entity: Entity) {
-        self.commands.push(DeferredCommand::RemoveComponent {
-            entity,
-            component_id: ComponentId::of::<T>(),
-        });
+        self.commands
+            .push(DeferredCommand::RemoveComponentFromEntity {
+                entity,
+                component_id: ComponentId::of::<T>(),
+            });
     }
 
     /// Queue destroying (removing) an entity
     pub fn destroy_entity(&mut self, entity: Entity) {
-        self.commands.push(DeferredCommand::Destroy { entity });
+        self.commands
+            .push(DeferredCommand::DestroyEntity { entity });
     }
 
     /// Execute all queued commands
@@ -169,7 +169,7 @@ impl CommandQueue {
     pub(crate) fn execute_queued_commands(&mut self, world: &mut World) {
         for command in self.commands.drain(..) {
             match command {
-                DeferredCommand::Create { component_adders } => {
+                DeferredCommand::CreateEntity { component_adders } => {
                     // Collect component IDs
                     let component_ids: Vec<ComponentId> = component_adders
                         .iter()
@@ -180,6 +180,7 @@ impl CommandQueue {
                     let entity = world.allocate_entity();
 
                     // Insert entity with components
+                    // TODO: Instead of passing lambda, we can pass componenent adders and let world handle archetype lookup and migration internally
                     world.insert_entity_with_components(entity, component_ids, |storage| {
                         for component_adder in component_adders {
                             component_adder.add_component_to_storage(storage);
@@ -187,7 +188,7 @@ impl CommandQueue {
                     });
                 }
 
-                DeferredCommand::AddComponent {
+                DeferredCommand::AddComponentToEntity {
                     entity,
                     component_adder,
                 } => {
@@ -247,7 +248,7 @@ impl CommandQueue {
                     );
                 }
 
-                DeferredCommand::RemoveComponent {
+                DeferredCommand::RemoveComponentFromEntity {
                     entity,
                     component_id,
                 } => {
@@ -283,7 +284,7 @@ impl CommandQueue {
                         .cloned()
                         .collect();
 
-                    // If no components left, destroy the entity instead
+                    // If no components left, destroy the entity instead and move to the next command
                     if new_component_ids.is_empty() {
                         world.destroy_entity(entity);
                         continue;
@@ -310,7 +311,7 @@ impl CommandQueue {
                     );
                 }
 
-                DeferredCommand::Destroy { entity } => {
+                DeferredCommand::DestroyEntity { entity } => {
                     if !world.destroy_entity(entity) {
                         println!(
                             "  [Deferred] Failed to destroy entity {:?} (not found)",
@@ -376,6 +377,14 @@ pub struct EntityBuilder<'a> {
 }
 
 impl<'a> EntityBuilder<'a> {
+    /// Create a new EntityBuilder
+    pub fn new(command_queue: &'a mut CommandQueue) -> Self {
+        Self {
+            command_queue,
+            components: Vec::new(),
+        }
+    }
+
     /// Add a component to the entity being created
     pub fn with<T>(mut self, component: T) -> Self
     where

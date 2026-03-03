@@ -1,14 +1,6 @@
-// ============================================================================
-// Entity System
-// ============================================================================
-//! Entity identification and management.
-//!
-//! Entities are unique identifiers for game objects. They don't contain data
-//! themselves, but serve as keys to look up associated components.
-
-/// Entity is a unique identifier for a game object
+/// Entity is an "object" in the ECS world.
 ///
-/// Entities are lightweight handles that reference a collection of components.
+/// Entities are actually lightweight handles that reference a collection of components.
 ///
 /// ## Generations
 ///
@@ -45,7 +37,7 @@ pub struct Entity {
 }
 
 impl Entity {
-    /// Create a new entity with the given id and generation (for testing purposes)
+    /// Create a new entity with the given id and generation (for testing purposes only)
     #[cfg(test)]
     pub(crate) fn new_for_test(id: u64, generation: u32) -> Self {
         Self { id, generation }

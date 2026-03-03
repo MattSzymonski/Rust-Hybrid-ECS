@@ -12,18 +12,43 @@ struct Counter {
 impl Component for Counter {}
 
 impl ScriptComponent for Counter {
-    fn update(&mut self, entity: Entity, engine: &mut Engine) {
+    fn update(&mut self, ctx: &mut ScriptContext) {
+        // Modify self directly (always safe)
         self.value = (self.value + self.increment).min(self.max_value);
         println!("Counter: {} / {}", self.value, self.max_value);
 
-        // Only update Position if the entity has one
-        if let Some(position) = engine.world_mut().get_component_mut::<Position>(entity) {
-            position.y = self.value as f32;
-            println!(
-                "  Updated Position.y to {} based on counter value",
-                self.value
-            );
+        // Read component on own entity
+        if let Some(position) = ctx.get_component::<Position>(ctx.get_owning_entity()) {
+            println!("  Position: ({}, {})", position.x, position.y);
         }
+
+        // Mutate component on own entity (different type than self - safe)
+        if let Some(position) = ctx.get_component_mut::<Position>(ctx.get_owning_entity()) {
+            position.y = self.value as f32;
+            println!("  Updated Position.y to {}", position.y);
+        }
+
+        // Destroy entity when max reached (deferred - executes after all scripts)
+        if self.value >= self.max_value {
+            println!("  Counter reached max! Queueing destruction...");
+            ctx.destroy_entity(ctx.get_owning_entity());
+        }
+
+        let entity: Entity = ctx.get_owning_entity().clone();
+
+        ctx.get_commands()
+            .add_component_to_entity(entity, Position { x: 42.0, y: 3.14 });
+
+        // // Example: Spawn new entity (deferred)
+        // ctx.create_entity()
+        //     .with(Position { x: 0.0, y: 0.0 })
+        //     .build();
+
+        // // Example: Add component to entity (deferred)
+        // ctx.add_component(ctx.get_owning_entity(), Velocity { x: 1.0, y: 0.0 });
+
+        // // Example: Remove component from entity (deferred)
+        // ctx.remove_component::<Velocity>(ctx.get_owning_entity());
     }
 }
 

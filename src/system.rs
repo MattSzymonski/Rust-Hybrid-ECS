@@ -9,7 +9,7 @@
 //! 2. Functions are automatically converted to systems based on their parameters
 //! 3. No manual wrapper code needed - just write functions and register them
 //!
-//! # Safety Warning: Lifetime Transmutation
+//! SAFETY: Warning: Lifetime Transmutation
 //!
 //! This module uses `std::mem::transmute` to convert references with actual
 //! lifetimes to `'static` lifetimes. This is a deliberate design choice to
@@ -102,7 +102,7 @@ where
 /// This is the core of the flexible system architecture. Types that implement
 /// SystemParam can be used as function parameters in systems.
 ///
-/// # Safety
+/// SAFETY:
 ///
 /// Implementations use lifetime transmutation internally. See module-level docs
 /// for the safety invariants that must be upheld.
@@ -111,7 +111,7 @@ where
 pub trait SystemParam: Sized {
     /// Fetch the parameter from world state.
     ///
-    /// # Safety Contract
+    /// SAFETY: Contract
     ///
     /// The returned value has a `'static` lifetime marker but actually borrows
     /// from `world` and `queue`. Callers must ensure:
@@ -135,7 +135,7 @@ pub trait SystemParam: Sized {
 /// Commands is a SystemParam - provides deferred entity operations
 impl SystemParam for Commands<'static> {
     fn fetch(_world: &mut World, queue: &mut CommandQueue) -> Self {
-        // SAFETY: Lifetime transmutation from actual borrow to 'static.
+        // CRITICAL RISK: Lifetime transmutation from actual borrow to 'static.
         //
         // This is sound IFF the caller upholds the SystemParam safety contract:
         // - The Commands<'static> must not escape the system function
@@ -145,7 +145,7 @@ impl SystemParam for Commands<'static> {
         // The Engine's system execution infrastructure ensures these invariants
         // by calling systems as opaque functions that cannot return the parameter.
         //
-        // UNDEFINED BEHAVIOR if Commands escapes (e.g., stored in static variable,
+        // Undefined behavior if Commands escapes (e.g., stored in static variable,
         // moved to another thread, or captured in an escaping closure).
         unsafe { std::mem::transmute(Commands::new(queue)) }
     }

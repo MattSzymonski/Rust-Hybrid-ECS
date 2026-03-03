@@ -9,7 +9,7 @@
 //!
 //! ## Storage Layout
 //!
-//! Archetypes use a **Structure of Arrays (SoA)** layout rather than an
+//! Archetypes use a Structure of Arrays (SoA) layout rather than an
 //! Array of Structures (AoS). This means components of the same type are
 //! stored contiguously in memory:
 //!
@@ -25,20 +25,23 @@
 //! ## Cache Efficiency
 //!
 //! When iterating over all entities with Position+Velocity:
-//! - **SoA (this design)**: Sequential memory access, excellent cache utilization
-//! - **AoS alternative**: Scattered access, poor cache performance
+//! - SoA (this design): Sequential memory access, excellent cache utilization
+//! - AoS alternative: Scattered access, poor cache performance
 //!
 //! The tradeoff is that accessing all components of a single entity requires
-//! multiple array lookups, but this is rare compared to bulk iteration.
+//! multiple array lookups, but this is rare compared to bulk iteration
+//! in ECS-style approaches.
 //!
 //! ## Entity Removal
 //!
-//! When an entity is removed, we use **swap-remove** to maintain dense storage:
+//! When an entity is removed, we use swap-remove to maintain dense storage:
 //! 1. Swap the removed entity with the last entity in each component array
 //! 2. Pop the last element (now the removed entity's data)
 //! 3. Update the swapped entity's location in the entity_locations map
 //!
 //! This keeps arrays dense without gaps, maintaining O(1) removal.
+
+use std::collections::HashMap;
 
 use trait_type_map::{TraitTypeMap, VecFamily};
 
@@ -53,11 +56,6 @@ pub type StorageFactory = Box<dyn Fn(&mut TraitTypeMap<dyn Component, VecFamily>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ArchetypeId(pub usize);
 
-/// Archetype stores all entities that share the same set of components
-///
-/// This is the core storage structure for the ECS. Components are stored in
-/// a columnar format (Structure of Arrays) using TraitTypeMap for true
-/// contiguous memory layout and cache efficiency.
 pub struct Archetype {
     pub id: ArchetypeId,
     pub component_types: Vec<ComponentId>, // Still needed for iteration/lookup
@@ -75,7 +73,7 @@ impl Archetype {
         id: ArchetypeId,
         component_types: Vec<ComponentId>,
         component_mask: ComponentMask,
-        storage_factories: &std::collections::HashMap<ComponentId, StorageFactory>,
+        storage_factories: &HashMap<ComponentId, StorageFactory>,
     ) -> Self {
         let mut component_storages = TraitTypeMap::new();
 
