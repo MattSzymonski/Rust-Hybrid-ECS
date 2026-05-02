@@ -7,7 +7,7 @@
 //! - Collision detection system
 //! - Performance measurements
 
-use ecs_hybrid::{Component, Engine, GlobalComponentQuery, Query};
+use ecs_hybrid::{Component, Engine, Query, Res, ResMut, Resource};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use trait_type_map::impl_trait_accessible;
@@ -24,7 +24,7 @@ struct SimulationStats {
     entity_count: usize,
 }
 
-impl Component for SimulationStats {}
+impl Resource for SimulationStats {}
 
 #[derive(Debug, Clone)]
 struct Transform {
@@ -120,7 +120,7 @@ struct Obstacle;
 impl Component for Obstacle {}
 
 // Make all components accessible via the Component trait for TraitTypeMap
-impl_trait_accessible!(dyn Component; SimulationStats, Transform, Velocity, BoxCollider, Obstacle);
+impl_trait_accessible!(dyn Component; Transform, Velocity, BoxCollider, Obstacle);
 
 // ============================================================================
 // Systems
@@ -189,7 +189,7 @@ fn collision_and_movement_system(
     }
 }
 
-fn simulation_tracker_system(mut stats: GlobalComponentQuery<SimulationStats>) {
+fn simulation_tracker_system(mut stats: ResMut<SimulationStats>) {
     if let Some(stats) = stats.get_mut() {
         stats.frame_count += 1;
 
@@ -224,7 +224,6 @@ pub fn main() {
     println!("Rayon threads: {}", rayon::current_num_threads());
 
     // Register all component types before use
-    engine.world_mut().register_component::<SimulationStats>();
     engine.world_mut().register_component::<Transform>();
     engine.world_mut().register_component::<Velocity>();
     engine.world_mut().register_component::<BoxCollider>();
@@ -276,7 +275,8 @@ pub fn main() {
 
     // Set up simulation stats as global component
     let max_frames = 10_000;
-    engine.world_mut().add_global_component(SimulationStats {
+
+    engine.world_mut().insert_resource(SimulationStats {
         frame_count: 0,
         max_frames,
         start_time: Instant::now(),
@@ -303,8 +303,8 @@ pub fn main() {
     println!("Entities near obstacle: {}", near_count);
 
     // Calculate average frame time
-    let stats_query = GlobalComponentQuery::<SimulationStats>::new(engine.world_mut());
-    let frame_time_ms = if let Some(stats) = stats_query.get() {
+    let stats_query = engine.world_mut().get_resource::<SimulationStats>();
+    let frame_time_ms = if let Some(stats) = stats_query {
         let duration = stats.start_time.elapsed();
         duration.as_millis() as f64 / stats.max_frames as f64
     } else {

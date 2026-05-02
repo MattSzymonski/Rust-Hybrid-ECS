@@ -16,6 +16,7 @@ use crate::archetype::{Archetype, ArchetypeId, StorageFactory};
 use crate::commands::CommandQueue;
 use crate::component::{Component, ComponentId, ComponentMask, ComponentRegistry};
 use crate::entity::Entity;
+use crate::resource::{Resource, ResourceId};
 use crate::scripting::{ScriptComponent, ScriptContext};
 
 /// Function that copies a component from one storage to another at given indices
@@ -111,8 +112,6 @@ pub struct World {
     pub(crate) entity_locations: HashMap<Entity, EntityLocation>,
     /// Lookup table mapping component masks to archetype IDs
     archetype_lookup: HashMap<ComponentMask, ArchetypeId>,
-    /// Global components not attached to any entity
-    pub(crate) global_components: HashMap<ComponentId, Box<dyn Any + Send>>,
     /// Storage factories for creating component storage by TypeId
     storage_factories: HashMap<ComponentId, StorageFactory>,
     /// Component copiers for moving entities between archetypes
@@ -123,6 +122,8 @@ pub struct World {
     script_updaters: HashMap<ComponentId, ScriptUpdater>,
     /// Component registry for bit indices and names
     pub(crate) component_registry: ComponentRegistry,
+    /// Resources (singleton data) stored by type
+    pub(crate) resources: HashMap<ResourceId, Box<dyn Any + Send + Sync>>,
 }
 
 impl World {
@@ -135,12 +136,12 @@ impl World {
             next_free_archetype_id: 0,
             entity_locations: HashMap::new(),
             archetype_lookup: HashMap::new(),
-            global_components: HashMap::new(),
             storage_factories: HashMap::new(),
             component_copiers: HashMap::new(),
             script_components: Vec::new(),
             script_updaters: HashMap::new(),
             component_registry: ComponentRegistry::new(),
+            resources: HashMap::new(),
         }
     }
 }
@@ -283,43 +284,44 @@ impl World {
         }
     }
 
-    /// Add or update a global component (singleton not attached to any entity)
+    // ========================================================================
+    // Resource Management
+    // ========================================================================
+
+    /// Insert a resource (singleton data not attached to any entity)
     ///
-    /// Global components are useful for singleton data like time, input state,
-    /// or game configuration that doesn't belong to any specific entity.
-    pub fn add_global_component<T: Component>(&mut self, component: T) {
-        self.global_components
-            .insert(ComponentId::of::<T>(), Box::new(component));
+    /// Resources are global state such as time, input, configuration, etc.
+    /// If a resource of this type already exists, it is replaced.
+    pub fn insert_resource<T: Resource>(&mut self, resource: T) {
+        self.resources
+            .insert(ResourceId::of::<T>(), Box::new(resource));
     }
 
-    /// Get immutable reference to a global component
-    pub fn get_global_component<T: Component>(&self) -> Option<&T> {
-        self.global_components
-            .get(&ComponentId::of::<T>())
+    /// Get immutable reference to a resource
+    pub fn get_resource<T: Resource>(&self) -> Option<&T> {
+        self.resources
+            .get(&ResourceId::of::<T>())
             .and_then(|boxed| boxed.downcast_ref::<T>())
     }
 
-    /// Get mutable reference to a global component
-    pub fn get_global_component_mut<T: Component>(&mut self) -> Option<&mut T> {
-        self.global_components
-            .get_mut(&ComponentId::of::<T>())
+    /// Get mutable reference to a resource
+    pub fn get_resource_mut<T: Resource>(&mut self) -> Option<&mut T> {
+        self.resources
+            .get_mut(&ResourceId::of::<T>())
             .and_then(|boxed| boxed.downcast_mut::<T>())
     }
 
-    /// Remove a global component and return it if it existed
-    ///
-    /// Returns `Some(component)` if the global component was present,
-    /// or `None` if it wasn't registered.
-    pub fn remove_global_component<T: Component>(&mut self) -> Option<T> {
-        self.global_components
-            .remove(&ComponentId::of::<T>())
+    /// Remove a resource and return it if it existed
+    pub fn remove_resource<T: Resource>(&mut self) -> Option<T> {
+        self.resources
+            .remove(&ResourceId::of::<T>())
             .and_then(|boxed| boxed.downcast::<T>().ok())
             .map(|boxed| *boxed)
     }
 
-    /// Check if a global component exists
-    pub fn has_global_component<T: Component>(&self) -> bool {
-        self.global_components.contains_key(&ComponentId::of::<T>())
+    /// Check if a resource exists
+    pub fn has_resource<T: Resource>(&self) -> bool {
+        self.resources.contains_key(&ResourceId::of::<T>())
     }
 
     /// Check if an entity exists and is valid (not destroyed/recycled)

@@ -48,6 +48,7 @@
 use crate::archetype::{Archetype, ArchetypeId};
 use crate::component::{Component, ComponentId, ComponentMask};
 use crate::entity::Entity;
+use crate::resource::Resource;
 use crate::world::World;
 
 use rayon::prelude::*;
@@ -779,25 +780,64 @@ impl std::fmt::Display for ParForEachResult {
 }
 
 // ============================================================================
-// Global Component Query
+// Resource Queries
 // ============================================================================
 
-/// Query for accessing global (singleton) components.
+/// Immutable resource access for systems.
+///
+/// Use `Res<T>` as a system parameter to read a resource without mutation.
+/// The scheduler tracks this as a read and allows multiple systems to
+/// read the same resource in parallel.
 ///
 /// # Example
 /// ```ignore
-/// fn my_system(mut time: GlobalComponentQuery<GameTime>) {
+/// fn my_system(time: Res<GameTime>) {
+///     if let Some(time) = time.get() {
+///         println!("Elapsed: {}", time.elapsed);
+///     }
+/// }
+/// ```
+pub struct Res<'w, T: Resource> {
+    world: &'w World,
+    _phantom: std::marker::PhantomData<T>,
+}
+
+impl<'w, T: Resource> Res<'w, T> {
+    pub fn new(world: &'w World) -> Self {
+        Self {
+            world,
+            _phantom: std::marker::PhantomData,
+        }
+    }
+
+    /// Get immutable reference to the resource.
+    ///
+    /// Returns `None` if the resource has not been inserted into the World.
+    pub fn get(&self) -> Option<&T> {
+        self.world.get_resource::<T>()
+    }
+}
+
+/// Mutable resource access for systems.
+///
+/// Use `ResMut<T>` as a system parameter to read and write a resource.
+/// The scheduler tracks this as a write and prevents other systems from
+/// accessing the same resource in parallel.
+///
+/// # Example
+/// ```ignore
+/// fn my_system(mut time: ResMut<GameTime>) {
 ///     if let Some(time) = time.get_mut() {
 ///         time.elapsed += time.delta;
 ///     }
 /// }
 /// ```
-pub struct GlobalComponentQuery<'w, T: Component> {
+pub struct ResMut<'w, T: Resource> {
     world: &'w mut World,
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<'w, T: Component> GlobalComponentQuery<'w, T> {
+impl<'w, T: Resource> ResMut<'w, T> {
     pub fn new(world: &'w mut World) -> Self {
         Self {
             world,
@@ -805,14 +845,18 @@ impl<'w, T: Component> GlobalComponentQuery<'w, T> {
         }
     }
 
-    /// Get immutable reference to the global component.
+    /// Get immutable reference to the resource.
+    ///
+    /// Returns `None` if the resource has not been inserted into the World.
     pub fn get(&self) -> Option<&T> {
-        self.world.get_global_component::<T>()
+        self.world.get_resource::<T>()
     }
 
-    /// Get mutable reference to the global component.
+    /// Get mutable reference to the resource.
+    ///
+    /// Returns `None` if the resource has not been inserted into the World.
     pub fn get_mut(&mut self) -> Option<&mut T> {
-        self.world.get_global_component_mut::<T>()
+        self.world.get_resource_mut::<T>()
     }
 }
 
@@ -1141,47 +1185,6 @@ mod tests {
 
         assert!(format!("{}", tracked).contains("threads: 4"));
         assert_eq!(format!("{}", untracked), "Untracked");
-    }
-
-    // ------------------------------------------------------------------------
-    // Global Component Query Tests
-    // ------------------------------------------------------------------------
-
-    #[test]
-    fn test_global_component_query() {
-        let mut world = setup_world();
-
-        world.add_global_component(Health(100));
-
-        let query = GlobalComponentQuery::<Health>::new(&mut world);
-        let health = query.get().unwrap();
-
-        assert_eq!(health.0, 100);
-    }
-
-    #[test]
-    fn test_global_component_query_mut() {
-        let mut world = setup_world();
-
-        world.add_global_component(Health(100));
-
-        {
-            let mut query = GlobalComponentQuery::<Health>::new(&mut world);
-            if let Some(health) = query.get_mut() {
-                health.0 -= 25;
-            }
-        }
-
-        let query = GlobalComponentQuery::<Health>::new(&mut world);
-        assert_eq!(query.get().unwrap().0, 75);
-    }
-
-    #[test]
-    fn test_global_component_query_missing() {
-        let mut world = setup_world();
-
-        let query = GlobalComponentQuery::<Health>::new(&mut world);
-        assert!(query.get().is_none());
     }
 
     // ------------------------------------------------------------------------
