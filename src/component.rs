@@ -9,6 +9,80 @@ use std::collections::HashMap;
 /// Component marker trait - all components must be 'static and Send
 pub trait Component: Send + 'static {}
 
+// ============================================================================
+// Change Detection Ticks
+// ============================================================================
+
+/// Monotonically increasing counter used to detect when components change.
+///
+/// The World maintains a global tick that is bumped each frame (or on demand).
+/// Each component instance carries its own `ComponentTicks` recording when it
+/// was added and most recently mutated. Systems can later compare these to
+/// their own `last_run` tick to find new or changed data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Tick(pub u32);
+
+impl Tick {
+    /// Construct a tick with an explicit value.
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Get the underlying counter value.
+    #[inline]
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// Returns true if this tick is strictly newer than `last_run`
+    /// (and not in the future relative to `this_run`).
+    #[inline]
+    pub fn is_newer_than(self, last_run: Tick, this_run: Tick) -> bool {
+        self.0 > last_run.0 && self.0 <= this_run.0
+    }
+}
+
+/// Per-component-instance change-detection metadata.
+///
+/// Stored in a parallel `Vec<ComponentTicks>` next to each archetype's
+/// component storage so that the metadata for row `i` lives at index `i`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ComponentTicks {
+    /// Tick at which this component was added to its current entity.
+    pub added: Tick,
+    /// Tick at which this component was most recently mutated through `Mut<T>`.
+    pub changed: Tick,
+}
+
+impl ComponentTicks {
+    /// Create new ticks with both `added` and `changed` set to the given tick.
+    #[inline]
+    pub fn new(tick: Tick) -> Self {
+        Self {
+            added: tick,
+            changed: tick,
+        }
+    }
+
+    /// Was this component added between `last_run` and `this_run`?
+    #[inline]
+    pub fn is_added(&self, last_run: Tick, this_run: Tick) -> bool {
+        self.added.is_newer_than(last_run, this_run)
+    }
+
+    /// Was this component changed (or added) between `last_run` and `this_run`?
+    #[inline]
+    pub fn is_changed(&self, last_run: Tick, this_run: Tick) -> bool {
+        self.changed.is_newer_than(last_run, this_run)
+    }
+
+    /// Force the `changed` tick to a value (bypasses normal `Mut` mutation path).
+    #[inline]
+    pub fn set_changed(&mut self, tick: Tick) {
+        self.changed = tick;
+    }
+}
+
 /// ComponentId uniquely identifies a component type using its TypeId
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ComponentId(pub TypeId);

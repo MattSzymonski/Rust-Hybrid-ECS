@@ -45,7 +45,7 @@ use std::collections::HashMap;
 
 use trait_type_map::{TraitTypeMap, VecFamily};
 
-use crate::component::{Component, ComponentId, ComponentMask};
+use crate::component::{Component, ComponentId, ComponentMask, ComponentTicks};
 use crate::entity::Entity;
 
 /// Type for component storage factory functions
@@ -62,6 +62,15 @@ pub struct Archetype {
     pub component_mask: ComponentMask,     // Fast bitmask for query matching
     pub component_storages: TraitTypeMap<dyn Component, VecFamily>,
     pub entities: Vec<Entity>,
+    /// Per-component-instance change-detection metadata.
+    ///
+    /// For each `ComponentId` in `component_types`, the matching
+    /// `Vec<ComponentTicks>` is kept in lockstep with the underlying
+    /// component storage: row `i` of the tick vec corresponds to row `i`
+    /// of the component vec for the same entity. Maintenance happens in
+    /// `World` whenever entities are inserted, moved between archetypes,
+    /// or destroyed.
+    pub component_ticks: HashMap<ComponentId, Vec<ComponentTicks>>,
 }
 
 impl Archetype {
@@ -76,6 +85,7 @@ impl Archetype {
         storage_factories: &HashMap<ComponentId, StorageFactory>,
     ) -> Self {
         let mut component_storages = TraitTypeMap::new();
+        let mut component_ticks: HashMap<ComponentId, Vec<ComponentTicks>> = HashMap::new();
 
         // Register storage for each component type using the factory
         for &component_id in &component_types {
@@ -85,6 +95,7 @@ impl Archetype {
                     component_id
                 ));
             factory(&mut component_storages);
+            component_ticks.insert(component_id, Vec::new());
         }
 
         Self {
@@ -93,6 +104,7 @@ impl Archetype {
             component_mask,
             component_storages,
             entities: Vec::new(),
+            component_ticks,
         }
     }
 

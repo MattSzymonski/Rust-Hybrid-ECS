@@ -171,6 +171,10 @@ impl Engine {
     /// This two-phase approach ensures structural changes don't interfere
     /// with systems that are still running.
     pub fn process_frame(&mut self) {
+        // Bump the world tick so that any change-detection comparisons
+        // performed by mutable queries during this frame use a fresh value.
+        self.world.increment_change_tick();
+
         // Phase 1: Run all systems
         if self.parallel_execution && self.systems.len() > 1 {
             self.run_systems_parallel();

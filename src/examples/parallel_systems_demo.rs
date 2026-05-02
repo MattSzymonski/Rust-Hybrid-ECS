@@ -24,21 +24,37 @@ impl Component for Health {}
 // Make components accessible through trait objects
 impl_trait_accessible!(dyn Component; Position, Velocity, Health);
 
+fn ttt_system(mut commands: Commands, mut query: Query<(&mut Position, &Velocity)>) {
+    for (mut pos, vel) in query.iter_mut() {
+        pos.x += vel.vx;
+        pos.y += vel.vy;
+    }
+
+    let _x = commands
+        .create_entity()
+        .with(Position { x: 0.0, y: 0.0 })
+        .with(Velocity { vx: 1.0, vy: 1.0 })
+        .with(Health(50.0))
+        .build();
+
+    
+}
+
 fn movement_system(mut query: Query<(&mut Position, &Velocity)>) {
-    for (pos, vel) in query.iter_mut() {
+    for (mut pos, vel) in query.iter_mut() {
         pos.x += vel.vx;
         pos.y += vel.vy;
     }
 }
 
 fn health_system(mut query: Query<&mut Health>) {
-    for health in query.iter_mut() {
+    for mut health in query.iter_mut() {
         health.0 = (health.0 - 0.1).max(0.0);
     }
 }
 
 fn damage_system(mut query: Query<(&mut Health, &Position)>) {
-    for (health, pos) in query.iter_mut() {
+    for (mut health, pos) in query.iter_mut() {
         if pos.x.abs() < 1.0 && pos.y.abs() < 1.0 {
             health.0 = (health.0 - 1.0).max(0.0);
         }
@@ -63,6 +79,7 @@ pub(crate) fn main() {
     engine.register_system("movement", movement_system);
     engine.register_system("health", health_system);
     engine.register_system("damage", damage_system);
+    engine.register_system("xxx", ttt_system);
 
     // Print the execution graph
     println!("System Execution Graph:");

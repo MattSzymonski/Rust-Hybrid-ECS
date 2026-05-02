@@ -66,7 +66,6 @@
 //! ```
 
 use crate::commands::{CommandQueue, Commands};
-use crate::component::Component;
 use crate::query::{Query, QueryTarget, Res, ResMut};
 use crate::resource::{Resource, ResourceId};
 use crate::scheduler::SystemAccess;

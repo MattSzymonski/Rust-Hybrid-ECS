@@ -14,7 +14,9 @@ use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
 
 use crate::archetype::{Archetype, ArchetypeId, StorageFactory};
 use crate::commands::CommandQueue;
-use crate::component::{Component, ComponentId, ComponentMask, ComponentRegistry};
+use crate::component::{
+    Component, ComponentId, ComponentMask, ComponentRegistry, ComponentTicks, Tick,
+};
 use crate::entity::Entity;
 use crate::resource::{Resource, ResourceId};
 use crate::scripting::{ScriptComponent, ScriptContext};
@@ -124,6 +126,16 @@ pub struct World {
     pub(crate) component_registry: ComponentRegistry,
     /// Resources (singleton data) stored by type
     pub(crate) resources: HashMap<ResourceId, Box<dyn Any + Send + Sync>>,
+    /// Per-resource change-detection ticks (parallel to `resources`).
+    pub(crate) resource_ticks: HashMap<ResourceId, ComponentTicks>,
+    /// Monotonically increasing world tick used for change detection.
+    ///
+    /// Bumped once per frame by the [`Engine`](crate::engine::Engine) and
+    /// also each time a query that supports change tracking begins iteration.
+    /// Stored as a plain `u32`; wrap-around handling is intentionally simple
+    /// (and matches the expected lifetime of long-running games at 60 fps:
+    /// ~828 days before overflow).
+    pub(crate) change_tick: u32,
 }
 
 impl World {
@@ -142,6 +154,8 @@ impl World {
             script_updaters: HashMap::new(),
             component_registry: ComponentRegistry::new(),
             resources: HashMap::new(),
+            resource_ticks: HashMap::new(),
+            change_tick: 0,
         }
     }
 }
@@ -285,6 +299,27 @@ impl World {
     }
 
     // ========================================================================
+    // Change Detection Ticks
+    // ========================================================================
+
+    /// Read the current world tick without modifying it.
+    #[inline]
+    pub fn change_tick(&self) -> Tick {
+        Tick::new(self.change_tick)
+    }
+
+    /// Bump the world tick and return the new value.
+    ///
+    /// Called by the [`Engine`](crate::engine::Engine) once per frame and
+    /// by mutable queries when they begin iteration so that mutations
+    /// performed during the same frame can still be distinguished by tick.
+    #[inline]
+    pub fn increment_change_tick(&mut self) -> Tick {
+        self.change_tick = self.change_tick.wrapping_add(1);
+        Tick::new(self.change_tick)
+    }
+
+    // ========================================================================
     // Resource Management
     // ========================================================================
 
@@ -293,8 +328,10 @@ impl World {
     /// Resources are global state such as time, input, configuration, etc.
     /// If a resource of this type already exists, it is replaced.
     pub fn insert_resource<T: Resource>(&mut self, resource: T) {
-        self.resources
-            .insert(ResourceId::of::<T>(), Box::new(resource));
+        let id = ResourceId::of::<T>();
+        let tick = Tick::new(self.change_tick);
+        self.resources.insert(id, Box::new(resource));
+        self.resource_ticks.insert(id, ComponentTicks::new(tick));
     }
 
     /// Get immutable reference to a resource
@@ -313,8 +350,10 @@ impl World {
 
     /// Remove a resource and return it if it existed
     pub fn remove_resource<T: Resource>(&mut self) -> Option<T> {
+        let id = ResourceId::of::<T>();
+        self.resource_ticks.remove(&id);
         self.resources
-            .remove(&ResourceId::of::<T>())
+            .remove(&id)
             .and_then(|boxed| boxed.downcast::<T>().ok())
             .map(|boxed| *boxed)
     }
@@ -516,6 +555,7 @@ impl World {
         F: FnOnce(&mut TraitTypeMap<dyn Component, VecFamily>),
     {
         let archetype_id = self.get_or_create_archetype(component_ids);
+        let current_tick = Tick::new(self.change_tick);
 
         let archetype = self
             .archetypes
@@ -528,6 +568,16 @@ impl World {
 
         // Use the provided closure to insert components with their concrete types
         insert_fn(&mut archetype.component_storages);
+
+        // Maintain change-detection ticks: every component_id in the archetype
+        // got exactly one push by the closure above, so push one fresh tick.
+        for component_id in archetype.component_types.clone() {
+            archetype
+                .component_ticks
+                .entry(component_id)
+                .or_default()
+                .push(ComponentTicks::new(current_tick));
+        }
 
         self.entity_locations.insert(
             entity,
@@ -613,6 +663,30 @@ impl World {
                 old_index,
             );
 
+            // Maintain change-detection ticks: for each component in the
+            // destination archetype, either preserve the existing ticks
+            // (component carried over) or push fresh ticks for a newly
+            // attached component.
+            let current_tick = Tick::new(self.change_tick);
+            let new_component_ids = new_arch.component_types.clone();
+            for component_id in new_component_ids {
+                let new_tick =
+                    if let Some(old_ticks_vec) = old_arch.component_ticks.get(&component_id) {
+                        // Component carried over from old archetype.
+                        *old_ticks_vec
+                            .get(old_index)
+                            .expect("old ticks vec out of sync with components")
+                    } else {
+                        // Newly added component on this entity.
+                        ComponentTicks::new(current_tick)
+                    };
+                new_arch
+                    .component_ticks
+                    .entry(component_id)
+                    .or_default()
+                    .push(new_tick);
+            }
+
             // Update entity location
             self.entity_locations.insert(
                 entity,
@@ -645,6 +719,12 @@ impl World {
                     .get_trait_storage_mut(component_id.0)
                 {
                     storage.swap_remove(old_index);
+                }
+                // Keep change-detection ticks in lockstep with storage.
+                if let Some(ticks) = old_archetype.component_ticks.get_mut(&component_id) {
+                    if old_index < ticks.len() {
+                        ticks.swap_remove(old_index);
+                    }
                 }
             }
         }
@@ -690,6 +770,13 @@ impl World {
             // Also swap_remove from all component storages to keep them in sync
             // Clone the component_types to avoid borrow issues
             let component_types: Vec<ComponentId> = archetype.component_types.clone();
+            for component_id in &component_types {
+                if let Some(ticks) = archetype.component_ticks.get_mut(component_id) {
+                    if old_index < ticks.len() {
+                        ticks.swap_remove(old_index);
+                    }
+                }
+            }
             for component_id in component_types {
                 if let Some(storage) = archetype
                     .component_storages

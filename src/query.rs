@@ -46,7 +46,8 @@
 //! ```
 
 use crate::archetype::{Archetype, ArchetypeId};
-use crate::component::{Component, ComponentId, ComponentMask};
+use crate::change_detection::Mut;
+use crate::component::{Component, ComponentId, ComponentMask, ComponentTicks, Tick};
 use crate::entity::Entity;
 use crate::resource::Resource;
 use crate::world::World;
@@ -211,16 +212,14 @@ pub trait QueryTarget {
     fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>);
 
     /// Initialize state for fetching from an archetype (caches storage pointers).
-    fn init_state(archetype: &mut Archetype) -> Self::State;
+    ///
+    /// `this_run` is the current world tick used by mutable fetches to populate
+    /// `Mut<T>::this_run`. Read-only targets ignore it.
+    fn init_state(archetype: &mut Archetype, this_run: Tick) -> Self::State;
 
-    /// Fetch components using cached state (for parallel iteration).
+    /// Fetch components using cached state (used by both sequential and
+    /// parallel iteration paths).
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a>;
-
-    /// Fetch components from an archetype (immutable access).
-    fn fetch<'a>(archetype: &'a Archetype, index: usize) -> Self::Item<'a>;
-
-    /// Fetch components from an archetype (mutable access).
-    fn fetch_mut<'a>(archetype: &'a mut Archetype, index: usize) -> Self::Item<'a>;
 }
 
 // ----------------------------------------------------------------------------
@@ -242,20 +241,12 @@ impl QueryTarget for Entity {
         (Vec::new(), Vec::new())
     }
 
-    fn init_state(archetype: &mut Archetype) -> Self::State {
+    fn init_state(archetype: &mut Archetype, _this_run: Tick) -> Self::State {
         SendPtr::new(&archetype.entities as *const Vec<Entity>)
     }
 
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
         unsafe { *(&*state.as_ptr()).get_unchecked(index) }
-    }
-
-    fn fetch<'a>(archetype: &'a Archetype, index: usize) -> Self::Item<'a> {
-        archetype.entities[index]
-    }
-
-    fn fetch_mut<'a>(archetype: &'a mut Archetype, index: usize) -> Self::Item<'a> {
-        archetype.entities[index]
     }
 }
 
@@ -274,7 +265,7 @@ impl<T: Component> QueryTarget for &T {
         (vec![ComponentId::of::<T>()], Vec::new())
     }
 
-    fn init_state(archetype: &mut Archetype) -> Self::State {
+    fn init_state(archetype: &mut Archetype, _this_run: Tick) -> Self::State {
         SendPtr::new(
             archetype.component_storages.get_storage::<T>() as *const VecStorage<T, dyn Component>
         )
@@ -283,22 +274,24 @@ impl<T: Component> QueryTarget for &T {
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
         unsafe { (*state.as_ptr()).get(index) }
     }
-
-    fn fetch<'a>(archetype: &'a Archetype, index: usize) -> Self::Item<'a> {
-        archetype.component_storages.get_storage::<T>().get(index)
-    }
-
-    fn fetch_mut<'a>(archetype: &'a mut Archetype, index: usize) -> Self::Item<'a> {
-        archetype
-            .component_storages
-            .get_storage_mut::<T>()
-            .get_mut(index)
-    }
 }
 
+/// Cached pointers used by mutable component queries to construct `Mut<T>`
+/// without re-locating the underlying storage on every access.
+pub struct MutFetchState<T: Component> {
+    values: SendPtrMut<VecStorage<T, dyn Component>>,
+    ticks: SendPtrMut<Vec<ComponentTicks>>,
+    this_run: Tick,
+}
+
+// SAFETY: Both inner pointers wrap raw addresses backed by storage that
+// outlives the query. Disjoint per-row access is guaranteed by the scheduler.
+unsafe impl<T: Component> Send for MutFetchState<T> {}
+unsafe impl<T: Component> Sync for MutFetchState<T> {}
+
 impl<T: Component> QueryTarget for &mut T {
-    type Item<'a> = &'a mut T;
-    type State = SendPtrMut<VecStorage<T, dyn Component>>;
+    type Item<'a> = Mut<'a, T>;
+    type State = MutFetchState<T>;
 
     fn component_ids() -> Vec<ComponentId> {
         vec![ComponentId::of::<T>()]
@@ -308,31 +301,33 @@ impl<T: Component> QueryTarget for &mut T {
         (Vec::new(), vec![ComponentId::of::<T>()])
     }
 
-    fn init_state(archetype: &mut Archetype) -> Self::State {
-        SendPtrMut::new(archetype.component_storages.get_storage_mut::<T>()
-            as *mut VecStorage<T, dyn Component>)
+    fn init_state(archetype: &mut Archetype, this_run: Tick) -> Self::State {
+        let values = SendPtrMut::new(archetype.component_storages.get_storage_mut::<T>()
+            as *mut VecStorage<T, dyn Component>);
+        let ticks_vec = archetype
+            .component_ticks
+            .get_mut(&ComponentId::of::<T>())
+            .expect("component_ticks vec missing for type - archetype not properly initialized")
+            as *mut Vec<ComponentTicks>;
+        let ticks = SendPtrMut::new(ticks_vec);
+        MutFetchState {
+            values,
+            ticks,
+            this_run,
+        }
     }
 
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
-        unsafe { (*state.as_ptr()).get_mut(index) }
-    }
-
-    fn fetch<'a>(_archetype: &'a Archetype, _index: usize) -> Self::Item<'a> {
-        // SAFETY: This path should never be reached in correct code.
-        // The query system ensures mutable queries use fetch_mut.
-        // If we get here, it indicates a bug in the query infrastructure.
-        unreachable!(
-            "BUG: fetch() called for &mut {} - mutable queries must use fetch_mut(). \
-             This indicates a bug in the query infrastructure.",
-            std::any::type_name::<T>()
-        )
-    }
-
-    fn fetch_mut<'a>(archetype: &'a mut Archetype, index: usize) -> Self::Item<'a> {
-        archetype
-            .component_storages
-            .get_storage_mut::<T>()
-            .get_mut(index)
+        // SAFETY: Disjoint per-row access guaranteed by the scheduler. Both
+        // pointers are valid for the lifetime of the iteration. Mutating
+        // through Mut::deref_mut updates ticks[index].changed without
+        // requiring atomics because no other thread observes this row.
+        unsafe {
+            let value: &'a mut T = (*state.values.as_ptr()).get_mut(index);
+            let ticks: &'a mut ComponentTicks =
+                &mut *(*state.ticks.as_ptr()).as_mut_ptr().add(index);
+            Mut::new(value, ticks, state.this_run)
+        }
     }
 }
 
@@ -365,27 +360,15 @@ macro_rules! impl_query_target_tuple {
             }
 
             #[allow(non_snake_case)]
-            fn init_state(archetype: &mut Archetype) -> Self::State {
+            fn init_state(archetype: &mut Archetype, this_run: Tick) -> Self::State {
                 let arch_ptr = archetype as *mut Archetype;
-                unsafe { ($($T::init_state(&mut *arch_ptr),)*) }
+                unsafe { ($($T::init_state(&mut *arch_ptr, this_run),)*) }
             }
 
             #[allow(non_snake_case)]
             fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
                 let ($($T,)*) = state;
                 ($($T::fetch_with_state($T, index),)*)
-            }
-
-            #[allow(non_snake_case)]
-            fn fetch<'a>(archetype: &'a Archetype, index: usize) -> Self::Item<'a> {
-                ($($T::fetch(archetype, index),)*)
-            }
-
-            #[allow(non_snake_case)]
-            fn fetch_mut<'a>(archetype: &'a mut Archetype, index: usize) -> Self::Item<'a> {
-                // SAFETY: We use raw pointers to allow multiple mutable borrows of different components
-                let arch_ptr = archetype as *mut Archetype;
-                unsafe { ($($T::fetch_mut(&mut *arch_ptr, index),)*) }
             }
         }
     };
@@ -439,6 +422,7 @@ impl<'w, Q: QueryTarget> Query<'w, Q> {
     #[inline]
     pub fn iter_mut(&mut self) -> QueryIterMut<'_, Q> {
         let query_mask = self.build_query_mask();
+        let this_run = self.world.increment_change_tick();
 
         let matching_archetypes: Vec<ArchetypeId> = self
             .world
@@ -455,6 +439,7 @@ impl<'w, Q: QueryTarget> Query<'w, Q> {
             current_entity_idx: 0,
             current_archetype_len: 0,
             current_state: None,
+            this_run,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -500,6 +485,7 @@ impl<'w, Q: QueryTarget> Query<'w, Q> {
         for<'a> Q::Item<'a>: Send,
     {
         let query_mask = self.build_query_mask();
+        let this_run = self.world.increment_change_tick();
 
         let archetype_ranges: Vec<ArchetypeRange<Q::State>> = self
             .world
@@ -507,7 +493,7 @@ impl<'w, Q: QueryTarget> Query<'w, Q> {
             .iter_mut()
             .filter(|(_, arch)| arch.matches_mask(&query_mask))
             .filter(|(_, arch)| !arch.is_empty())
-            .map(|(id, arch)| (*id, Q::init_state(arch), arch.len()))
+            .map(|(id, arch)| (*id, Q::init_state(arch, this_run), arch.len()))
             .collect();
 
         ParQueryIter {
@@ -533,6 +519,9 @@ pub struct QueryIterMut<'w, Q: QueryTarget> {
     current_archetype_len: usize,
     // Cache component storage pointers (always Some during iteration)
     current_state: Option<Q::State>,
+    /// World tick captured at iterator construction; passed into each
+    /// `Mut<T>` produced during iteration so mutations can be detected.
+    this_run: Tick,
     _phantom: std::marker::PhantomData<&'w mut Q>,
 }
 
@@ -585,7 +574,7 @@ impl<'w, Q: QueryTarget> QueryIterMut<'w, Q> {
 
             // Cache archetype length and component storage pointers
             self.current_archetype_len = archetype.len();
-            self.current_state = Some(Q::init_state(archetype));
+            self.current_state = Some(Q::init_state(archetype, self.this_run));
             self.current_entity_idx = 0;
             self.current_archetype_idx += 1;
         }
@@ -983,7 +972,7 @@ mod tests {
         // Modify position based on velocity
         {
             let mut query = Query::<(&mut Position, &Velocity)>::new(&mut world);
-            for (pos, vel) in query.iter_mut() {
+            for (mut pos, vel) in query.iter_mut() {
                 pos.x += vel.x;
                 pos.y += vel.y;
             }
@@ -1053,7 +1042,7 @@ mod tests {
         }
 
         let mut query = Query::<(&mut Position,)>::new(&mut world);
-        query.par_iter_mut().for_each(|(pos,)| {
+        query.par_iter_mut().for_each(|(mut pos,)| {
             pos.x += 1.0;
         });
 
@@ -1080,7 +1069,7 @@ mod tests {
             .par_iter_mut()
             .with_batch_size(100)
             .tracked()
-            .for_each(|(pos,)| {
+            .for_each(|(mut pos,)| {
                 pos.x = 1.0;
             });
 
@@ -1224,5 +1213,134 @@ mod tests {
     fn test_entity_has_no_component_ids() {
         let ids = Entity::component_ids();
         assert!(ids.is_empty());
+    }
+
+    // ------------------------------------------------------------------------
+    // Change Detection Tests
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_mut_deref_bumps_changed_tick() {
+        let mut world = setup_world();
+        world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build();
+
+        // Capture the tick at which the component was added (insert
+        // happened with whatever world.change_tick was at the time).
+        let added_tick = {
+            let mut q = Query::<(&mut Position,)>::new(&mut world);
+            let (m,) = q.first().unwrap();
+            m.last_added()
+        };
+
+        // Mutate via DerefMut - should bump `changed` to the iterator's
+        // this_run, which is strictly newer than `added`.
+        let changed_tick = {
+            let mut q = Query::<(&mut Position,)>::new(&mut world);
+            let (mut m,) = q.first().unwrap();
+            m.x += 5.0; // DerefMut path
+            m.last_changed()
+        };
+
+        assert!(
+            changed_tick > added_tick,
+            "expected changed ({:?}) > added ({:?})",
+            changed_tick,
+            added_tick
+        );
+    }
+
+    #[test]
+    fn test_immutable_deref_does_not_bump_changed_tick() {
+        let mut world = setup_world();
+        world
+            .create_entity()
+            .with(Position { x: 1.0, y: 2.0 })
+            .build();
+
+        let baseline = {
+            let mut q = Query::<(&mut Position,)>::new(&mut world);
+            let (m,) = q.first().unwrap();
+            m.last_changed()
+        };
+
+        // Read-only deref must not advance the changed tick.
+        let after_read = {
+            let mut q = Query::<(&mut Position,)>::new(&mut world);
+            let (m,) = q.first().unwrap();
+            let _x = m.x; // immutable deref
+            m.last_changed()
+        };
+
+        assert_eq!(baseline, after_read);
+    }
+
+    #[test]
+    fn test_bypass_change_detection_does_not_bump_tick() {
+        let mut world = setup_world();
+        world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build();
+
+        let baseline = {
+            let mut q = Query::<(&mut Position,)>::new(&mut world);
+            let (m,) = q.first().unwrap();
+            m.last_changed()
+        };
+
+        let after_bypass = {
+            let mut q = Query::<(&mut Position,)>::new(&mut world);
+            let (mut m,) = q.first().unwrap();
+            m.bypass_change_detection().x = 99.0;
+            m.last_changed()
+        };
+
+        assert_eq!(baseline, after_bypass);
+
+        // Verify the actual mutation still happened.
+        let mut verify = Query::<(&Position,)>::new(&mut world);
+        let (pos,) = verify.first().unwrap();
+        assert_eq!(pos.x, 99.0);
+    }
+
+    #[test]
+    fn test_added_tick_preserved_across_archetype_migration() {
+        let mut world = setup_world();
+        let entity = world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build();
+
+        let original_added = {
+            let mut q = Query::<(&mut Position,)>::new(&mut world);
+            let (m,) = q.first().unwrap();
+            m.last_added()
+        };
+
+        // Migrate to a new archetype by adding a component. The Position
+        // component carries over and its `added` tick must be preserved.
+        world
+            .add_component(entity, Velocity { x: 1.0, y: 1.0 })
+            .unwrap();
+
+        let after_migration = {
+            let mut q = Query::<(&mut Position,)>::new(&mut world);
+            let (m,) = q.first().unwrap();
+            m.last_added()
+        };
+
+        assert_eq!(original_added, after_migration);
+
+        // The newly attached Velocity should have an `added` tick that is
+        // at least as new as the original Position's added tick.
+        let velocity_added = {
+            let mut q = Query::<(&mut Velocity,)>::new(&mut world);
+            let (m,) = q.first().unwrap();
+            m.last_added()
+        };
+        assert!(velocity_added >= original_added);
     }
 }

@@ -5,6 +5,7 @@
 //! archetype-based storage for optimal cache locality and query performance.
 
 pub mod archetype;
+pub mod change_detection;
 pub mod commands;
 pub mod component;
 pub mod engine;
@@ -17,8 +18,9 @@ pub mod system;
 pub mod world;
 
 // Re-export commonly used types
+pub use change_detection::Mut;
 pub use commands::Commands;
-pub use component::Component;
+pub use component::{Component, ComponentTicks, Tick};
 pub use engine::Engine;
 pub use entity::Entity;
 pub use query::{BatchStats, Query, QueryTarget, Res, ResMut};

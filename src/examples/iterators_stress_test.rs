@@ -141,7 +141,7 @@ fn collision_and_movement_system(
             .par_iter_mut()
             .with_batch_size(200)
             .tracked()
-            .for_each(|(transform, velocity)| {
+            .for_each(|(mut transform, velocity)| {
                 let new_x = transform.x + velocity.x * 0.016;
                 let new_y = transform.y + velocity.y * 0.016;
                 let new_z = transform.z + velocity.z * 0.016;
