@@ -129,6 +129,24 @@ impl ComponentMask {
     pub fn contains_all(&self, other: &ComponentMask) -> bool {
         (self.0 & other.0) == other.0
     }
+
+    /// Bitwise AND of two masks - bits set in both inputs.
+    #[inline]
+    pub fn intersection(a: &ComponentMask, b: &ComponentMask) -> ComponentMask {
+        ComponentMask(a.0 & b.0)
+    }
+
+    /// True if no bits are set.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+
+    /// True if any bit set in `other` is also set in `self`.
+    #[inline]
+    pub fn intersects(&self, other: &ComponentMask) -> bool {
+        (self.0 & other.0) != 0
+    }
 }
 
 /// Registry that maps component types to bit indices in the component mask.

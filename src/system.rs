@@ -66,7 +66,7 @@
 //! ```
 
 use crate::commands::{CommandQueue, Commands};
-use crate::query::{Query, QueryTarget, Res, ResMut};
+use crate::query::{Query, QueryFilter, QueryTarget, Res, ResMut};
 use crate::resource::{Resource, ResourceId};
 use crate::scheduler::SystemAccess;
 use crate::world::World;
@@ -161,14 +161,14 @@ impl SystemParam for Commands<'static> {
 ///
 /// This implementation allows any query pattern to be used as a system parameter
 /// without needing separate implementations for each query type.
-impl<Q: QueryTarget + 'static> SystemParam for Query<'static, Q> {
+impl<Q: QueryTarget + 'static, F: QueryFilter + 'static> SystemParam for Query<'static, Q, F> {
     fn fetch(world: &mut World, _queue: &mut CommandQueue) -> Self {
         // SAFETY: Lifetime transmutation from actual borrow to 'static.
         //
         // This is sound IFF the caller upholds the SystemParam safety contract:
-        // - The Query<'static, Q> must not escape the system function
-        // - The Query<'static, Q> must not be stored in global/static state
-        // - The Query<'static, Q> must be dropped before system returns
+        // - The Query<'static, Q, F> must not escape the system function
+        // - The Query<'static, Q, F> must not be stored in global/static state
+        // - The Query<'static, Q, F> must be dropped before system returns
         //
         // The Engine's system execution infrastructure ensures these invariants
         // by calling systems as opaque functions that cannot return the parameter.
@@ -176,7 +176,7 @@ impl<Q: QueryTarget + 'static> SystemParam for Query<'static, Q> {
         // UNDEFINED BEHAVIOR if Query escapes (e.g., stored in static variable,
         // moved to another thread, or captured in an escaping closure).
         unsafe {
-            let query: Query<Q> = Query::new(world);
+            let query: Query<Q, F> = Query::new(world);
             std::mem::transmute(query)
         }
     }
@@ -188,6 +188,12 @@ impl<Q: QueryTarget + 'static> SystemParam for Query<'static, Q> {
         }
         for comp_id in writes {
             access.add_write(comp_id);
+        }
+        // Filters that gate on a component (e.g. Changed<T>, With<T>) need
+        // read access to that component's storage so they don't conflict
+        // with concurrent writers of the same component in another system.
+        for comp_id in F::included_component_ids() {
+            access.add_read(comp_id);
         }
     }
 }

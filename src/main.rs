@@ -13,7 +13,8 @@ fn main() {
     println!("1. Iterators Stress Test");
     println!("2. Scripting Basic");
     println!("3. Parallel Systems");
-    print!("Enter your choice (1-3): ");
+    println!("4. Change Detection");
+    print!("Enter your choice (1-4): ");
 
     io::stdout().flush().unwrap();
 
@@ -24,6 +25,7 @@ fn main() {
         "1" => examples::iterators_stress_test::main(),
         "2" => examples::scripting_demo::main(),
         "3" => examples::parallel_systems_demo::main(),
+        "4" => examples::change_detection_demo::main(),
         _ => println!("Invalid choice!"),
     }
 }

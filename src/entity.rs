@@ -42,4 +42,17 @@ impl Entity {
     pub(crate) fn new_for_test(id: u64, generation: u32) -> Self {
         Self { id, generation }
     }
+
+    /// Numeric ID of this entity (slot index, not unique on its own - pair
+    /// with [`generation`](Self::generation) for a unique handle).
+    #[inline]
+    pub fn id(self) -> u64 {
+        self.id
+    }
+
+    /// Generation counter that disambiguates recycled IDs.
+    #[inline]
+    pub fn generation(self) -> u32 {
+        self.generation
+    }
 }

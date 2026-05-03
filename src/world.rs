@@ -136,6 +136,16 @@ pub struct World {
     /// (and matches the expected lifetime of long-running games at 60 fps:
     /// ~828 days before overflow).
     pub(crate) change_tick: u32,
+    /// Last-run tick for the system that is currently fetching its
+    /// parameters from this world.
+    ///
+    /// The [`Engine`](crate::engine::Engine) sets this immediately before
+    /// invoking each system so that change-detection filters
+    /// (e.g. `Changed<T>`, `Added<T>`) constructed inside the system
+    /// compare against the correct baseline. Defaults to `0`, meaning
+    /// "since the beginning of time" - useful for ad-hoc queries that are
+    /// not driven by the engine.
+    pub(crate) system_last_run: u32,
 }
 
 impl World {
@@ -156,6 +166,7 @@ impl World {
             resources: HashMap::new(),
             resource_ticks: HashMap::new(),
             change_tick: 0,
+            system_last_run: 0,
         }
     }
 }
@@ -319,6 +330,56 @@ impl World {
         Tick::new(self.change_tick)
     }
 
+    /// Read the baseline tick that change-detection filters should compare
+    /// against (the tick at which the calling system last ran).
+    #[inline]
+    pub fn system_last_run(&self) -> Tick {
+        // Per-thread override takes precedence so parallel batches can
+        // give each thread its own baseline without contending on the
+        // world-level field.
+        if let Some(t) = system_last_run_thread_local() {
+            return t;
+        }
+        Tick::new(self.system_last_run)
+    }
+
+    /// Override the baseline tick used by change-detection filters.
+    ///
+    /// Normally the [`Engine`](crate::engine::Engine) manages this on the
+    /// caller's behalf. Tests and ad-hoc code that drive queries directly
+    /// can call this to control the comparison baseline.
+    #[inline]
+    pub fn set_system_last_run(&mut self, tick: Tick) {
+        self.system_last_run = tick.get();
+    }
+}
+
+thread_local! {
+    /// Per-thread override of [`World::system_last_run`].
+    ///
+    /// Used by the [`Engine`](crate::engine::Engine) when running a batch
+    /// of systems in parallel: each thread sets its system's baseline
+    /// tick before invoking the system, and clears it afterwards. When
+    /// the override is `None`, queries fall back to the world-level
+    /// `system_last_run` field (used by the sequential scheduler).
+    static SYSTEM_LAST_RUN_OVERRIDE: std::cell::Cell<Option<Tick>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[inline]
+fn system_last_run_thread_local() -> Option<Tick> {
+    SYSTEM_LAST_RUN_OVERRIDE.with(|cell| cell.get())
+}
+
+/// Install a per-thread override for `World::system_last_run`. The
+/// previous value is returned so callers can restore it (RAII style)
+/// after the system finishes executing on this thread.
+#[inline]
+pub(crate) fn set_thread_last_run_override(value: Option<Tick>) -> Option<Tick> {
+    SYSTEM_LAST_RUN_OVERRIDE.with(|cell| cell.replace(value))
+}
+
+impl World {
     // ========================================================================
     // Resource Management
     // ========================================================================

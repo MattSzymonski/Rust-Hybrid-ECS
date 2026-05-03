@@ -9,9 +9,10 @@
 //! - System state management (for persistent data between frames)
 
 use crate::commands::CommandQueue;
+use crate::component::Tick;
 use crate::scheduler::{SystemAccess, SystemScheduler};
 use crate::system::{IntoSystem, System, SystemParam};
-use crate::world::World;
+use crate::world::{set_thread_last_run_override, World};
 use rayon::prelude::*;
 
 /// Wrapper for a registered system with its name
@@ -19,6 +20,12 @@ struct RegisteredSystem {
     name: &'static str,
     system: Box<dyn System>,
     enabled: bool,
+    /// World tick at which this system was last executed.
+    ///
+    /// Used to seed `World::system_last_run` so change-detection filters
+    /// (`Changed<T>`, `Added<T>`) inside the system see only mutations
+    /// that happened since its last run.
+    last_run: u32,
 }
 
 /// The main Engine that drives the ECS
@@ -155,6 +162,7 @@ impl Engine {
             name,
             system: system.into_system(),
             enabled: true,
+            last_run: 0,
         });
 
         // Rebuild execution graph
@@ -196,8 +204,18 @@ impl Engine {
             if !registered.enabled {
                 continue;
             }
+            // Seed the change-detection baseline for this system: filters
+            // such as `Changed<T>` will compare against `last_run`.
+            self.world.system_last_run = registered.last_run;
+            let started_at = self.world.change_tick().get();
             registered.system.run(&mut self.world, &mut self.queue);
+            // Record the tick that was current at system entry so the next
+            // run sees mutations that happened during this run.
+            registered.last_run = started_at;
         }
+        // Reset the baseline so ad-hoc queries between frames behave
+        // predictably.
+        self.world.system_last_run = 0;
     }
 
     /// Run systems in parallel batches based on dependency analysis
@@ -217,9 +235,27 @@ impl Engine {
                 if !registered.enabled {
                     continue;
                 }
+                self.world.system_last_run = registered.last_run;
+                let started_at = self.world.change_tick().get();
                 registered.system.run(&mut self.world, &mut self.queue);
+                registered.last_run = started_at;
             } else {
-                // Multiple systems - run in parallel using rayon
+                // Multiple systems - run in parallel using rayon.
+                //
+                // For change-detection: every system in the batch has, by
+                // construction, disjoint component access from every other
+                // system. This means each system's filter only inspects
+                // ticks the scheduler has reserved for that system, so it
+                // is safe to share `system_last_run` even though several
+                // systems read it concurrently. We pre-compute each
+                // system's `last_run` and seed it via a per-thread local,
+                // sidestepping the world-level field for parallel batches.
+                let started_at = self.world.change_tick().get();
+                let last_runs: Vec<u32> = systems_batch
+                    .iter()
+                    .map(|&idx| self.systems[idx].last_run)
+                    .collect();
+
                 // SAFETY: The scheduler guarantees that systems in the same batch access disjoint data
                 // We use raw pointers and unsafe to allow parallel mutable access
                 let world_ptr = &mut self.world as *mut World as usize;
@@ -236,10 +272,17 @@ impl Engine {
                 systems_batch
                     .par_iter()
                     .zip(enabled_flags.par_iter())
-                    .for_each(|(&idx, &enabled)| {
+                    .zip(last_runs.par_iter())
+                    .for_each(|((&idx, &enabled), &last_run)| {
                         if !enabled {
                             return;
                         }
+                        // Each worker thread installs its own change-
+                        // detection baseline, runs the system, then
+                        // restores the previous override so unrelated
+                        // queries on this thread (e.g. nested rayon
+                        // pools) are unaffected.
+                        let prev = set_thread_last_run_override(Some(Tick::new(last_run)));
                         unsafe {
                             let world = &mut *(world_ptr as *mut World);
                             let queue = &mut *(queue_ptr as *mut CommandQueue);
@@ -247,8 +290,16 @@ impl Engine {
                                 &mut *(systems_ptr as *mut RegisteredSystem).add(idx);
                             registered_system.system.run(world, queue);
                         }
+                        set_thread_last_run_override(prev);
                     });
+
+                // After the batch finishes, advance every system's
+                // last_run to the tick we observed at batch start.
+                for &idx in systems_batch {
+                    self.systems[idx].last_run = started_at;
+                }
             }
         }
+        self.world.system_last_run = 0;
     }
 }
