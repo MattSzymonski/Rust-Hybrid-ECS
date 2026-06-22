@@ -98,13 +98,15 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         let this_run = self.world.increment_change_tick();
         let last_run = self.world.system_last_run();
 
-        let matching_archetypes: Vec<ArchetypeId> = self
+        let mut matching_archetypes: Vec<ArchetypeId> = self
             .world
             .archetypes
             .iter()
             .filter(|(_, arch)| Self::archetype_matches(arch, &include, &exclude))
             .map(|(id, _)| *id)
             .collect();
+        // Sort by ArchetypeId for deterministic iteration order across runs.
+        matching_archetypes.sort();
 
         QueryIterMut::new(
             self.world as *mut World,
@@ -148,7 +150,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         let this_run = self.world.increment_change_tick();
         let last_run = self.world.system_last_run();
 
-        let archetype_ranges: Vec<FilteredArchetypeRange<Q::State, F::State>> = self
+        let mut archetype_ranges: Vec<FilteredArchetypeRange<Q::State, F::State>> = self
             .world
             .archetypes
             .iter_mut()
@@ -164,6 +166,8 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
                 (*id, q_state, f_state, len)
             })
             .collect();
+        // Sort by ArchetypeId for deterministic iteration order across runs.
+        archetype_ranges.sort_by_key(|(id, _, _, _)| *id);
 
         ParQueryIter::new(archetype_ranges)
     }

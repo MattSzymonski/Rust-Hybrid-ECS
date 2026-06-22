@@ -42,7 +42,7 @@ impl ScriptComponent for Counter {
         // // Example: Spawn new entity (deferred)
         // ctx.create_entity()
         //     .with(Position { x: 0.0, y: 0.0 })
-        //     .build();
+        //     .build().unwrap();
 
         // // Example: Add component to entity (deferred)
         // ctx.add_component(ctx.get_owning_entity(), Velocity { x: 1.0, y: 0.0 });
@@ -84,7 +84,7 @@ pub fn main() {
             increment: 7,
             max_value: 50,
         })
-        .build();
+        .build().unwrap();
 
     // Create entity 2: Position + both scripts
     println!("Creating entity with position, and counter...\n");
@@ -97,7 +97,7 @@ pub fn main() {
             increment: 3,
             max_value: 120,
         })
-        .build();
+        .build().unwrap();
 
     // Simulate several frames
     for frame in 1..=8 {
@@ -108,3 +108,4 @@ pub fn main() {
 
     println!("=== Scripting Example Complete ===");
 }
+

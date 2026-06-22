@@ -13,6 +13,27 @@ use crate::entity::Entity;
 use super::change_detection::Mut;
 use super::ptr::{SendPtr, SendPtrMut};
 
+// ---------------------------------------------------------------------------
+// Duplicate-write detection (guards against `Query<(&mut T, &mut T)>` UB)
+// ---------------------------------------------------------------------------
+
+/// Returns `true` when `writes` contains any duplicate [`ComponentId`],
+/// which would mean a query tuple has two `&mut T` elements for the same
+/// `T`. That pattern creates aliasing `&mut` references — UB.
+#[inline]
+pub(crate) fn has_duplicate_writes(writes: &[ComponentId]) -> bool {
+    // Small-N linear scan: tuples are at most arity 4 (or 8 in the
+    // future), so O(n²) with n ≤ 8 is cheaper than allocating a HashSet.
+    for (i, a) in writes.iter().enumerate() {
+        for b in &writes[i + 1..] {
+            if a == b {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Trait for fetching components from archetypes.
 ///
 /// Implemented for:
@@ -187,6 +208,13 @@ macro_rules! impl_query_target_tuple {
                     reads.extend(r);
                     writes.extend(w);
                 )*
+
+                // Check for duplicate mutable component types in the tuple, which would create aliasing `&mut` references - UB.
+                debug_assert!(
+                    !$crate::query::target::has_duplicate_writes(&writes),
+                    "Query tuple contains duplicate mutable component types \
+                     (e.g. Query<(&mut T, &mut T)>). This is not allowed"
+                );
                 (reads, writes)
             }
 

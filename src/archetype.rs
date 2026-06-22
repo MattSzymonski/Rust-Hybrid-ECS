@@ -53,7 +53,7 @@ use crate::entity::Entity;
 pub type StorageFactory = Box<dyn Fn(&mut TraitTypeMap<dyn Component, VecFamily>) + Send + Sync>;
 
 /// ArchetypeId uniquely identifies an archetype (a unique combination of components)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ArchetypeId(pub usize);
 
 pub struct Archetype {

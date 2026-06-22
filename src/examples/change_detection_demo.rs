@@ -78,9 +78,7 @@ fn movement_system(frame: ResMut<FrameCounter>, mut q: Query<(&mut Position, &Ve
 /// Reacts only to entities whose Position was mutated since this system
 /// last ran. Combines a row-level filter (`Changed<Position>`) with an
 /// archetype-level filter (`With<Player>`) to scope the result.
-fn react_to_movement_system(
-    mut q: Query<(Entity, &Position), (Changed<Position>, With<Player>)>,
-) {
+fn react_to_movement_system(mut q: Query<(Entity, &Position), (Changed<Position>, With<Player>)>) {
     let mut count = 0;
     for (entity, pos) in q.iter_mut() {
         println!(
@@ -105,7 +103,7 @@ fn report_unhealthy_system(mut q: Query<(Entity,), (With<Position>, Without<Heal
 
 /// Detects newly attached Health components.
 fn react_to_new_health_system(mut q: Query<(Entity,), Added<Health>>) {
-    for (entity, ) in q.iter_mut() {
+    for (entity,) in q.iter_mut() {
         println!(
             "  [react_to_new_health] entity {} just gained Health!",
             entity.id()
@@ -121,14 +119,17 @@ fn driver_system(
     mut frame: ResMut<FrameCounter>,
     target: ResMut<TargetEntity>,
 ) {
-    let f = frame.get_mut().unwrap();
+    let mut f = frame.get_mut().unwrap();
     f.0 += 1;
     let frame_no = f.0;
 
     let target_entity = target.get().unwrap().0;
 
     if frame_no == 3 {
-        println!("  [driver] queueing Health for entity {}", target_entity.id());
+        println!(
+            "  [driver] queueing Health for entity {}",
+            target_entity.id()
+        );
         commands.add_component_to_entity(target_entity, Health(100));
     }
 }
@@ -156,20 +157,23 @@ pub fn main() {
         .with(Position { x: 0.0, y: 0.0 })
         .with(Velocity { x: 1.0, y: 0.5 })
         .with(Player)
-        .build();
+        .build()
+        .unwrap();
 
     let _player_b = world
         .create_entity()
         .with(Position { x: 10.0, y: 10.0 })
         .with(Velocity { x: 0.0, y: 0.0 }) // never moves -> never "changes"
         .with(Player)
-        .build();
+        .build()
+        .unwrap();
 
     let _npc = world
         .create_entity()
         .with(Position { x: -5.0, y: 0.0 })
         .with(Velocity { x: 0.0, y: 0.0 })
-        .build();
+        .build()
+        .unwrap();
 
     world.insert_resource(FrameCounter(0));
     world.insert_resource(TargetEntity(player_a));

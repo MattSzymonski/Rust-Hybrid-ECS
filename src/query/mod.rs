@@ -47,7 +47,7 @@
 //! }
 //! ```
 
-mod change_detection;
+pub(crate) mod change_detection;
 mod filter;
 mod iter;
 mod ptr;

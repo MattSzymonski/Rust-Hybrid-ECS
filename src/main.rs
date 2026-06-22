@@ -14,7 +14,8 @@ fn main() {
     println!("2. Scripting Basic");
     println!("3. Parallel Systems");
     println!("4. Change Detection");
-    print!("Enter your choice (1-4): ");
+    println!("5. Resources + Components + Systems");
+    print!("Enter your choice (1-5): ");
 
     io::stdout().flush().unwrap();
 
@@ -26,6 +27,7 @@ fn main() {
         "2" => examples::scripting_demo::main(),
         "3" => examples::parallel_systems_demo::main(),
         "4" => examples::change_detection_demo::main(),
+        "5" => examples::resources_demo::main(),
         _ => println!("Invalid choice!"),
     }
 }

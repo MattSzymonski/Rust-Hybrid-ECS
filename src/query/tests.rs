@@ -54,7 +54,7 @@ fn test_query_single_entity() {
         .create_entity()
         .with(Position { x: 1.0, y: 2.0 })
         .with(Velocity { x: 0.5, y: 0.5 })
-        .build();
+        .build().unwrap();
 
     let mut query = Query::<(&Position, &Velocity)>::new(&mut world);
     let results: Vec<_> = query.iter_mut().collect();
@@ -75,7 +75,7 @@ fn test_query_multiple_entities() {
                 x: i as f32,
                 y: 0.0,
             })
-            .build();
+            .build().unwrap();
     }
 
     let mut query = Query::<(&Position,)>::new(&mut world);
@@ -90,14 +90,14 @@ fn test_query_filters_by_components() {
     world
         .create_entity()
         .with(Position { x: 1.0, y: 1.0 })
-        .build();
+        .build().unwrap();
 
     // Entity with Position and Velocity
     world
         .create_entity()
         .with(Position { x: 2.0, y: 2.0 })
         .with(Velocity { x: 1.0, y: 1.0 })
-        .build();
+        .build().unwrap();
 
     // Query for entities with both Position and Velocity
     let mut query = Query::<(&Position, &Velocity)>::new(&mut world);
@@ -115,7 +115,7 @@ fn test_query_mutable_modification() {
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
         .with(Velocity { x: 1.0, y: 2.0 })
-        .build();
+        .build().unwrap();
 
     // Modify position based on velocity
     {
@@ -140,7 +140,7 @@ fn test_query_first() {
     world
         .create_entity()
         .with(Position { x: 5.0, y: 5.0 })
-        .build();
+        .build().unwrap();
 
     let mut query = Query::<(&Position,)>::new(&mut world);
     let first = query.first();
@@ -163,7 +163,7 @@ fn test_query_entity_access() {
     let entity = world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
-        .build();
+        .build().unwrap();
 
     let mut query = Query::<(Entity, &Position)>::new(&mut world);
     let (queried_entity, _) = query.first().unwrap();
@@ -186,7 +186,7 @@ fn test_par_iter_basic() {
                 x: i as f32,
                 y: 0.0,
             })
-            .build();
+            .build().unwrap();
     }
 
     let mut query = Query::<(&mut Position,)>::new(&mut world);
@@ -209,7 +209,7 @@ fn test_par_iter_with_batch_size() {
         world
             .create_entity()
             .with(Position { x: 0.0, y: 0.0 })
-            .build();
+            .build().unwrap();
     }
 
     let mut query = Query::<(&mut Position,)>::new(&mut world);
@@ -235,7 +235,7 @@ fn test_par_iter_tracked_stats() {
         world
             .create_entity()
             .with(Position { x: 0.0, y: 0.0 })
-            .build();
+            .build().unwrap();
     }
 
     let mut query = Query::<(&Position,)>::new(&mut world);
@@ -259,7 +259,7 @@ fn test_par_iter_untracked() {
     world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
-        .build();
+        .build().unwrap();
 
     let mut query = Query::<(&Position,)>::new(&mut world);
     let result = query.par_iter_mut().for_each(|_| {});
@@ -276,7 +276,7 @@ fn test_par_iter_entity_count() {
         world
             .create_entity()
             .with(Position { x: 0.0, y: 0.0 })
-            .build();
+            .build().unwrap();
     }
 
     let mut query = Query::<(&Position,)>::new(&mut world);
@@ -358,6 +358,31 @@ fn test_report_component_access_mixed() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "duplicate mutable component types")]
+fn test_duplicate_mutable_types_rejected() {
+    // Query<(&mut Position, &mut Position)> would create aliasing &mut
+    // references to the same storage — UB. The debug_assert! inside
+    // report_component_access() must catch this.
+    let _ = <(&mut Position, &mut Position)>::report_component_access();
+}
+
+#[test]
+fn test_has_duplicate_writes_detection() {
+    use crate::query::target::has_duplicate_writes;
+    let id = ComponentId::of::<Position>();
+    assert!(!has_duplicate_writes(&[]));
+    assert!(!has_duplicate_writes(&[id]));
+    assert!(!has_duplicate_writes(&[id, ComponentId::of::<Velocity>()]));
+    assert!(has_duplicate_writes(&[id, id]));
+    assert!(has_duplicate_writes(&[
+        id,
+        ComponentId::of::<Velocity>(),
+        id
+    ]));
+}
+
+#[test]
 fn test_entity_has_no_component_ids() {
     let ids = Entity::component_ids();
     assert!(ids.is_empty());
@@ -373,7 +398,7 @@ fn test_mut_deref_bumps_changed_tick() {
     world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
-        .build();
+        .build().unwrap();
 
     // Capture the tick at which the component was added (insert
     // happened with whatever world.change_tick was at the time).
@@ -406,7 +431,7 @@ fn test_immutable_deref_does_not_bump_changed_tick() {
     world
         .create_entity()
         .with(Position { x: 1.0, y: 2.0 })
-        .build();
+        .build().unwrap();
 
     let baseline = {
         let mut q = Query::<(&mut Position,)>::new(&mut world);
@@ -431,7 +456,7 @@ fn test_bypass_change_detection_does_not_bump_tick() {
     world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
-        .build();
+        .build().unwrap();
 
     let baseline = {
         let mut q = Query::<(&mut Position,)>::new(&mut world);
@@ -460,7 +485,7 @@ fn test_added_tick_preserved_across_archetype_migration() {
     let entity = world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
-        .build();
+        .build().unwrap();
 
     let original_added = {
         let mut q = Query::<(&mut Position,)>::new(&mut world);
@@ -504,11 +529,11 @@ fn test_filter_with_includes_only_matching_archetypes() {
         .create_entity()
         .with(Position { x: 1.0, y: 0.0 })
         .with(Health(100))
-        .build();
+        .build().unwrap();
     world
         .create_entity()
         .with(Position { x: 2.0, y: 0.0 })
-        .build();
+        .build().unwrap();
 
     let mut q = Query::<(&Position,), With<Health>>::new(&mut world);
     let xs: Vec<f32> = q.iter_mut().map(|(p,)| p.x).collect();
@@ -522,11 +547,11 @@ fn test_filter_without_excludes_archetypes() {
         .create_entity()
         .with(Position { x: 1.0, y: 0.0 })
         .with(Health(100))
-        .build();
+        .build().unwrap();
     world
         .create_entity()
         .with(Position { x: 2.0, y: 0.0 })
-        .build();
+        .build().unwrap();
 
     let mut q = Query::<(&Position,), Without<Health>>::new(&mut world);
     let xs: Vec<f32> = q.iter_mut().map(|(p,)| p.x).collect();
@@ -539,15 +564,15 @@ fn test_filter_changed_detects_mutated_rows_only() {
     let e1 = world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
-        .build();
+        .build().unwrap();
     let _e2 = world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
-        .build();
+        .build().unwrap();
     let _e3 = world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
-        .build();
+        .build().unwrap();
 
     // Set the baseline so all "Added" ticks are in the past.
     world.set_system_last_run(world.change_tick());
@@ -574,7 +599,7 @@ fn test_filter_added_detects_newly_inserted_components() {
     let _old = world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
-        .build();
+        .build().unwrap();
 
     // Lock in the current tick as the baseline so the existing entity
     // is NOT considered "added" relative to it.
@@ -586,7 +611,7 @@ fn test_filter_added_detects_newly_inserted_components() {
     let new_entity = world
         .create_entity()
         .with(Position { x: 1.0, y: 1.0 })
-        .build();
+        .build().unwrap();
 
     let mut q = Query::<(Entity,), Added<Position>>::new(&mut world);
     let hits: Vec<Entity> = q.iter_mut().map(|(e,)| e).collect();
@@ -600,12 +625,12 @@ fn test_filter_or_combines_predicates() {
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
         .with(Velocity { x: 0.0, y: 0.0 })
-        .build();
+        .build().unwrap();
     let e2 = world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
         .with(Velocity { x: 0.0, y: 0.0 })
-        .build();
+        .build().unwrap();
 
     world.set_system_last_run(world.change_tick());
 
@@ -621,8 +646,7 @@ fn test_filter_or_combines_predicates() {
         }
     }
 
-    let mut q =
-        Query::<(Entity,), Or<(Changed<Position>, Changed<Velocity>)>>::new(&mut world);
+    let mut q = Query::<(Entity,), Or<(Changed<Position>, Changed<Velocity>)>>::new(&mut world);
     let mut hits: Vec<Entity> = q.iter_mut().map(|(e,)| e).collect();
     hits.sort_by_key(|e| e.id());
     let mut expected = vec![e1, e2];
@@ -636,7 +660,7 @@ fn test_filter_changed_empty_after_no_mutation() {
     world
         .create_entity()
         .with(Position { x: 0.0, y: 0.0 })
-        .build();
+        .build().unwrap();
 
     // Baseline at the current tick - the existing component's
     // `changed` tick is older, so the filter must yield nothing.
@@ -645,3 +669,4 @@ fn test_filter_changed_empty_after_no_mutation() {
     let mut q = Query::<(Entity,), Changed<Position>>::new(&mut world);
     assert_eq!(q.iter_mut().count(), 0);
 }
+

@@ -1,209 +1,249 @@
-# Hybrid ECS Game Engine
+# Rust Hybrid ECS
 
-A Rust-based game engine architecture that combines the performance benefits of Entity Component System (ECS) with the intuitive, object-oriented API familiar to Unity developers.
+An archetype-based Entity Component System (ECS) for Rust with Bevy-style
+system parameters, automatic parallel scheduling, change detection, and
+scriptable components.
 
-## The Problem
+## Features
 
-When designing game engine architectures, there's typically a tradeoff:
+| Feature                     | Description                                                                                                                                                    |
+| --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Archetype storage**       | Components of the same type stored contiguously (Structure-of-Arrays) for cache-friendly bulk iteration                                                        |
+| **Bevy-style systems**      | `fn my_system(q: Query<(&mut Transform, &Velocity)>, time: Res<GameTime>)` — parameters resolved automatically                                                 |
+| **Automatic parallelism**   | Scheduler builds a dependency graph from component/resource access patterns; systems with disjoint access run concurrently via Rayon                           |
+| **Change detection**        | `Changed<T>` and `Added<T>` filters skip entities whose data hasn't changed since the system last ran                                                          |
+| **Deferred commands**       | Structural changes (create/destroy entities, add/remove components) are queued during system execution and applied at the frame boundary — no mid-iteration UB |
+| **Script components**       | Components with an `update()` method called every frame with safe, deferred-command-only World access                                                          |
+| **Resources**               | Global singleton data (`GameTime`, `InputState`, `AssetStore`) accessed via `Res<T>` / `ResMut<T>` with scheduler-tracked access                               |
+| **Deterministic iteration** | Queries and scripts iterate entities in a stable, sorted order regardless of HashMap layout                                                                    |
 
-### Unity (Pure OOP)
-- ✅ **Intuitive**: `GameObject.Instantiate()`, `AddComponent<T>()`, `GetComponent<T>()`
-- ✅ **Immediate**: Changes happen instantly, no frame delay
-- ❌ **Single-threaded**: Hard to parallelize
-- ❌ **Performance**: Object-oriented overhead
+## Quick Start
 
-### Bevy/Flecs (Pure ECS)
-- ✅ **Performance**: Cache-friendly, data-oriented
-- ✅ **Parallel**: Systems can run concurrently
-- ❌ **Learning curve**: Different mental model
-- ❌ **Deferred operations**: `commands.spawn()` takes effect next frame
-- ❌ **Inconsistent state**: Entity created but not accessible until later
-
-## The Solution: Hybrid Architecture
-
-This project implements a **hybrid approach** that wraps a high-performance ECS backend with a Unity-like object-oriented API.
-
-### Architecture Components
-
-```
-┌─────────────────────────────────────────┐
-│  GameObject API (Unity-like)            │  ← Game Developer Interface
-│  - scene.instantiate()                  │
-│  - gameObject.add_component(T)          │
-│  - gameObject.get_component<T>()        │
-└─────────────────────────────────────────┘
-                    ↓
-┌─────────────────────────────────────────┐
-│  Command Buffer                         │  ← Solves inconsistent state
-│  - Defers operations                    │
-│  - Maintains thread safety              │
-│  - Executes at frame boundaries         │
-└─────────────────────────────────────────┘
-                    ↓
-┌─────────────────────────────────────────┐
-│  ECS Core (Performance)                 │  ← Backend
-│  - Entity/Component storage             │
-│  - Parallel system execution            │
-│  - Cache-friendly data layout           │
-└─────────────────────────────────────────┘
-```
-
-## Key Features
-
-### 1. **Unity-like GameObject API**
 ```rust
-// Create entities naturally
-let player = scene.instantiate();
-player
-    .add_component(Transform::new(0.0, 0.0, 0.0))
-    .add_component(Velocity::new(1.0, 0.0, 0.0))
-    .add_component(Health::new(100.0));
+use ecs_hybrid::*;
 
-// Access components
-if let Some(health) = player.get_component::<Health>() {
-    health.with(|h| println!("Health: {}", h.current));
+// 1. Define components
+#[derive(Debug, Clone)]
+struct Position { x: f32, y: f32 }
+impl Component for Position {}
+
+#[derive(Debug, Clone)]
+struct Velocity { vx: f32, vy: f32 }
+impl Component for Velocity {}
+
+// 2. Create the engine and register types
+let mut engine = Engine::new();
+engine.world_mut().register_component::<Position>();
+engine.world_mut().register_component::<Velocity>();
+
+// 3. Spawn entities
+engine.world_mut()
+    .create_entity()
+    .with(Position { x: 0.0, y: 0.0 })
+    .with(Velocity { vx: 1.0, vy: 0.5 })
+    .build()
+    .unwrap();
+
+// 4. Define systems
+fn movement(mut q: Query<(&mut Position, &Velocity)>) {
+    for (mut pos, vel) in q.iter_mut() {
+        pos.x += vel.vx;
+        pos.y += vel.vy;
+    }
 }
 
-// Modify components
-if let Some(mut health) = player.get_component_mut::<Health>() {
-    health.with(|h| h.current -= 10.0);
+fn debug_positions(q: Query<(Entity, &Position)>) {
+    for (entity, pos) in q.iter_mut() {
+        println!("Entity {} at ({}, {})", entity.id(), pos.x, pos.y);
+    }
+}
+
+// 5. Register and run
+engine.register_system("movement", movement);
+engine.register_system("debug", debug_positions);
+
+// Each frame:
+engine.process_frame();
+```
+
+## System Parameters
+
+Systems declare what they need as function parameters — the engine resolves them automatically:
+
+```rust
+fn example(
+    mut q: Query<(&mut Transform, &Velocity), Changed<Transform>>,  // filtered query
+    time: Res<GameTime>,          // immutable resource
+    mut score: ResMut<Score>,     // mutable resource (change-tracked)
+    mut commands: Commands,       // deferred entity operations
+) {
+    for (mut transform, vel) in q.iter_mut() {
+        commands.create_entity().with(*transform).build();
+    }
 }
 ```
 
-### 2. **Command Buffer for Thread Safety**
-Operations are queued and executed at safe synchronization points:
-```rust
-// During gameplay (possibly from parallel systems)
-let projectile = scene.instantiate();  // Queued
-projectile.add_component(Transform::new(0.0, 0.0, 0.0));  // Queued
+### Built-in filters
 
-// At frame boundary
-scene.apply_commands();  // All changes applied atomically
+| Filter         | Effect                                                         |
+| -------------- | -------------------------------------------------------------- |
+| `()` (default) | All entities matching the data shape                           |
+| `With<T>`      | Only entities that have component `T`                          |
+| `Without<T>`   | Exclude entities that have component `T`                       |
+| `Changed<T>`   | Only entities whose `T` was mutated since this system last ran |
+| `Added<T>`     | Only entities whose `T` was added since this system last ran   |
+| `Or<(A, B)>`   | Row matches if ANY inner filter matches                        |
+
+## Resources
+
+Global singleton data stored in the World, not attached to entities:
+
+```rust
+#[derive(Debug)]
+struct GameTime { delta: f32, elapsed: f32 }
+impl Resource for GameTime {}
+
+// Insert
+engine.world_mut().insert_resource(GameTime { delta: 0.016, elapsed: 0.0 });
+
+// Access in systems
+fn time_system(mut time: ResMut<GameTime>) {
+    if let Some(mut t) = time.get_mut() {
+        t.elapsed += t.delta;  // bumps changed tick via DerefMut
+    }
+}
 ```
 
-### 3. **ECS Performance Benefits**
-Systems iterate over components efficiently:
+Lightweight handles (`ResHandle<T>`) allow storing typed resource references
+without borrowing the World:
+
 ```rust
-impl System for MovementSystem {
-    fn execute(&mut self, world: &mut World, delta_time: f32) {
-        // Iterate efficiently over all Transform+Velocity entities
-        for entity in world.query::<Transform>() {
-            // Update transforms based on velocity
+let handle = ResHandle::<GameTime>::new();
+let time = handle.get(&world).unwrap();
+```
+
+## Script Components
+
+Components that self-update each frame with safe, deferred-command-only access:
+
+```rust
+#[derive(Debug, Clone)]
+struct Rotator { speed: f32 }
+impl Component for Rotator {}
+impl ScriptComponent for Rotator {
+    fn update(&mut self, ctx: &mut ScriptContext) {
+        // Safe: reads from other components
+        if let Some(transform) = ctx.get_component::<Transform>(ctx.get_owning_entity()) {
+            // ...
+        }
+        // Safe: deferred commands
+        if self.speed > 10.0 {
+            ctx.destroy_entity(ctx.get_owning_entity());
         }
     }
 }
 ```
 
-### 4. **Parallel System Execution**
-Systems can run in parallel (with proper dependency management):
-```rust
-let mut executor = SystemExecutor::new();
-executor.add_system(MovementSystem);
-executor.add_system(PhysicsSystem);
-executor.add_system(RenderSystem);
+## Parallel Execution
 
-executor.execute(&mut world, delta_time);  // Can parallelize non-conflicting systems
+The scheduler automatically groups systems into parallel batches. Systems
+with disjoint component/resource access run concurrently:
+
+```
+Batch 0: [movement,  scoring   ]   ← movement writes Position, scoring reads Position ✓
+Batch 1: [physics              ]   ← writes Velocity (conflicts with nothing in batch 0)
+Batch 2: [render               ]   ← uses Commands (always runs alone)
 ```
 
-## Comparison Table
+Enable/disable parallelism at runtime:
+```rust
+engine.set_parallel_execution(false);  // sequential for debugging
+engine.set_parallel_execution(true);   // parallel (default)
+```
 
-| Feature          | Unity              | Bevy (Pure ECS)    | This Hybrid        |
-|------------------|--------------------|--------------------|---------------------|
-| **API Style**    | OOP, Immediate     | ECS, Deferred      | OOP Wrapper + ECS   |
-| **Create Entity** | `Instantiate()`   | `commands.spawn()` | `scene.instantiate()` |
-| **Add Component** | `AddComponent<T>()` | `.insert(Component)` | `.add_component(T)` |
-| **Access Comp**  | `GetComponent<T>()` | `Query<&T>`       | `.get_component<T>()` |
-| **Parallel Systems** | ✗ Single-threaded | ✓ Automatic       | ✓ Manual/Rayon      |
-| **Intuitive**    | ✓✓ Very natural    | △ Learning curve   | ✓ Natural for Unity |
-| **Performance**  | △ Limited          | ✓✓ Excellent       | ✓ Good (ECS backend) |
-| **Thread Safety** | △ Manual locking  | ✓✓ Automatic       | ✓ CommandBuffer     |
-| **State Sync**   | ✓ Always consistent | △ Frame delay     | ✓ Controlled delay  |
+## Change Detection
+
+`Changed<T>` and `Added<T>` filters skip work on unchanged data without
+manual dirty-flag bookkeeping:
+
+```rust
+fn render_changed(
+    q: Query<(Entity, &Transform), Changed<Transform>>,
+) {
+    // Only entities whose Transform was mutated since last frame
+    for (entity, transform) in q.iter_mut() {
+        // ...
+    }
+}
+```
+
+Works for both components (via `Mut<T>` from `&mut T` queries) and
+resources (via `ResMut<T>::get_mut()` returning `Mut<T>`).
 
 ## Project Structure
 
 ```
 src/
-├── main.rs           - Demo application & examples
-├── ecs_core.rs       - Core ECS implementation (Entity, World, Components)
-├── command_buffer.rs - Deferred operation queue
-├── game_object.rs    - Unity-like GameObject wrapper
-└── systems.rs        - System execution framework
+├── archetype.rs       — Archetype storage, ArchetypeId
+├── commands.rs        — Deferred CommandQueue, Commands system param
+├── component.rs       — Component trait, ComponentId, ComponentMask, Tick
+├── engine.rs          — Engine: system registration, frame loop, parallel runner
+├── entity.rs          — Entity handle with generation-based recycling
+├── lib.rs             — Public re-exports
+├── main.rs            — Interactive example launcher
+├── resource.rs        — Resource trait, ResourceId, ResHandle
+├── scheduler.rs       — SystemScheduler: dependency analysis, batch building
+├── scripting.rs       — ScriptComponent trait, ScriptContext
+├── system.rs          — System trait, SystemParam, IntoSystem
+├── world.rs           — World: central ECS state, entity/archetype/resource mgmt
+├── query/
+│   ├── mod.rs         — Module re-exports
+│   ├── change_detection.rs — Mut<T> smart pointer with tick bumping
+│   ├── filter.rs      — QueryFilter: With, Without, Changed, Added, Or
+│   ├── iter.rs        — Sequential + parallel iterators, BatchStats
+│   ├── ptr.rs         — SendPtr / SendPtrMut (thread-safe raw pointers)
+│   ├── query.rs       — Query struct: iter_mut, par_iter_mut, first
+│   ├── resource.rs    — Res / ResMut system parameters
+│   ├── target.rs      — QueryTarget: &T, &mut T, Entity, tuple impls
+│   └── tests.rs       — Query + change detection tests
+└── examples/
+    ├── change_detection_demo.rs
+    ├── iterators_stress_test.rs
+    ├── parallel_systems_demo.rs
+    ├── resources_demo.rs
+    └── scripting_demo.rs
 ```
 
-## Running the Demo
+## Frame Lifecycle
+
+```
+process_frame()
+│
+├─ increment_change_tick()          // advance global tick for change detection
+├─ rebuild execution graph          // if systems were enabled/disabled
+│
+├─ Phase 1: Run systems
+│   └─ parallel batches (or sequential if disabled)
+│       └─ each system:
+│           ├─ fetch system params (Query, Res, Commands, etc.)
+│           ├─ user code executes
+│           └─ queue deferred commands
+│
+├─ update_scripts()                 // call update() on all ScriptComponents
+│
+└─ Phase 2: execute_queued_commands() // apply all deferred structural changes
+```
+
+## Running
 
 ```bash
+# Run the interactive demo
 cargo run
+
+# Run tests
+cargo test
+
+# Run a specific example
+cargo run --example resources_demo
 ```
 
-The demo showcases:
-1. Unity-like entity creation
-2. Component manipulation
-3. System execution across multiple frames
-4. Dynamic entity creation during gameplay
-5. Entity destruction
-6. Comparison with Unity and Bevy approaches
-
-## Usage Example
-
-```rust
-use ecs_hybrid::*;
-
-// Create a scene
-let scene = Scene::new();
-
-// Create entities with Unity-like API
-let player = scene.instantiate();
-player
-    .add_component(Name::new("Player"))
-    .add_component(Transform::new(0.0, 0.0, 0.0))
-    .add_component(Health::new(100.0));
-
-// Create systems
-let mut executor = SystemExecutor::new();
-executor.add_system(MovementSystem);
-
-// Game loop
-loop {
-    // Execute systems
-    {
-        let world_lock = scene.world();
-        let mut world = world_lock.write();
-        executor.execute(&mut world, delta_time);
-    }
-    
-    // Apply deferred commands
-    scene.apply_commands();
-}
-```
-
-## Key Insights
-
-1. **Unity API**: Natural but single-threaded, immediate changes
-2. **Bevy ECS**: High performance but deferred operations can be confusing
-3. **Hybrid**: Best of both - Unity-like API with ECS performance
-4. **Command Buffer**: Solves the "inconsistent state" problem elegantly
-5. **GameObject Wrapper**: Hides ECS complexity from game developers
-
-## Future Enhancements
-
-- [ ] Actual parallel system execution with Rayon
-- [ ] System dependency graph for automatic parallelization
-- [ ] Prefab/template system
-- [ ] Entity hierarchy (parent-child relationships)
-- [ ] Event system
-- [ ] Resource management (singleton components)
-- [ ] Query builder with multiple component types
-- [ ] Compile-time system conflict detection
-
-## License
-
-This is a demonstration project created for educational purposes.
-
-## Inspiration
-
-This architecture is inspired by discussions about:
-- Unity's GameObject model
-- Bevy's ECS architecture
-- The tradeoffs between OOP and data-oriented design
-- Making high-performance systems accessible to developers familiar with Unity

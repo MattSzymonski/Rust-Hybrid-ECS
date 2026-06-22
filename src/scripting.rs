@@ -19,7 +19,7 @@ use crate::Resource;
 ///
 /// This provides safe access to the ECS by:
 /// - Allowing read-only world queries (get component, check existence)
-/// - Allowing mutable access to global components
+/// - Allowing mutable access to resources
 /// - Automatically deferring all structural changes to the command queue
 ///
 /// Scripts cannot directly add/remove components or destroy entities on the world.

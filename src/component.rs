@@ -116,13 +116,28 @@ impl ComponentMask {
         Self(0)
     }
 
+    /// Set a bit in the mask.
+    ///
+    /// # Panics
+    /// In debug builds, panics if `bit_index >= 128`.
     pub fn set(&mut self, bit_index: u8) {
+        debug_assert!(
+            bit_index < 128,
+            "ComponentMask bit index {bit_index} out of range (max 127)"
+        );
         self.0 |= 1u128 << bit_index;
     }
 
-    /// Check if a specific bit is set (O(1) component type check)
+    /// Check if a specific bit is set (O(1) component type check).
+    ///
+    /// # Panics
+    /// In debug builds, panics if `bit_index >= 128`.
     #[inline]
     pub fn has_bit(&self, bit_index: u8) -> bool {
+        debug_assert!(
+            bit_index < 128,
+            "ComponentMask bit index {bit_index} out of range (max 127)"
+        );
         (self.0 & (1u128 << bit_index)) != 0
     }
 

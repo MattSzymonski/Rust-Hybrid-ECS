@@ -36,8 +36,6 @@ fn ttt_system(mut commands: Commands, mut query: Query<(&mut Position, &Velocity
         .with(Velocity { vx: 1.0, vy: 1.0 })
         .with(Health(50.0))
         .build();
-
-    
 }
 
 fn movement_system(mut query: Query<(&mut Position, &Velocity)>) {
@@ -97,7 +95,8 @@ pub(crate) fn main() {
             })
             .with(Velocity { vx: 1.0, vy: 0.5 })
             .with(Health(100.0))
-            .build();
+            .build()
+            .unwrap();
     }
 
     println!("Running 5 frames...\n");

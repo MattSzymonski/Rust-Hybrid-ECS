@@ -7,7 +7,7 @@
 //! - Collision detection system
 //! - Performance measurements
 
-use ecs_hybrid::{Component, Engine, Query, Res, ResMut, Resource};
+use ecs_hybrid::{Component, Engine, Query, ResMut, Resource};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use trait_type_map::impl_trait_accessible;
@@ -190,7 +190,7 @@ fn collision_and_movement_system(
 }
 
 fn simulation_tracker_system(mut stats: ResMut<SimulationStats>) {
-    if let Some(stats) = stats.get_mut() {
+    if let Some(mut stats) = stats.get_mut() {
         stats.frame_count += 1;
 
         if stats.frame_count >= stats.max_frames {
@@ -250,7 +250,8 @@ pub fn main() {
         .with(Obstacle)
         .with(Transform::new(50.0, 0.0, 0.0))
         .with(box_collider)
-        .build();
+        .build()
+        .unwrap();
 
     println!("✓ Created obstacle entity with 5 box colliders");
 
@@ -265,7 +266,8 @@ pub fn main() {
             .create_entity()
             .with(Transform::new(angle.cos() * 20.0, angle.sin() * 20.0, 0.0))
             .with(Velocity::new(angle.cos() * 2.0, angle.sin() * 2.0, 0.0))
-            .build();
+            .build()
+            .unwrap();
     }
 
     println!("✓ Created {} moving entities", entity_count);
@@ -273,7 +275,7 @@ pub fn main() {
     println!("Collision check: Query-based iteration");
     println!("\nRunning 10,000 frame simulation...\n");
 
-    // Set up simulation stats as global component
+    // Set up simulation stats as resource
     let max_frames = 10_000;
 
     engine.world_mut().insert_resource(SimulationStats {

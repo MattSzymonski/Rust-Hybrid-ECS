@@ -1,5 +1,6 @@
 //! [`Res`] / [`ResMut`] system parameters for resource access.
 
+use crate::query::change_detection::Mut;
 use crate::resource::Resource;
 use crate::world::World;
 
@@ -38,17 +39,21 @@ impl<'w, T: Resource> Res<'w, T> {
     }
 }
 
-/// Mutable resource access for systems.
+/// Mutable resource access for systems — with change-detection tracking.
 ///
 /// Use `ResMut<T>` as a system parameter to read and write a resource.
 /// The scheduler tracks this as a write and prevents other systems from
 /// accessing the same resource in parallel.
 ///
+/// `get_mut()` returns a [`Mut<'_, T>`] that automatically bumps the
+/// resource's `changed` tick when mutated through `DerefMut`. This lets
+/// other systems (or future frames) detect that the resource was modified.
+///
 /// # Example
 /// ```ignore
 /// fn my_system(mut time: ResMut<GameTime>) {
-///     if let Some(time) = time.get_mut() {
-///         time.elapsed += time.delta;
+///     if let Some(mut time) = time.get_mut() {
+///         time.elapsed += time.delta; // bumps changed tick
 ///     }
 /// }
 /// ```
@@ -72,10 +77,14 @@ impl<'w, T: Resource> ResMut<'w, T> {
         self.world.get_resource::<T>()
     }
 
-    /// Get mutable reference to the resource.
+    /// Get mutable, change-tracking access to the resource.
+    ///
+    /// Returns a [`Mut<'_, T>`] that wraps both the value and its
+    /// change-detection ticks. Mutating through `DerefMut` automatically
+    /// bumps `ticks.changed` to the current world tick.
     ///
     /// Returns `None` if the resource has not been inserted into the World.
-    pub fn get_mut(&mut self) -> Option<&mut T> {
-        self.world.get_resource_mut::<T>()
+    pub fn get_mut(&mut self) -> Option<Mut<'_, T>> {
+        self.world.get_resource_mut_tracked::<T>()
     }
 }

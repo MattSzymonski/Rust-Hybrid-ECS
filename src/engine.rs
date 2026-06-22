@@ -50,6 +50,8 @@ pub struct Engine {
     scheduler: SystemScheduler,
     /// Whether parallel execution is enabled
     parallel_execution: bool,
+    /// Whether the execution graph needs rebuilding (dirty after enable/disable)
+    graph_dirty: bool,
 }
 
 impl Engine {
@@ -61,6 +63,7 @@ impl Engine {
             world: World::new(),
             scheduler: SystemScheduler::new(),
             parallel_execution: true,
+            graph_dirty: false,
         }
     }
 }
@@ -92,13 +95,18 @@ impl Engine {
         self.set_system_enabled(name, false)
     }
 
-    /// Set the enabled state of a system by name
+    /// Set the enabled state of a system by name.
     ///
     /// Returns true if the system was found, false otherwise.
+    /// Marks the execution graph as dirty so it is rebuilt before the
+    /// next frame, ensuring parallel batches reflect the new enabled set.
     pub fn set_system_enabled(&mut self, name: &str, enabled: bool) -> bool {
         for system in &mut self.systems {
             if system.name == name {
-                system.enabled = enabled;
+                if system.enabled != enabled {
+                    system.enabled = enabled;
+                    self.graph_dirty = true;
+                }
                 return true;
             }
         }
@@ -182,6 +190,13 @@ impl Engine {
         // Bump the world tick so that any change-detection comparisons
         // performed by mutable queries during this frame use a fresh value.
         self.world.increment_change_tick();
+
+        // Rebuild the execution graph if systems were enabled/disabled since
+        // the last frame, so parallel batches reflect the current active set.
+        if self.graph_dirty {
+            self.scheduler.build_execution_graph();
+            self.graph_dirty = false;
+        }
 
         // Phase 1: Run all systems
         if self.parallel_execution && self.systems.len() > 1 {

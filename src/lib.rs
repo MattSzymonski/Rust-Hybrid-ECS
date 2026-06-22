@@ -27,4 +27,4 @@ pub use query::{
 pub use resource::{ResHandle, Resource};
 pub use scheduler::{SystemAccess, SystemScheduler};
 pub use scripting::{ScriptComponent, ScriptContext};
-pub use world::{AddComponentError, EntityBuilder, RemoveComponentError, World};
+pub use world::{AddComponentError, BuildError, EntityBuilder, RemoveComponentError, World};

@@ -18,6 +18,7 @@ use crate::component::{
     Component, ComponentId, ComponentMask, ComponentRegistry, ComponentTicks, Tick,
 };
 use crate::entity::Entity;
+use crate::query::change_detection::Mut;
 use crate::resource::{Resource, ResourceId};
 use crate::scripting::{ScriptComponent, ScriptContext};
 
@@ -31,19 +32,17 @@ type ComponentCopier = Arc<
         + Sync,
 >;
 
-/// Function that updates a script component
-/// Takes: (storage, index, entity, world_ptr, commands_ptr)
-/// Uses raw pointers to safely create ScriptContext within the closure
-type ScriptUpdater = Arc<
-    dyn Fn(
-            &mut TraitTypeMap<dyn Component, VecFamily>,
-            usize,
-            Entity,
-            *mut World,
-            *mut CommandQueue,
-        ) + Send
-        + Sync,
->;
+/// Function that updates a script component.
+///
+/// Takes: (storage, index, entity, world_ptr, commands_ptr).
+/// Uses raw pointers to create a `ScriptContext` inside `update_scripts`.
+///
+/// SAFETY: The raw-pointer arguments (`world_ptr`, `commands_ptr`) are only
+/// valid during the `update_scripts` call. Using a plain function pointer
+/// (not a closure) guarantees that no state is captured and the callee
+/// cannot stash the pointers for later use.
+type ScriptUpdater =
+    fn(&mut TraitTypeMap<dyn Component, VecFamily>, usize, Entity, *mut World, *mut CommandQueue);
 
 /// EntityLocation tracks where an entity is stored in the archetype system
 #[derive(Clone, Copy)]
@@ -94,13 +93,37 @@ impl std::fmt::Display for RemoveComponentError {
 
 impl std::error::Error for RemoveComponentError {}
 
-/// World manages all entities, archetypes, and global components
+/// Error type for `EntityBuilder::build` when a component was not registered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuildError {
+    /// One or more component types were not registered with the world.
+    /// Call `world.register_component::<T>()` for each type first.
+    ComponentNotRegistered(ComponentId),
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BuildError::ComponentNotRegistered(id) => {
+                write!(
+                    f,
+                    "component {:?} not registered — call world.register_component::<T>() first",
+                    id
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for BuildError {}
+
+/// World manages all entities, archetypes, and resources
 ///
 /// This is the central hub of the ECS. It:
 /// - Allocates entity IDs
 /// - Manages archetype storage
 /// - Tracks entity locations
-/// - Stores global (singleton) components
+/// - Stores resources (singleton data)
 /// - Maintains component type registry for creating archetype storage
 pub struct World {
     next_free_entity_id: u64,
@@ -227,29 +250,32 @@ impl World {
         if let Some(bit) = self.component_registry.get_bit(&component_id) {
             self.script_components.push((component_id, bit));
 
-            // Register updater callback for this script component
+            // Register updater callback for this script component.
+            // Uses a non-capturing closure coerced to a function pointer
+            // so that no state (especially no raw pointer) is captured.
+            // The raw pointers are passed fresh by `update_scripts` on
+            // every invocation.
             self.script_updaters.insert(
                 component_id,
-                Arc::new(
-                    |storage: &mut TraitTypeMap<dyn Component, VecFamily>,
-                     index: usize,
-                     entity: Entity,
-                     world_ptr: *mut World,
-                     commands_ptr: *mut CommandQueue| {
-                        // Get mutable reference to the component
-                        let component = storage.get_storage_mut::<T>().get_mut(index);
-                        // SAFETY: We create a ScriptContext with mutable world access.
-                        // This is safe because:
-                        // - The script's own component is accessed via `storage`, not through world
-                        // - Different component types have separate storage (no aliasing)
-                        // - Structural changes are deferred through commands
-                        unsafe {
-                            let mut ctx =
-                                ScriptContext::new(&mut *world_ptr, &mut *commands_ptr, entity);
-                            component.update(&mut ctx);
-                        }
-                    },
-                ),
+                (|storage: &mut TraitTypeMap<dyn Component, VecFamily>,
+                  index: usize,
+                  entity: Entity,
+                  world_ptr: *mut World,
+                  commands_ptr: *mut CommandQueue| {
+                    // Get mutable reference to the component
+                    let component = storage.get_storage_mut::<T>().get_mut(index);
+                    // SAFETY: `world_ptr` and `commands_ptr` are derived from
+                    // `&mut World` / `&mut CommandQueue` that are valid for the
+                    // entire duration of `update_scripts`, which is the sole
+                    // caller of every stored updater. The function-pointer
+                    // representation prevents these pointers from being cached
+                    // across calls.
+                    unsafe {
+                        let mut ctx =
+                            ScriptContext::new(&mut *world_ptr, &mut *commands_ptr, entity);
+                        component.update(&mut ctx);
+                    }
+                }) as ScriptUpdater,
             );
         }
     }
@@ -269,8 +295,10 @@ impl World {
 
         for (component_id, comp_bit) in script_info {
             // Get the updater for this component type
+            // Function pointers are Copy — no Arc clone needed, and no risk
+            // of the callee caching the raw pointers across calls.
             let updater = match self.script_updaters.get(&component_id) {
-                Some(u) => Arc::clone(u),
+                Some(&u) => u,
                 None => continue,
             };
 
@@ -290,7 +318,10 @@ impl World {
                 }
             }
 
-            // Now update each entity's script component
+            // Now update each entity's script component.
+            // Sort by (archetype_id, index) for deterministic order across runs.
+            entities_to_update.sort_by_key(|(_, aid, idx)| (*aid, *idx));
+
             let world_ptr = self as *mut World;
             let commands_ptr = commands as *mut CommandQueue;
 
@@ -402,11 +433,37 @@ impl World {
             .and_then(|boxed| boxed.downcast_ref::<T>())
     }
 
-    /// Get mutable reference to a resource
+    /// Get mutable reference to a resource.
+    ///
+    /// Prefer [`get_resource_mut_tracked`] for system-parameter usage so
+    /// that change-detection ticks are automatically bumped on mutation.
     pub fn get_resource_mut<T: Resource>(&mut self) -> Option<&mut T> {
         self.resources
             .get_mut(&ResourceId::of::<T>())
             .and_then(|boxed| boxed.downcast_mut::<T>())
+    }
+
+    /// Get mutable, change-tracking access to a resource.
+    ///
+    /// Returns a [`Mut<'_, T>`] that wraps both the resource value and its
+    /// [`ComponentTicks`]. Mutating through `DerefMut` automatically bumps
+    /// `ticks.changed` to the current world tick, exactly like mutable
+    /// component queries do.
+    ///
+    /// This is used by [`ResMut`](crate::query::ResMut) so that systems
+    /// can later detect resource changes via tick inspection.
+    pub fn get_resource_mut_tracked<T: Resource>(&mut self) -> Option<Mut<'_, T>> {
+        let id = ResourceId::of::<T>();
+        let value: &mut T = self
+            .resources
+            .get_mut(&id)
+            .and_then(|boxed| boxed.downcast_mut::<T>())?;
+        let ticks: &mut ComponentTicks = self
+            .resource_ticks
+            .get_mut(&id)
+            .expect("resource_ticks must be in sync with resources");
+        let this_run = Tick::new(self.change_tick);
+        Some(Mut::new(value, ticks, this_run))
     }
 
     /// Remove a resource and return it if it existed
@@ -697,8 +754,12 @@ impl World {
         // 2. Remove entity from old archetype
         // 3. Add entity to new archetype
 
-        // SAFETY: We need to access two archetypes simultaneously
-        // We ensure old_archetype_id != new_archetype_id above
+        // SAFETY: We need to access two archetypes simultaneously.
+        // The early-return above ensures old_archetype_id != new_archetype_id,
+        // so the two HashMap entries are disjoint allocations.
+        // The debug_assert_ne! inside the unsafe block acts as a second
+        // line of defense against a future refactor accidentally removing
+        // or moving the early-return without updating this block.
         let old_arch_ptr = self
             .archetypes
             .get(&old_archetype_id)
@@ -711,6 +772,14 @@ impl World {
             as *mut Archetype;
 
         unsafe {
+            // SAFETY: old_archetype_id != new_archetype_id is proven by the
+            // early-return above and re-checked here. Different ArchetypeId
+            // values map to different HashMap entries, so old_arch and
+            // new_arch point to non-overlapping allocations.
+            debug_assert_ne!(
+                old_archetype_id, new_archetype_id,
+                "move_entity_to_archetype: old and new archetype IDs must differ"
+            );
             let old_arch = &*old_arch_ptr;
             let new_arch = &mut *new_arch_ptr;
 
@@ -1052,7 +1121,7 @@ impl<T: Component + TraitAccessible<dyn Component>> ComponentInserter
 /// world.create_entity()
 ///     .with(Transform { x: 0.0, y: 0.0, z: 0.0 })
 ///     .with(Velocity { x: 10.0 })
-///     .build();
+///     .build().unwrap();
 /// ```
 pub struct EntityBuilder<'w> {
     world: &'w mut World,
@@ -1071,11 +1140,23 @@ impl<'w> EntityBuilder<'w> {
         self
     }
 
-    /// Finish building and insert the entity into the world
-    pub fn build(self) -> Entity {
+    /// Finish building and insert the entity into the world.
+    ///
+    /// Returns `Err(BuildError::ComponentNotRegistered(id))` if any of the
+    /// component types added via [`.with()`](Self::with) were not registered
+    /// with the world beforehand.
+    pub fn build(self) -> Result<Entity, BuildError> {
         let entity = self.entity;
         let component_ids: Vec<ComponentId> =
             self.components.iter().map(|c| c.component_id()).collect();
+
+        // Validate that every component type is registered before we try to
+        // create the archetype (which would panic on an unregistered type).
+        for &id in &component_ids {
+            if !self.world.storage_factories.contains_key(&id) {
+                return Err(BuildError::ComponentNotRegistered(id));
+            }
+        }
 
         let components = self.components;
         self.world
@@ -1084,7 +1165,7 @@ impl<'w> EntityBuilder<'w> {
                     inserter.insert(storage);
                 }
             });
-        entity
+        Ok(entity)
     }
 }
 
@@ -1141,13 +1222,15 @@ mod tests {
             .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
             .with(Velocity { x: 1.0, y: 2.0 })
-            .build();
+            .build()
+            .unwrap();
 
         // Create entity with Position only
         let entity2 = world
             .create_entity()
             .with(Position { x: 5.0, y: 15.0 })
-            .build();
+            .build()
+            .unwrap();
 
         // Create entity with all three components
         let entity3 = world
@@ -1155,7 +1238,8 @@ mod tests {
             .with(Position { x: 100.0, y: 200.0 })
             .with(Velocity { x: 5.0, y: 10.0 })
             .with(Health { hp: 100 })
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(world.entity_locations.len(), 3);
         assert_eq!(world.archetypes.len(), 3);
@@ -1237,7 +1321,8 @@ mod tests {
             .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
             .with(Velocity { x: 1.0, y: 2.0 })
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(
             world.archetypes.len(),
@@ -1310,7 +1395,8 @@ mod tests {
             .with(Position { x: 100.0, y: 200.0 })
             .with(Velocity { x: 5.0, y: 10.0 })
             .with(Health { hp: 100 })
-            .build();
+            .build()
+            .unwrap();
 
         // Remove Velocity component
         let result = world.remove_component::<Velocity>(entity);
@@ -1396,7 +1482,8 @@ mod tests {
         let entity = world
             .create_entity()
             .with(Position { x: 5.0, y: 15.0 })
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(world.entity_locations.len(), 1);
 
@@ -1436,13 +1523,15 @@ mod tests {
         let entity1 = world
             .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
-            .build();
+            .build()
+            .unwrap();
 
         let entity2 = world
             .create_entity()
             .with(Position { x: 5.0, y: 15.0 })
             .with(Velocity { x: 1.0, y: 2.0 })
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(world.entity_locations.len(), 2);
 
@@ -1494,7 +1583,8 @@ mod tests {
         let entity = world
             .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
-            .build();
+            .build()
+            .unwrap();
 
         // First destroy should succeed
         let result1 = world.destroy_entity(entity);
@@ -1527,13 +1617,15 @@ mod tests {
         let entity1 = world
             .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
-            .build();
+            .build()
+            .unwrap();
 
         let entity2 = world
             .create_entity()
             .with(Position { x: 5.0, y: 15.0 })
             .with(Velocity { x: 1.0, y: 2.0 })
-            .build();
+            .build()
+            .unwrap();
 
         let initial_archetypes = world.archetypes.len();
         assert_eq!(initial_archetypes, 2);
@@ -1573,7 +1665,8 @@ mod tests {
             .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
             .with(Velocity { x: 1.0, y: 2.0 })
-            .build();
+            .build()
+            .unwrap();
 
         let initial_location = *world.entity_locations.get(&entity).unwrap();
 
@@ -1621,7 +1714,8 @@ mod tests {
             .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
             .with(Velocity { x: 1.0, y: 2.0 })
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(
             world.archetypes.len(),
@@ -1664,13 +1758,15 @@ mod tests {
             .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
             .with(Velocity { x: 1.0, y: 2.0 })
-            .build();
+            .build()
+            .unwrap();
 
         world
             .create_entity()
             .with(Position { x: 5.0, y: 15.0 })
             .with(Velocity { x: 0.5, y: 1.5 })
-            .build();
+            .build()
+            .unwrap();
 
         // Print info using the world helper method
         world.print_archetypes();
@@ -1747,7 +1843,8 @@ mod tests {
         let entity1 = world
             .create_entity()
             .with(Position { x: 10.0, y: 20.0 })
-            .build();
+            .build()
+            .unwrap();
 
         println!("Entity1: id={}, gen={}", entity1.id, entity1.generation);
         assert_eq!(entity1.id, 0, "First entity should have ID 0");
@@ -1781,7 +1878,8 @@ mod tests {
         let entity2 = world
             .create_entity()
             .with(Velocity { x: 5.0, y: 10.0 })
-            .build();
+            .build()
+            .unwrap();
 
         println!("Entity2: id={}, gen={}", entity2.id, entity2.generation);
         assert_eq!(entity2.id, 0, "New entity should reuse ID 0");
@@ -1832,7 +1930,8 @@ mod tests {
         let mut last_entity = world
             .create_entity()
             .with(Position { x: 0.0, y: 0.0 })
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(last_entity.id, 0);
         assert_eq!(last_entity.generation, 0);
 
@@ -1846,7 +1945,8 @@ mod tests {
                     x: round as f32,
                     y: 0.0,
                 })
-                .build();
+                .build()
+                .unwrap();
 
             assert_eq!(new_entity.id, 0, "Should reuse ID 0 in round {}", round);
             assert_eq!(
@@ -1878,15 +1978,18 @@ mod tests {
         let entity0 = world
             .create_entity()
             .with(Position { x: 0.0, y: 0.0 })
-            .build();
+            .build()
+            .unwrap();
         let entity1 = world
             .create_entity()
             .with(Position { x: 1.0, y: 1.0 })
-            .build();
+            .build()
+            .unwrap();
         let entity2 = world
             .create_entity()
             .with(Position { x: 2.0, y: 2.0 })
-            .build();
+            .build()
+            .unwrap();
 
         assert_eq!(entity0.id, 0);
         assert_eq!(entity1.id, 1);
@@ -1903,21 +2006,24 @@ mod tests {
         let new_entity1 = world
             .create_entity()
             .with(Position { x: 0.0, y: 0.0 })
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(new_entity1.id, 2, "Should pop ID 2 first (LIFO)");
         assert_eq!(new_entity1.generation, 1);
 
         let new_entity2 = world
             .create_entity()
             .with(Position { x: 0.0, y: 0.0 })
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(new_entity2.id, 1, "Should pop ID 1 second");
         assert_eq!(new_entity2.generation, 1);
 
         let new_entity3 = world
             .create_entity()
             .with(Position { x: 0.0, y: 0.0 })
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(new_entity3.id, 0, "Should pop ID 0 third");
         assert_eq!(new_entity3.generation, 1);
 
@@ -1925,7 +2031,8 @@ mod tests {
         let new_entity4 = world
             .create_entity()
             .with(Position { x: 0.0, y: 0.0 })
-            .build();
+            .build()
+            .unwrap();
         assert_eq!(new_entity4.id, 3, "Should allocate fresh ID 3");
         assert_eq!(new_entity4.generation, 0);
 
@@ -1953,19 +2060,22 @@ mod tests {
             .create_entity()
             .with(Position { x: 1.0, y: 1.0 })
             .with(Velocity { x: 10.0, y: 10.0 })
-            .build();
+            .build()
+            .unwrap();
 
         let entity2 = world
             .create_entity()
             .with(Position { x: 2.0, y: 2.0 })
             .with(Velocity { x: 20.0, y: 20.0 })
-            .build();
+            .build()
+            .unwrap();
 
         let entity3 = world
             .create_entity()
             .with(Position { x: 3.0, y: 3.0 })
             .with(Health { hp: 100 })
-            .build();
+            .build()
+            .unwrap();
 
         println!(
             "Created: entity1(id={}, gen={}), entity2(id={}, gen={}), entity3(id={}, gen={})",
@@ -2021,7 +2131,11 @@ mod tests {
         // entity1 (id=0) is still alive
 
         // Create new entity - should reuse ID 2 (last destroyed)
-        let new_entity1 = world.create_entity().with(Health { hp: 50 }).build();
+        let new_entity1 = world
+            .create_entity()
+            .with(Health { hp: 50 })
+            .build()
+            .unwrap();
 
         println!(
             "new_entity1: id={}, gen={}",
@@ -2045,7 +2159,8 @@ mod tests {
             .create_entity()
             .with(Position { x: 0.0, y: 0.0 })
             .with(Velocity { x: 0.0, y: 0.0 })
-            .build();
+            .build()
+            .unwrap();
 
         println!(
             "new_entity2: id={}, gen={}",
@@ -2078,7 +2193,8 @@ mod tests {
         let new_entity3 = world
             .create_entity()
             .with(Position { x: 0.0, y: 0.0 })
-            .build();
+            .build()
+            .unwrap();
         println!(
             "new_entity3: id={}, gen={}",
             new_entity3.id, new_entity3.generation
@@ -2106,15 +2222,18 @@ mod tests {
         let entity0 = world
             .create_entity()
             .with(Position { x: 0.0, y: 0.0 })
-            .build();
+            .build()
+            .unwrap();
         let entity1 = world
             .create_entity()
             .with(Position { x: 1.0, y: 1.0 })
-            .build();
+            .build()
+            .unwrap();
         let entity2 = world
             .create_entity()
             .with(Position { x: 2.0, y: 2.0 })
-            .build();
+            .build()
+            .unwrap();
 
         // Verify initial state
         assert_eq!(world.get_component::<Position>(entity0).unwrap().x, 0.0);
@@ -2188,17 +2307,20 @@ mod tests {
             .create_entity()
             .with(Position { x: 0.0, y: 0.0 })
             .with(Velocity { x: 100.0, y: 100.0 })
-            .build();
+            .build()
+            .unwrap();
         let entity1 = world
             .create_entity()
             .with(Position { x: 1.0, y: 1.0 })
             .with(Velocity { x: 101.0, y: 101.0 })
-            .build();
+            .build()
+            .unwrap();
         let entity2 = world
             .create_entity()
             .with(Position { x: 2.0, y: 2.0 })
             .with(Velocity { x: 102.0, y: 102.0 })
-            .build();
+            .build()
+            .unwrap();
 
         // Verify initial state
         assert_eq!(
