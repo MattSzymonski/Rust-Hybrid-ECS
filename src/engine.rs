@@ -8,7 +8,7 @@
 //! - Two-phase frame processing: systems execute → deferred commands execute
 //! - System state management (for persistent data between frames)
 
-use crate::commands::CommandQueue;
+use crate::commands::{CommandError, CommandQueue};
 use crate::component::Tick;
 use crate::scheduler::{SystemAccess, SystemScheduler};
 use crate::system::{IntoSystem, System, SystemParam};
@@ -52,6 +52,10 @@ pub struct Engine {
     parallel_execution: bool,
     /// Whether the execution graph needs rebuilding (dirty after enable/disable)
     graph_dirty: bool,
+    /// If true, `process_frame` returns an error immediately when any
+    /// deferred command fails.  When false (default), errors are logged
+    /// to stderr and execution continues.
+    pub should_exit_on_error: bool,
 }
 
 impl Engine {
@@ -64,6 +68,7 @@ impl Engine {
             scheduler: SystemScheduler::new(),
             parallel_execution: true,
             graph_dirty: false,
+            should_exit_on_error: false,
         }
     }
 }
@@ -186,7 +191,15 @@ impl Engine {
     ///
     /// This two-phase approach ensures structural changes don't interfere
     /// with systems that are still running.
-    pub fn process_frame(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(Vec<CommandError>)` when [`should_exit_on_error`] is
+    /// `true` and one or more deferred commands fail.  When the flag is
+    /// `false` (default), errors are logged and `Ok(())` is returned.
+    ///
+    /// [`should_exit_on_error`]: Engine::should_exit_on_error
+    pub fn process_frame(&mut self) -> Result<(), Vec<CommandError>> {
         // Bump the world tick so that any change-detection comparisons
         // performed by mutable queries during this frame use a fresh value.
         self.world.increment_change_tick();
@@ -210,7 +223,8 @@ impl Engine {
         self.world.update_scripts(&mut self.queue);
 
         // Phase 2: Execute all deferred commands (including those from scripts)
-        self.queue.execute_queued_commands(&mut self.world);
+        self.queue
+            .execute_queued_commands(&mut self.world, self.should_exit_on_error)
     }
 
     /// Run systems sequentially (fallback or when parallel is disabled)

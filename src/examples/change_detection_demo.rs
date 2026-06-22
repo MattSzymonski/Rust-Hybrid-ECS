@@ -187,7 +187,7 @@ pub fn main() {
 
     for frame in 1..=5 {
         println!("--- Frame {} ---", frame);
-        engine.process_frame();
+        engine.process_frame().unwrap();
         println!();
     }
 }

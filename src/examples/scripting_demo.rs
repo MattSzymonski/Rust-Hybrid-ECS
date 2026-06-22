@@ -102,7 +102,7 @@ pub fn main() {
     // Simulate several frames
     for frame in 1..=8 {
         println!("--- Frame {} ---", frame);
-        engine.process_frame();
+        engine.process_frame().unwrap();
         println!();
     }
 

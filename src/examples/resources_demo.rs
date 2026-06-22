@@ -97,21 +97,14 @@ fn scoring_system(mut query: Query<&Position>, mut score: ResMut<Score>) {
 /// - `Query<(Entity, &Position)>` ⇒ reads Position (and entity id).
 /// - `Res<GameTime>`              ⇒ reads GameTime.
 /// - `Res<Score>`                 ⇒ reads Score.
-fn display_system(
-    mut query: Query<(Entity, &Position)>,
-    time: Res<GameTime>,
-    score: Res<Score>,
-) {
+fn display_system(mut query: Query<(Entity, &Position)>, time: Res<GameTime>, score: Res<Score>) {
     let t = time.get().unwrap();
     let s = score.get().unwrap();
 
     println!("--- Frame stats @ {:.3}s ---", t.elapsed);
     println!("  score: {:>5}", s.0);
     for (entity, pos) in query.iter_mut() {
-        println!(
-            "  entity {:?} at ({:.1}, {:.1})",
-            entity, pos.x, pos.y
-        );
+        println!("  entity {:?} at ({:.1}, {:.1})", entity, pos.x, pos.y);
     }
 }
 
@@ -168,14 +161,14 @@ pub(crate) fn main() {
                 vx: 1.0,
                 vy: (i as f32) * 0.5,
             })
-            .build().unwrap();
+            .build()
+            .unwrap();
     }
 
     // --- Run a few frames --------------------------------------------------
     for _frame in 0..3 {
-        engine.process_frame();
+        engine.process_frame().unwrap();
     }
 
     println!("\nDemo complete!");
 }
-

@@ -287,7 +287,7 @@ pub fn main() {
 
     // Run simulation with systems
     for _frame in 0..max_frames {
-        engine.process_frame();
+        engine.process_frame().unwrap();
     }
 
     // Count entities near obstacle

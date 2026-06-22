@@ -107,6 +107,62 @@ enum DeferredCommand {
     },
 }
 
+/// Error returned when a deferred command cannot be executed.
+///
+/// Command errors are non-fatal by default — the engine logs them and
+/// continues.  Set `Engine::should_exit_on_error` to `true` for strict
+/// mode where any command failure stops the frame immediately.
+#[derive(Debug, Clone)]
+pub enum CommandError {
+    /// The target entity no longer exists in the world.
+    EntityNotFound {
+        entity: Entity,
+        operation: &'static str,
+    },
+    /// The entity already possesses the component being added.
+    ComponentAlreadyExists {
+        entity: Entity,
+        component_id: ComponentId,
+    },
+    /// The entity does not have the component being removed.
+    ComponentNotFound {
+        entity: Entity,
+        component_id: ComponentId,
+    },
+}
+
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EntityNotFound { entity, operation } => {
+                write!(f, "entity {:?} not found for {operation}", entity.id())
+            }
+            Self::ComponentAlreadyExists {
+                entity,
+                component_id,
+            } => {
+                write!(
+                    f,
+                    "entity {:?} already has component {:?}",
+                    entity.id(),
+                    component_id
+                )
+            }
+            Self::ComponentNotFound {
+                entity,
+                component_id,
+            } => {
+                write!(
+                    f,
+                    "entity {:?} doesn't have component {:?}",
+                    entity.id(),
+                    component_id
+                )
+            }
+        }
+    }
+}
+
 /// Commands queue for deferred operations
 ///
 /// Systems that want to modify entities use Commands to queue changes.
@@ -166,160 +222,180 @@ impl CommandQueue {
     /// Execute all queued commands
     ///
     /// This is called by the Engine after all systems have run.
-    pub(crate) fn execute_queued_commands(&mut self, world: &mut World) {
+    ///
+    /// When `exit_on_error` is `true`, any command failure causes an
+    /// immediate `Err` return.  When `false`, failures are logged to
+    /// stderr and execution continues (backward-compatible behaviour).
+    pub(crate) fn execute_queued_commands(
+        &mut self,
+        world: &mut World,
+        exit_on_error: bool,
+    ) -> Result<(), Vec<CommandError>> {
+        let mut errors = Vec::new();
+
         for command in self.commands.drain(..) {
             match command {
                 DeferredCommand::CreateEntity { component_adders } => {
-                    // Collect component IDs
-                    let component_ids: Vec<ComponentId> = component_adders
-                        .iter()
-                        .map(|adder| adder.component_id())
-                        .collect();
-
-                    // Allocate entity
-                    let entity = world.allocate_entity();
-
-                    // Insert entity with components
-                    // TODO: Instead of passing lambda, we can pass componenent adders and let world handle archetype lookup and migration internally
-                    world.insert_entity_with_components(entity, component_ids, |storage| {
-                        for component_adder in component_adders {
-                            component_adder.add_component_to_storage(storage);
-                        }
-                    });
+                    Self::execute_create_entity(world, component_adders);
                 }
 
                 DeferredCommand::AddComponentToEntity {
                     entity,
                     component_adder,
                 } => {
-                    // Get current entity location and components
-                    let entity_location = match world.entity_locations.get(&entity) {
-                        Some(location) => *location,
-                        None => {
-                            println!(
-                                "  [Deferred] Entity {:?} not found for add_component",
-                                entity.id
-                            );
-                            continue;
-                        }
-                    };
-
-                    // Check if entity already has this component
-                    let old_archetype =
-                        world.archetypes.get(&entity_location.archetype_id).unwrap();
-                    let mut new_component_ids = old_archetype.component_types.clone();
-                    let new_component_id = component_adder.component_id();
-                    if new_component_ids.contains(&new_component_id) {
-                        println!(
-                            "  [Deferred] Entity {:?} already has component {:?}",
-                            entity.id, new_component_id
-                        );
-                        continue;
-                    }
-
-                    // We need to move the entity to a new archetype with the added component
-                    new_component_ids.push(new_component_id);
-                    new_component_ids.sort();
-
-                    // Copy existing components using the registered copiers
-                    let old_component_ids = old_archetype.component_types.clone();
-
-                    // Collect copiers before borrowing world mutably (Arc::clone is cheap)
-                    let component_copiers: Vec<_> = old_component_ids
-                        .iter()
-                        .filter_map(|component_id| {
-                            world.component_copiers.get(component_id).map(Arc::clone)
-                        })
-                        .collect();
-
-                    // Move entity to the archetype with the additional component
-                    world.move_entity_to_archetype(
-                        entity,
-                        new_component_ids,
-                        |old_storage, new_storage, old_index| {
-                            // Copy all existing components from old archetype
-                            for component_copier in component_copiers.iter() {
-                                component_copier(old_storage, new_storage, old_index);
-                            }
-
-                            // Add the new component via the adder
-                            component_adder.add_component_to_storage(new_storage);
-                        },
-                    );
+                    Self::execute_add_component(world, entity, component_adder, &mut errors);
                 }
 
                 DeferredCommand::RemoveComponentFromEntity {
                     entity,
                     component_id,
                 } => {
-                    // Get current entity location and components
-                    let entity_location = match world.entity_locations.get(&entity) {
-                        Some(location) => *location,
-                        None => {
-                            println!(
-                                "  [Deferred] Entity {:?} not found for remove_component",
-                                entity.id
-                            );
-                            continue;
-                        }
-                    };
-
-                    let old_archetype =
-                        world.archetypes.get(&entity_location.archetype_id).unwrap();
-
-                    // Check if entity has this component
-                    if !old_archetype.component_types.contains(&component_id) {
-                        println!(
-                            "  [Deferred] Entity {:?} doesn't have component {:?}",
-                            entity.id, component_id
-                        );
-                        continue;
-                    }
-
-                    // Build new component list without the removed component
-                    let new_component_ids: Vec<ComponentId> = old_archetype
-                        .component_types
-                        .iter()
-                        .filter(|&id| *id != component_id)
-                        .cloned()
-                        .collect();
-
-                    // If no components left, destroy the entity instead and move to the next command
-                    if new_component_ids.is_empty() {
-                        world.destroy_entity(entity);
-                        continue;
-                    }
-
-                    // Collect copiers for remaining components
-                    let component_copiers: Vec<_> = new_component_ids
-                        .iter()
-                        .filter_map(|component_id| {
-                            world.component_copiers.get(component_id).map(Arc::clone)
-                        })
-                        .collect();
-
-                    // Move entity to new archetype without the removed component
-                    world.move_entity_to_archetype(
-                        entity,
-                        new_component_ids,
-                        |old_storage, new_storage, old_index| {
-                            // Copy all components except the removed one
-                            for component_copier in component_copiers.iter() {
-                                component_copier(old_storage, new_storage, old_index);
-                            }
-                        },
-                    );
+                    Self::execute_remove_component(world, entity, component_id, &mut errors);
                 }
 
                 DeferredCommand::DestroyEntity { entity } => {
-                    if !world.destroy_entity(entity) {
-                        println!(
-                            "  [Deferred] Failed to destroy entity {:?} (not found)",
-                            entity.id
-                        );
-                    }
+                    Self::execute_destroy_entity(world, entity, &mut errors);
                 }
             }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else if exit_on_error {
+            Err(errors)
+        } else {
+            for err in &errors {
+                eprintln!("  [Deferred] {err}");
+            }
+            Ok(())
+        }
+    }
+
+    fn execute_create_entity(world: &mut World, component_adders: Vec<Box<dyn ComponentAdder>>) {
+        let component_ids: Vec<ComponentId> = component_adders
+            .iter()
+            .map(|adder| adder.component_id())
+            .collect();
+
+        let entity = world.allocate_entity();
+
+        world.insert_entity_with_components(entity, component_ids, |storage| {
+            for component_adder in component_adders {
+                component_adder.add_component_to_storage(storage);
+            }
+        });
+    }
+
+    fn execute_add_component(
+        world: &mut World,
+        entity: Entity,
+        component_adder: Box<dyn ComponentAdder>,
+        errors: &mut Vec<CommandError>,
+    ) {
+        let entity_location = match world.entity_locations.get(&entity) {
+            Some(location) => *location,
+            None => {
+                errors.push(CommandError::EntityNotFound {
+                    entity,
+                    operation: "add_component",
+                });
+                return;
+            }
+        };
+
+        let old_archetype = world.archetypes.get(&entity_location.archetype_id).unwrap();
+        let mut new_component_ids = old_archetype.component_types.clone();
+        let new_component_id = component_adder.component_id();
+        if new_component_ids.contains(&new_component_id) {
+            errors.push(CommandError::ComponentAlreadyExists {
+                entity,
+                component_id: new_component_id,
+            });
+            return;
+        }
+
+        new_component_ids.push(new_component_id);
+        new_component_ids.sort();
+
+        let old_component_ids = old_archetype.component_types.clone();
+        let component_copiers: Vec<_> = old_component_ids
+            .iter()
+            .filter_map(|component_id| world.component_copiers.get(component_id).map(Arc::clone))
+            .collect();
+
+        world.move_entity_to_archetype(
+            entity,
+            new_component_ids,
+            |old_storage, new_storage, old_index| {
+                for component_copier in component_copiers.iter() {
+                    component_copier(old_storage, new_storage, old_index);
+                }
+                component_adder.add_component_to_storage(new_storage);
+            },
+        );
+    }
+
+    fn execute_remove_component(
+        world: &mut World,
+        entity: Entity,
+        component_id: ComponentId,
+        errors: &mut Vec<CommandError>,
+    ) {
+        let entity_location = match world.entity_locations.get(&entity) {
+            Some(location) => *location,
+            None => {
+                errors.push(CommandError::EntityNotFound {
+                    entity,
+                    operation: "remove_component",
+                });
+                return;
+            }
+        };
+
+        let old_archetype = world.archetypes.get(&entity_location.archetype_id).unwrap();
+
+        if !old_archetype.component_types.contains(&component_id) {
+            errors.push(CommandError::ComponentNotFound {
+                entity,
+                component_id,
+            });
+            return;
+        }
+
+        let new_component_ids: Vec<ComponentId> = old_archetype
+            .component_types
+            .iter()
+            .filter(|&id| *id != component_id)
+            .cloned()
+            .collect();
+
+        if new_component_ids.is_empty() {
+            world.destroy_entity(entity);
+            return;
+        }
+
+        let component_copiers: Vec<_> = new_component_ids
+            .iter()
+            .filter_map(|component_id| world.component_copiers.get(component_id).map(Arc::clone))
+            .collect();
+
+        world.move_entity_to_archetype(
+            entity,
+            new_component_ids,
+            |old_storage, new_storage, old_index| {
+                for component_copier in component_copiers.iter() {
+                    component_copier(old_storage, new_storage, old_index);
+                }
+            },
+        );
+    }
+
+    fn execute_destroy_entity(world: &mut World, entity: Entity, errors: &mut Vec<CommandError>) {
+        if !world.destroy_entity(entity) {
+            errors.push(CommandError::EntityNotFound {
+                entity,
+                operation: "destroy_entity",
+            });
         }
     }
 
@@ -460,7 +536,7 @@ mod tests {
         );
 
         // Execute commands
-        queue.execute_queued_commands(&mut world);
+        queue.execute_queued_commands(&mut world, false).unwrap();
 
         assert_eq!(world.entity_locations.len(), 1, "Entity should be created");
         assert_eq!(world.archetypes.len(), 1, "Should have 1 archetype");
@@ -513,7 +589,7 @@ mod tests {
         );
 
         // Execute commands
-        queue.execute_queued_commands(&mut world);
+        queue.execute_queued_commands(&mut world, false).unwrap();
 
         assert_eq!(world.entity_locations.len(), 1, "Entity should be created");
     }
@@ -559,7 +635,7 @@ mod tests {
         );
 
         // Execute commands
-        queue.execute_queued_commands(&mut world);
+        queue.execute_queued_commands(&mut world, false).unwrap();
 
         assert_eq!(world.entity_locations.len(), 1, "Entity should be created");
         let archetype = world.archetypes.values().next().unwrap();
@@ -583,7 +659,7 @@ mod tests {
             commands.remove_component_from_entity::<Velocity>(entity);
         }
 
-        queue.execute_queued_commands(&mut world);
+        queue.execute_queued_commands(&mut world, false).unwrap();
         assert_eq!(world.entity_locations.len(), 1, "Entity should still exist");
 
         let archetype = world.archetypes.values().next().unwrap();
@@ -640,7 +716,7 @@ mod tests {
             .build();
 
         // Execute commands
-        queue.execute_queued_commands(&mut world);
+        queue.execute_queued_commands(&mut world, false).unwrap();
 
         assert_eq!(world.entity_locations.len(), 3, "Should have 3 entities");
         assert_eq!(

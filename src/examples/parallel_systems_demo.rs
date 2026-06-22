@@ -102,7 +102,7 @@ pub(crate) fn main() {
     println!("Running 5 frames...\n");
     for frame in 0..5 {
         println!("Frame {}", frame);
-        engine.process_frame();
+        engine.process_frame().unwrap();
     }
 
     println!("\nDemo complete!");
