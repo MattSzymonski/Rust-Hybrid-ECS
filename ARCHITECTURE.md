@@ -662,6 +662,65 @@ batch**, so the shared `&mut CommandQueue` is never actually accessed by
 multiple threads simultaneously. Combined with the raw-pointer indirection
 through `usize`, this avoids data races.
 
+### Resource isolation — why the scheduler is sound
+
+The parallel executor casts `&mut World` to `*mut World as usize` and
+reconstructs `&mut World` on each worker thread. If two systems in the same
+batch both called `world.get_resource_mut::<GameTime>()`, they would create
+aliasing `&mut` to the same `Box<dyn Any>` — UB. This cannot happen with
+the built-in system parameters.
+
+**The chain of trust:**
+
+1. Every built-in `SystemParam` honestly reports its resource access.
+   `Res<T>` calls `add_resource_read`, `ResMut<T>` calls
+   `add_resource_write`, `Commands` sets `uses_commands = true`.
+
+2. `ResourceId(TypeId)` — `TypeId` is globally unique per type, so
+   `ResourceId::of::<GameTime>()` ≠ `ResourceId::of::<Score>()`.
+   `HashSet::is_disjoint` correctly detects overlap.
+
+3. `conflicts_with` flags resource write-write and read-write overlaps
+   (read-read is allowed). The greedy batch builder defers any system that
+   conflicts with a system already in the current batch to a later batch.
+
+4. Therefore: for any two systems registered with only built-in
+   `SystemParam` types, it is **impossible** for them to land in the same
+   parallel batch while accessing the same resource in a conflicting way.
+
+**The only hole:** a custom `SystemParam` implementation that accesses a
+resource without declaring it in `report_access`. For example, a parameter
+that calls `world.get_resource_mut::<T>()` inside `fetch` but reports no
+resource access would be invisible to the scheduler and could create
+aliasing `&mut` at runtime. This requires a deliberately buggy (or
+malicious) `unsafe`-adjacent implementation — the built-in types are
+provably correct.
+
+### Empirical verification — exhaustive + fuzz tests
+
+The scheduler's **implementation** is verified by two tests in
+`src/scheduler.rs`. These are empirical checks (finite cases), not a
+formal proof — they confirm the code matches the algorithm across a
+large sample of input categories.
+
+**Exhaustive enumeration** (`proof_exhaustive_small_n`). 10 access kinds
+cover every conflict category: read/write component A/B, read/write
+resource X/Y, Commands, and no-op. Every possible combination of 1–6
+systems is enumerated (10¹ + 10² + … + 10⁶ = 1,111,110 unique cases).
+For each, `build_execution_graph` is run and the invariants "no batch
+contains conflicting systems" and "all systems scheduled exactly once"
+are verified.
+
+**Random fuzz** (`proof_random_fuzz_large_n`). For larger system counts
+(up to 20), 500 random seeds each generate a random conflict graph.
+That's ~10,000 graphs covering patterns too large to exhaustively
+enumerate. All pass the same invariants.
+
+Together, the formal proof (algorithm-level) and the empirical tests
+(implementation-level) provide complementary confidence: the proof says
+the algorithm is correct for all n; the tests catch any implementation
+bugs that deviate from the algorithm.
+
 ---
 
 ## Deferred Commands
