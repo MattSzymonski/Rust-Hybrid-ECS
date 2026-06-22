@@ -38,43 +38,44 @@ use super::FilteredArchetypeRange;
 /// ```
 pub struct Query<'w, Q: QueryTarget, F: QueryFilter = ()> {
     world: &'w mut World,
+    /// Cached component mask for the query target (data being fetched).
+    /// Computed once at construction — static for a given `Q`.
+    target_mask: ComponentMask,
+    /// Cached filter mask pairs. Computed once at construction — static
+    /// for a given `F`.  For simple filters this is a single pair; only
+    /// [`Or`] filters produce multiple pairs.
+    filter_pairs: Vec<(ComponentMask, ComponentMask)>,
     _phantom: std::marker::PhantomData<(Q, F)>,
 }
 
 impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     pub fn new(world: &'w mut World) -> Self {
+        let target_mask = Self::build_target_mask(world);
+        let filter_pairs = Self::build_filter_mask_pairs(world);
         Self {
             world,
+            target_mask,
+            filter_pairs,
             _phantom: std::marker::PhantomData,
         }
     }
 
-    /// Build the component mask for the query target (data being fetched).
-    /// This is always mandatory — every matching archetype must contain
-    /// all components in this mask.
-    ///
-    /// This is separate from filter requirements so that [`Or`] filters can
-    /// add their own include/exclude pairs with OR semantics, while the
-    /// data we fetch remains a hard AND requirement.
-    fn build_target_mask(&self) -> ComponentMask {
+    /// Build the component mask for the query target from the world's
+    /// component registry.  Called once during [`new`](Self::new).
+    fn build_target_mask(world: &World) -> ComponentMask {
         let mut mask = ComponentMask::empty();
         for component_id in &Q::component_ids() {
-            if let Some(bit) = self.world.component_registry.get_bit(component_id) {
+            if let Some(bit) = world.component_registry.get_bit(component_id) {
                 mask.set(bit);
             }
         }
         mask
     }
 
-    /// Convert the filter's archetype-level requirements into
-    /// `(include_mask, exclude_mask)` pairs.
-    ///
-    /// For simple filters like [`With<A>`] or [`Without<B>`] this returns
-    /// exactly **one** pair — the same include/exclude logic as before.
-    /// Only [`Or`] filters return multiple pairs (one per inner filter),
-    /// enabling correct logical-OR at the archetype level.
-    fn build_filter_mask_pairs(&self) -> Vec<(ComponentMask, ComponentMask)> {
-        let registry = &self.world.component_registry;
+    /// Build filter mask pairs from the world's component registry.
+    /// Called once during [`new`](Self::new).
+    fn build_filter_mask_pairs(world: &World) -> Vec<(ComponentMask, ComponentMask)> {
+        let registry = &world.component_registry;
         F::archetype_filter_pairs()
             .into_iter()
             .map(|(inc_ids, exc_ids)| {
@@ -148,8 +149,6 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     /// Create a sequential iterator over all matching entities.
     #[inline]
     pub fn iter_mut(&mut self) -> QueryIterMut<'_, Q, F> {
-        let target_mask = self.build_target_mask();
-        let filter_pairs = self.build_filter_mask_pairs();
         let this_run = self.world.increment_change_tick();
         let last_run = self.world.system_last_run();
 
@@ -157,7 +156,9 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             .world
             .archetypes
             .iter()
-            .filter(|(_, arch)| Self::archetype_matches(arch, &target_mask, &filter_pairs))
+            .filter(|(_, arch)| {
+                Self::archetype_matches(arch, &self.target_mask, &self.filter_pairs)
+            })
             .map(|(id, _)| *id)
             .collect();
         // Sort by ArchetypeId for deterministic iteration order across runs.
@@ -200,8 +201,6 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         F::State: Send + Sync,
         for<'a> Q::Item<'a>: Send,
     {
-        let target_mask = self.build_target_mask();
-        let filter_pairs = self.build_filter_mask_pairs();
         let this_run = self.world.increment_change_tick();
         let last_run = self.world.system_last_run();
 
@@ -209,7 +208,9 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             .world
             .archetypes
             .iter_mut()
-            .filter(|(_, arch)| Self::archetype_matches(arch, &target_mask, &filter_pairs))
+            .filter(|(_, arch)| {
+                Self::archetype_matches(arch, &self.target_mask, &self.filter_pairs)
+            })
             .filter(|(_, arch)| !arch.is_empty())
             .map(|(id, arch)| {
                 let arch_ptr = arch as *mut Archetype;
