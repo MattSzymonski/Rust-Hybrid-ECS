@@ -169,6 +169,14 @@ pub struct World {
     /// "since the beginning of time" - useful for ad-hoc queries that are
     /// not driven by the engine.
     pub(crate) system_last_run: u32,
+
+    /// **Debug-only**: Tracks which resources currently have an active
+    /// mutable borrow.  Used to catch scheduler bugs where two systems
+    /// obtain `&mut` to the same resource simultaneously.
+    ///
+    /// Cleared at the start of every frame by the Engine.
+    #[cfg(debug_assertions)]
+    pub(crate) debug_resource_write_locks: std::collections::HashSet<ResourceId>,
 }
 
 impl World {
@@ -190,6 +198,8 @@ impl World {
             resource_ticks: HashMap::new(),
             change_tick: 0,
             system_last_run: 0,
+            #[cfg(debug_assertions)]
+            debug_resource_write_locks: std::collections::HashSet::new(),
         }
     }
 }
@@ -452,7 +462,24 @@ impl World {
     ///
     /// This is used by [`ResMut`](crate::query::ResMut) so that systems
     /// can later detect resource changes via tick inspection.
+    ///
+    /// # Panics (debug only)
+    ///
+    /// Panics if this resource was already fetched mutably during the
+    /// current frame — indicates a scheduler bug where two systems
+    /// obtained concurrent `&mut` access to the same resource.
     pub fn get_resource_mut_tracked<T: Resource>(&mut self) -> Option<Mut<'_, T>> {
+        #[cfg(debug_assertions)]
+        {
+            let id = ResourceId::of::<T>();
+            debug_assert!(
+                !self.debug_resource_write_locks.contains(&id),
+                "Resource {:?} is already mutably borrowed — possible scheduler bug or concurrent system access",
+                id
+            );
+            self.debug_resource_write_locks.insert(id);
+        }
+
         let id = ResourceId::of::<T>();
         let value: &mut T = self
             .resources
@@ -479,6 +506,16 @@ impl World {
     /// Check if a resource exists
     pub fn has_resource<T: Resource>(&self) -> bool {
         self.resources.contains_key(&ResourceId::of::<T>())
+    }
+
+    /// **Debug-only**: Clear the set of mutably-borrowed resources.
+    ///
+    /// Called by [`Engine::process_frame`] at the start of every frame so
+    /// that the isolation check only guards against concurrent access
+    /// within a single frame.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_clear_resource_locks(&mut self) {
+        self.debug_resource_write_locks.clear();
     }
 
     /// Check if an entity exists and is valid (not destroyed/recycled)

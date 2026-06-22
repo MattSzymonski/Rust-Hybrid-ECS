@@ -204,6 +204,11 @@ impl Engine {
         // performed by mutable queries during this frame use a fresh value.
         self.world.increment_change_tick();
 
+        // Debug-only: clear the resource write-lock tracker so that the
+        // isolation check only guards within a single frame.
+        #[cfg(debug_assertions)]
+        self.world.debug_clear_resource_locks();
+
         // Rebuild the execution graph if systems were enabled/disabled since
         // the last frame, so parallel batches reflect the current active set.
         if self.graph_dirty {

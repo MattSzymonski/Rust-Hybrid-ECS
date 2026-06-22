@@ -1007,6 +1007,9 @@ Engine::process_frame()
 ├─ world.increment_change_tick()
 │   └─ change_tick = change_tick.wrapping_add(1)
 │
+├─ [debug] world.debug_clear_resource_locks()
+│   └─ clear the HashSet<ResourceId> write-lock tracker
+│
 ├─ [if graph_dirty] scheduler.build_execution_graph()
 │   └─ greedy batching of systems by access pattern
 │
@@ -1052,6 +1055,18 @@ ensures:
 3. No two systems in a batch write the same resource type.
 4. No system writes a resource type while another reads it.
 5. Systems using `Commands` are alone in their batch.
+
+### Debug-only runtime validation — resource write locks
+
+As a second line of defense, `World` maintains a `HashSet<ResourceId>`
+(`#[cfg(debug_assertions)]` only) tracking which resources have been
+mutably borrowed this frame. `get_resource_mut_tracked` (the `ResMut` path)
+`debug_assert!`s that the resource isn't already locked, then inserts it.
+The set is cleared at frame start via `debug_clear_resource_locks()`.
+
+If the scheduler incorrectly allows two systems to write the same resource
+in parallel, the second one panics in debug builds. Release builds have
+zero overhead — the field and checks don't exist.
 
 ### Raw pointer patterns
 
