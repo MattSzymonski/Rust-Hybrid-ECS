@@ -49,14 +49,16 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         }
     }
 
-    /// Build the union of components that the data target and the filter
-    /// require to be present (i.e. the inclusion mask).
-    fn build_query_mask(&self) -> ComponentMask {
+    /// Build the component mask for the query target (data being fetched).
+    /// This is always mandatory — every matching archetype must contain
+    /// all components in this mask.
+    ///
+    /// This is separate from filter requirements so that [`Or`] filters can
+    /// add their own include/exclude pairs with OR semantics, while the
+    /// data we fetch remains a hard AND requirement.
+    fn build_target_mask(&self) -> ComponentMask {
         let mut mask = ComponentMask::empty();
-        for component_id in Q::component_ids()
-            .iter()
-            .chain(F::included_component_ids().iter())
-        {
+        for component_id in &Q::component_ids() {
             if let Some(bit) = self.world.component_registry.get_bit(component_id) {
                 mask.set(bit);
             }
@@ -64,37 +66,90 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         mask
     }
 
-    /// Build the mask of components whose presence excludes an archetype.
-    fn build_exclusion_mask(&self) -> ComponentMask {
-        let mut mask = ComponentMask::empty();
-        for component_id in &F::excluded_component_ids() {
-            if let Some(bit) = self.world.component_registry.get_bit(component_id) {
-                mask.set(bit);
-            }
-        }
-        mask
+    /// Convert the filter's archetype-level requirements into
+    /// `(include_mask, exclude_mask)` pairs.
+    ///
+    /// For simple filters like [`With<A>`] or [`Without<B>`] this returns
+    /// exactly **one** pair — the same include/exclude logic as before.
+    /// Only [`Or`] filters return multiple pairs (one per inner filter),
+    /// enabling correct logical-OR at the archetype level.
+    fn build_filter_mask_pairs(&self) -> Vec<(ComponentMask, ComponentMask)> {
+        let registry = &self.world.component_registry;
+        F::archetype_filter_pairs()
+            .into_iter()
+            .map(|(inc_ids, exc_ids)| {
+                let mut inc = ComponentMask::empty();
+                let mut exc = ComponentMask::empty();
+                for id in &inc_ids {
+                    if let Some(bit) = registry.get_bit(id) {
+                        inc.set(bit);
+                    }
+                }
+                for id in &exc_ids {
+                    if let Some(bit) = registry.get_bit(id) {
+                        exc.set(bit);
+                    }
+                }
+                (inc, exc)
+            })
+            .collect()
     }
 
-    /// True if `archetype` matches both the inclusion and exclusion masks.
+    /// True if `archetype` matches this query's requirements.
+    ///
+    /// The check has two layers:
+    ///
+    /// 1. **Target mask** (hard AND): the archetype must contain every
+    ///    component the query fetches (e.g. `&Position` + `&mut Velocity`).
+    ///
+    /// 2. **Filter pairs** (OR across pairs, AND within each pair):
+    ///    - **0 pairs** (e.g. no filter, or `()`): any archetype with the
+    ///      target components matches.
+    ///    - **1 pair** (e.g. `With<A>`, `Without<B>`, `Changed<A>`):
+    ///      the archetype must have all `include` components AND none of
+    ///      the `exclude` components. This is the simple case — just like
+    ///      the old `(include_mask, exclude_mask)` model.
+    ///    - **2+ pairs** (only [`Or`] filters): the archetype matches if
+    ///      **any** pair matches. For `Or<(With<A>, With<B>)>` the pairs
+    ///      are `({A},{})` and `({B},{})`, so archetypes with A, B, or
+    ///      both are included.
     fn archetype_matches(
         archetype: &Archetype,
-        include: &ComponentMask,
-        exclude: &ComponentMask,
+        target_mask: &ComponentMask,
+        filter_pairs: &[(ComponentMask, ComponentMask)],
     ) -> bool {
-        if !archetype.matches_mask(include) {
+        // Every matching archetype must contain the data we're fetching.
+        if !archetype.matches_mask(target_mask) {
             return false;
         }
-        // No bit in `exclude` may be set in the archetype's mask.
-        let am = &archetype.component_mask;
-        let combined = ComponentMask::intersection(am, exclude);
-        combined.is_empty()
+
+        match filter_pairs.len() {
+            // No filter restrictions — any archetype with the target components passes.
+            0 => true,
+
+            // Fast path: the common case. One include+exclude pair.
+            // Conceptually identical to the old `(include, exclude)` model.
+            1 => {
+                let (inc, exc) = &filter_pairs[0];
+                archetype.matches_mask(inc)
+                    && (exc.is_empty()
+                        || ComponentMask::intersection(&archetype.component_mask, exc).is_empty())
+            }
+
+            // Only reached for `Or<...>` filters. Match if ANY pair matches.
+            _ => filter_pairs.iter().any(|(inc, exc)| {
+                archetype.matches_mask(inc)
+                    && (exc.is_empty()
+                        || ComponentMask::intersection(&archetype.component_mask, exc).is_empty())
+            }),
+        }
     }
 
     /// Create a sequential iterator over all matching entities.
     #[inline]
     pub fn iter_mut(&mut self) -> QueryIterMut<'_, Q, F> {
-        let include = self.build_query_mask();
-        let exclude = self.build_exclusion_mask();
+        let target_mask = self.build_target_mask();
+        let filter_pairs = self.build_filter_mask_pairs();
         let this_run = self.world.increment_change_tick();
         let last_run = self.world.system_last_run();
 
@@ -102,7 +157,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             .world
             .archetypes
             .iter()
-            .filter(|(_, arch)| Self::archetype_matches(arch, &include, &exclude))
+            .filter(|(_, arch)| Self::archetype_matches(arch, &target_mask, &filter_pairs))
             .map(|(id, _)| *id)
             .collect();
         // Sort by ArchetypeId for deterministic iteration order across runs.
@@ -145,8 +200,8 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         F::State: Send + Sync,
         for<'a> Q::Item<'a>: Send,
     {
-        let include = self.build_query_mask();
-        let exclude = self.build_exclusion_mask();
+        let target_mask = self.build_target_mask();
+        let filter_pairs = self.build_filter_mask_pairs();
         let this_run = self.world.increment_change_tick();
         let last_run = self.world.system_last_run();
 
@@ -154,7 +209,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             .world
             .archetypes
             .iter_mut()
-            .filter(|(_, arch)| Self::archetype_matches(arch, &include, &exclude))
+            .filter(|(_, arch)| Self::archetype_matches(arch, &target_mask, &filter_pairs))
             .filter(|(_, arch)| !arch.is_empty())
             .map(|(id, arch)| {
                 let arch_ptr = arch as *mut Archetype;

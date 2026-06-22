@@ -317,41 +317,188 @@ system registration time in debug builds.
 
 ```rust
 pub trait QueryFilter {
-    type State;
-    fn included_component_ids() -> Vec<ComponentId>;
-    fn excluded_component_ids() -> Vec<ComponentId>;
+    type State: Send + Sync;
+    fn included_component_ids() -> Vec<ComponentId>;    // legacy, used by scheduler
+    fn excluded_component_ids() -> Vec<ComponentId>;    // legacy
+    fn archetype_filter_pairs() -> Vec<(Vec<ComponentId>, Vec<ComponentId>)>;
     fn init_state(archetype, last_run, this_run) -> State;
     fn matches(state, index) -> bool;
 }
 ```
 
-Two-level filtering:
+Filtering operates at two levels, connected by a **disjunctive normal form**
+(DNF) model at the archetype level:
 
-1. **Archetype level** (fast): `included_component_ids` and
-   `excluded_component_ids` narrow the set of archetypes the query visits.
-   `With<T>` adds T to the include set; `Without<T>` adds T to the exclude set.
-2. **Row level** (per-entity): `matches(state, index)` tests each row against
-   the filter predicate. `Changed<T>` checks whether `ticks[index].changed`
-   falls between the system's `last_run` and `this_run`.
+#### Level 1: Archetype scoping — the DNF model
 
-`Or<(A, B)>` ORs row-level predicates. The archetype-level include/exclude sets
-are unioned (not intersected) so all inner filters can run safely.
+Instead of a single `(include, exclude)` mask pair, each filter produces a
+**list** of `(include_ids, exclude_ids)` pairs. The semantics are:
+
+> An archetype matches the filter if it matches **any** pair (OR across pairs).
+> Within a pair, the archetype must contain **all** `include_ids` AND **none**
+> of the `exclude_ids` (AND within each pair).
+
+This is DNF: `(A₁ ∧ ¬X₁) ∨ (A₂ ∧ ¬X₂) ∨ …`
+
+| Filter                                | Pairs returned           | Archetype matches if…                                |
+| ------------------------------------- | ------------------------ | ---------------------------------------------------- |
+| `()` (no filter)                      | `[]` (0 pairs)           | Always — no archetype restrictions                   |
+| `With<A>`                             | `[({A}, {})]`            | Contains A                                           |
+| `Without<B>`                          | `[({}, {B})]`            | Does NOT contain B                                   |
+| `Changed<A>`                          | `[({A}, {})]`            | Contains A (row-level check decides which rows)      |
+| `(With<A>, Without<B>)` (AND tuple)   | `[({A}, {B})]`           | Contains A AND lacks B — cross-product: 1×1 = 1 pair |
+| `Or<(With<A>, With<B>)>`              | `[({A}, {}), ({B}, {})]` | Contains A **OR** B — one pair per inner filter      |
+| `(Or<(With<A>,With<B>)>, Without<C>)` | `[({A},{C}), ({B},{C})]` | (A∧¬C) ∨ (B∧¬C) — cross-product: 2×1 = 2 pairs       |
+
+**How the pairs are built:**
+
+- **Simple filters** (`With`, `Without`, `Changed`, `Added`): the default
+  `archetype_filter_pairs()` implementation returns `[(include_ids, exclude_ids)]`
+  — exactly one pair from the legacy methods.
+
+- **`Or<(A, B, …)>`**: collects pairs from all inner filters (union).
+  If **any** inner filter returns 0 pairs (meaning "no restrictions — matches
+  everything"), the whole `Or` returns 0 pairs. OR with "always true" is
+  "always true".
+
+- **AND tuples `(A, B, …)`**: computes the **cross-product** of inner filter
+  pairs via `and_filter_pairs()`. For each combination, includes and excludes
+  are merged. Inner filters with 0 pairs (no restrictions) are skipped
+  — AND with "always true" is identity.
+
+**Performance note:** For simple filters (1 pair), the archetype check is two
+bitwise ANDs — identical to the old single-mask model. Only `Or` filters pay
+the O(f) multiplier (f = inner filter count, typically 2–4), adding
+~nanoseconds per archetype.
+
+#### Level 2: Row-level predicates
+
+After an archetype passes the DNF check, `init_state` caches per-archetype
+data (e.g., a pointer into `component_ticks`). Then `matches(state, index)`
+is called for each entity row:
+
+| Filter                        | `matches()` logic                                     |
+| ----------------------------- | ----------------------------------------------------- |
+| `()`, `With<T>`, `Without<T>` | Always `true` — filtering happened at archetype level |
+| `Changed<T>`                  | `ticks[index].changed > last_run && <= this_run`      |
+| `Added<T>`                    | `ticks[index].added > last_run && <= this_run`        |
+| AND tuple `(A, B)`            | `A::matches(…) && B::matches(…)` — short-circuit AND  |
+| `Or<(A, B)>`                  | `A::matches(…)                                        |  | B::matches(…)` — short-circuit OR |
+
+**Safety: `Changed<T>` inside `Or`.** When `Or<(With<A>, Changed<B>)>` matches
+an archetype via the `With<A>` branch but the archetype lacks B,
+`Changed<B>::init_state` returns a `TickFilterState::missing()` sentinel.
+`matches()` checks for this and returns `false`, avoiding a null-pointer
+dereference. The entity still passes if another branch (e.g. `With<A>`)
+matches at the row level.
+
+#### Scheduler interaction — the dual purpose of filters
+
+Filters serve two roles that are easy to conflate but distinct in mechanism:
+
+| Role                   | Mechanism                                   | Purpose                                          |
+| ---------------------- | ------------------------------------------- | ------------------------------------------------ |
+| **Query scoping**      | `archetype_filter_pairs()` → DNF mask check | Decides *which archetypes* the query visits      |
+| **Scheduler contract** | `included_component_ids()` → `SystemAccess` | Declares *what components* this system "touches" |
+
+The scheduler side works as follows (`src/system.rs:191–196`):
+
+```rust
+// Filters that gate on a component (e.g. Changed<T>, With<T>) need
+// read access to that component's storage so they don't conflict
+// with concurrent writers of the same component in another system.
+for comp_id in F::included_component_ids() {
+    access.add_read(comp_id);
+}
+```
+
+Every filter that references a component type marks it as **read** in the
+scheduler's access graph, even if the filter doesn't actually read the
+component's data. This is deliberate:
+
+**Example — why `With<Test>` must declare a read on `Test`:**
+
+```
+System A: Query<&mut Position, With<Test>>   → writes Position, reads Test
+System B: Query<&mut Test>                    → writes Test
+```
+
+Without the read declaration, the scheduler would see disjoint access
+(A writes Position, B writes Test — no overlap) and run both in parallel.
+But System A's iteration depends on the archetype structure: if System B
+were to remove `Test` from an entity mid-iteration (moving it to a
+different archetype), System A would have a dangling reference into
+freed storage.
+
+In practice structural mutations go through `Commands` (deferred to the
+frame boundary), so no mid-frame archetype migration actually occurs.
+However, the scheduler takes the **conservative path** and treats the
+filtered component as "read," guaranteeing safety regardless of future
+implementation changes.
+
+**What gets marked for each filter type:**
+
+| Query                                        | `report_component_access` declares | Parallel with `Query<&mut Test>`? |
+| -------------------------------------------- | ---------------------------------- | --------------------------------- |
+| `Query<&Position, With<Test>>`               | Read Position, **Read Test**       | ❌ Conflicts on Test               |
+| `Query<&Position, Changed<Velocity>>`        | Read Position, **Read Velocity**   | ✅ (if Test ≠ Velocity)            |
+| `Query<&mut Health, Or<(With<A>, With<B>)>>` | Write Health, **Read A, Read B**   | ❌ Conflicts on A or B             |
+| `Query<&Position, Without<Test>>`            | Read Position                      | ✅ (Without doesn't mark Test)     |
+| `Query<&Position>` (no filter)               | Read Position                      | ✅                                 |
+
+Notice that `Without<T>` does **not** mark `T` as read — it only excludes
+archetypes containing `T` at the query level and has no scheduler impact.
+This is correct: a system writing to `T` cannot invalidate a
+`Without<T>` query because `T`'s presence is an archetype-level property
+that only changes through deferred commands.
+
+**Why the conservative approach is the right tradeoff:**
+
+- **Safety**: Over-declaring reads never causes unsoundness — it only
+  reduces parallelism by forcing systems into separate batches.
+- **Simplicity**: The scheduler doesn't need to distinguish between
+  "data read," "archetype-mask check," and "row-level filter check."
+  All are uniformly treated as "this system cares about component T."
+- **Correctness under change**: If the ECS later supports mid-frame
+  structural changes, the scheduler contract already prevents the
+  dangerous interleaving.
 
 ### Query execution flow
 
 ```
-Query::iter_mut()
-├─ build_query_mask()      → union of Q::component_ids + F::included_component_ids
-├─ build_exclusion_mask()  → F::excluded_component_ids
-├─ filter archetypes       → HashMap iteration, sorted for determinism
-├─ init_state per archetype → cache raw pointers to component storage
+Query::iter_mut()  /  par_iter_mut()
+│
+├─ build_target_mask()
+│   Uses Q::component_ids() only — the data being fetched.
+│   Separate from filter requirements so Or can add pairs
+│   with OR semantics while the data stays a hard AND.
+│
+├─ build_filter_mask_pairs()
+│   Calls F::archetype_filter_pairs() and converts each
+│   (Vec<ComponentId>, Vec<ComponentId>) into
+│   (ComponentMask, ComponentMask) via the registry.
+│
+├─ filter archetypes
+│   For each archetype in the World:
+│   ┌─ matches_mask(target_mask)          ← must have data components
+│   └─ match filter_pairs.len():
+│       0 → true                           ← no filter restrictions
+│       1 → one include+exclude check      ← the common case
+│       n → any pair matches (OR)          ← only for Or<…>
+│   Sorted by ArchetypeId for determinism.
+│
+├─ init_state per archetype
+│   Q::init_state → cache raw pointers to component storage
+│   F::init_state → cache tick-vec pointers (or missing sentinel)
+│
 └─ iterate rows
    ├─ F::matches(row)      → row-level filter
    └─ Q::fetch_with_state  → construct Item from cached pointers
 ```
 
-For parallel iteration (`par_iter_mut`), the same flow produces a flat
-`Vec<FilteredArchetypeRange>` that Rayon distributes across threads.
+For `par_iter_mut`, the archetype list (with pre-initialized state) is
+collected into a flat `Vec<FilteredArchetypeRange>` that Rayon distributes
+across threads. Empty archetypes are filtered out.
 
 ---
 
