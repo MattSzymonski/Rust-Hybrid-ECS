@@ -176,7 +176,7 @@ impl<'a> ScriptContext<'a> {
 ///         }
 ///
 ///         // Deferred structural changes - safe!
-///         if self.should_die() {
+///         if self.speed > 100.0 {
 ///             ctx.destroy_self(); // Won't execute until update completes
 ///         }
 ///

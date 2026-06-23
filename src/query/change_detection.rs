@@ -27,7 +27,12 @@ use crate::component::{ComponentTicks, Tick};
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```no_run
+/// # use ecs_hybrid::*;
+/// # #[derive(Debug, Clone)] struct Transform { x: f32, y: f32 }
+/// # impl Component for Transform {}
+/// # #[derive(Debug, Clone)] struct Velocity { x: f32, y: f32 }
+/// # impl Component for Velocity {}
 /// fn movement(mut q: Query<(&mut Transform, &Velocity)>) {
 ///     for (mut transform, vel) in q.iter_mut() {
 ///         transform.x += vel.x; // DerefMut bumps the changed tick

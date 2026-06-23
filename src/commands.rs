@@ -38,10 +38,13 @@
 //!
 //! ## Usage Example
 //!
-//! ```ignore
+//! ```no_run
+//! # use ecs_hybrid::*;
+//! # #[derive(Debug, Clone)] struct Health { current: f32 }
+//! # impl Component for Health {}
 //! fn combat_system(mut query: Query<(&Health, Entity)>, mut commands: Commands) {
-//!     for (health, entity) in query.iter() {
-//!         if health.current <= 0 {
+//!     for (health, entity) in query.iter_mut() {
+//!         if health.current <= 0.0 {
 //!             // Queue for destruction - doesn't happen immediately!
 //!             commands.destroy_entity(entity);
 //!         }

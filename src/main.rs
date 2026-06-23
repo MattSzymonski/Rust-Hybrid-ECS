@@ -1,4 +1,4 @@
-﻿use std::io::{self, Write};
+use std::io::{self, Write};
 
 // ============================================================================
 // Archetype-based ECS - Stress Test

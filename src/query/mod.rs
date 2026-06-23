@@ -26,7 +26,12 @@
 //!
 //! ## Usage Examples
 //!
-//! ```ignore
+//! ```no_run
+//! # use ecs_hybrid::*;
+//! # #[derive(Debug, Clone)] struct Transform { x: f32, y: f32 }
+//! # impl Component for Transform {}
+//! # #[derive(Debug, Clone)] struct Velocity { x: f32, y: f32 }
+//! # impl Component for Velocity {}
 //! // Sequential iteration
 //! fn movement_system(mut query: Query<(&mut Transform, &Velocity)>) {
 //!     for (mut transform, velocity) in query.iter_mut() {

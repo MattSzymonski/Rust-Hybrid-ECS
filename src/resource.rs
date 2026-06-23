@@ -15,13 +15,15 @@
 //!
 //! ## Usage
 //!
-//! ```ignore
+//! ```no_run
+//! # use ecs_hybrid::*;
 //! // Define a resource
 //! #[derive(Debug)]
 //! struct GameTime { delta: f32, elapsed: f32 }
 //! impl Resource for GameTime {}
 //!
 //! // Insert into world
+//! # let mut world = World::new();
 //! world.insert_resource(GameTime { delta: 0.016, elapsed: 0.0 });
 //!
 //! // Get a handle (cheap, copyable)
@@ -87,7 +89,8 @@ impl From<ResourceId> for TypeKey {
 /// - Defer resource access to a later point
 ///
 /// # Example
-/// ```ignore
+/// ```no_run
+/// # use ecs_hybrid::*;
 /// #[derive(Debug)]
 /// struct Score(u32);
 /// impl Resource for Score {}
@@ -96,6 +99,7 @@ impl From<ResourceId> for TypeKey {
 /// let handle = ResHandle::<Score>::new();
 ///
 /// // Insert the resource
+/// # let mut world = World::new();
 /// world.insert_resource(Score(0));
 ///
 /// // Use the handle to access the resource

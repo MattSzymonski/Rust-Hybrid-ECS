@@ -11,7 +11,10 @@ use crate::world::World;
 /// read the same resource in parallel.
 ///
 /// # Example
-/// ```ignore
+/// ```no_run
+/// # use ecs_hybrid::*;
+/// # #[derive(Debug)] struct GameTime { elapsed: f32 }
+/// # impl Resource for GameTime {}
 /// fn my_system(time: Res<GameTime>) {
 ///     if let Some(time) = time.get() {
 ///         println!("Elapsed: {}", time.elapsed);
@@ -50,7 +53,10 @@ impl<'w, T: Resource> Res<'w, T> {
 /// other systems (or future frames) detect that the resource was modified.
 ///
 /// # Example
-/// ```ignore
+/// ```no_run
+/// # use ecs_hybrid::*;
+/// # #[derive(Debug)] struct GameTime { elapsed: f32, delta: f32 }
+/// # impl Resource for GameTime {}
 /// fn my_system(mut time: ResMut<GameTime>) {
 ///     if let Some(mut time) = time.get_mut() {
 ///         time.elapsed += time.delta; // bumps changed tick

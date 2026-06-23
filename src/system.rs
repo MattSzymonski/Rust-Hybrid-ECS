@@ -47,9 +47,14 @@
 //!
 //! ## Example: Safe Usage
 //!
-//! ```ignore
-//! fn movement_system(query: Query<(&mut Position, &Velocity)>) {
-//!     for (pos, vel) in query.iter_mut() {
+//! ```no_run
+//! # use ecs_hybrid::*;
+//! # #[derive(Debug, Clone)] struct Position { x: f32, y: f32 }
+//! # impl Component for Position {}
+//! # #[derive(Debug, Clone)] struct Velocity { x: f32, y: f32 }
+//! # impl Component for Velocity {}
+//! fn movement_system(mut query: Query<(&mut Position, &Velocity)>) {
+//!     for (mut pos, vel) in query.iter_mut() {
 //!         pos.x += vel.x;  // OK - using within system
 //!     }
 //! }  // query dropped here - lifetime ends safely

@@ -31,13 +31,16 @@ struct RegisteredSystem {
 /// The main Engine that drives the ECS
 ///
 /// # Example
-/// ```ignore
+/// ```no_run
+/// # use ecs_hybrid::*;
+/// # fn movement_system() {}
+/// # fn collision_system() {}
 /// let mut engine = Engine::new();
 /// engine.register_system("movement", movement_system);
 /// engine.register_system("collision", collision_system);
 ///
 /// // Every frame:
-/// engine.process_frame();
+/// engine.process_frame().unwrap();
 /// ```
 pub struct Engine {
     /// All registered systems with their names and states
@@ -150,7 +153,13 @@ impl Engine {
     /// The name is used for debugging and profiling.
     ///
     /// # Example
-    /// ```ignore
+    /// ```no_run
+    /// # use ecs_hybrid::*;
+    /// # #[derive(Debug, Clone)] struct Position { x: f32, y: f32 }
+    /// # impl Component for Position {}
+    /// # #[derive(Debug, Clone)] struct Velocity { vx: f32, vy: f32 }
+    /// # impl Component for Velocity {}
+    /// # let mut engine = Engine::new();
     /// engine.register_system("movement", |
     ///     mut commands: Commands,
     ///     query: Query<(Entity, &mut Position, &Velocity)>

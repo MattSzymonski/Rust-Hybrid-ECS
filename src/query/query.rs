@@ -20,7 +20,18 @@ use super::FilteredArchetypeRange;
 ///   everything).
 ///
 /// # Examples
-/// ```ignore
+/// ```no_run
+/// # use ecs_hybrid::*;
+/// # #[derive(Debug, Clone)] struct Transform { x: f32, y: f32 }
+/// # impl Component for Transform {}
+/// # #[derive(Debug, Clone)] struct Velocity { vx: f32, vy: f32 }
+/// # impl Component for Velocity {}
+/// # #[derive(Debug, Clone)] struct Health(f32);
+/// # impl Component for Health {}
+/// # #[derive(Debug, Clone)] struct Enemy;
+/// # impl Component for Enemy {}
+/// # #[derive(Debug, Clone)] struct Frozen;
+/// # impl Component for Frozen {}
 /// // Plain query - data only
 /// fn movement(mut q: Query<(&mut Transform, &Velocity)>) { /* ... */ }
 ///

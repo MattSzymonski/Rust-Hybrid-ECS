@@ -8,15 +8,22 @@
 /// The generation is incremented each time an ID is reused. This prevents
 /// "dangling handle" bugs where old references incorrectly access new entities:
 ///
-/// ```ignore
-/// let enemy = world.create_entity().with(Health(100)).build();  // ID 5, gen 0
+/// ```no_run
+/// # use ecs_hybrid::*;
+/// # use trait_type_map::impl_trait_accessible;
+/// # #[derive(Debug, Clone)] struct Health(f32);
+/// # impl Component for Health {}
+/// # #[derive(Debug, Clone)] struct Damage(f32);
+/// # impl Component for Damage {}
+/// # impl_trait_accessible!(dyn Component; Health, Damage);
+/// # let mut world = World::new();
+/// let enemy = world.create_entity().with(Health(100.0)).build().unwrap();  // ID 5, gen 0
 /// world.destroy_entity(enemy);  // ID 5 added to free list with gen 1
 ///
-/// let bullet = world.create_entity().with(Damage(10)).build();  // Reuses ID 5, gen 1
+/// let bullet = world.create_entity().with(Damage(10.0)).build().unwrap();  // Reuses ID 5, gen 1
 ///
 /// // Old handle is safely invalidated:
-/// world.is_entity_valid(enemy);  // false - gen 0 != gen 1
-/// world.get_component::<Health>(enemy);  // None - entity no longer exists
+/// assert!(!world.is_entity_valid(enemy));  // gen 0 != gen 1
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Entity {
@@ -34,6 +41,12 @@ pub struct Entity {
     /// reused for a new entity. A handle is valid only if both id AND generation
     /// match the current entity at that slot.
     pub(crate) generation: u32,
+}
+
+impl std::fmt::Display for Entity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}v{}", self.id, self.generation)
+    }
 }
 
 impl Entity {

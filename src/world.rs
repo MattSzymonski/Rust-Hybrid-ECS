@@ -1143,10 +1143,18 @@ impl<T: Component + TraitAccessible<dyn Component>> ComponentInserter
 /// Builder for constructing entities with components using a fluent API
 ///
 /// Example:
-/// ```ignore
+/// ```no_run
+/// # use ecs_hybrid::*;
+/// # use trait_type_map::impl_trait_accessible;
+/// # #[derive(Debug, Clone)] struct Transform { x: f32, y: f32, z: f32 }
+/// # impl Component for Transform {}
+/// # #[derive(Debug, Clone)] struct Velocity { x: f32, y: f32 }
+/// # impl Component for Velocity {}
+/// # impl_trait_accessible!(dyn Component; Transform, Velocity);
+/// # let mut world = World::new();
 /// world.create_entity()
 ///     .with(Transform { x: 0.0, y: 0.0, z: 0.0 })
-///     .with(Velocity { x: 10.0 })
+///     .with(Velocity { x: 10.0, y: 0.0 })
 ///     .build().unwrap();
 /// ```
 pub struct EntityBuilder<'w> {
