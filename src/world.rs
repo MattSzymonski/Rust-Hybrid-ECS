@@ -131,12 +131,8 @@ pub struct World {
     free_entity_ids: Vec<(u64, u32)>,
     /// All archetypes in the world
     pub(crate) archetypes: HashMap<ArchetypeId, Archetype>,
-    /// Next available archetype ID
-    next_free_archetype_id: usize,
     /// Tracks where each entity is located in the archetype system
     pub(crate) entity_locations: HashMap<Entity, EntityLocation>,
-    /// Lookup table mapping component masks to archetype IDs
-    archetype_lookup: HashMap<ComponentMask, ArchetypeId>,
     /// Storage factories for creating component storage by TypeId
     storage_factories: HashMap<ComponentId, StorageFactory>,
     /// Component copiers for moving entities between archetypes
@@ -186,9 +182,7 @@ impl World {
             next_free_entity_id: 0,
             free_entity_ids: Vec::new(),
             archetypes: HashMap::new(),
-            next_free_archetype_id: 0,
             entity_locations: HashMap::new(),
-            archetype_lookup: HashMap::new(),
             storage_factories: HashMap::new(),
             component_copiers: HashMap::new(),
             script_components: Vec::new(),
@@ -659,8 +653,12 @@ impl World {
             }
         }
 
+        // Derive the archetype ID directly from the mask — the mask uniquely
+        // identifies the component set, so no separate lookup table is needed.
+        let archetype_id = ArchetypeId(component_mask.bits());
+
         // Hot path: archetype already exists (most common case)
-        if let Some(&archetype_id) = self.archetype_lookup.get(&component_mask) {
+        if self.archetypes.contains_key(&archetype_id) {
             return archetype_id;
         }
 
@@ -668,21 +666,16 @@ impl World {
         let mut sorted_ids = component_ids;
         sorted_ids.sort();
 
-        let new_archetype_id = ArchetypeId(self.next_free_archetype_id);
-        self.next_free_archetype_id += 1;
-
         // Create archetype with storage for all component types
         let new_archetype = Archetype::new(
-            new_archetype_id,
+            archetype_id,
             sorted_ids,
             component_mask,
             &self.storage_factories,
         );
-        self.archetypes.insert(new_archetype_id, new_archetype);
-        self.archetype_lookup
-            .insert(component_mask, new_archetype_id);
+        self.archetypes.insert(archetype_id, new_archetype);
 
-        new_archetype_id
+        archetype_id
     }
 
     /// Start building a new entity
@@ -898,9 +891,7 @@ impl World {
 
         // Clean up empty archetype - remove it from world to prevent memory leaks
         if old_archetype.entities.is_empty() {
-            let old_mask = old_archetype.component_mask;
             self.archetypes.remove(&old_archetype_id);
-            self.archetype_lookup.remove(&old_mask);
         }
     }
 
@@ -957,9 +948,7 @@ impl World {
         // Clean up empty archetype - remove it from world to prevent memory leaks
         let archetype_id = location.archetype_id;
         if archetype.entities.is_empty() {
-            let mask = archetype.component_mask;
             self.archetypes.remove(&archetype_id);
-            self.archetype_lookup.remove(&mask);
         }
 
         // Add entity ID to free list with incremented generation for recycling.
@@ -1105,10 +1094,7 @@ impl World {
             .collect();
 
         for archetype_id in empty_archetype_ids {
-            if let Some(archetype) = self.archetypes.remove(&archetype_id) {
-                // Also remove from lookup table
-                self.archetype_lookup.remove(&archetype.component_mask);
-            }
+            self.archetypes.remove(&archetype_id);
         }
     }
 

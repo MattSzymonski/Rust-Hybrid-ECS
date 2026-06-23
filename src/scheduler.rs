@@ -17,7 +17,28 @@
 
 use crate::component::{ComponentId, ComponentMask};
 use crate::resource::ResourceId;
+use std::any::TypeId;
 use std::collections::HashSet;
+
+/// Shared type-key wrapper around [`TypeId`], used as the foundation for
+/// both [`ComponentId`] and [`ResourceId`].
+///
+/// Lives in the scheduler module because it's the primary consumer that
+/// needs to treat component and resource identifiers uniformly when
+/// building access patterns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TypeKey(pub TypeId);
+
+impl TypeKey {
+    pub fn of<T: 'static>() -> Self {
+        TypeKey(TypeId::of::<T>())
+    }
+
+    /// Get the underlying [`TypeId`].
+    pub fn type_id(self) -> TypeId {
+        self.0
+    }
+}
 
 /// Component access information for a system.
 ///

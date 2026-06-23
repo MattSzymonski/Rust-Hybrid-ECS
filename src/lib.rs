@@ -18,13 +18,13 @@ pub mod world;
 
 // Re-export commonly used types
 pub use commands::{CommandError, Commands};
-pub use component::{Component, ComponentTicks, Tick};
+pub use component::{Component, ComponentId, ComponentTicks, Tick};
 pub use engine::Engine;
 pub use entity::Entity;
 pub use query::{
     Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,
 };
 pub use resource::{ResHandle, Resource};
-pub use scheduler::{SystemAccess, SystemScheduler};
+pub use scheduler::{SystemAccess, SystemScheduler, TypeKey};
 pub use scripting::{ScriptComponent, ScriptContext};
 pub use world::{AddComponentError, BuildError, EntityBuilder, RemoveComponentError, World};

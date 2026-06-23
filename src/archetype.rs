@@ -52,9 +52,12 @@ use crate::entity::Entity;
 /// These create empty storage for a specific component type
 pub type StorageFactory = Box<dyn Fn(&mut TraitTypeMap<dyn Component, VecFamily>) + Send + Sync>;
 
-/// ArchetypeId uniquely identifies an archetype (a unique combination of components)
+/// ArchetypeId uniquely identifies an archetype by its component mask.
+///
+/// Derived from the archetype's [`ComponentMask`], guaranteeing a 1:1
+/// mapping without a separate lookup table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ArchetypeId(pub usize);
+pub struct ArchetypeId(pub u128);
 
 pub struct Archetype {
     pub id: ArchetypeId,

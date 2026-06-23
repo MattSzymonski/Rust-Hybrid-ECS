@@ -83,7 +83,12 @@ impl ComponentTicks {
     }
 }
 
-/// ComponentId uniquely identifies a component type using its TypeId
+/// ComponentId uniquely identifies a component type using its TypeId.
+///
+/// Can be converted to/from [`TypeKey`] for code that needs to be generic
+/// over both component and resource type identifiers.
+///
+/// [`TypeKey`]: crate::scheduler::TypeKey
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ComponentId(pub TypeId);
 
@@ -162,6 +167,12 @@ impl ComponentMask {
     pub fn intersects(&self, other: &ComponentMask) -> bool {
         (self.0 & other.0) != 0
     }
+
+    /// Raw u128 bitfield — used to derive a unique [`ArchetypeId`].
+    #[inline]
+    pub(crate) fn bits(self) -> u128 {
+        self.0
+    }
 }
 
 /// Registry that maps component types to bit indices in the component mask.
@@ -220,5 +231,26 @@ impl ComponentRegistry {
     /// Get the type name of a registered component.
     pub fn get_name(&self, component_id: &ComponentId) -> Option<&str> {
         self.names.get(component_id).map(|s| s.as_str())
+    }
+
+    /// Check whether a component type has been registered.
+    ///
+    /// Returns `true` if `T` has been registered via [`register`](Self::register).
+    pub fn is_registered<T: Component>(&self) -> bool {
+        self.id_to_bit.contains_key(&ComponentId::of::<T>())
+    }
+
+    /// Iterate over all registered components.
+    ///
+    /// Yields `(ComponentId, bit_index, type_name)` for each registered
+    /// component type.  Useful for debugging and tooling.
+    pub fn registered_components(&self) -> impl Iterator<Item = (ComponentId, u8, &str)> {
+        self.id_to_bit.iter().map(|(id, &bit)| {
+            (
+                *id,
+                bit,
+                self.names.get(id).map(|s| s.as_str()).unwrap_or("?"),
+            )
+        })
     }
 }

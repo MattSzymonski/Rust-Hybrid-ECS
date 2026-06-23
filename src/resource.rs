@@ -39,6 +39,7 @@
 use std::any::TypeId;
 use std::marker::PhantomData;
 
+use crate::scheduler::TypeKey;
 use crate::world::World;
 
 /// Resource marker trait - resources are singleton data stored in the World.
@@ -49,13 +50,28 @@ use crate::world::World;
 /// Resources must be Send + Sync to support parallel system access.
 pub trait Resource: Send + Sync + 'static {}
 
-/// ResourceId uniquely identifies a resource type using its TypeId
+/// ResourceId uniquely identifies a resource type using its TypeId.
+///
+/// Shares the [`TypeKey`] foundation with [`ComponentId`]
+/// ([`crate::component::ComponentId`]) via [`From`] / [`Into`], allowing
+/// future code to be generic over both component and resource identifiers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ResourceId(pub TypeId);
 
 impl ResourceId {
     pub fn of<T: Resource>() -> Self {
         ResourceId(TypeId::of::<T>())
+    }
+
+    /// View as a [`TypeKey`] for generic type-id code.
+    pub fn as_type_key(self) -> TypeKey {
+        TypeKey(self.0)
+    }
+}
+
+impl From<ResourceId> for TypeKey {
+    fn from(id: ResourceId) -> Self {
+        TypeKey(id.0)
     }
 }
 
@@ -148,11 +164,7 @@ unsafe impl<T: Resource> Sync for ResHandle<T> {}
 
 impl<T: Resource> std::fmt::Debug for ResHandle<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "ResHandle<{}>",
-            std::any::type_name::<T>()
-        )
+        write!(f, "ResHandle<{}>", std::any::type_name::<T>())
     }
 }
 
