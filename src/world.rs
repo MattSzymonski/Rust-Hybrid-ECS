@@ -297,6 +297,11 @@ impl World {
         // Collect script component info to avoid borrow issues
         let script_info: Vec<(ComponentId, u8)> = self.script_components.clone();
 
+        // Pre-allocate size for entities to update. This avoids repeated allocations during the loop.
+        let total_entities = self.entity_locations.len();
+        let mut entities_to_update: Vec<(Entity, ArchetypeId, usize)> =
+            Vec::with_capacity(total_entities);
+
         for (component_id, comp_bit) in script_info {
             // Get the updater for this component type
             // Function pointers are Copy — no Arc clone needed, and no risk
@@ -307,8 +312,6 @@ impl World {
             };
 
             // Collect entities that have this script component
-            let mut entities_to_update: Vec<(Entity, ArchetypeId, usize)> = Vec::new();
-
             for (archetype_id, archetype) in &self.archetypes {
                 // Check if this archetype has the script component using bitmask
                 let mut mask = ComponentMask::empty();
@@ -329,7 +332,7 @@ impl World {
             let world_ptr = self as *mut World;
             let commands_ptr = commands as *mut CommandQueue;
 
-            for (entity, archetype_id, index) in entities_to_update {
+            for (entity, archetype_id, index) in entities_to_update.drain(..) {
                 if let Some(archetype) = self.archetypes.get_mut(&archetype_id) {
                     // Call the updater with mutable storage access
                     updater(
@@ -719,7 +722,7 @@ impl World {
 
         // Maintain change-detection ticks: every component_id in the archetype
         // got exactly one push by the closure above, so push one fresh tick.
-        for component_id in archetype.component_types.clone() {
+        for &component_id in &archetype.component_types {
             archetype
                 .component_ticks
                 .entry(component_id)

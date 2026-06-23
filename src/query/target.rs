@@ -237,3 +237,4 @@ impl_query_target_tuple!(A);
 impl_query_target_tuple!(A, B);
 impl_query_target_tuple!(A, B, C);
 impl_query_target_tuple!(A, B, C, D);
+impl_query_target_tuple!(A, B, C, D, E);

@@ -463,15 +463,15 @@ that only changes through deferred commands.
   structural changes, the scheduler contract already prevents the
   dangerous interleaving.
 
-### Query execution flow
+### Query execution flow (common path)
+
+Both `iter_mut` and `par_iter_mut` share the same build phase:
 
 ```
 Query::iter_mut()  /  par_iter_mut()
 │
 ├─ build_target_mask()
 │   Uses Q::component_ids() only — the data being fetched.
-│   Separate from filter requirements so Or can add pairs
-│   with OR semantics while the data stays a hard AND.
 │
 ├─ build_filter_mask_pairs()
 │   Calls F::archetype_filter_pairs() and converts each
@@ -491,14 +491,74 @@ Query::iter_mut()  /  par_iter_mut()
 │   Q::init_state → cache raw pointers to component storage
 │   F::init_state → cache tick-vec pointers (or missing sentinel)
 │
-└─ iterate rows
-   ├─ F::matches(row)      → row-level filter
-   └─ Q::fetch_with_state  → construct Item from cached pointers
+└─ collected into Vec<FilteredArchetypeRange> (one entry per archetype)
 ```
 
-For `par_iter_mut`, the archetype list (with pre-initialized state) is
-collected into a flat `Vec<FilteredArchetypeRange>` that Rayon distributes
-across threads. Empty archetypes are filtered out.
+### Sequential iteration
+
+`iter_mut()` produces a standard Rust `Iterator`. Each call to `next()`
+walks through archetypes and rows sequentially, advancing to the next
+archetype when the current one is exhausted. The hot path (same archetype)
+is a simple index increment + filter check; the cold path (`advance_archetype`)
+performs a HashMap lookup and caches new state pointers.
+
+### Parallel iteration with Rayon
+
+`par_iter_mut()` produces a `ParQueryIter` backed by Rayon.  The flow:
+
+1. **Build phase** (same as sequential): target mask, filter pairs, archetype
+   matching, deterministic sort, `init_state` for each matching archetype.
+   The result is a `Vec<FilteredArchetypeRange>` — one entry per matching
+   archetype, each containing pre-initialised query-target and filter state
+   plus the entity count.
+
+2. **Execution phase** — two strategies depending on workload size:
+
+#### Adaptive fallback
+
+Before spawning any Rayon tasks, the total entity count is computed (O(arch)
+sum of precomputed lengths).  If `total < num_threads × 256`, the iteration
+runs **sequentially**:
+
+```
+for each (archetype_state, filter_state, len) in ranges:
+    for i in 0..len:
+        if filter.matches(i): f(fetch(state, i))
+```
+
+This avoids Rayon's task-spawning and work-stealing overhead for tiny
+workloads — common when a world contains many small archetypes (e.g. marker
+components on otherwise-similar entities).  On an 8-core machine the
+threshold is 2048 entities; below that, the sequential loop is faster.
+
+#### Two-level `par_iter` (large workloads)
+
+When the total exceeds the threshold, the existing nested structure runs:
+
+```
+archetype_ranges.into_par_iter()          ← outer: one task per archetype
+    .for_each(|(_, q, f, len)| {
+        (0..len).into_par_iter()           ← inner: distribute rows
+            .with_min_len(min_len)          ← minimum chunk size
+            .for_each(|i| { if F::matches(&f, i) { callback(...) } })
+    });
+```
+
+- **Outer level**: Rayon distributes archetypes across threads.  Each thread
+  takes ownership of one archetype at a time via work-stealing.
+- **Inner level**: within an archetype, rows are further split into chunks
+  (`with_min_len` controls the minimum chunk size, default 1).  Multiple
+  threads can process different chunks of the same archetype concurrently.
+- **Safety**: two threads never observe the same row because they own
+  disjoint index ranges.  Raw pointers to component storage (`SendPtr`)
+  cross thread boundaries, but references are created locally on each
+  worker thread.
+
+For **tracked** iteration (`.tracked().for_each(...)`), each inner batch
+uses `fold_with` to accumulate a per-chunk entity count, then pushes it
+into shared `AtomicUsize` counters.  The aggregated `BatchStats` (thread
+count, batch count, min/max/avg batch size) are returned to the caller for
+performance introspection.
 
 ---
 

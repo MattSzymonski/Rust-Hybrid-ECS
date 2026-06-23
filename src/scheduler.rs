@@ -74,10 +74,12 @@ impl SystemAccess {
         Self::default()
     }
 
+    #[inline]
     pub fn add_read(&mut self, component_id: ComponentId) {
         self.reads.insert(component_id);
     }
 
+    #[inline]
     pub fn add_write(&mut self, component_id: ComponentId) {
         self.writes.insert(component_id);
     }
@@ -86,10 +88,12 @@ impl SystemAccess {
         self.uses_commands = uses;
     }
 
+    #[inline]
     pub fn add_resource_read(&mut self, resource_id: ResourceId) {
         self.resource_reads.insert(resource_id);
     }
 
+    #[inline]
     pub fn add_resource_write(&mut self, resource_id: ResourceId) {
         self.resource_writes.insert(resource_id);
     }
@@ -123,6 +127,7 @@ impl SystemAccess {
     /// when masks are empty (e.g. in tests that don't have a registry).
     ///
     /// Resource conflicts always use [`HashSet::is_disjoint`].
+    #[inline]
     pub fn conflicts_with(&self, other: &SystemAccess) -> bool {
         // Commands require exclusive World access
         if self.uses_commands || other.uses_commands {
