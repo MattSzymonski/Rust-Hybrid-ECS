@@ -131,11 +131,8 @@ impl<'w, Q: QueryTarget, F: QueryFilter> QueryIterMut<'w, Q, F> {
             self.current_archetype_len = archetype.len();
             let arch_ptr = archetype as *mut Archetype;
             self.current_state = Some(Q::init_state(&mut *arch_ptr, self.this_run));
-            self.current_filter_state = Some(F::init_state(
-                &mut *arch_ptr,
-                self.last_run,
-                self.this_run,
-            ));
+            self.current_filter_state =
+                Some(F::init_state(&mut *arch_ptr, self.last_run, self.this_run));
             self.current_entity_idx = 0;
             self.current_archetype_idx += 1;
         }
@@ -208,9 +205,7 @@ where
 impl<'w, Q: QueryTarget, F: QueryFilter> ParQueryIter<'w, Q, F> {
     /// Construct a new parallel iterator with default settings. Used by
     /// [`Query::par_iter_mut`].
-    pub(crate) fn new(
-        archetype_ranges: Vec<FilteredArchetypeRange<Q::State, F::State>>,
-    ) -> Self {
+    pub(crate) fn new(archetype_ranges: Vec<FilteredArchetypeRange<Q::State, F::State>>) -> Self {
         Self {
             archetype_ranges,
             min_batch_size: None,
@@ -238,7 +233,10 @@ where
     /// may be smaller when a non-trivial filter (e.g. `Changed<T>`) is in
     /// use.
     pub fn entity_count(&self) -> usize {
-        self.archetype_ranges.iter().map(|(_, _, _, len)| *len).sum()
+        self.archetype_ranges
+            .iter()
+            .map(|(_, _, _, len)| *len)
+            .sum()
     }
 
     /// Set minimum batch size for parallel iteration.
@@ -275,10 +273,39 @@ where
         }
     }
 
+    /// Execute the closure on every matching entity (untracked).
+    ///
+    /// Uses an adaptive fallback if the total entity count is below
+    /// `num_threads × 256`, the iteration runs sequentially — avoiding
+    /// Rayon scheduling overhead for tiny workloads (common when many
+    /// small archetypes exist).  Above the threshold, the existing
+    /// two-level `par_iter` (archetypes × rows) is used, which performs
+    /// well for large entity counts.
     fn execute_untracked<Func>(self, f: Func)
     where
         Func: Fn(Q::Item<'_>) + Send + Sync,
     {
+        // Sum precomputed entity counts — O(archetypes), negligible.
+        let total: usize = self.archetype_ranges.iter().map(|(_, _, _, len)| len).sum();
+        let threshold = rayon::current_num_threads() * 256;
+
+        if total < threshold {
+            // Adaptive fallback: sequential loop.  For small N the
+            // overhead of spawning Rayon tasks exceeds the work itself,
+            // especially with many tiny archetypes.
+            for (_, q_state, f_state, len) in &self.archetype_ranges {
+                for index in 0..*len {
+                    if F::matches(f_state, index) {
+                        f(Q::fetch_with_state(q_state, index));
+                    }
+                }
+            }
+            return;
+        }
+
+        // Parallel path: two-level par_iter (archetypes × rows).
+        // Each outer task handles one archetype; the inner par_iter
+        // distributes rows within that archetype across threads.
         let min_len = self.min_batch_size.unwrap_or(1);
 
         self.archetype_ranges
@@ -295,12 +322,50 @@ where
             });
     }
 
+    /// Execute the closure on every matching entity, collecting
+    /// [`BatchStats`] about how Rayon distributed the work.
+    ///
+    /// Same adaptive fallback as [`execute_untracked`]: sequential below
+    /// `num_threads × 256` entities, two-level `par_iter` above.
+    ///
+    /// Tracking adds per-batch atomics (count, min, max) so the caller
+    /// can inspect load distribution.  The atomic overhead is modest
+    /// because each batch only bumps the counters once.
+    ///
+    /// [`execute_untracked`]: Self::execute_untracked
     fn execute_tracked<Func>(self, f: Func) -> BatchStats
     where
         Func: Fn(Q::Item<'_>) + Send + Sync,
     {
         let num_threads = rayon::current_num_threads();
-        let total_entities = self.entity_count();
+        let total_entities: usize = self.archetype_ranges.iter().map(|(_, _, _, len)| len).sum();
+        let threshold = num_threads * 256;
+
+        // Adaptive fallback: sequential for tiny workloads.
+        if total_entities < threshold {
+            let mut processed = 0usize;
+            for (_, q_state, f_state, len) in &self.archetype_ranges {
+                for index in 0..*len {
+                    if F::matches(f_state, index) {
+                        f(Q::fetch_with_state(q_state, index));
+                    }
+                    processed += 1;
+                }
+            }
+            return BatchStats {
+                total_entities,
+                batch_count: 1,
+                min_batch_size: processed,
+                max_batch_size: processed,
+                avg_batch_size: processed as f64,
+                num_threads,
+            };
+        }
+
+        // Parallel path: two-level par_iter with per-batch atomics.
+        // `fold_with` accumulates a per-thread count within each inner
+        // batch; the `for_each` at the end pushes the count into shared
+        // atomics for aggregated stats.
         let min_len = self.min_batch_size.unwrap_or(1);
 
         let batch_count = Arc::new(AtomicUsize::new(0));
