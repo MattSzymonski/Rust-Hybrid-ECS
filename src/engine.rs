@@ -167,6 +167,9 @@ impl Engine {
         let mut access = SystemAccess::new();
         Input::report_access(&mut access);
 
+        // Precompute ComponentMask bitfields for O(1) conflict detection.
+        access.build_component_masks(&self.world.component_registry);
+
         // Register with scheduler
         self.scheduler.register_system(access);
 

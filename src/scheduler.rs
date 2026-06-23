@@ -15,16 +15,26 @@
 //! - The scheduler dependency analysis ensures that no two systems that access the same component in a conflicting way
 //!   are run in parallel, preventing data races and ensuring thread safety.
 
-use crate::component::ComponentId;
+use crate::component::{ComponentId, ComponentMask};
 use crate::resource::ResourceId;
 use std::collections::HashSet;
 
-/// Component access information for a system
+/// Component access information for a system.
+///
+/// During registration, components are collected into [`HashSet`]s via
+/// [`add_read`] / [`add_write`].  After registration, [`build_component_masks`]
+/// converts them into [`ComponentMask`] bitfields so that [`conflicts_with`]
+/// can use single-instruction bitwise AND instead of hashing.
+///
+/// [`add_read`]: SystemAccess::add_read
+/// [`add_write`]: SystemAccess::add_write
+/// [`build_component_masks`]: SystemAccess::build_component_masks
+/// [`conflicts_with`]: SystemAccess::conflicts_with
 #[derive(Debug, Clone, Default)]
 pub struct SystemAccess {
-    /// Components read immutably (&T)
+    /// Components read immutably (&T) — registration phase
     pub reads: HashSet<ComponentId>,
-    /// Components written mutably (&mut T)
+    /// Components written mutably (&mut T) — registration phase
     pub writes: HashSet<ComponentId>,
     /// Whether the system uses Commands (requires exclusive World access)
     pub uses_commands: bool,
@@ -32,6 +42,10 @@ pub struct SystemAccess {
     pub resource_reads: HashSet<ResourceId>,
     /// Resources written mutably (ResMut<T>)
     pub resource_writes: HashSet<ResourceId>,
+
+    // --- Precomputed bitmasks for O(1) conflict detection ---
+    reads_mask: ComponentMask,
+    writes_mask: ComponentMask,
 }
 
 impl SystemAccess {
@@ -59,49 +73,82 @@ impl SystemAccess {
         self.resource_writes.insert(resource_id);
     }
 
-    /// Check if this system conflicts with another
+    /// Populate the internal [`ComponentMask`] fields from the [`HashSet`]
+    /// fields using the given [`ComponentRegistry`](crate::component::ComponentRegistry).
     ///
-    /// Two systems conflict if:
-    /// - Either uses Commands (Commands require exclusive access)
-    /// - Both write to the same component (write-write conflict)
-    /// - One writes and the other reads the same component (read-write conflict)
+    /// Must be called after all `add_read` / `add_write` calls and before
+    /// the first [`conflicts_with`] call.  The scheduler calls this
+    /// automatically during graph building.
+    pub fn build_component_masks(&mut self, registry: &crate::component::ComponentRegistry) {
+        self.reads_mask = ComponentMask::empty();
+        self.writes_mask = ComponentMask::empty();
+        for id in &self.reads {
+            if let Some(bit) = registry.get_bit(id) {
+                self.reads_mask.set(bit);
+            }
+        }
+        for id in &self.writes {
+            if let Some(bit) = registry.get_bit(id) {
+                self.writes_mask.set(bit);
+            }
+        }
+    }
+
+    /// Check if this system conflicts with another.
     ///
-    /// Multiple systems can read the same component simultaneously (read-read is OK)
+    /// Component conflicts are detected with a single bitwise AND
+    /// (O(1) via [`ComponentMask`]) when masks have been built via
+    /// [`build_component_masks`].  Falls back to [`HashSet::is_disjoint`]
+    /// when masks are empty (e.g. in tests that don't have a registry).
+    ///
+    /// Resource conflicts always use [`HashSet::is_disjoint`].
     pub fn conflicts_with(&self, other: &SystemAccess) -> bool {
         // Commands require exclusive World access
         if self.uses_commands || other.uses_commands {
             return true;
         }
 
-        // Check for write-write conflicts
-        if !self.writes.is_disjoint(&other.writes) {
-            return true;
+        // Component conflicts — prefer O(1) bitmasks when available,
+        // fall back to HashSet for tests / ad-hoc usage.
+        if self.reads_mask.is_empty()
+            && self.writes_mask.is_empty()
+            && other.reads_mask.is_empty()
+            && other.writes_mask.is_empty()
+        {
+            // Fallback: use HashSet operations
+            if !self.writes.is_disjoint(&other.writes) {
+                return true;
+            }
+            if !self.writes.is_disjoint(&other.reads) {
+                return true;
+            }
+            if !self.reads.is_disjoint(&other.writes) {
+                return true;
+            }
+        } else {
+            // Fast path: O(1) bitwise AND
+            if self.writes_mask.intersects(&other.writes_mask) {
+                return true;
+            }
+            if self.writes_mask.intersects(&other.reads_mask) {
+                return true;
+            }
+            if self.reads_mask.intersects(&other.writes_mask) {
+                return true;
+            }
         }
 
-        // Check for read-write conflicts (write on one side, read on the other)
-        if !self.writes.is_disjoint(&other.reads) {
-            return true;
-        }
-
-        if !self.reads.is_disjoint(&other.writes) {
-            return true;
-        }
-
-        // Check for resource write-write conflicts
+        // Resource conflicts — still HashSet-based
         if !self.resource_writes.is_disjoint(&other.resource_writes) {
             return true;
         }
-
-        // Check for resource read-write conflicts
         if !self.resource_writes.is_disjoint(&other.resource_reads) {
             return true;
         }
-
         if !self.resource_reads.is_disjoint(&other.resource_writes) {
             return true;
         }
 
-        // No conflicts - systems can run in parallel
         false
     }
 }
@@ -112,6 +159,10 @@ pub struct SystemScheduler {
     system_count: usize,
     /// Access patterns for each system
     access_patterns: Vec<SystemAccess>,
+    /// Precomputed conflict matrix: `conflict_matrix[i][j]` is true when
+    /// system `i` conflicts with system `j`.  Built once after all systems
+    /// are registered, then reused for every graph rebuild.
+    conflict_matrix: Vec<Vec<bool>>,
     /// Computed execution graph: Vec of batches, each batch contains system indices that can run in parallel
     execution_graph: Vec<Vec<usize>>,
 }
@@ -122,6 +173,7 @@ impl SystemScheduler {
         Self {
             system_count: 0,
             access_patterns: Vec::new(),
+            conflict_matrix: Vec::new(),
             execution_graph: Vec::new(),
         }
     }
@@ -134,49 +186,41 @@ impl Default for SystemScheduler {
 }
 
 impl SystemScheduler {
-    /// Register a system with its access pattern
+    /// Register a system with its access pattern.
+    ///
+    /// Returns the system's index for later reference.
     pub fn register_system(&mut self, access: SystemAccess) -> usize {
         let index = self.system_count;
         self.access_patterns.push(access);
         self.system_count += 1;
+        // Extend the conflict matrix for the new system.
+        self.extend_conflict_matrix();
         index
     }
 
-    /// Build the execution graph based on dependencies
+    /// Extend the conflict matrix by one row and column for a newly
+    /// registered system.  Computes conflicts against all existing
+    /// systems (O(n) per registration, O(n²) total).
+    fn extend_conflict_matrix(&mut self) {
+        let new_idx = self.system_count - 1;
+        // Add a row for the new system.
+        let mut new_row = vec![false; self.system_count];
+        for j in 0..new_idx {
+            let conflict = self.access_patterns[new_idx].conflicts_with(&self.access_patterns[j]);
+            new_row[j] = conflict;
+            // Matrix is symmetric — also fill the column.
+            self.conflict_matrix[j].push(conflict);
+        }
+        // A system doesn't conflict with itself (already false).
+        self.conflict_matrix.push(new_row);
+    }
+
+    /// Build the execution graph based on dependencies.
     ///
-    /// # Algorithm
-    ///
-    /// Build the parallel execution graph using greedy batching.
-    ///
-    /// # Algorithm
-    ///
-    /// Uses a greedy approach that iterates through systems in registration order:
-    /// 1. Start with an empty batch
-    /// 2. For each unscheduled system:
-    ///    - If it doesn't conflict with any system in the current batch, add it
-    ///    - Otherwise, skip it for now
-    /// 3. When no more systems can be added, finalize the batch
-    /// 4. Repeat until all systems are scheduled
-    ///
-    /// # Limitations
-    ///
-    /// This greedy algorithm is O(n²) in the number of systems and may not produce
-    /// the optimal (minimum) number of batches. For example, with systems A, B, C where:
-    /// - A conflicts with B
-    /// - B conflicts with C  
-    /// - A does NOT conflict with C
-    ///
-    /// Registration order [A, B, C] produces: [[A, C], [B]] (2 batches, optimal)
-    /// Registration order [B, A, C] produces: [[B], [A, C]] (2 batches, optimal)
-    ///
-    /// However, pathological orderings could produce suboptimal results. For most
-    /// real-world system counts (<100), this is not a concern. For very large system
-    /// counts, consider using topological sort with graph coloring.
-    ///
-    /// # Correctness
-    ///
-    /// Despite potential suboptimality, the algorithm is **always correct**: systems
-    /// in the same batch are guaranteed to have non-conflicting access patterns.
+    /// Uses a precomputed conflict matrix so that each pairwise check is
+    /// an O(1) array lookup instead of a full `conflicts_with` call.
+    /// The batching algorithm itself remains O(n²) in the worst case,
+    /// but the constant factor is dramatically reduced.
     pub fn build_execution_graph(&mut self) {
         self.execution_graph.clear();
 
@@ -192,10 +236,9 @@ impl SystemScheduler {
                     continue;
                 }
 
-                // Check if this system conflicts with any system already in the batch
-                let conflicts = batch
-                    .iter()
-                    .any(|&j| self.access_patterns[i].conflicts_with(&self.access_patterns[j]));
+                // Check if this system conflicts with any system already in the batch.
+                // Uses the precomputed matrix — O(batch_size) array lookups.
+                let conflicts = batch.iter().any(|&j| self.conflict_matrix[i][j]);
 
                 if !conflicts {
                     batch.push(i);
@@ -766,6 +809,90 @@ mod tests {
         // System 1 and 2 conflict on resource X (write vs read)
         // System 3 doesn't conflict with either
         assert!(scheduler.execution_graph().len() >= 2);
+    }
+
+    #[test]
+    fn test_conflicts_with_uses_component_mask_fast_path() {
+        // Verify that conflicts_with correctly detects conflicts via the
+        // ComponentMask path (not the HashSet fallback).  The existing
+        // tests never call build_component_masks(), so they only exercise
+        // the fallback.
+        use crate::component::{Component, ComponentRegistry};
+        use std::any::TypeId;
+
+        // Simulate a registry with two component types at bits 0 and 1.
+        let mut registry = ComponentRegistry::new();
+
+        #[derive(Debug)]
+        struct A;
+        #[derive(Debug)]
+        struct B;
+        impl Component for A {}
+        impl Component for B {}
+
+        registry.register::<A>();
+        registry.register::<B>();
+
+        let id_a = ComponentId(TypeId::of::<A>());
+        let id_b = ComponentId(TypeId::of::<B>());
+
+        // --- write-write conflict via masks ---
+        let mut a = SystemAccess::new();
+        a.add_write(id_a);
+        a.build_component_masks(&registry);
+
+        let mut b = SystemAccess::new();
+        b.add_write(id_a);
+        b.build_component_masks(&registry);
+
+        // Both masks are non-empty — fast path must be active.
+        assert!(!a.reads_mask.is_empty() || !a.writes_mask.is_empty());
+        assert!(!b.reads_mask.is_empty() || !b.writes_mask.is_empty());
+        assert!(a.conflicts_with(&b), "write-write on A should conflict");
+
+        // --- read-write conflict via masks ---
+        let mut a = SystemAccess::new();
+        a.add_read(id_a);
+        a.build_component_masks(&registry);
+
+        let mut b = SystemAccess::new();
+        b.add_write(id_a);
+        b.build_component_masks(&registry);
+
+        assert!(a.conflicts_with(&b), "read(A) vs write(A) should conflict");
+        assert!(
+            b.conflicts_with(&a),
+            "write(A) vs read(A) should conflict (symmetric)"
+        );
+
+        // --- no conflict (disjoint types) via masks ---
+        let mut a = SystemAccess::new();
+        a.add_read(id_a);
+        a.build_component_masks(&registry);
+
+        let mut b = SystemAccess::new();
+        b.add_write(id_b);
+        b.build_component_masks(&registry);
+
+        assert!(
+            !a.conflicts_with(&b),
+            "read(A) vs write(B) should NOT conflict"
+        );
+        assert!(!b.conflicts_with(&a));
+
+        // --- read-read is fine via masks ---
+        let mut a = SystemAccess::new();
+        a.add_read(id_a);
+        a.build_component_masks(&registry);
+
+        let mut b = SystemAccess::new();
+        b.add_read(id_a);
+        b.build_component_masks(&registry);
+
+        assert!(
+            !a.conflicts_with(&b),
+            "read(A) vs read(A) should NOT conflict"
+        );
     }
 
     // ========================================================================
