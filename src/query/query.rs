@@ -186,23 +186,62 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     }
 
     /// Get the first matching entity's components.
+    ///
+    /// For unfiltered queries, finds the first non-empty matching archetype
+    /// directly. For filtered queries, falls back to the iterator.
     #[inline]
     pub fn first(&mut self) -> Option<Q::Item<'_>> {
+        // Fast path: unfiltered query - grab the first entity from the first non-empty matching archetype.
+        if self.filter_pairs.is_empty() {
+            let this_run = self.world.increment_change_tick();
+            for archetype in self.world.archetypes.values_mut() {
+                if archetype.matches_mask(&self.target_mask) && !archetype.is_empty() {
+                    let state = Q::init_state(archetype, this_run);
+                    return Some(Q::fetch_with_state(&state, 0));
+                }
+            }
+            return None;
+        }
         self.iter_mut().next()
     }
 
     /// Check if any entity matches this query.
+    ///
+    /// For unfiltered queries, this is O(archetypes).  
+    /// For filtered queries, falls back to checking the first matching row.
     #[inline]
     pub fn is_empty(&mut self) -> bool {
+        // Fast path: unfiltered query - just check if any matching archetype has entities.
+        if self.filter_pairs.is_empty() {
+            return !self
+                .world
+                .archetypes
+                .values()
+                .any(|arch| arch.matches_mask(&self.target_mask) && !arch.is_empty());
+        }
+        // Slow path: need per-row filter evaluation.
         self.iter_mut().next().is_none()
     }
 
     /// Count the number of entities matching this query.
     ///
-    /// When the filter is non-trivial (e.g. `Changed<T>`), this is O(n)
-    /// over candidate rows because each row must be tested individually.
+    /// For unfiltered queries (`F = ()`), this is O(archetypes) - sums
+    /// archetype entity counts directly without iterating rows.  For
+    /// filtered queries (e.g. `Changed<T>`), falls back to O(n) row-by-row
+    /// counting since each row must be tested individually.
     #[inline]
     pub fn entity_count(&mut self) -> usize {
+        // Fast path: unfiltered query - just sum archetype lengths.
+        if self.filter_pairs.is_empty() {
+            return self
+                .world
+                .archetypes
+                .values()
+                .filter(|arch| arch.matches_mask(&self.target_mask))
+                .map(|arch| arch.len())
+                .sum();
+        }
+        // Slow path: need per-row filter evaluation.
         self.iter_mut().count()
     }
 
@@ -227,8 +266,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             .filter(|(_, arch)| !arch.is_empty())
             .map(|(id, arch)| {
                 let arch_ptr = arch as *mut Archetype;
-                // SAFETY: We have exclusive access to `arch` and only call
-                // each init_state once.
+                // SAFETY: We have exclusive access to `arch` and only call each init_state once.
                 let q_state = unsafe { Q::init_state(&mut *arch_ptr, this_run) };
                 let f_state = unsafe { F::init_state(&mut *arch_ptr, last_run, this_run) };
                 let len = arch.len();

@@ -193,7 +193,7 @@ impl CommandQueue {
     /// Queue creating a new entity with components.
     ///
     /// The `entity` must have been pre-allocated from the world's free
-    /// list — it won't exist in the world until commands are flushed,
+    /// list - it won't exist in the world until commands are flushed,
     /// but the caller receives the handle immediately.
     pub fn create_entity(&mut self, entity: Entity, components: Vec<Box<dyn ComponentAdder>>) {
         self.commands.push(DeferredCommand::CreateEntity {
@@ -317,7 +317,10 @@ impl CommandQueue {
             }
         };
 
-        let old_archetype = world.archetypes.get(&entity_location.archetype_id).unwrap();
+        let old_archetype = world
+            .archetypes
+            .get(&entity_location.archetype_id)
+            .expect("archetype must exist for entity at its recorded location");
         let mut new_component_ids = old_archetype.component_types.clone();
         let new_component_id = component_adder.component_id();
         if new_component_ids.contains(&new_component_id) {
@@ -481,7 +484,7 @@ impl<'a> Commands<'a> {
 /// entities immediately, this builder queues the creation for deferred
 /// execution.  However, the entity ID is still allocated eagerly from the
 /// free list at construction time, so [`build()`](Self::build) can return
-/// it immediately — the entity just won't be queryable until after the
+/// it immediately - the entity just won't be queryable until after the
 /// current frame's deferred commands are flushed.
 pub struct DeferredEntityBuilder<'a> {
     command_queue: &'a mut CommandQueue,
