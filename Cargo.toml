@@ -8,6 +8,29 @@ rayon = "1.10"
 parking_lot = "0.12"
 trait_type_map = { path = "../trait_type_map" }
 
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "entity_lifecycle"
+harness = false
+
+[[bench]]
+name = "query_iteration"
+harness = false
+
+[[bench]]
+name = "archetype_migration"
+harness = false
+
+[[bench]]
+name = "scheduler_graph"
+harness = false
+
+[[bench]]
+name = "frame_loop"
+harness = false
+
 [lib]
 name = "ecs_hybrid"
 path = "src/lib.rs"
