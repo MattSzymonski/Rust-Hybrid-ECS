@@ -19,7 +19,7 @@ use super::ptr::{SendPtr, SendPtrMut};
 
 /// Returns `true` when `writes` contains any duplicate [`ComponentId`],
 /// which would mean a query tuple has two `&mut T` elements for the same
-/// `T`. That pattern creates aliasing `&mut` references — UB.
+/// `T`. That pattern creates aliasing `&mut` references - UB.
 #[inline]
 pub(crate) fn has_duplicate_writes(writes: &[ComponentId]) -> bool {
     // Small-N linear scan: tuples are at most arity 4 (or 8 in the

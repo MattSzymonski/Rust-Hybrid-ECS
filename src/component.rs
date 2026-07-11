@@ -1,17 +1,31 @@
-// ============================================================================
+// ----------------------------------------------------------------------------
 // Component System
-// ============================================================================
+// ----------------------------------------------------------------------------
 //! Component trait and identification system.
 
 use std::any::TypeId;
 use std::collections::HashMap;
 
-/// Component marker trait - all components must be 'static and Send
+/// Component marker trait - all components must be `'static` and [`Send`].
+///
+/// # Interior Mutability Warning
+///
+/// Components are accessed concurrently during parallel iteration. Although
+/// `Component` only requires [`Send`] (not [`Sync`]), parallel queries may
+/// create multiple `&T` references to the same component data across
+/// threads. **Avoid [`Cell`](std::cell::Cell), [`RefCell`](std::cell::RefCell),
+/// or other interior-mutability types in component structs** - they can
+/// cause data races when read concurrently through shared references.
+///
+/// If you need mutable state inside a component accessed by multiple
+/// systems, prefer splitting the mutable portion into a separate component
+/// type and using `&mut T` queries (which the scheduler serializes
+/// correctly).
 pub trait Component: Send + 'static {}
 
-// ============================================================================
+// ----------------------------------------------------------------------------
 // Change Detection Ticks
-// ============================================================================
+// ----------------------------------------------------------------------------
 
 /// Monotonically increasing counter used to detect when components change.
 ///
@@ -168,7 +182,7 @@ impl ComponentMask {
         (self.0 & other.0) != 0
     }
 
-    /// Raw u128 bitfield — used to derive a unique [`ArchetypeId`].
+    /// Raw u128 bitfield - used to derive a unique [`ArchetypeId`].
     #[inline]
     pub(crate) fn bits(self) -> u128 {
         self.0

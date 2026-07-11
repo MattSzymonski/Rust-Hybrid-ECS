@@ -1,6 +1,6 @@
-// ============================================================================
+// ----------------------------------------------------------------------------
 // System Infrastructure - Bevy-Style SystemParam
-// ============================================================================
+// ----------------------------------------------------------------------------
 //! Advanced system parameter infrastructure that allows automatic parameter
 //! resolution for system functions.
 //!
@@ -98,9 +98,9 @@ where
     }
 }
 
-// ============================================================================
+// ----------------------------------------------------------------------------
 // SystemParam - Automatic Parameter Extraction
-// ============================================================================
+// ----------------------------------------------------------------------------
 
 /// SystemParam trait - any type that can be extracted as a system parameter
 ///
@@ -139,7 +139,7 @@ pub trait SystemParam: Sized {
 
 /// Commands is a SystemParam - provides deferred entity operations
 impl SystemParam for Commands<'static> {
-    fn fetch(_world: &mut World, queue: &mut CommandQueue) -> Self {
+    fn fetch(world: &mut World, queue: &mut CommandQueue) -> Self {
         // CRITICAL RISK: Lifetime transmutation from actual borrow to 'static.
         //
         // This is sound IFF the caller upholds the SystemParam safety contract:
@@ -152,7 +152,7 @@ impl SystemParam for Commands<'static> {
         //
         // Undefined behavior if Commands escapes (e.g., stored in static variable,
         // moved to another thread, or captured in an escaping closure).
-        unsafe { std::mem::transmute(Commands::new(queue)) }
+        unsafe { std::mem::transmute(Commands::new(queue, world)) }
     }
 
     fn report_access(access: &mut SystemAccess) {
@@ -253,9 +253,9 @@ impl<T: Resource> SystemParam for ResMut<'static, T> {
     }
 }
 
-// ============================================================================
+// ----------------------------------------------------------------------------
 // SystemParam Tuple Implementations
-// ============================================================================
+// ----------------------------------------------------------------------------
 
 /// Macro to implement SystemParam for tuples
 ///
@@ -292,9 +292,9 @@ impl_system_param_tuple!(A, B, C, D);
 impl_system_param_tuple!(A, B, C, D, E);
 impl_system_param_tuple!(A, B, C, D, E, F1);
 
-// ============================================================================
+// ----------------------------------------------------------------------------
 // SystemParamFunction - Function to System Conversion
-// ============================================================================
+// ----------------------------------------------------------------------------
 
 /// SystemParamFunction trait - functions that can be converted to systems
 ///
@@ -339,9 +339,9 @@ impl_system_param_function!(A, B, C, D);
 impl_system_param_function!(A, B, C, D, E);
 impl_system_param_function!(A, B, C, D, E, F1);
 
-// ============================================================================
+// ----------------------------------------------------------------------------
 // IntoSystem - Automatic System Conversion
-// ============================================================================
+// ----------------------------------------------------------------------------
 
 /// Trait for converting functions into Systems
 ///

@@ -374,7 +374,7 @@ fn test_report_component_access_mixed() {
 #[should_panic(expected = "duplicate mutable component types")]
 fn test_duplicate_mutable_types_rejected() {
     // Query<(&mut Position, &mut Position)> would create aliasing &mut
-    // references to the same storage — UB. The debug_assert! inside
+    // references to the same storage - UB. The debug_assert! inside
     // report_component_access() must catch this.
     let _ = <(&mut Position, &mut Position)>::report_component_access();
 }
@@ -707,7 +707,7 @@ fn test_filter_or_with_components_either() {
         .with(Health(10))
         .build()
         .unwrap();
-    // This entity has neither A nor B — should be excluded.
+    // This entity has neither A nor B - should be excluded.
     let _e_none = world.create_entity().with(Health(10)).build().unwrap();
 
     // Query for entities that have Position OR Velocity (via With filter).
@@ -735,7 +735,7 @@ fn test_filter_or_with_without_correct_archetypes() {
         .with(Velocity { x: 0.0, y: 0.0 })
         .build()
         .unwrap();
-    // e_b has Velocity but no Position — excluded by both branches.
+    // e_b has Velocity but no Position - excluded by both branches.
     let _e_b = world
         .create_entity()
         .with(Velocity { x: 0.0, y: 0.0 })
@@ -869,8 +869,8 @@ fn test_filter_or_three_way() {
         .unwrap();
     let e_hp = world.create_entity().with(Health(10)).build().unwrap();
     // Entity with none of the three (empty archetype isn't possible, but
-    // we can make one with a different component — no, we don't have a
-    // 4th component. That's fine — the test covers A, B, C archetypes.)
+    // we can make one with a different component - no, we don't have a
+    // 4th component. That's fine - the test covers A, B, C archetypes.)
 
     let mut q =
         Query::<(Entity,), Or<(With<Position>, With<Velocity>, With<Health>)>>::new(&mut world);
@@ -945,7 +945,7 @@ fn test_filter_or_empty_target_with_or() {
         .unwrap();
     let _e_none = world.create_entity().with(Health(10)).build().unwrap();
 
-    // () as QueryTarget — fetches no data, but Entity is available via iter_mut
+    // () as QueryTarget - fetches no data, but Entity is available via iter_mut
     let mut q = Query::<(Entity,), Or<(With<Position>, With<Velocity>)>>::new(&mut world);
     let mut hits: Vec<Entity> = q.iter_mut().map(|(e,)| e).collect();
     hits.sort_by_key(|e| e.id());
@@ -979,7 +979,7 @@ fn test_filter_or_no_double_count() {
 
 #[test]
 fn test_filter_or_par_iter() {
-    // Parallel iteration with Or filter — smoke test for correctness.
+    // Parallel iteration with Or filter - smoke test for correctness.
     // Uses for_each with a Mutex since ParQueryIter doesn't implement
     // rayon::ParallelIterator directly.
     use std::sync::Mutex;
@@ -1063,7 +1063,7 @@ fn test_filter_or_with_unit_branch_first() {
 
 #[test]
 fn test_filter_or_duplicate_inner_filters() {
-    // Or<(With<A>, With<A>)>: redundant inner filters — should behave
+    // Or<(With<A>, With<A>)>: redundant inner filters - should behave
     // identically to a single With<A> (no double-counting, no panic).
     let mut world = setup_world();
     let e_a = world
@@ -1129,7 +1129,7 @@ fn test_filter_and_of_two_ors() {
 
 #[test]
 fn test_filter_single_element_tuple() {
-    // (With<A>,) — single-element filter tuple should behave same as With<A>.
+    // (With<A>,) - single-element filter tuple should behave same as With<A>.
     let mut world = setup_world();
     let e_a = world
         .create_entity()

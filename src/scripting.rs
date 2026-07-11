@@ -1,6 +1,6 @@
-// ============================================================================
+// ----------------------------------------------------------------------------
 // Scripting System
-// ============================================================================
+// ----------------------------------------------------------------------------
 //! Script components that can update themselves each frame.
 //!
 //! Scripts receive a `ScriptContext` instead of direct `Engine` access.
@@ -61,9 +61,9 @@ impl<'a> ScriptContext<'a> {
         self.self_entity
     }
 
-    // ========================================================================
+    // ----------------------------------------------------------------------------
     // Read-Only World Access (Safe - no structural changes)
-    // ========================================================================
+    // ----------------------------------------------------------------------------
 
     /// Get immutable reference to a component on any entity
     pub fn get_component<T>(&self, entity: Entity) -> Option<&T>
@@ -90,8 +90,8 @@ impl<'a> ScriptContext<'a> {
     where
         T: Component + TraitAccessible<dyn Component>,
     {
-        let ptr = self.world.get_component_ptr_mut::<T>(entity)?;
-        Some(unsafe { &mut *ptr })
+        let component_pointer = self.world.get_component_ptr_mut::<T>(entity)?;
+        Some(unsafe { &mut *component_pointer })
     }
 
     /// Check if an entity exists
@@ -104,16 +104,16 @@ impl<'a> ScriptContext<'a> {
         self.world.get_resource::<T>()
     }
 
-    // ========================================================================
+    // ----------------------------------------------------------------------------
     // Deferred Commands (Safe - executed after all scripts complete)
-    // ========================================================================
+    // ----------------------------------------------------------------------------
 
     /// Queue spawning a new entity (deferred)
     ///
     /// The entity will be created after all scripts finish updating.
-    /// Returns an EntityBuilder to add components.
-    pub fn create_entity(&mut self) -> crate::commands::EntityBuilder<'_> {
-        crate::commands::EntityBuilder::new(self.commands)
+    /// Returns a DeferredEntityBuilder to add components.
+    pub fn create_entity(&mut self) -> crate::commands::DeferredEntityBuilder<'_> {
+        crate::commands::DeferredEntityBuilder::new(self.commands, self.world)
     }
 
     /// Queue destroying an entity (deferred)
@@ -169,15 +169,15 @@ impl<'a> ScriptContext<'a> {
 /// }
 ///
 /// impl ScriptComponent for PlayerController {
-///     fn update(&mut self, ctx: &mut ScriptContext) {
+///     fn update(&mut self, script_context: &mut ScriptContext) {
 ///         // Safe read access
-///         if let Some(pos) = ctx.get_component::<Position>(ctx.entity()) {
-///             println!("Player at {:?}", pos);
+///         if let Some(position) = script_context.get_component::<Position>(script_context.get_owning_entity()) {
+///             println!("Player at {:?}", position);
 ///         }
 ///
 ///         // Deferred structural changes - safe!
 ///         if self.speed > 100.0 {
-///             ctx.destroy_self(); // Won't execute until update completes
+///             script_context.destroy_entity(script_context.get_owning_entity());
 ///         }
 ///
 ///         // Can still modify self safely
@@ -189,6 +189,6 @@ pub trait ScriptComponent: Component {
     /// Update this script component
     ///
     /// Called once per frame by the scripting system.
-    /// Use `ctx.entity()` to get the entity this script is attached to.
-    fn update(&mut self, ctx: &mut ScriptContext);
+    /// Use `script_context.get_owning_entity()` to get the entity this script is attached to.
+    fn update(&mut self, script_context: &mut ScriptContext);
 }

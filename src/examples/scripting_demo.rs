@@ -12,18 +12,18 @@ struct Counter {
 impl Component for Counter {}
 
 impl ScriptComponent for Counter {
-    fn update(&mut self, ctx: &mut ScriptContext) {
+    fn update(&mut self, script_context: &mut ScriptContext) {
         // Modify self directly (always safe)
         self.value = (self.value + self.increment).min(self.max_value);
         println!("Counter: {} / {}", self.value, self.max_value);
 
         // Read component on own entity
-        if let Some(position) = ctx.get_component::<Position>(ctx.get_owning_entity()) {
+        if let Some(position) = script_context.get_component::<Position>(script_context.get_owning_entity()) {
             println!("  Position: ({}, {})", position.x, position.y);
         }
 
         // Mutate component on own entity (different type than self - safe)
-        if let Some(position) = ctx.get_component_mut::<Position>(ctx.get_owning_entity()) {
+        if let Some(position) = script_context.get_component_mut::<Position>(script_context.get_owning_entity()) {
             position.y = self.value as f32;
             println!("  Updated Position.y to {}", position.y);
         }
@@ -31,24 +31,24 @@ impl ScriptComponent for Counter {
         // Destroy entity when max reached (deferred - executes after all scripts)
         if self.value >= self.max_value {
             println!("  Counter reached max! Queueing destruction...");
-            ctx.destroy_entity(ctx.get_owning_entity());
+            script_context.destroy_entity(script_context.get_owning_entity());
         }
 
-        let entity: Entity = ctx.get_owning_entity().clone();
+        let entity: Entity = script_context.get_owning_entity().clone();
 
-        ctx.get_commands()
+        script_context.get_commands()
             .add_component_to_entity(entity, Position { x: 42.0, y: 3.14 });
 
         // // Example: Spawn new entity (deferred)
-        // ctx.create_entity()
+        // script_context.create_entity()
         //     .with(Position { x: 0.0, y: 0.0 })
         //     .build().unwrap();
 
         // // Example: Add component to entity (deferred)
-        // ctx.add_component(ctx.get_owning_entity(), Velocity { x: 1.0, y: 0.0 });
+        // script_context.add_component(script_context.get_owning_entity(), Velocity { x: 1.0, y: 0.0 });
 
         // // Example: Remove component from entity (deferred)
-        // ctx.remove_component::<Velocity>(ctx.get_owning_entity());
+        // script_context.remove_component::<Velocity>(script_context.get_owning_entity());
     }
 }
 

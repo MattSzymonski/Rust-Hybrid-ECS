@@ -42,7 +42,7 @@ impl<'w, T: Resource> Res<'w, T> {
     }
 }
 
-/// Mutable resource access for systems — with change-detection tracking.
+/// Mutable resource access for systems - with change-detection tracking.
 ///
 /// Use `ResMut<T>` as a system parameter to read and write a resource.
 /// The scheduler tracks this as a write and prevents other systems from

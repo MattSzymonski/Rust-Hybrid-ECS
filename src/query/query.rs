@@ -50,9 +50,9 @@ use super::FilteredArchetypeRange;
 pub struct Query<'w, Q: QueryTarget, F: QueryFilter = ()> {
     world: &'w mut World,
     /// Cached component mask for the query target (data being fetched).
-    /// Computed once at construction — static for a given `Q`.
+    /// Computed once at construction - static for a given `Q`.
     target_mask: ComponentMask,
-    /// Cached filter mask pairs. Computed once at construction — static
+    /// Cached filter mask pairs. Computed once at construction - static
     /// for a given `F`.  For simple filters this is a single pair; only
     /// [`Or`] filters produce multiple pairs.
     filter_pairs: Vec<(ComponentMask, ComponentMask)>,
@@ -89,20 +89,20 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         let registry = &world.component_registry;
         F::archetype_filter_pairs()
             .into_iter()
-            .map(|(inc_ids, exc_ids)| {
-                let mut inc = ComponentMask::empty();
-                let mut exc = ComponentMask::empty();
-                for id in &inc_ids {
-                    if let Some(bit) = registry.get_bit(id) {
-                        inc.set(bit);
+            .map(|(included_ids, excluded_ids)| {
+                let mut included_mask = ComponentMask::empty();
+                let mut excluded_mask = ComponentMask::empty();
+                for component_id in &included_ids {
+                    if let Some(bit) = registry.get_bit(component_id) {
+                        included_mask.set(bit);
                     }
                 }
-                for id in &exc_ids {
-                    if let Some(bit) = registry.get_bit(id) {
-                        exc.set(bit);
+                for component_id in &excluded_ids {
+                    if let Some(bit) = registry.get_bit(component_id) {
+                        excluded_mask.set(bit);
                     }
                 }
-                (inc, exc)
+                (included_mask, excluded_mask)
             })
             .collect()
     }
@@ -119,7 +119,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     ///      target components matches.
     ///    - **1 pair** (e.g. `With<A>`, `Without<B>`, `Changed<A>`):
     ///      the archetype must have all `include` components AND none of
-    ///      the `exclude` components. This is the simple case — just like
+    ///      the `exclude` components. This is the simple case - just like
     ///      the old `(include_mask, exclude_mask)` model.
     ///    - **2+ pairs** (only [`Or`] filters): the archetype matches if
     ///      **any** pair matches. For `Or<(With<A>, With<B>)>` the pairs
@@ -136,23 +136,25 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         }
 
         match filter_pairs.len() {
-            // No filter restrictions — any archetype with the target components passes.
+            // No filter restrictions - any archetype with the target components passes.
             0 => true,
 
             // Fast path: the common case. One include+exclude pair.
             // Conceptually identical to the old `(include, exclude)` model.
             1 => {
-                let (inc, exc) = &filter_pairs[0];
-                archetype.matches_mask(inc)
-                    && (exc.is_empty()
-                        || ComponentMask::intersection(&archetype.component_mask, exc).is_empty())
+                let (included_mask, excluded_mask) = &filter_pairs[0];
+                archetype.matches_mask(included_mask)
+                    && (excluded_mask.is_empty()
+                        || ComponentMask::intersection(&archetype.component_mask, excluded_mask)
+                            .is_empty())
             }
 
             // Only reached for `Or<...>` filters. Match if ANY pair matches.
-            _ => filter_pairs.iter().any(|(inc, exc)| {
-                archetype.matches_mask(inc)
-                    && (exc.is_empty()
-                        || ComponentMask::intersection(&archetype.component_mask, exc).is_empty())
+            _ => filter_pairs.iter().any(|(included_mask, excluded_mask)| {
+                archetype.matches_mask(included_mask)
+                    && (excluded_mask.is_empty()
+                        || ComponentMask::intersection(&archetype.component_mask, excluded_mask)
+                            .is_empty())
             }),
         }
     }

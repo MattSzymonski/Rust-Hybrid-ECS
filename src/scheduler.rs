@@ -1,6 +1,6 @@
-// ============================================================================
+// ----------------------------------------------------------------------------
 // Parallel System Scheduler
-// ============================================================================
+// ----------------------------------------------------------------------------
 //! Automatic dependency analysis and parallel system execution.
 //!
 //! This module analyzes component access patterns to build a dependency graph
@@ -53,9 +53,9 @@ impl TypeKey {
 /// [`conflicts_with`]: SystemAccess::conflicts_with
 #[derive(Debug, Clone, Default)]
 pub struct SystemAccess {
-    /// Components read immutably (&T) — registration phase
+    /// Components read immutably (&T) - registration phase
     pub reads: HashSet<ComponentId>,
-    /// Components written mutably (&mut T) — registration phase
+    /// Components written mutably (&mut T) - registration phase
     pub writes: HashSet<ComponentId>,
     /// Whether the system uses Commands (requires exclusive World access)
     pub uses_commands: bool,
@@ -134,7 +134,7 @@ impl SystemAccess {
             return true;
         }
 
-        // Component conflicts — prefer O(1) bitmasks when available,
+        // Component conflicts - prefer O(1) bitmasks when available,
         // fall back to HashSet for tests / ad-hoc usage.
         if self.reads_mask.is_empty()
             && self.writes_mask.is_empty()
@@ -164,7 +164,7 @@ impl SystemAccess {
             }
         }
 
-        // Resource conflicts — still HashSet-based
+        // Resource conflicts - still HashSet-based
         if !self.resource_writes.is_disjoint(&other.resource_writes) {
             return true;
         }
@@ -234,7 +234,7 @@ impl SystemScheduler {
         for j in 0..new_idx {
             let conflict = self.access_patterns[new_idx].conflicts_with(&self.access_patterns[j]);
             new_row[j] = conflict;
-            // Matrix is symmetric — also fill the column.
+            // Matrix is symmetric - also fill the column.
             self.conflict_matrix[j].push(conflict);
         }
         // A system doesn't conflict with itself (already false).
@@ -263,7 +263,7 @@ impl SystemScheduler {
                 }
 
                 // Check if this system conflicts with any system already in the batch.
-                // Uses the precomputed matrix — O(batch_size) array lookups.
+                // Uses the precomputed matrix - O(batch_size) array lookups.
                 let conflicts = batch.iter().any(|&j| self.conflict_matrix[i][j]);
 
                 if !conflicts {
@@ -292,11 +292,11 @@ impl SystemScheduler {
     /// Print execution graph for debugging
     pub fn print_execution_graph(&self, system_names: &[&str]) {
         println!("\n=== System Execution Graph ===");
-        for (batch_idx, batch) in self.execution_graph.iter().enumerate() {
-            println!("Batch {}: {} systems (parallel)", batch_idx, batch.len());
-            for &sys_idx in batch {
-                let name = system_names.get(sys_idx).unwrap_or(&"<unknown>");
-                let access = &self.access_patterns[sys_idx];
+        for (batch_index, batch) in self.execution_graph.iter().enumerate() {
+            println!("Batch {}: {} systems (parallel)", batch_index, batch.len());
+            for &system_index in batch {
+                let name = system_names.get(system_index).unwrap_or(&"<unknown>");
+                let access = &self.access_patterns[system_index];
                 println!(
                     "  - {} (reads: {}, writes: {}, res_reads: {}, res_writes: {}, commands: {})",
                     name,
@@ -320,24 +320,24 @@ mod tests {
 
     // Helper: Verify that no batch contains conflicting systems
     fn assert_no_batch_conflicts(scheduler: &SystemScheduler) {
-        for (batch_idx, batch) in scheduler.execution_graph().iter().enumerate() {
-            for (i, &idx_a) in batch.iter().enumerate() {
-                let access_a = scheduler.get_access(idx_a).unwrap();
-                for &idx_b in &batch[i + 1..] {
-                    let access_b = scheduler.get_access(idx_b).unwrap();
+        for (batch_index, batch) in scheduler.execution_graph().iter().enumerate() {
+            for (i, &system_index_a) in batch.iter().enumerate() {
+                let access_a = scheduler.get_access(system_index_a).unwrap();
+                for &system_index_b in &batch[i + 1..] {
+                    let access_b = scheduler.get_access(system_index_b).unwrap();
                     assert!(
                         !access_a.conflicts_with(access_b),
                         "Batch {} contains conflicting systems {} and {}!\n\
                          System {}: reads={:?}, writes={:?}, commands={}\n\
                          System {}: reads={:?}, writes={:?}, commands={}",
-                        batch_idx,
-                        idx_a,
-                        idx_b,
-                        idx_a,
+                        batch_index,
+                        system_index_a,
+                        system_index_b,
+                        system_index_a,
                         access_a.reads,
                         access_a.writes,
                         access_a.uses_commands,
-                        idx_b,
+                        system_index_b,
                         access_b.reads,
                         access_b.writes,
                         access_b.uses_commands
@@ -351,13 +351,17 @@ mod tests {
     fn assert_all_systems_scheduled(scheduler: &SystemScheduler, system_count: usize) {
         let mut scheduled = vec![false; system_count];
         for batch in scheduler.execution_graph() {
-            for &idx in batch {
-                assert!(!scheduled[idx], "System {} scheduled multiple times", idx);
-                scheduled[idx] = true;
+            for &system_index in batch {
+                assert!(
+                    !scheduled[system_index],
+                    "System {} scheduled multiple times",
+                    system_index
+                );
+                scheduled[system_index] = true;
             }
         }
-        for (idx, &was_scheduled) in scheduled.iter().enumerate() {
-            assert!(was_scheduled, "System {} was not scheduled", idx);
+        for (system_index, &was_scheduled) in scheduled.iter().enumerate() {
+            assert!(was_scheduled, "System {} was not scheduled", system_index);
         }
     }
 
@@ -711,9 +715,9 @@ mod tests {
         assert_eq!(scheduler.execution_graph()[0].len(), 5);
     }
 
-    // ========================================================================
+    // ----------------------------------------------------------------------------
     // Resource Conflict Tests
-    // ========================================================================
+    // ----------------------------------------------------------------------------
 
     #[test]
     fn test_resource_read_read_parallel() {
@@ -871,7 +875,7 @@ mod tests {
         b.add_write(id_a);
         b.build_component_masks(&registry);
 
-        // Both masks are non-empty — fast path must be active.
+        // Both masks are non-empty - fast path must be active.
         assert!(!a.reads_mask.is_empty() || !a.writes_mask.is_empty());
         assert!(!b.reads_mask.is_empty() || !b.writes_mask.is_empty());
         assert!(a.conflicts_with(&b), "write-write on A should conflict");
@@ -921,13 +925,13 @@ mod tests {
         );
     }
 
-    // ========================================================================
+    // ----------------------------------------------------------------------------
     // Empirical verification: exhaustive enumeration + random fuzz
-    // ========================================================================
+    // ----------------------------------------------------------------------------
     //
     // These tests do NOT constitute a mathematical proof. They are empirical
     // checks that verify the implementation against a large but finite number
-    // of input patterns — covering all relevant conflict categories
+    // of input patterns - covering all relevant conflict categories
     // (components, resources, Commands, and combinations thereof).
     //
     // Together they provide high confidence that the scheduler never puts
@@ -938,16 +942,16 @@ mod tests {
     /// conflicts for both components and resources, plus Commands and no-op.
     #[derive(Clone, Copy, PartialEq, Eq, Hash)]
     enum AccessKind {
-        None,      // accesses nothing — free to run in any batch
+        None,      // accesses nothing - free to run in any batch
         ReadA,     // reads component A
-        WriteA,    // writes component A — conflicts with ReadA, WriteA
+        WriteA,    // writes component A - conflicts with ReadA, WriteA
         ReadB,     // reads component B
-        WriteB,    // writes component B — conflicts with ReadB, WriteB
-        Commands,  // uses Commands — conflicts with everything
+        WriteB,    // writes component B - conflicts with ReadB, WriteB
+        Commands,  // uses Commands - conflicts with everything
         ResReadX,  // reads resource X
-        ResWriteX, // writes resource X — conflicts with ResReadX, ResWriteX
+        ResWriteX, // writes resource X - conflicts with ResReadX, ResWriteX
         ResReadY,  // reads resource Y
-        ResWriteY, // writes resource Y — conflicts with ResReadY, ResWriteY
+        ResWriteY, // writes resource Y - conflicts with ResReadY, ResWriteY
     }
 
     /// Converts an `AccessKind` into a concrete `SystemAccess` value
@@ -1007,16 +1011,16 @@ mod tests {
 
             // Enumerate all n-tuples by counting in base kinds.len()
             for counter in 0..total {
-                let mut val = counter;
+                let mut counter_value = counter;
                 for i in 0..n as usize {
-                    tuple[i] = (val % kinds.len() as u32) as u8;
-                    val /= kinds.len() as u32;
+                    tuple[i] = (counter_value % kinds.len() as u32) as u8;
+                    counter_value /= kinds.len() as u32;
                 }
 
                 // Build a fresh scheduler with this specific combination
                 let mut scheduler = SystemScheduler::new();
-                for &idx in &tuple {
-                    scheduler.register_system(kind_to_access(kinds[idx as usize]));
+                for &kind_index in &tuple {
+                    scheduler.register_system(kind_to_access(kinds[kind_index as usize]));
                 }
                 scheduler.build_execution_graph();
 
@@ -1037,7 +1041,7 @@ mod tests {
     ///
     /// The random generator uses a simple LCG (Linear Congruential
     /// Generator) seeded from a hashed seed value. This gives
-    /// deterministic-but-varied sequences — reproducible if a failure
+    /// deterministic-but-varied sequences - reproducible if a failure
     /// is found, but covering a wide range of patterns across seeds.
     #[test]
     fn proof_random_fuzz_large_n() {
@@ -1067,9 +1071,9 @@ mod tests {
             // Build a scheduler with n randomly-chosen access kinds
             let mut scheduler = SystemScheduler::new();
             for _ in 0..n {
-                let idx = (rng % kinds.len() as u64) as usize;
+                let kind_index = (rng % kinds.len() as u64) as usize;
                 rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
-                scheduler.register_system(kind_to_access(kinds[idx]));
+                scheduler.register_system(kind_to_access(kinds[kind_index]));
             }
             scheduler.build_execution_graph();
 

@@ -13,9 +13,9 @@ use super::filter::QueryFilter;
 use super::target::QueryTarget;
 use super::FilteredArchetypeRange;
 
-// ============================================================================
+// ----------------------------------------------------------------------------
 // Batch Statistics
-// ============================================================================
+// ----------------------------------------------------------------------------
 
 /// Statistics about batch distribution during parallel iteration.
 ///
@@ -52,9 +52,9 @@ impl std::fmt::Display for BatchStats {
     }
 }
 
-// ============================================================================
+// ----------------------------------------------------------------------------
 // Sequential Iterator
-// ============================================================================
+// ----------------------------------------------------------------------------
 
 /// Sequential iterator for mutable queries.
 pub struct QueryIterMut<'w, Q: QueryTarget, F: QueryFilter = ()> {
@@ -167,9 +167,9 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Iterator for QueryIterMut<'w, Q, F> {
     }
 }
 
-// ============================================================================
+// ----------------------------------------------------------------------------
 // Parallel Iterator
-// ============================================================================
+// ----------------------------------------------------------------------------
 
 /// Parallel iterator for queries using Rayon.
 ///
@@ -276,7 +276,7 @@ where
     /// Execute the closure on every matching entity (untracked).
     ///
     /// Uses an adaptive fallback if the total entity count is below
-    /// `num_threads × 256`, the iteration runs sequentially — avoiding
+    /// `num_threads × 256`, the iteration runs sequentially - avoiding
     /// Rayon scheduling overhead for tiny workloads (common when many
     /// small archetypes exist).  Above the threshold, the existing
     /// two-level `par_iter` (archetypes × rows) is used, which performs
@@ -285,7 +285,7 @@ where
     where
         Func: Fn(Q::Item<'_>) + Send + Sync,
     {
-        // Sum precomputed entity counts — O(archetypes), negligible.
+        // Sum precomputed entity counts - O(archetypes), negligible.
         let total: usize = self.archetype_ranges.iter().map(|(_, _, _, len)| len).sum();
         let threshold = rayon::current_num_threads() * 256;
 

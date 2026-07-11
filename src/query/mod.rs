@@ -55,7 +55,7 @@
 pub(crate) mod change_detection;
 mod filter;
 mod iter;
-mod ptr;
+pub(crate) mod ptr;
 #[allow(clippy::module_inception)]
 mod query;
 mod resource;

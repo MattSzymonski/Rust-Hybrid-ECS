@@ -1,6 +1,6 @@
-// ============================================================================
+// ----------------------------------------------------------------------------
 // Stress Test Example - Performance Testing
-// ============================================================================
+// ----------------------------------------------------------------------------
 //! This example stress tests the ECS with:
 //! - 10,000 entities
 //! - Multiple box colliders on obstacle entity
@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use trait_type_map::impl_trait_accessible;
 
-// ============================================================================
+// ----------------------------------------------------------------------------
 // Components
-// ============================================================================
+// ----------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 struct SimulationStats {
@@ -122,9 +122,9 @@ impl Component for Obstacle {}
 // Make all components accessible via the Component trait for TraitTypeMap
 impl_trait_accessible!(dyn Component; Transform, Velocity, BoxCollider, Obstacle);
 
-// ============================================================================
+// ----------------------------------------------------------------------------
 // Systems
-// ============================================================================
+// ----------------------------------------------------------------------------
 
 fn collision_and_movement_system(
     mut moving_query: Query<(&mut Transform, &Velocity)>,
@@ -212,9 +212,9 @@ fn simulation_tracker_system(mut stats: ResMut<SimulationStats>) {
     }
 }
 
-// ============================================================================
+// ----------------------------------------------------------------------------
 // Main
-// ============================================================================
+// ----------------------------------------------------------------------------
 
 pub fn main() {
     println!("=== Stress Test: Archetype-Based ECS ===\n");
@@ -295,10 +295,10 @@ pub fn main() {
     let near_count = count_query
         .iter_mut()
         .filter(|(transform,)| {
-            let dx = transform.x - 50.0;
-            let dy = transform.y;
-            let dist = (dx * dx + dy * dy).sqrt();
-            dist < 15.0
+            let delta_x = transform.x - 50.0;
+            let delta_y = transform.y;
+            let distance = (delta_x * delta_x + delta_y * delta_y).sqrt();
+            distance < 15.0
         })
         .count();
 

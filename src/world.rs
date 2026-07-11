@@ -1,6 +1,6 @@
-// ============================================================================
+// ----------------------------------------------------------------------------
 // World - Central ECS State Management
-// ============================================================================
+// ----------------------------------------------------------------------------
 //! The World is the central container for all ECS data.
 //!
 //! It manages entities, archetypes, and provides the primary interface for
@@ -50,6 +50,10 @@ pub(crate) struct EntityLocation {
     pub(crate) archetype_id: ArchetypeId,
     pub(crate) index_in_archetype: usize,
 }
+
+// ----------------------------------------------------------------------------
+// Component add/remove errors
+// ----------------------------------------------------------------------------
 
 /// Error type for `add_component` operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,7 +111,7 @@ impl std::fmt::Display for BuildError {
             BuildError::ComponentNotRegistered(id) => {
                 write!(
                     f,
-                    "component {:?} not registered — call world.register_component::<T>() first",
+                    "component {:?} not registered - call world.register_component::<T>() first",
                     id
                 )
             }
@@ -116,6 +120,48 @@ impl std::fmt::Display for BuildError {
 }
 
 impl std::error::Error for BuildError {}
+
+// ----------------------------------------------------------------------------
+// Per-thread last-run tick
+// ----------------------------------------------------------------------------
+//
+// In parallel mode, multiple systems run on different threads simultaneously.
+// Each system needs its own "last ran at tick X" value so change-detection
+// filters compare against the correct baseline.  A single shared field on
+// World would race, so we use thread-local storage instead.
+//
+// How it works:
+//   1. Before running system A on thread 1:  store tick 5 in thread-local
+//   2. Before running system B on thread 2:  store tick 3 in thread-local
+//   3. Inside each system, world.system_last_run() checks the thread-local
+//      first → each thread sees its own value, no sharing, no race.
+//   4. After the system finishes: restore the previous value (usually None).
+//
+// In sequential mode the override stays None, so queries fall back to the
+// shared world.system_last_run field - no thread-local overhead.
+
+thread_local! {
+    /// Each thread's private "my system last ran at tick ___" value.
+    /// `None` means "not in a parallel batch - use the world field."
+    static PER_THREAD_LAST_RUN_TICK: std::cell::Cell<Option<Tick>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[inline]
+fn per_thread_last_run_tick() -> Option<Tick> {
+    PER_THREAD_LAST_RUN_TICK.with(|cell| cell.get())
+}
+
+/// Store a per-thread baseline tick, returning the old value so the
+/// caller can restore it when the system finishes (RAII-style).
+#[inline]
+pub(crate) fn set_per_thread_last_run_tick(value: Option<Tick>) -> Option<Tick> {
+    PER_THREAD_LAST_RUN_TICK.with(|cell| cell.replace(value))
+}
+
+// ----------------------------------------------------------------------------
+// World - Central ECS State Management
+// ----------------------------------------------------------------------------
 
 /// World manages all entities, archetypes, and resources
 ///
@@ -275,9 +321,9 @@ impl World {
                     // representation prevents these pointers from being cached
                     // across calls.
                     unsafe {
-                        let mut ctx =
+                        let mut script_context =
                             ScriptContext::new(&mut *world_ptr, &mut *commands_ptr, entity);
-                        component.update(&mut ctx);
+                        component.update(&mut script_context);
                     }
                 }) as ScriptUpdater,
             );
@@ -294,18 +340,19 @@ impl World {
     /// This ensures all structural changes (add/remove component, destroy entity)
     /// are automatically deferred, preventing use-after-free bugs.
     pub(crate) fn update_scripts(&mut self, commands: &mut CommandQueue) {
-        // Collect script component info to avoid borrow issues
-        let script_info: Vec<(ComponentId, u8)> = self.script_components.clone();
-
-        // Pre-allocate size for entities to update. This avoids repeated allocations during the loop.
+        // Pre-allocate the work list.  We recycle this Vec across script
+        // types via `.drain(..)`, so only one allocation per frame.
         let total_entities = self.entity_locations.len();
         let mut entities_to_update: Vec<(Entity, ArchetypeId, usize)> =
             Vec::with_capacity(total_entities);
 
-        for (component_id, comp_bit) in script_info {
-            // Get the updater for this component type
-            // Function pointers are Copy — no Arc clone needed, and no risk
-            // of the callee caching the raw pointers across calls.
+        // Take raw pointers once, BEFORE any field borrows on self.
+        let world_ptr = self as *mut World;
+        let commands_ptr = commands as *mut CommandQueue;
+
+        for &(component_id, comp_bit) in &self.script_components {
+            // Get the updater for this component type.
+            // Function pointers are Copy - no allocation here.
             let updater = match self.script_updaters.get(&component_id) {
                 Some(&u) => u,
                 None => continue,
@@ -329,9 +376,6 @@ impl World {
             // Sort by (archetype_id, index) for deterministic order across runs.
             entities_to_update.sort_by_key(|(_, aid, idx)| (*aid, *idx));
 
-            let world_ptr = self as *mut World;
-            let commands_ptr = commands as *mut CommandQueue;
-
             for (entity, archetype_id, index) in entities_to_update.drain(..) {
                 if let Some(archetype) = self.archetypes.get_mut(&archetype_id) {
                     // Call the updater with mutable storage access
@@ -347,9 +391,29 @@ impl World {
         }
     }
 
-    // ========================================================================
-    // Change Detection Ticks
-    // ========================================================================
+    // ----------------------------------------------------------------------------
+    // Change Detection - "what changed since my system last ran?"
+    // ----------------------------------------------------------------------------
+    //
+    // Every component and resource stores two tick values: `added` and `changed`.
+    // The world bumps a global tick counter each frame.  When you write to a
+    // component (through `&mut T` in a query, via `Mut<T>`), its `changed`
+    // tick is set to the current world tick.
+    //
+    // Filters like `Changed<T>` and `Added<T>` compare each entity's ticks
+    // against a *baseline* - the tick at which the calling system last ran.
+    // If a component's `changed` tick is newer than that baseline, the entity
+    // is yielded.  This is how "only process entities that were modified since
+    // I last looked" works without any manual dirty flags.
+    //
+    // The baseline comes from one of two places:
+    //
+    //   SEQUENTIAL mode → world.system_last_run  (one shared field)
+    //   PARALLEL  mode → per-thread override      (no sharing, no races)
+    //
+    // In parallel mode the Engine sets a thread-local override before each
+    // system runs, so every thread sees the correct baseline for its own
+    // system without touching shared state.
 
     /// Read the current world tick without modifying it.
     #[inline]
@@ -368,59 +432,31 @@ impl World {
         Tick::new(self.change_tick)
     }
 
-    /// Read the baseline tick that change-detection filters should compare
-    /// against (the tick at which the calling system last ran).
+    /// What tick was current when the calling system last ran?
+    ///
+    /// If a per-thread override is active (parallel execution), that value
+    /// wins.  Otherwise fall back to the shared world field (sequential
+    /// execution or ad-hoc queries).
     #[inline]
     pub fn system_last_run(&self) -> Tick {
-        // Per-thread override takes precedence so parallel batches can
-        // give each thread its own baseline without contending on the
-        // world-level field.
-        if let Some(t) = system_last_run_thread_local() {
+        if let Some(t) = per_thread_last_run_tick() {
             return t;
         }
         Tick::new(self.system_last_run)
     }
 
-    /// Override the baseline tick used by change-detection filters.
-    ///
-    /// Normally the [`Engine`](crate::engine::Engine) manages this on the
-    /// caller's behalf. Tests and ad-hoc code that drive queries directly
-    /// can call this to control the comparison baseline.
+    /// Set the world-level baseline directly.  Prefer letting the Engine
+    /// manage this - this method exists mainly for tests and one-off queries.
     #[inline]
     pub fn set_system_last_run(&mut self, tick: Tick) {
         self.system_last_run = tick.get();
     }
 }
 
-thread_local! {
-    /// Per-thread override of [`World::system_last_run`].
-    ///
-    /// Used by the [`Engine`](crate::engine::Engine) when running a batch
-    /// of systems in parallel: each thread sets its system's baseline
-    /// tick before invoking the system, and clears it afterwards. When
-    /// the override is `None`, queries fall back to the world-level
-    /// `system_last_run` field (used by the sequential scheduler).
-    static SYSTEM_LAST_RUN_OVERRIDE: std::cell::Cell<Option<Tick>> =
-        const { std::cell::Cell::new(None) };
-}
-
-#[inline]
-fn system_last_run_thread_local() -> Option<Tick> {
-    SYSTEM_LAST_RUN_OVERRIDE.with(|cell| cell.get())
-}
-
-/// Install a per-thread override for `World::system_last_run`. The
-/// previous value is returned so callers can restore it (RAII style)
-/// after the system finishes executing on this thread.
-#[inline]
-pub(crate) fn set_thread_last_run_override(value: Option<Tick>) -> Option<Tick> {
-    SYSTEM_LAST_RUN_OVERRIDE.with(|cell| cell.replace(value))
-}
-
 impl World {
-    // ========================================================================
+    // ----------------------------------------------------------------------------
     // Resource Management
-    // ========================================================================
+    // ----------------------------------------------------------------------------
 
     /// Insert a resource (singleton data not attached to any entity)
     ///
@@ -463,7 +499,7 @@ impl World {
     /// # Panics (debug only)
     ///
     /// Panics if this resource was already fetched mutably during the
-    /// current frame — indicates a scheduler bug where two systems
+    /// current frame - indicates a scheduler bug where two systems
     /// obtained concurrent `&mut` access to the same resource.
     pub fn get_resource_mut_tracked<T: Resource>(&mut self) -> Option<Mut<'_, T>> {
         #[cfg(debug_assertions)]
@@ -471,7 +507,7 @@ impl World {
             let id = ResourceId::of::<T>();
             debug_assert!(
                 !self.debug_resource_write_locks.contains(&id),
-                "Resource {:?} is already mutably borrowed — possible scheduler bug or concurrent system access",
+                "Resource {:?} is already mutably borrowed - possible scheduler bug or concurrent system access",
                 id
             );
             self.debug_resource_write_locks.insert(id);
@@ -501,6 +537,7 @@ impl World {
     }
 
     /// Check if a resource exists
+    #[must_use]
     pub fn has_resource<T: Resource>(&self) -> bool {
         self.resources.contains_key(&ResourceId::of::<T>())
     }
@@ -519,6 +556,7 @@ impl World {
     ///
     /// Returns true if the entity exists in the world with the correct generation.
     /// Returns false if the entity was destroyed or if its ID was recycled with a new generation.
+    #[must_use]
     pub fn is_entity_valid(&self, entity: Entity) -> bool {
         self.entity_locations.contains_key(&entity)
     }
@@ -656,7 +694,7 @@ impl World {
             }
         }
 
-        // Derive the archetype ID directly from the mask — the mask uniquely
+        // Derive the archetype ID directly from the mask - the mask uniquely
         // identifies the component set, so no separate lookup table is needed.
         let archetype_id = ArchetypeId(component_mask.bits());
 
@@ -793,36 +831,45 @@ impl World {
         // The debug_assert_ne! inside the unsafe block acts as a second
         // line of defense against a future refactor accidentally removing
         // or moving the early-return without updating this block.
-        let old_arch_ptr = self
+        let old_archetype_ptr = self
             .archetypes
             .get(&old_archetype_id)
             .expect("source archetype must exist during entity migration")
             as *const Archetype;
-        let new_arch_ptr = self
+        let new_archetype_ptr = self
             .archetypes
             .get_mut(&new_archetype_id)
             .expect("destination archetype must exist after get_or_create_archetype")
             as *mut Archetype;
 
+        // Clone component_types outside the unsafe block — we only need a
+        // shared reference for this, and it keeps the unsafe region minimal.
+        let new_component_ids = self
+            .archetypes
+            .get(&new_archetype_id)
+            .expect("destination archetype must exist")
+            .component_types
+            .clone();
+
         unsafe {
             // SAFETY: old_archetype_id != new_archetype_id is proven by the
             // early-return above and re-checked here. Different ArchetypeId
-            // values map to different HashMap entries, so old_arch and
-            // new_arch point to non-overlapping allocations.
+            // values map to different HashMap entries, so old_archetype and
+            // new_archetype point to non-overlapping allocations.
             debug_assert_ne!(
                 old_archetype_id, new_archetype_id,
                 "move_entity_to_archetype: old and new archetype IDs must differ"
             );
-            let old_arch = &*old_arch_ptr;
-            let new_arch = &mut *new_arch_ptr;
+            let old_archetype = &*old_archetype_ptr;
+            let new_archetype = &mut *new_archetype_ptr;
 
-            let new_index = new_arch.entities.len();
-            new_arch.entities.push(entity);
+            let new_index = new_archetype.entities.len();
+            new_archetype.entities.push(entity);
 
             // Call the move function to copy components
             move_fn(
-                &old_arch.component_storages,
-                &mut new_arch.component_storages,
+                &old_archetype.component_storages,
+                &mut new_archetype.component_storages,
                 old_index,
             );
 
@@ -831,10 +878,9 @@ impl World {
             // (component carried over) or push fresh ticks for a newly
             // attached component.
             let current_tick = Tick::new(self.change_tick);
-            let new_component_ids = new_arch.component_types.clone();
             for component_id in new_component_ids {
                 let new_tick =
-                    if let Some(old_ticks_vec) = old_arch.component_ticks.get(&component_id) {
+                    if let Some(old_ticks_vec) = old_archetype.component_ticks.get(&component_id) {
                         // Component carried over from old archetype.
                         *old_ticks_vec
                             .get(old_index)
@@ -843,7 +889,7 @@ impl World {
                         // Newly added component on this entity.
                         ComponentTicks::new(current_tick)
                     };
-                new_arch
+                new_archetype
                     .component_ticks
                     .entry(component_id)
                     .or_default()
@@ -902,6 +948,7 @@ impl World {
     ///
     /// This removes the entity from its archetype and updates all tracking structures.
     /// Returns true if the entity was found and removed, false otherwise.
+    #[must_use]
     pub fn destroy_entity(&mut self, entity: Entity) -> bool {
         // Get current location
         let location = match self.entity_locations.remove(&entity) {
@@ -928,17 +975,19 @@ impl World {
                 }
             }
 
-            // Also swap_remove from all component storages to keep them in sync
-            // Clone the component_types to avoid borrow issues
-            let component_types: Vec<ComponentId> = archetype.component_types.clone();
-            for component_id in &component_types {
+            // Also swap_remove from all component storages to keep them in sync.
+            // component_types, component_ticks, and component_storages are separate
+            // fields - Rust's split-borrow allows &component_types alongside mutable
+            // access to the other fields, so no clone is needed.
+            let component_type_ids: &[ComponentId] = &archetype.component_types;
+            for component_id in component_type_ids {
                 if let Some(ticks) = archetype.component_ticks.get_mut(component_id) {
                     if old_index < ticks.len() {
                         ticks.swap_remove(old_index);
                     }
                 }
             }
-            for component_id in component_types {
+            for component_id in component_type_ids {
                 if let Some(storage) = archetype
                     .component_storages
                     .get_trait_storage_mut(component_id.0)
@@ -967,6 +1016,7 @@ impl World {
     /// Returns `Ok(())` if the component was removed successfully.
     /// Returns `Err(RemoveComponentError::EntityNotFound)` if the entity doesn't exist.
     /// Returns `Err(RemoveComponentError::ComponentNotFound)` if the entity doesn't have the component.
+    #[must_use]
     pub fn remove_component<T: Component>(
         &mut self,
         entity: Entity,
@@ -997,9 +1047,11 @@ impl World {
             .cloned()
             .collect();
 
-        // If no components left, destroy the entity instead
+        // If no components left, destroy the entity instead.
+        // The entity may already be gone; that's fine - we just need to
+        // stop trying to migrate it.
         if new_component_ids.is_empty() {
-            self.destroy_entity(entity);
+            let _ = self.destroy_entity(entity);
             return Ok(());
         }
 
@@ -1029,6 +1081,7 @@ impl World {
     /// Returns `Ok(())` if the component was added successfully.
     /// Returns `Err(AddComponentError::EntityNotFound)` if the entity doesn't exist.
     /// Returns `Err(AddComponentError::ComponentAlreadyExists)` if the entity already has the component.
+    #[must_use]
     pub fn add_component<T>(
         &mut self,
         entity: Entity,
@@ -1115,6 +1168,60 @@ impl World {
         }
         println!("Total entities: {}", self.entity_locations.len());
     }
+
+    /// Total number of entities alive in the world.
+    #[inline]
+    pub fn entity_count(&self) -> usize {
+        self.entity_locations.len()
+    }
+
+    /// Generate a Graphviz DOT representation of archetypes and their components.
+    ///
+    /// Useful for debugging archetype fragmentation and visualizing the
+    /// relationship between component sets and entity counts.
+    ///
+    /// # Example output
+    /// ```dot
+    /// digraph World {
+    ///     rankdir=LR;
+    ///     node [shape=record];
+    ///     "arch_0" [label="Position, Velocity | 3 entities"];
+    ///     "arch_1" [label="Position, Health | 1 entity"];
+    /// }
+    /// ```
+    pub fn to_dot_graph(&self) -> String {
+        let mut dot = String::from("digraph World {\n    rankdir=LR;\n    node [shape=record];\n");
+
+        for (_, archetype) in self.archetypes.iter() {
+            let component_names: Vec<String> = archetype
+                .component_types
+                .iter()
+                .map(|id| {
+                    self.component_registry
+                        .get_name(id)
+                        .unwrap_or("?")
+                        .to_string()
+                })
+                .collect();
+            let label = format!(
+                "{} | {} entit{}",
+                component_names.join(", "),
+                archetype.entities.len(),
+                if archetype.entities.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            );
+            dot.push_str(&format!(
+                "    \"arch_{:?}\" [label=\"{}\"];\n",
+                archetype.id.0, label
+            ));
+        }
+
+        dot.push_str("}\n");
+        dot
+    }
 }
 
 /// Trait for inserting a component into storage
@@ -1179,6 +1286,7 @@ impl<'w> EntityBuilder<'w> {
     /// Returns `Err(BuildError::ComponentNotRegistered(id))` if any of the
     /// component types added via [`.with()`](Self::with) were not registered
     /// with the world beforehand.
+    #[must_use]
     pub fn build(self) -> Result<Entity, BuildError> {
         let entity = self.entity;
         let component_ids: Vec<ComponentId> =
@@ -1665,7 +1773,7 @@ mod tests {
         assert_eq!(initial_archetypes, 2);
 
         // Destroy one entity, leaving one archetype empty
-        world.destroy_entity(entity1);
+        let _ = world.destroy_entity(entity1);
 
         // Cleanup should remove empty archetype
         world.cleanup_empty_archetypes();
@@ -1971,7 +2079,7 @@ mod tests {
 
         for round in 1..=5 {
             let old_entity = last_entity;
-            world.destroy_entity(old_entity);
+            let _ = world.destroy_entity(old_entity);
 
             let new_entity = world
                 .create_entity()
@@ -2030,9 +2138,9 @@ mod tests {
         assert_eq!(entity2.id, 2);
 
         // Destroy in order: entity0, entity1, entity2
-        world.destroy_entity(entity0);
-        world.destroy_entity(entity1);
-        world.destroy_entity(entity2);
+        let _ = world.destroy_entity(entity0);
+        let _ = world.destroy_entity(entity1);
+        let _ = world.destroy_entity(entity2);
 
         // Free list should be: [(0, 1), (1, 1), (2, 1)]
         // Pop order (LIFO): entity2's ID first, then entity1's, then entity0's
@@ -2147,7 +2255,7 @@ mod tests {
 
         // Destroy entity2 (from Position+Velocity archetype)
         let old_entity2 = entity2;
-        world.destroy_entity(entity2);
+        let _ = world.destroy_entity(entity2);
         assert!(
             !world.is_entity_valid(old_entity2),
             "entity2 should be invalid after destruction"
@@ -2155,7 +2263,7 @@ mod tests {
 
         // Destroy entity3 (from Position+Health archetype)
         let old_entity3 = entity3;
-        world.destroy_entity(entity3);
+        let _ = world.destroy_entity(entity3);
         assert!(
             !world.is_entity_valid(old_entity3),
             "entity3 should be invalid after destruction"
@@ -2218,7 +2326,7 @@ mod tests {
         assert_eq!(pos.x, 1.0, "entity1 Position should be preserved");
 
         // Destroy entity1 and verify recycling
-        world.destroy_entity(entity1);
+        let _ = world.destroy_entity(entity1);
         assert!(
             !world.is_entity_valid(old_entity1),
             "entity1 should be invalid after destruction"
@@ -2285,7 +2393,7 @@ mod tests {
         // Component storage still: [Pos(0,0), Pos(1,1), Pos(2,2)]
         //
         // Now entity2 has index 0, but component at index 0 is Pos(0,0) - WRONG!
-        world.destroy_entity(entity0);
+        let _ = world.destroy_entity(entity0);
 
         // entity1 should still have its original position (index 1 unchanged)
         let pos1 = world.get_component::<Position>(entity1).unwrap();

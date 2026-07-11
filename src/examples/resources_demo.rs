@@ -1,6 +1,6 @@
-// ============================================================================
+// ----------------------------------------------------------------------------
 // Demo: Resources + Components + Systems Together
-// ============================================================================
+// ----------------------------------------------------------------------------
 //! Demonstrates using resources (Res/ResMut) alongside component queries
 //! in a single frame loop. The scheduler respects resource access patterns
 //! when building the dependency graph for parallel execution.

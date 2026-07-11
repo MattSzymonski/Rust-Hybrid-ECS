@@ -1,6 +1,6 @@
-// ============================================================================
+// ----------------------------------------------------------------------------
 // Engine - System Registration and Frame Execution
-// ============================================================================
+// ----------------------------------------------------------------------------
 //! The Engine manages system execution and frame processing.
 //!
 //! It provides:
@@ -12,7 +12,7 @@ use crate::commands::{CommandError, CommandQueue};
 use crate::component::Tick;
 use crate::scheduler::{SystemAccess, SystemScheduler};
 use crate::system::{IntoSystem, System, SystemParam};
-use crate::world::{set_thread_last_run_override, World};
+use crate::world::{set_per_thread_last_run_tick, World};
 use rayon::prelude::*;
 
 /// Wrapper for a registered system with its name
@@ -276,8 +276,8 @@ impl Engine {
         for systems_batch in self.scheduler.execution_graph() {
             if systems_batch.len() == 1 {
                 // Single system - run directly
-                let idx = systems_batch[0];
-                let registered = &mut self.systems[idx];
+                let system_index = systems_batch[0];
+                let registered = &mut self.systems[system_index];
                 if !registered.enabled {
                     continue;
                 }
@@ -299,50 +299,104 @@ impl Engine {
                 let started_at = self.world.change_tick().get();
                 let last_runs: Vec<u32> = systems_batch
                     .iter()
-                    .map(|&idx| self.systems[idx].last_run)
+                    .map(|&system_index| self.systems[system_index].last_run)
                     .collect();
 
-                // SAFETY: The scheduler guarantees that systems in the same batch access disjoint data
-                // We use raw pointers and unsafe to allow parallel mutable access
-                let world_ptr = &mut self.world as *mut World as usize;
-                let queue_ptr = &mut self.queue as *mut CommandQueue as usize;
-                let systems_ptr = self.systems.as_mut_ptr() as usize;
+                // ── Prepare raw pointers for parallel access ──
+                //
+                // Rust's borrow checker prevents us from passing `&mut self.world`,
+                // `&mut self.queue`, and `&mut self.systems[idx]` into a Rayon
+                // closure, even though the scheduler has *proven* that these
+                // accesses are disjoint.  We sidestep the checker with raw
+                // pointers, which carry no borrow obligations.
+                //
+                // Each pointer is wrapped in `SendPtrMut` so the closure can be
+                // sent (`Send`) and shared (`Sync`) across Rayon worker threads.
+                // The wrapper is zero-cost: a single `*mut T` field that LLVM
+                // inlines away at any optimisation level.
+                //
+                // `addr_of_mut!` is used instead of `&mut ... as *mut T` because
+                // it preserves pointer provenance - the compiler can still track
+                // which allocation the pointer was derived from, enabling better
+                // alias analysis and compatibility with strict-provenance
+                // hardware (CHERI, Arm MTE).
+                let world_ptr =
+                    crate::query::ptr::SendPtrMut::new(std::ptr::addr_of_mut!(self.world));
+                let queue_ptr =
+                    crate::query::ptr::SendPtrMut::new(std::ptr::addr_of_mut!(self.queue));
+                let systems_ptr = crate::query::ptr::SendPtrMut::new(self.systems.as_mut_ptr());
 
                 // Pre-compute enabled flags to avoid capturing self.systems in closure
                 // This is a small fixed-size read that avoids Vec allocation in most cases
                 let enabled_flags: Vec<bool> = systems_batch
                     .iter()
-                    .map(|&idx| self.systems[idx].enabled)
+                    .map(|&system_index| self.systems[system_index].enabled)
                     .collect();
 
                 systems_batch
                     .par_iter()
                     .zip(enabled_flags.par_iter())
                     .zip(last_runs.par_iter())
-                    .for_each(|((&idx, &enabled), &last_run)| {
+                    // `move` transfers ownership of the three SendPtrMut
+                    // handles into the closure.  SendPtrMut is Send + Sync
+                    // (see query/ptr.rs), so Rayon can safely move and share
+                    // the closure across its worker thread pool.
+                    .for_each(move |((&system_index, &enabled), &last_run)| {
                         if !enabled {
                             return;
                         }
-                        // Each worker thread installs its own change-
-                        // detection baseline, runs the system, then
-                        // restores the previous override so unrelated
-                        // queries on this thread (e.g. nested rayon
-                        // pools) are unaffected.
-                        let prev = set_thread_last_run_override(Some(Tick::new(last_run)));
+
+                        // Seed per-thread change-detection baseline.
+                        // Because the scheduler guarantees that no two
+                        // systems in this batch touch the same component,
+                        // each thread can independently set its own
+                        // `last_run` override without synchronization.
+                        let previous_override =
+                            set_per_thread_last_run_tick(Some(Tick::new(last_run)));
+
                         unsafe {
-                            let world = &mut *(world_ptr as *mut World);
-                            let queue = &mut *(queue_ptr as *mut CommandQueue);
-                            let registered_system =
-                                &mut *(systems_ptr as *mut RegisteredSystem).add(idx);
+                            // SAFETY:
+                            //
+                            // Dereferencing these raw pointers is sound
+                            // because the scheduler's conflict analysis
+                            // (see scheduler.rs) guarantees:
+                            //
+                            // 1. No two systems in the same batch have
+                            //    conflicting access (read-write or
+                            //    write-write) to any component or resource.
+                            //
+                            // 2. Systems that use Commands are always
+                            //    isolated into their own single-system
+                            //    batches, so `queue` is never aliased
+                            //    across threads here.
+                            //
+                            // 3. Each `system_index` is unique within
+                            //    the batch, so `systems_ptr.add(system_index)`
+                            //    yields a non-overlapping `RegisteredSystem`
+                            //    - no two threads touch the same slot.
+                            //
+                            // 4. `world_ptr`, `queue_ptr`, and
+                            //    `systems_ptr` all point to allocations
+                            //    owned by `Engine` (in `self`), which
+                            //    outlives the parallel iteration because
+                            //    `run_systems_parallel` borrows `&mut self`
+                            //    for its entire duration.
+                            let world = &mut *world_ptr.as_ptr();
+                            let queue = &mut *queue_ptr.as_ptr();
+                            let registered_system = &mut *systems_ptr.as_ptr().add(system_index);
                             registered_system.system.run(world, queue);
                         }
-                        set_thread_last_run_override(prev);
+
+                        // Restore the previous thread-local baseline so
+                        // unrelated queries on this thread (e.g. from a
+                        // nested rayon pool) are unaffected.
+                        set_per_thread_last_run_tick(previous_override);
                     });
 
                 // After the batch finishes, advance every system's
                 // last_run to the tick we observed at batch start.
-                for &idx in systems_batch {
-                    self.systems[idx].last_run = started_at;
+                for &system_index in systems_batch {
+                    self.systems[system_index].last_run = started_at;
                 }
             }
         }

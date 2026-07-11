@@ -1,6 +1,6 @@
-// ============================================================================
+// ----------------------------------------------------------------------------
 // Commands - Deferred Operation Queue
-// ============================================================================
+// ----------------------------------------------------------------------------
 //! Commands provide deferred operations on entities and components.
 //!
 //! Instead of modifying the world immediately (which would require mutable
@@ -95,6 +95,7 @@ impl<T: Component + TraitAccessible<dyn Component> + Send> ComponentAdder
 /// Deferred command to be executed later
 enum DeferredCommand {
     CreateEntity {
+        entity: Entity,
         component_adders: Vec<Box<dyn ComponentAdder>>,
     },
     AddComponentToEntity {
@@ -112,7 +113,7 @@ enum DeferredCommand {
 
 /// Error returned when a deferred command cannot be executed.
 ///
-/// Command errors are non-fatal by default — the engine logs them and
+/// Command errors are non-fatal by default - the engine logs them and
 /// continues.  Set `Engine::should_exit_on_error` to `true` for strict
 /// mode where any command failure stops the frame immediately.
 #[derive(Debug, Clone)]
@@ -189,9 +190,14 @@ impl Default for CommandQueue {
 }
 
 impl CommandQueue {
-    /// Queue creating a new entity with components
-    pub fn create_entity(&mut self, components: Vec<Box<dyn ComponentAdder>>) {
+    /// Queue creating a new entity with components.
+    ///
+    /// The `entity` must have been pre-allocated from the world's free
+    /// list — it won't exist in the world until commands are flushed,
+    /// but the caller receives the handle immediately.
+    pub fn create_entity(&mut self, entity: Entity, components: Vec<Box<dyn ComponentAdder>>) {
         self.commands.push(DeferredCommand::CreateEntity {
+            entity,
             component_adders: components,
         });
     }
@@ -238,8 +244,11 @@ impl CommandQueue {
 
         for command in self.commands.drain(..) {
             match command {
-                DeferredCommand::CreateEntity { component_adders } => {
-                    Self::execute_create_entity(world, component_adders);
+                DeferredCommand::CreateEntity {
+                    entity,
+                    component_adders,
+                } => {
+                    Self::execute_create_entity(world, entity, component_adders);
                 }
 
                 DeferredCommand::AddComponentToEntity {
@@ -274,13 +283,15 @@ impl CommandQueue {
         }
     }
 
-    fn execute_create_entity(world: &mut World, component_adders: Vec<Box<dyn ComponentAdder>>) {
+    fn execute_create_entity(
+        world: &mut World,
+        entity: Entity,
+        component_adders: Vec<Box<dyn ComponentAdder>>,
+    ) {
         let component_ids: Vec<ComponentId> = component_adders
             .iter()
             .map(|adder| adder.component_id())
             .collect();
-
-        let entity = world.allocate_entity();
 
         world.insert_entity_with_components(entity, component_ids, |storage| {
             for component_adder in component_adders {
@@ -320,8 +331,9 @@ impl CommandQueue {
         new_component_ids.push(new_component_id);
         new_component_ids.sort();
 
-        let old_component_ids = old_archetype.component_types.clone();
-        let component_copiers: Vec<_> = old_component_ids
+        // Collect copiers by iterating old_archetype.component_types directly
+        let component_copiers: Vec<_> = old_archetype
+            .component_types
             .iter()
             .filter_map(|component_id| world.component_copiers.get(component_id).map(Arc::clone))
             .collect();
@@ -373,7 +385,9 @@ impl CommandQueue {
             .collect();
 
         if new_component_ids.is_empty() {
-            world.destroy_entity(entity);
+            // If destroy_entity fails (entity already gone) we still want to
+            // bail out - no components remain to migrate.
+            let _ = world.destroy_entity(entity);
             return;
         }
 
@@ -409,23 +423,35 @@ impl CommandQueue {
 
 /// Commands allows systems to perform deferred entity operations
 ///
-/// This is a system parameter that provides access to the command queue.
+/// This is a system parameter that provides access to the command queue
+/// and world.  Entity IDs are allocated eagerly from the free list at
+/// `build()` time so the caller can track them immediately, even though
+/// the entity won't exist in the world until deferred commands are flushed.
 pub struct Commands<'a> {
     command_queue: &'a mut CommandQueue,
+    world: &'a mut World,
 }
 
 impl<'a> Commands<'a> {
-    pub(crate) fn new(command_queue: &'a mut CommandQueue) -> Self {
-        Self { command_queue }
+    pub(crate) fn new(command_queue: &'a mut CommandQueue, world: &'a mut World) -> Self {
+        Self {
+            command_queue,
+            world,
+        }
     }
 
-    /// Start building a new entity to create (executed later)
+    /// Start building a new entity to create (executed later).
     ///
-    /// Returns an EntityBuilder for fluent API to add components.
-    pub fn create_entity(&mut self) -> EntityBuilder<'_> {
-        EntityBuilder {
+    /// The entity ID is allocated immediately from the free list and
+    /// returned by [`.build()`](DeferredEntityBuilder::build).  The entity
+    /// won't appear in the world until deferred commands are flushed at
+    /// the end of the frame.
+    pub fn create_entity(&mut self) -> DeferredEntityBuilder<'_> {
+        let entity = self.world.allocate_entity();
+        DeferredEntityBuilder {
             command_queue: self.command_queue,
-            components: Vec::new(),
+            allocated_entity: entity,
+            components: Vec::with_capacity(8),
         }
     }
 
@@ -449,18 +475,28 @@ impl<'a> Commands<'a> {
     }
 }
 
-/// Builder for creating entities with components through the command queue
-pub struct EntityBuilder<'a> {
+/// Builder for creating entities with components through the command queue.
+///
+/// Unlike [`World::EntityBuilder`](crate::world::EntityBuilder) which creates
+/// entities immediately, this builder queues the creation for deferred
+/// execution.  However, the entity ID is still allocated eagerly from the
+/// free list at construction time, so [`build()`](Self::build) can return
+/// it immediately — the entity just won't be queryable until after the
+/// current frame's deferred commands are flushed.
+pub struct DeferredEntityBuilder<'a> {
     command_queue: &'a mut CommandQueue,
+    allocated_entity: Entity,
     components: Vec<Box<dyn ComponentAdder>>,
 }
 
-impl<'a> EntityBuilder<'a> {
-    /// Create a new EntityBuilder
-    pub fn new(command_queue: &'a mut CommandQueue) -> Self {
+impl<'a> DeferredEntityBuilder<'a> {
+    /// Create a new DeferredEntityBuilder with a pre-allocated entity ID.
+    /// Called by [`Commands::create_entity`] and [`ScriptContext::create_entity`].
+    pub fn new(command_queue: &'a mut CommandQueue, world: &mut World) -> Self {
         Self {
             command_queue,
-            components: Vec::new(),
+            allocated_entity: world.allocate_entity(),
+            components: Vec::with_capacity(8),
         }
     }
 
@@ -474,9 +510,16 @@ impl<'a> EntityBuilder<'a> {
         self
     }
 
-    /// Finish building and queue the create command
-    pub fn build(self) {
-        self.command_queue.create_entity(self.components);
+    /// Finish building and queue the create command.
+    ///
+    /// Returns the entity handle immediately.  The entity won't appear
+    /// in world queries until deferred commands are flushed at the end
+    /// of the frame, but the handle is valid and can be stored for later
+    /// use.
+    pub fn build(self) -> Entity {
+        let entity = self.allocated_entity;
+        self.command_queue.create_entity(entity, self.components);
+        entity
     }
 }
 
@@ -523,7 +566,7 @@ mod tests {
         world.register_component::<Velocity>();
 
         let mut queue = CommandQueue::new();
-        let mut commands = Commands::new(&mut queue);
+        let mut commands = Commands::new(&mut queue, &mut world);
 
         // Queue creating a new entity
         commands
@@ -576,7 +619,7 @@ mod tests {
         world.register_component::<Velocity>();
 
         let mut queue = CommandQueue::new();
-        let mut commands = Commands::new(&mut queue);
+        let mut commands = Commands::new(&mut queue, &mut world);
 
         // Queue creating a new entity
         commands
@@ -623,7 +666,7 @@ mod tests {
 
         // Queue creating a new entity
         {
-            let mut commands = Commands::new(&mut queue);
+            let mut commands = Commands::new(&mut queue, &mut world);
             commands
                 .create_entity()
                 .with(Position { x: 10.0, y: 20.0 })
@@ -658,7 +701,7 @@ mod tests {
         // Get the entity and queue remove component command
         let entity = *world.entity_locations.keys().next().unwrap();
         {
-            let mut commands = Commands::new(&mut queue);
+            let mut commands = Commands::new(&mut queue, &mut world);
             commands.remove_component_from_entity::<Velocity>(entity);
         }
 
@@ -699,7 +742,7 @@ mod tests {
         world.register_component::<Velocity>();
 
         let mut queue = CommandQueue::new();
-        let mut commands = Commands::new(&mut queue);
+        let mut commands = Commands::new(&mut queue, &mut world);
 
         // Queue creating multiple entities
         commands
