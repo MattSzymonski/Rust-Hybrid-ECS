@@ -321,7 +321,8 @@ impl CommandQueue {
             .archetypes
             .get(&entity_location.archetype_id)
             .expect("archetype must exist for entity at its recorded location");
-        let mut new_component_ids = old_archetype.component_types.clone();
+        let mut new_component_ids = Vec::with_capacity(old_archetype.component_types.len() + 1);
+        new_component_ids.extend_from_slice(&old_archetype.component_types);
         let new_component_id = component_adder.component_id();
         if new_component_ids.contains(&new_component_id) {
             errors.push(CommandError::ComponentAlreadyExists {

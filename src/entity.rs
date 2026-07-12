@@ -69,3 +69,18 @@ impl Entity {
         self.generation
     }
 }
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn entity_size_and_alignment() {
+        assert_eq!(
+            std::mem::size_of::<Entity>(),
+            16,
+            "Entity size changed — check field order"
+        );
+        assert_eq!(std::mem::align_of::<Entity>(), 8);
+    }
+}

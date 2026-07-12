@@ -97,6 +97,23 @@ impl ComponentTicks {
     }
 }
 
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn tick_size() {
+        assert_eq!(std::mem::size_of::<Tick>(), 4);
+        assert_eq!(std::mem::align_of::<Tick>(), 4);
+    }
+
+    #[test]
+    fn component_ticks_size() {
+        assert_eq!(std::mem::size_of::<ComponentTicks>(), 8);
+        assert_eq!(std::mem::align_of::<ComponentTicks>(), 4);
+    }
+}
+
 /// ComponentId uniquely identifies a component type using its TypeId.
 ///
 /// Can be converted to/from [`TypeKey`] for code that needs to be generic

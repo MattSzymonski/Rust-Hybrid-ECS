@@ -313,13 +313,13 @@ macro_rules! impl_query_filter_tuple {
             type State = ($($T::State,)*);
 
             fn included_component_ids() -> Vec<ComponentId> {
-                let mut ids = Vec::new();
+                let mut ids = Vec::with_capacity(4);
                 $(ids.extend($T::included_component_ids());)*
                 ids
             }
 
             fn excluded_component_ids() -> Vec<ComponentId> {
-                let mut ids = Vec::new();
+                let mut ids = Vec::with_capacity(4);
                 $(ids.extend($T::excluded_component_ids());)*
                 ids
             }
@@ -375,13 +375,13 @@ macro_rules! impl_query_filter_or {
             type State = ($($T::State,)*);
 
             fn included_component_ids() -> Vec<ComponentId> {
-                let mut ids = Vec::new();
+                let mut ids = Vec::with_capacity(4);
                 $(ids.extend($T::included_component_ids());)*
                 ids
             }
 
             fn excluded_component_ids() -> Vec<ComponentId> {
-                let mut ids = Vec::new();
+                let mut ids = Vec::with_capacity(4);
                 $(ids.extend($T::excluded_component_ids());)*
                 ids
             }
@@ -393,7 +393,7 @@ macro_rules! impl_query_filter_or {
             /// restrictions - matches everything"), the whole `Or` also
             /// returns zero pairs. OR with "always true" is "always true".
             fn archetype_filter_pairs() -> Vec<(Vec<ComponentId>, Vec<ComponentId>)> {
-                let mut pairs = Vec::new();
+                let mut pairs = Vec::with_capacity(4);
                 $(
                     let inner = $T::archetype_filter_pairs();
                     if inner.is_empty() {

@@ -254,7 +254,8 @@ impl SystemScheduler {
         let mut scheduled_count = 0;
 
         while scheduled_count < self.system_count {
-            let mut batch = Vec::new();
+            let remaining = self.system_count - scheduled_count;
+            let mut batch = Vec::with_capacity(remaining);
 
             // Try to add each unscheduled system to the current batch
             for (i, is_scheduled) in scheduled.iter_mut().enumerate() {

@@ -19,13 +19,13 @@ use rayon::prelude::*;
 struct RegisteredSystem {
     name: &'static str,
     system: Box<dyn System>,
-    enabled: bool,
     /// World tick at which this system was last executed.
     ///
     /// Used to seed `World::system_last_run` so change-detection filters
     /// (`Changed<T>`, `Added<T>`) inside the system see only mutations
     /// that happened since its last run.
     last_run: u32,
+    enabled: bool,
 }
 
 /// The main Engine that drives the ECS

@@ -51,6 +51,17 @@ pub(crate) struct EntityLocation {
     pub(crate) index_in_archetype: usize,
 }
 
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn entity_location_size() {
+        assert_eq!(std::mem::size_of::<EntityLocation>(), 32);
+        assert_eq!(std::mem::align_of::<EntityLocation>(), 16);
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Component add/remove errors
 // ----------------------------------------------------------------------------
@@ -727,7 +738,9 @@ impl World {
         EntityBuilder {
             world: self,
             entity,
-            components: Vec::new(),
+            // Most entities have 3-8 components; pre-allocate to avoid
+            // reallocation during .with() chains.
+            components: Vec::with_capacity(8),
         }
     }
 
@@ -842,15 +855,6 @@ impl World {
             .expect("destination archetype must exist after get_or_create_archetype")
             as *mut Archetype;
 
-        // Clone component_types outside the unsafe block — we only need a
-        // shared reference for this, and it keeps the unsafe region minimal.
-        let new_component_ids = self
-            .archetypes
-            .get(&new_archetype_id)
-            .expect("destination archetype must exist")
-            .component_types
-            .clone();
-
         unsafe {
             // SAFETY: old_archetype_id != new_archetype_id is proven by the
             // early-return above and re-checked here. Different ArchetypeId
@@ -862,6 +866,11 @@ impl World {
             );
             let old_archetype = &*old_archetype_ptr;
             let new_archetype = &mut *new_archetype_ptr;
+
+            // Read component_types via raw pointer — avoids a Vec clone.
+            // SAFETY: new_archetype_ptr is valid; component_types is only
+            // read (not mutated) in this loop.
+            let new_component_ids = &(*new_archetype_ptr).component_types;
 
             let new_index = new_archetype.entities.len();
             new_archetype.entities.push(entity);
@@ -878,7 +887,7 @@ impl World {
             // (component carried over) or push fresh ticks for a newly
             // attached component.
             let current_tick = Tick::new(self.change_tick);
-            for component_id in new_component_ids {
+            for &component_id in new_component_ids {
                 let new_tick =
                     if let Some(old_ticks_vec) = old_archetype.component_ticks.get(&component_id) {
                         // Component carried over from old archetype.
@@ -921,8 +930,7 @@ impl World {
             }
 
             // Also swap_remove from all component storages to keep them in sync
-            let component_types: Vec<ComponentId> = old_archetype.component_types.clone();
-            for component_id in component_types {
+            for &component_id in &old_archetype.component_types {
                 if let Some(storage) = old_archetype
                     .component_storages
                     .get_trait_storage_mut(component_id.0)
@@ -1109,7 +1117,8 @@ impl World {
         }
 
         // Build new component list with the added component
-        let mut new_component_ids = old_archetype.component_types.clone();
+        let mut new_component_ids = Vec::with_capacity(old_archetype.component_types.len() + 1);
+        new_component_ids.extend_from_slice(&old_archetype.component_types);
         new_component_ids.push(component_id);
         new_component_ids.sort();
 
@@ -2308,7 +2317,7 @@ mod tests {
             "new_entity2: id={}, gen={}",
             new_entity2.id, new_entity2.generation
         );
-        assert_eq!(new_entity2.id, 1, "Should reuse ID 1");
+        assert_eq!(new_entity2.id, 1, "Should reuse ID 2");
         assert_eq!(new_entity2.generation, 1, "Should have generation 1");
 
         // Old entity2 handle should NOT access new_entity2's data
@@ -2341,7 +2350,7 @@ mod tests {
             "new_entity3: id={}, gen={}",
             new_entity3.id, new_entity3.generation
         );
-        assert_eq!(new_entity3.id, 0, "Should reuse ID 0");
+        assert_eq!(new_entity3.id, 0, "Should reuse ID 1");
         assert_eq!(new_entity3.generation, 1, "Should have generation 1");
 
         println!("✓ Generations with multiple archetypes and component removal work correctly!");
