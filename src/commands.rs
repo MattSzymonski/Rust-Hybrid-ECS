@@ -57,7 +57,6 @@
 use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
 use crate::world::World;
-use std::sync::Arc;
 use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
 
 /// Trait for adding a component with its concrete type preserved
@@ -340,7 +339,7 @@ impl CommandQueue {
         let component_copiers: Vec<_> = old_archetype
             .component_types
             .iter()
-            .filter_map(|component_id| world.component_copiers.get(component_id).map(Arc::clone))
+            .filter_map(|component_id| world.component_copiers.get(component_id).copied())
             .collect();
 
         world.move_entity_to_archetype(
@@ -398,7 +397,7 @@ impl CommandQueue {
 
         let component_copiers: Vec<_> = new_component_ids
             .iter()
-            .filter_map(|component_id| world.component_copiers.get(component_id).map(Arc::clone))
+            .filter_map(|component_id| world.component_copiers.get(component_id).copied())
             .collect();
 
         world.move_entity_to_archetype(

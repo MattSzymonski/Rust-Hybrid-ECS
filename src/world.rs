@@ -8,7 +8,6 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
 
@@ -22,15 +21,12 @@ use crate::query::change_detection::Mut;
 use crate::resource::{Resource, ResourceId};
 use crate::scripting::{ScriptComponent, ScriptContext};
 
-/// Function that copies a component from one storage to another at given indices
-type ComponentCopier = Arc<
-    dyn Fn(
-            &TraitTypeMap<dyn Component, VecFamily>,
-            &mut TraitTypeMap<dyn Component, VecFamily>,
-            usize,
-        ) + Send
-        + Sync,
->;
+/// Function that copies a component from one storage to another at given indices.
+type ComponentCopier = fn(
+    source: &TraitTypeMap<dyn Component, VecFamily>,
+    destination: &mut TraitTypeMap<dyn Component, VecFamily>,
+    index: usize,
+);
 
 /// Function that updates a script component.
 ///
@@ -307,6 +303,16 @@ impl Default for World {
     }
 }
 
+/// Copies a single component instance from source to destination storage.
+fn copy_component<T: Component + TraitAccessible<dyn Component> + Clone>(
+    source: &TraitTypeMap<dyn Component, VecFamily>,
+    destination: &mut TraitTypeMap<dyn Component, VecFamily>,
+    index: usize,
+) {
+    let component = source.get_storage::<T>().get(index);
+    destination.get_storage_mut::<T>().push(component.clone());
+}
+
 impl World {
     /// Register a component type with the World
     ///
@@ -327,18 +333,11 @@ impl World {
             }),
         );
 
-        // Register copier function for this component type
-        self.component_copiers.insert(
-            component_id,
-            Arc::new(
-                |src: &TraitTypeMap<dyn Component, VecFamily>,
-                 dst: &mut TraitTypeMap<dyn Component, VecFamily>,
-                 index: usize| {
-                    let component = src.get_storage::<T>().get(index);
-                    dst.get_storage_mut::<T>().push(component.clone());
-                },
-            ),
-        );
+        // Register copier function for this component type.
+        // Uses a named generic function (not a closure) so the fn pointer
+        // requires no heap allocation or vtable dispatch.
+        self.component_copiers
+            .insert(component_id, copy_component::<T>);
     }
 
     /// Register a script component type with the World
@@ -1112,7 +1111,7 @@ impl World {
         // Collect copiers for all components except the one being removed
         let copiers: Vec<_> = new_component_ids
             .iter()
-            .filter_map(|component_id| self.component_copiers.get(component_id).map(Arc::clone))
+            .filter_map(|component_id| self.component_copiers.get(component_id).copied())
             .collect();
 
         // Move entity to new archetype without the removed component
@@ -1172,7 +1171,7 @@ impl World {
         let copiers: Vec<_> = old_archetype
             .component_types
             .iter()
-            .filter_map(|component_id| self.component_copiers.get(component_id).map(Arc::clone))
+            .filter_map(|component_id| self.component_copiers.get(component_id).copied())
             .collect();
 
         // Move entity to new archetype with the additional component
