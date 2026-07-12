@@ -14,6 +14,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 
 [features]
 tracy = ["dep:tracy-client"]
+tracy-no-details = ["dep:tracy-client"]
 
 [[bench]]
 name = "entity_lifecycle"
