@@ -302,7 +302,7 @@ impl Engine {
                     .map(|&system_index| self.systems[system_index].last_run)
                     .collect();
 
-                // ── Prepare raw pointers for parallel access ──
+                // - Prepare raw pointers for parallel access -
                 //
                 // Rust's borrow checker prevents us from passing `&mut self.world`,
                 // `&mut self.queue`, and `&mut self.systems[idx]` into a Rayon

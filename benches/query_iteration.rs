@@ -50,7 +50,7 @@ fn setup_world(entity_count: usize) -> World {
     world
 }
 
-// ── sequential, unfiltered ──────────────────────────────────────────
+// - sequential, unfiltered ---------------------
 
 fn bench_iter_unfiltered(c: &mut Criterion) {
     let mut group = c.benchmark_group("query_iter_unfiltered");
@@ -70,7 +70,7 @@ fn bench_iter_unfiltered(c: &mut Criterion) {
     group.finish();
 }
 
-// ── sequential, mutable ─────────────────────────────────────────────
+// - sequential, mutable ----------------------─
 
 fn bench_iter_mutable(c: &mut Criterion) {
     let mut group = c.benchmark_group("query_iter_mutable");
@@ -89,7 +89,7 @@ fn bench_iter_mutable(c: &mut Criterion) {
     group.finish();
 }
 
-// ── sequential, with change-detection filter ────────────────────────
+// - sequential, with change-detection filter ------------
 
 fn bench_iter_changed(c: &mut Criterion) {
     let mut group = c.benchmark_group("query_iter_changed");
@@ -118,7 +118,7 @@ fn bench_iter_changed(c: &mut Criterion) {
     group.finish();
 }
 
-// ── parallel, unfiltered ────────────────────────────────────────────
+// - parallel, unfiltered ----------------------
 
 fn bench_par_iter_unfiltered(c: &mut Criterion) {
     let mut group = c.benchmark_group("query_par_iter_unfiltered");
@@ -136,7 +136,67 @@ fn bench_par_iter_unfiltered(c: &mut Criterion) {
     group.finish();
 }
 
-// ── helper: count, is_empty, first ──────────────────────────────────
+// - parallel batch-size scaling ------------------─
+
+fn bench_par_batch_size_scaling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("query_par_batch_size");
+    let count = 10_000;
+
+    for &batch_size in &[1, 16, 64, 256, 512, 1024] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(batch_size),
+            &batch_size,
+            |b, &batch_size| {
+                let mut world = setup_world(count);
+                b.iter(|| {
+                    let mut q = Query::<(&Position, &Velocity)>::new(&mut world);
+                    q.par_iter_mut()
+                        .with_batch_size(batch_size)
+                        .for_each(|(pos, vel)| {
+                            black_box(pos.x + vel.x);
+                        });
+                });
+            },
+        );
+    }
+    group.finish();
+}
+
+// - parallel vs sequential crossover ----------------
+
+fn bench_crossover(c: &mut Criterion) {
+    let mut group = c.benchmark_group("query_crossover");
+    // Find the entity count where parallel beats sequential
+    for &count in &[1_000, 5_000, 10_000, 25_000, 50_000, 100_000] {
+        group.bench_with_input(
+            BenchmarkId::new("sequential", count),
+            &count,
+            |b, &count| {
+                let mut world = setup_world(count);
+                b.iter(|| {
+                    let mut q = Query::<(&Position, &Velocity)>::new(&mut world);
+                    let mut sum = 0.0f32;
+                    for (pos, vel) in q.iter_mut() {
+                        sum += pos.x + vel.x;
+                    }
+                    black_box(sum);
+                });
+            },
+        );
+        group.bench_with_input(BenchmarkId::new("parallel", count), &count, |b, &count| {
+            let mut world = setup_world(count);
+            b.iter(|| {
+                let mut q = Query::<(&Position, &Velocity)>::new(&mut world);
+                q.par_iter_mut().for_each(|(pos, vel)| {
+                    black_box(pos.x + vel.x);
+                });
+            });
+        });
+    }
+    group.finish();
+}
+
+// - helper: count, is_empty, first -----------------
 
 fn bench_query_helpers(c: &mut Criterion) {
     let mut group = c.benchmark_group("query_helpers");
@@ -175,6 +235,8 @@ criterion_group!(
     bench_iter_mutable,
     bench_iter_changed,
     bench_par_iter_unfiltered,
+    bench_par_batch_size_scaling,
+    bench_crossover,
     bench_query_helpers,
 );
 criterion_main!(benches);

@@ -306,7 +306,12 @@ where
         // Parallel path: two-level par_iter (archetypes × rows).
         // Each outer task handles one archetype; the inner par_iter
         // distributes rows within that archetype across threads.
-        let min_len = self.min_batch_size.unwrap_or(1);
+        //
+        // Default batch size of 256 amortizes Rayon scheduling overhead
+        // while maintaining good load balancing. For workloads where
+        // per-row cost is extremely low (< 10 ns), larger values (512-1024)
+        // yield better throughput.
+        let min_len = self.min_batch_size.unwrap_or(256);
 
         self.archetype_ranges
             .into_par_iter()
@@ -366,7 +371,7 @@ where
         // `fold_with` accumulates a per-thread count within each inner
         // batch; the `for_each` at the end pushes the count into shared
         // atomics for aggregated stats.
-        let min_len = self.min_batch_size.unwrap_or(1);
+        let min_len = self.min_batch_size.unwrap_or(256);
 
         let batch_count = Arc::new(AtomicUsize::new(0));
         let min_batch = Arc::new(AtomicUsize::new(usize::MAX));

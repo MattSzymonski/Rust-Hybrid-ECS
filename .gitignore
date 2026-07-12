@@ -1,3 +1,6 @@
 /target
 graphify-out/
 .github/copilot-instructions.md
+
+performance_benchmarks/
+benchmarks/
