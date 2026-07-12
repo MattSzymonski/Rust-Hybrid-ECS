@@ -7,6 +7,10 @@
 //   4. Watch live CPU zones, frame times, and thread work distribution
 //
 // Press Ctrl+C to stop.
+//
+// Reconnecting: after killing and restarting this program, Tracy auto-reconnects.
+// If it doesn't pick up, click the "Connect" button in Tracy GUI again — sometimes
+// the GUI stops listening after an abrupt disconnect.
 
 use ecs_hybrid::*;
 use std::time::Instant;
@@ -36,7 +40,18 @@ impl Component for Health {}
 struct Enemy;
 impl Component for Enemy {}
 
-impl_trait_accessible!(dyn Component; Position, Velocity, Health, Enemy);
+#[derive(Debug, Clone)]
+struct Mass(f32);
+impl Component for Mass {}
+
+#[derive(Debug, Clone)]
+struct GravityForce {
+    x: f32,
+    y: f32,
+}
+impl Component for GravityForce {}
+
+impl_trait_accessible!(dyn Component; Position, Velocity, Health, Enemy, Mass, GravityForce);
 
 // ---- Systems ----
 
@@ -48,9 +63,44 @@ fn movement_system(mut query: Query<(&mut Position, &Velocity)>) {
 }
 
 fn health_decay_system(mut query: Query<&mut Health>) {
-    for mut health in query.iter_mut() {
-        health.0 = (health.0 - 0.1).max(0.0);
-    }
+    let _zone = crate::profile_scope!("health_decay_systXxxxxxm");
+
+    // Parallel iteration
+    let stats: query::ParForEachResult = query
+        .par_iter_mut()
+        .tracked()
+        .label("health_decay_system")
+        .for_each(|mut health| {
+            health.0 = (health.0 + 0.1).max(0.0);
+        });
+    crate::profile_message!("movement: {}", stats);
+
+    // Sequential iteration
+    // for mut health in query.iter_mut() {
+    //     health.0 = (health.0 + 0.1).max(0.0);
+    // }
+
+    // query.iter_mut().for_each(|mut health| {
+    //     health.0 = (health.0 + 0.1).max(0.0);
+    // });
+
+    // let _zone = crate::profile_scope!("health_decay_system");
+    // let stats = query
+    //     .par_iter_mut()
+    //     .label("health_decay")
+    //     .tracked()
+    //     .for_each(|mut health| {
+    //         health.0 = (health.0 - 0.1).max(0.0);
+    //     });
+    // crate::profile_message!("health_decay: {}", stats);
+
+    // let x = query.iter_mut().for_each(|mut health| {
+    //     health.0 = (health.0 - 0.1).max(0.0);
+    // });
+
+    // for mut health in query.iter_mut() {
+    //     health.0 = (health.0 - 0.1).max(0.0);
+    // }
 }
 
 fn collision_damage_system(mut query: Query<(&mut Health, &Position)>) {
@@ -74,6 +124,30 @@ fn cleanup_system(mut commands: Commands, mut query: Query<(Entity, &Health)>) {
             let _ = commands.destroy_entity(entity);
         }
     }
+}
+
+/// Heavy per-entity work — trig, sqrt, mul — designed to stress
+/// parallel distribution and make wake-up latency negligible.
+/// Writes to its own `GravityForce` component so it can run in
+/// parallel with `movement` and `health_decay`.
+fn gravity_system(mut query: Query<(&mut GravityForce, &Mass)>) {
+    let _zone = crate::profile_scope!("gravity_system");
+
+    let stats = query
+        .par_iter_mut()
+        .tracked()
+        .label("gravity_system")
+        .for_each(|(mut force, mass)| {
+            // Inverse-square gravity toward origin with cheap sqrt.
+            let distance_sq = force.x * force.x + force.y.sqrt() * force.y + 0.01;
+            let distance = distance_sq.sqrt();
+            let magnitude = mass.0 / (distance_sq * distance); // 1/d³
+            force.x = -force.x * magnitude.sqrt();
+            force.y = -force.y * magnitude.sqrt();
+            force.x = force.x.clamp(-1.0, 1.0);
+            force.y = force.y.clamp(-1.0, 1.0);
+        });
+    crate::profile_message!("gravity: {}", stats);
 }
 
 fn spawner_system(mut commands: Commands) {
@@ -131,6 +205,11 @@ fn main() {
     crate::profile_init!();
     crate::profile_thread!("main");
 
+    // Brief pause lets Tracy's background connection thread establish
+    // the TCP link before we start flooding it with frame data.
+    // Also avoids TIME_WAIT collisions on Windows after a restart.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
     let mut engine = Engine::new();
     engine.set_parallel_execution(true);
 
@@ -138,19 +217,22 @@ fn main() {
     engine.world_mut().register_component::<Velocity>();
     engine.world_mut().register_component::<Health>();
     engine.world_mut().register_component::<Enemy>();
+    engine.world_mut().register_component::<Mass>();
+    engine.world_mut().register_component::<GravityForce>();
 
     engine.register_system("movement", movement_system);
     engine.register_system("health_decay", health_decay_system);
-    engine.register_system("collision_damage", collision_damage_system);
-    engine.register_system("enemy_ai", enemy_ai_system);
+    // engine.register_system("collision_damage", collision_damage_system);
+    // engine.register_system("enemy_ai", enemy_ai_system);
+    engine.register_system("gravity", gravity_system);
     engine.register_system("cleanup", cleanup_system);
-    engine.register_system("spawner", spawner_system);
+    //engine.register_system("spawner", spawner_system);
 
     // Set 30 FPS cap using the engine's built-in limiter
-    engine.set_fps_limit(200.0);
+    // engine.set_fps_limit(200.0);
     engine.trace_frame_wait = false;
-    engine.world_mut().reserve_entities(2000);
-    for _ in 0..1000 {
+    engine.world_mut().reserve_entities(32000);
+    for _ in 0..30000 {
         let _ = engine
             .world_mut()
             .create_entity()
@@ -163,12 +245,14 @@ fn main() {
                 y: (lcg() - 0.5) * 0.2,
             })
             .with(Health(100.0))
+            .with(Mass(1.0 + lcg() * 9.0))
+            .with(GravityForce { x: 0.0, y: 0.0 })
             .with(Enemy)
             .build();
     }
 
     println!("=== Tracy Live Profiling Demo ===");
-    println!("6 systems, 1000 entities, parallel ON");
+    println!("6 systems, 30000 entities, parallel ON");
     println!("Target: 30 FPS (engine limiter)");
     println!();
     println!("Connect Tracy now. Press Ctrl+C to stop.");

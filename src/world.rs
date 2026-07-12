@@ -170,6 +170,29 @@ pub(crate) fn set_per_thread_last_run_tick(value: Option<Tick>) -> Option<Tick> 
 }
 
 // ----------------------------------------------------------------------------
+// Per-thread timing hint — avoids the race condition that a shared
+// World atomic would have when multiple systems in a batch write to it.
+// ----------------------------------------------------------------------------
+
+thread_local! {
+    /// Per-thread timing hint (ns) fed from the engine to the query
+    /// iterator so it can choose an optimal number of parallel groups.
+    static PER_THREAD_TIMING_HINT_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Store a timing hint for the current thread, returning the old value.
+#[inline]
+pub(crate) fn set_per_thread_timing_hint(nanos: u64) -> u64 {
+    PER_THREAD_TIMING_HINT_NS.with(|cell| cell.replace(nanos))
+}
+
+/// Read the timing hint for the current thread.
+#[inline]
+pub(crate) fn get_per_thread_timing_hint() -> u64 {
+    PER_THREAD_TIMING_HINT_NS.with(|cell| cell.get())
+}
+
+// ----------------------------------------------------------------------------
 // World - Central ECS State Management
 // ----------------------------------------------------------------------------
 

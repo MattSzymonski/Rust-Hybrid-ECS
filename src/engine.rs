@@ -10,10 +10,13 @@
 
 use crate::commands::{CommandError, CommandQueue};
 use crate::component::Tick;
+use crate::query::EMA_ALPHA_DENOM;
 use crate::scheduler::{SystemAccess, SystemScheduler};
 use crate::system::{IntoSystem, System, SystemParam};
-use crate::world::{set_per_thread_last_run_tick, World};
+use crate::world::{set_per_thread_last_run_tick, set_per_thread_timing_hint, World};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Wrapper for a registered system with its name
@@ -27,6 +30,11 @@ struct RegisteredSystem {
     /// that happened since its last run.
     last_run: u32,
     enabled: bool,
+    /// Exponential moving average of this system's wall-clock execution
+    /// duration (nanoseconds).  Fed to the query iterator so it can pick
+    /// an optimal number of parallel groups.  Smoothing factor ≈ 1/32
+    /// gives a ~32-frame averaging window.
+    avg_execution_ns: u64,
 }
 
 /// The main Engine that drives the ECS
@@ -71,6 +79,10 @@ pub struct Engine {
 impl Engine {
     /// Create a new Engine with no systems
     pub fn new() -> Self {
+        // Warm up the Rayon thread pool so the first parallel batch
+        // does not pay thread-spawning costs (can be 1-10ms on some OS).
+        rayon::broadcast(|_ctx| {});
+
         Self {
             systems: Vec::new(),
             queue: CommandQueue::new(),
@@ -216,6 +228,7 @@ impl Engine {
             system: system.into_system(),
             enabled: true,
             last_run: 0,
+            avg_execution_ns: 0,
         });
 
         // Rebuild execution graph
@@ -321,6 +334,11 @@ impl Engine {
             // Seed the change-detection baseline for this system: filters
             // such as `Changed<T>` will compare against `last_run`.
             self.world.system_last_run = registered_system.last_run;
+
+            // Feed timing hint to query iterators inside this system.
+            set_per_thread_timing_hint(registered_system.avg_execution_ns);
+            let system_start = Instant::now();
+
             let started_at = self.world.change_tick().get();
             registered_system
                 .system
@@ -328,6 +346,11 @@ impl Engine {
             // Record the tick that was current at system entry so the next
             // run sees mutations that happened during this run.
             registered_system.last_run = started_at;
+            // Update EMA of execution time.
+            let elapsed = system_start.elapsed().as_nanos() as u64;
+            let old_avg = registered_system.avg_execution_ns;
+            let delta = elapsed as i64 - old_avg as i64;
+            registered_system.avg_execution_ns = (old_avg as i64 + delta / EMA_ALPHA_DENOM) as u64;
         }
         // Reset the baseline so ad-hoc queries between frames behave
         // predictably.
@@ -374,11 +397,21 @@ impl Engine {
                     continue;
                 }
                 self.world.system_last_run = registered.last_run;
+
+                // Feed timing hint to query iterators inside this system.
+                set_per_thread_timing_hint(registered.avg_execution_ns);
+                let system_start = Instant::now();
+
                 let started_at = self.world.change_tick().get();
 
                 let _zone = crate::profile_scope!("system: {}", registered.name);
                 registered.system.run(&mut self.world, &mut self.queue);
                 registered.last_run = started_at;
+                // Update EMA of execution time.
+                let elapsed = system_start.elapsed().as_nanos() as u64;
+                let old_avg = registered.avg_execution_ns;
+                let delta = elapsed as i64 - old_avg as i64;
+                registered.avg_execution_ns = (old_avg as i64 + delta / EMA_ALPHA_DENOM) as u64;
             } else {
                 // Multiple systems - run in parallel using rayon.
                 //
@@ -397,6 +430,12 @@ impl Engine {
                 let last_runs: Vec<u32> = systems_batch
                     .iter()
                     .map(|&system_index| self.systems[system_index].last_run)
+                    .collect();
+
+                // Pre-compute timing hints for feedback-driven group sizing.
+                let last_avg_ns: Vec<u64> = systems_batch
+                    .iter()
+                    .map(|&system_index| self.systems[system_index].avg_execution_ns)
                     .collect();
 
                 // - Prepare raw pointers for parallel access -
@@ -437,73 +476,56 @@ impl Engine {
                     .collect();
                 drop(_zone);
 
-                // Dispatch stage: execute all systems in this batch via Rayon
+                // Dispatch stage: execute all systems in this batch via Rayon.
+                // Use a single indexed parallel iterator instead of chained
+                // zip() — avoids deep iterator nesting that causes Rayon
+                // to spend more time splitting than executing on small batches.
                 let _zone = crate::profile_scope!(
                     "dispatch systems batch ({} systems across rayon)",
                     batch_size
                 );
-                systems_batch
-                    .par_iter()
-                    .zip(enabled_flags.par_iter())
-                    .zip(last_runs.par_iter())
-                    .zip(system_names.par_iter())
-                    // `move` transfers ownership of the three SendPtrMut
-                    // handles into the closure.  SendPtrMut is Send + Sync
-                    // (see query/ptr.rs), so Rayon can safely move and share
-                    // the closure across its worker thread pool.
-                    .for_each(move |(((&system_index, &enabled), &last_run), &name)| {
-                        if !enabled {
-                            return;
-                        }
+                let batch_len = systems_batch.len();
 
-                        let _zone = crate::profile_scope!("system: {}", name);
+                // Track how many Rayon tasks were spawned.
+                let task_count = Arc::new(AtomicUsize::new(0));
 
-                        // Seed per-thread change-detection baseline.
-                        // Because the scheduler guarantees that no two
-                        // systems in this batch touch the same component,
-                        // each thread can independently set its own
-                        // `last_run` override without synchronization.
-                        let previous_override =
-                            set_per_thread_last_run_tick(Some(Tick::new(last_run)));
+                (0..batch_len).into_par_iter().for_each(|i| {
+                    task_count.fetch_add(1, Ordering::Relaxed);
 
-                        unsafe {
-                            // SAFETY:
-                            //
-                            // Dereferencing these raw pointers is sound
-                            // because the scheduler's conflict analysis
-                            // (see scheduler.rs) guarantees:
-                            //
-                            // 1. No two systems in the same batch have
-                            //    conflicting access (read-write or
-                            //    write-write) to any component or resource.
-                            //
-                            // 2. Systems that use Commands are always
-                            //    isolated into their own single-system
-                            //    batches, so `queue` is never aliased
-                            //    across threads here.
-                            //
-                            // 3. Each `system_index` is unique within
-                            //    the batch, so `systems_ptr.add(system_index)`
-                            //    yields a non-overlapping `RegisteredSystem`
-                            //    - no two threads touch the same slot.
-                            //
-                            // 4. `world_ptr`, `queue_ptr`, and
-                            //    `systems_ptr` all point to allocations
-                            //    owned by `Engine` (in `self`), which
-                            //    outlives the parallel iteration because
-                            //    `run_systems_parallel` borrows `&mut self`
-                            //    for its entire duration.
-                            let world = &mut *world_ptr.as_ptr();
-                            let queue = &mut *queue_ptr.as_ptr();
-                            let registered_system = &mut *systems_ptr.as_ptr().add(system_index);
-                            registered_system.system.run(world, queue);
-                        }
+                    if !enabled_flags[i] {
+                        return;
+                    }
 
-                        // Restore the previous thread-local baseline so
-                        // unrelated queries on this thread (e.g. from a
-                        // nested rayon pool) are unaffected.
-                        set_per_thread_last_run_tick(previous_override);
-                    });
+                    let _zone = crate::profile_scope!("system: {}", system_names[i]);
+
+                    let previous_override =
+                        set_per_thread_last_run_tick(Some(Tick::new(last_runs[i])));
+
+                    unsafe {
+                        let world = &mut *world_ptr.as_ptr();
+                        // Per-thread hint — no race with other systems.
+                        set_per_thread_timing_hint(last_avg_ns[i]);
+                        let system_start = Instant::now();
+                        let queue = &mut *queue_ptr.as_ptr();
+                        let system_index = systems_batch[i];
+                        let registered_system = &mut *systems_ptr.as_ptr().add(system_index);
+                        registered_system.system.run(world, queue);
+                        // Update EMA of execution time.
+                        let elapsed = system_start.elapsed().as_nanos() as u64;
+                        let old_avg = registered_system.avg_execution_ns;
+                        let delta = elapsed as i64 - old_avg as i64;
+                        registered_system.avg_execution_ns =
+                            (old_avg as i64 + delta / EMA_ALPHA_DENOM) as u64;
+                    }
+
+                    set_per_thread_last_run_tick(previous_override);
+                });
+
+                crate::profile_message!(
+                    "rayon dispatch: {} systems → {} rayon tasks",
+                    batch_len,
+                    task_count.load(Ordering::Relaxed),
+                );
                 drop(_zone);
 
                 // After the batch finishes, advance every system's

@@ -54,6 +54,9 @@ mod enabled {
 
     /// Call once at startup to initialize Tracy. Idempotent — safe to call
     /// multiple times. Without this, all instrumentation silently no-ops.
+    ///
+    /// On Windows, after a previous process dies the TCP socket may linger
+    /// in TIME_WAIT (~30s).  We retry a few times to work around it.
     #[inline]
     pub fn init() {
         let _ = client();
