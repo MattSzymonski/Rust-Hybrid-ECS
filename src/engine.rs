@@ -305,14 +305,12 @@ impl Engine {
 
     /// Run systems sequentially (fallback or when parallel is disabled)
     fn run_systems_sequential(&mut self) {
-        let enabled_systems_len = self.systems.iter().filter(|system| system.enabled).count();
-        let total_systems_len = self.systems.len();
         let _zone = crate::profile_scope!(
             "systems/sequential",
             [(
                 "{} enabled systems ({} total registered)",
-                enabled_systems_len,
-                total_systems_len
+                self.systems.iter().filter(|s| s.enabled).count(),
+                self.systems.len()
             )]
         );
         for registered_system in &mut self.systems {
@@ -344,21 +342,22 @@ impl Engine {
     /// - No two systems in a batch can have conflicting access (write-write or read-write)
     /// - Systems using Commands run exclusively (not in parallel with anything)
     fn run_systems_parallel(&mut self) {
-        let batches_len = self.scheduler.execution_graph().len();
-        let enabled_systems_len = self.systems.iter().filter(|system| system.enabled).count();
-        let total_systems_len = self.systems.len();
         let _zone = crate::profile_scope!(
             "run systems parallel",
             [
                 (
                     "{} enabled systems ({} total)",
-                    enabled_systems_len,
-                    total_systems_len
+                    self.systems.iter().filter(|s| s.enabled).count(),
+                    self.systems.len()
                 ),
-                ("{} parallel batches", batches_len)
+                (
+                    "{} parallel batches",
+                    self.scheduler.execution_graph().len()
+                )
             ]
         );
         // Execute each batch
+        let batches_len = self.scheduler.execution_graph().len();
         for (batch_index, systems_batch) in self.scheduler.execution_graph().iter().enumerate() {
             let batch_size = systems_batch.len();
             let _zone = crate::profile_scope!(
@@ -374,9 +373,10 @@ impl Engine {
                 if !registered.enabled {
                     continue;
                 }
-                let _zone = crate::profile_scope!("system: {}", registered.name);
                 self.world.system_last_run = registered.last_run;
                 let started_at = self.world.change_tick().get();
+
+                let _zone = crate::profile_scope!("system: {}", registered.name);
                 registered.system.run(&mut self.world, &mut self.queue);
                 registered.last_run = started_at;
             } else {
@@ -439,7 +439,7 @@ impl Engine {
 
                 // Dispatch stage: execute all systems in this batch via Rayon
                 let _zone = crate::profile_scope!(
-                    "Dispatch systems batch `({} systems across rayon)",
+                    "dispatch systems batch ({} systems across rayon)",
                     batch_size
                 );
                 systems_batch
@@ -456,7 +456,7 @@ impl Engine {
                             return;
                         }
 
-                        let _zone = crate::profile_scope!("System: {}", name);
+                        let _zone = crate::profile_scope!("system: {}", name);
 
                         // Seed per-thread change-detection baseline.
                         // Because the scheduler guarantees that no two
@@ -509,7 +509,7 @@ impl Engine {
                 // After the batch finishes, advance every system's
                 // last_run to the tick we observed at batch start.
                 let _advance_zone =
-                    crate::profile_scope!("Batch advance ticks ({} systems)", systems_batch.len());
+                    crate::profile_scope!("batch advance ticks ({} systems)", systems_batch.len());
                 for &system_index in systems_batch {
                     self.systems[system_index].last_run = started_at;
                 }

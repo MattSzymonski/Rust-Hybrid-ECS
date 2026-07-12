@@ -30,10 +30,17 @@
 //! ```
 
 // ============================================================================
+// Compile-time safeguards
+// ============================================================================
+
+#[cfg(all(feature = "tracy", feature = "tracy-no-details"))]
+compile_error!("`tracy` and `tracy-no-details` are mutually exclusive. Enable only one.");
+
+// ============================================================================
 // Tracy-enabled implementation
 // ============================================================================
 
-#[cfg(feature = "tracy")]
+#[cfg(any(feature = "tracy", feature = "tracy-no-details"))]
 mod enabled {
     use std::fmt::Arguments;
     use tracy_client::Client;
@@ -144,7 +151,7 @@ mod enabled {
 // Disabled (no-op) implementation
 // ============================================================================
 
-#[cfg(not(feature = "tracy"))]
+#[cfg(not(any(feature = "tracy", feature = "tracy-no-details")))]
 mod enabled {
     use std::fmt::Arguments;
 
@@ -260,6 +267,10 @@ macro_rules! profile_scope {
 /// Two forms:
 /// - `("fmt", args...)` — formatted with `format_args!`
 /// - `"static text"` — bare string literal
+///
+/// When `tracy-no-details` is enabled, expands to nothing — arguments are
+/// never evaluated, eliminating all formatting overhead.
+#[cfg(feature = "tracy")]
 #[doc(hidden)]
 #[macro_export]
 macro_rules! profile_scope_detail {
@@ -269,6 +280,14 @@ macro_rules! profile_scope_detail {
     ($zone:ident, $text:literal) => {
         $zone.text(format_args!($text));
     };
+}
+
+#[cfg(not(feature = "tracy"))]
+#[doc(hidden)]
+#[macro_export]
+macro_rules! profile_scope_detail {
+    ($zone:ident, ($fmt:literal $(, $arg:expr)* $(,)?)) => {};
+    ($zone:ident, $text:literal) => {};
 }
 
 /// Marks the end of a frame. Call once per frame loop iteration.
@@ -307,8 +326,9 @@ macro_rules! profile_plot {
 /// profile_message!("archetype {:?} created", id);
 /// ```
 ///
-/// When `tracy` feature is disabled: macro expands to nothing — arguments
-/// are NOT evaluated. No runtime cost, no allocations.
+/// When `tracy` feature is disabled (including when `tracy-no-details` is
+/// enabled instead): macro expands to nothing — arguments are NOT evaluated.
+/// No runtime cost, no allocations.
 #[cfg(feature = "tracy")]
 #[macro_export]
 macro_rules! profile_message {

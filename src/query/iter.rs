@@ -136,15 +136,20 @@ impl<'w, Q: QueryTarget, F: QueryFilter> QueryIterMut<'w, Q, F> {
         //    - Archetypes are not moved/reallocated during iteration
         //    - Component storage vectors maintain stable addresses while we iterate
         unsafe {
-            let _zone_pointers = crate::profile_scope!("cache archetype pointers");
+            let _zone_pointers = crate::profile_scope!("get world and archetype id");
             let world = &mut *self.world_ptr;
             let archetype_id = self.matching_archetypes[self.current_archetype_idx];
-            let archetype = world.archetypes.get_mut(&archetype_id)?;
+            drop(_zone_pointers);
 
-            _zone.text(format_args!(
-                "{}",
-                archetype.get_archetype_info(&world.component_registry),
-            ));
+            let _zone_archetype = crate::profile_scope!(
+                "get archetype",
+                [(
+                    "{}",
+                    archetype.get_archetype_info(&world.component_registry)
+                )]
+            );
+            let archetype = world.archetypes.get_mut(&archetype_id)?;
+            drop(_zone_archetype);
 
             let _zone_cache = crate::profile_scope!("cache storage pointers");
 
@@ -425,6 +430,7 @@ where
                     "rayon archetype split",
                     [("archetype {:?} | {} entities", archetype_id, len)]
                 );
+                let _ = archetype_id;
                 // Capture by reference — Arcs outlive the parallel iteration
                 // because for_each blocks until all work completes.
                 let batch_count = &batch_count;
