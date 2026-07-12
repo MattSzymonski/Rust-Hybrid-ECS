@@ -127,12 +127,16 @@ impl Archetype {
         self.component_types.contains(&ComponentId::of::<T>())
     }
 
-    /// Check if this archetype matches the required component mask for a query
+    /// Check if this archetype matches the required component mask for a query.
+    ///
+    /// Called in the query setup hot path for every archetype.
+    #[inline]
     pub fn matches_mask(&self, required_mask: &ComponentMask) -> bool {
         self.component_mask.contains_all(required_mask)
     }
 
-    /// Get the number of entities in this archetype
+    /// Get the number of entities in this archetype.
+    #[inline]
     pub fn len(&self) -> usize {
         self.entities.len()
     }
@@ -151,7 +155,8 @@ impl Archetype {
         self.entities.is_empty()
     }
 
-    /// Print information about this archetype (component names and entity count)
+    /// Print information about this archetype (component names and entity count).
+    #[cold]
     pub fn print_info(&self, registry: &crate::component::ComponentRegistry) {
         let component_names: Vec<String> = self
             .component_types

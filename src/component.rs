@@ -177,6 +177,11 @@ impl ComponentMask {
         (self.0 & (1u128 << bit_index)) != 0
     }
 
+    /// Check if all bits in `other` are also set in this mask.
+    ///
+    /// Used in the query hot path to determine whether an archetype
+    /// satisfies the component requirements of a query.
+    #[inline]
     pub fn contains_all(&self, other: &ComponentMask) -> bool {
         (self.0 & other.0) == other.0
     }

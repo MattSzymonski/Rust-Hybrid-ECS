@@ -76,6 +76,7 @@ pub enum AddComponentError {
 }
 
 impl std::fmt::Display for AddComponentError {
+    #[cold]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AddComponentError::EntityNotFound => write!(f, "entity not found"),
@@ -98,6 +99,7 @@ pub enum RemoveComponentError {
 }
 
 impl std::fmt::Display for RemoveComponentError {
+    #[cold]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             RemoveComponentError::EntityNotFound => write!(f, "entity not found"),
@@ -117,6 +119,7 @@ pub enum BuildError {
 }
 
 impl std::fmt::Display for BuildError {
+    #[cold]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BuildError::ComponentNotRegistered(id) => {
@@ -251,6 +254,49 @@ impl World {
             system_last_run: 0,
             #[cfg(debug_assertions)]
             debug_resource_write_locks: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Reserve capacity for at least `additional` more entities.
+    ///
+    /// Pre-allocates internal data structures to avoid reallocation
+    /// overhead when creating many entities in a batch. Call this
+    /// before a loop that calls `create_entity()` for best performance.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use ecs_hybrid::*;
+    /// # let mut world = World::new();
+    /// world.reserve_entities(10_000);
+    /// for _ in 0..10_000 {
+    ///     world.create_entity(); // No reallocation overhead
+    /// }
+    /// ```
+    pub fn reserve_entities(&mut self, additional: usize) {
+        self.free_entity_ids.reserve(additional);
+        self.entity_locations.reserve(additional);
+    }
+
+    /// Reserve capacity for at least `additional` instances of component `T`
+    /// in every archetype that currently contains `T`.
+    ///
+    /// This is a hint — the ECS may reserve more or less than requested
+    /// depending on archetype distribution. Call after registering components
+    /// and after creating archetypes you intend to populate.
+    pub fn reserve_components<T>(&mut self, additional: usize)
+    where
+        T: Component + TraitAccessible<dyn Component>,
+    {
+        let component_id = ComponentId::of::<T>();
+        for archetype in self.archetypes.values_mut() {
+            if archetype.component_types.contains(&component_id) {
+                let storage = archetype.component_storages.get_storage_mut::<T>();
+                storage.data.reserve(additional);
+                if let Some(ticks) = archetype.component_ticks.get_mut(&component_id) {
+                    ticks.reserve(additional);
+                }
+            }
         }
     }
 }
@@ -1198,6 +1244,8 @@ impl World {
     ///     "arch_1" [label="Position, Health | 1 entity"];
     /// }
     /// ```
+    /// Generate a DOT graph representation of the world for debugging.
+    #[cold]
     pub fn to_dot_graph(&self) -> String {
         let mut dot = String::from("digraph World {\n    rankdir=LR;\n    node [shape=record];\n");
 
