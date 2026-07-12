@@ -56,6 +56,10 @@ pub struct Query<'w, Q: QueryTarget, F: QueryFilter = ()> {
     /// for a given `F`.  For simple filters this is a single pair; only
     /// [`Or`] filters produce multiple pairs.
     filter_pairs: Vec<(ComponentMask, ComponentMask)>,
+    /// Cached list of matching archetype IDs. Valid when
+    /// `cached_generation == world.archetype_generation`.
+    cached_matches: Vec<ArchetypeId>,
+    cached_generation: u64,
     _phantom: std::marker::PhantomData<(Q, F)>,
 }
 
@@ -67,6 +71,8 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             world,
             target_mask,
             filter_pairs,
+            cached_matches: Vec::new(),
+            cached_generation: 0,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -159,30 +165,36 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         }
     }
 
+    /// Get the list of archetype IDs matching this query, using a
+    /// generation-based cache to avoid rescanning when archetypes
+    /// haven't changed since the last call.
+    #[inline]
+    fn matching_archetype_ids(&mut self) -> &[ArchetypeId] {
+        if self.cached_generation != self.world.archetype_generation {
+            let mut matching: Vec<ArchetypeId> = self
+                .world
+                .archetypes
+                .iter()
+                .filter(|(_, arch)| {
+                    Self::archetype_matches(arch, &self.target_mask, &self.filter_pairs)
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            matching.sort();
+            self.cached_matches = matching;
+            self.cached_generation = self.world.archetype_generation;
+        }
+        &self.cached_matches
+    }
+
     /// Create a sequential iterator over all matching entities.
     #[inline]
     pub fn iter_mut(&mut self) -> QueryIterMut<'_, Q, F> {
         let this_run = self.world.increment_change_tick();
         let last_run = self.world.system_last_run();
+        let matching = self.matching_archetype_ids().to_vec();
 
-        let mut matching_archetypes: Vec<ArchetypeId> = self
-            .world
-            .archetypes
-            .iter()
-            .filter(|(_, arch)| {
-                Self::archetype_matches(arch, &self.target_mask, &self.filter_pairs)
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        // Sort by ArchetypeId for deterministic iteration order across runs.
-        matching_archetypes.sort();
-
-        QueryIterMut::new(
-            self.world as *mut World,
-            matching_archetypes,
-            this_run,
-            last_run,
-        )
+        QueryIterMut::new(self.world as *mut World, matching, this_run, last_run)
     }
 
     /// Get the first matching entity's components.
@@ -256,24 +268,22 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         let this_run = self.world.increment_change_tick();
         let last_run = self.world.system_last_run();
 
-        let mut archetype_ranges: Vec<FilteredArchetypeRange<Q::State, F::State>> = self
-            .world
-            .archetypes
-            .iter_mut()
-            .filter(|(_, arch)| {
-                Self::archetype_matches(arch, &self.target_mask, &self.filter_pairs)
+        // Use cached archetype IDs to avoid rescanning, but initialize
+        // states fresh (they capture the current tick).
+        let matching_ids = self.matching_archetype_ids().to_vec();
+        let mut archetype_ranges: Vec<FilteredArchetypeRange<Q::State, F::State>> = matching_ids
+            .iter()
+            .filter_map(|id| {
+                self.world.archetypes.get_mut(id).map(|arch| {
+                    let arch_ptr = arch as *mut Archetype;
+                    let q_state = unsafe { Q::init_state(&mut *arch_ptr, this_run) };
+                    let f_state = unsafe { F::init_state(&mut *arch_ptr, last_run, this_run) };
+                    let len = arch.len();
+                    (*id, q_state, f_state, len)
+                })
             })
-            .filter(|(_, arch)| !arch.is_empty())
-            .map(|(id, arch)| {
-                let arch_ptr = arch as *mut Archetype;
-                // SAFETY: We have exclusive access to `arch` and only call each init_state once.
-                let q_state = unsafe { Q::init_state(&mut *arch_ptr, this_run) };
-                let f_state = unsafe { F::init_state(&mut *arch_ptr, last_run, this_run) };
-                let len = arch.len();
-                (*id, q_state, f_state, len)
-            })
+            .filter(|(_, _, _, len)| *len > 0)
             .collect();
-        // Sort by ArchetypeId for deterministic iteration order across runs.
         archetype_ranges.sort_by_key(|(id, _, _, _)| *id);
 
         ParQueryIter::new(archetype_ranges)

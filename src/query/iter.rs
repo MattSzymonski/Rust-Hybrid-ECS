@@ -153,11 +153,15 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Iterator for QueryIterMut<'w, Q, F> {
 
                 // SAFETY: both states are Some during iteration in the hot path.
                 let state = unsafe { self.current_state.as_ref().unwrap_unchecked() };
-                let filter_state = unsafe { self.current_filter_state.as_ref().unwrap_unchecked() };
 
-                if !F::matches(filter_state, index) {
-                    continue;
+                if !F::ACCEPTS_ALL {
+                    let filter_state =
+                        unsafe { self.current_filter_state.as_ref().unwrap_unchecked() };
+                    if !F::matches(filter_state, index) {
+                        continue;
+                    }
                 }
+
                 return Some(Q::fetch_with_state(state, index));
             }
 

@@ -47,6 +47,11 @@ pub trait QueryFilter {
     /// Per-archetype cached state used by [`Self::matches`].
     type State: Send + Sync;
 
+    /// True when this filter accepts every row unconditionally (e.g. `()`).
+    /// Queries use this to skip filter evaluation in the inner loop.
+    /// Default: `false` — most filters do actual work.
+    const ACCEPTS_ALL: bool = false;
+
     /// Components that filtered archetypes MUST contain.
     /// Folded into the query mask so non-matching archetypes are skipped.
     fn included_component_ids() -> Vec<ComponentId> {
@@ -99,6 +104,7 @@ pub trait QueryFilter {
 /// The unit type acts as a no-op filter that accepts every row.
 impl QueryFilter for () {
     type State = ();
+    const ACCEPTS_ALL: bool = true;
 
     fn init_state(_archetype: &mut Archetype, _last_run: Tick, _this_run: Tick) -> Self::State {}
 

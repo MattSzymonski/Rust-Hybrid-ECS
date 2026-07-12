@@ -222,6 +222,12 @@ pub struct World {
     /// not driven by the engine.
     pub(crate) system_last_run: u32,
 
+    /// Monotonically incrementing generation counter. Bumped whenever
+    /// an archetype is added or removed.  Queries use this to cache
+    /// matching archetype lists - if the generation hasn't changed,
+    /// the cached list is still valid. Solely optimization reasons.
+    pub(crate) archetype_generation: u64,
+
     /// **Debug-only**: Tracks which resources currently have an active
     /// mutable borrow.  Used to catch scheduler bugs where two systems
     /// obtain `&mut` to the same resource simultaneously.
@@ -248,6 +254,7 @@ impl World {
             resource_ticks: HashMap::new(),
             change_tick: 0,
             system_last_run: 0,
+            archetype_generation: 0,
             #[cfg(debug_assertions)]
             debug_resource_write_locks: std::collections::HashSet::new(),
         }
@@ -771,6 +778,7 @@ impl World {
             &self.storage_factories,
         );
         self.archetypes.insert(archetype_id, new_archetype);
+        self.archetype_generation = self.archetype_generation.wrapping_add(1);
 
         archetype_id
     }
@@ -994,6 +1002,7 @@ impl World {
         // Clean up empty archetype - remove it from world to prevent memory leaks
         if old_archetype.entities.is_empty() {
             self.archetypes.remove(&old_archetype_id);
+            self.archetype_generation = self.archetype_generation.wrapping_add(1);
         }
     }
 
@@ -1054,6 +1063,7 @@ impl World {
         let archetype_id = location.archetype_id;
         if archetype.entities.is_empty() {
             self.archetypes.remove(&archetype_id);
+            self.archetype_generation = self.archetype_generation.wrapping_add(1);
         }
 
         // Add entity ID to free list with incremented generation for recycling.
@@ -1203,8 +1213,11 @@ impl World {
             .map(|(id, _)| *id)
             .collect();
 
-        for archetype_id in empty_archetype_ids {
-            self.archetypes.remove(&archetype_id);
+        for archetype_id in &empty_archetype_ids {
+            self.archetypes.remove(archetype_id);
+        }
+        if !empty_archetype_ids.is_empty() {
+            self.archetype_generation = self.archetype_generation.wrapping_add(1);
         }
     }
 
