@@ -87,8 +87,10 @@ impl Archetype {
         component_mask: ComponentMask,
         storage_factories: &HashMap<ComponentId, StorageFactory>,
     ) -> Self {
-        let mut component_storages = TraitTypeMap::new();
-        let mut component_ticks: HashMap<ComponentId, Vec<ComponentTicks>> = HashMap::new();
+        let component_count = component_types.len();
+        let mut component_storages = TraitTypeMap::with_capacity(component_count);
+        let mut component_ticks: HashMap<ComponentId, Vec<ComponentTicks>> =
+            HashMap::with_capacity(component_count);
 
         // Register storage for each component type using the factory
         for &component_id in &component_types {

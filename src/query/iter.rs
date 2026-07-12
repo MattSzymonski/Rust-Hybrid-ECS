@@ -384,9 +384,11 @@ where
         self.archetype_ranges
             .into_par_iter()
             .for_each(|(_, q_state, f_state, len)| {
-                let batch_count = Arc::clone(&batch_count);
-                let min_batch = Arc::clone(&min_batch);
-                let max_batch = Arc::clone(&max_batch);
+                // Capture by reference — Arcs outlive the parallel iteration
+                // because for_each blocks until all work completes.
+                let batch_count = &batch_count;
+                let min_batch = &min_batch;
+                let max_batch = &max_batch;
 
                 (0..len)
                     .into_par_iter()
