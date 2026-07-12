@@ -127,6 +127,8 @@ impl<'w, Q: QueryTarget, F: QueryFilter> QueryIterMut<'w, Q, F> {
             let archetype_id = self.matching_archetypes[self.current_archetype_idx];
             let archetype = world.archetypes.get_mut(&archetype_id)?;
 
+            let _zone = crate::profile_scope!("archetype");
+
             // Cache archetype length and component storage pointers
             self.current_archetype_len = archetype.len();
             let arch_ptr = archetype as *mut Archetype;
@@ -383,7 +385,8 @@ where
 
         self.archetype_ranges
             .into_par_iter()
-            .for_each(|(_, q_state, f_state, len)| {
+            .for_each(|(_archetype_id, q_state, f_state, len)| {
+                let _zone = crate::profile_scope!("archetype_par");
                 // Capture by reference — Arcs outlive the parallel iteration
                 // because for_each blocks until all work completes.
                 let batch_count = &batch_count;

@@ -9,6 +9,7 @@ pub mod commands;
 pub mod component;
 pub mod engine;
 pub mod entity;
+pub mod profiling;
 pub mod query;
 pub mod resource;
 pub mod scheduler;

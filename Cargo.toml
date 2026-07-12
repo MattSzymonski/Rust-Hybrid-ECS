@@ -7,9 +7,13 @@ edition = "2021"
 rayon = "1.10"
 parking_lot = "0.12"
 trait_type_map = { path = "../trait_type_map" }
+tracy-client = { version = "0.18", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+
+[features]
+tracy = ["dep:tracy-client"]
 
 [[bench]]
 name = "entity_lifecycle"

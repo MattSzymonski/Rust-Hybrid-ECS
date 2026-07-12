@@ -212,6 +212,8 @@ impl Engine {
     ///
     /// [`should_exit_on_error`]: Engine::should_exit_on_error
     pub fn process_frame(&mut self) -> Result<(), Vec<CommandError>> {
+        let _tracy_frame = crate::profile_scope!("frame");
+
         // Bump the world tick so that any change-detection comparisons
         // performed by mutable queries during this frame use a fresh value.
         self.world.increment_change_tick();
@@ -237,19 +239,31 @@ impl Engine {
 
         // Update script components after systems
         // Scripts receive a ScriptContext with read-only world access and deferred commands
-        self.world.update_scripts(&mut self.queue);
+        {
+            let _zone = crate::profile_scope!("update_scripts");
+            self.world.update_scripts(&mut self.queue);
+        }
 
         // Phase 2: Execute all deferred commands (including those from scripts)
-        self.queue
-            .execute_queued_commands(&mut self.world, self.should_exit_on_error)
+        let result;
+        {
+            let _zone = crate::profile_scope!("execute_commands");
+            result = self
+                .queue
+                .execute_queued_commands(&mut self.world, self.should_exit_on_error);
+        }
+        crate::profile_frame_mark!();
+        result
     }
 
     /// Run systems sequentially (fallback or when parallel is disabled)
     fn run_systems_sequential(&mut self) {
+        let _zone = crate::profile_scope!("systems/sequential");
         for registered in &mut self.systems {
             if !registered.enabled {
                 continue;
             }
+            let _tracy_sys = crate::profile_scope_dyn!(registered.name);
             // Seed the change-detection baseline for this system: filters
             // such as `Changed<T>` will compare against `last_run`.
             self.world.system_last_run = registered.last_run;
@@ -272,6 +286,7 @@ impl Engine {
     /// - No two systems in a batch can have conflicting access (write-write or read-write)
     /// - Systems using Commands run exclusively (not in parallel with anything)
     fn run_systems_parallel(&mut self) {
+        let _zone = crate::profile_scope!("systems/parallel");
         // Execute each batch
         for systems_batch in self.scheduler.execution_graph() {
             if systems_batch.len() == 1 {
@@ -281,6 +296,7 @@ impl Engine {
                 if !registered.enabled {
                     continue;
                 }
+                let _tracy_sys = crate::profile_scope_dyn!(registered.name);
                 self.world.system_last_run = registered.last_run;
                 let started_at = self.world.change_tick().get();
                 registered.system.run(&mut self.world, &mut self.queue);
@@ -333,18 +349,27 @@ impl Engine {
                     .map(|&system_index| self.systems[system_index].enabled)
                     .collect();
 
+                // Pre-compute system names for tracing spans in the parallel closure.
+                let system_names: Vec<&'static str> = systems_batch
+                    .iter()
+                    .map(|&system_index| self.systems[system_index].name)
+                    .collect();
+
                 systems_batch
                     .par_iter()
                     .zip(enabled_flags.par_iter())
                     .zip(last_runs.par_iter())
+                    .zip(system_names.par_iter())
                     // `move` transfers ownership of the three SendPtrMut
                     // handles into the closure.  SendPtrMut is Send + Sync
                     // (see query/ptr.rs), so Rayon can safely move and share
                     // the closure across its worker thread pool.
-                    .for_each(move |((&system_index, &enabled), &last_run)| {
+                    .for_each(move |(((&system_index, &enabled), &last_run), &name)| {
                         if !enabled {
                             return;
                         }
+
+                        let _tracy_sys = crate::profile_scope_dyn!(name);
 
                         // Seed per-thread change-detection baseline.
                         // Because the scheduler guarantees that no two

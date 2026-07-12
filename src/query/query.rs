@@ -171,6 +171,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     #[inline]
     fn matching_archetype_ids(&mut self) -> &[ArchetypeId] {
         if self.cached_generation != self.world.archetype_generation {
+            let _zone = crate::profile_scope!("query_cache_rebuild");
             let mut matching: Vec<ArchetypeId> = self
                 .world
                 .archetypes

@@ -403,6 +403,7 @@ impl World {
     /// This ensures all structural changes (add/remove component, destroy entity)
     /// are automatically deferred, preventing use-after-free bugs.
     pub(crate) fn update_scripts(&mut self, commands: &mut CommandQueue) {
+        let _zone = crate::profile_scope!("update_scripts");
         // Pre-allocate the work list.  We recycle this Vec across script
         // types via `.drain(..)`, so only one allocation per frame.
         let total_entities = self.entity_locations.len();
@@ -1357,6 +1358,7 @@ impl<'w> EntityBuilder<'w> {
     /// with the world beforehand.
     #[must_use]
     pub fn build(self) -> Result<Entity, BuildError> {
+        let _zone = crate::profile_scope!("entity_build");
         let entity = self.entity;
         let component_ids: Vec<ComponentId> =
             self.components.iter().map(|c| c.component_id()).collect();
