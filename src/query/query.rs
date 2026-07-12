@@ -65,6 +65,8 @@ pub struct Query<'w, Q: QueryTarget, F: QueryFilter = ()> {
 
 impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     pub fn new(world: &'w mut World) -> Self {
+        let _zone = crate::profile_scope!("create query");
+
         let target_mask = Self::build_target_mask(world);
         let filter_pairs = Self::build_filter_mask_pairs(world);
         Self {
@@ -92,6 +94,8 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     /// Build filter mask pairs from the world's component registry.
     /// Called once during [`new`](Self::new).
     fn build_filter_mask_pairs(world: &World) -> Vec<(ComponentMask, ComponentMask)> {
+        let _zone = crate::profile_scope!("build component query filter mask");
+
         let registry = &world.component_registry;
         F::archetype_filter_pairs()
             .into_iter()
@@ -171,7 +175,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     #[inline]
     fn matching_archetype_ids(&mut self) -> &[ArchetypeId] {
         if self.cached_generation != self.world.archetype_generation {
-            let _zone = crate::profile_scope!("query_cache_rebuild");
+            let _zone = crate::profile_scope!("find matching archetypes");
             let mut matching: Vec<ArchetypeId> = self
                 .world
                 .archetypes
@@ -182,6 +186,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
                 .map(|(id, _)| *id)
                 .collect();
             matching.sort();
+            crate::profile_message!("matched: {}", matching.len());
             self.cached_matches = matching;
             self.cached_generation = self.world.archetype_generation;
         }
@@ -191,6 +196,8 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     /// Create a sequential iterator over all matching entities.
     #[inline]
     pub fn iter_mut(&mut self) -> QueryIterMut<'_, Q, F> {
+        let _zone = crate::profile_scope!("create sequential query iterator");
+
         let this_run = self.world.increment_change_tick();
         let last_run = self.world.system_last_run();
         let matching = self.matching_archetype_ids().to_vec();
@@ -266,6 +273,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         F::State: Send + Sync,
         for<'a> Q::Item<'a>: Send,
     {
+        let _zone = crate::profile_scope!("create parallel query iterator");
         let this_run = self.world.increment_change_tick();
         let last_run = self.world.system_last_run();
 
@@ -276,9 +284,9 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             .iter()
             .filter_map(|id| {
                 self.world.archetypes.get_mut(id).map(|arch| {
-                    let arch_ptr = arch as *mut Archetype;
-                    let q_state = unsafe { Q::init_state(&mut *arch_ptr, this_run) };
-                    let f_state = unsafe { F::init_state(&mut *arch_ptr, last_run, this_run) };
+                    let archetype_ptr = arch as *mut Archetype;
+                    let q_state = unsafe { Q::init_state(&mut *archetype_ptr, this_run) };
+                    let f_state = unsafe { F::init_state(&mut *archetype_ptr, last_run, this_run) };
                     let len = arch.len();
                     (*id, q_state, f_state, len)
                 })

@@ -277,6 +277,7 @@ impl World {
     /// }
     /// ```
     pub fn reserve_entities(&mut self, additional: usize) {
+        let _zone = crate::profile_scope!("reserve_entities", [("additional: {}", additional)]);
         self.free_entity_ids.reserve(additional);
         self.entity_locations.reserve(additional);
     }
@@ -328,6 +329,10 @@ impl World {
     where
         T: Component + TraitAccessible<dyn Component> + Clone,
     {
+        let _zone = crate::profile_scope!(
+            "register_component",
+            [("type: {}", std::any::type_name::<T>())]
+        );
         let component_id = ComponentId::of::<T>();
 
         // Register component (bit index + name)
@@ -355,6 +360,10 @@ impl World {
     where
         T: ScriptComponent + TraitAccessible<dyn Component> + Clone,
     {
+        let _zone = crate::profile_scope!(
+            "register_script_component",
+            [("type: {}", std::any::type_name::<T>())]
+        );
         // First register as a normal component
         self.register_component::<T>();
 
@@ -403,7 +412,10 @@ impl World {
     /// This ensures all structural changes (add/remove component, destroy entity)
     /// are automatically deferred, preventing use-after-free bugs.
     pub(crate) fn update_scripts(&mut self, commands: &mut CommandQueue) {
-        let _zone = crate::profile_scope!("update_scripts");
+        let _zone = crate::profile_scope!(
+            "update_scripts",
+            [("scripts: {}", self.script_components.len())]
+        );
         // Pre-allocate the work list.  We recycle this Vec across script
         // types via `.drain(..)`, so only one allocation per frame.
         let total_entities = self.entity_locations.len();
@@ -527,6 +539,10 @@ impl World {
     /// Resources are global state such as time, input, configuration, etc.
     /// If a resource of this type already exists, it is replaced.
     pub fn insert_resource<T: Resource>(&mut self, resource: T) {
+        let _zone = crate::profile_scope!(
+            "insert_resource",
+            [("type: {}", std::any::type_name::<T>())]
+        );
         let id = ResourceId::of::<T>();
         let tick = Tick::new(self.change_tick);
         self.resources.insert(id, Box::new(resource));
@@ -727,6 +743,7 @@ impl World {
     /// Reuses IDs from the free list when available, incrementing the generation
     /// to invalidate any stale handles. Otherwise allocates a fresh ID.
     pub(crate) fn allocate_entity(&mut self) -> Entity {
+        let _zone = crate::profile_scope!("allocate_entity");
         // Try to reuse an ID from the free list
         if let Some((id, generation)) = self.free_entity_ids.pop() {
             Entity { id, generation }
@@ -749,6 +766,10 @@ impl World {
         &mut self,
         component_ids: Vec<ComponentId>,
     ) -> ArchetypeId {
+        let _zone = crate::profile_scope!(
+            "get_or_create_archetype",
+            [("types: {}", component_ids.len())]
+        );
         // Build component mask first - this is used for the fast lookup path
         // The mask uniquely identifies the component set regardless of order
         let mut component_mask = ComponentMask::empty();
@@ -810,6 +831,7 @@ impl World {
     ) where
         F: FnOnce(&mut TraitTypeMap<dyn Component, VecFamily>),
     {
+        let _zone = crate::profile_scope!("insert_entity", [("entity: {:?}", entity)]);
         let archetype_id = self.get_or_create_archetype(component_ids);
         let current_tick = Tick::new(self.change_tick);
 
@@ -1013,6 +1035,7 @@ impl World {
     /// Returns true if the entity was found and removed, false otherwise.
     #[must_use]
     pub fn destroy_entity(&mut self, entity: Entity) -> bool {
+        let _zone = crate::profile_scope!("destroy_entity", [("entity: {:?}", entity)]);
         // Get current location
         let location = match self.entity_locations.remove(&entity) {
             Some(loc) => loc,
@@ -1085,6 +1108,10 @@ impl World {
         &mut self,
         entity: Entity,
     ) -> Result<(), RemoveComponentError> {
+        let _zone = crate::profile_scope!(
+            "remove_component",
+            [("entity: {:?}, type: {}", entity, std::any::type_name::<T>())]
+        );
         let component_id = ComponentId::of::<T>();
 
         // Get current location
@@ -1154,6 +1181,10 @@ impl World {
     where
         T: Component + TraitAccessible<dyn Component> + Clone,
     {
+        let _zone = crate::profile_scope!(
+            "add_component",
+            [("entity: {:?}, type: {}", entity, std::any::type_name::<T>())]
+        );
         let component_id = ComponentId::of::<T>();
 
         // Get current location
@@ -1214,6 +1245,10 @@ impl World {
             .map(|(id, _)| *id)
             .collect();
 
+        let _zone = crate::profile_scope!(
+            "cleanup_empty_archetypes",
+            [("removed: {}", empty_archetype_ids.len())]
+        );
         for archetype_id in &empty_archetype_ids {
             self.archetypes.remove(archetype_id);
         }
@@ -1358,10 +1393,11 @@ impl<'w> EntityBuilder<'w> {
     /// with the world beforehand.
     #[must_use]
     pub fn build(self) -> Result<Entity, BuildError> {
-        let _zone = crate::profile_scope!("entity_build");
-        let entity = self.entity;
         let component_ids: Vec<ComponentId> =
             self.components.iter().map(|c| c.component_id()).collect();
+        let _zone =
+            crate::profile_scope!("entity_build", [("components: {}", component_ids.len())]);
+        let entity = self.entity;
 
         // Validate that every component type is registered before we try to
         // create the archetype (which would panic on an unregistered type).

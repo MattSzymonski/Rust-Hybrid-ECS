@@ -9,7 +9,7 @@
 // Press Ctrl+C to stop.
 
 use ecs_hybrid::*;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use trait_type_map::impl_trait_accessible;
 
 // ---- Components ----
@@ -92,12 +92,28 @@ fn spawner_system(mut commands: Commands) {
         .build();
 }
 
-/// Fast LCG random f32 — simple, no deps.
+/// Fast LCG random f32 — seeded from CPU counter, no syscalls.
 fn lcg() -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    fn seed() -> u64 {
+        // RDTSC — fast, non-crypto seed. No syscall, no blocking.
+        unsafe { std::arch::x86_64::_rdtsc() }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    fn seed() -> u64 {
+        // Fallback: wall clock microseconds
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros() as u64
+    }
+
     use std::cell::Cell;
-    use std::hash::{BuildHasher, RandomState};
     thread_local! {
-        static S: Cell<u64> = Cell::new(RandomState::new().hash_one(0u64));
+        static S: Cell<u64> = {
+            let _zone = crate::profile_scope!("lcg_init");
+            Cell::new(seed().wrapping_mul(6364136223846793005).wrapping_add(1))
+        };
     }
     S.with(|s| {
         let mut x = s.get();
@@ -130,6 +146,9 @@ fn main() {
     engine.register_system("cleanup", cleanup_system);
     engine.register_system("spawner", spawner_system);
 
+    // Set 30 FPS cap using the engine's built-in limiter
+    engine.set_fps_limit(200.0);
+    engine.trace_frame_wait = false;
     engine.world_mut().reserve_entities(2000);
     for _ in 0..1000 {
         let _ = engine
@@ -150,29 +169,17 @@ fn main() {
 
     println!("=== Tracy Live Profiling Demo ===");
     println!("6 systems, 1000 entities, parallel ON");
-    println!("Target: 30 FPS (limiter ON)");
+    println!("Target: 30 FPS (engine limiter)");
     println!();
     println!("Connect Tracy now. Press Ctrl+C to stop.");
     println!();
-
-    const TARGET_FPS: f64 = 30.0;
-    const FRAME_BUDGET: Duration = Duration::from_nanos((1_000_000_000.0 / TARGET_FPS) as u64);
 
     let mut count: u64 = 0;
     let mut last_report = Instant::now();
 
     loop {
-        let frame_start = Instant::now();
-
         engine.process_frame().unwrap();
-        crate::profile_frame_mark!();
         count += 1;
-
-        // FPS limiter — sleep remaining frame budget
-        let elapsed = frame_start.elapsed();
-        if elapsed < FRAME_BUDGET {
-            std::thread::sleep(FRAME_BUDGET - elapsed);
-        }
 
         // Report every 2 seconds
         let dt = last_report.elapsed().as_secs_f64();

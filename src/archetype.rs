@@ -88,6 +88,7 @@ impl Archetype {
         storage_factories: &HashMap<ComponentId, StorageFactory>,
     ) -> Self {
         let component_count = component_types.len();
+        let _zone = crate::profile_scope!("archetype_new", [("components: {}", component_count)]);
         let mut component_storages = TraitTypeMap::with_capacity(component_count);
         let mut component_ticks: HashMap<ComponentId, Vec<ComponentTicks>> =
             HashMap::with_capacity(component_count);
@@ -157,9 +158,7 @@ impl Archetype {
         self.entities.is_empty()
     }
 
-    /// Print information about this archetype (component names and entity count).
-    #[cold]
-    pub fn print_info(&self, registry: &crate::component::ComponentRegistry) {
+    pub fn get_archetype_info(&self, registry: &crate::component::ComponentRegistry) -> String {
         let component_names: Vec<String> = self
             .component_types
             .iter()
@@ -171,11 +170,18 @@ impl Archetype {
             })
             .collect();
 
-        println!(
+        format!(
             "Archetype {:?}: {} entities, components: [{}]",
             self.id,
             self.entities.len(),
             component_names.join(", ")
-        );
+        )
+    }
+
+    /// Print information about this archetype (component names and entity count).
+    #[cold]
+    pub fn print_info(&self, registry: &crate::component::ComponentRegistry) {
+        let info = self.get_archetype_info(registry);
+        println!("{}", info);
     }
 }

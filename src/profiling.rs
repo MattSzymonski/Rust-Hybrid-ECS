@@ -16,9 +16,6 @@
 //! // Static name (zero-allocation, preferred):
 //! let _zone = profile_scope!("movement");
 //!
-//! // Dynamic name (for system names, etc.):
-//! let _zone = profile_scope_dyn!(registered.name);
-//!
 //! // Frame boundary:
 //! profile_frame_mark!();
 //!
@@ -65,8 +62,14 @@ mod enabled {
     impl TracyZone {
         #[doc(hidden)]
         #[inline]
-        pub fn new_static(name: &'static str, _callstack: u16) -> Self {
-            let inner = Client::is_running().then(|| client().span_alloc(Some(name), "", "", 0, 0));
+        pub fn new_static(
+            name: &'static str,
+            function: &'static str,
+            file: &'static str,
+            line: u32,
+        ) -> Self {
+            let inner = Client::is_running()
+                .then(|| client().span_alloc(Some(name), function, file, line, 0));
             Self { inner }
         }
 
@@ -76,6 +79,20 @@ mod enabled {
             let inner = Client::is_running()
                 .then(|| client().span_alloc(Some(name), function, file, line, 0));
             Self { inner }
+        }
+
+        /// Attach a diagnostic message to this zone. The text appears in
+        /// Tracy's zone tooltip / detail view.
+        ///
+        /// Uses `format_args!` — no allocation occurs until Tracy is
+        /// actually running. Cheaper than `profile_message!` for zone-scoped
+        /// information.
+        #[inline]
+        pub fn text(&self, msg: Arguments<'_>) {
+            if let Some(span) = &self.inner {
+                let text = format!("{}", msg);
+                span.emit_text(&text);
+            }
         }
     }
 
@@ -137,7 +154,12 @@ mod enabled {
     impl TracyZone {
         #[doc(hidden)]
         #[inline(always)]
-        pub fn new_static(_name: &'static str, _callstack: u16) -> Self {
+        pub fn new_static(
+            _name: &'static str,
+            _fn: &'static str,
+            _file: &'static str,
+            _line: u32,
+        ) -> Self {
             Self
         }
 
@@ -146,6 +168,10 @@ mod enabled {
         pub fn new_dynamic(_name: &str, _function: &str, _file: &str, _line: u32) -> Self {
             Self
         }
+
+        /// No-op when Tracy is disabled.
+        #[inline(always)]
+        pub fn text(&self, _msg: Arguments<'_>) {}
     }
 
     #[inline(always)]
@@ -168,6 +194,7 @@ pub use enabled::*;
 
 /// Initializes the Tracy profiler client. Call once at startup.
 /// Idempotent and safe to call even when the `tracy` feature is disabled.
+#[cfg(feature = "tracy")]
 #[macro_export]
 macro_rules! profile_init {
     () => {
@@ -175,38 +202,77 @@ macro_rules! profile_init {
     };
 }
 
+#[cfg(not(feature = "tracy"))]
+#[macro_export]
+macro_rules! profile_init {
+    () => {};
+}
+
 /// Creates a scoped CPU profiling zone with a **static** (compile-time) name.
 ///
 /// Preferred form. Zero heap allocation — the name is embedded in the binary.
 ///
+/// An optional array of detail tuples can be attached to the zone. Each detail
+/// is either a bare `"static text"` or a `("fmt", args...)` tuple. When
+/// `tracy` is disabled the `format_args!` calls are stack-only structs that
+/// LLVM eliminates entirely.
+///
 /// ```ignore
-/// fn movement_system(query: Query<...>) {
-///     let _zone = profile_scope!("movement");
-///     for (pos, vel) in query.iter_mut() { ... }
-/// }
+/// // Basic:
+/// let _zone = profile_scope!("movement");
+///
+/// // With details (array always required):
+/// let _zone = profile_scope!("movement", [("entities: {}", count)]);
+/// let _zone = profile_scope!("frame", ["static note", ("dt: {:.2}ms", delta)]);
 /// ```
 #[macro_export]
 macro_rules! profile_scope {
     ($name:literal) => {
-        $crate::profiling::TracyZone::new_static($name, 0)
+        $crate::profiling::TracyZone::new_static($name, module_path!(), file!(), line!())
+    };
+    ($name:literal, [ $( $detail:tt ),* $(,)? ]) => {{
+        let zone = $crate::profiling::TracyZone::new_static($name, module_path!(), file!(), line!());
+        $( $crate::profile_scope_detail!(zone, $detail); )*
+        zone
+    }};
+    ($fmt:literal $(, $fmt_arg:expr)* ; [ $( $detail:tt ),* $(,)? ]) => {{
+        let zone = $crate::profiling::TracyZone::new_dynamic(
+            &format!($fmt, $($fmt_arg),*),
+            module_path!(),
+            file!(),
+            line!(),
+        );
+        $( $crate::profile_scope_detail!(zone, $detail); )*
+        zone
+    }};
+    ($fmt:literal $(, $arg:expr)* $(,)?) => {
+        $crate::profiling::TracyZone::new_dynamic(
+            &format!($fmt, $($arg),*),
+            module_path!(),
+            file!(),
+            line!(),
+        )
     };
 }
 
-/// Creates a scoped CPU profiling zone with a **dynamic** (runtime) name.
+/// Internal helper: dispatches a single detail element to `zone.text()`.
 ///
-/// For system names, entity IDs, etc. Slightly more expensive (allocates).
-///
-/// ```ignore
-/// let _zone = profile_scope_dyn!(registered.name);
-/// ```
+/// Two forms:
+/// - `("fmt", args...)` — formatted with `format_args!`
+/// - `"static text"` — bare string literal
+#[doc(hidden)]
 #[macro_export]
-macro_rules! profile_scope_dyn {
-    ($name:expr) => {
-        $crate::profiling::TracyZone::new_dynamic($name, module_path!(), file!(), line!())
+macro_rules! profile_scope_detail {
+    ($zone:ident, ($fmt:literal $(, $arg:expr)* $(,)?)) => {
+        $zone.text(format_args!($fmt, $($arg),*));
+    };
+    ($zone:ident, $text:literal) => {
+        $zone.text(format_args!($text));
     };
 }
 
 /// Marks the end of a frame. Call once per frame loop iteration.
+#[cfg(feature = "tracy")]
 #[macro_export]
 macro_rules! profile_frame_mark {
     () => {
@@ -214,11 +280,14 @@ macro_rules! profile_frame_mark {
     };
 }
 
+#[cfg(not(feature = "tracy"))]
+#[macro_export]
+macro_rules! profile_frame_mark {
+    () => {};
+}
+
 /// Emits a single data point on a named time-series plot.
-///
-/// ```ignore
-/// profile_plot!("entity_count", world.entity_count() as f64);
-/// ```
+#[cfg(feature = "tracy")]
 #[macro_export]
 macro_rules! profile_plot {
     ($name:expr, $value:expr) => {
@@ -226,11 +295,21 @@ macro_rules! profile_plot {
     };
 }
 
+#[cfg(not(feature = "tracy"))]
+#[macro_export]
+macro_rules! profile_plot {
+    ($name:expr, $value:expr) => {};
+}
+
 /// Emits a diagnostic message at the current point in the trace.
 ///
 /// ```ignore
 /// profile_message!("archetype {:?} created", id);
 /// ```
+///
+/// When `tracy` feature is disabled: macro expands to nothing — arguments
+/// are NOT evaluated. No runtime cost, no allocations.
+#[cfg(feature = "tracy")]
 #[macro_export]
 macro_rules! profile_message {
     ($($arg:tt)*) => {
@@ -238,14 +317,27 @@ macro_rules! profile_message {
     };
 }
 
+#[cfg(not(feature = "tracy"))]
+#[macro_export]
+macro_rules! profile_message {
+    ($($arg:tt)*) => {};
+}
+
 /// Sets the display name of the current thread in Tracy.
 ///
 /// ```ignore
 /// profile_thread!("main");
 /// ```
+#[cfg(feature = "tracy")]
 #[macro_export]
 macro_rules! profile_thread {
     ($name:expr) => {
         $crate::profiling::set_thread_name($name);
     };
+}
+
+#[cfg(not(feature = "tracy"))]
+#[macro_export]
+macro_rules! profile_thread {
+    ($name:expr) => {};
 }

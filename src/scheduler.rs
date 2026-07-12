@@ -248,7 +248,10 @@ impl SystemScheduler {
     /// The batching algorithm itself remains O(n²) in the worst case,
     /// but the constant factor is dramatically reduced.
     pub fn build_execution_graph(&mut self) {
-        let _zone = crate::profile_scope!("build_execution_graph");
+        let _zone = crate::profile_scope!(
+            "build execution graph",
+            [("systems: {}", self.system_count)]
+        );
         self.execution_graph.clear();
 
         let mut scheduled = vec![false; self.system_count];

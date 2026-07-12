@@ -240,7 +240,8 @@ impl CommandQueue {
         world: &mut World,
         exit_on_error: bool,
     ) -> Result<(), Vec<CommandError>> {
-        let _zone = crate::profile_scope!("execute_commands");
+        let _zone =
+            crate::profile_scope!("execute_commands", [("pending: {}", self.commands.len())]);
         let mut errors = Vec::new();
 
         for command in self.commands.drain(..) {

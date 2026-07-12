@@ -340,8 +340,8 @@ macro_rules! impl_query_filter_tuple {
 
             #[allow(non_snake_case)]
             fn init_state(archetype: &mut Archetype, last_run: Tick, this_run: Tick) -> Self::State {
-                let arch_ptr = archetype as *mut Archetype;
-                unsafe { ($($T::init_state(&mut *arch_ptr, last_run, this_run),)*) }
+                let archetype_ptr = archetype as *mut Archetype;
+                unsafe { ($($T::init_state(&mut *archetype_ptr, last_run, this_run),)*) }
             }
 
             #[allow(non_snake_case)]
@@ -414,8 +414,8 @@ macro_rules! impl_query_filter_or {
 
             #[allow(non_snake_case)]
             fn init_state(archetype: &mut Archetype, last_run: Tick, this_run: Tick) -> Self::State {
-                let arch_ptr = archetype as *mut Archetype;
-                unsafe { ($($T::init_state(&mut *arch_ptr, last_run, this_run),)*) }
+                let archetype_ptr = archetype as *mut Archetype;
+                unsafe { ($($T::init_state(&mut *archetype_ptr, last_run, this_run),)*) }
             }
 
             #[allow(non_snake_case)]

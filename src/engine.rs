@@ -14,6 +14,7 @@ use crate::scheduler::{SystemAccess, SystemScheduler};
 use crate::system::{IntoSystem, System, SystemParam};
 use crate::world::{set_per_thread_last_run_tick, World};
 use rayon::prelude::*;
+use std::time::{Duration, Instant};
 
 /// Wrapper for a registered system with its name
 struct RegisteredSystem {
@@ -59,6 +60,12 @@ pub struct Engine {
     /// deferred command fails.  When false (default), errors are logged
     /// to stderr and execution continues.
     pub should_exit_on_error: bool,
+    /// Optional frame rate limit. When set, `process_frame` sleeps the
+    /// remaining budget after completing the frame's work.
+    frame_budget: Option<Duration>,
+    /// When true, the FPS limiter sleep is wrapped in a Tracy zone
+    /// (`frame_wait`). Turn off to declutter the timeline.
+    pub trace_frame_wait: bool,
 }
 
 impl Engine {
@@ -72,6 +79,8 @@ impl Engine {
             parallel_execution: true,
             graph_dirty: false,
             should_exit_on_error: false,
+            frame_budget: None,
+            trace_frame_wait: true,
         }
     }
 }
@@ -86,6 +95,25 @@ impl Engine {
     /// Enable or disable parallel system execution
     pub fn set_parallel_execution(&mut self, enabled: bool) {
         self.parallel_execution = enabled;
+    }
+
+    /// Limit the frame rate to `fps` frames per second.
+    ///
+    /// After completing the frame's work, `process_frame` sleeps the
+    /// remaining budget. Pass `0.0` or `f64::INFINITY` to disable.
+    ///
+    /// # Example
+    /// ```no_run
+    /// # use ecs_hybrid::*;
+    /// # let mut engine = Engine::new();
+    /// engine.set_fps_limit(30.0); // Cap at 30 FPS
+    /// ```
+    pub fn set_fps_limit(&mut self, fps: f64) {
+        self.frame_budget = if fps > 0.0 && fps.is_finite() {
+            Some(Duration::from_nanos((1_000_000_000.0 / fps) as u64))
+        } else {
+            None
+        };
     }
 
     /// Enable a system by name
@@ -212,66 +240,96 @@ impl Engine {
     ///
     /// [`should_exit_on_error`]: Engine::should_exit_on_error
     pub fn process_frame(&mut self) -> Result<(), Vec<CommandError>> {
-        let _tracy_frame = crate::profile_scope!("frame");
-
-        // Bump the world tick so that any change-detection comparisons
-        // performed by mutable queries during this frame use a fresh value.
-        self.world.increment_change_tick();
-
-        // Debug-only: clear the resource write-lock tracker so that the
-        // isolation check only guards within a single frame.
-        #[cfg(debug_assertions)]
-        self.world.debug_clear_resource_locks();
-
-        // Rebuild the execution graph if systems were enabled/disabled since
-        // the last frame, so parallel batches reflect the current active set.
-        if self.graph_dirty {
-            self.scheduler.build_execution_graph();
-            self.graph_dirty = false;
-        }
-
-        // Phase 1: Run all systems
-        if self.parallel_execution && self.systems.len() > 1 {
-            self.run_systems_parallel();
-        } else {
-            self.run_systems_sequential();
-        }
-
-        // Update script components after systems
-        // Scripts receive a ScriptContext with read-only world access and deferred commands
-        {
-            let _zone = crate::profile_scope!("update_scripts");
-            self.world.update_scripts(&mut self.queue);
-        }
-
-        // Phase 2: Execute all deferred commands (including those from scripts)
+        let frame_start = Instant::now();
         let result;
+
         {
-            let _zone = crate::profile_scope!("execute_commands");
-            result = self
-                .queue
-                .execute_queued_commands(&mut self.world, self.should_exit_on_error);
+            // Tracy zone: frame = actual work, not including sleep
+            let _tracy_frame = crate::profile_scope!("frame");
+
+            // Bump the world tick so that any change-detection comparisons
+            // performed by mutable queries during this frame use a fresh value.
+            self.world.increment_change_tick();
+
+            // Debug-only: clear the resource write-lock tracker so that the
+            // isolation check only guards within a single frame.
+            #[cfg(debug_assertions)]
+            self.world.debug_clear_resource_locks();
+
+            // Rebuild the execution graph if systems were enabled/disabled since
+            // the last frame, so parallel batches reflect the current active set.
+            if self.graph_dirty {
+                self.scheduler.build_execution_graph();
+                self.graph_dirty = false;
+            }
+
+            // Phase 1: Run all systems
+            if self.parallel_execution && self.systems.len() > 1 {
+                self.run_systems_parallel();
+            } else {
+                self.run_systems_sequential();
+            }
+
+            // Scripts receive a ScriptContext with read-only world access and deferred commands
+            {
+                let _zone = crate::profile_scope!("update_scripts");
+                self.world.update_scripts(&mut self.queue);
+            }
+
+            // Phase 2: Execute all deferred commands (including those from scripts)
+            {
+                let _zone = crate::profile_scope!("execute_commands");
+                result = self
+                    .queue
+                    .execute_queued_commands(&mut self.world, self.should_exit_on_error);
+            }
+
+            crate::profile_frame_mark!();
+        } // ← frame zone ends here
+
+        // FPS limiter — sleep remaining budget OUTSIDE the frame zone
+        if let Some(budget) = self.frame_budget {
+            let elapsed = frame_start.elapsed();
+            if elapsed < budget {
+                if self.trace_frame_wait {
+                    let _zone = crate::profile_scope!("frame_wait");
+                    std::thread::sleep(budget - elapsed);
+                } else {
+                    std::thread::sleep(budget - elapsed);
+                }
+            }
         }
-        crate::profile_frame_mark!();
+
         result
     }
 
     /// Run systems sequentially (fallback or when parallel is disabled)
     fn run_systems_sequential(&mut self) {
-        let _zone = crate::profile_scope!("systems/sequential");
-        for registered in &mut self.systems {
-            if !registered.enabled {
+        let enabled_systems_len = self.systems.iter().filter(|system| system.enabled).count();
+        let total_systems_len = self.systems.len();
+        let _zone = crate::profile_scope!(
+            "systems/sequential",
+            [(
+                "{} enabled systems ({} total registered)",
+                enabled_systems_len,
+                total_systems_len
+            )]
+        );
+        for registered_system in &mut self.systems {
+            if !registered_system.enabled {
                 continue;
             }
-            let _tracy_sys = crate::profile_scope_dyn!(registered.name);
+            let _tracy_sys = crate::profile_scope!("system: {}", registered_system.name);
             // Seed the change-detection baseline for this system: filters
             // such as `Changed<T>` will compare against `last_run`.
-            self.world.system_last_run = registered.last_run;
+            self.world.system_last_run = registered_system.last_run;
             let started_at = self.world.change_tick().get();
-            registered.system.run(&mut self.world, &mut self.queue);
+            registered_system
+                .system
+                .run(&mut self.world, &mut self.queue);
             // Record the tick that was current at system entry so the next
             // run sees mutations that happened during this run.
-            registered.last_run = started_at;
+            registered_system.last_run = started_at;
         }
         // Reset the baseline so ad-hoc queries between frames behave
         // predictably.
@@ -286,17 +344,37 @@ impl Engine {
     /// - No two systems in a batch can have conflicting access (write-write or read-write)
     /// - Systems using Commands run exclusively (not in parallel with anything)
     fn run_systems_parallel(&mut self) {
-        let _zone = crate::profile_scope!("systems/parallel");
+        let batches_len = self.scheduler.execution_graph().len();
+        let enabled_systems_len = self.systems.iter().filter(|system| system.enabled).count();
+        let total_systems_len = self.systems.len();
+        let _zone = crate::profile_scope!(
+            "run systems parallel",
+            [
+                (
+                    "{} enabled systems ({} total)",
+                    enabled_systems_len,
+                    total_systems_len
+                ),
+                ("{} parallel batches", batches_len)
+            ]
+        );
         // Execute each batch
-        for systems_batch in self.scheduler.execution_graph() {
-            if systems_batch.len() == 1 {
-                // Single system - run directly
+        for (batch_index, systems_batch) in self.scheduler.execution_graph().iter().enumerate() {
+            let batch_size = systems_batch.len();
+            let _zone = crate::profile_scope!(
+                "run systems batch {}/{} ({} systems)",
+                batch_index + 1,
+                batches_len,
+                batch_size
+            );
+            if batch_size == 1 {
+                // Single system - run directly on main thread, skip rayon
                 let system_index = systems_batch[0];
                 let registered = &mut self.systems[system_index];
                 if !registered.enabled {
                     continue;
                 }
-                let _tracy_sys = crate::profile_scope_dyn!(registered.name);
+                let _zone = crate::profile_scope!("system: {}", registered.name);
                 self.world.system_last_run = registered.last_run;
                 let started_at = self.world.change_tick().get();
                 registered.system.run(&mut self.world, &mut self.queue);
@@ -313,6 +391,9 @@ impl Engine {
                 // system's `last_run` and seed it via a per-thread local,
                 // sidestepping the world-level field for parallel batches.
                 let started_at = self.world.change_tick().get();
+
+                // Prepare stage: collect per-system data + create raw pointers
+                let _zone = crate::profile_scope!("Setup systems batch ({} systems)", batch_size);
                 let last_runs: Vec<u32> = systems_batch
                     .iter()
                     .map(|&system_index| self.systems[system_index].last_run)
@@ -354,7 +435,13 @@ impl Engine {
                     .iter()
                     .map(|&system_index| self.systems[system_index].name)
                     .collect();
+                drop(_zone);
 
+                // Dispatch stage: execute all systems in this batch via Rayon
+                let _zone = crate::profile_scope!(
+                    "Dispatch systems batch `({} systems across rayon)",
+                    batch_size
+                );
                 systems_batch
                     .par_iter()
                     .zip(enabled_flags.par_iter())
@@ -369,7 +456,7 @@ impl Engine {
                             return;
                         }
 
-                        let _tracy_sys = crate::profile_scope_dyn!(name);
+                        let _zone = crate::profile_scope!("System: {}", name);
 
                         // Seed per-thread change-detection baseline.
                         // Because the scheduler guarantees that no two
@@ -417,9 +504,12 @@ impl Engine {
                         // nested rayon pool) are unaffected.
                         set_per_thread_last_run_tick(previous_override);
                     });
+                drop(_zone);
 
                 // After the batch finishes, advance every system's
                 // last_run to the tick we observed at batch start.
+                let _advance_zone =
+                    crate::profile_scope!("Batch advance ticks ({} systems)", systems_batch.len());
                 for &system_index in systems_batch {
                     self.systems[system_index].last_run = started_at;
                 }

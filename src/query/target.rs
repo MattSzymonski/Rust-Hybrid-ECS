@@ -88,6 +88,7 @@ impl QueryTarget for Entity {
     }
 
     fn init_state(archetype: &mut Archetype, _this_run: Tick) -> Self::State {
+        let _zone = crate::profile_scope!("create state for entity query target");
         SendPtr::new(&archetype.entities as *const Vec<Entity>)
     }
 
@@ -113,6 +114,7 @@ impl<T: Component> QueryTarget for &T {
     }
 
     fn init_state(archetype: &mut Archetype, _this_run: Tick) -> Self::State {
+        let _zone = crate::profile_scope!("create state for immutable component query target");
         SendPtr::new(
             archetype.component_storages.get_storage::<T>() as *const VecStorage<T, dyn Component>
         )
@@ -153,6 +155,7 @@ impl<T: Component> QueryTarget for &mut T {
     }
 
     fn init_state(archetype: &mut Archetype, this_run: Tick) -> Self::State {
+        let _zone = crate::profile_scope!("create state for mutable component query target");
         let values = SendPtrMut::new(archetype.component_storages.get_storage_mut::<T>()
             as *mut VecStorage<T, dyn Component>);
         let ticks_vec = archetype
@@ -220,8 +223,9 @@ macro_rules! impl_query_target_tuple {
 
             #[allow(non_snake_case)]
             fn init_state(archetype: &mut Archetype, this_run: Tick) -> Self::State {
-                let arch_ptr = archetype as *mut Archetype;
-                unsafe { ($($T::init_state(&mut *arch_ptr, this_run),)*) }
+                let _zone = crate::profile_scope!("create state for tuple query target");
+                let archetype_ptr = archetype as *mut Archetype;
+                unsafe { ($($T::init_state(&mut *archetype_ptr, this_run),)*) }
             }
 
             #[allow(non_snake_case)]

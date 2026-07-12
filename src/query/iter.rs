@@ -90,6 +90,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> QueryIterMut<'w, Q, F> {
         this_run: Tick,
         last_run: Tick,
     ) -> Self {
+        let _zone = crate::profile_scope!(
+            "create mutable query iterator",
+            [("Archetype ranges: {}", matching_archetypes.len())]
+        );
         Self {
             world_ptr,
             matching_archetypes,
@@ -112,6 +116,15 @@ impl<'w, Q: QueryTarget, F: QueryFilter> QueryIterMut<'w, Q, F> {
             return None;
         }
 
+        let _zone = crate::profile_scope!(
+            "advance to next archetype",
+            [(
+                "archetype {}/{}",
+                self.current_archetype_idx + 1,
+                self.matching_archetypes.len()
+            )]
+        );
+
         // SAFETY: This function is safe because:
         // 1. world_ptr was created from a valid &mut World reference in iter_mut()
         // 2. The QueryIterMut holds exclusive access to World through its lifetime 'w
@@ -123,18 +136,27 @@ impl<'w, Q: QueryTarget, F: QueryFilter> QueryIterMut<'w, Q, F> {
         //    - Archetypes are not moved/reallocated during iteration
         //    - Component storage vectors maintain stable addresses while we iterate
         unsafe {
+            let _zone_pointers = crate::profile_scope!("cache archetype pointers");
             let world = &mut *self.world_ptr;
             let archetype_id = self.matching_archetypes[self.current_archetype_idx];
             let archetype = world.archetypes.get_mut(&archetype_id)?;
 
-            let _zone = crate::profile_scope!("archetype");
+            _zone.text(format_args!(
+                "{}",
+                archetype.get_archetype_info(&world.component_registry),
+            ));
+
+            let _zone_cache = crate::profile_scope!("cache storage pointers");
 
             // Cache archetype length and component storage pointers
             self.current_archetype_len = archetype.len();
-            let arch_ptr = archetype as *mut Archetype;
-            self.current_state = Some(Q::init_state(&mut *arch_ptr, self.this_run));
-            self.current_filter_state =
-                Some(F::init_state(&mut *arch_ptr, self.last_run, self.this_run));
+            let archetype_ptr = archetype as *mut Archetype;
+            self.current_state = Some(Q::init_state(&mut *archetype_ptr, self.this_run));
+            self.current_filter_state = Some(F::init_state(
+                &mut *archetype_ptr,
+                self.last_run,
+                self.this_run,
+            ));
             self.current_entity_idx = 0;
             self.current_archetype_idx += 1;
         }
@@ -212,6 +234,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> ParQueryIter<'w, Q, F> {
     /// Construct a new parallel iterator with default settings. Used by
     /// [`Query::par_iter_mut`].
     pub(crate) fn new(archetype_ranges: Vec<FilteredArchetypeRange<Q::State, F::State>>) -> Self {
+        let _zone = crate::profile_scope!(
+            "create parallel query iterator",
+            [("Archetype ranges: {}", archetype_ranges.len())]
+        );
         Self {
             archetype_ranges,
             min_batch_size: None,
@@ -318,6 +344,13 @@ where
         // per-row cost is extremely low (< 10 ns), larger values (512-1024)
         // yield better throughput.
         let min_len = self.min_batch_size.unwrap_or(256);
+        crate::profile_message!(
+            "rayon start: {} threads | {} archetypes | {} entities | batch_min={}",
+            rayon::current_num_threads(),
+            self.archetype_ranges.len(),
+            total,
+            min_len
+        );
 
         self.archetype_ranges
             .into_par_iter()
@@ -331,6 +364,8 @@ where
                         }
                     });
             });
+
+        crate::profile_message!("rayon done: {} entities processed", total);
     }
 
     /// Execute the closure on every matching entity, collecting
@@ -385,8 +420,11 @@ where
 
         self.archetype_ranges
             .into_par_iter()
-            .for_each(|(_archetype_id, q_state, f_state, len)| {
-                let _zone = crate::profile_scope!("archetype_par");
+            .for_each(|(archetype_id, q_state, f_state, len)| {
+                let _zone = crate::profile_scope!(
+                    "rayon archetype split",
+                    [("archetype {:?} | {} entities", archetype_id, len)]
+                );
                 // Capture by reference — Arcs outlive the parallel iteration
                 // because for_each blocks until all work completes.
                 let batch_count = &batch_count;
@@ -412,6 +450,20 @@ where
         let batch_count = batch_count.load(Ordering::Relaxed);
         let min_batch_size = min_batch.load(Ordering::Relaxed);
         let max_batch_size = max_batch.load(Ordering::Relaxed);
+
+        crate::profile_message!(
+            "rayon split: {} threads | {} batches | {} entities | min={} max={} avg={:.1}",
+            num_threads,
+            batch_count,
+            total_entities,
+            min_batch_size,
+            max_batch_size,
+            if batch_count > 0 {
+                total_entities as f64 / batch_count as f64
+            } else {
+                0.0
+            }
+        );
 
         BatchStats {
             num_threads,
