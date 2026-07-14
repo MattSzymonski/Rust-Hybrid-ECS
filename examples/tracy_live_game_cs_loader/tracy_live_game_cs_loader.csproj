@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+
+    <!-- Unmanaged function pointers, [UnmanagedCallersOnly] entry points, and
+         the raw-pointer EngineApi/Engine facade all live in this project —
+         see CS_SCRIPTING_PROPOSAL.md's "Sandboxing" section for why this is
+         deliberately the *only* project in the C# path allowed to do so. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <!-- This is a library, but the Rust host loads it via hostfxr, which needs
+         a runtimeconfig.json describing the target framework. -->
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+  </PropertyGroup>
+
+</Project>

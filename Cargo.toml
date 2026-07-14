@@ -11,6 +11,12 @@ tracy-client = { version = "0.18", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+libloading = "0.8"
+notify = "6"
+
+[workspace]
+resolver = "2"
+members = [".", "examples/tracy_live_game"]
 
 [features]
 tracy = ["dep:tracy-client"]

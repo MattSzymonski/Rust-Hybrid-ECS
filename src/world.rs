@@ -1301,6 +1301,27 @@ impl World {
         self.entity_locations.len()
     }
 
+    /// Mutable slice over every entity's `T` component — for FFI-facing bulk
+    /// access (see `examples/tracy_live/hot_cs.rs`), not a general query.
+    ///
+    /// Returns `None` unless every entity carrying `T` lives in exactly one
+    /// archetype. `tracy_live`'s C# path relies on this holding (its
+    /// component set never changes at runtime), but this method itself makes
+    /// no such assumption — it just refuses to guess when there's more than
+    /// one archetype to pick from.
+    pub fn component_slice_mut<T: Component + 'static>(&mut self) -> Option<&mut [T]> {
+        let mut found: Option<&mut Archetype> = None;
+        for archetype in self.archetypes.values_mut() {
+            if archetype.has_component::<T>() {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(archetype);
+            }
+        }
+        found.map(|a| a.component_storages.get_storage_mut::<T>().data.as_mut_slice())
+    }
+
     /// Generate a Graphviz DOT representation of archetypes and their components.
     ///
     /// Useful for debugging archetype fragmentation and visualizing the

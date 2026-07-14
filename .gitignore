@@ -4,3 +4,6 @@ graphify-out/
 
 performance_benchmarks/
 benchmarks/
+/bin
+bin/
+obj/

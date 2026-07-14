@@ -1,0 +1,12 @@
+[package]
+name = "tracy_live_game"
+version = "0.1.0"
+edition = "2021"
+description = "Hot-reloadable ECS game logic for the tracy_live example"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ecs_hybrid = { path = "../.." }
+trait_type_map = { path = "../../../trait_type_map" }

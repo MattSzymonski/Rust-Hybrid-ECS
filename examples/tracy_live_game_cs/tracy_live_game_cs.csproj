@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+
+    <!-- Deliberately omitted: AllowUnsafeBlocks. This is the assembly you
+         edit constantly (Systems.cs) and hot-reload while the host runs —
+         it must not be able to construct raw pointers, so the compiler
+         itself refuses to build unsafe code here. See
+         CS_SCRIPTING_PROPOSAL.md's "Sandboxing" section. -->
+
+    <!-- This is a library, but the Rust host loads it via hostfxr, which
+         needs a runtimeconfig.json describing the target framework. -->
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- For Engine.cs's safe Span<T> facade and the Position/Velocity/...
+         struct definitions (see Components.cs in that project for why they
+         live there instead of here). -->
+    <ProjectReference Include="../tracy_live_game_cs_loader/tracy_live_game_cs_loader.csproj" />
+  </ItemGroup>
+
+</Project>

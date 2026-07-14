@@ -171,6 +171,30 @@ impl Engine {
             .map(|s| s.enabled)
     }
 
+    /// Clear all registered systems and reset the scheduler.
+    ///
+    /// Used by hot-reload harnesses to discard systems whose code lives in a
+    /// dylib that's about to be replaced, before registering the freshly
+    /// loaded set.
+    pub fn clear_systems(&mut self) {
+        self.systems.clear();
+        self.scheduler = SystemScheduler::new();
+        self.graph_dirty = false;
+    }
+
+    /// Reset the world and all registered systems to a blank slate, keeping
+    /// engine-level configuration (parallel execution, FPS limit, etc.)
+    /// intact.
+    ///
+    /// Used by hot-reload harnesses that rebuild the simulation from scratch
+    /// on every reload rather than trying to preserve entity state across a
+    /// dylib swap.
+    pub fn reset_world(&mut self) {
+        self.clear_systems();
+        self.world = World::new();
+        self.queue = CommandQueue::new();
+    }
+
     /// Print the execution graph for debugging
     pub fn print_execution_graph(&self) {
         let names: Vec<&str> = self.systems.iter().map(|s| s.name).collect();
