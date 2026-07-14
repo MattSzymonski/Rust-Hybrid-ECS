@@ -36,10 +36,13 @@ public static class HealthDecaySystem
 {
     public static void Run()
     {
+        var total_health = 0;
         var healths = Engine.Healths();
         for (int i = 0; i < healths.Length; i++)
         {
-            healths[i].Value = MathF.Max(healths[i].Value + 0.1f, 0f);
+            healths[i].Value = MathF.Max(healths[i].Value + 10.1f, 0f);
+            total_health += (int)healths[i].Value;
+            Console.WriteLine($"[tracy_live_game_cs] entity {i} health: {healths[i].Value}");
         }
     }
 }

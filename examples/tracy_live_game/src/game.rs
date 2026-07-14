@@ -184,7 +184,7 @@ pub fn setup(engine: &mut Engine) {
     //engine.register_system("spawner", spawner_system);
 
     engine.world_mut().reserve_entities(32000);
-    for _ in 0..30000 {
+    for _ in 0..20000 {
         let _ = engine
             .world_mut()
             .create_entity()

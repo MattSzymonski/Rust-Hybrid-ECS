@@ -1,5 +1,6 @@
 using System.Reflection;
 using System.Runtime.Loader;
+using System.Threading;
 
 namespace TracyLive.Loader;
 
@@ -52,9 +53,15 @@ internal sealed unsafe class GameHost
         }
     }
 
-    /// Check the file's timestamp roughly every half second rather than every
-    /// frame — cheap, but avoids a syscall on every single frame.
-    private const int PollEveryNFrames = 30;
+    /// Check the file's timestamp roughly every half second of wall-clock
+    /// time — cheap, but avoids a syscall on every single frame. Wall-clock
+    /// rather than a frame count specifically because this demo's FPS varies
+    /// wildly (a few hundred to several thousand): a frame-count-based
+    /// interval would poll every ~10ms at 3000 FPS instead of the intended
+    /// ~500ms, making it far likelier to land inside the brief window where
+    /// a freshly-written .dll is still locked (see the retry logic in
+    /// <see cref="ReadAllBytesWithRetry"/> for the other half of that fix).
+    private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(500);
 
     private readonly string _assemblyPath;
 
@@ -64,7 +71,7 @@ internal sealed unsafe class GameHost
 
     private IntPtr _api;
     private DateTime _lastWriteUtc;
-    private int _frameCounter;
+    private DateTime _lastPollUtc;
 
     public GameHost(string assemblyPath)
     {
@@ -79,9 +86,10 @@ internal sealed unsafe class GameHost
 
     public void Update(float dt)
     {
-        if (++_frameCounter >= PollEveryNFrames)
+        var now = DateTime.UtcNow;
+        if (now - _lastPollUtc >= PollInterval)
         {
-            _frameCounter = 0;
+            _lastPollUtc = now;
             MaybeReload();
         }
 
@@ -115,16 +123,20 @@ internal sealed unsafe class GameHost
         }
         catch (Exception e)
         {
-            // Leave the previous (working) version in place.
+            // Leave the previous (working) version in place. Deliberately do
+            // NOT record `written` into `_lastWriteUtc` here — if we did, a
+            // transient failure (see ReadAllBytesWithRetry) would look
+            // identical to "nothing changed" on the next poll and this
+            // rebuild would never be retried. Leaving `_lastWriteUtc` at its
+            // old value means the next poll still sees the file as newer and
+            // tries again.
             Console.Error.WriteLine($"[tracy_live_game_cs_loader] reload failed: {e}");
         }
     }
 
     private void Load()
     {
-        _lastWriteUtc = File.GetLastWriteTimeUtc(_assemblyPath);
-
-        var bytes = File.ReadAllBytes(_assemblyPath);
+        var bytes = ReadAllBytesWithRetry(_assemblyPath);
         var context = new GameContext();
         Assembly assembly;
         using (var stream = new MemoryStream(bytes))
@@ -146,7 +158,43 @@ internal sealed unsafe class GameHost
         _init = init;
         _update = update;
 
+        // Recorded here, on success, rather than at the top of this method —
+        // see the comment in MaybeReload's catch block for why that matters.
+        // Re-read the timestamp now rather than reusing whatever MaybeReload
+        // observed: if the file changed again while we were retrying the
+        // read below, this makes sure we record what we *actually* loaded,
+        // so a save that lands mid-retry still gets picked up by the next
+        // poll instead of being mistaken for "already applied."
+        _lastWriteUtc = File.GetLastWriteTimeUtc(_assemblyPath);
+
         _init(_api);
+    }
+
+    /// <summary>
+    /// `dotnet build` finishing its write and Windows Defender's real-time
+    /// scan of a freshly-written .dll both briefly hold an exclusive lock on
+    /// the file — typically for single-digit milliseconds, but long enough
+    /// to lose a race against this loader's poll. Retry a handful of times
+    /// with a short delay rather than treating the very first attempt as
+    /// authoritative; each attempt is cheap and the total retry budget
+    /// (roughly 500ms) stays well under the Rust host's 1-second watchdog
+    /// timeout for this call (see `hot_cs.rs`'s `CsGame::update`).
+    /// </summary>
+    private static byte[] ReadAllBytesWithRetry(string path)
+    {
+        const int maxAttempts = 10;
+        const int delayMs = 50;
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return File.ReadAllBytes(path);
+            }
+            catch (IOException) when (attempt < maxAttempts)
+            {
+                Thread.Sleep(delayMs);
+            }
+        }
     }
 
     private static nint GetExport(Type type, string methodName)
