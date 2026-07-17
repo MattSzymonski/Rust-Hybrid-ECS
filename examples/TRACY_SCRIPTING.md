@@ -40,25 +40,24 @@ Every other topic in the original brief — dynamic libraries, linking, ABI, FFI
 8. [FFI (Foreign Function Interface)](#ffi-foreign-function-interface)
 9. [Rust Integration](#rust-integration)
 10. [C# Integration](#c-integration)
-11. [Module Reference](#module-reference)
-12. [Build System](#build-system)
-13. [Command Reference](#command-reference)
-14. [Examples & Walkthroughs](#examples--walkthroughs)
-15. [API Reference](#api-reference)
-16. [Memory Management](#memory-management)
-17. [Threading](#threading)
-18. [Debugging Guide](#debugging-guide)
-19. [Troubleshooting](#troubleshooting)
-20. [Best Practices](#best-practices)
-21. [FAQ](#faq)
-22. [Design Decisions](#design-decisions)
-23. [Future Extensions](#future-extensions)
-24. [Glossary](#glossary)
+11. [C# Scripting Quirks & Gotchas](#c-scripting-quirks--gotchas)
+12. [Module Reference](#module-reference)
+13. [Build System](#build-system)
+14. [Command Reference](#command-reference)
+15. [Examples & Walkthroughs](#examples--walkthroughs)
+16. [API Reference](#api-reference)
+17. [Memory Management](#memory-management)
+18. [Threading](#threading)
+19. [Debugging Guide](#debugging-guide)
+20. [Troubleshooting](#troubleshooting)
+21. [Best Practices](#best-practices)
+22. [FAQ](#faq)
+23. [Design Decisions](#design-decisions)
+24. [Future Extensions](#future-extensions)
+25. [Glossary](#glossary)
 
 Related documents in this repository:
 - [`HOT_RELOADING_101.md`](../HOT_RELOADING_101.md) — a shorter, narrower write-up of just the Rust hot-reload mechanism (this guide supersedes and subsumes it, but that one is a good five-minute read).
-- [`CS_SCRIPTING_PROPOSAL.md`](../CS_SCRIPTING_PROPOSAL.md) — the original design proposal for the C# path, including alternatives that were considered and rejected.
-- [`CS_SCRIPTING_IMPLEMENTATION.md`](../CS_SCRIPTING_IMPLEMENTATION.md) — the implementation plan, including two real bugs found and fixed while building it.
 
 ---
 
@@ -79,7 +78,7 @@ Both let you edit gameplay-affecting code while the process runs. Neither is "th
 
 ### Why two implementations exist in one demo
 
-Not because the project needs two production scripting languages. Because the ECS's core API (`Query<T>`, `Commands`, `Component`) is a set of Rust generics that only Rust can express — a C# script cannot write `Query<(&mut Position, &Velocity)>`. So "add C# scripting" could not mean "let C# write the same kind of code Rust writes." It had to mean something adapted to what actually crosses a language boundary safely and fast. Working through that constraint — documented in depth in [`CS_SCRIPTING_PROPOSAL.md`](../CS_SCRIPTING_PROPOSAL.md) — is itself a worked example of the central problem in all runtime scripting: **the scripting language's capabilities are always bounded by what the FFI boundary can carry**, not by what the language can theoretically express.
+Not because the project needs two production scripting languages. Because the ECS's core API (`Query<T>`, `Commands`, `Component`) is a set of Rust generics that only Rust can express — a C# script cannot write `Query<(&mut Position, &Velocity)>`. So "add C# scripting" could not mean "let C# write the same kind of code Rust writes." It had to mean something adapted to what actually crosses a language boundary safely and fast. Working through that constraint is itself a worked example of the central problem in all runtime scripting: **the scripting language's capabilities are always bounded by what the FFI boundary can carry**, not by what the language can theoretically express.
 
 ---
 
@@ -570,7 +569,7 @@ public static Span<Position> Positions()
 
 #### Why not marshal element-by-element
 
-An alternative, "safer-looking" design would copy each `Position` value across the boundary individually (`GetPosition(int index) -> Position`) instead of exposing a bulk pointer. This project deliberately rejected that (documented as "Option B: batched marshaled copy" and "Option D: per-entity callback bridge" in [`CS_SCRIPTING_PROPOSAL.md`](../CS_SCRIPTING_PROPOSAL.md)'s alternatives table) because at 30,000 entities × 3+ systems × 60+ FPS, that's millions of cross-boundary calls per second — call overhead alone dominates. The pointer-plus-length pattern pays the FFI cost exactly **once per system per frame** regardless of entity count, which is the entire performance case for this project's design.
+An alternative, "safer-looking" design would copy each `Position` value across the boundary individually (`GetPosition(int index) -> Position`) instead of exposing a bulk pointer. This project deliberately rejected that (weighed and rejected as "batched marshaled copy" and "per-entity callback bridge" during this design's alternatives analysis) because at 30,000 entities × 3+ systems × 60+ FPS, that's millions of cross-boundary calls per second — call overhead alone dominates. The pointer-plus-length pattern pays the FFI cost exactly **once per system per frame** regardless of entity count, which is the entire performance case for this project's design.
 
 ### Callbacks
 
@@ -743,7 +742,7 @@ The **CLR** (Common Language Runtime) is .NET's virtual machine: it loads assemb
 
 Three real alternatives were available for "how does a native Rust process run some C# code," and this project picked the third:
 
-1. **Separate process, IPC.** Run C# in its own `dotnet` process, talk to it over a socket or shared memory. Rejected — this was Option E in [`CS_SCRIPTING_PROPOSAL.md`](../CS_SCRIPTING_PROPOSAL.md)'s alternatives table, and it's fundamentally incompatible with the zero-copy `Span<T>` design (see [FFI § arrays and buffers](#arrays-and-buffers)): a pointer is only meaningful within the process that owns the memory it points to.
+1. **Separate process, IPC.** Run C# in its own `dotnet` process, talk to it over a socket or shared memory. Rejected during this design's alternatives analysis — it's fundamentally incompatible with the zero-copy `Span<T>` design (see [FFI § arrays and buffers](#arrays-and-buffers)): a pointer is only meaningful within the process that owns the memory it points to.
 2. **Shell out to `dotnet run`/`dotnet exec`** and communicate via stdin/stdout or files. Would work, but reintroduces the IPC problem in a slower, less structured form, and still can't share memory directly.
 3. **Host the CLR in-process, via `hostfxr`.** What this project actually does. The C# code runs in the *same OS process* as the Rust host, sharing the same address space — so a raw pointer really does mean the same thing on both sides, which is exactly what makes the `Span<T>` design possible at all.
 
@@ -777,7 +776,7 @@ private sealed class GameContext : AssemblyLoadContext
 ```
 — the *reloadable* project references the *stable* one, not the other way around. This looks backwards compared to the natural mental model ("the stable loader drives the reloadable game"), but it's required because `Systems.cs` needs to call `Engine.Positions()`, `Engine.Velocities()`, etc. — and `Engine` (the safe `Span<T>` facade) lives in `tracy_live_game_cs_loader` (see [§ where each piece lives](#the-unsafe-forbidden-split--the-core-sandboxing-mechanism) below for why `Engine` couldn't just live in the reloadable project instead).
 
-**A real bug found while building this** (documented in full in [`CS_SCRIPTING_IMPLEMENTATION.md`](../CS_SCRIPTING_IMPLEMENTATION.md)'s corrections note): the naive `GameContext.Load` — return `null` for everything, exactly like the reference `flappy` example's `game_cs_loader` does — throws `FileNotFoundException` for `tracy_live_game_cs_loader` specifically, because `hostfxr`'s component-hosting mode does **not** load the assembly it hosts into `AssemblyLoadContext.Default` (verified by instrumenting it: `AssemblyLoadContext.Default.Assemblies` never lists it). The `flappy` reference example never hits this, because its `game_cs.dll` has zero custom dependencies of its own. The fix, in the actual shipped `GameHost.cs`:
+**A real bug found while building this**: the naive `GameContext.Load` — return `null` for everything, exactly like the reference `flappy` example's `game_cs_loader` does — throws `FileNotFoundException` for `tracy_live_game_cs_loader` specifically, because `hostfxr`'s component-hosting mode does **not** load the assembly it hosts into `AssemblyLoadContext.Default` (verified by instrumenting it: `AssemblyLoadContext.Default.Assemblies` never lists it). The `flappy` reference example never hits this, because its `game_cs.dll` has zero custom dependencies of its own. The fix, in the actual shipped `GameHost.cs`:
 ```csharp
 protected override Assembly? Load(AssemblyName assemblyName)
 {
@@ -854,9 +853,9 @@ pub fn update(&mut self, dt: f32) {
 ```
 On a timeout, `disabled` is set permanently — every future `update()` call becomes a no-op, forever, for the rest of the process's life. The worker thread is **never killed** — .NET (like most managed runtimes) provides no safe way to forcibly terminate a thread mid-operation (the old `Thread.Abort()` API was removed specifically because it could leave shared state, including the very memory `Span<T>`s point into, in a half-written state). The thread is simply abandoned, still running, forever, consuming one CPU core.
 
-**Why this is safe enough despite the abandoned thread still running**: after `disabled` is set, nothing else in this project's `--cs_scripting` mode ever touches the component arrays the zombie thread might still be writing into — there is zero registered Rust system in this mode, and no further spawn/destroy happens after startup, so those `Vec<T>` buffers never get reallocated. The zombie thread's writes are confined entirely within memory nothing else reads or relies on being coherent — a real, technically-undefined-behavior data race by the strict letter of the memory model, but one that (by construction) cannot corrupt anything *outside* those specific buffers or crash the process. This is a documented, deliberate trade-off, not an accident — see [`CS_SCRIPTING_PROPOSAL.md`](../CS_SCRIPTING_PROPOSAL.md)'s "Sandboxing" section for the original reasoning, and [Troubleshooting § watchdog fired](#watchdog-timeout-fired-c-scripting-permanently-disabled) for what you'll observe if this happens.
+**Why this is safe enough despite the abandoned thread still running**: after `disabled` is set, nothing else in this project's `--cs_scripting` mode ever touches the component arrays the zombie thread might still be writing into — there is zero registered Rust system in this mode, and no further spawn/destroy happens after startup, so those `Vec<T>` buffers never get reallocated. The zombie thread's writes are confined entirely within memory nothing else reads or relies on being coherent — a real, technically-undefined-behavior data race by the strict letter of the memory model, but one that (by construction) cannot corrupt anything *outside* those specific buffers or crash the process. This is a documented, deliberate trade-off, not an accident — see [Troubleshooting § watchdog fired](#watchdog-timeout-fired-c-scripting-permanently-disabled) for what you'll observe if this happens.
 
-**What this three-layer stack does *not* cover, on purpose, because no mechanism in any language can**: a **stack overflow** (e.g. unbounded recursion) always terminates the .NET process immediately — the CLR cannot safely run any handler, including this project's watchdog (which lives on a *different* thread and has no way to intervene in an already-overflowing one), with no stack space left. If you need protection against this specific failure mode too, the only real answer is running the script in a separate OS process (Option E in [`CS_SCRIPTING_PROPOSAL.md`](../CS_SCRIPTING_PROPOSAL.md)'s alternatives), which — as noted in [§ why hosting](#why-hosting-not-a-separate-process-and-not-dotnet-run) — this project deliberately does not do, trading that last increment of isolation for the zero-copy `Span<T>` performance model.
+**What this three-layer stack does *not* cover, on purpose, because no mechanism in any language can**: a **stack overflow** (e.g. unbounded recursion) always terminates the .NET process immediately — the CLR cannot safely run any handler, including this project's watchdog (which lives on a *different* thread and has no way to intervene in an already-overflowing one), with no stack space left. If you need protection against this specific failure mode too, the only real answer is running the script in a separate OS process (weighed as an alternative and rejected during this design's planning), which — as noted in [§ why hosting](#why-hosting-not-a-separate-process-and-not-dotnet-run) — this project deliberately does not do, trading that last increment of isolation for the zero-copy `Span<T>` performance model.
 
 ### C# hot-reload mechanism
 
@@ -892,7 +891,115 @@ sequenceDiagram
     end
 ```
 
-Contrast with the Rust path: there is **no file-system watcher on the Rust side at all** for this mode — the polling happens *inside* the already-running C# code (`GameHost.Update`'s `MaybeReload`), checked every 30 frames rather than via an OS file-change notification, and *you* are responsible for running `dotnet build` yourself (or set up `dotnet watch build` for automatic rebuilding — the polling loop doesn't care which triggered the file change). And critically, per [Architecture § component/data ownership](#componentdata-ownership-the-key-architectural-difference), **no world reset happens** — `GameHost.Load()`'s `_init(_api)` call re-binds the API table, but the entity data behind that table is the same Rust-owned memory it always was.
+Contrast with the Rust path: there is **no file-system watcher on the Rust side at all** for this mode — the polling happens *inside* the already-running C# code (`GameHost.Update`'s `MaybeReload`), checked roughly every 500ms of wall-clock time (deliberately *not* a frame count — see [§ C# Scripting Quirks & Gotchas](#c-scripting-quirks--gotchas) below for why that distinction turned out to matter) rather than via an OS file-change notification, and *you* are responsible for running `dotnet build` yourself (or set up `dotnet watch build` for automatic rebuilding — the polling loop doesn't care which triggered the file change). And critically, per [Architecture § component/data ownership](#componentdata-ownership-the-key-architectural-difference), **no world reset happens** — `GameHost.Load()`'s `_init(_api)` call re-binds the API table, but the entity data behind that table is the same Rust-owned memory it always was.
+
+---
+
+## C# Scripting Quirks & Gotchas
+
+Everything in this section was actually reproduced against this codebase, not just reasoned about — where a compiler error or a runtime behavior is quoted below, it's the real output from actually trying it in `examples/tracy_live_game_cs`. Split into "won't compile" and "compiles fine but will surprise you at runtime," closing with an honest answer to "can this be made completely safe."
+
+### Compile-time quirks
+
+**Caching a `Span<T>` in a field.** Already covered as the core sandboxing mechanism in [C# Integration](#the-unsafe-forbidden-split--the-core-sandboxing-mechanism), reproduced here for the exact wording:
+```csharp
+private static Span<Position> _cached;
+```
+```
+error CS8345: Field or auto-implemented property cannot be of type 'Span<Position>' unless it is an instance member of a ref struct.
+```
+This is not specific to `static` fields — the same error fires for an instance field of an ordinary (non-`ref struct`) class too. There is no way to make a `Span<T>` outlive the method that obtained it by putting it "somewhere safe" — the language doesn't have a safe place for it to go.
+
+**Using a raw pointer.** Also already covered — reproduced for the exact wording:
+```csharp
+private static Position* _cached;
+```
+```
+error CS0214: Pointers and fixed size buffers may only be used in an unsafe context
+```
+This fires regardless of whether the pointer would have been valid — `tracy_live_game_cs.csproj` doesn't set `AllowUnsafeBlocks`, so the *syntax itself* is rejected before the compiler even considers what the pointer would point at.
+
+**LINQ over a `Span<T>`.** A natural thing to reach for and a common surprise:
+```csharp
+var positions = Engine.Positions();
+var fast = positions.Where(p => p.X > 0).ToList();
+```
+```
+error CS0411: The type arguments for method 'ImmutableArrayExtensions.Where<T>(ImmutableArray<T>, Func<T, bool>)' cannot be inferred from the usage. Try specifying the type arguments explicitly.
+```
+Note how unhelpful this message is — it doesn't say "`Span<T>` doesn't support LINQ," it just fails to find *any* applicable `Where` overload and reports the closest near-miss it tried, which happens to be an unrelated `ImmutableArray` extension method. `Span<T>` doesn't implement `IEnumerable<T>` (it can't — it's a `ref struct`, and interface implementations that would require boxing aren't available to it), so none of `System.Linq`'s extension methods apply. A plain `for`/`foreach` loop (which every system in this project already uses) is the only option — `foreach` works because the compiler pattern-matches `Span<T>`'s own `GetEnumerator()` method directly, without going through `IEnumerable<T>` at all.
+
+**Holding a `Span<T>` across `await` or inside an iterator.** If you ever make a system `async`:
+```csharp
+public static async Task Run()
+{
+    var positions = Engine.Positions();
+    await Task.Delay(1);
+    positions[0] = positions[0];
+}
+```
+```
+error CS4007: Instance of type 'System.Span<TracyLive.Position>' cannot be preserved across 'await' or 'yield' boundary.
+```
+This is the compiler protecting you from exactly the hazard [Memory Management](#dangling-pointers-and-this-projects-actual-defenses-against-them) describes: an `async` method's local state gets hoisted onto the heap so it survives the `await`, and a `ref struct` is categorically not allowed to be hoisted that way. Practically: there's no reason for any system in this project to be `async` at all (there's nothing to await — see [Threading](#threading), everything runs synchronously on the `cs-script-worker` thread), so this should never come up in practice, but it's worth knowing *why* if you ever reach for `async` out of habit.
+
+**A non-blittable parameter on a new `[UnmanagedCallersOnly]` method.** If you add a new native entry point and give it a managed parameter type:
+```csharp
+[UnmanagedCallersOnly]
+public static void BadEntryPoint(string name) { }
+```
+```
+error CS8894: Cannot use 'string' as a parameter type on a method attributed with 'UnmanagedCallersOnly'.
+```
+This is a real, useful safety net for extending the FFI surface — the compiler enforces the [blittability requirement](#struct-layout-padding-and-alignment) `[UnmanagedCallersOnly]` needs, rather than letting you discover it as a runtime crash. Any new entry point must stick to primitives (`float`, `int`, `IntPtr`, etc.) and `[StructLayout(LayoutKind.Sequential)]` structs — exactly the same rule the existing `EngineApi` fields already follow.
+
+**The one silent, uncaught trap: `AllowUnsafeBlocks` itself.** Everything above is the compiler actively stopping you. This one isn't: if you (or a future contributor, or an IDE "quick fix" suggestion when hitting `CS0214`) adds
+```xml
+<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+```
+to `tracy_live_game_cs.csproj`, the project now compiles pointer code just fine — **with no warning that the entire sandboxing guarantee from [C# Integration](#the-unsafe-forbidden-split--the-core-sandboxing-mechanism) just silently disappeared.** Nothing in this codebase currently detects or prevents this. If you want a hard guarantee here rather than a documented expectation, the practical options are: a CI check that greps `tracy_live_game_cs.csproj` for that string and fails the build if present, or (more robust) a Roslyn analyzer/`.editorconfig` rule. Neither is implemented today — see [§ can this be made completely safe](#can-this-be-made-completely-safe) below.
+
+### Runtime quirks
+
+**Per-entity, per-frame logging is not a minor slowdown — it's a firehose.** Adding a single `Console.WriteLine` inside a 30,000-iteration loop that runs every frame produced **3.2 gigabytes of output in under 30 seconds** in actual testing against this codebase — not a hypothetical estimate, the literal size of the log file. `Console.WriteLine` is synchronous, unbuffered-enough-to-matter, and O(string length); at 30,000 calls × thousands of frames per second, this dominates everything else the process is doing. If you need per-entity visibility, throttle it (log one entity, or log every Nth frame — see the `HealthDecaySystem`/`ClampYSystem` examples in [Examples & Walkthroughs](#examples--walkthroughs)), the same way `main.rs`'s own FPS reporting only prints every 2 seconds, never every frame.
+
+**Static/global fields do *not* survive a hot-reload — only the entity data does.** This is the single most likely thing to trip you up coming from the Rust path, where the whole world resets on reload. On the C# side it's the exact opposite default: entity data (positions, health, etc.) lives in Rust-owned memory and survives every reload untouched, but **any `static` field you declare in `Systems.cs` resets to its default value on every single reload.** Verified directly: a `static int` counter incrementing every frame reached 932,000 immediately before a reload, and read back as roughly 2,000 (i.e., reset to 0) on the very first post-reload tick. The reason is structural, not a bug: `GameHost.Load()` loads each new build of `tracy_live_game_cs.dll` into a **fresh** collectible `AssemblyLoadContext` (see [C# Integration](#assembly-loading-and-assemblyloadcontext)), and a `static` field belongs to a `Type` object — a fresh load means fresh `Type` objects, with their own, independently-initialized static storage, even though the field is declared identically in the new code. If you need state to survive a C# reload the way entity data does, it has to live on the Rust side (as a new component, or a resource) and be read back through `EngineApi`, exactly like everything else that does survive.
+
+**The reload-race window is mitigated, not eliminated.** `GameHost.Load()` retries a locked-file read a handful of times with a short delay (added specifically because `dotnet build` finishing its write, or Windows Defender's real-time scan of a freshly-written `.dll`, can hold a brief exclusive lock right as the loader tries to read it) and only commits the new file's timestamp on a *successful* load, so a failed attempt gets retried on the *next* poll rather than being silently abandoned forever. But the retry budget is finite (~500ms) — an unusually slow or persistent external lock could still exhaust it, in which case you'll see `[tracy_live_game_cs_loader] reload failed: ...` once and the *previous* (still-working) version keeps running; just save again, or wait for the next poll.
+
+**The poll interval had to become wall-clock-based, not frame-count-based.** The original design checked the file's timestamp every 30 frames, on the assumption that's "roughly every half second" — true at a typical ~60 FPS, but this demo runs at several thousand FPS, making that interval closer to every 10 milliseconds. That doesn't just poll more than necessary (cheap, harmless on its own) — it also made the reload-race window above far more likely to actually be hit, since a poll landing inside a millisecond-scale lock window becomes near-guaranteed at that frequency. `GameHost.cs` now polls on a fixed `TimeSpan` (500ms) measured against `DateTime.UtcNow`, independent of how fast the simulation happens to be running.
+
+**The watchdog can't tell "genuinely hung" from "briefly very slow."** [C# Integration's sandboxing section](#sandboxing-containing-a-hung-or-buggy-script) already documents that a timeout is the mechanism for containing an infinite loop — worth being explicit that the *same* 1-second timeout fires for any cause of a slow frame, not just an infinite loop. A very heavy blocking operation in a system — the console-flooding scenario above being the clearest example, since 30,000 synchronous, unbuffered writes to a slow or redirected output stream can genuinely take a long time — is a real, reachable path to tripping the watchdog on code that has no bug in it at all, just an expensive frame. Once tripped, C# scripting is disabled for the rest of the process's life exactly the same way it would be for a true infinite loop — there's no distinction made, and none is possible with a fixed timeout alone.
+
+**Editing the wrong project silently does nothing (for hot-reload purposes).** Only `tracy_live_game_cs` (`Systems.cs`, `Interop.cs`) gets polled and reloaded. If you edit `Components.cs`, `EngineApi.cs`, `Engine.cs`, or `GameHost.cs`/`LoaderInterop.cs` — all of which live in `tracy_live_game_cs_loader`, per [§ why the dependency points "backwards"](#why-the-c-dependency-points-backwards) — nothing will pick up the change until you fully restart `tracy_live`, because the loader assembly is loaded once via hostfxr and never reloaded by design. There's no error or warning if you forget this — `dotnet build examples/tracy_live_game_cs` will happily rebuild and the loader will happily reload *that* project while silently still running the *old* build of anything that lives in the loader project.
+
+**Manually spawning a `Task`/`Thread` from inside a system is a genuine, uncaught data race.** Nothing stops you from writing:
+```csharp
+Task.Run(() => { var p = Engine.Positions(); /* ... */ });
+```
+inside `MovementSystem.Run()`. This compiles fine and will often even *appear* to work in casual testing. It is a real violation of [Threading](#threading)'s "only the `cs-script-worker` thread ever calls `EngineApi` functions" invariant — the `Task.Run` body executes on a thread-pool thread, potentially concurrently with the *next* frame's `Update()` call on `cs-script-worker`, both touching the same component storage with no synchronization at all. Nothing in this project's compiler or runtime checks for this; it's a discipline rule, not an enforced one — see [Best Practices § thread safety](#thread-safety).
+
+**Editing `Components.cs` without mirroring the Rust side is silent corruption, not an error.** Already covered in depth in [Troubleshooting § ABI mismatch](#abi-mismatch); restated here because it's specifically reachable from ordinary C#-side editing: nothing about changing a field's order or type in `Components.cs` alone fails to compile — it just silently stops matching `cs_components.rs`'s layout, and every `Position`/`Velocity`/etc. read through `Span<T>` from that point on reads the wrong bytes.
+
+### Can this be made completely safe?
+
+**No — not completely, and that's a deliberate trade-off, not a gap waiting to be closed.** Every quirk above falls into one of three buckets:
+
+1. **Already closed by the compiler** (`Span<T>` caching, raw pointers, non-blittable native parameters, holding a span across `await`) — these are the wins this architecture is actually built on, and they require no further work.
+2. **Closed by a runtime mechanism with a known, documented limit** (exceptions via try/catch; hangs via the watchdog) — the limit in both cases is explicit: try/catch cannot catch a stack overflow (no mechanism in any language/runtime can, see [C# Integration § sandboxing](#sandboxing-containing-a-hung-or-buggy-script)), and the watchdog cannot distinguish a genuine infinite loop from an expensive-but-finite frame, so it necessarily has false-positive risk in exchange for being simple and cheap.
+3. **Not enforced at all — relies on discipline, not tooling** (`AllowUnsafeBlocks` being flipped back on; manual `Task`/`Thread` use inside a system; keeping `Components.cs` mirrored with `cs_components.rs`; remembering which project actually hot-reloads).
+
+Closing bucket 3 completely is possible but not free, and each fix has a real cost:
+
+| Residual gap | What would fully close it | Cost |
+| --- | --- | --- |
+| `AllowUnsafeBlocks` silently re-enabled | A CI/pre-commit check asserting the string is absent from `tracy_live_game_cs.csproj` | Cheap to add; not done here because there's no CI at all yet (see [Best Practices § CI/CD](#cicd)) |
+| Manual threading bypassing the single-thread protocol | A Roslyn analyzer banning `Task`/`Thread`/`async` usage inside `TracyLive.*System` classes | Real engineering effort for a narrow, project-specific rule |
+| `Components.cs`/`cs_components.rs` drifting apart | Code generation from a single source of truth (see [Best Practices § cbindgen](#when-would-this-project-actually-need-cbindgen)) | Trades hand-editing simplicity for a build-time codegen step |
+| Watchdog false positives on expensive-but-not-hung frames | A smarter liveness signal (e.g. the script periodically reports "still making progress") instead of a bare timeout | Real design work, and still can't distinguish a truly stuck loop from one that's making extremely slow progress |
+| Stack overflow | Nothing, within this architecture | Requires a separate OS process, which gives up the zero-copy `Span<T>` design entirely — see [C# Integration § why hosting, not a separate process](#why-hosting-not-a-separate-process-and-not-dotnet-run) |
+
+The honest summary: this design closes the failure modes that are (a) common developer mistakes and (b) closable without sacrificing the zero-copy performance model — which is most of them. The ones left open are left open *because* closing them costs something this project judged not worth paying for a demo (tooling investment, or the performance/architecture this whole system exists to showcase). If your use case has different priorities — genuinely untrusted script authors, for instance — revisit [Design Decisions](#design-decisions)'s comparison table with that constraint in mind before assuming this exact architecture is still the right fit.
 
 ---
 
@@ -1496,7 +1603,7 @@ For the Rust side, any native debugger's memory-view window, given a pointer val
 
 ## Troubleshooting
 
-Each entry: symptoms → root cause → diagnosis → fix → prevention. Two of these (marked ★) are **real bugs actually hit and fixed while building this project** — see [`CS_SCRIPTING_IMPLEMENTATION.md`](../CS_SCRIPTING_IMPLEMENTATION.md) for the original incident write-up.
+Each entry: symptoms → root cause → diagnosis → fix → prevention. Two of these (marked ★) are **real bugs actually hit and fixed while building this project**.
 
 ### DLL not found / wrong version loaded
 
@@ -1628,7 +1735,7 @@ Not applicable — see the [scope note](#zero-scope-note--please-read-this-first
 
 - **Symptoms**: console prints `[cs] Update() did not return within 1s — assuming a hang. Disabling C# scripting for the rest of this run...`; the entity population visibly freezes (positions/health stop changing) but the process itself keeps running and reporting FPS (often at a *higher* FPS than before, since `cs.update()` now short-circuits instantly).
 - **Root cause**: an infinite loop, unbounded recursion short of an actual stack overflow, or any other way `Interop.Update` (or something it calls) never returns.
-- **Diagnosis**: the message fires exactly once — check `Systems.cs` for a loop condition that can fail to terminate (this is precisely what the [watchdog verification test](../CS_SCRIPTING_IMPLEMENTATION.md) in this project's own implementation record reproduced deliberately, with a literal `while (true) { }`).
+- **Diagnosis**: the message fires exactly once — check `Systems.cs` for a loop condition that can fail to terminate (this is precisely the scenario verified while developing this feature, by deliberately injecting a literal `while (true) { }` and confirming the described behavior).
 - **Fix**: fix the hang in `Systems.cs`; you must **restart the whole process** — this project's design deliberately does not attempt to recover a hung C# scripting session (see [C# Integration § sandboxing](#sandboxing-containing-a-hung-or-buggy-script) for why recovery isn't attempted).
 - **Prevention**: be as careful with loop termination conditions in `Systems.cs` as you would be in any code — the watchdog is a safety net for the *engine's* survival, not a substitute for correct code.
 
@@ -1675,7 +1782,7 @@ Restated from [Threading](#threading) as a rule: **never call an `EngineApi` fun
 
 ### Testing
 
-Honest gap: **this project's scripting harnesses (`hot.rs`, `hot_cs.rs`, `watch.rs`, and the C# loader/interop code) have no automated tests of their own** — `ecs_hybrid` itself has a substantial test suite ([`src/query/tests.rs`](../src/query/tests.rs) and the benches under `[[bench]]`), but the hot-reload machinery documented in this guide was verified manually (build, run, edit, observe the console output and behavior change) during development, as recorded in [`CS_SCRIPTING_IMPLEMENTATION.md`](../CS_SCRIPTING_IMPLEMENTATION.md)'s verification section — including the deliberate watchdog-timeout test. If you're extending this architecture for anything beyond a demo, adding an integration test that spawns the process, injects a file change, and asserts on the console output (or, more robustly, an FFI-exposed health-check value) would close this gap; it wasn't done here because a demo that's manually exercised on every change was judged sufficient for its purpose.
+Honest gap: **this project's scripting harnesses (`hot.rs`, `hot_cs.rs`, `watch.rs`, and the C# loader/interop code) have no automated tests of their own** — `ecs_hybrid` itself has a substantial test suite ([`src/query/tests.rs`](../src/query/tests.rs) and the benches under `[[bench]]`), but the hot-reload machinery documented in this guide was verified manually (build, run, edit, observe the console output and behavior change) during development — including the deliberate watchdog-timeout test. If you're extending this architecture for anything beyond a demo, adding an integration test that spawns the process, injects a file change, and asserts on the console output (or, more robustly, an FFI-exposed health-check value) would close this gap; it wasn't done here because a demo that's manually exercised on every change was judged sufficient for its purpose.
 
 ### CI/CD
 
@@ -1758,7 +1865,7 @@ Architecturally, yes — follow the same three questions this project's two path
 
 ### Why this specific pairing (Rust hot-reload + C# hosted-CLR hot-reload), not some other pair
 
-The two paths were chosen to sit at genuinely different points on the safety/performance/expressiveness trade-off space, deliberately, rather than being two arbitrary examples of "a scripting language": the Rust path demonstrates the *maximum-performance, zero-sandboxing* end (useful when you fully trust and are optimizing for whoever edits the reloaded code), and the C# path demonstrates that you can get *close to that same performance* while adding *real, compiler-and-runtime-enforced* sandboxing — which is the more interesting, less obvious result, and the reason the C# path's design ([`CS_SCRIPTING_PROPOSAL.md`](../CS_SCRIPTING_PROPOSAL.md)) went through several rounds of "what are the alternatives" before landing on zero-copy `Span<T>` plus the unsafe-forbidden split plus the watchdog thread.
+The two paths were chosen to sit at genuinely different points on the safety/performance/expressiveness trade-off space, deliberately, rather than being two arbitrary examples of "a scripting language": the Rust path demonstrates the *maximum-performance, zero-sandboxing* end (useful when you fully trust and are optimizing for whoever edits the reloaded code), and the C# path demonstrates that you can get *close to that same performance* while adding *real, compiler-and-runtime-enforced* sandboxing — which is the more interesting, less obvious result, and the reason the C# path's design went through several rounds of "what are the alternatives" before landing on zero-copy `Span<T>` plus the unsafe-forbidden split plus the watchdog thread.
 
 ---
 
@@ -1770,7 +1877,7 @@ Ideas consistent with this project's existing architecture, not commitments:
 - **A version field in `EngineApi`** if this architecture ever needs to tolerate a running host alongside an out-of-sync reloaded assembly — see [Best Practices § versioning](#versioning-and-abi-evolution).
 - **`cbindgen`-generated headers** once/if the hand-mirrored surface grows past the point where manual sync is comfortable — see [Best Practices § when would this project need cbindgen](#when-would-this-project-actually-need-cbindgen).
 - **A `catch_unwind` wrapper (plus `panic = "unwind"`) around the Rust path's `game_setup` call**, closing part of the crash-safety gap described in [Troubleshooting § Rust panic](#rust-panic-in-the-hot-reloaded-cdylib) — would not help with genuine memory corruption from `unsafe` code, only ordinary panics, but would bring the Rust path's *panic* handling in line with the C# path's *exception* handling.
-- **A separate-process option for the C# path**, trading the zero-copy `Span<T>` design for full isolation against hangs and stack overflows too — Option E in [`CS_SCRIPTING_PROPOSAL.md`](../CS_SCRIPTING_PROPOSAL.md)'s alternatives, deliberately not built, but a reasonable next step if "the engine must never even freeze" ever becomes a hard requirement rather than "protect against normal bugs."
+- **A separate-process option for the C# path**, trading the zero-copy `Span<T>` design for full isolation against hangs and stack overflows too — weighed as an alternative during this design's planning and deliberately not built, but a reasonable next step if "the engine must never even freeze" ever becomes a hard requirement rather than "protect against normal bugs."
 - **Packaging/deployment** — this project has never needed to answer "how would you ship this," since it's a developer-facing example, not a shippable product; if that changed, the natural approach would be `dotnet publish --self-contained` for the C# projects (bundling the runtime, removing the "needs .NET SDK installed" prerequisite for end users) and a normal `cargo build --release` artifact for the Rust side, with the hot-reload machinery itself likely disabled/removed for a shipped build (hot-reload is a *development-time* feature in this architecture, not a runtime one an end user would need).
 - **CI** — see [Best Practices § CI/CD](#cicd).
 
