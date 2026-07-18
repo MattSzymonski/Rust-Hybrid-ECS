@@ -13,8 +13,8 @@ tracy-client = { version = "0.18", optional = true }
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [features]
-tracy = ["dep:tracy-client"]
-tracy-no-details = ["dep:tracy-client"]
+tracing = ["dep:tracy-client"]
+tracing-minimal = ["dep:tracy-client"]
 
 [[bench]]
 name = "entity_lifecycle"

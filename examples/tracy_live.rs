@@ -2,7 +2,7 @@
 //
 // Usage:
 //   1. Start Tracy GUI (Tracy.exe from https://github.com/wolfpld/tracy/releases)
-//   2. cargo run --example tracy_live --release --features tracy
+//   2. cargo run --example tracy_live --release --features tracing
 //   3. Click Connect in Tracy
 //   4. Watch live CPU zones, frame times, and thread work distribution
 //

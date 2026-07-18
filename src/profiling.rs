@@ -2,7 +2,7 @@
 // Profiling Abstraction Layer (Tracy Profiler)
 // ----------------------------------------------------------------------------
 //!
-//! All profiling instrumentation lives here. When the `tracy` feature is
+//! All profiling instrumentation lives here. When the `tracing` feature is
 //! disabled, every macro and type compiles to zero-cost no-ops.
 //!
 //! # Setup
@@ -33,14 +33,14 @@
 // Compile-time safeguards
 // ============================================================================
 
-#[cfg(all(feature = "tracy", feature = "tracy-no-details"))]
-compile_error!("`tracy` and `tracy-no-details` are mutually exclusive. Enable only one.");
+#[cfg(all(feature = "tracing", feature = "tracing-minimal"))]
+compile_error!("`tracing` and `tracing-minimal` are mutually exclusive. Enable only one.");
 
 // ============================================================================
 // Tracy-enabled implementation
 // ============================================================================
 
-#[cfg(any(feature = "tracy", feature = "tracy-no-details"))]
+#[cfg(any(feature = "tracing", feature = "tracing-minimal"))]
 mod enabled {
     use std::fmt::Arguments;
     use tracy_client::Client;
@@ -154,7 +154,7 @@ mod enabled {
 // Disabled (no-op) implementation
 // ============================================================================
 
-#[cfg(not(any(feature = "tracy", feature = "tracy-no-details")))]
+#[cfg(not(any(feature = "tracing", feature = "tracing-minimal")))]
 mod enabled {
     use std::fmt::Arguments;
 
@@ -203,8 +203,8 @@ pub use enabled::*;
 // ============================================================================
 
 /// Initializes the Tracy profiler client. Call once at startup.
-/// Idempotent and safe to call even when the `tracy` feature is disabled.
-#[cfg(feature = "tracy")]
+/// Idempotent and safe to call even when the `tracing` feature is disabled.
+#[cfg(feature = "tracing")]
 #[macro_export]
 macro_rules! profile_init {
     () => {
@@ -212,7 +212,7 @@ macro_rules! profile_init {
     };
 }
 
-#[cfg(not(feature = "tracy"))]
+#[cfg(not(feature = "tracing"))]
 #[macro_export]
 macro_rules! profile_init {
     () => {};
@@ -271,9 +271,9 @@ macro_rules! profile_scope {
 /// - `("fmt", args...)` — formatted with `format_args!`
 /// - `"static text"` — bare string literal
 ///
-/// When `tracy-no-details` is enabled, expands to nothing — arguments are
+/// When `tracing-minimal` is enabled, expands to nothing — arguments are
 /// never evaluated, eliminating all formatting overhead.
-#[cfg(feature = "tracy")]
+#[cfg(feature = "tracing")]
 #[doc(hidden)]
 #[macro_export]
 macro_rules! profile_scope_detail {
@@ -285,7 +285,7 @@ macro_rules! profile_scope_detail {
     };
 }
 
-#[cfg(not(feature = "tracy"))]
+#[cfg(not(feature = "tracing"))]
 #[doc(hidden)]
 #[macro_export]
 macro_rules! profile_scope_detail {
@@ -294,7 +294,7 @@ macro_rules! profile_scope_detail {
 }
 
 /// Marks the end of a frame. Call once per frame loop iteration.
-#[cfg(feature = "tracy")]
+#[cfg(feature = "tracing")]
 #[macro_export]
 macro_rules! profile_frame_mark {
     () => {
@@ -302,14 +302,14 @@ macro_rules! profile_frame_mark {
     };
 }
 
-#[cfg(not(feature = "tracy"))]
+#[cfg(not(feature = "tracing"))]
 #[macro_export]
 macro_rules! profile_frame_mark {
     () => {};
 }
 
 /// Emits a single data point on a named time-series plot.
-#[cfg(feature = "tracy")]
+#[cfg(feature = "tracing")]
 #[macro_export]
 macro_rules! profile_plot {
     ($name:expr, $value:expr) => {
@@ -317,7 +317,7 @@ macro_rules! profile_plot {
     };
 }
 
-#[cfg(not(feature = "tracy"))]
+#[cfg(not(feature = "tracing"))]
 #[macro_export]
 macro_rules! profile_plot {
     ($name:expr, $value:expr) => {};
@@ -329,10 +329,10 @@ macro_rules! profile_plot {
 /// profile_message!("archetype {:?} created", id);
 /// ```
 ///
-/// When `tracy` feature is disabled (including when `tracy-no-details` is
+/// When `tracing` feature is disabled (including when `tracing-minimal` is
 /// enabled instead): macro expands to nothing — arguments are NOT evaluated.
 /// No runtime cost, no allocations.
-#[cfg(feature = "tracy")]
+#[cfg(feature = "tracing")]
 #[macro_export]
 macro_rules! profile_message {
     ($($arg:tt)*) => {
@@ -340,7 +340,7 @@ macro_rules! profile_message {
     };
 }
 
-#[cfg(not(feature = "tracy"))]
+#[cfg(not(feature = "tracing"))]
 #[macro_export]
 macro_rules! profile_message {
     ($($arg:tt)*) => {};
@@ -351,7 +351,7 @@ macro_rules! profile_message {
 /// ```ignore
 /// profile_thread!("main");
 /// ```
-#[cfg(feature = "tracy")]
+#[cfg(feature = "tracing")]
 #[macro_export]
 macro_rules! profile_thread {
     ($name:expr) => {
@@ -359,7 +359,7 @@ macro_rules! profile_thread {
     };
 }
 
-#[cfg(not(feature = "tracy"))]
+#[cfg(not(feature = "tracing"))]
 #[macro_export]
 macro_rules! profile_thread {
     ($name:expr) => {};
