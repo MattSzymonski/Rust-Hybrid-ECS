@@ -2673,7 +2673,7 @@ mod tests {
         println!("✓ Component cleanup on archetype migration works correctly!");
     }
 
-    /// Tests that `PerLabelTiming` detects duplicate labels within a frame.
+    /// Tests that `IteratorTimings` detects duplicate labels within a frame.
     ///
     /// Two iterators with the same label will corrupt the per-label EMA.
     /// This test simulates the logic inside `ParQueryIter::for_each`.

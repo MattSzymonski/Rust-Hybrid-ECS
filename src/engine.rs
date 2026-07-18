@@ -34,7 +34,7 @@ struct RegisteredSystem {
     /// duration (nanoseconds).  Fed to the query iterator so it can pick
     /// an optimal number of parallel groups.  Smoothing factor ≈ 1/32
     /// gives a ~32-frame averaging window.
-    avg_execution_ns: u64,
+    average_duration: u64,
 }
 
 /// The main Engine that drives the ECS
@@ -228,7 +228,7 @@ impl Engine {
             system: system.into_system(),
             enabled: true,
             last_run: 0,
-            avg_execution_ns: 0,
+            average_duration: 0,
         });
 
         // Rebuild execution graph
@@ -361,9 +361,9 @@ impl Engine {
             registered_system.last_run = started_at;
             // Update EMA of execution time.
             let elapsed = system_start.elapsed().as_nanos() as u64;
-            let old_avg = registered_system.avg_execution_ns;
+            let old_avg = registered_system.average_duration;
             let delta = elapsed as i64 - old_avg as i64;
-            registered_system.avg_execution_ns = (old_avg as i64 + delta / EMA_ALPHA_DENOM) as u64;
+            registered_system.average_duration = (old_avg as i64 + delta / EMA_ALPHA_DENOM) as u64;
         }
         // Reset the baseline so ad-hoc queries between frames behave
         // predictably.
@@ -421,9 +421,9 @@ impl Engine {
                 registered.last_run = started_at;
                 // Update EMA of execution time.
                 let elapsed = system_start.elapsed().as_nanos() as u64;
-                let old_avg = registered.avg_execution_ns;
+                let old_avg = registered.average_duration;
                 let delta = elapsed as i64 - old_avg as i64;
-                registered.avg_execution_ns = (old_avg as i64 + delta / EMA_ALPHA_DENOM) as u64;
+                registered.average_duration = (old_avg as i64 + delta / EMA_ALPHA_DENOM) as u64;
             } else {
                 // Multiple systems - run in parallel using rayon.
                 //
@@ -516,9 +516,9 @@ impl Engine {
                         registered_system.system.run(world, queue);
                         // Update EMA of execution time.
                         let elapsed = system_start.elapsed().as_nanos() as u64;
-                        let old_avg = registered_system.avg_execution_ns;
+                        let old_avg = registered_system.average_duration;
                         let delta = elapsed as i64 - old_avg as i64;
-                        registered_system.avg_execution_ns =
+                        registered_system.average_duration =
                             (old_avg as i64 + delta / EMA_ALPHA_DENOM) as u64;
                     }
 
