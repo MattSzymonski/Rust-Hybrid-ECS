@@ -59,7 +59,7 @@ fn damage_system(mut query: Query<(&mut Health, &Position)>) {
     }
 }
 
-pub(crate) fn main() {
+fn main() {
     println!("=== Parallel Systems Demo ===\n");
 
     let mut engine = Engine::new();

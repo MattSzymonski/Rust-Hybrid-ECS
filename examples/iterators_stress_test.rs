@@ -165,28 +165,6 @@ fn collision_and_movement_system(
             println!("Parallel batch stats: {}", stats);
         }
     }
-
-    // Sequential version
-    {
-        /*
-        moving_query.iter_mut().for_each(|(transform, velocity)| {
-            let new_x = transform.x + velocity.x * 0.016;
-            let new_y = transform.y + velocity.y * 0.016;
-            let new_z = transform.z + velocity.z * 0.016;
-
-            // Check collision with all colliders on the obstacle
-            let collided =
-                obstacle_collider.check_any_collision(&obstacle_transform, (new_x, new_y, new_z));
-
-            // Apply movement only if no collision
-            if !collided {
-                transform.x = new_x;
-                transform.y = new_y;
-                transform.z = new_z;
-            }
-        });
-        */
-    }
 }
 
 fn simulation_tracker_system(mut stats: ResMut<SimulationStats>) {
@@ -216,7 +194,7 @@ fn simulation_tracker_system(mut stats: ResMut<SimulationStats>) {
 // Main
 // ----------------------------------------------------------------------------
 
-pub fn main() {
+fn main() {
     println!("=== Stress Test: Archetype-Based ECS ===\n");
 
     let mut engine = Engine::new();
@@ -289,29 +267,4 @@ pub fn main() {
     for _frame in 0..max_frames {
         engine.process_frame().unwrap();
     }
-
-    // Count entities near obstacle
-    let mut count_query = Query::<(&Transform,)>::new(engine.world_mut());
-    let near_count = count_query
-        .iter_mut()
-        .filter(|(transform,)| {
-            let delta_x = transform.x - 50.0;
-            let delta_y = transform.y;
-            let distance = (delta_x * delta_x + delta_y * delta_y).sqrt();
-            distance < 15.0
-        })
-        .count();
-
-    println!("Entities near obstacle: {}", near_count);
-
-    // Calculate average frame time
-    let stats_query = engine.world_mut().get_resource::<SimulationStats>();
-    let frame_time_ms = if let Some(stats) = stats_query {
-        let duration = stats.start_time.elapsed();
-        duration.as_millis() as f64 / stats.max_frames as f64
-    } else {
-        0.0
-    };
-
-    println!("Avg frame time: {:.3} ms", frame_time_ms);
 }

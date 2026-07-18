@@ -112,7 +112,7 @@ fn display_system(mut query: Query<(Entity, &Position)>, time: Res<GameTime>, sc
 // Main
 // ----------------------------------------------------------------------------
 
-pub(crate) fn main() {
+fn main() {
     println!("=== Resources + Components Demo ===\n");
 
     let mut engine = Engine::new();

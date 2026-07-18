@@ -138,7 +138,7 @@ fn driver_system(
 // Main
 // ----------------------------------------------------------------------------
 
-pub fn main() {
+fn main() {
     println!("=== Change Detection Demo ===\n");
 
     let mut engine = Engine::new();

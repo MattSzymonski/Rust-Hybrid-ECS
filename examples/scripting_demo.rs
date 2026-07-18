@@ -18,12 +18,16 @@ impl ScriptComponent for Counter {
         println!("Counter: {} / {}", self.value, self.max_value);
 
         // Read component on own entity
-        if let Some(position) = script_context.get_component::<Position>(script_context.get_owning_entity()) {
+        if let Some(position) =
+            script_context.get_component::<Position>(script_context.get_owning_entity())
+        {
             println!("  Position: ({}, {})", position.x, position.y);
         }
 
         // Mutate component on own entity (different type than self - safe)
-        if let Some(position) = script_context.get_component_mut::<Position>(script_context.get_owning_entity()) {
+        if let Some(position) =
+            script_context.get_component_mut::<Position>(script_context.get_owning_entity())
+        {
             position.y = self.value as f32;
             println!("  Updated Position.y to {}", position.y);
         }
@@ -36,19 +40,9 @@ impl ScriptComponent for Counter {
 
         let entity: Entity = script_context.get_owning_entity().clone();
 
-        script_context.get_commands()
+        script_context
+            .get_commands()
             .add_component_to_entity(entity, Position { x: 42.0, y: 3.14 });
-
-        // // Example: Spawn new entity (deferred)
-        // script_context.create_entity()
-        //     .with(Position { x: 0.0, y: 0.0 })
-        //     .build().unwrap();
-
-        // // Example: Add component to entity (deferred)
-        // script_context.add_component(script_context.get_owning_entity(), Velocity { x: 1.0, y: 0.0 });
-
-        // // Example: Remove component from entity (deferred)
-        // script_context.remove_component::<Velocity>(script_context.get_owning_entity());
     }
 }
 
@@ -65,7 +59,7 @@ impl Component for Position {}
 // Make components accessible through trait objects
 impl_trait_accessible!(dyn Component; Counter, Position);
 
-pub fn main() {
+fn main() {
     println!("=== ECS Scripting Example ===\n");
 
     let mut engine = Engine::new();
@@ -84,7 +78,8 @@ pub fn main() {
             increment: 7,
             max_value: 50,
         })
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     // Create entity 2: Position + both scripts
     println!("Creating entity with position, and counter...\n");
@@ -97,7 +92,8 @@ pub fn main() {
             increment: 3,
             max_value: 120,
         })
-        .build().unwrap();
+        .build()
+        .unwrap();
 
     // Simulate several frames
     for frame in 1..=8 {
@@ -108,4 +104,3 @@ pub fn main() {
 
     println!("=== Scripting Example Complete ===");
 }
-
