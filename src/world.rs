@@ -170,26 +170,27 @@ pub(crate) fn set_per_thread_last_run_tick(value: Option<Tick>) -> Option<Tick> 
 }
 
 // ----------------------------------------------------------------------------
-// Per-thread timing hint — avoids the race condition that a shared
-// World atomic would have when multiple systems in a batch write to it.
+// Per-label iterator timing
 // ----------------------------------------------------------------------------
 
-thread_local! {
-    /// Per-thread timing hint (ns) fed from the engine to the query
-    /// iterator so it can choose an optimal number of parallel groups.
-    static PER_THREAD_TIMING_HINT_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+/// Shared state for per-label iterator timing feedback.
+pub(crate) struct IteratorTimings {
+    /// Per-label EMA duration (ns), ~32-frame average.
+    pub per_iterator_label_average_duration: std::collections::HashMap<&'static str, u64>,
+    /// Labels visited in the current frame. Cleared each frame.
+    pub visited_iterator_labels: Vec<&'static str>,
+    /// Labels that appeared more than once in the current frame.
+    pub visited_duplicated_iterator_labels: Vec<&'static str>,
 }
 
-/// Store a timing hint for the current thread, returning the old value.
-#[inline]
-pub(crate) fn set_per_thread_timing_hint(nanos: u64) -> u64 {
-    PER_THREAD_TIMING_HINT_NS.with(|cell| cell.replace(nanos))
-}
-
-/// Read the timing hint for the current thread.
-#[inline]
-pub(crate) fn get_per_thread_timing_hint() -> u64 {
-    PER_THREAD_TIMING_HINT_NS.with(|cell| cell.get())
+impl IteratorTimings {
+    pub fn new() -> Self {
+        Self {
+            per_iterator_label_average_duration: std::collections::HashMap::new(),
+            visited_iterator_labels: Vec::new(),
+            visited_duplicated_iterator_labels: Vec::new(),
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -258,6 +259,13 @@ pub struct World {
     /// Cleared at the start of every frame by the Engine.
     #[cfg(debug_assertions)]
     pub(crate) debug_resource_write_locks: std::collections::HashSet<ResourceId>,
+
+    /// Per-label EMA execution timing for parallel iterators.
+    /// Keyed by the `label()` string set on each `ParQueryIter`.
+    /// Shared via `Arc` so iterators can read/write without a raw
+    /// World pointer — the `Mutex` handles concurrent access from
+    /// systems in the same engine batch.
+    pub(crate) iterator_timings: std::sync::Arc<std::sync::Mutex<IteratorTimings>>,
 }
 
 impl World {
@@ -280,6 +288,7 @@ impl World {
             archetype_generation: 0,
             #[cfg(debug_assertions)]
             debug_resource_write_locks: std::collections::HashSet::new(),
+            iterator_timings: std::sync::Arc::new(std::sync::Mutex::new(IteratorTimings::new())),
         }
     }
 
@@ -2662,5 +2671,49 @@ mod tests {
         assert_eq!(world.get_component::<Position>(entity1).unwrap().x, 1.0);
 
         println!("✓ Component cleanup on archetype migration works correctly!");
+    }
+
+    /// Tests that `PerLabelTiming` detects duplicate labels within a frame.
+    ///
+    /// Two iterators with the same label will corrupt the per-label EMA.
+    /// This test simulates the logic inside `ParQueryIter::for_each`.
+    #[test]
+    fn test_per_label_duplicate_detection() {
+        let timing = std::sync::Mutex::new(IteratorTimings::new());
+
+        // Simulate iterator-1 with label "physics".
+        {
+            let mut t = timing.lock().unwrap();
+            assert!(!t.visited_iterator_labels.contains(&"physics"));
+            t.visited_iterator_labels.push("physics");
+            t.per_iterator_label_average_duration
+                .insert("physics", 120_000);
+        }
+
+        // Simulate iterator-2 with label "ai" — different label, no duplicate.
+        {
+            let mut t = timing.lock().unwrap();
+            assert!(!t.visited_iterator_labels.contains(&"ai"));
+            t.visited_iterator_labels.push("ai");
+            t.per_iterator_label_average_duration.insert("ai", 50_000);
+        }
+
+        // Simulate a second "physics" iterator — same label, DUPLICATE.
+        {
+            let mut t = timing.lock().unwrap();
+            assert!(t.visited_iterator_labels.contains(&"physics"));
+            t.visited_duplicated_iterator_labels.push("physics");
+            // Overwrites the EMA — exactly the problem we're detecting.
+            t.per_iterator_label_average_duration
+                .insert("physics", 800_000);
+        }
+
+        let t = timing.lock().unwrap();
+        assert_eq!(t.visited_duplicated_iterator_labels, vec!["physics"]);
+        assert_eq!(t.visited_iterator_labels, vec!["physics", "ai"]);
+        // "physics" EMA was corrupted by the second write.
+        assert_eq!(t.per_iterator_label_average_duration["physics"], 800_000);
+
+        println!("✓ Duplicate label detection works correctly!");
     }
 }

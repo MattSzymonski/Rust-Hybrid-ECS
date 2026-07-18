@@ -65,42 +65,14 @@ fn movement_system(mut query: Query<(&mut Position, &Velocity)>) {
 fn health_decay_system(mut query: Query<&mut Health>) {
     let _zone = crate::profile_scope!("health_decay_systXxxxxxm");
 
-    // Parallel iteration
-    let stats: query::ParForEachResult = query
+    // Light work — per-label timing will reduce groups to 1 after first frame.
+    query
         .par_iter_mut()
         .tracked()
         .label("health_decay_system")
         .for_each(|mut health| {
             health.0 = (health.0 + 0.1).max(0.0);
         });
-    crate::profile_message!("movement: {}", stats);
-
-    // Sequential iteration
-    // for mut health in query.iter_mut() {
-    //     health.0 = (health.0 + 0.1).max(0.0);
-    // }
-
-    // query.iter_mut().for_each(|mut health| {
-    //     health.0 = (health.0 + 0.1).max(0.0);
-    // });
-
-    // let _zone = crate::profile_scope!("health_decay_system");
-    // let stats = query
-    //     .par_iter_mut()
-    //     .label("health_decay")
-    //     .tracked()
-    //     .for_each(|mut health| {
-    //         health.0 = (health.0 - 0.1).max(0.0);
-    //     });
-    // crate::profile_message!("health_decay: {}", stats);
-
-    // let x = query.iter_mut().for_each(|mut health| {
-    //     health.0 = (health.0 - 0.1).max(0.0);
-    // });
-
-    // for mut health in query.iter_mut() {
-    //     health.0 = (health.0 - 0.1).max(0.0);
-    // }
 }
 
 fn collision_damage_system(mut query: Query<(&mut Health, &Position)>) {
@@ -119,6 +91,18 @@ fn enemy_ai_system(mut query: Query<(&mut Position, &mut Velocity), With<Enemy>>
 }
 
 fn cleanup_system(mut commands: Commands, mut query: Query<(Entity, &Health)>) {
+    // Heavy parallel pre-pass — auto-hinted from system EMA, uses full pool.
+    query
+        .par_iter_mut()
+        .label("cleanup_system")
+        .tracked()
+        .for_each(|(entity, health)| {
+            let mut acc = health.0 + entity.id() as f32;
+            acc = (acc.sqrt() * acc.cbrt()).clamp(-100.0, 100.0);
+            core::hint::black_box(acc);
+        });
+
+    // Actual cleanup — destroy entities at or below zero health.
     for (entity, health) in query.iter_mut() {
         if health.0 <= 0.0 {
             let _ = commands.destroy_entity(entity);

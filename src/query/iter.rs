@@ -236,9 +236,8 @@ pub struct ParQueryIter<'w, Q: QueryTarget, F: QueryFilter = ()> {
     tracked: bool,
     /// Optional label for Tracy zones — set via `.label("system_name")`.
     label: Option<&'static str>,
-    /// Previous-frame execution duration (ns) for this system.
-    /// 0 means "no data — use thread-count heuristic."
-    timing_hint_ns: u64,
+    /// Per-label EMA timing map, shared via Arc<Mutex<>> for thread-safe access.
+    iterator_timings: std::sync::Arc<std::sync::Mutex<crate::world::IteratorTimings>>,
     _phantom: std::marker::PhantomData<&'w mut (Q, F)>,
 }
 
@@ -263,7 +262,10 @@ where
 impl<'w, Q: QueryTarget, F: QueryFilter> ParQueryIter<'w, Q, F> {
     /// Construct a new parallel iterator with default settings. Used by
     /// [`Query::par_iter_mut`].
-    pub(crate) fn new(archetype_ranges: Vec<FilteredArchetypeRange<Q::State, F::State>>) -> Self {
+    pub(crate) fn new(
+        archetype_ranges: Vec<FilteredArchetypeRange<Q::State, F::State>>,
+        iterator_timings: std::sync::Arc<std::sync::Mutex<crate::world::IteratorTimings>>,
+    ) -> Self {
         let _zone = crate::profile_scope!(
             "create parallel query iterator",
             [("Archetype ranges: {}", archetype_ranges.len())]
@@ -273,7 +275,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> ParQueryIter<'w, Q, F> {
             min_batch_size: None,
             tracked: false,
             label: None,
-            timing_hint_ns: 0,
+            iterator_timings,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -281,14 +283,6 @@ impl<'w, Q: QueryTarget, F: QueryFilter> ParQueryIter<'w, Q, F> {
     /// Attach a label (usually the system name) for Tracy zone identification.
     pub fn label(mut self, name: &'static str) -> Self {
         self.label = Some(name);
-        self
-    }
-
-    /// Feed previous-frame execution timing so the iterator can pick an
-    /// optimal number of parallel groups — fewer for light systems,
-    /// more for heavy ones.  `0` means "unknown, use thread-count."
-    pub fn with_timing_hint(mut self, nanos: u64) -> Self {
-        self.timing_hint_ns = nanos;
         self
     }
 }
@@ -343,12 +337,50 @@ where
     where
         Func: Fn(Q::Item<'_>) + Send + Sync,
     {
-        if self.tracked {
-            ParForEachResult::Tracked(self.execute_tracked(f))
+        // Resolve timing hint from per-label EMA.
+        let hint_ns = self
+            .label
+            .and_then(|label| {
+                self.iterator_timings.lock().ok().and_then(|timing| {
+                    timing
+                        .per_iterator_label_average_duration
+                        .get(label)
+                        .copied()
+                })
+            })
+            .unwrap_or(0);
+
+        // Capture before self is moved into execute_*.
+        let label = self.label;
+        let iterator_timings = std::sync::Arc::clone(&self.iterator_timings);
+
+        let started = std::time::Instant::now();
+        let result = if self.tracked {
+            ParForEachResult::Tracked(self.execute_tracked(f, hint_ns))
         } else {
-            self.execute_untracked(f);
+            self.execute_untracked(f, hint_ns);
             ParForEachResult::Untracked
+        };
+        let elapsed_ns = started.elapsed().as_nanos() as u64;
+
+        // Store per-label EMA and track seen labels for duplicate detection.
+        if let Some(label) = label {
+            if let Ok(mut timing) = iterator_timings.lock() {
+                let entry = timing
+                    .per_iterator_label_average_duration
+                    .entry(label)
+                    .or_insert(elapsed_ns);
+                let delta = elapsed_ns as i64 - *entry as i64;
+                *entry = (*entry as i64 + delta / EMA_ALPHA_DENOM) as u64;
+                if timing.visited_iterator_labels.contains(&label) {
+                    timing.visited_duplicated_iterator_labels.push(label);
+                } else {
+                    timing.visited_iterator_labels.push(label);
+                }
+            }
         }
+
+        result
     }
 
     /// Execute the closure on every matching entity (untracked).
@@ -361,7 +393,7 @@ where
     /// into chunks and spawned via [`rayon::scope`], so every thread
     /// pulls tasks from a shared pool simultaneously
     /// — no work-stealing cascade, no late-arriving outliers.
-    fn execute_untracked<Func>(self, f: Func)
+    fn execute_untracked<Func>(self, f: Func, hint_ns: u64)
     where
         Func: Fn(Q::Item<'_>) + Send + Sync,
     {
@@ -406,11 +438,9 @@ where
         let pool_threads = rayon::current_num_threads();
 
         // Choose group count from timing feedback when available.
-        // Target ~20µs per group so wake-up latency doesn't dominate.
-        // Falls back to thread-count on the first frame.
-        let num_groups = if self.timing_hint_ns > 0 {
-            let target = (self.timing_hint_ns / TARGET_GROUP_DURATION_NS)
-                .clamp(1, pool_threads as u64) as usize;
+        let num_groups = if hint_ns > 0 {
+            let target =
+                (hint_ns / TARGET_GROUP_DURATION_NS).clamp(1, pool_threads as u64) as usize;
             target.min(work_slices.len()).max(1)
         } else {
             pool_threads.min(work_slices.len()).max(1)
@@ -442,7 +472,7 @@ where
             total,
             work_slices.len(),
             thread_groups.len(),
-            self.timing_hint_ns,
+            hint_ns,
         );
 
         let ranges_ref = &self.archetype_ranges;
@@ -486,7 +516,7 @@ where
     /// one stat, giving precise visibility into per-thread assignment.
     ///
     /// [`execute_untracked`]: Self::execute_untracked
-    fn execute_tracked<Func>(self, f: Func) -> BatchStats
+    fn execute_tracked<Func>(self, f: Func, hint_ns: u64) -> BatchStats
     where
         Func: Fn(Q::Item<'_>) + Send + Sync,
     {
@@ -542,10 +572,8 @@ where
         }
 
         // Choose group count from timing feedback when available.
-        // Target ~20µs per group so wake-up latency doesn't dominate.
-        let num_groups = if self.timing_hint_ns > 0 {
-            let target = (self.timing_hint_ns / TARGET_GROUP_DURATION_NS)
-                .clamp(1, num_threads as u64) as usize;
+        let num_groups = if hint_ns > 0 {
+            let target = (hint_ns / TARGET_GROUP_DURATION_NS).clamp(1, num_threads as u64) as usize;
             target.min(work_slices.len()).max(1)
         } else {
             num_threads.min(work_slices.len()).max(1)
@@ -583,7 +611,7 @@ where
             total_entities,
             work_slices.len(),
             thread_groups.len(),
-            self.timing_hint_ns,
+            hint_ns,
         );
 
         let ranges_ref = &self.archetype_ranges;

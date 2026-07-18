@@ -13,7 +13,7 @@ use crate::component::Tick;
 use crate::query::EMA_ALPHA_DENOM;
 use crate::scheduler::{SystemAccess, SystemScheduler};
 use crate::system::{IntoSystem, System, SystemParam};
-use crate::world::{set_per_thread_last_run_tick, set_per_thread_timing_hint, World};
+use crate::world::{set_per_thread_last_run_tick, World};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -297,6 +297,20 @@ impl Engine {
                     .execute_queued_commands(&mut self.world, self.should_exit_on_error);
             }
 
+            // Check for duplicate iterator labels within this frame.
+            {
+                let mut timing = self.world.iterator_timings.lock().unwrap();
+                if !timing.visited_duplicated_iterator_labels.is_empty() {
+                    let duplicates = std::mem::take(&mut timing.visited_duplicated_iterator_labels);
+                    eprintln!(
+                        "WARNING: duplicate parallel-iterator labels this frame: {:?}. \
+                         Two iterators sharing a .label() corrupt per-label timing.",
+                        duplicates
+                    );
+                }
+                timing.visited_iterator_labels.clear();
+            }
+
             crate::profile_frame_mark!();
         } // ← frame zone ends here
 
@@ -336,7 +350,6 @@ impl Engine {
             self.world.system_last_run = registered_system.last_run;
 
             // Feed timing hint to query iterators inside this system.
-            set_per_thread_timing_hint(registered_system.avg_execution_ns);
             let system_start = Instant::now();
 
             let started_at = self.world.change_tick().get();
@@ -383,7 +396,7 @@ impl Engine {
         let batches_len = self.scheduler.execution_graph().len();
         for (batch_index, systems_batch) in self.scheduler.execution_graph().iter().enumerate() {
             let batch_size = systems_batch.len();
-            let _zone = crate::profile_scope!(
+            let _zone: crate::profiling::TracyZone = crate::profile_scope!(
                 "run systems batch {}/{} ({} systems)",
                 batch_index + 1,
                 batches_len,
@@ -399,7 +412,6 @@ impl Engine {
                 self.world.system_last_run = registered.last_run;
 
                 // Feed timing hint to query iterators inside this system.
-                set_per_thread_timing_hint(registered.avg_execution_ns);
                 let system_start = Instant::now();
 
                 let started_at = self.world.change_tick().get();
@@ -430,12 +442,6 @@ impl Engine {
                 let last_runs: Vec<u32> = systems_batch
                     .iter()
                     .map(|&system_index| self.systems[system_index].last_run)
-                    .collect();
-
-                // Pre-compute timing hints for feedback-driven group sizing.
-                let last_avg_ns: Vec<u64> = systems_batch
-                    .iter()
-                    .map(|&system_index| self.systems[system_index].avg_execution_ns)
                     .collect();
 
                 // - Prepare raw pointers for parallel access -
@@ -503,8 +509,6 @@ impl Engine {
 
                     unsafe {
                         let world = &mut *world_ptr.as_ptr();
-                        // Per-thread hint — no race with other systems.
-                        set_per_thread_timing_hint(last_avg_ns[i]);
                         let system_start = Instant::now();
                         let queue = &mut *queue_ptr.as_ptr();
                         let system_index = systems_batch[i];

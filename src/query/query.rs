@@ -295,7 +295,6 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             .collect();
         archetype_ranges.sort_by_key(|(id, _, _, _)| *id);
 
-        let timing_hint = crate::world::get_per_thread_timing_hint();
-        ParQueryIter::new(archetype_ranges).with_timing_hint(timing_hint)
+        ParQueryIter::new(archetype_ranges, self.world.iterator_timings.clone())
     }
 }
