@@ -17,6 +17,15 @@ pub mod scripting;
 pub mod system;
 pub mod world;
 
+// ----------------------------------------------------------------------------
+// Tracy ProfiledAllocator - tracks allocations in Tracy's memory view.
+// Only active when the `tracing` feature is enabled.
+// ----------------------------------------------------------------------------
+#[cfg(feature = "tracing")]
+#[global_allocator]
+static ALLOC: tracy_client::ProfiledAllocator<std::alloc::System> =
+    tracy_client::ProfiledAllocator::new(std::alloc::System, 100);
+
 // Re-export commonly used types
 pub use commands::{CommandError, Commands};
 pub use component::{Component, ComponentId, ComponentTicks, Tick};

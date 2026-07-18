@@ -1,4 +1,4 @@
-//! Archetype migration benchmarks — add/remove component throughput.
+//! Archetype migration benchmarks - add/remove component throughput.
 //!
 //! Measures: clone + move overhead, HashMap insertion, Vec reallocation
 //! during entity archetype transitions.

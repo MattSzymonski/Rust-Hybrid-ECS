@@ -74,11 +74,18 @@ pub struct Engine {
     /// When true, the FPS limiter sleep is wrapped in a Tracy zone
     /// (`frame_wait`). Turn off to declutter the timeline.
     pub trace_frame_wait: bool,
+    /// Last seen archetype generation, used to detect when archetypes are
+    /// added or removed so we can emit per-archetype memory breakdowns.
+    last_archetype_generation: u64,
 }
 
 impl Engine {
     /// Create a new Engine with no systems
     pub fn new() -> Self {
+        // Name the main thread in Tracy BEFORE Rayon spawns workers,
+        // so it appears first in the thread list.
+        crate::profile_thread!("main");
+
         // Warm up the Rayon thread pool so the first parallel batch
         // does not pay thread-spawning costs (can be 1-10ms on some OS).
         rayon::broadcast(|_ctx| {});
@@ -93,6 +100,7 @@ impl Engine {
             should_exit_on_error: false,
             frame_budget: None,
             trace_frame_wait: true,
+            last_archetype_generation: 0,
         }
     }
 }
@@ -258,7 +266,13 @@ impl Engine {
 
         {
             // Tracy zone: frame = actual work, not including sleep
-            let _tracy_frame = crate::profile_scope!("frame");
+            let _tracy_frame = crate::profile_scope!(
+                "frame",
+                [
+                    ("Active entities in world: {}", self.world.entity_count()),
+                    ("Archetypes in world: {}", self.world.archetypes.len())
+                ]
+            );
 
             // Bump the world tick so that any change-detection comparisons
             // performed by mutable queries during this frame use a fresh value.
@@ -276,6 +290,26 @@ impl Engine {
                 self.graph_dirty = false;
             }
 
+            // Emit per-archetype memory breakdown when archetypes are added or removed.
+            let current_generation = self.world.archetype_generation;
+            if current_generation != self.last_archetype_generation {
+                self.last_archetype_generation = current_generation;
+                for archetype in self.world.archetypes.values() {
+                    crate::profile_message!(
+                        "archetype {:?}: {} entities, {} component types, ~{} bytes",
+                        archetype.id,
+                        archetype.entity_count(),
+                        archetype.component_types.len(),
+                        archetype.memory_estimate(&self.world.component_registry),
+                    );
+                }
+                crate::profile_message!(
+                    "total world memory estimate: ~{} bytes ({} KB)",
+                    self.world.memory_estimate(),
+                    self.world.memory_estimate() / 1024,
+                );
+            }
+
             // Phase 1: Run all systems
             if self.parallel_execution && self.systems.len() > 1 {
                 self.run_systems_parallel();
@@ -285,23 +319,32 @@ impl Engine {
 
             // Scripts receive a ScriptContext with read-only world access and deferred commands
             {
-                let _zone = crate::profile_scope!("update_scripts");
+                let _zone = crate::profile_scope!("update scripts");
                 self.world.update_scripts(&mut self.queue);
             }
+            crate::profile_secondary_frame_mark!("scripts");
 
             // Phase 2: Execute all deferred commands (including those from scripts)
             {
-                let _zone = crate::profile_scope!("execute_commands");
+                let _zone = crate::profile_scope!(
+                    "execute commands",
+                    [("Commands queued this frame: {}", !self.queue.is_empty())]
+                );
                 result = self
                     .queue
                     .execute_queued_commands(&mut self.world, self.should_exit_on_error);
             }
+            crate::profile_secondary_frame_mark!("commands");
 
             // Check for duplicate iterator labels within this frame.
             {
                 let mut timing = self.world.iterator_timings.lock().unwrap();
                 if !timing.visited_duplicated_iterator_labels.is_empty() {
                     let duplicates = std::mem::take(&mut timing.visited_duplicated_iterator_labels);
+                    crate::profile_warn!(
+                        "duplicate parallel-iterator labels this frame: {:?} — two iterators sharing a .label() corrupt per-label timing",
+                        duplicates
+                    );
                     eprintln!(
                         "WARNING: duplicate parallel-iterator labels this frame: {:?}. \
                          Two iterators sharing a .label() corrupt per-label timing.",
@@ -312,14 +355,43 @@ impl Engine {
             }
 
             crate::profile_frame_mark!();
-        } // ← frame zone ends here
+
+            // Emit per-frame time-series plots for Tracy (native plot API).
+            crate::profile_plot!(entity_count, self.world.entity_count() as f64);
+            crate::profile_plot!(archetype_count, self.world.archetypes.len() as f64);
+            crate::profile_plot!(frame_time_us, frame_start.elapsed().as_micros() as f64);
+            // Memory estimate: sums archetype columns, entity locations, resources, and overhead.
+            crate::profile_plot!(
+                memory_estimate_kb,
+                self.world.memory_estimate() as f64 / 1024.0
+            );
+            // ECS internals.
+            crate::profile_plot!(free_entity_ids, self.world.free_entity_ids.len() as f64);
+            crate::profile_plot!(component_types, self.world.component_registry.len() as f64);
+            crate::profile_plot!(resource_count, self.world.resources.len() as f64);
+            crate::profile_plot!(registered_systems, self.systems.len() as f64);
+            crate::profile_plot!(
+                execution_batches,
+                self.scheduler.execution_graph().len() as f64
+            );
+            crate::profile_plot!(
+                commands_executed,
+                self.world.commands_executed_this_frame as f64
+            );
+        } // <- frame zone ends here
 
         // FPS limiter — sleep remaining budget OUTSIDE the frame zone
         if let Some(budget) = self.frame_budget {
             let elapsed = frame_start.elapsed();
             if elapsed < budget {
                 if self.trace_frame_wait {
-                    let _zone = crate::profile_scope!("frame_wait");
+                    let _zone = crate::profile_scope!(
+                        "frame wait",
+                        [
+                            ("Frame budget (microseconds): {}", budget.as_micros()),
+                            ("Work elapsed (microseconds): {}", elapsed.as_micros())
+                        ]
+                    );
                     std::thread::sleep(budget - elapsed);
                 } else {
                     std::thread::sleep(budget - elapsed);
@@ -333,7 +405,7 @@ impl Engine {
     /// Run systems sequentially (fallback or when parallel is disabled)
     fn run_systems_sequential(&mut self) {
         let _zone = crate::profile_scope!(
-            "systems/sequential",
+            "systems sequential",
             [(
                 "{} enabled systems ({} total registered)",
                 self.systems.iter().filter(|s| s.enabled).count(),
@@ -344,7 +416,11 @@ impl Engine {
             if !registered_system.enabled {
                 continue;
             }
-            let _tracy_sys = crate::profile_scope!("system: {}", registered_system.name);
+            let _tracy_sys = crate::profile_scope!(
+                "system: {}",
+                registered_system.name;
+                [("System last ran at tick: {}", registered_system.last_run), ("System EMA execution time (ns): {}", registered_system.average_duration)]
+            );
             // Seed the change-detection baseline for this system: filters
             // such as `Changed<T>` will compare against `last_run`.
             self.world.system_last_run = registered_system.last_run;
@@ -416,7 +492,11 @@ impl Engine {
 
                 let started_at = self.world.change_tick().get();
 
-                let _zone = crate::profile_scope!("system: {}", registered.name);
+                let _zone = crate::profile_scope!(
+                    "system: {}",
+                    registered.name;
+                    [("System last ran at tick: {}", registered.last_run), ("System EMA execution time (ns): {}", registered.average_duration)]
+                );
                 registered.system.run(&mut self.world, &mut self.queue);
                 registered.last_run = started_at;
                 // Update EMA of execution time.
@@ -438,7 +518,7 @@ impl Engine {
                 let started_at = self.world.change_tick().get();
 
                 // Prepare stage: collect per-system data + create raw pointers
-                let _zone = crate::profile_scope!("Setup systems batch ({} systems)", batch_size);
+                let _zone = crate::profile_scope!("setup systems batch ({} systems)", batch_size);
                 let last_runs: Vec<u32> = systems_batch
                     .iter()
                     .map(|&system_index| self.systems[system_index].last_run)
@@ -498,11 +578,18 @@ impl Engine {
                 (0..batch_len).into_par_iter().for_each(|i| {
                     task_count.fetch_add(1, Ordering::Relaxed);
 
+                    // Name the Rayon worker thread for Tracy visibility.
+                    crate::profile_thread!("rayon worker");
+
                     if !enabled_flags[i] {
                         return;
                     }
 
-                    let _zone = crate::profile_scope!("system: {}", system_names[i]);
+                    let _zone = crate::profile_scope!(
+                        "system: {}",
+                        system_names[i];
+                        [("System position in batch: {}", i), ("Total systems in this batch: {}", batch_len)]
+                    );
 
                     let previous_override =
                         set_per_thread_last_run_tick(Some(Tick::new(last_runs[i])));
@@ -526,7 +613,9 @@ impl Engine {
                 });
 
                 crate::profile_message!(
-                    "rayon dispatch: {} systems → {} rayon tasks",
+                    "parallel system dispatch: batch {} of {} completed, {} systems spawned as {} rayon tasks across the thread pool",
+                    batch_index + 1,
+                    batches_len,
                     batch_len,
                     task_count.load(Ordering::Relaxed),
                 );

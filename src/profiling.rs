@@ -2,8 +2,26 @@
 // Profiling Abstraction Layer (Tracy Profiler)
 // ----------------------------------------------------------------------------
 //!
-//! All profiling instrumentation lives here. When the `tracing` feature is
-//! disabled, every macro and type compiles to zero-cost no-ops.
+//! All profiling instrumentation lives here. Two feature levels:
+//!
+//! | Capability                | `tracing` | `tracing-minimal` | (none) |
+//! |---------------------------|-----------|-------------------|--------|
+//! | CPU zones                 | +         | +                 | -      |
+//! | Zone text/details         | +         | -                 | -      |
+//! | Native Tracy plots        | +         | -                 | -      |
+//! | Messages (white)          | +         | -                 | -      |
+//! | Warnings (orange)         | +         | -                 | -      |
+//! | Errors (red)              | +         | -                 | -      |
+//! | Thread naming             | +         | -                 | -      |
+//! | Frame marks               | +         | +                 | -      |
+//! | Secondary frames          | +         | +                 | -      |
+//! | Non-continuous frames     | +         | +                 | -      |
+//! | Call stack sampling       | +         | +                 | -      |
+//! | Context switch tracing    | +         | -                 | -      |
+//! | System info (CPU freq)    | +         | -                 | -      |
+//! | On-demand collection      | +         | +                 | -      |
+//! | Code transfer (asm)       | +         | -                 | -      |
+//! | Allocation tracking       | +         | -                 | -      |
 //!
 //! # Setup
 //!
@@ -19,14 +37,26 @@
 //! // Frame boundary:
 //! profile_frame_mark!();
 //!
-//! // Plot:
-//! profile_plot!("entity_count", world.entity_count() as f64);
+//! // Secondary (named) frame for subsystems:
+//! profile_secondary_frame_mark!("scripts");
 //!
-//! // Message:
+//! // Plot (identifier name → native Tracy graph):
+//! profile_plot!(entity_count, world.entity_count() as f64);
+//!
+//! // Message / warn / error (warn=orange, error=red):
 //! profile_message!("archetype created: {:?}", id);
+//! profile_warn!("duplicate iterator label: {}", label);
+//! profile_error!("command execution failed: {:?}", err);
 //!
 //! // Thread naming:
 //! profile_thread!("worker_pool");
+//!
+//! // Non-continuous frame (one-shot operations):
+//! let _setup = profile_non_continuous_frame!("engine_init");
+//!
+//! // Plot configuration (one-time setup):
+//! profile_plot_config!(entity_count, PlotConfiguration::default()
+//!     .format(PlotFormat::Number));
 //! ```
 
 // ============================================================================
@@ -37,7 +67,7 @@
 compile_error!("`tracing` and `tracing-minimal` are mutually exclusive. Enable only one.");
 
 // ============================================================================
-// Tracy-enabled implementation
+// Tracy-enabled implementation (shared by both `tracing` and `tracing-minimal`)
 // ============================================================================
 
 #[cfg(any(feature = "tracing", feature = "tracing-minimal"))]
@@ -46,24 +76,21 @@ mod enabled {
     use tracy_client::Client;
 
     // Lazy-initialized client handle. The first call to `client()` starts Tracy.
-    fn client() -> Client {
+    pub(crate) fn client() -> Client {
         use std::sync::OnceLock;
         static CLIENT: OnceLock<Client> = OnceLock::new();
         CLIENT.get_or_init(Client::start).clone()
     }
 
-    /// Call once at startup to initialize Tracy. Idempotent — safe to call
+    /// Call once at startup to initialize Tracy. Idempotent - safe to call
     /// multiple times. Without this, all instrumentation silently no-ops.
-    ///
-    /// On Windows, after a previous process dies the TCP socket may linger
-    /// in TIME_WAIT (~30s).  We retry a few times to work around it.
     #[inline]
     pub fn init() {
         let _ = client();
     }
 
     /// RAII guard for a static-name CPU zone. Created by `profile_scope!("name")`.
-    #[must_use = "zone closes on drop — bind to a variable"]
+    #[must_use = "zone closes on drop - bind to a variable"]
     pub struct TracyZone {
         #[allow(dead_code)]
         inner: Option<tracy_client::Span>,
@@ -94,14 +121,14 @@ mod enabled {
         /// Attach a diagnostic message to this zone. The text appears in
         /// Tracy's zone tooltip / detail view.
         ///
-        /// Uses `format_args!` — no allocation occurs until Tracy is
-        /// actually running. Cheaper than `profile_message!` for zone-scoped
-        /// information.
+        /// Skips formatting and allocation when no profiler is connected.
         #[inline]
         pub fn text(&self, msg: Arguments<'_>) {
             if let Some(span) = &self.inner {
-                let text = format!("{}", msg);
-                span.emit_text(&text);
+                if Client::is_connected() {
+                    let text = format!("{}", msg);
+                    span.emit_text(&text);
+                }
             }
         }
     }
@@ -114,51 +141,107 @@ mod enabled {
         }
     }
 
-    /// Emit a plot data point for a time-series graph.
-    /// Note: plot name must be a compile-time literal for full Tracy support.
-    /// Currently emits a message with the value instead (Tracy plot API
-    /// requires compile-time names for full fidelity).
+    /// Mark end of a secondary (named) continuous frame.
     #[inline]
-    pub fn plot(name: &str, value: f64) {
+    pub fn secondary_frame_mark(name: tracy_client::FrameName) {
         if Client::is_running() {
-            // Tracy's plot system requires compile-time PlotName constants.
-            // Emit as a formatted message for now; full plot integration
-            // requires plot_name! macro usage at call sites.
-            let text = format!("{} = {:.2}", name, value);
-            client().message(&text, 0);
+            client().secondary_frame_mark(name);
         }
     }
 
-    /// Emit a diagnostic message.
+    /// RAII guard for a non-continuous frame. Frame ends on drop.
+    #[must_use = "non-continuous frame ends on drop - bind to a variable"]
+    pub struct NonContinuousFrame {
+        #[allow(dead_code)]
+        inner: Option<tracy_client::Frame>,
+    }
+
+    /// Begin a non-continuous frame (one-shot operation, not in a loop).
+    #[inline]
+    pub fn non_continuous_frame_begin(name: tracy_client::FrameName) -> NonContinuousFrame {
+        let inner = Client::running().map(|c| c.non_continuous_frame(name));
+        NonContinuousFrame { inner }
+    }
+}
+
+// ============================================================================
+// Full `tracing` feature - plots, messages, thread naming
+// ============================================================================
+
+#[cfg(feature = "tracing")]
+pub mod tracing_extras {
+    use std::fmt::Arguments;
+    use tracy_client::Client;
+
+    use super::enabled::client;
+
+    /// Emit a data point on a named time-series plot.
+    /// Uses Tracy's native plot system - renders as an actual graph in the UI.
+    /// Skips work when no profiler is connected.
+    #[inline]
+    pub fn plot(name: tracy_client::PlotName, value: f64) {
+        if Client::is_running() && Client::is_connected() {
+            client().plot(name, value);
+        }
+    }
+
+    /// Configure how a plot appears in the Tracy profiler UI.
+    #[inline]
+    pub fn plot_config(
+        name: tracy_client::PlotName,
+        configuration: tracy_client::PlotConfiguration,
+    ) {
+        if Client::is_running() {
+            client().plot_config(name, configuration);
+        }
+    }
+
+    /// Emit a diagnostic message (white). Skips formatting when no profiler is connected.
     #[inline]
     pub fn message(msg: Arguments<'_>) {
-        if Client::is_running() {
+        if Client::is_running() && Client::is_connected() {
             let text = format!("{}", msg);
             client().message(&text, 0);
         }
     }
 
+    /// Emit a warning message (orange, RGBA 0xFF8800FF).
+    #[inline]
+    pub fn warn(msg: Arguments<'_>) {
+        if Client::is_running() && Client::is_connected() {
+            let text = format!("{}", msg);
+            client().color_message(&text, 0xFF8800FF, 0);
+        }
+    }
+
+    /// Emit an error message (red, RGBA 0xFF0000FF).
+    #[inline]
+    pub fn error(msg: Arguments<'_>) {
+        if Client::is_running() && Client::is_connected() {
+            let text = format!("{}", msg);
+            client().color_message(&text, 0xFF0000FF, 0);
+        }
+    }
+
     /// Set the display name of the current thread.
+    /// Uses the safe `Client::set_thread_name` API instead of unsafe FFI.
     #[inline]
     pub fn set_thread_name(name: &str) {
         if Client::is_running() {
-            let c_name = std::ffi::CString::new(name).unwrap_or_default();
-            unsafe {
-                tracy_client::internal::set_thread_name(c_name.as_ptr().cast());
-            }
+            client().set_thread_name(name);
         }
     }
 }
 
 // ============================================================================
-// Disabled (no-op) implementation
+// Disabled (no-op) implementation - neither feature enabled
 // ============================================================================
 
 #[cfg(not(any(feature = "tracing", feature = "tracing-minimal")))]
 mod enabled {
     use std::fmt::Arguments;
 
-    #[must_use = "zone closes on drop — bind to a variable"]
+    #[must_use = "zone closes on drop - bind to a variable"]
     pub struct TracyZone;
 
     impl TracyZone {
@@ -179,32 +262,43 @@ mod enabled {
             Self
         }
 
-        /// No-op when Tracy is disabled.
         #[inline(always)]
         pub fn text(&self, _msg: Arguments<'_>) {}
     }
+
+    #[must_use = "non-continuous frame ends on drop - bind to a variable"]
+    pub struct NonContinuousFrame;
+
+    // Opaque stand-in for `tracy_client::FrameName` when the crate isn't linked.
+    #[doc(hidden)]
+    pub struct OpaqueFrameName;
 
     #[inline(always)]
     pub fn init() {}
     #[inline(always)]
     pub fn frame_mark() {}
     #[inline(always)]
-    pub fn plot(_name: &str, _value: f64) {}
+    pub fn secondary_frame_mark(_name: OpaqueFrameName) {}
     #[inline(always)]
-    pub fn message(_msg: Arguments<'_>) {}
-    #[inline(always)]
-    pub fn set_thread_name(_name: &str) {}
+    pub fn non_continuous_frame_begin(_name: OpaqueFrameName) -> NonContinuousFrame {
+        NonContinuousFrame
+    }
 }
 
 pub use enabled::*;
 
+// `tracing_extras` is only compiled under `tracing`. The macros reference it
+// via `$crate::profiling::extras::*` which only exists under `#[cfg(feature = "tracing")]`.
+#[cfg(feature = "tracing")]
+pub use tracing_extras as extras;
+
 // ============================================================================
-// Public macros — the only API call sites use
+// Public macros - the only API call sites use
 // ============================================================================
 
 /// Initializes the Tracy profiler client. Call once at startup.
-/// Idempotent and safe to call even when the `tracing` feature is disabled.
-#[cfg(feature = "tracing")]
+/// Active under both `tracing` and `tracing-minimal`.
+#[cfg(any(feature = "tracing", feature = "tracing-minimal"))]
 #[macro_export]
 macro_rules! profile_init {
     () => {
@@ -212,28 +306,26 @@ macro_rules! profile_init {
     };
 }
 
-#[cfg(not(feature = "tracing"))]
+#[cfg(not(any(feature = "tracing", feature = "tracing-minimal")))]
 #[macro_export]
 macro_rules! profile_init {
     () => {};
 }
 
-/// Creates a scoped CPU profiling zone with a **static** (compile-time) name.
+/// Creates a scoped CPU profiling zone.
 ///
-/// Preferred form. Zero heap allocation — the name is embedded in the binary.
-///
-/// An optional array of detail tuples can be attached to the zone. Each detail
-/// is either a bare `"static text"` or a `("fmt", args...)` tuple. When
-/// `tracy` is disabled the `format_args!` calls are stack-only structs that
-/// LLVM eliminates entirely.
+/// Active under both `tracing` and `tracing-minimal`. Zone text/details
+/// (the `[...]` form) only emit under `tracing`.
 ///
 /// ```ignore
-/// // Basic:
+/// // Static name (zero-allocation, preferred):
 /// let _zone = profile_scope!("movement");
 ///
-/// // With details (array always required):
+/// // With details (only active under `tracing`, no-op under `tracing-minimal`):
 /// let _zone = profile_scope!("movement", [("entities: {}", count)]);
-/// let _zone = profile_scope!("frame", ["static note", ("dt: {:.2}ms", delta)]);
+///
+/// // Dynamic name (use sparingly - allocates):
+/// let _zone = profile_scope!("system: {}", name);
 /// ```
 #[macro_export]
 macro_rules! profile_scope {
@@ -266,13 +358,7 @@ macro_rules! profile_scope {
 }
 
 /// Internal helper: dispatches a single detail element to `zone.text()`.
-///
-/// Two forms:
-/// - `("fmt", args...)` — formatted with `format_args!`
-/// - `"static text"` — bare string literal
-///
-/// When `tracing-minimal` is enabled, expands to nothing — arguments are
-/// never evaluated, eliminating all formatting overhead.
+/// Only active under `tracing` (no-op under `tracing-minimal`).
 #[cfg(feature = "tracing")]
 #[doc(hidden)]
 #[macro_export]
@@ -294,7 +380,8 @@ macro_rules! profile_scope_detail {
 }
 
 /// Marks the end of a frame. Call once per frame loop iteration.
-#[cfg(feature = "tracing")]
+/// Active under both `tracing` and `tracing-minimal`.
+#[cfg(any(feature = "tracing", feature = "tracing-minimal"))]
 #[macro_export]
 macro_rules! profile_frame_mark {
     () => {
@@ -302,41 +389,103 @@ macro_rules! profile_frame_mark {
     };
 }
 
-#[cfg(not(feature = "tracing"))]
+#[cfg(not(any(feature = "tracing", feature = "tracing-minimal")))]
 #[macro_export]
 macro_rules! profile_frame_mark {
     () => {};
 }
 
-/// Emits a single data point on a named time-series plot.
+/// Marks the end of a secondary (named) continuous frame.
+/// Active under both `tracing` and `tracing-minimal`.
+#[cfg(any(feature = "tracing", feature = "tracing-minimal"))]
+#[macro_export]
+macro_rules! profile_secondary_frame_mark {
+    ($name:literal) => {
+        $crate::profiling::secondary_frame_mark(tracy_client::frame_name!($name));
+    };
+}
+
+#[cfg(not(any(feature = "tracing", feature = "tracing-minimal")))]
+#[macro_export]
+macro_rules! profile_secondary_frame_mark {
+    ($name:literal) => {};
+}
+
+/// Begins a non-continuous frame (one-shot operation).
+/// Returns an RAII guard that ends the frame on drop.
+/// Active under both `tracing` and `tracing-minimal`.
+#[cfg(any(feature = "tracing", feature = "tracing-minimal"))]
+#[macro_export]
+macro_rules! profile_non_continuous_frame {
+    ($name:literal) => {
+        $crate::profiling::non_continuous_frame_begin(tracy_client::frame_name!($name))
+    };
+}
+
+#[cfg(not(any(feature = "tracing", feature = "tracing-minimal")))]
+#[macro_export]
+macro_rules! profile_non_continuous_frame {
+    ($name:literal) => {
+        $crate::profiling::NonContinuousFrame
+    };
+}
+
+/// Emits a data point on a named time-series plot.
+/// Uses Tracy's native plot system - renders as an actual graph in the UI.
+/// Only active under `tracing` (not `tracing-minimal`).
+///
+/// The plot name is a Rust identifier (not a string literal).
+///
+/// ```ignore
+/// profile_plot!(entity_count, world.entity_count() as f64);
+/// profile_plot!(frame_time_us, elapsed.as_micros() as f64);
+/// ```
 #[cfg(feature = "tracing")]
 #[macro_export]
 macro_rules! profile_plot {
-    ($name:expr, $value:expr) => {
-        $crate::profiling::plot($name, $value as f64);
+    ($name:ident, $value:expr) => {
+        $crate::profiling::extras::plot(tracy_client::plot_name!(stringify!($name)), $value as f64);
     };
 }
 
 #[cfg(not(feature = "tracing"))]
 #[macro_export]
 macro_rules! profile_plot {
-    ($name:expr, $value:expr) => {};
+    ($name:ident, $value:expr) => {};
 }
 
-/// Emits a diagnostic message at the current point in the trace.
+/// Configures how a plot appears in the Tracy profiler UI.
+/// Only active under `tracing`.
 ///
 /// ```ignore
-/// profile_message!("archetype {:?} created", id);
+/// use tracy_client::{PlotConfiguration, PlotFormat};
+/// profile_plot_config!(entity_count, PlotConfiguration::default()
+///     .format(PlotFormat::Number));
 /// ```
-///
-/// When `tracing` feature is disabled (including when `tracing-minimal` is
-/// enabled instead): macro expands to nothing — arguments are NOT evaluated.
-/// No runtime cost, no allocations.
+#[cfg(feature = "tracing")]
+#[macro_export]
+macro_rules! profile_plot_config {
+    ($name:ident, $config:expr) => {
+        $crate::profiling::extras::plot_config(
+            tracy_client::plot_name!(stringify!($name)),
+            $config,
+        );
+    };
+}
+
+#[cfg(not(feature = "tracing"))]
+#[macro_export]
+macro_rules! profile_plot_config {
+    ($name:ident, $config:expr) => {};
+}
+
+/// Emits a diagnostic message (white) at the current point in the trace.
+/// Only active under `tracing` (not `tracing-minimal`).
 #[cfg(feature = "tracing")]
 #[macro_export]
 macro_rules! profile_message {
     ($($arg:tt)*) => {
-        $crate::profiling::message(format_args!($($arg)*));
+        $crate::profiling::extras::message(format_args!($($arg)*));
     };
 }
 
@@ -346,16 +495,45 @@ macro_rules! profile_message {
     ($($arg:tt)*) => {};
 }
 
+/// Emits a warning message (orange) at the current point in the trace.
+/// Only active under `tracing`.
+#[cfg(feature = "tracing")]
+#[macro_export]
+macro_rules! profile_warn {
+    ($($arg:tt)*) => {
+        $crate::profiling::extras::warn(format_args!($($arg)*));
+    };
+}
+
+#[cfg(not(feature = "tracing"))]
+#[macro_export]
+macro_rules! profile_warn {
+    ($($arg:tt)*) => {};
+}
+
+/// Emits an error message (red) at the current point in the trace.
+/// Only active under `tracing`.
+#[cfg(feature = "tracing")]
+#[macro_export]
+macro_rules! profile_error {
+    ($($arg:tt)*) => {
+        $crate::profiling::extras::error(format_args!($($arg)*));
+    };
+}
+
+#[cfg(not(feature = "tracing"))]
+#[macro_export]
+macro_rules! profile_error {
+    ($($arg:tt)*) => {};
+}
+
 /// Sets the display name of the current thread in Tracy.
-///
-/// ```ignore
-/// profile_thread!("main");
-/// ```
+/// Only active under `tracing`.
 #[cfg(feature = "tracing")]
 #[macro_export]
 macro_rules! profile_thread {
     ($name:expr) => {
-        $crate::profiling::set_thread_name($name);
+        $crate::profiling::extras::set_thread_name($name);
     };
 }
 

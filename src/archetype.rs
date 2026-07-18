@@ -88,7 +88,10 @@ impl Archetype {
         storage_factories: &HashMap<ComponentId, StorageFactory>,
     ) -> Self {
         let component_count = component_types.len();
-        let _zone = crate::profile_scope!("archetype_new", [("components: {}", component_count)]);
+        let _zone = crate::profile_scope!(
+            "archetype new",
+            [("Component types in this archetype: {}", component_count)]
+        );
         let mut component_storages = TraitTypeMap::with_capacity(component_count);
         let mut component_ticks: HashMap<ComponentId, Vec<ComponentTicks>> =
             HashMap::with_capacity(component_count);
@@ -103,6 +106,12 @@ impl Archetype {
             factory(&mut component_storages);
             component_ticks.insert(component_id, Vec::new());
         }
+
+        crate::profile_message!(
+            "archetype {:?} allocated with {} component storage columns for up to 0 entities",
+            id,
+            component_count,
+        );
 
         Self {
             id,
@@ -183,5 +192,32 @@ impl Archetype {
     pub fn print_info(&self, registry: &crate::component::ComponentRegistry) {
         let info = self.get_archetype_info(registry);
         println!("{}", info);
+    }
+
+    /// Estimate the memory footprint of this archetype in bytes.
+    ///
+    /// Sums entity IDs, component column capacities x element sizes,
+    /// and change-detection tick vectors.
+    pub fn memory_estimate(&self, registry: &crate::component::ComponentRegistry) -> usize {
+        // Entity IDs: 16 bytes each
+        let mut total = self.entities.capacity() * std::mem::size_of::<crate::entity::Entity>();
+
+        // Component columns: capacity x element size
+        for &component_id in &self.component_types {
+            if let Some(size) = registry.get_size(&component_id) {
+                // We can't inspect the Vec's capacity through the trait object,
+                // so we use entity count as a lower bound. The actual Vec capacity
+                // may be larger due to pre-allocation.
+                total += self.entities.len() * size;
+            }
+        }
+
+        // Change-detection ticks: 8 bytes each
+        total += self.component_types.len() * self.entities.capacity() * 8;
+
+        // HashMap overhead for component_ticks (approximate)
+        total += self.component_types.len() * 64;
+
+        total
     }
 }

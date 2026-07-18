@@ -88,7 +88,10 @@ impl QueryTarget for Entity {
     }
 
     fn init_state(archetype: &mut Archetype, _this_run: Tick) -> Self::State {
-        let _zone = crate::profile_scope!("create state for entity query target");
+        let _zone = crate::profile_scope!(
+            "create state for entity query target",
+            [("Entities in this archetype: {}", archetype.entity_count())]
+        );
         SendPtr::new(&archetype.entities as *const Vec<Entity>)
     }
 
@@ -114,7 +117,10 @@ impl<T: Component> QueryTarget for &T {
     }
 
     fn init_state(archetype: &mut Archetype, _this_run: Tick) -> Self::State {
-        let _zone = crate::profile_scope!("create state for immutable component query target");
+        let _zone = crate::profile_scope!(
+            "create state for immutable component query target",
+            [("Entities in archetype: {}", archetype.entity_count()), ("Component type: {}", std::any::type_name::<T>())]
+        );
         SendPtr::new(
             archetype.component_storages.get_storage::<T>() as *const VecStorage<T, dyn Component>
         )
@@ -155,7 +161,10 @@ impl<T: Component> QueryTarget for &mut T {
     }
 
     fn init_state(archetype: &mut Archetype, this_run: Tick) -> Self::State {
-        let _zone = crate::profile_scope!("create state for mutable component query target");
+        let _zone = crate::profile_scope!(
+            "create state for mutable component query target",
+            [("Entities in archetype: {}", archetype.entity_count()), ("Component type (mutable): {}", std::any::type_name::<T>())]
+        );
         let values = SendPtrMut::new(archetype.component_storages.get_storage_mut::<T>()
             as *mut VecStorage<T, dyn Component>);
         let ticks_vec = archetype
@@ -223,7 +232,10 @@ macro_rules! impl_query_target_tuple {
 
             #[allow(non_snake_case)]
             fn init_state(archetype: &mut Archetype, this_run: Tick) -> Self::State {
-                let _zone = crate::profile_scope!("create state for tuple query target");
+                let _zone = crate::profile_scope!(
+                    "create state for tuple query target",
+                    [("Entities in archetype: {}", archetype.entity_count())]
+                );
                 let archetype_ptr = archetype as *mut Archetype;
                 unsafe { ($($T::init_state(&mut *archetype_ptr, this_run),)*) }
             }

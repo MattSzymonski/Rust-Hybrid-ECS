@@ -1,4 +1,4 @@
-//! Query iteration benchmarks — sequential + parallel, filtered + unfiltered.
+//! Query iteration benchmarks - sequential + parallel, filtered + unfiltered.
 //!
 //! Measures: per-row overhead, cache behaviour, parallel scaling,
 //! change-detection tick overhead, filter evaluation cost.

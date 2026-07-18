@@ -208,7 +208,7 @@ impl IteratorTimings {
 pub struct World {
     next_free_entity_id: u64,
     /// Free list of recycled entity IDs with their next generation. Stored as (id, next_generation) pairs
-    free_entity_ids: Vec<(u64, u32)>,
+    pub(crate) free_entity_ids: Vec<(u64, u32)>,
     /// All archetypes in the world
     pub(crate) archetypes: HashMap<ArchetypeId, Archetype>,
     /// Tracks where each entity is located in the archetype system
@@ -260,10 +260,14 @@ pub struct World {
     #[cfg(debug_assertions)]
     pub(crate) debug_resource_write_locks: std::collections::HashSet<ResourceId>,
 
+    /// Number of deferred commands executed in the current frame.
+    /// Set by `CommandQueue::execute_queued_commands`, read by the Engine for Tracy plots.
+    pub(crate) commands_executed_this_frame: usize,
+
     /// Per-label EMA execution timing for parallel iterators.
     /// Keyed by the `label()` string set on each `ParQueryIter`.
     /// Shared via `Arc` so iterators can read/write without a raw
-    /// World pointer — the `Mutex` handles concurrent access from
+    /// World pointer - the `Mutex` handles concurrent access from
     /// systems in the same engine batch.
     pub(crate) iterator_timings: std::sync::Arc<std::sync::Mutex<IteratorTimings>>,
 }
@@ -288,6 +292,7 @@ impl World {
             archetype_generation: 0,
             #[cfg(debug_assertions)]
             debug_resource_write_locks: std::collections::HashSet::new(),
+            commands_executed_this_frame: 0,
             iterator_timings: std::sync::Arc::new(std::sync::Mutex::new(IteratorTimings::new())),
         }
     }
@@ -309,7 +314,10 @@ impl World {
     /// }
     /// ```
     pub fn reserve_entities(&mut self, additional: usize) {
-        let _zone = crate::profile_scope!("reserve_entities", [("additional: {}", additional)]);
+        let _zone = crate::profile_scope!(
+            "reserve entities",
+            [("Additional entities to reserve: {}", additional)]
+        );
         self.free_entity_ids.reserve(additional);
         self.entity_locations.reserve(additional);
     }
@@ -317,7 +325,7 @@ impl World {
     /// Reserve capacity for at least `additional` instances of component `T`
     /// in every archetype that currently contains `T`.
     ///
-    /// This is a hint — the ECS may reserve more or less than requested
+    /// This is a hint - the ECS may reserve more or less than requested
     /// depending on archetype distribution. Call after registering components
     /// and after creating archetypes you intend to populate.
     pub fn reserve_components<T>(&mut self, additional: usize)
@@ -362,8 +370,11 @@ impl World {
         T: Component + TraitAccessible<dyn Component> + Clone,
     {
         let _zone = crate::profile_scope!(
-            "register_component",
-            [("type: {}", std::any::type_name::<T>())]
+            "register component",
+            [(
+                "Component type being registered: {}",
+                std::any::type_name::<T>()
+            )]
         );
         let component_id = ComponentId::of::<T>();
 
@@ -393,8 +404,11 @@ impl World {
         T: ScriptComponent + TraitAccessible<dyn Component> + Clone,
     {
         let _zone = crate::profile_scope!(
-            "register_script_component",
-            [("type: {}", std::any::type_name::<T>())]
+            "register script component",
+            [(
+                "Script component type being registered: {}",
+                std::any::type_name::<T>()
+            )]
         );
         // First register as a normal component
         self.register_component::<T>();
@@ -445,8 +459,11 @@ impl World {
     /// are automatically deferred, preventing use-after-free bugs.
     pub(crate) fn update_scripts(&mut self, commands: &mut CommandQueue) {
         let _zone = crate::profile_scope!(
-            "update_scripts",
-            [("scripts: {}", self.script_components.len())]
+            "update scripts",
+            [(
+                "Script component types in world: {}",
+                self.script_components.len()
+            )]
         );
         // Pre-allocate the work list.  We recycle this Vec across script
         // types via `.drain(..)`, so only one allocation per frame.
@@ -572,8 +589,11 @@ impl World {
     /// If a resource of this type already exists, it is replaced.
     pub fn insert_resource<T: Resource>(&mut self, resource: T) {
         let _zone = crate::profile_scope!(
-            "insert_resource",
-            [("type: {}", std::any::type_name::<T>())]
+            "insert resource",
+            [(
+                "Resource type being inserted: {}",
+                std::any::type_name::<T>()
+            )]
         );
         let id = ResourceId::of::<T>();
         let tick = Tick::new(self.change_tick);
@@ -583,6 +603,13 @@ impl World {
 
     /// Get immutable reference to a resource
     pub fn get_resource<T: Resource>(&self) -> Option<&T> {
+        let _zone = crate::profile_scope!(
+            "get resource",
+            [(
+                "Resource type being accessed (immutable): {}",
+                std::any::type_name::<T>()
+            )]
+        );
         self.resources
             .get(&ResourceId::of::<T>())
             .and_then(|boxed| boxed.downcast_ref::<T>())
@@ -614,6 +641,13 @@ impl World {
     /// current frame - indicates a scheduler bug where two systems
     /// obtained concurrent `&mut` access to the same resource.
     pub fn get_resource_mut_tracked<T: Resource>(&mut self) -> Option<Mut<'_, T>> {
+        let _zone = crate::profile_scope!(
+            "get resource mut tracked",
+            [(
+                "Resource type being accessed (mutable, tracked): {}",
+                std::any::type_name::<T>()
+            )]
+        );
         #[cfg(debug_assertions)]
         {
             let id = ResourceId::of::<T>();
@@ -680,6 +714,14 @@ impl World {
     where
         T: Component + TraitAccessible<dyn Component>,
     {
+        let _zone = crate::profile_scope!(
+            "get component",
+            [(
+                "Target entity: {:?}, Component type: {}",
+                entity,
+                std::any::type_name::<T>()
+            )]
+        );
         // Get component bit for O(1) archetype check
         let component_id = ComponentId::of::<T>();
         let bit = self.component_registry.get_bit(&component_id)?;
@@ -711,6 +753,14 @@ impl World {
     where
         T: Component + TraitAccessible<dyn Component>,
     {
+        let _zone = crate::profile_scope!(
+            "get component mut",
+            [(
+                "Target entity: {:?}, Component type (mutable): {}",
+                entity,
+                std::any::type_name::<T>()
+            )]
+        );
         // Get component bit for O(1) archetype check
         let component_id = ComponentId::of::<T>();
         let bit = self.component_registry.get_bit(&component_id)?;
@@ -775,7 +825,19 @@ impl World {
     /// Reuses IDs from the free list when available, incrementing the generation
     /// to invalidate any stale handles. Otherwise allocates a fresh ID.
     pub(crate) fn allocate_entity(&mut self) -> Entity {
-        let _zone = crate::profile_scope!("allocate_entity");
+        let _zone = crate::profile_scope!(
+            "allocate entity",
+            [
+                (
+                    "Free entity IDs available for reuse: {}",
+                    self.free_entity_ids.len()
+                ),
+                (
+                    "Next fresh entity ID to allocate: {}",
+                    self.next_free_entity_id
+                )
+            ]
+        );
         // Try to reuse an ID from the free list
         if let Some((id, generation)) = self.free_entity_ids.pop() {
             Entity { id, generation }
@@ -799,8 +861,8 @@ impl World {
         component_ids: Vec<ComponentId>,
     ) -> ArchetypeId {
         let _zone = crate::profile_scope!(
-            "get_or_create_archetype",
-            [("types: {}", component_ids.len())]
+            "get or create archetype",
+            [("Component types in archetype: {}", component_ids.len())]
         );
         // Build component mask first - this is used for the fast lookup path
         // The mask uniquely identifies the component set regardless of order
@@ -823,6 +885,13 @@ impl World {
         // Cold path: create new archetype (only sort when actually creating)
         let mut sorted_ids = component_ids;
         sorted_ids.sort();
+
+        crate::profile_message!(
+            "new archetype created: {:?} with {} component types (total archetypes now: {})",
+            ArchetypeId(component_mask.bits()),
+            sorted_ids.len(),
+            self.archetypes.len() + 1,
+        );
 
         // Create archetype with storage for all component types
         let new_archetype = Archetype::new(
@@ -863,7 +932,10 @@ impl World {
     ) where
         F: FnOnce(&mut TraitTypeMap<dyn Component, VecFamily>),
     {
-        let _zone = crate::profile_scope!("insert_entity", [("entity: {:?}", entity)]);
+        let _zone = crate::profile_scope!(
+            "insert entity",
+            [("Target entity being inserted: {:?}", entity)]
+        );
         let archetype_id = self.get_or_create_archetype(component_ids);
         let current_tick = Tick::new(self.change_tick);
 
@@ -917,6 +989,14 @@ impl World {
             usize,
         ),
     {
+        let _zone = crate::profile_scope!(
+            "move entity to archetype",
+            [(
+                "Entity being migrated: {:?}, New component type count: {}",
+                entity,
+                new_component_ids.len()
+            )]
+        );
         // Get current location
         let old_location = match self.entity_locations.get(&entity) {
             Some(loc) => *loc,
@@ -975,7 +1055,7 @@ impl World {
             let old_archetype = &*old_archetype_ptr;
             let new_archetype = &mut *new_archetype_ptr;
 
-            // Read component_types via raw pointer — avoids a Vec clone.
+            // Read component_types via raw pointer - avoids a Vec clone.
             // SAFETY: new_archetype_ptr is valid; component_types is only
             // read (not mutated) in this loop.
             let new_component_ids = &(*new_archetype_ptr).component_types;
@@ -1067,7 +1147,10 @@ impl World {
     /// Returns true if the entity was found and removed, false otherwise.
     #[must_use]
     pub fn destroy_entity(&mut self, entity: Entity) -> bool {
-        let _zone = crate::profile_scope!("destroy_entity", [("entity: {:?}", entity)]);
+        let _zone = crate::profile_scope!(
+            "destroy entity",
+            [("Target entity being destroyed: {:?}", entity)]
+        );
         // Get current location
         let location = match self.entity_locations.remove(&entity) {
             Some(loc) => loc,
@@ -1141,8 +1224,12 @@ impl World {
         entity: Entity,
     ) -> Result<(), RemoveComponentError> {
         let _zone = crate::profile_scope!(
-            "remove_component",
-            [("entity: {:?}, type: {}", entity, std::any::type_name::<T>())]
+            "remove component",
+            [(
+                "Target entity: {:?}, Component type being removed: {}",
+                entity,
+                std::any::type_name::<T>()
+            )]
         );
         let component_id = ComponentId::of::<T>();
 
@@ -1214,8 +1301,12 @@ impl World {
         T: Component + TraitAccessible<dyn Component> + Clone,
     {
         let _zone = crate::profile_scope!(
-            "add_component",
-            [("entity: {:?}, type: {}", entity, std::any::type_name::<T>())]
+            "add component",
+            [(
+                "Target entity: {:?}, Component type being added: {}",
+                entity,
+                std::any::type_name::<T>()
+            )]
         );
         let component_id = ComponentId::of::<T>();
 
@@ -1278,7 +1369,7 @@ impl World {
             .collect();
 
         let _zone = crate::profile_scope!(
-            "cleanup_empty_archetypes",
+            "cleanup empty archetypes",
             [("removed: {}", empty_archetype_ids.len())]
         );
         for archetype_id in &empty_archetype_ids {
@@ -1308,6 +1399,36 @@ impl World {
     #[inline]
     pub fn entity_count(&self) -> usize {
         self.entity_locations.len()
+    }
+
+    /// Estimate the total memory footprint of the world in bytes.
+    ///
+    /// Sums all archetype storage, entity location map, resources,
+    /// and internal data structures.
+    pub fn memory_estimate(&self) -> usize {
+        let mut total = 0usize;
+
+        // Archetype storage (component columns + entities + ticks)
+        for archetype in self.archetypes.values() {
+            total += archetype.memory_estimate(&self.component_registry);
+        }
+
+        // Entity location map: ~32 bytes per entry (Entity key + EntityLocation value + HashMap overhead)
+        total += self.entity_locations.len() * 48;
+
+        // Resources: approximate based on type count
+        total += self.resources.len() * 128;
+
+        // Free entity IDs
+        total += self.free_entity_ids.capacity() * 12;
+
+        // Storage factories, copiers, script data
+        total += self.storage_factories.len() * 128;
+        total += self.component_copiers.len() * 16;
+        total += self.script_components.len() * 24;
+        total += self.script_updaters.len() * 32;
+
+        total
     }
 
     /// Generate a Graphviz DOT representation of archetypes and their components.
@@ -1427,8 +1548,10 @@ impl<'w> EntityBuilder<'w> {
     pub fn build(self) -> Result<Entity, BuildError> {
         let component_ids: Vec<ComponentId> =
             self.components.iter().map(|c| c.component_id()).collect();
-        let _zone =
-            crate::profile_scope!("entity_build", [("components: {}", component_ids.len())]);
+        let _zone = crate::profile_scope!(
+            "entity build",
+            [("Component types on entity: {}", component_ids.len())]
+        );
         let entity = self.entity;
 
         // Validate that every component type is registered before we try to
@@ -2690,7 +2813,7 @@ mod tests {
                 .insert("physics", 120_000);
         }
 
-        // Simulate iterator-2 with label "ai" — different label, no duplicate.
+        // Simulate iterator-2 with label "ai" - different label, no duplicate.
         {
             let mut t = timing.lock().unwrap();
             assert!(!t.visited_iterator_labels.contains(&"ai"));
@@ -2698,12 +2821,12 @@ mod tests {
             t.per_iterator_label_average_duration.insert("ai", 50_000);
         }
 
-        // Simulate a second "physics" iterator — same label, DUPLICATE.
+        // Simulate a second "physics" iterator - same label, DUPLICATE.
         {
             let mut t = timing.lock().unwrap();
             assert!(t.visited_iterator_labels.contains(&"physics"));
             t.visited_duplicated_iterator_labels.push("physics");
-            // Overwrites the EMA — exactly the problem we're detecting.
+            // Overwrites the EMA - exactly the problem we're detecting.
             t.per_iterator_label_average_duration
                 .insert("physics", 800_000);
         }

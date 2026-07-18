@@ -114,7 +114,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> QueryIterMut<'w, Q, F> {
     ) -> Self {
         let _zone = crate::profile_scope!(
             "create mutable query iterator",
-            [("Archetype ranges: {}", matching_archetypes.len())]
+            [("Matching archetype ranges to iterate: {}", matching_archetypes.len())]
         );
         Self {
             world_ptr,
@@ -158,7 +158,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> QueryIterMut<'w, Q, F> {
         //    - Archetypes are not moved/reallocated during iteration
         //    - Component storage vectors maintain stable addresses while we iterate
         unsafe {
-            let _zone_pointers = crate::profile_scope!("get world and archetype id");
+            let _zone_pointers = crate::profile_scope!(
+                "get world and archetype id",
+                [("Advancing to archetype: {}/{}", self.current_archetype_idx, self.matching_archetypes.len())]
+            );
             let world = &mut *self.world_ptr;
             let archetype_id = self.matching_archetypes[self.current_archetype_idx];
             drop(_zone_pointers);
@@ -171,7 +174,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> QueryIterMut<'w, Q, F> {
             ));
             drop(_zone_archetype);
 
-            let _zone_cache = crate::profile_scope!("cache storage pointers");
+            let _zone_cache = crate::profile_scope!(
+                "cache storage pointers",
+                [("Entities in this archetype: {}", archetype.len())]
+            );
 
             // Cache archetype length and component storage pointers
             self.current_archetype_len = archetype.len();
@@ -268,7 +274,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> ParQueryIter<'w, Q, F> {
     ) -> Self {
         let _zone = crate::profile_scope!(
             "create parallel query iterator",
-            [("Archetype ranges: {}", archetype_ranges.len())]
+            [("Matching archetype ranges for parallel iteration: {}", archetype_ranges.len())]
         );
         Self {
             archetype_ranges,
@@ -466,7 +472,7 @@ where
         }
 
         crate::profile_message!(
-            "rayon scope: {} threads | {} archetypes | {} entities | {} slices → {} groups (hint={}ns)",
+            "rayon parallel iteration prepared: {} pool threads, {} archetype ranges totalling {} entities, sliced into {} work items, grouped into {} thread assignments (system EMA hint {} ns)",
             pool_threads,
             self.archetype_ranges.len(),
             total,
@@ -482,9 +488,16 @@ where
         // Wrap the scope itself so the whole parallel section appears
         // as a single named zone in Tracy.
         let _zone_scope = if let Some(sys) = scope_label {
-            crate::profile_scope!("{} parallel scope", sys)
+            crate::profile_scope!(
+                "{} parallel scope",
+                sys;
+                [("Total entities to process: {}", total), ("Rayon thread pool size: {}", pool_threads)]
+            )
         } else {
-            crate::profile_scope!("parallel scope")
+            crate::profile_scope!(
+                "parallel scope",
+                [("Total entities to process: {}", total), ("Rayon thread pool size: {}", pool_threads)]
+            )
         };
 
         rayon::scope(|scope| {
@@ -502,7 +515,10 @@ where
             }
         });
 
-        crate::profile_message!("rayon done: {} entities processed", total);
+        crate::profile_message!(
+            "rayon parallel iteration finished: {} entities processed across all work groups",
+            total,
+        );
     }
 
     /// Execute the closure on every matching entity, collecting
@@ -536,10 +552,10 @@ where
                 }
             }
             crate::profile_message!(
-                "rayon skipped: {} entities below threshold ({} threads × 256 = {})",
+                "rayon workload below parallel threshold: {} entities is less than {} ({} threads x 256), falling back to sequential iteration on the calling thread",
                 total_entities,
+                threshold,
                 num_threads,
-                threshold
             );
             return BatchStats {
                 total_entities,
@@ -550,7 +566,10 @@ where
                 num_threads,
             };
         }
-        let _zone_prepare = crate::profile_scope!("prepare batches");
+        let _zone_prepare = crate::profile_scope!(
+            "prepare batches",
+            [("Total entities to process: {}", total_entities), ("Rayon thread pool size: {}", num_threads)]
+        );
 
         // Parallel path: flat work slices distributed via rayon::scope.
         //
@@ -603,10 +622,13 @@ where
         let min_batch = Arc::new(AtomicUsize::new(usize::MAX));
         let max_batch = Arc::new(AtomicUsize::new(0));
         drop(_zone_prepare);
-        let _zone_dist = crate::profile_scope!("start dist");
+        let _zone_dist = crate::profile_scope!(
+            "start distribution",
+            [("Work slices prepared: {}", work_slices.len()), ("Thread groups assigned: {}", thread_groups.len())]
+        );
 
         crate::profile_message!(
-            "rayon scope: {} threads | {} entities | {} slices → {} groups (hint={}ns)",
+            "rayon tracked parallel iteration prepared: {} pool threads, {} total entities across {} work slices, grouped into {} thread assignments (system EMA hint {} ns)",
             num_threads,
             total_entities,
             work_slices.len(),
@@ -620,9 +642,16 @@ where
         // Wrap the scope itself so the whole parallel section appears
         // as a single named zone in Tracy.
         let _zone_scope = if let Some(sys) = system_label {
-            crate::profile_scope!("{} parallel scope", sys)
+            crate::profile_scope!(
+                "{} parallel scope",
+                sys;
+                [("Total entities to process: {}", total_entities), ("Rayon thread pool size: {}", num_threads)]
+            )
         } else {
-            crate::profile_scope!("parallel scope")
+            crate::profile_scope!(
+                "parallel scope",
+                [("Total entities to process: {}", total_entities), ("Rayon thread pool size: {}", num_threads)]
+            )
         };
 
         rayon::scope(|scope| {
@@ -641,14 +670,14 @@ where
                             sys,
                             group_idx + 1,
                             groups_total;
-                            [("{} total", group_total)]
+                            [("{} entities in this group", group_total)]
                         )
                     } else {
                         crate::profile_scope!(
                             "thread group {}/{}",
                             group_idx + 1,
                             groups_total;
-                            [("{} total", group_total)]
+                            [("{} entities in this group", group_total)]
                         )
                     };
                     zone.text(format_args!("thread {:?}", std::thread::current().id()));
@@ -678,7 +707,7 @@ where
         let max_batch_size = max_batch.load(Ordering::Relaxed);
 
         crate::profile_message!(
-            "rayon split: {} entities → {} threads participated (pool: {}) | min={} max={} avg={:.1}",
+            "rayon tracked parallel iteration completed: {} total entities distributed across {} rayon tasks (pool has {} threads), batch sizes min {} max {} avg {:.1} entities per task",
             total_entities,
             batch_count,
             num_threads,

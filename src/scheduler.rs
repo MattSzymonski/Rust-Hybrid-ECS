@@ -216,6 +216,10 @@ impl SystemScheduler {
     ///
     /// Returns the system's index for later reference.
     pub fn register_system(&mut self, access: SystemAccess) -> usize {
+        let _zone = crate::profile_scope!(
+            "scheduler register system",
+            [("System index in scheduler: {}", self.system_count)]
+        );
         let index = self.system_count;
         self.access_patterns.push(access);
         self.system_count += 1;
@@ -228,6 +232,10 @@ impl SystemScheduler {
     /// registered system.  Computes conflicts against all existing
     /// systems (O(n) per registration, O(n²) total).
     fn extend_conflict_matrix(&mut self) {
+        let _zone = crate::profile_scope!(
+            "extend conflict matrix",
+            [("Total systems after registration: {}", self.system_count)]
+        );
         let new_idx = self.system_count - 1;
         // Add a row for the new system.
         let mut new_row = vec![false; self.system_count];
@@ -250,7 +258,7 @@ impl SystemScheduler {
     pub fn build_execution_graph(&mut self) {
         let _zone = crate::profile_scope!(
             "build execution graph",
-            [("systems: {}", self.system_count)]
+            [("Number of systems to schedule: {}", self.system_count)]
         );
         self.execution_graph.clear();
 

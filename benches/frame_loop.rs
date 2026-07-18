@@ -1,7 +1,7 @@
-//! End-to-end frame loop benchmark — realistic game-loop simulation.
+//! End-to-end frame loop benchmark - realistic game-loop simulation.
 //!
 //! Measures: process_frame() wall-clock time under representative loads.
-//! This is the ultimate metric — all micro-optimizations must eventually
+//! This is the ultimate metric - all micro-optimizations must eventually
 //! show improvement here.
 
 #![allow(dead_code)]

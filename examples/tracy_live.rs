@@ -1,4 +1,4 @@
-// Tracy Profiling Demo — runs continuously for live profiling.
+// Tracy Profiling Demo - runs continuously for live profiling.
 //
 // Usage:
 //   1. Start Tracy GUI (Tracy.exe from https://github.com/wolfpld/tracy/releases)
@@ -9,7 +9,7 @@
 // Press Ctrl+C to stop.
 //
 // Reconnecting: after killing and restarting this program, Tracy auto-reconnects.
-// If it doesn't pick up, click the "Connect" button in Tracy GUI again — sometimes
+// If it doesn't pick up, click the "Connect" button in Tracy GUI again - sometimes
 // the GUI stops listening after an abrupt disconnect.
 
 use ecs_hybrid::*;
@@ -65,7 +65,7 @@ fn movement_system(mut query: Query<(&mut Position, &Velocity)>) {
 fn health_decay_system(mut query: Query<&mut Health>) {
     let _zone = crate::profile_scope!("health_decay_systXxxxxxm");
 
-    // Light work — per-label timing will reduce groups to 1 after first frame.
+    // Light work - per-label timing will reduce groups to 1 after first frame.
     query
         .par_iter_mut()
         .tracked()
@@ -91,7 +91,7 @@ fn enemy_ai_system(mut query: Query<(&mut Position, &mut Velocity), With<Enemy>>
 }
 
 fn cleanup_system(mut commands: Commands, mut query: Query<(Entity, &Health)>) {
-    // Heavy parallel pre-pass — auto-hinted from system EMA, uses full pool.
+    // Heavy parallel pre-pass - auto-hinted from system EMA, uses full pool.
     query
         .par_iter_mut()
         .label("cleanup_system")
@@ -102,7 +102,7 @@ fn cleanup_system(mut commands: Commands, mut query: Query<(Entity, &Health)>) {
             core::hint::black_box(acc);
         });
 
-    // Actual cleanup — destroy entities at or below zero health.
+    // Actual cleanup - destroy entities at or below zero health.
     for (entity, health) in query.iter_mut() {
         if health.0 <= 0.0 {
             let _ = commands.destroy_entity(entity);
@@ -110,7 +110,7 @@ fn cleanup_system(mut commands: Commands, mut query: Query<(Entity, &Health)>) {
     }
 }
 
-/// Heavy per-entity work — trig, sqrt, mul — designed to stress
+/// Heavy per-entity work - trig, sqrt, mul - designed to stress
 /// parallel distribution and make wake-up latency negligible.
 /// Writes to its own `GravityForce` component so it can run in
 /// parallel with `movement` and `health_decay`.
@@ -150,11 +150,11 @@ fn spawner_system(mut commands: Commands) {
         .build();
 }
 
-/// Fast LCG random f32 — seeded from CPU counter, no syscalls.
+/// Fast LCG random f32 - seeded from CPU counter, no syscalls.
 fn lcg() -> f32 {
     #[cfg(target_arch = "x86_64")]
     fn seed() -> u64 {
-        // RDTSC — fast, non-crypto seed. No syscall, no blocking.
+        // RDTSC - fast, non-crypto seed. No syscall, no blocking.
         unsafe { std::arch::x86_64::_rdtsc() }
     }
     #[cfg(not(target_arch = "x86_64"))]

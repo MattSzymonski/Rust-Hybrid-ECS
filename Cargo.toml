@@ -7,14 +7,33 @@ edition = "2021"
 rayon = "1.10"
 parking_lot = "0.12"
 trait_type_map = { path = "../trait_type_map" }
-tracy-client = { version = "0.18", optional = true }
+tracy-client = { version = "0.18", optional = true, default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [features]
-tracing = ["dep:tracy-client"]
-tracing-minimal = ["dep:tracy-client"]
+# Full profiling: zones, text, plots, messages, threads, frame marks,
+# plus Tracy system-level features (sampling, context switches, CPU info).
+tracing = [
+    "dep:tracy-client",
+    "tracy-client/enable",
+    "tracy-client/sampling",
+    "tracy-client/context-switch-tracing",
+    "tracy-client/system-tracing",
+    "tracy-client/ondemand",
+    "tracy-client/code-transfer",
+    "tracy-client/callstack-inlines",
+]
+# Minimal overhead: zones + frame marks only. No text, plots, messages, or threads.
+tracing-minimal = [
+    "dep:tracy-client",
+    "tracy-client/enable",
+    "tracy-client/sampling",
+    "tracy-client/ondemand",
+]
+# Debug: full tracing + instrumentation verification (~50% overhead).
+tracing-verify = ["tracing", "tracy-client/verify"]
 
 [[bench]]
 name = "entity_lifecycle"

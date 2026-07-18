@@ -218,6 +218,7 @@ impl ComponentMask {
 pub struct ComponentRegistry {
     id_to_bit: HashMap<ComponentId, u8>,
     names: HashMap<ComponentId, String>,
+    sizes: HashMap<ComponentId, usize>,
     next_bit: u8,
 }
 
@@ -226,6 +227,7 @@ impl ComponentRegistry {
         Self {
             id_to_bit: HashMap::new(),
             names: HashMap::new(),
+            sizes: HashMap::new(),
             next_bit: 0,
         }
     }
@@ -255,6 +257,7 @@ impl ComponentRegistry {
         self.id_to_bit.insert(component_id, bit);
         self.names
             .insert(component_id, std::any::type_name::<T>().to_string());
+        self.sizes.insert(component_id, std::mem::size_of::<T>());
         self.next_bit += 1;
         bit
     }
@@ -288,5 +291,22 @@ impl ComponentRegistry {
                 self.names.get(id).map(|s| s.as_str()).unwrap_or("?"),
             )
         })
+    }
+
+    /// Get the size in bytes of a registered component type.
+    pub fn get_size(&self, component_id: &ComponentId) -> Option<usize> {
+        self.sizes.get(component_id).copied()
+    }
+
+    /// Number of registered component types.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.id_to_bit.len()
+    }
+
+    /// Returns true if no component types are registered.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.id_to_bit.is_empty()
     }
 }

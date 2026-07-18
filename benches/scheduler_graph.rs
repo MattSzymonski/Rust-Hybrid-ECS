@@ -1,4 +1,4 @@
-//! Scheduler graph build benchmarks — conflict analysis + batch formation.
+//! Scheduler graph build benchmarks - conflict analysis + batch formation.
 //!
 //! Measures: O(n²) pairwise conflict check scaling, graph build time
 //! vs system count.

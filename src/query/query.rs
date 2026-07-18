@@ -65,7 +65,10 @@ pub struct Query<'w, Q: QueryTarget, F: QueryFilter = ()> {
 
 impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     pub fn new(world: &'w mut World) -> Self {
-        let _zone = crate::profile_scope!("create query");
+        let _zone = crate::profile_scope!(
+            "create query",
+            [("Query target component types: {}", Q::component_ids().len()), ("Filter archetype mask pairs: {}", F::archetype_filter_pairs().len())]
+        );
 
         let target_mask = Self::build_target_mask(world);
         let filter_pairs = Self::build_filter_mask_pairs(world);
@@ -94,7 +97,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     /// Build filter mask pairs from the world's component registry.
     /// Called once during [`new`](Self::new).
     fn build_filter_mask_pairs(world: &World) -> Vec<(ComponentMask, ComponentMask)> {
-        let _zone = crate::profile_scope!("build component query filter mask");
+        let _zone = crate::profile_scope!(
+            "build component query filter mask",
+            [("Filter archetype mask pairs to evaluate: {}", F::archetype_filter_pairs().len())]
+        );
 
         let registry = &world.component_registry;
         F::archetype_filter_pairs()
@@ -175,7 +181,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     #[inline]
     fn matching_archetype_ids(&mut self) -> &[ArchetypeId] {
         if self.cached_generation != self.world.archetype_generation {
-            let _zone = crate::profile_scope!("find matching archetypes");
+            let _zone = crate::profile_scope!(
+                "find matching archetypes",
+                [("All archetypes in world: {}", self.world.archetypes.len()), ("Cached archetype generation: {}", self.cached_generation), ("Current archetype generation: {}", self.world.archetype_generation)]
+            );
             let mut matching: Vec<ArchetypeId> = self
                 .world
                 .archetypes
@@ -186,7 +195,13 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
                 .map(|(id, _)| *id)
                 .collect();
             matching.sort();
-            crate::profile_message!("matched: {}", matching.len());
+            crate::profile_message!(
+                "query archetype cache miss: generation {} -> {}, rescanned {} archetypes -> {} matched for this query",
+                self.cached_generation,
+                self.world.archetype_generation,
+                self.world.archetypes.len(),
+                matching.len(),
+            );
             self.cached_matches = matching;
             self.cached_generation = self.world.archetype_generation;
         }
@@ -196,7 +211,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     /// Create a sequential iterator over all matching entities.
     #[inline]
     pub fn iter_mut(&mut self) -> QueryIterMut<'_, Q, F> {
-        let _zone = crate::profile_scope!("create sequential query iterator");
+        let _zone = crate::profile_scope!(
+            "create sequential query iterator",
+            [("Archetypes matching this query: {}", self.matching_archetype_ids().len())]
+        );
 
         let this_run = self.world.increment_change_tick();
         let last_run = self.world.system_last_run();
@@ -273,13 +291,16 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         F::State: Send + Sync,
         for<'a> Q::Item<'a>: Send,
     {
-        let _zone = crate::profile_scope!("create parallel query iterator");
         let this_run = self.world.increment_change_tick();
         let last_run = self.world.system_last_run();
 
         // Use cached archetype IDs to avoid rescanning, but initialize
         // states fresh (they capture the current tick).
         let matching_ids = self.matching_archetype_ids().to_vec();
+        let _zone = crate::profile_scope!(
+            "create parallel query iterator",
+            [("Archetypes matching this query: {}", matching_ids.len())]
+        );
         let mut archetype_ranges: Vec<FilteredArchetypeRange<Q::State, F::State>> = matching_ids
             .iter()
             .filter_map(|id| {

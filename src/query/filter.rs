@@ -49,7 +49,7 @@ pub trait QueryFilter {
 
     /// True when this filter accepts every row unconditionally (e.g. `()`).
     /// Queries use this to skip filter evaluation in the inner loop.
-    /// Default: `false` — most filters do actual work.
+    /// Default: `false` - most filters do actual work.
     const ACCEPTS_ALL: bool = false;
 
     /// Components that filtered archetypes MUST contain.

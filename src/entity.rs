@@ -79,7 +79,7 @@ mod layout_tests {
         assert_eq!(
             std::mem::size_of::<Entity>(),
             16,
-            "Entity size changed — check field order"
+            "Entity size changed - check field order"
         );
         assert_eq!(std::mem::align_of::<Entity>(), 8);
     }

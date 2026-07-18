@@ -1,4 +1,4 @@
-//! Entity lifecycle benchmarks — create + destroy at scale.
+//! Entity lifecycle benchmarks - create + destroy at scale.
 //!
 //! Measures: allocation overhead, HashMap insertion, Vec growth,
 //! archetype creation, free-list behaviour.
