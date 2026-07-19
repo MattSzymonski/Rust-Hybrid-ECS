@@ -114,7 +114,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> QueryIterMut<'w, Q, F> {
     ) -> Self {
         let _zone = crate::profile_scope!(
             "create mutable query iterator",
-            [("Matching archetype ranges to iterate: {}", matching_archetypes.len())]
+            [(
+                "Matching archetype ranges to iterate: {}",
+                matching_archetypes.len()
+            )]
         );
         Self {
             world_ptr,
@@ -160,7 +163,11 @@ impl<'w, Q: QueryTarget, F: QueryFilter> QueryIterMut<'w, Q, F> {
         unsafe {
             let _zone_pointers = crate::profile_scope!(
                 "get world and archetype id",
-                [("Advancing to archetype: {}/{}", self.current_archetype_idx, self.matching_archetypes.len())]
+                [(
+                    "Advancing to archetype: {}/{}",
+                    self.current_archetype_idx,
+                    self.matching_archetypes.len()
+                )]
             );
             let world = &mut *self.world_ptr;
             let archetype_id = self.matching_archetypes[self.current_archetype_idx];
@@ -274,7 +281,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> ParQueryIter<'w, Q, F> {
     ) -> Self {
         let _zone = crate::profile_scope!(
             "create parallel query iterator",
-            [("Matching archetype ranges for parallel iteration: {}", archetype_ranges.len())]
+            [(
+                "Matching archetype ranges for parallel iteration: {}",
+                archetype_ranges.len()
+            )]
         );
         Self {
             archetype_ranges,
@@ -431,7 +441,13 @@ where
         let min_len = self.min_batch_size.unwrap_or(DEFAULT_SLICE_ENTITIES);
 
         // Build flat work slices: each is (archetype_index, start_entity, end_entity).
-        let mut work_slices: Vec<(usize, usize, usize)> = Vec::new();
+        // Precompute capacity so the Vec never reallocates during push.
+        let slice_count: usize = self
+            .archetype_ranges
+            .iter()
+            .map(|(_, _, _, len)| (len + min_len - 1) / min_len)
+            .sum();
+        let mut work_slices: Vec<(usize, usize, usize)> = Vec::with_capacity(slice_count);
         for (arch_idx, (_, _, _, len)) in self.archetype_ranges.iter().enumerate() {
             let mut chunk_start = 0;
             while chunk_start < *len {
@@ -454,9 +470,11 @@ where
 
         // Pre-assign contiguous groups of slices so every
         // thread processes ALL its work back-to-back.
+        // Store (start_index, count) ranges into the flat work_slices
+        // array instead of copying slices with to_vec().
         let base = work_slices.len() / num_groups;
         let remainder = work_slices.len() % num_groups;
-        let mut thread_groups: Vec<Vec<(usize, usize, usize)>> = Vec::with_capacity(num_groups);
+        let mut thread_groups: Vec<(usize, usize)> = Vec::with_capacity(num_groups);
         let mut offset = 0;
         for group_idx in 0..num_groups {
             let count = if group_idx < remainder {
@@ -467,7 +485,7 @@ where
             if count == 0 {
                 break;
             }
-            thread_groups.push(work_slices[offset..offset + count].to_vec());
+            thread_groups.push((offset, count));
             offset += count;
         }
 
@@ -484,6 +502,7 @@ where
         let ranges_ref = &self.archetype_ranges;
         let func_ref = &f;
         let scope_label = self.label;
+        let work_ref = &work_slices;
 
         // Wrap the scope itself so the whole parallel section appears
         // as a single named zone in Tracy.
@@ -496,14 +515,17 @@ where
         } else {
             crate::profile_scope!(
                 "parallel scope",
-                [("Total entities to process: {}", total), ("Rayon thread pool size: {}", pool_threads)]
+                [
+                    ("Total entities to process: {}", total),
+                    ("Rayon thread pool size: {}", pool_threads)
+                ]
             )
         };
 
         rayon::scope(|scope| {
-            for group in thread_groups {
+            for &(start_idx, count) in &thread_groups {
                 scope.spawn(move |_| {
-                    for (arch_idx, start, end) in group {
+                    for &(arch_idx, start, end) in &work_ref[start_idx..start_idx + count] {
                         let (_, q_state, f_state, _) = &ranges_ref[arch_idx];
                         for index in start..end {
                             if F::matches(f_state, index) {
@@ -568,7 +590,10 @@ where
         }
         let _zone_prepare = crate::profile_scope!(
             "prepare batches",
-            [("Total entities to process: {}", total_entities), ("Rayon thread pool size: {}", num_threads)]
+            [
+                ("Total entities to process: {}", total_entities),
+                ("Rayon thread pool size: {}", num_threads)
+            ]
         );
 
         // Parallel path: flat work slices distributed via rayon::scope.
@@ -580,7 +605,13 @@ where
         let system_label = self.label;
 
         // Build flat work slices: each is (archetype_index, start_entity, end_entity).
-        let mut work_slices: Vec<(usize, usize, usize)> = Vec::new();
+        // Precompute capacity so the Vec never reallocates during push.
+        let slice_count: usize = self
+            .archetype_ranges
+            .iter()
+            .map(|(_, _, _, len)| (len + min_len - 1) / min_len)
+            .sum();
+        let mut work_slices: Vec<(usize, usize, usize)> = Vec::with_capacity(slice_count);
         for (arch_idx, (_, _, _, len)) in self.archetype_ranges.iter().enumerate() {
             let mut chunk_start = 0;
             while chunk_start < *len {
@@ -601,9 +632,11 @@ where
         // Pre-assign contiguous groups so every thread processes
         // ALL its work back-to-back — no per-chunk queue contention,
         // no 90µs gaps between chunks on the same thread.
+        // Store (start_index, count) ranges into the flat work_slices
+        // array instead of copying slices with to_vec().
         let base = work_slices.len() / num_groups;
         let remainder = work_slices.len() % num_groups;
-        let mut thread_groups: Vec<Vec<(usize, usize, usize)>> = Vec::with_capacity(num_groups);
+        let mut thread_groups: Vec<(usize, usize)> = Vec::with_capacity(num_groups);
         let mut offset = 0;
         for group_idx in 0..num_groups {
             let count = if group_idx < remainder {
@@ -614,7 +647,7 @@ where
             if count == 0 {
                 break;
             }
-            thread_groups.push(work_slices[offset..offset + count].to_vec());
+            thread_groups.push((offset, count));
             offset += count;
         }
 
@@ -624,7 +657,10 @@ where
         drop(_zone_prepare);
         let _zone_dist = crate::profile_scope!(
             "start distribution",
-            [("Work slices prepared: {}", work_slices.len()), ("Thread groups assigned: {}", thread_groups.len())]
+            [
+                ("Work slices prepared: {}", work_slices.len()),
+                ("Thread groups assigned: {}", thread_groups.len())
+            ]
         );
 
         crate::profile_message!(
@@ -638,6 +674,7 @@ where
 
         let ranges_ref = &self.archetype_ranges;
         let func_ref = &f;
+        let work_ref = &work_slices;
 
         // Wrap the scope itself so the whole parallel section appears
         // as a single named zone in Tracy.
@@ -650,18 +687,21 @@ where
         } else {
             crate::profile_scope!(
                 "parallel scope",
-                [("Total entities to process: {}", total_entities), ("Rayon thread pool size: {}", num_threads)]
+                [
+                    ("Total entities to process: {}", total_entities),
+                    ("Rayon thread pool size: {}", num_threads)
+                ]
             )
         };
 
         rayon::scope(|scope| {
             let groups_total = thread_groups.len();
-            for (group_idx, group) in thread_groups.into_iter().enumerate() {
+            for (group_idx, &(start_idx, count)) in thread_groups.iter().enumerate() {
                 let batch_count = &batch_count;
                 let min_batch = &min_batch;
                 let max_batch = &max_batch;
+                let group_slice = &work_ref[start_idx..start_idx + count];
                 scope.spawn(move |_| {
-                    let group_total: usize = group.iter().map(|(_, s, e)| e - s).sum();
                     // One zone per thread-group — all its slices run
                     // contiguously, no inter-chunk gaps on the same thread.
                     let zone = if let Some(sys) = system_label {
@@ -670,20 +710,20 @@ where
                             sys,
                             group_idx + 1,
                             groups_total;
-                            [("{} entities in this group", group_total)]
+                            [("{} entities in this group", group_slice.iter().map(|(_, s, e)| e - s).sum::<usize>())]
                         )
                     } else {
                         crate::profile_scope!(
                             "thread group {}/{}",
                             group_idx + 1,
                             groups_total;
-                            [("{} entities in this group", group_total)]
+                            [("{} entities in this group", group_slice.iter().map(|(_, s, e)| e - s).sum::<usize>())]
                         )
                     };
                     zone.text(format_args!("thread {:?}", std::thread::current().id()));
 
                     let mut processed = 0usize;
-                    for &(arch_idx, start, end) in &group {
+                    for &(arch_idx, start, end) in group_slice {
                         let (_, q_state, f_state, _) = &ranges_ref[arch_idx];
                         for index in start..end {
                             if F::matches(f_state, index) {

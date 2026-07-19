@@ -67,7 +67,13 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     pub fn new(world: &'w mut World) -> Self {
         let _zone = crate::profile_scope!(
             "create query",
-            [("Query target component types: {}", Q::component_ids().len()), ("Filter archetype mask pairs: {}", F::archetype_filter_pairs().len())]
+            [
+                ("Query target component types: {}", Q::component_ids().len()),
+                (
+                    "Filter archetype mask pairs: {}",
+                    F::archetype_filter_pairs().len()
+                )
+            ]
         );
 
         let target_mask = Self::build_target_mask(world);
@@ -99,7 +105,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     fn build_filter_mask_pairs(world: &World) -> Vec<(ComponentMask, ComponentMask)> {
         let _zone = crate::profile_scope!(
             "build component query filter mask",
-            [("Filter archetype mask pairs to evaluate: {}", F::archetype_filter_pairs().len())]
+            [(
+                "Filter archetype mask pairs to evaluate: {}",
+                F::archetype_filter_pairs().len()
+            )]
         );
 
         let registry = &world.component_registry;
@@ -183,7 +192,14 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         if self.cached_generation != self.world.archetype_generation {
             let _zone = crate::profile_scope!(
                 "find matching archetypes",
-                [("All archetypes in world: {}", self.world.archetypes.len()), ("Cached archetype generation: {}", self.cached_generation), ("Current archetype generation: {}", self.world.archetype_generation)]
+                [
+                    ("All archetypes in world: {}", self.world.archetypes.len()),
+                    ("Cached archetype generation: {}", self.cached_generation),
+                    (
+                        "Current archetype generation: {}",
+                        self.world.archetype_generation
+                    )
+                ]
             );
             let mut matching: Vec<ArchetypeId> = self
                 .world
@@ -213,7 +229,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     pub fn iter_mut(&mut self) -> QueryIterMut<'_, Q, F> {
         let _zone = crate::profile_scope!(
             "create sequential query iterator",
-            [("Archetypes matching this query: {}", self.matching_archetype_ids().len())]
+            [(
+                "Archetypes matching this query: {}",
+                self.matching_archetype_ids().len()
+            )]
         );
 
         let this_run = self.world.increment_change_tick();
@@ -301,7 +320,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             "create parallel query iterator",
             [("Archetypes matching this query: {}", matching_ids.len())]
         );
-        let mut archetype_ranges: Vec<FilteredArchetypeRange<Q::State, F::State>> = matching_ids
+        let archetype_ranges: Vec<FilteredArchetypeRange<Q::State, F::State>> = matching_ids
             .iter()
             .filter_map(|id| {
                 self.world.archetypes.get_mut(id).map(|arch| {
@@ -314,7 +333,9 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             })
             .filter(|(_, _, _, len)| *len > 0)
             .collect();
-        archetype_ranges.sort_by_key(|(id, _, _, _)| *id);
+        // Matching IDs are already sorted by matching_archetype_ids(), and
+        // filter_map preserves iteration order, so archetype_ranges is
+        // already sorted — no need for an extra sort_by_key.
 
         ParQueryIter::new(archetype_ranges, self.world.iterator_timings.clone())
     }
