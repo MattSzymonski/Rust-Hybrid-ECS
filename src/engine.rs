@@ -35,6 +35,10 @@ struct RegisteredSystem {
     /// an optimal number of parallel groups.  Smoothing factor ≈ 1/32
     /// gives a ~32-frame averaging window.
     average_duration: u64,
+    /// Wall-clock duration (nanoseconds) from the most recent frame.
+    /// Populated during `run_systems_sequential` / `run_systems_parallel`
+    /// and consumed by the parallel-utilization metrics.
+    last_duration: u64,
 }
 
 /// The main Engine that drives the ECS
@@ -101,6 +105,14 @@ impl Engine {
         );
         crate::profile_plot_config!(
             commands_executed,
+            tracy_client::PlotConfiguration::default()
+        );
+        crate::profile_plot_config!(
+            parallel_utilization_pct,
+            tracy_client::PlotConfiguration::default()
+        );
+        crate::profile_plot_config!(
+            batch_packing_pct,
             tracy_client::PlotConfiguration::default()
         );
 
@@ -261,6 +273,7 @@ impl Engine {
             enabled: true,
             last_run: 0,
             average_duration: 0,
+            last_duration: 0,
         });
 
         // Rebuild execution graph
@@ -339,6 +352,18 @@ impl Engine {
                 self.run_systems_parallel();
             } else {
                 self.run_systems_sequential();
+            }
+
+            // Compute parallel-utilization metrics and emit Tracy plots.
+            #[cfg(feature = "profiling")]
+            if !self.systems.is_empty() {
+                let durations: Vec<u64> = self.systems.iter().map(|s| s.last_duration).collect();
+                crate::profiling::emit_parallel_utilization_plots(
+                    &durations,
+                    frame_start.elapsed().as_nanos() as u64,
+                    rayon::current_num_threads(),
+                    self.scheduler.execution_graph(),
+                );
             }
 
             // Scripts receive a ScriptContext with read-only world access and deferred commands
@@ -465,6 +490,8 @@ impl Engine {
             let delta = elapsed as i64 - old_avg as i64;
             registered_system.average_duration =
                 (old_avg as i64 + delta / ParallelProcessingConfig::SPLITTING_HINT_WINDOW) as u64;
+            // Store instantaneous duration for utilization metric.
+            registered_system.last_duration = elapsed;
         }
         // Reset the baseline so ad-hoc queries between frames behave
         // predictably.
@@ -531,6 +558,8 @@ impl Engine {
                 registered.average_duration = (old_avg as i64
                     + delta / ParallelProcessingConfig::SPLITTING_HINT_WINDOW)
                     as u64;
+                // Store instantaneous duration for utilization metric.
+                registered.last_duration = elapsed;
             } else {
                 // Multiple systems - run in parallel using rayon.
                 //
@@ -582,7 +611,7 @@ impl Engine {
                     .map(|&system_index| self.systems[system_index].enabled)
                     .collect();
 
-                // Pre-compute system names for tracing spans in the parallel closure.
+                // Pre-compute system names for profiling spans in the parallel closure.
                 let system_names: Vec<&'static str> = systems_batch
                     .iter()
                     .map(|&system_index| self.systems[system_index].name)
@@ -634,6 +663,8 @@ impl Engine {
                         let delta = elapsed as i64 - old_avg as i64;
                         registered_system.average_duration =
                             (old_avg as i64 + delta / ParallelProcessingConfig::SPLITTING_HINT_WINDOW) as u64;
+                        // Store instantaneous duration for utilization metric.
+                        registered_system.last_duration = elapsed;
                     }
 
                     set_per_thread_last_run_tick(previous_override);

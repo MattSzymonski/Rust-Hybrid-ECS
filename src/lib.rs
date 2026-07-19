@@ -20,10 +20,10 @@ pub mod world;
 
 // ----------------------------------------------------------------------------
 // Tracy ProfiledAllocator - tracks allocations in Tracy's memory view.
-// Only active when the `tracing` feature is enabled.
+// Only active when the `profiling` feature is enabled.
 // Sampling rate controlled by `config::TRACY_ALLOC_SAMPLING_RATE`.
 // ----------------------------------------------------------------------------
-#[cfg(feature = "tracing")]
+#[cfg(feature = "profiling")]
 #[global_allocator]
 static ALLOC: tracy_client::ProfiledAllocator<std::alloc::System> =
     tracy_client::ProfiledAllocator::new(

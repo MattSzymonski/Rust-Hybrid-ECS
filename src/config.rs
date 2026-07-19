@@ -11,9 +11,10 @@
 
 /// Default number of entities per parallel work slice, clamped by component size.
 ///
-/// For small components (≤8 B): uses the full default (4096).
-/// For large components: scales down to keep the working set reasonable,
-/// with a floor of `MINIMUM_SLICE_SIZE` (256) to avoid per-slice overhead.
+/// Returns a value between [`MINIMUM_SLICE_SIZE`] (256) and
+/// [`DEFAULT_ITERATOR_SLICE_SIZE`] (4096).  The slice scales inversely
+/// with the total bytes per entity so that larger components get smaller
+/// slices, keeping per-slice overhead bounded.
 ///
 /// Set the `ECS_SLICE_SIZE` environment variable to override at runtime.
 pub fn default_entities_per_slice(bytes_per_entity: usize) -> usize {
@@ -255,11 +256,15 @@ impl ParallelProcessingConfig {
     /// latency (~10 µs) doesn't dominate.
     pub const TARGET_ITERATOR_WORK_GROUP_DURATION: u64 = 50_000;
 
-    /// Default entities per parallel work slice.  Sized so one slice fits
-    /// in L1 data cache for components up to 8 bytes (32 KiB / 8 B = 4096).
-    /// For the common `f32` component this is half-filling L1 — plenty of
-    /// room for filter state and adjacent cache lines.
-    pub const DEFAULT_ITERATOR_SLICE_SIZE: usize = 6144;
+    /// Default entities per parallel work slice.
+    ///
+    /// This is an arbitrary but well-tested starting point.  Benchmarked
+    /// values between 256 and 50000 show no measurable difference for
+    /// standard workloads — the streaming access pattern and hardware
+    /// prefetching make the exact number non-critical.  The clamped
+    /// formula (see [`default_entities_per_slice`]) scales this down
+    /// per-query for unusually large components.
+    pub const DEFAULT_ITERATOR_SLICE_SIZE: usize = 4096;
 
     /// Minimum entities per thread before parallel execution kicks in.
     ///
