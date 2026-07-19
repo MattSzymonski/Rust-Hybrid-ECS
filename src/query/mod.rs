@@ -68,7 +68,6 @@ use crate::archetype::ArchetypeId;
 
 pub use filter::{Added, Changed, Or, QueryFilter, With, Without};
 pub use iter::{BatchStats, ParForEachResult, ParQueryIter, QueryIterMut};
-pub(crate) use iter::EMA_ALPHA_DENOM;
 pub use query::Query;
 pub use resource::{Res, ResMut};
 pub use target::QueryTarget;

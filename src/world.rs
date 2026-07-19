@@ -916,7 +916,7 @@ impl World {
             entity,
             // Most entities have 3-8 components; pre-allocate to avoid
             // reallocation during .with() chains.
-            components: Vec::with_capacity(8),
+            components: Vec::with_capacity(crate::config::EntityBuilderConfig::DEFAULT_COMPONENTS_CAPACITY),
         }
     }
 

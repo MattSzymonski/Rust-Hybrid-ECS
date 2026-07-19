@@ -118,16 +118,55 @@ mod enabled {
             Self { inner }
         }
 
+        /// Same as [`new_dynamic`](Self::new_dynamic) but the name is
+        /// built lazily via a closure.  The closure only runs when Tracy
+        /// is running — no `format!()` allocation when profiling is off.
+        #[doc(hidden)]
+        #[inline]
+        pub fn new_dynamic_lazy(
+            name: impl FnOnce() -> String,
+            function: &str,
+            file: &str,
+            line: u32,
+        ) -> Self {
+            let inner = Client::is_running().then(|| {
+                let name = name();
+                client().span_alloc(Some(&name), function, file, line, 0)
+            });
+            Self { inner }
+        }
+
         /// Attach a diagnostic message to this zone. The text appears in
         /// Tracy's zone tooltip / detail view.
         ///
         /// Skips formatting and allocation when no profiler is connected.
+        ///
+        /// Prefer [`text_lazy`](Self::text_lazy) when the message is
+        /// expensive to construct (e.g. calls `format!()` or
+        /// `get_archetype_info()`).  With `text`, the caller builds the
+        /// `Arguments` eagerly which can skew execution timing.
         #[inline]
         pub fn text(&self, msg: Arguments<'_>) {
             if let Some(span) = &self.inner {
                 if Client::is_connected() {
                     let text = format!("{}", msg);
                     span.emit_text(&text);
+                }
+            }
+        }
+
+        /// Attach a lazily-built diagnostic message.  The closure is
+        /// only invoked when Tracy is actively connected and capturing,
+        /// so expensive operations (String allocation, archetype info
+        /// formatting, etc.) are skipped during normal execution.
+        ///
+        /// Use this instead of [`text`](Self::text) for any message
+        /// that requires an allocation or non-trivial computation.
+        #[inline]
+        pub fn text_lazy(&self, f: impl FnOnce() -> String) {
+            if let Some(span) = &self.inner {
+                if Client::is_connected() {
+                    span.emit_text(&f());
                 }
             }
         }
@@ -263,7 +302,20 @@ mod enabled {
         }
 
         #[inline(always)]
+        pub fn new_dynamic_lazy(
+            _name: impl FnOnce() -> String,
+            _function: &str,
+            _file: &str,
+            _line: u32,
+        ) -> Self {
+            Self
+        }
+
+        #[inline(always)]
         pub fn text(&self, _msg: Arguments<'_>) {}
+
+        #[inline(always)]
+        pub fn text_lazy(&self, _f: impl FnOnce() -> String) {}
     }
 
     #[must_use = "non-continuous frame ends on drop - bind to a variable"]
@@ -338,8 +390,8 @@ macro_rules! profile_scope {
         zone
     }};
     ($fmt:literal $(, $fmt_arg:expr)* ; [ $( $detail:tt ),* $(,)? ]) => {{
-        let zone = $crate::profiling::TracyZone::new_dynamic(
-            &format!($fmt, $($fmt_arg),*),
+        let zone = $crate::profiling::TracyZone::new_dynamic_lazy(
+            || format!($fmt, $($fmt_arg),*),
             module_path!(),
             file!(),
             line!(),
@@ -348,8 +400,8 @@ macro_rules! profile_scope {
         zone
     }};
     ($fmt:literal $(, $arg:expr)* $(,)?) => {
-        $crate::profiling::TracyZone::new_dynamic(
-            &format!($fmt, $($arg),*),
+        $crate::profiling::TracyZone::new_dynamic_lazy(
+            || format!($fmt, $($arg),*),
             module_path!(),
             file!(),
             line!(),

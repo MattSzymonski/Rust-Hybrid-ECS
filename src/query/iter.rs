@@ -5,35 +5,12 @@ use std::sync::Arc;
 
 use crate::archetype::{Archetype, ArchetypeId};
 use crate::component::Tick;
+use crate::config;
 use crate::world::World;
 
 use super::filter::QueryFilter;
 use super::target::QueryTarget;
 use super::FilteredArchetypeRange;
-
-// ----------------------------------------------------------------------------
-// Parallel-group tuning constants
-// ----------------------------------------------------------------------------
-
-/// Target wall-clock duration per parallel group (nanoseconds).
-///
-/// The timing-feedback loop divides the system's average execution time
-/// by this value to determine how many Rayon tasks to spawn.  Larger
-/// values mean fewer, bigger groups — less wake-up scatter but also
-/// less parallelism.  50 µs is a sweet spot where OS thread wake-up
-/// latency (~10 µs) doesn't dominate.
-const TARGET_GROUP_DURATION_NS: u64 = 50_000;
-
-/// Smoothing factor for the exponential moving average of system
-/// execution time.  `1/32 ≈ 0.031` gives a ~32-frame averaging window,
-/// damping frame-to-frame jitter.
-pub(crate) const EMA_ALPHA_DENOM: i64 = 32;
-
-/// Default entities per work slice.  Sized so one slice fits in L1
-/// data cache for components up to 8 bytes (32 KiB / 8 B = 4096).
-/// For the common `f32` component this is half-filling L1 — plenty of
-/// room for filter state and adjacent cache lines.
-const DEFAULT_SLICE_ENTITIES: usize = 4096;
 
 // ----------------------------------------------------------------------------
 // Batch Statistics
@@ -175,10 +152,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> QueryIterMut<'w, Q, F> {
 
             let _zone_archetype = crate::profile_scope!("get archetype");
             let archetype = world.archetypes.get_mut(&archetype_id)?;
-            _zone_archetype.text(format_args!(
-                "{}",
-                archetype.get_archetype_info(&world.component_registry),
-            ));
+            _zone_archetype.text_lazy(|| archetype.get_archetype_info(&world.component_registry));
             drop(_zone_archetype);
 
             let _zone_cache = crate::profile_scope!(
@@ -387,7 +361,8 @@ where
                     .entry(label)
                     .or_insert(elapsed_ns);
                 let delta = elapsed_ns as i64 - *entry as i64;
-                *entry = (*entry as i64 + delta / EMA_ALPHA_DENOM) as u64;
+                *entry = (*entry as i64 + delta / config::ParallelIteratorConfig::TIMING_EMA_WINDOW)
+                    as u64;
                 if timing.visited_iterator_labels.contains(&label) {
                     timing.visited_duplicated_iterator_labels.push(label);
                 } else {
@@ -415,7 +390,8 @@ where
     {
         // Sum precomputed entity counts - O(archetypes), negligible.
         let total: usize = self.archetype_ranges.iter().map(|(_, _, _, len)| len).sum();
-        let threshold = rayon::current_num_threads() * 256;
+        let threshold =
+            rayon::current_num_threads() * config::ParallelIteratorConfig::MINIMUM_SLICE_SIZE;
 
         if total < threshold {
             // Adaptive fallback: sequential loop.  For small N the
@@ -438,21 +414,24 @@ where
         // through rayon::scope lets every thread pull tasks from a shared
         // pool simultaneously — no work-stealing cascade, no head-start
         // for the owning thread, and no late-arriving outliers.
-        let min_len = self.min_batch_size.unwrap_or(DEFAULT_SLICE_ENTITIES);
+        let min_len = self
+            .min_batch_size
+            .unwrap_or(config::ParallelIteratorConfig::DEFAULT_ENTITIES_PER_SLICE);
 
         // Build flat work slices: each is (archetype_index, start_entity, end_entity).
         // Precompute capacity so the Vec never reallocates during push.
-        let slice_count: usize = self
+        let iterator_slice_count: usize = self
             .archetype_ranges
             .iter()
             .map(|(_, _, _, len)| (len + min_len - 1) / min_len)
             .sum();
-        let mut work_slices: Vec<(usize, usize, usize)> = Vec::with_capacity(slice_count);
+        let mut iterator_slices: Vec<(usize, usize, usize)> =
+            Vec::with_capacity(iterator_slice_count);
         for (arch_idx, (_, _, _, len)) in self.archetype_ranges.iter().enumerate() {
             let mut chunk_start = 0;
             while chunk_start < *len {
                 let chunk_end = (*len).min(chunk_start + min_len);
-                work_slices.push((arch_idx, chunk_start, chunk_end));
+                iterator_slices.push((arch_idx, chunk_start, chunk_end));
                 chunk_start = chunk_end;
             }
         }
@@ -460,24 +439,25 @@ where
         let pool_threads = rayon::current_num_threads();
 
         // Choose group count from timing feedback when available.
-        let num_groups = if hint_ns > 0 {
-            let target =
-                (hint_ns / TARGET_GROUP_DURATION_NS).clamp(1, pool_threads as u64) as usize;
-            target.min(work_slices.len()).max(1)
+        let iterator_work_group_count = if hint_ns > 0 {
+            let target = (hint_ns / config::ParallelIteratorConfig::TARGET_WORK_GROUP_DURATION)
+                .clamp(1, pool_threads as u64) as usize;
+            target.min(iterator_slices.len()).max(1)
         } else {
-            pool_threads.min(work_slices.len()).max(1)
+            pool_threads.min(iterator_slices.len()).max(1)
         };
 
         // Pre-assign contiguous groups of slices so every
         // thread processes ALL its work back-to-back.
-        // Store (start_index, count) ranges into the flat work_slices
+        // Store (start_index, count) ranges into the flat iterator_slices
         // array instead of copying slices with to_vec().
-        let base = work_slices.len() / num_groups;
-        let remainder = work_slices.len() % num_groups;
-        let mut thread_groups: Vec<(usize, usize)> = Vec::with_capacity(num_groups);
+        let base = iterator_slices.len() / iterator_work_group_count;
+        let remainder = iterator_slices.len() % iterator_work_group_count;
+        let mut iterator_work_groups: Vec<(usize, usize)> =
+            Vec::with_capacity(iterator_work_group_count);
         let mut offset = 0;
-        for group_idx in 0..num_groups {
-            let count = if group_idx < remainder {
+        for iterator_work_group_index in 0..iterator_work_group_count {
+            let count = if iterator_work_group_index < remainder {
                 base + 1
             } else {
                 base
@@ -485,7 +465,7 @@ where
             if count == 0 {
                 break;
             }
-            thread_groups.push((offset, count));
+            iterator_work_groups.push((offset, count));
             offset += count;
         }
 
@@ -494,15 +474,15 @@ where
             pool_threads,
             self.archetype_ranges.len(),
             total,
-            work_slices.len(),
-            thread_groups.len(),
+            iterator_slices.len(),
+            iterator_work_groups.len(),
             hint_ns,
         );
 
         let ranges_ref = &self.archetype_ranges;
         let func_ref = &f;
         let scope_label = self.label;
-        let work_ref = &work_slices;
+        let iterator_slices_ref = &iterator_slices;
 
         // Wrap the scope itself so the whole parallel section appears
         // as a single named zone in Tracy.
@@ -523,9 +503,11 @@ where
         };
 
         rayon::scope(|scope| {
-            for &(start_idx, count) in &thread_groups {
+            for &(start_idx, count) in &iterator_work_groups {
                 scope.spawn(move |_| {
-                    for &(arch_idx, start, end) in &work_ref[start_idx..start_idx + count] {
+                    for &(arch_idx, start, end) in
+                        &iterator_slices_ref[start_idx..start_idx + count]
+                    {
                         let (_, q_state, f_state, _) = &ranges_ref[arch_idx];
                         for index in start..end {
                             if F::matches(f_state, index) {
@@ -560,7 +542,7 @@ where
     {
         let num_threads = rayon::current_num_threads();
         let total_entities: usize = self.archetype_ranges.iter().map(|(_, _, _, len)| len).sum();
-        let threshold = num_threads * 256;
+        let threshold = num_threads * config::ParallelIteratorConfig::MINIMUM_SLICE_SIZE;
 
         // Adaptive fallback: sequential for tiny workloads.
         if total_entities < threshold {
@@ -601,45 +583,50 @@ where
         // Pre-building equal-sized slices and spawning them as scope tasks
         // lets every thread pull work from a shared pool simultaneously,
         // eliminating the work-stealing cascade and late-arriving outliers.
-        let min_len = self.min_batch_size.unwrap_or(DEFAULT_SLICE_ENTITIES);
+        let min_len = self
+            .min_batch_size
+            .unwrap_or(config::ParallelIteratorConfig::DEFAULT_ENTITIES_PER_SLICE);
         let system_label = self.label;
 
         // Build flat work slices: each is (archetype_index, start_entity, end_entity).
         // Precompute capacity so the Vec never reallocates during push.
-        let slice_count: usize = self
+        let iterator_slice_count: usize = self
             .archetype_ranges
             .iter()
             .map(|(_, _, _, len)| (len + min_len - 1) / min_len)
             .sum();
-        let mut work_slices: Vec<(usize, usize, usize)> = Vec::with_capacity(slice_count);
+        let mut iterator_slices: Vec<(usize, usize, usize)> =
+            Vec::with_capacity(iterator_slice_count);
         for (arch_idx, (_, _, _, len)) in self.archetype_ranges.iter().enumerate() {
             let mut chunk_start = 0;
             while chunk_start < *len {
                 let chunk_end = (*len).min(chunk_start + min_len);
-                work_slices.push((arch_idx, chunk_start, chunk_end));
+                iterator_slices.push((arch_idx, chunk_start, chunk_end));
                 chunk_start = chunk_end;
             }
         }
 
         // Choose group count from timing feedback when available.
-        let num_groups = if hint_ns > 0 {
-            let target = (hint_ns / TARGET_GROUP_DURATION_NS).clamp(1, num_threads as u64) as usize;
-            target.min(work_slices.len()).max(1)
+        let iterator_work_group_count = if hint_ns > 0 {
+            let target = (hint_ns / config::ParallelIteratorConfig::TARGET_WORK_GROUP_DURATION)
+                .clamp(1, num_threads as u64) as usize;
+            target.min(iterator_slices.len()).max(1)
         } else {
-            num_threads.min(work_slices.len()).max(1)
+            num_threads.min(iterator_slices.len()).max(1)
         };
 
         // Pre-assign contiguous groups so every thread processes
         // ALL its work back-to-back — no per-chunk queue contention,
         // no 90µs gaps between chunks on the same thread.
-        // Store (start_index, count) ranges into the flat work_slices
+        // Store (start_index, count) ranges into the flat iterator_slices
         // array instead of copying slices with to_vec().
-        let base = work_slices.len() / num_groups;
-        let remainder = work_slices.len() % num_groups;
-        let mut thread_groups: Vec<(usize, usize)> = Vec::with_capacity(num_groups);
+        let base = iterator_slices.len() / iterator_work_group_count;
+        let remainder = iterator_slices.len() % iterator_work_group_count;
+        let mut iterator_work_groups: Vec<(usize, usize)> =
+            Vec::with_capacity(iterator_work_group_count);
         let mut offset = 0;
-        for group_idx in 0..num_groups {
-            let count = if group_idx < remainder {
+        for iterator_work_group_index in 0..iterator_work_group_count {
+            let count = if iterator_work_group_index < remainder {
                 base + 1
             } else {
                 base
@@ -647,7 +634,7 @@ where
             if count == 0 {
                 break;
             }
-            thread_groups.push((offset, count));
+            iterator_work_groups.push((offset, count));
             offset += count;
         }
 
@@ -658,8 +645,8 @@ where
         let _zone_dist = crate::profile_scope!(
             "start distribution",
             [
-                ("Work slices prepared: {}", work_slices.len()),
-                ("Thread groups assigned: {}", thread_groups.len())
+                ("Work slices prepared: {}", iterator_slices.len()),
+                ("Thread groups assigned: {}", iterator_work_groups.len())
             ]
         );
 
@@ -667,14 +654,14 @@ where
             "rayon tracked parallel iteration prepared: {} pool threads, {} total entities across {} work slices, grouped into {} thread assignments (system EMA hint {} ns)",
             num_threads,
             total_entities,
-            work_slices.len(),
-            thread_groups.len(),
+            iterator_slices.len(),
+            iterator_work_groups.len(),
             hint_ns,
         );
 
         let ranges_ref = &self.archetype_ranges;
         let func_ref = &f;
-        let work_ref = &work_slices;
+        let iterator_slices_ref = &iterator_slices;
 
         // Wrap the scope itself so the whole parallel section appears
         // as a single named zone in Tracy.
@@ -695,12 +682,14 @@ where
         };
 
         rayon::scope(|scope| {
-            let groups_total = thread_groups.len();
-            for (group_idx, &(start_idx, count)) in thread_groups.iter().enumerate() {
+            let iterator_work_group_total = iterator_work_groups.len();
+            for (iterator_work_group_index, &(start_idx, count)) in
+                iterator_work_groups.iter().enumerate()
+            {
                 let batch_count = &batch_count;
                 let min_batch = &min_batch;
                 let max_batch = &max_batch;
-                let group_slice = &work_ref[start_idx..start_idx + count];
+                let iterator_work_group_slice = &iterator_slices_ref[start_idx..start_idx + count];
                 scope.spawn(move |_| {
                     // One zone per thread-group — all its slices run
                     // contiguously, no inter-chunk gaps on the same thread.
@@ -708,22 +697,22 @@ where
                         crate::profile_scope!(
                             "{} group {}/{}",
                             sys,
-                            group_idx + 1,
-                            groups_total;
-                            [("{} entities in this group", group_slice.iter().map(|(_, s, e)| e - s).sum::<usize>())]
+                            iterator_work_group_index + 1,
+                            iterator_work_group_total;
+                            [("{} entities in this group", iterator_work_group_slice.iter().map(|(_, s, e)| e - s).sum::<usize>())]
                         )
                     } else {
                         crate::profile_scope!(
                             "thread group {}/{}",
-                            group_idx + 1,
-                            groups_total;
-                            [("{} entities in this group", group_slice.iter().map(|(_, s, e)| e - s).sum::<usize>())]
+                            iterator_work_group_index + 1,
+                            iterator_work_group_total;
+                            [("{} entities in this group", iterator_work_group_slice.iter().map(|(_, s, e)| e - s).sum::<usize>())]
                         )
                     };
                     zone.text(format_args!("thread {:?}", std::thread::current().id()));
 
                     let mut processed = 0usize;
-                    for &(arch_idx, start, end) in group_slice {
+                    for &(arch_idx, start, end) in iterator_work_group_slice {
                         let (_, q_state, f_state, _) = &ranges_ref[arch_idx];
                         for index in start..end {
                             if F::matches(f_state, index) {

@@ -7,6 +7,7 @@
 pub mod archetype;
 pub mod commands;
 pub mod component;
+pub mod config;
 pub mod engine;
 pub mod entity;
 pub mod profiling;
@@ -20,11 +21,15 @@ pub mod world;
 // ----------------------------------------------------------------------------
 // Tracy ProfiledAllocator - tracks allocations in Tracy's memory view.
 // Only active when the `tracing` feature is enabled.
+// Sampling rate controlled by `config::TRACY_ALLOC_SAMPLING_RATE`.
 // ----------------------------------------------------------------------------
 #[cfg(feature = "tracing")]
 #[global_allocator]
 static ALLOC: tracy_client::ProfiledAllocator<std::alloc::System> =
-    tracy_client::ProfiledAllocator::new(std::alloc::System, 100);
+    tracy_client::ProfiledAllocator::new(
+        std::alloc::System,
+        crate::config::ProfilingConfig::MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY,
+    );
 
 // Re-export commonly used types
 pub use commands::{CommandError, Commands};

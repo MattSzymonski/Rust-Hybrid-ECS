@@ -10,7 +10,7 @@
 
 use crate::commands::{CommandError, CommandQueue};
 use crate::component::Tick;
-use crate::query::EMA_ALPHA_DENOM;
+use crate::config::ParallelIteratorConfig;
 use crate::scheduler::{SystemAccess, SystemScheduler};
 use crate::system::{IntoSystem, System, SystemParam};
 use crate::world::{set_per_thread_last_run_tick, World};
@@ -82,12 +82,14 @@ pub struct Engine {
 impl Engine {
     /// Create a new Engine with no systems
     pub fn new() -> Self {
+        // !!! Order matters: name the main thread in Tracy BEFORE any zone
+        // is emitted on it.  Tracy auto-registers a thread the first time
+        // it sees a zone, and thread list ordering follows registration
+        // order.  Naming first ensures "main" sits at the top.
+        crate::profile_thread!("main");
+
         // Wrap initialization in a non-continuous Tracy frame.
         let _init = crate::profile_non_continuous_frame!("engine init");
-
-        // Name the main thread in Tracy BEFORE Rayon spawns workers,
-        // so it appears first in the thread list.
-        crate::profile_thread!("main");
 
         // Configure plot appearance in Tracy UI.
         crate::profile_plot_config!(entity_count, tracy_client::PlotConfiguration::default());
@@ -455,7 +457,7 @@ impl Engine {
             let elapsed = system_start.elapsed().as_nanos() as u64;
             let old_avg = registered_system.average_duration;
             let delta = elapsed as i64 - old_avg as i64;
-            registered_system.average_duration = (old_avg as i64 + delta / EMA_ALPHA_DENOM) as u64;
+            registered_system.average_duration = (old_avg as i64 + delta / ParallelIteratorConfig::TIMING_EMA_WINDOW) as u64;
         }
         // Reset the baseline so ad-hoc queries between frames behave
         // predictably.
@@ -519,7 +521,7 @@ impl Engine {
                 let elapsed = system_start.elapsed().as_nanos() as u64;
                 let old_avg = registered.average_duration;
                 let delta = elapsed as i64 - old_avg as i64;
-                registered.average_duration = (old_avg as i64 + delta / EMA_ALPHA_DENOM) as u64;
+                registered.average_duration = (old_avg as i64 + delta / ParallelIteratorConfig::TIMING_EMA_WINDOW) as u64;
             } else {
                 // Multiple systems - run in parallel using rayon.
                 //
@@ -594,8 +596,8 @@ impl Engine {
                 (0..batch_len).into_par_iter().for_each(|i| {
                     task_count.fetch_add(1, Ordering::Relaxed);
 
-                    // Name the Rayon worker thread for Tracy visibility.
-                    crate::profile_thread!("rayon worker");
+                    // Name the parallel worker thread for Tracy visibility.
+                    crate::profile_thread!("parallel worker");
 
                     if !enabled_flags[i] {
                         return;
@@ -622,7 +624,7 @@ impl Engine {
                         let old_avg = registered_system.average_duration;
                         let delta = elapsed as i64 - old_avg as i64;
                         registered_system.average_duration =
-                            (old_avg as i64 + delta / EMA_ALPHA_DENOM) as u64;
+                            (old_avg as i64 + delta / ParallelIteratorConfig::TIMING_EMA_WINDOW) as u64;
                     }
 
                     set_per_thread_last_run_tick(previous_override);

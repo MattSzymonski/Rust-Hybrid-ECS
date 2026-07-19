@@ -473,7 +473,7 @@ impl<'a> Commands<'a> {
         DeferredEntityBuilder {
             command_queue: self.command_queue,
             allocated_entity: entity,
-            components: Vec::with_capacity(8),
+            components: Vec::with_capacity(crate::config::EntityBuilderConfig::DEFAULT_COMPONENTS_CAPACITY),
         }
     }
 
@@ -518,7 +518,7 @@ impl<'a> DeferredEntityBuilder<'a> {
         Self {
             command_queue,
             allocated_entity: world.allocate_entity(),
-            components: Vec::with_capacity(8),
+            components: Vec::with_capacity(crate::config::EntityBuilderConfig::DEFAULT_COMPONENTS_CAPACITY),
         }
     }
 

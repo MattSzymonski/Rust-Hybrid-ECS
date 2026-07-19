@@ -207,14 +207,14 @@ macro_rules! impl_query_target_tuple {
             type State = ($($T::State,)*);
 
             fn component_ids() -> Vec<ComponentId> {
-                let mut ids = Vec::with_capacity(4);
+                let mut ids = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
                 $(ids.extend($T::component_ids());)*
                 ids
             }
 
             fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>) {
-                let mut reads = Vec::with_capacity(4);
-                let mut writes = Vec::with_capacity(4);
+                let mut reads = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
+                let mut writes = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
                 $(
                     let (r, w) = $T::report_component_access();
                     reads.extend(r);
