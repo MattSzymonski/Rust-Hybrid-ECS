@@ -175,7 +175,7 @@ pub(crate) fn set_per_thread_last_run_tick(value: Option<Tick>) -> Option<Tick> 
 
 /// Shared state for per-label iterator timing feedback.
 pub(crate) struct IteratorTimings {
-    /// Per-label EMA duration (ns), ~32-frame average.
+    /// Per-label splitting hint duration (ns), ~32-frame average.
     pub per_iterator_label_average_duration: std::collections::HashMap<&'static str, u64>,
     /// Labels visited in the current frame. Cleared each frame.
     pub visited_iterator_labels: Vec<&'static str>,
@@ -264,7 +264,7 @@ pub struct World {
     /// Set by `CommandQueue::execute_queued_commands`, read by the Engine for Tracy plots.
     pub(crate) commands_executed_this_frame: usize,
 
-    /// Per-label EMA execution timing for parallel iterators.
+    /// Per-label splitting hint execution timing for parallel iterators.
     /// Keyed by the `label()` string set on each `ParQueryIter`.
     /// Shared via `Arc` so iterators can read/write without a raw
     /// World pointer - the `Mutex` handles concurrent access from
@@ -2798,7 +2798,7 @@ mod tests {
 
     /// Tests that `IteratorTimings` detects duplicate labels within a frame.
     ///
-    /// Two iterators with the same label will corrupt the per-label EMA.
+    /// Two iterators with the same label will corrupt the per-label splitting hint.
     /// This test simulates the logic inside `ParQueryIter::for_each`.
     #[test]
     fn test_per_label_duplicate_detection() {
@@ -2826,7 +2826,7 @@ mod tests {
             let mut t = timing.lock().unwrap();
             assert!(t.visited_iterator_labels.contains(&"physics"));
             t.visited_duplicated_iterator_labels.push("physics");
-            // Overwrites the EMA - exactly the problem we're detecting.
+            // Overwrites the splitting hint - exactly the problem we're detecting.
             t.per_iterator_label_average_duration
                 .insert("physics", 800_000);
         }
@@ -2834,7 +2834,7 @@ mod tests {
         let t = timing.lock().unwrap();
         assert_eq!(t.visited_duplicated_iterator_labels, vec!["physics"]);
         assert_eq!(t.visited_iterator_labels, vec!["physics", "ai"]);
-        // "physics" EMA was corrupted by the second write.
+        // "physics" splitting hint was corrupted by the second write.
         assert_eq!(t.per_iterator_label_average_duration["physics"], 800_000);
 
         println!("✓ Duplicate label detection works correctly!");

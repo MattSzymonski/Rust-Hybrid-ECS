@@ -51,7 +51,17 @@ struct GravityForce {
 }
 impl Component for GravityForce {}
 
-impl_trait_accessible!(dyn Component; Position, Velocity, Health, Enemy, Mass, GravityForce);
+/// 256 B large component — spans 4 cache lines, stresses cache-aware slicing
+#[derive(Debug, Clone)]
+struct RenderData([[f64; 4]; 8]);
+impl Component for RenderData {}
+
+/// 128 B medium component — spans 2 cache lines
+#[derive(Debug, Clone)]
+struct PhysicsData([[f32; 4]; 8]);
+impl Component for PhysicsData {}
+
+impl_trait_accessible!(dyn Component; Position, Velocity, Health, Enemy, Mass, GravityForce, RenderData, PhysicsData);
 
 // ---- Systems ----
 
@@ -122,16 +132,42 @@ fn gravity_system(mut query: Query<(&mut GravityForce, &Mass)>) {
         .tracked()
         .label("gravity_system")
         .for_each(|(mut force, mass)| {
-            // Inverse-square gravity toward origin with cheap sqrt.
             let distance_sq = force.x * force.x + force.y.sqrt() * force.y + 0.01;
             let distance = distance_sq.sqrt();
-            let magnitude = mass.0 / (distance_sq * distance); // 1/d³
+            let magnitude = mass.0 / (distance_sq * distance);
             force.x = -force.x * magnitude.sqrt();
             force.y = -force.y * magnitude.sqrt();
             force.x = force.x.clamp(-1.0, 1.0);
             force.y = force.y.clamp(-1.0, 1.0);
         });
     crate::profile_message!("gravity: {}", stats);
+}
+
+/// Reads 256 B RenderData + writes 4 B Health — tests mixed-size cache pressure
+fn render_system(mut query: Query<(&RenderData, &mut Health)>) {
+    query
+        .par_iter_mut()
+        .label("render_system")
+        .tracked()
+        .for_each(|(render, mut health)| {
+            // Touch every 8th f64 in the 256 B struct to simulate scattering reads
+            let acc = render.0[0][0] + render.0[2][1] + render.0[4][2] + render.0[6][3];
+            health.0 = (health.0 + acc as f32 * 0.001).clamp(0.0, 200.0);
+        });
+}
+
+/// Reads 128 B PhysicsData + writes 8 B Velocity — tests medium-size cache pressure
+fn physics_system(mut query: Query<(&PhysicsData, &mut Velocity)>) {
+    query
+        .par_iter_mut()
+        .label("physics_system")
+        .tracked()
+        .for_each(|(phys, mut vel)| {
+            let ax = phys.0[0][0] + phys.0[1][1];
+            let ay = phys.0[2][2] + phys.0[3][3];
+            vel.x = (vel.x + ax * 0.01).clamp(-5.0, 5.0);
+            vel.y = (vel.y + ay * 0.01).clamp(-5.0, 5.0);
+        });
 }
 
 fn spawner_system(mut commands: Commands) {
@@ -203,14 +239,15 @@ fn main() {
     engine.world_mut().register_component::<Enemy>();
     engine.world_mut().register_component::<Mass>();
     engine.world_mut().register_component::<GravityForce>();
+    engine.world_mut().register_component::<RenderData>();
+    engine.world_mut().register_component::<PhysicsData>();
 
     engine.register_system("movement", movement_system);
     engine.register_system("health_decay", health_decay_system);
-    // engine.register_system("collision_damage", collision_damage_system);
-    // engine.register_system("enemy_ai", enemy_ai_system);
     engine.register_system("gravity", gravity_system);
+    engine.register_system("render", render_system);
+    engine.register_system("physics", physics_system);
     engine.register_system("cleanup", cleanup_system);
-    //engine.register_system("spawner", spawner_system);
 
     // Set 30 FPS cap using the engine's built-in limiter
     // engine.set_fps_limit(200.0);
@@ -231,12 +268,14 @@ fn main() {
             .with(Health(100.0))
             .with(Mass(1.0 + lcg() * 9.0))
             .with(GravityForce { x: 0.0, y: 0.0 })
+            .with(RenderData([[0.0f64; 4]; 8]))
+            .with(PhysicsData([[0.0f32; 4]; 8]))
             .with(Enemy)
             .build();
     }
 
     println!("=== Tracy Live Profiling Demo ===");
-    println!("6 systems, 30000 entities, parallel ON");
+    println!("7 systems, 30000 entities, small+large components, parallel ON");
     println!("Target: 30 FPS (engine limiter)");
     println!();
     println!("Connect Tracy now. Press Ctrl+C to stop.");

@@ -11,24 +11,23 @@ use ecs_hybrid::*;
 use trait_type_map::impl_trait_accessible;
 
 #[derive(Debug, Clone)]
-struct Position {
-    x: f32,
-    y: f32,
-}
+struct Position { x: f32, y: f32 }
 impl Component for Position {}
 
 #[derive(Debug, Clone)]
-struct Velocity {
-    x: f32,
-    y: f32,
-}
+struct Velocity { x: f32, y: f32 }
 impl Component for Velocity {}
 
 #[derive(Debug, Clone)]
 struct Health(f32);
 impl Component for Health {}
 
-impl_trait_accessible!(dyn Component; Position, Velocity, Health);
+/// 256 B component — stresses cache hierarchy
+#[derive(Debug, Clone)]
+struct MassiveData([[f64; 4]; 8]);
+impl Component for MassiveData {}
+
+impl_trait_accessible!(dyn Component; Position, Velocity, Health, MassiveData);
 
 fn movement_system(mut query: Query<(&mut Position, &Velocity)>) {
     for (mut pos, vel) in query.iter_mut() {
@@ -53,26 +52,35 @@ fn reporting_system(mut query: Query<(&Position, &Health)>) {
     black_box((count, total_health));
 }
 
-fn build_engine(entity_count: usize) -> Engine {
+fn build_engine(entity_count: usize, use_large_component: bool) -> Engine {
     let mut engine = Engine::new();
     engine.set_parallel_execution(true);
 
     engine.world_mut().register_component::<Position>();
     engine.world_mut().register_component::<Velocity>();
     engine.world_mut().register_component::<Health>();
+    if use_large_component {
+        engine.world_mut().register_component::<MassiveData>();
+    }
 
     for i in 0..entity_count {
-        engine
-            .world_mut()
-            .create_entity()
-            .with(Position {
-                x: i as f32,
-                y: 0.0,
-            })
+        let mut builder = engine.world_mut().create_entity()
+            .with(Position { x: i as f32, y: 0.0 })
             .with(Velocity { x: 0.1, y: 0.2 })
-            .with(Health(100.0))
-            .build()
-            .unwrap();
+            .with(Health(100.0));
+        if use_large_component {
+            builder = builder.with(MassiveData([[i as f64; 4]; 8]));
+        }
+        builder.build().unwrap();
+    }
+
+    // System that reads the large component
+    if use_large_component {
+        engine.register_system("massive_read", |mut query: Query<(&MassiveData, &mut Health)>| {
+            for (massive, mut health) in query.iter_mut() {
+                health.0 += massive.0[0][0] as f32 * 0.001;
+            }
+        });
     }
 
     engine.register_system("movement", movement_system);
@@ -84,18 +92,31 @@ fn build_engine(entity_count: usize) -> Engine {
 
 fn bench_frame_loop(c: &mut Criterion) {
     let mut group = c.benchmark_group("frame_loop");
-    for &entity_count in &[1_000, 10_000, 100_000] {
+
+    // Standard components (8-16B each) — baseline
+    for &entity_count in &[100_000, 500_000] {
         group.bench_with_input(
-            BenchmarkId::from_parameter(entity_count),
+            BenchmarkId::new("standard", entity_count),
             &entity_count,
             |b, &entity_count| {
-                let mut engine = build_engine(entity_count);
-                b.iter(|| {
-                    black_box(engine.process_frame().is_ok());
-                });
+                let mut engine = build_engine(entity_count, false);
+                b.iter(|| { black_box(engine.process_frame().is_ok()); });
             },
         );
     }
+
+    // With 256B MassiveData component — cache pressure test
+    for &entity_count in &[100_000, 500_000] {
+        group.bench_with_input(
+            BenchmarkId::new("with_256B_component", entity_count),
+            &entity_count,
+            |b, &entity_count| {
+                let mut engine = build_engine(entity_count, true);
+                b.iter(|| { black_box(engine.process_frame().is_ok()); });
+            },
+        );
+    }
+
     group.finish();
 }
 

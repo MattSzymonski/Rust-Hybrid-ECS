@@ -27,7 +27,19 @@ impl Component for Velocity {}
 struct Health(f32);
 impl Component for Health {}
 
-impl_trait_accessible!(dyn Component; Position, Velocity, Health);
+/// Large component — 64 bytes, spans 2 cache lines per entity.
+/// Used to test cache-pressure behaviour with mixed-size components.
+#[derive(Debug, Clone)]
+struct LargeData([[f32; 4]; 4]); // 4×4 matrix = 16 × 4B = 64 B
+impl Component for LargeData {}
+
+/// Massive component — 256 bytes, spans 4 cache lines per entity.
+/// Forces extreme cache pressure to make slice-size effects visible.
+#[derive(Debug, Clone)]
+struct MassiveData([[f64; 4]; 8]); // 8×4 f64 = 32 × 8B = 256 B
+impl Component for MassiveData {}
+
+impl_trait_accessible!(dyn Component; Position, Velocity, Health, LargeData, MassiveData);
 
 fn setup_world(entity_count: usize) -> World {
     let mut world = World::new();
@@ -229,6 +241,64 @@ fn bench_query_helpers(c: &mut Criterion) {
     group.finish();
 }
 
+// - large/massive component — tests cache-pressure under extreme sizes -----
+
+fn bench_large_component(c: &mut Criterion) {
+    let mut group = c.benchmark_group("query_large_component");
+
+    // 64 B component
+    for &count in &[10_000, 50_000] {
+        group.bench_with_input(
+            BenchmarkId::new("64B_component", count),
+            &count,
+            |b, &count| {
+                let mut world = World::new();
+                world.register_component::<Health>();
+                world.register_component::<LargeData>();
+                for i in 0..count {
+                    world.create_entity()
+                        .with(Health((i % 100) as f32))
+                        .with(LargeData([[i as f32; 4]; 4]))
+                        .build().unwrap();
+                }
+                b.iter(|| {
+                    let mut q = Query::<(&Health, &LargeData)>::new(&mut world);
+                    q.par_iter_mut().for_each(|(health, large)| {
+                        black_box(health.0 + large.0[0][0]);
+                    });
+                });
+            },
+        );
+    }
+
+    // 256 B component — 4 cache lines per entity, extreme cache pressure
+    for &count in &[500_000, 2_000_000] {
+        group.bench_with_input(
+            BenchmarkId::new("256B_component", count),
+            &count,
+            |b, &count| {
+                let mut world = World::new();
+                world.register_component::<Health>();
+                world.register_component::<MassiveData>();
+                for i in 0..count {
+                    world.create_entity()
+                        .with(Health((i % 100) as f32))
+                        .with(MassiveData([[i as f64; 4]; 8]))
+                        .build().unwrap();
+                }
+                b.iter(|| {
+                    let mut q = Query::<(&Health, &MassiveData)>::new(&mut world);
+                    q.par_iter_mut().for_each(|(health, massive)| {
+                        black_box(health.0 + massive.0[0][0] as f32);
+                    });
+                });
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_iter_unfiltered,
@@ -238,5 +308,6 @@ criterion_group!(
     bench_par_batch_size_scaling,
     bench_crossover,
     bench_query_helpers,
+    bench_large_component,
 );
 criterion_main!(benches);

@@ -272,6 +272,11 @@ impl ComponentRegistry {
         self.names.get(component_id).map(|s| s.as_str())
     }
 
+    /// Get the size in bytes of a registered component type.
+    pub fn get_size(&self, component_id: &ComponentId) -> Option<usize> {
+        self.sizes.get(component_id).copied()
+    }
+
     /// Check whether a component type has been registered.
     ///
     /// Returns `true` if `T` has been registered via [`register`](Self::register).
@@ -291,11 +296,6 @@ impl ComponentRegistry {
                 self.names.get(id).map(|s| s.as_str()).unwrap_or("?"),
             )
         })
-    }
-
-    /// Get the size in bytes of a registered component type.
-    pub fn get_size(&self, component_id: &ComponentId) -> Option<usize> {
-        self.sizes.get(component_id).copied()
     }
 
     /// Number of registered component types.

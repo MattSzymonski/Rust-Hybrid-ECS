@@ -10,7 +10,7 @@
 
 use crate::commands::{CommandError, CommandQueue};
 use crate::component::Tick;
-use crate::config::ParallelIteratorConfig;
+use crate::config::ParallelProcessingConfig;
 use crate::scheduler::{SystemAccess, SystemScheduler};
 use crate::system::{IntoSystem, System, SystemParam};
 use crate::world::{set_per_thread_last_run_tick, World};
@@ -107,6 +107,12 @@ impl Engine {
         // Warm up the Rayon thread pool so the first parallel batch
         // does not pay thread-spawning costs (can be 1-10ms on some OS).
         rayon::broadcast(|_ctx| {});
+
+        // Report detected system hardware so users can tune config.
+        crate::config::print_system_specs();
+
+        // Print the active parallel-iteration knobs.
+        crate::config::print_parallel_config();
 
         Self {
             systems: Vec::new(),
@@ -437,7 +443,7 @@ impl Engine {
             let _tracy_sys = crate::profile_scope!(
                 "system: {}",
                 registered_system.name;
-                [("System last ran at tick: {}", registered_system.last_run), ("System EMA execution time (ns): {}", registered_system.average_duration)]
+                [("System last ran at tick: {}", registered_system.last_run), ("System splitting hint execution time (ns): {}", registered_system.average_duration)]
             );
             // Seed the change-detection baseline for this system: filters
             // such as `Changed<T>` will compare against `last_run`.
@@ -453,11 +459,12 @@ impl Engine {
             // Record the tick that was current at system entry so the next
             // run sees mutations that happened during this run.
             registered_system.last_run = started_at;
-            // Update EMA of execution time.
+            // Update splitting hint of execution time.
             let elapsed = system_start.elapsed().as_nanos() as u64;
             let old_avg = registered_system.average_duration;
             let delta = elapsed as i64 - old_avg as i64;
-            registered_system.average_duration = (old_avg as i64 + delta / ParallelIteratorConfig::TIMING_EMA_WINDOW) as u64;
+            registered_system.average_duration =
+                (old_avg as i64 + delta / ParallelProcessingConfig::SPLITTING_HINT_WINDOW) as u64;
         }
         // Reset the baseline so ad-hoc queries between frames behave
         // predictably.
@@ -513,15 +520,17 @@ impl Engine {
                 let _zone = crate::profile_scope!(
                     "system: {}",
                     registered.name;
-                    [("System last ran at tick: {}", registered.last_run), ("System EMA execution time (ns): {}", registered.average_duration)]
+                    [("System last ran at tick: {}", registered.last_run), ("System splitting hint execution time (ns): {}", registered.average_duration)]
                 );
                 registered.system.run(&mut self.world, &mut self.queue);
                 registered.last_run = started_at;
-                // Update EMA of execution time.
+                // Update splitting hint of execution time.
                 let elapsed = system_start.elapsed().as_nanos() as u64;
                 let old_avg = registered.average_duration;
                 let delta = elapsed as i64 - old_avg as i64;
-                registered.average_duration = (old_avg as i64 + delta / ParallelIteratorConfig::TIMING_EMA_WINDOW) as u64;
+                registered.average_duration = (old_avg as i64
+                    + delta / ParallelProcessingConfig::SPLITTING_HINT_WINDOW)
+                    as u64;
             } else {
                 // Multiple systems - run in parallel using rayon.
                 //
@@ -619,12 +628,12 @@ impl Engine {
                         let system_index = systems_batch[i];
                         let registered_system = &mut *systems_ptr.as_ptr().add(system_index);
                         registered_system.system.run(world, queue);
-                        // Update EMA of execution time.
+                        // Update splitting hint of execution time.
                         let elapsed = system_start.elapsed().as_nanos() as u64;
                         let old_avg = registered_system.average_duration;
                         let delta = elapsed as i64 - old_avg as i64;
                         registered_system.average_duration =
-                            (old_avg as i64 + delta / ParallelIteratorConfig::TIMING_EMA_WINDOW) as u64;
+                            (old_avg as i64 + delta / ParallelProcessingConfig::SPLITTING_HINT_WINDOW) as u64;
                     }
 
                     set_per_thread_last_run_tick(previous_override);

@@ -56,6 +56,8 @@ pub struct Query<'w, Q: QueryTarget, F: QueryFilter = ()> {
     /// for a given `F`.  For simple filters this is a single pair; only
     /// [`Or`] filters produce multiple pairs.
     filter_pairs: Vec<(ComponentMask, ComponentMask)>,
+    /// Sum of all queried component sizes in bytes — cached for slice clamping.
+    total_components_size: usize,
     /// Cached list of matching archetype IDs. Valid when
     /// `cached_generation == world.archetype_generation`.
     cached_matches: Vec<ArchetypeId>,
@@ -78,10 +80,16 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
 
         let target_mask = Self::build_target_mask(world);
         let filter_pairs = Self::build_filter_mask_pairs(world);
+        let total_components_size = Q::component_ids()
+            .iter()
+            .filter_map(|id| world.component_registry.get_size(id))
+            .sum::<usize>()
+            .max(8);
         Self {
             world,
             target_mask,
             filter_pairs,
+            total_components_size,
             cached_matches: Vec::new(),
             cached_generation: 0,
             _phantom: std::marker::PhantomData,
@@ -337,6 +345,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         // filter_map preserves iteration order, so archetype_ranges is
         // already sorted — no need for an extra sort_by_key.
 
-        ParQueryIter::new(archetype_ranges, self.world.iterator_timings.clone())
+        ParQueryIter::new(
+            archetype_ranges,
+            self.world.iterator_timings.clone(),
+            self.total_components_size,
+        )
     }
 }

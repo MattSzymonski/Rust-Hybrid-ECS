@@ -221,9 +221,11 @@ pub struct ParQueryIter<'w, Q: QueryTarget, F: QueryFilter = ()> {
     archetype_ranges: Vec<FilteredArchetypeRange<Q::State, F::State>>,
     min_batch_size: Option<usize>,
     tracked: bool,
+    /// Sum of all queried component sizes — used to clamp the slice size.
+    total_components_size: usize,
     /// Optional label for Tracy zones — set via `.label("system_name")`.
     label: Option<&'static str>,
-    /// Per-label EMA timing map, shared via Arc<Mutex<>> for thread-safe access.
+    /// Per-label splitting hint timing map, shared via Arc<Mutex<>> for thread-safe access.
     iterator_timings: std::sync::Arc<std::sync::Mutex<crate::world::IteratorTimings>>,
     _phantom: std::marker::PhantomData<&'w mut (Q, F)>,
 }
@@ -252,6 +254,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> ParQueryIter<'w, Q, F> {
     pub(crate) fn new(
         archetype_ranges: Vec<FilteredArchetypeRange<Q::State, F::State>>,
         iterator_timings: std::sync::Arc<std::sync::Mutex<crate::world::IteratorTimings>>,
+        total_components_size: usize,
     ) -> Self {
         let _zone = crate::profile_scope!(
             "create parallel query iterator",
@@ -264,6 +267,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> ParQueryIter<'w, Q, F> {
             archetype_ranges,
             min_batch_size: None,
             tracked: false,
+            total_components_size,
             label: None,
             iterator_timings,
             _phantom: std::marker::PhantomData,
@@ -327,7 +331,7 @@ where
     where
         Func: Fn(Q::Item<'_>) + Send + Sync,
     {
-        // Resolve timing hint from per-label EMA.
+        // Resolve timing hint from per-label splitting hint.
         let hint_ns = self
             .label
             .and_then(|label| {
@@ -353,7 +357,7 @@ where
         };
         let elapsed_ns = started.elapsed().as_nanos() as u64;
 
-        // Store per-label EMA and track seen labels for duplicate detection.
+        // Store per-label splitting hint and track seen labels for duplicate detection.
         if let Some(label) = label {
             if let Ok(mut timing) = iterator_timings.lock() {
                 let entry = timing
@@ -361,7 +365,8 @@ where
                     .entry(label)
                     .or_insert(elapsed_ns);
                 let delta = elapsed_ns as i64 - *entry as i64;
-                *entry = (*entry as i64 + delta / config::ParallelIteratorConfig::TIMING_EMA_WINDOW)
+                *entry = (*entry as i64
+                    + delta / config::ParallelProcessingConfig::SPLITTING_HINT_WINDOW)
                     as u64;
                 if timing.visited_iterator_labels.contains(&label) {
                     timing.visited_duplicated_iterator_labels.push(label);
@@ -391,7 +396,7 @@ where
         // Sum precomputed entity counts - O(archetypes), negligible.
         let total: usize = self.archetype_ranges.iter().map(|(_, _, _, len)| len).sum();
         let threshold =
-            rayon::current_num_threads() * config::ParallelIteratorConfig::MINIMUM_SLICE_SIZE;
+            rayon::current_num_threads() * config::ParallelProcessingConfig::MINIMUM_SLICE_SIZE;
 
         if total < threshold {
             // Adaptive fallback: sequential loop.  For small N the
@@ -416,7 +421,7 @@ where
         // for the owning thread, and no late-arriving outliers.
         let min_len = self
             .min_batch_size
-            .unwrap_or(config::ParallelIteratorConfig::DEFAULT_ENTITIES_PER_SLICE);
+            .unwrap_or(config::default_entities_per_slice(self.total_components_size));
 
         // Build flat work slices: each is (archetype_index, start_entity, end_entity).
         // Precompute capacity so the Vec never reallocates during push.
@@ -440,7 +445,8 @@ where
 
         // Choose group count from timing feedback when available.
         let iterator_work_group_count = if hint_ns > 0 {
-            let target = (hint_ns / config::ParallelIteratorConfig::TARGET_WORK_GROUP_DURATION)
+            let target = (hint_ns
+                / config::ParallelProcessingConfig::TARGET_ITERATOR_WORK_GROUP_DURATION)
                 .clamp(1, pool_threads as u64) as usize;
             target.min(iterator_slices.len()).max(1)
         } else {
@@ -470,7 +476,7 @@ where
         }
 
         crate::profile_message!(
-            "rayon parallel iteration prepared: {} pool threads, {} archetype ranges totalling {} entities, sliced into {} work items, grouped into {} thread assignments (system EMA hint {} ns)",
+            "rayon parallel iteration prepared: {} pool threads, {} archetype ranges totalling {} entities, sliced into {} work items, grouped into {} thread assignments (system splitting hint {} ns)",
             pool_threads,
             self.archetype_ranges.len(),
             total,
@@ -542,7 +548,7 @@ where
     {
         let num_threads = rayon::current_num_threads();
         let total_entities: usize = self.archetype_ranges.iter().map(|(_, _, _, len)| len).sum();
-        let threshold = num_threads * config::ParallelIteratorConfig::MINIMUM_SLICE_SIZE;
+        let threshold = num_threads * config::ParallelProcessingConfig::MINIMUM_SLICE_SIZE;
 
         // Adaptive fallback: sequential for tiny workloads.
         if total_entities < threshold {
@@ -585,7 +591,7 @@ where
         // eliminating the work-stealing cascade and late-arriving outliers.
         let min_len = self
             .min_batch_size
-            .unwrap_or(config::ParallelIteratorConfig::DEFAULT_ENTITIES_PER_SLICE);
+            .unwrap_or(config::default_entities_per_slice(self.total_components_size));
         let system_label = self.label;
 
         // Build flat work slices: each is (archetype_index, start_entity, end_entity).
@@ -608,7 +614,8 @@ where
 
         // Choose group count from timing feedback when available.
         let iterator_work_group_count = if hint_ns > 0 {
-            let target = (hint_ns / config::ParallelIteratorConfig::TARGET_WORK_GROUP_DURATION)
+            let target = (hint_ns
+                / config::ParallelProcessingConfig::TARGET_ITERATOR_WORK_GROUP_DURATION)
                 .clamp(1, num_threads as u64) as usize;
             target.min(iterator_slices.len()).max(1)
         } else {
@@ -651,7 +658,7 @@ where
         );
 
         crate::profile_message!(
-            "rayon tracked parallel iteration prepared: {} pool threads, {} total entities across {} work slices, grouped into {} thread assignments (system EMA hint {} ns)",
+            "rayon tracked parallel iteration prepared: {} pool threads, {} total entities across {} work slices, grouped into {} thread assignments (system splitting hint {} ns)",
             num_threads,
             total_entities,
             iterator_slices.len(),
