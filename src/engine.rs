@@ -82,9 +82,25 @@ pub struct Engine {
 impl Engine {
     /// Create a new Engine with no systems
     pub fn new() -> Self {
+        // Wrap initialization in a non-continuous Tracy frame.
+        let _init = crate::profile_non_continuous_frame!("engine init");
+
         // Name the main thread in Tracy BEFORE Rayon spawns workers,
         // so it appears first in the thread list.
         crate::profile_thread!("main");
+
+        // Configure plot appearance in Tracy UI.
+        crate::profile_plot_config!(entity_count, tracy_client::PlotConfiguration::default());
+        crate::profile_plot_config!(archetype_count, tracy_client::PlotConfiguration::default());
+        crate::profile_plot_config!(frame_time_us, tracy_client::PlotConfiguration::default());
+        crate::profile_plot_config!(
+            memory_estimate_kb,
+            tracy_client::PlotConfiguration::default()
+        );
+        crate::profile_plot_config!(
+            commands_executed,
+            tracy_client::PlotConfiguration::default()
+        );
 
         // Warm up the Rayon thread pool so the first parallel batch
         // does not pay thread-spawning costs (can be 1-10ms on some OS).
@@ -294,13 +310,13 @@ impl Engine {
             let current_generation = self.world.archetype_generation;
             if current_generation != self.last_archetype_generation {
                 self.last_archetype_generation = current_generation;
-                for archetype in self.world.archetypes.values() {
+                for _archetype in self.world.archetypes.values() {
                     crate::profile_message!(
                         "archetype {:?}: {} entities, {} component types, ~{} bytes",
-                        archetype.id,
-                        archetype.entity_count(),
-                        archetype.component_types.len(),
-                        archetype.memory_estimate(&self.world.component_registry),
+                        _archetype.id,
+                        _archetype.entity_count(),
+                        _archetype.component_types.len(),
+                        _archetype.memory_estimate(&self.world.component_registry),
                     );
                 }
                 crate::profile_message!(

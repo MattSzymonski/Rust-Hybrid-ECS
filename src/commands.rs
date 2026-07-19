@@ -242,11 +242,12 @@ impl CommandQueue {
     ) -> Result<(), Vec<CommandError>> {
         let pending = self.commands.len();
         world.commands_executed_this_frame = pending;
-        let _zone = crate::profile_scope!(
+        let zone = crate::profile_scope!(
             "execute commands",
             [("Deferred commands to execute: {}", pending)]
         );
         let mut errors = Vec::new();
+        let mut succeeded = 0usize;
 
         for command in self.commands.drain(..) {
             match command {
@@ -255,6 +256,7 @@ impl CommandQueue {
                     component_adders,
                 } => {
                     Self::execute_create_entity(world, entity, component_adders);
+                    succeeded += 1;
                 }
 
                 DeferredCommand::AddComponentToEntity {
@@ -262,6 +264,7 @@ impl CommandQueue {
                     component_adder,
                 } => {
                     Self::execute_add_component(world, entity, component_adder, &mut errors);
+                    succeeded += 1;
                 }
 
                 DeferredCommand::RemoveComponentFromEntity {
@@ -269,13 +272,21 @@ impl CommandQueue {
                     component_id,
                 } => {
                     Self::execute_remove_component(world, entity, component_id, &mut errors);
+                    succeeded += 1;
                 }
 
                 DeferredCommand::DestroyEntity { entity } => {
                     Self::execute_destroy_entity(world, entity, &mut errors);
+                    succeeded += 1;
                 }
             }
         }
+
+        zone.text(format_args!(
+            "{} succeeded, {} errors",
+            succeeded - errors.len(),
+            errors.len(),
+        ));
 
         if errors.is_empty() {
             Ok(())
@@ -283,6 +294,7 @@ impl CommandQueue {
             Err(errors)
         } else {
             for err in &errors {
+                crate::profile_error!("deferred command failed: {}", err);
                 eprintln!("  [Deferred] {err}");
             }
             Ok(())
