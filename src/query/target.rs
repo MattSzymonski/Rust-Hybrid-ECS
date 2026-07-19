@@ -127,7 +127,11 @@ impl<T: Component> QueryTarget for &T {
     }
 
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
-        unsafe { (*state.as_ptr()).get(index) }
+        // SAFETY: The query loop invariant guarantees `index < archetype.len()`,
+        // and the ECS invariant guarantees `archetype.len() == storage.len()`
+        // for every component type in the archetype. Therefore `index` is
+        // always in bounds for this storage.
+        unsafe { (*state.as_ptr()).get_unchecked(index) }
     }
 }
 
@@ -182,11 +186,13 @@ impl<T: Component> QueryTarget for &mut T {
 
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
         // SAFETY: Disjoint per-row access guaranteed by the scheduler. Both
-        // pointers are valid for the lifetime of the iteration. Mutating
-        // through Mut::deref_mut updates ticks[index].changed without
-        // requiring atomics because no other thread observes this row.
+        // pointers are valid for the lifetime of the iteration. The query loop
+        // invariant guarantees `index < archetype.len() == storage.len()`,
+        // so unchecked access is sound. Mutating through Mut::deref_mut
+        // updates ticks[index].changed without requiring atomics because
+        // no other thread observes this row.
         unsafe {
-            let value: &'a mut T = (*state.values.as_ptr()).get_mut(index);
+            let value: &'a mut T = (*state.values.as_ptr()).get_mut_unchecked(index);
             let ticks: &'a mut ComponentTicks =
                 &mut *(*state.ticks.as_ptr()).as_mut_ptr().add(index);
             Mut::new(value, ticks, state.this_run)

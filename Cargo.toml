@@ -72,6 +72,14 @@ codegen-units = 1
 strip = true
 panic = "abort"
 
+# Speed-optimized release profile: trades binary size for maximum throughput.
+# Uses opt-level=3 (aggressive inlining, loop unrolling, auto-vectorization)
+# instead of opt-level="s" (size-optimized). Recommended for production
+# deployments where throughput matters more than binary size.
+[profile.release-fast]
+inherits = "release"
+opt-level = 3
+
 [profile.release-with-debug]
 inherits = "release"
 debug = true

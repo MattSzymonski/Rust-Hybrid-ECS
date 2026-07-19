@@ -2,5 +2,8 @@
 graphify-out/
 .github/copilot-instructions.md
 
-performance_benchmarks/
 benchmarks/
+
+# Cache measurement pipeline artifacts
+performance_benchmarks/cache/artifacts/
+__pycache__/

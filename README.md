@@ -9,10 +9,10 @@ scriptable components.
 | Feature                     | Description                                                                                                                                                    |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Archetype storage**       | Components of the same type stored contiguously (Structure-of-Arrays) for cache-friendly bulk iteration                                                        |
-| **Bevy-style systems**      | `fn my_system(q: Query<(&mut Transform, &Velocity)>, time: Res<GameTime>)` — parameters resolved automatically                                                 |
+| **Bevy-style systems**      | `fn my_system(q: Query<(&mut Transform, &Velocity)>, time: Res<GameTime>)` - parameters resolved automatically                                                 |
 | **Automatic parallelism**   | Scheduler builds a dependency graph from component/resource access patterns; systems with disjoint access run concurrently via Rayon                           |
 | **Change detection**        | `Changed<T>` and `Added<T>` filters skip entities whose data hasn't changed since the system last ran                                                          |
-| **Deferred commands**       | Structural changes (create/destroy entities, add/remove components) are queued during system execution and applied at the frame boundary — no mid-iteration UB |
+| **Deferred commands**       | Structural changes (create/destroy entities, add/remove components) are queued during system execution and applied at the frame boundary - no mid-iteration UB |
 | **Script components**       | Components with an `update()` method called every frame with safe, deferred-command-only World access                                                          |
 | **Resources**               | Global singleton data (`GameTime`, `InputState`, `AssetStore`) accessed via `Res<T>` / `ResMut<T>` with scheduler-tracked access                               |
 | **Deterministic iteration** | Queries and scripts iterate entities in a stable, sorted order regardless of HashMap layout                                                                    |
@@ -68,7 +68,7 @@ engine.process_frame();
 
 ## System Parameters
 
-Systems declare what they need as function parameters — the engine resolves them automatically:
+Systems declare what they need as function parameters - the engine resolves them automatically:
 
 ```rust
 fn example(
@@ -184,28 +184,28 @@ resources (via `ResMut<T>::get_mut()` returning `Mut<T>`).
 
 ```
 src/
-├── archetype.rs       — Archetype storage, ArchetypeId
-├── commands.rs        — Deferred CommandQueue, Commands system param
-├── component.rs       — Component trait, ComponentId, ComponentMask, Tick
-├── engine.rs          — Engine: system registration, frame loop, parallel runner
-├── entity.rs          — Entity handle with generation-based recycling
-├── lib.rs             — Public re-exports
-├── main.rs            — Interactive example launcher
-├── resource.rs        — Resource trait, ResourceId, ResHandle
-├── scheduler.rs       — SystemScheduler: dependency analysis, batch building
-├── scripting.rs       — ScriptComponent trait, ScriptContext
-├── system.rs          — System trait, SystemParam, IntoSystem
-├── world.rs           — World: central ECS state, entity/archetype/resource mgmt
+├── archetype.rs       - Archetype storage, ArchetypeId
+├── commands.rs        - Deferred CommandQueue, Commands system param
+├── component.rs       - Component trait, ComponentId, ComponentMask, Tick
+├── engine.rs          - Engine: system registration, frame loop, parallel runner
+├── entity.rs          - Entity handle with generation-based recycling
+├── lib.rs             - Public re-exports
+├── main.rs            - Interactive example launcher
+├── resource.rs        - Resource trait, ResourceId, ResHandle
+├── scheduler.rs       - SystemScheduler: dependency analysis, batch building
+├── scripting.rs       - ScriptComponent trait, ScriptContext
+├── system.rs          - System trait, SystemParam, IntoSystem
+├── world.rs           - World: central ECS state, entity/archetype/resource mgmt
 ├── query/
-│   ├── mod.rs         — Module re-exports
-│   ├── change_detection.rs — Mut<T> smart pointer with tick bumping
-│   ├── filter.rs      — QueryFilter: With, Without, Changed, Added, Or
-│   ├── iter.rs        — Sequential + parallel iterators, BatchStats
-│   ├── ptr.rs         — SendPtr / SendPtrMut (thread-safe raw pointers)
-│   ├── query.rs       — Query struct: iter_mut, par_iter_mut, first
-│   ├── resource.rs    — Res / ResMut system parameters
-│   ├── target.rs      — QueryTarget: &T, &mut T, Entity, tuple impls
-│   └── tests.rs       — Query + change detection tests
+│   ├── mod.rs         - Module re-exports
+│   ├── change_detection.rs - Mut<T> smart pointer with tick bumping
+│   ├── filter.rs      - QueryFilter: With, Without, Changed, Added, Or
+│   ├── iter.rs        - Sequential + parallel iterators, BatchStats
+│   ├── ptr.rs         - SendPtr / SendPtrMut (thread-safe raw pointers)
+│   ├── query.rs       - Query struct: iter_mut, par_iter_mut, first
+│   ├── resource.rs    - Res / ResMut system parameters
+│   ├── target.rs      - QueryTarget: &T, &mut T, Entity, tuple impls
+│   └── tests.rs       - Query + change detection tests
 └── examples/
     ├── change_detection_demo.rs
     ├── iterators_stress_test.rs
