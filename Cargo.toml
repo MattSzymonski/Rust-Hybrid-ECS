@@ -24,6 +24,7 @@ tracing = [
     "tracy-client/ondemand",
     "tracy-client/code-transfer",
     "tracy-client/callstack-inlines",
+    "tracy-client/crash-handler",
 ]
 # Minimal overhead: zones + frame marks only. No text, plots, messages, or threads.
 tracing-minimal = [

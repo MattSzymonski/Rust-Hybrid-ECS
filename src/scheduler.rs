@@ -253,14 +253,27 @@ impl SystemScheduler {
     ///
     /// Uses a precomputed conflict matrix so that each pairwise check is
     /// an O(1) array lookup instead of a full `conflicts_with` call.
-    /// The batching algorithm itself remains O(n²) in the worst case,
-    /// but the constant factor is dramatically reduced.
+    ///
+    /// Systems are sorted by conflict count (ascending) before batching so
+    /// that the most independent systems are packed into early batches.
+    /// This makes the result independent of registration order and typically
+    /// reduces the total number of batches.
     pub fn build_execution_graph(&mut self) {
         let _zone = crate::profile_scope!(
             "build execution graph",
             [("Number of systems to schedule: {}", self.system_count)]
         );
         self.execution_graph.clear();
+
+        if self.system_count == 0 {
+            return;
+        }
+
+        // Precompute conflict count per system and build a permutation
+        // sorted by ascending conflict count. Systems with fewest conflicts
+        // are scheduled first — they pack densely into early batches.
+        let mut order: Vec<usize> = (0..self.system_count).collect();
+        order.sort_by_key(|&i| self.conflict_matrix[i].iter().filter(|&&c| c).count());
 
         let mut scheduled = vec![false; self.system_count];
         let mut scheduled_count = 0;
@@ -269,19 +282,18 @@ impl SystemScheduler {
             let remaining = self.system_count - scheduled_count;
             let mut batch = Vec::with_capacity(remaining);
 
-            // Try to add each unscheduled system to the current batch
-            for (i, is_scheduled) in scheduled.iter_mut().enumerate() {
-                if *is_scheduled {
+            // Iterate in sorted order: most-independent systems first.
+            for &i in &order {
+                if scheduled[i] {
                     continue;
                 }
 
                 // Check if this system conflicts with any system already in the batch.
-                // Uses the precomputed matrix - O(batch_size) array lookups.
                 let conflicts = batch.iter().any(|&j| self.conflict_matrix[i][j]);
 
                 if !conflicts {
                     batch.push(i);
-                    *is_scheduled = true;
+                    scheduled[i] = true;
                     scheduled_count += 1;
                 }
             }
