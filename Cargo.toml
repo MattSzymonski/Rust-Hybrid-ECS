@@ -57,6 +57,10 @@ harness = false
 name = "frame_loop"
 harness = false
 
+[[bench]]
+name = "resource_commands"
+harness = false
+
 [lib]
 name = "ecs_hybrid"
 path = "src/lib.rs"
