@@ -36,10 +36,11 @@ fn setup_world() -> World {
     world
 }
 
-// ------------------------------------------------------------------------
+// =============================================================================
 // Basic Query Tests
-// ------------------------------------------------------------------------
+// =============================================================================
 
+/// Verifies that querying an empty world yields zero results.
 #[test]
 fn test_query_empty_world() {
     let mut world = setup_world();
@@ -47,6 +48,7 @@ fn test_query_empty_world() {
     assert_eq!(query.iter_mut().count(), 0);
 }
 
+/// Verifies that a query returns the correct components for a single entity.
 #[test]
 fn test_query_single_entity() {
     let mut world = setup_world();
@@ -65,6 +67,7 @@ fn test_query_single_entity() {
     assert_eq!(results[0].1.x, 0.5);
 }
 
+/// Verifies that a query returns the correct count for multiple entities.
 #[test]
 fn test_query_multiple_entities() {
     let mut world = setup_world();
@@ -84,6 +87,7 @@ fn test_query_multiple_entities() {
     assert_eq!(query.iter_mut().count(), 10);
 }
 
+/// Verifies that queries only match entities with all requested components.
 #[test]
 fn test_query_filters_by_components() {
     let mut world = setup_world();
@@ -111,6 +115,7 @@ fn test_query_filters_by_components() {
     assert_eq!(results[0].0.x, 2.0);
 }
 
+/// Verifies that mutable queries can modify component values in place.
 #[test]
 fn test_query_mutable_modification() {
     let mut world = setup_world();
@@ -138,6 +143,7 @@ fn test_query_mutable_modification() {
     assert_eq!(pos.y, 2.0);
 }
 
+/// Verifies that `first()` returns the first matching entity.
 #[test]
 fn test_query_first() {
     let mut world = setup_world();
@@ -155,6 +161,7 @@ fn test_query_first() {
     assert_eq!(first.unwrap().0.x, 5.0);
 }
 
+/// Verifies that `first()` returns None for an empty result set.
 #[test]
 fn test_query_first_empty() {
     let mut world = setup_world();
@@ -162,6 +169,7 @@ fn test_query_first_empty() {
     assert!(query.first().is_none());
 }
 
+/// Verifies that `Entity` can be included in the query data tuple.
 #[test]
 fn test_query_entity_access() {
     let mut world = setup_world();
@@ -178,10 +186,11 @@ fn test_query_entity_access() {
     assert_eq!(queried_entity.id(), entity.id());
 }
 
-// ------------------------------------------------------------------------
+// =============================================================================
 // Parallel Iterator Tests
-// ------------------------------------------------------------------------
+// =============================================================================
 
+/// Verifies that parallel iteration modifies all matching entities.
 #[test]
 fn test_par_iter_basic() {
     let mut world = setup_world();
@@ -209,6 +218,7 @@ fn test_par_iter_basic() {
     }
 }
 
+/// Verifies that explicit batch sizes are respected during parallel iteration.
 #[test]
 fn test_par_iter_with_batch_size() {
     let mut world = setup_world();
@@ -236,6 +246,7 @@ fn test_par_iter_with_batch_size() {
     assert!(stats.min_batch_size >= 100 || stats.batch_count == 1);
 }
 
+/// Verifies that tracked parallel iteration returns valid `BatchStats`.
 #[test]
 fn test_par_iter_tracked_stats() {
     let mut world = setup_world();
@@ -262,6 +273,7 @@ fn test_par_iter_tracked_stats() {
     }
 }
 
+/// Verifies that untracked parallel iteration returns `Untracked` and no stats.
 #[test]
 fn test_par_iter_untracked() {
     let mut world = setup_world();
@@ -279,6 +291,7 @@ fn test_par_iter_untracked() {
     assert!(result.stats().is_none());
 }
 
+/// Verifies that `entity_count()` works correctly on a parallel iterator.
 #[test]
 fn test_par_iter_entity_count() {
     let mut world = setup_world();
@@ -297,10 +310,11 @@ fn test_par_iter_entity_count() {
     assert_eq!(par_iter.entity_count(), 250);
 }
 
-// ------------------------------------------------------------------------
+// =============================================================================
 // BatchStats Tests
-// ------------------------------------------------------------------------
+// =============================================================================
 
+/// Verifies that `BatchStats` Display implementation produces readable output.
 #[test]
 fn test_batch_stats_display() {
     let stats = BatchStats {
@@ -318,6 +332,7 @@ fn test_batch_stats_display() {
     assert!(display.contains("entities: 1000"));
 }
 
+/// Verifies that `ParForEachResult` Display implementation works for both variants.
 #[test]
 fn test_par_for_each_result_display() {
     let stats = BatchStats {
@@ -336,10 +351,11 @@ fn test_par_for_each_result_display() {
     assert_eq!(format!("{}", untracked), "Untracked");
 }
 
-// ------------------------------------------------------------------------
+// =============================================================================
 // QueryTarget Trait Tests
-// ------------------------------------------------------------------------
+// =============================================================================
 
+/// Verifies that `component_ids()` returns the correct set for a query target.
 #[test]
 fn test_component_ids() {
     let ids = <(&Position, &Velocity)>::component_ids();
@@ -348,6 +364,7 @@ fn test_component_ids() {
     assert!(ids.contains(&ComponentId::of::<Velocity>()));
 }
 
+/// Verifies that `report_component_access` correctly reports read-only access.
 #[test]
 fn test_report_component_access_read() {
     let (reads, writes) = <(&Position,)>::report_component_access();
@@ -355,6 +372,7 @@ fn test_report_component_access_read() {
     assert_eq!(writes.len(), 0);
 }
 
+/// Verifies that `report_component_access` correctly reports write access.
 #[test]
 fn test_report_component_access_write() {
     let (reads, writes) = <(&mut Position,)>::report_component_access();
@@ -362,6 +380,7 @@ fn test_report_component_access_write() {
     assert_eq!(writes.len(), 1);
 }
 
+/// Verifies that `report_component_access` correctly reports mixed read/write access.
 #[test]
 fn test_report_component_access_mixed() {
     let (reads, writes) = <(&Position, &mut Velocity)>::report_component_access();
@@ -379,6 +398,7 @@ fn test_duplicate_mutable_types_rejected() {
     let _ = <(&mut Position, &mut Position)>::report_component_access();
 }
 
+/// Verifies that `has_duplicate_writes` correctly detects duplicate component writes.
 #[test]
 fn test_has_duplicate_writes_detection() {
     use crate::query::target::has_duplicate_writes;
@@ -394,16 +414,18 @@ fn test_has_duplicate_writes_detection() {
     ]));
 }
 
+/// Verifies that `Entity` reports zero component IDs.
 #[test]
 fn test_entity_has_no_component_ids() {
     let ids = Entity::component_ids();
     assert!(ids.is_empty());
 }
 
-// ------------------------------------------------------------------------
+// =============================================================================
 // Change Detection Tests
-// ------------------------------------------------------------------------
+// =============================================================================
 
+/// Verifies that `DerefMut` on `Mut<T>` bumps the changed tick.
 #[test]
 fn test_mut_deref_bumps_changed_tick() {
     let mut world = setup_world();
@@ -438,6 +460,7 @@ fn test_mut_deref_bumps_changed_tick() {
     );
 }
 
+/// Verifies that immutable `Deref` on `Mut<T>` does not bump the changed tick.
 #[test]
 fn test_immutable_deref_does_not_bump_changed_tick() {
     let mut world = setup_world();
@@ -464,6 +487,7 @@ fn test_immutable_deref_does_not_bump_changed_tick() {
     assert_eq!(baseline, after_read);
 }
 
+/// Verifies that `bypass()` provides raw access without bumping change-detection ticks.
 #[test]
 fn test_bypass_change_detection_does_not_bump_tick() {
     let mut world = setup_world();
@@ -494,6 +518,7 @@ fn test_bypass_change_detection_does_not_bump_tick() {
     assert_eq!(pos.x, 99.0);
 }
 
+/// Verifies that `Added` ticks survive archetype migration.
 #[test]
 fn test_added_tick_preserved_across_archetype_migration() {
     let mut world = setup_world();
@@ -533,10 +558,11 @@ fn test_added_tick_preserved_across_archetype_migration() {
     assert!(velocity_added >= original_added);
 }
 
-// ------------------------------------------------------------------------
+// =============================================================================
 // QueryFilter Tests
-// ------------------------------------------------------------------------
+// =============================================================================
 
+/// Verifies that `With<T>` filter only matches archetypes containing T.
 #[test]
 fn test_filter_with_includes_only_matching_archetypes() {
     let mut world = setup_world();
@@ -558,6 +584,7 @@ fn test_filter_with_includes_only_matching_archetypes() {
     assert_eq!(xs, vec![1.0]);
 }
 
+/// Verifies that `Without<T>` filter excludes archetypes containing T.
 #[test]
 fn test_filter_without_excludes_archetypes() {
     let mut world = setup_world();
@@ -578,6 +605,7 @@ fn test_filter_without_excludes_archetypes() {
     assert_eq!(xs, vec![2.0]);
 }
 
+/// Verifies that `Changed<T>` filter only yields rows whose component was mutated.
 #[test]
 fn test_filter_changed_detects_mutated_rows_only() {
     let mut world = setup_world();
@@ -616,6 +644,7 @@ fn test_filter_changed_detects_mutated_rows_only() {
     assert_eq!(hits, vec![e1]);
 }
 
+/// Verifies that `Added<T>` filter only yields rows whose component was newly inserted.
 #[test]
 fn test_filter_added_detects_newly_inserted_components() {
     let mut world = setup_world();
@@ -643,6 +672,7 @@ fn test_filter_added_detects_newly_inserted_components() {
     assert_eq!(hits, vec![new_entity]);
 }
 
+/// Verifies that `Or` filter combines predicates with logical OR semantics.
 #[test]
 fn test_filter_or_combines_predicates() {
     let mut world = setup_world();
@@ -681,6 +711,7 @@ fn test_filter_or_combines_predicates() {
     assert_eq!(hits, expected);
 }
 
+/// Verifies that `Or<(With<A>, With<B>)>` matches entities with either component.
 #[test]
 fn test_filter_or_with_components_either() {
     // Regression test for issue 4.8: Or<(With<A>, With<B>)> must match
@@ -723,6 +754,7 @@ fn test_filter_or_with_components_either() {
     );
 }
 
+/// Verifies that `Or` with `With` and `Without` filters correct archetypes.
 #[test]
 fn test_filter_or_with_without_correct_archetypes() {
     // Or<(With<A>, Without<B>)>: match archetypes containing A, *or*
@@ -757,6 +789,7 @@ fn test_filter_or_with_without_correct_archetypes() {
     assert_eq!(hits, expected);
 }
 
+/// Verifies that `Or` mixed with `Changed` correctly combines archetype and row-level filtering.
 #[test]
 fn test_filter_or_mixed_with_and_changed() {
     // Or<(With<A>, Changed<B>)>: mixed archetype-level (With) and
@@ -811,6 +844,7 @@ fn test_filter_or_mixed_with_and_changed() {
     assert_eq!(hits, expected);
 }
 
+/// Verifies that `Or<(Without<A>, Without<B>)>` correctly excludes archetypes with either component.
 #[test]
 fn test_filter_or_without_or_without() {
     // Or<(Without<A>, Without<B>)>: include archetypes that lack A *or*
@@ -853,6 +887,7 @@ fn test_filter_or_without_or_without() {
     );
 }
 
+/// Verifies that a three-way `Or` filter correctly matches all three branches.
 #[test]
 fn test_filter_or_three_way() {
     // Or<(With<A>, With<B>, With<C>)>: 3-way OR at archetype level.
@@ -890,6 +925,7 @@ fn test_filter_or_three_way() {
     assert!(ids.contains(&e_hp.id()));
 }
 
+/// Verifies that `Or` within an AND tuple correctly narrows the result set.
 #[test]
 fn test_filter_or_within_and_tuple() {
     // (Or<(With<A>, With<B>)>, Without<C>): Or inside an AND tuple.
@@ -928,6 +964,7 @@ fn test_filter_or_within_and_tuple() {
     assert_eq!(hits, expected);
 }
 
+/// Verifies that an empty target query with `Or` filter produces correct results.
 #[test]
 fn test_filter_or_empty_target_with_or() {
     // Query<(), Or<(With<A>, With<B>)>>: no data fetched, only filter.
@@ -955,6 +992,7 @@ fn test_filter_or_empty_target_with_or() {
     assert_eq!(hits, expected);
 }
 
+/// Verifies that `Or` filters do not double-count entities matching multiple branches.
 #[test]
 fn test_filter_or_no_double_count() {
     // An entity in an archetype that matches multiple Or branches must
@@ -977,6 +1015,7 @@ fn test_filter_or_no_double_count() {
     assert_eq!(hits[0], e_both);
 }
 
+/// Verifies that `Or` filters work correctly with parallel iteration.
 #[test]
 fn test_filter_or_par_iter() {
     // Parallel iteration with Or filter - smoke test for correctness.
@@ -1020,6 +1059,7 @@ fn test_filter_or_par_iter() {
     );
 }
 
+/// Verifies that `Or` with a unit `()` branch is always true.
 #[test]
 fn test_filter_or_with_unit_branch_always_true() {
     // Or<(With<A>, ())>: the () branch has no restrictions and always
@@ -1048,6 +1088,7 @@ fn test_filter_or_with_unit_branch_always_true() {
     assert_eq!(hits, expected, "Or<(... , ())> should match all entities");
 }
 
+/// Verifies that `Or` with `()` as the first branch correctly short-circuits.
 #[test]
 fn test_filter_or_with_unit_branch_first() {
     // Or<((), With<A>)>: order of branches shouldn't matter. The ()
@@ -1061,6 +1102,7 @@ fn test_filter_or_with_unit_branch_first() {
     assert_eq!(hits[0], e_any);
 }
 
+/// Verifies that `Or` with duplicate inner filters still produces correct results.
 #[test]
 fn test_filter_or_duplicate_inner_filters() {
     // Or<(With<A>, With<A>)>: redundant inner filters - should behave
@@ -1083,6 +1125,7 @@ fn test_filter_or_duplicate_inner_filters() {
     assert_eq!(hits[0], e_a);
 }
 
+/// Verifies that AND of two `Or` filters correctly intersects their result sets.
 #[test]
 fn test_filter_and_of_two_ors() {
     // (Or<(With<A>, With<B>)>, Or<(Without<A>, Without<B>)>)
@@ -1127,6 +1170,7 @@ fn test_filter_and_of_two_ors() {
     assert_eq!(hits, expected);
 }
 
+/// Verifies that a single-element filter tuple works identically to the bare filter.
 #[test]
 fn test_filter_single_element_tuple() {
     // (With<A>,) - single-element filter tuple should behave same as With<A>.
@@ -1143,6 +1187,7 @@ fn test_filter_single_element_tuple() {
     assert_eq!(hits[0], e_a);
 }
 
+/// Verifies that `Changed<T>` returns no rows when no mutation has occurred.
 #[test]
 fn test_filter_changed_empty_after_no_mutation() {
     let mut world = setup_world();

@@ -1,11 +1,22 @@
-//! [`QueryTarget`] trait and built-in implementations.
+//! [`QueryTarget`] trait and built-in implementations for query data shapes.
 //!
-//! A `QueryTarget` is the *data* shape a query yields per row. It can be
-//! a single component reference (`&T` / `&mut T`), the [`Entity`] handle,
-//! or a tuple combining several of these.
+//! # Responsibilities
+//!
+//! - Defines the [`QueryTarget`] trait that determines what data a query yields per row.
+//! - Implements `QueryTarget` for `&T`, `&mut T`, [`Entity`], and tuples of these.
+//! - Detects duplicate mutable borrows (`Query<(&mut T, &mut T)>`) at construction time.
+//!
+//! # Design
+//!
+//! Each `QueryTarget` implementation reports its component IDs (for mask building),
+//! creates per-archetype state (raw pointers into component storage), and fetches
+//! one row of data at a given index. For parallel iteration, the state must be
+//! `Send + Sync` so it can be shared across Rayon threads.
 
+// External crates
 use trait_type_map::VecStorage;
 
+// Current crate
 use crate::archetype::Archetype;
 use crate::component::{Component, ComponentId, ComponentTicks, Tick};
 use crate::entity::Entity;
@@ -13,9 +24,9 @@ use crate::entity::Entity;
 use super::change_detection::Mut;
 use super::ptr::{SendPtr, SendPtrMut};
 
-// ---------------------------------------------------------------------------
-// Duplicate-write detection (guards against `Query<(&mut T, &mut T)>` UB)
-// ---------------------------------------------------------------------------
+// =============================================================================
+// General Functions
+// =============================================================================
 
 /// Returns `true` when `writes` contains any duplicate [`ComponentId`],
 /// which would mean a query tuple has two `&mut T` elements for the same
@@ -47,6 +58,11 @@ pub(crate) fn has_duplicate_writes(writes: &[ComponentId]) -> bool {
 /// matches a query has its state initialized once via [`init_state`].
 ///
 /// [`init_state`]: QueryTarget::init_state
+
+// =============================================================================
+// QueryTarget
+// =============================================================================
+
 pub trait QueryTarget {
     type Item<'a>;
     type State;
@@ -69,9 +85,11 @@ pub trait QueryTarget {
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a>;
 }
 
-// ----------------------------------------------------------------------------
+// =============================================================================
 // Entity
-// ----------------------------------------------------------------------------
+// =============================================================================
+// QueryTarget
+// =============================================================================
 
 /// Allows queries to include `Entity` in the data tuple, e.g.
 /// `Query<(Entity, &Transform)>` to get the entity along with its components.
@@ -100,9 +118,9 @@ impl QueryTarget for Entity {
     }
 }
 
-// ----------------------------------------------------------------------------
-// &T (immutable component reference)
-// ----------------------------------------------------------------------------
+// =============================================================================
+// &T (Immutable Reference)
+// =============================================================================
 
 impl<T: Component> QueryTarget for &T {
     type Item<'a> = &'a T;
@@ -119,7 +137,10 @@ impl<T: Component> QueryTarget for &T {
     fn init_state(archetype: &mut Archetype, _this_run: Tick) -> Self::State {
         let _zone = crate::profile_scope!(
             "create state for immutable component query target",
-            [("Entities in archetype: {}", archetype.entity_count()), ("Component type: {}", std::any::type_name::<T>())]
+            [
+                ("Entities in archetype: {}", archetype.entity_count()),
+                ("Component type: {}", std::any::type_name::<T>())
+            ]
         );
         SendPtr::new(
             archetype.component_storages.get_storage::<T>() as *const VecStorage<T, dyn Component>
@@ -135,9 +156,9 @@ impl<T: Component> QueryTarget for &T {
     }
 }
 
-// ----------------------------------------------------------------------------
-// &mut T (mutable component reference yielded as Mut<T>)
-// ----------------------------------------------------------------------------
+// =============================================================================
+// MutFetchState
+// =============================================================================
 
 /// Cached pointers used by mutable component queries to construct `Mut<T>`
 /// without re-locating the underlying storage on every access.
@@ -167,7 +188,10 @@ impl<T: Component> QueryTarget for &mut T {
     fn init_state(archetype: &mut Archetype, this_run: Tick) -> Self::State {
         let _zone = crate::profile_scope!(
             "create state for mutable component query target",
-            [("Entities in archetype: {}", archetype.entity_count()), ("Component type (mutable): {}", std::any::type_name::<T>())]
+            [
+                ("Entities in archetype: {}", archetype.entity_count()),
+                ("Component type (mutable): {}", std::any::type_name::<T>())
+            ]
         );
         let values = SendPtrMut::new(archetype.component_storages.get_storage_mut::<T>()
             as *mut VecStorage<T, dyn Component>);
@@ -200,9 +224,9 @@ impl<T: Component> QueryTarget for &mut T {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Tuple Implementations (via macro)
-// ----------------------------------------------------------------------------
+// =============================================================================
+// Tuple Implementations
+// =============================================================================
 
 /// Implements `QueryTarget` for tuples up to arity 4, e.g.
 /// `(Entity, &Transform, &mut Velocity)`.

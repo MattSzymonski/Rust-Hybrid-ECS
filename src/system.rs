@@ -1,13 +1,13 @@
-// ----------------------------------------------------------------------------
-// System Infrastructure - Bevy-Style SystemParam
-// ----------------------------------------------------------------------------
 //! Advanced system parameter infrastructure that allows automatic parameter
 //! resolution for system functions.
 //!
-//! This module implements a Bevy-style system parameter system where:
-//! 1. Each parameter type implements SystemParam to extract itself from World
-//! 2. Functions are automatically converted to systems based on their parameters
-//! 3. No manual wrapper code needed - just write functions and register them
+//! # Responsibilities
+//!
+//! - Defines the [`SystemParam`] trait that lets function parameters extract
+//!   themselves from the [`World`] (e.g., `Query<T>`, `Commands`, `Res<T>`).
+//! - Provides [`IntoSystem`] to convert plain functions into boxed [`System`] trait objects.
+//! - Implements the [`System`] trait for registered functions, enabling
+//!   the engine to call them generically.
 //!
 //! SAFETY: Warning: Lifetime Transmutation
 //!
@@ -76,6 +76,10 @@ use crate::resource::{Resource, ResourceId};
 use crate::scheduler::SystemAccess;
 use crate::world::World;
 
+// =============================================================================
+// System
+// =============================================================================
+
 /// Trait for systems that can be executed by the Engine
 ///
 /// Systems are functions that operate on World data. They are executed
@@ -98,9 +102,9 @@ where
     }
 }
 
-// ----------------------------------------------------------------------------
-// SystemParam - Automatic Parameter Extraction
-// ----------------------------------------------------------------------------
+// =============================================================================
+// SystemParam
+// =============================================================================
 
 /// SystemParam trait - any type that can be extracted as a system parameter
 ///
@@ -253,9 +257,9 @@ impl<T: Resource> SystemParam for ResMut<'static, T> {
     }
 }
 
-// ----------------------------------------------------------------------------
+// =============================================================================
 // SystemParam Tuple Implementations
-// ----------------------------------------------------------------------------
+// =============================================================================
 
 /// Macro to implement SystemParam for tuples
 ///
@@ -292,9 +296,9 @@ impl_system_param_tuple!(A, B, C, D);
 impl_system_param_tuple!(A, B, C, D, E);
 impl_system_param_tuple!(A, B, C, D, E, F1);
 
-// ----------------------------------------------------------------------------
-// SystemParamFunction - Function to System Conversion
-// ----------------------------------------------------------------------------
+// =============================================================================
+// SystemParamFunction
+// =============================================================================
 
 /// SystemParamFunction trait - functions that can be converted to systems
 ///
@@ -339,9 +343,9 @@ impl_system_param_function!(A, B, C, D);
 impl_system_param_function!(A, B, C, D, E);
 impl_system_param_function!(A, B, C, D, E, F1);
 
-// ----------------------------------------------------------------------------
-// IntoSystem - Automatic System Conversion
-// ----------------------------------------------------------------------------
+// =============================================================================
+// IntoSystem
+// =============================================================================
 
 /// Trait for converting functions into Systems
 ///

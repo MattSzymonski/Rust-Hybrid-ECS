@@ -1,12 +1,30 @@
-/// Entity is an "object" in the ECS world.
+//! Lightweight entity handles with generation-based invalidation.
+//!
+//! # Responsibilities
+//!
+//! - Defines the [`Entity`] handle type used throughout the ECS.
+//! - Provides generation-counter logic to prevent dangling-handle bugs.
+//! - Keeps the handle compact (16 bytes) for cheap copy and storage.
+//!
+//! # Design
+//!
+//! Entities are not objects - they are 64-bit IDs paired with a 32-bit
+//! generation counter. When an entity is destroyed, its ID is recycled via
+//! a free list and the generation is incremented. Any old handle still
+//! holding the previous generation will fail validation, preventing
+//! use-after-free bugs without reference counting or garbage collection.
+
+// Standard library
+use std::fmt;
+
+// =============================================================================
+// Entity
+// =============================================================================
+
+/// Lightweight handle referencing a collection of components in the [`World`].
 ///
-/// Entities are actually lightweight handles that reference a collection of components.
-///
-/// ## Generations
-///
-/// When an entity is destroyed, its ID is added to a free list for recycling.
-/// The generation is incremented each time an ID is reused. This prevents
-/// "dangling handle" bugs where old references incorrectly access new entities:
+/// Entities are 16 bytes, [`Copy`], and cheap to pass by value. The
+/// generation counter disambiguates recycled IDs:
 ///
 /// ```no_run
 /// # use ecs_hybrid::*;
@@ -17,13 +35,13 @@
 /// # impl Component for Damage {}
 /// # impl_trait_accessible!(dyn Component; Health, Damage);
 /// # let mut world = World::new();
-/// let enemy = world.create_entity().with(Health(100.0)).build().unwrap();  // ID 5, gen 0
-/// world.destroy_entity(enemy);  // ID 5 added to free list with gen 1
+/// let enemy = world.create_entity().with(Health(100.0)).build().unwrap();
+/// world.destroy_entity(enemy);
 ///
-/// let bullet = world.create_entity().with(Damage(10.0)).build().unwrap();  // Reuses ID 5, gen 1
+/// let bullet = world.create_entity().with(Damage(10.0)).build().unwrap();
 ///
 /// // Old handle is safely invalidated:
-/// assert!(!world.is_entity_valid(enemy));  // gen 0 != gen 1
+/// assert!(!world.is_entity_valid(enemy));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Entity {
@@ -43,37 +61,56 @@ pub struct Entity {
     pub(crate) generation: u32,
 }
 
-impl std::fmt::Display for Entity {
+// =============================================================================
+// Entity — Trait Implementations
+// =============================================================================
+
+impl fmt::Display for Entity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}v{}", self.id, self.generation)
     }
 }
 
 impl Entity {
-    /// Create a new entity with the given id and generation (for testing purposes only)
+    // -------------------------------------------------------------------------
+    // Construction
+    // -------------------------------------------------------------------------
+
+    /// Creates an entity handle for use in test fixtures only.
     #[cfg(test)]
     pub(crate) fn new_for_test(id: u64, generation: u32) -> Self {
         Self { id, generation }
     }
 
-    /// Numeric ID of this entity (slot index, not unique on its own - pair
-    /// with [`generation`](Self::generation) for a unique handle).
+    // -------------------------------------------------------------------------
+    // Property accessors
+    // -------------------------------------------------------------------------
+
+    /// Returns the numeric slot identifier for this entity.
+    ///
+    /// Not unique on its own - pair with [`generation`](Self::generation)
+    /// for a fully unique handle.
     #[inline]
     pub fn id(self) -> u64 {
         self.id
     }
 
-    /// Generation counter that disambiguates recycled IDs.
+    /// Returns the generation counter that disambiguates recycled entity IDs.
     #[inline]
     pub fn generation(self) -> u32 {
         self.generation
     }
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
-mod layout_tests {
+mod tests {
     use super::*;
 
+    /// Verifies that `Entity` is 16 bytes with 8-byte alignment.
     #[test]
     fn entity_size_and_alignment() {
         assert_eq!(

@@ -1,6 +1,21 @@
-//! The [`Query`] entry point - holds an exclusive borrow of the [`World`]
+//! The [`Query`] entry point — holds an exclusive borrow of the [`World`]
 //! and produces sequential or parallel iterators.
+//!
+//! # Responsibilities
+//!
+//! - Constructs queries from a `&mut World` and cached archetype lists.
+//! - Builds [`ComponentMask`] for target and filter types to skip non-matching archetypes.
+//! - Delegates iteration to [`QueryIterMut`] (sequential) or [`ParQueryIter`] (parallel).
+//!
+//! # Design
+//!
+//! The query caches matching archetype IDs with a generation counter so
+//! subsequent calls to [`iter_mut`](Query::iter_mut) avoid rescanning when
+//! no archetypes were added or removed since the last call.
 
+// Standard library
+
+// Current crate
 use crate::archetype::{Archetype, ArchetypeId};
 use crate::component::ComponentMask;
 use crate::world::World;
@@ -9,6 +24,10 @@ use super::filter::QueryFilter;
 use super::iter::{ParQueryIter, QueryIterMut};
 use super::target::QueryTarget;
 use super::FilteredArchetypeRange;
+
+// =============================================================================
+// Query
+// =============================================================================
 
 /// Query for iterating over entities matching a component pattern.
 ///

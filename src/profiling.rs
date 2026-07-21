@@ -1,8 +1,14 @@
-// ----------------------------------------------------------------------------
-// Profiling Abstraction Layer (Tracy Profiler)
-// ----------------------------------------------------------------------------
+//! Tracy profiler abstraction layer with compile-time feature gating.
 //!
-//! All profiling instrumentation lives here. Two feature levels:
+//! # Responsibilities
+//!
+//! - Provides macros (`profile_scope!`, `profile_frame_mark!`, etc.) that
+//!   emit Tracy zones, plots, and messages when profiling features are active.
+//! - Defines [`ProfilingConfig`] constants for allocation sampling rate.
+//! - Computes parallel-utilisation metrics for frame analysis.
+//! - Silently no-ops all instrumentation when no profiling feature is enabled.
+//!
+//! # Design
 //!
 //! | Capability                | `profiling` | `profiling-minimal` | (none) |
 //! |---------------------------|-----------|-------------------|--------|
@@ -59,9 +65,9 @@
 //!     .format(PlotFormat::Number));
 //! ```
 
-// ============================================================================
-// Parallel utilization metrics (only when profiling is active)
-// ============================================================================
+// =============================================================================
+// General Functions
+// =============================================================================
 
 /// Compute thread-utilization percentage for a single frame.
 ///

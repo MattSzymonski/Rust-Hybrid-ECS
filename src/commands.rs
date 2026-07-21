@@ -1,13 +1,15 @@
-// ----------------------------------------------------------------------------
-// Commands - Deferred Operation Queue
-// ----------------------------------------------------------------------------
-//! Commands provide deferred operations on entities and components.
+//! Deferred command queue for structural ECS mutations.
 //!
-//! Instead of modifying the world immediately (which would require mutable
-//! access), commands queue operations to be executed later. This allows
-//! component iterators and multiple systems to run in parallel without conflicts.
+//! # Responsibilities
 //!
-//! ## Frame Lifecycle (Two-Phase Approach)
+//! - Provides [`Commands`] — a deferred-operation queue for creating/destroying
+//!   entities and adding/removing components without holding `&mut World`.
+//! - Implements the two-phase frame lifecycle: systems queue commands during
+//!   execution, then the engine applies them after all systems finish.
+//! - Defines [`CommandError`] for queue-execution failures.
+//! - Provides [`DeferredEntityBuilder`] for ergonomic entity construction via commands.
+//!
+//! # Design
 //!
 //! The ECS uses a two-phase execution model each frame:
 //!
@@ -54,14 +56,23 @@
 //! // and the dead entities are actually removed.
 //! ```
 
+// Standard library
+
+// External crates
+use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
+
+// Current crate
 use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
 use crate::world::World;
-use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
 
-/// Trait for adding a component with its concrete type preserved
+// =============================================================================
+// ComponentAdder
+// =============================================================================
+
+/// Trait for adding a component with its concrete type preserved.
 ///
-/// Must be Send to support parallel execution of systems.
+/// Must be `Send` to support parallel execution of systems.
 pub trait ComponentAdder: Send {
     fn component_id(&self) -> ComponentId;
     fn add_component_to_storage(
@@ -109,6 +120,10 @@ enum DeferredCommand {
         entity: Entity,
     },
 }
+
+// =============================================================================
+// CommandError
+// =============================================================================
 
 /// Error returned when a deferred command cannot be executed.
 ///
@@ -166,6 +181,10 @@ impl std::fmt::Display for CommandError {
         }
     }
 }
+
+// =============================================================================
+// CommandQueue
+// =============================================================================
 
 /// Commands queue for deferred operations
 ///
@@ -443,6 +462,10 @@ impl CommandQueue {
     }
 }
 
+// =============================================================================
+// Commands
+// =============================================================================
+
 /// Commands allows systems to perform deferred entity operations
 ///
 /// This is a system parameter that provides access to the command queue
@@ -473,7 +496,9 @@ impl<'a> Commands<'a> {
         DeferredEntityBuilder {
             command_queue: self.command_queue,
             allocated_entity: entity,
-            components: Vec::with_capacity(crate::config::EntityBuilderConfig::DEFAULT_COMPONENTS_CAPACITY),
+            components: Vec::with_capacity(
+                crate::config::EntityBuilderConfig::DEFAULT_COMPONENTS_CAPACITY,
+            ),
         }
     }
 
@@ -497,6 +522,10 @@ impl<'a> Commands<'a> {
     }
 }
 
+// =============================================================================
+// DeferredEntityBuilder
+// =============================================================================
+
 /// Builder for creating entities with components through the command queue.
 ///
 /// Unlike [`World::EntityBuilder`](crate::world::EntityBuilder) which creates
@@ -518,7 +547,9 @@ impl<'a> DeferredEntityBuilder<'a> {
         Self {
             command_queue,
             allocated_entity: world.allocate_entity(),
-            components: Vec::with_capacity(crate::config::EntityBuilderConfig::DEFAULT_COMPONENTS_CAPACITY),
+            components: Vec::with_capacity(
+                crate::config::EntityBuilderConfig::DEFAULT_COMPONENTS_CAPACITY,
+            ),
         }
     }
 
@@ -544,6 +575,10 @@ impl<'a> DeferredEntityBuilder<'a> {
         entity
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

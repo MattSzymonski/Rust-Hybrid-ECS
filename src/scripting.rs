@@ -1,19 +1,33 @@
-// ----------------------------------------------------------------------------
-// Scripting System
-// ----------------------------------------------------------------------------
-//! Script components that can update themselves each frame.
+//! Script components with deferred structural mutation safety.
 //!
-//! Scripts receive a `ScriptContext` instead of direct `Engine` access.
+//! # Responsibilities
+//!
+//! - Defines [`ScriptComponent`] — a component trait with an `update()` method.
+//! - Provides [`ScriptContext`] — a restricted view of the ECS that forces all
+//!   structural changes through the deferred command queue.
+//!
+//! # Design
+//!
+//! Scripts receive a [`ScriptContext`] instead of direct [`Engine`] access.
 //! This ensures all structural changes (add/remove component, destroy entity)
-//! are automatically deferred, preventing use-after-free bugs.
+//! are automatically deferred, preventing use-after-free bugs that would
+//! occur if a script migrated its own entity while holding `&mut self`.
 
+// Standard library
+
+// External crates
 use trait_type_map::TraitAccessible;
 
+// Current crate
 use crate::commands::CommandQueue;
 use crate::component::Component;
 use crate::entity::Entity;
 use crate::world::World;
 use crate::Resource;
+
+// =============================================================================
+// ScriptContext
+// =============================================================================
 
 /// A restricted context for script components
 ///

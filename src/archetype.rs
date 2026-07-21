@@ -1,7 +1,4 @@
-// ----------------------------------------------------------------------------
-// Archetype Storage System
-// ----------------------------------------------------------------------------
-//! Archetype-based component storage.
+//! Archetype-based component storage with SoA layout.
 //!
 //! An archetype is a unique combination of component types. All entities with
 //! the same set of components are stored together in the same archetype for
@@ -48,9 +45,17 @@ use trait_type_map::{TraitTypeMap, VecFamily};
 use crate::component::{Component, ComponentId, ComponentMask, ComponentTicks};
 use crate::entity::Entity;
 
+// =============================================================================
+// StorageFactory
+// =============================================================================
+
 /// Type for component storage factory functions
 /// These create empty storage for a specific component type
 pub type StorageFactory = Box<dyn Fn(&mut TraitTypeMap<dyn Component, VecFamily>) + Send + Sync>;
+
+// =============================================================================
+// ArchetypeId
+// =============================================================================
 
 /// ArchetypeId uniquely identifies an archetype by its component mask.
 ///
@@ -59,6 +64,13 @@ pub type StorageFactory = Box<dyn Fn(&mut TraitTypeMap<dyn Component, VecFamily>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ArchetypeId(pub u128);
 
+// =============================================================================
+// Archetype
+// =============================================================================
+
+/// Core storage unit grouping entities with the same component set.
+///
+/// Uses a Structure of Arrays (SoA) layout for cache-friendly bulk iteration.
 pub struct Archetype {
     pub id: ArchetypeId,
     pub component_types: Vec<ComponentId>, // Still needed for iteration/lookup

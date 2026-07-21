@@ -1,8 +1,23 @@
 //! Sequential and parallel iterators produced by [`Query`](super::Query).
+//!
+//! # Responsibilities
+//!
+//! - Implements [`QueryIterMut`] for sequential, single-threaded iteration.
+//! - Implements [`ParQueryIter`] for Rayon-based parallel iteration with work stealing.
+//! - Provides [`BatchStats`] for inspecting parallel work distribution across threads.
+//!
+//! # Design
+//!
+//! Both iterators walk the query's cached matching-archetype list. Sequential
+//! iteration visits archetypes in order; parallel iteration slices the entity
+//! range into Rayon work units. Per-archetype component pointers are cached
+//! as raw pointers to avoid repeated HashMap lookups during iteration.
 
+// Standard library
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+// Current crate
 use crate::archetype::{Archetype, ArchetypeId};
 use crate::component::Tick;
 use crate::config;
@@ -12,9 +27,9 @@ use super::filter::QueryFilter;
 use super::target::QueryTarget;
 use super::FilteredArchetypeRange;
 
-// ----------------------------------------------------------------------------
-// Batch Statistics
-// ----------------------------------------------------------------------------
+// =============================================================================
+// BatchStats
+// =============================================================================
 
 /// Statistics about batch distribution during parallel iteration.
 ///
@@ -51,9 +66,9 @@ impl std::fmt::Display for BatchStats {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Sequential Iterator
-// ----------------------------------------------------------------------------
+// =============================================================================
+// QueryIterMut (Sequential)
+// =============================================================================
 
 /// Sequential iterator for mutable queries.
 pub struct QueryIterMut<'w, Q: QueryTarget, F: QueryFilter = ()> {
@@ -207,9 +222,9 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Iterator for QueryIterMut<'w, Q, F> {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Parallel Iterator
-// ----------------------------------------------------------------------------
+// =============================================================================
+// ParQueryIter (Parallel)
+// =============================================================================
 
 /// Parallel iterator for queries using Rayon.
 ///
@@ -770,6 +785,10 @@ where
         }
     }
 }
+
+// =============================================================================
+// ParForEachResult
+// =============================================================================
 
 /// Result of parallel for_each execution.
 #[derive(Debug, Clone, Default)]

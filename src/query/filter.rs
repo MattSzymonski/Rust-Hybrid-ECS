@@ -1,24 +1,32 @@
-//! [`QueryFilter`] trait and built-in filter types.
+//! [`QueryFilter`] trait and built-in filter types for entity-level predicates.
 //!
-//! Filters are composable predicates that decide which entities a query
-//! yields beyond the basic component-set match implied by the
-//! [`QueryTarget`].
+//! # Responsibilities
 //!
-//! Built-in filters:
+//! - Defines the [`QueryFilter`] trait that layers row-level predicates on queries.
+//! - Implements [`With`] / [`Without`] for archetype-level component scoping.
+//! - Implements [`Changed`] / [`Added`] for per-entity change-detection filtering.
+//! - Implements [`Or`] for logical-OR composition of multiple filters.
 //!
-//! - [`With<T>`] / [`Without<T>`] - archetype-level scoping
-//! - [`Changed<T>`] / [`Added<T>`] - row-level change-detection
-//! - Tuples - logical AND of inner filters
-//! - [`Or`] - logical OR of inner filters
+//! # Design
+//!
+//! Filters produce (include_mask, exclude_mask) pairs that are checked against
+//! each archetype's component mask at iteration start. `With<T>` adds T to the
+//! include set; `Without<T>` adds T to the exclude set. `Changed<T>` and
+//! `Added<T>` compare per-entity tick values against the calling system's
+//! last-run baseline. `Or` produces multiple pairs — an archetype matches if
+//! any pair passes.
 
+// Standard library
+
+// Current crate
 use crate::archetype::Archetype;
 use crate::component::{Component, ComponentId, ComponentTicks, Tick};
 
 use super::ptr::SendPtr;
 
-// ----------------------------------------------------------------------------
-// QueryFilter Trait
-// ----------------------------------------------------------------------------
+// =============================================================================
+// QueryFilter
+// =============================================================================
 
 /// Trait for predicates that decide which entities a query yields beyond
 /// the basic component-set match implied by the [`QueryTarget`].
@@ -43,6 +51,11 @@ use super::ptr::SendPtr;
 /// [`excluded_component_ids`]: QueryFilter::excluded_component_ids
 /// [`init_state`]: QueryFilter::init_state
 /// [`matches`]: QueryFilter::matches
+
+// =============================================================================
+// QueryFilter
+// =============================================================================
+
 pub trait QueryFilter {
     /// Per-archetype cached state used by [`Self::matches`].
     type State: Send + Sync;
@@ -97,9 +110,9 @@ pub trait QueryFilter {
     fn matches(state: &Self::State, index: usize) -> bool;
 }
 
-// ----------------------------------------------------------------------------
-// Trivial filter: ()
-// ----------------------------------------------------------------------------
+// =============================================================================
+// Trivial Filter: ()
+// =============================================================================
 
 /// The unit type acts as a no-op filter that accepts every row.
 impl QueryFilter for () {
@@ -114,9 +127,9 @@ impl QueryFilter for () {
     }
 }
 
-// ----------------------------------------------------------------------------
-// With<T> / Without<T>
-// ----------------------------------------------------------------------------
+// =============================================================================
+// With
+// =============================================================================
 
 /// Archetype filter: only yield rows whose archetype contains `T`.
 ///
@@ -139,6 +152,9 @@ impl<T: Component> QueryFilter for With<T> {
         true
     }
 }
+// =============================================================================
+// Without
+// =============================================================================
 
 /// Archetype filter: only yield rows whose archetype does NOT contain `T`.
 pub struct Without<T: Component>(std::marker::PhantomData<T>);
@@ -158,9 +174,9 @@ impl<T: Component> QueryFilter for Without<T> {
     }
 }
 
-// ----------------------------------------------------------------------------
+// =============================================================================
 // Changed<T> / Added<T>
-// ----------------------------------------------------------------------------
+// =============================================================================
 
 /// Per-row state shared by `Changed<T>` and `Added<T>`: a `Send` pointer to
 /// the archetype's tick vector plus the comparison window.
@@ -208,6 +224,10 @@ impl TickFilterState {
     }
 }
 
+// =============================================================================
+// Changed
+// =============================================================================
+
 /// Row filter: yields only entities whose `T` was mutated (or added) since
 /// the system that owns this query last ran.
 ///
@@ -243,6 +263,10 @@ impl<T: Component> QueryFilter for Changed<T> {
     }
 }
 
+// =============================================================================
+// Added
+// =============================================================================
+
 /// Row filter: yields only entities whose `T` was added since the system
 /// that owns this query last ran.
 pub struct Added<T: Component>(std::marker::PhantomData<T>);
@@ -274,9 +298,9 @@ impl<T: Component> QueryFilter for Added<T> {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Tuple filters: AND of all components
-// ----------------------------------------------------------------------------
+// =============================================================================
+// Tuple Filters (AND)
+// =============================================================================
 
 /// Compute the cross-product of filter pairs for AND semantics.
 ///
@@ -359,9 +383,9 @@ impl_query_filter_tuple!(A, B);
 impl_query_filter_tuple!(A, B, C);
 impl_query_filter_tuple!(A, B, C, D);
 
-// ----------------------------------------------------------------------------
-// Or<F>: yield rows that satisfy ANY filter in the tuple
-// ----------------------------------------------------------------------------
+// =============================================================================
+// Or<F> (Disjunction)
+// =============================================================================
 
 /// Disjunction over a tuple of filters: a row matches if at least one
 /// inner filter matches it.
@@ -373,6 +397,11 @@ impl_query_filter_tuple!(A, B, C, D);
 ///
 /// [`archetype_filter_pairs`]: QueryFilter::archetype_filter_pairs
 /// [`matches`]: QueryFilter::matches
+
+// =============================================================================
+// Or
+// =============================================================================
+
 pub struct Or<F>(std::marker::PhantomData<F>);
 
 macro_rules! impl_query_filter_or {

@@ -1,9 +1,11 @@
-// ----------------------------------------------------------------------------
-// Archetype-based ECS - Library binary
-// ----------------------------------------------------------------------------
-// This is a minimal binary that demonstrates the library is loaded.
-// For full examples, use: cargo run --example <name>
-//   e.g. cargo run --example iterators_stress_test
+//! Minimal binary demonstrating the ECS library is loaded.
+//!
+//! # Responsibilities
+//!
+//! - Prints version and entity count to confirm the library initialises correctly.
+//! - Lists available examples for users to explore.
+//!
+//! For full examples, use `cargo run --example <name>`.
 
 use ecs_hybrid::Engine;
 

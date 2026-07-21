@@ -1,24 +1,32 @@
-// ----------------------------------------------------------------------------
-// Parallel System Scheduler
-// ----------------------------------------------------------------------------
-//! Automatic dependency analysis and parallel system execution.
+//! Dependency analysis and parallel batch scheduling for system execution.
 //!
-//! This module analyzes component access patterns to build a dependency graph
-//! and executes systems in parallel batches when safe to do so.
+//! # Responsibilities
 //!
-//! ## How it works:
-//! - When a system is registered, it reports its access pattern (which components it reads/writes, whether it uses Commands).
-//! - The scheduler builds an execution graph that groups systems into batches that can run in
-//!   parallel without conflicts (no read-write or write-write conflicts, and Commands require exclusive access).
-//! - During frame processing and if parallel execution is enabled, the scheduler executes each batch in parallel using Rayon.
-//! - Systems that use Commands are executed sequentially to ensure safe access to the World.
-//! - The scheduler dependency analysis ensures that no two systems that access the same component in a conflicting way
-//!   are run in parallel, preventing data races and ensuring thread safety.
+//! - Analyzes component read/write access patterns across registered systems.
+//! - Builds a dependency graph and groups independent systems into parallel batches.
+//! - Provides [`SystemAccess`] for declaring per-system access requirements.
+//! - Implements O(1) conflict detection via [`ComponentMask`] bitwise AND.
+//! - Defines [`TypeKey`] as the shared foundation for [`ComponentId`] and [`ResourceId`].
+//!
+//! # Design
+//!
+//! Each system declares which components it reads and writes. The scheduler
+//! performs O(n²) pairwise conflict analysis using precomputed bitmasks:
+//! two systems conflict if one writes a component the other reads or writes.
+//! Systems with no conflicts can run in the same parallel batch. Systems
+//! that use [`Commands`] are always executed sequentially for safety.
 
-use crate::component::{ComponentId, ComponentMask};
-use crate::resource::ResourceId;
+// Standard library
 use std::any::TypeId;
 use std::collections::HashSet;
+
+// Current crate
+use crate::component::{ComponentId, ComponentMask};
+use crate::resource::ResourceId;
+
+// =============================================================================
+// TypeKey
+// =============================================================================
 
 /// Shared type-key wrapper around [`TypeId`], used as the foundation for
 /// both [`ComponentId`] and [`ResourceId`].
@@ -39,6 +47,10 @@ impl TypeKey {
         self.0
     }
 }
+
+// =============================================================================
+// SystemAccess
+// =============================================================================
 
 /// Component access information for a system.
 ///
@@ -178,6 +190,10 @@ impl SystemAccess {
         false
     }
 }
+
+// =============================================================================
+// SystemScheduler
+// =============================================================================
 
 /// Execution scheduler that builds parallel batches from system dependencies
 pub struct SystemScheduler {
@@ -337,6 +353,10 @@ impl SystemScheduler {
     }
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,6 +410,14 @@ mod tests {
         }
     }
 
+    /// Verifies that two systems reading different components can run in the same batch.
+    ///
+    /// This test verifies that:
+    /// - Read-read access to different components creates no conflict.
+    /// - Both systems are placed in a single parallel batch.
+    ///
+    /// Expected results:
+    /// - One execution batch containing both systems.
     #[test]
     fn test_no_conflicts() {
         let mut scheduler = SystemScheduler::new();
@@ -414,6 +442,14 @@ mod tests {
         assert_eq!(scheduler.execution_graph()[0].len(), 2);
     }
 
+    /// Verifies that two systems writing the same component cannot run together.
+    ///
+    /// This test verifies that:
+    /// - Write-write access to the same component creates a conflict.
+    /// - Systems are placed in separate batches.
+    ///
+    /// Expected results:
+    /// - Two execution batches, each containing one system.
     #[test]
     fn test_write_conflict() {
         let mut scheduler = SystemScheduler::new();
@@ -437,6 +473,14 @@ mod tests {
         assert_eq!(scheduler.execution_graph().len(), 2);
     }
 
+    /// Verifies that a reader and writer of the same component cannot run together.
+    ///
+    /// This test verifies that:
+    /// - Read-write access to the same component creates a conflict.
+    /// - The reader and writer are placed in separate batches.
+    ///
+    /// Expected results:
+    /// - Two execution batches, each containing one system.
     #[test]
     fn test_read_write_conflict() {
         let mut scheduler = SystemScheduler::new();
@@ -460,6 +504,14 @@ mod tests {
         assert_eq!(scheduler.execution_graph().len(), 2);
     }
 
+    /// Verifies that a Commands-using system conflicts with everything.
+    ///
+    /// This test verifies that:
+    /// - A system using Commands conflicts with a read-only system.
+    /// - Command systems always run in their own exclusive batch.
+    ///
+    /// Expected results:
+    /// - Two execution batches.
     #[test]
     fn test_commands_exclusive() {
         let mut scheduler = SystemScheduler::new();
@@ -483,6 +535,13 @@ mod tests {
         assert_eq!(scheduler.execution_graph().len(), 2);
     }
 
+    /// Verifies that multiple readers of the same component can all run in parallel.
+    ///
+    /// This test verifies that:
+    /// - Five systems reading the same component can coexist in one batch.
+    ///
+    /// Expected results:
+    /// - One batch containing all five systems.
     #[test]
     fn test_multiple_readers_parallel() {
         let mut scheduler = SystemScheduler::new();
@@ -504,6 +563,13 @@ mod tests {
         assert_eq!(scheduler.execution_graph()[0].len(), 5);
     }
 
+    /// Verifies that a single writer blocks all readers of the same component.
+    ///
+    /// This test verifies that:
+    /// - One writer forces all readers of the same component into separate batches.
+    ///
+    /// Expected results:
+    /// - At least two batches (readers and writer must not share a batch).
     #[test]
     fn test_single_writer_blocks_all() {
         let mut scheduler = SystemScheduler::new();
@@ -529,6 +595,13 @@ mod tests {
         assert!(scheduler.execution_graph().len() >= 2);
     }
 
+    /// Verifies that a chain of dependent systems is correctly serialized.
+    ///
+    /// This test verifies that:
+    /// - A→B→C dependency chain is detected and no conflicting systems share a batch.
+    ///
+    /// Expected results:
+    /// - Between 2 and 3 batches with no internal conflicts.
     #[test]
     fn test_complex_dependency_graph() {
         let mut scheduler = SystemScheduler::new();
@@ -561,6 +634,13 @@ mod tests {
         assert_all_systems_scheduled(&scheduler, 4);
     }
 
+    /// Verifies that systems writing disjoint component sets can run in parallel.
+    ///
+    /// This test verifies that:
+    /// - Three systems writing three different component types have no conflicts.
+    ///
+    /// Expected results:
+    /// - One batch containing all three systems.
     #[test]
     fn test_disjoint_component_sets() {
         let mut scheduler = SystemScheduler::new();
@@ -590,6 +670,13 @@ mod tests {
         assert_eq!(scheduler.execution_graph()[0].len(), 3);
     }
 
+    /// Verifies that multiple Commands-using systems all run sequentially.
+    ///
+    /// This test verifies that:
+    /// - Three Command systems each conflict with each other.
+    ///
+    /// Expected results:
+    /// - Three separate batches, one per command system.
     #[test]
     fn test_multiple_commands_sequential() {
         let mut scheduler = SystemScheduler::new();
@@ -610,6 +697,13 @@ mod tests {
         assert_eq!(scheduler.execution_graph().len(), 3);
     }
 
+    /// Verifies that Command and read-only systems are correctly interleaved.
+    ///
+    /// This test verifies that:
+    /// - Two command systems and two read-only systems are scheduled correctly.
+    ///
+    /// Expected results:
+    /// - No batch contains conflicting systems.
     #[test]
     fn test_mixed_commands_and_queries() {
         let mut scheduler = SystemScheduler::new();
@@ -640,6 +734,7 @@ mod tests {
         assert_all_systems_scheduled(&scheduler, 4);
     }
 
+    /// Verifies that an empty scheduler produces an empty execution graph.
     #[test]
     fn test_empty_scheduler() {
         let mut scheduler = SystemScheduler::new();
@@ -648,6 +743,7 @@ mod tests {
         assert_eq!(scheduler.execution_graph().len(), 0);
     }
 
+    /// Verifies that a single-system scheduler produces one batch with one system.
     #[test]
     fn test_single_system() {
         let mut scheduler = SystemScheduler::new();
@@ -665,6 +761,13 @@ mod tests {
         assert_eq!(scheduler.execution_graph()[0].len(), 1);
     }
 
+    /// Verifies that chained read-write dependencies produce correct batches.
+    ///
+    /// This test verifies that:
+    /// - System0 writes A, System1 reads A + writes B, System2 reads B + writes C.
+    ///
+    /// Expected results:
+    /// - Between 2 and 3 batches with no internal conflicts.
     #[test]
     fn test_chain_dependencies() {
         let mut scheduler = SystemScheduler::new();
@@ -700,6 +803,7 @@ mod tests {
         assert!(scheduler.execution_graph().len() <= 3);
     }
 
+    /// Verifies that five systems writing five different components form one batch.
     #[test]
     fn test_large_parallel_batch() {
         // Test with 5 systems all accessing different components
@@ -740,10 +844,10 @@ mod tests {
         assert_eq!(scheduler.execution_graph()[0].len(), 5);
     }
 
-    // ----------------------------------------------------------------------------
-    // Resource Conflict Tests
+    /// Resource Conflict Tests
     // ----------------------------------------------------------------------------
 
+    /// Verifies that two systems reading the same resource can run in parallel.
     #[test]
     fn test_resource_read_read_parallel() {
         let mut scheduler = SystemScheduler::new();
@@ -767,6 +871,7 @@ mod tests {
         assert_eq!(scheduler.execution_graph()[0].len(), 2);
     }
 
+    /// Verifies that two systems writing the same resource must run sequentially.
     #[test]
     fn test_resource_write_write_conflict() {
         let mut scheduler = SystemScheduler::new();
@@ -789,6 +894,7 @@ mod tests {
         assert_eq!(scheduler.execution_graph().len(), 2);
     }
 
+    /// Verifies that a resource reader and writer of the same resource conflict.
     #[test]
     fn test_resource_read_write_conflict() {
         let mut scheduler = SystemScheduler::new();
@@ -811,6 +917,7 @@ mod tests {
         assert_eq!(scheduler.execution_graph().len(), 2);
     }
 
+    /// Verifies that writers of different resources can run in parallel.
     #[test]
     fn test_resource_disjoint_writes_parallel() {
         let mut scheduler = SystemScheduler::new();
@@ -834,6 +941,7 @@ mod tests {
         assert_eq!(scheduler.execution_graph()[0].len(), 2);
     }
 
+    /// Verifies correct conflict detection when both component and resource access patterns mix.
     #[test]
     fn test_resource_and_component_mixed() {
         let mut scheduler = SystemScheduler::new();
@@ -866,6 +974,12 @@ mod tests {
         assert!(scheduler.execution_graph().len() >= 2);
     }
 
+    /// Verifies that `conflicts_with` uses the ComponentMask fast path when masks are built.
+    ///
+    /// This test verifies that:
+    /// - After calling `build_component_masks`, the bitmask path is active.
+    /// - Write-write, read-write, and read-read conflicts are correctly detected via masks.
+    /// - Disjoint component types correctly report no conflict.
     #[test]
     fn test_conflicts_with_uses_component_mask_fast_path() {
         // Verify that conflicts_with correctly detects conflicts via the
@@ -950,8 +1064,7 @@ mod tests {
         );
     }
 
-    // ----------------------------------------------------------------------------
-    // Empirical verification: exhaustive enumeration + random fuzz
+    /// Empirical verification: exhaustive enumeration + random fuzz
     // ----------------------------------------------------------------------------
     //
     // These tests do NOT constitute a mathematical proof. They are empirical
@@ -1014,6 +1127,10 @@ mod tests {
     /// n-tuples are generated by counting in base 10: counter 0 → [None,
     /// None, ...], counter 1 → [ReadA, None, ...], etc. This covers every
     /// combination with repetition (systems can have the same access kind).
+    /// Exhaustively verifies all 1,111,110 possible system combinations for n=1..=6.
+    ///
+    /// Enumerates every n-tuple of access kinds (10 kinds) and verifies that no batch
+    /// contains conflicting systems and every system is scheduled exactly once.
     #[test]
     fn proof_exhaustive_small_n() {
         let kinds: Vec<AccessKind> = vec![
@@ -1068,6 +1185,10 @@ mod tests {
     /// Generator) seeded from a hashed seed value. This gives
     /// deterministic-but-varied sequences - reproducible if a failure
     /// is found, but covering a wide range of patterns across seeds.
+    /// Randomised fuzz test for larger system counts (up to 20 systems, 500 seeds).
+    ///
+    /// Generates ~10,000 random conflict graphs and verifies the same invariants
+    /// as the exhaustive test: no batch conflicts and every system scheduled once.
     #[test]
     fn proof_random_fuzz_large_n() {
         let kinds: Vec<AccessKind> = vec![

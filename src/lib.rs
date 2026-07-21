@@ -1,22 +1,16 @@
-// ----------------------------------------------------------------------------
-// Archetype-based ECS Library
-// ----------------------------------------------------------------------------
-//! A high-performance Entity Component System (ECS) implementation using
-//! archetype-based storage for optimal cache locality and query performance.
-
-pub mod archetype;
-pub mod commands;
-pub mod component;
-pub mod config;
-pub mod engine;
-pub mod entity;
-pub mod profiling;
-pub mod query;
-pub mod resource;
-pub mod scheduler;
-pub mod scripting;
-pub mod system;
-pub mod world;
+//! High-performance Entity Component System with archetype-based storage.
+//!
+//! # Responsibilities
+//!
+//! - Re-exports all public types for convenient single-import usage (`use ecs_hybrid::*`).
+//! - Declares all public modules that compose the ECS library.
+//! - Configures the Tracy profiled allocator when the `profiling` feature is active.
+//!
+//! # Design
+//!
+//! The crate root is a thin re-export layer. All implementation lives in
+//! submodules (`world`, `query`, `scheduler`, etc.). Users import everything
+//! from `ecs_hybrid` without needing deep module paths.
 
 // ----------------------------------------------------------------------------
 // Tracy ProfiledAllocator - tracks allocations in Tracy's memory view.
@@ -31,7 +25,27 @@ static ALLOC: tracy_client::ProfiledAllocator<std::alloc::System> =
         crate::config::ProfilingConfig::MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY,
     );
 
-// Re-export commonly used types
+// =============================================================================
+// Public Modules
+// =============================================================================
+
+pub mod archetype;
+pub mod commands;
+pub mod component;
+pub mod config;
+pub mod engine;
+pub mod entity;
+pub mod profiling;
+pub mod query;
+pub mod resource;
+pub mod scheduler;
+pub mod scripting;
+pub mod system;
+pub mod world;
+// =============================================================================
+// Public Re-exports
+// =============================================================================
+
 pub use commands::{CommandError, Commands};
 pub use component::{Component, ComponentId, ComponentTicks, Tick};
 pub use engine::Engine;

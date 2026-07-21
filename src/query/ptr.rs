@@ -1,9 +1,24 @@
 //! Thread-safe raw-pointer wrappers used internally by the query system.
 //!
-//! These wrappers allow caching pointers to archetype-owned storage
-//! across thread boundaries during parallel iteration. Safety relies on
-//! the scheduler guaranteeing exclusive `World` access for the lifetime
-//! of the query and disjoint per-row access between threads.
+//! # Responsibilities
+//!
+//! - Provides [`SendPtr<T>`] and [`SendPtrMut<T>`] — raw-pointer wrappers
+//!   that implement [`Send`] and [`Sync`] for cross-thread sharing.
+//! - Caches pointers to archetype-owned storage so worker threads can
+//!   access components without repeated HashMap lookups.
+//!
+//! # Design
+//!
+//! These wrappers hold plain addresses with no ownership semantics. Moving
+//! them between threads is harmless; sharing `&SendPtr<T>` only allows
+//! copying the address. Actual dereference requires `unsafe` blocks that
+//! the query system protects through the scheduler's disjoint-access guarantee.
+
+// Standard library
+
+// =============================================================================
+// SendPtr
+// =============================================================================
 
 /// A wrapper for `*const T` that implements [`Send`] and [`Sync`].
 ///
@@ -33,6 +48,10 @@ impl<T> SendPtr<T> {
         self.0
     }
 }
+
+// =============================================================================
+// SendPtrMut
+// =============================================================================
 
 /// A wrapper for `*mut T` that implements [`Send`] and [`Sync`].
 ///

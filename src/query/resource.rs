@@ -1,8 +1,26 @@
-//! [`Res`] / [`ResMut`] system parameters for resource access.
+//! [`Res`] and [`ResMut`] system parameters for resource access in systems.
+//!
+//! # Responsibilities
+//!
+//! - Provides [`Res<T>`] for immutable singleton resource access from system functions.
+//! - Provides [`ResMut<T>`] for mutable resource access with change-detection tracking.
+//!
+//! # Design
+//!
+//! These types implement [`SystemParam`] so they can appear as system function
+//! parameters. The scheduler tracks resource reads and writes for conflict
+//! detection, ensuring no two systems obtain `&mut` to the same resource simultaneously.
 
+// Standard library
+
+// Current crate
 use crate::query::change_detection::Mut;
 use crate::resource::Resource;
 use crate::world::World;
+
+// =============================================================================
+// Res
+// =============================================================================
 
 /// Immutable resource access for systems.
 ///

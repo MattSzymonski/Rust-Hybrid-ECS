@@ -1,28 +1,29 @@
-//! # Query System - Component Access and Iteration
+//! Query system — efficient iteration over entities with specific components.
 //!
-//! Queries provide efficient iteration over entities with specific components.
-//! The query system uses the [`QueryTarget`] trait to support flexible component
-//! access patterns (immutable / mutable / `Entity`) and the [`QueryFilter`]
-//! trait to layer additional predicates on top, including change detection.
+//! # Responsibilities
 //!
-//! ## How it works
-//! - The `Query` struct is parameterized by a [`QueryTarget`] (the data
-//!   yielded per row) and a [`QueryFilter`] (an optional predicate).
-//! - Component requirements from the target and filter are folded into a
-//!   single [`ComponentMask`] used to skip non-matching archetypes.
-//! - For parallel iteration, per-archetype state caches raw pointers so
-//!   worker threads access components without repeated lookups.
-//! - [`BatchStats`] reports how Rayon distributed work across threads.
+//! - Defines the [`Query`] type as the primary entry point for component iteration.
+//! - Provides [`QueryTarget`] for data shapes (`&T`, `&mut T`, `Entity`, tuples).
+//! - Provides [`QueryFilter`] for predicates (`With`, `Without`, `Changed`, `Added`, `Or`).
+//! - Implements sequential ([`QueryIterMut`]) and parallel ([`ParQueryIter`]) iterators.
+//! - Re-exports [`Res`] / [`ResMut`] for resource access in systems.
+//!
+//! # Design
+//!
+//! The query is parameterized by a target (what data to fetch) and a filter
+//! (which entities to skip). Both fold their component requirements into a
+//! single [`ComponentMask`] used to skip non-matching archetypes via bitwise
+//! AND. For parallel iteration, per-archetype state caches raw pointers so
+//! worker threads access components without repeated lookups.
 //!
 //! ## Module layout
 //!
-//! - [`target`] - the [`QueryTarget`] trait and its impls (`Entity`, `&T`,
-//!   `&mut T`, tuples)
-//! - [`filter`] - the [`QueryFilter`] trait and concrete filters
-//!   ([`With`], [`Without`], [`Changed`], [`Added`], [`Or`])
-//! - [`iter`] - the sequential and parallel iterator types
-//! - [`ptr`] - thread-safe raw-pointer wrappers shared by target and filter
-//! - [`resource`] - [`Res`] / [`ResMut`] system parameters
+//! - [`target`] — the [`QueryTarget`] trait and its impls
+//! - [`filter`] — the [`QueryFilter`] trait and concrete filters
+//! - [`iter`] — sequential and parallel iterator types
+//! - [`ptr`] — thread-safe raw-pointer wrappers
+//! - [`resource`] — [`Res`] / [`ResMut`] system parameters
+//! - [`change_detection`] — [`Mut`] smart pointer for tick tracking
 //!
 //! ## Usage Examples
 //!
@@ -61,9 +62,14 @@ mod query;
 mod resource;
 mod target;
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests;
 
+// Current crate
 use crate::archetype::ArchetypeId;
 
 pub use filter::{Added, Changed, Or, QueryFilter, With, Without};

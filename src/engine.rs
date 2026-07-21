@@ -1,23 +1,41 @@
-// ----------------------------------------------------------------------------
-// Engine - System Registration and Frame Execution
-// ----------------------------------------------------------------------------
-//! The Engine manages system execution and frame processing.
+//! System registration, frame execution, and parallel dispatch orchestration.
 //!
-//! It provides:
-//! - System registration with names for debugging
-//! - Two-phase frame processing: systems execute → deferred commands execute
-//! - System state management (for persistent data between frames)
+//! # Responsibilities
+//!
+//! - Registers systems by name and manages their lifecycle (enable/disable).
+//! - Orchestrates the two-phase frame: execute systems in parallel batches,
+//!   then apply deferred commands from the queue.
+//! - Manages frame-rate limiting via `set_fps_limit`.
+//! - Tracks per-system execution duration for adaptive parallelism hints.
+//! - Provides `world()` and `world_mut()` accessors for ad-hoc queries.
+//!
+//! # Design
+//!
+//! The engine owns the [`World`], [`SystemScheduler`], and [`CommandQueue`].
+//! Each frame: (1) bump the world tick, (2) walk the scheduler's execution
+//! graph running systems in parallel batches via Rayon, (3) flush deferred
+//! commands. Systems that use [`Commands`] always run sequentially due to
+//! their exclusive-world-access requirement.
 
+// Standard library
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+// External crates
+use rayon::prelude::*;
+
+// Current crate
 use crate::commands::{CommandError, CommandQueue};
 use crate::component::Tick;
 use crate::config::ParallelProcessingConfig;
 use crate::scheduler::{SystemAccess, SystemScheduler};
 use crate::system::{IntoSystem, System, SystemParam};
 use crate::world::{set_per_thread_last_run_tick, World};
-use rayon::prelude::*;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+
+// =============================================================================
+// RegisteredSystem
+// =============================================================================
 
 /// Wrapper for a registered system with its name
 struct RegisteredSystem {
@@ -55,6 +73,11 @@ struct RegisteredSystem {
 /// // Every frame:
 /// engine.process_frame().unwrap();
 /// ```
+
+// =============================================================================
+// Engine
+// =============================================================================
+
 pub struct Engine {
     /// All registered systems with their names and states
     systems: Vec<RegisteredSystem>,
@@ -84,6 +107,10 @@ pub struct Engine {
 }
 
 impl Engine {
+    // -------------------------------------------------------------------------
+    // Construction
+    // -------------------------------------------------------------------------
+
     /// Create a new Engine with no systems
     pub fn new() -> Self {
         // !!! Order matters: name the main thread in Tracy BEFORE any zone
@@ -148,6 +175,10 @@ impl Default for Engine {
 }
 
 impl Engine {
+    // -------------------------------------------------------------------------
+    // Configuration
+    // -------------------------------------------------------------------------
+
     /// Enable or disable parallel system execution
     pub fn set_parallel_execution(&mut self, enabled: bool) {
         self.parallel_execution = enabled;
@@ -205,6 +236,10 @@ impl Engine {
         false
     }
 
+    // -------------------------------------------------------------------------
+    // Inspection
+    // -------------------------------------------------------------------------
+
     /// Check if a system is enabled
     ///
     /// Returns None if the system was not found.
@@ -221,6 +256,10 @@ impl Engine {
         self.scheduler.print_execution_graph(&names);
     }
 
+    // -------------------------------------------------------------------------
+    // World Access
+    // -------------------------------------------------------------------------
+
     /// Get a reference to the world
     pub fn world(&self) -> &World {
         &self.world
@@ -230,6 +269,10 @@ impl Engine {
     pub fn world_mut(&mut self) -> &mut World {
         &mut self.world
     }
+
+    // -------------------------------------------------------------------------
+    // System Registration
+    // -------------------------------------------------------------------------
 
     /// Register a system with a name
     ///
@@ -279,6 +322,10 @@ impl Engine {
         // Rebuild execution graph
         self.scheduler.build_execution_graph();
     }
+
+    // -------------------------------------------------------------------------
+    // Frame Processing
+    // -------------------------------------------------------------------------
 
     /// Process one frame - execute all systems then apply deferred commands
     ///
@@ -451,6 +498,10 @@ impl Engine {
         result
     }
 
+    // -------------------------------------------------------------------------
+    // Internal: Sequential Execution
+    // -------------------------------------------------------------------------
+
     /// Run systems sequentially (fallback or when parallel is disabled)
     fn run_systems_sequential(&mut self) {
         let _zone = crate::profile_scope!(
@@ -497,6 +548,10 @@ impl Engine {
         // predictably.
         self.world.system_last_run = 0;
     }
+
+    // -------------------------------------------------------------------------
+    // Internal: Parallel Execution
+    // -------------------------------------------------------------------------
 
     /// Run systems in parallel batches based on dependency analysis
     ///

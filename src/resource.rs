@@ -1,17 +1,18 @@
-// ----------------------------------------------------------------------------
-// Resource System
-// ----------------------------------------------------------------------------
-//! Resources are singleton data stored in the World, not attached to entities.
+//! Singleton resources stored in the [`World`], not attached to entities.
 //!
-//! Resources represent global/shared state such as time, input, configuration,
-//! asset stores, etc. They can be accessed by systems through `Res<T>` (immutable)
-//! and `ResMut<T>` (mutable) system parameters.
+//! # Responsibilities
 //!
-//! ## Resource Handles
+//! - Defines the [`Resource`] marker trait for global/shared state types.
+//! - Provides [`ResourceId`] for type-erased resource identification.
+//! - Implements [`ResHandle`] — a lightweight, copyable handle for deferred resource access.
 //!
-//! `ResHandle<T>` provides a lightweight, typed reference to a resource that can
-//! be stored and passed around without borrowing the World. Handles can be used
-//! to retrieve the resource later from the World.
+//! # Design
+//!
+//! Resources represent global state such as time, input, configuration,
+//! and asset stores. They are accessed by systems through `Res<T>` (immutable)
+//! and `ResMut<T>` (mutable) system parameters. [`ResHandle<T>`] provides a
+//! zero-cost typed reference that can be stored and passed around without
+//! borrowing the [`World`].
 //!
 //! ## Usage
 //!
@@ -38,11 +39,17 @@
 //! }
 //! ```
 
+// Standard library
 use std::any::TypeId;
 use std::marker::PhantomData;
 
+// Current crate
 use crate::scheduler::TypeKey;
 use crate::world::World;
+
+// =============================================================================
+// Resource
+// =============================================================================
 
 /// Resource marker trait - resources are singleton data stored in the World.
 ///
@@ -51,6 +58,10 @@ use crate::world::World;
 ///
 /// Resources must be Send + Sync to support parallel system access.
 pub trait Resource: Send + Sync + 'static {}
+
+// =============================================================================
+// ResourceId
+// =============================================================================
 
 /// ResourceId uniquely identifies a resource type using its TypeId.
 ///
@@ -76,6 +87,10 @@ impl From<ResourceId> for TypeKey {
         TypeKey(id.0)
     }
 }
+
+// =============================================================================
+// ResHandle
+// =============================================================================
 
 /// A lightweight, typed handle to a resource in the World.
 ///
@@ -172,9 +187,9 @@ impl<T: Resource> std::fmt::Debug for ResHandle<T> {
     }
 }
 
-// ----------------------------------------------------------------------------
+// =============================================================================
 // Tests
-// ----------------------------------------------------------------------------
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -191,6 +206,7 @@ mod tests {
     }
     impl Resource for GameTime {}
 
+    /// Verifies that `ResourceId` stores the correct TypeId internally.
     #[test]
     fn test_resource_id() {
         let id1 = ResourceId::of::<Score>();
@@ -201,18 +217,21 @@ mod tests {
         assert_ne!(id1, id3);
     }
 
+    /// Verifies that `ResHandle::new()` creates a handle for the correct type.
     #[test]
     fn test_res_handle_new() {
         let handle = ResHandle::<Score>::new();
         assert_eq!(handle.id(), ResourceId::of::<Score>());
     }
 
+    /// Verifies that `ResHandle::default()` creates a valid zero-cost handle.
     #[test]
     fn test_res_handle_default() {
         let handle = ResHandle::<Score>::default();
         assert_eq!(handle.id(), ResourceId::of::<Score>());
     }
 
+    /// Verifies that `ResHandle` implements Copy and Clone correctly.
     #[test]
     fn test_res_handle_copy_clone() {
         let handle = ResHandle::<Score>::new();
@@ -223,6 +242,7 @@ mod tests {
         assert_eq!(handle.id(), handle3.id());
     }
 
+    /// Verifies that `ResHandle` implements Debug for diagnostic output.
     #[test]
     fn test_res_handle_debug() {
         let handle = ResHandle::<Score>::new();
@@ -231,6 +251,7 @@ mod tests {
         assert!(debug_str.contains("Score"));
     }
 
+    /// Verifies that `ResHandle::get()` returns the resource when it exists.
     #[test]
     fn test_res_handle_get() {
         let mut world = World::new();
@@ -248,6 +269,7 @@ mod tests {
         assert_eq!(handle.get(&world).unwrap().0, 42);
     }
 
+    /// Verifies that `ResHandle::get_mut()` allows mutable access to an existing resource.
     #[test]
     fn test_res_handle_get_mut() {
         let mut world = World::new();
@@ -263,6 +285,7 @@ mod tests {
         assert_eq!(handle.get(&world).unwrap().0, 15);
     }
 
+    /// Verifies that `ResHandle::get()` returns None for a missing resource.
     #[test]
     fn test_res_handle_missing_resource() {
         let world = World::new();
@@ -272,6 +295,7 @@ mod tests {
         assert!(handle.get(&world).is_none());
     }
 
+    /// Verifies that handles for different resource types are independent.
     #[test]
     fn test_multiple_handles_different_types() {
         let mut world = World::new();

@@ -1,8 +1,23 @@
-// ----------------------------------------------------------------------------
-// Component System
-// ----------------------------------------------------------------------------
-//! Component trait and identification system.
+//! Component trait, type identification, and change-detection primitives.
+//!
+//! # Responsibilities
+//!
+//! - Defines the [`Component`] marker trait required by all ECS component types.
+//! - Provides [`ComponentId`] for type-erased component identification.
+//! - Implements [`Tick`] and [`ComponentTicks`] for frame-based change detection.
+//! - Manages the [`ComponentRegistry`] that assigns bit indices for archetype masks.
+//! - Defines [`ComponentMask`] (u128) for O(1) archetype matching.
+//!
+//! # Design
+//!
+//! Component types are registered at runtime and assigned a bit position in a
+//! 128-bit mask. Archetypes carry a mask of their component set; queries build
+//! a mask from their requested types and use bitwise AND to find matching
+//! archetypes in O(1). Change detection uses a global tick counter bumped each
+//! frame - components record the tick at which they were added/mutated, and
+//! filters compare against the calling system's last-run tick.
 
+// Standard library
 use std::any::TypeId;
 use std::collections::HashMap;
 
@@ -21,11 +36,16 @@ use std::collections::HashMap;
 /// systems, prefer splitting the mutable portion into a separate component
 /// type and using `&mut T` queries (which the scheduler serializes
 /// correctly).
+
+// =============================================================================
+// Component
+// =============================================================================
+
 pub trait Component: Send + 'static {}
 
-// ----------------------------------------------------------------------------
-// Change Detection Ticks
-// ----------------------------------------------------------------------------
+// =============================================================================
+// Tick
+// =============================================================================
 
 /// Monotonically increasing counter used to detect when components change.
 ///
@@ -37,12 +57,21 @@ pub trait Component: Send + 'static {}
 pub struct Tick(pub u32);
 
 impl Tick {
-    /// Construct a tick with an explicit value.
+    // -------------------------------------------------------------------------
+    // Construction
+    // -------------------------------------------------------------------------
+
+    /// Constructs a tick with an explicit counter value.
+    #[inline]
     pub const fn new(value: u32) -> Self {
         Self(value)
     }
 
-    /// Get the underlying counter value.
+    // -------------------------------------------------------------------------
+    // Queries
+    // -------------------------------------------------------------------------
+
+    /// Returns the underlying counter value.
     #[inline]
     pub const fn get(self) -> u32 {
         self.0
@@ -55,6 +84,10 @@ impl Tick {
         self.0 > last_run.0 && self.0 <= this_run.0
     }
 }
+
+// =============================================================================
+// ComponentTicks
+// =============================================================================
 
 /// Per-component-instance change-detection metadata.
 ///
@@ -69,7 +102,11 @@ pub struct ComponentTicks {
 }
 
 impl ComponentTicks {
-    /// Create new ticks with both `added` and `changed` set to the given tick.
+    // -------------------------------------------------------------------------
+    // Construction
+    // -------------------------------------------------------------------------
+
+    /// Creates new ticks with both `added` and `changed` set to the given tick.
     #[inline]
     pub fn new(tick: Tick) -> Self {
         Self {
@@ -90,23 +127,33 @@ impl ComponentTicks {
         self.changed.is_newer_than(last_run, this_run)
     }
 
-    /// Force the `changed` tick to a value (bypasses normal `Mut` mutation path).
+    // -------------------------------------------------------------------------
+    // Mutations
+    // -------------------------------------------------------------------------
+
+    /// Sets the `changed` tick directly, bypassing the normal `Mut<T>` path.
     #[inline]
     pub fn set_changed(&mut self, tick: Tick) {
         self.changed = tick;
     }
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
-mod layout_tests {
+mod tests {
     use super::*;
 
+    /// Verifies that `Tick` is exactly 4 bytes (a single u32).
     #[test]
     fn tick_size() {
         assert_eq!(std::mem::size_of::<Tick>(), 4);
         assert_eq!(std::mem::align_of::<Tick>(), 4);
     }
 
+    /// Verifies that `ComponentTicks` is exactly 8 bytes (two u32 fields).
     #[test]
     fn component_ticks_size() {
         assert_eq!(std::mem::size_of::<ComponentTicks>(), 8);
@@ -114,7 +161,11 @@ mod layout_tests {
     }
 }
 
-/// ComponentId uniquely identifies a component type using its TypeId.
+// =============================================================================
+// ComponentId
+// =============================================================================
+
+/// Type-erased identifier for a registered component type.
 ///
 /// Can be converted to/from [`TypeKey`] for code that needs to be generic
 /// over both component and resource type identifiers.
@@ -128,6 +179,10 @@ impl ComponentId {
         ComponentId(TypeId::of::<T>())
     }
 }
+
+// =============================================================================
+// ComponentMask
+// =============================================================================
 
 /// Bitmask for efficiently representing sets of components.
 ///
@@ -210,6 +265,10 @@ impl ComponentMask {
         self.0
     }
 }
+
+// =============================================================================
+// ComponentRegistry
+// =============================================================================
 
 /// Registry that maps component types to bit indices in the component mask.
 ///

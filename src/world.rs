@@ -1,16 +1,30 @@
-// ----------------------------------------------------------------------------
-// World - Central ECS State Management
-// ----------------------------------------------------------------------------
-//! The World is the central container for all ECS data.
+//! Central ECS state container — entities, archetypes, components, and resources.
 //!
-//! It manages entities, archetypes, and provides the primary interface for
-//! creating entities and managing components.
+//! # Responsibilities
+//!
+//! - Manages entity creation, destruction, and ID recycling via a free list.
+//! - Owns all archetypes and provides the primary interface for component operations.
+//! - Stores singleton resources with change-detection tick tracking.
+//! - Provides random access to individual components via `get_component` / `get_component_mut`.
+//! - Manages script component registration and per-frame update dispatch.
+//!
+//! # Design
+//!
+//! The [`World`] is the central hub of the ECS. It allocates entity IDs,
+//! manages archetype storage, tracks entity-to-archetype mappings, and stores
+//! resources (singleton data). Component types must be registered before use
+//! so the world can assign bit indices for archetype mask matching. Entity
+//! destruction recycles IDs through a free list with generation counters
+//! to prevent dangling-handle bugs.
 
+// Standard library
 use std::any::Any;
 use std::collections::HashMap;
 
+// External crates
 use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
 
+// Current crate
 use crate::archetype::{Archetype, ArchetypeId, StorageFactory};
 use crate::commands::CommandQueue;
 use crate::component::{
@@ -47,10 +61,15 @@ pub(crate) struct EntityLocation {
     pub(crate) index_in_archetype: usize,
 }
 
+// =============================================================================
+// EntityLocation — Layout Tests
+// =============================================================================
+
 #[cfg(test)]
 mod layout_tests {
     use super::*;
 
+    /// Verifies that `EntityLocation` is 32 bytes with 16-byte alignment.
     #[test]
     fn entity_location_size() {
         assert_eq!(std::mem::size_of::<EntityLocation>(), 32);
@@ -58,9 +77,10 @@ mod layout_tests {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Component add/remove errors
-// ----------------------------------------------------------------------------
+// =============================================================================
+// =============================================================================
+// Component Add/Remove Errors
+// =============================================================================
 
 /// Error type for `add_component` operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +105,10 @@ impl std::fmt::Display for AddComponentError {
 
 impl std::error::Error for AddComponentError {}
 
+// =============================================================================
+// RemoveComponentError
+// =============================================================================
+
 /// Error type for `remove_component` operations
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemoveComponentError {
@@ -105,6 +129,10 @@ impl std::fmt::Display for RemoveComponentError {
 }
 
 impl std::error::Error for RemoveComponentError {}
+
+// =============================================================================
+// BuildError
+// =============================================================================
 
 /// Error type for `EntityBuilder::build` when a component was not registered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,9 +159,9 @@ impl std::fmt::Display for BuildError {
 
 impl std::error::Error for BuildError {}
 
-// ----------------------------------------------------------------------------
-// Per-thread last-run tick
-// ----------------------------------------------------------------------------
+// =============================================================================
+// Per-Thread Last-Run Tick
+// =============================================================================
 //
 // In parallel mode, multiple systems run on different threads simultaneously.
 // Each system needs its own "last ran at tick X" value so change-detection
@@ -169,9 +197,9 @@ pub(crate) fn set_per_thread_last_run_tick(value: Option<Tick>) -> Option<Tick> 
     PER_THREAD_LAST_RUN_TICK.with(|cell| cell.replace(value))
 }
 
-// ----------------------------------------------------------------------------
-// Per-label iterator timing
-// ----------------------------------------------------------------------------
+// =============================================================================
+// Per-Label Iterator Timing
+// =============================================================================
 
 /// Shared state for per-label iterator timing feedback.
 pub(crate) struct IteratorTimings {
@@ -193,9 +221,13 @@ impl IteratorTimings {
     }
 }
 
-// ----------------------------------------------------------------------------
-// World - Central ECS State Management
-// ----------------------------------------------------------------------------
+// =============================================================================
+// World
+// =============================================================================
+
+// =============================================================================
+// World
+// =============================================================================
 
 /// World manages all entities, archetypes, and resources
 ///
@@ -350,6 +382,10 @@ impl Default for World {
         Self::new()
     }
 }
+
+// =============================================================================
+// General Functions
+// =============================================================================
 
 /// Copies a single component instance from source to destination storage.
 fn copy_component<T: Component + TraitAccessible<dyn Component> + Clone>(
@@ -916,7 +952,9 @@ impl World {
             entity,
             // Most entities have 3-8 components; pre-allocate to avoid
             // reallocation during .with() chains.
-            components: Vec::with_capacity(crate::config::EntityBuilderConfig::DEFAULT_COMPONENTS_CAPACITY),
+            components: Vec::with_capacity(
+                crate::config::EntityBuilderConfig::DEFAULT_COMPONENTS_CAPACITY,
+            ),
         }
     }
 
@@ -1522,6 +1560,11 @@ impl<T: Component + TraitAccessible<dyn Component>> ComponentInserter
 ///     .with(Velocity { x: 10.0, y: 0.0 })
 ///     .build().unwrap();
 /// ```
+
+// =============================================================================
+// EntityBuilder
+// =============================================================================
+
 pub struct EntityBuilder<'w> {
     world: &'w mut World,
     entity: Entity,
@@ -1573,7 +1616,9 @@ impl<'w> EntityBuilder<'w> {
     }
 }
 
-// --- Tests ---------------------------------------------------------------------------------------------------------
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

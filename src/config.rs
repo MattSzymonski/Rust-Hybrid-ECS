@@ -1,13 +1,21 @@
-// ----------------------------------------------------------------------------
-// Centralised Configuration Constants
-// ----------------------------------------------------------------------------
-//! All tunable constants live here so they can be adjusted without hunting
-//! through source files.  Re-exported at the crate root so module paths
-//! stay short (e.g. `crate::config::ParallelProcessingConfig::DEFAULT_ITERATOR_SLICE_SIZE`).
+//! Centralised configuration constants and hardware detection.
+//!
+//! # Responsibilities
+//!
+//! - Defines all tunable constants (slice sizes, thread counts, profiling knobs).
+//! - Provides `default_entities_per_slice()` for adaptive parallel work sizing.
+//! - Detects and reports system hardware specs at engine startup.
+//!
+//! # Design
+//!
+//! All magic numbers live here so they can be adjusted without hunting through
+//! source files. The [`ParallelProcessingConfig`] struct groups related knobs;
+//! free functions handle slice-size computation and hardware reporting.
+//! Re-exported at the crate root via `crate::config`.
 
-// ----------------------------------------------------------------------------
-// Parallel slice size
-// ----------------------------------------------------------------------------
+// =============================================================================
+// General Functions
+// =============================================================================
 
 /// Default number of entities per parallel work slice, clamped by component size.
 ///
@@ -31,10 +39,6 @@ pub fn default_entities_per_slice(bytes_per_entity: usize) -> usize {
     // bytes_per_entity is already clamped to at least 8 in the caller.
     (default * 8 / bytes_per_entity).clamp(min, default)
 }
-
-// ----------------------------------------------------------------------------
-// System hardware detection
-// ----------------------------------------------------------------------------
 
 /// Print a summary of detected system hardware to stdout.
 ///
@@ -104,10 +108,6 @@ pub fn print_system_specs() {
     println!();
 }
 
-// ----------------------------------------------------------------------------
-// Parallel execution configuration
-// ----------------------------------------------------------------------------
-
 /// Print the active parallel-iterator configuration to stdout.
 ///
 /// Shows the Rayon thread-pool size and every tunable in
@@ -137,10 +137,6 @@ pub fn print_parallel_config() {
     );
     println!();
 }
-
-// ----------------------------------------------------------------------------
-// Memory / disk / uptime helpers
-// ----------------------------------------------------------------------------
 
 fn print_disk_info(disks: &sysinfo::Disks) {
     if disks.is_empty() {
@@ -201,9 +197,9 @@ fn os_pretty_name() -> String {
     }
 }
 
-// ----------------------------------------------------------------------------
-// Tracy Profiler
-// ----------------------------------------------------------------------------
+// =============================================================================
+// ProfilingConfig
+// =============================================================================
 
 pub struct ProfilingConfig;
 
@@ -215,9 +211,9 @@ impl ProfilingConfig {
     /// `100` = track 1 in 100 allocations (minimal overhead, statistical).
     pub const MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY: u16 = 10;
 }
-// ----------------------------------------------------------------------------
-// Parallel iteration — group sizing
-// ----------------------------------------------------------------------------
+// =============================================================================
+// ParallelProcessingConfig
+// =============================================================================
 
 // Frame
 //  └─ Scheduler BATCH ("run systems batch 1/2")
@@ -274,9 +270,9 @@ impl ParallelProcessingConfig {
     pub const MINIMUM_SLICE_SIZE: usize = 256;
 }
 
-// ----------------------------------------------------------------------------
-// Entity builder — pre-allocation
-// ----------------------------------------------------------------------------
+// =============================================================================
+// EntityBuilderConfig
+// =============================================================================
 
 /// Zero-sized struct grouping configuration constants for entity builders.
 pub struct EntityBuilderConfig;
@@ -290,9 +286,9 @@ impl EntityBuilderConfig {
     pub const DEFAULT_COMPONENTS_CAPACITY: usize = 8;
 }
 
-// ----------------------------------------------------------------------------
-// Query internals — pre-allocation
-// ----------------------------------------------------------------------------
+// =============================================================================
+// QueryConfig
+// =============================================================================
 
 /// Zero-sized struct grouping configuration constants for query internals.
 pub struct QueryConfig;

@@ -1,21 +1,23 @@
-// ----------------------------------------------------------------------------
-// Change Detection - Mut<T> Smart Pointer
-// ----------------------------------------------------------------------------
-//! Smart-pointer wrapper that records mutation ticks on `DerefMut`.
+//! [`Mut<T>`] smart pointer that records component mutation ticks on `DerefMut`.
 //!
-//! Queries that request mutable component access (`&mut T`) yield `Mut<'a, T>`
-//! values instead of bare `&'a mut T`. The wrapper transparently dereferences
-//! to the underlying component, so existing code that does
-//! `transform.x += vel.x` continues to compile unchanged.
+//! # Responsibilities
 //!
-//! When a `Mut<T>` is dereferenced through `DerefMut`, the associated
-//! `ComponentTicks::changed` field is bumped to the current world tick.
-//! This per-row update requires no synchronization for parallel queries
-//! because the scheduler guarantees that no two threads observe the same
-//! component row mutably.
+//! - Wraps `&mut T` in a [`Mut<T>`] that transparently dereferences to the inner value.
+//! - Bumps the component's `changed` tick on every mutable dereference for
+//!   frame-based change detection by [`Changed`] and [`Added`] filters.
+//!
+//! # Design
+//!
+//! Queries requesting `&mut T` yield `Mut<'a, T>` instead of bare `&'a mut T`.
+//! The wrapper's `DerefMut` implementation updates the associated
+//! [`ComponentTicks::changed`] field to the current world tick. This per-row
+//! update requires no synchronization because the scheduler guarantees
+//! disjoint mutable access per thread.
 
+// Standard library
 use std::ops::{Deref, DerefMut};
 
+// Current crate
 use crate::component::{ComponentTicks, Tick};
 
 /// Mutable, change-tracking access to a component (or resource) instance.
@@ -39,6 +41,16 @@ use crate::component::{ComponentTicks, Tick};
 ///     }
 /// }
 /// ```
+///
+/// # Safety
+///
+/// The wrapper stores raw mutable pointers; safety relies on the scheduler's
+/// guarantee that no two threads obtain `Mut<T>` for the same component row.
+
+// =============================================================================
+// Mut
+// =============================================================================
+
 pub struct Mut<'a, T: ?Sized> {
     pub(crate) value: &'a mut T,
     pub(crate) ticks: &'a mut ComponentTicks,
@@ -127,10 +139,15 @@ impl<T: ?Sized + std::fmt::Debug> std::fmt::Debug for Mut<'_, T> {
     }
 }
 
+// =============================================================================
+// Tests
+// =============================================================================
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Verifies that immutable `Deref` does not bump the changed tick.
     #[test]
     fn deref_does_not_bump_changed() {
         let mut value = 42_i32;
@@ -141,6 +158,7 @@ mod tests {
         assert_eq!(m.last_changed(), Tick::new(1));
     }
 
+    /// Verifies that `DerefMut` bumps the changed tick to the current world tick.
     #[test]
     fn deref_mut_bumps_changed() {
         let mut value = 42_i32;
@@ -151,6 +169,7 @@ mod tests {
         assert_eq!(*m, 43);
     }
 
+    /// Verifies that `bypass()` provides raw access without bumping the changed tick.
     #[test]
     fn bypass_skips_tick_bump() {
         let mut value = 0_i32;
@@ -161,6 +180,7 @@ mod tests {
         assert_eq!(*m, 99);
     }
 
+    /// Verifies that `set_changed()` explicitly marks a row as changed at the given tick.
     #[test]
     fn set_changed_marks_row() {
         let mut value = 0_i32;
