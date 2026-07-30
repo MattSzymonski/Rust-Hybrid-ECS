@@ -41,8 +41,8 @@ cargo bench --bench <name> --no-run  # build only
 | `query_iter_without` | 1K, 10K, 100K | `Without<Frozen>` filter (~86% match) |
 | `query_iter_or` | 1K, 10K, 100K | `Or<(With<Enemy>, With<Frozen>)>` filter |
 | `query_iter_added` | 1K, 10K, 100K | `Added<Position>` filter |
-| `query_entity_only` | 10K, 100K | `Query<Entity>` — no component data |
-| `query_multi_component` | 10K, 100K | `(&Pos, &Vel, &Health)` — 3 components |
+| `query_entity_only` | 10K, 100K | `Query<Entity>` - no component data |
+| `query_multi_component` | 10K, 100K | `(&Pos, &Vel, &Health)` - 3 components |
 | `query_get_component` | 10K | Random access via `world.get_component()` / `get_component_mut()` |
 | `query_par_iter_unfiltered` | 10K, 100K, 1M | Parallel read-only |
 | `query_par_batch_size` | 10K | Batch sizes 1–1024 |

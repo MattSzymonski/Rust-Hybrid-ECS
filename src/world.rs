@@ -1,4 +1,4 @@
-//! Central ECS state container — entities, archetypes, components, and resources.
+//! Central ECS state container - entities, archetypes, components, and resources.
 //!
 //! # Responsibilities
 //!
@@ -62,7 +62,7 @@ pub(crate) struct EntityLocation {
 }
 
 // =============================================================================
-// EntityLocation — Layout Tests
+// EntityLocation - Layout Tests
 // =============================================================================
 
 #[cfg(test)]
@@ -284,7 +284,7 @@ pub struct World {
     /// the cached list is still valid. Solely optimization reasons.
     pub(crate) archetype_generation: u64,
 
-    /// **Debug-only**: Tracks which resources currently have an active
+    /// Debug-only: Tracks which resources currently have an active
     /// mutable borrow.  Used to catch scheduler bugs where two systems
     /// obtain `&mut` to the same resource simultaneously.
     ///
@@ -724,7 +724,7 @@ impl World {
         self.resources.contains_key(&ResourceId::of::<T>())
     }
 
-    /// **Debug-only**: Clear the set of mutably-borrowed resources.
+    /// Debug-only: Clear the set of mutably-borrowed resources.
     ///
     /// Called by [`Engine::process_frame`] at the start of every frame so
     /// that the isolation check only guards against concurrent access

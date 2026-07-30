@@ -2,8 +2,8 @@
 //!
 //! # Responsibilities
 //!
-//! - Defines [`ScriptComponent`] — a component trait with an `update()` method.
-//! - Provides [`ScriptContext`] — a restricted view of the ECS that forces all
+//! - Defines [`ScriptComponent`] - a component trait with an `update()` method.
+//! - Provides [`ScriptContext`] - a restricted view of the ECS that forces all
 //!   structural changes through the deferred command queue.
 //!
 //! # Design

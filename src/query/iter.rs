@@ -236,9 +236,9 @@ pub struct ParQueryIter<'w, Q: QueryTarget, F: QueryFilter = ()> {
     archetype_ranges: Vec<FilteredArchetypeRange<Q::State, F::State>>,
     min_batch_size: Option<usize>,
     tracked: bool,
-    /// Sum of all queried component sizes — used to clamp the slice size.
+    /// Sum of all queried component sizes - used to clamp the slice size.
     total_components_size: usize,
-    /// Optional label for Tracy zones — set via `.label("system_name")`.
+    /// Optional label for Tracy zones - set via `.label("system_name")`.
     label: Option<&'static str>,
     /// Per-label splitting hint timing map, shared via Arc<Mutex<>> for thread-safe access.
     iterator_timings: std::sync::Arc<std::sync::Mutex<crate::world::IteratorTimings>>,
@@ -403,7 +403,7 @@ where
     /// (default 4096 entities each, matching L1 data cache) are grouped
     /// into chunks and spawned via [`rayon::scope`], so every thread
     /// pulls tasks from a shared pool simultaneously
-    /// — no work-stealing cascade, no late-arriving outliers.
+    /// - no work-stealing cascade, no late-arriving outliers.
     fn execute_untracked<Func>(self, f: Func, hint_ns: u64)
     where
         Func: Fn(Q::Item<'_>) + Send + Sync,
@@ -432,7 +432,7 @@ where
         // We pre-build equal-sized entity-range slices, then group them
         // into num_threads × 2 chunks. Spawning all chunks at once
         // through rayon::scope lets every thread pull tasks from a shared
-        // pool simultaneously — no work-stealing cascade, no head-start
+        // pool simultaneously - no work-stealing cascade, no head-start
         // for the owning thread, and no late-arriving outliers.
         let min_len = self
             .min_batch_size
@@ -638,7 +638,7 @@ where
         };
 
         // Pre-assign contiguous groups so every thread processes
-        // ALL its work back-to-back — no per-chunk queue contention,
+        // ALL its work back-to-back - no per-chunk queue contention,
         // no 90µs gaps between chunks on the same thread.
         // Store (start_index, count) ranges into the flat iterator_slices
         // array instead of copying slices with to_vec().
@@ -713,7 +713,7 @@ where
                 let max_batch = &max_batch;
                 let iterator_work_group_slice = &iterator_slices_ref[start_idx..start_idx + count];
                 scope.spawn(move |_| {
-                    // One zone per thread-group — all its slices run
+                    // One zone per thread-group - all its slices run
                     // contiguously, no inter-chunk gaps on the same thread.
                     let zone = if let Some(sys) = system_label {
                         crate::profile_scope!(

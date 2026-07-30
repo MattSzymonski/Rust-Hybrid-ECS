@@ -13,7 +13,7 @@
 //! each archetype's component mask at iteration start. `With<T>` adds T to the
 //! include set; `Without<T>` adds T to the exclude set. `Changed<T>` and
 //! `Added<T>` compare per-entity tick values against the calling system's
-//! last-run baseline. `Or` produces multiple pairs — an archetype matches if
+//! last-run baseline. `Or` produces multiple pairs - an archetype matches if
 //! any pair passes.
 
 // Standard library
@@ -33,14 +33,14 @@ use super::ptr::SendPtr;
 ///
 /// Filters operate at two levels:
 ///
-/// 1. **Archetype-level**: [`archetype_filter_pairs`] returns a list of
+/// 1. Archetype-level: [`archetype_filter_pairs`] returns a list of
 ///    `(include, exclude)` component-id pairs. An archetype matches the
-///    filter if it satisfies **any** pair (OR semantics). The default
+///    filter if it satisfies any pair (OR semantics). The default
 ///    implementation delegates to [`included_component_ids`] /
 ///    [`excluded_component_ids`]; [`Or`] overrides this to produce one
 ///    pair per inner filter.
 ///
-/// 2. **Row-level**: [`init_state`] caches per-archetype data (e.g. a
+/// 2. Row-level: [`init_state`] caches per-archetype data (e.g. a
 ///    pointer into `component_ticks`) and [`matches`] is invoked for each
 ///    candidate row. This drives [`Changed`] and [`Added`].
 ///
@@ -78,7 +78,7 @@ pub trait QueryFilter {
     }
 
     /// Returns a list of `(include_ids, exclude_ids)` pairs for archetype
-    /// scoping. An archetype matches the filter if it matches **any** of
+    /// scoping. An archetype matches the filter if it matches any of
     /// the pairs - i.e. OR semantics across pairs.
     ///
     /// Each pair means: the archetype must contain ALL `include_ids` AND

@@ -2,7 +2,7 @@
 //!
 //! # Responsibilities
 //!
-//! - Provides [`SendPtr<T>`] and [`SendPtrMut<T>`] — raw-pointer wrappers
+//! - Provides [`SendPtr<T>`] and [`SendPtrMut<T>`] - raw-pointer wrappers
 //!   that implement [`Send`] and [`Sync`] for cross-thread sharing.
 //! - Caches pointers to archetype-owned storage so worker threads can
 //!   access components without repeated HashMap lookups.

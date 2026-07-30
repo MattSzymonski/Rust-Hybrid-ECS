@@ -438,7 +438,7 @@ impl Engine {
                 if !timing.visited_duplicated_iterator_labels.is_empty() {
                     let duplicates = std::mem::take(&mut timing.visited_duplicated_iterator_labels);
                     crate::profile_warn!(
-                        "duplicate parallel-iterator labels this frame: {:?} — two iterators sharing a .label() corrupt per-label timing",
+                        "duplicate parallel-iterator labels this frame: {:?} - two iterators sharing a .label() corrupt per-label timing",
                         duplicates
                     );
                     eprintln!(
@@ -476,7 +476,7 @@ impl Engine {
             );
         } // <- frame zone ends here
 
-        // FPS limiter — sleep remaining budget OUTSIDE the frame zone
+        // FPS limiter - sleep remaining budget OUTSIDE the frame zone
         if let Some(budget) = self.frame_budget {
             let elapsed = frame_start.elapsed();
             if elapsed < budget {
@@ -675,7 +675,7 @@ impl Engine {
 
                 // Dispatch stage: execute all systems in this batch via Rayon.
                 // Use a single indexed parallel iterator instead of chained
-                // zip() — avoids deep iterator nesting that causes Rayon
+                // zip() - avoids deep iterator nesting that causes Rayon
                 // to spend more time splitting than executing on small batches.
                 let _zone = crate::profile_scope!(
                     "dispatch systems batch ({} systems across rayon)",

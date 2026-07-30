@@ -247,7 +247,7 @@ impl ParallelProcessingConfig {
     ///
     /// The timing-feedback loop divides the system's average execution time
     /// by this value to determine how many Rayon tasks to spawn.  Larger
-    /// values mean fewer, bigger groups — less wake-up scatter but also
+    /// values mean fewer, bigger groups - less wake-up scatter but also
     /// less parallelism.  50 µs is a sweet spot where OS thread wake-up
     /// latency (~10 µs) doesn't dominate.
     pub const TARGET_ITERATOR_WORK_GROUP_DURATION: u64 = 50_000;
@@ -256,7 +256,7 @@ impl ParallelProcessingConfig {
     ///
     /// This is an arbitrary but well-tested starting point.  Benchmarked
     /// values between 256 and 50000 show no measurable difference for
-    /// standard workloads — the streaming access pattern and hardware
+    /// standard workloads - the streaming access pattern and hardware
     /// prefetching make the exact number non-critical.  The clamped
     /// formula (see [`default_entities_per_slice`]) scales this down
     /// per-query for unusually large components.
@@ -265,7 +265,7 @@ impl ParallelProcessingConfig {
     /// Minimum entities per thread before parallel execution kicks in.
     ///
     /// Below `num_threads × MINIMUM_SLICE_SIZE` total entities, the
-    /// iterator falls back to a sequential loop — Rayon task-spawning
+    /// iterator falls back to a sequential loop - Rayon task-spawning
     /// overhead would dominate the actual work.
     pub const MINIMUM_SLICE_SIZE: usize = 256;
 }

@@ -85,8 +85,8 @@
 /// | 50%   | Half the available CPU-time was idle |
 /// | <100% | Batch serialization, imbalanced systems, or dispatch overhead |
 ///
-/// This is a **lower-bound estimate** because each system's wall-clock
-/// duration already includes internal Rayon parallelism — a system that
+/// This is a lower-bound estimate because each system's wall-clock
+/// duration already includes internal Rayon parallelism - a system that
 /// takes 10 ms on 12 threads may represent up to 120 ms of CPU work.
 /// The metric treats each system as using one thread, so actual thread
 /// saturation is always at least this number.
@@ -162,7 +162,7 @@ pub fn compute_batch_packing_efficiency(
 /// the necessary inputs, computes both utilization and batch-packing
 /// percentages, and emits them as native Tracy plot points.
 ///
-/// Only compiled when the `profiling` feature is active — `profiling-minimal`
+/// Only compiled when the `profiling` feature is active - `profiling-minimal`
 /// does not include native Tracy plots.
 #[cfg(feature = "profiling")]
 pub fn emit_parallel_utilization_plots(
@@ -239,7 +239,7 @@ mod enabled {
 
         /// Same as [`new_dynamic`](Self::new_dynamic) but the name is
         /// built lazily via a closure.  The closure only runs when Tracy
-        /// is running — no `format!()` allocation when profiling is off.
+        /// is running - no `format!()` allocation when profiling is off.
         #[doc(hidden)]
         #[inline]
         pub fn new_dynamic_lazy(

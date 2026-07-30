@@ -62,7 +62,7 @@ pub struct Entity {
 }
 
 // =============================================================================
-// Entity — Trait Implementations
+// Entity - Trait Implementations
 // =============================================================================
 
 impl fmt::Display for Entity {

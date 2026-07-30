@@ -4,7 +4,7 @@
 //!
 //! - Defines the [`Resource`] marker trait for global/shared state types.
 //! - Provides [`ResourceId`] for type-erased resource identification.
-//! - Implements [`ResHandle`] — a lightweight, copyable handle for deferred resource access.
+//! - Implements [`ResHandle`] - a lightweight, copyable handle for deferred resource access.
 //!
 //! # Design
 //!

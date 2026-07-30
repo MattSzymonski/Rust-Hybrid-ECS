@@ -28,8 +28,8 @@ use std::collections::HashMap;
 /// Components are accessed concurrently during parallel iteration. Although
 /// `Component` only requires [`Send`] (not [`Sync`]), parallel queries may
 /// create multiple `&T` references to the same component data across
-/// threads. **Avoid [`Cell`](std::cell::Cell), [`RefCell`](std::cell::RefCell),
-/// or other interior-mutability types in component structs** - they can
+/// threads. Avoid [`Cell`](std::cell::Cell), [`RefCell`](std::cell::RefCell),
+/// or other interior-mutability types in component structs - they can
 /// cause data races when read concurrently through shared references.
 ///
 /// If you need mutable state inside a component accessed by multiple
@@ -191,9 +191,9 @@ impl ComponentId {
 /// Uses a `u128` internally, limiting the ECS to 128 unique component types.
 /// This is a deliberate design tradeoff:
 ///
-/// - **O(1) archetype matching**: Query matching is a simple bitwise AND
-/// - **128 bits = 128 component types**: Sufficient for most games
-/// - **No heap allocation**: Masks are stack-allocated and Copy
+/// - O(1) archetype matching: Query matching is a simple bitwise AND
+/// - 128 bits = 128 component types: Sufficient for most games
+/// - No heap allocation: Masks are stack-allocated and Copy
 ///
 /// If you hit the 128 limit, consider:
 /// 1. Combining related components (e.g., Transform instead of Position + Rotation + Scale)

@@ -287,7 +287,7 @@ impl SystemScheduler {
 
         // Precompute conflict count per system and build a permutation
         // sorted by ascending conflict count. Systems with fewest conflicts
-        // are scheduled first — they pack densely into early batches.
+        // are scheduled first - they pack densely into early batches.
         let mut order: Vec<usize> = (0..self.system_count).collect();
         order.sort_by_key(|&i| self.conflict_matrix[i].iter().filter(|&&c| c).count());
 

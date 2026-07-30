@@ -2,7 +2,7 @@
 //!
 //! # Responsibilities
 //!
-//! - Provides [`Commands`] — a deferred-operation queue for creating/destroying
+//! - Provides [`Commands`] - a deferred-operation queue for creating/destroying
 //!   entities and adding/removing components without holding `&mut World`.
 //! - Implements the two-phase frame lifecycle: systems queue commands during
 //!   execution, then the engine applies them after all systems finish.

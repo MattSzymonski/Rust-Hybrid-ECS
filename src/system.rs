@@ -15,20 +15,20 @@
 //! lifetimes to `'static` lifetimes. This is a deliberate design choice to
 //! work around Rust's borrowing rules in the context of dynamic system execution.
 //!
-//! **This is technically undefined behavior if the reference escapes the system.**
+//! This is technically undefined behavior if the reference escapes the system.
 //!
 //! The safety of this pattern relies on these invariants being upheld:
 //!
-//! 1. **System parameters must NOT be stored** - Parameters like `Query<'static, Q>`
+//! 1. System parameters must NOT be stored - Parameters like `Query<'static, Q>`
 //!    and `Commands<'static>` must only be used within the system function body.
 //!    Storing them in static variables, global state, or any location that outlives
-//!    the system call is **undefined behavior**.
+//!    the system call is undefined behavior.
 //!
-//! 2. **System parameters must NOT escape via closures** - Do not capture system
+//! 2. System parameters must NOT escape via closures - Do not capture system
 //!    parameters in closures that outlive the system (e.g., background threads, async
 //!    tasks, or callbacks registered for later execution).
 //!
-//! 3. **System parameters must NOT be returned** - While the type system prevents
+//! 3. System parameters must NOT be returned - While the type system prevents
 //!    most cases, do not use unsafe code to extract and return the inner reference.
 //!
 //! ## Why This Pattern?
@@ -40,9 +40,9 @@
 //!
 //! ## Safe Alternatives (Not Yet Implemented)
 //!
-//! - **Token type pattern**: Pass a lifetime-bound token that proves the borrow
+//! - Token type pattern: Pass a lifetime-bound token that proves the borrow
 //!   is still valid, making misuse a compile error.
-//! - **GAT-based SystemParam**: Use Generic Associated Types to properly model
+//! - GAT-based SystemParam: Use Generic Associated Types to properly model
 //!   the lifetime relationship (requires more complex trait bounds).
 //!
 //! ## Example: Safe Usage
@@ -116,7 +116,7 @@ where
 /// Implementations use lifetime transmutation internally. See module-level docs
 /// for the safety invariants that must be upheld.
 ///
-/// **The returned parameter must not escape the system function scope.**
+/// The returned parameter must not escape the system function scope.
 pub trait SystemParam: Sized {
     /// Fetch the parameter from world state.
     ///
@@ -129,7 +129,7 @@ pub trait SystemParam: Sized {
     /// 2. The returned value is not stored in static/global state
     /// 3. The returned value is not moved into background threads or async tasks
     ///
-    /// Violating these invariants is **undefined behavior**.
+    /// Violating these invariants is undefined behavior.
     fn fetch(world: &mut World, queue: &mut CommandQueue) -> Self;
 
     /// Report component access pattern for dependency analysis

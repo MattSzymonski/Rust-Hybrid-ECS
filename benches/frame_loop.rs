@@ -1,7 +1,7 @@
 //! Frame Loop Benchmark
 //! ====================
 //!
-//! This is the integration benchmark — it measures `engine.process_frame()`
+//! This is the integration benchmark - it measures `engine.process_frame()`
 //! wall-clock time, exercising every ECS subsystem together: system registration,
 //! scheduler graph build + batch dispatch, query iteration (sequential and
 //! parallel), change detection, and command execution.
@@ -66,12 +66,12 @@ struct GravityForce {
 }
 impl Component for GravityForce {}
 
-/// 256 B — 4 cache lines per entity
+/// 256 B - 4 cache lines per entity
 #[derive(Debug, Clone)]
 struct RenderData([[f64; 4]; 8]);
 impl Component for RenderData {}
 
-/// 128 B — 2 cache lines per entity
+/// 128 B - 2 cache lines per entity
 #[derive(Debug, Clone)]
 struct PhysicsData([[f32; 4]; 8]);
 impl Component for PhysicsData {}
@@ -210,18 +210,18 @@ fn build_engine(entity_count: usize, profile: Profile, parallel: bool) -> Engine
     // Spawn entities
     let mut random_state: u64 = 0xDEAD_BEEF_CAFE_BABE;
     for i in 0..entity_count {
-        let (x, s1) = lcg(random_state);
-        let (y, s2) = lcg(s1);
-        let (velocity_x, s3) = lcg(s2);
-        let (velocity_y, s4) = lcg(s3);
-        random_state = s4;
+        let (position_x, next_state) = lcg(random_state);
+        let (position_y, next_state) = lcg(next_state);
+        let (velocity_x, next_state) = lcg(next_state);
+        let (velocity_y, next_state) = lcg(next_state);
+        random_state = next_state;
 
         let mut builder = engine
             .world_mut()
             .create_entity()
             .with(Position {
-                x: (x - 0.5) * 1000.0,
-                y: (y - 0.5) * 1000.0,
+                x: (position_x - 0.5) * 1000.0,
+                y: (position_y - 0.5) * 1000.0,
             })
             .with(Velocity {
                 x: (velocity_x - 0.5) * 0.2,
@@ -230,8 +230,8 @@ fn build_engine(entity_count: usize, profile: Profile, parallel: bool) -> Engine
             .with(Health(100.0));
 
         if needs_heavy {
-            let (mass_value, s5) = lcg(random_state);
-            random_state = s5;
+            let (mass_value, next_state) = lcg(random_state);
+            random_state = next_state;
             builder = builder
                 .with(Mass(1.0 + mass_value * 9.0))
                 .with(GravityForce { x: 0.0, y: 0.0 });
@@ -291,9 +291,9 @@ fn build_engine(entity_count: usize, profile: Profile, parallel: bool) -> Engine
 
 /// Runs `engine.process_frame()` across 6 workload profiles (standard → full tracy_live),
 /// each at multiple entity counts with both parallel and sequential execution.
-/// Measures end-to-end frame cost — the ultimate integration metric for all ECS subsystems.
-fn bench_frame_loop(c: &mut Criterion) {
-    let mut group = c.benchmark_group("frame_loop");
+/// Measures end-to-end frame cost - the ultimate integration metric for all ECS subsystems.
+fn bench_frame_loop(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("frame_loop");
 
     let profiles: &[(&str, Profile, &[usize])] = &[
         ("standard", Profile::Standard, &[100_000, 500_000]),
@@ -318,18 +318,18 @@ fn bench_frame_loop(c: &mut Criterion) {
             group.bench_with_input(
                 BenchmarkId::new(label, entity_count),
                 &entity_count,
-                |b, &entity_count| {
+                |benchmark, &entity_count| {
                     let mut engine = build_engine(entity_count, profile, true);
-                    b.iter(|| black_box(engine.process_frame().is_ok()));
+                    benchmark.iter(|| black_box(engine.process_frame().is_ok()));
                 },
             );
             // Sequential baseline
             group.bench_with_input(
                 BenchmarkId::new(&format!("{}_sequential", label), entity_count),
                 &entity_count,
-                |b, &entity_count| {
+                |benchmark, &entity_count| {
                     let mut engine = build_engine(entity_count, profile, false);
-                    b.iter(|| black_box(engine.process_frame().is_ok()));
+                    benchmark.iter(|| black_box(engine.process_frame().is_ok()));
                 },
             );
         }

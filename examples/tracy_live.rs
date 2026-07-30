@@ -51,12 +51,12 @@ struct GravityForce {
 }
 impl Component for GravityForce {}
 
-/// 256 B large component — spans 4 cache lines, stresses cache-aware slicing
+/// 256 B large component - spans 4 cache lines, stresses cache-aware slicing
 #[derive(Debug, Clone)]
 struct RenderData([[f64; 4]; 8]);
 impl Component for RenderData {}
 
-/// 128 B medium component — spans 2 cache lines
+/// 128 B medium component - spans 2 cache lines
 #[derive(Debug, Clone)]
 struct PhysicsData([[f32; 4]; 8]);
 impl Component for PhysicsData {}
@@ -143,7 +143,7 @@ fn gravity_system(mut query: Query<(&mut GravityForce, &Mass)>) {
     crate::profile_message!("gravity: {}", stats);
 }
 
-/// Reads 256 B RenderData + writes 4 B Health — tests mixed-size cache pressure
+/// Reads 256 B RenderData + writes 4 B Health - tests mixed-size cache pressure
 fn render_system(mut query: Query<(&RenderData, &mut Health)>) {
     query
         .par_iter_mut()
@@ -156,7 +156,7 @@ fn render_system(mut query: Query<(&RenderData, &mut Health)>) {
         });
 }
 
-/// Reads 128 B PhysicsData + writes 8 B Velocity — tests medium-size cache pressure
+/// Reads 128 B PhysicsData + writes 8 B Velocity - tests medium-size cache pressure
 fn physics_system(mut query: Query<(&PhysicsData, &mut Velocity)>) {
     query
         .par_iter_mut()

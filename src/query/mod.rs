@@ -1,4 +1,4 @@
-//! Query system — efficient iteration over entities with specific components.
+//! Query system - efficient iteration over entities with specific components.
 //!
 //! # Responsibilities
 //!
@@ -18,12 +18,12 @@
 //!
 //! ## Module layout
 //!
-//! - [`target`] — the [`QueryTarget`] trait and its impls
-//! - [`filter`] — the [`QueryFilter`] trait and concrete filters
-//! - [`iter`] — sequential and parallel iterator types
-//! - [`ptr`] — thread-safe raw-pointer wrappers
-//! - [`resource`] — [`Res`] / [`ResMut`] system parameters
-//! - [`change_detection`] — [`Mut`] smart pointer for tick tracking
+//! - [`target`] - the [`QueryTarget`] trait and its impls
+//! - [`filter`] - the [`QueryFilter`] trait and concrete filters
+//! - [`iter`] - sequential and parallel iterator types
+//! - [`ptr`] - thread-safe raw-pointer wrappers
+//! - [`resource`] - [`Res`] / [`ResMut`] system parameters
+//! - [`change_detection`] - [`Mut`] smart pointer for tick tracking
 //!
 //! ## Usage Examples
 //!

@@ -6,12 +6,12 @@
 //! systems into parallel batches. These benchmarks measure both halves of
 //! that pipeline.
 //!
-//! **Graph build** (`scheduler_graph_build`): pure O(n²) pairwise conflict
+//! Graph build (`scheduler_graph_build`): pure O(n²) pairwise conflict
 //! analysis using bitmask AND operations. Simulates 10–200 systems with a
 //! realistic 1/3-write conflict pattern across 20 distinct component types.
-//! No real components or entities are involved — just `TypeId` values.
+//! No real components or entities are involved - just `TypeId` values.
 //!
-//! **Batch execution** (`scheduler_batch_execution`): end-to-end frame dispatch
+//! Batch execution (`scheduler_batch_execution`): end-to-end frame dispatch
 //! with 100 entities carrying 20 components. Each system does trivial per-entity
 //! work so the benchmark measures scheduler overhead (graph walk, batch dispatch,
 //! thread wake-up) rather than system compute time.
@@ -53,7 +53,7 @@ fn build_scheduler(system_count: usize) -> SystemScheduler {
     for i in 0..system_count {
         let mut access = SystemAccess::new();
         let type_id = DISTINCT_TYPE_IDS[i % DISTINCT_TYPE_IDS.len()];
-        // Every third system writes; others read — realistic conflict mix.
+        // Every third system writes; others read - realistic conflict mix.
         if i % 3 == 0 {
             access.add_write(ComponentId(type_id));
         } else {
@@ -170,14 +170,14 @@ fn build_engine_for_batch_execution(system_count: usize) -> Engine {
 
 /// Builds the execution graph for `system_count` systems with a realistic read/write conflict mix.
 /// Measures the O(n²) pairwise conflict analysis and batch-formation cost as system count grows.
-fn bench_graph_build(c: &mut Criterion) {
-    let mut group = c.benchmark_group("scheduler_graph_build");
+fn bench_graph_build(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("scheduler_graph_build");
     for &system_count in &[10, 50, 100, 200] {
         group.bench_with_input(
             BenchmarkId::from_parameter(system_count),
             &system_count,
-            |b, &system_count| {
-                b.iter_batched(
+            |benchmark, &system_count| {
+                benchmark.iter_batched(
                     || build_scheduler(system_count),
                     |mut scheduler| {
                         scheduler.build_execution_graph();
@@ -192,16 +192,16 @@ fn bench_graph_build(c: &mut Criterion) {
 }
 
 /// Runs a full `engine.process_frame()` with `system_count` registered systems and 100 entities.
-/// Measures end-to-end scheduler dispatch overhead — graph walk + parallel batch execution + system invocation.
-fn bench_batch_execution(c: &mut Criterion) {
-    let mut group = c.benchmark_group("scheduler_batch_execution");
+/// Measures end-to-end scheduler dispatch overhead - graph walk + parallel batch execution + system invocation.
+fn bench_batch_execution(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("scheduler_batch_execution");
     for &system_count in &[10, 50, 100, 200] {
         group.bench_with_input(
             BenchmarkId::from_parameter(system_count),
             &system_count,
-            |b, &system_count| {
+            |benchmark, &system_count| {
                 let mut engine = build_engine_for_batch_execution(system_count);
-                b.iter(|| black_box(engine.process_frame().is_ok()));
+                benchmark.iter(|| black_box(engine.process_frame().is_ok()));
             },
         );
     }

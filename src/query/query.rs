@@ -1,4 +1,4 @@
-//! The [`Query`] entry point — holds an exclusive borrow of the [`World`]
+//! The [`Query`] entry point - holds an exclusive borrow of the [`World`]
 //! and produces sequential or parallel iterators.
 //!
 //! # Responsibilities
@@ -75,7 +75,7 @@ pub struct Query<'w, Q: QueryTarget, F: QueryFilter = ()> {
     /// for a given `F`.  For simple filters this is a single pair; only
     /// [`Or`] filters produce multiple pairs.
     filter_pairs: Vec<(ComponentMask, ComponentMask)>,
-    /// Sum of all queried component sizes in bytes — cached for slice clamping.
+    /// Sum of all queried component sizes in bytes - cached for slice clamping.
     total_components_size: usize,
     /// Cached list of matching archetype IDs. Valid when
     /// `cached_generation == world.archetype_generation`.
@@ -163,18 +163,18 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     ///
     /// The check has two layers:
     ///
-    /// 1. **Target mask** (hard AND): the archetype must contain every
+    /// 1. Target mask (hard AND): the archetype must contain every
     ///    component the query fetches (e.g. `&Position` + `&mut Velocity`).
     ///
-    /// 2. **Filter pairs** (OR across pairs, AND within each pair):
-    ///    - **0 pairs** (e.g. no filter, or `()`): any archetype with the
+    /// 2. Filter pairs (OR across pairs, AND within each pair):
+    ///    - 0 pairs (e.g. no filter, or `()`): any archetype with the
     ///      target components matches.
-    ///    - **1 pair** (e.g. `With<A>`, `Without<B>`, `Changed<A>`):
+    ///    - 1 pair (e.g. `With<A>`, `Without<B>`, `Changed<A>`):
     ///      the archetype must have all `include` components AND none of
     ///      the `exclude` components. This is the simple case - just like
     ///      the old `(include_mask, exclude_mask)` model.
-    ///    - **2+ pairs** (only [`Or`] filters): the archetype matches if
-    ///      **any** pair matches. For `Or<(With<A>, With<B>)>` the pairs
+    ///    - 2+ pairs (only [`Or`] filters): the archetype matches if
+    ///      any pair matches. For `Or<(With<A>, With<B>)>` the pairs
     ///      are `({A},{})` and `({B},{})`, so archetypes with A, B, or
     ///      both are included.
     fn archetype_matches(
@@ -362,7 +362,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             .collect();
         // Matching IDs are already sorted by matching_archetype_ids(), and
         // filter_map preserves iteration order, so archetype_ranges is
-        // already sorted — no need for an extra sort_by_key.
+        // already sorted - no need for an extra sort_by_key.
 
         ParQueryIter::new(
             archetype_ranges,
