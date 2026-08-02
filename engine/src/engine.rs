@@ -323,6 +323,22 @@ impl Engine {
         self.scheduler.build_execution_graph();
     }
 
+    /// Remove all registered systems, clearing the scheduler state.
+    ///
+    /// This is used during hot-reload: the old game DLL's system function
+    /// pointers become invalid after unloading, so all systems must be
+    /// dropped and re-registered from the newly loaded DLL.
+    ///
+    /// Component registrations, entities, and resources are **not** cleared —
+    /// only systems are affected. The world state persists across reloads.
+    pub fn clear_systems(&mut self) {
+        self.systems.clear();
+        self.scheduler.clear();
+        self.graph_dirty = false;
+        // Reset the execution graph so it does not reference stale indices.
+        self.scheduler.build_execution_graph();
+    }
+
     // -------------------------------------------------------------------------
     // Frame Processing
     // -------------------------------------------------------------------------

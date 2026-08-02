@@ -29,12 +29,14 @@ static ALLOC: tracy_client::ProfiledAllocator<std::alloc::System> =
 // Public Modules
 // =============================================================================
 
+pub mod api;
 pub mod archetype;
 pub mod commands;
 pub mod component;
 pub mod config;
 pub mod engine;
 pub mod entity;
+pub mod persistence;
 pub mod profiling;
 pub mod query;
 pub mod resource;
@@ -46,14 +48,17 @@ pub mod world;
 // Public Re-exports
 // =============================================================================
 
+pub use api::EngineApi;
 pub use commands::{CommandError, Commands};
 pub use component::{Component, ComponentId, ComponentTicks, Tick};
 pub use engine::Engine;
 pub use entity::Entity;
+pub use persistence::ComponentSnapshot;
 pub use query::{
     Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,
 };
 pub use resource::{ResHandle, Resource};
 pub use scheduler::{SystemAccess, SystemScheduler, TypeKey};
 pub use scripting::{ScriptComponent, ScriptContext};
+pub use serde::{Deserialize, Serialize};
 pub use world::{AddComponentError, BuildError, EntityBuilder, RemoveComponentError, World};

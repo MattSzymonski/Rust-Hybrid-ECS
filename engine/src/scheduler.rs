@@ -330,6 +330,18 @@ impl SystemScheduler {
         self.access_patterns.get(index)
     }
 
+    /// Clear all registered systems and their access patterns.
+    ///
+    /// Resets the scheduler to its initial empty state. Used during
+    /// hot-reload so that stale system indices and conflict data are
+    /// discarded before re-registering systems from the new DLL.
+    pub fn clear(&mut self) {
+        self.system_count = 0;
+        self.access_patterns.clear();
+        self.conflict_matrix.clear();
+        self.execution_graph.clear();
+    }
+
     /// Print execution graph for debugging
     pub fn print_execution_graph(&self, system_names: &[&str]) {
         println!("\n=== System Execution Graph ===");

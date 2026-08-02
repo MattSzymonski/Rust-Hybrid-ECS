@@ -246,7 +246,7 @@ pub struct World {
     /// Tracks where each entity is located in the archetype system
     pub(crate) entity_locations: HashMap<Entity, EntityLocation>,
     /// Storage factories for creating component storage by TypeId
-    storage_factories: HashMap<ComponentId, StorageFactory>,
+    pub(crate) storage_factories: HashMap<ComponentId, StorageFactory>,
     /// Component copiers for moving entities between archetypes
     pub(crate) component_copiers: HashMap<ComponentId, ComponentCopier>,
     /// Script component types (ComponentId, component mask bit)
@@ -302,6 +302,18 @@ pub struct World {
     /// World pointer - the `Mutex` handles concurrent access from
     /// systems in the same engine batch.
     pub(crate) iterator_timings: std::sync::Arc<std::sync::Mutex<IteratorTimings>>,
+
+    /// Per-component-type serialize fn for snapshotting (persistence module).
+    pub(crate) persist_serializers:
+        HashMap<ComponentId, crate::persistence::SerializeComponentFn>,
+    /// Per-type-name deserialize fn for restoring (persistence module).
+    pub(crate) persist_deserializers:
+        HashMap<String, crate::persistence::DeserializeComponentFn>,
+    /// Per-component-type insert fn for pushing Box<dyn Component> into storage.
+    pub(crate) persist_inserters:
+        HashMap<ComponentId, crate::persistence::InsertComponentFn>,
+    /// Per-type-name schema hash for persistable components.
+    pub(crate) persist_schema_hashes: HashMap<String, u64>,
 }
 
 impl World {
@@ -326,6 +338,10 @@ impl World {
             debug_resource_write_locks: std::collections::HashSet::new(),
             commands_executed_this_frame: 0,
             iterator_timings: std::sync::Arc::new(std::sync::Mutex::new(IteratorTimings::new())),
+            persist_serializers: HashMap::new(),
+            persist_deserializers: HashMap::new(),
+            persist_inserters: HashMap::new(),
+            persist_schema_hashes: HashMap::new(),
         }
     }
 

@@ -1,11 +1,27 @@
+# Rust build artifacts
 /target
-graphify-out/
-.github/copilot-instructions.md
+/tests/game/target
 
-benchmarks/
+# Hot-reload runtime temp copies
+standalone_temp/
 
-# Cache measurement pipeline artifacts
-performance_benchmarks/cache/artifacts/
+# Test infrastructure
+tests/__pycache__/
 __pycache__/
+*.pyc
+*.pyo
 
+# Editor / IDE
+.vscode/settings.json
+.idea/
+
+# Profiling and benchmark artifacts
+graphify-out/
+benchmarks/
+performance_benchmarks/cache/artifacts/
+
+# Local developer notes
 local/
+
+# Copilot instructions (generated)
+.github/copilot-instructions.md
