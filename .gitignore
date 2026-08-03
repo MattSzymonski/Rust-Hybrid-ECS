@@ -25,3 +25,6 @@ local/
 
 # Copilot instructions (generated)
 .github/copilot-instructions.md
+
+/examples/tracy_live_game_cs
+/examples/tracy_live_game_cs_loader
