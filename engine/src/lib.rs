@@ -60,7 +60,7 @@ pub use query::{
     Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,
 };
 #[cfg(feature = "rendering")]
-pub use render::{draw_sprites, Color, Position, Sprite};
+pub use render::{Color, Position, Sprite, SpriteRenderer};
 pub use resource::{ResHandle, Resource};
 pub use scheduler::{SystemAccess, SystemScheduler, TypeKey};
 pub use scripting::{ScriptComponent, ScriptContext};

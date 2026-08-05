@@ -75,7 +75,7 @@ pub fn print_system_specs() {
         .map(|cpu| cpu.brand().to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    let physical_cores = system.physical_core_count().unwrap_or(0);
+    let physical_cores = sysinfo::System::physical_core_count().unwrap_or(0);
     let logical_threads = system.cpus().len();
 
     let uptime_secs = System::uptime();

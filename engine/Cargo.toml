@@ -6,12 +6,13 @@ edition = "2021"
 [dependencies]
 rayon = "1.10"
 parking_lot = "0.12"
-sysinfo = "0.33"
+sysinfo = "0.39"
 trait_type_map = { path = "../../Trait-Type-Map" }
 tracy-client = { version = "0.18", optional = true, default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-macroquad = { version = "0.4", optional = true }
+wgpu = { version = "26.0.1", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -39,9 +40,10 @@ profiling-minimal = [
 ]
 # Debug: full profiling + instrumentation verification (~50% overhead).
 profiling-verify = ["profiling", "tracy-client/verify"]
-# Minimal 2D renderer (macroquad-backed): Position/Sprite components + a
-# draw_sprites() helper the host can call after process_frame().
-rendering = ["dep:macroquad"]
+# Minimal 2D renderer (wgpu-backed): Position/Sprite components + a
+# SpriteRenderer the host can drive after process_frame(). The host owns
+# the window/surface/device/queue - this crate never creates a window.
+rendering = ["dep:wgpu", "dep:bytemuck"]
 
 [[bench]]
 name = "entity_lifecycle"
