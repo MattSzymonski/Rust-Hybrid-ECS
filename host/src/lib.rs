@@ -382,7 +382,12 @@ fn cleanup_temporary_files(workspace_root: &Path) {
 pub struct Host {
     workspace_root: PathBuf,
     module_config: GameModuleConfig,
-    engine: Engine,
+    // Boxed so its heap address stays stable even when `Host` itself is
+    // moved (e.g. returned by value from `setup`, or moved again into a
+    // caller's own struct). `engine_api.engine_handle` is a raw pointer into
+    // this allocation - if `Engine` lived inline in `Host`, moving `Host`
+    // after constructing `EngineApi` would leave that pointer dangling.
+    engine: Box<Engine>,
     engine_api: EngineApi,
     game_library: GameLibrary,
     reload_flag: Arc<AtomicBool>,
@@ -429,7 +434,13 @@ pub fn setup(module_config: GameModuleConfig) -> Result<Host, Box<dyn std::error
     cleanup_temporary_files(&workspace_root);
 
     // Step 1: Create the engine and its C-compatible API table.
-    let mut engine = Engine::new();
+    //
+    // `engine` is boxed BEFORE building `EngineApi` so `engine_api.engine_handle`
+    // points at its final, stable heap address. If `EngineApi::new` captured
+    // the address of a stack-local `Engine` that later moved into `Host`
+    // (returned by value below), the pointer would dangle - see the comment
+    // on `Host::engine`.
+    let mut engine = Box::new(Engine::new());
     engine.set_parallel_execution(true);
     engine.set_fps_limit(60.0);
 
