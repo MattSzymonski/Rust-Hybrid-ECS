@@ -102,11 +102,35 @@ struct GameModuleConfig {
 
 impl GameModuleConfig {
     /// Default configuration for a Rust `cdylib` game module built with Cargo.
+    ///
+    /// When `standalone` itself is built with the `rendering` feature, the
+    /// game module is built with its own `rendering` feature too, so both
+    /// sides agree on which components (`Position`, `Sprite`, ...) exist.
+    #[cfg(not(feature = "rendering"))]
     pub const fn rust_default() -> Self {
         Self {
             name: "game",
             watch_directory: "game/src",
             build_command: &["cargo", "build", "--package", "game"],
+            library_name: "game",
+            output_subdirectory: "target/debug",
+        }
+    }
+
+    /// See the non-`rendering` variant above.
+    #[cfg(feature = "rendering")]
+    pub const fn rust_default() -> Self {
+        Self {
+            name: "game",
+            watch_directory: "game/src",
+            build_command: &[
+                "cargo",
+                "build",
+                "--package",
+                "game",
+                "--features",
+                "rendering",
+            ],
             library_name: "game",
             output_subdirectory: "target/debug",
         }
@@ -366,10 +390,32 @@ fn cleanup_temporary_files(workspace_root: &Path) {
 }
 
 // =============================================================================
-// Main
+// Host State
 // =============================================================================
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// Everything the frame-step loop needs, assembled once during startup.
+///
+/// Bundled into a struct so both the headless loop and the macroquad-driven
+/// loop (behind the `rendering` feature) can share the exact same
+/// per-frame/hot-reload logic in [`run_one_frame`].
+struct Host {
+    workspace_root: PathBuf,
+    module_config: GameModuleConfig,
+    engine: Engine,
+    engine_api: EngineApi,
+    game_library: GameLibrary,
+    reload_flag: Arc<AtomicBool>,
+    frame_count: u64,
+    last_report: std::time::Instant,
+    // Graveyard: old DLLs are never unloaded — their code/vtables may still
+    // be referenced by storage factories and component copiers in the World.
+    // Keeping them mapped avoids use-after-free crashes on hot-reload.
+    old_libraries: Vec<Library>,
+}
+
+/// Perform one-time setup: build/load the game module, create the engine,
+/// and start the file watcher. Returns the assembled [`Host`] state.
+fn setup() -> Result<Host, Box<dyn std::error::Error>> {
     // Determine workspace root (standalone's parent directory).
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -407,7 +453,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Step 2: Build and load the game module for the first time.
     let library_path = build_game_module(&workspace_root, &module_config)?;
-    let mut game_library = load_game_library(&library_path, &workspace_root)?;
+    let game_library = load_game_library(&library_path, &workspace_root)?;
 
     // Step 3: Call game_init so the module registers its components and systems.
     game_library.call_game_init(&engine_api);
@@ -416,7 +462,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let reload_flag = Arc::new(AtomicBool::new(false));
     spawn_file_watcher(workspace_root.clone(), &module_config, reload_flag.clone())?;
 
-    // Step 5: Main game loop.
     println!();
     println!(
         "[standalone] Entering game loop. Edit {}/**/* to hot-reload.",
@@ -425,130 +470,182 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[standalone] Press Ctrl+C to stop.");
     println!();
 
-    let mut frame_count: u64 = 0;
-    let mut last_report = std::time::Instant::now();
+    Ok(Host {
+        workspace_root,
+        module_config,
+        engine,
+        engine_api,
+        game_library,
+        reload_flag,
+        frame_count: 0,
+        last_report: std::time::Instant::now(),
+        old_libraries: Vec::new(),
+    })
+}
 
-    // Graveyard: old DLLs are never unloaded — their code/vtables may still
-    // be referenced by storage factories and component copiers in the World.
-    // Keeping them mapped avoids use-after-free crashes on hot-reload.
-    let mut old_libraries: Vec<Library> = Vec::new();
+/// Run one iteration of the host loop: check for hot-reload, process one
+/// engine frame, call the game's update hook, and report FPS periodically.
+fn run_one_frame(host: &mut Host) {
+    let Host {
+        workspace_root,
+        module_config,
+        engine,
+        engine_api,
+        game_library,
+        reload_flag,
+        frame_count,
+        last_report,
+        old_libraries,
+    } = host;
 
-    loop {
-        // Check if a reload was requested by the file watcher.
-        if reload_flag.swap(false, Ordering::Acquire) {
-            println!();
-            println!("[standalone] === Hot-reload triggered ===");
+    // Check if a reload was requested by the file watcher.
+    if reload_flag.swap(false, Ordering::Acquire) {
+        println!();
+        println!("[standalone] === Hot-reload triggered ===");
 
-            // Step A: Try to build and load the new library BEFORE dropping
-            // the old one. If the build or load fails, we keep the old
-            // game module running — zero downtime.
-            match build_game_module(&workspace_root, &module_config) {
-                Ok(path) => match load_game_library(&path, &workspace_root) {
-                    Ok(new_library) => {
-                        let previous_metadata_by_name =
-                            engine.world().capture_persist_type_metadata();
-                        let previous_manifest = engine.world().persist_type_manifest();
+        // Step A: Try to build and load the new library BEFORE dropping
+        // the old one. If the build or load fails, we keep the old
+        // game module running — zero downtime.
+        match build_game_module(workspace_root, module_config) {
+            Ok(path) => match load_game_library(&path, workspace_root) {
+                Ok(new_library) => {
+                    let previous_metadata_by_name =
+                        engine.world().capture_persist_type_metadata();
+                    let previous_manifest = engine.world().persist_type_manifest();
 
-                        println!("[standalone] === Reload step 1/4: clearing old systems ===");
-                        engine.clear_systems();
+                    println!("[standalone] === Reload step 1/4: clearing old systems ===");
+                    engine.clear_systems();
+                    println!(
+                        "[standalone] === Reload step 2/4: calling game_init on new DLL ==="
+                    );
+                    new_library.call_game_init(engine_api);
+
+                    let current_manifest = engine.world().persist_type_manifest();
+                    let current_schema_by_name: std::collections::HashMap<String, u64> =
+                        current_manifest
+                            .iter()
+                            .map(|entry| (entry.type_name.clone(), entry.schema_hash))
+                            .collect();
+
+                    let changed_type_names: std::collections::HashSet<String> = previous_manifest
+                        .iter()
+                        .filter_map(|entry| {
+                            current_schema_by_name
+                                .get(&entry.type_name)
+                                .filter(|&&current_hash| current_hash != entry.schema_hash)
+                                .map(|_| entry.type_name.clone())
+                        })
+                        .collect();
+
+                    if changed_type_names.is_empty() {
                         println!(
-                            "[standalone] === Reload step 2/4: calling game_init on new DLL ==="
+                            "[standalone] Schema unchanged for all persistable component types — fast path.",
                         );
-                        new_library.call_game_init(&engine_api);
-
-                        let current_manifest = engine.world().persist_type_manifest();
-                        let current_schema_by_name: std::collections::HashMap<String, u64> =
-                            current_manifest
-                                .iter()
-                                .map(|entry| (entry.type_name.clone(), entry.schema_hash))
-                                .collect();
-
-                        let changed_type_names: std::collections::HashSet<String> =
-                            previous_manifest
-                                .iter()
-                                .filter_map(|entry| {
-                                    current_schema_by_name
-                                        .get(&entry.type_name)
-                                        .filter(|&&current_hash| current_hash != entry.schema_hash)
-                                        .map(|_| entry.type_name.clone())
-                                })
-                                .collect();
-
-                        if changed_type_names.is_empty() {
-                            println!(
-                                "[standalone] Schema unchanged for all persistable component types — fast path.",
-                            );
-                        } else {
-                            println!(
-                                "[standalone] === Reload step 3/4: selectively migrating {} component type(s) ===",
-                                changed_type_names.len(),
-                            );
-                            let migration_report =
-                                engine.world_mut().migrate_changed_persistable_components(
-                                    &previous_metadata_by_name,
-                                    &changed_type_names,
-                                );
-
-                            println!(
-                                "[standalone] Selective migration complete: {} type(s), {} entities.",
-                                migration_report.migrated_type_count,
-                                migration_report.migrated_entity_count,
+                    } else {
+                        println!(
+                            "[standalone] === Reload step 3/4: selectively migrating {} component type(s) ===",
+                            changed_type_names.len(),
+                        );
+                        let migration_report =
+                            engine.world_mut().migrate_changed_persistable_components(
+                                &previous_metadata_by_name,
+                                &changed_type_names,
                             );
 
-                            if !migration_report.skipped_type_names.is_empty() {
-                                eprintln!(
-                                    "[standalone] Selective migration skipped {} type(s): {:?}",
-                                    migration_report.skipped_type_names.len(),
-                                    migration_report.skipped_type_names,
-                                );
-                            }
+                        println!(
+                            "[standalone] Selective migration complete: {} type(s), {} entities.",
+                            migration_report.migrated_type_count,
+                            migration_report.migrated_entity_count,
+                        );
+
+                        if !migration_report.skipped_type_names.is_empty() {
+                            eprintln!(
+                                "[standalone] Selective migration skipped {} type(s): {:?}",
+                                migration_report.skipped_type_names.len(),
+                                migration_report.skipped_type_names,
+                            );
                         }
+                    }
 
-                        println!(
-                            "[standalone] === Reload step 4/4: archiving old DLL, swapping ==="
-                        );
-                        old_libraries.push(game_library.library);
-                        game_library = new_library;
-                        println!(
-                            "[standalone] Hot-reload complete ({} entities, {} old libs in graveyard).",
-                            engine.world().entity_count(),
-                            old_libraries.len(),
-                        );
-                    }
-                    Err(error) => {
-                        eprintln!("[standalone] Failed to load new library: {}", error);
-                        eprintln!(
-                            "[standalone] Keeping old game module. Fix errors and save again."
-                        );
-                    }
-                },
-                Err(error) => {
-                    eprintln!("[standalone] Build failed: {}", error);
-                    eprintln!(
-                        "[standalone] Keeping old game module. Fix compilation errors and save again."
+                    println!("[standalone] === Reload step 4/4: archiving old DLL, swapping ===");
+                    old_libraries.push(std::mem::replace(game_library, new_library).library);
+                    println!(
+                        "[standalone] Hot-reload complete ({} entities, {} old libs in graveyard).",
+                        engine.world().entity_count(),
+                        old_libraries.len(),
                     );
                 }
+                Err(error) => {
+                    eprintln!("[standalone] Failed to load new library: {}", error);
+                    eprintln!("[standalone] Keeping old game module. Fix errors and save again.");
+                }
+            },
+            Err(error) => {
+                eprintln!("[standalone] Build failed: {}", error);
+                eprintln!(
+                    "[standalone] Keeping old game module. Fix compilation errors and save again."
+                );
             }
         }
-
-        // Run one frame of engine systems.
-        if let Err(errors) = engine.process_frame() {
-            eprintln!("[standalone] Frame error: {:?}", errors);
-        }
-
-        // Call the game's per-frame update hook.
-        game_library.call_game_update(&engine_api);
-
-        frame_count += 1;
-
-        // Report FPS every 2 seconds.
-        let elapsed = last_report.elapsed().as_secs_f64();
-        if elapsed >= 2.0 {
-            let fps = frame_count as f64 / elapsed;
-            let entity_count = engine.world().entity_count();
-            println!("  {:>6.0} FPS | {:>5} entities", fps, entity_count);
-            frame_count = 0;
-            last_report = std::time::Instant::now();
-        }
     }
+
+    // Run one frame of engine systems.
+    if let Err(errors) = engine.process_frame() {
+        eprintln!("[standalone] Frame error: {:?}", errors);
+    }
+
+    // Call the game's per-frame update hook.
+    game_library.call_game_update(engine_api);
+
+    *frame_count += 1;
+
+    // Report FPS every 2 seconds.
+    let elapsed = last_report.elapsed().as_secs_f64();
+    if elapsed >= 2.0 {
+        let fps = *frame_count as f64 / elapsed;
+        let entity_count = engine.world().entity_count();
+        println!("  {:>6.0} FPS | {:>5} entities", fps, entity_count);
+        *frame_count = 0;
+        *last_report = std::time::Instant::now();
+    }
+}
+
+// =============================================================================
+// Main
+// =============================================================================
+
+/// Headless host: runs the engine loop as fast as its FPS limiter allows,
+/// with no window or rendering.
+#[cfg(not(feature = "rendering"))]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut host = setup()?;
+    loop {
+        run_one_frame(&mut host);
+    }
+}
+
+/// Windowed host: opens a macroquad window and draws every entity with a
+/// `Position` + `Sprite` component after each engine frame.
+#[cfg(feature = "rendering")]
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut host = setup()?;
+
+    let window_config = macroquad::window::Conf {
+        window_title: "ECS Standalone Host".to_owned(),
+        window_width: 800,
+        window_height: 600,
+        ..Default::default()
+    };
+
+    macroquad::Window::from_config(window_config, async move {
+        loop {
+            run_one_frame(&mut host);
+
+            macroquad::prelude::clear_background(macroquad::prelude::BLACK);
+            ecs_hybrid::draw_sprites(host.engine.world_mut());
+            macroquad::prelude::next_frame().await;
+        }
+    });
+
+    Ok(())
 }

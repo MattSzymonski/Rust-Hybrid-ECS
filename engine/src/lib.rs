@@ -39,6 +39,8 @@ pub mod entity;
 pub mod persistence;
 pub mod profiling;
 pub mod query;
+#[cfg(feature = "rendering")]
+pub mod render;
 pub mod resource;
 pub mod scheduler;
 pub mod scripting;
@@ -57,6 +59,8 @@ pub use persistence::ComponentSnapshot;
 pub use query::{
     Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,
 };
+#[cfg(feature = "rendering")]
+pub use render::{draw_sprites, Color, Position, Sprite};
 pub use resource::{ResHandle, Resource};
 pub use scheduler::{SystemAccess, SystemScheduler, TypeKey};
 pub use scripting::{ScriptComponent, ScriptContext};

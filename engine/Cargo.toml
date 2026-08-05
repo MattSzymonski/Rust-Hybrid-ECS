@@ -7,10 +7,11 @@ edition = "2021"
 rayon = "1.10"
 parking_lot = "0.12"
 sysinfo = "0.33"
-trait_type_map = { path = "../../trait_type_map" }
+trait_type_map = { path = "../../Trait-Type-Map" }
 tracy-client = { version = "0.18", optional = true, default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+macroquad = { version = "0.4", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -38,6 +39,9 @@ profiling-minimal = [
 ]
 # Debug: full profiling + instrumentation verification (~50% overhead).
 profiling-verify = ["profiling", "tracy-client/verify"]
+# Minimal 2D renderer (macroquad-backed): Position/Sprite components + a
+# draw_sprites() helper the host can call after process_frame().
+rendering = ["dep:macroquad"]
 
 [[bench]]
 name = "entity_lifecycle"

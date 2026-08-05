@@ -33,9 +33,34 @@ impl Component for FrameCounter {}
 
 impl_trait_accessible!(dyn Component; FrameCounter);
 
+/// Horizontal speed (pixels/frame) for the demo bouncing sprite.
+#[cfg(feature = "rendering")]
+#[derive(Clone)]
+struct BounceVelocity {
+    dx: f32,
+}
+#[cfg(feature = "rendering")]
+impl Component for BounceVelocity {}
+#[cfg(feature = "rendering")]
+impl_trait_accessible!(dyn Component; BounceVelocity);
+
 // =============================================================================
 // Systems
 // =============================================================================
+
+/// Bounces the demo sprite left/right across the window.
+#[cfg(feature = "rendering")]
+fn bounce_system(mut query: Query<(&mut ecs_hybrid::Position, &mut BounceVelocity)>) {
+    const MIN_X: f32 = 0.0;
+    const MAX_X: f32 = 600.0;
+
+    for (mut position, mut velocity) in query.iter_mut() {
+        position.x += velocity.dx;
+        if position.x <= MIN_X || position.x >= MAX_X {
+            velocity.dx = -velocity.dx;
+        }
+    }
+}
 
 /// Increments the counter every frame. When it reaches the threshold,
 /// resets and prints a timestamp to the console.
@@ -85,6 +110,27 @@ pub extern "C" fn game_init(api: *const EngineApi) {
         .create_entity()
         .with(FrameCounter { count: 0 })
         .build();
+
+    #[cfg(feature = "rendering")]
+    {
+        engine.world_mut().register_component::<Position>();
+        engine.world_mut().register_component::<Sprite>();
+        engine.world_mut().register_component::<BounceVelocity>();
+        engine.register_system("bounce", bounce_system);
+
+        // Spawn one bouncing sprite entity to demonstrate rendering.
+        let _ = engine
+            .world_mut()
+            .create_entity()
+            .with(Position { x: 0.0, y: 100.0 })
+            .with(Sprite {
+                width: 32.0,
+                height: 32.0,
+                color: Color::new(1.0, 0.6, 0.0, 1.0), // orange
+            })
+            .with(BounceVelocity { dx: 3.0 })
+            .build();
+    }
 }
 
 #[no_mangle]

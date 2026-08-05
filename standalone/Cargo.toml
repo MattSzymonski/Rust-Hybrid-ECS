@@ -7,3 +7,7 @@ edition = "2021"
 ecs_hybrid = { path = "../engine" }
 libloading = "0.8"
 notify = "6"
+macroquad = { version = "0.4", optional = true }
+
+[features]
+rendering = ["dep:macroquad", "ecs_hybrid/rendering"]
