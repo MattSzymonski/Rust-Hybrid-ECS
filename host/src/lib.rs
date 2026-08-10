@@ -39,6 +39,8 @@ use libloading::{Library, Symbol};
 // Current crate
 use ecs_hybrid::{Engine, EngineApi};
 
+mod cs;
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -52,6 +54,26 @@ const TEMPORARY_DIRECTORY: &str = "standalone_temp";
 // =============================================================================
 // GameModuleConfig
 // =============================================================================
+
+/// Backend-specific output information for a hot-reloadable game module.
+#[derive(Debug, Clone)]
+pub enum GameModuleBackend {
+    /// A native shared library exporting `game_init` and `game_update`.
+    NativeLibrary {
+        library_name: &'static str,
+        output_subdirectory: &'static str,
+    },
+    /// A managed game assembly loaded through the stable `cs_runtime` host.
+    CSharp(CSharpModuleConfig),
+}
+
+#[derive(Debug, Clone)]
+pub struct CSharpModuleConfig {
+    pub runtime_assembly_name: &'static str,
+    pub runtime_output_subdirectory: &'static str,
+    pub game_assembly_name: &'static str,
+    pub game_output_subdirectory: &'static str,
+}
 
 /// Configuration for a hot-reloadable game module.
 ///
@@ -71,14 +93,8 @@ pub struct GameModuleConfig {
     /// Executed with `current_dir` set to the workspace root.
     pub build_command: &'static [&'static str],
 
-    /// Base name of the shared library (without extension or `lib` prefix).
-    /// The extension is determined automatically from the host platform.
-    pub library_name: &'static str,
-
-    /// Subdirectory (relative to workspace root) where the build system
-    /// places the output shared library.  Defaults to `"target/debug"` for
-    /// Cargo projects.
-    pub output_subdirectory: &'static str,
+    /// How the built module is loaded and executed.
+    pub backend: GameModuleBackend,
 }
 
 impl GameModuleConfig {
@@ -90,11 +106,13 @@ impl GameModuleConfig {
     #[cfg(not(feature = "rendering"))]
     pub const fn rust_default() -> Self {
         Self {
-            name: "game",
-            watch_directory: "game/src",
+            name: "game-rs",
+            watch_directory: "game_rs/src",
             build_command: &["cargo", "build", "--package", "game"],
-            library_name: "game",
-            output_subdirectory: "target/debug",
+            backend: GameModuleBackend::NativeLibrary {
+                library_name: "game",
+                output_subdirectory: "target/debug",
+            },
         }
     }
 
@@ -102,8 +120,8 @@ impl GameModuleConfig {
     #[cfg(feature = "rendering")]
     pub const fn rust_default() -> Self {
         Self {
-            name: "game",
-            watch_directory: "game/src",
+            name: "game-rs",
+            watch_directory: "game_rs/src",
             build_command: &[
                 "cargo",
                 "build",
@@ -112,8 +130,32 @@ impl GameModuleConfig {
                 "--features",
                 "rendering",
             ],
-            library_name: "game",
-            output_subdirectory: "target/debug",
+            backend: GameModuleBackend::NativeLibrary {
+                library_name: "game",
+                output_subdirectory: "target/debug",
+            },
+        }
+    }
+
+    /// Default scheduler-integrated C# game loaded through `cs_runtime`.
+    pub const fn csharp_default() -> Self {
+        Self {
+            name: "game-cs",
+            watch_directory: "game_cs/src",
+            build_command: &[
+                "dotnet",
+                "build",
+                "game_cs/game_cs.csproj",
+                "-c",
+                "Release",
+                "--nologo",
+            ],
+            backend: GameModuleBackend::CSharp(CSharpModuleConfig {
+                runtime_assembly_name: "cs_runtime",
+                runtime_output_subdirectory: "cs_runtime/bin/Release/net8.0",
+                game_assembly_name: "game_cs",
+                game_output_subdirectory: "game_cs/bin/Release/net8.0",
+            }),
         }
     }
 
@@ -123,8 +165,10 @@ impl GameModuleConfig {
             name: "tests-game",
             watch_directory: "tests/game/src",
             build_command: &["cargo", "build", "--manifest-path", "tests/game/Cargo.toml"],
-            library_name: "game",
-            output_subdirectory: "tests/game/target/debug",
+            backend: GameModuleBackend::NativeLibrary {
+                library_name: "game",
+                output_subdirectory: "tests/game/target/debug",
+            },
         }
     }
 
@@ -132,6 +176,13 @@ impl GameModuleConfig {
     pub fn from_environment() -> Self {
         match std::env::var("ECS_HOT_RELOAD_MODULE") {
             Ok(value) if value.eq_ignore_ascii_case("tests-game") => Self::tests_game(),
+            Ok(value)
+                if value.eq_ignore_ascii_case("cs")
+                    || value.eq_ignore_ascii_case("csharp")
+                    || value.eq_ignore_ascii_case("game-cs") =>
+            {
+                Self::csharp_default()
+            }
             _ => Self::rust_default(),
         }
     }
@@ -222,24 +273,30 @@ fn build_game_module(
         return Err(format!("Build command failed for '{}':\n{}", config.name, stderr).into());
     }
 
-    // Determine the shared library filename based on the target platform.
-    let library_filename = if cfg!(target_os = "windows") {
-        format!("{}.dll", config.library_name)
-    } else if cfg!(target_os = "macos") {
-        format!("lib{}.dylib", config.library_name)
-    } else {
-        format!("lib{}.so", config.library_name)
+    let library_path = match &config.backend {
+        GameModuleBackend::NativeLibrary {
+            library_name,
+            output_subdirectory,
+        } => {
+            let filename = if cfg!(target_os = "windows") {
+                format!("{library_name}.dll")
+            } else if cfg!(target_os = "macos") {
+                format!("lib{library_name}.dylib")
+            } else {
+                format!("lib{library_name}.so")
+            };
+            workspace_root.join(output_subdirectory).join(filename)
+        }
+        GameModuleBackend::CSharp(config) => workspace_root
+            .join(config.game_output_subdirectory)
+            .join(format!("{}.dll", config.game_assembly_name)),
     };
-
-    let library_path = workspace_root
-        .join(config.output_subdirectory)
-        .join(&library_filename);
 
     if !library_path.exists() {
         return Err(format!(
             "Shared library not found at expected path: {}\n\
              Build succeeded but the output was not where we expected. \
-             Check `output_subdirectory` in GameModuleConfig.",
+             Check the selected backend output directory in GameModuleConfig.",
             library_path.display()
         )
         .into());
@@ -389,14 +446,18 @@ pub struct Host {
     // after constructing `EngineApi` would leave that pointer dangling.
     engine: Box<Engine>,
     engine_api: EngineApi,
-    game_library: GameLibrary,
+    loaded_game: LoadedGame,
     reload_flag: Arc<AtomicBool>,
     frame_count: u64,
     last_report: std::time::Instant,
-    // Graveyard: old DLLs are never unloaded — their code/vtables may still
-    // be referenced by storage factories and component copiers in the World.
-    // Keeping them mapped avoids use-after-free crashes on hot-reload.
-    old_libraries: Vec<Library>,
+}
+
+enum LoadedGame {
+    Native {
+        current: GameLibrary,
+        old_libraries: Vec<Library>,
+    },
+    CSharp(cs::CSharpRuntime),
 }
 
 impl Host {
@@ -423,15 +484,20 @@ pub fn setup(module_config: GameModuleConfig) -> Result<Host, Box<dyn std::error
     println!("=== ECS Host ===");
     println!("Workspace:   {}", workspace_root.display());
     println!(
-        "Game module: {} ({})",
-        module_config.name, module_config.library_name
+        "Game module: {} ({:?})",
+        module_config.name, module_config.backend
     );
     println!("Build cmd:   {}", module_config.build_command.join(" "));
     println!("Watch dir:   {}", module_config.watch_directory);
     println!();
 
     // Clean up leftover temporary files from previous runs.
-    cleanup_temporary_files(&workspace_root);
+    if matches!(
+        module_config.backend,
+        GameModuleBackend::NativeLibrary { .. }
+    ) {
+        cleanup_temporary_files(&workspace_root);
+    }
 
     // Step 1: Create the engine and its C-compatible API table.
     //
@@ -449,11 +515,22 @@ pub fn setup(module_config: GameModuleConfig) -> Result<Host, Box<dyn std::error
     let engine_api = EngineApi::new(&mut engine);
 
     // Step 2: Build and load the game module for the first time.
-    let library_path = build_game_module(&workspace_root, &module_config)?;
-    let game_library = load_game_library(&library_path, &workspace_root)?;
-
-    // Step 3: Call game_init so the module registers its components and systems.
-    game_library.call_game_init(&engine_api);
+    let output_path = build_game_module(&workspace_root, &module_config)?;
+    let loaded_game = match &module_config.backend {
+        GameModuleBackend::NativeLibrary { .. } => {
+            let library = load_game_library(&output_path, &workspace_root)?;
+            library.call_game_init(&engine_api);
+            LoadedGame::Native {
+                current: library,
+                old_libraries: Vec::new(),
+            }
+        }
+        GameModuleBackend::CSharp(config) => LoadedGame::CSharp(cs::CSharpRuntime::start(
+            &mut engine,
+            &workspace_root,
+            config,
+        )?),
+    };
 
     // Step 4: Set up the file watcher for hot-reloading.
     let reload_flag = Arc::new(AtomicBool::new(false));
@@ -471,11 +548,10 @@ pub fn setup(module_config: GameModuleConfig) -> Result<Host, Box<dyn std::error
         module_config,
         engine,
         engine_api,
-        game_library,
+        loaded_game,
         reload_flag,
         frame_count: 0,
         last_report: std::time::Instant::now(),
-        old_libraries: Vec::new(),
     })
 }
 
@@ -497,11 +573,10 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
         module_config,
         engine,
         engine_api,
-        game_library,
+        loaded_game,
         reload_flag,
         frame_count,
         last_report,
-        old_libraries,
     } = host;
 
     // Check if a reload was requested by the file watcher.
@@ -509,88 +584,117 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
         println!();
         println!("[host] === Hot-reload triggered ===");
 
-        // Step A: Try to build and load the new library BEFORE dropping
-        // the old one. If the build or load fails, we keep the old
-        // game module running — zero downtime.
-        match build_game_module(workspace_root, module_config) {
-            Ok(path) => match load_game_library(&path, workspace_root) {
-                Ok(new_library) => {
-                    let previous_metadata_by_name =
-                        engine.world().capture_persist_type_metadata();
-                    let previous_manifest = engine.world().persist_type_manifest();
+        match loaded_game {
+            LoadedGame::Native {
+                current: game_library,
+                old_libraries,
+            } => {
+                // Step A: Try to build and load the new library BEFORE dropping
+                // the old one. If the build or load fails, we keep the old
+                // game module running — zero downtime.
+                match build_game_module(workspace_root, module_config) {
+                    Ok(path) => match load_game_library(&path, workspace_root) {
+                        Ok(new_library) => {
+                            let previous_metadata_by_name =
+                                engine.world().capture_persist_type_metadata();
+                            let previous_manifest = engine.world().persist_type_manifest();
 
-                    println!("[host] === Reload step 1/4: clearing old systems ===");
-                    engine.clear_systems();
-                    println!("[host] === Reload step 2/4: calling game_init on new DLL ===");
-                    new_library.call_game_init(engine_api);
+                            println!("[host] === Reload step 1/4: clearing old systems ===");
+                            engine.clear_systems();
+                            println!(
+                                "[host] === Reload step 2/4: calling game_init on new DLL ==="
+                            );
+                            new_library.call_game_init(engine_api);
 
-                    let current_manifest = engine.world().persist_type_manifest();
-                    let current_schema_by_name: std::collections::HashMap<String, u64> =
-                        current_manifest
-                            .iter()
-                            .map(|entry| (entry.type_name.clone(), entry.schema_hash))
-                            .collect();
+                            let current_manifest = engine.world().persist_type_manifest();
+                            let current_schema_by_name: std::collections::HashMap<String, u64> =
+                                current_manifest
+                                    .iter()
+                                    .map(|entry| (entry.type_name.clone(), entry.schema_hash))
+                                    .collect();
 
-                    let changed_type_names: std::collections::HashSet<String> = previous_manifest
-                        .iter()
-                        .filter_map(|entry| {
-                            current_schema_by_name
-                                .get(&entry.type_name)
-                                .filter(|&&current_hash| current_hash != entry.schema_hash)
-                                .map(|_| entry.type_name.clone())
-                        })
-                        .collect();
+                            let changed_type_names: std::collections::HashSet<String> =
+                                previous_manifest
+                                    .iter()
+                                    .filter_map(|entry| {
+                                        current_schema_by_name
+                                            .get(&entry.type_name)
+                                            .filter(|&&current_hash| {
+                                                current_hash != entry.schema_hash
+                                            })
+                                            .map(|_| entry.type_name.clone())
+                                    })
+                                    .collect();
 
-                    if changed_type_names.is_empty() {
-                        println!(
+                            if changed_type_names.is_empty() {
+                                println!(
                             "[host] Schema unchanged for all persistable component types — fast path.",
                         );
-                    } else {
-                        println!(
+                            } else {
+                                println!(
                             "[host] === Reload step 3/4: selectively migrating {} component type(s) ===",
                             changed_type_names.len(),
                         );
-                        let migration_report =
-                            engine.world_mut().migrate_changed_persistable_components(
-                                &previous_metadata_by_name,
-                                &changed_type_names,
-                            );
+                                let migration_report =
+                                    engine.world_mut().migrate_changed_persistable_components(
+                                        &previous_metadata_by_name,
+                                        &changed_type_names,
+                                    );
 
-                        println!(
-                            "[host] Selective migration complete: {} type(s), {} entities.",
-                            migration_report.migrated_type_count,
-                            migration_report.migrated_entity_count,
-                        );
+                                println!(
+                                    "[host] Selective migration complete: {} type(s), {} entities.",
+                                    migration_report.migrated_type_count,
+                                    migration_report.migrated_entity_count,
+                                );
 
-                        if !migration_report.skipped_type_names.is_empty() {
-                            eprintln!(
-                                "[host] Selective migration skipped {} type(s): {:?}",
-                                migration_report.skipped_type_names.len(),
-                                migration_report.skipped_type_names,
-                            );
-                        }
-                    }
+                                if !migration_report.skipped_type_names.is_empty() {
+                                    eprintln!(
+                                        "[host] Selective migration skipped {} type(s): {:?}",
+                                        migration_report.skipped_type_names.len(),
+                                        migration_report.skipped_type_names,
+                                    );
+                                }
+                            }
 
-                    println!("[host] === Reload step 4/4: archiving old DLL, swapping ===");
-                    old_libraries.push(std::mem::replace(game_library, new_library).library);
-                    println!(
+                            println!("[host] === Reload step 4/4: archiving old DLL, swapping ===");
+                            old_libraries
+                                .push(std::mem::replace(game_library, new_library).library);
+                            println!(
                         "[host] Hot-reload complete ({} entities, {} old libs in graveyard).",
                         engine.world().entity_count(),
                         old_libraries.len(),
                     );
-                }
-                Err(error) => {
-                    eprintln!("[host] Failed to load new library: {}", error);
-                    eprintln!("[host] Keeping old game module. Fix errors and save again.");
-                }
-            },
-            Err(error) => {
-                eprintln!("[host] Build failed: {}", error);
-                eprintln!(
+                        }
+                        Err(error) => {
+                            eprintln!("[host] Failed to load new library: {}", error);
+                            eprintln!("[host] Keeping old game module. Fix errors and save again.");
+                        }
+                    },
+                    Err(error) => {
+                        eprintln!("[host] Build failed: {}", error);
+                        eprintln!(
                     "[host] Keeping old game module. Fix compilation errors and save again."
                 );
+                    }
+                }
             }
+            LoadedGame::CSharp(runtime) => match build_game_module(workspace_root, module_config) {
+                Ok(_) => {
+                    println!("[host] C# build complete; waiting for managed reload.");
+                    runtime.poll_reload();
+                }
+                Err(error) => {
+                    eprintln!("[host] C# build failed: {error}");
+                    eprintln!("[host] Keeping the currently loaded C# game assembly.");
+                }
+            },
         }
+    }
+
+    // The managed loader watches the built assembly rather than source files,
+    // so poll each frame to pick up a successful build after its debounce.
+    if let LoadedGame::CSharp(runtime) = loaded_game {
+        runtime.poll_reload();
     }
 
     // Run one frame of engine systems.
@@ -598,8 +702,11 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
         eprintln!("[host] Frame error: {:?}", errors);
     }
 
-    // Call the game's per-frame update hook.
-    game_library.call_game_update(engine_api);
+    // Managed games express their work as scheduler systems. Native games also
+    // retain the optional per-frame update hook.
+    if let LoadedGame::Native { current, .. } = loaded_game {
+        current.call_game_update(engine_api);
+    }
 
     *frame_count += 1;
 

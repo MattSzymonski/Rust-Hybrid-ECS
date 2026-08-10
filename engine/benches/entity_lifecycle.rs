@@ -71,16 +71,20 @@ fn create_entities(world: &mut World, count: usize) {
 fn bench_create(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("entity_create");
     for &count in &[100, 1_000, 10_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            benchmark.iter(|| {
-                let mut world = World::new();
-                world.register_component::<Transform>();
-                world.register_component::<Velocity>();
-                world.register_component::<Health>();
-                create_entities(&mut world, count);
-                black_box(world.entity_count());
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                benchmark.iter(|| {
+                    let mut world = World::new();
+                    world.register_component::<Transform>();
+                    world.register_component::<Velocity>();
+                    world.register_component::<Health>();
+                    create_entities(&mut world, count);
+                    black_box(world.entity_count());
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -90,17 +94,21 @@ fn bench_create(criterion: &mut Criterion) {
 fn bench_create_reserved(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("entity_create_reserved");
     for &count in &[1_000, 10_000, 100_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            benchmark.iter(|| {
-                let mut world = World::new();
-                world.register_component::<Transform>();
-                world.register_component::<Velocity>();
-                world.register_component::<Health>();
-                world.reserve_entities(count);
-                create_entities(&mut world, count);
-                black_box(world.entity_count());
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                benchmark.iter(|| {
+                    let mut world = World::new();
+                    world.register_component::<Transform>();
+                    world.register_component::<Velocity>();
+                    world.register_component::<Health>();
+                    world.reserve_entities(count);
+                    create_entities(&mut world, count);
+                    black_box(world.entity_count());
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -110,35 +118,39 @@ fn bench_create_reserved(criterion: &mut Criterion) {
 fn bench_destroy(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("entity_destroy");
     for &count in &[100, 1_000, 10_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            benchmark.iter_batched(
-                || {
-                    let mut world = World::new();
-                    world.register_component::<Transform>();
-                    let mut handles = Vec::with_capacity(count);
-                    for i in 0..count {
-                        handles.push(
-                            world
-                                .create_entity()
-                                .with(Transform {
-                                    x: i as f32,
-                                    y: 0.0,
-                                    z: 0.0,
-                                })
-                                .build()
-                                .unwrap(),
-                        );
-                    }
-                    (world, handles)
-                },
-                |(mut world, handles)| {
-                    for entity in handles {
-                        black_box(world.destroy_entity(entity));
-                    }
-                },
-                criterion::BatchSize::LargeInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                benchmark.iter_batched(
+                    || {
+                        let mut world = World::new();
+                        world.register_component::<Transform>();
+                        let mut handles = Vec::with_capacity(count);
+                        for i in 0..count {
+                            handles.push(
+                                world
+                                    .create_entity()
+                                    .with(Transform {
+                                        x: i as f32,
+                                        y: 0.0,
+                                        z: 0.0,
+                                    })
+                                    .build()
+                                    .unwrap(),
+                            );
+                        }
+                        (world, handles)
+                    },
+                    |(mut world, handles)| {
+                        for entity in handles {
+                            black_box(world.destroy_entity(entity));
+                        }
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
     }
     group.finish();
 }
@@ -230,38 +242,42 @@ fn bench_create_many_components(criterion: &mut Criterion) {
     impl_trait_accessible!(dyn Component; Armor, Mana, Stamina);
 
     for &count in &[100, 1_000, 10_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            benchmark.iter(|| {
-                let mut world = World::new();
-                world.register_component::<Transform>();
-                world.register_component::<Velocity>();
-                world.register_component::<Health>();
-                world.register_component::<Armor>();
-                world.register_component::<Mana>();
-                world.register_component::<Stamina>();
-                for i in 0..count {
-                    world
-                        .create_entity()
-                        .with(Transform {
-                            x: i as f32,
-                            y: 0.0,
-                            z: 0.0,
-                        })
-                        .with(Velocity {
-                            x: 0.1,
-                            y: 0.2,
-                            z: 0.3,
-                        })
-                        .with(Health(100.0))
-                        .with(Armor(50.0))
-                        .with(Mana(200.0))
-                        .with(Stamina(150.0))
-                        .build()
-                        .unwrap();
-                }
-                black_box(world.entity_count());
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                benchmark.iter(|| {
+                    let mut world = World::new();
+                    world.register_component::<Transform>();
+                    world.register_component::<Velocity>();
+                    world.register_component::<Health>();
+                    world.register_component::<Armor>();
+                    world.register_component::<Mana>();
+                    world.register_component::<Stamina>();
+                    for i in 0..count {
+                        world
+                            .create_entity()
+                            .with(Transform {
+                                x: i as f32,
+                                y: 0.0,
+                                z: 0.0,
+                            })
+                            .with(Velocity {
+                                x: 0.1,
+                                y: 0.2,
+                                z: 0.3,
+                            })
+                            .with(Health(100.0))
+                            .with(Armor(50.0))
+                            .with(Mana(200.0))
+                            .with(Stamina(150.0))
+                            .build()
+                            .unwrap();
+                    }
+                    black_box(world.entity_count());
+                });
+            },
+        );
     }
     group.finish();
 }

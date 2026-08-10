@@ -323,6 +323,35 @@ impl Engine {
         self.scheduler.build_execution_graph();
     }
 
+    /// Register a system whose access pattern was derived outside Rust's
+    /// [`SystemParam`] machinery (for example from a managed-language system
+    /// signature).
+    ///
+    /// # Safety
+    ///
+    /// `access` must describe every component/resource the system may touch.
+    /// An incomplete declaration can make the scheduler run conflicting
+    /// systems concurrently and cause undefined behavior.
+    pub unsafe fn register_system_with_access<F>(
+        &mut self,
+        name: &'static str,
+        mut access: SystemAccess,
+        system: F,
+    ) where
+        F: FnMut(&mut World, &mut CommandQueue) + Send + 'static,
+    {
+        access.build_component_masks(&self.world.component_registry);
+        self.scheduler.register_system(access);
+        self.systems.push(RegisteredSystem {
+            name,
+            system: Box::new(system),
+            enabled: true,
+            last_run: 0,
+            average_duration: 0,
+            last_duration: 0,
+        });
+        self.scheduler.build_execution_graph();
+    }
     /// Remove all registered systems, clearing the scheduler state.
     ///
     /// This is used during hot-reload: the old game DLL's system function

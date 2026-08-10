@@ -30,6 +30,7 @@ use crate::world::World;
 // =============================================================================
 
 /// World-space position of an entity's top-left draw origin, in pixels.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Position {
     pub x: f32,
@@ -48,7 +49,12 @@ pub struct Color {
 }
 
 impl Color {
-    pub const WHITE: Color = Color { r: 1.0, g: 1.0, b: 1.0, a: 1.0 };
+    pub const WHITE: Color = Color {
+        r: 1.0,
+        g: 1.0,
+        b: 1.0,
+        a: 1.0,
+    };
 
     pub const fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
         Self { r, g, b, a }
@@ -294,7 +300,12 @@ impl SpriteRenderer {
                 .map(|(position, sprite)| SpriteInstance {
                     position: [position.x, position.y],
                     size: [sprite.width, sprite.height],
-                    color: [sprite.color.r, sprite.color.g, sprite.color.b, sprite.color.a],
+                    color: [
+                        sprite.color.r,
+                        sprite.color.g,
+                        sprite.color.b,
+                        sprite.color.a,
+                    ],
                 })
                 .collect()
         };
@@ -312,11 +323,12 @@ impl SpriteRenderer {
         if !instances.is_empty() {
             if instances.len() > self.instance_capacity {
                 self.instance_capacity = instances.len().next_power_of_two();
-                self.instance_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("sprite instance buffer"),
-                    contents: bytemuck::cast_slice(&instances),
-                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-                });
+                self.instance_buffer =
+                    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("sprite instance buffer"),
+                        contents: bytemuck::cast_slice(&instances),
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    });
             } else {
                 queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instances));
             }

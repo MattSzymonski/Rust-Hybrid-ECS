@@ -304,14 +304,11 @@ pub struct World {
     pub(crate) iterator_timings: std::sync::Arc<std::sync::Mutex<IteratorTimings>>,
 
     /// Per-component-type serialize fn for snapshotting (persistence module).
-    pub(crate) persist_serializers:
-        HashMap<ComponentId, crate::persistence::SerializeComponentFn>,
+    pub(crate) persist_serializers: HashMap<ComponentId, crate::persistence::SerializeComponentFn>,
     /// Per-type-name deserialize fn for restoring (persistence module).
-    pub(crate) persist_deserializers:
-        HashMap<String, crate::persistence::DeserializeComponentFn>,
+    pub(crate) persist_deserializers: HashMap<String, crate::persistence::DeserializeComponentFn>,
     /// Per-component-type insert fn for pushing Box<dyn Component> into storage.
-    pub(crate) persist_inserters:
-        HashMap<ComponentId, crate::persistence::InsertComponentFn>,
+    pub(crate) persist_inserters: HashMap<ComponentId, crate::persistence::InsertComponentFn>,
     /// Per-type-name schema hash for persistable components.
     pub(crate) persist_schema_hashes: HashMap<String, u64>,
 }
@@ -390,6 +387,26 @@ impl World {
                 }
             }
         }
+    }
+
+    /// Return one archetype-sized component chunk for language bindings.
+    ///
+    /// `chunk_index` is relative to archetypes containing `T`. The entity
+    /// ID identifies the archetype shared by corresponding chunks of other
+    /// component types.
+    pub fn component_chunk_mut<T>(&mut self, chunk_index: usize) -> Option<(ArchetypeId, &mut [T])>
+    where
+        T: Component + TraitAccessible<dyn Component>,
+    {
+        let component_id = ComponentId::of::<T>();
+        let archetype = self
+            .archetypes
+            .values_mut()
+            .filter(|archetype| archetype.component_types.contains(&component_id))
+            .nth(chunk_index)?;
+        let archetype_id = archetype.id;
+        let storage = archetype.component_storages.get_storage_mut::<T>();
+        Some((archetype_id, storage.data.as_mut_slice()))
     }
 }
 

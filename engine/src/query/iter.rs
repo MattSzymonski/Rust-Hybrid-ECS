@@ -436,7 +436,9 @@ where
         // for the owning thread, and no late-arriving outliers.
         let min_len = self
             .min_batch_size
-            .unwrap_or(config::default_entities_per_slice(self.total_components_size));
+            .unwrap_or(config::default_entities_per_slice(
+                self.total_components_size,
+            ));
 
         // Build flat work slices: each is (archetype_index, start_entity, end_entity).
         // Precompute capacity so the Vec never reallocates during push.
@@ -606,7 +608,9 @@ where
         // eliminating the work-stealing cascade and late-arriving outliers.
         let min_len = self
             .min_batch_size
-            .unwrap_or(config::default_entities_per_slice(self.total_components_size));
+            .unwrap_or(config::default_entities_per_slice(
+                self.total_components_size,
+            ));
         let system_label = self.label;
 
         // Build flat work slices: each is (archetype_index, start_entity, end_entity).

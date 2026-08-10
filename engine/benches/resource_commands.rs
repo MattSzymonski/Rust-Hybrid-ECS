@@ -75,18 +75,22 @@ impl Resource for Config {}
 fn bench_resource_insert(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("resource_insert");
     for &count in &[100, 1_000, 10_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            benchmark.iter(|| {
-                let mut world = World::new();
-                for i in 0..count {
-                    world.insert_resource(GameTime {
-                        delta: 0.016,
-                        elapsed: i as f32 * 0.016,
-                    });
-                }
-                black_box(world.has_resource::<GameTime>());
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                benchmark.iter(|| {
+                    let mut world = World::new();
+                    for i in 0..count {
+                        world.insert_resource(GameTime {
+                            delta: 0.016,
+                            elapsed: i as f32 * 0.016,
+                        });
+                    }
+                    black_box(world.has_resource::<GameTime>());
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -96,22 +100,26 @@ fn bench_resource_insert(criterion: &mut Criterion) {
 fn bench_resource_get(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("resource_get");
     for &count in &[1_000, 10_000, 100_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            let mut world = World::new();
-            world.insert_resource(GameTime {
-                delta: 0.016,
-                elapsed: 0.0,
-            });
-            benchmark.iter(|| {
-                for _ in 0..count {
-                    black_box(
-                        world
-                            .get_resource::<GameTime>()
-                            .map(|resource| resource.elapsed),
-                    );
-                }
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                let mut world = World::new();
+                world.insert_resource(GameTime {
+                    delta: 0.016,
+                    elapsed: 0.0,
+                });
+                benchmark.iter(|| {
+                    for _ in 0..count {
+                        black_box(
+                            world
+                                .get_resource::<GameTime>()
+                                .map(|resource| resource.elapsed),
+                        );
+                    }
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -121,21 +129,25 @@ fn bench_resource_get(criterion: &mut Criterion) {
 fn bench_resource_get_mut(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("resource_get_mut");
     for &count in &[1_000, 10_000, 100_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            let mut world = World::new();
-            world.insert_resource(GameTime {
-                delta: 0.016,
-                elapsed: 0.0,
-            });
-            benchmark.iter(|| {
-                for _ in 0..count {
-                    if let Some(time) = world.get_resource_mut::<GameTime>() {
-                        time.elapsed += time.delta;
-                        black_box(time.elapsed);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                let mut world = World::new();
+                world.insert_resource(GameTime {
+                    delta: 0.016,
+                    elapsed: 0.0,
+                });
+                benchmark.iter(|| {
+                    for _ in 0..count {
+                        if let Some(time) = world.get_resource_mut::<GameTime>() {
+                            time.elapsed += time.delta;
+                            black_box(time.elapsed);
+                        }
                     }
-                }
-            });
-        });
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -145,24 +157,28 @@ fn bench_resource_get_mut(criterion: &mut Criterion) {
 fn bench_resource_remove(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("resource_remove");
     for &count in &[100, 1_000, 10_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            benchmark.iter_batched(
-                || {
-                    let mut world = World::new();
-                    for i in 0..count {
-                        world.insert_resource(GameTime {
-                            delta: 0.016,
-                            elapsed: i as f32,
-                        });
-                    }
-                    world
-                },
-                |mut world| {
-                    black_box(world.remove_resource::<GameTime>());
-                },
-                criterion::BatchSize::LargeInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                benchmark.iter_batched(
+                    || {
+                        let mut world = World::new();
+                        for i in 0..count {
+                            world.insert_resource(GameTime {
+                                delta: 0.016,
+                                elapsed: i as f32,
+                            });
+                        }
+                        world
+                    },
+                    |mut world| {
+                        black_box(world.remove_resource::<GameTime>());
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
     }
     group.finish();
 }
@@ -172,30 +188,34 @@ fn bench_resource_remove(criterion: &mut Criterion) {
 fn bench_commands_create_entity(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("commands_create_entity");
     for &count in &[100, 1_000, 10_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            benchmark.iter(|| {
-                let mut engine = Engine::new();
-                engine.world_mut().register_component::<Position>();
-                engine.world_mut().register_component::<Velocity>();
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                benchmark.iter(|| {
+                    let mut engine = Engine::new();
+                    engine.world_mut().register_component::<Position>();
+                    engine.world_mut().register_component::<Velocity>();
 
-                // System that queues entity creation via Commands
-                engine.register_system("spawner", move |mut commands: Commands| {
-                    for i in 0..count {
-                        commands
-                            .create_entity()
-                            .with(Position {
-                                x: i as f32,
-                                y: 0.0,
-                            })
-                            .with(Velocity { x: 0.1, y: 0.2 })
-                            .build();
-                    }
+                    // System that queues entity creation via Commands
+                    engine.register_system("spawner", move |mut commands: Commands| {
+                        for i in 0..count {
+                            commands
+                                .create_entity()
+                                .with(Position {
+                                    x: i as f32,
+                                    y: 0.0,
+                                })
+                                .with(Velocity { x: 0.1, y: 0.2 })
+                                .build();
+                        }
+                    });
+
+                    engine.process_frame().unwrap();
+                    black_box(engine.world().entity_count());
                 });
-
-                engine.process_frame().unwrap();
-                black_box(engine.world().entity_count());
-            });
-        });
+            },
+        );
     }
     group.finish();
 }
@@ -205,40 +225,44 @@ fn bench_commands_create_entity(criterion: &mut Criterion) {
 fn bench_commands_destroy_entity(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("commands_destroy_entity");
     for &count in &[100, 1_000, 10_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            benchmark.iter_batched(
-                || {
-                    let mut engine = Engine::new();
-                    engine.world_mut().register_component::<Position>();
-                    // Pre-spawn entities to destroy
-                    for i in 0..count {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                benchmark.iter_batched(
+                    || {
+                        let mut engine = Engine::new();
+                        engine.world_mut().register_component::<Position>();
+                        // Pre-spawn entities to destroy
+                        for i in 0..count {
+                            engine
+                                .world_mut()
+                                .create_entity()
+                                .with(Position {
+                                    x: i as f32,
+                                    y: 0.0,
+                                })
+                                .build()
+                                .unwrap();
+                        }
                         engine
-                            .world_mut()
-                            .create_entity()
-                            .with(Position {
-                                x: i as f32,
-                                y: 0.0,
-                            })
-                            .build()
-                            .unwrap();
-                    }
-                    engine
-                },
-                |mut engine| {
-                    // System that queues all entities for destruction
-                    engine.register_system(
-                        "despawner",
-                        move |mut query: Query<Entity>, mut commands: Commands| {
-                            for entity in query.iter_mut() {
-                                commands.destroy_entity(entity);
-                            }
-                        },
-                    );
-                    black_box(engine.process_frame().is_ok());
-                },
-                criterion::BatchSize::LargeInput,
-            );
-        });
+                    },
+                    |mut engine| {
+                        // System that queues all entities for destruction
+                        engine.register_system(
+                            "despawner",
+                            move |mut query: Query<Entity>, mut commands: Commands| {
+                                for entity in query.iter_mut() {
+                                    commands.destroy_entity(entity);
+                                }
+                            },
+                        );
+                        black_box(engine.process_frame().is_ok());
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
     }
     group.finish();
 }
@@ -248,39 +272,43 @@ fn bench_commands_destroy_entity(criterion: &mut Criterion) {
 fn bench_commands_add_component(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("commands_add_component");
     for &count in &[100, 1_000, 10_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            benchmark.iter_batched(
-                || {
-                    let mut engine = Engine::new();
-                    engine.world_mut().register_component::<Position>();
-                    engine.world_mut().register_component::<Health>();
-                    for i in 0..count {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                benchmark.iter_batched(
+                    || {
+                        let mut engine = Engine::new();
+                        engine.world_mut().register_component::<Position>();
+                        engine.world_mut().register_component::<Health>();
+                        for i in 0..count {
+                            engine
+                                .world_mut()
+                                .create_entity()
+                                .with(Position {
+                                    x: i as f32,
+                                    y: 0.0,
+                                })
+                                .build()
+                                .unwrap();
+                        }
                         engine
-                            .world_mut()
-                            .create_entity()
-                            .with(Position {
-                                x: i as f32,
-                                y: 0.0,
-                            })
-                            .build()
-                            .unwrap();
-                    }
-                    engine
-                },
-                |mut engine| {
-                    engine.register_system(
-                        "adder",
-                        move |mut query: Query<(Entity, &Position)>, mut commands: Commands| {
-                            for (entity, _position) in query.iter_mut() {
-                                commands.add_component_to_entity(entity, Health(100.0));
-                            }
-                        },
-                    );
-                    black_box(engine.process_frame().is_ok());
-                },
-                criterion::BatchSize::LargeInput,
-            );
-        });
+                    },
+                    |mut engine| {
+                        engine.register_system(
+                            "adder",
+                            move |mut query: Query<(Entity, &Position)>, mut commands: Commands| {
+                                for (entity, _position) in query.iter_mut() {
+                                    commands.add_component_to_entity(entity, Health(100.0));
+                                }
+                            },
+                        );
+                        black_box(engine.process_frame().is_ok());
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
     }
     group.finish();
 }

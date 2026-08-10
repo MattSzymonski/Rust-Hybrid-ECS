@@ -1,13 +1,15 @@
 [package]
-name = "host"
+name = "game"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+crate-type = ["cdylib"]
+
 [dependencies]
 ecs_hybrid = { path = "../engine" }
-libloading = "0.8"
-notify = "6"
 trait_type_map = { path = "../../Trait-Type-Map" }
+serde = { version = "1", features = ["derive"] }
 
 [features]
 rendering = ["ecs_hybrid/rendering"]

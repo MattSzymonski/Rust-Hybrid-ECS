@@ -86,21 +86,25 @@ fn setup_world(entity_count: usize) -> (World, Vec<Entity>) {
 fn bench_add_component(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("archetype_add_component");
     for &count in &[1_000, 10_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            benchmark.iter_batched(
-                || setup_world(count),
-                |(mut world, handles)| {
-                    for entity in handles {
-                        black_box(
-                            world
-                                .add_component(entity, Health(entity.id() as f32))
-                                .is_ok(),
-                        );
-                    }
-                },
-                criterion::BatchSize::LargeInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                benchmark.iter_batched(
+                    || setup_world(count),
+                    |(mut world, handles)| {
+                        for entity in handles {
+                            black_box(
+                                world
+                                    .add_component(entity, Health(entity.id() as f32))
+                                    .is_ok(),
+                            );
+                        }
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
     }
     group.finish();
 }
@@ -110,25 +114,29 @@ fn bench_add_component(criterion: &mut Criterion) {
 fn bench_remove_component(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("archetype_remove_component");
     for &count in &[1_000, 10_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            benchmark.iter_batched(
-                || {
-                    let (mut world, handles) = setup_world(count);
-                    for &entity in &handles {
-                        world
-                            .add_component(entity, Health(entity.id() as f32))
-                            .unwrap();
-                    }
-                    (world, handles)
-                },
-                |(mut world, handles)| {
-                    for entity in handles {
-                        black_box(world.remove_component::<Health>(entity).is_ok());
-                    }
-                },
-                criterion::BatchSize::LargeInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                benchmark.iter_batched(
+                    || {
+                        let (mut world, handles) = setup_world(count);
+                        for &entity in &handles {
+                            world
+                                .add_component(entity, Health(entity.id() as f32))
+                                .unwrap();
+                        }
+                        (world, handles)
+                    },
+                    |(mut world, handles)| {
+                        for entity in handles {
+                            black_box(world.remove_component::<Health>(entity).is_ok());
+                        }
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
     }
     group.finish();
 }
@@ -138,20 +146,24 @@ fn bench_remove_component(criterion: &mut Criterion) {
 fn bench_add_multi_component(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("archetype_add_multi_component");
     for &count in &[1_000, 10_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            benchmark.iter_batched(
-                || setup_world(count),
-                |(mut world, handles)| {
-                    for entity in handles {
-                        // Add 3 components → entity migrates through 3 archetypes
-                        black_box(world.add_component(entity, Health(100.0)).is_ok());
-                        black_box(world.add_component(entity, Armor(50.0)).is_ok());
-                        black_box(world.add_component(entity, Mana(200.0)).is_ok());
-                    }
-                },
-                criterion::BatchSize::LargeInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                benchmark.iter_batched(
+                    || setup_world(count),
+                    |(mut world, handles)| {
+                        for entity in handles {
+                            // Add 3 components → entity migrates through 3 archetypes
+                            black_box(world.add_component(entity, Health(100.0)).is_ok());
+                            black_box(world.add_component(entity, Armor(50.0)).is_ok());
+                            black_box(world.add_component(entity, Mana(200.0)).is_ok());
+                        }
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
     }
     group.finish();
 }
@@ -161,27 +173,31 @@ fn bench_add_multi_component(criterion: &mut Criterion) {
 fn bench_remove_multi_component(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("archetype_remove_multi_component");
     for &count in &[1_000, 10_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            benchmark.iter_batched(
-                || {
-                    let (mut world, handles) = setup_world(count);
-                    for &entity in &handles {
-                        world.add_component(entity, Health(100.0)).unwrap();
-                        world.add_component(entity, Armor(50.0)).unwrap();
-                        world.add_component(entity, Mana(200.0)).unwrap();
-                    }
-                    (world, handles)
-                },
-                |(mut world, handles)| {
-                    for entity in handles {
-                        black_box(world.remove_component::<Health>(entity).is_ok());
-                        black_box(world.remove_component::<Armor>(entity).is_ok());
-                        black_box(world.remove_component::<Mana>(entity).is_ok());
-                    }
-                },
-                criterion::BatchSize::LargeInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                benchmark.iter_batched(
+                    || {
+                        let (mut world, handles) = setup_world(count);
+                        for &entity in &handles {
+                            world.add_component(entity, Health(100.0)).unwrap();
+                            world.add_component(entity, Armor(50.0)).unwrap();
+                            world.add_component(entity, Mana(200.0)).unwrap();
+                        }
+                        (world, handles)
+                    },
+                    |(mut world, handles)| {
+                        for entity in handles {
+                            black_box(world.remove_component::<Health>(entity).is_ok());
+                            black_box(world.remove_component::<Armor>(entity).is_ok());
+                            black_box(world.remove_component::<Mana>(entity).is_ok());
+                        }
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
     }
     group.finish();
 }
@@ -193,41 +209,45 @@ fn bench_archetype_explosion(criterion: &mut Criterion) {
     // Each entity gets a unique combination of optional tag components,
     // creating up to `entity_count` distinct archetypes.
     for &count in &[100, 1_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            benchmark.iter(|| {
-                let mut world = World::new();
-                world.register_component::<Position>();
-                world.register_component::<Health>();
-                world.register_component::<Armor>();
-                world.register_component::<Mana>();
-                world.register_component::<Stamina>();
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                benchmark.iter(|| {
+                    let mut world = World::new();
+                    world.register_component::<Position>();
+                    world.register_component::<Health>();
+                    world.register_component::<Armor>();
+                    world.register_component::<Mana>();
+                    world.register_component::<Stamina>();
 
-                for i in 0..count {
-                    let mut builder = world.create_entity().with(Position {
-                        x: i as f32,
-                        y: 0.0,
-                    });
+                    for i in 0..count {
+                        let mut builder = world.create_entity().with(Position {
+                            x: i as f32,
+                            y: 0.0,
+                        });
 
-                    // Each entity gets a subset of optional components,
-                    // creating many distinct archetypes.
-                    if i % 2 == 0 {
-                        builder = builder.with(Health(100.0));
-                    }
-                    if i % 3 == 0 {
-                        builder = builder.with(Armor(50.0));
-                    }
-                    if i % 5 == 0 {
-                        builder = builder.with(Mana(200.0));
-                    }
-                    if i % 7 == 0 {
-                        builder = builder.with(Stamina(150.0));
-                    }
+                        // Each entity gets a subset of optional components,
+                        // creating many distinct archetypes.
+                        if i % 2 == 0 {
+                            builder = builder.with(Health(100.0));
+                        }
+                        if i % 3 == 0 {
+                            builder = builder.with(Armor(50.0));
+                        }
+                        if i % 5 == 0 {
+                            builder = builder.with(Mana(200.0));
+                        }
+                        if i % 7 == 0 {
+                            builder = builder.with(Stamina(150.0));
+                        }
 
-                    builder.build().unwrap();
-                }
-                black_box(world.entity_count());
-            });
-        });
+                        builder.build().unwrap();
+                    }
+                    black_box(world.entity_count());
+                });
+            },
+        );
     }
     group.finish();
 }

@@ -25,9 +25,11 @@ use host::{run_one_frame, setup, GameModuleConfig, Host};
 
 fn main() {
     let config = Config::new()
-        .with_window(dioxus::desktop::tao::window::WindowBuilder::new()
-            .with_title("ECS Editor")
-            .with_transparent(true))
+        .with_window(
+            dioxus::desktop::tao::window::WindowBuilder::new()
+                .with_title("ECS Editor")
+                .with_transparent(true),
+        )
         .with_on_window(|window, dom| {
             let context = Arc::new(pollster::block_on(async {
                 let context = EditorContextAsyncBuilder {

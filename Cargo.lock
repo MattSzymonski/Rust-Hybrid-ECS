@@ -2379,6 +2379,7 @@ dependencies = [
  "ecs_hybrid",
  "libloading 0.8.9",
  "notify",
+ "trait_type_map",
 ]
 
 [[package]]

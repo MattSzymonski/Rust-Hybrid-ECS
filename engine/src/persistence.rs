@@ -685,12 +685,14 @@ impl World {
                 continue;
             };
 
-            let current_schema_hash = self.persist_schema_hashes.get(type_name).copied().unwrap_or(0);
+            let current_schema_hash = self
+                .persist_schema_hashes
+                .get(type_name)
+                .copied()
+                .unwrap_or(0);
             println!(
                 "[persistence]   '{}' -> migrating (schema {} -> {})",
-                type_name,
-                previous_metadata.schema_hash,
-                current_schema_hash,
+                type_name, previous_metadata.schema_hash, current_schema_hash,
             );
 
             match self.migrate_single_component_type(type_name, previous_metadata) {
@@ -785,7 +787,9 @@ impl World {
                 };
 
                 (0..archetype.entities.len())
-                    .map(|entity_index| serialize_old_component(&archetype.component_storages, entity_index))
+                    .map(|entity_index| {
+                        serialize_old_component(&archetype.component_storages, entity_index)
+                    })
                     .collect()
             };
 
@@ -898,7 +902,8 @@ impl World {
                         continue;
                     }
 
-                    let Some(&copy_component) = self.component_copiers.get(source_component_id) else {
+                    let Some(&copy_component) = self.component_copiers.get(source_component_id)
+                    else {
                         return Err(());
                     };
 

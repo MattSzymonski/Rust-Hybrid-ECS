@@ -126,17 +126,21 @@ fn setup_filtered_world(entity_count: usize) -> World {
 fn bench_iter_unfiltered(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("query_iter_unfiltered");
     for &count in &[1_000, 10_000, 100_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            let mut world = setup_world(count);
-            benchmark.iter(|| {
-                let mut query = Query::<(&Position, &Velocity)>::new(&mut world);
-                let mut sum_x: f32 = 0.0;
-                for (position, velocity) in query.iter_mut() {
-                    sum_x += position.x + velocity.x;
-                }
-                black_box(sum_x);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                let mut world = setup_world(count);
+                benchmark.iter(|| {
+                    let mut query = Query::<(&Position, &Velocity)>::new(&mut world);
+                    let mut sum_x: f32 = 0.0;
+                    for (position, velocity) in query.iter_mut() {
+                        sum_x += position.x + velocity.x;
+                    }
+                    black_box(sum_x);
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -146,16 +150,20 @@ fn bench_iter_unfiltered(criterion: &mut Criterion) {
 fn bench_iter_mutable(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("query_iter_mutable");
     for &count in &[1_000, 10_000, 100_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            let mut world = setup_world(count);
-            benchmark.iter(|| {
-                let mut query = Query::<(&mut Position, &Velocity)>::new(&mut world);
-                for (mut position, velocity) in query.iter_mut() {
-                    position.x += velocity.x;
-                    position.y += velocity.y;
-                }
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                let mut world = setup_world(count);
+                benchmark.iter(|| {
+                    let mut query = Query::<(&mut Position, &Velocity)>::new(&mut world);
+                    for (mut position, velocity) in query.iter_mut() {
+                        position.x += velocity.x;
+                        position.y += velocity.y;
+                    }
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -165,26 +173,30 @@ fn bench_iter_mutable(criterion: &mut Criterion) {
 fn bench_iter_changed(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("query_iter_changed");
     for &count in &[1_000, 10_000, 100_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            let mut world = setup_world(count);
-            // First frame: mutate all positions so Changed<Position> fires.
-            {
-                let mut query = Query::<&mut Position>::new(&mut world);
-                for mut position in query.iter_mut() {
-                    position.x += 1.0;
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                let mut world = setup_world(count);
+                // First frame: mutate all positions so Changed<Position> fires.
+                {
+                    let mut query = Query::<&mut Position>::new(&mut world);
+                    for mut position in query.iter_mut() {
+                        position.x += 1.0;
+                    }
                 }
-            }
-            world.increment_change_tick();
-            benchmark.iter(|| {
-                let mut query = Query::<(&Position,), Changed<Position>>::new(&mut world);
-                let mut matched_count = 0usize;
-                for (position,) in query.iter_mut() {
-                    black_box(position.x);
-                    matched_count += 1;
-                }
-                black_box(matched_count);
-            });
-        });
+                world.increment_change_tick();
+                benchmark.iter(|| {
+                    let mut query = Query::<(&Position,), Changed<Position>>::new(&mut world);
+                    let mut matched_count = 0usize;
+                    for (position,) in query.iter_mut() {
+                        black_box(position.x);
+                        matched_count += 1;
+                    }
+                    black_box(matched_count);
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -194,15 +206,19 @@ fn bench_iter_changed(criterion: &mut Criterion) {
 fn bench_par_iter_unfiltered(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("query_par_iter_unfiltered");
     for &count in &[10_000, 100_000, 1_000_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            let mut world = setup_world(count);
-            benchmark.iter(|| {
-                let mut query = Query::<(&Position, &Velocity)>::new(&mut world);
-                query.par_iter_mut().for_each(|(position, velocity)| {
-                    black_box(position.x + velocity.x);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                let mut world = setup_world(count);
+                benchmark.iter(|| {
+                    let mut query = Query::<(&Position, &Velocity)>::new(&mut world);
+                    query.par_iter_mut().for_each(|(position, velocity)| {
+                        black_box(position.x + velocity.x);
+                    });
                 });
-            });
-        });
+            },
+        );
     }
     group.finish();
 }
@@ -254,15 +270,19 @@ fn bench_crossover(criterion: &mut Criterion) {
                 });
             },
         );
-        group.bench_with_input(BenchmarkId::new("parallel", count), &count, |benchmark, &count| {
-            let mut world = setup_world(count);
-            benchmark.iter(|| {
-                let mut query = Query::<(&Position, &Velocity)>::new(&mut world);
-                query.par_iter_mut().for_each(|(position, velocity)| {
-                    black_box(position.x + velocity.x);
+        group.bench_with_input(
+            BenchmarkId::new("parallel", count),
+            &count,
+            |benchmark, &count| {
+                let mut world = setup_world(count);
+                benchmark.iter(|| {
+                    let mut query = Query::<(&Position, &Velocity)>::new(&mut world);
+                    query.par_iter_mut().for_each(|(position, velocity)| {
+                        black_box(position.x + velocity.x);
+                    });
                 });
-            });
-        });
+            },
+        );
     }
     group.finish();
 }
@@ -367,17 +387,21 @@ fn bench_large_component(criterion: &mut Criterion) {
 fn bench_iter_with_filter(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("query_iter_with");
     for &count in &[1_000, 10_000, 100_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            let mut world = setup_filtered_world(count);
-            benchmark.iter(|| {
-                let mut query = Query::<(&Position,), With<Enemy>>::new(&mut world);
-                let mut sum: f32 = 0.0;
-                for (position,) in query.iter_mut() {
-                    sum += position.x;
-                }
-                black_box(sum);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                let mut world = setup_filtered_world(count);
+                benchmark.iter(|| {
+                    let mut query = Query::<(&Position,), With<Enemy>>::new(&mut world);
+                    let mut sum: f32 = 0.0;
+                    for (position,) in query.iter_mut() {
+                        sum += position.x;
+                    }
+                    black_box(sum);
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -387,17 +411,21 @@ fn bench_iter_with_filter(criterion: &mut Criterion) {
 fn bench_iter_without_filter(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("query_iter_without");
     for &count in &[1_000, 10_000, 100_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            let mut world = setup_filtered_world(count);
-            benchmark.iter(|| {
-                let mut query = Query::<(&Position,), Without<Frozen>>::new(&mut world);
-                let mut sum: f32 = 0.0;
-                for (position,) in query.iter_mut() {
-                    sum += position.x;
-                }
-                black_box(sum);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                let mut world = setup_filtered_world(count);
+                benchmark.iter(|| {
+                    let mut query = Query::<(&Position,), Without<Frozen>>::new(&mut world);
+                    let mut sum: f32 = 0.0;
+                    for (position,) in query.iter_mut() {
+                        sum += position.x;
+                    }
+                    black_box(sum);
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -407,18 +435,22 @@ fn bench_iter_without_filter(criterion: &mut Criterion) {
 fn bench_iter_or_filter(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("query_iter_or");
     for &count in &[1_000, 10_000, 100_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            let mut world = setup_filtered_world(count);
-            benchmark.iter(|| {
-                let mut query =
-                    Query::<(&Position,), Or<(With<Enemy>, With<Frozen>)>>::new(&mut world);
-                let mut sum: f32 = 0.0;
-                for (position,) in query.iter_mut() {
-                    sum += position.x;
-                }
-                black_box(sum);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                let mut world = setup_filtered_world(count);
+                benchmark.iter(|| {
+                    let mut query =
+                        Query::<(&Position,), Or<(With<Enemy>, With<Frozen>)>>::new(&mut world);
+                    let mut sum: f32 = 0.0;
+                    for (position,) in query.iter_mut() {
+                        sum += position.x;
+                    }
+                    black_box(sum);
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -428,20 +460,24 @@ fn bench_iter_or_filter(criterion: &mut Criterion) {
 fn bench_iter_added(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("query_iter_added");
     for &count in &[1_000, 10_000, 100_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            let mut world = setup_world(count);
-            // Bump tick so Added<Position> fires for all entities
-            world.increment_change_tick();
-            benchmark.iter(|| {
-                let mut query = Query::<(&Position,), Added<Position>>::new(&mut world);
-                let mut matched_count = 0usize;
-                for (position,) in query.iter_mut() {
-                    black_box(position.x);
-                    matched_count += 1;
-                }
-                black_box(matched_count);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                let mut world = setup_world(count);
+                // Bump tick so Added<Position> fires for all entities
+                world.increment_change_tick();
+                benchmark.iter(|| {
+                    let mut query = Query::<(&Position,), Added<Position>>::new(&mut world);
+                    let mut matched_count = 0usize;
+                    for (position,) in query.iter_mut() {
+                        black_box(position.x);
+                        matched_count += 1;
+                    }
+                    black_box(matched_count);
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -451,17 +487,21 @@ fn bench_iter_added(criterion: &mut Criterion) {
 fn bench_entity_only_query(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("query_entity_only");
     for &count in &[10_000, 100_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            let mut world = setup_world(count);
-            benchmark.iter(|| {
-                let mut query = Query::<Entity>::new(&mut world);
-                let mut identifier_sum: u64 = 0;
-                for entity in query.iter_mut() {
-                    identifier_sum += entity.id();
-                }
-                black_box(identifier_sum);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                let mut world = setup_world(count);
+                benchmark.iter(|| {
+                    let mut query = Query::<Entity>::new(&mut world);
+                    let mut identifier_sum: u64 = 0;
+                    for entity in query.iter_mut() {
+                        identifier_sum += entity.id();
+                    }
+                    black_box(identifier_sum);
+                });
+            },
+        );
     }
     group.finish();
 }
@@ -513,15 +553,19 @@ fn bench_get_component(criterion: &mut Criterion) {
 fn bench_par_with_filter(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("query_par_with");
     for &count in &[10_000, 100_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            let mut world = setup_filtered_world(count);
-            benchmark.iter(|| {
-                let mut query = Query::<(&Position,), With<Enemy>>::new(&mut world);
-                query.par_iter_mut().for_each(|(position,)| {
-                    black_box(position.x);
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                let mut world = setup_filtered_world(count);
+                benchmark.iter(|| {
+                    let mut query = Query::<(&Position,), With<Enemy>>::new(&mut world);
+                    query.par_iter_mut().for_each(|(position,)| {
+                        black_box(position.x);
+                    });
                 });
-            });
-        });
+            },
+        );
     }
     group.finish();
 }
@@ -531,17 +575,21 @@ fn bench_par_with_filter(criterion: &mut Criterion) {
 fn bench_multi_component(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("query_multi_component");
     for &count in &[10_000, 100_000] {
-        group.bench_with_input(BenchmarkId::from_parameter(count), &count, |benchmark, &count| {
-            let mut world = setup_world(count);
-            benchmark.iter(|| {
-                let mut query = Query::<(&Position, &Velocity, &Health)>::new(&mut world);
-                let mut sum: f32 = 0.0;
-                for (position, velocity, health) in query.iter_mut() {
-                    sum += position.x + velocity.x + health.0;
-                }
-                black_box(sum);
-            });
-        });
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                let mut world = setup_world(count);
+                benchmark.iter(|| {
+                    let mut query = Query::<(&Position, &Velocity, &Health)>::new(&mut world);
+                    let mut sum: f32 = 0.0;
+                    for (position, velocity, health) in query.iter_mut() {
+                        sum += position.x + velocity.x + health.0;
+                    }
+                    black_box(sum);
+                });
+            },
+        );
     }
     group.finish();
 }
