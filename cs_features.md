@@ -4,6 +4,9 @@ This document tracks the work required to turn the current C# demo bridge into
 a general ECS scripting backend. Items are ordered by correctness and by how
 many later features depend on them.
 
+For a detailed explanation of the previous and current component architecture,
+see [`components_approach.md`](components_approach.md).
+
 ## Current pipeline
 
 ```text
@@ -20,6 +23,8 @@ The pipeline now registers every unmanaged component used by discovered C#
 systems from a managed manifest. Renderer-owned components use stable mirrors
 from `cs_runtime`; game-owned components use type-erased native storage. Demo
 world initialization is still native and remains the next major hardcoded part.
+Composable queries now derive scheduler access automatically, expose entity
+IDs through `EntityTerm`, and update per-row change ticks for managed writes.
 
 ## Implementation phases
 
@@ -30,20 +35,23 @@ world initialization is still native and remains the next major hardcoded part.
 - [ ] Phase 2: Dynamic game-defined worlds
   - [x] Export a component manifest from `game_cs`.
   - [x] Register unmanaged components dynamically.
-  - [ ] Add entity IDs and deferred commands.
+  - [x] Expose entity IDs in managed queries.
+  - [ ] Add deferred entity/component commands.
   - [ ] Move game initialization into C#.
 - [ ] Phase 3: General system parameters
   - [x] Replace specialized query classes with composable query descriptors.
   - [ ] Add resources and query filters.
   - [ ] Support multiple system parameters.
 - [ ] Phase 4: Complete hot reload
+  - [x] Reject incompatible query/manifest reloads without committing them.
   - [ ] Rebuild scheduler metadata when system signatures change.
   - [ ] Add component schema migration.
   - [ ] Improve dependency and PDB loading.
 - [ ] Phase 5: Diagnostics, performance, and hardening
+  - [x] Add manifest, scheduler, write-tracking, and query regression tests.
   - [ ] Export managed system names and propagate errors.
   - [ ] Replace repeated chunk joins with one native query cursor.
-  - [ ] Improve .NET discovery and end-to-end tests.
+  - [ ] Add automated hostfxr/reload lifecycle tests and improve .NET discovery.
   - [ ] Define the trust and sandboxing model.
 
 ---
@@ -51,6 +59,8 @@ world initialization is still native and remains the next major hardcoded part.
 ## 1. Managed write tracking
 
 **Priority:** Critical
+
+**Status:** Implemented
 
 ### Problem
 
@@ -91,10 +101,10 @@ change the value. Precisely detecting assignments after returning a raw C#
 
 ### Acceptance tests
 
-- A C# system writes one entity and a following Rust `Changed<T>` query returns
+- [x] A C# system writes one entity and a following Rust `Changed<T>` query returns
   exactly that entity.
-- Read-only C# queries do not set changed ticks.
-- Parallel writes to different component types update the correct tick columns.
+- [x] Read-only C# queries do not set changed ticks.
+- [x] Parallel writes to different component types update the correct tick columns.
 
 ---
 
@@ -102,11 +112,13 @@ change the value. Precisely detecting assignments after returning a raw C#
 
 **Priority:** Critical
 
+**Status:** Implemented
+
 ### Problem
 
-The Rust bridge currently contains explicit Rust definitions and match arms for
-every C# component. Adding a component requires modifying and recompiling the
-host, which means C# does not yet define the game's component universe.
+The original Rust bridge contained explicit Rust definitions and match arms for
+every C# component. Adding a component required modifying and recompiling the
+host, so C# could not define the game's component universe.
 
 ### Implementation
 
@@ -154,6 +166,9 @@ old collectible context until the process restarts and can rebuild storage.
 - `engine/src/archetype.rs`
 - `engine/src/world.rs`
 - `host/src/cs/cs_api.rs`
+- `cs_runtime/src/ComponentManifest.cs`
+- `cs_runtime/src/SharedComponents.cs`
+- `cs_runtime/src/Engine.cs`
 - `cs_runtime/src/GameHost.cs`
 - `cs_runtime/src/LoaderInterop.cs`
 
@@ -161,7 +176,8 @@ old collectible context until the process restarts and can rebuild storage.
 
 - [x] Adding `BallTag` only in `game_cs` requires no host match arm or Rust type.
 - [x] Two dynamically registered components coexist in one archetype.
-- [x] Dynamic bytes and ticks survive add/remove archetype migration.
+- [x] Dynamic bytes survive add/remove archetype migration.
+- [ ] Add a focused regression test for dynamic tick preservation during migration.
 - [x] Invalid managed and native-shared layouts fail before the first frame.
 
 ---
@@ -170,16 +186,24 @@ old collectible context until the process restarts and can rebuild storage.
 
 **Priority:** Critical
 
+**Status:** Partially implemented
+
 ### Problem
 
 C# systems cannot create or destroy entities or add and remove components.
 `setup_world()` in the Rust bridge currently creates the demo entities.
 
-### Implementation
+### Implemented foundation
 
-1. Add an opaque managed `Entity` value matching the native entity ID and
-   generation layout.
-2. Add command callbacks to the native API:
+- [x] Added an ABI-stable managed `Entity` containing the native ID and
+  generation.
+- [x] Added `EntityTerm` and native entity chunks, so a managed query can read
+  the entity corresponding to each component row.
+- [x] Kept entity access out of scheduler component conflicts.
+
+### Remaining implementation
+
+1. Add command callbacks to the native API:
 
    ```text
    reserve_entity()
@@ -189,18 +213,18 @@ C# systems cannot create or destroy entities or add and remove components.
    queue_remove_component(entity, component_id)
    ```
 
-3. Implement a managed `Commands` system parameter that records requests into
+2. Implement a managed `Commands` system parameter that records requests into
    the existing Rust `CommandQueue`.
-4. Include `uses_commands` in reflected `SystemAccess`. The scheduler must keep
+3. Include `uses_commands` in reflected `SystemAccess`. The scheduler must keep
    command-producing systems under the same exclusivity rules as Rust systems.
-5. Add a managed startup method, for example:
+4. Add a managed startup method, for example:
 
    ```csharp
    [EcsStartup]
    public static void Start(Commands commands) { ... }
    ```
 
-6. Remove demo-specific entity creation from `setup_world()` after startup
+5. Remove demo-specific entity creation from `setup_world()` after startup
    commands are available.
 
 ### Affected files
@@ -214,10 +238,10 @@ C# systems cannot create or destroy entities or add and remove components.
 
 ### Acceptance tests
 
-- C# startup creates exactly 100 balls without Rust demo code.
-- A C# system can despawn an entity safely during deferred command execution.
-- Adding/removing a component migrates the entity to the correct archetype.
-- Stale entity generations are rejected.
+- [ ] C# startup creates exactly 100 balls without Rust demo code.
+- [ ] A C# system can despawn an entity safely during deferred command execution.
+- [ ] Managed commands add/remove a component and migrate the entity correctly.
+- [ ] Managed commands reject stale entity generations.
 
 ---
 
@@ -225,11 +249,13 @@ C# systems cannot create or destroy entities or add and remove components.
 
 **Priority:** High
 
+**Status:** Implemented for query arities one through eight
+
 ### Problem
 
-The runtime currently needs a new class and reflection branch for each shape,
-such as `WriteQuery`, `WriteReadQuery`, and `Write3Query`. This grows
-combinatorially and does not match Rust tuple queries.
+The original runtime needed a new class and reflection branch for each shape,
+such as `WriteQuery`, `WriteReadQuery`, and `Write3Query`. This grew
+combinatorially and did not match Rust tuple queries.
 
 ### Implementation
 
@@ -269,10 +295,10 @@ also drive queries containing only optional terms.
 
 ### Acceptance tests
 
-- Arbitrary read/write combinations work without modifying `GameHost`.
-- Duplicate or contradictory component terms fail during discovery.
-- Scheduler access exactly matches every query term.
-- Query rows remain stack-only and cannot retain native spans.
+- [x] Supported read/write combinations work without modifying `GameHost`.
+- [x] Duplicate or contradictory component terms fail during discovery.
+- [x] Scheduler access exactly matches every query term.
+- [x] Query rows remain stack-only and cannot retain native spans.
 
 ---
 
@@ -280,37 +306,51 @@ also drive queries containing only optional terms.
 
 **Priority:** High
 
+**Status:** Partially implemented; incompatible reloads are safe but require a restart
+
 ### Problem
 
 Managed behavior can reload, but changing a method name or query signature is
 rejected because the Rust scheduler graph was built only at startup.
 
-### Implementation
+### Implemented foundation
 
-1. Split managed reload into prepare and commit phases.
-2. Prepare a new collectible context and export its complete system manifest.
-3. At a frame boundary:
+- [x] A candidate assembly is loaded into a new collectible context before the
+  active context is replaced.
+- [x] The candidate's ordered system signatures and complete component
+  manifest are validated first.
+- [x] Incompatible candidates are rejected and unloaded while the old context
+  remains active.
+
+### Remaining implementation
+
+1. Export a complete native-consumable system manifest for the candidate
+   context, including names and stable system IDs.
+2. At a frame boundary:
    - stop scheduling old managed systems;
    - validate all new component and system metadata;
    - clear only managed system registrations;
    - register new closures and rebuild the execution graph;
    - commit the new managed context.
-4. Keep the old context active if any validation or registration step fails.
-5. Assign stable system IDs so unchanged systems preserve enabled/disabled
+3. Make native registration transactional so a failure preserves both the old
+   scheduler closures and old managed context.
+4. Assign stable system IDs so unchanged systems preserve enabled/disabled
    state and timing information.
 
 ### Acceptance tests
 
-- Changing `Read<T>` to `Write<T>` rebuilds the scheduler without restart.
-- Adding and removing a system works at the next frame boundary.
-- A failed reload leaves the old systems running.
-- No closure retains a function pointer into an unloaded context.
+- [ ] Changing `Read<T>` to `Write<T>` rebuilds the scheduler without restart.
+- [ ] Adding and removing a system works at the next frame boundary.
+- [ ] A failed native registration leaves the old systems running.
+- [ ] No closure retains a function pointer into an unloaded context.
 
 ---
 
 ## 6. Stable component identity
 
 **Priority:** High
+
+**Status:** Implemented for full-name identities; explicit rename-stable IDs remain optional work
 
 ### Problem
 
@@ -337,15 +377,20 @@ allowing C# namespace/type refactors without changing persisted component IDs.
 
 ### Acceptance tests
 
-- Equal short names in different namespaces register independently.
-- Duplicate explicit IDs fail deterministically.
-- IDs remain stable across rebuilds and process architectures.
+- [x] Component IDs use `Type.FullName`, not the collision-prone short name.
+- [x] Duplicate manifest IDs and incompatible ID re-registration fail.
+- [x] Repeated ID generation for an unchanged full name is deterministic.
+- [ ] Add a regression fixture with equal short names in different namespaces.
+- [ ] Add explicit canonical IDs for rename-stable persisted schemas.
+- [ ] Verify fixed ID fixtures on every supported process architecture.
 
 ---
 
 ## 7. Complete ABI and schema validation
 
 **Priority:** High
+
+**Status:** Implemented for current unmanaged components
 
 ### Problem
 
@@ -366,9 +411,10 @@ the authoritative schema.
 
 ### Acceptance tests
 
-- Reordered equal-sized fields are rejected.
-- Incorrect enum/boolean representation is rejected.
-- Nested `Color` inside `Sprite` validates on x64 and supported platforms.
+- [x] Reordered equal-sized shared fields are rejected.
+- [x] Ambiguous managed `bool` and `char` fields are rejected.
+- [x] Nested `Color` inside `Sprite` validates in the current x64 pipeline.
+- [ ] Add explicit enum-underlying-type and cross-platform layout fixtures.
 
 ---
 
@@ -402,21 +448,30 @@ therefore absent from their scheduler declarations.
 
 **Priority:** Medium
 
+**Status:** Implemented
+
 ### Problem
 
-Managed rows expose component values but not the entity owning the row.
+Managed rows originally exposed component values but not the entity owning the
+row.
 
 ### Implementation
 
-1. Extend `NativeComponentChunk` with the archetype's entity pointer.
-2. Add an ABI-stable managed `Entity` struct.
-3. Expose entity access as a query term or as a property common to every row.
-4. Treat entity access as metadata, not a component read/write.
+Implemented with a separate native entity-chunk callback. The managed
+`Entity` struct mirrors the native ID/generation layout. `EntityTerm` requests
+the entity column and `QueryRow.Entity` returns the entity at the current row.
+The iterator joins entity and component columns by archetype ID and verifies
+matching row counts.
+
+`EntityTerm` is descriptor metadata rather than a component access, so it does
+not add scheduler conflicts. Optional-only queries can use the entity column as
+their driver.
 
 ### Acceptance tests
 
-- Each managed row returns the same entity ID as the corresponding Rust query.
-- Entity IDs remain aligned with component rows after swap-remove and migration.
+- [x] Managed query tests return the entity corresponding to each component row.
+- [x] Native entity chunks are accessible only during the scheduled managed call.
+- [ ] Add an end-to-end managed regression after native swap-remove and migration.
 
 ---
 
@@ -632,27 +687,34 @@ Default Linux and macOS installations may require manual configuration.
 
 **Priority:** Low, but required before calling the backend production-ready
 
+**Status:** Partially implemented
+
 ### Problem
 
-Current tests cover access reflection and a renderer query, but not the complete
-native/managed lifecycle or parallel execution behavior.
+The suite now covers managed query execution, manifest generation, dynamic
+storage and migration, scheduler conflict derivation, native renderer queries,
+and managed write tracking. It still does not automate the complete hostfxr,
+reload, dependency, error, and collectible-context lifecycle.
 
 ### Implementation
 
 Add automated scenarios for:
 
-- hostfxr startup and managed export resolution;
-- component manifest registration and layout rejection;
-- Rust/C# read-read parallelism and read-write exclusion;
-- managed writes observed by `Changed<T>`;
-- commands and entity migration;
-- behavior-only reload;
-- scheduler-signature reload;
-- failed reload rollback;
-- exception propagation;
-- collectible-context unloading;
-- dependency and PDB loading;
-- repeated startup/shutdown and multiple frame execution.
+- [ ] hostfxr startup and managed export resolution;
+- [x] component manifest registration and layout rejection;
+- [x] dynamic component coexistence and archetype migration;
+- [x] Rust/C# read-read parallelism and read-write exclusion;
+- [x] managed writes observed by `Changed<T>`;
+- [x] entity and optional-term managed query iteration;
+- [x] renderer-facing native `Position`/`Sprite` query compatibility;
+- [ ] managed commands and their end-to-end entity migration;
+- [ ] behavior-only reload;
+- [ ] scheduler-signature reload;
+- [ ] failed reload rollback;
+- [ ] exception propagation;
+- [ ] collectible-context unloading;
+- [ ] dependency and PDB loading;
+- [ ] repeated startup/shutdown and multiple-frame execution.
 
 Where GPU automation is unavailable, test the renderer-facing
 `Query<(&Position, &Sprite)>` without creating a surface.
@@ -699,16 +761,19 @@ Do not attempt to secure this pipeline using only reflection checks,
 
 ## Recommended first milestone
 
-The first useful milestone should deliver these together:
+Current progress toward the first useful milestone:
 
-1. Correct managed change ticks.
-2. Stable component IDs and full layout validation.
-3. A game-exported component/system manifest.
-4. Dynamic native storage for unmanaged C# components.
-5. Managed startup plus deferred commands.
-6. Removal of the demo-specific `setup_world()` implementation.
+- [x] Correct managed change ticks.
+- [x] Stable component IDs and full layout validation.
+- [x] A game-exported component/system manifest.
+- [x] Dynamic native storage for unmanaged C# components.
+- [x] Composable scheduler-aware queries and entity IDs.
+- [ ] Managed startup plus deferred commands.
+- [ ] Removal of the demo-specific `setup_world()` implementation.
 
-At that point, a new C# component and its initial entities can be added without
-editing or recompiling the Rust host. That is the point where C# becomes a true
-game scripting backend rather than a managed behavior layer over a Rust-defined
-demo world.
+A new C# component can now be added without editing or recompiling the Rust
+host. Its initial entity composition is still controlled by the native demo
+bootstrap, which currently attaches every discovered dynamic component to the
+100 demo entities. Managed startup and deferred commands are the remaining
+requirements for C# to own the complete game world rather than only its
+component schemas and behavior.
