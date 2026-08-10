@@ -263,14 +263,19 @@ fn build_game_module(
     let program = config.build_command[0];
     let arguments = &config.build_command[1..];
 
-    let output = Command::new(program)
+    // `status` inherits the host's stdout/stderr handles, so Cargo, dotnet,
+    // and other compilers stream their normal progress and diagnostics live.
+    let status = Command::new(program)
         .args(arguments)
         .current_dir(workspace_root)
-        .output()?;
+        .status()?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("Build command failed for '{}':\n{}", config.name, stderr).into());
+    if !status.success() {
+        return Err(format!(
+            "Build command failed for '{}' with status {}",
+            config.name, status
+        )
+        .into());
     }
 
     let library_path = match &config.backend {
