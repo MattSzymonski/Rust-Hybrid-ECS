@@ -53,6 +53,7 @@ pub trait Component: Send + 'static {}
 /// Each component instance carries its own `ComponentTicks` recording when it
 /// was added and most recently mutated. Systems can later compare these to
 /// their own `last_run` tick to find new or changed data.
+#[repr(transparent)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Tick(pub u32);
 
@@ -93,6 +94,7 @@ impl Tick {
 ///
 /// Stored in a parallel `Vec<ComponentTicks>` next to each archetype's
 /// component storage so that the metadata for row `i` lives at index `i`.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ComponentTicks {
     /// Tick at which this component was added to its current entity.

@@ -22,7 +22,7 @@ use std::path::Path;
 // Current workspace crates
 #[cfg(feature = "rendering")]
 use ecs_hybrid::{Color, Position, Sprite};
-use ecs_hybrid::{Component, ComponentId, Engine, SystemAccess, World};
+use ecs_hybrid::{Component, ComponentId, ComponentTicks, Engine, SystemAccess, World};
 use trait_type_map::{impl_trait_accessible, TraitAccessible};
 
 // Current crate
@@ -123,6 +123,8 @@ struct ComponentChunk {
     data: *mut std::ffi::c_void,
     len: u32,
     element_size: u32,
+    ticks: *mut ComponentTicks,
+    change_tick: u32,
 }
 
 /// One reflected scheduler access, where `0` is read and `1` is write.
@@ -227,7 +229,10 @@ fn get_component_chunk<T: Component + TraitAccessible<dyn Component>>(
     chunk_index: u32,
     output: *mut ComponentChunk,
 ) -> u8 {
-    let Some((archetype, slice)) = world.component_chunk_mut::<T>(chunk_index as usize) else {
+    let change_tick = world.change_tick().get();
+    let Some((archetype, slice, ticks)) =
+        world.component_chunk_with_ticks_mut::<T>(chunk_index as usize)
+    else {
         return 0;
     };
     let bits = archetype.0;
@@ -240,6 +245,8 @@ fn get_component_chunk<T: Component + TraitAccessible<dyn Component>>(
             data: slice.as_mut_ptr().cast(),
             len: slice.len() as u32,
             element_size: std::mem::size_of::<T>() as u32,
+            ticks: ticks.as_mut_ptr(),
+            change_tick,
         });
     }
     1
@@ -299,6 +306,8 @@ extern "C" fn ffi_get_entity_chunk(chunk_index: u32, output: *mut ComponentChunk
                 data: entities.as_ptr().cast_mut().cast(),
                 len: entities.len() as u32,
                 element_size: std::mem::size_of::<ecs_hybrid::Entity>() as u32,
+                ticks: std::ptr::null_mut(),
+                change_tick: world.change_tick().get(),
             });
         }
         1
@@ -559,6 +568,37 @@ mod tests {
             .any(|batch| batch.contains(&first) && batch.contains(&second)));
     }
 
+    fn empty_chunk() -> ComponentChunk {
+        ComponentChunk {
+            archetype_low: 0,
+            archetype_high: 0,
+            data: std::ptr::null_mut(),
+            len: 0,
+            element_size: 0,
+            ticks: std::ptr::null_mut(),
+            change_tick: 0,
+        }
+    }
+
+    unsafe fn simulate_managed_write(chunk: &ComponentChunk, row: usize) {
+        assert!(row < chunk.len as usize);
+        assert!(!chunk.ticks.is_null());
+        // SAFETY: the chunk callback returns a tick slice parallel to the
+        // component data and `row` was checked against that shared length.
+        unsafe {
+            (*chunk.ticks.add(row)).set_changed(ecs_hybrid::Tick::new(chunk.change_tick));
+        }
+    }
+
+    #[test]
+    fn component_chunk_change_tracking_abi_layout_is_stable() {
+        assert_eq!(std::mem::size_of::<ComponentTicks>(), 8);
+        assert_eq!(std::mem::offset_of!(ComponentTicks, changed), 4);
+        assert_eq!(std::mem::size_of::<ComponentChunk>(), 48);
+        assert_eq!(std::mem::offset_of!(ComponentChunk, ticks), 32);
+        assert_eq!(std::mem::offset_of!(ComponentChunk, change_tick), 40);
+    }
+
     #[cfg(feature = "rendering")]
     #[test]
     fn csharp_world_supports_the_sprite_renderer_query() {
@@ -647,16 +687,130 @@ mod tests {
     }
 
     #[test]
+    fn one_managed_row_write_is_visible_to_rust_changed_filter() {
+        let mut engine = Engine::new();
+        setup_world(&mut engine);
+        let baseline = engine.world().change_tick();
+        engine.world_mut().set_system_last_run(baseline);
+        engine.world_mut().increment_change_tick();
+
+        let accesses = [NativeSystemAccess {
+            component_key: component_key("Position"),
+            mode: 1,
+        }];
+        let mut component_chunk = empty_chunk();
+        let mut entity_chunk = empty_chunk();
+        {
+            let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses);
+            assert_eq!(
+                ffi_get_component_chunk(component_key("Position"), 1, 0, &mut component_chunk,),
+                1
+            );
+            assert_eq!(ffi_get_entity_chunk(0, &mut entity_chunk), 1);
+            unsafe { simulate_managed_write(&component_chunk, 37) };
+        }
+
+        let expected = unsafe { *((entity_chunk.data as *const ecs_hybrid::Entity).add(37)) };
+        let mut changed =
+            ecs_hybrid::Query::<(ecs_hybrid::Entity,), ecs_hybrid::Changed<Position>>::new(
+                engine.world_mut(),
+            );
+        let hits: Vec<_> = changed.iter_mut().map(|(entity,)| entity).collect();
+        assert_eq!(hits, vec![expected]);
+    }
+
+    #[test]
+    fn managed_read_only_chunk_does_not_trigger_changed_filter() {
+        let mut engine = Engine::new();
+        setup_world(&mut engine);
+        let baseline = engine.world().change_tick();
+        engine.world_mut().set_system_last_run(baseline);
+        engine.world_mut().increment_change_tick();
+
+        let accesses = [NativeSystemAccess {
+            component_key: component_key("Position"),
+            mode: 0,
+        }];
+        let mut chunk = empty_chunk();
+        {
+            let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses);
+            assert_eq!(
+                ffi_get_component_chunk(component_key("Position"), 0, 0, &mut chunk),
+                1
+            );
+            assert!(!chunk.ticks.is_null());
+        }
+
+        let mut changed =
+            ecs_hybrid::Query::<(ecs_hybrid::Entity,), ecs_hybrid::Changed<Position>>::new(
+                engine.world_mut(),
+            );
+        assert_eq!(changed.iter_mut().count(), 0);
+    }
+
+    #[test]
+    fn disjoint_managed_writes_mark_the_correct_tick_columns() {
+        let mut engine = Engine::new();
+        setup_world(&mut engine);
+        let baseline = engine.world().change_tick();
+        engine.world_mut().set_system_last_run(baseline);
+        engine.world_mut().increment_change_tick();
+
+        let accesses = [
+            NativeSystemAccess {
+                component_key: component_key("Position"),
+                mode: 1,
+            },
+            NativeSystemAccess {
+                component_key: component_key("Sprite"),
+                mode: 1,
+            },
+        ];
+        let mut positions = empty_chunk();
+        let mut sprites = empty_chunk();
+        let mut entities = empty_chunk();
+        {
+            let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses);
+            assert_eq!(
+                ffi_get_component_chunk(component_key("Position"), 1, 0, &mut positions),
+                1
+            );
+            assert_eq!(
+                ffi_get_component_chunk(component_key("Sprite"), 1, 0, &mut sprites),
+                1
+            );
+            assert_eq!(ffi_get_entity_chunk(0, &mut entities), 1);
+            assert_ne!(positions.ticks, sprites.ticks);
+            unsafe {
+                simulate_managed_write(&positions, 3);
+                simulate_managed_write(&sprites, 7);
+            }
+        }
+
+        let entity_at = |row| unsafe { *((entities.data as *const ecs_hybrid::Entity).add(row)) };
+        let mut changed_positions = ecs_hybrid::Query::<
+            (ecs_hybrid::Entity,),
+            ecs_hybrid::Changed<Position>,
+        >::new(engine.world_mut());
+        let position_hits: Vec<_> = changed_positions
+            .iter_mut()
+            .map(|(entity,)| entity)
+            .collect();
+        assert_eq!(position_hits, vec![entity_at(3)]);
+
+        let mut changed_sprites = ecs_hybrid::Query::<
+            (ecs_hybrid::Entity,),
+            ecs_hybrid::Changed<Sprite>,
+        >::new(engine.world_mut());
+        let sprite_hits: Vec<_> = changed_sprites.iter_mut().map(|(entity,)| entity).collect();
+        assert_eq!(sprite_hits, vec![entity_at(7)]);
+    }
+
+    #[test]
     fn entity_chunks_are_available_only_during_a_managed_system() {
         let mut engine = Engine::new();
         setup_world(&mut engine);
-        let mut chunk = ComponentChunk {
-            archetype_low: 0,
-            archetype_high: 0,
-            data: std::ptr::null_mut(),
-            len: 0,
-            element_size: 0,
-        };
+        let mut chunk = empty_chunk();
 
         assert_eq!(ffi_get_entity_chunk(0, &mut chunk), 3);
         {

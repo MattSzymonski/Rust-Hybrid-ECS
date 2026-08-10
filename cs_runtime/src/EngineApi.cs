@@ -50,4 +50,18 @@ public struct NativeComponentChunk
 
     /// <summary>Native size of one component, used for ABI validation.</summary>
     internal uint ElementSize;
+
+    /// <summary>Parallel per-row change metadata for component columns.</summary>
+    internal IntPtr Ticks;
+
+    /// <summary>World change tick current at managed system execution.</summary>
+    internal uint ChangeTick;
+}
+
+/// <summary>ABI mirror of Rust's per-component change-detection metadata.</summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct NativeComponentTicks
+{
+    internal uint Added;
+    internal uint Changed;
 }

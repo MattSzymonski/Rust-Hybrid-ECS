@@ -409,6 +409,39 @@ impl World {
         Some((archetype_id, storage.data.as_mut_slice()))
     }
 
+    /// Return one component chunk together with its parallel change-tick column.
+    ///
+    /// Language bindings use this form when exposing writable component data.
+    /// Both slices have identical lengths and row `i` in `ticks` describes row
+    /// `i` in `components`.
+    pub fn component_chunk_with_ticks_mut<T>(
+        &mut self,
+        chunk_index: usize,
+    ) -> Option<(ArchetypeId, &mut [T], &mut [ComponentTicks])>
+    where
+        T: Component + TraitAccessible<dyn Component>,
+    {
+        let component_id = ComponentId::of::<T>();
+        let archetype = self
+            .archetypes
+            .values_mut()
+            .filter(|archetype| archetype.component_types.contains(&component_id))
+            .nth(chunk_index)?;
+        let archetype_id = archetype.id;
+        let components = archetype
+            .component_storages
+            .get_storage_mut::<T>()
+            .data
+            .as_mut_slice();
+        let ticks = archetype
+            .component_ticks
+            .get_mut(&component_id)
+            .expect("component tick column missing")
+            .as_mut_slice();
+        debug_assert_eq!(components.len(), ticks.len());
+        Some((archetype_id, components, ticks))
+    }
+
     /// Return one archetype-sized entity chunk for language bindings.
     ///
     /// Entity chunks enumerate every archetype and provide the driver for

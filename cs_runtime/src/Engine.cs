@@ -172,6 +172,9 @@ public static unsafe class Engine
             throw new InvalidOperationException(
                 $"Component {term.ComponentType!.FullName} has size {term.ComponentSize} in C# but " +
                 $"{chunk.ElementSize} in Rust. The component layouts must match exactly.");
+        if (term.Access == QueryAccess.Write && chunk.Ticks == IntPtr.Zero)
+            throw new InvalidOperationException(
+                $"Writable component {term.ComponentType!.FullName} has no native change-tick column.");
         return true;
     }
 
@@ -236,13 +239,22 @@ internal struct QueryColumn
     internal IntPtr Data;
     internal int Length;
     internal bool Present;
+    internal IntPtr Ticks;
+    internal uint ChangeTick;
 }
 
 /// <summary>Optional writable reference valid only for the current row.</summary>
 public readonly unsafe ref struct OptionalWriteRef<T> where T : unmanaged
 {
     private readonly T* _value;
-    internal OptionalWriteRef(T* value) => _value = value;
+    private readonly NativeComponentTicks* _ticks;
+    private readonly uint _changeTick;
+    internal OptionalWriteRef(T* value, NativeComponentTicks* ticks, uint changeTick)
+    {
+        _value = value;
+        _ticks = ticks;
+        _changeTick = changeTick;
+    }
     public bool HasValue => _value != null;
     public ref T Value
     {
@@ -250,6 +262,10 @@ public readonly unsafe ref struct OptionalWriteRef<T> where T : unmanaged
         {
             if (_value == null)
                 throw new InvalidOperationException($"Optional component {typeof(T).FullName} is absent.");
+            if (_ticks == null)
+                throw new InvalidOperationException(
+                    $"Writable component {typeof(T).FullName} has no native change-tick column.");
+            _ticks->Changed = _changeTick;
             return ref *_value;
         }
     }
@@ -290,6 +306,7 @@ public readonly unsafe ref struct QueryRow
     public ref T Write<T>() where T : unmanaged
     {
         QueryColumn column = Find<T>(QueryAccess.Write, optional: false);
+        MarkChanged(column);
         return ref ((T*)column.Data)[_row];
     }
 
@@ -304,7 +321,10 @@ public readonly unsafe ref struct QueryRow
     public OptionalWriteRef<T> OptionalWrite<T>() where T : unmanaged
     {
         QueryColumn column = Find<T>(QueryAccess.Write, optional: true);
-        return new OptionalWriteRef<T>(column.Present ? &((T*)column.Data)[_row] : null);
+        return new OptionalWriteRef<T>(
+            column.Present ? &((T*)column.Data)[_row] : null,
+            column.Present ? &((NativeComponentTicks*)column.Ticks)[_row] : null,
+            column.ChangeTick);
     }
 
     /// <summary>Borrow an optional read-only component when it is present.</summary>
@@ -342,6 +362,14 @@ public readonly unsafe ref struct QueryRow
         throw new InvalidOperationException(
             $"This query does not declare {(optional ? "optional " : "")}{access.ToString().ToLowerInvariant()} " +
             $"access to {typeof(T).FullName}.");
+    }
+
+    private void MarkChanged(QueryColumn column)
+    {
+        if (column.Ticks == IntPtr.Zero)
+            throw new InvalidOperationException(
+                $"Writable component {column.Term.ComponentType!.FullName} has no native change-tick column.");
+        ((NativeComponentTicks*)column.Ticks)[_row].Changed = column.ChangeTick;
     }
 
     private QueryColumn Column(int index)
@@ -430,6 +458,8 @@ public ref struct QueryEnumerator
                     Data = chunk.Data,
                     Length = present ? checked((int)chunk.Length) : 0,
                     Present = present,
+                    Ticks = present ? chunk.Ticks : IntPtr.Zero,
+                    ChangeTick = present ? chunk.ChangeTick : 0,
                 });
             }
 

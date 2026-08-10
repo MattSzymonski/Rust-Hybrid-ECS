@@ -23,7 +23,7 @@ world initialization, and native query dispatch are still defined manually in
 ## Implementation phases
 
 - [ ] Phase 1: Correctness and stable metadata
-  - [ ] Track managed component writes.
+  - [x] Track managed component writes.
   - [ ] Introduce collision-resistant component identities.
   - [ ] Validate complete component layouts.
 - [ ] Phase 2: Dynamic game-defined worlds
@@ -60,20 +60,25 @@ mutations.
 
 ### Implementation
 
-1. Extend `NativeComponentChunk` with a pointer to its `ComponentTicks` column,
-   or expose a separate native `MarkChunkChanged` callback.
-2. Prefer marking individual rows rather than the entire chunk:
+Implemented. `NativeComponentChunk` now carries the component's parallel
+`ComponentTicks` column and the world's change tick captured while the managed
+system is active. Rust and C# use explicit ABI-compatible tick layouts.
 
-   ```csharp
-   ref T value = ref row.Write;
-   // Mark the row when writable access is first requested or mutated.
-   ```
+Required writes mark the exact row when `QueryRow.Write<T>()` is requested:
 
-3. A simple first implementation may mark every row yielded by a writable
-   query. A later implementation can use a managed `WriteRef<T>` wrapper that
-   marks only rows actually mutated.
-4. Use the world's current change tick supplied at system entry.
-5. Never update ticks for `ReadOnlySpan<T>` access.
+```csharp
+ref T value = ref row.Write<T>();
+```
+
+Rows that are merely yielded are not marked. Optional writes use a stack-only
+`OptionalWriteRef<T>` and mark only when its `.Value` ref is requested;
+checking `.HasValue` does not count as a write. `Read<T>()` and
+`OptionalRead<T>()` never update ticks.
+
+This has the same conservative behavior as Rust's `Mut<T>`: requesting a
+writable reference marks the row even if gameplay subsequently chooses not to
+change the value. Precisely detecting assignments after returning a raw C#
+`ref T` is not possible without replacing it with a more restrictive wrapper.
 
 ### Affected files
 

@@ -63,8 +63,13 @@ internal static unsafe class MockNativeWorld
 {
     internal static TestPosition* Positions;
     internal static TestVelocity* Velocities;
+    internal static TestHealth* Healths;
     internal static Entity* Entities;
+    internal static NativeComponentTicks* PositionTicks;
+    internal static NativeComponentTicks* VelocityTicks;
+    internal static NativeComponentTicks* HealthTicks;
     internal static uint Length;
+    internal static uint ChangeTick;
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     internal static uint EntityCount() => Length;
@@ -77,12 +82,17 @@ internal static unsafe class MockNativeWorld
             return 0;
         if (key == Engine.ComponentKey(typeof(TestPosition)) && mode == 1)
         {
-            *output = Chunk(Positions, sizeof(TestPosition));
+            *output = Chunk(Positions, PositionTicks, sizeof(TestPosition));
             return 1;
         }
         if (key == Engine.ComponentKey(typeof(TestVelocity)) && mode == 0)
         {
-            *output = Chunk(Velocities, sizeof(TestVelocity));
+            *output = Chunk(Velocities, VelocityTicks, sizeof(TestVelocity));
+            return 1;
+        }
+        if (key == Engine.ComponentKey(typeof(TestHealth)) && mode == 1 && Healths != null)
+        {
+            *output = Chunk(Healths, HealthTicks, sizeof(TestHealth));
             return 1;
         }
         return 0;
@@ -93,7 +103,7 @@ internal static unsafe class MockNativeWorld
     {
         if (index != 0)
             return 0;
-        *output = Chunk(Entities, sizeof(Entity));
+        *output = Chunk(Entities, null, sizeof(Entity));
         return 1;
     }
 
@@ -104,13 +114,16 @@ internal static unsafe class MockNativeWorld
         GetEntityChunk = &GetEntityChunk,
     };
 
-    private static NativeComponentChunk Chunk(void* data, int elementSize) => new()
+    private static NativeComponentChunk Chunk(
+        void* data, NativeComponentTicks* ticks, int elementSize) => new()
     {
         ArchetypeLow = 7,
         ArchetypeHigh = 11,
         Data = (IntPtr)data,
         Length = Length,
         ElementSize = checked((uint)elementSize),
+        Ticks = (IntPtr)ticks,
+        ChangeTick = ChangeTick,
     };
 }
 
@@ -207,6 +220,20 @@ internal static class Program
                     "Sprite.Color offset mismatch");
             });
 
+            Test("native change tracking ABI layout is stable", () =>
+            {
+                Equal(Marshal.SizeOf<NativeComponentTicks>(), 8,
+                    "NativeComponentTicks size mismatch");
+                Equal(Marshal.OffsetOf<NativeComponentTicks>(nameof(NativeComponentTicks.Changed))
+                    .ToInt32(), 4, "NativeComponentTicks.Changed offset mismatch");
+                Equal(Marshal.SizeOf<NativeComponentChunk>(), 48,
+                    "NativeComponentChunk size mismatch");
+                Equal(Marshal.OffsetOf<NativeComponentChunk>(nameof(NativeComponentChunk.Ticks))
+                    .ToInt32(), 32, "NativeComponentChunk.Ticks offset mismatch");
+                Equal(Marshal.OffsetOf<NativeComponentChunk>(nameof(NativeComponentChunk.ChangeTick))
+                    .ToInt32(), 40, "NativeComponentChunk.ChangeTick offset mismatch");
+            });
+
             Test("single-term query reports one write", () =>
             {
                 var system = GameHost.CreateSystem(Method(nameof(TestSystems.SingleWriter)));
@@ -270,17 +297,26 @@ internal static class Program
                 TestPosition* positions = stackalloc TestPosition[2];
                 TestVelocity* velocities = stackalloc TestVelocity[2];
                 Entity* entities = stackalloc Entity[2];
+                NativeComponentTicks* positionTicks = stackalloc NativeComponentTicks[2];
+                NativeComponentTicks* velocityTicks = stackalloc NativeComponentTicks[2];
                 positions[0].X = 1;
                 positions[1].X = 2;
                 velocities[0].X = 10;
                 velocities[1].X = 20;
                 entities[0] = new Entity(100, 3);
                 entities[1] = new Entity(200, 4);
+                positionTicks[0] = positionTicks[1] = new NativeComponentTicks
+                    { Added = 1, Changed = 2 };
+                velocityTicks[0] = velocityTicks[1] = new NativeComponentTicks
+                    { Added = 1, Changed = 2 };
 
                 MockNativeWorld.Positions = positions;
                 MockNativeWorld.Velocities = velocities;
                 MockNativeWorld.Entities = entities;
+                MockNativeWorld.PositionTicks = positionTicks;
+                MockNativeWorld.VelocityTicks = velocityTicks;
                 MockNativeWorld.Length = 2;
+                MockNativeWorld.ChangeTick = 9;
                 EngineApi api = MockNativeWorld.Api();
                 Engine.Bind(&api);
 
@@ -290,9 +326,12 @@ internal static class Program
                 var seen = 0;
                 foreach (var row in query)
                 {
-                    ref TestPosition position = ref row.Write<TestPosition>();
-                    ref readonly TestVelocity velocity = ref row.Read<TestVelocity>();
-                    position.X += velocity.X;
+                    if (row.Entity.Id == 100)
+                    {
+                        ref TestPosition position = ref row.Write<TestPosition>();
+                        ref readonly TestVelocity velocity = ref row.Read<TestVelocity>();
+                        position.X += velocity.X;
+                    }
                     Assert(!row.OptionalWrite<TestHealth>().HasValue,
                         "missing optional component unexpectedly has a value");
                     Equal(row.Entity.Id, entities[seen].Id, "wrong entity joined to row");
@@ -301,7 +340,47 @@ internal static class Program
 
                 Equal(seen, 2, "wrong composed query row count");
                 Equal(positions[0].X, 11.0f, "first writable row was not updated");
-                Equal(positions[1].X, 22.0f, "second writable row was not updated");
+                Equal(positions[1].X, 2.0f, "unrequested writable row was modified");
+                Equal(positionTicks[0].Changed, 9u, "written row was not marked changed");
+                Equal(positionTicks[1].Changed, 2u, "unrequested row was marked changed");
+                Equal(velocityTicks[0].Changed, 2u, "read-only row was marked changed");
+                Equal(velocityTicks[1].Changed, 2u, "read-only row was marked changed");
+            });
+
+            Test("optional writes mark only rows whose value is requested", () =>
+            {
+                TestHealth* health = stackalloc TestHealth[2];
+                Entity* entities = stackalloc Entity[2];
+                NativeComponentTicks* ticks = stackalloc NativeComponentTicks[2];
+                health[0].Value = 10;
+                health[1].Value = 20;
+                entities[0] = new Entity(100, 3);
+                entities[1] = new Entity(200, 4);
+                ticks[0] = ticks[1] = new NativeComponentTicks { Added = 1, Changed = 2 };
+
+                MockNativeWorld.Healths = health;
+                MockNativeWorld.HealthTicks = ticks;
+                MockNativeWorld.Entities = entities;
+                MockNativeWorld.Length = 2;
+                MockNativeWorld.ChangeTick = 12;
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+
+                var query = new Query<OptionalWrite<TestHealth>, EntityTerm>();
+                foreach (var row in query)
+                {
+                    var optional = row.OptionalWrite<TestHealth>();
+                    Assert(optional.HasValue, "present optional component was not found");
+                    if (row.Entity.Id == 100)
+                        optional.Value.Value += 5;
+                }
+
+                Equal(health[0].Value, 15.0f, "optional writable value was not updated");
+                Equal(health[1].Value, 20.0f, "unrequested optional value was modified");
+                Equal(ticks[0].Changed, 12u, "optional written row was not marked changed");
+                Equal(ticks[1].Changed, 2u, "HasValue incorrectly marked the optional row");
+                MockNativeWorld.Healths = null;
+                MockNativeWorld.HealthTicks = null;
             });
 
             Test("compiled runner supplies its query parameter", () =>
