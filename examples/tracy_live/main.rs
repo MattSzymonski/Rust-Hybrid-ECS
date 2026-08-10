@@ -118,7 +118,7 @@ fn run_rs_scripting() {
 
 fn run_cs_scripting() {
     let mut engine = Engine::new();
-    engine.set_parallel_execution(true); // harmless: zero registered Rust systems in this mode
+    engine.set_parallel_execution(true);
     engine.trace_frame_wait = false;
 
     cs_components::setup(&mut engine);
@@ -131,8 +131,10 @@ fn run_cs_scripting() {
         }
     };
 
+    engine.print_execution_graph();
+
     println!("=== Tracy Live Profiling Demo (C# scripting) ===");
-    println!("3 systems, 30000 entities, single-threaded C#");
+    println!("3 systems, 30000 entities, Rust-scheduled parallel C#");
     println!("Edit examples/tracy_live_game_cs/src/Systems.cs, then run:");
     println!("  dotnet build examples/tracy_live_game_cs -c Release");
     println!("in another terminal to hot-reload it.");
@@ -140,15 +142,11 @@ fn run_cs_scripting() {
     println!("Connect Tracy now. Press Ctrl+C to stop.");
     println!();
 
-    let mut last_frame = Instant::now();
     let mut count: u64 = 0;
     let mut last_report = Instant::now();
 
     loop {
-        let dt = last_frame.elapsed().as_secs_f32();
-        last_frame = Instant::now();
-
-        cs.update(dt);
+        cs.poll_reload();
         engine.process_frame().unwrap();
         count += 1;
 

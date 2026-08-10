@@ -1,7 +1,7 @@
 //! Components for the `--cs_scripting` path.
 //!
 //! Defined here — in the host, never rebuilt while the process runs —
-//! because C# mirrors their exact layout (`tracy_live_game_cs_loader/src/
+//! because C# mirrors their exact layout (`tracy_live_game_cs/src/
 //! Components.cs`) and needs it to stay byte-stable for the whole process
 //! lifetime. This is a deliberate contrast with `tracy_live_game`'s
 //! components (used by `--rs_scripting`), which live in the *reloaded*

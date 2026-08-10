@@ -12,9 +12,15 @@ namespace TracyLive;
 public unsafe struct EngineApi
 {
     public delegate* unmanaged[Cdecl]<uint> EntityCount;
-    public delegate* unmanaged[Cdecl]<Position**, uint*, void> GetPositions;
-    public delegate* unmanaged[Cdecl]<Velocity**, uint*, void> GetVelocities;
-    public delegate* unmanaged[Cdecl]<Health**, uint*, void> GetHealths;
-    public delegate* unmanaged[Cdecl]<Mass**, uint*, void> GetMasses;
-    public delegate* unmanaged[Cdecl]<GravityForce**, uint*, void> GetGravityForces;
+    public delegate* unmanaged[Cdecl]<ulong, byte, uint, NativeComponentChunk*, byte> GetComponentChunk;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct NativeComponentChunk
+{
+    internal ulong ArchetypeLow;
+    internal ulong ArchetypeHigh;
+    internal IntPtr Data;
+    internal uint Length;
+    internal uint ElementSize;
 }

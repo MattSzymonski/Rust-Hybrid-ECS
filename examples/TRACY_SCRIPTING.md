@@ -18,7 +18,7 @@ This guide was written against a request that also asked for documentation of **
 | `UBT` (Unreal Build Tool) | `cargo build` / `dotnet build` — see [Command Reference](#command-reference) |
 | `UHT` (Unreal Header Tool) | Not applicable — no reflection code generation is used anywhere in this project |
 | `RunUAT` / packaging / cooking | Not applicable — this is a developer example, not a shippable game; see [Future Extensions](#future-extensions) for what packaging would even mean here |
-| Game Thread / Render Thread | One "main" thread plus one dedicated worker thread (`cs-script-worker`) — see [Threading](#threading) |
+| Game Thread / Render Thread | One main frame thread plus Rayon scheduler workers; C# systems use the same scheduler batches as Rust systems — see [Threading](#threading) |
 | `UObject` lifetime / Unreal's Garbage Collector | Rust's ownership system (no GC) on the native side; the .NET CLR's GC on the managed side — see [Memory Management](#memory-management) |
 | Unreal reflection (`UCLASS`, `UPROPERTY`) | Not applicable — this project's "reflection" equivalent is Rust's `TraitAccessible`/`TypeId` machinery inside `ecs_hybrid`, unrelated to Unreal's UHT-generated reflection |
 | Play-In-Editor (PIE) | Not applicable — there is no editor |
@@ -78,7 +78,7 @@ Both let you edit gameplay-affecting code while the process runs. Neither is "th
 
 ### Why two implementations exist in one demo
 
-Not because the project needs two production scripting languages. Because the ECS's core API (`Query<T>`, `Commands`, `Component`) is a set of Rust generics that only Rust can express — a C# script cannot write `Query<(&mut Position, &Velocity)>`. So "add C# scripting" could not mean "let C# write the same kind of code Rust writes." It had to mean something adapted to what actually crosses a language boundary safely and fast. Working through that constraint is itself a worked example of the central problem in all runtime scripting: **the scripting language's capabilities are always bounded by what the FFI boundary can carry**, not by what the language can theoretically express.
+Not because the project needs two production scripting languages. The ECS's core API (`Query<T>`, `Commands`, `Component`) uses Rust references and tuples that C# cannot express literally. A C# system instead takes one `WriteQuery<T>` or `WriteReadQuery<TWrite, TRead>` parameter. The loader derives its scheduler access set from that parameter, so it is simultaneously the iterator and the single source of truth for dependency analysis.
 
 ---
 
@@ -105,6 +105,14 @@ cargo run --example tracy_live --release --features tracy -- --rs_scripting
 
 # C# scripting path — needs the .NET SDK; builds both C# projects on first run
 cargo run --example tracy_live --release -- --cs_scripting
+```
+
+Access-inference tests cover the managed query signatures and their Rust
+`SystemAccess` conversion separately:
+
+```sh
+dotnet run --project examples/tracy_live_game_cs_tests -c Release
+cargo test --example tracy_live
 ```
 
 `--features tracy` is optional in both modes — without it, all `profile_*!` macro calls compile to no-ops and the demo just runs standalone (see [`src/profiling.rs`](../src/profiling.rs)). `--release` is strongly recommended; this is a 30,000-entity workload and debug builds are noticeably slower, especially on the C# path (see [Threading](#threading) for why C# is inherently slower here regardless of build mode).
@@ -189,7 +197,7 @@ The yellow boxes are the pieces you edit while the process runs. Everything else
 This is the single most important thing to internalize before reading anything else in this document:
 
 - **`--rs_scripting`**: the reloadable unit (`tracy_live_game`) defines the component *types themselves* (`struct Position { x: f32, y: f32 }`, etc.) and owns the whole `World`. Every reload **resets the world from scratch** — new components, new systems, freshly re-spawned entities. See [§ Reload model: reset, not persist](#rust-hot-reload-mechanism) for exactly why this is unavoidable, not a shortcut.
-- **`--cs_scripting`**: the component types are defined **once, in the host** ([`examples/tracy_live/cs_components.rs`](tracy_live/cs_components.rs)) and never change. The reloadable unit (`tracy_live_game_cs`) only contains *systems* — functions that read/write those components through a stable API. So a C# reload **does not reset anything** — the entity population, positions, health values, all of it survives, because none of the data it lives in ever gets rebuilt.
+- **`--cs_scripting`**: component storage and the authoritative layouts are defined **once, in the Rust host** ([`examples/tracy_live/cs_components.rs`](tracy_live/cs_components.rs)) and never change. The reloadable C# unit declares blittable mirrors in [`Components.cs`](tracy_live_game_cs/src/Components.cs) and queries the persistent native storage through a stable, type-erased API. A C# reload **does not reset anything** — the entity population, positions, health values, all of it survives because the C# structs are views, not owners of that data.
 
 Put another way: the Rust path reloads *data and behavior together*; the C# path reloads *only behavior*, over data that's pinned in place. Neither is "better" in the abstract — they're different answers to different constraints (Rust's `TypeId` instability across rebuilds vs. C#'s ability to share a stable, host-defined memory layout). Both are explained in full in [Rust Integration](#rust-integration) and [C# Integration](#c-integration).
 
@@ -479,7 +487,7 @@ Get this wrong (e.g., a C# `[Cdecl]` calling into a Rust function accidentally c
 
 ### Struct layout, padding, and alignment
 
-Every one of this project's shared data types — `Position`, `Velocity`, `Health`, `Mass`, `GravityForce` (defined once, in [`cs_components.rs`](tracy_live/cs_components.rs)) — is marked `#[repr(C)]` on the Rust side and `[StructLayout(LayoutKind.Sequential)]` on the C# side (see [`Components.cs`](tracy_live_game_cs_loader/src/Components.cs)). Both annotations mean the same thing: **lay out the fields in declaration order, using the platform C compiler's normal padding/alignment rules**, instead of whatever layout-optimizing order the language's default representation would otherwise choose (Rust's un-annotated `repr(Rust)` is explicitly *unspecified* and may reorder fields for better packing; C#'s default `LayoutKind.Auto` likewise permits reordering). Without `#[repr(C)]`/`LayoutKind.Sequential`, there is **no guarantee whatsoever** that `Position { x: f32, y: f32 }` on the Rust side and `struct Position { float X, Y; }` on the C# side put `x`/`X` at the same byte offset — and a mismatch here is silent memory corruption, not an error.
+Every one of this project's shared data types — `Position`, `Velocity`, `Health`, `Mass`, `GravityForce` (defined authoritatively in [`cs_components.rs`](tracy_live/cs_components.rs)) — is marked `#[repr(C)]` on the Rust side and `[StructLayout(LayoutKind.Sequential)]` on the C# side (see [`Components.cs`](tracy_live_game_cs/src/Components.cs)). Both annotations mean the same thing: **lay out the fields in declaration order, using the platform C compiler's normal padding/alignment rules**. The generic query bridge validates the total element size before constructing a `Span<T>`; field order and meaning must still be kept in sync by the developer.
 
 Concretely, for `Position { x: f32, y: f32 }` under `#[repr(C)]`: `x` at byte offset 0, `y` at byte offset 4, total size 8 bytes, alignment 4 bytes (both fields are 4-byte `f32`s, so no padding is needed here — but `Health(pub f32)`, a Rust tuple struct with one field, is likewise 4 bytes under `repr(C)`, matching C#'s `struct Health { public float Value; }`). **Padding** would appear if fields of different sizes/alignments were mixed (e.g., a `bool` next to an `f64`) — the compiler inserts unused bytes so each field starts at an address that's a multiple of its own alignment requirement, which is why field *order* in a `#[repr(C)]` struct can change its total size, and why both sides of an FFI boundary must declare fields in the exact same order, not just with the same types.
 
@@ -828,34 +836,11 @@ Every raw pointer in the entire C# side is confined to `tracy_live_game_cs_loade
 
 This is what makes the sandboxing claim in [Runtime Scripting 101 § why games use scripting](#why-games-and-game-adjacent-tools-use-scripting) concrete rather than aspirational: it is not "please don't write unsafe code," it is "the compiler will not let you." See [§ sandboxing](#sandboxing-containing-a-hung-or-buggy-script) below for the full picture, including what this mechanism does *not* cover.
 
-### Sandboxing: containing a hung or buggy script
+### Sandboxing: containing a buggy script
 
-Three independent layers, stacked, each covering a different failure mode:
+The reloadable project still forbids `unsafe`, query rows expose bounds-checked spans, and every scheduled managed call is wrapped in `try/catch`. The native bridge additionally checks each component request against the read/write set derived from the currently-running system parameter. A cached or reflection-created query therefore cannot expand a system's scheduler permissions.
 
-1. **try/catch at the native boundary** (covered in [FFI § panic and exception safety](#panic-safety-and-exception-safety-across-the-boundary)): catches ordinary exceptions (null ref, bad index — though a `Span<T>` index is already bounds-checked so this specifically manifests as `IndexOutOfRangeException`, div-by-zero, any custom exception a script throws).
-2. **The unsafe-forbidden split** (just above): prevents memory corruption at the source — the reloadable project cannot construct a bad pointer even if it wanted to.
-3. **The watchdog thread** (below): the one failure mode neither of the above can catch — an infinite loop or otherwise-hung `Update()` call, which never throws and never returns.
-
-[`hot_cs.rs`](tracy_live/hot_cs.rs)'s `CsGame` runs every `Update(dt)` call on a dedicated `cs-script-worker` thread, and the main thread waits for a response with a **1-second timeout**:
-```rust
-pub fn update(&mut self, dt: f32) {
-    if self.disabled { return; }
-    if self.request_tx.send(dt).is_err() { self.disabled = true; return; }
-    match self.response_rx.recv_timeout(UPDATE_TIMEOUT) {
-        Ok(()) => {}
-        Err(RecvTimeoutError::Timeout) => {
-            eprintln!("[cs] Update() did not return within {:?} — assuming a hang. ...", UPDATE_TIMEOUT);
-            self.disabled = true;
-        }
-        Err(RecvTimeoutError::Disconnected) => { self.disabled = true; }
-    }
-}
-```
-On a timeout, `disabled` is set permanently — every future `update()` call becomes a no-op, forever, for the rest of the process's life. The worker thread is **never killed** — .NET (like most managed runtimes) provides no safe way to forcibly terminate a thread mid-operation (the old `Thread.Abort()` API was removed specifically because it could leave shared state, including the very memory `Span<T>`s point into, in a half-written state). The thread is simply abandoned, still running, forever, consuming one CPU core.
-
-**Why this is safe enough despite the abandoned thread still running**: after `disabled` is set, nothing else in this project's `--cs_scripting` mode ever touches the component arrays the zombie thread might still be writing into — there is zero registered Rust system in this mode, and no further spawn/destroy happens after startup, so those `Vec<T>` buffers never get reallocated. The zombie thread's writes are confined entirely within memory nothing else reads or relies on being coherent — a real, technically-undefined-behavior data race by the strict letter of the memory model, but one that (by construction) cannot corrupt anything *outside* those specific buffers or crash the process. This is a documented, deliberate trade-off, not an accident — see [Troubleshooting § watchdog fired](#watchdog-timeout-fired-c-scripting-permanently-disabled) for what you'll observe if this happens.
-
-**What this three-layer stack does *not* cover, on purpose, because no mechanism in any language can**: a **stack overflow** (e.g. unbounded recursion) always terminates the .NET process immediately — the CLR cannot safely run any handler, including this project's watchdog (which lives on a *different* thread and has no way to intervene in an already-overflowing one), with no stack space left. If you need protection against this specific failure mode too, the only real answer is running the script in a separate OS process (weighed as an alternative and rejected during this design's planning), which — as noted in [§ why hosting](#why-hosting-not-a-separate-process-and-not-dotnet-run) — this project deliberately does not do, trading that last increment of isolation for the zero-copy `Span<T>` performance model.
+There is deliberately no in-process hang watchdog in the scheduler-integrated design. Managed systems execute synchronously on the scheduler's Rayon threads. Returning from a timeout while an abandoned managed call still holds a native component pointer would let later scheduler batches touch the same storage and would be undefined behavior. If hard containment of infinite loops or stack overflow is required, scripts must run in a separate process; that is incompatible with this example's zero-copy spans.
 
 ### C# hot-reload mechanism
 
@@ -865,7 +850,7 @@ The complete, annotated flow, mirroring the Rust one in [§ Rust hot-reload mech
 sequenceDiagram
     participant You as You (another terminal)
     participant Host as hot_cs.rs (main thread, once, at start())
-    participant Worker as cs-script-worker thread
+    participant Scheduler as Rust scheduler / Rayon workers
     participant GH as GameHost.cs
     participant OldAsm as tracy_live_game_cs.dll (old bytes, in memory)
     participant NewAsm as tracy_live_game_cs.dll (new bytes, on disk)
@@ -873,25 +858,25 @@ sequenceDiagram
     Note over Host: start() — once, at process startup
     Host->>Host: dotnet build tracy_live_game_cs_loader -c Release
     Host->>Host: dotnet build tracy_live_game_cs -c Release
-    Host->>Host: hostfxr: load loader, resolve Init/Update
-    Host->>Worker: spawn, with mpsc channels
+    Host->>Host: hostfxr: load loader and discover [EcsSystem] methods
+    Host->>Host: derive SystemAccess from each query parameter
+    Host->>Scheduler: register one proxy per managed system
     loop every frame
-        Worker->>GH: Update(dt) [via LoaderInterop.Update]
-        GH->>GH: every 30th call: check file mtime
+        Host->>GH: PollReload before process_frame
+        GH->>GH: every ~500ms: check file mtime
         alt no change
-            GH->>OldAsm: forward to current Interop.Update
+            Scheduler->>OldAsm: RunSystem(index), parallel when access permits
         else file changed (you ran dotnet build)
             You->>NewAsm: dotnet build (overwrites file on disk)
             GH->>NewAsm: File.ReadAllBytes + LoadFromStream (new collectible ALC)
-            GH->>GH: resolve new Init/Update via reflection
+            GH->>GH: rediscover systems and validate unchanged signatures
             GH->>GH: unload OLD AssemblyLoadContext
-            GH->>NewAsm: call new Init(cached api pointer)
-            GH->>NewAsm: forward this frame's Update to new code
+            Scheduler->>NewAsm: subsequent RunSystem calls use new delegates
         end
     end
 ```
 
-Contrast with the Rust path: there is **no file-system watcher on the Rust side at all** for this mode — the polling happens *inside* the already-running C# code (`GameHost.Update`'s `MaybeReload`), checked roughly every 500ms of wall-clock time (deliberately *not* a frame count — see [§ C# Scripting Quirks & Gotchas](#c-scripting-quirks--gotchas) below for why that distinction turned out to matter) rather than via an OS file-change notification, and *you* are responsible for running `dotnet build` yourself (or set up `dotnet watch build` for automatic rebuilding — the polling loop doesn't care which triggered the file change). And critically, per [Architecture § component/data ownership](#componentdata-ownership-the-key-architectural-difference), **no world reset happens** — `GameHost.Load()`'s `_init(_api)` call re-binds the API table, but the entity data behind that table is the same Rust-owned memory it always was.
+Contrast with the Rust path: there is no file-system watcher for this mode. `CsGame::poll_reload` calls `GameHost.PollReload` before `Engine::process_frame`, when no system is running. Behavior-only changes reload in place. Adding/removing a system or changing a query signature is rejected until restart because Rust's scheduler graph was built from the startup signatures. No world reset happens; component data remains in Rust-owned storage.
 
 ---
 
@@ -1073,12 +1058,12 @@ graph LR
 | | |
 | --- | --- |
 | **Purpose** | The stable, never-reloaded half of the C# scripting path. Hosts the reload machinery and the only unsafe/pointer-touching C# code in the whole project. |
-| **Responsibilities** | Defining the shared component structs ([§ why the dependency points "backwards"](#why-the-c-dependency-points-backwards) explains why they live here); defining `EngineApi` (the P/Invoke struct mirror); defining `Engine` (the safe `Span<T>` facade — the sandboxing boundary); owning `GameHost` (the reload-polling + `AssemblyLoadContext` logic); exposing the two stable native entry points via `LoaderInterop`. |
-| **Public API (FFI surface)** | `[UnmanagedCallersOnly] LoaderInterop.Init(IntPtr api)`, `[UnmanagedCallersOnly] LoaderInterop.Update(float dt)` — resolved once by `tracy_live` via hostfxr and never re-resolved. See [API Reference](#api-reference). |
-| **Internal implementation** | [`src/Components.cs`](tracy_live_game_cs_loader/src/Components.cs), [`src/EngineApi.cs`](tracy_live_game_cs_loader/src/EngineApi.cs), [`src/Engine.cs`](tracy_live_game_cs_loader/src/Engine.cs), [`src/GameHost.cs`](tracy_live_game_cs_loader/src/GameHost.cs), [`src/LoaderInterop.cs`](tracy_live_game_cs_loader/src/LoaderInterop.cs). |
+| **Responsibilities** | Defining `EngineApi`, the safe query parameters, `[EcsSystem]` discovery, access-metadata export, reload polling, and stable per-system invocation entry points. Game-specific component mirrors live in the reloadable project. |
+| **Public API (FFI surface)** | `LoaderInterop.Init`, `SystemCount`, `SystemAccessCount`, `GetSystemAccess`, `RunSystem`, and `PollReload` — resolved once by `tracy_live` via hostfxr. |
+| **Internal implementation** | [`src/EngineApi.cs`](tracy_live_game_cs_loader/src/EngineApi.cs), [`src/Engine.cs`](tracy_live_game_cs_loader/src/Engine.cs), [`src/GameHost.cs`](tracy_live_game_cs_loader/src/GameHost.cs), [`src/LoaderInterop.cs`](tracy_live_game_cs_loader/src/LoaderInterop.cs). |
 | **Dependencies** | None beyond the .NET base class library (`System.Runtime.Loader`, `System.Reflection`). No `ProjectReference` to anything. |
 | **Lifetime** | Loaded once, via hostfxr, at `tracy_live` startup (in C# mode only), and never reloaded for the life of the process — this is the whole point of it being "stable." |
-| **Threading** | Everything in this module runs on the `cs-script-worker` thread `hot_cs.rs` spawns — never the main thread, and never any other thread. |
+| **Threading** | Initialization/reload polling runs before a frame on the main thread. `RunSystem` may execute concurrently on Rayon workers according to scheduler access analysis. |
 | **Memory ownership** | Owns the `EngineApi` struct's *managed-side copy* (`Engine._api`, a value-type field, copied by value from the pointer Rust handed it — see [`Engine.Bind`](tracy_live_game_cs_loader/src/Engine.cs)). Owns the collectible `GameContext` (`AssemblyLoadContext`) that `tracy_live_game_cs` gets loaded into. |
 | **Communication** | Called by `tracy_live` (via hostfxr, at startup only) and, every frame, forwards into whichever build of `tracy_live_game_cs` is currently loaded (via reflection-obtained function pointers). Calls back into `tracy_live`'s `EngineApi` function pointers whenever `Engine.cs`'s facade methods are invoked (by the *currently-loaded* `tracy_live_game_cs`, not by this module itself). |
 | **Build output** | `examples/tracy_live_game_cs_loader/bin/Release/net8.0/tracy_live_game_cs_loader.dll` + `.pdb` + `.runtimeconfig.json` (hostfxr needs this to know which framework version to host — see [C# Integration § hostfxr](#hostfxr-and-runtime-resolution)) + `.deps.json`. |
@@ -1087,13 +1072,13 @@ graph LR
 
 | | |
 | --- | --- |
-| **Purpose** | The hot-reloadable C# "game" for `--cs_scripting`: systems only (no component definitions, no world setup — both live in the host, see [Architecture § component/data ownership](#componentdata-ownership-the-key-architectural-difference)). The file you edit in this mode is [`src/Systems.cs`](tracy_live_game_cs/src/Systems.cs). |
-| **Responsibilities** | Defining `MovementSystem`/`HealthDecaySystem`/`GravitySystem` (each a static `Run()` method operating on `Span<T>`s obtained from `Engine`); exposing the two reloadable native entry points via `Interop`. |
-| **Public API (FFI surface)** | `[UnmanagedCallersOnly] Interop.Init(IntPtr api)`, `[UnmanagedCallersOnly] Interop.Update(float dt)` — resolved fresh, via reflection, on every reload by `GameHost`. See [API Reference](#api-reference). |
-| **Internal implementation** | [`src/Systems.cs`](tracy_live_game_cs/src/Systems.cs), [`src/Interop.cs`](tracy_live_game_cs/src/Interop.cs). |
+| **Purpose** | The hot-reloadable C# game for `--cs_scripting`: blittable component mirrors plus automatically discovered systems. |
+| **Responsibilities** | Defining component layouts and `[EcsSystem]` static methods whose one query parameter declares both iteration and scheduler access. |
+| **Public API (FFI surface)** | None. `GameHost` discovers ordinary managed methods through reflection and wraps them as delegates. |
+| **Internal implementation** | [`src/Components.cs`](tracy_live_game_cs/src/Components.cs), [`src/Systems.cs`](tracy_live_game_cs/src/Systems.cs). |
 | **Dependencies** | `tracy_live_game_cs_loader` (`ProjectReference` — see [§ why the dependency points "backwards"](#why-the-c-dependency-points-backwards)). |
 | **Lifetime** | Rebuilt whenever *you* run `dotnet build` against it; reloaded by `GameHost` the next time it polls (at most every 30 frames) after the file's last-write time changes. Never automatically rebuilt — see [§ C# hot-reload mechanism](#c-hot-reload-mechanism). |
-| **Threading** | Runs entirely on the `cs-script-worker` thread. |
+| **Threading** | Systems run on the Rust scheduler's main/Rayon threads, in the same dependency batches as native systems. |
 | **Memory ownership** | Owns nothing beyond the current call — every `Span<T>` it obtains points into memory `ecs_hybrid`/`tracy_live` owns, and it must not retain any of it past the current `Update()` call (see [FFI § lifetime management](#lifetime-management-across-the-boundary)). |
 | **Communication** | Called by `tracy_live_game_cs_loader` (via reflection); calls `Engine`'s static methods (defined in the loader project) to obtain `Span<T>`s, which in turn call through `EngineApi`'s function pointers into `hot_cs.rs`. |
 | **Build output** | `examples/tracy_live_game_cs/bin/Release/net8.0/tracy_live_game_cs.dll` + `.pdb` + `.runtimeconfig.json` + `.deps.json`. Only the `.dll`'s bytes are ever read by `GameHost` (via `File.ReadAllBytes`) — the `.pdb` is used only if you attach a managed debugger (see [Debugging Guide](#debugging-guide)). |
@@ -1524,22 +1509,22 @@ The general form of the previous few sections' specific cases: **if code in DLL 
 
 ### The thread topology, precisely
 
-Exactly two threads exist at any given time in this project, and which second thread exists depends entirely on which scripting mode is active (never both, since the modes are mutually exclusive):
+The main thread owns the frame loop. Rust and C# ECS systems may additionally run on the shared Rayon worker pool when the scheduler proves their declared accesses do not conflict:
 
 | Thread | Exists in | Created by | Purpose |
 | --- | --- | --- | --- |
 | Main thread | Always | The OS, at process start | Owns `Engine`; runs the frame loop (`run_rs_scripting`/`run_cs_scripting`); the *only* thread that ever mutates `Engine` directly |
 | `notify` watcher thread | `--rs_scripting` only | [`watch.rs`](tracy_live/watch.rs)'s `spawn` (called from `hot.rs::start`) | Watches `examples/tracy_live_game/src` for file changes; on a change, rebuilds and reloads the DLL, then atomically publishes the new function pointer — **never calls into the DLL's code itself**, only prepares the pointer for the main thread to call |
-| `cs-script-worker` thread | `--cs_scripting` only | [`hot_cs.rs`](tracy_live/hot_cs.rs)'s `start` | Runs the *entire* C# call chain (`LoaderInterop.Update` → `GameHost.Update` → possibly a reload → `Interop.Update` → the three systems) every frame |
+| Rayon scheduler workers | Either mode when parallel execution is enabled | Rayon / [`Engine::process_frame`](../src/engine.rs) | Run non-conflicting Rust and C# proxy systems in parallel batches |
 
-There is no render thread, no separate worker-thread pool, and no equivalent of Unreal's Game Thread/Render Thread split (see the [scope note](#zero-scope-note--please-read-this-first)) — this is a headless demo with a single simulation loop.
+There is no render thread or Unreal-style Game Thread/Render Thread split. This is a headless demo with one frame loop and an ECS worker pool.
 
-### Why the watcher thread never calls into the DLL, but the worker thread runs the whole C# chain
+### Why reload polling happens outside scheduled execution
 
 This asymmetry is the key to understanding both paths' concurrency safety, and it comes directly from the different reload semantics established in [Architecture § component/data ownership](#componentdata-ownership-the-key-architectural-difference):
 
 - **Rust path**: because a reload means *rebuilding the whole world*, and that must happen exactly once per reload event, on a thread that's guaranteed not to be racing with anything else touching `Engine` — the main thread is the only such thread, so `hot.rs`'s watcher thread only ever prepares a fresh function pointer (via lock-free atomics) and *flags* that a reload is pending; the main thread picks that flag up on its own schedule (once per loop iteration, via `take_pending_reload()`) and does the actual, potentially-expensive `game_setup` call itself.
-- **C# path**: because a reload means *nothing structural changes* (the `World` isn't touched), there's no equivalent "must happen exactly once, on the right thread" constraint for the reload step itself — `GameHost.Update`'s polling-and-reloading logic can safely run on the same worker thread as every other frame's `Update` call, because it's just as safe (or unsafe) as any other frame's call into the currently-loaded code.
+- **C# path**: `CsGame::poll_reload` runs on the main thread immediately before `process_frame`, so delegate arrays cannot be replaced while Rayon workers are invoking them. A reload may change behavior, but changing discovered systems or query signatures requires a restart and scheduler rebuild.
 
 ### Synchronization primitives used, and exactly what each one guarantees
 
@@ -1547,15 +1532,14 @@ This asymmetry is the key to understanding both paths' concurrency safety, and i
 | --- | --- | --- |
 | `AtomicPtr<()>` + `Ordering::Release`/`Acquire` | [`hot.rs`](tracy_live/hot.rs)'s `HotFnTable::setup` | The watcher thread's `patch()` (a `Release` store) happens-before the main thread's `read_setup()` (an `Acquire` load) sees the *new* pointer — this is what makes it safe to publish a freshly-loaded function pointer from one thread and consume it on another without a lock |
 | `AtomicBool` + `Ordering::Release`/`Acquire` | [`hot.rs`](tracy_live/hot.rs)'s `HotFnTable::pending`, [`hot_cs.rs`](tracy_live/hot_cs.rs) doesn't use one directly (see below) | Same happens-before guarantee, applied to "is a reload waiting to be applied" rather than to the pointer itself; `take_pending_reload()`'s `swap(false, Acquire)` is what makes the edge-triggered "apply exactly once" behavior correct even if the watcher thread patches again while the main thread hasn't yet consumed the previous patch (the `AtomicU32` version counter, `PATCH_VERSION`, means each patch still gets logged distinctly even if the main thread only ever "sees" the latest one) |
-| `AtomicPtr<Engine>` + `Ordering::Release`/`Acquire` | [`hot_cs.rs`](tracy_live/hot_cs.rs)'s `ENGINE_PTR` | The main thread's one-time `store` (before spawning the worker thread) happens-before every subsequent `load` from the worker thread — necessary even though the pointer is only ever written once, because without it, the *worker thread* has no guarantee it would ever observe the write at all under Rust's memory model (a plain, non-atomic static would technically permit the compiler/CPU to assume the value never changes and cache a stale read) |
-| `std::sync::mpsc::channel` (two of them: request and response) | [`hot_cs.rs`](tracy_live/hot_cs.rs)'s `CsGame`/worker thread | A blocking, ordered, single-producer-single-consumer queue — this is what implements the "hand off dt, wait for done, one at a time" ping-pong protocol between the main thread and the worker thread; `Sender::send`/`Receiver::recv_timeout` handle all the synchronization internally, no manual locking needed |
+| Thread-local active-world/access context | [`hot_cs.rs`](tracy_live/hot_cs.rs) | Gives each managed proxy access only to the `World` and read/write component keys authorized for that scheduler invocation; it is cleared when the call returns |
 | `Mutex<Vec<Library>>` | [`hot.rs`](tracy_live/hot.rs)'s `HotGame::_old_libraries` | Ordinary mutual exclusion — both the main thread (reading `_old_libraries` indirectly, though in practice it's only ever appended to from the watcher thread) and the watcher thread can safely `.push()` a newly-loaded `Library` without corrupting the `Vec`'s internal bookkeeping |
 
 ### Why there are no deadlocks in this design
 
 A deadlock requires a cycle of threads each waiting on a resource another one holds. This project's two synchronization patterns are both structurally acyclic:
 - The Rust path's atomics are lock-free by construction — there is no "held" resource to wait on at all, only atomic reads/writes that always complete.
-- The C# path's channel-based ping-pong has exactly one thread waiting at a time, on exactly one thing (a channel receive), and the *other* thread (the worker) is never simultaneously waiting on anything the main thread would need to provide — it just runs to completion (or hangs, which the **timeout**, not a second thread, resolves; see [C# Integration § sandboxing](#sandboxing-containing-a-hung-or-buggy-script)). The `recv_timeout` call specifically exists to convert "the worker thread never responds" from "the main thread waits forever" (which would be indistinguishable from a two-thread deadlock in its symptoms, even though only one side is actually stuck) into "the main thread gives up after one second and moves on."
+- C# proxy systems add no locks or channel waits. They synchronously enter managed code on the scheduler thread and return before the batch completes. Reload polling never overlaps a scheduler batch.
 
 ### Which APIs are thread-safe, and which are not — a definitive table
 
@@ -1563,13 +1547,13 @@ A deadlock requires a cycle of threads each waiting on a resource another one ho
 | --- | --- | --- |
 | `Engine::process_frame`, `Engine::world`/`world_mut`, any direct `ecs_hybrid` method | Main thread only | Nothing makes `Engine`/`World` internally thread-safe against concurrent external mutation; this project's design guarantees only the main thread ever calls these directly |
 | `game_setup` | Main thread only | Takes `*mut Engine` — same reasoning |
-| Every `EngineApi` function pointer (`entity_count`, `get_positions`, etc.) | `cs-script-worker` thread only, in this project's current design | They dereference `ENGINE_PTR`/call `World` methods directly — safe *only* because this project's protocol guarantees the main thread is blocked (in `recv_timeout`) for the entire duration any of these could be called; calling one from the main thread *concurrently* with the worker thread doing so would be a data race |
+| Every `EngineApi` function pointer | Only inside the currently scheduled managed system | Thread-local authorization rejects calls outside a proxy or component accesses absent from that system's derived query signature |
 | `HotFnTable::read_setup`/`take_pending_reload` | Any thread (that's the whole point — they're the lock-free bridge) | Safe by construction (atomics) |
 | `watch::spawn`'s callback | Runs on its own dedicated thread, never call it from elsewhere expecting main-thread semantics | It calls `build_and_load`, which shells out to `cargo build` — safe to run concurrently with the main thread's loop, by design |
 
 ### Why C# is measurably slower here
 
-Not a bug, and not primarily about the JIT warm-up (which is a one-time, sub-second cost, invisible in steady-state FPS numbers). The real, ongoing cost is **the absence of parallelism**: `ecs_hybrid`'s Rust systems run through a scheduler ([`scheduler.rs`](../src/scheduler.rs)) that analyzes each system's component read/write sets and runs non-conflicting systems concurrently across multiple threads via `rayon` — this is a large part of `ecs_hybrid`'s whole reason for existing. `Systems.cs`'s three systems run **sequentially, on a single thread** (the `cs-script-worker` thread), every frame, with no equivalent scheduler on the C# side at all. At 30,000 entities, this is the dominant factor in the FPS difference you'll observe between `--rs_scripting` (typically 400-1600 FPS in local testing) and `--cs_scripting` (typically 2500-3000 FPS — wait, that number is *higher*, not lower, in this specific demo's measured results, because the C# systems as written are individually cheaper per-entity than the Rust path's heavier `gravity_system`/`health_decay_system` tracked-parallel-iterator overhead at this entity count; the *general* principle — single-threaded C# vs. multi-threaded Rust — still holds, and would dominate decisively at either a larger entity count or heavier per-entity work in the C# systems. Treat the specific FPS numbers as a snapshot of this demo's specific systems, not a universal ranking of the two approaches).
+C# systems now use the same access-aware scheduler as Rust systems. Remaining performance differences come from CLR transition/JIT costs, reflection-generated delegate wrappers, and differences in the system workloads themselves—not from forcing all managed systems onto one worker thread. The current three managed systems have disjoint access sets and can occupy the same parallel batch.
 
 ---
 

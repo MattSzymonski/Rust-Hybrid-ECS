@@ -4,8 +4,8 @@ namespace TracyLive;
 /// The systems that actually drive the simulation — straight ports of
 /// <c>tracy_live_game/src/game.rs</c>'s <c>movement_system</c>/
 /// <c>health_decay_system</c>/<c>gravity_system</c>, operating on the same
-/// native component storage via the <see cref="Engine"/> facade's
-/// <see cref="Span{T}"/> accessors instead of Rust's <c>Query&lt;T&gt;</c>.
+/// native component storage via the <see cref="Engine"/> facade's generic
+/// queries. The first type parameter is writable and the second is read-only.
 ///
 /// <b>This is the file to edit to test hot-reload</b> — change something
 /// (e.g. the health-decay increment below, or the gravity formula), save,
@@ -13,36 +13,34 @@ namespace TracyLive;
 /// another terminal. `TracyLive.Loader.GameHost` picks up the new build
 /// within about half a second.
 ///
-/// Every method here must re-fetch its spans each call rather than caching
-/// them across frames — the same rule Rust's own `SystemParam` doc comment
-/// states ("must not escape the system function"), just enforced by
-/// convention here instead of the type system.
+/// The query parameter is also the scheduler declaration: its generic types
+/// are reflected at load time into Rust read/write access metadata. Native
+/// access is authorized only for the duration of this scheduled call.
 /// </summary>
 public static class MovementSystem
 {
-    public static void Run()
+    [EcsSystem]
+    public static void Run(WriteReadQuery<Position, Velocity> query)
     {
-        var positions = Engine.Positions();
-        var velocities = Engine.Velocities();
-        for (int i = 0; i < positions.Length; i++)
+        foreach (var components in query)
         {
-            positions[i].X += velocities[i].X;
-            positions[i].Y += velocities[i].Y;
+            ref var position = ref components.Write;
+            ref readonly var velocity = ref components.Read;
+            position.X += velocity.X;
+            position.Y += velocity.Y;
         }
     }
 }
 
 public static class HealthDecaySystem
 {
-    public static void Run()
+    [EcsSystem]
+    public static void Run(WriteQuery<Health> query)
     {
-        var total_health = 0;
-        var healths = Engine.Healths();
-        for (int i = 0; i < healths.Length; i++)
+        foreach (var components in query)
         {
-            healths[i].Value = MathF.Max(healths[i].Value + 10.1f, 0f);
-            total_health += (int)healths[i].Value;
-            Console.WriteLine($"[tracy_live_game_cs] entity {i} health: {healths[i].Value}");
+            ref var health = ref components.Write;
+            health.Value = MathF.Max(health.Value + 10.1f, 0f);
         }
     }
 }
@@ -54,17 +52,18 @@ public static class HealthDecaySystem
 /// </summary>
 public static class GravitySystem
 {
-    public static void Run()
+    [EcsSystem]
+    public static void Run(WriteReadQuery<GravityForce, Mass> query)
     {
-        var forces = Engine.GravityForces();
-        var masses = Engine.Masses();
-        for (int i = 0; i < forces.Length; i++)
+        foreach (var components in query)
         {
-            float distanceSq = forces[i].X * forces[i].X + MathF.Sqrt(forces[i].Y) * forces[i].Y + 0.01f;
+            ref var force = ref components.Write;
+            ref readonly var mass = ref components.Read;
+            float distanceSq = force.X * force.X + MathF.Sqrt(force.Y) * force.Y + 0.01f;
             float distance = MathF.Sqrt(distanceSq);
-            float magnitude = masses[i].Value / (distanceSq * distance); // 1/d^3
-            forces[i].X = Math.Clamp(-forces[i].X * MathF.Sqrt(magnitude), -1f, 1f);
-            forces[i].Y = Math.Clamp(-forces[i].Y * MathF.Sqrt(magnitude), -1f, 1f);
+            float magnitude = mass.Value / (distanceSq * distance); // 1/d^3
+            force.X = Math.Clamp(-force.X * MathF.Sqrt(magnitude), -1f, 1f);
+            force.Y = Math.Clamp(-force.Y * MathF.Sqrt(magnitude), -1f, 1f);
         }
     }
 }

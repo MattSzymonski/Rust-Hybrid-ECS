@@ -1319,7 +1319,44 @@ impl World {
                 found = Some(archetype);
             }
         }
-        found.map(|a| a.component_storages.get_storage_mut::<T>().data.as_mut_slice())
+        found.map(|a| {
+            a.component_storages
+                .get_storage_mut::<T>()
+                .data
+                .as_mut_slice()
+        })
+    }
+
+    /// Returns one archetype-local, mutable component chunk by index.
+    ///
+    /// This is primarily intended for foreign-language bindings which need
+    /// to build a query from type-erased component identifiers. The returned
+    /// archetype id lets the binding join chunks of different component
+    /// types without assuming that all components live in one archetype.
+    /// Chunk ordering is deliberately unspecified; callers must join chunks
+    /// by the returned archetype id.
+    ///
+    /// Prefer [`crate::Query`] in ordinary Rust systems. In particular, a
+    /// binding which retains the returned pointer after the borrow ends is
+    /// responsible for preventing structural world changes and overlapping
+    /// mutable access for the duration of that foreign query.
+    pub fn component_chunk_mut<T: Component + 'static>(
+        &mut self,
+        chunk_index: usize,
+    ) -> Option<(ArchetypeId, &mut [T])> {
+        self.archetypes
+            .values_mut()
+            .filter(|archetype| archetype.has_component::<T>())
+            .nth(chunk_index)
+            .map(|archetype| {
+                let id = archetype.id;
+                let slice = archetype
+                    .component_storages
+                    .get_storage_mut::<T>()
+                    .data
+                    .as_mut_slice();
+                (id, slice)
+            })
     }
 
     /// Generate a Graphviz DOT representation of archetypes and their components.
@@ -2683,5 +2720,40 @@ mod tests {
         assert_eq!(world.get_component::<Position>(entity1).unwrap().x, 1.0);
 
         println!("✓ Component cleanup on archetype migration works correctly!");
+    }
+
+    #[test]
+    fn component_chunks_are_separated_and_identified_by_archetype() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Velocity>();
+
+        world
+            .create_entity()
+            .with(Position { x: 1.0, y: 2.0 })
+            .build()
+            .unwrap();
+        world
+            .create_entity()
+            .with(Position { x: 3.0, y: 4.0 })
+            .with(Velocity { x: 5.0, y: 6.0 })
+            .build()
+            .unwrap();
+
+        let mut position_chunks = Vec::new();
+        let mut index = 0;
+        while let Some((id, positions)) = world.component_chunk_mut::<Position>(index) {
+            position_chunks.push((id, positions.len()));
+            index += 1;
+        }
+        assert_eq!(position_chunks.len(), 2);
+        assert!(position_chunks.iter().all(|(_, len)| *len == 1));
+
+        let (velocity_archetype, velocities) = world.component_chunk_mut::<Velocity>(0).unwrap();
+        assert_eq!(velocities.len(), 1);
+        assert!(position_chunks
+            .iter()
+            .any(|(id, len)| *id == velocity_archetype && *len == velocities.len()));
+        assert!(world.component_chunk_mut::<Velocity>(1).is_none());
     }
 }

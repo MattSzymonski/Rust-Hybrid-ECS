@@ -2,51 +2,96 @@ using System.Runtime.InteropServices;
 
 namespace TracyLive.Loader;
 
-/// <summary>
-/// The stable native boundary. The Rust host resolves these
-/// <see cref="UnmanagedCallersOnlyAttribute"/> entry points by name
-/// (<c>TracyLive.Loader.LoaderInterop, tracy_live_game_cs_loader</c>)
-/// instead of going straight to <c>TracyLive.Interop</c> in
-/// <c>tracy_live_game_cs.dll</c>.
-///
-/// Unlike <c>tracy_live_game_cs.dll</c>, this assembly is loaded once via
-/// hostfxr into .NET's default (non-collectible) load context and never
-/// reloaded — so the addresses Rust caches for <see cref="Init"/>/
-/// <see cref="Update"/> stay valid forever. The actual game gets reloaded
-/// underneath, inside <see cref="GameHost"/>, through its own collectible
-/// <see cref="System.Runtime.Loader.AssemblyLoadContext"/>.
-/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct NativeSystemAccess
+{
+    public ulong ComponentKey;
+    public byte Mode; // 0 = read, 1 = write
+}
+
+/// <summary>Stable native entry points used by the Rust scheduler bridge.</summary>
 public static unsafe class LoaderInterop
 {
     private static GameHost? _host;
 
     [UnmanagedCallersOnly]
-    public static void Init(IntPtr api)
+    public static byte Init(IntPtr api)
     {
         try
         {
+            Engine.Bind(api);
             var dir = Environment.GetEnvironmentVariable("TRACY_LIVE_MANAGED_DIR")
                 ?? AppContext.BaseDirectory;
-            var assemblyPath = Path.Combine(dir, "tracy_live_game_cs.dll");
-            _host = new GameHost(assemblyPath);
-            _host.Init(api);
+            _host = new GameHost(Path.Combine(dir, "tracy_live_game_cs.dll"));
+            _host.Init();
+            return 1;
         }
         catch (Exception e)
         {
             Console.Error.WriteLine($"[tracy_live_game_cs_loader] Init failed: {e}");
+            return 0;
         }
     }
 
     [UnmanagedCallersOnly]
-    public static void Update(float dt)
+    public static uint SystemCount() => (uint)(_host?.SystemCount ?? 0);
+
+    [UnmanagedCallersOnly]
+    public static uint SystemAccessCount(uint systemIndex)
     {
         try
         {
-            _host?.Update(dt);
+            return (uint)(_host?.GetAccessCount(checked((int)systemIndex)) ?? 0);
         }
         catch (Exception e)
         {
-            Console.Error.WriteLine($"[tracy_live_game_cs_loader] Update failed: {e}");
+            Console.Error.WriteLine($"[tracy_live_game_cs_loader] SystemAccessCount failed: {e}");
+            return 0;
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    public static byte GetSystemAccess(uint systemIndex, uint accessIndex, NativeSystemAccess* output)
+    {
+        try
+        {
+            if (_host is null || output is null)
+                return 0;
+            var access = _host.GetAccess(checked((int)systemIndex), checked((int)accessIndex));
+            output->ComponentKey = access.ComponentKey;
+            output->Mode = access.Mode;
+            return 1;
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"[tracy_live_game_cs_loader] GetSystemAccess failed: {e}");
+            return 0;
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    public static void RunSystem(uint systemIndex)
+    {
+        try
+        {
+            _host?.RunSystem(checked((int)systemIndex));
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"[tracy_live_game_cs_loader] system {systemIndex} failed: {e}");
+        }
+    }
+
+    [UnmanagedCallersOnly]
+    public static void PollReload()
+    {
+        try
+        {
+            _host?.PollReload();
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"[tracy_live_game_cs_loader] PollReload failed: {e}");
         }
     }
 }
