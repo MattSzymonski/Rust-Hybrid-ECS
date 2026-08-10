@@ -24,6 +24,9 @@ public unsafe struct EngineApi
 
     /// <summary>Request one native archetype column by component key and mode.</summary>
     public delegate* unmanaged[Cdecl]<ulong, byte, uint, NativeComponentChunk*, byte> GetComponentChunk;
+
+    /// <summary>Request one native archetype's entity-handle column.</summary>
+    public delegate* unmanaged[Cdecl]<uint, NativeComponentChunk*, byte> GetEntityChunk;
 }
 
 /// <summary>

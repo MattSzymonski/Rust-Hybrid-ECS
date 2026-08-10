@@ -43,6 +43,7 @@ use std::fmt;
 /// // Old handle is safely invalidated:
 /// assert!(!world.is_entity_valid(enemy));
 /// ```
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Entity {
     /// Unique numeric identifier for this entity slot.

@@ -20,9 +20,9 @@ use std::cell::Cell;
 use std::path::Path;
 
 // Current workspace crates
-use ecs_hybrid::{Component, ComponentId, Engine, SystemAccess, World};
 #[cfg(feature = "rendering")]
 use ecs_hybrid::{Color, Position, Sprite};
+use ecs_hybrid::{Component, ComponentId, Engine, SystemAccess, World};
 use trait_type_map::{impl_trait_accessible, TraitAccessible};
 
 // Current crate
@@ -102,6 +102,7 @@ impl_trait_accessible!(dyn Component; PhysicsState);
 struct CsEngineApi {
     entity_count: extern "C" fn() -> u32,
     get_component_chunk: extern "C" fn(u64, u8, u32, *mut ComponentChunk) -> u8,
+    get_entity_chunk: extern "C" fn(u32, *mut ComponentChunk) -> u8,
 }
 
 impl CsEngineApi {
@@ -109,6 +110,7 @@ impl CsEngineApi {
         Self {
             entity_count: ffi_entity_count,
             get_component_chunk: ffi_get_component_chunk,
+            get_entity_chunk: ffi_get_entity_chunk,
         }
     }
 }
@@ -212,9 +214,7 @@ const fn component_key(name: &str) -> u64 {
 /// Resolve a managed component key into the native scheduler identifier.
 fn component_id(key: u64) -> Option<ComponentId> {
     match key {
-        value if value == component_key("PhysicsState") => {
-            Some(ComponentId::of::<PhysicsState>())
-        }
+        value if value == component_key("PhysicsState") => Some(ComponentId::of::<PhysicsState>()),
         value if value == component_key("Position") => Some(ComponentId::of::<Position>()),
         value if value == component_key("Sprite") => Some(ComponentId::of::<Sprite>()),
         _ => None,
@@ -276,6 +276,32 @@ extern "C" fn ffi_get_component_chunk(
             get_component_chunk::<Sprite>(world, chunk_index, output)
         }
         _ => 2,
+    })
+    .unwrap_or(3)
+}
+
+/// C ABI entry point returning the `chunk_index`th archetype entity column.
+extern "C" fn ffi_get_entity_chunk(chunk_index: u32, output: *mut ComponentChunk) -> u8 {
+    if output.is_null() {
+        return 0;
+    }
+    with_active_world(|world| {
+        let Some((archetype, entities)) = world.entity_chunk(chunk_index as usize) else {
+            return 0;
+        };
+        let bits = archetype.0;
+        // SAFETY: `output` was checked above and the entity slice remains
+        // borrowed only for the active managed system invocation.
+        unsafe {
+            output.write(ComponentChunk {
+                archetype_low: bits as u64,
+                archetype_high: (bits >> 64) as u64,
+                data: entities.as_ptr().cast_mut().cast(),
+                len: entities.len() as u32,
+                element_size: std::mem::size_of::<ecs_hybrid::Entity>() as u32,
+            });
+        }
+        1
     })
     .unwrap_or(3)
 }
@@ -497,6 +523,41 @@ fn setup_world(engine: &mut Engine) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ecs_hybrid::SystemScheduler;
+
+    fn managed_access(entries: &[(&str, u8)]) -> SystemAccess {
+        let native: Vec<_> = entries
+            .iter()
+            .map(|(name, mode)| NativeSystemAccess {
+                component_key: component_key(name),
+                mode: *mode,
+            })
+            .collect();
+        derive_system_access(&native).expect("managed access should map to native components")
+    }
+
+    fn scheduler_for(accesses: impl IntoIterator<Item = SystemAccess>) -> SystemScheduler {
+        let mut scheduler = SystemScheduler::new();
+        for access in accesses {
+            scheduler.register_system(access);
+        }
+        scheduler.build_execution_graph();
+        scheduler
+    }
+
+    fn assert_same_batch(scheduler: &SystemScheduler, systems: &[usize]) {
+        assert!(scheduler
+            .execution_graph()
+            .iter()
+            .any(|batch| systems.iter().all(|system| batch.contains(system))));
+    }
+
+    fn assert_different_batches(scheduler: &SystemScheduler, first: usize, second: usize) {
+        assert!(!scheduler
+            .execution_graph()
+            .iter()
+            .any(|batch| batch.contains(&first) && batch.contains(&second)));
+    }
 
     #[cfg(feature = "rendering")]
     #[test]
@@ -509,27 +570,105 @@ mod tests {
     }
 
     #[test]
-    fn managed_accesses_map_to_scheduler_conflicts() {
-        let ball_physics = derive_system_access(&[
-            NativeSystemAccess {
-                component_key: component_key("PhysicsState"),
-                mode: 1,
-            },
-            NativeSystemAccess {
-                component_key: component_key("Position"),
-                mode: 1,
-            },
-            NativeSystemAccess {
-                component_key: component_key("Sprite"),
-                mode: 1,
-            },
-        ])
-        .unwrap();
-        let position_reader = derive_system_access(&[NativeSystemAccess {
-            component_key: component_key("Position"),
-            mode: 0,
-        }])
-        .unwrap();
-        assert!(ball_physics.conflicts_with(&position_reader));
+    fn disjoint_managed_writers_share_a_parallel_batch() {
+        let scheduler = scheduler_for([
+            managed_access(&[("PhysicsState", 1)]),
+            managed_access(&[("Position", 1)]),
+            managed_access(&[("Sprite", 1)]),
+        ]);
+
+        assert_eq!(scheduler.execution_graph().len(), 1);
+        assert_same_batch(&scheduler, &[0, 1, 2]);
+    }
+
+    #[test]
+    fn managed_readers_of_the_same_component_share_a_parallel_batch() {
+        let scheduler = scheduler_for([
+            managed_access(&[("Position", 0)]),
+            managed_access(&[("Position", 0)]),
+        ]);
+
+        assert_eq!(scheduler.execution_graph().len(), 1);
+        assert_same_batch(&scheduler, &[0, 1]);
+    }
+
+    #[test]
+    fn managed_reader_and_writer_are_scheduled_in_different_batches() {
+        let scheduler = scheduler_for([
+            managed_access(&[("Position", 0)]),
+            managed_access(&[("Position", 1)]),
+        ]);
+
+        assert_eq!(scheduler.execution_graph().len(), 2);
+        assert_different_batches(&scheduler, 0, 1);
+    }
+
+    #[test]
+    fn managed_writers_of_the_same_component_are_scheduled_in_different_batches() {
+        let scheduler = scheduler_for([
+            managed_access(&[("Sprite", 1)]),
+            managed_access(&[("Sprite", 1)]),
+        ]);
+
+        assert_eq!(scheduler.execution_graph().len(), 2);
+        assert_different_batches(&scheduler, 0, 1);
+    }
+
+    #[test]
+    fn entity_only_managed_system_does_not_create_a_scheduler_conflict() {
+        // EntityTerm is intentionally omitted from the native component
+        // access list exported by IQueryDescriptor.
+        let scheduler = scheduler_for([
+            managed_access(&[]),
+            managed_access(&[("PhysicsState", 1), ("Position", 1), ("Sprite", 1)]),
+        ]);
+
+        assert_eq!(scheduler.execution_graph().len(), 1);
+        assert_same_batch(&scheduler, &[0, 1]);
+    }
+
+    #[test]
+    fn optional_managed_access_conflicts_when_the_component_may_be_present() {
+        // OptionalWrite<Sprite> exports the same scheduler write as Write<Sprite>;
+        // optionality affects matching, never parallel safety.
+        let scheduler = scheduler_for([
+            managed_access(&[("PhysicsState", 1), ("Sprite", 0)]),
+            managed_access(&[("Position", 1)]),
+            managed_access(&[("Sprite", 1)]),
+        ]);
+
+        assert_eq!(scheduler.execution_graph().len(), 2);
+        assert_same_batch(&scheduler, &[0, 1]);
+        assert_different_batches(&scheduler, 0, 2);
+        assert!(!scheduler
+            .get_access(1)
+            .unwrap()
+            .conflicts_with(scheduler.get_access(2).unwrap()));
+    }
+
+    #[test]
+    fn entity_chunks_are_available_only_during_a_managed_system() {
+        let mut engine = Engine::new();
+        setup_world(&mut engine);
+        let mut chunk = ComponentChunk {
+            archetype_low: 0,
+            archetype_high: 0,
+            data: std::ptr::null_mut(),
+            len: 0,
+            element_size: 0,
+        };
+
+        assert_eq!(ffi_get_entity_chunk(0, &mut chunk), 3);
+        {
+            let _guard = ActiveSystemGuard::set(engine.world_mut(), &[]);
+            assert_eq!(ffi_get_entity_chunk(0, &mut chunk), 1);
+            assert_eq!(chunk.len, 100);
+            assert_eq!(
+                chunk.element_size as usize,
+                std::mem::size_of::<ecs_hybrid::Entity>()
+            );
+            assert!(!chunk.data.is_null());
+        }
+        assert_eq!(ffi_get_entity_chunk(0, &mut chunk), 3);
     }
 }

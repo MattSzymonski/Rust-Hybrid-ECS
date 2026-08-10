@@ -408,6 +408,15 @@ impl World {
         let storage = archetype.component_storages.get_storage_mut::<T>();
         Some((archetype_id, storage.data.as_mut_slice()))
     }
+
+    /// Return one archetype-sized entity chunk for language bindings.
+    ///
+    /// Entity chunks enumerate every archetype and provide the driver for
+    /// `EntityTerm` and queries containing only optional component terms.
+    pub fn entity_chunk(&self, chunk_index: usize) -> Option<(ArchetypeId, &[Entity])> {
+        let archetype = self.archetypes.values().nth(chunk_index)?;
+        Some((archetype.id, archetype.entities.as_slice()))
+    }
 }
 
 impl Default for World {

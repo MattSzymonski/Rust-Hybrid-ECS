@@ -190,45 +190,27 @@ internal sealed class GameHost
                 $"{method} must have exactly one supported ECS query parameter.");
 
         Type queryType = parameters[0].ParameterType;
-        if (!queryType.IsGenericType)
+        if (!typeof(IQueryDescriptor).IsAssignableFrom(queryType))
             throw UnsupportedQuery(method);
 
-        Type generic = queryType.GetGenericTypeDefinition();
-        Type[] components = queryType.GetGenericArguments();
-        ManagedAccess[] accesses;
-        if (generic == typeof(WriteQuery<>))
+        object query;
+        try
         {
-            accesses = [new ManagedAccess(Engine.ComponentKey(components[0]), 1)];
+            query = Activator.CreateInstance(queryType, nonPublic: true)
+                ?? throw new InvalidOperationException($"Could not create query parameter {queryType}.");
         }
-        else if (generic == typeof(WriteReadQuery<,>))
+        catch (TargetInvocationException exception) when (exception.InnerException is not null)
         {
-            ulong write = Engine.ComponentKey(components[0]);
-            ulong read = Engine.ComponentKey(components[1]);
-            if (write == read)
-                throw new InvalidOperationException($"{method} reads and writes the same component type.");
-            accesses = [new ManagedAccess(write, 1), new ManagedAccess(read, 0)];
-        }
-        else if (generic == typeof(Write3Query<,,>))
-        {
-            ulong first = Engine.ComponentKey(components[0]);
-            ulong second = Engine.ComponentKey(components[1]);
-            ulong third = Engine.ComponentKey(components[2]);
-            if (first == second || first == third || second == third)
-                throw new InvalidOperationException($"{method} writes the same component type more than once.");
-            accesses =
-            [
-                new ManagedAccess(first, 1),
-                new ManagedAccess(second, 1),
-                new ManagedAccess(third, 1),
-            ];
-        }
-        else
-        {
-            throw UnsupportedQuery(method);
+            throw new InvalidOperationException(
+                $"Invalid query parameter on {method}: {exception.InnerException.Message}",
+                exception.InnerException);
         }
 
-        object query = Activator.CreateInstance(queryType, nonPublic: true)
-            ?? throw new InvalidOperationException($"Could not create query parameter {queryType}.");
+        var descriptor = ((IQueryDescriptor)query).Descriptor;
+        ManagedAccess[] accesses = descriptor.Terms
+            .Where(term => !term.IsEntity)
+            .Select(term => new ManagedAccess(term.ComponentKey, (byte)term.Access))
+            .ToArray();
         var call = Expression.Call(method, Expression.Constant(query, queryType));
         Action runner = Expression.Lambda<Action>(call).Compile();
         string name = $"{method.DeclaringType?.FullName}.{method.Name}";
@@ -236,7 +218,8 @@ internal sealed class GameHost
     }
 
     private static InvalidOperationException UnsupportedQuery(MethodInfo method) => new(
-        $"{method} has an unsupported parameter. Use WriteQuery<T>, WriteReadQuery<TWrite, TRead>, or Write3Query<T1, T2, T3>.");
+        $"{method} has an unsupported parameter. Use Query<...> composed from " +
+        "Read<T>, Write<T>, OptionalRead<T>, OptionalWrite<T>, and EntityTerm.");
 
     // =========================================================================
     // File Loading

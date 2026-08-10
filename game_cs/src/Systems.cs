@@ -14,7 +14,7 @@ public static class BallPhysicsSystem
     private static long _lastFrame = Stopwatch.GetTimestamp();
 
     [EcsSystem]
-    public static void Run(Write3Query<PhysicsState, Position, Sprite> query)
+    public static void Run(Query<Write<PhysicsState>, Write<Position>, Write<Sprite>> query)
     {
         long now = Stopwatch.GetTimestamp();
         float deltaTime = Math.Clamp(
@@ -25,9 +25,9 @@ public static class BallPhysicsSystem
 
         foreach (var components in query)
         {
-            ref var physics = ref components.First;
-            ref var position = ref components.Second;
-            ref var sprite = ref components.Third;
+            ref var physics = ref components.Write<PhysicsState>();
+            ref var position = ref components.Write<Position>();
+            ref var sprite = ref components.Write<Sprite>();
 
             physics.DeltaTime = deltaTime;
             if (physics.Active != 0)
