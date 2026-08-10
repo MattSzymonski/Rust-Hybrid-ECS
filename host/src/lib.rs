@@ -508,7 +508,6 @@ pub fn setup(module_config: GameModuleConfig) -> Result<Host, Box<dyn std::error
     // on `Host::engine`.
     let mut engine = Box::new(Engine::new());
     engine.set_parallel_execution(true);
-    engine.set_fps_limit(60.0);
 
     // Build the EngineApi ONCE — all function pointers target `engine`.
     // The game module receives this via `game_init`.
@@ -565,7 +564,7 @@ pub struct FrameReport {
 /// Run one iteration of the host loop: check for hot-reload, process one
 /// engine frame, call the game's update hook, and track FPS.
 ///
-/// Returns `Some(FrameReport)` roughly every 2 seconds; `None` otherwise.
+/// Returns `Some(FrameReport)` roughly every 3 seconds; `None` otherwise.
 /// Callers that want to print or display live stats should check this.
 pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     let Host {
@@ -710,9 +709,9 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
 
     *frame_count += 1;
 
-    // Report FPS every 2 seconds.
+    // Report FPS every 3 seconds.
     let elapsed = last_report.elapsed().as_secs_f64();
-    if elapsed >= 2.0 {
+    if elapsed >= 3.0 {
         let fps = *frame_count as f64 / elapsed;
         let entity_count = engine.world().entity_count();
         *frame_count = 0;

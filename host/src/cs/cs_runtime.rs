@@ -1,9 +1,30 @@
-//! Minimal .NET runtime bootstrap used by the C# game backend.
+//! Low-level .NET hosting bootstrap used by the C# game backend.
+//!
+//! # Responsibilities
+//!
+//! - Locates the newest installed `hostfxr` library.
+//! - Starts .NET from a managed runtime configuration file.
+//! - Resolves methods marked with `UnmanagedCallersOnly` into native pointers.
+//! - Keeps the native hosting library and runtime context alive.
+//!
+//! # Design
+//!
+//! This module contains no ECS knowledge. It is a narrow wrapper around the
+//! stable `hostfxr` ABI and returns typed function pointers to [`cs_api`].
+//! The file is named `cs_runtime.rs`, but Microsoft-owned library and export
+//! names remain `hostfxr` and must not be renamed.
 
+// Standard library
 use std::path::{Path, PathBuf};
 
+// External crates
 use libloading::Library;
 
+// =============================================================================
+// hostfxr ABI Types
+// =============================================================================
+
+/// Native character type used by `hostfxr` on the current platform.
 #[cfg(windows)]
 type HostChar = u16;
 #[cfg(not(windows))]
@@ -24,9 +45,17 @@ type LoadAssemblyFn = unsafe extern "system" fn(
     *mut *const std::ffi::c_void,
 ) -> i32;
 
-// `hostfxr_delegate_type::hdt_load_assembly_and_get_function_pointer`.
+/// `hostfxr_delegate_type::hdt_load_assembly_and_get_function_pointer`.
 const LOAD_ASSEMBLY_AND_GET_FUNCTION_POINTER: i32 = 5;
 
+// =============================================================================
+// DotnetRuntimeContext
+// =============================================================================
+
+/// Owns one initialized .NET runtime context and its assembly loader delegate.
+///
+/// `_library` intentionally remains stored for the full lifetime of the
+/// context because `close` and `load_assembly` point into that native module.
 pub struct DotnetRuntimeContext {
     _library: Library,
     handle: RuntimeHandle,
@@ -35,9 +64,13 @@ pub struct DotnetRuntimeContext {
 }
 
 impl DotnetRuntimeContext {
+    /// Load `hostfxr`, initialize .NET from `runtime_config`, and acquire the
+    /// `load_assembly_and_get_function_pointer` runtime delegate.
     pub fn new(runtime_config: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let library_path = find_dotnet_host()?;
+        // SAFETY: The path was selected from an installed `host/fxr` version.
         let library = unsafe { Library::new(&library_path)? };
+        // SAFETY: These names and signatures are fixed by the hostfxr ABI.
         let initialize: InitializeFn =
             unsafe { *library.get(b"hostfxr_initialize_for_runtime_config")? };
         let get_delegate: GetDelegateFn = unsafe { *library.get(b"hostfxr_get_runtime_delegate")? };
@@ -45,6 +78,8 @@ impl DotnetRuntimeContext {
 
         let config = host_string(runtime_config.as_os_str())?;
         let mut handle = std::ptr::null_mut();
+        // SAFETY: `config` is nul-terminated and `handle` points to writable
+        // storage that remains valid for the complete call.
         let status = unsafe { initialize(config.as_ptr(), std::ptr::null(), &mut handle) };
         if status < 0 || handle.is_null() {
             return Err(format!(
@@ -54,6 +89,7 @@ impl DotnetRuntimeContext {
         }
 
         let mut delegate = std::ptr::null_mut();
+        // SAFETY: `handle` was returned by successful runtime initialization.
         let status = unsafe {
             get_delegate(
                 handle,
@@ -62,10 +98,13 @@ impl DotnetRuntimeContext {
             )
         };
         if status < 0 || delegate.is_null() {
+            // SAFETY: Initialization produced this live context handle.
             unsafe { close(handle) };
             return Err(format!("hostfxr_get_runtime_delegate failed with 0x{status:08X}").into());
         }
 
+        // SAFETY: Delegate kind 5 guarantees the returned pointer has the
+        // `LoadAssemblyFn` signature defined above.
         let load_assembly =
             unsafe { std::mem::transmute::<*mut std::ffi::c_void, LoadAssemblyFn>(delegate) };
         Ok(Self {
@@ -76,6 +115,9 @@ impl DotnetRuntimeContext {
         })
     }
 
+    /// Resolve an `UnmanagedCallersOnly` static method from a managed assembly.
+    ///
+    /// `T` must be the exact native signature declared on the managed method.
     pub fn get_unmanaged_fn<T: Copy>(
         &self,
         assembly: &Path,
@@ -91,8 +133,9 @@ impl DotnetRuntimeContext {
         let method_name = host_string(std::ffi::OsStr::new(method_name))?;
         let mut function = std::ptr::null();
 
-        // (char_t*)-1 requests a method marked UnmanagedCallersOnly.
+        // `(char_t*)-1` requests a method marked `UnmanagedCallersOnly`.
         let unmanaged_callers_only = usize::MAX as *const HostChar;
+        // SAFETY: All strings are nul-terminated and the output slot is valid.
         let status = unsafe {
             (self.load_assembly)(
                 assembly.as_ptr(),
@@ -110,6 +153,8 @@ impl DotnetRuntimeContext {
             .into());
         }
 
+        // SAFETY: The size check above guarantees a pointer-sized target. The
+        // caller supplies the signature matching the managed export.
         Ok(unsafe { std::mem::transmute_copy::<*const std::ffi::c_void, T>(&function) })
     }
 }
@@ -117,11 +162,17 @@ impl DotnetRuntimeContext {
 impl Drop for DotnetRuntimeContext {
     fn drop(&mut self) {
         if !self.handle.is_null() {
+            // SAFETY: This object uniquely owns the live hostfxr context.
             unsafe { (self.close)(self.handle) };
         }
     }
 }
 
+// =============================================================================
+// Runtime Discovery and String Conversion
+// =============================================================================
+
+/// Locate the newest installed `hostfxr` beneath `DOTNET_ROOT` or Program Files.
 fn find_dotnet_host() -> Result<PathBuf, Box<dyn std::error::Error>> {
     let dotnet_root = std::env::var_os("DOTNET_ROOT")
         .map(PathBuf::from)
@@ -158,12 +209,14 @@ fn find_dotnet_host() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Ok(directory.join(filename))
 }
 
+/// Encode an OS string as nul-terminated UTF-16 for Windows hostfxr.
 #[cfg(windows)]
 fn host_string(value: &std::ffi::OsStr) -> Result<Vec<HostChar>, Box<dyn std::error::Error>> {
     use std::os::windows::ffi::OsStrExt;
     Ok(value.encode_wide().chain(std::iter::once(0)).collect())
 }
 
+/// Encode an OS string as nul-terminated bytes for Unix hostfxr.
 #[cfg(not(windows))]
 fn host_string(value: &std::ffi::OsStr) -> Result<Vec<HostChar>, Box<dyn std::error::Error>> {
     use std::os::unix::ffi::OsStrExt;

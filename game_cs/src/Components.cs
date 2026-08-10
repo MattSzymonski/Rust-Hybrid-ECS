@@ -2,20 +2,38 @@ using System.Runtime.InteropServices;
 
 namespace TracyLive;
 
-// Game components live in the reloadable script assembly. Any unmanaged
-// struct whose name is registered by the Rust host can be queried; the
-// loader itself contains no per-component knowledge.
 [StructLayout(LayoutKind.Sequential)]
-public struct Position { public float X, Y; }
+public struct PhysicsState
+{
+    public float DeltaTime;
+    public float PositionX;
+    public float PositionY;
+    public float VelocityX;
+    public float VelocityY;
+    public float Radius;
+    public byte Active;
+}
 
 [StructLayout(LayoutKind.Sequential)]
-public struct Velocity { public float X, Y; }
+public struct Position
+{
+    public float X;
+    public float Y;
+}
 
 [StructLayout(LayoutKind.Sequential)]
-public struct Health { public float Value; }
+public struct Color
+{
+    public float R;
+    public float G;
+    public float B;
+    public float A;
+}
 
 [StructLayout(LayoutKind.Sequential)]
-public struct Mass { public float Value; }
-
-[StructLayout(LayoutKind.Sequential)]
-public struct GravityForce { public float X, Y; }
+public struct Sprite
+{
+    public float Width;
+    public float Height;
+    public Color Color;
+}

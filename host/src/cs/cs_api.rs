@@ -1,18 +1,45 @@
-//! Rust side of the scheduler-aware C# runtime bridge.
+//! Native ECS adapter for scheduler-managed C# systems.
+//!
+//! # Responsibilities
+//!
+//! - Defines ABI-compatible mirrors of components used by the C# game.
+//! - Gives managed queries temporary access to native archetype columns.
+//! - Validates every managed read/write against scheduler-declared access.
+//! - Registers reflected managed methods as ordinary Rust ECS systems.
+//!
+//! # Design
+//!
+//! Managed code never owns ECS storage. During a scheduled system call,
+//! [`ActiveSystemGuard`] publishes the current [`World`] and the system's
+//! declared access list through thread-local slots. Native callbacks reject
+//! requests made outside that scope or requests absent from the declaration.
+//! Component keys are stable FNV-1a hashes of the shared short type names.
 
+// Standard library
 use std::cell::Cell;
 use std::path::Path;
 
+// Current workspace crates
 use ecs_hybrid::{Component, ComponentId, Engine, SystemAccess, World};
 #[cfg(feature = "rendering")]
 use ecs_hybrid::{Color, Position, Sprite};
 use trait_type_map::{impl_trait_accessible, TraitAccessible};
 
+// Current crate
 use crate::CSharpModuleConfig;
 
 use super::cs_runtime::DotnetRuntimeContext;
 
+// =============================================================================
+// ABI Component Mirrors
+// =============================================================================
+
+// In rendering builds these names resolve to the renderer's components so
+// managed physics writes directly into the columns consumed by the renderer.
+// Headless builds provide layout-identical local definitions instead.
+
 #[cfg(not(feature = "rendering"))]
+/// Headless ABI mirror of `TracyLive.Position`.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Position {
@@ -22,41 +49,55 @@ struct Position {
 #[cfg(not(feature = "rendering"))]
 impl Component for Position {}
 
+/// ABI mirror of `TracyLive.PhysicsState`.
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct Velocity {
-    x: f32,
-    y: f32,
+struct PhysicsState {
+    delta_time: f32,
+    position_x: f32,
+    position_y: f32,
+    velocity_x: f32,
+    velocity_y: f32,
+    radius: f32,
+    active: u8,
 }
-impl Component for Velocity {}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Health {
-    value: f32,
-}
-impl Component for Health {}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct Mass {
-    value: f32,
-}
-impl Component for Mass {}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-struct GravityForce {
-    x: f32,
-    y: f32,
-}
-impl Component for GravityForce {}
+impl Component for PhysicsState {}
 
 #[cfg(not(feature = "rendering"))]
-impl_trait_accessible!(dyn Component; Position, Velocity, Health, Mass, GravityForce);
-#[cfg(feature = "rendering")]
-impl_trait_accessible!(dyn Component; Velocity, Health, Mass, GravityForce);
+/// Headless ABI mirror of the renderer's RGBA color.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Color {
+    r: f32,
+    g: f32,
+    b: f32,
+    a: f32,
+}
 
+#[cfg(not(feature = "rendering"))]
+/// Headless ABI mirror of `TracyLive.Sprite`.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Sprite {
+    width: f32,
+    height: f32,
+    color: Color,
+}
+#[cfg(not(feature = "rendering"))]
+impl Component for Sprite {}
+
+#[cfg(not(feature = "rendering"))]
+impl_trait_accessible!(dyn Component; Position, PhysicsState, Sprite);
+#[cfg(feature = "rendering")]
+impl_trait_accessible!(dyn Component; PhysicsState);
+
+// =============================================================================
+// Native API Layout
+// =============================================================================
+
+/// Function table copied by `cs_runtime` during managed initialization.
+///
+/// Field order and calling conventions must match `EngineApi.cs` exactly.
 #[repr(C)]
 struct CsEngineApi {
     entity_count: extern "C" fn() -> u32,
@@ -72,6 +113,7 @@ impl CsEngineApi {
     }
 }
 
+/// Description of one contiguous component column returned to managed code.
 #[repr(C)]
 struct ComponentChunk {
     archetype_low: u64,
@@ -81,6 +123,7 @@ struct ComponentChunk {
     element_size: u32,
 }
 
+/// One reflected scheduler access, where `0` is read and `1` is write.
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct NativeSystemAccess {
@@ -88,12 +131,19 @@ struct NativeSystemAccess {
     mode: u8,
 }
 
+// =============================================================================
+// Scheduled Invocation Scope
+// =============================================================================
+
 thread_local! {
+    /// World available only while the current thread executes a C# system.
     static ACTIVE_WORLD: Cell<*mut World> = const { Cell::new(std::ptr::null_mut()) };
+    /// Access declaration belonging to that active C# system.
     static ACTIVE_ACCESS: Cell<(*const NativeSystemAccess, usize)> =
         const { Cell::new((std::ptr::null(), 0)) };
 }
 
+/// Clears thread-local native access even if managed execution unwinds.
 struct ActiveSystemGuard;
 
 impl ActiveSystemGuard {
@@ -117,16 +167,24 @@ impl Drop for ActiveSystemGuard {
 fn with_active_world<R>(f: impl FnOnce(&mut World) -> R) -> Option<R> {
     ACTIVE_WORLD.with(|slot| {
         let pointer = slot.get();
+        // SAFETY: ActiveSystemGuard installs this pointer immediately before
+        // managed invocation and clears it before the borrowed world expires.
         (!pointer.is_null()).then(|| unsafe { f(&mut *pointer) })
     })
 }
 
+/// Check whether the active system declared the requested component mode.
+///
+/// A write declaration also permits reads; a read declaration never permits
+/// writes. `None` means no managed system is currently active on this thread.
 fn access_is_authorized(key: u64, requested_mode: u8) -> Option<bool> {
     ACTIVE_ACCESS.with(|slot| {
         let (pointer, len) = slot.get();
         if pointer.is_null() {
             return None;
         }
+        // SAFETY: ActiveSystemGuard stores a slice owned by the registered
+        // system closure and clears the slot before that invocation returns.
         let accesses = unsafe { std::slice::from_raw_parts(pointer, len) };
         Some(accesses.iter().any(|access| {
             access.component_key == key && (requested_mode == 0 || access.mode == requested_mode)
@@ -134,6 +192,11 @@ fn access_is_authorized(key: u64, requested_mode: u8) -> Option<bool> {
     })
 }
 
+// =============================================================================
+// Component Registry and Native Query Callbacks
+// =============================================================================
+
+/// Produce the same stable FNV-1a key as `Engine.ComponentKey` in C#.
 const fn component_key(name: &str) -> u64 {
     let bytes = name.as_bytes();
     let mut hash = 0xcbf29ce484222325u64;
@@ -146,17 +209,19 @@ const fn component_key(name: &str) -> u64 {
     hash
 }
 
+/// Resolve a managed component key into the native scheduler identifier.
 fn component_id(key: u64) -> Option<ComponentId> {
     match key {
+        value if value == component_key("PhysicsState") => {
+            Some(ComponentId::of::<PhysicsState>())
+        }
         value if value == component_key("Position") => Some(ComponentId::of::<Position>()),
-        value if value == component_key("Velocity") => Some(ComponentId::of::<Velocity>()),
-        value if value == component_key("Health") => Some(ComponentId::of::<Health>()),
-        value if value == component_key("Mass") => Some(ComponentId::of::<Mass>()),
-        value if value == component_key("GravityForce") => Some(ComponentId::of::<GravityForce>()),
+        value if value == component_key("Sprite") => Some(ComponentId::of::<Sprite>()),
         _ => None,
     }
 }
 
+/// Return the `chunk_index`th archetype column containing `T`.
 fn get_component_chunk<T: Component + TraitAccessible<dyn Component>>(
     world: &mut World,
     chunk_index: u32,
@@ -166,6 +231,8 @@ fn get_component_chunk<T: Component + TraitAccessible<dyn Component>>(
         return 0;
     };
     let bits = archetype.0;
+    // SAFETY: `output` was checked by the FFI entry point and the slice stays
+    // alive for the duration of the active scheduled system invocation.
     unsafe {
         output.write(ComponentChunk {
             archetype_low: bits as u64,
@@ -178,6 +245,11 @@ fn get_component_chunk<T: Component + TraitAccessible<dyn Component>>(
     1
 }
 
+/// C ABI entry point used by managed query enumerators.
+///
+/// Status codes are interpreted by `Engine.TryGetChunk`: `0` ends iteration,
+/// `1` returns a chunk, `2` is unknown component, `3` is out-of-scope access,
+/// and `4` is an undeclared access mode.
 extern "C" fn ffi_get_component_chunk(
     key: u64,
     mode: u8,
@@ -194,29 +266,28 @@ extern "C" fn ffi_get_component_chunk(
     }
 
     with_active_world(|world| match key {
+        value if value == component_key("PhysicsState") => {
+            get_component_chunk::<PhysicsState>(world, chunk_index, output)
+        }
         value if value == component_key("Position") => {
             get_component_chunk::<Position>(world, chunk_index, output)
         }
-        value if value == component_key("Velocity") => {
-            get_component_chunk::<Velocity>(world, chunk_index, output)
-        }
-        value if value == component_key("Health") => {
-            get_component_chunk::<Health>(world, chunk_index, output)
-        }
-        value if value == component_key("Mass") => {
-            get_component_chunk::<Mass>(world, chunk_index, output)
-        }
-        value if value == component_key("GravityForce") => {
-            get_component_chunk::<GravityForce>(world, chunk_index, output)
+        value if value == component_key("Sprite") => {
+            get_component_chunk::<Sprite>(world, chunk_index, output)
         }
         _ => 2,
     })
     .unwrap_or(3)
 }
 
+/// Return the current entity count while a managed system is active.
 extern "C" fn ffi_entity_count() -> u32 {
     with_active_world(|world| world.entity_count() as u32).unwrap_or(0)
 }
+
+// =============================================================================
+// Managed Export Signatures
+// =============================================================================
 
 type InitFn = extern "system" fn(*const CsEngineApi) -> u8;
 type SystemCountFn = extern "system" fn() -> u32;
@@ -225,6 +296,15 @@ type GetSystemAccessFn = extern "system" fn(u32, u32, *mut NativeSystemAccess) -
 type RunSystemFn = extern "system" fn(u32);
 type PollReloadFn = extern "system" fn();
 
+// =============================================================================
+// CSharpRuntime
+// =============================================================================
+
+/// Owns the hosted .NET context, stable API table, and reload callback.
+///
+/// Keeping `_runtime` and `_api` alive guarantees that both the managed
+/// runtime and every native function pointer remain valid for registered
+/// scheduler closures.
 pub struct CSharpRuntime {
     poll_reload: PollReloadFn,
     _runtime: DotnetRuntimeContext,
@@ -232,6 +312,8 @@ pub struct CSharpRuntime {
 }
 
 impl CSharpRuntime {
+    /// Start .NET, load `cs_runtime`, discover managed systems, and register
+    /// each system with its reflected read/write access declaration.
     pub fn start(
         engine: &mut Engine,
         workspace_root: &Path,
@@ -303,6 +385,8 @@ impl CSharpRuntime {
             let access = derive_system_access(&managed_access)?;
             let managed_access = managed_access.into_boxed_slice();
             let name = Box::leak(format!("csharp_system_{system_index}").into_boxed_str());
+            // SAFETY: `derive_system_access` has resolved every managed access
+            // and the closure exposes the world only under that exact list.
             unsafe {
                 engine.register_system_with_access(
                     name,
@@ -322,11 +406,13 @@ impl CSharpRuntime {
         })
     }
 
+    /// Ask the collectible managed loader to reload a changed game assembly.
     pub fn poll_reload(&mut self) {
         (self.poll_reload)();
     }
 }
 
+/// Translate managed component modes into native scheduler metadata.
 fn derive_system_access(
     accesses: &[NativeSystemAccess],
 ) -> Result<SystemAccess, Box<dyn std::error::Error>> {
@@ -347,49 +433,66 @@ fn derive_system_access(
     Ok(result)
 }
 
-fn setup_world(engine: &mut Engine) {
-    engine.world_mut().register_component::<Position>();
-    engine.world_mut().register_component::<Velocity>();
-    engine.world_mut().register_component::<Health>();
-    engine.world_mut().register_component::<Mass>();
-    engine.world_mut().register_component::<GravityForce>();
-    #[cfg(feature = "rendering")]
-    engine.world_mut().register_component::<Sprite>();
-    engine.world_mut().reserve_entities(30_000);
+// =============================================================================
+// Demo World Initialization
+// =============================================================================
 
-    let mut state = 0x1234_5678_9abc_def0u64;
-    let mut random = || {
-        state = state
-            .wrapping_mul(6_364_136_223_846_793_005)
-            .wrapping_add(1);
-        (state >> 32) as f32 / u32::MAX as f32
-    };
-    for _ in 0..30_000 {
-        let entity = engine
+/// Register ABI-visible components and create the C# bouncing-ball demo.
+fn setup_world(engine: &mut Engine) {
+    const BALL_COUNT: usize = 100;
+    const FIXED_DELTA_TIME: f32 = 1.0 / 60.0;
+    const BOUNCE_VELOCITY_Y: f32 = -500.0;
+    const BOUNCE_VELOCITY_X: f32 = 150.0;
+
+    engine.world_mut().register_component::<PhysicsState>();
+    engine.world_mut().register_component::<Position>();
+    engine.world_mut().register_component::<Sprite>();
+    engine.world_mut().reserve_entities(BALL_COUNT);
+
+    for index in 0..BALL_COUNT {
+        let column = (index % 10) as f32;
+        let row = (index / 10) as f32;
+        let radius = 10.0 + (index % 4) as f32 * 2.0;
+        let position_x = 60.0 + column * 72.0;
+        let position_y = 60.0 + row * 42.0;
+        engine
             .world_mut()
             .create_entity()
+            .with(PhysicsState {
+                delta_time: FIXED_DELTA_TIME,
+                position_x,
+                position_y,
+                velocity_x: if index % 2 == 0 {
+                    BOUNCE_VELOCITY_X + row * 8.0
+                } else {
+                    -BOUNCE_VELOCITY_X - row * 8.0
+                },
+                velocity_y: BOUNCE_VELOCITY_Y + column * 18.0,
+                radius,
+                active: 1,
+            })
             .with(Position {
-                x: (random() - 0.5) * 1000.0,
-                y: (random() - 0.5) * 1000.0,
+                x: position_x - radius,
+                y: position_y - radius,
             })
-            .with(Velocity {
-                x: (random() - 0.5) * 0.2,
-                y: (random() - 0.5) * 0.2,
+            .with(Sprite {
+                width: radius * 2.0,
+                height: radius * 2.0,
+                color: Color {
+                    r: 1.0,
+                    g: 0.3,
+                    b: 0.3,
+                    a: 1.0,
+                },
             })
-            .with(Health { value: 100.0 })
-            .with(Mass {
-                value: 1.0 + random() * 9.0,
-            })
-            .with(GravityForce { x: 0.0, y: 0.0 });
-        #[cfg(feature = "rendering")]
-        let entity = entity.with(Sprite {
-            width: 3.0,
-            height: 3.0,
-            color: Color::new(0.2, 0.7, 1.0, 1.0),
-        });
-        entity.build().expect("C# demo entity should build");
+            .build()
+            .expect("C# ball entity should build");
     }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -402,19 +505,23 @@ mod tests {
         setup_world(&mut engine);
 
         let mut query = ecs_hybrid::Query::<(&Position, &Sprite)>::new(engine.world_mut());
-        assert_eq!(query.iter_mut().count(), 30_000);
+        assert_eq!(query.iter_mut().count(), 100);
     }
 
     #[test]
     fn managed_accesses_map_to_scheduler_conflicts() {
-        let movement = derive_system_access(&[
+        let ball_physics = derive_system_access(&[
+            NativeSystemAccess {
+                component_key: component_key("PhysicsState"),
+                mode: 1,
+            },
             NativeSystemAccess {
                 component_key: component_key("Position"),
                 mode: 1,
             },
             NativeSystemAccess {
-                component_key: component_key("Velocity"),
-                mode: 0,
+                component_key: component_key("Sprite"),
+                mode: 1,
             },
         ])
         .unwrap();
@@ -423,13 +530,6 @@ mod tests {
             mode: 0,
         }])
         .unwrap();
-        let health_writer = derive_system_access(&[NativeSystemAccess {
-            component_key: component_key("Health"),
-            mode: 1,
-        }])
-        .unwrap();
-
-        assert!(movement.conflicts_with(&position_reader));
-        assert!(!movement.conflicts_with(&health_writer));
+        assert!(ball_physics.conflicts_with(&position_reader));
     }
 }

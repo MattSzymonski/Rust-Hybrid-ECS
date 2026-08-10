@@ -40,6 +40,7 @@ impl Component for Position {}
 impl_trait_accessible!(dyn Component; Position);
 
 /// Plain RGBA color, backend-agnostic (0.0-1.0 per channel).
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Color {
     pub r: f32,
@@ -68,6 +69,7 @@ impl Default for Color {
 }
 
 /// Axis-aligned colored rectangle drawn at an entity's [`Position`].
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Sprite {
     pub width: f32,

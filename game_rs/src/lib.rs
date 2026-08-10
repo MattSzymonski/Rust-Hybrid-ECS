@@ -1,163 +1,251 @@
-//! Hot-reloadable game module — minimal single-component counter for testing.
-//!
-//! # Responsibilities
-//!
-//! - Defines a single `FrameCounter` component.
-//! - Implements a single `counter_system` that prints a timestamp at threshold.
-//! - Exports `game_init` and `game_update` for the standalone host.
-//!
-//! # Design
-//!
-//! This crate is compiled as a `cdylib` (dynamic library). The standalone
-//! host loads it at runtime and calls `game_init` to register the component
-//! and system. When source files change, the host rebuilds and reloads this
-//! module without restarting. Component data is preserved across reloads
-//! via JSON serialization and matched by type name.
+//! Hot-reloadable bouncing-ball game implemented with ECS systems.
 
-// External crates
+use ecs_hybrid::*;
 use serde::{Deserialize, Serialize};
+use std::time::Instant;
 use trait_type_map::impl_trait_accessible;
 
-// Current crate
-use ecs_hybrid::*;
-
 // =============================================================================
-// Components
+// Ball physics component
 // =============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct FrameCounter {
-    count: u64,
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PhysicsState {
+    pub delta_time: f32,
+    pub position_x: f32,
+    pub position_y: f32,
+    pub velocity_x: f32,
+    pub velocity_y: f32,
+    pub radius: f32,
+    pub active: bool,
 }
-impl Component for FrameCounter {}
 
-impl_trait_accessible!(dyn Component; FrameCounter);
+impl Component for PhysicsState {}
+impl_trait_accessible!(dyn Component; PhysicsState);
 
-/// Horizontal speed (pixels/frame) for the demo bouncing sprite.
-#[cfg(feature = "rendering")]
-#[derive(Clone)]
-struct BounceVelocity {
-    dx: f32,
+const FIXED_DELTA_TIME: f32 = 1.0 / 60.0;
+const GRAVITY: f32 = 800.0;
+const BOUNCE_VELOCITY_Y: f32 = -500.0;
+const BOUNCE_VELOCITY_X: f32 = 150.0;
+const RESTITUTION: f32 = 0.7;
+const FLOOR_Y: f32 = 580.0;
+const CEILING_Y: f32 = 20.0;
+const LEFT_WALL: f32 = 20.0;
+const RIGHT_WALL: f32 = 780.0;
+const BALL_COUNT: usize = 100;
+
+struct SimulationTime {
+    last_frame: Instant,
+    delta_seconds: f32,
 }
-#[cfg(feature = "rendering")]
-impl Component for BounceVelocity {}
-#[cfg(feature = "rendering")]
-impl_trait_accessible!(dyn Component; BounceVelocity);
 
-// =============================================================================
-// Systems
-// =============================================================================
+impl Resource for SimulationTime {}
 
-/// Bounces the demo sprite left/right across the window.
-#[cfg(feature = "rendering")]
-fn bounce_system(mut query: Query<(&mut ecs_hybrid::Position, &mut BounceVelocity)>) {
-    const MIN_X: f32 = 0.0;
-    const MAX_X: f32 = 600.0;
+fn update_time_system(mut time: ResMut<SimulationTime>) {
+    let now = Instant::now();
+    let mut time = time
+        .get_mut()
+        .expect("SimulationTime is inserted during game initialization");
+    time.delta_seconds = now.duration_since(time.last_frame).as_secs_f32().min(0.1);
+    time.last_frame = now;
+}
 
-    for (mut position, mut velocity) in query.iter_mut() {
-        position.x += velocity.dx;
-        if position.x <= MIN_X || position.x >= MAX_X {
-            velocity.dx = -velocity.dx;
-        }
+fn initial_physics_state() -> PhysicsState {
+    PhysicsState {
+        delta_time: FIXED_DELTA_TIME,
+        position_x: 400.0,
+        position_y: 500.0,
+        velocity_x: BOUNCE_VELOCITY_X,
+        velocity_y: BOUNCE_VELOCITY_Y,
+        radius: 16.0,
+        active: true,
     }
 }
 
-/// Increments the counter every frame. When it reaches the threshold,
-/// resets and prints a timestamp to the console.
-fn counter_system(mut query: Query<&mut FrameCounter>) {
-    const THRESHOLD: u64 = 200;
+impl Default for PhysicsState {
+    fn default() -> Self {
+        initial_physics_state()
+    }
+}
 
-    for mut counter in query.iter_mut() {
-        counter.count += 1;
-        if counter.count >= THRESHOLD {
-            counter.count = 0;
+fn simulate_ball(state: &mut PhysicsState) {
+    if !state.active {
+        return;
+    }
 
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
-            let seconds = now.as_secs();
-            let milliseconds = now.subsec_millis();
+    let delta = state.delta_time.clamp(0.0, 0.1);
+    state.velocity_y += GRAVITY * delta;
+    state.position_x += state.velocity_x * delta;
+    state.position_y += state.velocity_y * delta;
 
-            let hours = (seconds / 3600) % 24;
-            let minutes = (seconds / 60) % 60;
-            let secs = seconds % 60;
-
-            println!(
-                "counter tick [{:02}:{:02}:{:02}.{:03}]",
-                hours, minutes, secs, milliseconds
-            );
+    if state.position_y + state.radius >= FLOOR_Y {
+        state.position_y = FLOOR_Y - state.radius;
+        state.velocity_y = -state.velocity_y.abs() * RESTITUTION;
+        if state.velocity_y.abs() < 10.0 {
+            state.velocity_y = 0.0;
         }
+    }
+    if state.position_y - state.radius <= CEILING_Y {
+        state.position_y = CEILING_Y + state.radius;
+        state.velocity_y = state.velocity_y.abs() * RESTITUTION;
+    }
+    if state.position_x - state.radius <= LEFT_WALL {
+        state.position_x = LEFT_WALL + state.radius;
+        state.velocity_x = state.velocity_x.abs() * RESTITUTION;
+    }
+    if state.position_x + state.radius >= RIGHT_WALL {
+        state.position_x = RIGHT_WALL - state.radius;
+        state.velocity_x = -state.velocity_x.abs() * RESTITUTION;
+    }
+}
+
+#[cfg(not(feature = "rendering"))]
+fn physics_system(time: Res<SimulationTime>, mut query: Query<&mut PhysicsState>) {
+    let delta_seconds = time
+        .get()
+        .expect("SimulationTime is inserted during game initialization")
+        .delta_seconds;
+    for mut physics in query.iter_mut() {
+        physics.delta_time = delta_seconds;
+        simulate_ball(&mut physics);
+    }
+}
+
+#[cfg(feature = "rendering")]
+fn physics_system(
+    time: Res<SimulationTime>,
+    mut query: Query<(&mut PhysicsState, &mut Position, &mut Sprite)>,
+) {
+    let delta_seconds = time
+        .get()
+        .expect("SimulationTime is inserted during game initialization")
+        .delta_seconds;
+    for (mut physics, mut position, mut sprite) in query.iter_mut() {
+        physics.delta_time = delta_seconds;
+        simulate_ball(&mut physics);
+
+        // Physics coordinates describe the center of the ball; the sprite
+        // renderer expects the top-left corner.
+        position.x = physics.position_x - physics.radius;
+        position.y = physics.position_y - physics.radius;
+        sprite.width = physics.radius * 2.0;
+        sprite.height = physics.radius * 2.0;
+        sprite.color = if physics.active {
+            Color::new(1.0, 0.3, 0.3, 1.0)
+        } else {
+            Color::new(0.5, 0.5, 0.5, 1.0)
+        };
     }
 }
 
 // =============================================================================
-// FFI Entry Points
+// Game module entry points
 // =============================================================================
 
 #[no_mangle]
 pub extern "C" fn game_init(api: *const EngineApi) {
     let api = unsafe { &*api };
-    let engine: &mut Engine = unsafe { &mut *(api.engine_handle as *mut Engine) };
+    let engine = unsafe { &mut *(api.engine_handle as *mut Engine) };
 
     engine
         .world_mut()
-        .register_persistable_component::<FrameCounter>();
-    engine.register_system("counter", counter_system);
-
-    // Spawn one entity to drive the counter.
-    let _ = engine
-        .world_mut()
-        .create_entity()
-        .with(FrameCounter { count: 0 })
-        .build();
+        .register_persistable_component::<PhysicsState>();
 
     #[cfg(feature = "rendering")]
     {
         engine.world_mut().register_component::<Position>();
         engine.world_mut().register_component::<Sprite>();
-        engine.world_mut().register_component::<BounceVelocity>();
-        engine.register_system("bounce", bounce_system);
+    }
 
-        // Spawn one bouncing sprite entity to demonstrate rendering.
-        let _ = engine
-            .world_mut()
-            .create_entity()
-            .with(Position { x: 0.0, y: 100.0 })
-            .with(Sprite {
-                width: 32.0,
-                height: 32.0,
-                color: Color::new(1.0, 0.6, 0.0, 1.0), // orange
+    engine.world_mut().insert_resource(SimulationTime {
+        last_frame: Instant::now(),
+        delta_seconds: FIXED_DELTA_TIME,
+    });
+    engine.register_system("simulation_time", update_time_system);
+    engine.register_system("ball_physics", physics_system);
+
+    // Hot reload preserves entities, so only fill the world up to the target
+    // instead of adding another 100 balls on every rebuild.
+    let existing_balls = {
+        let mut query = Query::<&PhysicsState>::new(engine.world_mut());
+        query.iter_mut().count()
+    };
+    for index in existing_balls..BALL_COUNT {
+        let column = (index % 10) as f32;
+        let row = (index / 10) as f32;
+        let mut physics = initial_physics_state();
+        physics.position_x = 60.0 + column * 72.0;
+        physics.position_y = 60.0 + row * 42.0;
+        physics.velocity_x = if index % 2 == 0 {
+            BOUNCE_VELOCITY_X + row * 8.0
+        } else {
+            -BOUNCE_VELOCITY_X - row * 8.0
+        };
+        physics.velocity_y = BOUNCE_VELOCITY_Y + column * 18.0;
+        physics.radius = 10.0 + (index % 4) as f32 * 2.0;
+
+        let entity = engine.world_mut().create_entity().with(physics);
+
+        #[cfg(feature = "rendering")]
+        let entity = entity
+            .with(Position {
+                x: physics.position_x - physics.radius,
+                y: physics.position_y - physics.radius,
             })
-            .with(BounceVelocity { dx: 3.0 })
-            .build();
+            .with(Sprite {
+                width: physics.radius * 2.0,
+                height: physics.radius * 2.0,
+                color: Color::new(1.0, 0.3, 0.3, 1.0),
+            });
+
+        entity.build().expect("ball components should be registered");
     }
 }
 
 #[no_mangle]
-pub extern "C" fn game_update(api: *const EngineApi) {
-    let _ = api;
+pub extern "C" fn game_update(_api: *const EngineApi) {
+    // Gameplay is executed entirely by scheduler-managed ECS systems.
 }
 
-/// Returns a hash of all persistable component TypeIds and sizes.
-///
-/// The standalone host calls this *before* `game_init` on every reload.
-/// If the fingerprint matches the previous DLL's fingerprint, no component
-/// schema has changed — the host takes a fast path that skips
-/// serialization and only swaps systems.  If it differs, the host takes
-/// the slow path: snapshot all entities, migrate, restore.
-///
-/// When you add or change a persistable component, add its TypeId here.
 #[no_mangle]
 pub extern "C" fn game_schema_fingerprint() -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
-
-    // --- Persistable components: hash TypeId + size ---
-    std::any::TypeId::of::<FrameCounter>().hash(&mut hasher);
-    std::mem::size_of::<FrameCounter>().hash(&mut hasher);
-    // Add new persistable components here.
-
+    std::any::TypeId::of::<PhysicsState>().hash(&mut hasher);
+    std::mem::size_of::<PhysicsState>().hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ball_bounces_off_floor() {
+        let mut state = initial_physics_state();
+        state.position_y = FLOOR_Y - state.radius;
+        state.velocity_y = 100.0;
+
+        simulate_ball(&mut state);
+
+        assert_eq!(state.position_y, FLOOR_Y - state.radius);
+        assert!(state.velocity_y < 0.0);
+    }
+
+    #[test]
+    fn inactive_ball_does_not_move() {
+        let mut state = initial_physics_state();
+        state.active = false;
+        let before = state;
+
+        simulate_ball(&mut state);
+
+        assert_eq!(state.position_x, before.position_x);
+        assert_eq!(state.position_y, before.position_y);
+        assert_eq!(state.velocity_x, before.velocity_x);
+        assert_eq!(state.velocity_y, before.velocity_y);
+    }
 }

@@ -1,69 +1,72 @@
+using System.Diagnostics;
+
 namespace TracyLive;
 
-/// <summary>
-/// The systems that actually drive the simulation — straight ports of
-/// <c>game_rs/src/lib.rs</c>'s <c>movement_system</c>/
-/// <c>health_decay_system</c>/<c>gravity_system</c>, operating on the same
-/// native component storage via the <see cref="Engine"/> facade's generic
-/// queries. The first type parameter is writable and the second is read-only.
-///
-/// <b>This is the file to edit to test hot-reload</b> — change something
-/// (e.g. the health-decay increment below, or the gravity formula), save,
-/// The host builds <c>game_cs/game_cs.csproj</c> when this file changes;
-/// <c>TracyLive.Loader.GameHost</c> picks up the new assembly
-/// within about half a second.
-///
-/// The query parameter is also the scheduler declaration: its generic types
-/// are reflected at load time into Rust read/write access metadata. Native
-/// access is authorized only for the duration of this scheduled call.
-/// </summary>
-public static class MovementSystem
+public static class BallPhysicsSystem
 {
-    [EcsSystem]
-    public static void Run(WriteReadQuery<Position, Velocity> query)
-    {
-        foreach (var components in query)
-        {
-            ref var position = ref components.Write;
-            ref readonly var velocity = ref components.Read;
-            position.X += velocity.X;
-            position.Y += velocity.Y;
-        }
-    }
-}
+    private const float Gravity = 800.0f;
+    private const float Restitution = 0.7f;
+    private const float FloorY = 580.0f;
+    private const float CeilingY = 20.0f;
+    private const float LeftWall = 20.0f;
+    private const float RightWall = 780.0f;
 
-public static class HealthDecaySystem
-{
-    [EcsSystem]
-    public static void Run(WriteQuery<Health> query)
-    {
-        foreach (var components in query)
-        {
-            ref var health = ref components.Write;
-            health.Value = MathF.Max(health.Value + 10.1f, 0f);
-        }
-    }
-}
+    private static long _lastFrame = Stopwatch.GetTimestamp();
 
-/// <summary>
-/// Heavy per-entity work — trig, sqrt, mul — mirroring
-/// <c>game_rs</c>'s inverse-square gravity
-/// toward the origin.
-/// </summary>
-public static class GravitySystem
-{
     [EcsSystem]
-    public static void Run(WriteReadQuery<GravityForce, Mass> query)
+    public static void Run(Write3Query<PhysicsState, Position, Sprite> query)
     {
+        long now = Stopwatch.GetTimestamp();
+        float deltaTime = Math.Clamp(
+            (float)Stopwatch.GetElapsedTime(_lastFrame, now).TotalSeconds,
+            0.0f,
+            0.1f);
+        _lastFrame = now;
+
         foreach (var components in query)
         {
-            ref var force = ref components.Write;
-            ref readonly var mass = ref components.Read;
-            float distanceSq = force.X * force.X + MathF.Sqrt(force.Y) * force.Y + 0.01f;
-            float distance = MathF.Sqrt(distanceSq);
-            float magnitude = mass.Value / (distanceSq * distance); // 1/d^3
-            force.X = Math.Clamp(-force.X * MathF.Sqrt(magnitude), -1f, 1f);
-            force.Y = Math.Clamp(-force.Y * MathF.Sqrt(magnitude), -1f, 1f);
+            ref var physics = ref components.First;
+            ref var position = ref components.Second;
+            ref var sprite = ref components.Third;
+
+            physics.DeltaTime = deltaTime;
+            if (physics.Active != 0)
+            {
+                physics.VelocityY += Gravity * deltaTime;
+                physics.PositionX += physics.VelocityX * deltaTime;
+                physics.PositionY += physics.VelocityY * deltaTime;
+
+                if (physics.PositionY + physics.Radius >= FloorY)
+                {
+                    physics.PositionY = FloorY - physics.Radius;
+                    physics.VelocityY = -MathF.Abs(physics.VelocityY) * Restitution;
+                    if (MathF.Abs(physics.VelocityY) < 10.0f)
+                        physics.VelocityY = 0.0f;
+                }
+                if (physics.PositionY - physics.Radius <= CeilingY)
+                {
+                    physics.PositionY = CeilingY + physics.Radius;
+                    physics.VelocityY = MathF.Abs(physics.VelocityY) * Restitution;
+                }
+                if (physics.PositionX - physics.Radius <= LeftWall)
+                {
+                    physics.PositionX = LeftWall + physics.Radius;
+                    physics.VelocityX = MathF.Abs(physics.VelocityX) * Restitution;
+                }
+                if (physics.PositionX + physics.Radius >= RightWall)
+                {
+                    physics.PositionX = RightWall - physics.Radius;
+                    physics.VelocityX = -MathF.Abs(physics.VelocityX) * Restitution;
+                }
+            }
+
+            position.X = physics.PositionX - physics.Radius;
+            position.Y = physics.PositionY - physics.Radius;
+            sprite.Width = physics.Radius * 2.0f;
+            sprite.Height = physics.Radius * 2.0f;
+            sprite.Color = physics.Active != 0
+                ? new Color { R = 1.0f, G = 0.3f, B = 0.3f, A = 1.0f }
+                : new Color { R = 0.5f, G = 0.5f, B = 0.5f, A = 1.0f };
         }
     }
 }

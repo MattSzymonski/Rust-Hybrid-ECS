@@ -11,6 +11,9 @@ public struct Position { public float X, Y; }
 [StructLayout(LayoutKind.Sequential)]
 public struct Velocity { public float X, Y; }
 
+[StructLayout(LayoutKind.Sequential)]
+public struct Health { public float Value; }
+
 internal static class TestSystems
 {
     internal static bool WasRun;
@@ -20,6 +23,7 @@ internal static class TestSystems
 
     [EcsSystem]
     public static void PositionWriter(WriteQuery<Position> query) { }
+    public static void TripleWriter(Write3Query<Position, Velocity, Health> query) { }
 
     public static void Duplicate(WriteReadQuery<Position, Position> query) { }
     public static void NoParameters() { }
@@ -81,6 +85,20 @@ internal static class Program
                     "Position access must be write");
                 Assert(system.Accesses[1] == new ManagedAccess(Engine.ComponentKey(typeof(Velocity)), 0),
                     "Velocity access must be read");
+            });
+
+            Test("Write3Query reports three writes", () =>
+            {
+                var system = GameHost.CreateSystem(Method(nameof(TestSystems.TripleWriter)));
+                Assert(system.Accesses.Length == 3, "expected three accesses");
+                Assert(system.Accesses.All(access => access.Mode == 1),
+                    "all Write3Query accesses must be writable");
+                Assert(system.Accesses[0].ComponentKey == Engine.ComponentKey(typeof(Position)),
+                    "wrong first component key");
+                Assert(system.Accesses[1].ComponentKey == Engine.ComponentKey(typeof(Velocity)),
+                    "wrong second component key");
+                Assert(system.Accesses[2].ComponentKey == Engine.ComponentKey(typeof(Health)),
+                    "wrong third component key");
             });
 
             Test("compiled runner supplies query parameter", () =>

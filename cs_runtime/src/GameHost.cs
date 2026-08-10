@@ -1,3 +1,17 @@
+// Collectible managed gameplay loader and ECS system discovery.
+//
+// Responsibilities:
+// - Loads game assemblies without locking their build output.
+// - Discovers and deterministically orders methods marked with EcsSystem.
+// - Derives scheduler access from each method's single query parameter.
+// - Reloads behavior while rejecting scheduler-signature changes.
+//
+// Design:
+// - Every game version lives in a collectible AssemblyLoadContext and is read
+//   from bytes so the compiler can replace the source DLL on Windows.
+// - Rust builds its execution graph once. A reload may replace method bodies,
+//   but names and access signatures must remain stable until host restart.
+
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Runtime.Loader;
@@ -5,13 +19,23 @@ using System.Threading;
 
 namespace TracyLive.Loader;
 
+// =============================================================================
+// Discovered System Metadata
+// =============================================================================
+
+/// <summary>One component key and its native access mode.</summary>
 internal readonly record struct ManagedAccess(ulong ComponentKey, byte Mode);
 
+/// <summary>Compiled managed system plus its scheduler declaration.</summary>
 internal sealed record ManagedSystem(string Name, ManagedAccess[] Accesses, Action Run)
 {
     internal string Signature =>
         $"{Name}:{string.Join(',', Accesses.Select(a => $"{a.Mode}:{a.ComponentKey}"))}";
 }
+
+// =============================================================================
+// GameHost
+// =============================================================================
 
 /// <summary>
 /// Loads the collectible gameplay assembly and discovers methods marked with
@@ -20,6 +44,10 @@ internal sealed record ManagedSystem(string Name, ManagedAccess[] Accesses, Acti
 /// </summary>
 internal sealed class GameHost
 {
+    /// <summary>
+    /// Collectible context for one game version. Requests for cs_runtime types
+    /// resolve to the already-loaded stable runtime assembly.
+    /// </summary>
     private sealed class GameContext : AssemblyLoadContext
     {
         public GameContext() : base(isCollectible: true) { }
@@ -39,19 +67,26 @@ internal sealed class GameHost
     private DateTime _lastWriteUtc;
     private DateTime _lastPollUtc;
 
+    /// <summary>Create a loader for the configured gameplay assembly.</summary>
     public GameHost(string assemblyPath) => _assemblyPath = assemblyPath;
 
+    /// <summary>Number of systems exposed by the active game version.</summary>
     public int SystemCount => _systems.Length;
 
+    /// <summary>Return one reflected scheduler access.</summary>
     public ManagedAccess GetAccess(int systemIndex, int accessIndex) =>
         _systems[systemIndex].Accesses[accessIndex];
 
+    /// <summary>Return the number of accesses declared by one system.</summary>
     public int GetAccessCount(int systemIndex) => _systems[systemIndex].Accesses.Length;
 
+    /// <summary>Load the initial game assembly and compile its runners.</summary>
     public void Init() => Load(isReload: false);
 
+    /// <summary>Invoke a discovered system by its stable index.</summary>
     public void RunSystem(int index) => _systems[index].Run();
 
+    /// <summary>Poll the game DLL timestamp and reload a newer build.</summary>
     public void PollReload()
     {
         var now = DateTime.UtcNow;
@@ -83,6 +118,10 @@ internal sealed class GameHost
         }
     }
 
+    /// <summary>
+    /// Load one assembly version, validate its scheduler signature, then swap
+    /// it atomically with the active collectible context.
+    /// </summary>
     private void Load(bool isReload)
     {
         var bytes = ReadAllBytesWithRetry(_assemblyPath);
@@ -119,6 +158,11 @@ internal sealed class GameHost
         }
     }
 
+    // =========================================================================
+    // System Discovery and Compilation
+    // =========================================================================
+
+    /// <summary>Discover attributed static methods in deterministic order.</summary>
     internal static ManagedSystem[] DiscoverSystems(Assembly assembly)
     {
         return assembly.GetTypes()
@@ -131,6 +175,10 @@ internal sealed class GameHost
             .ToArray();
     }
 
+    /// <summary>
+    /// Validate one managed method, derive component access from its query
+    /// type, and compile a parameterless runner for the Rust scheduler.
+    /// </summary>
     internal static ManagedSystem CreateSystem(MethodInfo method)
     {
         if (method.ReturnType != typeof(void))
@@ -139,7 +187,7 @@ internal sealed class GameHost
         var parameters = method.GetParameters();
         if (parameters.Length != 1)
             throw new InvalidOperationException(
-                $"{method} must have exactly one WriteQuery<T> or WriteReadQuery<TWrite, TRead> parameter.");
+                $"{method} must have exactly one supported ECS query parameter.");
 
         Type queryType = parameters[0].ParameterType;
         if (!queryType.IsGenericType)
@@ -160,6 +208,20 @@ internal sealed class GameHost
                 throw new InvalidOperationException($"{method} reads and writes the same component type.");
             accesses = [new ManagedAccess(write, 1), new ManagedAccess(read, 0)];
         }
+        else if (generic == typeof(Write3Query<,,>))
+        {
+            ulong first = Engine.ComponentKey(components[0]);
+            ulong second = Engine.ComponentKey(components[1]);
+            ulong third = Engine.ComponentKey(components[2]);
+            if (first == second || first == third || second == third)
+                throw new InvalidOperationException($"{method} writes the same component type more than once.");
+            accesses =
+            [
+                new ManagedAccess(first, 1),
+                new ManagedAccess(second, 1),
+                new ManagedAccess(third, 1),
+            ];
+        }
         else
         {
             throw UnsupportedQuery(method);
@@ -174,8 +236,13 @@ internal sealed class GameHost
     }
 
     private static InvalidOperationException UnsupportedQuery(MethodInfo method) => new(
-        $"{method} has an unsupported parameter. Use WriteQuery<T> or WriteReadQuery<TWrite, TRead>.");
+        $"{method} has an unsupported parameter. Use WriteQuery<T>, WriteReadQuery<TWrite, TRead>, or Write3Query<T1, T2, T3>.");
 
+    // =========================================================================
+    // File Loading
+    // =========================================================================
+
+    /// <summary>Read a just-built DLL, retrying transient compiler file locks.</summary>
     private static byte[] ReadAllBytesWithRetry(string path)
     {
         const int maxAttempts = 10;

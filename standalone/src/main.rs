@@ -81,13 +81,29 @@ mod windowed {
 
             let capabilities = surface.get_capabilities(&adapter);
             let surface_format = capabilities.formats[0];
+            let present_mode = if capabilities
+                .present_modes
+                .contains(&wgpu::PresentMode::Immediate)
+            {
+                wgpu::PresentMode::Immediate
+            } else if capabilities
+                .present_modes
+                .contains(&wgpu::PresentMode::Mailbox)
+            {
+                wgpu::PresentMode::Mailbox
+            } else {
+                // Universally accepted; wgpu selects Immediate or Mailbox when
+                // available and falls back to Fifo only when neither exists.
+                wgpu::PresentMode::AutoNoVsync
+            };
+            println!("[render] Present mode: {present_mode:?}");
 
             let surface_config = wgpu::SurfaceConfiguration {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 format: surface_format,
                 width: size.width.max(1),
                 height: size.height.max(1),
-                present_mode: wgpu::PresentMode::Fifo,
+                present_mode,
                 desired_maximum_frame_latency: 2,
                 alpha_mode: capabilities.alpha_modes[0],
                 view_formats: vec![],
@@ -181,6 +197,10 @@ mod windowed {
                 WindowEvent::RedrawRequested => {
                     if let (Some(host), Some(graphics)) = (&mut self.host, &mut self.graphics) {
                         if let Some(report) = run_one_frame(host) {
+                            println!(
+                                "  {:>6.0} FPS | {:>5} entities",
+                                report.fps, report.entity_count
+                            );
                             graphics.window.set_title(&format!(
                                 "ECS Standalone Host — {:.0} FPS | {} entities",
                                 report.fps, report.entity_count
