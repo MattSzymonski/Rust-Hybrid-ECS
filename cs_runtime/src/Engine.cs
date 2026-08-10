@@ -55,6 +55,7 @@ public enum QueryAccess : byte
 public readonly record struct QueryTermDescriptor(
     Type? ComponentType,
     ulong ComponentKey,
+    ulong ComponentKeyHigh,
     int ComponentSize,
     QueryAccess Access,
     bool Optional,
@@ -71,7 +72,7 @@ public sealed class QueryDescriptor
             throw new InvalidOperationException("An ECS query must contain at least one term.");
 
         _terms = termTypes.Select(CreateTerm).ToArray();
-        var components = new HashSet<ulong>();
+        var components = new HashSet<UInt128>();
         var hasEntity = false;
         foreach (var term in _terms)
         {
@@ -81,7 +82,7 @@ public sealed class QueryDescriptor
                     throw new InvalidOperationException("An ECS query cannot contain EntityTerm more than once.");
                 hasEntity = true;
             }
-            else if (!components.Add(term.ComponentKey))
+            else if (!components.Add(((UInt128)term.ComponentKeyHigh << 64) | term.ComponentKey))
             {
                 throw new InvalidOperationException(
                     $"An ECS query cannot contain component {term.ComponentType!.FullName} more than once.");
@@ -97,7 +98,7 @@ public sealed class QueryDescriptor
     private static QueryTermDescriptor CreateTerm(Type termType)
     {
         if (termType == typeof(EntityTerm))
-            return new QueryTermDescriptor(null, 0, Marshal.SizeOf<Entity>(), QueryAccess.Read, false, true);
+            return new QueryTermDescriptor(null, 0, 0, Marshal.SizeOf<Entity>(), QueryAccess.Read, false, true);
         if (!termType.IsGenericType)
             throw UnsupportedTerm(termType);
 
@@ -116,9 +117,11 @@ public sealed class QueryDescriptor
         else
             throw UnsupportedTerm(termType);
 
+        var stableId = Engine.ComponentStableId(component);
         return new QueryTermDescriptor(
             component,
-            Engine.ComponentKey(component),
+            stableId.Low,
+            stableId.High,
             Marshal.SizeOf(component),
             access,
             optional,
@@ -153,8 +156,15 @@ public static unsafe class Engine
     /// <summary>Return the active native world's entity count.</summary>
     public static uint EntityCount() => _api.EntityCount();
 
-    /// <summary>Build the stable component key shared with the Rust adapter.</summary>
-    internal static ulong ComponentKey(Type type) => HashName(type.Name);
+    /// <summary>Build the stable component ID shared with the Rust adapter.</summary>
+    internal static ulong ComponentKey(Type type) => ComponentStableId(type).Low;
+    internal static ulong ComponentKeyHigh(Type type) => ComponentStableId(type).High;
+    internal static StableComponentId ComponentStableId(Type type)
+    {
+        string name = type.FullName ?? type.Name;
+        return new StableComponentId(HashName(name, 0xcbf29ce484222325),
+            HashName(name, 0x84222325cbf29ce4));
+    }
 
     internal static bool TryGetChunk(
         QueryTermDescriptor term,
@@ -163,7 +173,7 @@ public static unsafe class Engine
     {
         NativeComponentChunk result;
         byte status = _api.GetComponentChunk(
-            term.ComponentKey, (byte)term.Access, index, &result);
+            term.ComponentKey, term.ComponentKeyHigh, (byte)term.Access, index, &result);
         chunk = result;
         if (status == 0)
             return false;
@@ -203,9 +213,8 @@ public static unsafe class Engine
                 $"The current system did not declare this {access.ToString().ToLowerInvariant()} access to {name}.");
     }
 
-    private static ulong HashName(string name)
+    private static ulong HashName(string name, ulong offset)
     {
-        const ulong offset = 0xcbf29ce484222325;
         const ulong prime = 0x100000001b3;
         ulong hash = offset;
         foreach (byte value in Encoding.UTF8.GetBytes(name))
@@ -216,6 +225,8 @@ public static unsafe class Engine
         return hash;
     }
 }
+
+internal readonly record struct StableComponentId(ulong Low, ulong High);
 
 // =============================================================================
 // Stack-only Row Views
@@ -351,11 +362,12 @@ public readonly unsafe ref struct QueryRow
 
     private QueryColumn Find<T>(QueryAccess access, bool optional) where T : unmanaged
     {
-        ulong key = Engine.ComponentKey(typeof(T));
+        StableComponentId key = Engine.ComponentStableId(typeof(T));
         for (var i = 0; i < _count; i++)
         {
             QueryColumn column = Column(i);
-            if (!column.Term.IsEntity && column.Term.ComponentKey == key &&
+            if (!column.Term.IsEntity && column.Term.ComponentKey == key.Low &&
+                column.Term.ComponentKeyHigh == key.High &&
                 column.Term.Access == access && column.Term.Optional == optional)
                 return column;
         }

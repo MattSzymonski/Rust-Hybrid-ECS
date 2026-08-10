@@ -2379,6 +2379,8 @@ dependencies = [
  "ecs_hybrid",
  "libloading 0.8.9",
  "notify",
+ "serde",
+ "serde_json",
  "trait_type_map",
 ]
 

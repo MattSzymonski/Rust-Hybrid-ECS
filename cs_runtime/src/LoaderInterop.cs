@@ -23,8 +23,11 @@ namespace TracyLive.Loader;
 [StructLayout(LayoutKind.Sequential)]
 public struct NativeSystemAccess
 {
-    /// <summary>Stable FNV-1a component key.</summary>
+    /// <summary>Low half of the stable 128-bit component ID.</summary>
     public ulong ComponentKey;
+
+    /// <summary>High half of the stable 128-bit component identifier.</summary>
+    public ulong ComponentKeyHigh;
 
     /// <summary>Access mode: zero for read, one for write.</summary>
     public byte Mode;
@@ -67,6 +70,29 @@ public static unsafe class LoaderInterop
     [UnmanagedCallersOnly]
     public static uint SystemCount() => (uint)(_host?.SystemCount ?? 0);
 
+    /// <summary>Return the UTF-8 JSON component manifest byte count.</summary>
+    [UnmanagedCallersOnly]
+    public static uint ComponentManifestLength() =>
+        checked((uint)(_host?.ComponentManifest.Length ?? 0));
+
+    /// <summary>Copy the complete UTF-8 JSON component manifest.</summary>
+    [UnmanagedCallersOnly]
+    public static byte CopyComponentManifest(byte* output, uint capacity)
+    {
+        try
+        {
+            if (_host is null || output is null || capacity < _host.ComponentManifest.Length)
+                return 0;
+            _host.ComponentManifest.CopyTo(new Span<byte>(output, checked((int)capacity)));
+            return 1;
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"[cs_runtime] CopyComponentManifest failed: {e}");
+            return 0;
+        }
+    }
+
     /// <summary>Return the number of scheduler accesses for one system.</summary>
     [UnmanagedCallersOnly]
     public static uint SystemAccessCount(uint systemIndex)
@@ -93,6 +119,7 @@ public static unsafe class LoaderInterop
                 return 0;
             var access = _host.GetAccess(checked((int)systemIndex), checked((int)accessIndex));
             output->ComponentKey = access.ComponentKey;
+            output->ComponentKeyHigh = access.ComponentKeyHigh;
             output->Mode = access.Mode;
             return 1;
         }

@@ -169,16 +169,34 @@ mod tests {
 
 /// Type-erased identifier for a registered component type.
 ///
-/// Can be converted to/from [`TypeKey`] for code that needs to be generic
-/// over both component and resource type identifiers.
-///
-/// [`TypeKey`]: crate::scheduler::TypeKey
+/// Native components retain their Rust [`TypeId`]. Runtime-defined components
+/// use the stable 128-bit identity supplied by their external manifest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ComponentId(pub TypeId);
+pub enum ComponentId {
+    /// Component backed by a concrete Rust type.
+    Native(TypeId),
+    /// Component described at runtime by an external language manifest.
+    Dynamic(u128),
+}
 
 impl ComponentId {
-    pub fn of<T: Component>() -> Self {
-        ComponentId(TypeId::of::<T>())
+    pub fn of<T: 'static>() -> Self {
+        Self::Native(TypeId::of::<T>())
+    }
+
+    pub const fn dynamic(stable_id: u128) -> Self {
+        Self::Dynamic(stable_id)
+    }
+
+    pub const fn native(type_id: TypeId) -> Self {
+        Self::Native(type_id)
+    }
+
+    pub const fn native_type_id(self) -> Option<TypeId> {
+        match self {
+            Self::Native(type_id) => Some(type_id),
+            Self::Dynamic(_) => None,
+        }
     }
 }
 
@@ -320,6 +338,29 @@ impl ComponentRegistry {
             .insert(component_id, std::any::type_name::<T>().to_string());
         self.sizes.insert(component_id, std::mem::size_of::<T>());
         self.next_bit += 1;
+        bit
+    }
+
+    /// Register a component whose concrete type is defined outside Rust.
+    pub fn register_dynamic(
+        &mut self,
+        stable_id: u128,
+        name: impl Into<String>,
+        size: usize,
+    ) -> u8 {
+        let component_id = ComponentId::dynamic(stable_id);
+        if let Some(&bit) = self.id_to_bit.get(&component_id) {
+            return bit;
+        }
+        assert!(
+            self.next_bit < 128,
+            "Component type limit exceeded (max 128)"
+        );
+        let bit = self.next_bit;
+        self.next_bit += 1;
+        self.id_to_bit.insert(component_id, bit);
+        self.names.insert(component_id, name.into());
+        self.sizes.insert(component_id, size);
         bit
     }
 

@@ -22,8 +22,8 @@ public unsafe struct EngineApi
     /// <summary>Return the entity count from the currently scheduled world.</summary>
     public delegate* unmanaged[Cdecl]<uint> EntityCount;
 
-    /// <summary>Request one native archetype column by component key and mode.</summary>
-    public delegate* unmanaged[Cdecl]<ulong, byte, uint, NativeComponentChunk*, byte> GetComponentChunk;
+    /// <summary>Request one native archetype column by component ID and mode.</summary>
+    public delegate* unmanaged[Cdecl]<ulong, ulong, byte, uint, NativeComponentChunk*, byte> GetComponentChunk;
 
     /// <summary>Request one native archetype's entity-handle column.</summary>
     public delegate* unmanaged[Cdecl]<uint, NativeComponentChunk*, byte> GetEntityChunk;

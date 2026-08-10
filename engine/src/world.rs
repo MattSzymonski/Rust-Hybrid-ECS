@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
 
 // Current crate
-use crate::archetype::{Archetype, ArchetypeId, StorageFactory};
+use crate::archetype::{Archetype, ArchetypeId, DynamicComponentLayout, StorageFactory};
 use crate::commands::CommandQueue;
 use crate::component::{
     Component, ComponentId, ComponentMask, ComponentRegistry, ComponentTicks, Tick,
@@ -494,9 +494,11 @@ impl World {
 
         self.storage_factories.insert(
             component_id,
-            Box::new(|map: &mut TraitTypeMap<dyn Component, VecFamily>| {
-                map.register_type_storage::<T>();
-            }),
+            StorageFactory::Native(Box::new(
+                |map: &mut TraitTypeMap<dyn Component, VecFamily>| {
+                    map.register_type_storage::<T>();
+                },
+            )),
         );
 
         // Register copier function for this component type.
@@ -504,6 +506,152 @@ impl World {
         // requires no heap allocation or vtable dispatch.
         self.component_copiers
             .insert(component_id, copy_component::<T>);
+    }
+
+    /// Register an unmanaged component described by an external language.
+    pub fn register_dynamic_component(
+        &mut self,
+        stable_id: u128,
+        name: impl Into<String>,
+        size: usize,
+        align: usize,
+        schema_hash: u64,
+    ) -> Result<ComponentId, String> {
+        if stable_id == 0 {
+            return Err("dynamic component stable ID cannot be zero".into());
+        }
+        if size == 0 {
+            return Err("dynamic component size cannot be zero".into());
+        }
+        if align == 0 || !align.is_power_of_two() {
+            return Err("dynamic component alignment must be a non-zero power of two".into());
+        }
+        if std::alloc::Layout::from_size_align(size, align).is_err() {
+            return Err("dynamic component size and alignment do not form a valid layout".into());
+        }
+        let name = name.into();
+        let component_id = ComponentId::dynamic(stable_id);
+        if let Some(existing) = self.storage_factories.get(&component_id) {
+            return match existing {
+                StorageFactory::Dynamic(layout)
+                    if layout.size == size
+                        && layout.align == align
+                        && layout.schema_hash == schema_hash
+                        && self.component_registry.get_name(&component_id) == Some(&name) =>
+                {
+                    Ok(component_id)
+                }
+                _ => Err(
+                    "dynamic component stable ID is already registered with another name or schema"
+                        .into(),
+                ),
+            };
+        }
+        if self.component_registry.len() >= 128 {
+            return Err("component type limit exceeded (max 128)".into());
+        }
+        self.component_registry
+            .register_dynamic(stable_id, name, size);
+        self.storage_factories.insert(
+            component_id,
+            StorageFactory::Dynamic(DynamicComponentLayout {
+                size,
+                align,
+                schema_hash,
+            }),
+        );
+        Ok(component_id)
+    }
+
+    /// Return a raw dynamic component column for language bindings.
+    pub fn dynamic_component_chunk_mut(
+        &mut self,
+        component_id: ComponentId,
+        chunk_index: usize,
+    ) -> Option<(ArchetypeId, *mut u8, usize, &mut [ComponentTicks])> {
+        let archetype = self
+            .archetypes
+            .values_mut()
+            .filter(|archetype| archetype.component_types.contains(&component_id))
+            .nth(chunk_index)?;
+        let archetype_id = archetype.id;
+        let column = archetype
+            .dynamic_component_storages
+            .get_mut(&component_id)?;
+        let len = column.len();
+        let data = column.as_mut_ptr();
+        let ticks = archetype
+            .component_ticks
+            .get_mut(&component_id)?
+            .as_mut_slice();
+        debug_assert_eq!(len, ticks.len());
+        Some((archetype_id, data, len, ticks))
+    }
+
+    /// Create an entity consisting entirely of runtime-defined components.
+    pub fn create_dynamic_entity(
+        &mut self,
+        components: &[(ComponentId, Vec<u8>)],
+    ) -> Result<Entity, String> {
+        if components.is_empty() {
+            return Err("a dynamic entity must contain at least one component".into());
+        }
+        let mut component_ids: Vec<_> = components.iter().map(|(id, _)| *id).collect();
+        component_ids.sort();
+        component_ids.dedup();
+        if component_ids.len() != components.len() {
+            return Err("a dynamic entity cannot contain duplicate components".into());
+        }
+        for (id, bytes) in components {
+            let Some(StorageFactory::Dynamic(layout)) = self.storage_factories.get(id) else {
+                return Err(format!("dynamic component {id:?} is not registered"));
+            };
+            if bytes.len() != layout.size {
+                return Err(format!(
+                    "dynamic component {id:?} byte length does not match its manifest"
+                ));
+            }
+        }
+
+        let entity = self.allocate_entity();
+        let archetype_id = self.get_or_create_archetype(component_ids);
+        let archetype = self.archetypes.get_mut(&archetype_id).unwrap();
+        let index = archetype.entities.len();
+        archetype.entities.push(entity);
+        for (id, bytes) in components {
+            archetype
+                .dynamic_component_storages
+                .get_mut(id)
+                .unwrap()
+                .push_bytes(bytes)?;
+            archetype
+                .component_ticks
+                .get_mut(id)
+                .unwrap()
+                .push(ComponentTicks::new(Tick::new(self.change_tick)));
+        }
+        self.entity_locations.insert(
+            entity,
+            EntityLocation {
+                archetype_id,
+                index_in_archetype: index,
+            },
+        );
+        Ok(entity)
+    }
+
+    /// Read one runtime-defined component as its raw manifest bytes.
+    pub fn dynamic_component_bytes(
+        &self,
+        entity: Entity,
+        component_id: ComponentId,
+    ) -> Option<&[u8]> {
+        let location = self.entity_locations.get(&entity)?;
+        self.archetypes
+            .get(&location.archetype_id)?
+            .dynamic_component_storages
+            .get(&component_id)?
+            .bytes(location.index_in_archetype)
     }
 
     /// Register a script component type with the World
@@ -1183,6 +1331,22 @@ impl World {
                 old_index,
             );
 
+            // Runtime-defined columns participate in every archetype move
+            // without requiring a concrete Rust copier function.
+            for &component_id in new_component_ids {
+                let Some(destination) = new_archetype
+                    .dynamic_component_storages
+                    .get_mut(&component_id)
+                else {
+                    continue;
+                };
+                if let Some(source) = old_archetype.dynamic_component_storages.get(&component_id) {
+                    destination.push_from(source, old_index);
+                } else {
+                    destination.push_zeroed();
+                }
+            }
+
             // Maintain change-detection ticks: for each component in the
             // destination archetype, either preserve the existing ticks
             // (component carried over) or push fresh ticks for a newly
@@ -1232,11 +1396,20 @@ impl World {
 
             // Also swap_remove from all component storages to keep them in sync
             for &component_id in &old_archetype.component_types {
-                if let Some(storage) = old_archetype
-                    .component_storages
-                    .get_trait_storage_mut(component_id.0)
-                {
-                    storage.swap_remove(old_index);
+                match component_id.native_type_id() {
+                    Some(type_id) => {
+                        if let Some(storage) = old_archetype
+                            .component_storages
+                            .get_trait_storage_mut(type_id)
+                        {
+                            storage.swap_remove(old_index);
+                        }
+                    }
+                    None => old_archetype
+                        .dynamic_component_storages
+                        .get_mut(&component_id)
+                        .expect("dynamic storage missing")
+                        .swap_remove(old_index),
                 }
                 // Keep change-detection ticks in lockstep with storage.
                 if let Some(ticks) = old_archetype.component_ticks.get_mut(&component_id) {
@@ -1302,11 +1475,19 @@ impl World {
                 }
             }
             for component_id in component_type_ids {
-                if let Some(storage) = archetype
-                    .component_storages
-                    .get_trait_storage_mut(component_id.0)
-                {
-                    storage.swap_remove(old_index);
+                match component_id.native_type_id() {
+                    Some(type_id) => {
+                        if let Some(storage) =
+                            archetype.component_storages.get_trait_storage_mut(type_id)
+                        {
+                            storage.swap_remove(old_index);
+                        }
+                    }
+                    None => archetype
+                        .dynamic_component_storages
+                        .get_mut(component_id)
+                        .expect("dynamic storage missing")
+                        .swap_remove(old_index),
                 }
             }
         }
@@ -1466,6 +1647,104 @@ impl World {
             },
         );
 
+        Ok(())
+    }
+
+    /// Add a runtime-defined component and migrate the entity's other columns.
+    pub fn add_dynamic_component(
+        &mut self,
+        entity: Entity,
+        component_id: ComponentId,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let location = *self
+            .entity_locations
+            .get(&entity)
+            .ok_or("entity not found")?;
+        let old_archetype = self.archetypes.get(&location.archetype_id).unwrap();
+        if old_archetype.component_types.contains(&component_id) {
+            return Err("entity already contains the dynamic component".into());
+        }
+        let expected_size = match self.storage_factories.get(&component_id) {
+            Some(StorageFactory::Dynamic(layout)) => layout.size,
+            _ => return Err("dynamic component is not registered".into()),
+        };
+        if bytes.len() != expected_size {
+            return Err("dynamic component byte length does not match its manifest".into());
+        }
+        let mut new_ids = old_archetype.component_types.clone();
+        new_ids.push(component_id);
+        new_ids.sort();
+        let copiers: Vec<_> = old_archetype
+            .component_types
+            .iter()
+            .filter_map(|id| self.component_copiers.get(id).copied())
+            .collect();
+        self.move_entity_to_archetype(entity, new_ids, |old, new, index| {
+            for copier in &copiers {
+                copier(old, new, index);
+            }
+        });
+        let location = self.entity_locations[&entity];
+        self.archetypes
+            .get_mut(&location.archetype_id)
+            .unwrap()
+            .dynamic_component_storages
+            .get_mut(&component_id)
+            .unwrap()
+            .set_bytes(location.index_in_archetype, bytes)?;
+        Ok(())
+    }
+
+    /// Add a zero-initialized runtime-defined component.
+    pub fn add_dynamic_component_default(
+        &mut self,
+        entity: Entity,
+        component_id: ComponentId,
+    ) -> Result<(), String> {
+        let size = match self.storage_factories.get(&component_id) {
+            Some(StorageFactory::Dynamic(layout)) => layout.size,
+            _ => return Err("dynamic component is not registered".into()),
+        };
+        self.add_dynamic_component(entity, component_id, &vec![0; size])
+    }
+
+    /// Remove a runtime-defined component while preserving every other column.
+    pub fn remove_dynamic_component(
+        &mut self,
+        entity: Entity,
+        component_id: ComponentId,
+    ) -> Result<(), String> {
+        let location = *self
+            .entity_locations
+            .get(&entity)
+            .ok_or("entity not found")?;
+        let old_archetype = self.archetypes.get(&location.archetype_id).unwrap();
+        if !old_archetype
+            .dynamic_component_storages
+            .contains_key(&component_id)
+        {
+            return Err("entity does not contain the dynamic component".into());
+        }
+        let new_ids: Vec<_> = old_archetype
+            .component_types
+            .iter()
+            .copied()
+            .filter(|id| *id != component_id)
+            .collect();
+        if new_ids.is_empty() {
+            let _ = self.destroy_entity(entity);
+            return Ok(());
+        }
+        let copiers: Vec<_> = new_ids
+            .iter()
+            .filter_map(|id| self.component_copiers.get(id).copied())
+            .collect();
+        self.move_entity_to_archetype(entity, new_ids, |old, new, index| {
+            for copier in &copiers {
+                copier(old, new, index);
+            }
+        });
         Ok(())
     }
 
@@ -1722,6 +2001,93 @@ mod tests {
     impl Component for Health {}
 
     impl_trait_accessible!(dyn Component; Position, Velocity, Health);
+
+    #[test]
+    fn dynamic_components_coexist_and_survive_archetype_migration() {
+        let mut world = World::new();
+        let a = world
+            .register_dynamic_component(0xA1, "Game.A", 4, 4, 11)
+            .unwrap();
+        let b = world
+            .register_dynamic_component(0xB2, "Game.B", 4, 4, 22)
+            .unwrap();
+        let c = world
+            .register_dynamic_component(0xC3, "Game.C", 8, 8, 33)
+            .unwrap();
+        let entity = world
+            .create_dynamic_entity(&[
+                (a, 10_u32.to_ne_bytes().to_vec()),
+                (b, 20_u32.to_ne_bytes().to_vec()),
+            ])
+            .unwrap();
+
+        assert_eq!(
+            world.dynamic_component_bytes(entity, a).unwrap(),
+            10_u32.to_ne_bytes()
+        );
+        assert_eq!(
+            world.dynamic_component_bytes(entity, b).unwrap(),
+            20_u32.to_ne_bytes()
+        );
+
+        world.add_dynamic_component_default(entity, c).unwrap();
+        assert_eq!(
+            world.dynamic_component_bytes(entity, a).unwrap(),
+            10_u32.to_ne_bytes()
+        );
+        assert_eq!(
+            world.dynamic_component_bytes(entity, b).unwrap(),
+            20_u32.to_ne_bytes()
+        );
+        assert_eq!(world.dynamic_component_bytes(entity, c).unwrap(), [0; 8]);
+
+        world.remove_dynamic_component(entity, b).unwrap();
+        assert_eq!(
+            world.dynamic_component_bytes(entity, a).unwrap(),
+            10_u32.to_ne_bytes()
+        );
+        assert!(world.dynamic_component_bytes(entity, b).is_none());
+        assert_eq!(world.dynamic_component_bytes(entity, c).unwrap(), [0; 8]);
+    }
+
+    #[test]
+    fn invalid_dynamic_component_layouts_are_rejected() {
+        let mut world = World::new();
+        assert!(
+            world
+                .register_dynamic_component(1, "Zero", 0, 1, 0)
+                .is_err()
+        );
+        assert!(
+            world
+                .register_dynamic_component(2, "BadAlign", 4, 3, 0)
+                .is_err()
+        );
+        assert!(
+            world
+                .register_dynamic_component(4, "Oversized", usize::MAX, 1, 0)
+                .is_err()
+        );
+        world
+            .register_dynamic_component(3, "SchemaA", 4, 4, 10)
+            .unwrap();
+        assert!(
+            world
+                .register_dynamic_component(3, "SameSchemaDifferentName", 4, 4, 10)
+                .is_err()
+        );
+        assert!(
+            world
+                .register_dynamic_component(3, "SchemaB", 8, 8, 20)
+                .is_err()
+        );
+
+        let valid = world
+            .register_dynamic_component(5, "Valid", 4, 4, 30)
+            .unwrap();
+        assert!(world.create_dynamic_entity(&[(valid, vec![0; 3])]).is_err());
+        assert_eq!(world.entity_count(), 0);
+    }
 
     /// Tests creating multiple entities with different component combinations.
     ///

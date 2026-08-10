@@ -19,7 +19,7 @@
 //! Together these reveal whether scaling bottlenecks are in conflict analysis
 //! or in the runtime dispatch machinery.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use ecs_hybrid::*;
 use std::any::TypeId;
 use trait_type_map::impl_trait_accessible;
@@ -55,9 +55,9 @@ fn build_scheduler(system_count: usize) -> SystemScheduler {
         let type_id = DISTINCT_TYPE_IDS[i % DISTINCT_TYPE_IDS.len()];
         // Every third system writes; others read - realistic conflict mix.
         if i % 3 == 0 {
-            access.add_write(ComponentId(type_id));
+            access.add_write(ComponentId::native(type_id));
         } else {
-            access.add_read(ComponentId(type_id));
+            access.add_read(ComponentId::native(type_id));
         }
         scheduler.register_system(access);
     }

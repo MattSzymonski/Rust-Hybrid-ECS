@@ -16,19 +16,20 @@ Rust host
   -> managed query iterators borrow native archetype columns
 ```
 
-The current pipeline is suitable for the bouncing-ball demo. Component types,
-world initialization, and native query dispatch are still defined manually in
-`host/src/cs/cs_api.rs`.
+The pipeline now registers every unmanaged component used by discovered C#
+systems from a managed manifest. Renderer-owned components use stable mirrors
+from `cs_runtime`; game-owned components use type-erased native storage. Demo
+world initialization is still native and remains the next major hardcoded part.
 
 ## Implementation phases
 
-- [ ] Phase 1: Correctness and stable metadata
+- [x] Phase 1: Correctness and stable metadata
   - [x] Track managed component writes.
-  - [ ] Introduce collision-resistant component identities.
-  - [ ] Validate complete component layouts.
+  - [x] Introduce collision-resistant component identities.
+  - [x] Validate complete component layouts.
 - [ ] Phase 2: Dynamic game-defined worlds
-  - [ ] Export a component manifest from `game_cs`.
-  - [ ] Register unmanaged components dynamically.
+  - [x] Export a component manifest from `game_cs`.
+  - [x] Register unmanaged components dynamically.
   - [ ] Add entity IDs and deferred commands.
   - [ ] Move game initialization into C#.
 - [ ] Phase 3: General system parameters
@@ -109,27 +110,43 @@ host, which means C# does not yet define the game's component universe.
 
 ### Implementation
 
-1. Have `cs_runtime` inspect unmanaged structs used by discovered systems.
-2. Export a component manifest before system registration:
+Implemented. `cs_runtime` inspects every component term in every discovered
+system and exports a UTF-8 JSON manifest before Rust reads scheduler access.
+Each descriptor contains:
 
-   ```text
-   ComponentDescriptor
-   - stable_id: 128-bit identifier
-   - full_name: UTF-8 name
-   - size: u32
-   - alignment: u32
-   - schema_hash: u64 or u128
-   - fields: name, offset, primitive type, nested schema
-   ```
+```text
+ComponentDescriptor
+- stable_id: two u64 halves derived from the canonical full name
+- full_name: UTF-8 managed full name
+- size and alignment
+- schema_hash: FNV-1a hash of the canonical field schema
+- fields: name, offset, size, primitive kind, and nested fields
+- shared: whether the type is owned by cs_runtime
+```
 
-3. Add type-erased component storage to the engine. The storage must support:
-   allocation, swap-remove, move between archetypes, default construction, and
-   optional serialization without a compile-time Rust type.
-4. Register manifest components before systems are registered.
-5. Replace `component_id()` and the hardcoded callback match in `cs_api.rs`
-   with a runtime registry keyed by `stable_id`.
-6. Keep built-in native components such as renderer `Position` and `Sprite` in
-   an explicit shared-component registry so managed types can bind to them.
+`World::register_dynamic_component` installs a type-erased storage factory.
+`DynamicColumn` owns an aligned dense byte allocation and supports append,
+zero initialization, row replacement, swap-remove, and copying during
+archetype migration. Tick columns remain parallel to both native and dynamic
+storage, so managed writes keep the same change-detection behavior.
+
+The host loads and validates the manifest before creating the demo world or
+registering systems. Its runtime binding table is keyed by the full 128-bit
+stable ID. A binding either dispatches to a generic native column callback or
+to a dynamic column; `ffi_get_component_chunk` contains no per-game type match.
+
+`Position`, `Color`, and `Sprite` now live in `cs_runtime/SharedComponents.cs`.
+The native registry explicitly binds the renderer-owned `Position` and
+`Sprite` mirrors and checks size, alignment, and the complete field schema.
+`PhysicsState` and `BallTag` live only in `game_cs`; both register from the
+manifest without Rust component definitions. Native demo setup generically
+default-constructs every game-defined manifest component without knowing its
+name, size, or fields, and C# performs semantic initialization. Deferred C#
+entity commands can later move entity creation itself into the game assembly.
+
+Reload remains behavior-only. `GameHost` compares the new manifest byte for
+byte with the active one and rejects schema or identity changes, preserving the
+old collectible context until the process restarts and can rebuild storage.
 
 ### Affected files
 
@@ -142,10 +159,10 @@ host, which means C# does not yet define the game's component universe.
 
 ### Acceptance tests
 
-- Adding a new unmanaged struct only in `game_cs` requires no host edit.
-- Two dynamically registered components can coexist in one archetype.
-- Dynamic components survive entity migration between archetypes.
-- Invalid managed layouts are rejected before the first frame.
+- [x] Adding `BallTag` only in `game_cs` requires no host match arm or Rust type.
+- [x] Two dynamically registered components coexist in one archetype.
+- [x] Dynamic bytes and ticks survive add/remove archetype migration.
+- [x] Invalid managed and native-shared layouts fail before the first frame.
 
 ---
 
@@ -297,25 +314,26 @@ rejected because the Rust scheduler graph was built only at startup.
 
 ### Problem
 
-The current key is an FNV-1a hash of `Type.Name`. `Foo.Position` and
-`Bar.Position` collide by construction, and ordinary hash collisions are not
-detected.
+The original key was one FNV-1a hash of `Type.Name`, so `Foo.Position` and
+`Bar.Position` collided by construction. The manifest work replaced it with a
+128-bit ID derived from `Type.FullName` and rejects duplicate IDs. An explicit
+canonical-name attribute would still be useful for intentional type renames.
 
 ### Implementation
 
-1. Introduce an explicit attribute:
+Implemented foundation: query metadata, manifests, native bindings, and FFI
+calls all carry both halves of the 128-bit full-name ID. Duplicate IDs fail
+during manifest loading, and collectible assembly identity/version is excluded.
+
+Optional follow-up: introduce an explicit attribute:
 
    ```csharp
    [EcsComponent("game.physics.position", Version = 1)]
    public struct Position { ... }
    ```
 
-2. Derive a 128-bit ID from the explicit canonical name, or store the canonical
-   string in the native registry and use an assigned runtime integer afterward.
-3. Reserve canonical IDs for shared native components.
-4. Detect duplicate IDs during manifest loading and report both managed types.
-5. Do not use assembly version or collectible load-context identity in the ID;
-   an unchanged component must keep its identity across hot reload.
+The attribute's canonical name would replace `Type.FullName` as hash input,
+allowing C# namespace/type refactors without changing persisted component IDs.
 
 ### Acceptance tests
 
@@ -331,20 +349,20 @@ detected.
 
 ### Problem
 
-Only `sizeof(T)` is checked today. Equal-sized structs can still disagree on
-alignment, offsets, primitive types, signedness, or nested layout.
+The original bridge checked only `sizeof(T)`, so equal-sized structs could
+disagree on alignment, offsets, primitive types, signedness, or nested layout.
 
 ### Implementation
 
-1. Generate a schema descriptor from managed reflection using
-   `Marshal.OffsetOf`, `Unsafe.SizeOf`, field types, and explicit packing.
-2. Generate the equivalent descriptor for shared Rust components.
-3. Hash canonical field metadata into a schema hash.
-4. Validate size, alignment, field count, offsets, primitive kinds, nesting,
-   and schema hash during startup.
-5. Restrict components to blittable unmanaged fields. Require explicit byte
-   representation for booleans and enums unless their representation is fixed.
-6. Add `#[repr(C)]` to every native type shared with managed code.
+Implemented as part of dynamic registration. Managed reflection records size,
+alignment, offsets, primitive kinds, and recursive nested fields in a canonical
+schema. Components containing managed references, pointers, `bool`, `char`,
+auto layout, or recursive value layouts are rejected during discovery.
+
+The host validates every field range and uses the schema hash to compare shared
+managed mirrors with the explicit native registry. Native shared types use
+`#[repr(C)]`; game-owned dynamic types use their validated managed layout as
+the authoritative schema.
 
 ### Acceptance tests
 

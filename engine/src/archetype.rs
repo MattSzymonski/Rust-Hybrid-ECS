@@ -38,7 +38,9 @@
 //!
 //! This keeps arrays dense without gaps, maintaining O(1) removal.
 
+use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
 use std::collections::HashMap;
+use std::ptr::NonNull;
 
 use trait_type_map::{TraitTypeMap, VecFamily};
 
@@ -51,7 +53,206 @@ use crate::entity::Entity;
 
 /// Type for component storage factory functions
 /// These create empty storage for a specific component type
-pub type StorageFactory = Box<dyn Fn(&mut TraitTypeMap<dyn Component, VecFamily>) + Send + Sync>;
+pub enum StorageFactory {
+    Native(Box<dyn Fn(&mut TraitTypeMap<dyn Component, VecFamily>) + Send + Sync>),
+    Dynamic(DynamicComponentLayout),
+}
+
+/// Runtime layout for a component whose concrete type is owned by another language.
+#[derive(Debug, Clone)]
+pub struct DynamicComponentLayout {
+    pub size: usize,
+    pub align: usize,
+    pub schema_hash: u64,
+}
+
+/// Aligned, densely packed storage for a type-erased component column.
+pub struct DynamicColumn {
+    layout: DynamicComponentLayout,
+    data: NonNull<u8>,
+    len: usize,
+    capacity: usize,
+}
+
+// SAFETY: Dynamic manifests admit only unmanaged value types. Access remains
+// protected by the same scheduler rules as native component columns.
+unsafe impl Send for DynamicColumn {}
+unsafe impl Sync for DynamicColumn {}
+
+impl DynamicColumn {
+    pub fn new(layout: DynamicComponentLayout) -> Self {
+        Self {
+            layout,
+            data: NonNull::dangling(),
+            len: 0,
+            capacity: 0,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn element_size(&self) -> usize {
+        self.layout.size
+    }
+
+    pub fn alignment(&self) -> usize {
+        self.layout.align
+    }
+
+    pub fn schema_hash(&self) -> u64 {
+        self.layout.schema_hash
+    }
+
+    pub fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.data.as_ptr()
+    }
+
+    pub fn push_zeroed(&mut self) {
+        self.reserve_one();
+        // SAFETY: reserve_one guarantees one writable, correctly aligned slot.
+        unsafe {
+            std::ptr::write_bytes(
+                self.data.as_ptr().add(self.len * self.layout.size),
+                0,
+                self.layout.size,
+            )
+        };
+        self.len += 1;
+    }
+
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
+        if bytes.len() != self.layout.size {
+            return Err("dynamic component byte length does not match its registered size");
+        }
+        self.reserve_one();
+        // SAFETY: source and destination are valid for exactly one element and
+        // cannot overlap because the source is outside this column's spare slot.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.data.as_ptr().add(self.len * self.layout.size),
+                self.layout.size,
+            );
+        }
+        self.len += 1;
+        Ok(())
+    }
+
+    pub fn push_from(&mut self, source: &Self, index: usize) {
+        assert_eq!(self.layout.size, source.layout.size);
+        assert!(index < source.len);
+        self.reserve_one();
+        // SAFETY: both slots are allocated, aligned, non-overlapping columns.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                source.data.as_ptr().add(index * source.layout.size),
+                self.data.as_ptr().add(self.len * self.layout.size),
+                self.layout.size,
+            );
+        }
+        self.len += 1;
+    }
+
+    pub fn set_bytes(&mut self, index: usize, bytes: &[u8]) -> Result<(), &'static str> {
+        if index >= self.len || bytes.len() != self.layout.size {
+            return Err("dynamic component row or byte length is invalid");
+        }
+        // SAFETY: the checked row is initialized and bytes has one element's size.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.data.as_ptr().add(index * self.layout.size),
+                self.layout.size,
+            );
+        }
+        Ok(())
+    }
+
+    pub fn bytes(&self, index: usize) -> Option<&[u8]> {
+        if index >= self.len {
+            return None;
+        }
+        // SAFETY: the row is initialized and lives for the returned shared borrow.
+        Some(unsafe {
+            std::slice::from_raw_parts(
+                self.data.as_ptr().add(index * self.layout.size),
+                self.layout.size,
+            )
+        })
+    }
+
+    pub fn swap_remove(&mut self, index: usize) {
+        assert!(index < self.len);
+        let last = self.len - 1;
+        if index != last {
+            // SAFETY: both rows are within this allocation; copy permits overlap.
+            unsafe {
+                std::ptr::copy(
+                    self.data.as_ptr().add(last * self.layout.size),
+                    self.data.as_ptr().add(index * self.layout.size),
+                    self.layout.size,
+                );
+            }
+        }
+        self.len = last;
+    }
+
+    fn reserve_one(&mut self) {
+        if self.len < self.capacity {
+            return;
+        }
+        let new_capacity = self.capacity.max(4).saturating_mul(2);
+        let new_layout = Layout::from_size_align(
+            self.layout
+                .size
+                .checked_mul(new_capacity)
+                .expect("dynamic column too large"),
+            self.layout.align,
+        )
+        .expect("invalid dynamic component layout");
+        // SAFETY: new_layout has non-zero size because component size is validated.
+        let new_data = unsafe { alloc(new_layout) };
+        let new_data = NonNull::new(new_data).unwrap_or_else(|| handle_alloc_error(new_layout));
+        if self.len != 0 {
+            // SAFETY: both allocations are valid and non-overlapping.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.data.as_ptr(),
+                    new_data.as_ptr(),
+                    self.len * self.layout.size,
+                );
+                dealloc(
+                    self.data.as_ptr(),
+                    Layout::from_size_align_unchecked(
+                        self.layout.size * self.capacity,
+                        self.layout.align,
+                    ),
+                );
+            }
+        }
+        self.data = new_data;
+        self.capacity = new_capacity;
+    }
+}
+
+impl Drop for DynamicColumn {
+    fn drop(&mut self) {
+        if self.capacity != 0 {
+            // SAFETY: this is the live allocation created by reserve_one.
+            unsafe {
+                dealloc(
+                    self.data.as_ptr(),
+                    Layout::from_size_align_unchecked(
+                        self.layout.size * self.capacity,
+                        self.layout.align,
+                    ),
+                );
+            }
+        }
+    }
+}
 
 // =============================================================================
 // ArchetypeId
@@ -76,6 +277,7 @@ pub struct Archetype {
     pub component_types: Vec<ComponentId>, // Still needed for iteration/lookup
     pub component_mask: ComponentMask,     // Fast bitmask for query matching
     pub component_storages: TraitTypeMap<dyn Component, VecFamily>,
+    pub dynamic_component_storages: HashMap<ComponentId, DynamicColumn>,
     pub entities: Vec<Entity>,
     /// Per-component-instance change-detection metadata.
     ///
@@ -105,6 +307,7 @@ impl Archetype {
             [("Component types in this archetype: {}", component_count)]
         );
         let mut component_storages = TraitTypeMap::with_capacity(component_count);
+        let mut dynamic_component_storages = HashMap::new();
         let mut component_ticks: HashMap<ComponentId, Vec<ComponentTicks>> =
             HashMap::with_capacity(component_count);
 
@@ -115,7 +318,13 @@ impl Archetype {
                     "Component type {:?} not registered. Call world.register_component::<T>() first.",
                     component_id
                 ));
-            factory(&mut component_storages);
+            match factory {
+                StorageFactory::Native(factory) => factory(&mut component_storages),
+                StorageFactory::Dynamic(layout) => {
+                    dynamic_component_storages
+                        .insert(component_id, DynamicColumn::new(layout.clone()));
+                }
+            }
             component_ticks.insert(component_id, Vec::new());
         }
 
@@ -130,6 +339,7 @@ impl Archetype {
             component_types,
             component_mask,
             component_storages,
+            dynamic_component_storages,
             entities: Vec::new(),
             component_ticks,
         }

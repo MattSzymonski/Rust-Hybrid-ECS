@@ -41,7 +41,7 @@
 use std::collections::{HashMap, HashSet};
 
 // External crates
-use serde::{de::DeserializeOwned, Serialize};
+use serde::{Serialize, de::DeserializeOwned};
 use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
 
 // Current crate
@@ -437,7 +437,9 @@ impl World {
 
         println!(
             "[persistence] Snapshot complete: {} entities, {} components serialized ({} non-persistable skipped)",
-            entries.len(), total_components_serialized, skipped_non_persistable,
+            entries.len(),
+            total_components_serialized,
+            skipped_non_persistable,
         );
 
         ComponentSnapshot { entries }
@@ -809,13 +811,20 @@ impl World {
 
             if archetype
                 .component_storages
-                .remove_trait_storage(component_id.0)
+                .remove_trait_storage(
+                    component_id
+                        .native_type_id()
+                        .expect("persisted components must have native Rust storage"),
+                )
                 .is_none()
             {
                 return Err(());
             }
 
             let Some(storage_factory) = self.storage_factories.get(&component_id) else {
+                return Err(());
+            };
+            let crate::archetype::StorageFactory::Native(storage_factory) = storage_factory else {
                 return Err(());
             };
             storage_factory(&mut archetype.component_storages);

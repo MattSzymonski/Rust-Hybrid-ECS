@@ -23,14 +23,15 @@ namespace TracyLive.Loader;
 // Discovered System Metadata
 // =============================================================================
 
-/// <summary>One component key and its native access mode.</summary>
-internal readonly record struct ManagedAccess(ulong ComponentKey, byte Mode);
+/// <summary>One 128-bit component ID and its native access mode.</summary>
+internal readonly record struct ManagedAccess(ulong ComponentKey, ulong ComponentKeyHigh, byte Mode);
 
 /// <summary>Compiled managed system plus its scheduler declaration.</summary>
-internal sealed record ManagedSystem(string Name, ManagedAccess[] Accesses, Action Run)
+internal sealed record ManagedSystem(
+    string Name, ManagedAccess[] Accesses, QueryDescriptor QueryDescriptor, Action Run)
 {
     internal string Signature =>
-        $"{Name}:{string.Join(',', Accesses.Select(a => $"{a.Mode}:{a.ComponentKey}"))}";
+        $"{Name}:{string.Join(',', Accesses.Select(a => $"{a.Mode}:{a.ComponentKeyHigh:X16}{a.ComponentKey:X16}"))}";
 }
 
 // =============================================================================
@@ -64,6 +65,7 @@ internal sealed class GameHost
     private readonly string _assemblyPath;
     private GameContext? _context;
     private ManagedSystem[] _systems = [];
+    private byte[] _componentManifest = [];
     private DateTime _lastWriteUtc;
     private DateTime _lastPollUtc;
 
@@ -72,6 +74,7 @@ internal sealed class GameHost
 
     /// <summary>Number of systems exposed by the active game version.</summary>
     public int SystemCount => _systems.Length;
+    public ReadOnlySpan<byte> ComponentManifest => _componentManifest;
 
     /// <summary>Return one reflected scheduler access.</summary>
     public ManagedAccess GetAccess(int systemIndex, int accessIndex) =>
@@ -137,17 +140,23 @@ internal sealed class GameHost
                 throw new InvalidOperationException(
                     "No [EcsSystem] methods with a supported query parameter were found.");
 
-            // Rust's execution graph is built at startup. Behavior-only reloads
-            // are safe; changing a query signature needs a restart so Rust can
-            // rebuild the scheduler metadata.
+            byte[] manifest = ComponentManifestBuilder.Build(systems);
+
+            // Rust's execution graph and component registry are built at
+            // startup. Behavior-only reloads are safe; changing either
+            // contract needs a restart so native metadata cannot go stale.
             if (isReload && !_systems.Select(s => s.Signature).SequenceEqual(
                     systems.Select(s => s.Signature)))
                 throw new InvalidOperationException(
                     "C# system names or query signatures changed; restart the host to rebuild the Rust scheduler.");
+            if (isReload && !_componentManifest.AsSpan().SequenceEqual(manifest))
+                throw new InvalidOperationException(
+                    "C# component identities or layouts changed; restart the host to rebuild the native component registry.");
 
             var oldContext = _context;
             _context = context;
             _systems = systems;
+            _componentManifest = manifest;
             _lastWriteUtc = File.GetLastWriteTimeUtc(_assemblyPath);
             oldContext?.Unload();
         }
@@ -209,12 +218,13 @@ internal sealed class GameHost
         var descriptor = ((IQueryDescriptor)query).Descriptor;
         ManagedAccess[] accesses = descriptor.Terms
             .Where(term => !term.IsEntity)
-            .Select(term => new ManagedAccess(term.ComponentKey, (byte)term.Access))
+            .Select(term => new ManagedAccess(
+                term.ComponentKey, term.ComponentKeyHigh, (byte)term.Access))
             .ToArray();
         var call = Expression.Call(method, Expression.Constant(query, queryType));
         Action runner = Expression.Lambda<Action>(call).Compile();
         string name = $"{method.DeclaringType?.FullName}.{method.Name}";
-        return new ManagedSystem(name, accesses, runner);
+        return new ManagedSystem(name, accesses, descriptor, runner);
     }
 
     private static InvalidOperationException UnsupportedQuery(MethodInfo method) => new(

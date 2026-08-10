@@ -14,26 +14,10 @@ public struct PhysicsState
     public byte Active;
 }
 
+// Game-owned component: the native host discovers and registers this layout
+// from the managed component manifest without a Rust mirror or match arm.
 [StructLayout(LayoutKind.Sequential)]
-public struct Position
+public struct BallTag
 {
-    public float X;
-    public float Y;
-}
-
-[StructLayout(LayoutKind.Sequential)]
-public struct Color
-{
-    public float R;
-    public float G;
-    public float B;
-    public float A;
-}
-
-[StructLayout(LayoutKind.Sequential)]
-public struct Sprite
-{
-    public float Width;
-    public float Height;
-    public Color Color;
+    public uint Kind;
 }

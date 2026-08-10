@@ -27,6 +27,9 @@ internal struct TestVelocity { public float X, Y; }
 [StructLayout(LayoutKind.Sequential)]
 internal struct TestHealth { public float Value; }
 
+[StructLayout(LayoutKind.Sequential)]
+internal struct InvalidBoolComponent { public bool Value; }
+
 internal static class TestSystems
 {
     internal static bool WasRun;
@@ -57,6 +60,8 @@ internal static class TestSystems
     public static int NonVoid(Query<Write<TestPosition>> query) => 0;
 
     public static void Unsupported(string value) { }
+
+    public static void InvalidLayout(Query<Read<InvalidBoolComponent>> query) { }
 }
 
 internal static unsafe class MockNativeWorld
@@ -76,21 +81,24 @@ internal static unsafe class MockNativeWorld
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     internal static byte GetComponentChunk(
-        ulong key, byte mode, uint index, NativeComponentChunk* output)
+        ulong key, ulong keyHigh, byte mode, uint index, NativeComponentChunk* output)
     {
         if (index != 0)
             return 0;
-        if (key == Engine.ComponentKey(typeof(TestPosition)) && mode == 1)
+        if (key == Engine.ComponentKey(typeof(TestPosition)) &&
+            keyHigh == Engine.ComponentKeyHigh(typeof(TestPosition)) && mode == 1)
         {
             *output = Chunk(Positions, PositionTicks, sizeof(TestPosition));
             return 1;
         }
-        if (key == Engine.ComponentKey(typeof(TestVelocity)) && mode == 0)
+        if (key == Engine.ComponentKey(typeof(TestVelocity)) &&
+            keyHigh == Engine.ComponentKeyHigh(typeof(TestVelocity)) && mode == 0)
         {
             *output = Chunk(Velocities, VelocityTicks, sizeof(TestVelocity));
             return 1;
         }
-        if (key == Engine.ComponentKey(typeof(TestHealth)) && mode == 1 && Healths != null)
+        if (key == Engine.ComponentKey(typeof(TestHealth)) &&
+            keyHigh == Engine.ComponentKeyHigh(typeof(TestHealth)) && mode == 1 && Healths != null)
         {
             *output = Chunk(Healths, HealthTicks, sizeof(TestHealth));
             return 1;
@@ -178,12 +186,44 @@ internal static class Program
     {
         try
         {
-            Test("current game discovers exactly the ball physics system", () =>
+            Test("current game discovers native and dynamic component systems", () =>
             {
                 var systems = GameHost.DiscoverSystems(typeof(BallPhysicsSystem).Assembly);
-                Equal(systems.Length, 1, "unexpected game system count");
-                Equal(systems[0].Name, "TracyLive.BallPhysicsSystem.Run",
-                    "unexpected managed system name");
+                Equal(systems.Length, 2, "unexpected game system count");
+                Assert(systems.Any(system => system.Name == "TracyLive.BallPhysicsSystem.Run"),
+                    "ball physics system was not discovered");
+                Assert(systems.Any(system => system.Name == "TracyLive.BallTagSystem.Observe"),
+                    "dynamic component system was not discovered");
+            });
+
+            Test("component manifest separates runtime mirrors from game components", () =>
+            {
+                var systems = GameHost.DiscoverSystems(typeof(BallPhysicsSystem).Assembly);
+                using var json = System.Text.Json.JsonDocument.Parse(
+                    ComponentManifestBuilder.Build(systems));
+                var components = json.RootElement.EnumerateArray().ToArray();
+                Equal(components.Length, 4, "unexpected manifest component count");
+                var position = components.Single(component =>
+                    component.GetProperty("full_name").GetString() == "TracyLive.Position");
+                var sprite = components.Single(component =>
+                    component.GetProperty("full_name").GetString() == "TracyLive.Sprite");
+                var physics = components.Single(component =>
+                    component.GetProperty("full_name").GetString() == "TracyLive.PhysicsState");
+                var tag = components.Single(component =>
+                    component.GetProperty("full_name").GetString() == "TracyLive.BallTag");
+                Assert(position.GetProperty("shared").GetBoolean(),
+                    "runtime Position mirror must be shared");
+                Assert(sprite.GetProperty("shared").GetBoolean(),
+                    "runtime Sprite mirror must be shared");
+                Assert(!physics.GetProperty("shared").GetBoolean(),
+                    "game-owned PhysicsState must be dynamic");
+                Assert(!tag.GetProperty("shared").GetBoolean(),
+                    "game-owned BallTag must be dynamic");
+                Equal(tag.GetProperty("size").GetInt32(), 4, "BallTag size mismatch");
+                Equal(tag.GetProperty("alignment").GetInt32(), 4,
+                    "BallTag alignment mismatch");
+                Equal(tag.GetProperty("fields").GetArrayLength(), 1,
+                    "BallTag field schema mismatch");
             });
 
             Test("ball physics declares PhysicsState, Position, and Sprite writes", () =>
@@ -197,13 +237,19 @@ internal static class Program
                     "ball physics accesses must all be writable");
                 Equal(system.Accesses[0].ComponentKey, Engine.ComponentKey(typeof(PhysicsState)),
                     "wrong PhysicsState key");
+                Equal(system.Accesses[0].ComponentKeyHigh,
+                    Engine.ComponentKeyHigh(typeof(PhysicsState)), "wrong PhysicsState high key");
                 Equal(system.Accesses[1].ComponentKey, Engine.ComponentKey(typeof(Position)),
                     "wrong Position key");
+                Equal(system.Accesses[1].ComponentKeyHigh,
+                    Engine.ComponentKeyHigh(typeof(Position)), "wrong Position high key");
                 Equal(system.Accesses[2].ComponentKey, Engine.ComponentKey(typeof(Sprite)),
                     "wrong Sprite key");
+                Equal(system.Accesses[2].ComponentKeyHigh,
+                    Engine.ComponentKeyHigh(typeof(Sprite)), "wrong Sprite high key");
             });
 
-            Test("game component ABI layouts match the native bridge", () =>
+            Test("game and shared component layouts match their manifests", () =>
             {
                 Equal(Marshal.SizeOf<PhysicsState>(), 28, "PhysicsState size mismatch");
                 Equal(Marshal.OffsetOf<PhysicsState>(nameof(PhysicsState.DeltaTime)).ToInt32(), 0,
@@ -239,7 +285,7 @@ internal static class Program
                 var system = GameHost.CreateSystem(Method(nameof(TestSystems.SingleWriter)));
                 Equal(system.Accesses.Length, 1, "unexpected access count");
                 Equal(system.Accesses[0],
-                    new ManagedAccess(Engine.ComponentKey(typeof(TestPosition)), 1),
+                    new ManagedAccess(Engine.ComponentKey(typeof(TestPosition)), Engine.ComponentKeyHigh(typeof(TestPosition)), 1),
                     "wrong write access");
             });
 
@@ -248,10 +294,10 @@ internal static class Program
                 var system = GameHost.CreateSystem(Method(nameof(TestSystems.MixedAccess)));
                 Equal(system.Accesses.Length, 2, "unexpected access count");
                 Equal(system.Accesses[0],
-                    new ManagedAccess(Engine.ComponentKey(typeof(TestPosition)), 1),
+                    new ManagedAccess(Engine.ComponentKey(typeof(TestPosition)), Engine.ComponentKeyHigh(typeof(TestPosition)), 1),
                     "wrong writable access");
                 Equal(system.Accesses[1],
-                    new ManagedAccess(Engine.ComponentKey(typeof(TestVelocity)), 0),
+                    new ManagedAccess(Engine.ComponentKey(typeof(TestVelocity)), Engine.ComponentKeyHigh(typeof(TestVelocity)), 0),
                     "wrong read-only access");
             });
 
@@ -274,10 +320,10 @@ internal static class Program
                 var system = GameHost.CreateSystem(Method(nameof(TestSystems.OptionalAndEntity)));
                 Equal(system.Accesses.Length, 2, "EntityTerm must not create scheduler access");
                 Equal(system.Accesses[0],
-                    new ManagedAccess(Engine.ComponentKey(typeof(TestPosition)), 0),
+                    new ManagedAccess(Engine.ComponentKey(typeof(TestPosition)), Engine.ComponentKeyHigh(typeof(TestPosition)), 0),
                     "wrong required read access");
                 Equal(system.Accesses[1],
-                    new ManagedAccess(Engine.ComponentKey(typeof(TestHealth)), 1),
+                    new ManagedAccess(Engine.ComponentKey(typeof(TestHealth)), Engine.ComponentKeyHigh(typeof(TestHealth)), 1),
                     "wrong optional write access");
             });
 
@@ -431,6 +477,14 @@ internal static class Program
                 Throws<InvalidOperationException>(
                     () => GameHost.CreateSystem(Method(nameof(TestSystems.Unsupported))),
                     "unsupported parameter should be rejected"));
+
+            Test("invalid managed component layout is rejected before registration", () =>
+            {
+                var system = GameHost.CreateSystem(Method(nameof(TestSystems.InvalidLayout)));
+                Throws<InvalidOperationException>(
+                    () => ComponentManifestBuilder.Build([system]),
+                    "bool fields must be rejected from native component manifests");
+            });
 
             Console.WriteLine($"C# ECS runtime tests passed: {_passed}");
             return 0;

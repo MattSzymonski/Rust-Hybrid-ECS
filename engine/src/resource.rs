@@ -65,9 +65,7 @@ pub trait Resource: Send + Sync + 'static {}
 
 /// ResourceId uniquely identifies a resource type using its TypeId.
 ///
-/// Shares the [`TypeKey`] foundation with [`ComponentId`]
-/// ([`crate::component::ComponentId`]) via [`From`] / [`Into`], allowing
-/// future code to be generic over both component and resource identifiers.
+/// Can be viewed as a native [`TypeKey`] by generic resource metadata code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ResourceId(pub TypeId);
 
