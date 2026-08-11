@@ -2,6 +2,47 @@ using System.Diagnostics;
 
 namespace TracyLive;
 
+public static class GameStartup
+{
+    [EcsStartup]
+    public static void Start(Commands commands)
+    {
+        for (int index = 0; index < 100; index++)
+        {
+            float column = index % 10;
+            float row = index / 10;
+            float radius = 10.0f + index % 4 * 2.0f;
+            float positionX = 60.0f + column * 72.0f;
+            float positionY = 60.0f + row * 42.0f;
+            commands.CreateEntity()
+                .With(new PhysicsState
+                {
+                    PositionX = positionX,
+                    PositionY = positionY,
+                    VelocityX = index % 2 == 0
+                        ? BallPhysicsSystem.BounceVelocityX + row * 8.0f
+                        : -BallPhysicsSystem.BounceVelocityX - row * 8.0f,
+                    VelocityY = BallPhysicsSystem.BounceVelocityY + column * 18.0f,
+                    Radius = radius,
+                    Active = 1,
+                })
+                .With(new Position
+                {
+                    X = positionX - radius,
+                    Y = positionY - radius,
+                })
+                .With(new Sprite
+                {
+                    Width = radius * 2.0f,
+                    Height = radius * 2.0f,
+                    Color = new Color { R = 1.0f, G = 0.3f, B = 0.3f, A = 1.0f },
+                })
+                .With(new BallTag { Kind = 1 })
+                .Build();
+        }
+    }
+}
+
 public static class BallPhysicsSystem
 {
     private const float Gravity = 800.0f;
@@ -10,8 +51,8 @@ public static class BallPhysicsSystem
     private const float CeilingY = 20.0f;
     private const float LeftWall = 20.0f;
     private const float RightWall = 780.0f;
-    private const float BounceVelocityY = -500.0f;
-    private const float BounceVelocityX = 150.0f;
+    internal const float BounceVelocityY = -500.0f;
+    internal const float BounceVelocityX = 150.0f;
 
     private static long _lastFrame = Stopwatch.GetTimestamp();
 
@@ -31,24 +72,6 @@ public static class BallPhysicsSystem
             ref var physics = ref components.Write<PhysicsState>();
             ref var position = ref components.Write<Position>();
             ref var sprite = ref components.Write<Sprite>();
-
-            // PhysicsState is a game-owned dynamic component. Native startup
-            // only default-constructs it; all semantic initialization belongs
-            // here and uses the stable entity ID to make each ball distinct.
-            if (physics.Radius == 0.0f)
-            {
-                int index = (int)(components.Entity.Id % 100);
-                float column = index % 10;
-                float row = index / 10;
-                physics.PositionX = 60.0f + column * 72.0f;
-                physics.PositionY = 60.0f + row * 42.0f;
-                physics.VelocityX = index % 2 == 0
-                    ? BounceVelocityX + row * 8.0f
-                    : -BounceVelocityX - row * 8.0f;
-                physics.VelocityY = BounceVelocityY + column * 18.0f;
-                physics.Radius = 10.0f + index % 4 * 2.0f;
-                physics.Active = 1;
-            }
 
             physics.DeltaTime = deltaTime;
             if (physics.Active != 0)

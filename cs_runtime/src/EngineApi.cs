@@ -27,6 +27,31 @@ public unsafe struct EngineApi
 
     /// <summary>Request one native archetype's entity-handle column.</summary>
     public delegate* unmanaged[Cdecl]<uint, NativeComponentChunk*, byte> GetEntityChunk;
+
+    /// <summary>Reserve a generation-checked handle for deferred creation.</summary>
+    public delegate* unmanaged[Cdecl]<Entity*, byte> ReserveEntity;
+
+    /// <summary>Queue creation with an array of pinned component blobs.</summary>
+    public delegate* unmanaged[Cdecl]<Entity*, NativeComponentBlob*, uint, byte> QueueCreate;
+
+    /// <summary>Queue destruction of a currently live entity.</summary>
+    public delegate* unmanaged[Cdecl]<Entity*, byte> QueueDestroy;
+
+    /// <summary>Queue adding one native or runtime-defined component.</summary>
+    public delegate* unmanaged[Cdecl]<Entity*, ulong, ulong, byte*, uint, byte> QueueAddComponent;
+
+    /// <summary>Queue removing one component selected by stable identity.</summary>
+    public delegate* unmanaged[Cdecl]<Entity*, ulong, ulong, byte> QueueRemoveComponent;
+}
+
+/// <summary>Pinned component value passed synchronously to native commands.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct NativeComponentBlob
+{
+    internal ulong ComponentKey;
+    internal ulong ComponentKeyHigh;
+    internal IntPtr Data;
+    internal uint Size;
 }
 
 /// <summary>

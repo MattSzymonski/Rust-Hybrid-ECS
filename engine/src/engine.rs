@@ -372,6 +372,21 @@ impl Engine {
     // Frame Processing
     // -------------------------------------------------------------------------
 
+    /// Run a one-shot command producer and flush its deferred mutations.
+    ///
+    /// This is primarily used by scripting-runtime startup hooks. The callback
+    /// receives the same world/queue pair as an ordinary command-producing
+    /// system, and all structural changes become visible only after it returns.
+    pub fn run_deferred_commands<F>(&mut self, run: F) -> Result<(), Vec<CommandError>>
+    where
+        F: FnOnce(&mut World, &mut CommandQueue),
+    {
+        run(&mut self.world, &mut self.queue);
+        // One-shot startup has no following frame in which to surface a
+        // failure, so always return command errors to its caller.
+        self.queue.execute_queued_commands(&mut self.world, true)
+    }
+
     /// Process one frame - execute all systems then apply deferred commands
     ///
     /// This is the main loop of the ECS:

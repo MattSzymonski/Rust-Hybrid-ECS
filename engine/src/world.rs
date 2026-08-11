@@ -1111,6 +1111,15 @@ impl World {
         }
     }
 
+    /// Reserve a generation-checked handle for a deferred entity creation.
+    ///
+    /// The returned entity is not visible to queries until a command inserts
+    /// it. This is the type-erased counterpart of [`Commands::create_entity`]
+    /// used by foreign-language runtimes.
+    pub fn reserve_entity(&mut self) -> Entity {
+        self.allocate_entity()
+    }
+
     /// Get or create an archetype for a given set of components
     ///
     /// Archetypes are cached and reused for entities with the same component set.
@@ -1211,6 +1220,15 @@ impl World {
 
         // Use the provided closure to insert components with their concrete types
         insert_fn(&mut archetype.component_storages);
+
+        // Type-erased components have no concrete Rust value for `insert_fn`
+        // to push. Allocate their rows here; the command executor overwrites
+        // the zero bytes before the newly created entity becomes observable.
+        for &component_id in &archetype.component_types {
+            if let Some(column) = archetype.dynamic_component_storages.get_mut(&component_id) {
+                column.push_zeroed();
+            }
+        }
 
         // Maintain change-detection ticks: every component_id in the archetype
         // got exactly one push by the closure above, so push one fresh tick.
@@ -1696,6 +1714,25 @@ impl World {
         Ok(())
     }
 
+    /// Replace the bytes of an existing runtime-defined component row.
+    pub(crate) fn set_dynamic_component_bytes(
+        &mut self,
+        entity: Entity,
+        component_id: ComponentId,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let location = *self
+            .entity_locations
+            .get(&entity)
+            .ok_or("entity not found")?;
+        self.archetypes
+            .get_mut(&location.archetype_id)
+            .and_then(|archetype| archetype.dynamic_component_storages.get_mut(&component_id))
+            .ok_or_else(|| "entity does not contain the dynamic component".to_string())?
+            .set_bytes(location.index_in_archetype, bytes)
+            .map_err(str::to_string)
+    }
+
     /// Add a zero-initialized runtime-defined component.
     pub fn add_dynamic_component_default(
         &mut self,
@@ -2053,34 +2090,24 @@ mod tests {
     #[test]
     fn invalid_dynamic_component_layouts_are_rejected() {
         let mut world = World::new();
-        assert!(
-            world
-                .register_dynamic_component(1, "Zero", 0, 1, 0)
-                .is_err()
-        );
-        assert!(
-            world
-                .register_dynamic_component(2, "BadAlign", 4, 3, 0)
-                .is_err()
-        );
-        assert!(
-            world
-                .register_dynamic_component(4, "Oversized", usize::MAX, 1, 0)
-                .is_err()
-        );
+        assert!(world
+            .register_dynamic_component(1, "Zero", 0, 1, 0)
+            .is_err());
+        assert!(world
+            .register_dynamic_component(2, "BadAlign", 4, 3, 0)
+            .is_err());
+        assert!(world
+            .register_dynamic_component(4, "Oversized", usize::MAX, 1, 0)
+            .is_err());
         world
             .register_dynamic_component(3, "SchemaA", 4, 4, 10)
             .unwrap();
-        assert!(
-            world
-                .register_dynamic_component(3, "SameSchemaDifferentName", 4, 4, 10)
-                .is_err()
-        );
-        assert!(
-            world
-                .register_dynamic_component(3, "SchemaB", 8, 8, 20)
-                .is_err()
-        );
+        assert!(world
+            .register_dynamic_component(3, "SameSchemaDifferentName", 4, 4, 10)
+            .is_err());
+        assert!(world
+            .register_dynamic_component(3, "SchemaB", 8, 8, 20)
+            .is_err());
 
         let valid = world
             .register_dynamic_component(5, "Valid", 4, 4, 30)

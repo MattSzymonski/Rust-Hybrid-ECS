@@ -117,6 +117,7 @@ Rust host
   | validates the manifest
   | binds shared native components
   | registers game components dynamically
+  | runs [EcsStartup] with the native CommandQueue
   | converts managed access declarations to SystemAccess
   v
 ECS engine
@@ -730,22 +731,18 @@ Rust engine/host
   BallTag        no Rust type
 ```
 
-At startup, the demo's temporary native `setup_world` function:
+After registration, the host invokes every `[EcsStartup]` method inside a
+command-enabled native scope. `GameStartup.Start(Commands commands)` reserves
+100 generation-checked entity handles and describes each ball with exactly
+`PhysicsState`, `Position`, `Sprite`, and `BallTag`. Component blobs are copied
+into the Rust `CommandQueue`; the host flushes that queue before the first
+frame, so no partially built entity is observable.
 
-1. Creates 100 entities with native `Position` and `Sprite`.
-2. Collects every `Dynamic` binding from the manifest.
-3. Default-constructs every dynamic component on every demo entity.
-
-The bootstrap does not know the dynamic components' names, sizes, or fields.
-
-`BallPhysicsSystem` sees a zero-initialized `PhysicsState`. A zero radius is its
-initialization sentinel, so C# assigns the initial position, velocity, radius,
-and active state. Gameplay semantics remain in C#.
-
-Attaching every discovered dynamic component to every demo entity is a
-temporary bootstrap policy, not the intended final entity-authoring API. Once
-managed deferred commands exist, C# startup code should choose which entities
-receive which components.
+Native shared blobs are decoded into concrete renderer components. Game-owned
+blobs remain type-erased and populate `DynamicColumn` rows. The same mixed
+creation command therefore builds one archetype without a host match arm for
+`PhysicsState` or `BallTag`. `BallPhysicsSystem` receives fully initialized
+state and no longer uses zero radius as an initialization sentinel.
 
 ---
 
@@ -908,25 +905,24 @@ end.
 The dynamic component foundation is complete for the current query pipeline,
 but these limitations remain:
 
-1. **Registration is query-driven.** An unused component is not exported.
+1. **Registration scans supported game structs.** Query component types are
+   always included, and supported unmanaged structs declared in `game_cs` are
+   also exported so command-only components can be registered before startup.
+   This can register an otherwise unused game struct as a component.
 2. **The world has a 128-component limit.** This comes from the existing
    `u128` component mask, not from C# interop.
 3. **Components must be unmanaged.** Managed references and variable-lifetime
    values cannot live in raw Rust archetype memory.
 4. **Structural hot reload requires a restart.** There is no schema migration
    yet.
-5. **Entity creation is still a demo bootstrap in Rust.** C# deferred commands
-   and managed startup systems are the proper next step.
-6. **The demo attaches every discovered dynamic type to every demo entity.**
-   Managed commands should eventually define exact entity composition.
-7. **Dynamic persistence is not integrated with snapshots yet.** Dynamic rows
+5. **Dynamic persistence is not integrated with snapshots yet.** Dynamic rows
    can be exposed as raw bytes, but there is no managed versioned
    serializer/deserializer callback or snapshot registration yet.
-8. **Rust typed queries cannot name game-only types.** Native systems need a
+6. **Rust typed queries cannot name game-only types.** Native systems need a
    type-erased query/filter API to consume arbitrary managed component schemas.
-9. **Chunk joining is performed in managed code.** A native query cursor could
+7. **Chunk joining is performed in managed code.** A native query cursor could
    reduce repeated archetype lookup work.
-10. **Identity follows the managed full name.** An explicit canonical identity
+8. **Identity follows the managed full name.** An explicit canonical identity
     attribute would make namespace/type renames migration-friendly.
 
 The central architectural boundary is nevertheless in place: shared engine

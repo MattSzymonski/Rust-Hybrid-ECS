@@ -25,6 +25,10 @@ namespace TracyLive;
 [AttributeUsage(AttributeTargets.Method)]
 public sealed class EcsSystemAttribute : Attribute;
 
+/// <summary>Marks a one-shot method run before the first ECS frame.</summary>
+[AttributeUsage(AttributeTargets.Method)]
+public sealed class EcsStartupAttribute : Attribute;
+
 // =============================================================================
 // Query Terms and Descriptors
 // =============================================================================
@@ -213,6 +217,57 @@ public static unsafe class Engine
                 $"The current system did not declare this {access.ToString().ToLowerInvariant()} access to {name}.");
     }
 
+    internal static Entity ReserveEntity()
+    {
+        Entity entity;
+        ValidateCommandStatus(_api.ReserveEntity(&entity), "reserve an entity");
+        return entity;
+    }
+
+    internal static void QueueCreate(Entity entity, Span<NativeComponentBlob> blobs)
+    {
+        fixed (NativeComponentBlob* pointer = blobs)
+            ValidateCommandStatus(
+                _api.QueueCreate(&entity, pointer, checked((uint)blobs.Length)),
+                "create an entity");
+    }
+
+    internal static void QueueDestroy(Entity entity) =>
+        ValidateCommandStatus(_api.QueueDestroy(&entity), "destroy an entity");
+
+    internal static void QueueAdd<T>(Entity entity, T value) where T : unmanaged
+    {
+        StableComponentId id = ComponentStableId(typeof(T));
+        ValidateCommandStatus(
+            _api.QueueAddComponent(
+                &entity, id.Low, id.High, (byte*)&value, checked((uint)sizeof(T))),
+            $"add component {typeof(T).FullName}");
+    }
+
+    internal static void QueueRemove<T>(Entity entity) where T : unmanaged
+    {
+        StableComponentId id = ComponentStableId(typeof(T));
+        ValidateCommandStatus(
+            _api.QueueRemoveComponent(&entity, id.Low, id.High),
+            $"remove component {typeof(T).FullName}");
+    }
+
+    private static void ValidateCommandStatus(byte status, string operation)
+    {
+        if (status == 1)
+            return;
+        string reason = status switch
+        {
+            2 => "the component is not registered",
+            3 => "Commands was used outside an active startup or scheduled system",
+            4 => "the current system did not declare a Commands parameter",
+            5 => "the entity handle is stale, invalid, or was not reserved by this invocation",
+            6 => "the component list or ABI layout is invalid",
+            _ => $"native status {status}",
+        };
+        throw new InvalidOperationException($"Could not {operation}: {reason}.");
+    }
+
     private static ulong HashName(string name, ulong offset)
     {
         const ulong prime = 0x100000001b3;
@@ -227,6 +282,95 @@ public static unsafe class Engine
 }
 
 internal readonly record struct StableComponentId(ulong Low, ulong High);
+
+// =============================================================================
+// Deferred Entity Commands
+// =============================================================================
+
+/// <summary>
+/// Stateless system parameter for deferred structural mutations. Native code
+/// accepts calls only during the startup/system invocation that supplied it.
+/// </summary>
+public readonly struct Commands
+{
+    /// <summary>Begin describing a new entity.</summary>
+    public DeferredEntityBuilder CreateEntity() => new();
+
+    /// <summary>Queue adding one component after the current system phase.</summary>
+    public void AddComponent<T>(Entity entity, T component) where T : unmanaged =>
+        Engine.QueueAdd(entity, component);
+
+    /// <summary>Queue removing one component after the current system phase.</summary>
+    public void RemoveComponent<T>(Entity entity) where T : unmanaged =>
+        Engine.QueueRemove<T>(entity);
+
+    /// <summary>Queue entity destruction after the current system phase.</summary>
+    public void DestroyEntity(Entity entity) => Engine.QueueDestroy(entity);
+}
+
+/// <summary>Managed component value retained until a creation command is queued.</summary>
+internal readonly record struct DeferredComponentValue(
+    StableComponentId Id, Type Type, byte[] Bytes);
+
+/// <summary>Fluent, allocation-backed builder for one deferred entity.</summary>
+public sealed class DeferredEntityBuilder
+{
+    private readonly List<DeferredComponentValue> _components = [];
+    private readonly HashSet<UInt128> _ids = [];
+    private bool _built;
+
+    /// <summary>Add an unmanaged component value to this new entity.</summary>
+    public DeferredEntityBuilder With<T>(T component) where T : unmanaged
+    {
+        if (_built)
+            throw new InvalidOperationException("A deferred entity builder can only be built once.");
+        StableComponentId id = Engine.ComponentStableId(typeof(T));
+        UInt128 key = ((UInt128)id.High << 64) | id.Low;
+        if (!_ids.Add(key))
+            throw new InvalidOperationException(
+                $"Entity creation contains component {typeof(T).FullName} more than once.");
+        byte[] bytes = new byte[Marshal.SizeOf<T>()];
+        MemoryMarshal.Write(bytes, in component);
+        _components.Add(new DeferredComponentValue(id, typeof(T), bytes));
+        return this;
+    }
+
+    /// <summary>Reserve the entity handle and queue its atomic creation.</summary>
+    public Entity Build()
+    {
+        if (_built)
+            throw new InvalidOperationException("A deferred entity builder can only be built once.");
+        _built = true;
+        Entity entity = Engine.ReserveEntity();
+        var handles = new GCHandle[_components.Count];
+        Span<NativeComponentBlob> blobs = _components.Count <= 64
+            ? stackalloc NativeComponentBlob[_components.Count]
+            : new NativeComponentBlob[_components.Count];
+        try
+        {
+            for (int index = 0; index < _components.Count; index++)
+            {
+                DeferredComponentValue component = _components[index];
+                handles[index] = GCHandle.Alloc(component.Bytes, GCHandleType.Pinned);
+                blobs[index] = new NativeComponentBlob
+                {
+                    ComponentKey = component.Id.Low,
+                    ComponentKeyHigh = component.Id.High,
+                    Data = handles[index].AddrOfPinnedObject(),
+                    Size = checked((uint)component.Bytes.Length),
+                };
+            }
+            Engine.QueueCreate(entity, blobs);
+            return entity;
+        }
+        finally
+        {
+            foreach (GCHandle handle in handles)
+                if (handle.IsAllocated)
+                    handle.Free();
+        }
+    }
+}
 
 // =============================================================================
 // Stack-only Row Views

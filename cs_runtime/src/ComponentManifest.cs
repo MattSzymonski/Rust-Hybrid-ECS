@@ -1,10 +1,13 @@
 // Managed component discovery and native manifest generation.
 //
-// Every unmanaged component appearing in a query is described before Rust
-// registers managed systems. Native-owned mirrors and game-owned structs use
-// the same schema format and stable 128-bit identity.
+// Every unmanaged query component and supported game-declared struct is
+// described before Rust registers managed systems or runs startup commands.
+// Native-owned mirrors and game-owned structs use the same schema format and
+// stable 128-bit identity.
 
 using System.Runtime.InteropServices;
+using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
 
@@ -28,12 +31,18 @@ internal static class ComponentManifestBuilder
         public T Value;
     }
 
-    internal static byte[] Build(IEnumerable<ManagedSystem> systems)
+    internal static byte[] Build(IEnumerable<ManagedSystem> systems, Assembly? gameAssembly = null)
     {
-        ComponentManifest[] components = systems
-            .SelectMany(system => system.QueryDescriptor.Terms)
+        IEnumerable<Type> queryComponents = systems
+            .Where(system => system.QueryDescriptor is not null)
+            .SelectMany(system => system.QueryDescriptor!.Terms)
             .Where(term => !term.IsEntity)
-            .Select(term => term.ComponentType!)
+            .Select(term => term.ComponentType!);
+        IEnumerable<Type> declaredGameComponents = gameAssembly is null
+            ? []
+            : gameAssembly.GetTypes().Where(IsGameComponentCandidate);
+        ComponentManifest[] components = queryComponents
+            .Concat(declaredGameComponents)
             .Distinct()
             .Select(Describe)
             .OrderBy(component => component.StableIdHigh)
@@ -43,6 +52,27 @@ internal static class ComponentManifestBuilder
         {
             PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
         });
+    }
+
+    /// <summary>
+    /// Include supported unmanaged structs declared by the game even when
+    /// they currently appear only in Commands.With/Add/Remove calls. Query
+    /// terms remain authoritative for shared runtime component discovery.
+    /// </summary>
+    private static bool IsGameComponentCandidate(Type type)
+    {
+        if (!type.IsValueType || type.IsEnum || type.IsPrimitive || type.IsGenericType ||
+            type.IsDefined(typeof(CompilerGeneratedAttribute), inherit: false))
+            return false;
+        try
+        {
+            ValidateValueType(type, new HashSet<Type>());
+            return true;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
     }
 
     private static ComponentManifest Describe(Type type)

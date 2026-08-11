@@ -70,6 +70,43 @@ public static unsafe class LoaderInterop
     [UnmanagedCallersOnly]
     public static uint SystemCount() => (uint)(_host?.SystemCount ?? 0);
 
+    /// <summary>Return the number of one-shot startup methods.</summary>
+    [UnmanagedCallersOnly]
+    public static uint StartupCount() => (uint)(_host?.StartupCount ?? 0);
+
+    /// <summary>Return whether a system declared the Commands parameter.</summary>
+    [UnmanagedCallersOnly]
+    public static byte SystemUsesCommands(uint systemIndex)
+    {
+        try
+        {
+            return _host?.UsesCommands(checked((int)systemIndex)) == true ? (byte)1 : (byte)0;
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"[cs_runtime] SystemUsesCommands failed: {e}");
+            return 0;
+        }
+    }
+
+    /// <summary>Run one startup method before the first frame.</summary>
+    [UnmanagedCallersOnly]
+    public static byte RunStartup(uint startupIndex)
+    {
+        try
+        {
+            if (_host is null)
+                return 0;
+            _host.RunStartup(checked((int)startupIndex));
+            return 1;
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"[cs_runtime] startup {startupIndex} failed: {e}");
+            return 0;
+        }
+    }
+
     /// <summary>Return the UTF-8 JSON component manifest byte count.</summary>
     [UnmanagedCallersOnly]
     public static uint ComponentManifestLength() =>

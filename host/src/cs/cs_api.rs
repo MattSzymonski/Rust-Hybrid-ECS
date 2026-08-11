@@ -16,19 +16,22 @@
 //! Component IDs are stable 128-bit hashes of canonical managed full names.
 
 // Standard library
-use std::cell::Cell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
 // Current workspace crates
+use ecs_hybrid::commands::{boxed_component_adder, CommandQueue, ComponentAdder};
+#[cfg(all(feature = "rendering", test))]
+use ecs_hybrid::Color;
+use ecs_hybrid::{Component, ComponentId, ComponentTicks, Engine, Entity, SystemAccess, World};
 #[cfg(feature = "rendering")]
-use ecs_hybrid::{Color, Position, Sprite};
-use ecs_hybrid::{Component, ComponentId, ComponentTicks, Engine, SystemAccess, World};
+use ecs_hybrid::{Position, Sprite};
 use serde::Deserialize;
-use trait_type_map::TraitAccessible;
 #[cfg(not(feature = "rendering"))]
 use trait_type_map::impl_trait_accessible;
+use trait_type_map::TraitAccessible;
 
 // Current crate
 use crate::CSharpModuleConfig;
@@ -92,6 +95,11 @@ struct CsEngineApi {
     entity_count: extern "C" fn() -> u32,
     get_component_chunk: extern "C" fn(u64, u64, u8, u32, *mut ComponentChunk) -> u8,
     get_entity_chunk: extern "C" fn(u32, *mut ComponentChunk) -> u8,
+    reserve_entity: extern "C" fn(*mut Entity) -> u8,
+    queue_create: extern "C" fn(*const Entity, *const NativeComponentBlob, u32) -> u8,
+    queue_destroy: extern "C" fn(*const Entity) -> u8,
+    queue_add_component: extern "C" fn(*const Entity, u64, u64, *const u8, u32) -> u8,
+    queue_remove_component: extern "C" fn(*const Entity, u64, u64) -> u8,
 }
 
 impl CsEngineApi {
@@ -100,8 +108,22 @@ impl CsEngineApi {
             entity_count: ffi_entity_count,
             get_component_chunk: ffi_get_component_chunk,
             get_entity_chunk: ffi_get_entity_chunk,
+            reserve_entity: ffi_reserve_entity,
+            queue_create: ffi_queue_create,
+            queue_destroy: ffi_queue_destroy,
+            queue_add_component: ffi_queue_add_component,
+            queue_remove_component: ffi_queue_remove_component,
         }
     }
+}
+
+/// One pinned managed component value supplied to a deferred command.
+#[repr(C)]
+struct NativeComponentBlob {
+    component_key: u64,
+    component_key_high: u64,
+    data: *const u8,
+    size: u32,
 }
 
 /// Description of one contiguous component column returned to managed code.
@@ -135,6 +157,7 @@ impl StableComponentId {
 }
 
 type NativeChunkGetter = fn(&mut World, u32, *mut ComponentChunk) -> u8;
+type NativeBlobDecoder = fn(*const u8, usize) -> Result<Box<dyn ComponentAdder>, String>;
 
 #[derive(Clone, Copy)]
 enum ComponentBinding {
@@ -144,6 +167,7 @@ enum ComponentBinding {
         size: usize,
         align: usize,
         schema_hash: u64,
+        decode: NativeBlobDecoder,
     },
     Dynamic {
         component_id: ComponentId,
@@ -174,19 +198,49 @@ thread_local! {
         const { Cell::new((std::ptr::null(), 0)) };
     /// Stable component bindings belonging to the active C# runtime.
     static ACTIVE_BINDINGS: Cell<*const ComponentBindings> = const { Cell::new(std::ptr::null()) };
+    /// Deferred queue available only to systems declaring `Commands`.
+    static ACTIVE_QUEUE: Cell<*mut CommandQueue> = const { Cell::new(std::ptr::null_mut()) };
+    /// Handles reserved during this invocation and not yet consumed by create.
+    static ACTIVE_RESERVED: RefCell<HashSet<Entity>> = RefCell::new(HashSet::new());
+    /// Whether reflected system metadata declared the managed Commands parameter.
+    static ACTIVE_USES_COMMANDS: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Clears thread-local native access even if managed execution unwinds.
 struct ActiveSystemGuard;
 
 impl ActiveSystemGuard {
+    #[cfg(test)]
     fn set(world: &mut World, access: &[NativeSystemAccess], bindings: &ComponentBindings) -> Self {
+        Self::set_inner(world, std::ptr::null_mut(), access, bindings, false)
+    }
+
+    fn set_with_commands(
+        world: &mut World,
+        queue: &mut CommandQueue,
+        access: &[NativeSystemAccess],
+        bindings: &ComponentBindings,
+        uses_commands: bool,
+    ) -> Self {
+        Self::set_inner(world, queue, access, bindings, uses_commands)
+    }
+
+    fn set_inner(
+        world: &mut World,
+        queue: *mut CommandQueue,
+        access: &[NativeSystemAccess],
+        bindings: &ComponentBindings,
+        uses_commands: bool,
+    ) -> Self {
         ACTIVE_WORLD.with(|slot| {
             assert!(slot.get().is_null(), "nested managed ECS system invocation");
             slot.set(world as *mut World);
         });
         ACTIVE_ACCESS.with(|slot| slot.set((access.as_ptr(), access.len())));
         ACTIVE_BINDINGS.with(|slot| slot.set(bindings));
+        ACTIVE_QUEUE.with(|slot| slot.set(queue));
+        ACTIVE_USES_COMMANDS.with(|slot| slot.set(uses_commands));
+        ACTIVE_RESERVED.with(|slot| slot.borrow_mut().clear());
         Self
     }
 }
@@ -195,8 +249,43 @@ impl Drop for ActiveSystemGuard {
     fn drop(&mut self) {
         ACTIVE_ACCESS.with(|slot| slot.set((std::ptr::null(), 0)));
         ACTIVE_BINDINGS.with(|slot| slot.set(std::ptr::null()));
+        ACTIVE_QUEUE.with(|slot| slot.set(std::ptr::null_mut()));
+        ACTIVE_USES_COMMANDS.with(|slot| slot.set(false));
+        ACTIVE_RESERVED.with(|slot| slot.borrow_mut().clear());
         ACTIVE_WORLD.with(|slot| slot.set(std::ptr::null_mut()));
     }
+}
+
+fn with_active_command_context<R>(
+    f: impl FnOnce(&mut World, &mut CommandQueue, &ComponentBindings, &mut HashSet<Entity>) -> R,
+) -> Option<R> {
+    if !ACTIVE_USES_COMMANDS.with(Cell::get) {
+        return None;
+    }
+    ACTIVE_WORLD.with(|world_slot| {
+        ACTIVE_QUEUE.with(|queue_slot| {
+            ACTIVE_BINDINGS.with(|bindings_slot| {
+                let world = world_slot.get();
+                let queue = queue_slot.get();
+                let bindings = bindings_slot.get();
+                if world.is_null() || queue.is_null() || bindings.is_null() {
+                    return None;
+                }
+                ACTIVE_RESERVED.with(|reserved| {
+                    // SAFETY: all pointers are installed for one scheduled
+                    // invocation and cleared before its native borrows expire.
+                    Some(unsafe {
+                        f(
+                            &mut *world,
+                            &mut *queue,
+                            &*bindings,
+                            &mut reserved.borrow_mut(),
+                        )
+                    })
+                })
+            })
+        })
+    })
 }
 
 fn with_active_world<R>(f: impl FnOnce(&mut World) -> R) -> Option<R> {
@@ -296,6 +385,22 @@ fn get_component_chunk<T: Component + TraitAccessible<dyn Component>>(
     1
 }
 
+fn decode_native_component<T>(
+    data: *const u8,
+    size: usize,
+) -> Result<Box<dyn ComponentAdder>, String>
+where
+    T: Component + TraitAccessible<dyn Component> + Copy + Send,
+{
+    if data.is_null() || size != std::mem::size_of::<T>() {
+        return Err("native component blob does not match its ABI layout".into());
+    }
+    // SAFETY: the binding validated the exact type size. `read_unaligned`
+    // permits managed pinned buffers with no stronger alignment guarantee.
+    let component = unsafe { std::ptr::read_unaligned(data.cast::<T>()) };
+    Ok(boxed_component_adder(component))
+}
+
 /// C ABI entry point used by managed query enumerators.
 ///
 /// Status codes are interpreted by `Engine.TryGetChunk`: `0` ends iteration,
@@ -383,6 +488,186 @@ extern "C" fn ffi_entity_count() -> u32 {
     with_active_world(|world| world.entity_count() as u32).unwrap_or(0)
 }
 
+/// Return the command-specific scope error used by all lifecycle callbacks.
+fn command_scope_error() -> u8 {
+    if ACTIVE_WORLD.with(|slot| slot.get().is_null()) {
+        3
+    } else {
+        4
+    }
+}
+
+/// Reserve a generation-checked handle without inserting it into an archetype.
+extern "C" fn ffi_reserve_entity(output: *mut Entity) -> u8 {
+    if output.is_null() {
+        return 6;
+    }
+    with_active_command_context(|world, _queue, _bindings, reserved| {
+        let entity = world.reserve_entity();
+        reserved.insert(entity);
+        // SAFETY: managed code supplied a checked, non-null out pointer whose
+        // ABI layout is validated by the managed Entity mirror.
+        unsafe { output.write(entity) };
+        1
+    })
+    .unwrap_or_else(command_scope_error)
+}
+
+fn decode_command_component(
+    binding: ComponentBinding,
+    data: *const u8,
+    size: usize,
+) -> Result<DecodedCommandComponent, String> {
+    if data.is_null() {
+        return Err("component data pointer is null".into());
+    }
+    match binding {
+        ComponentBinding::Native {
+            size: expected,
+            decode,
+            ..
+        } => {
+            if size != expected {
+                return Err("native component blob has the wrong size".into());
+            }
+            decode(data, size).map(DecodedCommandComponent::Native)
+        }
+        ComponentBinding::Dynamic {
+            component_id,
+            size: expected,
+            ..
+        } => {
+            if size != expected {
+                return Err("dynamic component blob has the wrong size".into());
+            }
+            // SAFETY: the managed caller pins a buffer of exactly `size`
+            // bytes for this callback; the bytes are copied before returning.
+            let bytes = unsafe { std::slice::from_raw_parts(data, size) }.to_vec();
+            Ok(DecodedCommandComponent::Dynamic(component_id, bytes))
+        }
+    }
+}
+
+enum DecodedCommandComponent {
+    Native(Box<dyn ComponentAdder>),
+    Dynamic(ComponentId, Vec<u8>),
+}
+
+/// Queue creation after validating every supplied component blob atomically.
+extern "C" fn ffi_queue_create(
+    entity: *const Entity,
+    blobs: *const NativeComponentBlob,
+    count: u32,
+) -> u8 {
+    if entity.is_null() || (count != 0 && blobs.is_null()) || count > 1024 {
+        return 6;
+    }
+    with_active_command_context(|_world, queue, bindings, reserved| {
+        // SAFETY: pointers were checked above and managed pins the descriptor
+        // array for this synchronous call.
+        let entity = unsafe { *entity };
+        if !reserved.contains(&entity) {
+            return 5;
+        }
+        let blobs = unsafe { std::slice::from_raw_parts(blobs, count as usize) };
+        let mut seen = HashSet::with_capacity(blobs.len());
+        let mut native = Vec::new();
+        let mut dynamic = Vec::new();
+        for blob in blobs {
+            let stable =
+                StableComponentId::from_halves(blob.component_key, blob.component_key_high);
+            if !seen.insert(stable) {
+                return 6;
+            }
+            let Some(binding) = bindings.get(&stable).copied() else {
+                return 2;
+            };
+            match decode_command_component(binding, blob.data, blob.size as usize) {
+                Ok(DecodedCommandComponent::Native(component)) => native.push(component),
+                Ok(DecodedCommandComponent::Dynamic(id, bytes)) => dynamic.push((id, bytes)),
+                Err(_) => return 6,
+            }
+        }
+        reserved.remove(&entity);
+        queue.create_mixed_entity(entity, native, dynamic);
+        1
+    })
+    .unwrap_or_else(command_scope_error)
+}
+
+/// Queue destruction only for a currently live generation.
+extern "C" fn ffi_queue_destroy(entity: *const Entity) -> u8 {
+    if entity.is_null() {
+        return 6;
+    }
+    with_active_command_context(|world, queue, _bindings, _reserved| {
+        // SAFETY: pointer is checked and consumed synchronously.
+        let entity = unsafe { *entity };
+        if !world.is_entity_valid(entity) {
+            return 5;
+        }
+        queue.destroy_entity(entity);
+        1
+    })
+    .unwrap_or_else(command_scope_error)
+}
+
+/// Queue a component addition selected by stable managed identity.
+extern "C" fn ffi_queue_add_component(
+    entity: *const Entity,
+    key_low: u64,
+    key_high: u64,
+    data: *const u8,
+    size: u32,
+) -> u8 {
+    if entity.is_null() {
+        return 6;
+    }
+    with_active_command_context(|world, queue, bindings, _reserved| {
+        // SAFETY: pointer is checked and consumed synchronously.
+        let entity = unsafe { *entity };
+        if !world.is_entity_valid(entity) {
+            return 5;
+        }
+        let stable = StableComponentId::from_halves(key_low, key_high);
+        let Some(binding) = bindings.get(&stable).copied() else {
+            return 2;
+        };
+        match decode_command_component(binding, data, size as usize) {
+            Ok(DecodedCommandComponent::Native(component)) => {
+                queue.add_component_adder_to_entity(entity, component)
+            }
+            Ok(DecodedCommandComponent::Dynamic(component_id, bytes)) => {
+                queue.add_dynamic_component_to_entity(entity, component_id, bytes)
+            }
+            Err(_) => return 6,
+        }
+        1
+    })
+    .unwrap_or_else(command_scope_error)
+}
+
+/// Queue component removal without requiring a concrete Rust type.
+extern "C" fn ffi_queue_remove_component(entity: *const Entity, key_low: u64, key_high: u64) -> u8 {
+    if entity.is_null() {
+        return 6;
+    }
+    with_active_command_context(|world, queue, bindings, _reserved| {
+        // SAFETY: pointer is checked and consumed synchronously.
+        let entity = unsafe { *entity };
+        if !world.is_entity_valid(entity) {
+            return 5;
+        }
+        let stable = StableComponentId::from_halves(key_low, key_high);
+        let Some(binding) = bindings.get(&stable).copied() else {
+            return 2;
+        };
+        queue.remove_component_by_id(entity, binding.component_id());
+        1
+    })
+    .unwrap_or_else(command_scope_error)
+}
+
 // =============================================================================
 // Managed Component Manifest
 // =============================================================================
@@ -414,7 +699,7 @@ fn register_native_binding<T>(
     managed_name: &str,
     managed_schema: &str,
 ) where
-    T: Component + TraitAccessible<dyn Component> + Clone,
+    T: Component + TraitAccessible<dyn Component> + Copy + Send,
 {
     engine.world_mut().register_component::<T>();
     bindings.insert(
@@ -425,6 +710,7 @@ fn register_native_binding<T>(
             size: std::mem::size_of::<T>(),
             align: std::mem::align_of::<T>(),
             schema_hash: component_hash(managed_schema, 0xcbf29ce484222325),
+            decode: decode_native_component::<T>,
         },
     );
 }
@@ -558,6 +844,9 @@ fn register_component_manifest(
 
 type InitFn = extern "system" fn(*const CsEngineApi) -> u8;
 type SystemCountFn = extern "system" fn() -> u32;
+type StartupCountFn = extern "system" fn() -> u32;
+type SystemUsesCommandsFn = extern "system" fn(u32) -> u8;
+type RunStartupFn = extern "system" fn(u32) -> u8;
 type ComponentManifestLengthFn = extern "system" fn() -> u32;
 type CopyComponentManifestFn = extern "system" fn(*mut u8, u32) -> u8;
 type SystemAccessCountFn = extern "system" fn(u32) -> u32;
@@ -612,6 +901,15 @@ impl CSharpRuntime {
         let init = runtime.get_unmanaged_fn::<InitFn>(&assembly, &type_name, "Init")?;
         let system_count =
             runtime.get_unmanaged_fn::<SystemCountFn>(&assembly, &type_name, "SystemCount")?;
+        let startup_count =
+            runtime.get_unmanaged_fn::<StartupCountFn>(&assembly, &type_name, "StartupCount")?;
+        let system_uses_commands = runtime.get_unmanaged_fn::<SystemUsesCommandsFn>(
+            &assembly,
+            &type_name,
+            "SystemUsesCommands",
+        )?;
+        let run_startup =
+            runtime.get_unmanaged_fn::<RunStartupFn>(&assembly, &type_name, "RunStartup")?;
         let manifest_length = runtime.get_unmanaged_fn::<ComponentManifestLengthFn>(
             &assembly,
             &type_name,
@@ -651,7 +949,30 @@ impl CSharpRuntime {
             &manifest,
             shared_bindings,
         )?);
-        setup_world(engine, &bindings)?;
+
+        let startup_bindings = Arc::clone(&bindings);
+        let mut startup_failed = None;
+        engine
+            .run_deferred_commands(|world, queue| {
+                let no_accesses = [];
+                for startup_index in 0..startup_count() {
+                    let _guard = ActiveSystemGuard::set_with_commands(
+                        world,
+                        queue,
+                        &no_accesses,
+                        &startup_bindings,
+                        true,
+                    );
+                    if run_startup(startup_index) == 0 {
+                        startup_failed = Some(startup_index);
+                        break;
+                    }
+                }
+            })
+            .map_err(|errors| format!("C# startup commands failed: {errors:?}"))?;
+        if let Some(index) = startup_failed {
+            return Err(format!("C# startup method {index} failed").into());
+        }
 
         let count = system_count();
         if count == 0 {
@@ -674,7 +995,9 @@ impl CSharpRuntime {
                 managed_access.push(item);
             }
 
-            let access = derive_system_access(&managed_access, &bindings)?;
+            let uses_commands = system_uses_commands(system_index) != 0;
+            let mut access = derive_system_access(&managed_access, &bindings)?;
+            access.set_uses_commands(uses_commands);
             let managed_access = managed_access.into_boxed_slice();
             let system_bindings = Arc::clone(&bindings);
             let name = Box::leak(format!("csharp_system_{system_index}").into_boxed_str());
@@ -684,9 +1007,14 @@ impl CSharpRuntime {
                 engine.register_system_with_access(
                     name,
                     access,
-                    move |world: &mut World, _queue: &mut ecs_hybrid::commands::CommandQueue| {
-                        let _guard =
-                            ActiveSystemGuard::set(world, &managed_access, &system_bindings);
+                    move |world: &mut World, queue: &mut ecs_hybrid::commands::CommandQueue| {
+                        let _guard = ActiveSystemGuard::set_with_commands(
+                            world,
+                            queue,
+                            &managed_access,
+                            &system_bindings,
+                            uses_commands,
+                        );
                         run_system(system_index);
                     },
                 );
@@ -732,59 +1060,6 @@ fn derive_system_access(
         }
     }
     Ok(result)
-}
-
-// =============================================================================
-// Demo World Initialization
-// =============================================================================
-
-/// Create the bouncing-ball demo after the managed manifest is registered.
-///
-/// Every game-defined component is default-constructed through type-erased
-/// storage, without the host knowing its name or fields. `Position` and
-/// `Sprite` remain native renderer components exposed through the explicit
-/// shared-component registry.
-fn setup_world(
-    engine: &mut Engine,
-    bindings: &ComponentBindings,
-) -> Result<(), Box<dyn std::error::Error>> {
-    const BALL_COUNT: usize = 100;
-
-    engine.world_mut().register_component::<Position>();
-    engine.world_mut().register_component::<Sprite>();
-    engine.world_mut().reserve_entities(BALL_COUNT);
-    let dynamic_components: Vec<_> = bindings
-        .values()
-        .filter_map(|binding| match binding {
-            ComponentBinding::Dynamic { component_id, .. } => Some(*component_id),
-            ComponentBinding::Native { .. } => None,
-        })
-        .collect();
-
-    for _ in 0..BALL_COUNT {
-        let entity = engine
-            .world_mut()
-            .create_entity()
-            .with(Position { x: 0.0, y: 0.0 })
-            .with(Sprite {
-                width: 0.0,
-                height: 0.0,
-                color: Color {
-                    r: 1.0,
-                    g: 0.3,
-                    b: 0.3,
-                    a: 1.0,
-                },
-            })
-            .build()
-            .expect("C# ball entity should build");
-        for &component_id in &dynamic_components {
-            engine
-                .world_mut()
-                .add_dynamic_component_default(entity, component_id)?;
-        }
-    }
-    Ok(())
 }
 
 // =============================================================================
@@ -859,7 +1134,29 @@ mod tests {
         let bindings =
             register_component_manifest(engine, &serde_json::to_vec(&manifest).unwrap(), shared)
                 .unwrap();
-        setup_world(engine, &bindings).unwrap();
+        let physics = bindings[&stable_id].component_id();
+        for _ in 0..100 {
+            let entity = engine
+                .world_mut()
+                .create_entity()
+                .with(Position { x: 0.0, y: 0.0 })
+                .with(Sprite {
+                    width: 0.0,
+                    height: 0.0,
+                    color: Color {
+                        r: 1.0,
+                        g: 0.3,
+                        b: 0.3,
+                        a: 1.0,
+                    },
+                })
+                .build()
+                .unwrap();
+            engine
+                .world_mut()
+                .add_dynamic_component_default(entity, physics)
+                .unwrap();
+        }
         bindings
     }
 
@@ -872,22 +1169,182 @@ mod tests {
         scheduler
     }
 
-    fn assert_same_batch(scheduler: &SystemScheduler, systems: &[usize]) {
-        assert!(
-            scheduler
-                .execution_graph()
-                .iter()
-                .any(|batch| systems.iter().all(|system| batch.contains(system)))
+    #[test]
+    fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
+        let mut engine = Engine::new();
+        let mut bindings = shared_component_bindings(&mut engine);
+        let dynamic_a_key = stable_component_id("TracyLive.DynamicA");
+        let dynamic_b_key = stable_component_id("TracyLive.DynamicB");
+        let dynamic_a = engine
+            .world_mut()
+            .register_dynamic_component(dynamic_a_key.0, "TracyLive.DynamicA", 4, 4, 1)
+            .unwrap();
+        let dynamic_b = engine
+            .world_mut()
+            .register_dynamic_component(dynamic_b_key.0, "TracyLive.DynamicB", 4, 4, 2)
+            .unwrap();
+        bindings.insert(
+            dynamic_a_key,
+            ComponentBinding::Dynamic {
+                component_id: dynamic_a,
+                size: 4,
+                align: 4,
+            },
         );
+        bindings.insert(
+            dynamic_b_key,
+            ComponentBinding::Dynamic {
+                component_id: dynamic_b,
+                size: 4,
+                align: 4,
+            },
+        );
+        let position_key = stable_component_id("TracyLive.Position");
+        let position = Position { x: 9.0, y: 12.0 };
+        let dynamic_a_value = 41_u32;
+        let mut created = None;
+
+        engine
+            .run_deferred_commands(|world, queue| {
+                let _guard =
+                    ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
+                let mut entity = std::mem::MaybeUninit::uninit();
+                assert_eq!(ffi_reserve_entity(entity.as_mut_ptr()), 1);
+                // SAFETY: successful reserve initialized the output.
+                let entity = unsafe { entity.assume_init() };
+                let blobs = [
+                    NativeComponentBlob {
+                        component_key: position_key.0 as u64,
+                        component_key_high: (position_key.0 >> 64) as u64,
+                        data: std::ptr::from_ref(&position).cast(),
+                        size: std::mem::size_of::<Position>() as u32,
+                    },
+                    NativeComponentBlob {
+                        component_key: dynamic_a_key.0 as u64,
+                        component_key_high: (dynamic_a_key.0 >> 64) as u64,
+                        data: std::ptr::from_ref(&dynamic_a_value).cast(),
+                        size: 4,
+                    },
+                ];
+                assert_eq!(
+                    ffi_queue_create(&entity, blobs.as_ptr(), blobs.len() as u32),
+                    1
+                );
+                created = Some(entity);
+            })
+            .unwrap();
+
+        let entity = created.unwrap();
+        assert_eq!(engine.world().entity_count(), 1);
+        assert_eq!(
+            engine.world().get_component::<Position>(entity).unwrap().x,
+            9.0
+        );
+        assert_eq!(
+            engine
+                .world()
+                .dynamic_component_bytes(entity, dynamic_a)
+                .unwrap(),
+            41_u32.to_ne_bytes()
+        );
+
+        let dynamic_b_value = 77_u32;
+        engine
+            .run_deferred_commands(|world, queue| {
+                let _guard =
+                    ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
+                assert_eq!(
+                    ffi_queue_add_component(
+                        &entity,
+                        dynamic_b_key.0 as u64,
+                        (dynamic_b_key.0 >> 64) as u64,
+                        std::ptr::from_ref(&dynamic_b_value).cast(),
+                        4,
+                    ),
+                    1
+                );
+                assert_eq!(
+                    ffi_queue_remove_component(
+                        &entity,
+                        dynamic_a_key.0 as u64,
+                        (dynamic_a_key.0 >> 64) as u64,
+                    ),
+                    1
+                );
+            })
+            .unwrap();
+        assert!(engine
+            .world()
+            .dynamic_component_bytes(entity, dynamic_a)
+            .is_none());
+        assert_eq!(
+            engine
+                .world()
+                .dynamic_component_bytes(entity, dynamic_b)
+                .unwrap(),
+            77_u32.to_ne_bytes()
+        );
+        assert!(engine.world().get_component::<Position>(entity).is_some());
+
+        engine
+            .run_deferred_commands(|world, queue| {
+                let _guard =
+                    ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
+                assert_eq!(ffi_queue_destroy(&entity), 1);
+            })
+            .unwrap();
+        assert_eq!(engine.world().entity_count(), 0);
+    }
+
+    #[test]
+    fn managed_command_abi_rejects_stale_generations_and_undeclared_commands() {
+        let mut engine = Engine::new();
+        let bindings = shared_component_bindings(&mut engine);
+        let stale = engine
+            .world_mut()
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build()
+            .unwrap();
+        assert!(engine.world_mut().destroy_entity(stale));
+        let _replacement = engine.world_mut().reserve_entity();
+        engine
+            .run_deferred_commands(|world, queue| {
+                let _guard =
+                    ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
+                assert_eq!(ffi_queue_destroy(&stale), 5);
+            })
+            .unwrap();
+        engine
+            .run_deferred_commands(|world, queue| {
+                let _guard =
+                    ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, false);
+                assert_eq!(ffi_queue_destroy(&stale), 4);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn reflected_managed_commands_access_is_scheduler_exclusive() {
+        let mut commands_access = managed_access(&[("Position", 0)]);
+        commands_access.set_uses_commands(true);
+        let disjoint_reader = managed_access(&[("Sprite", 0)]);
+        let scheduler = scheduler_for([commands_access, disjoint_reader]);
+        assert_different_batches(&scheduler, 0, 1);
+    }
+
+    fn assert_same_batch(scheduler: &SystemScheduler, systems: &[usize]) {
+        assert!(scheduler
+            .execution_graph()
+            .iter()
+            .any(|batch| systems.iter().all(|system| batch.contains(system))));
     }
 
     fn assert_different_batches(scheduler: &SystemScheduler, first: usize, second: usize) {
-        assert!(
-            !scheduler
-                .execution_graph()
-                .iter()
-                .any(|batch| batch.contains(&first) && batch.contains(&second))
-        );
+        assert!(!scheduler
+            .execution_graph()
+            .iter()
+            .any(|batch| batch.contains(&first) && batch.contains(&second)));
     }
 
     fn empty_chunk() -> ComponentChunk {
@@ -1088,12 +1545,10 @@ mod tests {
         assert_eq!(scheduler.execution_graph().len(), 2);
         assert_same_batch(&scheduler, &[0, 1]);
         assert_different_batches(&scheduler, 0, 2);
-        assert!(
-            !scheduler
-                .get_access(1)
-                .unwrap()
-                .conflicts_with(scheduler.get_access(2).unwrap())
-        );
+        assert!(!scheduler
+            .get_access(1)
+            .unwrap()
+            .conflicts_with(scheduler.get_access(2).unwrap()));
     }
 
     #[test]

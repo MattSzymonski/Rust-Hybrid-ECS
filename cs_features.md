@@ -36,7 +36,7 @@ IDs through `EntityTerm`, and update per-row change ticks for managed writes.
   - [x] Export a component manifest from `game_cs`.
   - [x] Register unmanaged components dynamically.
   - [x] Expose entity IDs in managed queries.
-  - [ ] Add deferred entity/component commands.
+  - [x] Add deferred entity/component commands.
   - [ ] Move game initialization into C#.
 - [ ] Phase 3: General system parameters
   - [x] Replace specialized query classes with composable query descriptors.
@@ -123,7 +123,10 @@ host, so C# could not define the game's component universe.
 ### Implementation
 
 Implemented. `cs_runtime` inspects every component term in every discovered
-system and exports a UTF-8 JSON manifest before Rust reads scheduler access.
+system plus supported unmanaged structs declared by the game assembly. The
+latter makes components used only by startup/deferred commands available
+before those commands run. It exports a UTF-8 JSON manifest before Rust reads
+scheduler access.
 Each descriptor contains:
 
 ```text
@@ -142,7 +145,7 @@ zero initialization, row replacement, swap-remove, and copying during
 archetype migration. Tick columns remain parallel to both native and dynamic
 storage, so managed writes keep the same change-detection behavior.
 
-The host loads and validates the manifest before creating the demo world or
+The host loads and validates the manifest before running managed startup or
 registering systems. Its runtime binding table is keyed by the full 128-bit
 stable ID. A binding either dispatches to a generic native column callback or
 to a dynamic column; `ffi_get_component_chunk` contains no per-game type match.
@@ -151,10 +154,9 @@ to a dynamic column; `ffi_get_component_chunk` contains no per-game type match.
 The native registry explicitly binds the renderer-owned `Position` and
 `Sprite` mirrors and checks size, alignment, and the complete field schema.
 `PhysicsState` and `BallTag` live only in `game_cs`; both register from the
-manifest without Rust component definitions. Native demo setup generically
-default-constructs every game-defined manifest component without knowing its
-name, size, or fields, and C# performs semantic initialization. Deferred C#
-entity commands can later move entity creation itself into the game assembly.
+manifest without Rust component definitions. The managed `[EcsStartup]`
+method now chooses exact entity composition and initializes all values through
+deferred commands; the host has no demo-specific component attachment policy.
 
 Reload remains behavior-only. `GameHost` compares the new manifest byte for
 byte with the active one and rejects schema or identity changes, preserving the
@@ -186,14 +188,14 @@ old collectible context until the process restarts and can rebuild storage.
 
 **Priority:** Critical
 
-**Status:** Partially implemented
+**Status:** Implemented
 
 ### Problem
 
-C# systems cannot create or destroy entities or add and remove components.
-`setup_world()` in the Rust bridge currently creates the demo entities.
+C# systems previously could not create or destroy entities or add and remove
+components. The Rust bridge therefore owned game-specific demo creation.
 
-### Implemented foundation
+### Implementation
 
 - [x] Added an ABI-stable managed `Entity` containing the native ID and
   generation.
@@ -201,9 +203,7 @@ C# systems cannot create or destroy entities or add and remove components.
   the entity corresponding to each component row.
 - [x] Kept entity access out of scheduler component conflicts.
 
-### Remaining implementation
-
-1. Add command callbacks to the native API:
+The native API now exports:
 
    ```text
    reserve_entity()
@@ -213,19 +213,35 @@ C# systems cannot create or destroy entities or add and remove components.
    queue_remove_component(entity, component_id)
    ```
 
-2. Implement a managed `Commands` system parameter that records requests into
-   the existing Rust `CommandQueue`.
-3. Include `uses_commands` in reflected `SystemAccess`. The scheduler must keep
-   command-producing systems under the same exclusivity rules as Rust systems.
-4. Add a managed startup method, for example:
+`Commands` and `DeferredEntityBuilder` copy unmanaged component values into
+pinned blobs, reserve generation-checked handles, and synchronously submit the
+blobs to the host. Native shared values are decoded into concrete
+`ComponentAdder`s; game components remain byte-owned dynamic values. Both are
+stored in the existing Rust `CommandQueue`, so structural changes remain
+deferred until the current system phase ends.
+
+System discovery accepts `Commands`, a composable query, or one of each.
+`SystemUsesCommands` is exported separately and sets
+`SystemAccess.uses_commands`; command-producing managed systems consequently
+use the same scheduler exclusivity rule as Rust systems. Calls outside that
+declared invocation are rejected by the thread-local capability guard.
+
+One-shot startup methods use:
 
    ```csharp
    [EcsStartup]
    public static void Start(Commands commands) { ... }
    ```
 
-5. Remove demo-specific entity creation from `setup_world()` after startup
-   commands are available.
+The host runs every startup under a command-enabled scope after component
+registration and flushes the queue before registering/running frame systems.
+`GameStartup.Start` creates exactly 100 fully initialized balls. The former
+Rust `setup_world()` demo bootstrap has been removed.
+
+All entity-taking callbacks validate the complete ID/generation pair before
+queueing. Creation additionally requires a handle reserved during the same
+managed invocation and rejects duplicate components, unknown IDs, null data,
+or layout-size mismatches before enqueueing anything.
 
 ### Affected files
 
@@ -238,10 +254,10 @@ C# systems cannot create or destroy entities or add and remove components.
 
 ### Acceptance tests
 
-- [ ] C# startup creates exactly 100 balls without Rust demo code.
-- [ ] A C# system can despawn an entity safely during deferred command execution.
-- [ ] Managed commands add/remove a component and migrate the entity correctly.
-- [ ] Managed commands reject stale entity generations.
+- [x] C# startup creates exactly 100 balls without Rust demo code.
+- [x] A C# system can despawn an entity safely during deferred command execution.
+- [x] Managed commands add/remove a component and migrate the entity correctly.
+- [x] Managed commands reject stale entity generations.
 
 ---
 
@@ -768,12 +784,9 @@ Current progress toward the first useful milestone:
 - [x] A game-exported component/system manifest.
 - [x] Dynamic native storage for unmanaged C# components.
 - [x] Composable scheduler-aware queries and entity IDs.
-- [ ] Managed startup plus deferred commands.
-- [ ] Removal of the demo-specific `setup_world()` implementation.
+- [x] Managed startup plus deferred commands.
+- [x] Removal of the demo-specific `setup_world()` implementation.
 
 A new C# component can now be added without editing or recompiling the Rust
-host. Its initial entity composition is still controlled by the native demo
-bootstrap, which currently attaches every discovered dynamic component to the
-100 demo entities. Managed startup and deferred commands are the remaining
-requirements for C# to own the complete game world rather than only its
-component schemas and behavior.
+host. C# owns component schemas, startup entity composition, and frame
+behavior; structural mutations use the engine's normal deferred command phase.

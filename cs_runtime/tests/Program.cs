@@ -28,6 +28,9 @@ internal struct TestVelocity { public float X, Y; }
 internal struct TestHealth { public float Value; }
 
 [StructLayout(LayoutKind.Sequential)]
+internal struct CommandOnlyComponent { public uint Value; }
+
+[StructLayout(LayoutKind.Sequential)]
 internal struct InvalidBoolComponent { public bool Value; }
 
 internal static class TestSystems
@@ -62,6 +65,21 @@ internal static class TestSystems
     public static void Unsupported(string value) { }
 
     public static void InvalidLayout(Query<Read<InvalidBoolComponent>> query) { }
+
+    public static void CommandsOnly(Commands commands) { }
+
+    public static void QueryAndCommands(
+        Query<Read<TestPosition>> query, Commands commands) { }
+
+    public static void DespawnSystem(
+        Query<EntityTerm, Read<TestVelocity>> query, Commands commands)
+    {
+        foreach (var row in query)
+        {
+            commands.DestroyEntity(row.Entity);
+            break;
+        }
+    }
 }
 
 internal static unsafe class MockNativeWorld
@@ -75,6 +93,10 @@ internal static unsafe class MockNativeWorld
     internal static NativeComponentTicks* HealthTicks;
     internal static uint Length;
     internal static uint ChangeTick;
+    internal static ulong NextEntityId;
+    internal static int QueuedCreates;
+    internal static int LastCreateComponentCount;
+    internal static int QueuedDestroys;
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     internal static uint EntityCount() => Length;
@@ -115,12 +137,58 @@ internal static unsafe class MockNativeWorld
         return 1;
     }
 
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static byte ReserveEntity(Entity* output)
+    {
+        *output = new Entity(++NextEntityId, 0);
+        return 1;
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static byte QueueCreate(Entity* entity, NativeComponentBlob* blobs, uint count)
+    {
+        if (entity is null || (count != 0 && blobs is null))
+            return 6;
+        QueuedCreates++;
+        LastCreateComponentCount = checked((int)count);
+        return 1;
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static byte QueueDestroy(Entity* entity)
+    {
+        if (entity->Generation == 99)
+            return 5;
+        QueuedDestroys++;
+        return 1;
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static byte QueueAddComponent(
+        Entity* entity, ulong low, ulong high, byte* data, uint size) => 1;
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static byte QueueRemoveComponent(Entity* entity, ulong low, ulong high) => 1;
+
     internal static EngineApi Api() => new()
     {
         EntityCount = &EntityCount,
         GetComponentChunk = &GetComponentChunk,
         GetEntityChunk = &GetEntityChunk,
+        ReserveEntity = &ReserveEntity,
+        QueueCreate = &QueueCreate,
+        QueueDestroy = &QueueDestroy,
+        QueueAddComponent = &QueueAddComponent,
+        QueueRemoveComponent = &QueueRemoveComponent,
     };
+
+    internal static void ResetCommands()
+    {
+        NextEntityId = 0;
+        QueuedCreates = 0;
+        LastCreateComponentCount = 0;
+        QueuedDestroys = 0;
+    }
 
     private static NativeComponentChunk Chunk(
         void* data, NativeComponentTicks* ticks, int elementSize) => new()
@@ -226,6 +294,16 @@ internal static class Program
                     "BallTag field schema mismatch");
             });
 
+            Test("manifest includes game structs used only by commands", () =>
+            {
+                using var json = System.Text.Json.JsonDocument.Parse(
+                    ComponentManifestBuilder.Build([], typeof(CommandOnlyComponent).Assembly));
+                Assert(json.RootElement.EnumerateArray().Any(component =>
+                        component.GetProperty("full_name").GetString() ==
+                        typeof(CommandOnlyComponent).FullName),
+                    "command-only game component was omitted from the manifest");
+            });
+
             Test("ball physics declares PhysicsState, Position, and Sprite writes", () =>
             {
                 var method = typeof(BallPhysicsSystem).GetMethod(nameof(BallPhysicsSystem.Run))
@@ -247,6 +325,56 @@ internal static class Program
                     "wrong Sprite key");
                 Equal(system.Accesses[2].ComponentKeyHigh,
                     Engine.ComponentKeyHigh(typeof(Sprite)), "wrong Sprite high key");
+            });
+
+            Test("managed Commands parameter is reflected into system metadata", () =>
+            {
+                var commandsOnly = GameHost.CreateSystem(Method(nameof(TestSystems.CommandsOnly)));
+                Assert(commandsOnly.UsesCommands, "Commands-only system did not declare commands");
+                Equal(commandsOnly.Accesses.Length, 0, "Commands-only system has component access");
+                var mixed = GameHost.CreateSystem(Method(nameof(TestSystems.QueryAndCommands)));
+                Assert(mixed.UsesCommands, "query plus Commands did not declare commands");
+                Equal(mixed.Accesses.Length, 1, "query plus Commands lost query access");
+            });
+
+            Test("game startup queues exactly 100 fully described balls", () =>
+            {
+                MockNativeWorld.ResetCommands();
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+                var startups = GameHost.DiscoverStartups(typeof(GameStartup).Assembly);
+                Equal(startups.Length, 1, "unexpected startup count");
+                startups[0].Run();
+                Equal(MockNativeWorld.QueuedCreates, 100, "startup create count mismatch");
+                Equal(MockNativeWorld.LastCreateComponentCount, 4,
+                    "each ball must contain PhysicsState, Position, Sprite, and BallTag");
+                Equal(MockNativeWorld.NextEntityId, 100UL, "startup did not reserve unique entities");
+            });
+
+            Test("managed Commands reports stale entity generations", () =>
+            {
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+                Throws<InvalidOperationException>(
+                    () => new Commands().DestroyEntity(new Entity(7, 99)),
+                    "stale entity command should be rejected");
+            });
+
+            Test("a query system can queue despawn for its current entity", () =>
+            {
+                TestVelocity* velocities = stackalloc TestVelocity[1];
+                Entity* entities = stackalloc Entity[1];
+                velocities[0].X = 1;
+                entities[0] = new Entity(55, 2);
+                MockNativeWorld.Velocities = velocities;
+                MockNativeWorld.Entities = entities;
+                MockNativeWorld.Length = 1;
+                MockNativeWorld.ResetCommands();
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+                GameHost.CreateSystem(Method(nameof(TestSystems.DespawnSystem))).Run();
+                Equal(MockNativeWorld.QueuedDestroys, 1,
+                    "despawn system did not enqueue destruction");
             });
 
             Test("game and shared component layouts match their manifests", () =>

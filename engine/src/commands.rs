@@ -86,6 +86,17 @@ struct TypedComponentAdder<T: Component + TraitAccessible<dyn Component>> {
     component: T,
 }
 
+/// Preserve a native component's concrete Rust type in a type-erased command.
+///
+/// Foreign-language adapters use this after validating and decoding an ABI
+/// component blob against an explicitly shared native component binding.
+pub fn boxed_component_adder<T>(component: T) -> Box<dyn ComponentAdder>
+where
+    T: Component + TraitAccessible<dyn Component> + Send,
+{
+    Box::new(TypedComponentAdder { component })
+}
+
 impl<T: Component + TraitAccessible<dyn Component> + Send> ComponentAdder
     for TypedComponentAdder<T>
 {
@@ -107,10 +118,16 @@ enum DeferredCommand {
     CreateEntity {
         entity: Entity,
         component_adders: Vec<Box<dyn ComponentAdder>>,
+        dynamic_components: Vec<(ComponentId, Vec<u8>)>,
     },
     AddComponentToEntity {
         entity: Entity,
         component_adder: Box<dyn ComponentAdder>,
+    },
+    AddDynamicComponentToEntity {
+        entity: Entity,
+        component_id: ComponentId,
+        bytes: Vec<u8>,
     },
     RemoveComponentFromEntity {
         entity: Entity,
@@ -218,6 +235,22 @@ impl CommandQueue {
         self.commands.push(DeferredCommand::CreateEntity {
             entity,
             component_adders: components,
+            dynamic_components: Vec::new(),
+        });
+    }
+
+    /// Queue an entity containing both concrete native and type-erased
+    /// runtime components.
+    pub fn create_mixed_entity(
+        &mut self,
+        entity: Entity,
+        native_components: Vec<Box<dyn ComponentAdder>>,
+        dynamic_components: Vec<(ComponentId, Vec<u8>)>,
+    ) {
+        self.commands.push(DeferredCommand::CreateEntity {
+            entity,
+            component_adders: native_components,
+            dynamic_components,
         });
     }
 
@@ -232,12 +265,48 @@ impl CommandQueue {
         });
     }
 
+    /// Queue a concrete native component already erased by an ABI adapter.
+    pub fn add_component_adder_to_entity(
+        &mut self,
+        entity: Entity,
+        component_adder: Box<dyn ComponentAdder>,
+    ) {
+        self.commands.push(DeferredCommand::AddComponentToEntity {
+            entity,
+            component_adder,
+        });
+    }
+
+    /// Queue adding a type-erased runtime component.
+    pub fn add_dynamic_component_to_entity(
+        &mut self,
+        entity: Entity,
+        component_id: ComponentId,
+        bytes: Vec<u8>,
+    ) {
+        self.commands
+            .push(DeferredCommand::AddDynamicComponentToEntity {
+                entity,
+                component_id,
+                bytes,
+            });
+    }
+
     /// Queue removing a component from an entity
     pub fn remove_component_from_entity<T: Component>(&mut self, entity: Entity) {
         self.commands
             .push(DeferredCommand::RemoveComponentFromEntity {
                 entity,
                 component_id: ComponentId::of::<T>(),
+            });
+    }
+
+    /// Queue removing a component selected by its runtime component ID.
+    pub fn remove_component_by_id(&mut self, entity: Entity, component_id: ComponentId) {
+        self.commands
+            .push(DeferredCommand::RemoveComponentFromEntity {
+                entity,
+                component_id,
             });
     }
 
@@ -273,8 +342,14 @@ impl CommandQueue {
                 DeferredCommand::CreateEntity {
                     entity,
                     component_adders,
+                    dynamic_components,
                 } => {
-                    Self::execute_create_entity(world, entity, component_adders);
+                    Self::execute_create_entity(
+                        world,
+                        entity,
+                        component_adders,
+                        dynamic_components,
+                    );
                     succeeded += 1;
                 }
 
@@ -283,6 +358,21 @@ impl CommandQueue {
                     component_adder,
                 } => {
                     Self::execute_add_component(world, entity, component_adder, &mut errors);
+                    succeeded += 1;
+                }
+
+                DeferredCommand::AddDynamicComponentToEntity {
+                    entity,
+                    component_id,
+                    bytes,
+                } => {
+                    Self::execute_add_dynamic_component(
+                        world,
+                        entity,
+                        component_id,
+                        bytes,
+                        &mut errors,
+                    );
                     succeeded += 1;
                 }
 
@@ -324,17 +414,55 @@ impl CommandQueue {
         world: &mut World,
         entity: Entity,
         component_adders: Vec<Box<dyn ComponentAdder>>,
+        dynamic_components: Vec<(ComponentId, Vec<u8>)>,
     ) {
-        let component_ids: Vec<ComponentId> = component_adders
+        let mut component_ids: Vec<ComponentId> = component_adders
             .iter()
             .map(|adder| adder.component_id())
             .collect();
+        component_ids.extend(dynamic_components.iter().map(|(id, _)| *id));
 
         world.insert_entity_with_components(entity, component_ids, |storage| {
             for component_adder in component_adders {
                 component_adder.add_component_to_storage(storage);
             }
         });
+        for (component_id, bytes) in dynamic_components {
+            world
+                .set_dynamic_component_bytes(entity, component_id, &bytes)
+                .expect("validated dynamic create component must have a storage row");
+        }
+    }
+
+    fn execute_add_dynamic_component(
+        world: &mut World,
+        entity: Entity,
+        component_id: ComponentId,
+        bytes: Vec<u8>,
+        errors: &mut Vec<CommandError>,
+    ) {
+        if !world.is_entity_valid(entity) {
+            errors.push(CommandError::EntityNotFound {
+                entity,
+                operation: "add_component",
+            });
+            return;
+        }
+        let already_present = world
+            .entity_locations
+            .get(&entity)
+            .and_then(|location| world.archetypes.get(&location.archetype_id))
+            .is_some_and(|archetype| archetype.component_types.contains(&component_id));
+        if already_present {
+            errors.push(CommandError::ComponentAlreadyExists {
+                entity,
+                component_id,
+            });
+            return;
+        }
+        world
+            .add_dynamic_component(entity, component_id, &bytes)
+            .expect("managed command blobs are validated before being queued");
     }
 
     fn execute_add_component(
@@ -695,6 +823,81 @@ mod tests {
         queue.execute_queued_commands(&mut world, false).unwrap();
 
         assert_eq!(world.entity_locations.len(), 1, "Entity should be created");
+    }
+
+    #[test]
+    fn type_erased_commands_create_add_remove_and_destroy_through_migrations() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let dynamic_a = world
+            .register_dynamic_component(0xA1, "Game.DynamicA", 4, 4, 1)
+            .unwrap();
+        let dynamic_b = world
+            .register_dynamic_component(0xB2, "Game.DynamicB", 4, 4, 2)
+            .unwrap();
+        let entity = world.reserve_entity();
+        let mut queue = CommandQueue::new();
+
+        queue.create_mixed_entity(
+            entity,
+            vec![boxed_component_adder(Position { x: 3.0, y: 4.0 })],
+            vec![(dynamic_a, 11_u32.to_ne_bytes().to_vec())],
+        );
+        assert!(
+            !world.is_entity_valid(entity),
+            "creation must remain deferred"
+        );
+        queue.execute_queued_commands(&mut world, true).unwrap();
+        assert_eq!(world.entity_count(), 1);
+        assert_eq!(world.get_component::<Position>(entity).unwrap().x, 3.0);
+        assert_eq!(
+            world.dynamic_component_bytes(entity, dynamic_a).unwrap(),
+            11_u32.to_ne_bytes()
+        );
+
+        queue.add_dynamic_component_to_entity(entity, dynamic_b, 22_u32.to_ne_bytes().to_vec());
+        queue.remove_component_by_id(entity, dynamic_a);
+        queue.execute_queued_commands(&mut world, true).unwrap();
+        assert!(world.dynamic_component_bytes(entity, dynamic_a).is_none());
+        assert_eq!(
+            world.dynamic_component_bytes(entity, dynamic_b).unwrap(),
+            22_u32.to_ne_bytes()
+        );
+        assert_eq!(world.get_component::<Position>(entity).unwrap().y, 4.0);
+
+        queue.destroy_entity(entity);
+        assert!(
+            world.is_entity_valid(entity),
+            "destruction must remain deferred"
+        );
+        queue.execute_queued_commands(&mut world, true).unwrap();
+        assert!(!world.is_entity_valid(entity));
+    }
+
+    #[test]
+    fn type_erased_command_rejects_a_stale_entity_generation() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let entity = world
+            .create_entity()
+            .with(Position { x: 1.0, y: 2.0 })
+            .build()
+            .unwrap();
+        assert!(world.destroy_entity(entity));
+        let replacement = world.reserve_entity();
+        assert_eq!(replacement.id(), entity.id());
+        assert_ne!(replacement.generation(), entity.generation());
+
+        let mut queue = CommandQueue::new();
+        queue.destroy_entity(entity);
+        let errors = queue.execute_queued_commands(&mut world, true).unwrap_err();
+        assert!(matches!(
+            errors.as_slice(),
+            [CommandError::EntityNotFound {
+                operation: "destroy_entity",
+                ..
+            }]
+        ));
     }
 
     /// Tests entity archetype migration and automatic cleanup when components are removed.
