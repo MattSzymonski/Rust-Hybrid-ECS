@@ -50,7 +50,7 @@ internal sealed record ManagedStartup(string Name, Action Run);
 internal sealed class GameHost
 {
     /// <summary>
-    /// Collectible context for one game version. Requests for cs_runtime types
+    /// Collectible context for one game version. Requests for csharp_runtime types
     /// resolve to the already-loaded stable runtime assembly.
     /// </summary>
     private sealed class GameContext : AssemblyLoadContext
@@ -59,7 +59,7 @@ internal sealed class GameHost
 
         protected override Assembly? Load(AssemblyName assemblyName)
         {
-            if (assemblyName.Name == "cs_runtime")
+            if (assemblyName.Name == "csharp_runtime")
                 return typeof(GameHost).Assembly;
             return null;
         }
@@ -121,11 +121,11 @@ internal sealed class GameHost
         try
         {
             Load(isReload: true);
-            Console.WriteLine($"[cs_runtime] reloaded {Path.GetFileName(_assemblyPath)}");
+            Console.WriteLine($"[csharp_runtime] reloaded {Path.GetFileName(_assemblyPath)}");
         }
         catch (Exception e)
         {
-            Console.Error.WriteLine($"[cs_runtime] reload failed: {e}");
+            Console.Error.WriteLine($"[csharp_runtime] reload failed: {e}");
         }
     }
 

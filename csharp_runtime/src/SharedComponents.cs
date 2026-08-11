@@ -1,6 +1,6 @@
 // Canonical managed mirrors of components owned by the native engine.
 //
-// Game assemblies reference these definitions through cs_runtime so their
+// Game assemblies reference these definitions through csharp_runtime so their
 // names and layouts cannot silently diverge between independently reloaded
 // gameplay projects.
 

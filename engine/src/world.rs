@@ -2088,6 +2088,78 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_component_ticks_survive_archetype_migration() {
+        fn ticks_for(world: &World, entity: Entity, component: ComponentId) -> ComponentTicks {
+            let location = world.entity_locations[&entity];
+            world.archetypes[&location.archetype_id].component_ticks[&component]
+                [location.index_in_archetype]
+        }
+
+        let mut world = World::new();
+        let retained = world
+            .register_dynamic_component(0xA1, "Game.Retained", 4, 4, 11)
+            .unwrap();
+        let removed = world
+            .register_dynamic_component(0xB2, "Game.Removed", 4, 4, 22)
+            .unwrap();
+        let added = world
+            .register_dynamic_component(0xC3, "Game.Added", 8, 8, 33)
+            .unwrap();
+        let entity = world
+            .create_dynamic_entity(&[
+                (retained, 10_u32.to_ne_bytes().to_vec()),
+                (removed, 20_u32.to_ne_bytes().to_vec()),
+            ])
+            .unwrap();
+
+        let original_retained_ticks = ticks_for(&world, entity, retained);
+        let original_removed_ticks = ticks_for(&world, entity, removed);
+        let changed_tick = world.increment_change_tick();
+        let location = world.entity_locations[&entity];
+        world
+            .archetypes
+            .get_mut(&location.archetype_id)
+            .unwrap()
+            .component_ticks
+            .get_mut(&retained)
+            .unwrap()[location.index_in_archetype]
+            .set_changed(changed_tick);
+        let retained_before_migration = ticks_for(&world, entity, retained);
+        assert_eq!(
+            retained_before_migration.added,
+            original_retained_ticks.added
+        );
+        assert_eq!(retained_before_migration.changed, changed_tick);
+
+        let addition_tick = world.increment_change_tick();
+        world.add_dynamic_component_default(entity, added).unwrap();
+
+        let retained_after_add = ticks_for(&world, entity, retained);
+        let removed_after_add = ticks_for(&world, entity, removed);
+        let added_after_add = ticks_for(&world, entity, added);
+        assert_eq!(retained_after_add.added, retained_before_migration.added);
+        assert_eq!(
+            retained_after_add.changed,
+            retained_before_migration.changed
+        );
+        assert_eq!(removed_after_add.added, original_removed_ticks.added);
+        assert_eq!(removed_after_add.changed, original_removed_ticks.changed);
+        assert_eq!(added_after_add.added, addition_tick);
+        assert_eq!(added_after_add.changed, addition_tick);
+
+        world.increment_change_tick();
+        world.remove_dynamic_component(entity, removed).unwrap();
+
+        let retained_after_remove = ticks_for(&world, entity, retained);
+        let added_after_remove = ticks_for(&world, entity, added);
+        assert_eq!(retained_after_remove.added, retained_after_add.added);
+        assert_eq!(retained_after_remove.changed, retained_after_add.changed);
+        assert_eq!(added_after_remove.added, added_after_add.added);
+        assert_eq!(added_after_remove.changed, added_after_add.changed);
+        assert!(world.dynamic_component_bytes(entity, removed).is_none());
+    }
+
+    #[test]
     fn invalid_dynamic_component_layouts_are_rejected() {
         let mut world = World::new();
         assert!(world

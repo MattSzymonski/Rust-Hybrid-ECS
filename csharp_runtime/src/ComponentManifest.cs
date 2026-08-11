@@ -1,4 +1,4 @@
-// Managed component discovery and native manifest generation.
+// C# component discovery and native manifest generation.
 //
 // Every unmanaged query component and supported game-declared struct is
 // described before Rust registers managed systems or runs startup commands.

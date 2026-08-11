@@ -12,8 +12,8 @@ see [`components_approach.md`](components_approach.md).
 ```text
 Rust host
   -> starts .NET through hostfxr
-  -> loads cs_runtime.dll
-  -> cs_runtime loads game_cs.dll in a collectible AssemblyLoadContext
+  -> loads csharp_runtime.dll
+  -> csharp_runtime loads game_cs.dll in a collectible AssemblyLoadContext
   -> query parameters are reflected into Rust SystemAccess
   -> Rust scheduler invokes managed systems
   -> managed query iterators borrow native archetype columns
@@ -21,7 +21,7 @@ Rust host
 
 The pipeline now registers every unmanaged component used by discovered C#
 systems from a managed manifest. Renderer-owned components use stable mirrors
-from `cs_runtime`; game-owned components use type-erased native storage. Demo
+from `csharp_runtime`; game-owned components use type-erased native storage. Demo
 world initialization is still native and remains the next major hardcoded part.
 Composable queries now derive scheduler access automatically, expose entity
 IDs through `EntityTerm`, and update per-row change ticks for managed writes.
@@ -95,9 +95,9 @@ change the value. Precisely detecting assignments after returning a raw C#
 
 - `engine/src/world.rs`
 - `engine/src/query/change_detection.rs`
-- `host/src/cs/cs_api.rs`
-- `cs_runtime/src/EngineApi.cs`
-- `cs_runtime/src/Engine.cs`
+- `host/src/csharp/abi.rs`
+- `csharp_runtime/src/EngineApi.cs`
+- `csharp_runtime/src/Engine.cs`
 
 ### Acceptance tests
 
@@ -122,7 +122,7 @@ host, so C# could not define the game's component universe.
 
 ### Implementation
 
-Implemented. `cs_runtime` inspects every component term in every discovered
+Implemented. `csharp_runtime` inspects every component term in every discovered
 system plus supported unmanaged structs declared by the game assembly. The
 latter makes components used only by startup/deferred commands available
 before those commands run. It exports a UTF-8 JSON manifest before Rust reads
@@ -136,7 +136,7 @@ ComponentDescriptor
 - size and alignment
 - schema_hash: FNV-1a hash of the canonical field schema
 - fields: name, offset, size, primitive kind, and nested fields
-- shared: whether the type is owned by cs_runtime
+- shared: whether the type is owned by csharp_runtime
 ```
 
 `World::register_dynamic_component` installs a type-erased storage factory.
@@ -150,7 +150,7 @@ registering systems. Its runtime binding table is keyed by the full 128-bit
 stable ID. A binding either dispatches to a generic native column callback or
 to a dynamic column; `ffi_get_component_chunk` contains no per-game type match.
 
-`Position`, `Color`, and `Sprite` now live in `cs_runtime/SharedComponents.cs`.
+`Position`, `Color`, and `Sprite` now live in `csharp_runtime/SharedComponents.cs`.
 The native registry explicitly binds the renderer-owned `Position` and
 `Sprite` mirrors and checks size, alignment, and the complete field schema.
 `PhysicsState` and `BallTag` live only in `game_cs`; both register from the
@@ -167,19 +167,19 @@ old collectible context until the process restarts and can rebuild storage.
 - `engine/src/component.rs`
 - `engine/src/archetype.rs`
 - `engine/src/world.rs`
-- `host/src/cs/cs_api.rs`
-- `cs_runtime/src/ComponentManifest.cs`
-- `cs_runtime/src/SharedComponents.cs`
-- `cs_runtime/src/Engine.cs`
-- `cs_runtime/src/GameHost.cs`
-- `cs_runtime/src/LoaderInterop.cs`
+- `host/src/csharp/components.rs`
+- `csharp_runtime/src/ComponentManifest.cs`
+- `csharp_runtime/src/SharedComponents.cs`
+- `csharp_runtime/src/Engine.cs`
+- `csharp_runtime/src/GameHost.cs`
+- `csharp_runtime/src/LoaderInterop.cs`
 
 ### Acceptance tests
 
 - [x] Adding `BallTag` only in `game_cs` requires no host match arm or Rust type.
 - [x] Two dynamically registered components coexist in one archetype.
 - [x] Dynamic bytes survive add/remove archetype migration.
-- [ ] Add a focused regression test for dynamic tick preservation during migration.
+- [x] Dynamic `added` and `changed` ticks survive add/remove archetype migration.
 - [x] Invalid managed and native-shared layouts fail before the first frame.
 
 ---
@@ -246,10 +246,10 @@ or layout-size mismatches before enqueueing anything.
 ### Affected files
 
 - `engine/src/commands.rs`
-- `host/src/cs/cs_api.rs`
-- `cs_runtime/src/EngineApi.cs`
-- `cs_runtime/src/Engine.cs`
-- `cs_runtime/src/GameHost.cs`
+- `host/src/csharp/commands.rs`
+- `csharp_runtime/src/EngineApi.cs`
+- `csharp_runtime/src/Engine.cs`
+- `csharp_runtime/src/GameHost.cs`
 - `game_cs/src`
 
 ### Acceptance tests
@@ -300,9 +300,11 @@ longer branches on query arity or read/write shape.
 All arities share one `QueryEnumerator` and one `QueryRow`. Gameplay retrieves
 typed references with `row.Write<T>()`, `row.Read<T>()`,
 `row.OptionalWrite<T>()`, and `row.OptionalRead<T>()`; `row.Entity` exposes an
-`EntityTerm`. Reflection occurs only once while a closed descriptor is built,
-never while rows are iterated. A source generator is therefore not required
-for the hot path.
+`EntityTerm`. Reflection occurs only once while a closed descriptor or generic
+component metadata cache is initialized. Row access reuses its cached stable
+component ID, so it performs no type-name lookup, UTF-8 allocation, or hashing
+while rows are iterated. A source generator is therefore not required for the
+hot path.
 
 `QueryRow`, `QueryEnumerator`, and optional reference wrappers are `ref struct`
 types, preventing native pointers from being boxed, captured, or retained on
@@ -605,7 +607,7 @@ the system successful even if it partially modified component data.
 
 ### Problem
 
-The collectible context explicitly resolves only `cs_runtime`. Gameplay
+The collectible context explicitly resolves only `csharp_runtime`. Gameplay
 assemblies with additional NuGet or project dependencies may fail to load or
 may bind accidentally to the default context.
 
@@ -613,7 +615,7 @@ may bind accidentally to the default context.
 
 1. Construct an `AssemblyDependencyResolver` from the game assembly path.
 2. Resolve managed and unmanaged dependencies inside `GameContext`.
-3. Continue returning the already-loaded `cs_runtime` assembly for its shared
+3. Continue returning the already-loaded `csharp_runtime` assembly for its shared
    contract types.
 4. Define which dependencies are shared and which are collectible.
 5. Report unresolved dependency names and searched locations.
@@ -622,7 +624,7 @@ may bind accidentally to the default context.
 
 - A game can reference a secondary managed project and a NuGet library.
 - Reload unloads collectible dependencies with the game context.
-- `cs_runtime` is never loaded twice into incompatible contexts.
+- `csharp_runtime` is never loaded twice into incompatible contexts.
 
 ---
 

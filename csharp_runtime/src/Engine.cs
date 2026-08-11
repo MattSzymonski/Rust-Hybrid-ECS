@@ -1,4 +1,4 @@
-// Safe managed ECS facade and composable scheduler-aware queries.
+// Safe C# ECS facade and composable scheduler-aware queries.
 //
 // Responsibilities:
 // - Binds the native engine function table supplied by the Rust host.
@@ -237,16 +237,17 @@ public static unsafe class Engine
 
     internal static void QueueAdd<T>(Entity entity, T value) where T : unmanaged
     {
-        StableComponentId id = ComponentStableId(typeof(T));
+        StableComponentId id = ComponentTypeMetadata<T>.StableId;
         ValidateCommandStatus(
             _api.QueueAddComponent(
-                &entity, id.Low, id.High, (byte*)&value, checked((uint)sizeof(T))),
+                &entity, id.Low, id.High, (byte*)&value,
+                checked((uint)ComponentTypeMetadata<T>.Size)),
             $"add component {typeof(T).FullName}");
     }
 
     internal static void QueueRemove<T>(Entity entity) where T : unmanaged
     {
-        StableComponentId id = ComponentStableId(typeof(T));
+        StableComponentId id = ComponentTypeMetadata<T>.StableId;
         ValidateCommandStatus(
             _api.QueueRemoveComponent(&entity, id.Low, id.High),
             $"remove component {typeof(T).FullName}");
@@ -282,6 +283,18 @@ public static unsafe class Engine
 }
 
 internal readonly record struct StableComponentId(ulong Low, ulong High);
+
+/// <summary>
+/// Per-closed-component metadata initialized once outside row iteration.
+/// Generic static initialization avoids repeated Type.FullName lookup,
+/// UTF-8 allocation, hashing, and Marshal.SizeOf calls in managed hot paths.
+/// </summary>
+internal static class ComponentTypeMetadata<T> where T : unmanaged
+{
+    internal static readonly StableComponentId StableId =
+        Engine.ComponentStableId(typeof(T));
+    internal static readonly int Size = Marshal.SizeOf<T>();
+}
 
 // =============================================================================
 // Deferred Entity Commands
@@ -324,12 +337,12 @@ public sealed class DeferredEntityBuilder
     {
         if (_built)
             throw new InvalidOperationException("A deferred entity builder can only be built once.");
-        StableComponentId id = Engine.ComponentStableId(typeof(T));
+        StableComponentId id = ComponentTypeMetadata<T>.StableId;
         UInt128 key = ((UInt128)id.High << 64) | id.Low;
         if (!_ids.Add(key))
             throw new InvalidOperationException(
                 $"Entity creation contains component {typeof(T).FullName} more than once.");
-        byte[] bytes = new byte[Marshal.SizeOf<T>()];
+        byte[] bytes = new byte[ComponentTypeMetadata<T>.Size];
         MemoryMarshal.Write(bytes, in component);
         _components.Add(new DeferredComponentValue(id, typeof(T), bytes));
         return this;
@@ -506,7 +519,7 @@ public readonly unsafe ref struct QueryRow
 
     private QueryColumn Find<T>(QueryAccess access, bool optional) where T : unmanaged
     {
-        StableComponentId key = Engine.ComponentStableId(typeof(T));
+        StableComponentId key = ComponentTypeMetadata<T>.StableId;
         for (var i = 0; i < _count; i++)
         {
             QueryColumn column = Column(i);

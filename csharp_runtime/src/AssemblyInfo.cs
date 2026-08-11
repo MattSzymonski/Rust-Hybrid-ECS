@@ -5,8 +5,8 @@
 //
 // Design:
 // - Production consumers use only the public query API; the friend assembly is
-//   deliberately limited to cs_runtime_tests.
+//   deliberately limited to csharp_runtime_tests.
 
 using System.Runtime.CompilerServices;
 
-[assembly: InternalsVisibleTo("cs_runtime_tests")]
+[assembly: InternalsVisibleTo("csharp_runtime_tests")]

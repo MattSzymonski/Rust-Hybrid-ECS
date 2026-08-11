@@ -51,9 +51,9 @@ public static unsafe class LoaderInterop
         try
         {
             Engine.Bind(api);
-            var dir = Environment.GetEnvironmentVariable("ECS_CS_GAME_DIR")
+            var dir = Environment.GetEnvironmentVariable("ECS_CSHARP_GAME_DIR")
                 ?? AppContext.BaseDirectory;
-            var assembly = Environment.GetEnvironmentVariable("ECS_CS_GAME_ASSEMBLY")
+            var assembly = Environment.GetEnvironmentVariable("ECS_CSHARP_GAME_ASSEMBLY")
                 ?? "game_cs.dll";
             _host = new GameHost(Path.Combine(dir, assembly));
             _host.Init();
@@ -61,7 +61,7 @@ public static unsafe class LoaderInterop
         }
         catch (Exception e)
         {
-            Console.Error.WriteLine($"[cs_runtime] Init failed: {e}");
+            Console.Error.WriteLine($"[csharp_runtime] Init failed: {e}");
             return 0;
         }
     }
@@ -84,7 +84,7 @@ public static unsafe class LoaderInterop
         }
         catch (Exception e)
         {
-            Console.Error.WriteLine($"[cs_runtime] SystemUsesCommands failed: {e}");
+            Console.Error.WriteLine($"[csharp_runtime] SystemUsesCommands failed: {e}");
             return 0;
         }
     }
@@ -102,7 +102,7 @@ public static unsafe class LoaderInterop
         }
         catch (Exception e)
         {
-            Console.Error.WriteLine($"[cs_runtime] startup {startupIndex} failed: {e}");
+            Console.Error.WriteLine($"[csharp_runtime] startup {startupIndex} failed: {e}");
             return 0;
         }
     }
@@ -125,7 +125,7 @@ public static unsafe class LoaderInterop
         }
         catch (Exception e)
         {
-            Console.Error.WriteLine($"[cs_runtime] CopyComponentManifest failed: {e}");
+            Console.Error.WriteLine($"[csharp_runtime] CopyComponentManifest failed: {e}");
             return 0;
         }
     }
@@ -140,7 +140,7 @@ public static unsafe class LoaderInterop
         }
         catch (Exception e)
         {
-            Console.Error.WriteLine($"[cs_runtime] SystemAccessCount failed: {e}");
+            Console.Error.WriteLine($"[csharp_runtime] SystemAccessCount failed: {e}");
             return 0;
         }
     }
@@ -162,7 +162,7 @@ public static unsafe class LoaderInterop
         }
         catch (Exception e)
         {
-            Console.Error.WriteLine($"[cs_runtime] GetSystemAccess failed: {e}");
+            Console.Error.WriteLine($"[csharp_runtime] GetSystemAccess failed: {e}");
             return 0;
         }
     }
@@ -177,7 +177,7 @@ public static unsafe class LoaderInterop
         }
         catch (Exception e)
         {
-            Console.Error.WriteLine($"[cs_runtime] system {systemIndex} failed: {e}");
+            Console.Error.WriteLine($"[csharp_runtime] system {systemIndex} failed: {e}");
         }
     }
 
@@ -191,7 +191,7 @@ public static unsafe class LoaderInterop
         }
         catch (Exception e)
         {
-            Console.Error.WriteLine($"[cs_runtime] PollReload failed: {e}");
+            Console.Error.WriteLine($"[csharp_runtime] PollReload failed: {e}");
         }
     }
 }

@@ -15,10 +15,10 @@ There are now two intentional component categories:
 
 | Category | Type owner | Storage owner | Example |
 |---|---|---|---|
-| Shared native component | Rust engine, with a canonical C# mirror in `cs_runtime` | Typed Rust storage | `Position`, `Sprite` |
+| Shared native component | Rust engine, with a canonical C# mirror in `csharp_runtime` | Typed Rust storage | `Position`, `Sprite` |
 | Dynamic game component | `game_cs` | Type-erased Rust storage described by the managed manifest | `PhysicsState`, `BallTag` |
 
-`Color` is also mirrored in `cs_runtime`, but it is currently a nested field of
+`Color` is also mirrored in `csharp_runtime`, but it is currently a nested field of
 `Sprite`, not an independently registered ECS component.
 
 ---
@@ -107,7 +107,7 @@ game_cs.dll
   |
   | reflection finds [EcsSystem] methods and their Query<...> terms
   v
-cs_runtime
+csharp_runtime
   |
   | builds a UTF-8 JSON component manifest
   | exports system access declarations
@@ -138,12 +138,12 @@ the scheduler and before the first frame runs.
 
 The main implementation files are:
 
-- [`cs_runtime/src/ComponentManifest.cs`](cs_runtime/src/ComponentManifest.cs)
-- [`cs_runtime/src/SharedComponents.cs`](cs_runtime/src/SharedComponents.cs)
-- [`cs_runtime/src/Engine.cs`](cs_runtime/src/Engine.cs)
-- [`cs_runtime/src/GameHost.cs`](cs_runtime/src/GameHost.cs)
-- [`cs_runtime/src/LoaderInterop.cs`](cs_runtime/src/LoaderInterop.cs)
-- [`host/src/cs/cs_api.rs`](host/src/cs/cs_api.rs)
+- [`csharp_runtime/src/ComponentManifest.cs`](csharp_runtime/src/ComponentManifest.cs)
+- [`csharp_runtime/src/SharedComponents.cs`](csharp_runtime/src/SharedComponents.cs)
+- [`csharp_runtime/src/Engine.cs`](csharp_runtime/src/Engine.cs)
+- [`csharp_runtime/src/GameHost.cs`](csharp_runtime/src/GameHost.cs)
+- [`csharp_runtime/src/LoaderInterop.cs`](csharp_runtime/src/LoaderInterop.cs)
+- [`host/src/csharp/components.rs`](host/src/csharp/components.rs)
 - [`engine/src/component.rs`](engine/src/component.rs)
 - [`engine/src/archetype.rs`](engine/src/archetype.rs)
 - [`engine/src/world.rs`](engine/src/world.rs)
@@ -203,7 +203,7 @@ type renames. It is not implemented yet.
 
 ---
 
-## 4. How `cs_runtime` discovers components
+## 4. How `csharp_runtime` discovers components
 
 `GameHost` reflects all static methods marked with `[EcsSystem]`. A method must
 currently:
@@ -328,7 +328,7 @@ second dynamic storage column. The renderer's `Position` and `Sprite` are the
 current examples.
 
 Their canonical C# mirrors live in
-[`cs_runtime/src/SharedComponents.cs`](cs_runtime/src/SharedComponents.cs):
+[`csharp_runtime/src/SharedComponents.cs`](csharp_runtime/src/SharedComponents.cs):
 
 ```csharp
 [StructLayout(LayoutKind.Sequential)]
@@ -339,12 +339,12 @@ public struct Position
 }
 ```
 
-The gameplay assembly references these definitions from `cs_runtime` instead
+The gameplay assembly references these definitions from `csharp_runtime` instead
 of redeclaring them in `game_cs`. This gives every C# game one authoritative
 managed definition.
 
 The manifest marks a component as shared when its type comes from the
-`cs_runtime` assembly:
+`csharp_runtime` assembly:
 
 ```csharp
 type.Assembly == typeof(Engine).Assembly
@@ -368,7 +368,7 @@ Therefore an equal-sized but reordered or differently typed C# mirror is
 rejected.
 
 The shared registry is intentionally explicit. Adding a new engine-owned
-component requires adding its canonical mirror to `cs_runtime` and its native
+component requires adding its canonical mirror to `csharp_runtime` and its native
 binding to the host. Adding a game-owned component does not.
 
 In a rendering build, the host binds the actual renderer types. In a headless
@@ -715,7 +715,7 @@ code.
 The current ownership is:
 
 ```text
-cs_runtime
+csharp_runtime
   Position       shared native mirror
   Color          nested shared ABI type
   Sprite         shared native mirror
@@ -812,9 +812,9 @@ owns its typed Rust column.
 For a new engine-owned component, intentionally do all of the following:
 
 1. Define the native component with a stable C-compatible layout.
-2. Add the canonical C# mirror to `cs_runtime`, not `game_cs`.
+2. Add the canonical C# mirror to `csharp_runtime`, not `game_cs`.
 3. Add an explicit entry to `shared_component_bindings` in
-   `host/src/cs/cs_api.rs`.
+   `host/src/csharp/components.rs`.
 4. Provide the expected canonical schema used for startup validation.
 5. Add ABI layout tests.
 

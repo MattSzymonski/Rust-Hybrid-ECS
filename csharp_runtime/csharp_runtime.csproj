@@ -8,7 +8,7 @@
 
     <!-- Unmanaged function pointers, [UnmanagedCallersOnly] entry points, and
          the raw-pointer EngineApi/Engine facade all live in this project —
-         see CS_SCRIPTING_PROPOSAL.md's "Sandboxing" section for why this is
+         see csharp_features.md's "Trust and sandboxing model" section for why this is
          deliberately the *only* project in the C# path allowed to do so. -->
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 

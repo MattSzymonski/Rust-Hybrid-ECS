@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
-    <!-- Keep the nested test -> game -> runtime project chain serialized.
+    <!-- Keep the nested test -> game -> C# runtime project chain serialized.
          MSBuild can otherwise fail its project-reference traversal silently
          when this project is built with a high global node count. -->
     <BuildInParallel>false</BuildInParallel>

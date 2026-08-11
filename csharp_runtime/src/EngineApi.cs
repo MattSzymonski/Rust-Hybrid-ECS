@@ -6,7 +6,7 @@
 //
 // Design:
 // - These structs contain no behavior. Their sequential field order and sizes
-//   are part of the ABI and must change in lockstep with host/src/cs/cs_api.rs.
+//   are part of the ABI and must change in lockstep with host/src/csharp/abi.rs.
 
 using System.Runtime.InteropServices;
 

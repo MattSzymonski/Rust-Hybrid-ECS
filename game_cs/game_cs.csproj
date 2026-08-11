@@ -10,7 +10,7 @@
          edit constantly (Systems.cs) and hot-reload while the host runs —
          it must not be able to construct raw pointers, so the compiler
          itself refuses to build unsafe code here. See
-         CS_SCRIPTING_PROPOSAL.md's "Sandboxing" section. -->
+         csharp_features.md's "Trust and sandboxing model" section. -->
 
     <!-- This is a library, but the Rust host loads it via hostfxr, which
          needs a runtimeconfig.json describing the target framework. -->
@@ -20,7 +20,7 @@
   <ItemGroup>
     <!-- For Engine.cs's safe generic query facade. Game-specific component
          structs live in this reloadable project. -->
-    <ProjectReference Include="../cs_runtime/cs_runtime.csproj" />
+    <ProjectReference Include="../csharp_runtime/csharp_runtime.csproj" />
   </ItemGroup>
 
 </Project>

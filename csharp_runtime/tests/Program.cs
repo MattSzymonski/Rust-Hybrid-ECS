@@ -1,4 +1,4 @@
-// Executable regression tests for the managed ECS runtime and current C# game.
+// Executable regression tests for the C# ECS runtime and current C# game.
 //
 // Responsibilities:
 // - Verifies scheduler access derived from every supported query shape.
@@ -28,6 +28,21 @@ internal struct TestVelocity { public float X, Y; }
 internal struct TestHealth { public float Value; }
 
 [StructLayout(LayoutKind.Sequential)]
+internal struct TestComponent4 { public uint Value; }
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct TestComponent5 { public uint Value; }
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct TestComponent6 { public uint Value; }
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct TestComponent7 { public uint Value; }
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct TestComponent8 { public uint Value; }
+
+[StructLayout(LayoutKind.Sequential)]
 internal struct CommandOnlyComponent { public uint Value; }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -49,6 +64,12 @@ internal static class TestSystems
 
     public static void OptionalAndEntity(
         Query<EntityTerm, Read<TestPosition>, OptionalWrite<TestHealth>> query) { }
+
+    public static void EightTerms(
+        Query<
+            Read<TestPosition>, Write<TestVelocity>, OptionalRead<TestHealth>,
+            Write<TestComponent4>, Read<TestComponent5>, Write<TestComponent6>,
+            Read<TestComponent7>, OptionalWrite<TestComponent8>> query) { }
 
     public static void DuplicateReadWrite(
         Query<Write<TestPosition>, Read<TestPosition>> query) { }
@@ -120,7 +141,8 @@ internal static unsafe class MockNativeWorld
             return 1;
         }
         if (key == Engine.ComponentKey(typeof(TestHealth)) &&
-            keyHigh == Engine.ComponentKeyHigh(typeof(TestHealth)) && mode == 1 && Healths != null)
+            keyHigh == Engine.ComponentKeyHigh(typeof(TestHealth)) &&
+            (mode == 0 || mode == 1) && Healths != null)
         {
             *output = Chunk(Healths, HealthTicks, sizeof(TestHealth));
             return 1;
@@ -455,6 +477,66 @@ internal static class Program
                     "wrong optional write access");
             });
 
+            Test("query arities one through eight build closed descriptors", () =>
+            {
+                Type[] definitions =
+                [
+                    typeof(Query<>),
+                    typeof(Query<,>),
+                    typeof(Query<,,>),
+                    typeof(Query<,,,>),
+                    typeof(Query<,,,,>),
+                    typeof(Query<,,,,,>),
+                    typeof(Query<,,,,,,>),
+                    typeof(Query<,,,,,,,>),
+                ];
+                Type[] terms =
+                [
+                    typeof(Read<TestPosition>),
+                    typeof(Write<TestVelocity>),
+                    typeof(OptionalRead<TestHealth>),
+                    typeof(Write<TestComponent4>),
+                    typeof(Read<TestComponent5>),
+                    typeof(Write<TestComponent6>),
+                    typeof(Read<TestComponent7>),
+                    typeof(OptionalWrite<TestComponent8>),
+                ];
+                for (int arity = 1; arity <= definitions.Length; arity++)
+                {
+                    Type closed = definitions[arity - 1]
+                        .MakeGenericType(terms.Take(arity).ToArray());
+                    var query = (IQueryDescriptor)(Activator.CreateInstance(
+                        closed, nonPublic: true)
+                        ?? throw new InvalidOperationException(
+                            $"Could not instantiate query arity {arity}."));
+                    Equal(query.Descriptor.Terms.Count, arity,
+                        $"query arity {arity} descriptor term count mismatch");
+                }
+            });
+
+            Test("eight-term query exports every scheduler access in order", () =>
+            {
+                var system = GameHost.CreateSystem(Method(nameof(TestSystems.EightTerms)));
+                Type[] componentTypes =
+                [
+                    typeof(TestPosition), typeof(TestVelocity), typeof(TestHealth),
+                    typeof(TestComponent4), typeof(TestComponent5),
+                    typeof(TestComponent6), typeof(TestComponent7),
+                    typeof(TestComponent8),
+                ];
+                byte[] modes = [0, 1, 0, 1, 0, 1, 0, 1];
+                Equal(system.Accesses.Length, componentTypes.Length,
+                    "eight-term scheduler access count mismatch");
+                for (int index = 0; index < componentTypes.Length; index++)
+                {
+                    Equal(system.Accesses[index], new ManagedAccess(
+                            Engine.ComponentKey(componentTypes[index]),
+                            Engine.ComponentKeyHigh(componentTypes[index]),
+                            modes[index]),
+                        $"wrong scheduler access at term {index}");
+                }
+            });
+
             Test("query rows and enumerators are stack-only", () =>
             {
                 Assert(typeof(QueryRow).IsByRefLike, "QueryRow must remain a ref struct");
@@ -555,6 +637,87 @@ internal static class Program
                 Equal(ticks[1].Changed, 2u, "HasValue incorrectly marked the optional row");
                 MockNativeWorld.Healths = null;
                 MockNativeWorld.HealthTicks = null;
+            });
+
+            Test("optional-read-only query yields present and missing components", () =>
+            {
+                TestHealth* health = stackalloc TestHealth[1];
+                Entity* entities = stackalloc Entity[1];
+                health[0].Value = 42;
+                entities[0] = new Entity(300, 5);
+                MockNativeWorld.Healths = health;
+                MockNativeWorld.Entities = entities;
+                MockNativeWorld.Length = 1;
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+
+                var presentRows = 0;
+                foreach (var row in new Query<OptionalRead<TestHealth>>())
+                {
+                    var optional = row.OptionalRead<TestHealth>();
+                    Assert(optional.HasValue, "present optional read was not found");
+                    Equal(optional.Value.Value, 42.0f, "optional read returned the wrong value");
+                    presentRows++;
+                }
+                Equal(presentRows, 1, "optional-only query did not use the entity driver");
+
+                MockNativeWorld.Healths = null;
+                var missingRows = 0;
+                foreach (var row in new Query<OptionalRead<TestHealth>>())
+                {
+                    Assert(!row.OptionalRead<TestHealth>().HasValue,
+                        "missing optional read unexpectedly had a value");
+                    missingRows++;
+                }
+                Equal(missingRows, 1,
+                    "optional-only query skipped entities without the component");
+            });
+
+            Test("entity-only query iterates native entity chunks", () =>
+            {
+                Entity* entities = stackalloc Entity[2];
+                entities[0] = new Entity(400, 6);
+                entities[1] = new Entity(500, 7);
+                MockNativeWorld.Entities = entities;
+                MockNativeWorld.Length = 2;
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+
+                ulong idSum = 0;
+                var rows = 0;
+                foreach (var row in new Query<EntityTerm>())
+                {
+                    idSum += row.Entity.Id;
+                    rows++;
+                }
+                Equal(rows, 2, "entity-only query row count mismatch");
+                Equal(idSum, 900UL, "entity-only query returned the wrong entities");
+            });
+
+            Test("warmed typed row access performs no managed allocations", () =>
+            {
+                TestVelocity* velocities = stackalloc TestVelocity[1];
+                Entity* entities = stackalloc Entity[1];
+                velocities[0].X = 3;
+                entities[0] = new Entity(600, 8);
+                MockNativeWorld.Velocities = velocities;
+                MockNativeWorld.Entities = entities;
+                MockNativeWorld.Length = 1;
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+
+                long allocated = -1;
+                float sum = 0;
+                foreach (var row in new Query<Read<TestVelocity>>())
+                {
+                    _ = row.Read<TestVelocity>().X; // Initialize generic metadata and JIT paths.
+                    long before = GC.GetAllocatedBytesForCurrentThread();
+                    for (int iteration = 0; iteration < 1_000; iteration++)
+                        sum += row.Read<TestVelocity>().X;
+                    allocated = GC.GetAllocatedBytesForCurrentThread() - before;
+                }
+                Equal(allocated, 0L, "typed row access allocated after warm-up");
+                Equal(sum, 3_000.0f, "typed row access loop was not executed");
             });
 
             Test("compiled runner supplies its query parameter", () =>
