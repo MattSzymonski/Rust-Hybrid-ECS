@@ -11,6 +11,16 @@ cargo bench --bench <name> -- --quick  # quick check, no saved results
 cargo bench --bench <name> --no-run  # build only
 ```
 
+To run the `minimal` benchmark 10 times and write the averaged Criterion tree
+to `target/criterion/`:
+
+```bash
+python engine/run_minimal_benchmark.py
+```
+
+Individual runs use an isolated temporary directory and are deleted after a
+successful average. Pass `--keep-runs target/minimal-runs` to retain them.
+
 ## Files
 
 ### `minimal.rs`
