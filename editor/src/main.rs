@@ -11,6 +11,7 @@
 
 mod dock_view;
 mod layout;
+mod popout;
 
 use std::cell::{Cell, RefCell};
 use std::io::Write;
@@ -19,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use dioxus::desktop::tao::dpi::LogicalSize;
 use dioxus::desktop::tao::event::Event as TaoEvent;
-use dioxus::desktop::tao::window::Window;
+use dioxus::desktop::tao::window::{Window, WindowId};
 use dioxus::desktop::{use_wry_event_handler, window, Config};
 use dioxus::prelude::*;
 use futures_util::StreamExt;
@@ -29,7 +30,10 @@ use host::{
 };
 
 use dock_view::DockView;
-use layout::{compute_layout, load_or_default, LayoutMetrics, Rect};
+use layout::{
+    compute_layout, load_or_default, LayoutAction, LayoutMetrics, LayoutNode, PanelKind, Rect,
+};
+use popout::PopoutManager;
 
 /// Maximum frequency at which live host statistics invalidate the Dioxus UI.
 const STATS_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
@@ -40,6 +44,7 @@ const GAME_VIRTUAL_RESOLUTION: VirtualResolution = VirtualResolution::new(800.0,
 /// Create the Dioxus window and attach a rendering host to that same window.
 fn main() {
     let config = Config::new()
+        .with_disable_context_menu(true)
         .with_window(
             dioxus::desktop::tao::window::WindowBuilder::new()
                 .with_title("ECS Editor")
@@ -76,6 +81,7 @@ struct EditorSize {
 /// Build the editor UI and drive the host from Dioxus's native event loop.
 fn app() -> Element {
     let editor = consume_context::<Arc<EditorContext>>();
+    let popouts = use_hook(|| Arc::new(PopoutManager::default()));
     let mut stats = use_signal(Stats::default);
     let layout_model = use_signal(load_or_default);
     let initial_size = editor.logical_size();
@@ -119,6 +125,7 @@ fn app() -> Element {
     });
 
     let event_editor = Arc::clone(&editor);
+    let event_popouts = Arc::clone(&popouts);
     use_wry_event_handler(move |event, _| {
         use dioxus::desktop::tao::event::WindowEvent;
 
@@ -127,10 +134,11 @@ fn app() -> Element {
                 event: WindowEvent::Resized(size),
                 ..
             } => {
-                event_editor.resize(size.width, size.height);
+                event_editor.resize_main_window(size.width, size.height);
                 layout_size.set(event_editor.logical_size());
             }
             TaoEvent::RedrawRequested(_) => {
+                restore_detached_panels(layout_model, event_popouts.drain_redocks());
                 if let Some(frame) = event_editor.render() {
                     if let Some(report) = frame.console_report {
                         println!(
@@ -164,8 +172,60 @@ fn app() -> Element {
     );
     drop(model);
 
+    let undock_editor = Arc::clone(&editor);
+    let undock_popouts = Arc::clone(&popouts);
     rsx! {
-        DockView { model: layout_model, snapshot, stats }
+        DockView {
+            model: layout_model,
+            snapshot,
+            stats,
+            on_undock: move |panel| {
+                popout::open_panel_window(
+                    panel,
+                    Arc::clone(&undock_editor),
+                    Arc::clone(&undock_popouts),
+                );
+            }
+        }
+    }
+}
+
+/// Reinsert panels whose native pop-out windows have been closed.
+fn restore_detached_panels(mut model: Signal<layout::LayoutModel>, panels: Vec<PanelKind>) {
+    let mut changed = false;
+    for panel in panels {
+        let target_tabset = {
+            let current = model.peek();
+            if current
+                .nodes
+                .values()
+                .any(|node| matches!(node, LayoutNode::Tab(tab) if tab.panel == panel))
+            {
+                continue;
+            }
+            current
+                .active_tabset
+                .filter(|id| current.tabset(*id).is_some())
+                .or_else(|| {
+                    current
+                        .nodes
+                        .iter()
+                        .find_map(|(id, node)| matches!(node, LayoutNode::TabSet(_)).then_some(*id))
+                })
+        };
+        let Some(target_tabset) = target_tabset else {
+            continue;
+        };
+        match model.write().apply(LayoutAction::OpenTab {
+            panel,
+            target_tabset,
+        }) {
+            Ok(_) => changed = true,
+            Err(error) => eprintln!("[editor] Could not redock {panel:?}: {error}"),
+        }
+    }
+    if changed {
+        layout::save(&model.peek());
     }
 }
 
@@ -184,10 +244,12 @@ pub(crate) fn StatsWidget(stats: Signal<Stats>) -> Element {
 }
 
 /// Interior-mutable rendering host used from Dioxus's shared event callbacks.
-struct EditorContext {
+pub(crate) struct EditorContext {
     host: RefCell<RenderingHost>,
     window: Arc<Window>,
     last_stats_update: Cell<Instant>,
+    main_scene_viewport: Cell<RenderViewport>,
+    detached_scene_window: Cell<Option<WindowId>>,
 }
 
 /// Values produced while advancing one editor frame.
@@ -214,12 +276,16 @@ impl EditorContext {
             host: RefCell::new(host),
             window,
             last_stats_update: Cell::new(Instant::now()),
+            main_scene_viewport: Cell::new(RenderViewport::default()),
+            detached_scene_window: Cell::new(None),
         }
     }
 
-    /// Reconfigure the engine surface after Dioxus reports a physical resize.
-    fn resize(&self, width: u32, height: u32) {
-        self.host.borrow_mut().resize(width, height);
+    /// Reconfigure the renderer only when it currently targets the main window.
+    fn resize_main_window(&self, width: u32, height: u32) {
+        if self.detached_scene_window.get().is_none() {
+            self.host.borrow_mut().resize(width, height);
+        }
     }
 
     /// Current WebView size in the logical coordinates used by CSS.
@@ -237,7 +303,56 @@ impl EditorContext {
         let viewport = rect
             .map(|rect| logical_rect_to_physical(rect, self.window.scale_factor()))
             .unwrap_or_default();
-        self.host.borrow_mut().set_render_viewport(Some(viewport));
+        self.main_scene_viewport.set(viewport);
+        if self.detached_scene_window.get().is_none() {
+            self.host.borrow_mut().set_render_viewport(Some(viewport));
+        }
+    }
+
+    /// Move the live engine surface from the dock to a detached Scene window.
+    pub(crate) fn attach_detached_scene(&self, window: Arc<Window>) -> Result<(), String> {
+        let size = window.inner_size();
+        let window_id = window.id();
+        let mut host = self.host.borrow_mut();
+        host.retarget_render_window(window, size.width, size.height)
+            .map_err(|error| error.to_string())?;
+        host.set_render_virtual_resolution(Some(GAME_VIRTUAL_RESOLUTION));
+        host.set_render_viewport(Some(RenderViewport::full(size.width, size.height)));
+        self.detached_scene_window.set(Some(window_id));
+        Ok(())
+    }
+
+    /// Resize the detached renderer without accepting events from stale windows.
+    pub(crate) fn resize_detached_scene(&self, window_id: WindowId, width: u32, height: u32) {
+        if self.detached_scene_window.get() == Some(window_id) {
+            let mut host = self.host.borrow_mut();
+            host.resize(width, height);
+            host.set_render_viewport(Some(RenderViewport::full(width, height)));
+        }
+    }
+
+    /// Return the live Scene renderer to the main editor window.
+    pub(crate) fn reattach_main_scene(&self, detached_window: WindowId) -> Result<(), String> {
+        if self.detached_scene_window.get() != Some(detached_window) {
+            return Ok(());
+        }
+        let size = self.window.inner_size();
+        let mut host = self.host.borrow_mut();
+        host.retarget_render_window(Arc::clone(&self.window), size.width, size.height)
+            .map_err(|error| error.to_string())?;
+        host.set_render_virtual_resolution(Some(GAME_VIRTUAL_RESOLUTION));
+        host.set_render_viewport(Some(self.main_scene_viewport.get()));
+        self.detached_scene_window.set(None);
+        Ok(())
+    }
+
+    /// Snapshot engine statistics for a detached panel's isolated VirtualDom.
+    pub(crate) fn current_stats(&self) -> Stats {
+        let report = self.host.borrow().current_frame_report();
+        Stats {
+            fps: report.fps,
+            entity_count: report.entity_count,
+        }
     }
 
     /// Advance the ECS and present one frame on Dioxus's redraw event.

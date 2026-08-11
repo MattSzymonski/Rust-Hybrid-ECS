@@ -129,6 +129,23 @@ fn apply_in_place(model: &mut LayoutModel, action: LayoutAction) -> Result<bool,
             model.nodes.remove(&tab);
             Ok(true)
         }
+        LayoutAction::DetachTab { tab } => {
+            if model
+                .nodes
+                .values()
+                .filter(|node| matches!(node, LayoutNode::Tab(_)))
+                .count()
+                <= 1
+            {
+                return Err(LayoutError::WouldEmptyLayout);
+            }
+            if model.tab(tab).is_none() {
+                return Err(LayoutError::WrongNodeKind(tab));
+            }
+            remove_tab(model, tab)?;
+            model.nodes.remove(&tab);
+            Ok(true)
+        }
         LayoutAction::OpenTab {
             panel,
             target_tabset,
@@ -506,6 +523,41 @@ mod tests {
             .values()
             .all(|node| !matches!(node, LayoutNode::Tab(tab) if tab.panel == PanelKind::Console)));
         model.validate().unwrap();
+    }
+
+    /// Detaching is structural removal and is allowed for the non-closeable Scene tab.
+    #[test]
+    fn detaching_scene_removes_it_and_preserves_a_valid_layout() {
+        let mut model = LayoutModel::default_editor();
+        let scene = tab_for(&model, PanelKind::Scene);
+
+        model.apply(LayoutAction::DetachTab { tab: scene }).unwrap();
+
+        assert!(model.tab(scene).is_none());
+        assert!(model.validate().is_ok());
+    }
+
+    /// A pop-out cannot consume the final dock node because the root must remain valid.
+    #[test]
+    fn detaching_the_last_tab_is_rejected_atomically() {
+        let mut model = LayoutModel::default_editor();
+        for panel in [
+            PanelKind::Hierarchy,
+            PanelKind::Inspector,
+            PanelKind::Console,
+            PanelKind::Statistics,
+        ] {
+            let tab = tab_for(&model, panel);
+            model.apply(LayoutAction::DetachTab { tab }).unwrap();
+        }
+        let before = model.clone();
+        let scene = tab_for(&model, PanelKind::Scene);
+
+        assert_eq!(
+            model.apply(LayoutAction::DetachTab { tab: scene }),
+            Err(LayoutError::WouldEmptyLayout)
+        );
+        assert_eq!(model, before);
     }
 
     #[test]

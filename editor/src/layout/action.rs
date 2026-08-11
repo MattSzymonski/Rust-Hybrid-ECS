@@ -39,6 +39,9 @@ pub enum LayoutAction {
     CloseTab {
         tab: NodeId,
     },
+    DetachTab {
+        tab: NodeId,
+    },
     OpenTab {
         panel: PanelKind,
         target_tabset: NodeId,

@@ -31,6 +31,8 @@ The core dock model and an interactive editor version are implemented:
 - [x] Tab reordering and movement between tabsets.
 - [x] Center and four-edge docking relative to tabsets, with live previews.
 - [x] Geometry-driven Scene viewport alignment and clipping.
+- [x] Native panel pop-out windows with close-to-redock behavior and live Scene
+  renderer surface handoff.
 - [x] Versioned layout persistence with invalid-file recovery.
 - [x] Initial tab/separator ARIA roles and arrow-key navigation.
 - [x] Model, reducer, geometry, and persistence unit tests.
@@ -565,7 +567,7 @@ and all acceptance tests pass.
 
 These FlexLayout features should not delay the first complete docking workflow:
 
-- Native popout windows and multi-monitor restoration.
+- Persisted pop-out placement and multi-monitor restoration.
 - Floating panels.
 - Border tabsets and overlay borders.
 - Nested independent submodels.

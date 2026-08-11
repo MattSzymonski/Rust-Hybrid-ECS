@@ -8,7 +8,7 @@ use crate::layout::{
 };
 use crate::{Stats, StatsWidget};
 
-const DOCK_CSS: &str = include_str!("../assets/dock_layout.css");
+pub(crate) const DOCK_CSS: &str = include_str!("../assets/dock_layout.css");
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PointerDrag {
@@ -55,6 +55,7 @@ pub fn DockView(
     mut model: Signal<LayoutModel>,
     snapshot: LayoutSnapshot,
     stats: Signal<Stats>,
+    on_undock: EventHandler<PanelKind>,
 ) -> Element {
     let mut drag = use_signal(|| None::<PointerDrag>);
     let mut context_menu = use_signal(|| None::<(f64, f64)>);
@@ -321,6 +322,32 @@ pub fn DockView(
                                                         });
                                                     },
                                                     span { "{tab.title}" }
+                                                    {
+                                                        let detach_tab = *tab_id;
+                                                        let detach_panel = tab.panel;
+                                                        rsx! {
+                                                            span {
+                                                                class: "dock-undock",
+                                                                role: "button",
+                                                                aria_label: "Open tab in a separate window",
+                                                                title: "Open in new window",
+                                                                onpointerdown: move |event| {
+                                                                    event.stop_propagation();
+                                                                },
+                                                                onclick: move |event| {
+                                                                    event.stop_propagation();
+                                                                    if apply_layout_action(
+                                                                        model,
+                                                                        LayoutAction::DetachTab { tab: detach_tab },
+                                                                        false,
+                                                                    ) {
+                                                                        on_undock.call(detach_panel);
+                                                                    }
+                                                                },
+                                                                "↗"
+                                                            }
+                                                        }
+                                                    }
                                                     if tab.closeable {
                                                         {
                                                             let close_tab = *tab_id;
@@ -496,7 +523,7 @@ pub fn DockView(
 
 /// Instantiate editor content from its durable panel identity.
 #[component]
-fn PanelContent(panel: PanelKind, stats: Signal<Stats>) -> Element {
+pub(crate) fn PanelContent(panel: PanelKind, stats: Signal<Stats>) -> Element {
     match panel {
         PanelKind::Scene => rsx! { ViewportFps { stats } },
         PanelKind::Statistics => rsx! { StatsWidget { stats } },
@@ -566,14 +593,24 @@ fn active_drop_at(snapshot: &LayoutSnapshot, x: f64, y: f64) -> Option<ActiveDro
     snapshot.drop_target_at(x, y).map(ActiveDrop::Dock)
 }
 
-fn apply_layout_action(mut model: Signal<LayoutModel>, action: LayoutAction, persist: bool) {
+fn apply_layout_action(
+    mut model: Signal<LayoutModel>,
+    action: LayoutAction,
+    persist: bool,
+) -> bool {
     let result = {
         let mut model_value = model.write();
         model_value.apply(action)
     };
     match result {
-        Ok(_) if persist => crate::layout::save(&model.peek()),
-        Ok(_) => {}
-        Err(error) => eprintln!("[editor] Dock action rejected: {error}"),
+        Ok(_) if persist => {
+            crate::layout::save(&model.peek());
+            true
+        }
+        Ok(_) => true,
+        Err(error) => {
+            eprintln!("[editor] Dock action rejected: {error}");
+            false
+        }
     }
 }

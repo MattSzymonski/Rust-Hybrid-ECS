@@ -75,6 +75,25 @@ pub struct RenderingHost {
 
 #[cfg(feature = "rendering")]
 impl RenderingHost {
+    /// Move rendering to a newly created native window surface.
+    ///
+    /// The existing ECS host and game module remain alive. A replacement is
+    /// constructed before the old renderer is dropped, so initialization
+    /// failure leaves the current surface untouched.
+    pub fn retarget_render_window<W>(
+        &mut self,
+        window: W,
+        width: u32,
+        height: u32,
+    ) -> Result<(), RendererError>
+    where
+        W: RendererWindow + 'static,
+    {
+        let renderer = Renderer::new(window, width, height)?;
+        self.renderer = renderer;
+        Ok(())
+    }
+
     /// Forward a physical window resize to the engine renderer.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.renderer.resize(width, height);
