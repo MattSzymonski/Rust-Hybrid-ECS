@@ -21,7 +21,6 @@ use wgpu::util::DeviceExt;
 
 // Current crate
 use crate::component::Component;
-use crate::query::Query;
 use crate::world::World;
 
 // =============================================================================
@@ -294,22 +293,7 @@ impl SpriteRenderer {
         viewport_width: u32,
         viewport_height: u32,
     ) {
-        let instances: Vec<SpriteInstance> = {
-            let mut query = Query::<(&Position, &Sprite)>::new(world);
-            query
-                .iter_mut()
-                .map(|(position, sprite)| SpriteInstance {
-                    position: [position.x, position.y],
-                    size: [sprite.width, sprite.height],
-                    color: [
-                        sprite.color.r,
-                        sprite.color.g,
-                        sprite.color.b,
-                        sprite.color.a,
-                    ],
-                })
-                .collect()
-        };
+        let instances = collect_sprite_instances(world);
 
         queue.write_buffer(
             &self.viewport_buffer,
@@ -365,5 +349,160 @@ impl SpriteRenderer {
         }
 
         queue.submit(Some(encoder.finish()));
+    }
+}
+
+/// Collect renderer components across the native game-module ABI boundary.
+///
+/// A hot-loaded Rust game and the host executable can assign different
+/// `TypeId` values to the same `ecs_hybrid` type. Renderer components are a
+/// deliberately shared ABI, so resolve their columns by stable type name and
+/// verify their C layouts instead of issuing a host-typed ECS query.
+fn collect_sprite_instances(world: &World) -> Vec<SpriteInstance> {
+    collect_sprite_instances_named(
+        world,
+        std::any::type_name::<Position>(),
+        std::any::type_name::<Sprite>(),
+    )
+}
+
+/// Type-erased implementation separated from the public renderer names so its
+/// cross-`TypeId` behavior can be covered by an ordinary unit test.
+fn collect_sprite_instances_named(
+    world: &World,
+    position_name: &str,
+    sprite_name: &str,
+) -> Vec<SpriteInstance> {
+    let registry = &world.component_registry;
+    let mut instances = Vec::new();
+
+    for archetype in world.archetypes.values() {
+        // Resolve each column among the components actually present in this
+        // archetype. This also supports entities retained from older DLL
+        // generations whose component IDs differ from the current module.
+        let position_id = archetype.component_types.iter().copied().find(|id| {
+            registry.get_name(id) == Some(position_name)
+                && registry.get_size(id) == Some(std::mem::size_of::<Position>())
+        });
+        let sprite_id = archetype.component_types.iter().copied().find(|id| {
+            registry.get_name(id) == Some(sprite_name)
+                && registry.get_size(id) == Some(std::mem::size_of::<Sprite>())
+        });
+        let (Some(position_id), Some(sprite_id)) = (position_id, sprite_id) else {
+            continue;
+        };
+        let (Some(position_type_id), Some(sprite_type_id)) =
+            (position_id.native_type_id(), sprite_id.native_type_id())
+        else {
+            continue;
+        };
+        let Some(position_storage) = archetype
+            .component_storages
+            .get_trait_storage(position_type_id)
+        else {
+            continue;
+        };
+        let Some(sprite_storage) = archetype
+            .component_storages
+            .get_trait_storage(sprite_type_id)
+        else {
+            continue;
+        };
+
+        // Both shared types are repr(C), Copy, and size-checked above. Reading
+        // from the data pointer of the type-erased trait reference therefore
+        // remains valid even when its Rust TypeId originated in another DLL.
+        let row_count = archetype
+            .entity_count()
+            .min(position_storage.len())
+            .min(sprite_storage.len());
+        for row in 0..row_count {
+            let position = unsafe { read_shared_component::<Position>(position_storage.get(row)) };
+            let sprite = unsafe { read_shared_component::<Sprite>(sprite_storage.get(row)) };
+            instances.push(SpriteInstance {
+                position: [position.x, position.y],
+                size: [sprite.width, sprite.height],
+                color: [
+                    sprite.color.r,
+                    sprite.color.g,
+                    sprite.color.b,
+                    sprite.color.a,
+                ],
+            });
+        }
+    }
+
+    instances
+}
+
+/// Copy one layout-validated shared component out of type-erased storage.
+///
+/// # Safety
+///
+/// `component` must point to a value with the same `repr(C)` layout and size
+/// as `T`. Callers establish this through the shared component name and size.
+unsafe fn read_shared_component<T: Copy>(component: &dyn Component) -> T {
+    let data = component as *const dyn Component as *const T;
+    // SAFETY: Guaranteed by the caller. `read_unaligned` also avoids relying
+    // on alignment information that is not present in ComponentRegistry.
+    unsafe { data.read_unaligned() }
+}
+
+#[cfg(test)]
+mod shared_component_tests {
+    use super::*;
+    use trait_type_map::impl_trait_accessible;
+
+    /// Layout-compatible stand-in with a different TypeId than Position.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ForeignPosition {
+        x: f32,
+        y: f32,
+    }
+
+    impl Component for ForeignPosition {}
+    impl_trait_accessible!(dyn Component; ForeignPosition);
+
+    /// Layout-compatible stand-in with a different TypeId than Sprite.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct ForeignSprite {
+        width: f32,
+        height: f32,
+        color: Color,
+    }
+
+    impl Component for ForeignSprite {}
+    impl_trait_accessible!(dyn Component; ForeignSprite);
+
+    /// Shared renderer layouts can be read even when their native TypeIds
+    /// originate from a different compilation unit.
+    #[test]
+    fn collects_layout_compatible_components_with_foreign_type_ids() {
+        let mut world = World::new();
+        world.register_component::<ForeignPosition>();
+        world.register_component::<ForeignSprite>();
+        world
+            .create_entity()
+            .with(ForeignPosition { x: 12.0, y: 34.0 })
+            .with(ForeignSprite {
+                width: 56.0,
+                height: 78.0,
+                color: Color::new(0.1, 0.2, 0.3, 0.4),
+            })
+            .build()
+            .unwrap();
+
+        let instances = collect_sprite_instances_named(
+            &world,
+            std::any::type_name::<ForeignPosition>(),
+            std::any::type_name::<ForeignSprite>(),
+        );
+
+        assert_eq!(instances.len(), 1);
+        assert_eq!(instances[0].position, [12.0, 34.0]);
+        assert_eq!(instances[0].size, [56.0, 78.0]);
+        assert_eq!(instances[0].color, [0.1, 0.2, 0.3, 0.4]);
     }
 }

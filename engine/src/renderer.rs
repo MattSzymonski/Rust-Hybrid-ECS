@@ -75,10 +75,7 @@ impl Renderer {
             .first()
             .copied()
             .ok_or_else(|| RendererError::message("GPU surface exposes no texture formats"))?;
-        let alpha_mode = capabilities
-            .alpha_modes
-            .first()
-            .copied()
+        let alpha_mode = select_alpha_mode(&capabilities.alpha_modes)
             .ok_or_else(|| RendererError::message("GPU surface exposes no alpha modes"))?;
         let present_mode = select_present_mode(&capabilities.present_modes);
         println!("[render] Present mode: {present_mode:?}");
@@ -175,6 +172,25 @@ fn select_present_mode(supported: &[wgpu::PresentMode]) -> wgpu::PresentMode {
     }
 }
 
+/// Prefer an alpha-composited surface for transparent UI overlays.
+///
+/// Standalone windows remain opaque at the platform window level, while
+/// Dioxus can opt its window into transparency and reveal this same surface
+/// beneath the webview layer.
+fn select_alpha_mode(supported: &[wgpu::CompositeAlphaMode]) -> Option<wgpu::CompositeAlphaMode> {
+    supported
+        .iter()
+        .copied()
+        .find(|mode| *mode == wgpu::CompositeAlphaMode::PostMultiplied)
+        .or_else(|| {
+            supported
+                .iter()
+                .copied()
+                .find(|mode| *mode == wgpu::CompositeAlphaMode::PreMultiplied)
+        })
+        .or_else(|| supported.first().copied())
+}
+
 /// Rendering initialization or presentation failure without exposed wgpu types.
 #[derive(Debug)]
 pub struct RendererError {
@@ -231,6 +247,29 @@ mod tests {
         assert_eq!(
             select_present_mode(&[wgpu::PresentMode::Fifo]),
             wgpu::PresentMode::AutoNoVsync
+        );
+    }
+
+    /// Transparent UI hosts prefer an explicitly composited alpha mode.
+    #[test]
+    fn alpha_mode_prefers_composited_surface() {
+        let supported = [
+            wgpu::CompositeAlphaMode::Opaque,
+            wgpu::CompositeAlphaMode::PreMultiplied,
+            wgpu::CompositeAlphaMode::PostMultiplied,
+        ];
+        assert_eq!(
+            select_alpha_mode(&supported),
+            Some(wgpu::CompositeAlphaMode::PostMultiplied)
+        );
+    }
+
+    /// Platforms without composited modes retain their first supported mode.
+    #[test]
+    fn alpha_mode_falls_back_to_first_supported_mode() {
+        assert_eq!(
+            select_alpha_mode(&[wgpu::CompositeAlphaMode::Opaque]),
+            Some(wgpu::CompositeAlphaMode::Opaque)
         );
     }
 }

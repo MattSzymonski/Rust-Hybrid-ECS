@@ -1,28 +1,24 @@
-//! Editor — a Dioxus desktop app with a live game viewport and details panel.
+//! Dioxus editor with a live engine-rendered game viewport.
 //!
 //! # Design
 //!
-//! Dioxus owns the single native window (`with_as_child_window()` +
-//! `with_transparent(true)`), following the pattern in dioxus's own
-//! `examples/08-apis/wgpu_child_window.rs`. A `wgpu` surface is created
-//! against that same window and draws the running game's sprites; the
-//! transparent HTML overlay on top shows FPS and entity count.
-//!
-//! The engine and game DLL hot-reload loop live in the shared [`host`]
-//! crate. Each redraw runs one engine frame ([`host::run_one_frame`]) then
-//! renders it, so the viewport, engine simulation, and UI panel all advance
-//! together on Dioxus's own event loop - there is no separate render thread.
+//! Dioxus owns the native window and its event loop. During window creation,
+//! the editor passes an `Arc` clone of Dioxus's Tao window to
+//! [`host::setup_rendering`]. The engine creates one GPU surface for that
+//! window, while [`host::RenderingHost`] owns both engine and renderer state.
+//! The editor only forwards resize and redraw events and draws its transparent
+//! HTML diagnostics above the rendered game.
 
 use std::cell::RefCell;
 use std::sync::Arc;
 
-use dioxus::desktop::tao::event::Event as WryEvent;
+use dioxus::desktop::tao::event::Event as TaoEvent;
 use dioxus::desktop::tao::window::Window;
-use dioxus::desktop::{use_wry_event_handler, window, Config};
+use dioxus::desktop::{use_wry_event_handler, Config};
 use dioxus::prelude::*;
-use ecs_hybrid::SpriteRenderer;
-use host::{run_one_frame, setup, GameModuleConfig, Host};
+use host::{setup_rendering, FrameReport, GameModuleConfig, RenderingHost};
 
+/// Create the Dioxus window and attach a rendering host to that same window.
 fn main() {
     let config = Config::new()
         .with_window(
@@ -31,17 +27,9 @@ fn main() {
                 .with_transparent(true),
         )
         .with_on_window(|window, dom| {
-            let context = Arc::new(pollster::block_on(async {
-                let context = EditorContextAsyncBuilder {
-                    desktop: window,
-                    resources_builder: |ctx| Box::pin(EditorResources::new(ctx.clone())),
-                }
-                .build()
-                .await;
-
-                context
-            }));
-
+            // Dioxus retains event-loop ownership. The cloned Arc is passed to
+            // the engine only so wgpu can keep the native surface alive.
+            let context = Arc::new(EditorContext::new(window));
             dom.provide_root_context(context);
         })
         .with_as_child_window();
@@ -51,53 +39,41 @@ fn main() {
         .launch(app);
 }
 
-/// Live stats read by the details panel. Updated once per rendered frame.
+/// Live statistics displayed by the transparent Dioxus overlay.
 #[derive(Debug, Clone, Copy, Default)]
 struct Stats {
     fps: f64,
     entity_count: usize,
 }
 
+/// Build the editor UI and drive the host from Dioxus's native event loop.
 fn app() -> Element {
-    let editor_context = consume_context::<Arc<EditorContext>>();
+    let editor = consume_context::<Arc<EditorContext>>();
     let mut stats = use_signal(Stats::default);
-
-    // Kick off the render loop with an initial redraw request; each
-    // RedrawRequested we process one engine frame, render it, and request
-    // the next redraw, so the loop keeps going on its own.
-    use_effect(move || {
-        window().window.request_redraw();
-    });
 
     use_wry_event_handler(move |event, _| {
         use dioxus::desktop::tao::event::WindowEvent;
 
         match event {
-            WryEvent::WindowEvent {
-                event: WindowEvent::Resized(new_size),
+            TaoEvent::WindowEvent {
+                event: WindowEvent::Resized(size),
                 ..
             } => {
-                editor_context.with_resources(|resources| {
-                    resources.resize(new_size.width, new_size.height);
-                });
-                window().window.request_redraw();
+                editor.resize(size.width, size.height);
             }
-            WryEvent::RedrawRequested(_) => {
-                let report = editor_context.with_resources(|resources| resources.render());
-                if let Some(report) = report {
+            TaoEvent::RedrawRequested(_) => {
+                if let Some(report) = editor.render() {
                     stats.set(Stats {
                         fps: report.fps,
                         entity_count: report.entity_count,
                     });
                 }
-                window().window.request_redraw();
             }
             _ => {}
         }
     });
 
     let stats = stats.read();
-
     rsx! {
         div {
             width: "100vw",
@@ -120,141 +96,52 @@ fn app() -> Element {
     }
 }
 
-/// This borrows from the `window` which is contained within an `Arc`, so it
-/// needs to be a self-referencing struct to be able to borrow the window for
-/// the wgpu::Surface.
-#[ouroboros::self_referencing]
+/// Interior-mutable rendering host used from Dioxus's shared event callbacks.
 struct EditorContext {
-    desktop: Arc<Window>,
-    #[borrows(desktop)]
-    #[not_covariant]
-    resources: EditorResources<'this>,
+    host: RefCell<RenderingHost>,
 }
 
-/// GPU + engine state, borrowing the Dioxus-owned window for the wgpu surface.
-///
-/// Mutable fields are wrapped in `RefCell` because `resize()`/`render()` are
-/// called through a shared `&self` borrow (ouroboros only exposes
-/// `with_resources` with a shared reference to the borrowing struct).
-struct EditorResources<'a> {
-    surface: wgpu::Surface<'a>,
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    surface_config: RefCell<wgpu::SurfaceConfiguration>,
-    sprite_renderer: RefCell<SpriteRenderer>,
-    host: RefCell<Host>,
-}
-
-impl<'a> EditorResources<'a> {
-    async fn new(window: Arc<Window>) -> Self {
+impl EditorContext {
+    /// Create one engine renderer surface from the Dioxus/Tao window handle.
+    fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
+        let host = setup_rendering(
+            GameModuleConfig::from_environment(),
+            Arc::clone(&window),
+            size.width,
+            size.height,
+        )
+        .expect("editor rendering host setup failed");
 
-        let instance = wgpu::Instance::default();
-        let surface: wgpu::Surface<'a> = instance.create_surface(window).unwrap();
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
-                force_fallback_adapter: false,
-                compatible_surface: Some(&surface),
-            })
-            .await
-            .expect("failed to find a suitable GPU adapter");
-
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: None,
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                    .using_resolution(adapter.limits()),
-                memory_hints: wgpu::MemoryHints::default(),
-                ..Default::default()
-            })
-            .await
-            .expect("failed to create GPU device");
-
-        let capabilities = surface.get_capabilities(&adapter);
-        let surface_format = capabilities.formats[0];
-
-        let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: surface_format,
-            width: size.width.max(1),
-            height: size.height.max(1),
-            present_mode: wgpu::PresentMode::Fifo,
-            desired_maximum_frame_latency: 2,
-            // Prefer a blending alpha mode so the wgpu-rendered viewport
-            // shows through wherever the Dioxus overlay is transparent
-            // HTML; not every backend (notably DX12 on Windows) supports
-            // one, so fall back to whatever the surface actually reports.
-            alpha_mode: capabilities
-                .alpha_modes
-                .iter()
-                .copied()
-                .find(|mode| {
-                    matches!(
-                        mode,
-                        wgpu::CompositeAlphaMode::PostMultiplied
-                            | wgpu::CompositeAlphaMode::PreMultiplied
-                    )
-                })
-                .unwrap_or(capabilities.alpha_modes[0]),
-            view_formats: vec![],
-        };
-        surface.configure(&device, &surface_config);
-
-        let sprite_renderer = SpriteRenderer::new(&device, surface_format);
-
-        let host = setup(GameModuleConfig::from_environment()).expect("host setup failed");
+        // Dioxus resets Tao to ControlFlow::Wait after each event. Let the
+        // host asynchronously wake that loop after every presented frame so
+        // redraw requests cannot be coalesced inside RedrawRequested.
+        let weak_window = Arc::downgrade(&window);
+        let mut host = host;
+        host.start_continuous_rendering(move || {
+            if let Some(window) = weak_window.upgrade() {
+                window.request_redraw();
+            }
+        });
 
         Self {
-            surface,
-            device,
-            queue,
-            surface_config: RefCell::new(surface_config),
-            sprite_renderer: RefCell::new(sprite_renderer),
             host: RefCell::new(host),
         }
     }
 
+    /// Reconfigure the engine surface after Dioxus reports a physical resize.
     fn resize(&self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
-        }
-        let mut surface_config = self.surface_config.borrow_mut();
-        surface_config.width = width;
-        surface_config.height = height;
-        self.surface.configure(&self.device, &surface_config);
+        self.host.borrow_mut().resize(width, height);
     }
 
-    /// Run one engine frame and draw it. Returns a fresh [`host::FrameReport`]
-    /// when one was due this frame (roughly every 2 seconds).
-    fn render(&self) -> Option<host::FrameReport> {
-        let mut host = self.host.borrow_mut();
-        let report = run_one_frame(&mut host);
-
-        let surface_config = self.surface_config.borrow();
-        let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(_) => {
-                self.surface.configure(&self.device, &surface_config);
-                return report;
+    /// Advance the ECS and present one frame on Dioxus's redraw event.
+    fn render(&self) -> Option<FrameReport> {
+        match self.host.borrow_mut().run_one_frame() {
+            Ok(report) => report,
+            Err(error) => {
+                eprintln!("[editor] Fatal renderer error: {error}");
+                None
             }
-        };
-        let view = frame
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-
-        self.sprite_renderer.borrow_mut().render(
-            host.engine_mut().world_mut(),
-            &self.device,
-            &self.queue,
-            &view,
-            surface_config.width,
-            surface_config.height,
-        );
-
-        frame.present();
-        report
+        }
     }
 }

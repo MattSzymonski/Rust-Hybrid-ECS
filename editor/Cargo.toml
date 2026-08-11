@@ -4,9 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ecs_hybrid = { path = "../engine", features = ["rendering"] }
 host = { path = "../host", features = ["rendering"] }
 dioxus = { version = "0.7", features = ["desktop"] }
-wgpu = "26.0.1"
-pollster = "0.4"
-ouroboros = "0.18"

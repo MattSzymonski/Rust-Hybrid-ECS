@@ -5,10 +5,14 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(feature = "rendering")]
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::Instant;
 
 use ecs_hybrid::{Engine, EngineApi};
+#[cfg(feature = "rendering")]
+use ecs_hybrid::{Renderer, RendererError, RendererWindow};
 
 use crate::game_module::LoadedGame;
 use crate::native_library::cleanup_temporary_files;
@@ -41,6 +45,101 @@ impl Host {
     /// Mutable engine access for frontend-owned ad-hoc work.
     pub fn engine_mut(&mut self) -> &mut Engine {
         &mut self.engine
+    }
+}
+
+/// Host state with the engine renderer attached to one native window surface.
+///
+/// Keeping the renderer beside [`Host`] makes its creation and lifetime part
+/// of host setup. Executable crates never construct or retain GPU resources.
+#[cfg(feature = "rendering")]
+pub struct RenderingHost {
+    host: Host,
+    renderer: Renderer,
+    redraw_pump: Option<RedrawPump>,
+}
+
+#[cfg(feature = "rendering")]
+impl RenderingHost {
+    /// Install an asynchronous request callback for continuous rendering.
+    ///
+    /// Some UI frameworks force their event loop into a waiting state and
+    /// coalesce redraws requested from inside a redraw handler. The pump calls
+    /// `request_redraw` from a helper thread after every presented frame,
+    /// waking that event loop without moving engine or GPU work off its owner
+    /// thread. At most one request can be pending.
+    pub fn start_continuous_rendering(&mut self, request_redraw: impl Fn() + Send + 'static) {
+        self.redraw_pump = Some(RedrawPump::new(request_redraw));
+        self.request_next_frame();
+    }
+
+    /// Request one frame through the installed continuous redraw pump.
+    pub fn request_next_frame(&self) {
+        if let Some(pump) = &self.redraw_pump {
+            pump.request();
+        }
+    }
+
+    /// Forward a physical window resize to the engine renderer.
+    pub fn resize(&mut self, width: u32, height: u32) {
+        self.renderer.resize(width, height);
+    }
+
+    /// Execute one ECS frame and present its resulting world to the surface.
+    pub fn run_one_frame(&mut self) -> Result<Option<FrameReport>, RendererError> {
+        let report = run_one_frame(&mut self.host);
+        self.renderer.render(self.host.engine_mut())?;
+        self.request_next_frame();
+        Ok(report)
+    }
+}
+
+/// Single-slot bridge that wakes a waiting platform event loop once per frame.
+#[cfg(feature = "rendering")]
+struct RedrawPump {
+    sender: Option<SyncSender<()>>,
+}
+
+#[cfg(feature = "rendering")]
+impl RedrawPump {
+    /// Start a helper that translates frame completions into redraw requests.
+    fn new(request_redraw: impl Fn() + Send + 'static) -> Self {
+        let (sender, receiver) = sync_channel(1);
+        std::thread::Builder::new()
+            .name("ecs-redraw-pump".into())
+            .spawn(move || {
+                while receiver.recv().is_ok() {
+                    request_redraw();
+                }
+            })
+            .expect("failed to start redraw pump");
+        Self {
+            sender: Some(sender),
+        }
+    }
+
+    /// Queue a redraw unless one is already waiting to be delivered.
+    fn request(&self) {
+        let Some(sender) = &self.sender else {
+            return;
+        };
+        match sender.try_send(()) {
+            Ok(()) | Err(TrySendError::Full(())) => {}
+            Err(TrySendError::Disconnected(())) => {
+                eprintln!("[render] Continuous redraw pump stopped unexpectedly");
+            }
+        }
+    }
+}
+
+#[cfg(feature = "rendering")]
+impl Drop for RedrawPump {
+    /// Disconnect the helper without blocking the platform event-loop thread.
+    fn drop(&mut self) {
+        // The worker captures only its callback, which should hold a Weak
+        // window handle. Disconnecting lets it exit after any in-flight
+        // request without risking a join/request_redraw shutdown deadlock.
+        self.sender.take();
     }
 }
 
@@ -91,6 +190,30 @@ pub fn setup(module_config: GameModuleConfig) -> Result<Host, Box<dyn std::error
         reload_flag,
         frame_count: 0,
         last_report: Instant::now(),
+    })
+}
+
+/// Set up the engine, game module, hot reload, and renderer together.
+///
+/// A frontend owns its platform event loop and supplies its cloneable window
+/// handle. The engine creates exactly one surface for that window, while the
+/// returned [`RenderingHost`] owns the renderer for the rest of its lifetime.
+#[cfg(feature = "rendering")]
+pub fn setup_rendering<W>(
+    module_config: GameModuleConfig,
+    window: W,
+    width: u32,
+    height: u32,
+) -> Result<RenderingHost, Box<dyn std::error::Error>>
+where
+    W: RendererWindow + 'static,
+{
+    let host = setup(module_config)?;
+    let renderer = Renderer::new(window, width, height)?;
+    Ok(RenderingHost {
+        host,
+        renderer,
+        redraw_pump: None,
     })
 }
 
