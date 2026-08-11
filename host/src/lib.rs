@@ -28,7 +28,7 @@ mod watcher;
 
 pub use config::{CSharpModuleConfig, GameModuleBackend, GameModuleConfig};
 #[cfg(feature = "rendering")]
-pub use ecs_hybrid::RenderViewport;
+pub use ecs_hybrid::{RenderViewport, VirtualResolution};
 pub use runner::run;
 pub use runtime::{run_one_frame, setup, FrameReport, Host};
 #[cfg(feature = "rendering")]

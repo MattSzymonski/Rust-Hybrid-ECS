@@ -127,6 +127,31 @@ impl RenderViewport {
     }
 }
 
+/// Logical coordinate space mapped into a physical [`RenderViewport`].
+///
+/// Keeping this separate from the swapchain dimensions lets an embedded game
+/// keep a stable coordinate system while its dock panel is resized. The GPU
+/// viewport performs the final scaling into the panel rectangle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VirtualResolution {
+    /// Horizontal extent of the game coordinate space.
+    pub width: f32,
+    /// Vertical extent of the game coordinate space.
+    pub height: f32,
+}
+
+impl VirtualResolution {
+    /// Construct a logical scene resolution.
+    pub const fn new(width: f32, height: f32) -> Self {
+        Self { width, height }
+    }
+
+    /// Return whether both dimensions can safely be used by the projection.
+    pub fn is_valid(self) -> bool {
+        self.width.is_finite() && self.height.is_finite() && self.width > 0.0 && self.height > 0.0
+    }
+}
+
 // =============================================================================
 // GPU instance data
 // =============================================================================
@@ -355,14 +380,39 @@ impl SpriteRenderer {
         view: &wgpu::TextureView,
         viewport: RenderViewport,
     ) {
+        self.render_in_viewport_with_resolution(
+            world,
+            device,
+            queue,
+            view,
+            viewport,
+            VirtualResolution::new(viewport.width.max(1) as f32, viewport.height.max(1) as f32),
+        );
+    }
+
+    /// Draw sprites in a physical viewport using a stable logical resolution.
+    ///
+    /// Sprite positions and sizes are interpreted in `virtual_resolution`.
+    /// wgpu then scales that complete coordinate space to fill `viewport`, and
+    /// the scissor rectangle prevents pixels from escaping the dock panel.
+    pub fn render_in_viewport_with_resolution(
+        &mut self,
+        world: &mut World,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        viewport: RenderViewport,
+        virtual_resolution: VirtualResolution,
+    ) {
+        debug_assert!(virtual_resolution.is_valid());
         let instances = collect_sprite_instances(world);
 
         queue.write_buffer(
             &self.viewport_buffer,
             0,
             bytemuck::bytes_of(&ViewportUniform {
-                width: viewport.width.max(1) as f32,
-                height: viewport.height.max(1) as f32,
+                width: virtual_resolution.width,
+                height: virtual_resolution.height,
                 _padding: [0.0, 0.0],
             }),
         );
@@ -580,5 +630,14 @@ mod shared_component_tests {
         assert_eq!(instances[0].position, [12.0, 34.0]);
         assert_eq!(instances[0].size, [56.0, 78.0]);
         assert_eq!(instances[0].color, [0.1, 0.2, 0.3, 0.4]);
+    }
+
+    /// Projection dimensions must be finite and strictly positive.
+    #[test]
+    fn virtual_resolution_rejects_invalid_projection_dimensions() {
+        assert!(VirtualResolution::new(800.0, 600.0).is_valid());
+        assert!(!VirtualResolution::new(0.0, 600.0).is_valid());
+        assert!(!VirtualResolution::new(800.0, f32::NAN).is_valid());
+        assert!(!VirtualResolution::new(f32::INFINITY, 600.0).is_valid());
     }
 }

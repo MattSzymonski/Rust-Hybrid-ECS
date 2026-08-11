@@ -18,7 +18,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use crate::engine::Engine;
-use crate::render::{RenderViewport, SpriteRenderer};
+use crate::render::{RenderViewport, SpriteRenderer, VirtualResolution};
 
 /// Window-handle capability accepted by the engine renderer.
 ///
@@ -36,6 +36,7 @@ pub struct Renderer {
     surface_config: wgpu::SurfaceConfiguration,
     sprite_renderer: SpriteRenderer,
     viewport: Option<RenderViewport>,
+    virtual_resolution: Option<VirtualResolution>,
 }
 
 impl Renderer {
@@ -101,6 +102,7 @@ impl Renderer {
             surface_config,
             sprite_renderer,
             viewport: None,
+            virtual_resolution: None,
         })
     }
 
@@ -129,6 +131,14 @@ impl Renderer {
     /// window scale changes.
     pub fn set_viewport(&mut self, viewport: Option<RenderViewport>) {
         self.viewport = viewport;
+    }
+
+    /// Select the logical scene size that should fill the physical viewport.
+    ///
+    /// `None` keeps the original one-logical-unit-per-surface-pixel behavior.
+    /// Invalid dimensions are rejected by disabling the override.
+    pub fn set_virtual_resolution(&mut self, resolution: Option<VirtualResolution>) {
+        self.virtual_resolution = resolution.filter(|resolution| resolution.is_valid());
     }
 
     /// Draw and present every `(Position, Sprite)` entity in the engine world.
@@ -162,12 +172,15 @@ impl Renderer {
             .clamped_to(self.surface_config.width, self.surface_config.height)
             .unwrap_or_default();
 
-        self.sprite_renderer.render_in_viewport(
+        let virtual_resolution = resolve_virtual_resolution(self.virtual_resolution, viewport);
+
+        self.sprite_renderer.render_in_viewport_with_resolution(
             engine.world_mut(),
             &self.device,
             &self.queue,
             &view,
             viewport,
+            virtual_resolution,
         );
         frame.present();
         Ok(())
@@ -177,6 +190,18 @@ impl Renderer {
     fn configure_surface(&self) {
         self.surface.configure(&self.device, &self.surface_config);
     }
+}
+
+/// Resolve the logical projection without coupling it to surface dimensions.
+fn resolve_virtual_resolution(
+    configured: Option<VirtualResolution>,
+    viewport: RenderViewport,
+) -> VirtualResolution {
+    configured
+        .filter(|resolution| resolution.is_valid())
+        .unwrap_or_else(|| {
+            VirtualResolution::new(viewport.width.max(1) as f32, viewport.height.max(1) as f32)
+        })
 }
 
 /// Select the lowest-latency non-vsync mode supported by the current surface.
@@ -301,6 +326,21 @@ mod tests {
         assert_eq!(
             RenderViewport::new(100, 0, 20, 20).clamped_to(100, 90),
             None
+        );
+    }
+
+    /// A configured game coordinate space remains stable as the panel changes.
+    #[test]
+    fn virtual_resolution_is_independent_of_physical_viewport_size() {
+        let configured = VirtualResolution::new(800.0, 600.0);
+
+        assert_eq!(
+            resolve_virtual_resolution(Some(configured), RenderViewport::new(240, 80, 517, 463)),
+            configured
+        );
+        assert_eq!(
+            resolve_virtual_resolution(None, RenderViewport::new(240, 80, 517, 463)),
+            VirtualResolution::new(517.0, 463.0)
         );
     }
 }

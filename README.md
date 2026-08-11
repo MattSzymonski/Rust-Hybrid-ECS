@@ -1,3 +1,18 @@
+- Hot-reloading (standalone console, standalone window, editor)
+    - Engine
+    - Game
+    - Renderer
+- Speed of loading (especially editor)
+- Persistance/serialization works
+
+
+
+
+
+
+
+
+
 - `cargo run --package standalone` — Run the Rust game in the headless standalone host.
 
 - `cargo run --package standalone --features rendering` — Run the Rust game in the standalone host with rendering enabled.

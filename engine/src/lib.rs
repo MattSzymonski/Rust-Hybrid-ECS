@@ -62,7 +62,7 @@ pub use query::{
     Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,
 };
 #[cfg(feature = "rendering")]
-pub use render::{Color, Position, RenderViewport, Sprite, SpriteRenderer};
+pub use render::{Color, Position, RenderViewport, Sprite, SpriteRenderer, VirtualResolution};
 #[cfg(feature = "rendering")]
 pub use renderer::{Renderer, RendererError, RendererWindow};
 pub use resource::{ResHandle, Resource};

@@ -146,8 +146,11 @@ transparent window into the existing surface:
 3. The same rectangle is converted to physical pixels with the Tao scale
    factor.
 4. `RenderingHost::set_render_viewport()` receives the resulting rectangle.
-5. wgpu applies both viewport and scissor clipping.
-6. When Scene is hidden or unselected, an empty viewport disables drawing.
+5. The editor keeps an 800 x 600 virtual game resolution independent of the
+   physical rectangle, so wgpu scales the complete game view to fill the
+   current Scene panel.
+6. wgpu applies both viewport scaling and scissor clipping.
+7. When Scene is hidden or unselected, an empty viewport disables drawing.
 
 The Rust geometry pass, not delayed DOM measurement, will be the source of
 truth. This keeps HTML and wgpu pixel-aligned during docking and splitter

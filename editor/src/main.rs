@@ -23,13 +23,19 @@ use dioxus::desktop::tao::window::Window;
 use dioxus::desktop::{use_wry_event_handler, window, Config};
 use dioxus::prelude::*;
 use futures_util::StreamExt;
-use host::{setup_rendering, FrameReport, GameModuleConfig, RenderViewport, RenderingHost};
+use host::{
+    setup_rendering, FrameReport, GameModuleConfig, RenderViewport, RenderingHost,
+    VirtualResolution,
+};
 
 use dock_view::DockView;
 use layout::{compute_layout, load_or_default, LayoutMetrics, Rect};
 
 /// Maximum frequency at which live host statistics invalidate the Dioxus UI.
 const STATS_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Stable coordinate space used by the bouncing-ball game systems.
+const GAME_VIRTUAL_RESOLUTION: VirtualResolution = VirtualResolution::new(800.0, 600.0);
 
 /// Create the Dioxus window and attach a rendering host to that same window.
 fn main() {
@@ -202,6 +208,7 @@ impl EditorContext {
         )
         .expect("editor rendering host setup failed");
         host.set_render_viewport(Some(RenderViewport::default()));
+        host.set_render_virtual_resolution(Some(GAME_VIRTUAL_RESOLUTION));
 
         Self {
             host: RefCell::new(host),

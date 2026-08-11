@@ -57,6 +57,7 @@ pub fn DockView(
     stats: Signal<Stats>,
 ) -> Element {
     let mut drag = use_signal(|| None::<PointerDrag>);
+    let mut context_menu = use_signal(|| None::<(f64, f64)>);
     let model_value = model.read();
     let move_snapshot = snapshot.clone();
     let active_tabset = model_value.active_tabset.or_else(|| {
@@ -92,6 +93,14 @@ pub fn DockView(
         style { dangerous_inner_html: DOCK_CSS }
         div {
             class: "dock-root",
+            onclick: move |_| context_menu.set(None),
+            oncontextmenu: move |event| {
+                // Suppress the WebView/browser menu and place the editor menu
+                // at the pointer in the same logical coordinates as the DOM.
+                event.prevent_default();
+                let position = event.client_coordinates();
+                context_menu.set(Some((position.x, position.y)));
+            },
             onpointermove: move |event| {
                 let position = event.client_coordinates();
                 let Some(state) = *drag.peek() else {
@@ -207,6 +216,7 @@ pub fn DockView(
             onkeydown: move |event| {
                 if event.data.key().to_string() == "Escape" {
                     drag.set(None);
+                    context_menu.set(None);
                 }
             },
 
@@ -457,6 +467,27 @@ pub fn DockView(
                         apply_layout_action(model, LayoutAction::ResetLayout, true);
                     },
                     "Reset Layout"
+                }
+            }
+
+            if let Some((x, y)) = *context_menu.read() {
+                div {
+                    class: "dock-context-menu",
+                    role: "menu",
+                    style: format!("left:{x:.3}px;top:{y:.3}px;"),
+                    oncontextmenu: move |event| event.prevent_default(),
+                    button {
+                        class: "dock-context-menu-item",
+                        role: "menuitem",
+                        onclick: move |_| context_menu.set(None),
+                        "hello1"
+                    }
+                    button {
+                        class: "dock-context-menu-item",
+                        role: "menuitem",
+                        onclick: move |_| context_menu.set(None),
+                        "hello2"
+                    }
                 }
             }
         }

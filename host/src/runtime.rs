@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use ecs_hybrid::{Engine, EngineApi};
 #[cfg(feature = "rendering")]
-use ecs_hybrid::{RenderViewport, Renderer, RendererError, RendererWindow};
+use ecs_hybrid::{RenderViewport, Renderer, RendererError, RendererWindow, VirtualResolution};
 
 use crate::game_module::LoadedGame;
 use crate::native_library::cleanup_temporary_files;
@@ -87,6 +87,13 @@ impl RenderingHost {
     /// panels opaque.
     pub fn set_render_viewport(&mut self, viewport: Option<RenderViewport>) {
         self.renderer.set_viewport(viewport);
+    }
+
+    /// Map a stable game coordinate space into the current physical viewport.
+    ///
+    /// Pass `None` to make logical renderer units match physical pixels again.
+    pub fn set_render_virtual_resolution(&mut self, resolution: Option<VirtualResolution>) {
+        self.renderer.set_virtual_resolution(resolution);
     }
 
     /// Execute one ECS frame and present its resulting world to the surface.

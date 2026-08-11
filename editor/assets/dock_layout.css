@@ -215,3 +215,35 @@ body {
 .dock-tool-button:hover {
     background: rgb(82, 82, 82);
 }
+
+.dock-context-menu {
+    position: fixed;
+    z-index: 100;
+    min-width: 150px;
+    box-sizing: border-box;
+    padding: 4px;
+    border: 1px solid rgb(34, 34, 34);
+    border-radius: 4px;
+    background: rgb(52, 52, 52);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.42);
+}
+
+.dock-context-menu-item {
+    display: block;
+    width: 100%;
+    padding: 6px 10px;
+    border: 0;
+    border-radius: 2px;
+    background: transparent;
+    color: var(--dock-text);
+    font: inherit;
+    font-size: 12px;
+    text-align: left;
+}
+
+.dock-context-menu-item:hover,
+.dock-context-menu-item:focus-visible {
+    outline: none;
+    background: var(--dock-accent);
+    color: white;
+}
