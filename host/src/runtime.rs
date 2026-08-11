@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use ecs_hybrid::{Engine, EngineApi};
 #[cfg(feature = "rendering")]
-use ecs_hybrid::{Renderer, RendererError, RendererWindow};
+use ecs_hybrid::{RenderViewport, Renderer, RendererError, RendererWindow};
 
 use crate::game_module::LoadedGame;
 use crate::native_library::cleanup_temporary_files;
@@ -78,6 +78,15 @@ impl RenderingHost {
     /// Forward a physical window resize to the engine renderer.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.renderer.resize(width, height);
+    }
+
+    /// Restrict engine drawing to a physical region of the native surface.
+    ///
+    /// Use `None` for full-window rendering. Embedded frontends can leave the
+    /// corresponding WebView region transparent and keep surrounding UI
+    /// panels opaque.
+    pub fn set_render_viewport(&mut self, viewport: Option<RenderViewport>) {
+        self.renderer.set_viewport(viewport);
     }
 
     /// Execute one ECS frame and present its resulting world to the surface.

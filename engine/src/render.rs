@@ -87,6 +87,46 @@ impl Default for Sprite {
     }
 }
 
+/// Physical-pixel rectangle within a render target.
+///
+/// Sprite positions are interpreted relative to this rectangle's top-left
+/// corner. The GPU viewport maps their local coordinates into the rectangle,
+/// while a matching scissor prevents drawing outside it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderViewport {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl RenderViewport {
+    /// Construct a physical-pixel viewport rectangle.
+    pub const fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
+        Self {
+            x,
+            y,
+            width,
+            height,
+        }
+    }
+
+    /// Construct a viewport covering an entire render target.
+    pub const fn full(width: u32, height: u32) -> Self {
+        Self::new(0, 0, width, height)
+    }
+
+    /// Clamp this rectangle to a render target, returning `None` when empty.
+    pub fn clamped_to(self, target_width: u32, target_height: u32) -> Option<Self> {
+        let x = self.x.min(target_width);
+        let y = self.y.min(target_height);
+        let width = self.width.min(target_width.saturating_sub(x));
+        let height = self.height.min(target_height.saturating_sub(y));
+
+        (width > 0 && height > 0).then_some(Self::new(x, y, width, height))
+    }
+}
+
 // =============================================================================
 // GPU instance data
 // =============================================================================
@@ -293,14 +333,36 @@ impl SpriteRenderer {
         viewport_width: u32,
         viewport_height: u32,
     ) {
+        self.render_in_viewport(
+            world,
+            device,
+            queue,
+            view,
+            RenderViewport::full(viewport_width, viewport_height),
+        );
+    }
+
+    /// Draw sprites within one physical region of a larger render target.
+    ///
+    /// The render pass still clears the complete target to transparent so UI
+    /// frameworks can composite their opaque panels above it. Sprite pixels
+    /// are transformed and clipped to `viewport`.
+    pub fn render_in_viewport(
+        &mut self,
+        world: &mut World,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        view: &wgpu::TextureView,
+        viewport: RenderViewport,
+    ) {
         let instances = collect_sprite_instances(world);
 
         queue.write_buffer(
             &self.viewport_buffer,
             0,
             bytemuck::bytes_of(&ViewportUniform {
-                width: viewport_width.max(1) as f32,
-                height: viewport_height.max(1) as f32,
+                width: viewport.width.max(1) as f32,
+                height: viewport.height.max(1) as f32,
                 _padding: [0.0, 0.0],
             }),
         );
@@ -340,8 +402,22 @@ impl SpriteRenderer {
                 occlusion_query_set: None,
             });
 
-            if !instances.is_empty() {
+            if !instances.is_empty() && viewport.width > 0 && viewport.height > 0 {
                 render_pass.set_pipeline(&self.pipeline);
+                render_pass.set_viewport(
+                    viewport.x as f32,
+                    viewport.y as f32,
+                    viewport.width as f32,
+                    viewport.height as f32,
+                    0.0,
+                    1.0,
+                );
+                render_pass.set_scissor_rect(
+                    viewport.x,
+                    viewport.y,
+                    viewport.width,
+                    viewport.height,
+                );
                 render_pass.set_bind_group(0, &self.viewport_bind_group, &[]);
                 render_pass.set_vertex_buffer(0, self.instance_buffer.slice(..));
                 render_pass.draw(0..6, 0..instances.len() as u32);

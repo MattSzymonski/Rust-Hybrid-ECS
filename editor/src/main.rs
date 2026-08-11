@@ -6,23 +6,31 @@
 //! the editor passes an `Arc` clone of Dioxus's Tao window to
 //! [`host::setup_rendering`]. The engine creates one GPU surface for that
 //! window, while [`host::RenderingHost`] owns both engine and renderer state.
-//! The editor only forwards resize and redraw events and draws its transparent
-//! HTML diagnostics above the rendered game.
+//! The editor forwards resize and redraw events, keeps its center viewport
+//! transparent for the surface, and draws opaque HTML panels around it.
 
 use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use dioxus::desktop::tao::dpi::LogicalSize;
 use dioxus::desktop::tao::event::Event as TaoEvent;
 use dioxus::desktop::tao::window::Window;
 use dioxus::desktop::{use_wry_event_handler, window, Config};
 use dioxus::prelude::*;
 use futures_util::StreamExt;
-use host::{setup_rendering, FrameReport, GameModuleConfig, RenderingHost};
+use host::{setup_rendering, FrameReport, GameModuleConfig, RenderViewport, RenderingHost};
 
 /// Maximum frequency at which live host statistics invalidate the Dioxus UI.
 const STATS_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
+
+// These logical dimensions are shared by the CSS grid and the physical wgpu
+// viewport calculation. Changing the layout requires updating both together.
+const TOP_BAR_HEIGHT: f64 = 48.0;
+const LEFT_PANEL_WIDTH: f64 = 220.0;
+const RIGHT_PANEL_WIDTH: f64 = 260.0;
+const BOTTOM_BAR_HEIGHT: f64 = 32.0;
 
 /// Create the Dioxus window and attach a rendering host to that same window.
 fn main() {
@@ -30,6 +38,7 @@ fn main() {
         .with_window(
             dioxus::desktop::tao::window::WindowBuilder::new()
                 .with_title("ECS Editor")
+                .with_inner_size(LogicalSize::new(1280.0, 800.0))
                 .with_transparent(true),
         )
         .with_on_window(|window, dom| {
@@ -117,12 +126,69 @@ fn app() -> Element {
 
     rsx! {
         div {
-            width: "100vw",
-            height: "100vh",
-            display: "flex",
-            align_items: "flex-start",
-            justify_content: "flex-end",
-            StatsWidget { stats }
+            position: "fixed",
+            top: "0",
+            right: "0",
+            bottom: "0",
+            left: "0",
+            display: "grid",
+            grid_template_columns: "220px minmax(0, 1fr) 260px",
+            grid_template_rows: "48px minmax(0, 1fr) 32px",
+            background_color: "transparent",
+
+            // Opaque checker panels surround the transparent scene viewport.
+            div {
+                grid_column: "1 / -1",
+                grid_row: "1",
+                display: "flex",
+                align_items: "center",
+                padding: "0 16px",
+                box_sizing: "border-box",
+                background_color: "rgb(64, 64, 64)",
+                background_image: "linear-gradient(45deg, rgba(255, 255, 255, 0.08) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.08) 75%), linear-gradient(45deg, rgba(255, 255, 255, 0.08) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.08) 75%)",
+                background_size: "16px 16px",
+                background_position: "0 0, 8px 8px",
+                color: "white",
+                font_family: "sans-serif",
+                font_weight: "600",
+                "ECS Editor"
+            }
+            div {
+                grid_column: "1",
+                grid_row: "2",
+                background_color: "rgb(64, 64, 64)",
+                background_image: "linear-gradient(45deg, rgba(255, 255, 255, 0.08) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.08) 75%), linear-gradient(45deg, rgba(255, 255, 255, 0.08) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.08) 75%)",
+                background_size: "16px 16px",
+                background_position: "0 0, 8px 8px",
+            }
+            div {
+                grid_column: "2",
+                grid_row: "2",
+                position: "relative",
+                overflow: "hidden",
+                background_color: "transparent",
+                box_shadow: "inset 0 0 0 1px rgba(255, 255, 255, 0.18)",
+            }
+            div {
+                grid_column: "3",
+                grid_row: "2",
+                display: "flex",
+                align_items: "flex-start",
+                justify_content: "flex-end",
+                background_color: "rgb(64, 64, 64)",
+                background_image: "linear-gradient(45deg, rgba(255, 255, 255, 0.08) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.08) 75%), linear-gradient(45deg, rgba(255, 255, 255, 0.08) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.08) 75%)",
+                background_size: "16px 16px",
+                background_position: "0 0, 8px 8px",
+                StatsWidget { stats }
+            }
+            div {
+                grid_column: "1 / -1",
+                grid_row: "3",
+                background_color: "rgb(64, 64, 64)",
+                background_image: "linear-gradient(45deg, rgba(255, 255, 255, 0.08) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.08) 75%), linear-gradient(45deg, rgba(255, 255, 255, 0.08) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.08) 75%)",
+                background_size: "16px 16px",
+                background_position: "0 0, 8px 8px",
+            }
         }
     }
 }
@@ -150,6 +216,7 @@ fn StatsWidget(stats: Signal<Stats>) -> Element {
 /// Interior-mutable rendering host used from Dioxus's shared event callbacks.
 struct EditorContext {
     host: RefCell<RenderingHost>,
+    window: Arc<Window>,
     last_stats_update: Cell<Instant>,
 }
 
@@ -163,23 +230,35 @@ impl EditorContext {
     /// Create one engine renderer surface from the Dioxus/Tao window handle.
     fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
-        let host = setup_rendering(
+        let mut host = setup_rendering(
             GameModuleConfig::from_environment(),
-            window,
+            Arc::clone(&window),
             size.width,
             size.height,
         )
         .expect("editor rendering host setup failed");
+        host.set_render_viewport(Some(editor_render_viewport(
+            size.width,
+            size.height,
+            window.scale_factor(),
+        )));
 
         Self {
             host: RefCell::new(host),
+            window,
             last_stats_update: Cell::new(Instant::now()),
         }
     }
 
     /// Reconfigure the engine surface after Dioxus reports a physical resize.
     fn resize(&self, width: u32, height: u32) {
-        self.host.borrow_mut().resize(width, height);
+        let mut host = self.host.borrow_mut();
+        host.resize(width, height);
+        host.set_render_viewport(Some(editor_render_viewport(
+            width,
+            height,
+            self.window.scale_factor(),
+        )));
     }
 
     /// Advance the ECS and present one frame on Dioxus's redraw event.
@@ -206,5 +285,48 @@ impl EditorContext {
                 None
             }
         }
+    }
+}
+
+/// Convert the Dioxus grid's logical center cell into physical GPU pixels.
+fn editor_render_viewport(width: u32, height: u32, scale_factor: f64) -> RenderViewport {
+    let physical = |logical: f64| (logical * scale_factor).round() as u32;
+    let left = physical(LEFT_PANEL_WIDTH);
+    let right = physical(RIGHT_PANEL_WIDTH);
+    let top = physical(TOP_BAR_HEIGHT);
+    let bottom = physical(BOTTOM_BAR_HEIGHT);
+
+    RenderViewport::new(
+        left.min(width),
+        top.min(height),
+        width.saturating_sub(left.saturating_add(right)),
+        height.saturating_sub(top.saturating_add(bottom)),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The native viewport matches the center cell of the editor CSS grid.
+    #[test]
+    fn viewport_tracks_layout_and_scale_factor() {
+        assert_eq!(
+            editor_render_viewport(1280, 800, 1.0),
+            RenderViewport::new(220, 48, 800, 720)
+        );
+        assert_eq!(
+            editor_render_viewport(2560, 1600, 2.0),
+            RenderViewport::new(440, 96, 1600, 1440)
+        );
+    }
+
+    /// Very small windows yield an empty viewport instead of underflowing.
+    #[test]
+    fn viewport_saturates_for_small_windows() {
+        assert_eq!(
+            editor_render_viewport(320, 60, 1.0),
+            RenderViewport::new(220, 48, 0, 0)
+        );
     }
 }

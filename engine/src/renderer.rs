@@ -18,7 +18,7 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use crate::engine::Engine;
-use crate::render::SpriteRenderer;
+use crate::render::{RenderViewport, SpriteRenderer};
 
 /// Window-handle capability accepted by the engine renderer.
 ///
@@ -35,6 +35,7 @@ pub struct Renderer {
     queue: wgpu::Queue,
     surface_config: wgpu::SurfaceConfiguration,
     sprite_renderer: SpriteRenderer,
+    viewport: Option<RenderViewport>,
 }
 
 impl Renderer {
@@ -99,6 +100,7 @@ impl Renderer {
             queue,
             surface_config,
             sprite_renderer,
+            viewport: None,
         })
     }
 
@@ -118,6 +120,15 @@ impl Renderer {
     /// Return the physical dimensions of the currently configured surface.
     pub fn surface_size(&self) -> (u32, u32) {
         (self.surface_config.width, self.surface_config.height)
+    }
+
+    /// Restrict rendering to a physical-pixel rectangle within the surface.
+    ///
+    /// Passing `None` restores full-surface rendering. Frontends embedding the
+    /// surface behind UI should update this rectangle whenever their layout or
+    /// window scale changes.
+    pub fn set_viewport(&mut self, viewport: Option<RenderViewport>) {
+        self.viewport = viewport;
     }
 
     /// Draw and present every `(Position, Sprite)` entity in the engine world.
@@ -143,13 +154,20 @@ impl Renderer {
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        self.sprite_renderer.render(
+        let viewport = self
+            .viewport
+            .unwrap_or_else(|| {
+                RenderViewport::full(self.surface_config.width, self.surface_config.height)
+            })
+            .clamped_to(self.surface_config.width, self.surface_config.height)
+            .unwrap_or_default();
+
+        self.sprite_renderer.render_in_viewport(
             engine.world_mut(),
             &self.device,
             &self.queue,
             &view,
-            self.surface_config.width,
-            self.surface_config.height,
+            viewport,
         );
         frame.present();
         Ok(())
@@ -270,6 +288,19 @@ mod tests {
         assert_eq!(
             select_alpha_mode(&[wgpu::CompositeAlphaMode::Opaque]),
             Some(wgpu::CompositeAlphaMode::Opaque)
+        );
+    }
+
+    /// Embedded viewports cannot extend beyond their native surface.
+    #[test]
+    fn render_viewport_clamps_to_surface_bounds() {
+        assert_eq!(
+            RenderViewport::new(80, 40, 50, 70).clamped_to(100, 90),
+            Some(RenderViewport::new(80, 40, 20, 50))
+        );
+        assert_eq!(
+            RenderViewport::new(100, 0, 20, 20).clamped_to(100, 90),
+            None
         );
     }
 }
