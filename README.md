@@ -15,3 +15,4 @@
 - `cargo test --workspace` — Run all Rust workspace tests.
 
 - `cargo check --workspace` — Type-check the complete Rust workspace without producing release binaries.
+

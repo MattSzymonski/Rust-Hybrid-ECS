@@ -9,14 +9,20 @@
 //! The editor only forwards resize and redraw events and draws its transparent
 //! HTML diagnostics above the rendered game.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::io::Write;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use dioxus::desktop::tao::event::Event as TaoEvent;
 use dioxus::desktop::tao::window::Window;
-use dioxus::desktop::{use_wry_event_handler, Config};
+use dioxus::desktop::{use_wry_event_handler, window, Config};
 use dioxus::prelude::*;
+use futures_util::StreamExt;
 use host::{setup_rendering, FrameReport, GameModuleConfig, RenderingHost};
+
+/// Maximum frequency at which live host statistics invalidate the Dioxus UI.
+const STATS_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Create the Dioxus window and attach a rendering host to that same window.
 fn main() {
@@ -51,6 +57,29 @@ fn app() -> Element {
     let editor = consume_context::<Arc<EditorContext>>();
     let mut stats = use_signal(Stats::default);
 
+    // Defer each next-frame request through Dioxus's own scheduler. The yield
+    // guarantees request_redraw runs in a later event-loop turn instead of
+    // being coalesced into the RedrawRequested event currently in progress.
+    // One completion produces one request, so this neither needs a timer nor
+    // floods the runtime with a permanently self-waking task.
+    let redraw_window = Arc::downgrade(&window().window);
+    let redraw_scheduler = use_coroutine(move |mut requests: UnboundedReceiver<()>| {
+        let redraw_window = redraw_window.clone();
+        async move {
+            while requests.next().await.is_some() {
+                tokio::task::yield_now().await;
+                let Some(window) = redraw_window.upgrade() else {
+                    break;
+                };
+                window.request_redraw();
+            }
+        }
+    });
+
+    // Seed the first frame. Subsequent frames schedule themselves only after
+    // their current engine update and presentation have completed.
+    use_effect(move || redraw_scheduler.send(()));
+
     use_wry_event_handler(move |event, _| {
         use dioxus::desktop::tao::event::WindowEvent;
 
@@ -62,18 +91,30 @@ fn app() -> Element {
                 editor.resize(size.width, size.height);
             }
             TaoEvent::RedrawRequested(_) => {
-                if let Some(report) = editor.render() {
-                    stats.set(Stats {
-                        fps: report.fps,
-                        entity_count: report.entity_count,
-                    });
+                if let Some(frame) = editor.render() {
+                    if let Some(report) = frame.console_report {
+                        println!(
+                            "  {:>6.0} FPS | {:>5} entities",
+                            report.fps, report.entity_count
+                        );
+                        let _ = std::io::stdout().flush();
+                    }
+
+                    // Only this signal write invalidates the overlay. The ECS
+                    // and renderer continue running at their uncapped rate.
+                    if let Some(report) = frame.ui_report {
+                        stats.set(Stats {
+                            fps: report.fps,
+                            entity_count: report.entity_count,
+                        });
+                    }
                 }
+                redraw_scheduler.send(());
             }
             _ => {}
         }
     });
 
-    let stats = stats.read();
     rsx! {
         div {
             width: "100vw",
@@ -81,17 +122,27 @@ fn app() -> Element {
             display: "flex",
             align_items: "flex-start",
             justify_content: "flex-end",
-            div {
-                margin: "12px",
-                padding: "10px 14px",
-                background_color: "rgba(20, 20, 20, 0.65)",
-                color: "white",
-                font_family: "monospace",
-                font_size: "14px",
-                border_radius: "6px",
-                div { "FPS: {stats.fps:.0}" }
-                div { "Entities: {stats.entity_count}" }
-            }
+            StatsWidget { stats }
+        }
+    }
+}
+
+/// Display live engine statistics without invalidating the parent editor UI.
+#[component]
+fn StatsWidget(stats: Signal<Stats>) -> Element {
+    let stats = stats.read();
+
+    rsx! {
+        div {
+            margin: "12px",
+            padding: "10px 14px",
+            background_color: "rgba(20, 20, 20, 0.65)",
+            color: "white",
+            font_family: "monospace",
+            font_size: "14px",
+            border_radius: "6px",
+            div { "FPS: {stats.fps:.0}" }
+            div { "Entities: {stats.entity_count}" }
         }
     }
 }
@@ -99,6 +150,13 @@ fn app() -> Element {
 /// Interior-mutable rendering host used from Dioxus's shared event callbacks.
 struct EditorContext {
     host: RefCell<RenderingHost>,
+    last_stats_update: Cell<Instant>,
+}
+
+/// Values produced while advancing one editor frame.
+struct EditorFrame {
+    console_report: Option<FrameReport>,
+    ui_report: Option<FrameReport>,
 }
 
 impl EditorContext {
@@ -107,25 +165,15 @@ impl EditorContext {
         let size = window.inner_size();
         let host = setup_rendering(
             GameModuleConfig::from_environment(),
-            Arc::clone(&window),
+            window,
             size.width,
             size.height,
         )
         .expect("editor rendering host setup failed");
 
-        // Dioxus resets Tao to ControlFlow::Wait after each event. Let the
-        // host asynchronously wake that loop after every presented frame so
-        // redraw requests cannot be coalesced inside RedrawRequested.
-        let weak_window = Arc::downgrade(&window);
-        let mut host = host;
-        host.start_continuous_rendering(move || {
-            if let Some(window) = weak_window.upgrade() {
-                window.request_redraw();
-            }
-        });
-
         Self {
             host: RefCell::new(host),
+            last_stats_update: Cell::new(Instant::now()),
         }
     }
 
@@ -135,9 +183,24 @@ impl EditorContext {
     }
 
     /// Advance the ECS and present one frame on Dioxus's redraw event.
-    fn render(&self) -> Option<FrameReport> {
-        match self.host.borrow_mut().run_one_frame() {
-            Ok(report) => report,
+    fn render(&self) -> Option<EditorFrame> {
+        let mut host = self.host.borrow_mut();
+        match host.run_one_frame() {
+            Ok(console_report) => {
+                let now = Instant::now();
+                let ui_report =
+                    if now.duration_since(self.last_stats_update.get()) >= STATS_UPDATE_INTERVAL {
+                        self.last_stats_update.set(now);
+                        Some(host.current_frame_report())
+                    } else {
+                        None
+                    };
+
+                Some(EditorFrame {
+                    console_report,
+                    ui_report,
+                })
+            }
             Err(error) => {
                 eprintln!("[editor] Fatal renderer error: {error}");
                 None
