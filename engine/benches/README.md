@@ -13,6 +13,11 @@ cargo bench --bench <name> --no-run  # build only
 
 ## Files
 
+### `minimal.rs`
+Four focused hot-path cases at fixed sizes: `query_iter_unfiltered`,
+`query_iter_changed`, `query_par_iter_unfiltered`, and
+`archetype_add_component`.
+
 ### `entity_lifecycle.rs`
 | Group | Counts | Description |
 |-------|--------|-------------|

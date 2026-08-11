@@ -8,7 +8,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 ecs_hybrid = { path = "../engine" }
-trait_type_map = { path = "../../trait_type_map" }
+trait_type_map = { path = "../../Trait-Type-Map" }
 serde = { version = "1", features = ["derive"] }
 
 [features]
