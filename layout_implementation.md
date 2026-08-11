@@ -22,20 +22,97 @@ remains the only component updated periodically.
 
 ## Current implementation status
 
-The first dockable-layout version described by this plan is implemented:
+The core dock model and an interactive editor version are implemented:
 
 - [x] Serializable, validated node model with atomic reducer actions.
 - [x] Nested weighted rows, tabsets, tab selection, close, reopen, and reset.
 - [x] Stable keyed panel hosts that retain Dioxus component state.
-- [x] Horizontal and vertical splitter resizing with keyboard controls.
+- [x] Basic horizontal and vertical splitter resizing with keyboard controls.
 - [x] Tab reordering and movement between tabsets.
-- [x] Center and four-edge docking with live preview rectangles.
+- [x] Center and four-edge docking relative to tabsets, with live previews.
 - [x] Geometry-driven Scene viewport alignment and clipping.
 - [x] Versioned layout persistence with invalid-file recovery.
-- [x] Baseline tab/separator ARIA roles and arrow-key navigation.
-- [x] Model, geometry, persistence, renderer, and host validation tests.
+- [x] Initial tab/separator ARIA roles and arrow-key navigation.
+- [x] Model, reducer, geometry, and persistence unit tests.
+- [x] Workspace, host, renderer, and responsive-window smoke validation.
 
-The features in **Explicitly deferred features** remain future work.
+The first complete version is not finished yet. The checklist below records the
+remaining work independently from the advanced features deliberately deferred
+at the end of this document.
+
+## Remaining work for the first complete version
+
+### Docking and pointer behavior
+
+- [ ] Add root-edge docking so a tab can split the complete workspace, not only
+  an existing tabset.
+- [ ] Capture the active pointer during tab and splitter drags. Dragging outside
+  the layout or WebView must end or cancel cleanly without leaving stale state.
+- [ ] Add an explicit drag ghost and show all eligible drop indicators, while
+  retaining the current active-target preview.
+- [ ] Handle touch and pen input through the same pointer state machine and
+  verify pointer cancellation paths.
+- [ ] Add tab-strip overflow scrolling and then an accessible overflow menu.
+
+### Geometry and resizing
+
+- [ ] Enforce minimum pane width and height in the geometry solver itself. The
+  current pointer clamp is only a partial guard and does not constrain initial,
+  restored, or very small layouts.
+- [ ] Redistribute constrained row space deterministically when several
+  children reach their minimum size.
+- [ ] Add double-click splitter equalization.
+- [ ] Remove duplicated Rust/CSS metric values by generating them from one
+  source or add a parity test that fails when they diverge.
+- [ ] Handle Tao scale-factor changes explicitly instead of relying on an
+  accompanying resize event.
+
+### Architecture cleanup
+
+- [ ] Finish extracting `main.rs` into `app.rs` and `renderer_bridge.rs`.
+- [ ] Move editor panels into the planned `panels/` modules.
+- [ ] Replace the direct `PanelKind` match with a panel registry/factory so new
+  editor panels do not require changes in the dock view.
+- [ ] Move drag logic out of `dock_view.rs` into a dedicated controller and
+  isolate drag-overlay invalidation from tabset/panel reconciliation.
+
+### Persistence
+
+- [ ] Debounce layout writes rather than saving every durable selection or tab
+  action immediately.
+- [ ] Use a truly atomic replace operation on Windows. The current backup and
+  rename fallback is recoverable but has a short interval without the primary
+  file.
+- [ ] Add schema-migration infrastructure before introducing a second persisted
+  layout version.
+- [ ] Preserve unknown optional panel configuration where possible.
+
+### Accessibility and keyboard controls
+
+- [ ] Expose splitter `aria-valuemin`, `aria-valuemax`, and `aria-valuenow`.
+- [ ] Make close controls proper keyboard-operable buttons without nesting
+  invalid interactive HTML.
+- [ ] Verify focus restoration after close, move, dock, reset, and overflow-menu
+  operations.
+- [ ] Add keyboard commands for moving tabs and traversing tabsets.
+- [ ] Add an accessibility test pass for tab, tablist, tabpanel, separator, and
+  menu semantics.
+
+### Automated validation and profiling
+
+- [ ] Add Dioxus interaction tests for selection, reorder, cross-tabset moves,
+  splitter dragging, edge docking, cancellation, close, reopen, and reset.
+- [ ] Add a stateful test panel proving component state survives selection and
+  cross-tabset movement.
+- [ ] Test that hiding Scene sends an empty native viewport and selecting it
+  restores the correct physical rectangle without recreating the surface.
+- [ ] Test resize and display-scale transitions at 100%, 125%, 150%, and 200%.
+- [ ] Add corrupted-file and interrupted-write persistence tests.
+- [ ] Profile drag-time Dioxus reconciliation and confirm idle engine FPS is not
+  affected by the dock model.
+
+The features in **Explicitly deferred features** remain future work after this
+checklist is complete.
 
 ## Reference architecture
 
