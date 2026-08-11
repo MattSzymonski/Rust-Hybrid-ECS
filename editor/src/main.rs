@@ -9,6 +9,9 @@
 //! The editor forwards resize and redraw events, keeps its center viewport
 //! transparent for the surface, and draws opaque HTML panels around it.
 
+mod dock_view;
+mod layout;
+
 use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::sync::Arc;
@@ -22,15 +25,11 @@ use dioxus::prelude::*;
 use futures_util::StreamExt;
 use host::{setup_rendering, FrameReport, GameModuleConfig, RenderViewport, RenderingHost};
 
+use dock_view::DockView;
+use layout::{compute_layout, load_or_default, LayoutMetrics, Rect};
+
 /// Maximum frequency at which live host statistics invalidate the Dioxus UI.
 const STATS_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
-
-// These logical dimensions are shared by the CSS grid and the physical wgpu
-// viewport calculation. Changing the layout requires updating both together.
-const TOP_BAR_HEIGHT: f64 = 48.0;
-const LEFT_PANEL_WIDTH: f64 = 220.0;
-const RIGHT_PANEL_WIDTH: f64 = 260.0;
-const BOTTOM_BAR_HEIGHT: f64 = 32.0;
 
 /// Create the Dioxus window and attach a rendering host to that same window.
 fn main() {
@@ -55,16 +54,26 @@ fn main() {
 }
 
 /// Live statistics displayed by the transparent Dioxus overlay.
-#[derive(Debug, Clone, Copy, Default)]
-struct Stats {
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct Stats {
     fps: f64,
     entity_count: usize,
+}
+
+/// Current WebView content size expressed in logical CSS pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct EditorSize {
+    width: f64,
+    height: f64,
 }
 
 /// Build the editor UI and drive the host from Dioxus's native event loop.
 fn app() -> Element {
     let editor = consume_context::<Arc<EditorContext>>();
     let mut stats = use_signal(Stats::default);
+    let layout_model = use_signal(load_or_default);
+    let initial_size = editor.logical_size();
+    let mut layout_size = use_signal(move || initial_size);
 
     // Defer each next-frame request through Dioxus's own scheduler. The yield
     // guarantees request_redraw runs in a later event-loop turn instead of
@@ -89,6 +98,21 @@ fn app() -> Element {
     // their current engine update and presentation have completed.
     use_effect(move || redraw_scheduler.send(()));
 
+    // Layout geometry is the shared source of truth for DOM positioning and
+    // native GPU clipping. No DOM measurement round trip is required.
+    let viewport_editor = Arc::clone(&editor);
+    use_effect(move || {
+        let size = *layout_size.read();
+        let model = layout_model.read();
+        let snapshot = compute_layout(
+            &model,
+            Rect::new(0.0, 0.0, size.width, size.height),
+            LayoutMetrics::default(),
+        );
+        viewport_editor.set_scene_rect(snapshot.scene_rect);
+    });
+
+    let event_editor = Arc::clone(&editor);
     use_wry_event_handler(move |event, _| {
         use dioxus::desktop::tao::event::WindowEvent;
 
@@ -97,10 +121,11 @@ fn app() -> Element {
                 event: WindowEvent::Resized(size),
                 ..
             } => {
-                editor.resize(size.width, size.height);
+                event_editor.resize(size.width, size.height);
+                layout_size.set(event_editor.logical_size());
             }
             TaoEvent::RedrawRequested(_) => {
-                if let Some(frame) = editor.render() {
+                if let Some(frame) = event_editor.render() {
                     if let Some(report) = frame.console_report {
                         println!(
                             "  {:>6.0} FPS | {:>5} entities",
@@ -124,89 +149,28 @@ fn app() -> Element {
         }
     });
 
-    rsx! {
-        div {
-            position: "fixed",
-            top: "0",
-            right: "0",
-            bottom: "0",
-            left: "0",
-            display: "grid",
-            grid_template_columns: "220px minmax(0, 1fr) 260px",
-            grid_template_rows: "48px minmax(0, 1fr) 32px",
-            background_color: "transparent",
+    let size = *layout_size.read();
+    let model = layout_model.read();
+    let snapshot = compute_layout(
+        &model,
+        Rect::new(0.0, 0.0, size.width, size.height),
+        LayoutMetrics::default(),
+    );
+    drop(model);
 
-            // Opaque checker panels surround the transparent scene viewport.
-            div {
-                grid_column: "1 / -1",
-                grid_row: "1",
-                display: "flex",
-                align_items: "center",
-                padding: "0 16px",
-                box_sizing: "border-box",
-                background_color: "rgb(64, 64, 64)",
-                background_image: "linear-gradient(45deg, rgba(255, 255, 255, 0.08) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.08) 75%), linear-gradient(45deg, rgba(255, 255, 255, 0.08) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.08) 75%)",
-                background_size: "16px 16px",
-                background_position: "0 0, 8px 8px",
-                color: "white",
-                font_family: "sans-serif",
-                font_weight: "600",
-                "ECS Editor"
-            }
-            div {
-                grid_column: "1",
-                grid_row: "2",
-                background_color: "rgb(64, 64, 64)",
-                background_image: "linear-gradient(45deg, rgba(255, 255, 255, 0.08) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.08) 75%), linear-gradient(45deg, rgba(255, 255, 255, 0.08) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.08) 75%)",
-                background_size: "16px 16px",
-                background_position: "0 0, 8px 8px",
-            }
-            div {
-                grid_column: "2",
-                grid_row: "2",
-                position: "relative",
-                overflow: "hidden",
-                background_color: "transparent",
-                box_shadow: "inset 0 0 0 1px rgba(255, 255, 255, 0.18)",
-            }
-            div {
-                grid_column: "3",
-                grid_row: "2",
-                display: "flex",
-                align_items: "flex-start",
-                justify_content: "flex-end",
-                background_color: "rgb(64, 64, 64)",
-                background_image: "linear-gradient(45deg, rgba(255, 255, 255, 0.08) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.08) 75%), linear-gradient(45deg, rgba(255, 255, 255, 0.08) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.08) 75%)",
-                background_size: "16px 16px",
-                background_position: "0 0, 8px 8px",
-                StatsWidget { stats }
-            }
-            div {
-                grid_column: "1 / -1",
-                grid_row: "3",
-                background_color: "rgb(64, 64, 64)",
-                background_image: "linear-gradient(45deg, rgba(255, 255, 255, 0.08) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.08) 75%), linear-gradient(45deg, rgba(255, 255, 255, 0.08) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.08) 75%)",
-                background_size: "16px 16px",
-                background_position: "0 0, 8px 8px",
-            }
-        }
+    rsx! {
+        DockView { model: layout_model, snapshot, stats }
     }
 }
 
 /// Display live engine statistics without invalidating the parent editor UI.
 #[component]
-fn StatsWidget(stats: Signal<Stats>) -> Element {
+pub(crate) fn StatsWidget(stats: Signal<Stats>) -> Element {
     let stats = stats.read();
 
     rsx! {
         div {
-            margin: "12px",
-            padding: "10px 14px",
-            background_color: "rgba(20, 20, 20, 0.65)",
-            color: "white",
-            font_family: "monospace",
-            font_size: "14px",
-            border_radius: "6px",
+            class: "dock-statistics",
             div { "FPS: {stats.fps:.0}" }
             div { "Entities: {stats.entity_count}" }
         }
@@ -237,11 +201,7 @@ impl EditorContext {
             size.height,
         )
         .expect("editor rendering host setup failed");
-        host.set_render_viewport(Some(editor_render_viewport(
-            size.width,
-            size.height,
-            window.scale_factor(),
-        )));
+        host.set_render_viewport(Some(RenderViewport::default()));
 
         Self {
             host: RefCell::new(host),
@@ -252,13 +212,25 @@ impl EditorContext {
 
     /// Reconfigure the engine surface after Dioxus reports a physical resize.
     fn resize(&self, width: u32, height: u32) {
-        let mut host = self.host.borrow_mut();
-        host.resize(width, height);
-        host.set_render_viewport(Some(editor_render_viewport(
-            width,
-            height,
-            self.window.scale_factor(),
-        )));
+        self.host.borrow_mut().resize(width, height);
+    }
+
+    /// Current WebView size in the logical coordinates used by CSS.
+    fn logical_size(&self) -> EditorSize {
+        let size = self.window.inner_size();
+        let scale = self.window.scale_factor();
+        EditorSize {
+            width: size.width as f64 / scale,
+            height: size.height as f64 / scale,
+        }
+    }
+
+    /// Align native wgpu rendering to the selected Scene panel.
+    fn set_scene_rect(&self, rect: Option<Rect>) {
+        let viewport = rect
+            .map(|rect| logical_rect_to_physical(rect, self.window.scale_factor()))
+            .unwrap_or_default();
+        self.host.borrow_mut().set_render_viewport(Some(viewport));
     }
 
     /// Advance the ECS and present one frame on Dioxus's redraw event.
@@ -288,19 +260,17 @@ impl EditorContext {
     }
 }
 
-/// Convert the Dioxus grid's logical center cell into physical GPU pixels.
-fn editor_render_viewport(width: u32, height: u32, scale_factor: f64) -> RenderViewport {
-    let physical = |logical: f64| (logical * scale_factor).round() as u32;
-    let left = physical(LEFT_PANEL_WIDTH);
-    let right = physical(RIGHT_PANEL_WIDTH);
-    let top = physical(TOP_BAR_HEIGHT);
-    let bottom = physical(BOTTOM_BAR_HEIGHT);
-
+/// Convert a logical dock rectangle to stable physical edge coordinates.
+fn logical_rect_to_physical(rect: Rect, scale_factor: f64) -> RenderViewport {
+    let left = (rect.x * scale_factor).round().max(0.0) as u32;
+    let top = (rect.y * scale_factor).round().max(0.0) as u32;
+    let right = ((rect.x + rect.width) * scale_factor).round().max(0.0) as u32;
+    let bottom = ((rect.y + rect.height) * scale_factor).round().max(0.0) as u32;
     RenderViewport::new(
-        left.min(width),
-        top.min(height),
-        width.saturating_sub(left.saturating_add(right)),
-        height.saturating_sub(top.saturating_add(bottom)),
+        left,
+        top,
+        right.saturating_sub(left),
+        bottom.saturating_sub(top),
     )
 }
 
@@ -308,25 +278,25 @@ fn editor_render_viewport(width: u32, height: u32, scale_factor: f64) -> RenderV
 mod tests {
     use super::*;
 
-    /// The native viewport matches the center cell of the editor CSS grid.
+    /// Logical layout edges map consistently at common display scales.
     #[test]
     fn viewport_tracks_layout_and_scale_factor() {
         assert_eq!(
-            editor_render_viewport(1280, 800, 1.0),
-            RenderViewport::new(220, 48, 800, 720)
+            logical_rect_to_physical(Rect::new(220.0, 48.0, 800.0, 720.0), 1.0),
+            RenderViewport::new(220, 48, 800, 720),
         );
         assert_eq!(
-            editor_render_viewport(2560, 1600, 2.0),
-            RenderViewport::new(440, 96, 1600, 1440)
+            logical_rect_to_physical(Rect::new(220.0, 48.0, 800.0, 720.0), 2.0),
+            RenderViewport::new(440, 96, 1600, 1440),
         );
     }
 
-    /// Very small windows yield an empty viewport instead of underflowing.
+    /// Empty rectangles disable rendering without coordinate underflow.
     #[test]
     fn viewport_saturates_for_small_windows() {
         assert_eq!(
-            editor_render_viewport(320, 60, 1.0),
-            RenderViewport::new(220, 48, 0, 0)
+            logical_rect_to_physical(Rect::new(12.0, 20.0, 0.0, 0.0), 1.5),
+            RenderViewport::new(18, 30, 0, 0),
         );
     }
 }

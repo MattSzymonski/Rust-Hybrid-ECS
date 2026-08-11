@@ -1554,6 +1554,8 @@ dependencies = [
  "dioxus",
  "futures-util",
  "host",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
