@@ -1543,6 +1543,7 @@ dependencies = [
  "bytemuck",
  "criterion",
  "parking_lot",
+ "pollster",
  "rayon",
  "serde",
  "serde_json",

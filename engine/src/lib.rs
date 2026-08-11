@@ -41,6 +41,8 @@ pub mod profiling;
 pub mod query;
 #[cfg(feature = "rendering")]
 pub mod render;
+#[cfg(feature = "rendering")]
+pub mod renderer;
 pub mod resource;
 pub mod scheduler;
 pub mod scripting;
@@ -61,6 +63,8 @@ pub use query::{
 };
 #[cfg(feature = "rendering")]
 pub use render::{Color, Position, Sprite, SpriteRenderer};
+#[cfg(feature = "rendering")]
+pub use renderer::{Renderer, RendererError, RendererWindow};
 pub use resource::{ResHandle, Resource};
 pub use scheduler::{SystemAccess, SystemScheduler, TypeKey};
 pub use scripting::{ScriptComponent, ScriptContext};

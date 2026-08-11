@@ -4,17 +4,16 @@
 //!
 //! - Defines [`Position`] and [`Sprite`] components describing where and how
 //!   to draw an entity as a colored rectangle.
-//! - Provides [`SpriteRenderer`], which builds a wgpu pipeline and draws all
-//!   `(Position, Sprite)` entities as instanced quads into a given texture view.
+//! - Provides [`SpriteRenderer`], the low-level sprite pipeline used by the
+//!   engine-owned [`Renderer`](crate::Renderer).
 //!
 //! # Design
 //!
 //! This module intentionally stays tiny: it draws colored rectangles, not a
-//! general sprite/texture pipeline. It owns no window or surface - the host
-//! application (`standalone`, `editor`) creates the wgpu `Device`/`Queue`/
-//! `Surface` and calls [`SpriteRenderer::render`] once per frame with the
-//! surface's current texture view. This keeps the renderer reusable across
-//! hosts with very different windowing (`winit` vs. a Dioxus-owned window).
+//! general sprite/texture pipeline. [`crate::Renderer`] owns the normal window
+//! surface/device/queue lifecycle. Advanced integrations such as the editor
+//! may still drive `SpriteRenderer` directly when they must attach to a surface
+//! whose lifetime is owned by another UI framework.
 
 // External crates
 use trait_type_map::impl_trait_accessible;
