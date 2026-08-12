@@ -1,8 +1,9 @@
 //! Complete standalone application runner owned by the host crate.
 //!
-//! The non-rendering build drives frames in a tight headless loop. The
-//! rendering build owns `winit`, creates the native window, asks host setup to
-//! attach the engine renderer, and forwards resize/redraw events.
+//! The non-rendering build drives frames in a tight headless loop.
+//! The rendering build owns `winit`, creates the native window,
+//! asks host setup to attach the engine renderer,
+//! and forwards resize/redraw events.
 //!
 //! # Responsibilities
 //!
@@ -19,7 +20,7 @@ use winit::application::ApplicationHandler;
 #[cfg(feature = "rendering")]
 use winit::event::WindowEvent;
 #[cfg(feature = "rendering")]
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 #[cfg(feature = "rendering")]
 use winit::window::{Window, WindowId};
 
@@ -27,7 +28,7 @@ use winit::window::{Window, WindowId};
 use crate::GameModuleConfig;
 
 // =============================================================================
-// Types + Impls
+// WindowedApplication
 // =============================================================================
 
 /// State retained by `winit` for the lifetime of the standalone application.
@@ -46,8 +47,10 @@ impl ApplicationHandler for WindowedApplication {
             return;
         }
 
-        // `winit` only permits creating a window while the event loop is
-        // active, so this is the first point where rendering setup can finish.
+        // Step 1: Create the native window for the standalone host.
+        //
+        // `winit` only permits creating a window while the event loop is active,
+        // so this is the first point where rendering setup can finish.
         let attributes = Window::default_attributes()
             .with_title("ECS Standalone Host")
             .with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0));
@@ -58,6 +61,9 @@ impl ApplicationHandler for WindowedApplication {
         );
         let size = window.inner_size();
 
+        // Step 2: Complete host setup with rendering enabled, attaching the engine renderer
+        // to the native window and configuring the initial viewport size.
+        //
         // Renderer construction is part of host setup; this runner supplies
         // only the platform window that wgpu needs for its surface.
         let host = crate::setup_rendering(
@@ -68,6 +74,7 @@ impl ApplicationHandler for WindowedApplication {
         )
         .expect("rendering host setup failed");
 
+        // Step 3: Store the host and window for use in the event loop.
         self.host = Some(host);
         window.request_redraw();
         self.window = Some(window);
@@ -132,8 +139,6 @@ impl WindowedApplication {
 pub fn run(module_config: GameModuleConfig) -> Result<(), Box<dyn std::error::Error>> {
     let mut host = crate::setup(module_config)?;
 
-    // Headless execution advances continuously; the engine scheduler decides
-    // how each frame's systems are parallelized.
     loop {
         if let Some(report) = crate::run_one_frame(&mut host) {
             println!(
@@ -147,18 +152,21 @@ pub fn run(module_config: GameModuleConfig) -> Result<(), Box<dyn std::error::Er
 /// Run the configured game in the host-owned native window and render loop.
 #[cfg(feature = "rendering")]
 pub fn run(module_config: GameModuleConfig) -> Result<(), Box<dyn std::error::Error>> {
-    use winit::event_loop::{ControlFlow, EventLoop};
-
-    // Poll continuously so presentation is not artificially restricted by a
-    // wait-based event-loop cadence.
+    // Create a new event loop for the windowed application.
     let event_loop = EventLoop::new()?;
+
+    // Set the event loop to poll continuously, so that the host can run
+    // frames as fast as possible without waiting for user input.
     event_loop.set_control_flow(ControlFlow::Poll);
 
+    // Create the application state and run the event loop.
     let mut application = WindowedApplication {
         module_config,
         window: None,
         host: None,
     };
+
+    // Run the event loop until the window is closed.
     event_loop.run_app(&mut application)?;
     Ok(())
 }

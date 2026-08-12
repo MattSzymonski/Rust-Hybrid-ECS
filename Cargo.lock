@@ -1531,29 +1531,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
-name = "pill_engine"
-version = "0.1.0"
-dependencies = [
- "bytemuck",
- "criterion",
- "parking_lot",
- "pollster",
- "rayon",
- "serde",
- "serde_json",
- "sysinfo",
- "tracy-client",
- "trait_type_map",
- "wgpu",
-]
-
-[[package]]
 name = "editor"
 version = "0.1.0"
 dependencies = [
  "dioxus",
  "futures-util",
- "host",
+ "pill_host",
  "serde",
  "serde_json",
  "tokio",
@@ -2366,19 +2349,6 @@ name = "hexf-parse"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
-
-[[package]]
-name = "host"
-version = "0.1.0"
-dependencies = [
- "pill_engine",
- "libloading 0.8.9",
- "notify",
- "serde",
- "serde_json",
- "trait_type_map",
- "winit",
-]
 
 [[package]]
 name = "html5ever"
@@ -4082,11 +4052,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "pill_engine"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "criterion",
+ "parking_lot",
+ "pollster",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sysinfo",
+ "tracy-client",
+ "trait_type_map",
+ "wgpu",
+]
+
+[[package]]
+name = "pill_host"
+version = "0.1.0"
+dependencies = [
+ "libloading 0.8.9",
+ "notify",
+ "pill_engine",
+ "serde",
+ "serde_json",
+ "trait_type_map",
+ "winit",
+]
+
+[[package]]
 name = "pill_standalone"
 version = "0.1.0"
 dependencies = [
  "pill_engine",
- "host",
+ "pill_host",
  "pollster",
  "wgpu",
  "winit",

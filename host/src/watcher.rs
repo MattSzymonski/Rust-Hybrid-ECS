@@ -12,11 +12,10 @@
 //!
 //! # Design
 //!
-//! The file watcher runs in a separate thread to avoid blocking the main
-//! frame loop. A debounce window coalesces multiple file events into a
-//! single reload signal, and the changed paths collected during that window
-//! are reported to the console. The main thread checks the reload flag each
-//! frame and triggers a hot reload when it is set.
+//! The file watcher runs in a separate thread to avoid blocking the main loop.
+//! A debounce window coalesces multiple file events into a single reload signal,
+//! and the changed paths collected during that window are reported to the console.
+//! The main thread checks the reload flag each loop and triggers a hot reload when it is set.
 
 // Standard library
 use std::collections::HashSet;
@@ -41,6 +40,12 @@ const DEBOUNCE_DURATION: Duration = Duration::from_millis(300);
 
 /// Directory names that never contain source code worth rebuilding for.
 const IGNORED_DIRECTORY_NAMES: [&str; 3] = ["target", "bin", "obj"];
+
+/// Suffixes editors use for temporary and swap files written around saves.
+const EDITOR_TEMPORARY_FILE_SUFFIXES: [&str; 3] = ["~", ".swp", ".swx"];
+
+/// Prefix shared by hidden files, which never contain source code.
+const HIDDEN_FILE_PREFIX: &str = ".";
 
 /// Maximum number of changed paths printed per reload report.
 const REPORTED_PATH_LIMIT: usize = 5;
@@ -82,10 +87,10 @@ fn is_relevant_path(path: &Path) -> bool {
     // would otherwise trigger a rebuild of half-written content.
     match path.file_name().and_then(|name| name.to_str()) {
         Some(name) => {
-            !name.starts_with('.')
-                && !name.ends_with('~')
-                && !name.ends_with(".swp")
-                && !name.ends_with(".swx")
+            !name.starts_with(HIDDEN_FILE_PREFIX)
+                && !EDITOR_TEMPORARY_FILE_SUFFIXES
+                    .iter()
+                    .any(|suffix| name.ends_with(suffix))
         }
         None => false,
     }
@@ -121,9 +126,6 @@ pub(crate) fn spawn_file_watcher(
 
     // Step 2: Create the watcher with a minimal callback that forwards
     // relevant paths to a debounce channel.
-    // The notify callback should do as little work as possible because its
-    // execution model differs between operating-system backends. A channel
-    // transfers relevant paths to one host-owned debounce thread.
     let (sender, receiver) = std::sync::mpsc::channel::<PathBuf>();
     let mut watcher = RecommendedWatcher::new(
         move |result: Result<Event, notify::Error>| match result {
@@ -151,28 +153,27 @@ pub(crate) fn spawn_file_watcher(
     watcher.watch(&watch_path, RecursiveMode::Recursive)?;
 
     // Step 3: Run the debounce worker that reports changes and signals the
-    // main frame loop.
+    // main loop in the host.
     std::thread::spawn(move || {
-        // RecommendedWatcher unregisters its OS handles when dropped. Move it
-        // into the worker even though the loop never calls it directly, keeping
-        // those handles alive for exactly as long as the receiver remains live.
+        // RecommendedWatcher unregisters its OS handles when dropped.
+        // Move it into the worker even though the loop never calls it directly,
+        // keeping those handles alive for exactly as long as the receiver remains live.
         let _watcher = watcher;
 
-        // Block without consuming CPU until an event starts a debounce
-        // window. A disconnected channel cleanly ends the worker.
+        // Block without consuming CPU until an event starts a debounce window.
         while let Ok(first_path) = receiver.recv() {
-            // One source save can produce several notifications for the same
-            // file. Wait for the burst to settle, deduplicate all signals in
-            // a set, and report the trigger before signalling the frame loop.
+            // One source save can produce several notifications for the same file.
+            // Wait for the burst to settle, deduplicate all signals in a set,
+            // and report the trigger before signalling the main loop in the host.
             let mut changed_paths = HashSet::from([first_path]);
             std::thread::sleep(DEBOUNCE_DURATION);
             while let Ok(path) = receiver.try_recv() {
                 changed_paths.insert(path);
             }
 
-            // Paths are printed relative to the watch directory so the report
-            // stays short and readable even for long workspace paths.
-            let mut report = changed_paths
+            // Prepare a short report of the changed paths for the console.
+            // Paths are printed relative to the watch directory.
+            let mut report: String = changed_paths
                 .iter()
                 .take(REPORTED_PATH_LIMIT)
                 .map(|path| {
@@ -191,9 +192,7 @@ pub(crate) fn spawn_file_watcher(
             }
             println!("[host] Change detected: {report}");
 
-            // The frame loop swaps this flag with Acquire ordering. Release is
-            // sufficient for the cross-thread handoff without the stronger
-            // global ordering cost of a sequentially consistent atomic.
+            // Signal the main loop to perform a hot reload on the next loop iteration.
             reload_flag.store(true, Ordering::Release);
         }
     });

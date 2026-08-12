@@ -25,7 +25,7 @@ use super::change_detection::Mut;
 use super::ptr::{SendPtr, SendPtrMut};
 
 // =============================================================================
-// General Functions
+// Free Functions
 // =============================================================================
 
 /// Returns `true` when `writes` contains any duplicate [`ComponentId`],

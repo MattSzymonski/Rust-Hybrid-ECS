@@ -10,12 +10,12 @@
 //!
 //! # Design
 //!
-//! The crate has no `main` function, but it owns the complete standalone run
-//! loop. With `rendering` enabled that includes the window, event loop, and
-//! engine renderer. Embedding frontends such as `editor` can instead provide
-//! their own window and event loop through [`setup_rendering`]. Configuration
-//! is externalized in [`GameModuleConfig`], keeping backend selection out of
-//! executable crates.
+//! The crate has no `main` function, but it owns the complete standalone run loop.
+//! With `rendering` enabled that includes the window, event loop, and engine renderer.
+//! Embedding frontends such as `editor` can instead provide their own window and
+//! event loop through [`setup_rendering`].
+//! Configuration is externalized in [`GameModuleConfig`],
+//! keeping backend selection out of executable crates.
 
 mod build;
 mod config;
@@ -27,9 +27,11 @@ mod runtime;
 mod watcher;
 
 pub use config::{CSharpModuleConfig, GameModuleBackend, GameModuleConfig};
-#[cfg(feature = "rendering")]
-pub use pill_engine::{RenderViewport, RendererError, VirtualResolution};
 pub use runner::run;
 pub use runtime::{run_one_frame, setup, FrameReport, Host};
+
+#[cfg(feature = "rendering")]
+pub use pill_engine::{RenderViewport, RendererError, VirtualResolution};
+
 #[cfg(feature = "rendering")]
 pub use runtime::{setup_rendering, RenderingHost};

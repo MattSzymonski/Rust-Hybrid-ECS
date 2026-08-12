@@ -21,7 +21,7 @@ use crate::native_library::GameLibrary;
 use crate::{GameModuleBackend, GameModuleConfig};
 
 // =============================================================================
-// Types + Impls
+// LoadedGame
 // =============================================================================
 
 /// The backend-specific state kept alive by the host loop.

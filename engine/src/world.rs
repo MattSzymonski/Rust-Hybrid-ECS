@@ -459,7 +459,7 @@ impl Default for World {
 }
 
 // =============================================================================
-// General Functions
+// Free Functions
 // =============================================================================
 
 /// Copies a single component instance from source to destination storage.

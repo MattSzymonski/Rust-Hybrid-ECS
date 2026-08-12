@@ -14,7 +14,7 @@
 //! Re-exported at the crate root via `crate::config`.
 
 // =============================================================================
-// General Functions
+// Free Functions
 // =============================================================================
 
 /// Default number of entities per parallel work slice, clamped by component size.
