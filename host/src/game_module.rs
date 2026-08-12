@@ -10,7 +10,7 @@
 // Standard library
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU64;
 
 // External crates
 use pill_engine::{Engine, EngineApi};
@@ -20,6 +20,17 @@ use crate::build::build_game_module;
 use crate::csharp::CSharpRuntime;
 use crate::native_library::GameLibrary;
 use crate::{GameModuleBackend, GameModuleConfig};
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Maximum number of retired native generations kept mapped.
+///
+/// The immediately previous generation must stay mapped because its persist
+/// metadata drives the next migration; anything older can be evicted and its
+/// temporary file deleted.
+const MAX_GRAVEYARD_GENERATIONS: usize = 2;
 
 // =============================================================================
 // LoadedGame
@@ -92,7 +103,7 @@ impl LoadedGame {
         engine_api: &EngineApi,
         workspace_root: &Path,
         config: &GameModuleConfig,
-        cancel_flag: Option<&AtomicBool>,
+        cancel_flag: Option<(&AtomicU64, u64)>,
     ) {
         match self {
             // Native reload owns schema migration and DLL lifetime handling, so
@@ -159,7 +170,7 @@ fn reload_native(
     engine_api: &EngineApi,
     workspace_root: &Path,
     config: &GameModuleConfig,
-    cancel_flag: Option<&AtomicBool>,
+    cancel_flag: Option<(&AtomicU64, u64)>,
 ) {
     // Step 1: Compile the new module before touching engine state.
     // Complete compilation before mutating engine state. A compiler error can
@@ -271,6 +282,23 @@ fn reload_native(
     // Moving it into the graveyard keeps those addresses valid permanently.
     println!("[host] === Reload step 4/4: archiving old DLL, swapping ===");
     old_libraries.push(std::mem::replace(current, new_library));
+
+    // Keep the graveyard bounded. Engine-owned pointers only reference the
+    // immediately previous generation (its persist metadata drives the next
+    // migration), so anything older than the cap can be evicted safely.
+    if old_libraries.len() > MAX_GRAVEYARD_GENERATIONS {
+        let evicted = old_libraries.remove(0);
+        let temporary_path = evicted.temporary_path().to_path_buf();
+        // Drop the library first so the module is unmapped; Windows refuses
+        // to delete a file that is still mapped into the process.
+        drop(evicted);
+        if let Err(error) = std::fs::remove_file(&temporary_path) {
+            eprintln!(
+                "[host] Failed to remove evicted temporary DLL {}: {error}",
+                temporary_path.display()
+            );
+        }
+    }
     println!(
         "[host] Hot-reload complete ({} entities, {} old libs in graveyard).",
         engine.world().entity_count(),

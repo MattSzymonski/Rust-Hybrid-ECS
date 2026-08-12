@@ -154,7 +154,9 @@ fn get_component_chunk<T: Component + TraitAccessible<dyn Component>>(
     };
     let bits = archetype.0;
     // SAFETY: `output` was checked by the FFI entry point and the slice stays
-    // alive for the duration of the active scheduled system invocation.
+    // alive for the duration of the active scheduled system invocation. The
+    // managed side must stay within `len * element_size` and must not retain
+    // the returned pointers beyond that invocation.
     unsafe {
         output.write(ComponentChunk {
             archetype_low: bits as u64,

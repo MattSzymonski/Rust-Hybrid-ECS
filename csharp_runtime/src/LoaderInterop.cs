@@ -40,6 +40,16 @@ public struct NativeSystemAccess
 /// <summary>Stable native entry points used by the Rust scheduler bridge.</summary>
 public static unsafe class LoaderInterop
 {
+    /// <summary>
+    /// Unmanaged ABI contract version shared with the Rust host.
+    /// Bump whenever any unmanaged export signature changes.
+    /// </summary>
+    public const uint InteropContractVersion = 1;
+
+    /// <summary>Return the unmanaged ABI contract version for host validation.</summary>
+    [UnmanagedCallersOnly]
+    public static uint InteropVersion() => InteropContractVersion;
+
     // The stable runtime owns exactly one active collectible game loader.
     private static GameHost? _host;
 

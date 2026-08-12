@@ -58,6 +58,24 @@ pub struct GameModuleConfig {
 }
 
 impl GameModuleConfig {
+    /// Verify that the configuration is internally consistent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a description of the first invalid field.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.name.is_empty() {
+            return Err("name must not be empty");
+        }
+        if self.watch_directory.is_empty() {
+            return Err("watch_directory must not be empty");
+        }
+        if self.build_command.is_empty() {
+            return Err("build_command must not be empty");
+        }
+        Ok(())
+    }
+
     /// Default configuration for a Rust `cdylib` game module built with Cargo.
     ///
     /// When the host is built with the `rendering` feature, the game module is

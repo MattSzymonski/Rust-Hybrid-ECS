@@ -69,8 +69,15 @@ pub(super) struct NativeComponentBlob {
 
 /// Description of one contiguous ECS column returned to managed code.
 ///
-/// Pointers reference storage owned by the active archetype and remain valid
-/// only for the duration of the scheduled managed invocation.
+/// # Managed-side obligations
+///
+/// - `data` and `ticks` point into engine-owned storage and remain valid only
+///   for the duration of the scheduled managed invocation that received them;
+///   they must never be cached or dereferenced in a later invocation.
+/// - Managed code may write through `data` only for components the system
+///   declared with write access, and must stay within `len * element_size`.
+/// - `ticks` may be null for read-only columns; entity columns always carry
+///   null ticks and their `data` must never be written through.
 #[repr(C)]
 pub(super) struct ComponentChunk {
     pub(super) archetype_low: u64,
@@ -87,7 +94,7 @@ pub(super) struct ComponentChunk {
 /// Managed systems declare one entry per queried component before the native
 /// side derives scheduler metadata.
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct NativeSystemAccess {
     pub(super) component_key: u64,
     pub(super) component_key_high: u64,

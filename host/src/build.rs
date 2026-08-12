@@ -12,7 +12,7 @@
 // Standard library
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // Current crate
@@ -42,7 +42,7 @@ const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(100);
 pub(crate) fn build_game_module(
     workspace_root: &Path,
     config: &GameModuleConfig,
-    cancel_flag: Option<&AtomicBool>,
+    cancel_flag: Option<(&AtomicU64, u64)>,
 ) -> Result<PathBuf, Box<dyn std::error::Error>> {
     println!("[host] Building {} module...", config.name);
 
@@ -69,9 +69,13 @@ pub(crate) fn build_game_module(
     // newer source saves.
     let deadline = Instant::now() + BUILD_TIMEOUT;
     let status = loop {
-        // A newer save during the build cancels this attempt. The caller keeps
-        // the old module and the next frame rebuilds with the newer sources.
-        if cancel_flag.is_some_and(|flag| flag.load(Ordering::Acquire)) {
+        // A newer save during the build advances the generation beyond the
+        // baseline captured when the reload started, which cancels this
+        // attempt. The caller keeps the old module and the next frame
+        // rebuilds with the newer sources.
+        if cancel_flag
+            .is_some_and(|(generation, baseline)| generation.load(Ordering::Acquire) != baseline)
+        {
             let _ = child.kill();
             let _ = child.wait();
             return Err("Build cancelled: sources changed again during compilation.".into());

@@ -53,7 +53,9 @@ pub(super) extern "C" fn ffi_get_component_chunk(
             };
             let bits = archetype.0;
             // SAFETY: output is non-null and all pointers remain owned by the
-            // active world's archetype for the managed invocation.
+            // active world's archetype for the managed invocation. The managed
+            // side must not retain the pointers beyond that invocation and
+            // must respect the declared access mode.
             unsafe {
                 output.write(ComponentChunk {
                     archetype_low: bits as u64,
@@ -83,7 +85,9 @@ pub(super) extern "C" fn ffi_get_entity_chunk(chunk_index: u32, output: *mut Com
         };
         let bits = archetype.0;
         // SAFETY: `output` was checked above and the entity slice remains
-        // borrowed only for the active managed system invocation.
+        // borrowed only for the active managed system invocation. The managed
+        // side must treat the returned pointers as read-only and must not
+        // retain them beyond the invocation.
         unsafe {
             output.write(ComponentChunk {
                 archetype_low: bits as u64,

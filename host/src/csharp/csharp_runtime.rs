@@ -218,41 +218,52 @@ impl Drop for DotnetRuntimeContext {
 // Runtime Discovery and String Conversion
 // =============================================================================
 
-/// Locate the newest installed `hostfxr` beneath `DOTNET_ROOT` or Program Files.
+/// One installed `hostfxr` candidate with its parsed version key.
+struct HostfxrVersion {
+    /// Numeric base version components used for ordering.
+    numeric: Vec<u32>,
+    /// Whether the version carries no prerelease suffix.
+    stable: bool,
+    path: PathBuf,
+}
+
+/// Locate the newest installed `hostfxr` library.
+///
+/// An explicit `ECS_DOTNET_HOSTFXR` path wins. Otherwise every configured
+/// .NET root is scanned and the newest `hostfxr` version is selected;
+/// prereleases only win when no stable release of the same base version
+/// exists.
 fn find_dotnet_host() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    // An explicit DOTNET_ROOT takes precedence, matching .NET hosting tools.
-    // Program Files is the conventional fallback for system-wide Windows SDKs.
-    let dotnet_root = std::env::var_os("DOTNET_ROOT")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("ProgramFiles").map(|path| PathBuf::from(path).join("dotnet")))
-        .ok_or("DOTNET_ROOT and ProgramFiles are both unset")?;
-    let fxr_root = dotnet_root.join("host").join("fxr");
+    // An explicit override lets users pin one hostfxr regardless of what
+    // other SDKs are installed.
+    if let Some(override_path) = std::env::var_os("ECS_DOTNET_HOSTFXR") {
+        let path = PathBuf::from(override_path);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(format!(
+            "ECS_DOTNET_HOSTFXR does not point at a file: {}",
+            path.display()
+        )
+        .into());
+    }
 
-    // Every child directory represents one installed hostfxr version. Convert
-    // its dot/dash-separated numeric pieces before sorting so, for example,
-    // version 10 correctly sorts after version 9 instead of before it.
-    let mut versions: Vec<(Vec<u32>, PathBuf)> = std::fs::read_dir(&fxr_root)?
-        .filter_map(Result::ok)
-        .filter(|entry| entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false))
-        .map(|entry| {
-            let version = entry
-                .file_name()
-                .to_string_lossy()
-                .split(['.', '-'])
-                .map(|part| part.parse::<u32>().unwrap_or(0))
-                .collect();
-            (version, entry.path())
-        })
-        .collect();
-    versions.sort_by(|left, right| left.0.cmp(&right.0));
+    let mut versions: Vec<HostfxrVersion> = Vec::new();
+    for root in dotnet_roots() {
+        collect_hostfxr_versions(&root, &mut versions);
+    }
 
-    // Use the newest installed hostfxr. Framework compatibility is still
-    // decided by hostfxr itself from the runtimeconfig during initialization.
+    // Newest version wins; a stable release beats a prerelease of the same
+    // base version because `true` sorts after `false`.
+    versions.sort_by(|left, right| {
+        left.numeric
+            .cmp(&right.numeric)
+            .then(left.stable.cmp(&right.stable))
+    });
     let directory = versions
         .last()
-        .ok_or("no .NET hostfxr installation found")?
-        .1
-        .clone();
+        .map(|version| version.path.clone())
+        .ok_or("no .NET hostfxr installation found; searched the configured dotnet roots")?;
 
     #[cfg(windows)]
     let filename = "hostfxr.dll";
@@ -264,6 +275,79 @@ fn find_dotnet_host() -> Result<PathBuf, Box<dyn std::error::Error>> {
     // The version directory layout is identical across platforms; only the
     // native shared-library filename differs.
     Ok(directory.join(filename))
+}
+
+/// Candidate .NET installation roots, in preference order.
+fn dotnet_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(root) = std::env::var_os("DOTNET_ROOT").map(PathBuf::from) {
+        roots.push(root);
+    }
+    #[cfg(windows)]
+    {
+        if let Some(program_files) = std::env::var_os("ProgramFiles") {
+            roots.push(PathBuf::from(program_files).join("dotnet"));
+        }
+        if let Some(program_files_x86) = std::env::var_os("ProgramFiles(x86)") {
+            roots.push(PathBuf::from(program_files_x86).join("dotnet"));
+        }
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            roots.push(
+                PathBuf::from(local_app_data)
+                    .join("Microsoft")
+                    .join("dotnet"),
+            );
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(home) = std::env::var_os("HOME") {
+            roots.push(PathBuf::from(home).join(".dotnet"));
+        }
+        roots.push(PathBuf::from("/usr/share/dotnet"));
+        roots.push(PathBuf::from("/usr/lib/dotnet"));
+    }
+    roots
+}
+
+/// Append every `host/fxr/<version>` candidate found beneath one dotnet root.
+fn collect_hostfxr_versions(root: &Path, versions: &mut Vec<HostfxrVersion>) {
+    // Missing roots are normal: not every candidate location exists on every
+    // machine, so unreadable directories are skipped instead of failing.
+    let fxr_root = root.join("host").join("fxr");
+    let Ok(entries) = std::fs::read_dir(&fxr_root) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let (numeric, stable) = parse_hostfxr_version(&entry.file_name().to_string_lossy());
+        versions.push(HostfxrVersion {
+            numeric,
+            stable,
+            path: entry.path(),
+        });
+    }
+}
+
+/// Split a `hostfxr` directory name into an orderable version key.
+///
+/// Only the numeric base version participates in comparison; a directory with
+/// any non-numeric segment (e.g. `-preview.7`) is marked non-stable so a
+/// stable release of the same base version always wins.
+fn parse_hostfxr_version(name: &str) -> (Vec<u32>, bool) {
+    let mut numeric = Vec::new();
+    for part in name.split('.') {
+        match part.find(|character: char| !character.is_ascii_digit()) {
+            Some(_) => return (numeric, false),
+            None => numeric.push(part.parse::<u32>().unwrap_or(0)),
+        }
+    }
+    (numeric, true)
 }
 
 /// Encode an OS string as nul-terminated UTF-16 for Windows hostfxr.

@@ -34,12 +34,20 @@ use super::csharp_runtime::DotnetRuntimeContext;
 /// managed assembly from driving a multi-gigabyte host allocation.
 pub(super) const MAX_COMPONENT_MANIFEST_BYTES: u32 = 16 * 1024 * 1024;
 
+/// Unmanaged ABI contract version shared with `csharp_runtime`.
+///
+/// Bump whenever any `UnmanagedCallersOnly` export signature changes; the host
+/// refuses to start against a runtime built for a different version.
+const INTEROP_CONTRACT_VERSION: u32 = 1;
+
 // =============================================================================
 // Types
 // =============================================================================
 
 /// Signature of the managed runtime entry point that receives the API table.
 type InitFn = extern "system" fn(*const CsEngineApi) -> u8;
+/// Signature returning the unmanaged ABI contract version.
+type InteropVersionFn = extern "system" fn() -> u32;
 /// Signature returning the number of registered scheduler systems.
 type SystemCountFn = extern "system" fn() -> u32;
 /// Signature returning the number of managed startup methods.
@@ -73,6 +81,16 @@ pub(crate) const POLL_REJECTED: u8 = 2;
 // Types + Impls
 // =============================================================================
 
+/// Reflected metadata of one managed system, captured at startup.
+///
+/// The snapshot is compared against a re-reflection after every successful
+/// reload, so a managed-side bug that silently changes system metadata can
+/// never run stale index bindings unnoticed.
+struct ManagedSystemSnapshot {
+    accesses: Box<[NativeSystemAccess]>,
+    uses_commands: bool,
+}
+
 /// Owns the hosted .NET context, stable API table, and reload callback.
 ///
 /// Keeping `_runtime` and `_api` alive guarantees that both the managed
@@ -80,7 +98,12 @@ pub(crate) const POLL_REJECTED: u8 = 2;
 /// scheduler closures.
 pub(crate) struct CSharpRuntime {
     poll_reload: PollReloadFn,
+    system_count: SystemCountFn,
+    access_count: SystemAccessCountFn,
+    get_access: GetSystemAccessFn,
+    system_uses_commands: SystemUsesCommandsFn,
     last_poll_status: u8,
+    system_snapshot: Vec<ManagedSystemSnapshot>,
     _runtime: DotnetRuntimeContext,
     _api: Box<CsEngineApi>,
     _bindings: Arc<ComponentBindings>,
@@ -122,6 +145,24 @@ impl CSharpRuntime {
             "TracyLive.Loader.LoaderInterop, {}",
             config.runtime_assembly_name
         );
+
+        // Step 1a: Validate the unmanaged ABI contract before resolving any
+        // export. A mismatched runtime assembly was built against different
+        // export signatures and must be rebuilt before the host can proceed.
+        let interop_version = runtime.get_unmanaged_fn::<InteropVersionFn>(
+            &assembly,
+            &type_name,
+            "InteropVersion",
+        )?;
+        if interop_version() != INTEROP_CONTRACT_VERSION {
+            return Err(format!(
+                "csharp_runtime interop version mismatch: host expects {INTEROP_CONTRACT_VERSION} \
+                 but the runtime reports {}; rebuild csharp_runtime.",
+                interop_version()
+            )
+            .into());
+        }
+
         let init = runtime.get_unmanaged_fn::<InitFn>(&assembly, &type_name, "Init")?;
         let system_count =
             runtime.get_unmanaged_fn::<SystemCountFn>(&assembly, &type_name, "SystemCount")?;
@@ -227,6 +268,7 @@ impl CSharpRuntime {
         if count == 0 {
             return Err("game_cs contains no [EcsSystem] methods".into());
         }
+        let mut system_snapshot = Vec::with_capacity(count as usize);
         for system_index in 0..count {
             let mut managed_access = Vec::with_capacity(access_count(system_index) as usize);
             for access_index in 0..access_count(system_index) {
@@ -247,6 +289,13 @@ impl CSharpRuntime {
             let uses_commands = system_uses_commands(system_index) != 0;
             let mut access = derive_system_access(&managed_access, &bindings)?;
             access.set_uses_commands(uses_commands);
+            // Snapshot the reflected metadata before moving the access list
+            // into the scheduler closure, so reloads can verify that the
+            // managed side never changes it silently.
+            system_snapshot.push(ManagedSystemSnapshot {
+                accesses: managed_access.clone().into_boxed_slice(),
+                uses_commands,
+            });
             let managed_access = managed_access.into_boxed_slice();
             let system_bindings = Arc::clone(&bindings);
             let name = Box::leak(format!("csharp_system_{system_index}").into_boxed_str());
@@ -272,7 +321,12 @@ impl CSharpRuntime {
 
         Ok(Self {
             poll_reload,
+            system_count,
+            access_count,
+            get_access,
+            system_uses_commands,
             last_poll_status: POLL_NO_CHANGE,
+            system_snapshot,
             _runtime: runtime,
             _api: api,
             _bindings: bindings,
@@ -293,10 +347,55 @@ impl CSharpRuntime {
             );
         }
         if status == POLL_RELOADED {
-            println!("[host] C# hot reload complete.");
+            if self.verify_systems_unchanged() {
+                println!("[host] C# hot reload complete.");
+            } else {
+                eprintln!(
+                    "[host] Reloaded assembly exposes different system metadata than the \
+                     registered snapshot; restart the host to re-register systems."
+                );
+            }
         }
         self.last_poll_status = status;
         status
+    }
+
+    /// Re-reflect the active game assembly and verify that its system metadata
+    /// still matches the snapshot captured at startup.
+    ///
+    /// The managed loader already rejects swaps whose system signatures
+    /// changed, so this is defense in depth: a mismatch means the loader
+    /// validation and the host snapshot disagree, and continuing would run
+    /// stale index bindings.
+    fn verify_systems_unchanged(&self) -> bool {
+        let count = (self.system_count)();
+        if count as usize != self.system_snapshot.len() {
+            return false;
+        }
+        for system_index in 0..count {
+            let snapshot = &self.system_snapshot[system_index as usize];
+            let access_count = (self.access_count)(system_index);
+            if access_count as usize != snapshot.accesses.len() {
+                return false;
+            }
+            for access_index in 0..access_count {
+                let mut item = NativeSystemAccess {
+                    component_key: 0,
+                    component_key_high: 0,
+                    mode: 0,
+                };
+                if (self.get_access)(system_index, access_index, &mut item) == 0 {
+                    return false;
+                }
+                if item != snapshot.accesses[access_index as usize] {
+                    return false;
+                }
+            }
+            if ((self.system_uses_commands)(system_index) != 0) != snapshot.uses_commands {
+                return false;
+            }
+        }
+        true
     }
 }
 

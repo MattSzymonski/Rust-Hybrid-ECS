@@ -13,9 +13,9 @@
 
 // Standard library
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // External crates
 use pill_engine::{Engine, EngineApi};
@@ -27,6 +27,13 @@ use crate::game_module::LoadedGame;
 use crate::native_library::cleanup_temporary_files;
 use crate::watcher::spawn_file_watcher;
 use crate::{GameModuleBackend, GameModuleConfig};
+
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Minimum interval between repeated frame-error reports.
+const FRAME_ERROR_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 
 // =============================================================================
 // Types + Impls
@@ -44,7 +51,11 @@ pub struct Host {
     engine: Box<Engine>,
     engine_api: EngineApi,
     loaded_game: LoadedGame,
-    reload_flag: Arc<AtomicBool>,
+    reload_generation: Arc<AtomicU64>,
+    last_processed_generation: u64,
+    last_frame_error: Option<String>,
+    last_error_report: Instant,
+    suppressed_error_count: u64,
     frame_count: u64,
     last_report: Instant,
     last_measured_fps: f64,
@@ -75,6 +86,31 @@ impl Host {
             fps,
             entity_count: self.engine.world().entity_count(),
         }
+    }
+
+    /// Report one per-frame engine error with rate limiting.
+    ///
+    /// Repeated identical errors are collapsed: they print at most once per
+    /// [`FRAME_ERROR_REPORT_INTERVAL`] together with the number of suppressed
+    /// occurrences, so a broken system cannot flood the terminal at frame rate.
+    fn report_frame_error(&mut self, signature: String) {
+        let now = Instant::now();
+        if self.last_frame_error.as_deref() == Some(signature.as_str()) {
+            self.suppressed_error_count += 1;
+            if now.duration_since(self.last_error_report) >= FRAME_ERROR_REPORT_INTERVAL {
+                eprintln!(
+                    "[host] Frame error ({} more occurrences): {signature}",
+                    self.suppressed_error_count
+                );
+                self.suppressed_error_count = 0;
+                self.last_error_report = now;
+            }
+            return;
+        }
+        eprintln!("[host] Frame error: {signature}");
+        self.last_frame_error = Some(signature);
+        self.suppressed_error_count = 0;
+        self.last_error_report = now;
     }
 }
 
@@ -159,6 +195,9 @@ pub struct FrameReport {
 
 /// Build/load the game module, create the engine, and start its source watcher.
 pub fn setup(module_config: GameModuleConfig) -> Result<Host, Box<dyn std::error::Error>> {
+    // Step 0: Reject inconsistent configurations before any build or load.
+    module_config.validate()?;
+
     // Step 1: Resolve the workspace root and print the selected configuration.
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -184,11 +223,11 @@ pub fn setup(module_config: GameModuleConfig) -> Result<Host, Box<dyn std::error
     // Step 3: Build and load the game module, then start its source watcher.
     let loaded_game = LoadedGame::start(&mut engine, &engine_api, &workspace_root, &module_config)?;
 
-    let reload_flag = Arc::new(AtomicBool::new(false));
+    let reload_generation = Arc::new(AtomicU64::new(0));
     spawn_file_watcher(
         workspace_root.clone(),
         &module_config,
-        Arc::clone(&reload_flag),
+        Arc::clone(&reload_generation),
     )?;
 
     println!();
@@ -204,7 +243,11 @@ pub fn setup(module_config: GameModuleConfig) -> Result<Host, Box<dyn std::error
         engine,
         engine_api,
         loaded_game,
-        reload_flag,
+        reload_generation,
+        last_processed_generation: 0,
+        last_frame_error: None,
+        last_error_report: Instant::now(),
+        suppressed_error_count: 0,
         frame_count: 0,
         last_report: Instant::now(),
         last_measured_fps: 0.0,
@@ -237,7 +280,11 @@ where
 /// display; all other frames return `None`.
 pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     // Step 1: Process a pending hot reload before running systems.
-    if host.reload_flag.swap(false, Ordering::Acquire) {
+    // The watcher bumps a generation counter; reloading while it differs from
+    // the last processed value means events that arrive during a reload are
+    // never lost.
+    let generation = host.reload_generation.load(Ordering::Acquire);
+    if generation != host.last_processed_generation {
         println!();
         println!("[host] === Hot-reload triggered ===");
         host.loaded_game.reload(
@@ -245,11 +292,12 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
             &host.engine_api,
             &host.workspace_root,
             &host.module_config,
-            // A save during the build cancels the in-flight compilation. The
-            // flag was consumed by swap(false) above, so only newer saves can
-            // set it while this reload is running.
-            Some(&host.reload_flag),
+            // A save during the build advances the generation beyond this
+            // baseline, which cancels the in-flight compilation; the next
+            // frame observes the newer generation and rebuilds.
+            Some((&host.reload_generation, generation)),
         );
+        host.last_processed_generation = host.reload_generation.load(Ordering::Acquire);
     }
 
     // Step 2: Poll the managed loader for an assembly swap.
@@ -258,7 +306,7 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
 
     // Step 3: Execute one scheduler frame.
     if let Err(errors) = host.engine.process_frame() {
-        eprintln!("[host] Frame error: {errors:?}");
+        host.report_frame_error(format!("{errors:?}"));
     }
 
     // Step 4: Invoke the native compatibility update after scheduler systems.

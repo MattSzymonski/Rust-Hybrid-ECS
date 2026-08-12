@@ -5,8 +5,8 @@
 //!
 //! - Spawn a worker thread that monitors the source tree for changes.
 //! - Classify file events and paths so only real source edits trigger reloads.
-//! - Set a reload flag when relevant file events are detected, letting the
-//!   main thread perform a hot reload.
+//! - Bump a reload generation counter when relevant file events are
+//!   detected, letting the main thread perform a hot reload.
 //! - Report which files changed so reloads are debuggable.
 //! - Handle cross-platform file notification differences through `notify`.
 //!
@@ -14,13 +14,15 @@
 //!
 //! The file watcher runs in a separate thread to avoid blocking the main loop.
 //! A debounce window coalesces multiple file events into a single reload signal,
-//! and the changed paths collected during that window are reported to the console.
-//! The main thread checks the reload flag each loop and triggers a hot reload when it is set.
+//! and the changed paths collected during that window are reported to the
+//! console. The main thread compares a generation counter against the last
+//! processed value each loop, so events arriving during a reload are never
+//! lost.
 
 // Standard library
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -67,17 +69,53 @@ fn is_relevant_event(kind: &EventKind) -> bool {
     )
 }
 
-/// Whether a changed path should trigger a rebuild.
+/// Whether a changed absolute path should trigger a rebuild.
 ///
-/// Hidden files, editor temporary and swap files, and build output
-/// directories are excluded because none of them contain source code.
-fn is_relevant_path(path: &Path) -> bool {
-    // Every directory component must be neither hidden nor a build output
-    // directory; a single write inside `target/` or `.git/` must not
-    // trigger a rebuild.
-    for component in path.parent().into_iter().flat_map(Path::components) {
+/// Both sides are canonicalized so symlinked directories cannot smuggle
+/// events from outside the watch tree, and the remaining policy is applied
+/// to the resulting relative path.
+fn is_relevant_path(path: &Path, watch_root: &Path) -> bool {
+    let canonical_root = match watch_root.canonicalize() {
+        Ok(root) => root,
+        Err(_) => return false,
+    };
+    let canonical_path = match path.canonicalize() {
+        Ok(path) => path,
+        // Events for files deleted between notification and check carry no
+        // source content; skipping them is harmless.
+        Err(_) => return false,
+    };
+    if !canonical_path.starts_with(&canonical_root) {
+        return false;
+    }
+    let relative = canonical_path
+        .strip_prefix(&canonical_root)
+        .unwrap_or(Path::new(""));
+    is_relevant_relative_path(relative)
+}
+
+/// Whether a path relative to the canonical watch root should trigger a
+/// rebuild.
+///
+/// Build output directories are ignored only at the top level of the watch
+/// tree; deeper directories may legitimately use the same names. Hidden
+/// files and directories and editor temporary files are excluded at any
+/// depth.
+fn is_relevant_relative_path(relative: &Path) -> bool {
+    // Build outputs are anchored to the watch root: `target/...` directly
+    // beneath it is compiler output, while `src/target_logic/` is source.
+    if let Some(first) = relative.components().next() {
+        if let Some(name) = first.as_os_str().to_str() {
+            if IGNORED_DIRECTORY_NAMES.contains(&name) {
+                return false;
+            }
+        }
+    }
+
+    // Hidden entries are excluded at any depth.
+    for component in relative.components() {
         if let Some(name) = component.as_os_str().to_str() {
-            if name.starts_with('.') || IGNORED_DIRECTORY_NAMES.contains(&name) {
+            if name.starts_with(HIDDEN_FILE_PREFIX) {
                 return false;
             }
         }
@@ -85,13 +123,10 @@ fn is_relevant_path(path: &Path) -> bool {
 
     // Editor temporary files appear and disappear around every save and
     // would otherwise trigger a rebuild of half-written content.
-    match path.file_name().and_then(|name| name.to_str()) {
-        Some(name) => {
-            !name.starts_with(HIDDEN_FILE_PREFIX)
-                && !EDITOR_TEMPORARY_FILE_SUFFIXES
-                    .iter()
-                    .any(|suffix| name.ends_with(suffix))
-        }
+    match relative.file_name().and_then(|name| name.to_str()) {
+        Some(name) => !EDITOR_TEMPORARY_FILE_SUFFIXES
+            .iter()
+            .any(|suffix| name.ends_with(suffix)),
         None => false,
     }
 }
@@ -105,7 +140,7 @@ fn is_relevant_path(path: &Path) -> bool {
 pub(crate) fn spawn_file_watcher(
     workspace_root: PathBuf,
     config: &GameModuleConfig,
-    reload_flag: Arc<AtomicBool>,
+    reload_generation: Arc<AtomicU64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Step 1: Resolve and validate the configured watch directory.
     // Watch paths are configured relative to the repository so the same
@@ -126,13 +161,14 @@ pub(crate) fn spawn_file_watcher(
 
     // Step 2: Create the watcher with a minimal callback that forwards
     // relevant paths to a debounce channel.
+    let callback_root = watch_path.clone();
     let (sender, receiver) = std::sync::mpsc::channel::<PathBuf>();
     let mut watcher = RecommendedWatcher::new(
         move |result: Result<Event, notify::Error>| match result {
             Ok(event) => {
                 if is_relevant_event(&event.kind) {
                     for path in event.paths {
-                        if is_relevant_path(&path) {
+                        if is_relevant_path(&path, &callback_root) {
                             // Failure only means the receiving thread has
                             // shut down, so there is no recovery work for the
                             // callback to perform.
@@ -192,8 +228,11 @@ pub(crate) fn spawn_file_watcher(
             }
             println!("[host] Change detected: {report}");
 
-            // Signal the main loop to perform a hot reload on the next loop iteration.
-            reload_flag.store(true, Ordering::Release);
+            // Bump the reload generation. The main loop compares it against
+            // the last processed value, so signals are never overwritten.
+            // Release publishing makes every earlier write on this thread
+            // visible to the Acquire read on the frame loop.
+            reload_generation.fetch_add(1, Ordering::Release);
         }
     });
 
@@ -232,29 +271,64 @@ mod tests {
         assert!(!is_relevant_event(&EventKind::Other));
     }
 
-    /// Verifies that build output and hidden directories are filtered out
-    /// while ordinary source paths are accepted.
+    /// Verifies that build output directories are filtered out only at the
+    /// top level of the watch tree while deeper source directories using the
+    /// same names stay relevant.
     #[test]
-    fn paths_inside_build_and_hidden_directories_are_filtered_out() {
-        assert!(!is_relevant_path(Path::new(
-            "game_rs/target/debug/libgame.so"
+    fn build_output_directories_are_filtered_only_at_the_watch_root() {
+        assert!(!is_relevant_relative_path(Path::new(
+            "target/debug/libgame.so"
         )));
-        assert!(!is_relevant_path(Path::new(
-            "game_cs/bin/Release/game_cs.dll"
+        assert!(!is_relevant_relative_path(Path::new(
+            "bin/Release/game_cs.dll"
         )));
-        assert!(!is_relevant_path(Path::new(
-            "game_cs/obj/x64/game_cs.csproj.CoreCompileInputs.cache"
+        assert!(!is_relevant_relative_path(Path::new(
+            "obj/x64/project.cache"
         )));
-        assert!(!is_relevant_path(Path::new("game_rs/src/.hidden_file")));
-        assert!(is_relevant_path(Path::new("game_rs/src/main.rs")));
-        assert!(is_relevant_path(Path::new("game_cs/src/Bird.cs")));
+        // Deeper directories may legitimately use these names.
+        assert!(is_relevant_relative_path(Path::new(
+            "src/target_logic/module.rs"
+        )));
+        assert!(is_relevant_relative_path(Path::new("scripts/bin/run.rs")));
+        assert!(is_relevant_relative_path(Path::new("src/main.rs")));
+        assert!(is_relevant_relative_path(Path::new("Bird.cs")));
+    }
+
+    /// Verifies that hidden files and directories are excluded at any depth.
+    #[test]
+    fn hidden_files_and_directories_are_filtered_out() {
+        assert!(!is_relevant_relative_path(Path::new(".hidden_file")));
+        assert!(!is_relevant_relative_path(Path::new(
+            "src/.hidden_dir/file.rs"
+        )));
     }
 
     /// Verifies that editor temporary and swap files never trigger a rebuild.
     #[test]
     fn editor_temporary_and_swap_files_are_filtered_out() {
-        assert!(!is_relevant_path(Path::new("game_rs/src/main.rs~")));
-        assert!(!is_relevant_path(Path::new("game_rs/src/.main.rs.swp")));
-        assert!(!is_relevant_path(Path::new("game_rs/src/main.rs.swx")));
+        assert!(!is_relevant_relative_path(Path::new("src/main.rs~")));
+        assert!(!is_relevant_relative_path(Path::new("src/.main.rs.swp")));
+        assert!(!is_relevant_relative_path(Path::new("src/main.rs.swx")));
+    }
+
+    /// Verifies that paths outside the watch root are rejected, which also
+    /// closes the symlink-escape hatch.
+    #[test]
+    fn paths_outside_the_watch_root_are_filtered_out() {
+        let base = std::env::temp_dir().join(format!("pill_watcher_test_{}", std::process::id()));
+        let watch_root = base.join("watch");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&watch_root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let outside_file = outside.join("game.rs");
+        std::fs::write(&outside_file, "// test").unwrap();
+        assert!(!is_relevant_path(&outside_file, &watch_root));
+
+        let inside_file = watch_root.join("main.rs");
+        std::fs::write(&inside_file, "// test").unwrap();
+        assert!(is_relevant_path(&inside_file, &watch_root));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

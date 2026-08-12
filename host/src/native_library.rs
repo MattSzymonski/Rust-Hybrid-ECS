@@ -27,7 +27,7 @@
 //! rolled back by re-initializing the previous module.
 
 // Standard library
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // External crates
 use libloading::{Library, Symbol};
@@ -63,6 +63,9 @@ pub(crate) struct GameLibrary {
     _library: Library,
     game_init: GameInitFn,
     game_update: Option<GameUpdateFn>,
+    /// Temporary copy backing this library; deleted when the generation is
+    /// evicted from the graveyard.
+    temporary_path: PathBuf,
 }
 
 impl GameLibrary {
@@ -98,7 +101,7 @@ impl GameLibrary {
         // Step 3: Load the copy and validate its required exports.
         // SAFETY: The configured build just produced this module and its
         // required exports are validated before the handle is returned.
-        let game_library = unsafe { Self::load(&temporary_path)? };
+        let game_library = unsafe { Self::load(&temporary_path, temporary_path.clone()) }?;
         println!("[host] Game DLL loaded successfully.");
         Ok(game_library)
     }
@@ -109,7 +112,10 @@ impl GameLibrary {
     ///
     /// `path` must point to a valid native library whose `game_init` export
     /// uses the expected C ABI.
-    unsafe fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    unsafe fn load(
+        path: &Path,
+        temporary_path: PathBuf,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         // SAFETY: The caller guarantees that `path` points to a native module.
         let library = unsafe { Library::new(path)? };
 
@@ -130,6 +136,7 @@ impl GameLibrary {
             _library: library,
             game_init: game_init_pointer,
             game_update: game_update_pointer,
+            temporary_path,
         })
     }
 
@@ -154,6 +161,14 @@ impl GameLibrary {
             // remains valid for the complete duration of this call.
             unsafe { game_update(api as *const EngineApi) };
         }
+    }
+
+    /// Path of the temporary copy backing this library.
+    ///
+    /// The evicting reload path deletes this file once the library is no
+    /// longer mapped, so retired generations do not accumulate on disk.
+    pub(crate) fn temporary_path(&self) -> &Path {
+        &self.temporary_path
     }
 }
 
