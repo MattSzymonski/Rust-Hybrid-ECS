@@ -38,6 +38,21 @@ internal sealed record ManagedSystem(
 /// <summary>Compiled one-shot startup method.</summary>
 internal sealed record ManagedStartup(string Name, Action Run);
 
+/// <summary>
+/// Outcome of one reload poll, reported back to the Rust host.
+/// </summary>
+internal enum PollStatus : byte
+{
+    /// <summary>No reload was due or the assembly has not changed.</summary>
+    NoChange = 0,
+
+    /// <summary>A behavior-compatible assembly was swapped in.</summary>
+    Reloaded = 1,
+
+    /// <summary>The new assembly was rejected; the old one stays loaded.</summary>
+    Rejected = 2,
+}
+
 // =============================================================================
 // GameHost
 // =============================================================================
@@ -97,12 +112,16 @@ internal sealed class GameHost
     public void RunSystem(int index) => _systems[index].Run();
     public void RunStartup(int index) => _startups[index].Run();
 
-    /// <summary>Poll the game DLL timestamp and reload a newer build.</summary>
-    public void PollReload()
+    /// <summary>
+    /// Poll the game DLL timestamp and reload a newer build.
+    /// Returns the swap outcome so the Rust host can distinguish a clean
+    /// behavior reload from a rejection that requires a host restart.
+    /// </summary>
+    public byte PollReload()
     {
         var now = DateTime.UtcNow;
         if (now - _lastPollUtc < PollInterval)
-            return;
+            return (byte)PollStatus.NoChange;
         _lastPollUtc = now;
 
         DateTime written;
@@ -112,20 +131,22 @@ internal sealed class GameHost
         }
         catch (IOException)
         {
-            return;
+            return (byte)PollStatus.NoChange;
         }
 
         if (written <= _lastWriteUtc)
-            return;
+            return (byte)PollStatus.NoChange;
 
         try
         {
             Load(isReload: true);
             Console.WriteLine($"[csharp_runtime] reloaded {Path.GetFileName(_assemblyPath)}");
+            return (byte)PollStatus.Reloaded;
         }
         catch (Exception e)
         {
             Console.Error.WriteLine($"[csharp_runtime] reload failed: {e}");
+            return (byte)PollStatus.Rejected;
         }
     }
 

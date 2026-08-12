@@ -10,7 +10,9 @@ use pill_engine::{ComponentTicks, Engine, SystemAccess, SystemScheduler};
 
 // Current crate
 use super::abi::{ComponentChunk, NativeComponentBlob, NativeSystemAccess};
-use super::backend::derive_system_access;
+use super::backend::{
+    derive_system_access, is_supported_manifest_length, MAX_COMPONENT_MANIFEST_BYTES,
+};
 use super::commands::{
     ffi_queue_add_component, ffi_queue_create, ffi_queue_destroy, ffi_queue_remove_component,
     ffi_reserve_entity,
@@ -642,4 +644,66 @@ fn entity_chunks_are_available_only_during_a_managed_system() {
         assert!(!chunk.data.is_null());
     }
     assert_eq!(ffi_get_entity_chunk(0, &mut chunk), 3);
+}
+
+/// Verifies that an excessively nested field manifest fails validation with a
+/// regular error instead of exhausting the validation stack.
+#[test]
+fn deeply_nested_manifest_is_rejected_without_stack_overflow() {
+    let mut engine = Engine::new();
+    let shared = shared_component_bindings(&mut engine);
+    let stable_id = stable_component_id("TracyLive.DeeplyNested");
+
+    // Build a field tree deeper than the validation depth budget without
+    // nesting this test's own call stack. It must also stay below
+    // serde_json's own recursion limit so the validator, not the parser,
+    // produces the rejection.
+    let mut field = serde_json::json!({
+        "name": "leaf",
+        "offset": 0,
+        "size": 1,
+        "primitive_type": "System.Byte",
+        "fields": []
+    });
+    for _ in 0..40 {
+        field = serde_json::json!({
+            "name": "wrapper",
+            "offset": 0,
+            "size": 1,
+            "primitive_type": "struct",
+            "fields": [field]
+        });
+    }
+    let manifest = serde_json::json!([{
+        "stable_id_low": stable_id.0 as u64,
+        "stable_id_high": (stable_id.0 >> 64) as u64,
+        "full_name": "TracyLive.DeeplyNested",
+        "size": 1,
+        "alignment": 1,
+        "schema_hash": 1,
+        "shared": false,
+        "fields": [field]
+    }]);
+
+    let error =
+        register_component_manifest(&mut engine, &serde_json::to_vec(&manifest).unwrap(), shared)
+            .err()
+            .expect("an excessively nested manifest must be rejected");
+    assert!(
+        error.to_string().contains("nesting depth"),
+        "unexpected error: {error}"
+    );
+}
+
+/// Verifies that managed-reported manifest lengths are bounded before any
+/// host allocation happens.
+#[test]
+fn manifest_length_bounds_reject_empty_and_oversized_values() {
+    assert!(!is_supported_manifest_length(0));
+    assert!(is_supported_manifest_length(1));
+    assert!(is_supported_manifest_length(MAX_COMPONENT_MANIFEST_BYTES));
+    assert!(!is_supported_manifest_length(
+        MAX_COMPONENT_MANIFEST_BYTES + 1
+    ));
+    assert!(!is_supported_manifest_length(u32::MAX));
 }

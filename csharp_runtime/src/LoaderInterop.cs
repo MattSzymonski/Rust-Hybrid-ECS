@@ -181,17 +181,26 @@ public static unsafe class LoaderInterop
         }
     }
 
-    /// <summary>Poll and apply a behavior-compatible gameplay assembly reload.</summary>
+    /// <summary>
+    /// Poll and apply a behavior-compatible gameplay assembly reload.
+    /// </summary>
+    /// <returns>
+    /// Zero when no reload is due, one after a successful swap, and two when
+    /// the loader rejected the new assembly so the old version stays loaded.
+    /// </returns>
     [UnmanagedCallersOnly]
-    public static void PollReload()
+    public static byte PollReload()
     {
         try
         {
-            _host?.PollReload();
+            if (_host is null)
+                return (byte)PollStatus.Rejected;
+            return _host.PollReload();
         }
         catch (Exception e)
         {
             Console.Error.WriteLine($"[csharp_runtime] PollReload failed: {e}");
+            return (byte)PollStatus.Rejected;
         }
     }
 }

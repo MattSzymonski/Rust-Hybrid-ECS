@@ -88,8 +88,9 @@ fn counter_system(mut query: Query<&mut FrameCounter>) {
 // FFI Entry Points
 // =============================================================================
 
+/// Registers test components, systems, and seed entities; returns zero.
 #[no_mangle]
-pub extern "C" fn game_init(api: *const EngineApi) {
+pub extern "C" fn game_init(api: *const EngineApi) -> u32 {
     let api = unsafe { &*api };
     let engine: &mut Engine = unsafe { &mut *(api.engine_handle as *mut Engine) };
 
@@ -148,6 +149,9 @@ pub extern "C" fn game_init(api: *const EngineApi) {
             vertical_speed: 0.75,
         })
         .build();
+
+    // Report successful registration so the host keeps this generation.
+    0
 }
 
 #[no_mangle]

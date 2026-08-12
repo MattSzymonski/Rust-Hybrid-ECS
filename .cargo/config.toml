@@ -1,0 +1,11 @@
+# Style the rustdoc output with the shared guide stylesheet.
+#
+# Cargo runs rustdoc from the workspace root, so `..` reaches the
+# sibling Pill-Engine-Website repository for every workspace member.
+# If the repos are not checked out as siblings, switch this to an
+# absolute path or set RUSTDOCFLAGS instead.
+[build]
+rustdocflags = [
+    "--extend-css",
+    "../Pill-Engine-Website/guide/.vitepress/theme/shared.css",
+]

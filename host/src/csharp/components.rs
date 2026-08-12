@@ -254,18 +254,42 @@ pub(super) fn shared_component_bindings(engine: &mut Engine) -> ComponentBinding
     bindings
 }
 
-/// Recursively verify that a field and each nested field fit within the byte
-/// range of the struct that directly contains it.
+/// Maximum nesting depth accepted in a managed component field tree.
+///
+/// Real component layouts never exceed a handful of levels. The budget stays
+/// below `serde_json`'s own parser recursion limit so this validation, not an
+/// opaque parser error, rejects pathological manifests.
+const MAX_FIELD_NESTING_DEPTH: usize = 32;
+
+/// Verify that a field and every nested field fit within the byte range of
+/// the struct that directly contains it.
+///
+/// The field tree is walked with an explicit worklist so deeply nested input
+/// consumes heap rather than stack, and the depth budget rejects pathological
+/// manifests before they cost real work.
 fn validate_field_manifest(field: &ManagedFieldManifest, parent_size: usize) -> Result<(), String> {
-    let end = field
-        .offset
-        .checked_add(field.size)
-        .ok_or("managed field range overflow")?;
-    if field.name.is_empty() || field.primitive_type.is_empty() || end > parent_size {
-        return Err("managed field lies outside its component layout".into());
-    }
-    for nested in &field.fields {
-        validate_field_manifest(nested, field.size)?;
+    // Each entry carries the field to inspect, the size of the struct that
+    // directly contains it, and that branch's current nesting depth.
+    let mut worklist = vec![(field, parent_size, 0_usize)];
+    while let Some((field, parent_size, depth)) = worklist.pop() {
+        let end = field
+            .offset
+            .checked_add(field.size)
+            .ok_or("managed field range overflow")?;
+        if field.name.is_empty() || field.primitive_type.is_empty() || end > parent_size {
+            return Err("managed field lies outside its component layout".into());
+        }
+        // The depth check runs after the field validates so the error always
+        // names a well-formed field.
+        if depth >= MAX_FIELD_NESTING_DEPTH {
+            return Err(format!(
+                "managed field {} exceeds the maximum nesting depth of {MAX_FIELD_NESTING_DEPTH}",
+                field.name
+            ));
+        }
+        for nested in &field.fields {
+            worklist.push((nested, field.size, depth + 1));
+        }
     }
     Ok(())
 }

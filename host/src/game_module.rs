@@ -10,6 +10,7 @@
 // Standard library
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 
 // External crates
 use pill_engine::{Engine, EngineApi};
@@ -46,7 +47,7 @@ impl LoadedGame {
         // Step 1: Build the module through the shared command runner.
         // Build before branching so both backends use the same command runner,
         // diagnostics, output validation, and initial failure behavior.
-        let output_path = build_game_module(workspace_root, config)?;
+        let output_path = build_game_module(workspace_root, config, None)?;
 
         // Step 2: Initialize the backend-specific runtime.
         match &config.backend {
@@ -58,7 +59,13 @@ impl LoadedGame {
 
                 // Native modules register their components and systems through
                 // the stable EngineApi table before the first frame is run.
-                library.call_game_init(engine_api);
+                // A non-zero status means the module failed to initialize.
+                let status = library.call_game_init(engine_api);
+                if status != 0 {
+                    return Err(
+                        format!("game module initialization failed with status {status}").into(),
+                    );
+                }
                 Ok(Self::Native {
                     current: library,
                     old_libraries: Vec::new(),
@@ -75,13 +82,17 @@ impl LoadedGame {
     }
 
     /// Rebuild and replace the active module while preserving a working old
-    /// generation whenever compilation or loading fails.
+    /// generation whenever compilation, loading, or registration fails.
+    ///
+    /// `cancel_flag` is the watcher's reload signal: a newer save during the
+    /// build aborts the in-flight compilation and the next frame retries.
     pub(crate) fn reload(
         &mut self,
         engine: &mut Engine,
         engine_api: &EngineApi,
         workspace_root: &Path,
         config: &GameModuleConfig,
+        cancel_flag: Option<&AtomicBool>,
     ) {
         match self {
             // Native reload owns schema migration and DLL lifetime handling, so
@@ -96,12 +107,15 @@ impl LoadedGame {
                 engine_api,
                 workspace_root,
                 config,
+                cancel_flag,
             ),
             // C# source changes are compiled by the host. The collectible
-            // managed loader then notices and swaps the resulting assembly.
-            Self::CSharp(runtime) => match build_game_module(workspace_root, config) {
+            // managed loader validates the rebuilt assembly's component
+            // manifest and system signatures before swapping; poll_reload
+            // reports the outcome and logs any rejection.
+            Self::CSharp(runtime) => match build_game_module(workspace_root, config, cancel_flag) {
                 Ok(_) => {
-                    println!("[host] C# build complete; waiting for managed reload.");
+                    println!("[host] C# build complete; polling managed loader.");
                     runtime.poll_reload();
                 }
                 Err(error) => {
@@ -145,11 +159,12 @@ fn reload_native(
     engine_api: &EngineApi,
     workspace_root: &Path,
     config: &GameModuleConfig,
+    cancel_flag: Option<&AtomicBool>,
 ) {
     // Step 1: Compile the new module before touching engine state.
     // Complete compilation before mutating engine state. A compiler error can
     // therefore never remove the systems belonging to the working generation.
-    let output_path = match build_game_module(workspace_root, config) {
+    let output_path = match build_game_module(workspace_root, config, cancel_flag) {
         Ok(path) => path,
         Err(error) => {
             eprintln!("[host] Build failed: {error}");
@@ -183,7 +198,24 @@ fn reload_native(
     println!("[host] === Reload step 1/4: clearing old systems ===");
     engine.clear_systems();
     println!("[host] === Reload step 2/4: calling game_init on new DLL ===");
-    new_library.call_game_init(engine_api);
+    if new_library.call_game_init(engine_api) != 0 {
+        // The new generation failed to register itself. Roll the engine back
+        // to the previous module: game_init must be idempotent, re-registering
+        // the same components and systems and only filling entities up to a
+        // target count.
+        eprintln!(
+            "[host] New game module failed to initialize; rolling back to the previous generation."
+        );
+        engine.clear_systems();
+        let rollback_status = current.call_game_init(engine_api);
+        if rollback_status != 0 {
+            eprintln!(
+                "[host] Rollback of the previous generation also failed (status {rollback_status}); \
+                 the host continues without gameplay systems."
+            );
+        }
+        return;
+    }
 
     // Match schemas by stable type name rather than runtime ComponentId: IDs
     // can differ across dynamically loaded generations, while names persist.

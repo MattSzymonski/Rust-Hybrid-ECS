@@ -10,6 +10,21 @@
 //! - Validate required exports before returning a loaded library.
 //! - Call native registration and per-frame update entry points.
 //! - Remove temporary copies left behind by earlier host processes.
+//!
+//! # Design
+//!
+//! The native ABI is a fixed export contract:
+//!
+//! - `game_init(*const EngineApi) -> u32` — required. Registers components
+//!   and systems before the first frame and returns zero on success; any
+//!   other status aborts the load transaction.
+//! - `game_update(*const EngineApi)` — optional. Called once per frame for
+//!   modules that keep the legacy explicit update hook.
+//!
+//! Both exports are resolved and cached when the library is loaded, so the
+//! frame loop never performs a dynamic lookup or panics on a missing
+//! optional export. `game_init` must be idempotent: a failed generation is
+//! rolled back by re-initializing the previous module.
 
 // Standard library
 use std::path::Path;
@@ -29,9 +44,25 @@ const TEMPORARY_DIRECTORY: &str = "standalone_temp";
 // Types + Impls
 // =============================================================================
 
+/// Signature of the required `game_init` registration entry point.
+///
+/// Returns zero on success; any non-zero status reports a registration
+/// failure and keeps the previous generation loaded.
+type GameInitFn = unsafe extern "C" fn(*const EngineApi) -> u32;
+
+/// Signature of the optional `game_update` per-frame entry point.
+type GameUpdateFn = unsafe extern "C" fn(*const EngineApi);
+
 /// Owns one loaded native game module.
+///
+/// Export symbols are resolved once during loading and stored as raw function
+/// pointers. The pointers stay valid for as long as `_library` keeps the
+/// module mapped, so frame-loop calls never perform a dynamic lookup or panic
+/// on a missing optional export.
 pub(crate) struct GameLibrary {
-    library: Library,
+    _library: Library,
+    game_init: GameInitFn,
+    game_update: Option<GameUpdateFn>,
 }
 
 impl GameLibrary {
@@ -82,37 +113,46 @@ impl GameLibrary {
         // SAFETY: The caller guarantees that `path` points to a native module.
         let library = unsafe { Library::new(path)? };
 
-        // SAFETY: Reading the export validates its name and expected type. It
-        // is not invoked until the engine API has been created.
-        let _: Symbol<unsafe extern "C" fn(*const EngineApi)> =
-            unsafe { library.get(b"game_init")? };
+        // SAFETY: Resolving the export validates its name and expected type.
+        // The symbol is not invoked until the engine API has been created.
+        let game_init: Symbol<GameInitFn> = unsafe { library.get(b"game_init")? };
 
-        Ok(Self { library })
+        // `game_update` is optional: modules without the legacy per-frame
+        // update simply run their registered scheduler systems.
+        let game_update: Option<Symbol<GameUpdateFn>> = unsafe { library.get(b"game_update") }.ok();
+
+        // Copy the resolved pointers out of the borrowed Symbol wrappers. The
+        // `_library` field keeps the module mapped, so these raw pointers
+        // remain valid for the complete lifetime of the returned GameLibrary.
+        let game_init_pointer = *game_init;
+        let game_update_pointer = game_update.map(|symbol| *symbol);
+        Ok(Self {
+            _library: library,
+            game_init: game_init_pointer,
+            game_update: game_update_pointer,
+        })
     }
 
     /// Call the module's registration entry point.
-    pub(crate) fn call_game_init(&self, api: &EngineApi) {
+    ///
+    /// Returns the module's status code: zero reports successful registration;
+    /// any non-zero value means the module failed to initialize and the
+    /// previous generation must remain active.
+    pub(crate) fn call_game_init(&self, api: &EngineApi) -> u32 {
         // SAFETY: The export was validated while loading and `api` remains
         // valid for the complete duration of this call.
-        unsafe {
-            let game_init: Symbol<unsafe extern "C" fn(*const EngineApi)> = self
-                .library
-                .get(b"game_init")
-                .expect("game_init symbol missing");
-            game_init(api as *const EngineApi);
-        }
+        unsafe { (self.game_init)(api as *const EngineApi) }
     }
 
-    /// Call the optional native per-frame update entry point.
+    /// Call the optional native per-frame update entry point, when exported.
+    ///
+    /// Modules that omit `game_update` run entirely through their registered
+    /// scheduler systems, so a missing export is a no-op rather than an error.
     pub(crate) fn call_game_update(&self, api: &EngineApi) {
-        // SAFETY: Native game modules use the host's fixed C ABI and `api`
-        // remains valid for the complete duration of this call.
-        unsafe {
-            let game_update: Symbol<unsafe extern "C" fn(*const EngineApi)> = self
-                .library
-                .get(b"game_update")
-                .expect("game_update symbol missing");
-            game_update(api as *const EngineApi);
+        if let Some(game_update) = self.game_update {
+            // SAFETY: The export was validated while loading and `api`
+            // remains valid for the complete duration of this call.
+            unsafe { game_update(api as *const EngineApi) };
         }
     }
 }

@@ -245,6 +245,10 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
             &host.engine_api,
             &host.workspace_root,
             &host.module_config,
+            // A save during the build cancels the in-flight compilation. The
+            // flag was consumed by swap(false) above, so only newer saves can
+            // set it while this reload is running.
+            Some(&host.reload_flag),
         );
     }
 

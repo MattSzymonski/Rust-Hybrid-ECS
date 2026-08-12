@@ -25,6 +25,16 @@ use super::context::ActiveSystemGuard;
 use super::csharp_runtime::DotnetRuntimeContext;
 
 // =============================================================================
+// Constants
+// =============================================================================
+
+/// Upper bound for the serialized managed component manifest.
+///
+/// Real manifests are a few hundred bytes. The cap keeps a buggy or hostile
+/// managed assembly from driving a multi-gigabyte host allocation.
+pub(super) const MAX_COMPONENT_MANIFEST_BYTES: u32 = 16 * 1024 * 1024;
+
+// =============================================================================
 // Types
 // =============================================================================
 
@@ -48,8 +58,16 @@ type SystemAccessCountFn = extern "system" fn(u32) -> u32;
 type GetSystemAccessFn = extern "system" fn(u32, u32, *mut NativeSystemAccess) -> u8;
 /// Signature running one scheduler system by index.
 type RunSystemFn = extern "system" fn(u32);
-/// Signature polling the collectible loader for a new game assembly.
-type PollReloadFn = extern "system" fn();
+/// Signature polling the collectible loader for a new game assembly and
+/// reporting the swap outcome through the status codes below.
+type PollReloadFn = extern "system" fn() -> u8;
+
+/// Poll returned without a reload: nothing was due or the file is unchanged.
+pub(crate) const POLL_NO_CHANGE: u8 = 0;
+/// Poll swapped in a behavior-compatible assembly.
+pub(crate) const POLL_RELOADED: u8 = 1;
+/// Poll rejected the new assembly; the old version stays loaded.
+pub(crate) const POLL_REJECTED: u8 = 2;
 
 // =============================================================================
 // Types + Impls
@@ -62,6 +80,7 @@ type PollReloadFn = extern "system" fn();
 /// scheduler closures.
 pub(crate) struct CSharpRuntime {
     poll_reload: PollReloadFn,
+    last_poll_status: u8,
     _runtime: DotnetRuntimeContext,
     _api: Box<CsEngineApi>,
     _bindings: Arc<ComponentBindings>,
@@ -147,8 +166,28 @@ impl CSharpRuntime {
             return Err("csharp_runtime initialization failed".into());
         }
 
-        let mut manifest = vec![0_u8; manifest_length() as usize];
-        if manifest.is_empty() || copy_manifest(manifest.as_mut_ptr(), manifest.len() as u32) == 0 {
+        // The manifest length comes from managed code, so it must be bounded
+        // before the host allocates anything from it.
+        let manifest_length = manifest_length();
+        if !is_supported_manifest_length(manifest_length) {
+            return Err(format!(
+                "C# component manifest length {manifest_length} is outside the supported range \
+                 (1..={MAX_COMPONENT_MANIFEST_BYTES})"
+            )
+            .into());
+        }
+
+        // Reserve explicitly so an allocation failure surfaces as a regular
+        // error instead of aborting the host process.
+        let mut manifest = Vec::new();
+        manifest
+            .try_reserve_exact(manifest_length as usize)
+            .map_err(|_| "out of memory allocating the C# component manifest buffer")?;
+        manifest.resize(manifest_length as usize, 0);
+
+        // The managed contract rejects any caller buffer smaller than the
+        // manifest, so a successful copy guarantees a complete payload.
+        if copy_manifest(manifest.as_mut_ptr(), manifest_length) == 0 {
             return Err("failed to copy the C# component manifest".into());
         }
         let bindings = Arc::new(register_component_manifest(
@@ -233,21 +272,45 @@ impl CSharpRuntime {
 
         Ok(Self {
             poll_reload,
+            last_poll_status: POLL_NO_CHANGE,
             _runtime: runtime,
             _api: api,
             _bindings: bindings,
         })
     }
 
-    /// Ask the collectible managed loader to reload a changed game assembly.
-    pub(crate) fn poll_reload(&mut self) {
-        (self.poll_reload)();
+    /// Poll the collectible loader and report the outcome of any swap attempt.
+    ///
+    /// The managed loader validates the rebuilt assembly's component manifest
+    /// and system signatures before swapping. A rejection is logged once per
+    /// attempt so the per-frame poll cannot drown the terminal in messages.
+    pub(crate) fn poll_reload(&mut self) -> u8 {
+        let status = (self.poll_reload)();
+        if status == POLL_REJECTED && self.last_poll_status != POLL_REJECTED {
+            eprintln!(
+                "[host] C# reload rejected: component or system signatures changed. \
+                 Restart the host to rebuild the native component registry and scheduler."
+            );
+        }
+        if status == POLL_RELOADED {
+            println!("[host] C# hot reload complete.");
+        }
+        self.last_poll_status = status;
+        status
     }
 }
 
 // =============================================================================
 // Free Functions
 // =============================================================================
+
+/// Whether a managed-reported manifest length lies within the supported range.
+///
+/// Rejects zero and any value above [`MAX_COMPONENT_MANIFEST_BYTES`], so a
+/// buggy managed assembly can never drive an unbounded host allocation.
+pub(super) fn is_supported_manifest_length(length: u32) -> bool {
+    (1..=MAX_COMPONENT_MANIFEST_BYTES).contains(&length)
+}
 
 /// Translate managed component modes into native scheduler metadata.
 ///

@@ -143,8 +143,14 @@ fn physics_system(
 // Game module entry points
 // =============================================================================
 
+/// Registers components, resources, and systems; returns zero on success.
+///
+/// The host treats a non-zero status as a failed generation and rolls back to
+/// the previously loaded module. Initialization must therefore be idempotent:
+/// re-registering the same components and systems is safe, and entities are
+/// only filled up to a target count.
 #[no_mangle]
-pub extern "C" fn game_init(api: *const EngineApi) {
+pub extern "C" fn game_init(api: *const EngineApi) -> u32 {
     let api = unsafe { &*api };
     let engine = unsafe { &mut *(api.engine_handle as *mut Engine) };
 
@@ -199,8 +205,13 @@ pub extern "C" fn game_init(api: *const EngineApi) {
                 color: Color::new(1.0, 0.3, 0.3, 1.0),
             });
 
-        entity.build().expect("ball components should be registered");
+        entity
+            .build()
+            .expect("ball components should be registered");
     }
+
+    // Report successful registration so the host keeps this generation.
+    0
 }
 
 #[no_mangle]
