@@ -56,15 +56,14 @@ type GameUpdateFn = unsafe extern "C" fn(*const EngineApi);
 /// Owns one loaded native game module.
 ///
 /// Export symbols are resolved once during loading and stored as raw function
-/// pointers. The pointers stay valid for as long as `_library` keeps the
-/// module mapped, so frame-loop calls never perform a dynamic lookup or panic
-/// on a missing optional export.
+/// pointers. The pointers stay valid for as long as the `library` field keeps
+/// the module mapped, so frame-loop calls never perform a dynamic lookup or
+/// panic on a missing optional export.
 pub(crate) struct GameLibrary {
-    _library: Library,
+    library: Option<Library>,
     game_init: GameInitFn,
     game_update: Option<GameUpdateFn>,
-    /// Temporary copy backing this library; deleted when the generation is
-    /// evicted from the graveyard.
+    /// Temporary copy backing this library; deleted when the library drops.
     temporary_path: PathBuf,
 }
 
@@ -80,8 +79,10 @@ impl GameLibrary {
         build_output: &Path,
         workspace_root: &Path,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        // Step 1: Prepare the temporary directory and a unique target path.
-        let temporary_directory = workspace_root.join(TEMPORARY_DIRECTORY);
+        // Step 1: Prepare this process's temporary directory and a unique
+        // target path. Scoping the directory per process id keeps concurrent
+        // host instances from touching each other's copies.
+        let temporary_directory = process_temporary_directory(workspace_root);
         std::fs::create_dir_all(&temporary_directory)?;
 
         let timestamp = std::time::SystemTime::now()
@@ -128,12 +129,12 @@ impl GameLibrary {
         let game_update: Option<Symbol<GameUpdateFn>> = unsafe { library.get(b"game_update") }.ok();
 
         // Copy the resolved pointers out of the borrowed Symbol wrappers. The
-        // `_library` field keeps the module mapped, so these raw pointers
+        // `library` field keeps the module mapped, so these raw pointers
         // remain valid for the complete lifetime of the returned GameLibrary.
         let game_init_pointer = *game_init;
         let game_update_pointer = game_update.map(|symbol| *symbol);
         Ok(Self {
-            _library: library,
+            library: Some(library),
             game_init: game_init_pointer,
             game_update: game_update_pointer,
             temporary_path,
@@ -162,13 +163,22 @@ impl GameLibrary {
             unsafe { game_update(api as *const EngineApi) };
         }
     }
+}
 
-    /// Path of the temporary copy backing this library.
+impl Drop for GameLibrary {
+    /// Unmap the module and delete its temporary copy.
     ///
-    /// The evicting reload path deletes this file once the library is no
-    /// longer mapped, so retired generations do not accumulate on disk.
-    pub(crate) fn temporary_path(&self) -> &Path {
-        &self.temporary_path
+    /// The library handle is dropped explicitly before the file is removed
+    /// because Windows refuses to delete a file that is still mapped into the
+    /// process. Cleanup failures are reported rather than swallowed.
+    fn drop(&mut self) {
+        drop(self.library.take());
+        if let Err(error) = std::fs::remove_file(&self.temporary_path) {
+            eprintln!(
+                "[host] Failed to remove temporary DLL {}: {error}",
+                self.temporary_path.display()
+            );
+        }
     }
 }
 
@@ -176,11 +186,77 @@ impl GameLibrary {
 // Free Functions
 // =============================================================================
 
-/// Remove temporary native-library copies left by earlier host processes.
+/// Directory used by this host process for temporary native-library copies.
+///
+/// Scoping the directory per process id means one host instance can never
+/// delete or overwrite the copies of another instance running against the
+/// same workspace.
+fn process_temporary_directory(workspace_root: &Path) -> PathBuf {
+    workspace_root
+        .join(TEMPORARY_DIRECTORY)
+        .join(std::process::id().to_string())
+}
+
+/// Whether a process with the given id is still running.
+///
+/// Linux probes `/proc` directly. Other platforms cannot probe process
+/// liveness cheaply, so stale directories are detected by attempting the
+/// removal: a live process keeps its mapped modules locked and the deletion
+/// fails naturally.
+fn process_is_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::path::Path::new("/proc").join(pid.to_string()).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Remove temporary copies left by earlier runs of this host process.
+///
+/// Directories belonging to other, still-running host instances are skipped;
+/// stale directories from crashed processes are removed. Removal failures are
+/// reported instead of swallowed.
 pub(crate) fn cleanup_temporary_files(workspace_root: &Path) {
-    let temporary_directory = workspace_root.join(TEMPORARY_DIRECTORY);
-    if temporary_directory.exists() {
-        let _ = std::fs::remove_dir_all(&temporary_directory);
-        println!("[host] Cleaned up leftover temporary files.");
+    let temporary_root = workspace_root.join(TEMPORARY_DIRECTORY);
+    let Ok(entries) = std::fs::read_dir(&temporary_root) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid != std::process::id() && process_is_alive(pid) {
+            continue;
+        }
+        match std::fs::remove_dir_all(entry.path()) {
+            Ok(()) => {
+                if pid != std::process::id() {
+                    println!("[host] Cleaned up stale temporary files from process {pid}.");
+                }
+            }
+            Err(error) => {
+                if pid == std::process::id() {
+                    eprintln!(
+                        "[host] Could not remove temporary directory {}: {error}",
+                        entry.path().display()
+                    );
+                } else {
+                    // On platforms without process probing the removal may
+                    // fail simply because another live host holds the files.
+                    println!(
+                        "[host] Temporary directory {} left in place (possibly still in use): {error}",
+                        entry.path().display()
+                    );
+                }
+            }
+        }
     }
 }

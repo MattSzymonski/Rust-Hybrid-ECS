@@ -287,17 +287,9 @@ fn reload_native(
     // immediately previous generation (its persist metadata drives the next
     // migration), so anything older than the cap can be evicted safely.
     if old_libraries.len() > MAX_GRAVEYARD_GENERATIONS {
-        let evicted = old_libraries.remove(0);
-        let temporary_path = evicted.temporary_path().to_path_buf();
-        // Drop the library first so the module is unmapped; Windows refuses
-        // to delete a file that is still mapped into the process.
-        drop(evicted);
-        if let Err(error) = std::fs::remove_file(&temporary_path) {
-            eprintln!(
-                "[host] Failed to remove evicted temporary DLL {}: {error}",
-                temporary_path.display()
-            );
-        }
+        // Dropping the evicted generation unmaps its module and deletes its
+        // temporary copy on disk; cleanup errors are reported by the Drop.
+        drop(old_libraries.remove(0));
     }
     println!(
         "[host] Hot-reload complete ({} entities, {} old libs in graveyard).",
