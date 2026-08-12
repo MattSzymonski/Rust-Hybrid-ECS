@@ -39,7 +39,7 @@ use crate::world::{set_per_thread_last_run_tick, World};
 
 /// Wrapper for a registered system with its name
 struct RegisteredSystem {
-    name: &'static str,
+    name: String,
     system: Box<dyn System>,
     /// World tick at which this system was last executed.
     ///
@@ -252,7 +252,7 @@ impl Engine {
 
     /// Print the execution graph for debugging
     pub fn print_execution_graph(&self) {
-        let names: Vec<&str> = self.systems.iter().map(|s| s.name).collect();
+        let names: Vec<&str> = self.systems.iter().map(|s| s.name.as_str()).collect();
         self.scheduler.print_execution_graph(&names);
     }
 
@@ -294,7 +294,7 @@ impl Engine {
     ///     // System implementation
     /// });
     /// ```
-    pub fn register_system<F, Input>(&mut self, name: &'static str, system: F)
+    pub fn register_system<F, Input>(&mut self, name: impl Into<String>, system: F)
     where
         F: IntoSystem<Input>,
         Input: SystemParam,
@@ -311,7 +311,7 @@ impl Engine {
 
         // Store system
         self.systems.push(RegisteredSystem {
-            name,
+            name: name.into(),
             system: system.into_system(),
             enabled: true,
             last_run: 0,
@@ -334,7 +334,7 @@ impl Engine {
     /// systems concurrently and cause undefined behavior.
     pub unsafe fn register_system_with_access<F>(
         &mut self,
-        name: &'static str,
+        name: impl Into<String>,
         mut access: SystemAccess,
         system: F,
     ) where
@@ -343,7 +343,7 @@ impl Engine {
         access.build_component_masks(&self.world.component_registry);
         self.scheduler.register_system(access);
         self.systems.push(RegisteredSystem {
-            name,
+            name: name.into(),
             system: Box::new(system),
             enabled: true,
             last_run: 0,
@@ -385,6 +385,33 @@ impl Engine {
         // One-shot startup has no following frame in which to surface a
         // failure, so always return command errors to its caller.
         self.queue.execute_queued_commands(&mut self.world, true)
+    }
+
+    /// Run a command-producing closure without applying its commands.
+    ///
+    /// The transactional counterpart of [`Self::run_deferred_commands`]: the
+    /// caller commits with [`Self::flush_deferred_commands`] or rolls back
+    /// with [`Self::discard_deferred_commands`], so a failed phase can never
+    /// leave partial world state behind.
+    pub fn queue_deferred_commands<F>(&mut self, run: F)
+    where
+        F: FnOnce(&mut World, &mut CommandQueue),
+    {
+        run(&mut self.world, &mut self.queue);
+    }
+
+    /// Apply every command queued since the last flush.
+    ///
+    /// # Errors
+    ///
+    /// Returns one entry per command that could not be applied.
+    pub fn flush_deferred_commands(&mut self) -> Result<(), Vec<CommandError>> {
+        self.queue.execute_queued_commands(&mut self.world, true)
+    }
+
+    /// Discard every command queued since the last flush without applying it.
+    pub fn discard_deferred_commands(&mut self) {
+        self.queue.clear();
     }
 
     /// Process one frame - execute all systems then apply deferred commands
@@ -727,9 +754,9 @@ impl Engine {
                     .collect();
 
                 // Pre-compute system names for profiling spans in the parallel closure.
-                let system_names: Vec<&'static str> = systems_batch
+                let system_names: Vec<&str> = systems_batch
                     .iter()
-                    .map(|&system_index| self.systems[system_index].name)
+                    .map(|&system_index| self.systems[system_index].name.as_str())
                     .collect();
                 drop(_zone);
 

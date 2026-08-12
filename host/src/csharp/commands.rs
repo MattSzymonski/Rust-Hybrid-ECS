@@ -20,6 +20,16 @@ use super::components::{ComponentBinding, StableComponentId};
 use super::context::{active_world_exists, with_active_command_context};
 
 // =============================================================================
+// Constants
+// =============================================================================
+
+/// Maximum number of component blobs one managed create may carry.
+///
+/// Part of the shared ABI contract: `queue_create` rejects larger counts
+/// with an error status, and the managed side must respect the same bound.
+pub(super) const MAX_COMPONENTS_PER_CREATE: u32 = 1024;
+
+// =============================================================================
 // Free Functions
 // =============================================================================
 
@@ -33,6 +43,9 @@ fn command_scope_error() -> u8 {
 }
 
 /// Reserve a generation-checked handle without inserting it into an archetype.
+///
+/// Reservations that are never consumed by a create are returned to the
+/// entity allocator automatically when the invocation scope ends.
 pub(super) extern "C" fn ffi_reserve_entity(output: *mut Entity) -> u8 {
     if output.is_null() {
         return 6;
@@ -94,12 +107,15 @@ enum DecodedCommandComponent {
 }
 
 /// Queue creation after validating every supplied component blob atomically.
+///
+/// Rejects more than [`MAX_COMPONENTS_PER_CREATE`] blobs as part of the
+/// documented ABI contract.
 pub(super) extern "C" fn ffi_queue_create(
     entity: *const Entity,
     blobs: *const NativeComponentBlob,
     count: u32,
 ) -> u8 {
-    if entity.is_null() || (count != 0 && blobs.is_null()) || count > 1024 {
+    if entity.is_null() || (count != 0 && blobs.is_null()) || count > MAX_COMPONENTS_PER_CREATE {
         return 6;
     }
     with_active_command_context(|_world, queue, bindings, reserved| {

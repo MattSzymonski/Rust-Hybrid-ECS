@@ -101,6 +101,13 @@ internal sealed class GameHost
     public ManagedAccess GetAccess(int systemIndex, int accessIndex) =>
         _systems[systemIndex].Accesses[accessIndex];
 
+    /// <summary>Return the reflected name of one system.</summary>
+    public string GetSystemName(int systemIndex) => _systems[systemIndex].Name;
+
+    /// <summary>Return the UTF-8 byte count of one system's name.</summary>
+    public int GetSystemNameLength(int systemIndex) =>
+        System.Text.Encoding.UTF8.GetByteCount(_systems[systemIndex].Name);
+
     /// <summary>Return the number of accesses declared by one system.</summary>
     public int GetAccessCount(int systemIndex) => _systems[systemIndex].Accesses.Length;
     public bool UsesCommands(int systemIndex) => _systems[systemIndex].UsesCommands;

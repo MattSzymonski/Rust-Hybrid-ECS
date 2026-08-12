@@ -122,12 +122,14 @@ fn is_relevant_relative_path(relative: &Path) -> bool {
     }
 
     // Editor temporary files appear and disappear around every save and
-    // would otherwise trigger a rebuild of half-written content.
+    // would otherwise trigger a rebuild of half-written content. Non-UTF-8
+    // file names are treated as relevant: they cannot match any ignore
+    // suffix, and filtering them out would silently stop hot reload.
     match relative.file_name().and_then(|name| name.to_str()) {
         Some(name) => !EDITOR_TEMPORARY_FILE_SUFFIXES
             .iter()
             .any(|suffix| name.ends_with(suffix)),
-        None => false,
+        None => true,
     }
 }
 
@@ -330,5 +332,18 @@ mod tests {
         assert!(is_relevant_path(&inside_file, &watch_root));
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Verifies that non-UTF-8 file names stay relevant instead of being
+    /// silently filtered out. Unix-only because non-UTF-8 `OsStr` literals are
+    /// not constructible through stable APIs on Windows.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_file_names_stay_relevant() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        assert!(is_relevant_relative_path(Path::new(OsStr::from_bytes(
+            b"src/caf\xe9.rs"
+        ))));
     }
 }

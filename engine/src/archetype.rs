@@ -38,7 +38,7 @@
 //!
 //! This keeps arrays dense without gaps, maintaining O(1) removal.
 
-use std::alloc::{Layout, alloc, dealloc, handle_alloc_error};
+use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::collections::HashMap;
 use std::ptr::NonNull;
 

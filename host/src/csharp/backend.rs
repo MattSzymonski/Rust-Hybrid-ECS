@@ -34,11 +34,14 @@ use super::csharp_runtime::DotnetRuntimeContext;
 /// managed assembly from driving a multi-gigabyte host allocation.
 pub(super) const MAX_COMPONENT_MANIFEST_BYTES: u32 = 16 * 1024 * 1024;
 
+/// Maximum UTF-8 byte length accepted for a managed system name.
+const MAX_SYSTEM_NAME_BYTES: u32 = 1024;
+
 /// Unmanaged ABI contract version shared with `csharp_runtime`.
 ///
 /// Bump whenever any `UnmanagedCallersOnly` export signature changes; the host
 /// refuses to start against a runtime built for a different version.
-const INTEROP_CONTRACT_VERSION: u32 = 1;
+const INTEROP_CONTRACT_VERSION: u32 = 2;
 
 // =============================================================================
 // Types
@@ -60,6 +63,10 @@ type RunStartupFn = extern "system" fn(u32) -> u8;
 type ComponentManifestLengthFn = extern "system" fn() -> u32;
 /// Signature copying the serialized component manifest into a caller buffer.
 type CopyComponentManifestFn = extern "system" fn(*mut u8, u32) -> u8;
+/// Signature returning the UTF-8 byte length of one system's reflected name.
+type SystemNameLengthFn = extern "system" fn(u32) -> u32;
+/// Signature copying one system's reflected name into a caller buffer.
+type CopySystemNameFn = extern "system" fn(u32, *mut u8, u32) -> u8;
 /// Signature returning how many accesses one system declared.
 type SystemAccessCountFn = extern "system" fn(u32) -> u32;
 /// Signature copying one system's reflected accesses into a caller buffer.
@@ -185,6 +192,16 @@ impl CSharpRuntime {
             &type_name,
             "CopyComponentManifest",
         )?;
+        let system_name_length = runtime.get_unmanaged_fn::<SystemNameLengthFn>(
+            &assembly,
+            &type_name,
+            "SystemNameLength",
+        )?;
+        let copy_system_name = runtime.get_unmanaged_fn::<CopySystemNameFn>(
+            &assembly,
+            &type_name,
+            "CopySystemName",
+        )?;
         let access_count = runtime.get_unmanaged_fn::<SystemAccessCountFn>(
             &assembly,
             &type_name,
@@ -237,30 +254,37 @@ impl CSharpRuntime {
             shared_bindings,
         )?);
 
-        // Step 3: Run every reflected managed startup method.
+        // Step 3: Run every reflected managed startup method transactionally.
+        // Commands are queued first and applied only when every startup
+        // method reports success, so a failing generation leaves no partial
+        // world state behind.
         let startup_bindings = Arc::clone(&bindings);
         let mut startup_failed = None;
-        engine
-            .run_deferred_commands(|world, queue| {
-                let no_accesses = [];
-                for startup_index in 0..startup_count() {
-                    let _guard = ActiveSystemGuard::set_with_commands(
-                        world,
-                        queue,
-                        &no_accesses,
-                        &startup_bindings,
-                        true,
-                    );
-                    if run_startup(startup_index) == 0 {
-                        startup_failed = Some(startup_index);
-                        break;
-                    }
+        engine.queue_deferred_commands(|world, queue| {
+            let no_accesses = [];
+            for startup_index in 0..startup_count() {
+                let _guard = ActiveSystemGuard::set_with_commands(
+                    world,
+                    queue,
+                    &no_accesses,
+                    &startup_bindings,
+                    true,
+                );
+                if run_startup(startup_index) == 0 {
+                    startup_failed = Some(startup_index);
+                    break;
                 }
-            })
-            .map_err(|errors| format!("C# startup commands failed: {errors:?}"))?;
+            }
+        });
         if let Some(index) = startup_failed {
+            // Roll back the queued commands so the failure is truly
+            // transactional, even if setup ever becomes retryable.
+            engine.discard_deferred_commands();
             return Err(format!("C# startup method {index} failed").into());
         }
+        engine
+            .flush_deferred_commands()
+            .map_err(|errors| format!("C# startup commands failed: {errors:?}"))?;
 
         // Step 4: Reflect each system's accesses and register it with the
         // scheduler under the exact resolved read/write list.
@@ -298,7 +322,11 @@ impl CSharpRuntime {
             });
             let managed_access = managed_access.into_boxed_slice();
             let system_bindings = Arc::clone(&bindings);
-            let name = Box::leak(format!("csharp_system_{system_index}").into_boxed_str());
+            // Prefer the reflected managed name (type and method) so profiling
+            // and scheduler debugging show real identities; fall back to a
+            // synthetic index-based name when the export is unavailable.
+            let name = managed_system_name(system_name_length, copy_system_name, system_index)
+                .unwrap_or_else(|| format!("csharp_system_{system_index}"));
             // SAFETY: `derive_system_access` has resolved every managed access
             // and the closure exposes the world only under that exact list.
             unsafe {
@@ -409,6 +437,26 @@ impl CSharpRuntime {
 /// buggy managed assembly can never drive an unbounded host allocation.
 pub(super) fn is_supported_manifest_length(length: u32) -> bool {
     (1..=MAX_COMPONENT_MANIFEST_BYTES).contains(&length)
+}
+
+/// Fetch the reflected managed name for one system.
+///
+/// Returns `None` when the name is missing, oversized, or not valid UTF-8;
+/// callers fall back to a synthetic index-based name.
+fn managed_system_name(
+    name_length: SystemNameLengthFn,
+    copy_name: CopySystemNameFn,
+    system_index: u32,
+) -> Option<String> {
+    let length = name_length(system_index);
+    if length == 0 || length > MAX_SYSTEM_NAME_BYTES {
+        return None;
+    }
+    let mut buffer = vec![0_u8; length as usize];
+    if copy_name(system_index, buffer.as_mut_ptr(), length) == 0 {
+        return None;
+    }
+    String::from_utf8(buffer).ok()
 }
 
 /// Translate managed component modes into native scheduler metadata.

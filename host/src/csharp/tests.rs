@@ -695,6 +695,36 @@ fn deeply_nested_manifest_is_rejected_without_stack_overflow() {
     );
 }
 
+/// Verifies that overlapping component fields are rejected so conflicting
+/// byte interpretations cannot corrupt data silently.
+#[test]
+fn overlapping_component_fields_are_rejected() {
+    let mut engine = Engine::new();
+    let shared = shared_component_bindings(&mut engine);
+    let stable_id = stable_component_id("TracyLive.Overlapping");
+    let manifest = serde_json::json!([{
+        "stable_id_low": stable_id.0 as u64,
+        "stable_id_high": (stable_id.0 >> 64) as u64,
+        "full_name": "TracyLive.Overlapping",
+        "size": 8,
+        "alignment": 4,
+        "schema_hash": 1,
+        "shared": false,
+        "fields": [
+            { "name": "First", "offset": 0, "size": 6, "primitive_type": "struct", "fields": [] },
+            { "name": "Second", "offset": 4, "size": 4, "primitive_type": "struct", "fields": [] }
+        ]
+    }]);
+    let error =
+        register_component_manifest(&mut engine, &serde_json::to_vec(&manifest).unwrap(), shared)
+            .err()
+            .expect("overlapping component fields must be rejected");
+    assert!(
+        error.to_string().contains("overlap"),
+        "unexpected error: {error}"
+    );
+}
+
 /// Verifies that managed-reported manifest lengths are bounded before any
 /// host allocation happens.
 #[test]

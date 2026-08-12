@@ -217,6 +217,14 @@ impl CommandQueue {
             commands: Vec::new(),
         }
     }
+
+    /// Discard every queued command without applying it.
+    ///
+    /// Used by transactional startup paths that must roll back a failed
+    /// command-producing phase.
+    pub(crate) fn clear(&mut self) {
+        self.commands.clear();
+    }
 }
 
 impl Default for CommandQueue {

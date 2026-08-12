@@ -17,7 +17,7 @@
 //! Configuration is externalized in [`GameModuleConfig`],
 //! keeping backend selection out of executable crates.
 
-mod build;
+mod build_runner;
 mod config;
 mod csharp;
 mod game_module;

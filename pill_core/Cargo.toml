@@ -1,0 +1,29 @@
+[package]
+name = "pill_core"
+version = "0.1.0"
+authors = [
+    # Extend this list when submiting PR
+    "Mateusz Szymoński <mateusz.szymonski@gmail.com>",
+    "Jakub Duchniewicz <j.duchniewicz@gmail.com>",
+]
+edition = "2021"
+
+[dependencies]
+glam = { version = "0.33", features = ["serde"] }
+thiserror = "2"
+boolinator = "2.4"
+log = { version = "0.4", features = ["release_max_level_off"] }
+web-time = "1"
+
+# Native-only dependencies (not available on WASM)
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+colored = "3"
+config = "0.11"
+env_logger = "0.11"
+chrono = "0.4"
+strum_macros = "0.28"
+strum = "0.28"
+bincode = "1.0"
+renet = "2"
+renet_netcode = "2"
+serde = { version = "1", features = ["derive"] }

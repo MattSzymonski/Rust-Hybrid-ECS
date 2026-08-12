@@ -23,10 +23,8 @@ use super::abi::ComponentChunk;
 // In rendering builds these names resolve to the renderer's components so
 // managed physics writes directly into the columns consumed by the renderer.
 // Headless builds provide layout-identical local definitions instead.
-#[cfg(all(feature = "rendering", test))]
-pub(super) use pill_engine::Color;
 #[cfg(feature = "rendering")]
-pub(super) use pill_engine::{Position, Sprite};
+pub(super) use pill_engine::{Color, Position, Sprite};
 
 // =============================================================================
 // Types
@@ -53,6 +51,8 @@ pub(super) struct Color {
     pub(super) b: f32,
     pub(super) a: f32,
 }
+#[cfg(not(feature = "rendering"))]
+impl Component for Color {}
 
 #[cfg(not(feature = "rendering"))]
 /// Headless ABI mirror of `TracyLive.Sprite`.
@@ -67,7 +67,7 @@ pub(super) struct Sprite {
 impl Component for Sprite {}
 
 #[cfg(not(feature = "rendering"))]
-impl_trait_accessible!(dyn Component; Position, Sprite);
+impl_trait_accessible!(dyn Component; Position, Sprite, Color);
 
 /// Stable 128-bit identity derived from a managed component's canonical name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -156,7 +156,8 @@ fn get_component_chunk<T: Component + TraitAccessible<dyn Component>>(
     // SAFETY: `output` was checked by the FFI entry point and the slice stays
     // alive for the duration of the active scheduled system invocation. The
     // managed side must stay within `len * element_size` and must not retain
-    // the returned pointers beyond that invocation.
+    // the returned pointers beyond that invocation. The u32 length ceiling
+    // is documented on `ComponentChunk`.
     unsafe {
         output.write(ComponentChunk {
             archetype_low: bits as u64,
@@ -253,6 +254,12 @@ pub(super) fn shared_component_bindings(engine: &mut Engine) -> ComponentBinding
         "TracyLive.Sprite",
         "TracyLive.Sprite|24|4|Width@0:4:System.Single|Height@4:4:System.Single|Color@8:16:struct|R@0:4:System.Single|G@4:4:System.Single|B@8:4:System.Single|A@12:4:System.Single",
     );
+    register_native_binding::<Color>(
+        engine,
+        &mut bindings,
+        "TracyLive.Color",
+        "TracyLive.Color|16|4|R@0:4:System.Single|G@4:4:System.Single|B@8:4:System.Single|A@12:4:System.Single",
+    );
     bindings
 }
 
@@ -263,8 +270,32 @@ pub(super) fn shared_component_bindings(engine: &mut Engine) -> ComponentBinding
 /// opaque parser error, rejects pathological manifests.
 const MAX_FIELD_NESTING_DEPTH: usize = 32;
 
+/// Reject sibling fields that share any byte range.
+///
+/// Conflicting interpretations of the same storage would corrupt data
+/// silently, so overlaps and duplicated offsets are invalid layouts.
+fn validate_sibling_non_overlap(
+    fields: &[ManagedFieldManifest],
+    parent_name: &str,
+) -> Result<(), String> {
+    for (index, left) in fields.iter().enumerate() {
+        let left_end = left.offset.saturating_add(left.size);
+        for right in &fields[index + 1..] {
+            let right_end = right.offset.saturating_add(right.size);
+            if left.offset < right_end && right.offset < left_end {
+                return Err(format!(
+                    "managed fields {} and {} overlap inside {parent_name}",
+                    left.name, right.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Verify that a field and every nested field fit within the byte range of
-/// the struct that directly contains it.
+/// the struct that directly contains it, and that sibling fields never
+/// overlap.
 ///
 /// The field tree is walked with an explicit worklist so deeply nested input
 /// consumes heap rather than stack, and the depth budget rejects pathological
@@ -289,6 +320,8 @@ fn validate_field_manifest(field: &ManagedFieldManifest, parent_size: usize) -> 
                 field.name
             ));
         }
+        // Sibling fields must not share any byte.
+        validate_sibling_non_overlap(&field.fields, &field.name)?;
         for nested in &field.fields {
             worklist.push((nested, field.size, depth + 1));
         }
@@ -334,6 +367,8 @@ pub(super) fn register_component_manifest(
             )
             .into());
         }
+        // Sibling fields of the component itself must not overlap either.
+        validate_sibling_non_overlap(&component.fields, &component.full_name)?;
         for field in &component.fields {
             validate_field_manifest(field, component.size)?;
         }

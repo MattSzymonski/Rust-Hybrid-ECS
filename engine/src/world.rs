@@ -1120,6 +1120,16 @@ impl World {
         self.allocate_entity()
     }
 
+    /// Return a reserved entity handle that was never created.
+    ///
+    /// The handle must have come from [`Self::reserve_entity`] and must not
+    /// have been inserted into any archetype. Releasing an entity that is
+    /// visible to queries would allow its id to be handed out again with a
+    /// conflicting generation.
+    pub fn release_entity(&mut self, entity: Entity) {
+        self.free_entity_ids.push((entity.id, entity.generation));
+    }
+
     /// Get or create an archetype for a given set of components
     ///
     /// Archetypes are cached and reused for entities with the same component set.

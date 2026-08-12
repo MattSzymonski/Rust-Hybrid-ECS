@@ -44,7 +44,7 @@ public static unsafe class LoaderInterop
     /// Unmanaged ABI contract version shared with the Rust host.
     /// Bump whenever any unmanaged export signature changes.
     /// </summary>
-    public const uint InteropContractVersion = 1;
+    public const uint InteropContractVersion = 2;
 
     /// <summary>Return the unmanaged ABI contract version for host validation.</summary>
     [UnmanagedCallersOnly]
@@ -173,6 +173,44 @@ public static unsafe class LoaderInterop
         catch (Exception e)
         {
             Console.Error.WriteLine($"[csharp_runtime] GetSystemAccess failed: {e}");
+            return 0;
+        }
+    }
+
+    /// <summary>Return the UTF-8 byte count of one system's reflected name.</summary>
+    [UnmanagedCallersOnly]
+    public static uint SystemNameLength(uint systemIndex)
+    {
+        try
+        {
+            return (uint)(_host?.GetSystemNameLength(checked((int)systemIndex)) ?? 0);
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"[csharp_runtime] SystemNameLength failed: {e}");
+            return 0;
+        }
+    }
+
+    /// <summary>Copy one system's reflected UTF-8 name into a caller buffer.</summary>
+    /// <returns>One on success or zero for invalid input/failure.</returns>
+    [UnmanagedCallersOnly]
+    public static byte CopySystemName(uint systemIndex, byte* output, uint capacity)
+    {
+        try
+        {
+            if (_host is null || output is null)
+                return 0;
+            var bytes = System.Text.Encoding.UTF8.GetBytes(
+                _host.GetSystemName(checked((int)systemIndex)));
+            if ((uint)bytes.Length > capacity)
+                return 0;
+            bytes.CopyTo(new Span<byte>(output, checked((int)capacity)));
+            return 1;
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"[csharp_runtime] CopySystemName failed: {e}");
             return 0;
         }
     }

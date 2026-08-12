@@ -357,7 +357,14 @@ fn host_string(value: &std::ffi::OsStr) -> Result<Vec<HostChar>, Box<dyn std::er
 
     // Windows hostfxr consumes native UTF-16 strings. Append the terminator
     // explicitly because OsStrExt yields only the encoded contents.
-    Ok(value.encode_wide().chain(std::iter::once(0)).collect())
+    let mut encoded: Vec<HostChar> = value.encode_wide().collect();
+    // An interior terminator would truncate the string at the ABI boundary,
+    // mirroring the Unix-side check for parity and future-proofing.
+    if encoded.contains(&0) {
+        return Err(".NET host string contains an interior NUL".into());
+    }
+    encoded.push(0);
+    Ok(encoded)
 }
 
 /// Encode an OS string as nul-terminated bytes for Unix hostfxr.

@@ -46,6 +46,8 @@ pub struct Color {
     pub b: f32,
     pub a: f32,
 }
+impl Component for Color {}
+impl_trait_accessible!(dyn Component; Color);
 
 impl Color {
     pub const WHITE: Color = Color {

@@ -120,7 +120,7 @@ fn archetype_add_component(criterion: &mut Criterion) {
 criterion_group!(
     benches,
     query_iter_unfiltered,
-   // query_iter_changed,
+    // query_iter_changed,
     // query_par_iter_unfiltered,
     // archetype_add_component,
 );

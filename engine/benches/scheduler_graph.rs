@@ -19,7 +19,7 @@
 //! Together these reveal whether scaling bottlenecks are in conflict analysis
 //! or in the runtime dispatch machinery.
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use pill_engine::*;
 use std::any::TypeId;
 use trait_type_map::impl_trait_accessible;

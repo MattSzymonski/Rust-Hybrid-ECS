@@ -11,6 +11,7 @@
 // =============================================================================
 
 /// Backend-specific output information for a hot-reloadable game module.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum GameModuleBackend {
     /// A native shared library exporting `game_init` and `game_update`.
@@ -25,6 +26,7 @@ pub enum GameModuleBackend {
 }
 
 /// Output locations and assembly names used by the managed game backend.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct CSharpModuleConfig {
     /// Name of the runtime assembly that hosts the collectible loader.
@@ -42,6 +44,10 @@ pub struct CSharpModuleConfig {
 /// Describes how to build the module, where to find its output, and which
 /// source directories to watch. Change the fields here to support Rust, C,
 /// C++, Zig, or any other language that produces a compatible game module.
+///
+/// `#[non_exhaustive]` allows new fields to be added without breaking
+/// frontends; prefer the provided constructors over struct literals.
+#[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct GameModuleConfig {
     /// Human-readable name used in log messages.
@@ -150,6 +156,9 @@ impl GameModuleConfig {
     }
 
     /// Pick module configuration from the environment, defaulting to Rust.
+    ///
+    /// Unrecognized values are reported instead of silently launching the
+    /// Rust module, so typos cannot hide behind a working default.
     pub fn from_environment() -> Self {
         match std::env::var("ECS_HOT_RELOAD_MODULE") {
             Ok(value) if value.eq_ignore_ascii_case("tests-game") => Self::tests_game(),
@@ -159,7 +168,19 @@ impl GameModuleConfig {
             {
                 Self::csharp_default()
             }
-            _ => Self::rust_default(),
+            Ok(value)
+                if value.eq_ignore_ascii_case("rust") || value.eq_ignore_ascii_case("game-rs") =>
+            {
+                Self::rust_default()
+            }
+            Ok(value) => {
+                eprintln!(
+                    "[host] Unknown ECS_HOT_RELOAD_MODULE value {value:?}; using the Rust module. \
+                     Expected one of: rust, game-rs, csharp, game-csharp, tests-game."
+                );
+                Self::rust_default()
+            }
+            Err(_) => Self::rust_default(),
         }
     }
 }

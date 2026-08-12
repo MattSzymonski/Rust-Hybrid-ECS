@@ -41,7 +41,7 @@
 use std::collections::{HashMap, HashSet};
 
 // External crates
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{de::DeserializeOwned, Serialize};
 use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
 
 // Current crate

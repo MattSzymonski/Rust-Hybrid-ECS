@@ -28,6 +28,7 @@
 
 // Standard library
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // External crates
 use libloading::{Library, Symbol};
@@ -39,6 +40,10 @@ use pill_engine::EngineApi;
 
 /// Directory where temporary native-library copies are stored.
 const TEMPORARY_DIRECTORY: &str = "standalone_temp";
+
+/// Monotonic suffix ensuring temporary copies never collide, even when the
+/// system clock repeats or moves backwards.
+static TEMPORARY_COPY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // =============================================================================
 // Types + Impls
@@ -87,13 +92,15 @@ impl GameLibrary {
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default();
+        let counter = TEMPORARY_COPY_COUNTER.fetch_add(1, Ordering::Relaxed);
         let extension = build_output
             .extension()
             .and_then(|extension| extension.to_str())
             .unwrap_or("dll");
-        let temporary_path = temporary_directory.join(format!("game_{timestamp}.{extension}"));
+        let temporary_path =
+            temporary_directory.join(format!("game_{timestamp}_{counter}.{extension}"));
 
         // Step 2: Copy the built library to the unique temporary path.
         std::fs::copy(build_output, &temporary_path)?;

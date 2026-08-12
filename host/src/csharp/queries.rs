@@ -55,7 +55,8 @@ pub(super) extern "C" fn ffi_get_component_chunk(
             // SAFETY: output is non-null and all pointers remain owned by the
             // active world's archetype for the managed invocation. The managed
             // side must not retain the pointers beyond that invocation and
-            // must respect the declared access mode.
+            // must respect the declared access mode. The u32 length ceiling
+            // is documented on `ComponentChunk`.
             unsafe {
                 output.write(ComponentChunk {
                     archetype_low: bits as u64,
@@ -105,6 +106,9 @@ pub(super) extern "C" fn ffi_get_entity_chunk(chunk_index: u32, output: *mut Com
 }
 
 /// Return the current entity count while a managed system is active.
+///
+/// The count is `u32` by ABI design; worlds above ~4.29 billion entities are
+/// unsupported (see the `ComponentChunk` layout-limits documentation).
 pub(super) extern "C" fn ffi_entity_count() -> u32 {
     with_active_world(|world| world.entity_count() as u32).unwrap_or(0)
 }

@@ -16,7 +16,7 @@ use std::sync::atomic::AtomicU64;
 use pill_engine::{Engine, EngineApi};
 
 // Current crate
-use crate::build::build_game_module;
+use crate::build_runner::build_game_module;
 use crate::csharp::CSharpRuntime;
 use crate::native_library::GameLibrary;
 use crate::{GameModuleBackend, GameModuleConfig};

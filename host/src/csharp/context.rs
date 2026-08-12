@@ -123,16 +123,29 @@ impl ActiveSystemGuard {
 }
 
 impl Drop for ActiveSystemGuard {
-    /// Clear the complete scope before the scheduler's native borrows expire.
+    /// Return unconsumed reservations to the entity allocator and clear the
+    /// complete scope before the scheduler's native borrows expire.
     fn drop(&mut self) {
-        // Clear per-invocation reservations first so no handle survives the
-        // scope, then remove the scope in one assignment.
-        ACTIVE_RESERVED.with(|slot| {
-            if let Ok(mut reserved) = slot.try_borrow_mut() {
-                reserved.clear();
-            }
+        ACTIVE_SCOPE.with(|scope_slot| {
+            let world_pointer = scope_slot.get().map(|scope| scope.world);
+            ACTIVE_RESERVED.with(|reserved_slot| {
+                if let Ok(mut reserved) = reserved_slot.try_borrow_mut() {
+                    // Reserved handles never consumed by a create are returned
+                    // to the allocator, so speculative managed allocations
+                    // cannot leak entity generation slots.
+                    if let Some(world) = world_pointer.filter(|pointer| !pointer.is_null()) {
+                        // SAFETY: the scope is still installed for the
+                        // duration of this drop, so the world pointer remains
+                        // valid until the scope is cleared below.
+                        let world = unsafe { &mut *world };
+                        for entity in reserved.drain() {
+                            world.release_entity(entity);
+                        }
+                    }
+                }
+            });
+            scope_slot.set(None);
         });
-        ACTIVE_SCOPE.with(|slot| slot.set(None));
     }
 }
 

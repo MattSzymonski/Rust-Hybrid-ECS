@@ -25,7 +25,8 @@ use super::queries::{ffi_entity_count, ffi_get_component_chunk, ffi_get_entity_c
 /// Function table copied by `csharp_runtime` during managed initialization.
 ///
 /// Every slot maps to one `extern "C"` callback implemented by the query and
-/// deferred-command adapters in this crate.
+/// deferred-command adapters in this crate. `queue_create` accepts at most
+/// `MAX_COMPONENTS_PER_CREATE` component blobs per call.
 #[repr(C)]
 pub(super) struct CsEngineApi {
     entity_count: extern "C" fn() -> u32,
@@ -78,6 +79,11 @@ pub(super) struct NativeComponentBlob {
 ///   declared with write access, and must stay within `len * element_size`.
 /// - `ticks` may be null for read-only columns; entity columns always carry
 ///   null ticks and their `data` must never be written through.
+///
+/// # Layout limits
+///
+/// `len` is `u32` by ABI design; worlds larger than ~4.29 billion entities
+/// per column are unsupported and must not be relied upon to wrap.
 #[repr(C)]
 pub(super) struct ComponentChunk {
     pub(super) archetype_low: u64,
