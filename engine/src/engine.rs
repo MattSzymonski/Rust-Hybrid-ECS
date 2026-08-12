@@ -63,7 +63,7 @@ struct RegisteredSystem {
 ///
 /// # Example
 /// ```no_run
-/// # use ecs_hybrid::*;
+/// # use pill_engine::*;
 /// # fn movement_system() {}
 /// # fn collision_system() {}
 /// let mut engine = Engine::new();
@@ -191,7 +191,7 @@ impl Engine {
     ///
     /// # Example
     /// ```no_run
-    /// # use ecs_hybrid::*;
+    /// # use pill_engine::*;
     /// # let mut engine = Engine::new();
     /// engine.set_fps_limit(30.0); // Cap at 30 FPS
     /// ```
@@ -281,7 +281,7 @@ impl Engine {
     ///
     /// # Example
     /// ```no_run
-    /// # use ecs_hybrid::*;
+    /// # use pill_engine::*;
     /// # #[derive(Debug, Clone)] struct Position { x: f32, y: f32 }
     /// # impl Component for Position {}
     /// # #[derive(Debug, Clone)] struct Velocity { vx: f32, vy: f32 }

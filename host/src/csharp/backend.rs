@@ -3,8 +3,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use ecs_hybrid::commands::CommandQueue;
-use ecs_hybrid::{Engine, SystemAccess, World};
+use pill_engine::commands::CommandQueue;
+use pill_engine::{Engine, SystemAccess, World};
 
 use crate::CSharpModuleConfig;
 

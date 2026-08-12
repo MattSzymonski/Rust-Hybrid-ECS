@@ -20,7 +20,7 @@ scriptable components.
 ## Quick Start
 
 ```rust
-use ecs_hybrid::*;
+use pill_engine::*;
 
 // 1. Define components
 #[derive(Debug, Clone)]

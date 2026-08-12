@@ -12,7 +12,7 @@
 // If it doesn't pick up, click the "Connect" button in Tracy GUI again - sometimes
 // the GUI stops listening after an abrupt disconnect.
 
-use ecs_hybrid::*;
+use pill_engine::*;
 use std::time::Instant;
 use trait_type_map::impl_trait_accessible;
 

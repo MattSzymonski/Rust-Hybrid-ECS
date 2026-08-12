@@ -2,8 +2,8 @@
 
 use std::collections::HashSet;
 
-use ecs_hybrid::commands::ComponentAdder;
-use ecs_hybrid::{ComponentId, Entity};
+use pill_engine::commands::ComponentAdder;
+use pill_engine::{ComponentId, Entity};
 
 use super::abi::NativeComponentBlob;
 use super::components::{ComponentBinding, StableComponentId};

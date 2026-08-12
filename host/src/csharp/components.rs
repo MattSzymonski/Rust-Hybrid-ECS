@@ -2,8 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use ecs_hybrid::commands::{boxed_component_adder, ComponentAdder};
-use ecs_hybrid::{Component, ComponentId, Engine, World};
+use pill_engine::commands::{boxed_component_adder, ComponentAdder};
+use pill_engine::{Component, ComponentId, Engine, World};
 use serde::Deserialize;
 #[cfg(not(feature = "rendering"))]
 use trait_type_map::impl_trait_accessible;
@@ -15,9 +15,9 @@ use super::abi::ComponentChunk;
 // managed physics writes directly into the columns consumed by the renderer.
 // Headless builds provide layout-identical local definitions instead.
 #[cfg(all(feature = "rendering", test))]
-pub(super) use ecs_hybrid::Color;
+pub(super) use pill_engine::Color;
 #[cfg(feature = "rendering")]
-pub(super) use ecs_hybrid::{Position, Sprite};
+pub(super) use pill_engine::{Position, Sprite};
 
 #[cfg(not(feature = "rendering"))]
 /// Headless ABI mirror of `TracyLive.Position`.

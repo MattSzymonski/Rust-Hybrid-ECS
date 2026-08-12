@@ -1,6 +1,6 @@
 //! Hot-reloadable bouncing-ball game implemented with ECS systems.
 
-use ecs_hybrid::*;
+use pill_engine::*;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use trait_type_map::impl_trait_accessible;

@@ -351,7 +351,7 @@ impl World {
     /// # Example
     ///
     /// ```no_run
-    /// # use ecs_hybrid::*;
+    /// # use pill_engine::*;
     /// # let mut world = World::new();
     /// world.reserve_entities(10_000);
     /// for _ in 0..10_000 {
@@ -1938,7 +1938,7 @@ impl<T: Component + TraitAccessible<dyn Component>> ComponentInserter
 ///
 /// Example:
 /// ```no_run
-/// # use ecs_hybrid::*;
+/// # use pill_engine::*;
 /// # use trait_type_map::impl_trait_accessible;
 /// # #[derive(Debug, Clone)] struct Transform { x: f32, y: f32, z: f32 }
 /// # impl Component for Transform {}

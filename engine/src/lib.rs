@@ -2,7 +2,7 @@
 //!
 //! # Responsibilities
 //!
-//! - Re-exports all public types for convenient single-import usage (`use ecs_hybrid::*`).
+//! - Re-exports all public types for convenient single-import usage (`use pill_engine::*`).
 //! - Declares all public modules that compose the ECS library.
 //! - Configures the Tracy profiled allocator when the `profiling` feature is active.
 //!
@@ -10,7 +10,7 @@
 //!
 //! The crate root is a thin re-export layer. All implementation lives in
 //! submodules (`world`, `query`, `scheduler`, etc.). Users import everything
-//! from `ecs_hybrid` without needing deep module paths.
+//! from `pill_engine` without needing deep module paths.
 
 // ----------------------------------------------------------------------------
 // Tracy ProfiledAllocator - tracks allocations in Tracy's memory view.

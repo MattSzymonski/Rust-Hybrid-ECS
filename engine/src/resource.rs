@@ -17,7 +17,7 @@
 //! ## Usage
 //!
 //! ```no_run
-//! # use ecs_hybrid::*;
+//! # use pill_engine::*;
 //! // Define a resource
 //! #[derive(Debug)]
 //! struct GameTime { delta: f32, elapsed: f32 }
@@ -103,7 +103,7 @@ impl From<ResourceId> for TypeKey {
 ///
 /// # Example
 /// ```no_run
-/// # use ecs_hybrid::*;
+/// # use pill_engine::*;
 /// #[derive(Debug)]
 /// struct Score(u32);
 /// impl Resource for Score {}

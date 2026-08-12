@@ -6,7 +6,7 @@
 
 use std::path::Path;
 
-use ecs_hybrid::EngineApi;
+use pill_engine::EngineApi;
 use libloading::{Library, Symbol};
 
 /// Directory where temporary native-library copies are stored.

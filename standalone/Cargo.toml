@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ecs_hybrid = { path = "../engine" }
+pill_engine = { path = "../engine" }
 host = { path = "../host" }
 wgpu = { version = "26.0.1", optional = true }
 winit = { version = "0.30", optional = true }
@@ -15,6 +15,6 @@ rendering = [
     "dep:wgpu",
     "dep:winit",
     "dep:pollster",
-    "ecs_hybrid/rendering",
+    "pill_engine/rendering",
     "host/rendering",
 ]

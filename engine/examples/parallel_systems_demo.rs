@@ -1,6 +1,6 @@
 // Demo of parallel system execution
 
-use ecs_hybrid::*;
+use pill_engine::*;
 use trait_type_map::impl_trait_accessible;
 
 #[derive(Debug, Clone)]

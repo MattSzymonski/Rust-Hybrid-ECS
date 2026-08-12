@@ -106,7 +106,7 @@ def parse_arguments() -> argparse.Namespace:
 
 def run_benchmarks(run_count: int, output_directory: Path, temporary_root: Path) -> list[Path]:
     run_directories: list[Path] = []
-    command = ["cargo", "bench", "-p", "ecs_hybrid", "--bench", "minimal"]
+    command = ["cargo", "bench", "-p", "pill_engine", "--bench", "minimal"]
 
     for run_number in range(1, run_count + 1):
         print(f"\n[{run_number}/{run_count}] {' '.join(command)}", flush=True)

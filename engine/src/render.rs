@@ -481,7 +481,7 @@ impl SpriteRenderer {
 /// Collect renderer components across the native game-module ABI boundary.
 ///
 /// A hot-loaded Rust game and the host executable can assign different
-/// `TypeId` values to the same `ecs_hybrid` type. Renderer components are a
+/// `TypeId` values to the same `pill_engine` type. Renderer components are a
 /// deliberately shared ABI, so resolve their columns by stable type name and
 /// verify their C layouts instead of issuing a host-typed ECS query.
 fn collect_sprite_instances(world: &World) -> Vec<SpriteInstance> {

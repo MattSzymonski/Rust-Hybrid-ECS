@@ -1,4 +1,14 @@
-//! Debounced source-tree watcher for game-module hot reloads.
+//! Watch the configured source tree for file changes and signal reloads to the main thread.
+//!
+//! # Design
+//! The file watcher runs in a separate thread to avoid blocking the main frame loop. It uses a debounce
+//! window to coalesce multiple file events into a single reload signal. The main thread checks the
+//! reload flag each frame and triggers a hot reload when it is set.
+//!
+//! # Responsibilities
+//! - Spawn a file watcher thread that monitors the source tree for changes.
+//! - Set a reload flag when relevant file events are detected, allowing the main thread to perform a hot reload.
+//! - Use the `notify` crate to watch for file events and handle cross-platform differences in file system notifications.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,6 +19,9 @@ use notify::event::EventKind;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::GameModuleConfig;
+
+
+
 
 /// File events arriving within this window are coalesced into one reload.
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(300);

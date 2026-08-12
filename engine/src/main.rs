@@ -7,12 +7,12 @@
 //!
 //! For full examples, use `cargo run --example <name>`.
 
-use ecs_hybrid::Engine;
+use pill_engine::Engine;
 
 fn main() {
     let engine = Engine::new();
     println!(
-        "ecs_hybrid v{} - {} entities",
+        "pill_engine v{} - {} entities",
         env!("CARGO_PKG_VERSION"),
         engine.world().entity_count(),
     );

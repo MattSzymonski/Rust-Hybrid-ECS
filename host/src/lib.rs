@@ -2,7 +2,7 @@
 //!
 //! # Responsibilities
 //!
-//! - Creates and owns the [`ecs_hybrid::Engine`] instance.
+//! - Creates and owns the [`pill_engine::Engine`] instance.
 //! - Builds and loads native or C# game modules.
 //! - Watches game sources and coordinates safe hot reloads.
 //! - Exposes [`setup`] and [`run_one_frame`] to embedding frontends.
@@ -28,7 +28,7 @@ mod watcher;
 
 pub use config::{CSharpModuleConfig, GameModuleBackend, GameModuleConfig};
 #[cfg(feature = "rendering")]
-pub use ecs_hybrid::{RenderViewport, RendererError, VirtualResolution};
+pub use pill_engine::{RenderViewport, RendererError, VirtualResolution};
 pub use runner::run;
 pub use runtime::{run_one_frame, setup, FrameReport, Host};
 #[cfg(feature = "rendering")]

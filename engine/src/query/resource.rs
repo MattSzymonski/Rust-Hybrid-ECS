@@ -30,7 +30,7 @@ use crate::world::World;
 ///
 /// # Example
 /// ```no_run
-/// # use ecs_hybrid::*;
+/// # use pill_engine::*;
 /// # #[derive(Debug)] struct GameTime { elapsed: f32 }
 /// # impl Resource for GameTime {}
 /// fn my_system(time: Res<GameTime>) {
@@ -72,7 +72,7 @@ impl<'w, T: Resource> Res<'w, T> {
 ///
 /// # Example
 /// ```no_run
-/// # use ecs_hybrid::*;
+/// # use pill_engine::*;
 /// # #[derive(Debug)] struct GameTime { elapsed: f32, delta: f32 }
 /// # impl Resource for GameTime {}
 /// fn my_system(mut time: ResMut<GameTime>) {

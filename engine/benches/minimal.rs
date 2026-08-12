@@ -1,7 +1,7 @@
 //! Minimal benchmarks for the main query and archetype-migration hot paths.
 
 use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
-use ecs_hybrid::{Changed, Component, Entity, Query, World};
+use pill_engine::{Changed, Component, Entity, Query, World};
 use trait_type_map::impl_trait_accessible;
 
 const QUERY_ENTITIES: usize = 100_000;

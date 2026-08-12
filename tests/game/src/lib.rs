@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use trait_type_map::impl_trait_accessible;
 
 // Current crate
-use ecs_hybrid::*;
+use pill_engine::*;
 
 // =============================================================================
 // Components

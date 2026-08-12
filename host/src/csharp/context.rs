@@ -3,8 +3,8 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 
-use ecs_hybrid::commands::CommandQueue;
-use ecs_hybrid::{Entity, World};
+use pill_engine::commands::CommandQueue;
+use pill_engine::{Entity, World};
 
 use super::abi::NativeSystemAccess;
 use super::components::{ComponentBindings, StableComponentId};

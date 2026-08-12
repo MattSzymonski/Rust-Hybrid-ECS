@@ -30,7 +30,7 @@ use crate::component::{ComponentTicks, Tick};
 /// # Example
 ///
 /// ```no_run
-/// # use ecs_hybrid::*;
+/// # use pill_engine::*;
 /// # #[derive(Debug, Clone)] struct Transform { x: f32, y: f32 }
 /// # impl Component for Transform {}
 /// # #[derive(Debug, Clone)] struct Velocity { x: f32, y: f32 }

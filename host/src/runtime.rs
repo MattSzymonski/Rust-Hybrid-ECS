@@ -8,9 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use ecs_hybrid::{Engine, EngineApi};
+use pill_engine::{Engine, EngineApi};
 #[cfg(feature = "rendering")]
-use ecs_hybrid::{RenderViewport, Renderer, RendererError, RendererWindow, VirtualResolution};
+use pill_engine::{RenderViewport, Renderer, RendererError, RendererWindow, VirtualResolution};
 
 use crate::game_module::LoadedGame;
 use crate::native_library::cleanup_temporary_files;

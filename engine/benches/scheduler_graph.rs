@@ -20,7 +20,7 @@
 //! or in the runtime dispatch machinery.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use ecs_hybrid::*;
+use pill_engine::*;
 use std::any::TypeId;
 use trait_type_map::impl_trait_accessible;
 

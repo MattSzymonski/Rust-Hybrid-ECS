@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use ecs_hybrid::{Engine, EngineApi};
+use pill_engine::{Engine, EngineApi};
 
 use crate::build::build_game_module;
 use crate::csharp::CSharpRuntime;

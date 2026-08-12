@@ -7,7 +7,7 @@
 //! - Collision detection system
 //! - Performance measurements
 
-use ecs_hybrid::{Component, Engine, Query, ResMut, Resource};
+use pill_engine::{Component, Engine, Query, ResMut, Resource};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use trait_type_map::impl_trait_accessible;

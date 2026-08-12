@@ -27,7 +27,7 @@ use std::fmt;
 /// generation counter disambiguates recycled IDs:
 ///
 /// ```no_run
-/// # use ecs_hybrid::*;
+/// # use pill_engine::*;
 /// # use trait_type_map::impl_trait_accessible;
 /// # #[derive(Debug, Clone)] struct Health(f32);
 /// # impl Component for Health {}

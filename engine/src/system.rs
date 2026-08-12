@@ -48,7 +48,7 @@
 //! ## Example: Safe Usage
 //!
 //! ```no_run
-//! # use ecs_hybrid::*;
+//! # use pill_engine::*;
 //! # #[derive(Debug, Clone)] struct Position { x: f32, y: f32 }
 //! # impl Component for Position {}
 //! # #[derive(Debug, Clone)] struct Velocity { x: f32, y: f32 }

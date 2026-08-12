@@ -1,4 +1,4 @@
-use ecs_hybrid::*;
+use pill_engine::*;
 use trait_type_map::impl_trait_accessible;
 
 /// A counter component that acts as a script

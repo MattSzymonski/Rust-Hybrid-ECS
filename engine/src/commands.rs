@@ -41,7 +41,7 @@
 //! ## Usage Example
 //!
 //! ```no_run
-//! # use ecs_hybrid::*;
+//! # use pill_engine::*;
 //! # #[derive(Debug, Clone)] struct Health { current: f32 }
 //! # impl Component for Health {}
 //! fn combat_system(mut query: Query<(&Health, Entity)>, mut commands: Commands) {

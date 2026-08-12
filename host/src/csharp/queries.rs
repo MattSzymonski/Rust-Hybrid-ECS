@@ -1,6 +1,6 @@
 //! Native callbacks used by C# query enumerators.
 
-use ecs_hybrid::Entity;
+use pill_engine::Entity;
 
 use super::abi::ComponentChunk;
 use super::components::{ComponentBinding, StableComponentId};

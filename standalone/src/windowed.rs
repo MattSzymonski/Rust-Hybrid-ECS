@@ -1,5 +1,5 @@
 //! Windowed host — opens a `winit` + `wgpu` window and renders every
-//! `(Position, Sprite)` entity via [`ecs_hybrid::SpriteRenderer`] each frame.
+//! `(Position, Sprite)` entity via [`pill_engine::SpriteRenderer`] each frame.
 //!
 //! # Responsibilities
 //!
@@ -9,8 +9,8 @@
 
 use std::sync::Arc;
 
-use ecs_hybrid::SpriteRenderer;
 use host::{run_one_frame, setup, GameModuleConfig, Host};
+use pill_engine::SpriteRenderer;
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};

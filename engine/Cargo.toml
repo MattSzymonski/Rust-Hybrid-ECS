@@ -1,5 +1,5 @@
 [package]
-name = "ecs_hybrid"
+name = "pill_engine"
 version = "0.1.0"
 edition = "2021"
 
@@ -75,11 +75,11 @@ name = "minimal"
 harness = false
 
 [lib]
-name = "ecs_hybrid"
+name = "pill_engine"
 path = "src/lib.rs"
 
 [[bin]]
-name = "ecs_hybrid"
+name = "pill_engine"
 path = "src/main.rs"
 
 [profile.release]

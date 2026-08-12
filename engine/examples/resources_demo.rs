@@ -17,7 +17,7 @@
 //!                       (Query<&Position>, ResMut<Score>)
 //! - `display_system`  – prints stats (Query<&Position>, Res<GameTime>, Res<Score>)
 
-use ecs_hybrid::*;
+use pill_engine::*;
 use trait_type_map::impl_trait_accessible;
 
 // ----------------------------------------------------------------------------

@@ -7,7 +7,7 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-ecs_hybrid = { path = "../../engine" }
+pill_engine = { path = "../../engine" }
 trait_type_map = { path = "../../../Trait-Type-Map" }
 serde = { version = "1", features = ["derive"] }
 

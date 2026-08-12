@@ -1,10 +1,10 @@
 [package]
-name = "host"
+name = "pill_host"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ecs_hybrid = { path = "../engine" }
+pill_engine = { path = "../engine" }
 libloading = "0.8"
 notify = "6"
 serde = { version = "1", features = ["derive"] }
@@ -13,4 +13,4 @@ trait_type_map = { path = "../../Trait-Type-Map" }
 winit = { version = "0.30", optional = true }
 
 [features]
-rendering = ["ecs_hybrid/rendering", "dep:winit"]
+rendering = ["pill_engine/rendering", "dep:winit"]

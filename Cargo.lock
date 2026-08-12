@@ -1531,7 +1531,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0881ea181b1df73ff77ffaaf9c7544ecc11e82fba9b5f27b262a3c73a332555"
 
 [[package]]
-name = "ecs_hybrid"
+name = "pill_engine"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
@@ -1872,7 +1872,7 @@ dependencies = [
 name = "game"
 version = "0.1.0"
 dependencies = [
- "ecs_hybrid",
+ "pill_engine",
  "serde",
  "trait_type_map",
 ]
@@ -2371,7 +2371,7 @@ checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 name = "host"
 version = "0.1.0"
 dependencies = [
- "ecs_hybrid",
+ "pill_engine",
  "libloading 0.8.9",
  "notify",
  "serde",
@@ -4085,7 +4085,7 @@ dependencies = [
 name = "pill_standalone"
 version = "0.1.0"
 dependencies = [
- "ecs_hybrid",
+ "pill_engine",
  "host",
  "pollster",
  "wgpu",

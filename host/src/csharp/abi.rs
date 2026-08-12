@@ -3,7 +3,7 @@
 //! Field order, field widths, and calling conventions in this module are part
 //! of the native/managed ABI and must remain synchronized with `EngineApi.cs`.
 
-use ecs_hybrid::{ComponentTicks, Entity};
+use pill_engine::{ComponentTicks, Entity};
 
 use super::commands::{
     ffi_queue_add_component, ffi_queue_create, ffi_queue_destroy, ffi_queue_remove_component,

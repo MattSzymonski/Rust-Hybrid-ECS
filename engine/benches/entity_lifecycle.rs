@@ -21,7 +21,7 @@
 #![allow(dead_code)]
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use ecs_hybrid::*;
+use pill_engine::*;
 use trait_type_map::impl_trait_accessible;
 
 #[derive(Debug, Clone)]

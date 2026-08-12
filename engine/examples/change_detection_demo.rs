@@ -16,7 +16,7 @@
 //!   Added<Health>>` to react when Health appears on an entity for the
 //!   first time. Commands add Health to entity 0 on frame 3.
 
-use ecs_hybrid::{
+use pill_engine::{
     Added, Changed, Commands, Component, Engine, Entity, Query, ResMut, Resource, With, Without,
 };
 use trait_type_map::impl_trait_accessible;

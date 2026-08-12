@@ -1,6 +1,6 @@
 //! Integration-style unit tests for the native/C# ECS boundary.
 
-use ecs_hybrid::{ComponentTicks, Engine, SystemAccess, SystemScheduler};
+use pill_engine::{ComponentTicks, Engine, SystemAccess, SystemScheduler};
 
 use super::abi::{ComponentChunk, NativeComponentBlob, NativeSystemAccess};
 use super::backend::derive_system_access;
@@ -322,7 +322,7 @@ unsafe fn simulate_managed_write(chunk: &ComponentChunk, row: usize) {
     // SAFETY: the chunk callback returns a tick slice parallel to the
     // component data and `row` was checked against that shared length.
     unsafe {
-        (*chunk.ticks.add(row)).set_changed(ecs_hybrid::Tick::new(chunk.change_tick));
+        (*chunk.ticks.add(row)).set_changed(pill_engine::Tick::new(chunk.change_tick));
     }
 }
 
@@ -425,7 +425,7 @@ fn csharp_world_supports_the_sprite_renderer_query() {
     let mut engine = Engine::new();
     setup_test_world(&mut engine);
 
-    let mut query = ecs_hybrid::Query::<(&Position, &Sprite)>::new(engine.world_mut());
+    let mut query = pill_engine::Query::<(&Position, &Sprite)>::new(engine.world_mut());
     assert_eq!(query.iter_mut().count(), 100);
 }
 
@@ -531,9 +531,9 @@ fn one_managed_row_write_is_visible_to_rust_changed_filter() {
         unsafe { simulate_managed_write(&component_chunk, 37) };
     }
 
-    let expected = unsafe { *((entity_chunk.data as *const ecs_hybrid::Entity).add(37)) };
+    let expected = unsafe { *((entity_chunk.data as *const pill_engine::Entity).add(37)) };
     let mut changed =
-        ecs_hybrid::Query::<(ecs_hybrid::Entity,), ecs_hybrid::Changed<Position>>::new(
+        pill_engine::Query::<(pill_engine::Entity,), pill_engine::Changed<Position>>::new(
             engine.world_mut(),
         );
     let hits: Vec<_> = changed.iter_mut().map(|(entity,)| entity).collect();
@@ -558,7 +558,7 @@ fn managed_read_only_chunk_does_not_trigger_changed_filter() {
     }
 
     let mut changed =
-        ecs_hybrid::Query::<(ecs_hybrid::Entity,), ecs_hybrid::Changed<Position>>::new(
+        pill_engine::Query::<(pill_engine::Entity,), pill_engine::Changed<Position>>::new(
             engine.world_mut(),
         );
     assert_eq!(changed.iter_mut().count(), 0);
@@ -589,10 +589,10 @@ fn disjoint_managed_writes_mark_the_correct_tick_columns() {
         }
     }
 
-    let entity_at = |row| unsafe { *((entities.data as *const ecs_hybrid::Entity).add(row)) };
-    let mut changed_positions = ecs_hybrid::Query::<
-        (ecs_hybrid::Entity,),
-        ecs_hybrid::Changed<Position>,
+    let entity_at = |row| unsafe { *((entities.data as *const pill_engine::Entity).add(row)) };
+    let mut changed_positions = pill_engine::Query::<
+        (pill_engine::Entity,),
+        pill_engine::Changed<Position>,
     >::new(engine.world_mut());
     let position_hits: Vec<_> = changed_positions
         .iter_mut()
@@ -601,7 +601,7 @@ fn disjoint_managed_writes_mark_the_correct_tick_columns() {
     assert_eq!(position_hits, vec![entity_at(3)]);
 
     let mut changed_sprites =
-        ecs_hybrid::Query::<(ecs_hybrid::Entity,), ecs_hybrid::Changed<Sprite>>::new(
+        pill_engine::Query::<(pill_engine::Entity,), pill_engine::Changed<Sprite>>::new(
             engine.world_mut(),
         );
     let sprite_hits: Vec<_> = changed_sprites.iter_mut().map(|(entity,)| entity).collect();
@@ -622,7 +622,7 @@ fn entity_chunks_are_available_only_during_a_managed_system() {
         assert_eq!(chunk.len, 100);
         assert_eq!(
             chunk.element_size as usize,
-            std::mem::size_of::<ecs_hybrid::Entity>()
+            std::mem::size_of::<pill_engine::Entity>()
         );
         assert!(!chunk.data.is_null());
     }
