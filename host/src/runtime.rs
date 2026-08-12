@@ -1,21 +1,36 @@
 //! Engine ownership and frontend-facing frame orchestration.
 //!
+//! # Responsibilities
+//!
+//! - Own the engine instance and expose safe frontend access.
+//! - Assemble the host state shared by all frontends.
+//! - Execute one hot-reload-aware frame per [`run_one_frame`] call.
+//!
+//! # Design
+//!
 //! This module contains the stable API used by `standalone`, `editor`, and
 //! other host binaries. Backend-specific loading stays behind [`LoadedGame`].
 
+// Standard library
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+// External crates
 use pill_engine::{Engine, EngineApi};
 #[cfg(feature = "rendering")]
 use pill_engine::{RenderViewport, Renderer, RendererError, RendererWindow, VirtualResolution};
 
+// Current crate
 use crate::game_module::LoadedGame;
 use crate::native_library::cleanup_temporary_files;
 use crate::watcher::spawn_file_watcher;
 use crate::{GameModuleBackend, GameModuleConfig};
+
+// =============================================================================
+// Types + Impls
+// =============================================================================
 
 /// Everything the frame-step loop needs, assembled once during startup.
 ///
@@ -129,8 +144,22 @@ impl RenderingHost {
     }
 }
 
+/// Result of one [`run_one_frame`] call when the reporting interval elapses.
+#[derive(Debug, Clone, Copy)]
+pub struct FrameReport {
+    /// Frames per second measured over the reporting window.
+    pub fps: f64,
+    /// Number of live entities at report time.
+    pub entity_count: usize,
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
 /// Build/load the game module, create the engine, and start its source watcher.
 pub fn setup(module_config: GameModuleConfig) -> Result<Host, Box<dyn std::error::Error>> {
+    // Step 1: Resolve the workspace root and print the selected configuration.
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or("Cannot determine workspace root")?
@@ -145,12 +174,14 @@ pub fn setup(module_config: GameModuleConfig) -> Result<Host, Box<dyn std::error
         cleanup_temporary_files(&workspace_root);
     }
 
+    // Step 2: Construct the engine and its stable API table.
     // EngineApi stores a raw pointer into this allocation, so the engine must
     // reach its final stable address before the API table is constructed.
     let mut engine = Box::new(Engine::new());
     engine.set_parallel_execution(true);
     let engine_api = EngineApi::new(&mut engine);
 
+    // Step 3: Build and load the game module, then start its source watcher.
     let loaded_game = LoadedGame::start(&mut engine, &engine_api, &workspace_root, &module_config)?;
 
     let reload_flag = Arc::new(AtomicBool::new(false));
@@ -200,18 +231,12 @@ where
     Ok(RenderingHost { host, renderer })
 }
 
-/// Result of one [`run_one_frame`] call when the reporting interval elapses.
-#[derive(Debug, Clone, Copy)]
-pub struct FrameReport {
-    pub fps: f64,
-    pub entity_count: usize,
-}
-
 /// Process hot reloads, execute one scheduler frame, and update FPS tracking.
 ///
 /// Returns a report roughly every three seconds for a frontend to print or
 /// display; all other frames return `None`.
 pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
+    // Step 1: Process a pending hot reload before running systems.
     if host.reload_flag.swap(false, Ordering::Acquire) {
         println!();
         println!("[host] === Hot-reload triggered ===");
@@ -223,17 +248,21 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
         );
     }
 
+    // Step 2: Poll the managed loader for an assembly swap.
     // The managed loader watches the built assembly instead of source files.
     host.loaded_game.poll_managed_reload();
 
+    // Step 3: Execute one scheduler frame.
     if let Err(errors) = host.engine.process_frame() {
         eprintln!("[host] Frame error: {errors:?}");
     }
 
+    // Step 4: Invoke the native compatibility update after scheduler systems.
     // Managed games run entirely as scheduler systems. Native games retain
     // this compatibility update hook after their scheduled work.
     host.loaded_game.update(&host.engine_api);
 
+    // Step 5: Track and report FPS over the three-second window.
     host.frame_count += 1;
     let elapsed = host.last_report.elapsed().as_secs_f64();
     if elapsed < 3.0 {

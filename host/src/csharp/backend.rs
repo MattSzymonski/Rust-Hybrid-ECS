@@ -1,11 +1,20 @@
 //! High-level C# game startup, discovery, and scheduler registration.
+//!
+//! # Responsibilities
+//!
+//! - Start .NET and discover the managed interop exports.
+//! - Register reflected component manifests and startup methods.
+//! - Translate reflected system accesses into scheduler registrations.
 
+// Standard library
 use std::path::Path;
 use std::sync::Arc;
 
+// External crates
 use pill_engine::commands::CommandQueue;
 use pill_engine::{Engine, SystemAccess, World};
 
+// Current crate
 use crate::CSharpModuleConfig;
 
 use super::abi::{CsEngineApi, NativeSystemAccess};
@@ -15,17 +24,36 @@ use super::components::{
 use super::context::ActiveSystemGuard;
 use super::csharp_runtime::DotnetRuntimeContext;
 
+// =============================================================================
+// Types
+// =============================================================================
+
+/// Signature of the managed runtime entry point that receives the API table.
 type InitFn = extern "system" fn(*const CsEngineApi) -> u8;
+/// Signature returning the number of registered scheduler systems.
 type SystemCountFn = extern "system" fn() -> u32;
+/// Signature returning the number of managed startup methods.
 type StartupCountFn = extern "system" fn() -> u32;
+/// Signature reporting whether one system declares a Commands parameter.
 type SystemUsesCommandsFn = extern "system" fn(u32) -> u8;
+/// Signature executing one managed startup method by index.
 type RunStartupFn = extern "system" fn(u32) -> u8;
+/// Signature returning the serialized component manifest byte length.
 type ComponentManifestLengthFn = extern "system" fn() -> u32;
+/// Signature copying the serialized component manifest into a caller buffer.
 type CopyComponentManifestFn = extern "system" fn(*mut u8, u32) -> u8;
+/// Signature returning how many accesses one system declared.
 type SystemAccessCountFn = extern "system" fn(u32) -> u32;
+/// Signature copying one system's reflected accesses into a caller buffer.
 type GetSystemAccessFn = extern "system" fn(u32, u32, *mut NativeSystemAccess) -> u8;
+/// Signature running one scheduler system by index.
 type RunSystemFn = extern "system" fn(u32);
+/// Signature polling the collectible loader for a new game assembly.
 type PollReloadFn = extern "system" fn();
+
+// =============================================================================
+// Types + Impls
+// =============================================================================
 
 /// Owns the hosted .NET context, stable API table, and reload callback.
 ///
@@ -42,6 +70,13 @@ pub(crate) struct CSharpRuntime {
 impl CSharpRuntime {
     /// Start .NET, load `csharp_runtime`, discover managed systems, and register
     /// each system with its reflected read/write access declaration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the runtime cannot start, a managed export is
+    /// missing, runtime initialization fails, the component manifest cannot be
+    /// copied or registered, a startup method fails, or a reflected access
+    /// references an unregistered component.
     pub(crate) fn start(
         engine: &mut Engine,
         workspace_root: &Path,
@@ -49,6 +84,7 @@ impl CSharpRuntime {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let shared_bindings = shared_component_bindings(engine);
 
+        // Step 1: Resolve assembly paths, start .NET, and load managed exports.
         let runtime_dir = workspace_root.join(config.runtime_output_subdirectory);
         let game_dir = workspace_root.join(config.game_output_subdirectory);
         let assembly = runtime_dir.join(format!("{}.dll", config.runtime_assembly_name));
@@ -104,6 +140,8 @@ impl CSharpRuntime {
         let poll_reload =
             runtime.get_unmanaged_fn::<PollReloadFn>(&assembly, &type_name, "PollReload")?;
 
+        // Step 2: Initialize the runtime bridge and register the component
+        // manifest copied from the managed assembly.
         let api = Box::new(CsEngineApi::new());
         if init(api.as_ref() as *const CsEngineApi) == 0 {
             return Err("csharp_runtime initialization failed".into());
@@ -119,6 +157,7 @@ impl CSharpRuntime {
             shared_bindings,
         )?);
 
+        // Step 3: Run every reflected managed startup method.
         let startup_bindings = Arc::clone(&bindings);
         let mut startup_failed = None;
         engine
@@ -143,6 +182,8 @@ impl CSharpRuntime {
             return Err(format!("C# startup method {index} failed").into());
         }
 
+        // Step 4: Reflect each system's accesses and register it with the
+        // scheduler under the exact resolved read/write list.
         let count = system_count();
         if count == 0 {
             return Err("game_cs contains no [EcsSystem] methods".into());
@@ -204,7 +245,16 @@ impl CSharpRuntime {
     }
 }
 
+// =============================================================================
+// Free Functions
+// =============================================================================
+
 /// Translate managed component modes into native scheduler metadata.
+///
+/// # Errors
+///
+/// Returns an error if a declared component key is not registered or an
+/// access mode is neither read nor write.
 pub(super) fn derive_system_access(
     accesses: &[NativeSystemAccess],
     bindings: &ComponentBindings,

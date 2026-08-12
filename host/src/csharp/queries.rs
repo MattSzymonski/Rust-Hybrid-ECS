@@ -1,10 +1,22 @@
 //! Native callbacks used by C# query enumerators.
+//!
+//! # Responsibilities
+//!
+//! - Return validated component chunks to managed query iterators.
+//! - Return entity columns and live entity counts during scheduled systems.
+//! - Enforce the active system's declared read/write access.
 
+// External crates
 use pill_engine::Entity;
 
+// Current crate
 use super::abi::ComponentChunk;
 use super::components::{ComponentBinding, StableComponentId};
 use super::context::{access_is_authorized, with_active_context, with_active_world};
+
+// =============================================================================
+// Free Functions
+// =============================================================================
 
 /// Return a component chunk to managed code after validating scheduler access.
 ///

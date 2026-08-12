@@ -1,7 +1,14 @@
 //! Integration-style unit tests for the native/C# ECS boundary.
+//!
+//! # Responsibilities
+//!
+//! - Verify command-callback ABI behaviour against a live engine.
+//! - Verify component-chunk queries and scheduler access derivation.
 
+// External crates
 use pill_engine::{ComponentTicks, Engine, SystemAccess, SystemScheduler};
 
+// Current crate
 use super::abi::{ComponentChunk, NativeComponentBlob, NativeSystemAccess};
 use super::backend::derive_system_access;
 use super::commands::{
@@ -14,6 +21,10 @@ use super::components::{
 };
 use super::context::ActiveSystemGuard;
 use super::queries::{ffi_get_component_chunk, ffi_get_entity_chunk};
+
+// =============================================================================
+// Test Helpers
+// =============================================================================
 
 /// Return the stable ID used by a component in the shared `TracyLive` namespace.
 fn test_stable_id(name: &str) -> StableComponentId {
@@ -118,6 +129,10 @@ fn scheduler_for(accesses: impl IntoIterator<Item = SystemAccess>) -> SystemSche
     scheduler.build_execution_graph();
     scheduler
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 /// Verify managed commands can create, migrate, and destroy a mixed entity.
 #[test]
@@ -600,10 +615,10 @@ fn disjoint_managed_writes_mark_the_correct_tick_columns() {
         .collect();
     assert_eq!(position_hits, vec![entity_at(3)]);
 
-    let mut changed_sprites =
-        pill_engine::Query::<(pill_engine::Entity,), pill_engine::Changed<Sprite>>::new(
-            engine.world_mut(),
-        );
+    let mut changed_sprites = pill_engine::Query::<
+        (pill_engine::Entity,),
+        pill_engine::Changed<Sprite>,
+    >::new(engine.world_mut());
     let sprite_hits: Vec<_> = changed_sprites.iter_mut().map(|(entity,)| entity).collect();
     assert_eq!(sprite_hits, vec![entity_at(7)]);
 }

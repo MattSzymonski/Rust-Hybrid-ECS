@@ -3,47 +3,17 @@
 //! The non-rendering build drives frames in a tight headless loop. The
 //! rendering build owns `winit`, creates the native window, asks host setup to
 //! attach the engine renderer, and forwards resize/redraw events.
+//!
+//! # Responsibilities
+//!
+//! - Run the configured game in a headless loop when rendering is disabled.
+//! - Run the configured game in a `winit` window when rendering is enabled.
 
-use crate::GameModuleConfig;
-
-/// Run the configured game continuously without creating a native window.
-#[cfg(not(feature = "rendering"))]
-pub fn run(module_config: GameModuleConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let mut host = crate::setup(module_config)?;
-
-    // Headless execution advances continuously; the engine scheduler decides
-    // how each frame's systems are parallelized.
-    loop {
-        if let Some(report) = crate::run_one_frame(&mut host) {
-            println!(
-                "  {:>6.0} FPS | {:>5} entities",
-                report.fps, report.entity_count
-            );
-        }
-    }
-}
-
-/// Run the configured game in the host-owned native window and render loop.
-#[cfg(feature = "rendering")]
-pub fn run(module_config: GameModuleConfig) -> Result<(), Box<dyn std::error::Error>> {
-    use winit::event_loop::{ControlFlow, EventLoop};
-
-    // Poll continuously so presentation is not artificially restricted by a
-    // wait-based event-loop cadence.
-    let event_loop = EventLoop::new()?;
-    event_loop.set_control_flow(ControlFlow::Poll);
-
-    let mut application = WindowedApplication {
-        module_config,
-        window: None,
-        host: None,
-    };
-    event_loop.run_app(&mut application)?;
-    Ok(())
-}
-
+// Standard library
 #[cfg(feature = "rendering")]
 use std::sync::Arc;
+
+// External crates
 #[cfg(feature = "rendering")]
 use winit::application::ApplicationHandler;
 #[cfg(feature = "rendering")]
@@ -52,6 +22,13 @@ use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 #[cfg(feature = "rendering")]
 use winit::window::{Window, WindowId};
+
+// Current crate
+use crate::GameModuleConfig;
+
+// =============================================================================
+// Types + Impls
+// =============================================================================
 
 /// State retained by `winit` for the lifetime of the standalone application.
 #[cfg(feature = "rendering")]
@@ -144,4 +121,44 @@ impl WindowedApplication {
             }
         }
     }
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Run the configured game continuously without creating a native window.
+#[cfg(not(feature = "rendering"))]
+pub fn run(module_config: GameModuleConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let mut host = crate::setup(module_config)?;
+
+    // Headless execution advances continuously; the engine scheduler decides
+    // how each frame's systems are parallelized.
+    loop {
+        if let Some(report) = crate::run_one_frame(&mut host) {
+            println!(
+                "  {:>6.0} FPS | {:>5} entities",
+                report.fps, report.entity_count
+            );
+        }
+    }
+}
+
+/// Run the configured game in the host-owned native window and render loop.
+#[cfg(feature = "rendering")]
+pub fn run(module_config: GameModuleConfig) -> Result<(), Box<dyn std::error::Error>> {
+    use winit::event_loop::{ControlFlow, EventLoop};
+
+    // Poll continuously so presentation is not artificially restricted by a
+    // wait-based event-loop cadence.
+    let event_loop = EventLoop::new()?;
+    event_loop.set_control_flow(ControlFlow::Poll);
+
+    let mut application = WindowedApplication {
+        module_config,
+        window: None,
+        host: None,
+    };
+    event_loop.run_app(&mut application)?;
+    Ok(())
 }

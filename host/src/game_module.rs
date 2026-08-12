@@ -7,15 +7,22 @@
 //! - Delegates managed reload polling to `csharp_runtime`.
 //! - Keeps native component-schema migration beside the DLL swap it protects.
 
+// Standard library
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+// External crates
 use pill_engine::{Engine, EngineApi};
 
+// Current crate
 use crate::build::build_game_module;
 use crate::csharp::CSharpRuntime;
 use crate::native_library::GameLibrary;
 use crate::{GameModuleBackend, GameModuleConfig};
+
+// =============================================================================
+// Types + Impls
+// =============================================================================
 
 /// The backend-specific state kept alive by the host loop.
 pub(crate) enum LoadedGame {
@@ -36,10 +43,12 @@ impl LoadedGame {
         workspace_root: &Path,
         config: &GameModuleConfig,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Step 1: Build the module through the shared command runner.
         // Build before branching so both backends use the same command runner,
         // diagnostics, output validation, and initial failure behavior.
         let output_path = build_game_module(workspace_root, config)?;
 
+        // Step 2: Initialize the backend-specific runtime.
         match &config.backend {
             GameModuleBackend::NativeLibrary { .. } => {
                 // Native build outputs cannot be loaded in place on Windows:
@@ -123,6 +132,10 @@ impl LoadedGame {
     }
 }
 
+// =============================================================================
+// Free Functions
+// =============================================================================
+
 /// Reload one native generation and migrate components whose persisted schema
 /// changed across the module boundary.
 fn reload_native(
@@ -133,6 +146,7 @@ fn reload_native(
     workspace_root: &Path,
     config: &GameModuleConfig,
 ) {
+    // Step 1: Compile the new module before touching engine state.
     // Complete compilation before mutating engine state. A compiler error can
     // therefore never remove the systems belonging to the working generation.
     let output_path = match build_game_module(workspace_root, config) {
@@ -144,6 +158,7 @@ fn reload_native(
         }
     };
 
+    // Step 2: Load and validate the replacement library transactionally.
     // Loading and symbol validation are also transactional. Keep `current`
     // untouched until a complete replacement library is ready to initialize.
     let new_library = match GameLibrary::load_copy(&output_path, workspace_root) {
@@ -155,6 +170,8 @@ fn reload_native(
         }
     };
 
+    // Step 3: Capture old schemas, clear old systems, and initialize the new
+    // generation while both DLLs remain mapped.
     // Capture the old generation's persistence functions and schemas while its
     // DLL is still mapped. Migration may need those functions after game_init
     // has registered the replacement generation's component definitions.
@@ -186,6 +203,7 @@ fn reload_native(
         })
         .collect();
 
+    // Step 4: Migrate changed schemas and archive the old DLL.
     if changed_type_names.is_empty() {
         // Avoid touching archetype storage when every persisted layout is
         // byte-for-byte compatible with the previous generation.

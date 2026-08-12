@@ -1,13 +1,27 @@
 //! Native callbacks that translate C# lifecycle requests into deferred ECS commands.
+//!
+//! # Responsibilities
+//!
+//! - Reserve generation-checked entity handles for managed callers.
+//! - Decode managed component blobs into native or dynamic adders.
+//! - Queue create, destroy, add, and remove operations against the active
+//!   world, rejecting stale generations and undeclared scopes.
 
+// Standard library
 use std::collections::HashSet;
 
+// External crates
 use pill_engine::commands::ComponentAdder;
 use pill_engine::{ComponentId, Entity};
 
+// Current crate
 use super::abi::NativeComponentBlob;
 use super::components::{ComponentBinding, StableComponentId};
 use super::context::{active_world_exists, with_active_command_context};
+
+// =============================================================================
+// Free Functions
+// =============================================================================
 
 /// Return the command-specific scope error used by all lifecycle callbacks.
 fn command_scope_error() -> u8 {
@@ -71,8 +85,11 @@ fn decode_command_component(
     }
 }
 
+/// A decoded command component in its native or type-erased representation.
 enum DecodedCommandComponent {
+    /// A concrete Rust component decoded through its native binding.
     Native(Box<dyn ComponentAdder>),
+    /// A type-erased byte payload for a dynamically registered component.
     Dynamic(ComponentId, Vec<u8>),
 }
 

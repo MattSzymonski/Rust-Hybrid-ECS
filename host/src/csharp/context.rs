@@ -1,11 +1,20 @@
 //! Thread-local access scope installed around one scheduled C# system.
+//!
+//! # Responsibilities
+//!
+//! - Publish the active world, queue, and bindings for managed callbacks.
+//! - Reject nested or out-of-scope managed invocation.
+//! - Clear every thread-local slot when the invocation ends.
 
+// Standard library
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 
+// External crates
 use pill_engine::commands::CommandQueue;
 use pill_engine::{Entity, World};
 
+// Current crate
 use super::abi::NativeSystemAccess;
 use super::components::{ComponentBindings, StableComponentId};
 
@@ -24,6 +33,10 @@ thread_local! {
     /// Whether reflected system metadata declared the managed Commands parameter.
     static ACTIVE_USES_COMMANDS: Cell<bool> = const { Cell::new(false) };
 }
+
+// =============================================================================
+// Types + Impls
+// =============================================================================
 
 /// Clears thread-local native access even if managed execution unwinds.
 pub(super) struct ActiveSystemGuard;
@@ -88,6 +101,10 @@ impl Drop for ActiveSystemGuard {
         ACTIVE_WORLD.with(|slot| slot.set(std::ptr::null_mut()));
     }
 }
+
+// =============================================================================
+// Free Functions
+// =============================================================================
 
 /// Run a callback with the active world, deferred queue, component bindings,
 /// and reservation set only when the system declared a Commands parameter.

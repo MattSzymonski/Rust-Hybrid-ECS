@@ -1,7 +1,15 @@
 //! C# component identities, native bindings, and manifest registration.
+//!
+//! # Responsibilities
+//!
+//! - Define native ABI mirrors for shared managed components.
+//! - Resolve stable managed identities to native or dynamic bindings.
+//! - Validate and register reflected component manifests.
 
+// Standard library
 use std::collections::{HashMap, HashSet};
 
+// External crates
 use pill_engine::commands::{boxed_component_adder, ComponentAdder};
 use pill_engine::{Component, ComponentId, Engine, World};
 use serde::Deserialize;
@@ -9,6 +17,7 @@ use serde::Deserialize;
 use trait_type_map::impl_trait_accessible;
 use trait_type_map::TraitAccessible;
 
+// Current crate
 use super::abi::ComponentChunk;
 
 // In rendering builds these names resolve to the renderer's components so
@@ -18,6 +27,10 @@ use super::abi::ComponentChunk;
 pub(super) use pill_engine::Color;
 #[cfg(feature = "rendering")]
 pub(super) use pill_engine::{Position, Sprite};
+
+// =============================================================================
+// Types
+// =============================================================================
 
 #[cfg(not(feature = "rendering"))]
 /// Headless ABI mirror of `TracyLive.Position`.
@@ -75,6 +88,7 @@ type NativeBlobDecoder = fn(*const u8, usize) -> Result<Box<dyn ComponentAdder>,
 /// Resolves a stable managed identity to native or type-erased ECS storage.
 #[derive(Clone, Copy)]
 pub(super) enum ComponentBinding {
+    /// A concrete Rust component with chunk access and a typed decoder.
     Native {
         component_id: ComponentId,
         get_chunk: NativeChunkGetter,
@@ -83,6 +97,7 @@ pub(super) enum ComponentBinding {
         schema_hash: u64,
         decode: NativeBlobDecoder,
     },
+    /// A dynamically registered layout stored as raw bytes.
     Dynamic {
         component_id: ComponentId,
         size: usize,
@@ -99,6 +114,10 @@ impl ComponentBinding {
         }
     }
 }
+
+// =============================================================================
+// Free Functions
+// =============================================================================
 
 /// Produce one half of the stable component identity or a native schema hash.
 pub(super) const fn component_hash(name: &str, offset: u64) -> u64 {
@@ -170,6 +189,7 @@ where
     Ok(boxed_component_adder(component))
 }
 
+/// Deserialized entry from the managed component manifest.
 #[derive(Deserialize)]
 struct ManagedComponentManifest {
     stable_id_low: u64,
@@ -182,6 +202,7 @@ struct ManagedComponentManifest {
     fields: Vec<ManagedFieldManifest>,
 }
 
+/// Deserialized field entry within a managed component manifest.
 #[derive(Deserialize)]
 struct ManagedFieldManifest {
     name: String,
@@ -255,6 +276,7 @@ pub(super) fn register_component_manifest(
     bytes: &[u8],
     mut bindings: ComponentBindings,
 ) -> Result<ComponentBindings, Box<dyn std::error::Error>> {
+    // Step 1: Parse and validate every entry against canonical identities.
     let manifest: Vec<ManagedComponentManifest> = serde_json::from_slice(bytes)?;
     let mut seen = HashSet::new();
     for component in manifest {
@@ -316,6 +338,7 @@ pub(super) fn register_component_manifest(
             }
             continue;
         }
+        // Step 2: Register each remaining component as dynamic storage.
         if component.shared {
             return Err(format!(
                 "managed shared component {} has no native engine binding",

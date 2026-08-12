@@ -6,12 +6,18 @@
 //! - Provides the standard Rust, C#, and integration-test configurations.
 //! - Selects a configuration from the host process environment.
 
+// =============================================================================
+// Types
+// =============================================================================
+
 /// Backend-specific output information for a hot-reloadable game module.
 #[derive(Debug, Clone)]
 pub enum GameModuleBackend {
     /// A native shared library exporting `game_init` and `game_update`.
     NativeLibrary {
+        /// Library name without the platform prefix or suffix.
         library_name: &'static str,
+        /// Output subdirectory relative to the workspace root.
         output_subdirectory: &'static str,
     },
     /// A managed game assembly loaded through the stable `csharp_runtime` host.
@@ -21,9 +27,13 @@ pub enum GameModuleBackend {
 /// Output locations and assembly names used by the managed game backend.
 #[derive(Debug, Clone)]
 pub struct CSharpModuleConfig {
+    /// Name of the runtime assembly that hosts the collectible loader.
     pub runtime_assembly_name: &'static str,
+    /// Output subdirectory for the runtime assembly, relative to the workspace root.
     pub runtime_output_subdirectory: &'static str,
+    /// Name of the game assembly loaded by the runtime.
     pub game_assembly_name: &'static str,
+    /// Output subdirectory for the game assembly, relative to the workspace root.
     pub game_output_subdirectory: &'static str,
 }
 

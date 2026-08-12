@@ -1,37 +1,56 @@
-//! Watch the configured source tree for file changes and signal reloads to the main thread.
-//!
-//! # Design
-//! The file watcher runs in a separate thread to avoid blocking the main frame loop. It uses a debounce
-//! window to coalesce multiple file events into a single reload signal. The main thread checks the
-//! reload flag each frame and triggers a hot reload when it is set.
+//! Watch the configured source tree for file changes and signal reloads to
+//! the main thread.
 //!
 //! # Responsibilities
-//! - Spawn a file watcher thread that monitors the source tree for changes.
-//! - Set a reload flag when relevant file events are detected, allowing the main thread to perform a hot reload.
-//! - Use the `notify` crate to watch for file events and handle cross-platform differences in file system notifications.
+//!
+//! - Spawn a worker thread that monitors the source tree for changes.
+//! - Set a reload flag when relevant file events are detected, letting the
+//!   main thread perform a hot reload.
+//! - Handle cross-platform file notification differences through `notify`.
+//!
+//! # Design
+//!
+//! The file watcher runs in a separate thread to avoid blocking the main
+//! frame loop. A debounce window coalesces multiple file events into a
+//! single reload signal. The main thread checks the reload flag each frame
+//! and triggers a hot reload when it is set.
 
+// Standard library
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+// External crates
 use notify::event::EventKind;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 
+// Current crate
 use crate::GameModuleConfig;
 
-
-
+// =============================================================================
+// Constants
+// =============================================================================
 
 /// File events arriving within this window are coalesced into one reload.
 const DEBOUNCE_DURATION: Duration = Duration::from_millis(300);
 
+// =============================================================================
+// Free Functions
+// =============================================================================
+
 /// Watch the configured source tree and signal reloads from a worker thread.
+///
+/// # Errors
+///
+/// Returns an error if the watch directory does not exist, the watcher cannot
+/// be created, or the watch path cannot be registered.
 pub(crate) fn spawn_file_watcher(
     workspace_root: PathBuf,
     config: &GameModuleConfig,
     reload_flag: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Step 1: Resolve and validate the configured watch directory.
     // Watch paths are configured relative to the repository so the same
     // configuration works regardless of the process's current directory.
     let watch_path = workspace_root.join(config.watch_directory);
@@ -48,6 +67,8 @@ pub(crate) fn spawn_file_watcher(
         watch_path.display()
     );
 
+    // Step 2: Create the watcher with a minimal callback that forwards
+    // relevant events to a debounce channel.
     // The notify callback should do as little work as possible because its
     // execution model differs between operating-system backends. A channel
     // transfers relevant events to one host-owned debounce thread.
@@ -72,6 +93,7 @@ pub(crate) fn spawn_file_watcher(
     // language backend to enumerate its own directory structure.
     watcher.watch(&watch_path, RecursiveMode::Recursive)?;
 
+    // Step 3: Run the debounce worker that signals the main frame loop.
     std::thread::spawn(move || {
         // RecommendedWatcher unregisters its OS handles when dropped. Move it
         // into the worker even though the loop never calls it directly, keeping

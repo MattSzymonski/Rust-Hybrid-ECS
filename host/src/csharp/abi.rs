@@ -2,16 +2,30 @@
 //!
 //! Field order, field widths, and calling conventions in this module are part
 //! of the native/managed ABI and must remain synchronized with `EngineApi.cs`.
+//!
+//! # Responsibilities
+//!
+//! - Define the C-compatible function table copied by `csharp_runtime`.
+//! - Describe component blobs, chunks, and scheduler access for managed code.
 
+// External crates
 use pill_engine::{ComponentTicks, Entity};
 
+// Current crate
 use super::commands::{
     ffi_queue_add_component, ffi_queue_create, ffi_queue_destroy, ffi_queue_remove_component,
     ffi_reserve_entity,
 };
 use super::queries::{ffi_entity_count, ffi_get_component_chunk, ffi_get_entity_chunk};
 
+// =============================================================================
+// Types
+// =============================================================================
+
 /// Function table copied by `csharp_runtime` during managed initialization.
+///
+/// Every slot maps to one `extern "C"` callback implemented by the query and
+/// deferred-command adapters in this crate.
 #[repr(C)]
 pub(super) struct CsEngineApi {
     entity_count: extern "C" fn() -> u32,
@@ -42,6 +56,9 @@ impl CsEngineApi {
 }
 
 /// One pinned managed component value supplied to a deferred command.
+///
+/// Managed code pins the data buffer for the complete duration of the call
+/// that consumes the blob.
 #[repr(C)]
 pub(super) struct NativeComponentBlob {
     pub(super) component_key: u64,
@@ -51,6 +68,9 @@ pub(super) struct NativeComponentBlob {
 }
 
 /// Description of one contiguous ECS column returned to managed code.
+///
+/// Pointers reference storage owned by the active archetype and remain valid
+/// only for the duration of the scheduled managed invocation.
 #[repr(C)]
 pub(super) struct ComponentChunk {
     pub(super) archetype_low: u64,
@@ -63,6 +83,9 @@ pub(super) struct ComponentChunk {
 }
 
 /// One reflected scheduler access, where `0` is read and `1` is write.
+///
+/// Managed systems declare one entry per queried component before the native
+/// side derives scheduler metadata.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct NativeSystemAccess {

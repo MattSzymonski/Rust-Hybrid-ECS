@@ -3,14 +3,31 @@
 //! Loaded modules are copied to unique paths before opening. This permits a
 //! newly compiled DLL to replace the build output while an older generation
 //! remains mapped for outstanding function pointers and vtables.
+//!
+//! # Responsibilities
+//!
+//! - Load native game libraries from unique temporary paths.
+//! - Validate required exports before returning a loaded library.
+//! - Call native registration and per-frame update entry points.
+//! - Remove temporary copies left behind by earlier host processes.
 
+// Standard library
 use std::path::Path;
 
-use pill_engine::EngineApi;
+// External crates
 use libloading::{Library, Symbol};
+use pill_engine::EngineApi;
+
+// =============================================================================
+// Constants
+// =============================================================================
 
 /// Directory where temporary native-library copies are stored.
 const TEMPORARY_DIRECTORY: &str = "standalone_temp";
+
+// =============================================================================
+// Types + Impls
+// =============================================================================
 
 /// Owns one loaded native game module.
 pub(crate) struct GameLibrary {
@@ -19,10 +36,17 @@ pub(crate) struct GameLibrary {
 
 impl GameLibrary {
     /// Copy and load the built shared library from a unique temporary path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the temporary directory cannot be created, the
+    /// built library cannot be copied, or the copy is not a valid native
+    /// library exporting the required `game_init` symbol.
     pub(crate) fn load_copy(
         build_output: &Path,
         workspace_root: &Path,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Step 1: Prepare the temporary directory and a unique target path.
         let temporary_directory = workspace_root.join(TEMPORARY_DIRECTORY);
         std::fs::create_dir_all(&temporary_directory)?;
 
@@ -36,9 +60,11 @@ impl GameLibrary {
             .unwrap_or("dll");
         let temporary_path = temporary_directory.join(format!("game_{timestamp}.{extension}"));
 
+        // Step 2: Copy the built library to the unique temporary path.
         std::fs::copy(build_output, &temporary_path)?;
         println!("[host] Copied DLL to: {}", temporary_path.display());
 
+        // Step 3: Load the copy and validate its required exports.
         // SAFETY: The configured build just produced this module and its
         // required exports are validated before the handle is returned.
         let game_library = unsafe { Self::load(&temporary_path)? };
@@ -90,6 +116,10 @@ impl GameLibrary {
         }
     }
 }
+
+// =============================================================================
+// Free Functions
+// =============================================================================
 
 /// Remove temporary native-library copies left by earlier host processes.
 pub(crate) fn cleanup_temporary_files(workspace_root: &Path) {

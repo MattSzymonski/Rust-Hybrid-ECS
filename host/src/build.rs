@@ -2,13 +2,31 @@
 //!
 //! Build processes inherit the host's standard streams so compiler progress
 //! and diagnostics remain visible in the terminal that launched the host.
+//!
+//! # Responsibilities
+//!
+//! - Execute backend-specific build commands from the workspace root.
+//! - Resolve each backend's expected output artifact path.
+//! - Validate that build artifacts exist before loading is attempted.
 
+// Standard library
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+// Current crate
 use crate::{GameModuleBackend, GameModuleConfig};
 
+// =============================================================================
+// Free Functions
+// =============================================================================
+
 /// Build the selected game module and return its expected output artifact.
+///
+/// # Errors
+///
+/// Returns an error if the build command fails to spawn, exits with a
+/// non-zero status, or the resolved output artifact does not exist at the
+/// configured path.
 pub(crate) fn build_game_module(
     workspace_root: &Path,
     config: &GameModuleConfig,
