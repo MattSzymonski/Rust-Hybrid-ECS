@@ -9,8 +9,7 @@
 
 use host::{run_one_frame, setup, GameModuleConfig};
 
-/// Run the engine loop as fast as the FPS limiter allows, printing a
-/// status line on every completed frame.
+/// Main entry point and program loop for the headless host.
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut host = setup(GameModuleConfig::from_environment())?;
     loop {

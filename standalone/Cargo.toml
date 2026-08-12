@@ -1,5 +1,5 @@
 [package]
-name = "standalone"
+name = "pill_standalone"
 version = "0.1.0"
 edition = "2021"
 
@@ -11,4 +11,10 @@ winit = { version = "0.30", optional = true }
 pollster = { version = "0.4", optional = true }
 
 [features]
-rendering = ["dep:wgpu", "dep:winit", "dep:pollster", "ecs_hybrid/rendering", "host/rendering"]
+rendering = [
+    "dep:wgpu",
+    "dep:winit",
+    "dep:pollster",
+    "ecs_hybrid/rendering",
+    "host/rendering",
+]

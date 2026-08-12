@@ -12,17 +12,26 @@
 //! only adds the execution loop: a plain console loop in `headless`, or a
 //! `winit` + `wgpu` render loop in `windowed`.
 
+// =============================================================================
+// Headless Mode
+// =============================================================================
+
+#[cfg(not(feature = "rendering"))]
+mod headless;
+
 #[cfg(not(feature = "rendering"))]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     headless::run()
 }
 
+// =============================================================================
+// Windowed Mode
+// =============================================================================
+
+#[cfg(feature = "rendering")]
+mod windowed;
+
 #[cfg(feature = "rendering")]
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     windowed::run()
 }
-
-mod headless;
-
-#[cfg(feature = "rendering")]
-mod windowed;
