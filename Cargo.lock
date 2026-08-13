@@ -1579,9 +1579,13 @@ version = "0.1.0"
 dependencies = [
  "dioxus",
  "futures-util",
+ "miette",
+ "pill_core",
+ "pill_core_macros",
  "pill_host",
  "serde",
  "serde_json",
+ "thiserror 2.0.19",
  "tokio",
 ]
 

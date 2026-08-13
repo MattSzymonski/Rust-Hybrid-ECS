@@ -10,6 +10,7 @@
 //! transparent for the surface, and draws opaque HTML panels around it.
 
 mod dock_view;
+mod error;
 mod layout;
 mod popout;
 
@@ -25,11 +26,13 @@ use dioxus::desktop::{use_wry_event_handler, window, Config};
 use dioxus::prelude::*;
 use futures_util::StreamExt;
 use host::{
-    engine_report, install_engine_report_handler, setup_rendering, EngineError, FrameReport,
-    GameModuleConfig, RenderViewport, RenderingHost, VirtualResolution,
+    engine_report, install_engine_report_handler, setup_rendering, FrameReport, GameModuleConfig,
+    RenderViewport, RenderingHost, VirtualResolution,
 };
+use pill_core::error::EngineMessage;
 
 use dock_view::DockView;
+use error::EditorError;
 use layout::{
     compute_layout, load_or_default, LayoutAction, LayoutMetrics, LayoutNode, PanelKind, Rect,
 };
@@ -273,9 +276,10 @@ impl EditorContext {
     ///
     /// # Errors
     ///
-    /// Returns the composed [`EngineError`] when host setup or GPU surface
-    /// creation fails; the caller reports it once and exits.
-    fn new(window: Arc<Window>) -> Result<Self, EngineError> {
+    /// Returns the composed [`EditorError`] wrapping the host
+    /// [`host::EngineError`] when setup or GPU surface creation fails; the
+    /// caller reports it once and exits.
+    fn new(window: Arc<Window>) -> Result<Self, EditorError> {
         let size = window.inner_size();
         let mut host = setup_rendering(
             GameModuleConfig::from_environment(),
@@ -324,12 +328,12 @@ impl EditorContext {
     }
 
     /// Move the live engine surface from the dock to a detached Scene window.
-    pub(crate) fn attach_detached_scene(&self, window: Arc<Window>) -> Result<(), String> {
+    pub(crate) fn attach_detached_scene(&self, window: Arc<Window>) -> Result<(), EditorError> {
         let size = window.inner_size();
         let window_id = window.id();
         let mut host = self.host.borrow_mut();
         host.retarget_render_window(window, size.width, size.height)
-            .map_err(|error| error.to_string())?;
+            .map_err(|source| EditorError::Retarget { source })?;
         host.set_render_virtual_resolution(Some(GAME_VIRTUAL_RESOLUTION));
         host.set_render_viewport(Some(RenderViewport::full(size.width, size.height)));
         self.detached_scene_window.set(Some(window_id));
@@ -346,14 +350,14 @@ impl EditorContext {
     }
 
     /// Return the live Scene renderer to the main editor window.
-    pub(crate) fn reattach_main_scene(&self, detached_window: WindowId) -> Result<(), String> {
+    pub(crate) fn reattach_main_scene(&self, detached_window: WindowId) -> Result<(), EditorError> {
         if self.detached_scene_window.get() != Some(detached_window) {
             return Ok(());
         }
         let size = self.window.inner_size();
         let mut host = self.host.borrow_mut();
         host.retarget_render_window(Arc::clone(&self.window), size.width, size.height)
-            .map_err(|error| error.to_string())?;
+            .map_err(|source| EditorError::Retarget { source })?;
         host.set_render_virtual_resolution(Some(GAME_VIRTUAL_RESOLUTION));
         host.set_render_viewport(Some(self.main_scene_viewport.get()));
         self.detached_scene_window.set(None);
@@ -389,7 +393,10 @@ impl EditorContext {
                 })
             }
             Err(error) => {
-                eprintln!("[editor] Fatal renderer error: {error}");
+                eprintln!(
+                    "[editor] Fatal renderer error: {}",
+                    EditorError::Frame { source: error }.to_plain_message()
+                );
                 None
             }
         }

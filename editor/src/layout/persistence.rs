@@ -1,8 +1,11 @@
 //! Versioned editor-layout loading and recoverable writes.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use pill_core::error::EngineMessage;
 
 use super::LayoutModel;
+use crate::error::LayoutPersistenceError;
 
 const APPLICATION_DIRECTORY: &str = "RustHybridEcs";
 const LAYOUT_FILE: &str = "editor_layout.json";
@@ -10,42 +13,75 @@ const LAYOUT_FILE: &str = "editor_layout.json";
 /// Load the saved workspace, falling back safely on any invalid document.
 pub fn load_or_default() -> LayoutModel {
     let path = layout_path();
+    // A missing file is the normal first-run state and stays silent.
     let Ok(contents) = std::fs::read_to_string(&path) else {
         return LayoutModel::default_editor();
     };
-    match serde_json::from_str::<LayoutModel>(&contents)
-        .map_err(|error| error.to_string())
-        .and_then(|model| {
-            model
-                .validate()
-                .map(|_| model)
-                .map_err(|error| error.to_string())
-        }) {
+    let model = match serde_json::from_str::<LayoutModel>(&contents) {
         Ok(model) => model,
-        Err(error) => {
-            eprintln!(
-                "[editor] Ignoring invalid saved layout '{}': {error}",
-                path.display()
+        Err(source) => {
+            report_load_failure(
+                &path,
+                LayoutPersistenceError::Invalid {
+                    path: path.display().to_string(),
+                    source,
+                },
             );
-            LayoutModel::default_editor()
+            return LayoutModel::default_editor();
         }
+    };
+    if let Err(source) = model.validate() {
+        report_load_failure(&path, LayoutPersistenceError::Validation { source });
+        return LayoutModel::default_editor();
     }
+    model
+}
+
+/// Log one rejected layout document and continue with the default layout.
+fn report_load_failure(path: &Path, error: LayoutPersistenceError) {
+    eprintln!(
+        "[editor] Ignoring invalid saved layout '{}': {}",
+        path.display(),
+        error.to_plain_message()
+    );
 }
 
 /// Persist a validated model through a temporary file and recoverable replace.
 pub fn save(model: &LayoutModel) {
     if let Err(error) = save_to_path(model, layout_path()) {
-        eprintln!("[editor] Cannot save dock layout: {error}");
+        eprintln!(
+            "[editor] Cannot save dock layout: {}",
+            error.to_plain_message()
+        );
     }
 }
 
-fn save_to_path(model: &LayoutModel, path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    model.validate()?;
-    let parent = path.parent().ok_or("layout path has no parent")?;
-    std::fs::create_dir_all(parent)?;
+/// Install `model` at `path` without ever corrupting the previous document.
+fn save_to_path(model: &LayoutModel, path: PathBuf) -> Result<(), LayoutPersistenceError> {
+    model
+        .validate()
+        .map_err(|source| LayoutPersistenceError::Validation { source })?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| LayoutPersistenceError::Filesystem {
+            path: path.display().to_string(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "layout path has no parent",
+            ),
+        })?;
+    std::fs::create_dir_all(parent).map_err(|source| LayoutPersistenceError::Filesystem {
+        path: parent.display().to_string(),
+        source,
+    })?;
     let temporary = path.with_extension("json.tmp");
     let backup = path.with_extension("json.bak");
-    std::fs::write(&temporary, serde_json::to_vec_pretty(model)?)?;
+    let document = serde_json::to_vec_pretty(model)
+        .map_err(|source| LayoutPersistenceError::Serialization { source })?;
+    std::fs::write(&temporary, document).map_err(|source| LayoutPersistenceError::Filesystem {
+        path: temporary.display().to_string(),
+        source,
+    })?;
 
     // Unix rename replaces atomically. Windows rename does not replace an
     // existing target, so retain the previous valid file as a short-lived
@@ -53,11 +89,19 @@ fn save_to_path(model: &LayoutModel, path: PathBuf) -> Result<(), Box<dyn std::e
     if std::fs::rename(&temporary, &path).is_err() {
         let _ = std::fs::remove_file(&backup);
         if path.exists() {
-            std::fs::rename(&path, &backup)?;
+            std::fs::rename(&path, &backup).map_err(|source| {
+                LayoutPersistenceError::Filesystem {
+                    path: backup.display().to_string(),
+                    source,
+                }
+            })?;
         }
-        if let Err(error) = std::fs::rename(&temporary, &path) {
+        if let Err(source) = std::fs::rename(&temporary, &path) {
             let _ = std::fs::rename(&backup, &path);
-            return Err(error.into());
+            return Err(LayoutPersistenceError::Filesystem {
+                path: path.display().to_string(),
+                source,
+            });
         }
         let _ = std::fs::remove_file(backup);
     }
@@ -93,5 +137,28 @@ mod tests {
         let restored: LayoutModel = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(restored, model);
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// Unwritable destinations surface as a typed filesystem error.
+    #[test]
+    fn save_reports_filesystem_failures_as_typed_errors() {
+        let directory = std::env::temp_dir().join(format!(
+            "ecs-layout-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // Occupying the directory path with a regular file makes
+        // `create_dir_all` fail, which is the first filesystem step.
+        std::fs::write(&directory, "not a directory").unwrap();
+        let path = directory.join("layout.json");
+        let model = LayoutModel::default_editor();
+        let error = save_to_path(&model, path).unwrap_err();
+        assert!(error
+            .to_plain_message()
+            .contains("failed to write the dock layout"));
+        let _ = std::fs::remove_file(directory);
     }
 }
