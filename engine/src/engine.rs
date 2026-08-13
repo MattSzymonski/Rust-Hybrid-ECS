@@ -19,7 +19,7 @@
 
 // Standard library
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // External crates
@@ -29,6 +29,7 @@ use rayon::prelude::*;
 use crate::commands::{CommandError, CommandQueue};
 use crate::component::Tick;
 use crate::config::ParallelProcessingConfig;
+use crate::error::{SystemError, SystemFailure};
 use crate::scheduler::{SystemAccess, SystemScheduler};
 use crate::system::{IntoSystem, System, SystemParam};
 use crate::world::{set_per_thread_last_run_tick, World};
@@ -87,6 +88,10 @@ pub struct Engine {
     world: World,
     /// System scheduler for parallel execution
     scheduler: SystemScheduler,
+    /// Failures recorded by systems during the most recent frames, drained
+    /// once per frame by the reporting boundary. A failing system never
+    /// aborts its batch or the frame.
+    system_failures: Vec<SystemFailure>,
     /// Whether parallel execution is enabled
     parallel_execution: bool,
     /// Whether the execution graph needs rebuilding (dirty after enable/disable)
@@ -158,6 +163,7 @@ impl Engine {
             queue: CommandQueue::new(),
             world: World::new(),
             scheduler: SystemScheduler::new(),
+            system_failures: Vec::new(),
             parallel_execution: true,
             graph_dirty: false,
             should_exit_on_error: false,
@@ -338,7 +344,7 @@ impl Engine {
         mut access: SystemAccess,
         system: F,
     ) where
-        F: FnMut(&mut World, &mut CommandQueue) + Send + 'static,
+        F: FnMut(&mut World, &mut CommandQueue) -> Result<(), SystemError> + Send + 'static,
     {
         access.build_component_masks(&self.world.component_registry);
         self.scheduler.register_system(access);
@@ -366,6 +372,21 @@ impl Engine {
         self.graph_dirty = false;
         // Reset the execution graph so it does not reference stale indices.
         self.scheduler.build_execution_graph();
+    }
+
+    /// Drain the system failures recorded since the previous drain.
+    ///
+    /// The reporting boundary calls this once per frame and logs each
+    /// failure's semantic message. A failed system never aborts its batch,
+    /// so the remaining systems still complete the frame.
+    pub fn drain_system_failures(&mut self) -> Vec<SystemFailure> {
+        std::mem::take(&mut self.system_failures)
+    }
+
+    /// Read the system failures recorded since the previous drain without
+    /// clearing them.
+    pub fn system_failures(&self) -> &[SystemFailure] {
+        &self.system_failures
     }
 
     // -------------------------------------------------------------------------
@@ -620,9 +641,13 @@ impl Engine {
             let system_start = Instant::now();
 
             let started_at = self.world.change_tick().get();
-            registered_system
+            let result = registered_system
                 .system
                 .run(&mut self.world, &mut self.queue);
+            if let Err(error) = result {
+                self.system_failures
+                    .push(SystemFailure::new(registered_system.name.clone(), error));
+            }
             // Record the tick that was current at system entry so the next
             // run sees mutations that happened during this run.
             registered_system.last_run = started_at;
@@ -695,7 +720,11 @@ impl Engine {
                     registered.name;
                     [("System last ran at tick: {}", registered.last_run), ("System splitting hint execution time (ns): {}", registered.average_duration)]
                 );
-                registered.system.run(&mut self.world, &mut self.queue);
+                let result = registered.system.run(&mut self.world, &mut self.queue);
+                if let Err(error) = result {
+                    self.system_failures
+                        .push(SystemFailure::new(registered.name.clone(), error));
+                }
                 registered.last_run = started_at;
                 // Update splitting hint of execution time.
                 let elapsed = system_start.elapsed().as_nanos() as u64;
@@ -777,6 +806,11 @@ impl Engine {
                 // Track how many Rayon tasks were spawned.
                 let task_count = Arc::new(AtomicUsize::new(0));
 
+                // Collect failed systems from the worker threads; the
+                // scheduler guarantees disjoint system state, but the error
+                // buffer itself is shared and must stay synchronized.
+                let batch_failures = Mutex::new(Vec::<(String, SystemError)>::new());
+
                 (0..batch_len).into_par_iter().for_each(|i| {
                     task_count.fetch_add(1, Ordering::Relaxed);
 
@@ -802,7 +836,13 @@ impl Engine {
                         let queue = &mut *queue_ptr.as_ptr();
                         let system_index = systems_batch[i];
                         let registered_system = &mut *systems_ptr.as_ptr().add(system_index);
-                        registered_system.system.run(world, queue);
+                        let result = registered_system.system.run(world, queue);
+                        if let Err(error) = result {
+                            batch_failures
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .push((system_names[i].to_string(), error));
+                        }
                         // Update splitting hint of execution time.
                         let elapsed = system_start.elapsed().as_nanos() as u64;
                         let old_avg = registered_system.average_duration;
@@ -825,6 +865,17 @@ impl Engine {
                 );
                 drop(_zone);
 
+                // Fold the batch's failures into the per-frame record. The
+                // order follows the workers' completion, not the batch index.
+                let mut collected = batch_failures
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                self.system_failures.extend(
+                    collected
+                        .drain(..)
+                        .map(|(system, error)| SystemFailure::new(system, error)),
+                );
+
                 // After the batch finishes, advance every system's
                 // last_run to the tick we observed at batch start.
                 let _advance_zone =
@@ -835,5 +886,94 @@ impl Engine {
             }
         }
         self.world.system_last_run = 0;
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pill_core::error::EngineMessage as _;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+
+    /// A failing system is recorded with its name and drained by the frame.
+    #[test]
+    fn failing_system_is_recorded_and_drained_by_the_frame() {
+        let mut engine = Engine::new();
+        engine.register_system("failing_system", || -> Result<(), SystemError> {
+            Err(SystemError::Failure {
+                message: String::from("simulation exploded"),
+            })
+        });
+        engine.process_frame().unwrap();
+        let failures = engine.drain_system_failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].system, "failing_system");
+        assert_eq!(
+            failures[0].to_plain_message(),
+            "system failing_system failed: simulation exploded"
+        );
+        // Draining cleared the record for the boundary...
+        assert!(engine.system_failures().is_empty());
+        // ...and the same failing system fails again on the next frame.
+        engine.process_frame().unwrap();
+        assert_eq!(engine.drain_system_failures().len(), 1);
+    }
+
+    /// Unit-returning systems still run without producing a failure record.
+    #[test]
+    fn unit_system_runs_without_recording_a_failure() {
+        let mut engine = Engine::new();
+        engine.register_system("unit_system", || {});
+        engine.process_frame().unwrap();
+        assert!(engine.system_failures().is_empty());
+    }
+
+    /// A failed system never aborts the systems that follow it.
+    #[test]
+    fn failing_system_does_not_abort_the_remaining_systems() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_system = Arc::clone(&counter);
+        let mut engine = Engine::new();
+        engine.register_system("failing_system", || -> Result<(), SystemError> {
+            Err(SystemError::Failure {
+                message: String::from("boom"),
+            })
+        });
+        engine.register_system("counting_system", move || {
+            counter_system.fetch_add(1, AtomicOrdering::SeqCst);
+        });
+        engine.process_frame().unwrap();
+        assert_eq!(counter.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(engine.drain_system_failures().len(), 1);
+    }
+
+    /// Parallel batches record every failing system in the batch.
+    #[test]
+    fn parallel_batch_records_every_failing_system() {
+        let mut engine = Engine::new();
+        engine.register_system("first_failure", || -> Result<(), SystemError> {
+            Err(SystemError::Failure {
+                message: String::from("first"),
+            })
+        });
+        engine.register_system("second_failure", || -> Result<(), SystemError> {
+            Err(SystemError::Failure {
+                message: String::from("second"),
+            })
+        });
+        engine.process_frame().unwrap();
+        let failures = engine.drain_system_failures();
+        assert_eq!(failures.len(), 2);
+        assert!(failures
+            .iter()
+            .any(|failure| failure.system == "first_failure"));
+        assert!(failures
+            .iter()
+            .any(|failure| failure.system == "second_failure"));
     }
 }

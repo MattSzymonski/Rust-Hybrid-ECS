@@ -42,15 +42,19 @@ struct SimulationTime {
 
 impl Resource for SimulationTime {}
 
-fn update_time_system(mut time: ResMut<SimulationTime>) {
+fn update_time_system(mut time: ResMut<SimulationTime>) -> Result<(), SystemError> {
     let now = Instant::now();
     // A missing resource means the game module and host disagree about
-    // initialization; skip the frame instead of panicking in the scheduler.
+    // initialization; report it through the system result so the frame
+    // continues while the host logs the failure.
     let Some(mut time) = time.get_mut() else {
-        return;
+        return Err(SystemError::MissingResource {
+            name: String::from("SimulationTime"),
+        });
     };
     time.delta_seconds = now.duration_since(time.last_frame).as_secs_f32().min(0.1);
     time.last_frame = now;
+    Ok(())
 }
 
 fn initial_physics_state() -> PhysicsState {
@@ -103,24 +107,32 @@ fn simulate_ball(state: &mut PhysicsState) {
 }
 
 #[cfg(not(feature = "rendering"))]
-fn physics_system(time: Res<SimulationTime>, mut query: Query<&mut PhysicsState>) {
+fn physics_system(
+    time: Res<SimulationTime>,
+    mut query: Query<&mut PhysicsState>,
+) -> Result<(), SystemError> {
     let Some(time) = time.get() else {
-        return;
+        return Err(SystemError::MissingResource {
+            name: String::from("SimulationTime"),
+        });
     };
     let delta_seconds = time.delta_seconds;
     for mut physics in query.iter_mut() {
         physics.delta_time = delta_seconds;
         simulate_ball(&mut physics);
     }
+    Ok(())
 }
 
 #[cfg(feature = "rendering")]
 fn physics_system(
     time: Res<SimulationTime>,
     mut query: Query<(&mut PhysicsState, &mut Position, &mut Sprite)>,
-) {
+) -> Result<(), SystemError> {
     let Some(time) = time.get() else {
-        return;
+        return Err(SystemError::MissingResource {
+            name: String::from("SimulationTime"),
+        });
     };
     let delta_seconds = time.delta_seconds;
     for (mut physics, mut position, mut sprite) in query.iter_mut() {
@@ -139,6 +151,7 @@ fn physics_system(
             Color::new(0.5, 0.5, 0.5, 1.0)
         };
     }
+    Ok(())
 }
 
 // =============================================================================

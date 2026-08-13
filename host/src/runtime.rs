@@ -29,7 +29,7 @@ use crate::watcher::spawn_file_watcher;
 use crate::{GameModuleBackend, GameModuleConfig};
 
 // External crates
-use pill_core::error::HostError;
+use pill_core::error::{EngineMessage, HostError};
 #[cfg(feature = "rendering")]
 use pill_engine::EngineError;
 
@@ -329,6 +329,13 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
             .collect::<Vec<_>>()
             .join("; ");
         host.report_frame_error(summary);
+    }
+
+    // Step 3b: Report systems that returned an error during the frame. Each
+    // failure carries the system name and its semantic message; the rate
+    // limiter collapses repeated identical failures across frames.
+    for failure in host.engine.drain_system_failures() {
+        host.report_frame_error(failure.to_plain_message());
     }
 
     // Step 4: Invoke the native compatibility update after scheduler systems.

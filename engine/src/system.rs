@@ -71,6 +71,7 @@
 //! ```
 
 use crate::commands::{CommandQueue, Commands};
+use crate::error::SystemError;
 use crate::query::{Query, QueryFilter, QueryTarget, Res, ResMut};
 use crate::resource::{Resource, ResourceId};
 use crate::scheduler::SystemAccess;
@@ -85,20 +86,47 @@ use crate::world::World;
 /// Systems are functions that operate on World data. They are executed
 /// every frame and can read/write components, create entities, etc.
 ///
+/// A system reports its own failure through [`Result::Err`]; the engine
+/// records it and continues with the remaining systems.
+///
 /// Must be Send to support parallel execution.
 pub trait System: Send {
-    fn run(&mut self, world: &mut World, queue: &mut CommandQueue);
+    /// Execute one system invocation, returning its failure when it aborted.
+    fn run(&mut self, world: &mut World, queue: &mut CommandQueue) -> Result<(), SystemError>;
+}
+
+/// Accepted return types of a system function.
+///
+/// Systems may return `()` when they cannot fail or `Result<(), SystemError>`
+/// when they can. The engine converts both into the uniform result type used
+/// by the execution loops.
+pub trait SystemOutput: 'static {
+    /// Convert one system return value into the uniform result type.
+    fn into_system_result(self) -> Result<(), SystemError>;
+}
+
+impl SystemOutput for () {
+    fn into_system_result(self) -> Result<(), SystemError> {
+        Ok(())
+    }
+}
+
+impl SystemOutput for Result<(), SystemError> {
+    fn into_system_result(self) -> Result<(), SystemError> {
+        self
+    }
 }
 
 /// Implement System for any FnMut closure with the right signature
 ///
 /// This allows us to store system closures in a `Vec<Box<dyn System>>`.
-impl<F> System for F
+impl<F, Output> System for F
 where
-    F: FnMut(&mut World, &mut CommandQueue) + Send,
+    F: FnMut(&mut World, &mut CommandQueue) -> Output + Send,
+    Output: SystemOutput,
 {
-    fn run(&mut self, world: &mut World, queue: &mut CommandQueue) {
-        self(world, queue);
+    fn run(&mut self, world: &mut World, queue: &mut CommandQueue) -> Result<(), SystemError> {
+        self(world, queue).into_system_result()
     }
 }
 
@@ -304,20 +332,29 @@ impl_system_param_tuple!(A, B, C, D, E, F1);
 ///
 /// This trait is implemented for functions with different numbers of
 /// SystemParam parameters. It provides the bridge between user-written
-/// functions and the System trait.
+/// functions and the System trait. The associated [`Output`] is the
+/// function's return type, either `()` or `Result<(), SystemError>`.
+///
+/// [`Output`]: SystemParamFunction::Output
 pub trait SystemParamFunction<Input: SystemParam>: 'static {
-    fn run(&mut self, input: Input);
+    /// The function's return value, `()` or `Result<(), SystemError>`.
+    type Output: SystemOutput;
+
+    fn run(&mut self, input: Input) -> Self::Output;
 }
 
 /// Macro to implement SystemParamFunction for functions with different arities
 macro_rules! impl_system_param_function {
     ($($T:ident),*) => {
         #[allow(non_snake_case)]
-        impl<F, $($T: SystemParam),*> SystemParamFunction<($($T,)*)> for F
+        impl<F, Output, $($T: SystemParam),*> SystemParamFunction<($($T,)*)> for F
         where
-            F: FnMut($($T),*) + Send + 'static,
+            F: FnMut($($T),*) -> Output + Send + 'static,
+            Output: SystemOutput,
         {
-            fn run(&mut self, input: ($($T,)*)) {
+            type Output = Output;
+
+            fn run(&mut self, input: ($($T,)*)) -> Self::Output {
                 let ($($T,)*) = input;
                 self($($T),*)
             }
@@ -326,11 +363,14 @@ macro_rules! impl_system_param_function {
 }
 
 // Implement for functions with 0 parameters
-impl<F> SystemParamFunction<()> for F
+impl<F, Output> SystemParamFunction<()> for F
 where
-    F: FnMut() + Send + 'static,
+    F: FnMut() -> Output + Send + 'static,
+    Output: SystemOutput,
 {
-    fn run(&mut self, _input: ()) {
+    type Output = Output;
+
+    fn run(&mut self, _input: ()) -> Self::Output {
         self()
     }
 }
@@ -371,7 +411,7 @@ where
     fn into_system(mut self) -> Box<dyn System> {
         Box::new(move |world: &mut World, queue: &mut CommandQueue| {
             let input = Input::fetch(world, queue);
-            self.run(input);
+            self.run(input).into_system_result()
         })
     }
 }

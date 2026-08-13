@@ -60,22 +60,27 @@ internal static class TestSystems
     public static void MixedAccess(Query<Write<TestPosition>, Read<TestVelocity>> query) { }
 
     public static void TripleWriter(
-        Query<Write<TestPosition>, Write<TestVelocity>, Write<TestHealth>> query) { }
+        Query<Write<TestPosition>, Write<TestVelocity>, Write<TestHealth>> query)
+    { }
 
     public static void OptionalAndEntity(
-        Query<EntityTerm, Read<TestPosition>, OptionalWrite<TestHealth>> query) { }
+        Query<EntityTerm, Read<TestPosition>, OptionalWrite<TestHealth>> query)
+    { }
 
     public static void EightTerms(
         Query<
             Read<TestPosition>, Write<TestVelocity>, OptionalRead<TestHealth>,
             Write<TestComponent4>, Read<TestComponent5>, Write<TestComponent6>,
-            Read<TestComponent7>, OptionalWrite<TestComponent8>> query) { }
+            Read<TestComponent7>, OptionalWrite<TestComponent8>> query)
+    { }
 
     public static void DuplicateReadWrite(
-        Query<Write<TestPosition>, Read<TestPosition>> query) { }
+        Query<Write<TestPosition>, Read<TestPosition>> query)
+    { }
 
     public static void DuplicateTriple(
-        Query<Write<TestPosition>, Write<TestPosition>, Write<TestHealth>> query) { }
+        Query<Write<TestPosition>, Write<TestPosition>, Write<TestHealth>> query)
+    { }
 
     public static void DuplicateEntity(Query<EntityTerm, EntityTerm> query) { }
 
@@ -90,7 +95,8 @@ internal static class TestSystems
     public static void CommandsOnly(Commands commands) { }
 
     public static void QueryAndCommands(
-        Query<Read<TestPosition>> query, Commands commands) { }
+        Query<Read<TestPosition>> query, Commands commands)
+    { }
 
     public static void DespawnSystem(
         Query<EntityTerm, Read<TestVelocity>> query, Commands commands)
@@ -214,15 +220,15 @@ internal static unsafe class MockNativeWorld
 
     private static NativeComponentChunk Chunk(
         void* data, NativeComponentTicks* ticks, int elementSize) => new()
-    {
-        ArchetypeLow = 7,
-        ArchetypeHigh = 11,
-        Data = (IntPtr)data,
-        Length = Length,
-        ElementSize = checked((uint)elementSize),
-        Ticks = (IntPtr)ticks,
-        ChangeTick = ChangeTick,
-    };
+        {
+            ArchetypeLow = 7,
+            ArchetypeHigh = 11,
+            Data = (IntPtr)data,
+            Length = Length,
+            ElementSize = checked((uint)elementSize),
+            Ticks = (IntPtr)ticks,
+            ChangeTick = ChangeTick,
+        };
 }
 
 // =============================================================================
@@ -562,9 +568,9 @@ internal static class Program
                 entities[0] = new Entity(100, 3);
                 entities[1] = new Entity(200, 4);
                 positionTicks[0] = positionTicks[1] = new NativeComponentTicks
-                    { Added = 1, Changed = 2 };
+                { Added = 1, Changed = 2 };
                 velocityTicks[0] = velocityTicks[1] = new NativeComponentTicks
-                    { Added = 1, Changed = 2 };
+                { Added = 1, Changed = 2 };
 
                 MockNativeWorld.Positions = positions;
                 MockNativeWorld.Velocities = velocities;
@@ -775,6 +781,38 @@ internal static class Program
                 Throws<InvalidOperationException>(
                     () => ComponentManifestBuilder.Build([system]),
                     "bool fields must be rejected from native component manifests");
+            });
+
+            Test("loader interop runs a discovered system and clears its error slot", () =>
+            {
+                var gameAssembly = typeof(BallPhysicsSystem).Assembly;
+                Environment.SetEnvironmentVariable(
+                    "ECS_CSHARP_GAME_DIR", Path.GetDirectoryName(gameAssembly.Location));
+                Environment.SetEnvironmentVariable(
+                    "ECS_CSHARP_GAME_ASSEMBLY", Path.GetFileName(gameAssembly.Location));
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+
+                // The Rust host consumes these exports through function
+                // pointers, so the regression tests do exactly the same.
+                var init = (delegate* unmanaged<nint, byte>)&LoaderInterop.Init;
+                var systemCount = (delegate* unmanaged<uint>)&LoaderInterop.SystemCount;
+                var runSystem = (delegate* unmanaged<uint, byte>)&LoaderInterop.RunSystem;
+                var errorLength =
+                    (delegate* unmanaged<uint, uint>)&LoaderInterop.SystemErrorMessageLength;
+
+                Equal(init((IntPtr)(&api)), 1, "loader init failed");
+                Equal(systemCount(), 2u, "unexpected managed system count");
+                Equal(runSystem(1), 1, "healthy system reported failure");
+                Equal(errorLength(1), 0u,
+                    "healthy system carries a stale error message");
+            });
+
+            Test("loader interop reports failure for an invalid system index", () =>
+            {
+                var runSystem = (delegate* unmanaged<uint, byte>)&LoaderInterop.RunSystem;
+                Equal(runSystem(99), 0,
+                    "invalid managed system index reported success");
             });
 
             Console.WriteLine($"C# ECS runtime tests passed: {_passed}");

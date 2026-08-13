@@ -86,6 +86,7 @@ internal sealed class GameHost
     private ManagedSystem[] _systems = [];
     private ManagedStartup[] _startups = [];
     private byte[] _componentManifest = [];
+    private string?[] _lastSystemErrors = [];
     private DateTime _lastWriteUtc;
     private DateTime _lastPollUtc;
 
@@ -118,6 +119,21 @@ internal sealed class GameHost
     /// <summary>Invoke a discovered system by its stable index.</summary>
     public void RunSystem(int index) => _systems[index].Run();
     public void RunStartup(int index) => _startups[index].Run();
+
+    /// <summary>Return the last failure message recorded for one system, if any.</summary>
+    public string GetSystemError(int systemIndex) =>
+        (uint)systemIndex < (uint)_lastSystemErrors.Length
+            ? _lastSystemErrors[systemIndex] ?? ""
+            : "";
+
+    /// <summary>Record the failure message reported by one managed system.</summary>
+    /// <remarks>Out-of-range indices are ignored so a hostile or stale system
+    /// index can never corrupt the error store.</remarks>
+    public void SetSystemError(int systemIndex, string message)
+    {
+        if ((uint)systemIndex < (uint)_lastSystemErrors.Length)
+            _lastSystemErrors[systemIndex] = message;
+    }
 
     /// <summary>
     /// Poll the game DLL timestamp and reload a newer build.
@@ -198,6 +214,7 @@ internal sealed class GameHost
             _systems = systems;
             _startups = startups;
             _componentManifest = manifest;
+            _lastSystemErrors = new string?[systems.Length];
             _lastWriteUtc = File.GetLastWriteTimeUtc(_assemblyPath);
             oldContext?.Unload();
         }

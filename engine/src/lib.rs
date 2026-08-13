@@ -58,7 +58,7 @@ pub use commands::{CommandError, Commands};
 pub use component::{Component, ComponentId, ComponentTicks, Tick};
 pub use engine::Engine;
 pub use entity::Entity;
-pub use error::EngineError;
+pub use error::{EngineError, SystemError, SystemFailure};
 pub use persistence::ComponentSnapshot;
 pub use query::{
     Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,

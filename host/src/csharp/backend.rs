@@ -11,21 +11,18 @@ use std::path::Path;
 use std::sync::Arc;
 
 // External crates
+use pill_core::error::CSharpError;
 use pill_engine::commands::CommandQueue;
-use pill_engine::{Engine, SystemAccess, World};
+use pill_engine::{Engine, SystemAccess, SystemError, World};
 
 // Current crate
-use crate::CSharpModuleConfig;
-
-// External crates
-use pill_core::error::CSharpError;
-
 use super::abi::{CsEngineApi, NativeSystemAccess};
 use super::components::{
     register_component_manifest, shared_component_bindings, ComponentBindings, StableComponentId,
 };
 use super::context::ActiveSystemGuard;
 use super::csharp_runtime::DotnetRuntimeContext;
+use crate::CSharpModuleConfig;
 
 // =============================================================================
 // Constants
@@ -40,11 +37,14 @@ pub(super) const MAX_COMPONENT_MANIFEST_BYTES: u32 = 16 * 1024 * 1024;
 /// Maximum UTF-8 byte length accepted for a managed system name.
 const MAX_SYSTEM_NAME_BYTES: u32 = 1024;
 
+/// Maximum UTF-8 byte length accepted for a managed system error message.
+const MAX_SYSTEM_ERROR_BYTES: u32 = 4096;
+
 /// Unmanaged ABI contract version shared with `csharp_runtime`.
 ///
 /// Bump whenever any `UnmanagedCallersOnly` export signature changes; the host
 /// refuses to start against a runtime built for a different version.
-const INTEROP_CONTRACT_VERSION: u32 = 2;
+const INTEROP_CONTRACT_VERSION: u32 = 3;
 
 // =============================================================================
 // Types
@@ -75,7 +75,14 @@ type SystemAccessCountFn = extern "system" fn(u32) -> u32;
 /// Signature copying one system's reflected accesses into a caller buffer.
 type GetSystemAccessFn = extern "system" fn(u32, u32, *mut NativeSystemAccess) -> u8;
 /// Signature running one scheduler system by index.
-type RunSystemFn = extern "system" fn(u32);
+///
+/// Returns one on success and zero after the managed side records the
+/// failure for [`SystemErrorMessageLengthFn`] retrieval.
+type RunSystemFn = extern "system" fn(u32) -> u8;
+/// Signature returning the UTF-8 byte length of one system's last error message.
+type SystemErrorMessageLengthFn = extern "system" fn(u32) -> u32;
+/// Signature copying one system's last error message into a caller buffer.
+type CopySystemErrorMessageFn = extern "system" fn(u32, *mut u8, u32) -> u8;
 /// Signature polling the collectible loader for a new game assembly and
 /// reporting the swap outcome through the status codes below.
 type PollReloadFn = extern "system" fn() -> u8;
@@ -215,6 +222,16 @@ impl CSharpRuntime {
         )?;
         let run_system =
             runtime.get_unmanaged_fn::<RunSystemFn>(&assembly, &type_name, "RunSystem")?;
+        let system_error_length = runtime.get_unmanaged_fn::<SystemErrorMessageLengthFn>(
+            &assembly,
+            &type_name,
+            "SystemErrorMessageLength",
+        )?;
+        let copy_system_error = runtime.get_unmanaged_fn::<CopySystemErrorMessageFn>(
+            &assembly,
+            &type_name,
+            "CopySystemErrorMessage",
+        )?;
         let poll_reload =
             runtime.get_unmanaged_fn::<PollReloadFn>(&assembly, &type_name, "PollReload")?;
 
@@ -335,7 +352,7 @@ impl CSharpRuntime {
                 engine.register_system_with_access(
                     name,
                     access,
-                    move |world: &mut World, queue: &mut CommandQueue| {
+                    move |world: &mut World, queue: &mut CommandQueue| -> Result<(), SystemError> {
                         let _guard = ActiveSystemGuard::set_with_commands(
                             world,
                             queue,
@@ -343,7 +360,16 @@ impl CSharpRuntime {
                             &system_bindings,
                             uses_commands,
                         );
-                        run_system(system_index);
+                        if run_system(system_index) == 0 {
+                            return Err(SystemError::Managed {
+                                message: managed_system_error_message(
+                                    system_error_length,
+                                    copy_system_error,
+                                    system_index,
+                                ),
+                            });
+                        }
+                        Ok(())
                     },
                 );
             }
@@ -459,6 +485,27 @@ fn managed_system_name(
         return None;
     }
     String::from_utf8(buffer).ok()
+}
+
+/// Copy the failure message one managed system reported after a failed run.
+///
+/// Falls back to a neutral message when the managed side reports no text,
+/// an oversized message, or a failed copy.
+fn managed_system_error_message(
+    length: SystemErrorMessageLengthFn,
+    copy: CopySystemErrorMessageFn,
+    system_index: u32,
+) -> String {
+    const NEUTRAL_MESSAGE: &str = "managed system reported failure";
+    let length = length(system_index);
+    if length == 0 || length > MAX_SYSTEM_ERROR_BYTES {
+        return String::from(NEUTRAL_MESSAGE);
+    }
+    let mut buffer = vec![0_u8; length as usize];
+    if copy(system_index, buffer.as_mut_ptr(), length) == 0 {
+        return String::from(NEUTRAL_MESSAGE);
+    }
+    String::from_utf8_lossy(&buffer).into_owned()
 }
 
 /// Translate managed component modes into native scheduler metadata.

@@ -6,7 +6,8 @@
 //! - Verify component-chunk queries and scheduler access derivation.
 
 // External crates
-use pill_engine::{ComponentTicks, Engine, SystemAccess, SystemScheduler};
+use pill_core::error::EngineMessage;
+use pill_engine::{ComponentTicks, Engine, SystemAccess, SystemError, SystemScheduler};
 
 // Current crate
 use super::abi::{ComponentChunk, NativeComponentBlob, NativeSystemAccess};
@@ -644,6 +645,50 @@ fn entity_chunks_are_available_only_during_a_managed_system() {
         assert!(!chunk.data.is_null());
     }
     assert_eq!(ffi_get_entity_chunk(0, &mut chunk), 3);
+}
+
+/// Verify a managed system that reports failure is recorded as a drained
+/// system failure carrying the managed message.
+#[test]
+fn failing_managed_system_is_recorded_as_a_system_failure() {
+    let mut engine = Engine::new();
+    // SAFETY: the closure never touches the world, so the empty access
+    // declaration is exact.
+    unsafe {
+        engine.register_system_with_access(
+            "managed_failure",
+            SystemAccess::new(),
+            move |_world, _queue| -> Result<(), SystemError> {
+                Err(SystemError::Managed {
+                    message: String::from("index out of range"),
+                })
+            },
+        );
+    }
+    engine.process_frame().unwrap();
+    let failures = engine.drain_system_failures();
+    assert_eq!(failures.len(), 1);
+    assert_eq!(failures[0].system, "managed_failure");
+    assert!(failures[0]
+        .to_plain_message()
+        .contains("index out of range"));
+}
+
+/// Verify a healthy managed system leaves the frame failure record empty.
+#[test]
+fn succeeding_managed_system_leaves_no_system_failure() {
+    let mut engine = Engine::new();
+    // SAFETY: the closure never touches the world, so the empty access
+    // declaration is exact.
+    unsafe {
+        engine.register_system_with_access(
+            "managed_success",
+            SystemAccess::new(),
+            move |_world, _queue| Ok(()),
+        );
+    }
+    engine.process_frame().unwrap();
+    assert!(engine.drain_system_failures().is_empty());
 }
 
 /// Verifies that an excessively nested field manifest fails validation with a

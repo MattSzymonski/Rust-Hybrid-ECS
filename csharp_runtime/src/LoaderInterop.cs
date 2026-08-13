@@ -44,7 +44,7 @@ public static unsafe class LoaderInterop
     /// Unmanaged ABI contract version shared with the Rust host.
     /// Bump whenever any unmanaged export signature changes.
     /// </summary>
-    public const uint InteropContractVersion = 2;
+    public const uint InteropContractVersion = 3;
 
     /// <summary>Return the unmanaged ABI contract version for host validation.</summary>
     [UnmanagedCallersOnly]
@@ -216,16 +216,62 @@ public static unsafe class LoaderInterop
     }
 
     /// <summary>Run one managed system selected by its stable discovery index.</summary>
+    /// <returns>One on success; zero after recording the failure message for
+    /// later retrieval through the error-message exports.</returns>
     [UnmanagedCallersOnly]
-    public static void RunSystem(uint systemIndex)
+    public static byte RunSystem(uint systemIndex)
     {
         try
         {
-            _host?.RunSystem(checked((int)systemIndex));
+            if (_host is null)
+                return 0;
+            _host.RunSystem(checked((int)systemIndex));
+            return 1;
         }
         catch (Exception e)
         {
             Console.Error.WriteLine($"[csharp_runtime] system {systemIndex} failed: {e}");
+            _host?.SetSystemError((int)systemIndex, e.Message);
+            return 0;
+        }
+    }
+
+    /// <summary>Return the UTF-8 byte count of one system's last error message.</summary>
+    [UnmanagedCallersOnly]
+    public static uint SystemErrorMessageLength(uint systemIndex)
+    {
+        try
+        {
+            return checked((uint)System.Text.Encoding.UTF8.GetByteCount(
+                _host?.GetSystemError((int)systemIndex) ?? ""));
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"[csharp_runtime] SystemErrorMessageLength failed: {e}");
+            return 0;
+        }
+    }
+
+    /// <summary>Copy one system's last UTF-8 error message into a caller buffer.</summary>
+    /// <returns>One on success or zero for invalid input/failure.</returns>
+    [UnmanagedCallersOnly]
+    public static byte CopySystemErrorMessage(uint systemIndex, byte* output, uint capacity)
+    {
+        try
+        {
+            if (_host is null || output is null)
+                return 0;
+            var bytes = System.Text.Encoding.UTF8.GetBytes(
+                _host.GetSystemError((int)systemIndex));
+            if ((uint)bytes.Length > capacity)
+                return 0;
+            bytes.CopyTo(new Span<byte>(output, checked((int)capacity)));
+            return 1;
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"[csharp_runtime] CopySystemErrorMessage failed: {e}");
+            return 0;
         }
     }
 

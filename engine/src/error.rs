@@ -17,7 +17,11 @@
 //! through transparent `#[from]` wrappers. Frontends receive the composed
 //! [`EngineError`] at their boundary and report it exactly once.
 
+// Standard library
+use std::fmt;
+
 // External crates
+use pill_core::error::{EngineMessage, MessageRenderer, SemanticRole};
 use pill_core_macros::engine_error;
 
 // Current crate
@@ -293,6 +297,67 @@ pub enum RendererError {
 }
 
 // =============================================================================
+// System Errors
+// =============================================================================
+
+/// Failure reported by one scheduler system during a frame.
+///
+/// Systems return `Result<(), SystemError>`; the engine records every `Err`
+/// with the failing system's name and exposes the batch through
+/// [`Engine::drain_system_failures`](crate::Engine::drain_system_failures)
+/// for the reporting boundary. A failed system never aborts the remaining
+/// batch or the frame.
+#[engine_error(namespace = engine::systems, runtime = ::pill_core::error)]
+pub enum SystemError {
+    /// A resource the system requested is missing from the world.
+    #[message("resource ", name_style(name), " is missing from the world")]
+    MissingResource { name: String },
+
+    /// A managed-language system reported failure through the interop bridge.
+    #[message("managed failure: ", value(message))]
+    Managed { message: String },
+
+    /// A system aborted with an arbitrary reported message.
+    #[message(value(message))]
+    Failure { message: String },
+}
+
+/// One failed system execution recorded during a frame.
+///
+/// Wraps the failing system's name with its [`SystemError`] and renders the
+/// pair through the shared semantic protocol, so the host boundary can log
+/// `system "name" failed: <error>` with role-aware styling.
+#[derive(Debug)]
+pub struct SystemFailure {
+    /// Registered name of the system that failed.
+    pub system: String,
+    /// The error the system returned.
+    pub error: SystemError,
+}
+
+impl SystemFailure {
+    /// Pair one failing system name with its error.
+    pub fn new(system: String, error: SystemError) -> Self {
+        Self { system, error }
+    }
+}
+
+impl EngineMessage for SystemFailure {
+    fn render_message(&self, renderer: &mut dyn MessageRenderer) -> fmt::Result {
+        renderer.text("system ")?;
+        renderer.styled(SemanticRole::Name, &self.system)?;
+        renderer.text(" failed: ")?;
+        self.error.render_message(renderer)
+    }
+}
+
+impl fmt::Display for SystemFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}", self.to_plain_message())
+    }
+}
+
+// =============================================================================
 // Engine Error Composition
 // =============================================================================
 
@@ -393,6 +458,38 @@ mod tests {
                 .map(|code| code.to_string())
                 .as_deref(),
             Some("engine::renderer::no_texture_formats")
+        );
+    }
+
+    /// System failures render the failing system's name with its error.
+    #[test]
+    fn system_failure_renders_name_and_leaf_message() {
+        let failure = SystemFailure::new(
+            String::from("ball_physics"),
+            SystemError::MissingResource {
+                name: String::from("SimulationTime"),
+            },
+        );
+        assert_eq!(
+            failure.to_plain_message(),
+            "system ball_physics failed: resource SimulationTime is missing from the world"
+        );
+        assert_eq!(failure.to_string(), failure.to_plain_message());
+    }
+
+    /// Managed failures keep the managed-reported message verbatim.
+    #[test]
+    fn managed_system_error_keeps_the_managed_message() {
+        let error = SystemError::Managed {
+            message: String::from("index out of range"),
+        };
+        assert_eq!(
+            error.to_plain_message(),
+            "managed failure: index out of range"
+        );
+        assert_eq!(
+            error.code().map(|code| code.to_string()).as_deref(),
+            Some("engine::systems::managed")
         );
     }
 }
