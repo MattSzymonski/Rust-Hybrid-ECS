@@ -521,7 +521,11 @@ impl Engine {
 
             // Check for duplicate iterator labels within this frame.
             {
-                let mut timing = self.world.iterator_timings.lock().unwrap();
+                let mut timing = self
+                    .world
+                    .iterator_timings
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if !timing.visited_duplicated_iterator_labels.is_empty() {
                     let duplicates = std::mem::take(&mut timing.visited_duplicated_iterator_labels);
                     crate::profile_warn!(

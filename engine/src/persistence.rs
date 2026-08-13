@@ -47,6 +47,7 @@ use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
 // Current crate
 use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
+use crate::error::PersistenceError;
 use crate::world::World;
 
 // =============================================================================
@@ -706,8 +707,8 @@ impl World {
                     report.migrated_type_count += 1;
                     report.migrated_entity_count += migrated_entity_count_for_type;
                 }
-                Err(()) => {
-                    println!("[persistence]   '{}' -> SKIP (migration failed)", type_name,);
+                Err(error) => {
+                    println!("[persistence]   '{type_name}' -> SKIP ({error})",);
                     report.skipped_type_names.push(type_name.clone());
                 }
             }
@@ -727,17 +728,23 @@ impl World {
         &mut self,
         type_name: &str,
         previous_metadata: &PersistTypeMetadata,
-    ) -> Result<usize, ()> {
+    ) -> Result<usize, PersistenceError> {
         let Some(new_component_id) = self.resolve_component_id_by_name(type_name) else {
-            return Err(());
+            return Err(PersistenceError::ComponentTypeUnregistered {
+                type_name: type_name.to_string(),
+            });
         };
 
         let Some(&deserialize_component) = self.persist_deserializers.get(type_name) else {
-            return Err(());
+            return Err(PersistenceError::DeserializerMissing {
+                type_name: type_name.to_string(),
+            });
         };
 
         let Some(&insert_component) = self.persist_inserters.get(&new_component_id) else {
-            return Err(());
+            return Err(PersistenceError::InserterMissing {
+                type_name: type_name.to_string(),
+            });
         };
 
         if previous_metadata.component_id == new_component_id {
@@ -772,7 +779,7 @@ impl World {
         serialize_old_component: SerializeComponentFn,
         deserialize_new_component: DeserializeComponentFn,
         insert_new_component: InsertComponentFn,
-    ) -> Result<usize, ()> {
+    ) -> Result<usize, PersistenceError> {
         let archetype_ids: Vec<_> = self
             .archetypes
             .iter()
@@ -801,7 +808,7 @@ impl World {
             for bytes in &serialized_components {
                 let component = deserialize_new_component(bytes)
                     .or_else(|| deserialize_new_component(b"{}"))
-                    .ok_or(())?;
+                    .ok_or(PersistenceError::DeserializationFailed { component_id })?;
                 migrated_components.push(component);
             }
 
@@ -818,14 +825,14 @@ impl World {
                 )
                 .is_none()
             {
-                return Err(());
+                return Err(PersistenceError::StorageRemovalFailed { component_id });
             }
 
             let Some(storage_factory) = self.storage_factories.get(&component_id) else {
-                return Err(());
+                return Err(PersistenceError::StorageFactoryMissing { component_id });
             };
             let crate::archetype::StorageFactory::Native(storage_factory) = storage_factory else {
-                return Err(());
+                return Err(PersistenceError::NativeStorageExpected { component_id });
             };
             storage_factory(&mut archetype.component_storages);
 
@@ -846,7 +853,7 @@ impl World {
         serialize_old_component: SerializeComponentFn,
         deserialize_new_component: DeserializeComponentFn,
         insert_new_component: InsertComponentFn,
-    ) -> Result<usize, ()> {
+    ) -> Result<usize, PersistenceError> {
         let source_archetype_ids: Vec<_> = self
             .archetypes
             .iter()
@@ -890,13 +897,15 @@ impl World {
             for bytes in &serialized_components {
                 let component = deserialize_new_component(bytes)
                     .or_else(|| deserialize_new_component(b"{}"))
-                    .ok_or(())?;
+                    .ok_or(PersistenceError::DeserializationFailed {
+                        component_id: old_component_id,
+                    })?;
                 migrated_components.push(component);
             }
 
             let Some(destination_archetype) = self.archetypes.get_mut(&destination_archetype_id)
             else {
-                return Err(());
+                return Err(PersistenceError::DestinationArchetypeMissing);
             };
 
             let current_tick = crate::component::Tick::new(self.change_tick);
@@ -913,7 +922,9 @@ impl World {
 
                     let Some(&copy_component) = self.component_copiers.get(source_component_id)
                     else {
-                        return Err(());
+                        return Err(PersistenceError::CopierMissing {
+                            component_id: *source_component_id,
+                        });
                     };
 
                     copy_component(

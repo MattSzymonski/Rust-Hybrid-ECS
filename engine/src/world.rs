@@ -82,82 +82,7 @@ mod layout_tests {
 // Component Add/Remove Errors
 // =============================================================================
 
-/// Error type for `add_component` operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AddComponentError {
-    /// The entity does not exist (was destroyed or never created)
-    EntityNotFound,
-    /// The entity already has a component of this type
-    ComponentAlreadyExists,
-}
-
-impl std::fmt::Display for AddComponentError {
-    #[cold]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AddComponentError::EntityNotFound => write!(f, "entity not found"),
-            AddComponentError::ComponentAlreadyExists => {
-                write!(f, "component already exists on entity")
-            }
-        }
-    }
-}
-
-impl std::error::Error for AddComponentError {}
-
-// =============================================================================
-// RemoveComponentError
-// =============================================================================
-
-/// Error type for `remove_component` operations
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemoveComponentError {
-    /// The entity does not exist (was destroyed or never created)
-    EntityNotFound,
-    /// The entity does not have a component of this type
-    ComponentNotFound,
-}
-
-impl std::fmt::Display for RemoveComponentError {
-    #[cold]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RemoveComponentError::EntityNotFound => write!(f, "entity not found"),
-            RemoveComponentError::ComponentNotFound => write!(f, "component not found on entity"),
-        }
-    }
-}
-
-impl std::error::Error for RemoveComponentError {}
-
-// =============================================================================
-// BuildError
-// =============================================================================
-
-/// Error type for `EntityBuilder::build` when a component was not registered.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BuildError {
-    /// One or more component types were not registered with the world.
-    /// Call `world.register_component::<T>()` for each type first.
-    ComponentNotRegistered(ComponentId),
-}
-
-impl std::fmt::Display for BuildError {
-    #[cold]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            BuildError::ComponentNotRegistered(id) => {
-                write!(
-                    f,
-                    "component {:?} not registered - call world.register_component::<T>() first",
-                    id
-                )
-            }
-        }
-    }
-}
-
-impl std::error::Error for BuildError {}
+pub use crate::error::{AddComponentError, BuildError, RemoveComponentError, WorldError};
 
 // =============================================================================
 // Per-Thread Last-Run Tick
@@ -516,18 +441,18 @@ impl World {
         size: usize,
         align: usize,
         schema_hash: u64,
-    ) -> Result<ComponentId, String> {
+    ) -> Result<ComponentId, WorldError> {
         if stable_id == 0 {
-            return Err("dynamic component stable ID cannot be zero".into());
+            return Err(WorldError::DynamicStableIdZero);
         }
         if size == 0 {
-            return Err("dynamic component size cannot be zero".into());
+            return Err(WorldError::DynamicSizeZero);
         }
         if align == 0 || !align.is_power_of_two() {
-            return Err("dynamic component alignment must be a non-zero power of two".into());
+            return Err(WorldError::DynamicAlignmentInvalid);
         }
         if std::alloc::Layout::from_size_align(size, align).is_err() {
-            return Err("dynamic component size and alignment do not form a valid layout".into());
+            return Err(WorldError::DynamicLayoutInvalid);
         }
         let name = name.into();
         let component_id = ComponentId::dynamic(stable_id);
@@ -541,14 +466,11 @@ impl World {
                 {
                     Ok(component_id)
                 }
-                _ => Err(
-                    "dynamic component stable ID is already registered with another name or schema"
-                        .into(),
-                ),
+                _ => Err(WorldError::DynamicAlreadyRegistered),
             };
         }
         if self.component_registry.len() >= 128 {
-            return Err("component type limit exceeded (max 128)".into());
+            return Err(WorldError::ComponentTypeLimitExceeded);
         }
         self.component_registry
             .register_dynamic(stable_id, name, size);
@@ -592,24 +514,22 @@ impl World {
     pub fn create_dynamic_entity(
         &mut self,
         components: &[(ComponentId, Vec<u8>)],
-    ) -> Result<Entity, String> {
+    ) -> Result<Entity, WorldError> {
         if components.is_empty() {
-            return Err("a dynamic entity must contain at least one component".into());
+            return Err(WorldError::DynamicEntityEmpty);
         }
         let mut component_ids: Vec<_> = components.iter().map(|(id, _)| *id).collect();
         component_ids.sort();
         component_ids.dedup();
         if component_ids.len() != components.len() {
-            return Err("a dynamic entity cannot contain duplicate components".into());
+            return Err(WorldError::DynamicDuplicateComponent);
         }
         for (id, bytes) in components {
             let Some(StorageFactory::Dynamic(layout)) = self.storage_factories.get(id) else {
-                return Err(format!("dynamic component {id:?} is not registered"));
+                return Err(WorldError::DynamicComponentNotRegistered { id: *id });
             };
             if bytes.len() != layout.size {
-                return Err(format!(
-                    "dynamic component {id:?} byte length does not match its manifest"
-                ));
+                return Err(WorldError::DynamicByteLengthMismatch { id: *id });
             }
         }
 
@@ -1684,21 +1604,21 @@ impl World {
         entity: Entity,
         component_id: ComponentId,
         bytes: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<(), WorldError> {
         let location = *self
             .entity_locations
             .get(&entity)
-            .ok_or("entity not found")?;
+            .ok_or(WorldError::EntityNotFound)?;
         let old_archetype = self.archetypes.get(&location.archetype_id).unwrap();
         if old_archetype.component_types.contains(&component_id) {
-            return Err("entity already contains the dynamic component".into());
+            return Err(WorldError::DynamicComponentAlreadyPresent);
         }
         let expected_size = match self.storage_factories.get(&component_id) {
             Some(StorageFactory::Dynamic(layout)) => layout.size,
-            _ => return Err("dynamic component is not registered".into()),
+            _ => return Err(WorldError::DynamicComponentNotRegistered { id: component_id }),
         };
         if bytes.len() != expected_size {
-            return Err("dynamic component byte length does not match its manifest".into());
+            return Err(WorldError::DynamicByteLengthMismatch { id: component_id });
         }
         let mut new_ids = old_archetype.component_types.clone();
         new_ids.push(component_id);
@@ -1730,17 +1650,16 @@ impl World {
         entity: Entity,
         component_id: ComponentId,
         bytes: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<(), WorldError> {
         let location = *self
             .entity_locations
             .get(&entity)
-            .ok_or("entity not found")?;
+            .ok_or(WorldError::EntityNotFound)?;
         self.archetypes
             .get_mut(&location.archetype_id)
             .and_then(|archetype| archetype.dynamic_component_storages.get_mut(&component_id))
-            .ok_or_else(|| "entity does not contain the dynamic component".to_string())?
+            .ok_or(WorldError::DynamicComponentMissing)?
             .set_bytes(location.index_in_archetype, bytes)
-            .map_err(str::to_string)
     }
 
     /// Add a zero-initialized runtime-defined component.
@@ -1748,10 +1667,10 @@ impl World {
         &mut self,
         entity: Entity,
         component_id: ComponentId,
-    ) -> Result<(), String> {
+    ) -> Result<(), WorldError> {
         let size = match self.storage_factories.get(&component_id) {
             Some(StorageFactory::Dynamic(layout)) => layout.size,
-            _ => return Err("dynamic component is not registered".into()),
+            _ => return Err(WorldError::DynamicComponentNotRegistered { id: component_id }),
         };
         self.add_dynamic_component(entity, component_id, &vec![0; size])
     }
@@ -1761,17 +1680,17 @@ impl World {
         &mut self,
         entity: Entity,
         component_id: ComponentId,
-    ) -> Result<(), String> {
+    ) -> Result<(), WorldError> {
         let location = *self
             .entity_locations
             .get(&entity)
-            .ok_or("entity not found")?;
+            .ok_or(WorldError::EntityNotFound)?;
         let old_archetype = self.archetypes.get(&location.archetype_id).unwrap();
         if !old_archetype
             .dynamic_component_storages
             .contains_key(&component_id)
         {
-            return Err("entity does not contain the dynamic component".into());
+            return Err(WorldError::DynamicComponentMissing);
         }
         let new_ids: Vec<_> = old_archetype
             .component_types
@@ -2002,7 +1921,7 @@ impl<'w> EntityBuilder<'w> {
         // create the archetype (which would panic on an unregistered type).
         for &id in &component_ids {
             if !self.world.storage_factories.contains_key(&id) {
-                return Err(BuildError::ComponentNotRegistered(id));
+                return Err(BuildError::ComponentNotRegistered { id });
             }
         }
 

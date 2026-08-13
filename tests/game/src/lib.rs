@@ -89,8 +89,13 @@ fn counter_system(mut query: Query<&mut FrameCounter>) {
 // =============================================================================
 
 /// Registers test components, systems, and seed entities; returns zero.
+///
+/// # Safety
+///
+/// `api` must be a valid [`EngineApi`] pointer owned by the host for the
+/// complete duration of this call.
 #[no_mangle]
-pub extern "C" fn game_init(api: *const EngineApi) -> u32 {
+pub unsafe extern "C" fn game_init(api: *const EngineApi) -> u32 {
     let api = unsafe { &*api };
     let engine: &mut Engine = unsafe { &mut *(api.engine_handle as *mut Engine) };
 

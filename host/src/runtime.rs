@@ -31,7 +31,7 @@ use crate::{GameModuleBackend, GameModuleConfig};
 // External crates
 use pill_core::error::HostError;
 #[cfg(feature = "rendering")]
-use pill_core::error::RenderingError;
+use pill_engine::EngineError;
 
 // =============================================================================
 // Constants
@@ -269,19 +269,23 @@ pub fn setup(module_config: GameModuleConfig) -> Result<Host, HostError> {
 /// A frontend owns its platform event loop and supplies its cloneable window
 /// handle. The engine creates exactly one surface for that window, while the
 /// returned [`RenderingHost`] owns the renderer for the rest of its lifetime.
+///
+/// # Errors
+///
+/// Returns the composed [`EngineError`], which transparently carries either
+/// a [`HostError`] from setup or a [`RendererError`] from surface creation.
 #[cfg(feature = "rendering")]
 pub fn setup_rendering<W>(
     module_config: GameModuleConfig,
     window: W,
     width: u32,
     height: u32,
-) -> Result<RenderingHost, HostError>
+) -> Result<RenderingHost, EngineError>
 where
     W: RendererWindow + 'static,
 {
     let host = setup(module_config)?;
-    let renderer = Renderer::new(window, width, height)
-        .map_err(|source| RenderingError::SetupFailed { source })?;
+    let renderer = Renderer::new(window, width, height)?;
     Ok(RenderingHost { host, renderer })
 }
 
@@ -317,7 +321,14 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
 
     // Step 3: Execute one scheduler frame.
     if let Err(errors) = host.engine.process_frame() {
-        host.report_frame_error(format!("{errors:?}"));
+        // Deferred command failures arrive as a batch; flatten them into one
+        // rate-limited report using each error's plain semantic message.
+        let summary = errors
+            .iter()
+            .map(pill_core::error::EngineMessage::to_plain_message)
+            .collect::<Vec<_>>()
+            .join("; ");
+        host.report_frame_error(summary);
     }
 
     // Step 4: Invoke the native compatibility update after scheduler systems.

@@ -142,62 +142,7 @@ enum DeferredCommand {
 // CommandError
 // =============================================================================
 
-/// Error returned when a deferred command cannot be executed.
-///
-/// Command errors are non-fatal by default - the engine logs them and
-/// continues.  Set `Engine::should_exit_on_error` to `true` for strict
-/// mode where any command failure stops the frame immediately.
-#[derive(Debug, Clone)]
-pub enum CommandError {
-    /// The target entity no longer exists in the world.
-    EntityNotFound {
-        entity: Entity,
-        operation: &'static str,
-    },
-    /// The entity already possesses the component being added.
-    ComponentAlreadyExists {
-        entity: Entity,
-        component_id: ComponentId,
-    },
-    /// The entity does not have the component being removed.
-    ComponentNotFound {
-        entity: Entity,
-        component_id: ComponentId,
-    },
-}
-
-impl std::fmt::Display for CommandError {
-    #[cold]
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::EntityNotFound { entity, operation } => {
-                write!(f, "entity {:?} not found for {operation}", entity.id())
-            }
-            Self::ComponentAlreadyExists {
-                entity,
-                component_id,
-            } => {
-                write!(
-                    f,
-                    "entity {:?} already has component {:?}",
-                    entity.id(),
-                    component_id
-                )
-            }
-            Self::ComponentNotFound {
-                entity,
-                component_id,
-            } => {
-                write!(
-                    f,
-                    "entity {:?} doesn't have component {:?}",
-                    entity.id(),
-                    component_id
-                )
-            }
-        }
-    }
-}
+pub use crate::error::CommandError;
 
 // =============================================================================
 // CommandQueue

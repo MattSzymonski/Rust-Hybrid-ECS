@@ -587,25 +587,11 @@ impl From<serde_json::Error> for CSharpError {
     }
 }
 
-/// Windowed-host rendering failures, compiled only with the `rendering`
-/// feature.
+/// Windowed-frontend failures produced by `winit`, compiled only with the
+/// `rendering` feature.
 #[cfg(feature = "rendering")]
-#[engine_error(namespace = host::rendering)]
-pub enum RenderingError {
-    /// The engine renderer could not initialize against the window.
-    #[message("engine renderer setup failed")]
-    SetupFailed {
-        #[source]
-        source: pill_engine::RendererError,
-    },
-
-    /// One frame failed to render.
-    #[message("engine renderer frame failed")]
-    FrameFailed {
-        #[source]
-        source: pill_engine::RendererError,
-    },
-
+#[engine_error(namespace = host::frontend)]
+pub enum FrontendError {
     /// The `winit` event loop could not be created.
     #[message("failed to create the event loop")]
     EventLoopCreation {
@@ -651,10 +637,10 @@ pub enum HostError {
     #[transparent]
     CSharp(#[from] CSharpError),
 
-    /// The windowed host failed to set up rendering.
+    /// The windowed frontend failed to create its event loop or window.
     #[cfg(feature = "rendering")]
     #[transparent]
-    Rendering(#[from] RenderingError),
+    Frontend(#[from] FrontendError),
 
     /// The workspace root cannot be derived from the manifest directory.
     #[message("cannot determine the workspace root")]

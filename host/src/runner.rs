@@ -28,9 +28,12 @@ use winit::window::{Window, WindowId};
 use crate::GameModuleConfig;
 
 // External crates
+#[cfg(feature = "rendering")]
+use pill_core::error::FrontendError;
+#[cfg(not(feature = "rendering"))]
 use pill_core::error::HostError;
 #[cfg(feature = "rendering")]
-use pill_core::error::RenderingError;
+use pill_engine::EngineError;
 
 // =============================================================================
 // WindowedApplication
@@ -43,7 +46,7 @@ struct WindowedApplication {
     window: Option<Arc<Window>>,
     host: Option<crate::RenderingHost>,
     /// Failure recorded during `resumed`; surfaced after the loop exits.
-    setup_error: Option<HostError>,
+    setup_error: Option<EngineError>,
 }
 
 #[cfg(feature = "rendering")]
@@ -64,7 +67,7 @@ impl ApplicationHandler for WindowedApplication {
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(source) => {
-                self.setup_error = Some(RenderingError::WindowCreation { source }.into());
+                self.setup_error = Some(FrontendError::WindowCreation { source }.into());
                 event_loop.exit();
                 return;
             }
@@ -140,7 +143,7 @@ impl WindowedApplication {
             Err(source) => {
                 // The frame renderer failed; stop the loop and report the
                 // typed failure through the regular error boundary.
-                self.setup_error = Some(RenderingError::FrameFailed { source }.into());
+                self.setup_error = Some(source.into());
                 event_loop.exit();
             }
         }
@@ -168,10 +171,10 @@ pub fn run(module_config: GameModuleConfig) -> Result<(), HostError> {
 
 /// Run the configured game in the host-owned native window and render loop.
 #[cfg(feature = "rendering")]
-pub fn run(module_config: GameModuleConfig) -> Result<(), HostError> {
+pub fn run(module_config: GameModuleConfig) -> Result<(), EngineError> {
     // Create a new event loop for the windowed application.
     let event_loop =
-        EventLoop::new().map_err(|source| RenderingError::EventLoopCreation { source })?;
+        EventLoop::new().map_err(|source| FrontendError::EventLoopCreation { source })?;
 
     // Set the event loop to poll continuously, so that the host can run
     // frames as fast as possible without waiting for user input.
@@ -188,7 +191,7 @@ pub fn run(module_config: GameModuleConfig) -> Result<(), HostError> {
     // Run the event loop until the window is closed.
     event_loop
         .run_app(&mut application)
-        .map_err(|source| RenderingError::EventLoopCreation { source })?;
+        .map_err(|source| FrontendError::EventLoopCreation { source })?;
 
     // Window-creation and host setup happen inside the event loop; surface
     // any deferred failure after the loop exits.

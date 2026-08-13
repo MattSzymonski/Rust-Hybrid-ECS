@@ -21,7 +21,7 @@ use trait_type_map::TraitAccessible;
 use super::abi::ComponentChunk;
 
 // External crates
-use pill_core::error::CSharpError;
+use pill_core::error::{CSharpError, EngineMessage};
 
 // In rendering builds these names resolve to the renderer's components so
 // managed physics writes directly into the columns consumed by the renderer.
@@ -410,13 +410,18 @@ pub(super) fn register_component_manifest(
             )
             .into());
         }
-        let id = engine.world_mut().register_dynamic_component(
-            stable_id.0,
-            component.full_name,
-            component.size,
-            component.alignment,
-            component.schema_hash,
-        )?;
+        let id = engine
+            .world_mut()
+            .register_dynamic_component(
+                stable_id.0,
+                component.full_name,
+                component.size,
+                component.alignment,
+                component.schema_hash,
+            )
+            .map_err(|error| CSharpError::ManifestInvalid {
+                message: error.to_plain_message(),
+            })?;
         bindings.insert(
             stable_id,
             ComponentBinding::Dynamic {

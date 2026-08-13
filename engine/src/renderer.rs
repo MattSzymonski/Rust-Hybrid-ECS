@@ -14,9 +14,6 @@
 //! [`Renderer::resize`] and [`Renderer::render`]. No frontend needs a direct
 //! dependency on wgpu or an async executor.
 
-use std::error::Error;
-use std::fmt::{Display, Formatter};
-
 use crate::engine::Engine;
 use crate::render::{RenderViewport, SpriteRenderer, VirtualResolution};
 
@@ -52,14 +49,14 @@ impl Renderer {
         let instance = wgpu::Instance::default();
         let surface = instance
             .create_surface(window)
-            .map_err(|error| RendererError::initialization("create GPU surface", error))?;
+            .map_err(|error| RendererError::SurfaceCreation { source: error })?;
 
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
             force_fallback_adapter: false,
             compatible_surface: Some(&surface),
         }))
-        .map_err(|error| RendererError::initialization("find a compatible GPU adapter", error))?;
+        .map_err(|error| RendererError::AdapterRequest { source: error })?;
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("ECS renderer device"),
@@ -69,16 +66,16 @@ impl Renderer {
             memory_hints: wgpu::MemoryHints::default(),
             ..Default::default()
         }))
-        .map_err(|error| RendererError::initialization("create GPU device", error))?;
+        .map_err(|error| RendererError::DeviceCreation { source: error })?;
 
         let capabilities = surface.get_capabilities(&adapter);
         let format = capabilities
             .formats
             .first()
             .copied()
-            .ok_or_else(|| RendererError::message("GPU surface exposes no texture formats"))?;
-        let alpha_mode = select_alpha_mode(&capabilities.alpha_modes)
-            .ok_or_else(|| RendererError::message("GPU surface exposes no alpha modes"))?;
+            .ok_or(RendererError::NoTextureFormats)?;
+        let alpha_mode =
+            select_alpha_mode(&capabilities.alpha_modes).ok_or(RendererError::NoAlphaModes)?;
         let present_mode = select_present_mode(&capabilities.present_modes);
         println!("[render] Present mode: {present_mode:?}");
 
@@ -155,9 +152,7 @@ impl Renderer {
             }
             Err(wgpu::SurfaceError::Timeout) => return Ok(()),
             Err(error @ (wgpu::SurfaceError::OutOfMemory | wgpu::SurfaceError::Other)) => {
-                return Err(RendererError::message(format!(
-                    "failed to acquire GPU surface texture: {error}"
-                )));
+                return Err(RendererError::SurfaceTextureFailed { source: error });
             }
         };
 
@@ -235,33 +230,10 @@ fn select_alpha_mode(supported: &[wgpu::CompositeAlphaMode]) -> Option<wgpu::Com
 }
 
 /// Rendering initialization or presentation failure without exposed wgpu types.
-#[derive(Debug)]
-pub struct RendererError {
-    message: String,
-}
-
-impl RendererError {
-    /// Add operation context to an error returned by the GPU backend.
-    fn initialization(operation: &str, error: impl Display) -> Self {
-        Self::message(format!("failed to {operation}: {error}"))
-    }
-
-    /// Construct an opaque renderer error suitable for frontend diagnostics.
-    fn message(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl Display for RendererError {
-    /// Format the backend-independent renderer diagnostic.
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(&self.message)
-    }
-}
-
-impl Error for RendererError {}
+///
+/// The semantic error enum is declared in [`crate::error::RendererError`] and
+/// re-exported here for the pre-existing module path.
+pub use crate::error::RendererError;
 
 #[cfg(test)]
 mod tests {

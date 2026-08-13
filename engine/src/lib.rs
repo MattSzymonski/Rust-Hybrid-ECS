@@ -36,6 +36,7 @@ pub mod component;
 pub mod config;
 pub mod engine;
 pub mod entity;
+pub mod error;
 pub mod persistence;
 pub mod profiling;
 pub mod query;
@@ -57,6 +58,7 @@ pub use commands::{CommandError, Commands};
 pub use component::{Component, ComponentId, ComponentTicks, Tick};
 pub use engine::Engine;
 pub use entity::Entity;
+pub use error::EngineError;
 pub use persistence::ComponentSnapshot;
 pub use query::{
     Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,

@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+pill_core = { path = "../pill_core" }
+pill_core_macros = { path = "../pill_core_macros" }
 rayon = "1.10"
 parking_lot = "0.12"
 sysinfo = "0.39"
@@ -11,6 +13,8 @@ trait_type_map = { path = "../../Trait-Type-Map" }
 tracy-client = { version = "0.18", optional = true, default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+thiserror = "2"
+miette = { version = "7", features = ["derive"] }
 wgpu = { version = "26.0.1", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 pollster = { version = "0.4", optional = true }
@@ -44,7 +48,7 @@ profiling-verify = ["profiling", "tracy-client/verify"]
 # Minimal 2D renderer (wgpu-backed): Position/Sprite components, the sprite
 # pipeline, and window-surface/device/queue lifecycle. Frontends supply only a
 # compatible window handle and drive the engine Renderer API.
-rendering = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
+rendering = ["dep:wgpu", "dep:bytemuck", "dep:pollster", "pill_core/rendering"]
 
 [[bench]]
 name = "entity_lifecycle"

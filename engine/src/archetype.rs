@@ -46,6 +46,7 @@ use trait_type_map::{TraitTypeMap, VecFamily};
 
 use crate::component::{Component, ComponentId, ComponentMask, ComponentTicks};
 use crate::entity::Entity;
+use crate::error::WorldError;
 
 // =============================================================================
 // StorageFactory
@@ -122,9 +123,9 @@ impl DynamicColumn {
         self.len += 1;
     }
 
-    pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), &'static str> {
+    pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), WorldError> {
         if bytes.len() != self.layout.size {
-            return Err("dynamic component byte length does not match its registered size");
+            return Err(WorldError::DynamicSizeMismatch);
         }
         self.reserve_one();
         // SAFETY: source and destination are valid for exactly one element and
@@ -155,9 +156,9 @@ impl DynamicColumn {
         self.len += 1;
     }
 
-    pub fn set_bytes(&mut self, index: usize, bytes: &[u8]) -> Result<(), &'static str> {
+    pub fn set_bytes(&mut self, index: usize, bytes: &[u8]) -> Result<(), WorldError> {
         if index >= self.len || bytes.len() != self.layout.size {
-            return Err("dynamic component row or byte length is invalid");
+            return Err(WorldError::DynamicRowInvalid);
         }
         // SAFETY: the checked row is initialized and bytes has one element's size.
         unsafe {

@@ -25,8 +25,8 @@ use dioxus::desktop::{use_wry_event_handler, window, Config};
 use dioxus::prelude::*;
 use futures_util::StreamExt;
 use host::{
-    setup_rendering, FrameReport, GameModuleConfig, RenderViewport, RenderingHost,
-    VirtualResolution,
+    engine_report, install_engine_report_handler, setup_rendering, EngineError, FrameReport,
+    GameModuleConfig, RenderViewport, RenderingHost, VirtualResolution,
 };
 
 use dock_view::DockView;
@@ -43,6 +43,8 @@ const GAME_VIRTUAL_RESOLUTION: VirtualResolution = VirtualResolution::new(800.0,
 
 /// Create the Dioxus window and attach a rendering host to that same window.
 fn main() {
+    install_engine_report_handler();
+
     let config = Config::new()
         .with_disable_context_menu(true)
         .with_window(
@@ -54,7 +56,15 @@ fn main() {
         .with_on_window(|window, dom| {
             // Dioxus retains event-loop ownership. The cloned Arc is passed to
             // the engine only so wgpu can keep the native surface alive.
-            let context = Arc::new(EditorContext::new(window));
+            let context = match EditorContext::new(window) {
+                Ok(context) => Arc::new(context),
+                Err(error) => {
+                    // The editor cannot render without its engine surface;
+                    // report the typed failure once and stop the process.
+                    eprintln!("{:?}", engine_report(error));
+                    std::process::exit(1);
+                }
+            };
             dom.provide_root_context(context);
         })
         .with_as_child_window();
@@ -260,25 +270,29 @@ struct EditorFrame {
 
 impl EditorContext {
     /// Create one engine renderer surface from the Dioxus/Tao window handle.
-    fn new(window: Arc<Window>) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns the composed [`EngineError`] when host setup or GPU surface
+    /// creation fails; the caller reports it once and exits.
+    fn new(window: Arc<Window>) -> Result<Self, EngineError> {
         let size = window.inner_size();
         let mut host = setup_rendering(
             GameModuleConfig::from_environment(),
             Arc::clone(&window),
             size.width,
             size.height,
-        )
-        .expect("editor rendering host setup failed");
+        )?;
         host.set_render_viewport(Some(RenderViewport::default()));
         host.set_render_virtual_resolution(Some(GAME_VIRTUAL_RESOLUTION));
 
-        Self {
+        Ok(Self {
             host: RefCell::new(host),
             window,
             last_stats_update: Cell::new(Instant::now()),
             main_scene_viewport: Cell::new(RenderViewport::default()),
             detached_scene_window: Cell::new(None),
-        }
+        })
     }
 
     /// Reconfigure the renderer only when it currently targets the main window.

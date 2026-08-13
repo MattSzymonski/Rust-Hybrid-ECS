@@ -44,9 +44,11 @@ impl Resource for SimulationTime {}
 
 fn update_time_system(mut time: ResMut<SimulationTime>) {
     let now = Instant::now();
-    let mut time = time
-        .get_mut()
-        .expect("SimulationTime is inserted during game initialization");
+    // A missing resource means the game module and host disagree about
+    // initialization; skip the frame instead of panicking in the scheduler.
+    let Some(mut time) = time.get_mut() else {
+        return;
+    };
     time.delta_seconds = now.duration_since(time.last_frame).as_secs_f32().min(0.1);
     time.last_frame = now;
 }
@@ -102,10 +104,10 @@ fn simulate_ball(state: &mut PhysicsState) {
 
 #[cfg(not(feature = "rendering"))]
 fn physics_system(time: Res<SimulationTime>, mut query: Query<&mut PhysicsState>) {
-    let delta_seconds = time
-        .get()
-        .expect("SimulationTime is inserted during game initialization")
-        .delta_seconds;
+    let Some(time) = time.get() else {
+        return;
+    };
+    let delta_seconds = time.delta_seconds;
     for mut physics in query.iter_mut() {
         physics.delta_time = delta_seconds;
         simulate_ball(&mut physics);
@@ -117,10 +119,10 @@ fn physics_system(
     time: Res<SimulationTime>,
     mut query: Query<(&mut PhysicsState, &mut Position, &mut Sprite)>,
 ) {
-    let delta_seconds = time
-        .get()
-        .expect("SimulationTime is inserted during game initialization")
-        .delta_seconds;
+    let Some(time) = time.get() else {
+        return;
+    };
+    let delta_seconds = time.delta_seconds;
     for (mut physics, mut position, mut sprite) in query.iter_mut() {
         physics.delta_time = delta_seconds;
         simulate_ball(&mut physics);
@@ -149,8 +151,13 @@ fn physics_system(
 /// the previously loaded module. Initialization must therefore be idempotent:
 /// re-registering the same components and systems is safe, and entities are
 /// only filled up to a target count.
+///
+/// # Safety
+///
+/// `api` must be a valid [`EngineApi`] pointer owned by the host for the
+/// complete duration of this call.
 #[no_mangle]
-pub extern "C" fn game_init(api: *const EngineApi) -> u32 {
+pub unsafe extern "C" fn game_init(api: *const EngineApi) -> u32 {
     let api = unsafe { &*api };
     let engine = unsafe { &mut *(api.engine_handle as *mut Engine) };
 
@@ -205,9 +212,15 @@ pub extern "C" fn game_init(api: *const EngineApi) -> u32 {
                 color: Color::new(1.0, 0.3, 0.3, 1.0),
             });
 
-        entity
-            .build()
-            .expect("ball components should be registered");
+        match entity.build() {
+            Ok(_) => {}
+            Err(error) => {
+                // Report the failure and abort the generation: the host keeps
+                // the previously loaded module when game_init returns non-zero.
+                eprintln!("[game_rs] failed to build a ball entity: {error}");
+                return 1;
+            }
+        }
     }
 
     // Report successful registration so the host keeps this generation.

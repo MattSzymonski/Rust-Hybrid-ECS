@@ -28,7 +28,7 @@ mod watcher;
 
 pub use config::{CSharpModuleConfig, GameModuleBackend, GameModuleConfig};
 #[cfg(feature = "rendering")]
-pub use pill_core::error::RenderingError;
+pub use pill_core::error::FrontendError;
 pub use pill_core::error::{
     engine_report, install_engine_report_handler, BuildError, CSharpError, ConfigError,
     EngineMessage, EngineReportHandler, HostError, LibraryError, MessageRenderer,
@@ -39,7 +39,7 @@ pub use runner::run;
 pub use runtime::{run_one_frame, setup, FrameReport, Host};
 
 #[cfg(feature = "rendering")]
-pub use pill_engine::{RenderViewport, RendererError, VirtualResolution};
+pub use pill_engine::{EngineError, RenderViewport, RendererError, VirtualResolution};
 
 #[cfg(feature = "rendering")]
 pub use runtime::{setup_rendering, RenderingHost};
