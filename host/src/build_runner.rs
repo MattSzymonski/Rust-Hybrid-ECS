@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 // Current crate
 use crate::{GameModuleBackend, GameModuleConfig};
 
+// External crates
+use pill_core::error::BuildError;
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -43,7 +46,7 @@ pub(crate) fn build_game_module(
     workspace_root: &Path,
     config: &GameModuleConfig,
     cancel_flag: Option<(&AtomicU64, u64)>,
-) -> Result<PathBuf, Box<dyn std::error::Error>> {
+) -> Result<PathBuf, BuildError> {
     println!("[host] Building {} module...", config.name);
 
     // GameModuleConfig stores commands as static slices so callers can define
@@ -52,7 +55,7 @@ pub(crate) fn build_game_module(
     let (program, arguments) = config
         .build_command
         .split_first()
-        .ok_or("build command must not be empty")?;
+        .ok_or(BuildError::EmptyCommand)?;
 
     // Run from the workspace root because configured paths and Cargo package
     // selection are workspace-relative. The child inherits the host's stdout
@@ -61,7 +64,11 @@ pub(crate) fn build_game_module(
     let mut child = Command::new(program)
         .args(arguments)
         .current_dir(workspace_root)
-        .spawn()?;
+        .spawn()
+        .map_err(|source| BuildError::SpawnFailed {
+            name: config.name.to_string(),
+            source,
+        })?;
 
     // Wait for the compiler under a watchdog. The host frame loop must never
     // block indefinitely on a hung compiler or an interactive prompt, so the
@@ -78,20 +85,21 @@ pub(crate) fn build_game_module(
         {
             let _ = child.kill();
             let _ = child.wait();
-            return Err("Build cancelled: sources changed again during compilation.".into());
+            return Err(BuildError::Cancelled);
         }
-        if let Some(status) = child.try_wait()? {
+        if let Some(status) = child.try_wait().map_err(|source| BuildError::WaitFailed {
+            name: config.name.to_string(),
+            source,
+        })? {
             break status;
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(format!(
-                "Build command for '{}' timed out after {} seconds.",
-                config.name,
-                BUILD_TIMEOUT.as_secs()
-            )
-            .into());
+            return Err(BuildError::TimedOut {
+                name: config.name.to_string(),
+                seconds: BUILD_TIMEOUT.as_secs(),
+            });
         }
         std::thread::sleep(WATCHDOG_POLL_INTERVAL);
     };
@@ -99,11 +107,10 @@ pub(crate) fn build_game_module(
     // A failed compiler must stop the load transaction. During hot reload the
     // caller handles this error by leaving the current game module untouched.
     if !status.success() {
-        return Err(format!(
-            "Build command failed for '{}' with status {}",
-            config.name, status
-        )
-        .into());
+        return Err(BuildError::CommandFailed {
+            name: config.name.to_string(),
+            status,
+        });
     }
 
     // The build command itself is backend-agnostic, but each backend names and
@@ -126,13 +133,9 @@ pub(crate) fn build_game_module(
     // errors identify an output-directory mismatch rather than an opaque DLL
     // or managed-runtime failure later in the startup sequence.
     if !output_path.exists() {
-        return Err(format!(
-            "Shared library not found at expected path: {}\n\
-             Build succeeded but the output was not where we expected. \
-             Check the selected backend output directory in GameModuleConfig.",
-            output_path.display()
-        )
-        .into());
+        return Err(BuildError::OutputMissing {
+            path: output_path.display().to_string(),
+        });
     }
 
     Ok(output_path)

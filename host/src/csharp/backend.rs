@@ -17,6 +17,9 @@ use pill_engine::{Engine, SystemAccess, World};
 // Current crate
 use crate::CSharpModuleConfig;
 
+// External crates
+use pill_core::error::CSharpError;
+
 use super::abi::{CsEngineApi, NativeSystemAccess};
 use super::components::{
     register_component_manifest, shared_component_bindings, ComponentBindings, StableComponentId,
@@ -130,7 +133,7 @@ impl CSharpRuntime {
         engine: &mut Engine,
         workspace_root: &Path,
         config: &CSharpModuleConfig,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, CSharpError> {
         let shared_bindings = shared_component_bindings(engine);
 
         // Step 1: Resolve assembly paths, start .NET, and load managed exports.
@@ -162,12 +165,10 @@ impl CSharpRuntime {
             "InteropVersion",
         )?;
         if interop_version() != INTEROP_CONTRACT_VERSION {
-            return Err(format!(
-                "csharp_runtime interop version mismatch: host expects {INTEROP_CONTRACT_VERSION} \
-                 but the runtime reports {}; rebuild csharp_runtime.",
-                interop_version()
-            )
-            .into());
+            return Err(CSharpError::InteropVersionMismatch {
+                expected: INTEROP_CONTRACT_VERSION,
+                actual: interop_version(),
+            });
         }
 
         let init = runtime.get_unmanaged_fn::<InitFn>(&assembly, &type_name, "Init")?;
@@ -221,18 +222,17 @@ impl CSharpRuntime {
         // manifest copied from the managed assembly.
         let api = Box::new(CsEngineApi::new());
         if init(api.as_ref() as *const CsEngineApi) == 0 {
-            return Err("csharp_runtime initialization failed".into());
+            return Err(CSharpError::RuntimeInitFailed);
         }
 
         // The manifest length comes from managed code, so it must be bounded
         // before the host allocates anything from it.
         let manifest_length = manifest_length();
         if !is_supported_manifest_length(manifest_length) {
-            return Err(format!(
-                "C# component manifest length {manifest_length} is outside the supported range \
-                 (1..={MAX_COMPONENT_MANIFEST_BYTES})"
-            )
-            .into());
+            return Err(CSharpError::ManifestLengthOutOfRange {
+                length: manifest_length,
+                limit: MAX_COMPONENT_MANIFEST_BYTES,
+            });
         }
 
         // Reserve explicitly so an allocation failure surfaces as a regular
@@ -240,13 +240,13 @@ impl CSharpRuntime {
         let mut manifest = Vec::new();
         manifest
             .try_reserve_exact(manifest_length as usize)
-            .map_err(|_| "out of memory allocating the C# component manifest buffer")?;
+            .map_err(|_| CSharpError::ManifestAllocationFailed)?;
         manifest.resize(manifest_length as usize, 0);
 
         // The managed contract rejects any caller buffer smaller than the
         // manifest, so a successful copy guarantees a complete payload.
         if copy_manifest(manifest.as_mut_ptr(), manifest_length) == 0 {
-            return Err("failed to copy the C# component manifest".into());
+            return Err(CSharpError::ManifestCopyFailed);
         }
         let bindings = Arc::new(register_component_manifest(
             engine,
@@ -280,17 +280,19 @@ impl CSharpRuntime {
             // Roll back the queued commands so the failure is truly
             // transactional, even if setup ever becomes retryable.
             engine.discard_deferred_commands();
-            return Err(format!("C# startup method {index} failed").into());
+            return Err(CSharpError::StartupFailed { index });
         }
         engine
             .flush_deferred_commands()
-            .map_err(|errors| format!("C# startup commands failed: {errors:?}"))?;
+            .map_err(|errors| CSharpError::StartupCommandsFailed {
+                details: format!("{errors:?}"),
+            })?;
 
         // Step 4: Reflect each system's accesses and register it with the
         // scheduler under the exact resolved read/write list.
         let count = system_count();
         if count == 0 {
-            return Err("game_cs contains no [EcsSystem] methods".into());
+            return Err(CSharpError::NoSystems);
         }
         let mut system_snapshot = Vec::with_capacity(count as usize);
         for system_index in 0..count {
@@ -302,10 +304,10 @@ impl CSharpRuntime {
                     mode: 0,
                 };
                 if get_access(system_index, access_index, &mut item) == 0 {
-                    return Err(format!(
-                        "failed to get access {access_index} for C# system {system_index}"
-                    )
-                    .into());
+                    return Err(CSharpError::SystemAccessFailed {
+                        system: system_index,
+                        access: access_index,
+                    });
                 }
                 managed_access.push(item);
             }
@@ -468,7 +470,7 @@ fn managed_system_name(
 pub(super) fn derive_system_access(
     accesses: &[NativeSystemAccess],
     bindings: &ComponentBindings,
-) -> Result<SystemAccess, Box<dyn std::error::Error>> {
+) -> Result<SystemAccess, CSharpError> {
     let mut result = SystemAccess::new();
     for access in accesses {
         let stable_id =
@@ -476,16 +478,16 @@ pub(super) fn derive_system_access(
         let component = bindings
             .get(&stable_id)
             .map(|binding| binding.component_id())
-            .ok_or_else(|| {
-                format!(
-                    "C# system references unregistered component key {:016X}{:016X}",
+            .ok_or_else(|| CSharpError::UnregisteredComponent {
+                key: format!(
+                    "{:016X}{:016X}",
                     access.component_key_high, access.component_key
-                )
+                ),
             })?;
         match access.mode {
             0 => result.add_read(component),
             1 => result.add_write(component),
-            mode => return Err(format!("unknown C# access mode {mode}").into()),
+            mode => return Err(CSharpError::UnknownAccessMode { mode }),
         }
     }
     Ok(result)

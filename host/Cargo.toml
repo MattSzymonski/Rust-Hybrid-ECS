@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 pill_engine = { path = "../engine" }
+pill_core = { path = "../pill_core" }
 libloading = "0.8"
 notify = "6"
 serde = { version = "1", features = ["derive"] }
@@ -13,4 +14,4 @@ trait_type_map = { path = "../../Trait-Type-Map" }
 winit = { version = "0.30", optional = true }
 
 [features]
-rendering = ["pill_engine/rendering", "dep:winit"]
+rendering = ["pill_engine/rendering", "pill_core/rendering", "dep:winit"]

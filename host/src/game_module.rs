@@ -21,6 +21,9 @@ use crate::csharp::CSharpRuntime;
 use crate::native_library::GameLibrary;
 use crate::{GameModuleBackend, GameModuleConfig};
 
+// External crates
+use pill_core::error::{HostError, LibraryError};
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -54,7 +57,7 @@ impl LoadedGame {
         engine_api: &EngineApi,
         workspace_root: &Path,
         config: &GameModuleConfig,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, HostError> {
         // Step 1: Build the module through the shared command runner.
         // Build before branching so both backends use the same command runner,
         // diagnostics, output validation, and initial failure behavior.
@@ -73,9 +76,7 @@ impl LoadedGame {
                 // A non-zero status means the module failed to initialize.
                 let status = library.call_game_init(engine_api);
                 if status != 0 {
-                    return Err(
-                        format!("game module initialization failed with status {status}").into(),
-                    );
+                    return Err(LibraryError::InitializationFailed { status }.into());
                 }
                 Ok(Self::Native {
                     current: library,

@@ -1,3 +1,11 @@
 [workspace]
-members = ["editor", "engine", "game_rs", "host", "standalone"]
+members = [
+    "editor",
+    "engine",
+    "pill_core",
+    "pill_core_macros",
+    "game_rs",
+    "host",
+    "standalone",
+]
 resolver = "2"

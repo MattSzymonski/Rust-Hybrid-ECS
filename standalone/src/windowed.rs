@@ -16,6 +16,8 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
+use super::error::StandaloneError;
+
 // =============================================================================
 // GraphicsState
 // =============================================================================
@@ -37,10 +39,12 @@ impl GraphicsState {
     // -------------------------------------------------------------------------
 
     // Create a new `GraphicsState` with GPU resources for the given window.
-    fn new(window: Arc<Window>) -> Self {
+    fn new(window: Arc<Window>) -> Result<Self, StandaloneError> {
         let size = window.inner_size();
         let instance = wgpu::Instance::default();
-        let surface = instance.create_surface(window.clone()).unwrap();
+        let surface = instance
+            .create_surface(window.clone())
+            .map_err(|source| StandaloneError::SurfaceCreation { source })?;
 
         // Request a GPU adapter.
         // This is a blocking call, but it's only done once at startup, so it's acceptable.
@@ -49,7 +53,7 @@ impl GraphicsState {
             force_fallback_adapter: false,
             compatible_surface: Some(&surface),
         }))
-        .expect("failed to find a suitable GPU adapter");
+        .map_err(|source| StandaloneError::AdapterUnavailable { source })?;
 
         // Request a device and queue from the adapter.
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
@@ -60,7 +64,7 @@ impl GraphicsState {
             memory_hints: wgpu::MemoryHints::default(),
             ..Default::default()
         }))
-        .expect("failed to create GPU device");
+        .map_err(|source| StandaloneError::DeviceCreation { source })?;
 
         // Configure the surface with a format and present mode.
         let capabilities = surface.get_capabilities(&adapter);
@@ -99,14 +103,14 @@ impl GraphicsState {
         let sprite_renderer = SpriteRenderer::new(&device, surface_format);
 
         // Return the new GraphicsState.
-        Self {
+        Ok(Self {
             window,
             surface,
             device,
             queue,
             surface_config,
             sprite_renderer,
-        }
+        })
     }
 
     // -------------------------------------------------------------------------
@@ -165,27 +169,46 @@ struct App {
     module_config: GameModuleConfig,
     host: Option<Host>,
     graphics: Option<GraphicsState>,
+    /// Failure recorded during `resumed`; surfaced after the loop exits.
+    setup_error: Option<StandaloneError>,
 }
 
 impl ApplicationHandler for App {
     // Resume the application after a pause or suspension.
     // Initialize the host and graphics state if they haven't been created yet.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.graphics.is_some() {
+        if self.graphics.is_some() || self.setup_error.is_some() {
             return;
         }
 
         let window_attributes = Window::default_attributes()
             .with_title("ECS Standalone Host")
             .with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0));
-        let window = Arc::new(
-            event_loop
-                .create_window(window_attributes)
-                .expect("failed to create window"),
-        );
+        let window = match event_loop.create_window(window_attributes) {
+            Ok(window) => Arc::new(window),
+            Err(error) => {
+                self.setup_error = Some(StandaloneError::WindowCreation { source: error });
+                event_loop.exit();
+                return;
+            }
+        };
 
-        self.host = Some(setup(self.module_config.clone()).expect("host setup failed"));
-        self.graphics = Some(GraphicsState::new(window));
+        match setup(self.module_config.clone()) {
+            Ok(host) => self.host = Some(host),
+            Err(error) => {
+                self.setup_error = Some(error.into());
+                event_loop.exit();
+                return;
+            }
+        }
+
+        match GraphicsState::new(window) {
+            Ok(graphics) => self.graphics = Some(graphics),
+            Err(error) => {
+                self.setup_error = Some(error);
+                event_loop.exit();
+            }
+        }
     }
 
     fn window_event(
@@ -235,9 +258,10 @@ impl ApplicationHandler for App {
 
 /// Create a window, initialise the host, and run the render loop until the
 /// window is closed.
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run() -> Result<(), StandaloneError> {
     // Create a new event loop for the windowed application.
-    let event_loop = EventLoop::new()?;
+    let event_loop =
+        EventLoop::new().map_err(|source| StandaloneError::EventLoopCreation { source })?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
     // Create the application state and run the event loop.
@@ -245,8 +269,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         module_config: GameModuleConfig::from_environment(),
         host: None,
         graphics: None,
+        setup_error: None,
     };
-    event_loop.run_app(&mut app)?;
+    event_loop
+        .run_app(&mut app)
+        .map_err(|source| StandaloneError::EventLoopCreation { source })?;
 
+    // Window-creation and GPU setup happen inside the event loop; surface
+    // any deferred failure after the loop exits.
+    if let Some(error) = app.setup_error {
+        return Err(error);
+    }
     Ok(())
 }

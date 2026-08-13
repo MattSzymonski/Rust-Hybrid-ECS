@@ -28,6 +28,11 @@ use crate::native_library::cleanup_temporary_files;
 use crate::watcher::spawn_file_watcher;
 use crate::{GameModuleBackend, GameModuleConfig};
 
+// External crates
+use pill_core::error::HostError;
+#[cfg(feature = "rendering")]
+use pill_core::error::RenderingError;
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -194,14 +199,19 @@ pub struct FrameReport {
 // =============================================================================
 
 /// Build/load the game module, create the engine, and start its source watcher.
-pub fn setup(module_config: GameModuleConfig) -> Result<Host, Box<dyn std::error::Error>> {
+///
+/// # Errors
+///
+/// Returns a typed [`HostError`] naming the failing subsystem: configuration,
+/// build, library loading, watcher startup, or managed backend startup.
+pub fn setup(module_config: GameModuleConfig) -> Result<Host, HostError> {
     // Step 0: Reject inconsistent configurations before any build or load.
     module_config.validate()?;
 
     // Step 1: Resolve the workspace root and print the selected configuration.
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .ok_or("Cannot determine workspace root")?
+        .ok_or(HostError::WorkspaceRootUndetermined)?
         .to_path_buf();
 
     print_startup_configuration(&workspace_root, &module_config);
@@ -265,12 +275,13 @@ pub fn setup_rendering<W>(
     window: W,
     width: u32,
     height: u32,
-) -> Result<RenderingHost, Box<dyn std::error::Error>>
+) -> Result<RenderingHost, HostError>
 where
     W: RendererWindow + 'static,
 {
     let host = setup(module_config)?;
-    let renderer = Renderer::new(window, width, height)?;
+    let renderer = Renderer::new(window, width, height)
+        .map_err(|source| RenderingError::SetupFailed { source })?;
     Ok(RenderingHost { host, renderer })
 }
 

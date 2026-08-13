@@ -9,8 +9,10 @@
 
 use host::{run_one_frame, setup, GameModuleConfig};
 
+use super::error::StandaloneError;
+
 /// Main entry point and program loop for the headless host.
-pub fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub fn run() -> Result<(), StandaloneError> {
     let mut host = setup(GameModuleConfig::from_environment())?;
     loop {
         if let Some(report) = run_one_frame(&mut host) {

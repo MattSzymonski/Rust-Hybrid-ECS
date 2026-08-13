@@ -33,6 +33,9 @@ use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 // Current crate
 use crate::GameModuleConfig;
 
+// External crates
+use pill_core::error::WatcherError;
+
 // =============================================================================
 // Constants
 // =============================================================================
@@ -143,7 +146,7 @@ pub(crate) fn spawn_file_watcher(
     workspace_root: PathBuf,
     config: &GameModuleConfig,
     reload_generation: Arc<AtomicU64>,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), WatcherError> {
     // Step 1: Resolve and validate the configured watch directory.
     // Watch paths are configured relative to the repository so the same
     // configuration works regardless of the process's current directory.
@@ -152,7 +155,9 @@ pub(crate) fn spawn_file_watcher(
     // Fail during host setup instead of silently running without hot reload
     // when a module configuration contains an outdated source path.
     if !watch_path.exists() {
-        return Err(format!("Watch directory does not exist: {}", watch_path.display()).into());
+        return Err(WatcherError::WatchDirectoryMissing {
+            path: watch_path.display().to_string(),
+        });
     }
 
     println!(
@@ -184,11 +189,17 @@ pub(crate) fn spawn_file_watcher(
             Err(error) => eprintln!("[host] File watcher error: {error}"),
         },
         Config::default(),
-    )?;
+    )
+    .map_err(|source| WatcherError::CreationFailed { source })?;
 
     // Recursive watching covers nested source modules without requiring every
     // language backend to enumerate its own directory structure.
-    watcher.watch(&watch_path, RecursiveMode::Recursive)?;
+    watcher
+        .watch(&watch_path, RecursiveMode::Recursive)
+        .map_err(|source| WatcherError::RegistrationFailed {
+            path: watch_path.display().to_string(),
+            source,
+        })?;
 
     // Step 3: Run the debounce worker that reports changes and signals the
     // main loop in the host.

@@ -32,6 +32,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 // External crates
 use libloading::{Library, Symbol};
+use pill_core::error::LibraryError;
 use pill_engine::EngineApi;
 
 // =============================================================================
@@ -83,12 +84,17 @@ impl GameLibrary {
     pub(crate) fn load_copy(
         build_output: &Path,
         workspace_root: &Path,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    ) -> Result<Self, LibraryError> {
         // Step 1: Prepare this process's temporary directory and a unique
         // target path. Scoping the directory per process id keeps concurrent
         // host instances from touching each other's copies.
         let temporary_directory = process_temporary_directory(workspace_root);
-        std::fs::create_dir_all(&temporary_directory)?;
+        std::fs::create_dir_all(&temporary_directory).map_err(|source| {
+            LibraryError::TemporaryDirectory {
+                directory: temporary_directory.display().to_string(),
+                source,
+            }
+        })?;
 
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -103,7 +109,13 @@ impl GameLibrary {
             temporary_directory.join(format!("game_{timestamp}_{counter}.{extension}"));
 
         // Step 2: Copy the built library to the unique temporary path.
-        std::fs::copy(build_output, &temporary_path)?;
+        std::fs::copy(build_output, &temporary_path).map_err(|source| {
+            LibraryError::CopyFailed {
+                source_path: build_output.display().to_string(),
+                target_path: temporary_path.display().to_string(),
+                source,
+            }
+        })?;
         println!("[host] Copied DLL to: {}", temporary_path.display());
 
         // Step 3: Load the copy and validate its required exports.
@@ -120,16 +132,25 @@ impl GameLibrary {
     ///
     /// `path` must point to a valid native library whose `game_init` export
     /// uses the expected C ABI.
-    unsafe fn load(
-        path: &Path,
-        temporary_path: PathBuf,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
+    unsafe fn load(path: &Path, temporary_path: PathBuf) -> Result<Self, LibraryError> {
         // SAFETY: The caller guarantees that `path` points to a native module.
-        let library = unsafe { Library::new(path)? };
+        let library = unsafe {
+            Library::new(path).map_err(|source| LibraryError::LoadFailed {
+                path: path.display().to_string(),
+                source,
+            })?
+        };
 
         // SAFETY: Resolving the export validates its name and expected type.
         // The symbol is not invoked until the engine API has been created.
-        let game_init: Symbol<GameInitFn> = unsafe { library.get(b"game_init")? };
+        let game_init: Symbol<GameInitFn> = unsafe {
+            library
+                .get(b"game_init")
+                .map_err(|source| LibraryError::MissingExport {
+                    symbol: "game_init".to_string(),
+                    source,
+                })?
+        };
 
         // `game_update` is optional: modules without the legacy per-frame
         // update simply run their registered scheduler systems.

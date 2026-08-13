@@ -6,6 +6,11 @@
 //! - Provides the standard Rust, C#, and integration-test configurations.
 //! - Selects a configuration from the host process environment.
 
+//! # Design
+
+// Current crate
+use pill_core::error::ConfigError;
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -68,16 +73,16 @@ impl GameModuleConfig {
     ///
     /// # Errors
     ///
-    /// Returns a description of the first invalid field.
-    pub fn validate(&self) -> Result<(), &'static str> {
+    /// Returns a typed [`ConfigError`] naming the first invalid field.
+    pub fn validate(&self) -> Result<(), ConfigError> {
         if self.name.is_empty() {
-            return Err("name must not be empty");
+            return Err(ConfigError::EmptyModuleName);
         }
         if self.watch_directory.is_empty() {
-            return Err("watch_directory must not be empty");
+            return Err(ConfigError::EmptyWatchDirectory);
         }
         if self.build_command.is_empty() {
-            return Err("build_command must not be empty");
+            return Err(ConfigError::EmptyBuildCommand);
         }
         Ok(())
     }

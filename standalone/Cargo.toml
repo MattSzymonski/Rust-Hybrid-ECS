@@ -5,7 +5,11 @@ edition = "2021"
 
 [dependencies]
 pill_engine = { path = "../engine" }
+pill_core = { path = "../pill_core" }
 host = { package = "pill_host", path = "../host" }
+pill_core_macros = { path = "../pill_core_macros" }
+thiserror = "2"
+miette = { version = "7", features = ["fancy"] }
 wgpu = { version = "26.0.1", optional = true }
 winit = { version = "0.30", optional = true }
 pollster = { version = "0.4", optional = true }

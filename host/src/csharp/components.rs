@@ -20,6 +20,9 @@ use trait_type_map::TraitAccessible;
 // Current crate
 use super::abi::ComponentChunk;
 
+// External crates
+use pill_core::error::CSharpError;
+
 // In rendering builds these names resolve to the renderer's components so
 // managed physics writes directly into the columns consumed by the renderer.
 // Headless builds provide layout-identical local definitions instead.
@@ -334,7 +337,7 @@ pub(super) fn register_component_manifest(
     engine: &mut Engine,
     bytes: &[u8],
     mut bindings: ComponentBindings,
-) -> Result<ComponentBindings, Box<dyn std::error::Error>> {
+) -> Result<ComponentBindings, CSharpError> {
     // Step 1: Parse and validate every entry against canonical identities.
     let manifest: Vec<ManagedComponentManifest> = serde_json::from_slice(bytes)?;
     let mut seen = HashSet::new();

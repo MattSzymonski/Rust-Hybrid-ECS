@@ -3,14 +3,21 @@
 //!
 //! # Responsibilities
 //!
-//! - Gate the entry point on `#[cfg(feature = "rendering")]`.
-//! - Delegate to [`headless::run`] or [`windowed::run`].
+//! - Gate the execution path on `#[cfg(feature = "rendering")]`.
+//! - Install the engine report handler and convert the final error into one
+//!   styled miette report at the single reporting boundary.
 //!
 //! # Design
 //!
 //! All hot-reload logic lives in the shared [`host`] crate. This binary
 //! only adds the execution loop: a plain console loop in `headless`, or a
-//! `winit` + `wgpu` render loop in `windowed`.
+//! `winit` + `wgpu` render loop in `windowed`. Errors propagate typed all
+//! the way to `main`, where they are reported exactly once.
+
+mod error;
+
+use error::StandaloneError;
+use host::{engine_report, install_engine_report_handler};
 
 // =============================================================================
 // Headless Mode
@@ -20,7 +27,7 @@
 mod headless;
 
 #[cfg(not(feature = "rendering"))]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn dispatch() -> Result<(), StandaloneError> {
     headless::run()
 }
 
@@ -32,6 +39,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod windowed;
 
 #[cfg(feature = "rendering")]
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn dispatch() -> Result<(), StandaloneError> {
     windowed::run()
+}
+
+// =============================================================================
+// Reporting Boundary
+// =============================================================================
+
+/// Install the report handler once and report the final error once.
+fn main() -> miette::Result<()> {
+    install_engine_report_handler();
+    dispatch().map_err(engine_report)
 }

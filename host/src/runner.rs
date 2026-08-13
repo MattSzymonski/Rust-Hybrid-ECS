@@ -27,6 +27,11 @@ use winit::window::{Window, WindowId};
 // Current crate
 use crate::GameModuleConfig;
 
+// External crates
+use pill_core::error::HostError;
+#[cfg(feature = "rendering")]
+use pill_core::error::RenderingError;
+
 // =============================================================================
 // WindowedApplication
 // =============================================================================
@@ -57,6 +62,7 @@ impl ApplicationHandler for WindowedApplication {
         let window = Arc::new(
             event_loop
                 .create_window(attributes)
+                .map_err(|source| RenderingError::WindowCreation { source })
                 .expect("failed to create standalone host window"),
         );
         let size = window.inner_size();
@@ -136,7 +142,7 @@ impl WindowedApplication {
 
 /// Run the configured game continuously without creating a native window.
 #[cfg(not(feature = "rendering"))]
-pub fn run(module_config: GameModuleConfig) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(module_config: GameModuleConfig) -> Result<(), HostError> {
     let mut host = crate::setup(module_config)?;
 
     loop {
@@ -151,9 +157,10 @@ pub fn run(module_config: GameModuleConfig) -> Result<(), Box<dyn std::error::Er
 
 /// Run the configured game in the host-owned native window and render loop.
 #[cfg(feature = "rendering")]
-pub fn run(module_config: GameModuleConfig) -> Result<(), Box<dyn std::error::Error>> {
+pub fn run(module_config: GameModuleConfig) -> Result<(), HostError> {
     // Create a new event loop for the windowed application.
-    let event_loop = EventLoop::new()?;
+    let event_loop =
+        EventLoop::new().map_err(|source| RenderingError::EventLoopCreation { source })?;
 
     // Set the event loop to poll continuously, so that the host can run
     // frames as fast as possible without waiting for user input.
@@ -167,6 +174,8 @@ pub fn run(module_config: GameModuleConfig) -> Result<(), Box<dyn std::error::Er
     };
 
     // Run the event loop until the window is closed.
-    event_loop.run_app(&mut application)?;
+    event_loop
+        .run_app(&mut application)
+        .map_err(|source| RenderingError::EventLoopCreation { source })?;
     Ok(())
 }
