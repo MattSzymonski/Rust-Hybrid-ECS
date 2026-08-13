@@ -42,13 +42,15 @@ struct WindowedApplication {
     module_config: GameModuleConfig,
     window: Option<Arc<Window>>,
     host: Option<crate::RenderingHost>,
+    /// Failure recorded during `resumed`; surfaced after the loop exits.
+    setup_error: Option<HostError>,
 }
 
 #[cfg(feature = "rendering")]
 impl ApplicationHandler for WindowedApplication {
     /// Create the native window and complete host/renderer setup on resume.
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
+        if self.window.is_some() || self.setup_error.is_some() {
             return;
         }
 
@@ -59,12 +61,14 @@ impl ApplicationHandler for WindowedApplication {
         let attributes = Window::default_attributes()
             .with_title("ECS Standalone Host")
             .with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0));
-        let window = Arc::new(
-            event_loop
-                .create_window(attributes)
-                .map_err(|source| RenderingError::WindowCreation { source })
-                .expect("failed to create standalone host window"),
-        );
+        let window = match event_loop.create_window(attributes) {
+            Ok(window) => Arc::new(window),
+            Err(source) => {
+                self.setup_error = Some(RenderingError::WindowCreation { source }.into());
+                event_loop.exit();
+                return;
+            }
+        };
         let size = window.inner_size();
 
         // Step 2: Complete host setup with rendering enabled, attaching the engine renderer
@@ -72,18 +76,23 @@ impl ApplicationHandler for WindowedApplication {
         //
         // Renderer construction is part of host setup; this runner supplies
         // only the platform window that wgpu needs for its surface.
-        let host = crate::setup_rendering(
+        match crate::setup_rendering(
             self.module_config.clone(),
             Arc::clone(&window),
             size.width,
             size.height,
-        )
-        .expect("rendering host setup failed");
-
-        // Step 3: Store the host and window for use in the event loop.
-        self.host = Some(host);
-        window.request_redraw();
-        self.window = Some(window);
+        ) {
+            Ok(host) => {
+                // Step 3: Store the host and window for use in the event loop.
+                self.host = Some(host);
+                window.request_redraw();
+                self.window = Some(window);
+            }
+            Err(error) => {
+                self.setup_error = Some(error);
+                event_loop.exit();
+            }
+        }
     }
 
     /// Route lifecycle and drawing events to host-owned rendering state.
@@ -128,8 +137,10 @@ impl WindowedApplication {
                 }
                 window.request_redraw();
             }
-            Err(error) => {
-                eprintln!("[render] Fatal renderer error: {error}");
+            Err(source) => {
+                // The frame renderer failed; stop the loop and report the
+                // typed failure through the regular error boundary.
+                self.setup_error = Some(RenderingError::FrameFailed { source }.into());
                 event_loop.exit();
             }
         }
@@ -171,11 +182,18 @@ pub fn run(module_config: GameModuleConfig) -> Result<(), HostError> {
         module_config,
         window: None,
         host: None,
+        setup_error: None,
     };
 
     // Run the event loop until the window is closed.
     event_loop
         .run_app(&mut application)
         .map_err(|source| RenderingError::EventLoopCreation { source })?;
+
+    // Window-creation and host setup happen inside the event loop; surface
+    // any deferred failure after the loop exits.
+    if let Some(error) = application.setup_error {
+        return Err(error);
+    }
     Ok(())
 }

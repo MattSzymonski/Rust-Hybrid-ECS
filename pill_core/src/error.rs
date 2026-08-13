@@ -599,6 +599,13 @@ pub enum RenderingError {
         source: pill_engine::RendererError,
     },
 
+    /// One frame failed to render.
+    #[message("engine renderer frame failed")]
+    FrameFailed {
+        #[source]
+        source: pill_engine::RendererError,
+    },
+
     /// The `winit` event loop could not be created.
     #[message("failed to create the event loop")]
     EventLoopCreation {
