@@ -45,6 +45,10 @@ pub mod telemetry;
 pub use style::PillStyle;
 pub use tracing;
 
+pub mod color;
+pub mod math;
+pub mod utils;
+
 // -----------------------------------------------------------------------------
 // Flat re-exports: tracing, metrics, and tracy-client
 // -----------------------------------------------------------------------------

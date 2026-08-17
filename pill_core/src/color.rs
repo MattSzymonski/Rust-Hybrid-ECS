@@ -1,3 +1,18 @@
+//! Color palettes for debug visualization.
+//!
+//! # Responsibilities
+//!
+//! - Provide a fixed, visually distinct palette for coloring entities.
+//! - Generate evenly spaced HSL-derived palettes.
+//!
+//! # Design
+//!
+//! Pure functions returning `(f32, f32, f32)` RGB tuples in the 0.0-1.0
+//! range. No engine state or external dependencies.
+
+/// A fixed palette of visually distinct RGB colors, for debug rendering.
+///
+/// Each entry is an `(r, g, b)` tuple in the 0.0-1.0 range.
 pub const DISTINCT_COLOR_PALETTE: &[(f32, f32, f32)] = &[
     (0.894, 0.102, 0.110), // Red
     (0.215, 0.494, 0.721), // Blue
@@ -21,6 +36,16 @@ pub const DISTINCT_COLOR_PALETTE: &[(f32, f32, f32)] = &[
     (0.125, 0.694, 0.298), // Bright green
 ];
 
+/// Generate 100 evenly spaced HSL-derived colors.
+///
+/// # Examples
+///
+/// ```
+/// use pill_core::color::generate_color_palette;
+///
+/// let palette = generate_color_palette();
+/// assert_eq!(palette.len(), 100);
+/// ```
 pub fn generate_color_palette() -> Vec<(f32, f32, f32)> {
     (0..100)
         .map(|i| {
@@ -30,7 +55,21 @@ pub fn generate_color_palette() -> Vec<(f32, f32, f32)> {
         .collect()
 }
 
-// Convert HSL to RGB
+/// Convert a hue/saturation/lightness triple (HLS) to an RGB triple.
+///
+/// `h` is expected in the 0.0-1.0 range; all channels come back in the
+/// 0.0-1.0 range.
+///
+/// # Examples
+///
+/// ```
+/// use pill_core::color::hsl_to_rgb;
+///
+/// let color = hsl_to_rgb(0.5, 0.6, 0.5);
+/// assert!(color.0 >= 0.0 && color.0 <= 1.0);
+/// assert!(color.1 >= 0.0 && color.1 <= 1.0);
+/// assert!(color.2 >= 0.0 && color.2 <= 1.0);
+/// ```
 pub fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
     let a = s * l.min(1.0 - l);
     let f = |n: f32| {

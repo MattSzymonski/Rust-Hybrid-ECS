@@ -115,6 +115,8 @@ impl EngineMetricsRecorder {
         values
     }
 
+    /// Directly record one gauge value into the store (test helper).
+    #[cfg(test)]
     fn record_gauge(&self, name: &str, value: f64) {
         self.inner
             .store
@@ -125,6 +127,8 @@ impl EngineMetricsRecorder {
         self.inner.emit_tracy_plot(name, value);
     }
 
+    /// Directly record one counter value into the store (test helper).
+    #[cfg(test)]
     fn record_counter(&self, name: &str, value: u64) {
         self.inner
             .store
@@ -133,6 +137,8 @@ impl EngineMetricsRecorder {
             .insert(name.to_owned(), MetricSnapshot::Counter(value));
     }
 
+    /// Directly record one histogram sample into the store (test helper).
+    #[cfg(test)]
     fn record_histogram(&self, name: &str, value: f64) {
         self.inner
             .store
@@ -303,6 +309,10 @@ impl metrics::HistogramFn for DelegatingHistogram {
         }
     }
     fn record_many(&self, value: f64, count: usize) {
+        // Without the `tracy` feature, the recent-value store keeps only the
+        // latest sample, so `count` is intentionally unused.
+        #[cfg(not(feature = "tracy"))]
+        let _ = count;
         if let Some(inner) = self.inner.upgrade() {
             inner
                 .store

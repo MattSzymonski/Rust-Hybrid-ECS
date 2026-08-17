@@ -231,6 +231,11 @@ mod enabled {
     /// such a layer the span is a no-op. This is the single CPU-zone API.
     #[must_use = "zone closes on drop - bind to a variable"]
     pub struct TracyZone {
+        // Holds the entered tracing span for the zone's lifetime (RAII exit).
+        // Under `profiling-minimal` no method reads it because `text` /
+        // `text_lazy` are compiled out, but dropping it early would close the
+        // zone, so the field must stay.
+        #[cfg_attr(not(feature = "profiling"), allow(dead_code))]
         span: Option<tracing::span::EnteredSpan>,
     }
 

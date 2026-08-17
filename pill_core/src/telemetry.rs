@@ -356,6 +356,14 @@ type FileLayer = tracing_subscriber::filter::Filtered<
     TerminalStack,
 >;
 
+/// The three artifacts produced when installing the optional file lane:
+/// the layer itself, the non-blocking writer guard, and the reload handle.
+type FileLaneArtifacts = (
+    Option<FileLayer>,
+    Option<Arc<tracing_appender::non_blocking::WorkerGuard>>,
+    Option<reload::Handle<EnvFilter, TerminalStack>>,
+);
+
 /// Build and install the engine telemetry subscriber stack.
 ///
 /// The terminal and file lanes are filtered independently and both are
@@ -450,11 +458,7 @@ impl TelemetryBuilder {
 
         // The file lane is optional; `Option<L>` implements `Layer`, so a
         // missing file lane is simply a no-op layer in the same position.
-        let (file_layer, file_guard, file_handle): (
-            Option<FileLayer>,
-            Option<Arc<tracing_appender::non_blocking::WorkerGuard>>,
-            Option<reload::Handle<EnvFilter, TerminalStack>>,
-        ) = match self.file_logging {
+        let (file_layer, file_guard, file_handle): FileLaneArtifacts = match self.file_logging {
             Some((file_config, directory)) => {
                 let file_filter = file_config.build_env_filter()?;
                 let (file_reload, file_handle) =

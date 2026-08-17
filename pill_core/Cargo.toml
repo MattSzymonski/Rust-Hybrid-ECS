@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+glam = { version = "0.33", features = ["serde"] }
 pill_core_macros = { path = "../pill_core_macros" }
 libloading = "0.8"
 notify = "6"
