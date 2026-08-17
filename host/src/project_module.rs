@@ -1,4 +1,4 @@
-//! Lifecycle management for the active native or managed game module.
+//! Lifecycle management for the active native or managed project module.
 //!
 //! # Responsibilities
 //!
@@ -9,7 +9,7 @@
 //!
 //! # Design
 //!
-//! The host keeps exactly one [`LoadedGame`] alive at a time. Native backends
+//! The host keeps exactly one [`LoadedProject`] alive at a time. Native backends
 //! are reloaded transactionally by [`reload_native`]: the previous DLL stays
 //! mapped in a bounded graveyard while changed persist schemas migrate, so
 //! engine-owned pointers into retired code remain valid. Managed backends
@@ -27,10 +27,10 @@ use pill_core::{debug, error, info, warn};
 use pill_engine::{Engine, EngineApi};
 
 // Current crate
-use crate::build_runner::build_game_module;
+use crate::build_runner::build_project_module;
 use crate::csharp::CSharpRuntime;
-use crate::native_library::GameLibrary;
-use crate::{GameModuleBackend, GameModuleConfig};
+use crate::native_library::ProjectLibrary;
+use crate::{ProjectModuleBackend, ProjectModuleConfig};
 
 // =============================================================================
 // Constants
@@ -44,7 +44,7 @@ use crate::{GameModuleBackend, GameModuleConfig};
 const MAX_GRAVEYARD_GENERATIONS: usize = 2;
 
 // =============================================================================
-// LoadedGame
+// LoadedProject
 // =============================================================================
 
 /// The backend-specific state kept alive by the host loop.
@@ -52,49 +52,49 @@ const MAX_GRAVEYARD_GENERATIONS: usize = 2;
 /// The enum lets the host hold either a mapped native library or a managed
 /// runtime behind one interface; the variant in use is fixed at startup and
 /// only changes across a full restart.
-pub(crate) enum LoadedGame {
+pub(crate) enum LoadedProject {
     /// A mapped native module plus any retired DLLs that must stay mapped.
     Native {
-        current: GameLibrary,
+        current: ProjectLibrary,
         /// Old DLLs intentionally remain mapped because engine-owned function
         /// pointers and vtables may still refer to their code.
-        old_libraries: Vec<GameLibrary>,
+        old_libraries: Vec<ProjectLibrary>,
     },
-    /// A collectible managed runtime hosting the C# game assembly.
+    /// A collectible managed runtime hosting the C# project assembly.
     CSharp(CSharpRuntime),
 }
 
-impl LoadedGame {
-    /// Build and initialize the configured game backend.
+impl LoadedProject {
+    /// Build and initialize the configured project backend.
     ///
     /// # Errors
     ///
     /// Returns `HostError` when the module fails to compile, when the native
-    /// library cannot be loaded, or when the module's `game_init` reports a
+    /// library cannot be loaded, or when the module's `project_init` reports a
     /// non-zero initialization status.
     pub(crate) fn start(
         engine: &mut Engine,
         engine_api: &EngineApi,
         workspace_root: &Path,
-        config: &GameModuleConfig,
+        config: &ProjectModuleConfig,
     ) -> Result<Self, HostError> {
         // Step 1: Build the module through the shared command runner.
         // Build before branching so both backends use the same command runner,
         // diagnostics, output validation, and initial failure behavior.
-        let output_path = build_game_module(workspace_root, config, None)?;
+        let output_path = build_project_module(workspace_root, config, None)?;
 
         // Step 2: Initialize the backend-specific runtime.
         match &config.backend {
-            GameModuleBackend::NativeLibrary { .. } => {
+            ProjectModuleBackend::NativeLibrary { .. } => {
                 // Native build outputs cannot be loaded in place on Windows:
                 // the OS locks a mapped DLL. Load a uniquely named copy so the
                 // next compilation remains free to replace the original.
-                let library = GameLibrary::load_copy(&output_path, workspace_root)?;
+                let library = ProjectLibrary::load_copy(&output_path, workspace_root)?;
 
                 // Native modules register their components and systems through
                 // the stable EngineApi table before the first frame is run.
                 // A non-zero status means the module failed to initialize.
-                let status = library.call_game_init(engine_api);
+                let status = library.call_project_init(engine_api);
                 if status != 0 {
                     return Err(LibraryError::InitializationFailed { status }.into());
                 }
@@ -105,7 +105,7 @@ impl LoadedGame {
             }
             // The managed runtime performs assembly discovery, component
             // registration, startup commands, and system registration itself.
-            GameModuleBackend::CSharp(config) => Ok(Self::CSharp(CSharpRuntime::start(
+            ProjectModuleBackend::CSharp(config) => Ok(Self::CSharp(CSharpRuntime::start(
                 engine,
                 workspace_root,
                 config,
@@ -123,7 +123,7 @@ impl LoadedGame {
         engine: &mut Engine,
         engine_api: &EngineApi,
         workspace_root: &Path,
-        config: &GameModuleConfig,
+        config: &ProjectModuleConfig,
         cancel_flag: Option<(&AtomicU64, u64)>,
     ) {
         match self {
@@ -145,7 +145,7 @@ impl LoadedGame {
             // managed loader validates the rebuilt assembly's component
             // manifest and system signatures before swapping; poll_reload
             // reports the outcome and logs any rejection.
-            Self::CSharp(runtime) => match build_game_module(workspace_root, config, cancel_flag) {
+            Self::CSharp(runtime) => match build_project_module(workspace_root, config, cancel_flag) {
                 Ok(_) => {
                     info!(
                         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -157,7 +157,7 @@ impl LoadedGame {
                     error!(
                         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                         error = %error,
-                        "C# build failed; keeping the currently loaded C# game assembly"
+                        "C# build failed; keeping the currently loaded C# project assembly"
                     );
                 }
             },
@@ -179,7 +179,7 @@ impl LoadedGame {
         // C# gameplay is represented entirely by registered ECS systems. Only
         // native modules retain the legacy explicit per-frame callback.
         if let Self::Native { current, .. } = self {
-            current.call_game_update(engine_api);
+            current.call_project_update(engine_api);
         }
     }
 }
@@ -191,24 +191,24 @@ impl LoadedGame {
 /// Reload one native generation and migrate components whose persisted schema
 /// changed across the module boundary.
 fn reload_native(
-    current: &mut GameLibrary,
-    old_libraries: &mut Vec<GameLibrary>,
+    current: &mut ProjectLibrary,
+    old_libraries: &mut Vec<ProjectLibrary>,
     engine: &mut Engine,
     engine_api: &EngineApi,
     workspace_root: &Path,
-    config: &GameModuleConfig,
+    config: &ProjectModuleConfig,
     cancel_flag: Option<(&AtomicU64, u64)>,
 ) {
     // Step 1: Compile the new module before touching engine state.
     // Complete compilation before mutating engine state. A compiler error can
     // therefore never remove the systems belonging to the working generation.
-    let output_path = match build_game_module(workspace_root, config, cancel_flag) {
+    let output_path = match build_project_module(workspace_root, config, cancel_flag) {
         Ok(path) => path,
         Err(error) => {
             error!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 error = %error,
-                "build failed; keeping the old game module"
+                "build failed; keeping the old project module"
             );
             return;
         }
@@ -217,13 +217,13 @@ fn reload_native(
     // Step 2: Load and validate the replacement library transactionally.
     // Loading and symbol validation are also transactional. Keep `current`
     // untouched until a complete replacement library is ready to initialize.
-    let new_library = match GameLibrary::load_copy(&output_path, workspace_root) {
+    let new_library = match ProjectLibrary::load_copy(&output_path, workspace_root) {
         Ok(library) => library,
         Err(error) => {
             error!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 error = %error,
-                "failed to load the new library; keeping the old game module"
+                "failed to load the new library; keeping the old project module"
             );
             return;
         }
@@ -232,13 +232,13 @@ fn reload_native(
     // Step 3: Capture old schemas, clear old systems, and initialize the new
     // generation while both DLLs remain mapped.
     // Capture the old generation's persistence functions and schemas while its
-    // DLL is still mapped. Migration may need those functions after game_init
+    // DLL is still mapped. Migration may need those functions after project_init
     // has registered the replacement generation's component definitions.
     let previous_metadata_by_name = engine.world().capture_persist_type_metadata();
     let previous_manifest = engine.world().persist_type_manifest();
 
     // Registered native system closures can point into the old DLL. Remove
-    // them before game_init installs closures from the replacement module.
+    // them before project_init installs closures from the replacement module.
     debug!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
         "reload step 1/4: clearing old systems"
@@ -246,19 +246,19 @@ fn reload_native(
     engine.clear_systems();
     debug!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-        "reload step 2/4: calling game_init on the new module"
+        "reload step 2/4: calling project_init on the new module"
     );
-    if new_library.call_game_init(engine_api) != 0 {
+    if new_library.call_project_init(engine_api) != 0 {
         // The new generation failed to register itself. Roll the engine back
-        // to the previous module: game_init must be idempotent, re-registering
+        // to the previous module: project_init must be idempotent, re-registering
         // the same components and systems and only filling entities up to a
         // target count.
         error!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-            "new game module failed to initialize; rolling back to the previous generation"
+            "new project module failed to initialize; rolling back to the previous generation"
         );
         engine.clear_systems();
-        let rollback_status = current.call_game_init(engine_api);
+        let rollback_status = current.call_project_init(engine_api);
         if rollback_status != 0 {
             error!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,

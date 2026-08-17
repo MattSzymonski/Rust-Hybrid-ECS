@@ -1,8 +1,8 @@
-// Executable regression tests for the C# ECS runtime and current C# game.
+// Executable regression tests for the C# ECS runtime and current C# project.
 //
 // Responsibilities:
 // - Verifies scheduler access derived from every supported query shape.
-// - Validates the actual bouncing-ball system discovered from game_cs.dll.
+// - Validates the actual bouncing-ball system discovered from project_cs.dll.
 // - Guards native/managed component sizes and field offsets.
 // - Checks invalid managed system signatures are rejected before registration.
 
@@ -282,19 +282,19 @@ internal static class Program
     {
         try
         {
-            Test("current game discovers native and dynamic component systems", () =>
+            Test("current project discovers native and dynamic component systems", () =>
             {
-                var systems = GameHost.DiscoverSystems(typeof(BallPhysicsSystem).Assembly);
-                Equal(systems.Length, 2, "unexpected game system count");
+                var systems = ProjectHost.DiscoverSystems(typeof(BallPhysicsSystem).Assembly);
+                Equal(systems.Length, 2, "unexpected project system count");
                 Assert(systems.Any(system => system.Name == "TracyLive.BallPhysicsSystem.Run"),
                     "ball physics system was not discovered");
                 Assert(systems.Any(system => system.Name == "TracyLive.BallTagSystem.Observe"),
                     "dynamic component system was not discovered");
             });
 
-            Test("component manifest separates runtime mirrors from game components", () =>
+            Test("component manifest separates runtime mirrors from project components", () =>
             {
-                var systems = GameHost.DiscoverSystems(typeof(BallPhysicsSystem).Assembly);
+                var systems = ProjectHost.DiscoverSystems(typeof(BallPhysicsSystem).Assembly);
                 using var json = System.Text.Json.JsonDocument.Parse(
                     ComponentManifestBuilder.Build(systems));
                 var components = json.RootElement.EnumerateArray().ToArray();
@@ -312,9 +312,9 @@ internal static class Program
                 Assert(sprite.GetProperty("shared").GetBoolean(),
                     "runtime Sprite mirror must be shared");
                 Assert(!physics.GetProperty("shared").GetBoolean(),
-                    "game-owned PhysicsState must be dynamic");
+                    "project-owned PhysicsState must be dynamic");
                 Assert(!tag.GetProperty("shared").GetBoolean(),
-                    "game-owned BallTag must be dynamic");
+                    "project-owned BallTag must be dynamic");
                 Equal(tag.GetProperty("size").GetInt32(), 4, "BallTag size mismatch");
                 Equal(tag.GetProperty("alignment").GetInt32(), 4,
                     "BallTag alignment mismatch");
@@ -322,21 +322,21 @@ internal static class Program
                     "BallTag field schema mismatch");
             });
 
-            Test("manifest includes game structs used only by commands", () =>
+            Test("manifest includes project structs used only by commands", () =>
             {
                 using var json = System.Text.Json.JsonDocument.Parse(
                     ComponentManifestBuilder.Build([], typeof(CommandOnlyComponent).Assembly));
                 Assert(json.RootElement.EnumerateArray().Any(component =>
                         component.GetProperty("full_name").GetString() ==
                         typeof(CommandOnlyComponent).FullName),
-                    "command-only game component was omitted from the manifest");
+                    "command-only project component was omitted from the manifest");
             });
 
             Test("ball physics declares PhysicsState, Position, and Sprite writes", () =>
             {
                 var method = typeof(BallPhysicsSystem).GetMethod(nameof(BallPhysicsSystem.Run))
                     ?? throw new InvalidOperationException("BallPhysicsSystem.Run is missing");
-                var system = GameHost.CreateSystem(method);
+                var system = ProjectHost.CreateSystem(method);
 
                 Equal(system.Accesses.Length, 3, "unexpected ball access count");
                 Assert(system.Accesses.All(access => access.Mode == 1),
@@ -357,20 +357,20 @@ internal static class Program
 
             Test("managed Commands parameter is reflected into system metadata", () =>
             {
-                var commandsOnly = GameHost.CreateSystem(Method(nameof(TestSystems.CommandsOnly)));
+                var commandsOnly = ProjectHost.CreateSystem(Method(nameof(TestSystems.CommandsOnly)));
                 Assert(commandsOnly.UsesCommands, "Commands-only system did not declare commands");
                 Equal(commandsOnly.Accesses.Length, 0, "Commands-only system has component access");
-                var mixed = GameHost.CreateSystem(Method(nameof(TestSystems.QueryAndCommands)));
+                var mixed = ProjectHost.CreateSystem(Method(nameof(TestSystems.QueryAndCommands)));
                 Assert(mixed.UsesCommands, "query plus Commands did not declare commands");
                 Equal(mixed.Accesses.Length, 1, "query plus Commands lost query access");
             });
 
-            Test("game startup queues exactly 100 fully described balls", () =>
+            Test("project startup queues exactly 100 fully described balls", () =>
             {
                 MockNativeWorld.ResetCommands();
                 EngineApi api = MockNativeWorld.Api();
                 Engine.Bind(&api);
-                var startups = GameHost.DiscoverStartups(typeof(GameStartup).Assembly);
+                var startups = ProjectHost.DiscoverStartups(typeof(ProjectStartup).Assembly);
                 Equal(startups.Length, 1, "unexpected startup count");
                 startups[0].Run();
                 Equal(MockNativeWorld.QueuedCreates, 100, "startup create count mismatch");
@@ -400,12 +400,12 @@ internal static class Program
                 MockNativeWorld.ResetCommands();
                 EngineApi api = MockNativeWorld.Api();
                 Engine.Bind(&api);
-                GameHost.CreateSystem(Method(nameof(TestSystems.DespawnSystem))).Run();
+                ProjectHost.CreateSystem(Method(nameof(TestSystems.DespawnSystem))).Run();
                 Equal(MockNativeWorld.QueuedDestroys, 1,
                     "despawn system did not enqueue destruction");
             });
 
-            Test("game and shared component layouts match their manifests", () =>
+            Test("project and shared component layouts match their manifests", () =>
             {
                 Equal(Marshal.SizeOf<PhysicsState>(), 28, "PhysicsState size mismatch");
                 Equal(Marshal.OffsetOf<PhysicsState>(nameof(PhysicsState.DeltaTime)).ToInt32(), 0,
@@ -438,7 +438,7 @@ internal static class Program
 
             Test("single-term query reports one write", () =>
             {
-                var system = GameHost.CreateSystem(Method(nameof(TestSystems.SingleWriter)));
+                var system = ProjectHost.CreateSystem(Method(nameof(TestSystems.SingleWriter)));
                 Equal(system.Accesses.Length, 1, "unexpected access count");
                 Equal(system.Accesses[0],
                     new ManagedAccess(Engine.ComponentKey(typeof(TestPosition)), Engine.ComponentKeyHigh(typeof(TestPosition)), 1),
@@ -447,7 +447,7 @@ internal static class Program
 
             Test("composed query reports write then read", () =>
             {
-                var system = GameHost.CreateSystem(Method(nameof(TestSystems.MixedAccess)));
+                var system = ProjectHost.CreateSystem(Method(nameof(TestSystems.MixedAccess)));
                 Equal(system.Accesses.Length, 2, "unexpected access count");
                 Equal(system.Accesses[0],
                     new ManagedAccess(Engine.ComponentKey(typeof(TestPosition)), Engine.ComponentKeyHigh(typeof(TestPosition)), 1),
@@ -459,7 +459,7 @@ internal static class Program
 
             Test("three composed terms report writes in declaration order", () =>
             {
-                var system = GameHost.CreateSystem(Method(nameof(TestSystems.TripleWriter)));
+                var system = ProjectHost.CreateSystem(Method(nameof(TestSystems.TripleWriter)));
                 Equal(system.Accesses.Length, 3, "unexpected access count");
                 Equal(system.Accesses[0].ComponentKey, Engine.ComponentKey(typeof(TestPosition)),
                     "wrong first key");
@@ -473,7 +473,7 @@ internal static class Program
 
             Test("entity and optional terms produce exact scheduler access", () =>
             {
-                var system = GameHost.CreateSystem(Method(nameof(TestSystems.OptionalAndEntity)));
+                var system = ProjectHost.CreateSystem(Method(nameof(TestSystems.OptionalAndEntity)));
                 Equal(system.Accesses.Length, 2, "EntityTerm must not create scheduler access");
                 Equal(system.Accesses[0],
                     new ManagedAccess(Engine.ComponentKey(typeof(TestPosition)), Engine.ComponentKeyHigh(typeof(TestPosition)), 0),
@@ -522,7 +522,7 @@ internal static class Program
 
             Test("eight-term query exports every scheduler access in order", () =>
             {
-                var system = GameHost.CreateSystem(Method(nameof(TestSystems.EightTerms)));
+                var system = ProjectHost.CreateSystem(Method(nameof(TestSystems.EightTerms)));
                 Type[] componentTypes =
                 [
                     typeof(TestPosition), typeof(TestVelocity), typeof(TestHealth),
@@ -729,7 +729,7 @@ internal static class Program
             Test("compiled runner supplies its query parameter", () =>
             {
                 TestSystems.WasRun = false;
-                GameHost.CreateSystem(Method(nameof(TestSystems.Runner))).Run();
+                ProjectHost.CreateSystem(Method(nameof(TestSystems.Runner))).Run();
                 Assert(TestSystems.WasRun, "compiled runner did not invoke the method");
             });
 
@@ -739,45 +739,45 @@ internal static class Program
                     Engine.ComponentKey(typeof(Position)), "Position key is unstable");
                 Assert(Engine.ComponentKey(typeof(PhysicsState)) !=
                        Engine.ComponentKey(typeof(Position)),
-                    "different current game components produced the same key");
+                    "different current project components produced the same key");
                 Assert(Engine.ComponentKey(typeof(Position)) !=
                        Engine.ComponentKey(typeof(Sprite)),
-                    "different current game components produced the same key");
+                    "different current project components produced the same key");
             });
 
             Test("duplicate write/read component is rejected", () =>
                 Throws<InvalidOperationException>(
-                    () => GameHost.CreateSystem(Method(nameof(TestSystems.DuplicateReadWrite))),
+                    () => ProjectHost.CreateSystem(Method(nameof(TestSystems.DuplicateReadWrite))),
                     "duplicate write/read component should be rejected"));
 
             Test("duplicate component in a three-term query is rejected", () =>
                 Throws<InvalidOperationException>(
-                    () => GameHost.CreateSystem(Method(nameof(TestSystems.DuplicateTriple))),
+                    () => ProjectHost.CreateSystem(Method(nameof(TestSystems.DuplicateTriple))),
                     "duplicate component in a three-term query should be rejected"));
 
             Test("duplicate entity term is rejected", () =>
                 Throws<InvalidOperationException>(
-                    () => GameHost.CreateSystem(Method(nameof(TestSystems.DuplicateEntity))),
+                    () => ProjectHost.CreateSystem(Method(nameof(TestSystems.DuplicateEntity))),
                     "duplicate EntityTerm should be rejected"));
 
             Test("zero-parameter system is rejected", () =>
                 Throws<InvalidOperationException>(
-                    () => GameHost.CreateSystem(Method(nameof(TestSystems.NoParameters))),
+                    () => ProjectHost.CreateSystem(Method(nameof(TestSystems.NoParameters))),
                     "zero-parameter system should be rejected"));
 
             Test("non-void system is rejected", () =>
                 Throws<InvalidOperationException>(
-                    () => GameHost.CreateSystem(Method(nameof(TestSystems.NonVoid))),
+                    () => ProjectHost.CreateSystem(Method(nameof(TestSystems.NonVoid))),
                     "non-void system should be rejected"));
 
             Test("unsupported parameter is rejected", () =>
                 Throws<InvalidOperationException>(
-                    () => GameHost.CreateSystem(Method(nameof(TestSystems.Unsupported))),
+                    () => ProjectHost.CreateSystem(Method(nameof(TestSystems.Unsupported))),
                     "unsupported parameter should be rejected"));
 
             Test("invalid managed component layout is rejected before registration", () =>
             {
-                var system = GameHost.CreateSystem(Method(nameof(TestSystems.InvalidLayout)));
+                var system = ProjectHost.CreateSystem(Method(nameof(TestSystems.InvalidLayout)));
                 Throws<InvalidOperationException>(
                     () => ComponentManifestBuilder.Build([system]),
                     "bool fields must be rejected from native component manifests");
@@ -785,11 +785,11 @@ internal static class Program
 
             Test("loader interop runs a discovered system and clears its error slot", () =>
             {
-                var gameAssembly = typeof(BallPhysicsSystem).Assembly;
+                var projectAssembly = typeof(BallPhysicsSystem).Assembly;
                 Environment.SetEnvironmentVariable(
-                    "ECS_CSHARP_GAME_DIR", Path.GetDirectoryName(gameAssembly.Location));
+                    "ECS_CSHARP_PROJECT_DIR", Path.GetDirectoryName(projectAssembly.Location));
                 Environment.SetEnvironmentVariable(
-                    "ECS_CSHARP_GAME_ASSEMBLY", Path.GetFileName(gameAssembly.Location));
+                    "ECS_CSHARP_PROJECT_ASSEMBLY", Path.GetFileName(projectAssembly.Location));
                 EngineApi api = MockNativeWorld.Api();
                 Engine.Bind(&api);
 

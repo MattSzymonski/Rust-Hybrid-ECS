@@ -2,7 +2,7 @@ using System.Diagnostics;
 
 namespace TracyLive;
 
-public static class GameStartup
+public static class ProjectStartup
 {
     [EcsStartup]
     public static void Start(Commands commands)
@@ -121,7 +121,7 @@ public static class BallTagSystem
     public static void Observe(Query<Read<BallTag>> query)
     {
         // Declaring and iterating this type exercises automatic registration
-        // of a component owned entirely by game_cs.
+        // of a component owned entirely by project_cs.
         foreach (var row in query)
             _ = row.Read<BallTag>().Kind;
     }

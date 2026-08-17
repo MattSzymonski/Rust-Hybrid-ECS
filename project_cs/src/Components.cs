@@ -14,7 +14,7 @@ public struct PhysicsState
     public byte Active;
 }
 
-// Game-owned component: the native host discovers and registers this layout
+// Project-owned component: the native host discovers and registers this layout
 // from the managed component manifest without a Rust mirror or match arm.
 [StructLayout(LayoutKind.Sequential)]
 public struct BallTag

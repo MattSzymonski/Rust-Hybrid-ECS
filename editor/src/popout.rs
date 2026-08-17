@@ -82,7 +82,7 @@ pub(crate) fn open_panel_window(
 
     if panel == PanelKind::Scene {
         // The renderer remains owned by the same host; only its native surface
-        // is replaced. The ECS world and hot-loaded game are not recreated.
+        // is replaced. The ECS world and hot-loaded project are not recreated.
         config = config
             .with_on_window(move |window, _| {
                 if let Err(error) = editor.attach_detached_scene(window) {

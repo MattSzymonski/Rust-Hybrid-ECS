@@ -106,7 +106,7 @@ test_launcher_create() {
     echo -e "${BOLD}${CYAN}===============================================================================${NC}"
     echo "(2/9) Create action"
 
-    # `PillLauncher create -n MyGame` - Creates ./MyGame/ from template,
+    # `PillLauncher create -n MyProject` - Creates ./MyProject/ from template,
     #   rewrites Cargo.toml and config.ini with project name + absolute engine paths
     local project_directory="$test_workspace_root/CreateTest"
     assert_ok "create project" create -n CreateTest -p "$test_workspace_root"
@@ -129,7 +129,7 @@ test_launcher_create() {
     # `PillLauncher create` (missing `-n`) - Error: `--name <name> is required`
     assert_fail "create without --name" "name" create -p "$test_workspace_root"
 
-    # `PillLauncher create -n MyGame -p ../my_projects` - Creates in custom path
+    # `PillLauncher create -n MyProject -p ../my_projects` - Creates in custom path
     assert_ok "create with short flags" create -n CreateTest_ShortFlags -p "$test_workspace_root"
 }
 
@@ -435,16 +435,16 @@ test_launcher_run() {
     fi
 
     # `PillLauncher run -p ./examples/cube -- --help` - Passes `--help` to the running project executable
-    # The project may not support --help (game loop runs until timeout); we only verify the launcher accepts `--`.
+    # The project may not support --help (project loop runs until timeout); we only verify the launcher accepts `--`.
     local passthrough_exit_code=0
     timeout 5s "$pill_launcher_bin" run -p "$project_directory" -c debug -- --help > /dev/null 2>&1 || passthrough_exit_code=$?
     if [ "$passthrough_exit_code" -eq 0 ] || [ "$passthrough_exit_code" -eq 124 ]; then
         report_pass "run with passthrough arguments"
     else
-        report_skip "run passthrough" "exit $passthrough_exit_code (game may not support --help)"
+        report_skip "run passthrough" "exit $passthrough_exit_code (project may not support --help)"
     fi
 
-    # Clean up any lingering game windows / dev servers
+    # Clean up any lingering project windows / dev servers
     taskkill //F //IM RunTest.exe > /dev/null 2>&1 || true
     kill_server_on_port 8080
     kill_server_on_port 9090
@@ -509,7 +509,7 @@ test_launcher_hot_reload() {
         report_skip "hot-reload survived" "process died (may be normal on headless CI)"
     fi
 
-    # Clean up - kill the launcher and any spawned game processes
+    # Clean up - kill the launcher and any spawned project processes
     kill "$launcher_pid" 2>/dev/null || true
     wait "$launcher_pid" 2>/dev/null || true
     taskkill //F //IM HotReloadTest.exe > /dev/null 2>&1 || true

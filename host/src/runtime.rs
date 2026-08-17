@@ -9,9 +9,9 @@
 //! # Design
 //!
 //! This module contains the stable API used by `standalone`, `editor`, and
-//! other host binaries. [`Host`] bundles the engine and game module for the
+//! other host binaries. [`Host`] bundles the engine and project module for the
 //! headless path, [`RenderingHost`] adds a renderer for windowed frontends,
-//! and backend-specific loading stays behind [`LoadedGame`].
+//! and backend-specific loading stays behind [`LoadedProject`].
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -30,10 +30,10 @@ use pill_engine::{Engine, EngineApi};
 use pill_engine::{RenderViewport, Renderer, RendererError, RendererWindow, VirtualResolution};
 
 // Current crate
-use crate::game_module::LoadedGame;
+use crate::project_module::LoadedProject;
 use crate::native_library::cleanup_temporary_files;
 use crate::watcher::spawn_file_watcher;
-use crate::{GameModuleBackend, GameModuleConfig};
+use crate::{ProjectModuleBackend, ProjectModuleConfig};
 
 // =============================================================================
 // Constants
@@ -52,12 +52,12 @@ const FRAME_ERROR_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 /// same engine lifetime and hot-reload behavior through [`run_one_frame`].
 pub struct Host {
     workspace_root: PathBuf,
-    module_config: GameModuleConfig,
+    module_config: ProjectModuleConfig,
     // Boxed before EngineApi is created so its raw engine pointer remains
     // stable even if Host is moved by a caller.
     engine: Box<Engine>,
     engine_api: EngineApi,
-    loaded_game: LoadedGame,
+    loaded_project: LoadedProject,
     reload_generation: Arc<AtomicU64>,
     last_processed_generation: u64,
     last_frame_error: Option<String>,
@@ -141,7 +141,7 @@ pub struct RenderingHost {
 impl RenderingHost {
     /// Move rendering to a newly created native window surface.
     ///
-    /// The existing ECS host and game module remain alive. A replacement is
+    /// The existing ECS host and project module remain alive. A replacement is
     /// constructed before the old renderer is dropped, so initialization
     /// failure leaves the current surface untouched.
     pub fn retarget_render_window<W>(
@@ -172,7 +172,7 @@ impl RenderingHost {
         self.renderer.set_viewport(viewport);
     }
 
-    /// Map a stable game coordinate space into the current physical viewport.
+    /// Map a stable project coordinate space into the current physical viewport.
     ///
     /// Pass `None` to make logical renderer units match physical pixels again.
     pub fn set_render_virtual_resolution(&mut self, resolution: Option<VirtualResolution>) {
@@ -206,13 +206,13 @@ pub struct FrameReport {
 // Free Functions
 // =============================================================================
 
-/// Build/load the game module, create the engine, and start its source watcher.
+/// Build/load the project module, create the engine, and start its source watcher.
 ///
 /// # Errors
 ///
 /// Returns a typed [`HostError`] naming the failing subsystem: configuration,
 /// build, library loading, watcher startup, or managed backend startup.
-pub fn setup(module_config: GameModuleConfig) -> Result<Host, HostError> {
+pub fn setup(module_config: ProjectModuleConfig) -> Result<Host, HostError> {
     // Step 1: Reject inconsistent configurations before any build or load.
     module_config.validate()?;
 
@@ -226,7 +226,7 @@ pub fn setup(module_config: GameModuleConfig) -> Result<Host, HostError> {
 
     if matches!(
         module_config.backend,
-        GameModuleBackend::NativeLibrary { .. }
+        ProjectModuleBackend::NativeLibrary { .. }
     ) {
         cleanup_temporary_files(&workspace_root);
     }
@@ -238,8 +238,8 @@ pub fn setup(module_config: GameModuleConfig) -> Result<Host, HostError> {
     engine.set_parallel_execution(true);
     let engine_api = EngineApi::new(&mut engine);
 
-    // Step 4: Build and load the game module, then start its source watcher.
-    let loaded_game = LoadedGame::start(&mut engine, &engine_api, &workspace_root, &module_config)?;
+    // Step 4: Build and load the project module, then start its source watcher.
+    let loaded_project = LoadedProject::start(&mut engine, &engine_api, &workspace_root, &module_config)?;
 
     let reload_generation = Arc::new(AtomicU64::new(0));
     spawn_file_watcher(
@@ -250,7 +250,7 @@ pub fn setup(module_config: GameModuleConfig) -> Result<Host, HostError> {
 
     println!();
     println!(
-        "[host] Entering game loop. Edit {}/**/* to hot-reload.",
+        "[host] Entering project loop. Edit {}/**/* to hot-reload.",
         module_config.watch_directory
     );
     println!();
@@ -260,7 +260,7 @@ pub fn setup(module_config: GameModuleConfig) -> Result<Host, HostError> {
         module_config,
         engine,
         engine_api,
-        loaded_game,
+        loaded_project,
         reload_generation,
         last_processed_generation: 0,
         last_frame_error: None,
@@ -272,7 +272,7 @@ pub fn setup(module_config: GameModuleConfig) -> Result<Host, HostError> {
     })
 }
 
-/// Set up the engine, game module, hot reload, and renderer together.
+/// Set up the engine, project module, hot reload, and renderer together.
 ///
 /// A frontend owns its platform event loop and supplies its cloneable window
 /// handle. The engine creates exactly one surface for that window, while the
@@ -284,7 +284,7 @@ pub fn setup(module_config: GameModuleConfig) -> Result<Host, HostError> {
 /// a [`HostError`] from setup or a [`RendererError`] from surface creation.
 #[cfg(feature = "rendering")]
 pub fn setup_rendering<W>(
-    module_config: GameModuleConfig,
+    module_config: ProjectModuleConfig,
     window: W,
     width: u32,
     height: u32,
@@ -316,7 +316,7 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
             generation,
             "hot reload triggered"
         );
-        host.loaded_game.reload(
+        host.loaded_project.reload(
             &mut host.engine,
             &host.engine_api,
             &host.workspace_root,
@@ -331,7 +331,7 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
 
     // Step 2: Poll the managed loader for an assembly swap.
     // The managed loader watches the built assembly instead of source files.
-    host.loaded_game.poll_managed_reload();
+    host.loaded_project.poll_managed_reload();
 
     // Step 3: Execute one scheduler frame and report its failures.
     if let Err(errors) = host.engine.process_frame() {
@@ -355,7 +355,7 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     // Step 4: Invoke the native compatibility update after scheduler systems.
     // Managed games run entirely as scheduler systems. Native games retain
     // this compatibility update hook after their scheduled work.
-    host.loaded_game.update(&host.engine_api);
+    host.loaded_project.update(&host.engine_api);
 
     // Step 5: Track and report FPS over the three-second window.
     host.frame_count += 1;
@@ -400,7 +400,7 @@ fn record_frame_metrics(entity_count: usize, frame_time_ms: f64, fps: f64) {
 }
 
 /// Print the selected backend before any build output starts streaming.
-fn print_startup_configuration(workspace_root: &Path, module_config: &GameModuleConfig) {
+fn print_startup_configuration(workspace_root: &Path, module_config: &ProjectModuleConfig) {
     info!(
         target: telemetry_target::ENGINE,
         workspace = %workspace_root.display(),

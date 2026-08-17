@@ -76,21 +76,21 @@ impl_trait_accessible!(dyn Component; Position, Velocity, Health);
 // Resources
 // =============================================================================
 
-/// Accumulated game clock singleton resource.
+/// Accumulated project clock singleton resource.
 ///
 /// Holds the per-frame delta and total elapsed time; the target of the
 /// resource insert/get/get_mut/remove benchmarks.
 #[derive(Debug)]
-struct GameTime {
+struct ProjectTime {
     delta: f32,
     elapsed: f32,
 }
-impl Resource for GameTime {}
+impl Resource for ProjectTime {}
 
 /// Mouse position and button state singleton resource.
 ///
 /// Unused fixture type that exercises the world's ability to store multiple
-/// distinct resource types alongside `GameTime`.
+/// distinct resource types alongside `ProjectTime`.
 #[derive(Debug)]
 struct InputState {
     mouse_x: f32,
@@ -114,7 +114,7 @@ impl Resource for Config {}
 // Benchmarks
 // =============================================================================
 
-/// Inserts the same `GameTime` resource `count` times into a fresh `World` (last write wins).
+/// Inserts the same `ProjectTime` resource `count` times into a fresh `World` (last write wins).
 /// Measures HashMap insertion overhead for singleton resources, including the `Any` box allocation.
 fn bench_resource_insert(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("resource_insert");
@@ -126,12 +126,12 @@ fn bench_resource_insert(criterion: &mut Criterion) {
                 benchmark.iter(|| {
                     let mut world = World::new();
                     for i in 0..count {
-                        world.insert_resource(GameTime {
+                        world.insert_resource(ProjectTime {
                             delta: 0.016,
                             elapsed: i as f32 * 0.016,
                         });
                     }
-                    black_box(world.has_resource::<GameTime>());
+                    black_box(world.has_resource::<ProjectTime>());
                 });
             },
         );
@@ -139,7 +139,7 @@ fn bench_resource_insert(criterion: &mut Criterion) {
     group.finish();
 }
 
-/// Reads a `GameTime` resource `count` times via `world.get_resource()` in a tight loop.
+/// Reads a `ProjectTime` resource `count` times via `world.get_resource()` in a tight loop.
 /// Measures the cost of the immutable HashMap lookup + downcast path for resources.
 fn bench_resource_get(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("resource_get");
@@ -149,7 +149,7 @@ fn bench_resource_get(criterion: &mut Criterion) {
             &count,
             |benchmark, &count| {
                 let mut world = World::new();
-                world.insert_resource(GameTime {
+                world.insert_resource(ProjectTime {
                     delta: 0.016,
                     elapsed: 0.0,
                 });
@@ -157,7 +157,7 @@ fn bench_resource_get(criterion: &mut Criterion) {
                     for _ in 0..count {
                         black_box(
                             world
-                                .get_resource::<GameTime>()
+                                .get_resource::<ProjectTime>()
                                 .map(|resource| resource.elapsed),
                         );
                     }
@@ -168,7 +168,7 @@ fn bench_resource_get(criterion: &mut Criterion) {
     group.finish();
 }
 
-/// Mutates a `GameTime` resource `count` times via `world.get_resource_mut()`.
+/// Mutates a `ProjectTime` resource `count` times via `world.get_resource_mut()`.
 /// Measures the mutable borrow path including change-detection tick updates.
 fn bench_resource_get_mut(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("resource_get_mut");
@@ -178,13 +178,13 @@ fn bench_resource_get_mut(criterion: &mut Criterion) {
             &count,
             |benchmark, &count| {
                 let mut world = World::new();
-                world.insert_resource(GameTime {
+                world.insert_resource(ProjectTime {
                     delta: 0.016,
                     elapsed: 0.0,
                 });
                 benchmark.iter(|| {
                     for _ in 0..count {
-                        if let Some(time) = world.get_resource_mut::<GameTime>() {
+                        if let Some(time) = world.get_resource_mut::<ProjectTime>() {
                             time.elapsed += time.delta;
                             black_box(time.elapsed);
                         }
@@ -196,7 +196,7 @@ fn bench_resource_get_mut(criterion: &mut Criterion) {
     group.finish();
 }
 
-/// Removes and drops a `GameTime` resource from the `World`.
+/// Removes and drops a `ProjectTime` resource from the `World`.
 /// Measures HashMap removal + `Box` deallocation cost for resources.
 fn bench_resource_remove(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("resource_remove");
@@ -209,7 +209,7 @@ fn bench_resource_remove(criterion: &mut Criterion) {
                     || {
                         let mut world = World::new();
                         for i in 0..count {
-                            world.insert_resource(GameTime {
+                            world.insert_resource(ProjectTime {
                                 delta: 0.016,
                                 elapsed: i as f32,
                             });
@@ -217,7 +217,7 @@ fn bench_resource_remove(criterion: &mut Criterion) {
                         world
                     },
                     |mut world| {
-                        black_box(world.remove_resource::<GameTime>());
+                        black_box(world.remove_resource::<ProjectTime>());
                     },
                     criterion::BatchSize::LargeInput,
                 );

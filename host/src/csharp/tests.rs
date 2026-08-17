@@ -377,11 +377,11 @@ fn component_chunk_change_tracking_abi_layout_is_stable() {
 fn managed_manifest_registers_and_queries_a_new_dynamic_component() {
     let mut engine = Engine::new();
     let shared = shared_component_bindings(&mut engine);
-    let stable_id = stable_component_id("Game.CustomOnlyInCSharp");
+    let stable_id = stable_component_id("Project.CustomOnlyInCSharp");
     let manifest = serde_json::json!([{
         "stable_id_low": stable_id.0 as u64,
         "stable_id_high": (stable_id.0 >> 64) as u64,
-        "full_name": "Game.CustomOnlyInCSharp",
+        "full_name": "Project.CustomOnlyInCSharp",
         "size": 4,
         "alignment": 4,
         "schema_hash": 12345,

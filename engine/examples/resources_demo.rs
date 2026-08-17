@@ -7,19 +7,19 @@
 //! # Responsibilities
 //!
 //! - Defines two components, `Position` and `Velocity`, and two resources,
-//!   `GameTime` (delta time, elapsed) and `Score` (total points), for a
-//!   minimal game loop.
-//! - Provides four systems: `time_system` (writes `GameTime`),
+//!   `ProjectTime` (delta time, elapsed) and `Score` (total points), for a
+//!   minimal project loop.
+//! - Provides four systems: `time_system` (writes `ProjectTime`),
 //!   `movement_system` (writes `Position`, reads `Velocity`),
 //!   `scoring_system` (reads `Position`, writes `Score`), and
-//!   `display_system` (reads `Position`, `GameTime`, and `Score`).
+//!   `display_system` (reads `Position`, `ProjectTime`, and `Score`).
 //! - Registers components, resources, and systems with an `Engine`, prints the
 //!   execution graph, and runs a few frames under parallel execution.
 //!
 //! # Design
 //!
 //! The scheduler analyses each system's access pattern *before* any frame and
-//! splits batches wherever access patterns conflict: writes to `GameTime`,
+//! splits batches wherever access patterns conflict: writes to `ProjectTime`,
 //! `Position`, and `Score` force a batch split against readers of the same
 //! storage. This demo is the smallest end-to-end illustration of that
 //! resource-aware dependency graph.
@@ -65,13 +65,13 @@ impl_trait_accessible!(dyn Component; Position, Velocity);
 ///
 /// Written by `time_system` and read by `display_system` each frame.
 #[derive(Debug)]
-struct GameTime {
+struct ProjectTime {
     /// Seconds elapsed since the previous frame.
     delta: f32,
     /// Total seconds since the loop started.
     elapsed: f32,
 }
-impl Resource for GameTime {}
+impl Resource for ProjectTime {}
 
 /// Total points awarded so far, written by `scoring_system`.
 #[derive(Debug)]
@@ -82,11 +82,11 @@ impl Resource for Score {}
 // Systems
 // ============================================================================
 
-/// Update the global game time.
+/// Update the global project time.
 ///
-/// - `ResMut<GameTime>` ⇒ writes the resource (scheduler prevents parallel
-///   writes to GameTime).
-fn time_system(mut time: ResMut<GameTime>) {
+/// - `ResMut<ProjectTime>` ⇒ writes the resource (scheduler prevents parallel
+///   writes to ProjectTime).
+fn time_system(mut time: ResMut<ProjectTime>) {
     let Some(mut t) = time.get_mut() else { return };
     t.elapsed += t.delta;
 }
@@ -114,12 +114,12 @@ fn scoring_system(mut query: Query<&Position>, mut score: ResMut<Score>) {
     }
 }
 
-/// Print current game stats.
+/// Print current project stats.
 ///
 /// - `Query<(Entity, &Position)>` ⇒ reads Position (and entity id).
-/// - `Res<GameTime>`              ⇒ reads GameTime.
+/// - `Res<ProjectTime>`              ⇒ reads ProjectTime.
 /// - `Res<Score>`                 ⇒ reads Score.
-fn display_system(mut query: Query<(Entity, &Position)>, time: Res<GameTime>, score: Res<Score>) {
+fn display_system(mut query: Query<(Entity, &Position)>, time: Res<ProjectTime>, score: Res<Score>) {
     let t = time.get().unwrap();
     let s = score.get().unwrap();
 
@@ -147,7 +147,7 @@ fn main() {
     engine.world_mut().register_component::<Velocity>();
 
     // Insert the initial resources.
-    engine.world_mut().insert_resource(GameTime {
+    engine.world_mut().insert_resource(ProjectTime {
         delta: 0.016,
         elapsed: 0.0,
     });
@@ -155,13 +155,13 @@ fn main() {
 
     // Step 2: Register systems and print the scheduler's execution graph.
     // The scheduler analyses each system's access pattern *before* any frame:
-    //   time_system      ⇒ writes GameTime
+    //   time_system      ⇒ writes ProjectTime
     //   movement_system  ⇒ writes Position, reads Velocity
     //   scoring_system   ⇒ reads Position, writes Score
-    //   display_system   ⇒ reads Position, reads GameTime, reads Score
+    //   display_system   ⇒ reads Position, reads ProjectTime, reads Score
     //
     // Conflicts found by the scheduler:
-    //   • time_system (w GameTime) ⇏ display_system (r GameTime)  → batch split
+    //   • time_system (w ProjectTime) ⇏ display_system (r ProjectTime)  → batch split
     //   • movement_system (w Pos)  ⇏ scoring_system (r Pos)       → batch split
     //   • movement_system (w Pos)  ⇏ display_system (r Pos)       → batch split
     //   • scoring_system  (w Score) ⇏ display_system (r Score)     → batch split

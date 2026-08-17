@@ -1,9 +1,9 @@
-//! Language-agnostic engine API for external hot-reloadable game consumers.
+//! Language-agnostic engine API for external hot-reloadable project consumers.
 //!
 //! # Responsibilities
 //!
 //! - Defines the [`EngineApi`] struct — a C-compatible function-pointer table
-//!   passed across the FFI boundary to dynamically loaded game modules.
+//!   passed across the FFI boundary to dynamically loaded project modules.
 //! - Provides function-pointer type aliases for all API operations.
 //! - Implements the actual C-callable functions that wrap [`Engine`] methods.
 //! - Constructs a fully populated [`EngineApi`] via [`EngineApi::new`].
@@ -12,8 +12,8 @@
 //!
 //! The standalone host owns the [`Engine`](crate::Engine). It builds an
 //! [`EngineApi`] populated with function pointers that all target the same
-//! engine instance. The game module receives this struct through its exported
-//! `game_init` entry point.
+//! engine instance. The project module receives this struct through its exported
+//! `project_init` entry point.
 //!
 //! ## Two consumption paths
 //!
@@ -23,7 +23,7 @@
 //! | C / C++ / Zig     | Passes `engine_handle` to every function pointer in the table. Never touches Rust types. |
 //!
 //! This dual design avoids forcing a lowest-common-denominator C API on Rust
-//! consumers while still enabling future non-Rust game modules.
+//! consumers while still enabling future non-Rust project modules.
 
 // Standard library
 use std::ffi::{c_char, c_void};
@@ -86,24 +86,24 @@ pub type ReserveEntitiesFn = unsafe extern "C" fn(engine: *mut c_void, capacity:
 
 /// C-compatible function-pointer table for interacting with the ECS engine.
 ///
-/// Rust game modules should cast `engine_handle` to `&mut Engine` and use
+/// Rust project modules should cast `engine_handle` to `&mut Engine` and use
 /// the full typed API. Non-Rust modules should call the function pointers,
 /// passing `engine_handle` as the first argument.
 ///
 /// # Safety
 ///
 /// All function pointers and the `engine_handle` are only valid while the
-/// host's [`Engine`](crate::Engine) lives and while the game module is loaded.
-/// The game must not store any of these pointers beyond the duration of the
-/// `game_init` / `game_update` call.
+/// host's [`Engine`](crate::Engine) lives and while the project module is loaded.
+/// The project must not store any of these pointers beyond the duration of the
+/// `project_init` / `project_update` call.
 ///
 /// # Examples
 ///
-/// **Rust game module** (full typed API):
+/// **Rust project module** (full typed API):
 ///
 /// ```ignore
 /// #[no_mangle]
-/// pub extern "C" fn game_init(api: *const EngineApi) {
+/// pub extern "C" fn project_init(api: *const EngineApi) {
 ///     let api = unsafe { &*api };
 ///     let engine: &mut Engine = unsafe { &mut *(api.engine_handle as *mut Engine) };
 ///     engine.register_component::<Position>();
@@ -111,10 +111,10 @@ pub type ReserveEntitiesFn = unsafe extern "C" fn(engine: *mut c_void, capacity:
 /// }
 /// ```
 ///
-/// **C game module** (function pointers only):
+/// **C project module** (function pointers only):
 ///
 /// ```c
-/// void game_init(const EngineApi* api) {
+/// void project_init(const EngineApi* api) {
 ///     api->register_component(api->engine_handle, "Position", 8, 4);
 ///     api->set_fps_limit(api->engine_handle, 60.0);
 /// }
@@ -219,7 +219,7 @@ unsafe extern "C" fn api_register_component(
     // SAFETY: The handle was created by `EngineApi::new` via
     // `engine as *mut Engine as *mut c_void`, so it points to a valid,
     // correctly aligned `Engine`. The host keeps the engine alive for the
-    // entire time the game module is loaded, so the engine outlives this
+    // entire time the project module is loaded, so the engine outlives this
     // call. No other reference to the engine exists during this call, so
     // the reconstructed `&mut Engine` is the only outstanding reference
     // (no overlapping `&mut` aliasing).
@@ -274,7 +274,7 @@ unsafe extern "C" fn api_register_system_raw(
     // SAFETY: The handle was created by `EngineApi::new` via
     // `engine as *mut Engine as *mut c_void`, so it points to a valid,
     // correctly aligned `Engine`. The host keeps the engine alive for the
-    // entire time the game module is loaded, so the engine outlives this
+    // entire time the project module is loaded, so the engine outlives this
     // call. No other reference to the engine exists during this call, so
     // the reconstructed `&mut Engine` is the only outstanding reference
     // (no overlapping `&mut` aliasing).
@@ -319,7 +319,7 @@ unsafe extern "C" fn api_process_frame(engine: *mut c_void) -> i32 {
     // SAFETY: The handle was created by `EngineApi::new` via
     // `engine as *mut Engine as *mut c_void`, so it points to a valid,
     // correctly aligned `Engine`. The host keeps the engine alive for the
-    // entire time the game module is loaded, so the engine outlives this
+    // entire time the project module is loaded, so the engine outlives this
     // call. No other reference to the engine exists during this call, so
     // the reconstructed `&mut Engine` is the only outstanding reference
     // (no overlapping `&mut` aliasing).
@@ -344,7 +344,7 @@ unsafe extern "C" fn api_set_fps_limit(engine: *mut c_void, frames_per_second: f
     // SAFETY: The handle was created by `EngineApi::new` via
     // `engine as *mut Engine as *mut c_void`, so it points to a valid,
     // correctly aligned `Engine`. The host keeps the engine alive for the
-    // entire time the game module is loaded, so the engine outlives this
+    // entire time the project module is loaded, so the engine outlives this
     // call. No other reference to the engine exists during this call, so
     // the reconstructed `&mut Engine` is the only outstanding reference
     // (no overlapping `&mut` aliasing).
@@ -361,7 +361,7 @@ unsafe extern "C" fn api_set_parallel_execution(engine: *mut c_void, enabled: bo
     // SAFETY: The handle was created by `EngineApi::new` via
     // `engine as *mut Engine as *mut c_void`, so it points to a valid,
     // correctly aligned `Engine`. The host keeps the engine alive for the
-    // entire time the game module is loaded, so the engine outlives this
+    // entire time the project module is loaded, so the engine outlives this
     // call. No other reference to the engine exists during this call, so
     // the reconstructed `&mut Engine` is the only outstanding reference
     // (no overlapping `&mut` aliasing).
@@ -378,7 +378,7 @@ unsafe extern "C" fn api_entity_count(engine: *mut c_void) -> u64 {
     // SAFETY: The handle was created by `EngineApi::new` via
     // `engine as *mut Engine as *mut c_void`, so it points to a valid,
     // correctly aligned `Engine`. The host keeps the engine alive for the
-    // entire time the game module is loaded, so the engine outlives this
+    // entire time the project module is loaded, so the engine outlives this
     // call. Only a shared `&Engine` is reconstructed here, so no mutable
     // aliasing is introduced; the caller must not mutate the engine
     // concurrently with this call.
@@ -395,7 +395,7 @@ unsafe extern "C" fn api_reserve_entities(engine: *mut c_void, capacity: u64) {
     // SAFETY: The handle was created by `EngineApi::new` via
     // `engine as *mut Engine as *mut c_void`, so it points to a valid,
     // correctly aligned `Engine`. The host keeps the engine alive for the
-    // entire time the game module is loaded, so the engine outlives this
+    // entire time the project module is loaded, so the engine outlives this
     // call. No other reference to the engine exists during this call, so
     // the reconstructed `&mut Engine` is the only outstanding reference
     // (no overlapping `&mut` aliasing).

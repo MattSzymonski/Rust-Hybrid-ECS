@@ -1,17 +1,17 @@
-//! Game-module configuration shared by every host frontend.
+//! Project-module configuration shared by every host frontend.
 //!
 //! # Responsibilities
 //!
-//! - Describes how a game module is built, watched, and loaded.
+//! - Describes how a project module is built, watched, and loaded.
 //! - Provides the standard Rust, C#, and integration-test configurations.
 //! - Selects a configuration from the host process environment.
 //!
 //! # Design
 //!
-//! All configuration is owned by [`GameModuleConfig`], whose `const`
+//! All configuration is owned by [`ProjectModuleConfig`], whose `const`
 //! constructors produce consistent, valid configurations for each supported
-//! backend. [`GameModuleConfig::validate`] reports the first invalid field so
-//! callers can correct it directly, and [`GameModuleConfig::from_environment`]
+//! backend. [`ProjectModuleConfig::validate`] reports the first invalid field so
+//! callers can correct it directly, and [`ProjectModuleConfig::from_environment`]
 //! keeps backend selection out of executable crates.
 
 // Current crate
@@ -21,27 +21,27 @@ use pill_core::error::ConfigError;
 // Types
 // =============================================================================
 
-/// Backend-specific output information for a hot-reloadable game module.
+/// Backend-specific output information for a hot-reloadable project module.
 ///
 /// The variant determines how the host locates and loads the built output:
 /// a native shared library or a managed assembly hosted by `csharp_runtime`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
-pub enum GameModuleBackend {
-    /// A native shared library exporting `game_init` and `game_update`.
+pub enum ProjectModuleBackend {
+    /// A native shared library exporting `project_init` and `project_update`.
     NativeLibrary {
         /// Library name without the platform prefix or suffix.
         library_name: &'static str,
         /// Output subdirectory relative to the workspace root.
         output_subdirectory: &'static str,
     },
-    /// A managed game assembly loaded through the stable `csharp_runtime` host.
+    /// A managed project assembly loaded through the stable `csharp_runtime` host.
     CSharp(CSharpModuleConfig),
 }
 
-/// Output locations and assembly names used by the managed game backend.
+/// Output locations and assembly names used by the managed project backend.
 ///
-/// The runtime assembly hosts the collectible loader; the game assembly is
+/// The runtime assembly hosts the collectible loader; the project assembly is
 /// loaded by the runtime, so both assemblies and their output directories are
 /// needed to start the managed module.
 #[non_exhaustive]
@@ -51,23 +51,23 @@ pub struct CSharpModuleConfig {
     pub runtime_assembly_name: &'static str,
     /// Output subdirectory for the runtime assembly, relative to the workspace root.
     pub runtime_output_subdirectory: &'static str,
-    /// Name of the game assembly loaded by the runtime.
-    pub game_assembly_name: &'static str,
-    /// Output subdirectory for the game assembly, relative to the workspace root.
-    pub game_output_subdirectory: &'static str,
+    /// Name of the project assembly loaded by the runtime.
+    pub project_assembly_name: &'static str,
+    /// Output subdirectory for the project assembly, relative to the workspace root.
+    pub project_output_subdirectory: &'static str,
 }
 
-/// Configuration for a hot-reloadable game module.
+/// Configuration for a hot-reloadable project module.
 ///
 /// Describes how to build the module, where to find its output, and which
 /// source directories to watch. Change the fields here to support Rust, C,
-/// C++, Zig, or any other language that produces a compatible game module.
+/// C++, Zig, or any other language that produces a compatible project module.
 ///
 /// `#[non_exhaustive]` allows new fields to be added without breaking
 /// frontends; prefer the provided constructors over struct literals.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
-pub struct GameModuleConfig {
+pub struct ProjectModuleConfig {
     /// Human-readable name used in log messages.
     pub name: &'static str,
 
@@ -78,10 +78,10 @@ pub struct GameModuleConfig {
     pub build_command: &'static [&'static str],
 
     /// How the built module is loaded and executed.
-    pub backend: GameModuleBackend,
+    pub backend: ProjectModuleBackend,
 }
 
-impl GameModuleConfig {
+impl ProjectModuleConfig {
     /// Verify that the configuration is internally consistent.
     ///
     /// Checks every field that must be non-empty and returns on the first
@@ -106,18 +106,18 @@ impl GameModuleConfig {
         Ok(())
     }
 
-    /// Default configuration for a Rust `cdylib` game module built with Cargo.
+    /// Default configuration for a Rust `cdylib` project module built with Cargo.
     ///
-    /// When the host is built with the `rendering` feature, the game module is
+    /// When the host is built with the `rendering` feature, the project module is
     /// built with the same feature so both sides share renderer components.
     #[cfg(not(feature = "rendering"))]
     pub const fn rust_default() -> Self {
         Self {
-            name: "game-rs",
-            watch_directory: "game_rs/src",
-            build_command: &["cargo", "build", "--package", "game"],
-            backend: GameModuleBackend::NativeLibrary {
-                library_name: "game",
+            name: "project-rs",
+            watch_directory: "project_rs/src",
+            build_command: &["cargo", "build", "--package", "project"],
+            backend: ProjectModuleBackend::NativeLibrary {
+                library_name: "project",
                 output_subdirectory: "target/debug",
             },
         }
@@ -127,54 +127,54 @@ impl GameModuleConfig {
     #[cfg(feature = "rendering")]
     pub const fn rust_default() -> Self {
         Self {
-            name: "game-rs",
-            watch_directory: "game_rs/src",
+            name: "project-rs",
+            watch_directory: "project_rs/src",
             build_command: &[
                 "cargo",
                 "build",
                 "--package",
-                "game",
+                "project",
                 "--features",
                 "rendering",
             ],
-            backend: GameModuleBackend::NativeLibrary {
-                library_name: "game",
+            backend: ProjectModuleBackend::NativeLibrary {
+                library_name: "project",
                 output_subdirectory: "target/debug",
             },
         }
     }
 
-    /// Default scheduler-integrated C# game loaded through `csharp_runtime`.
+    /// Default scheduler-integrated C# project loaded through `csharp_runtime`.
     pub const fn csharp_default() -> Self {
         Self {
-            name: "game-csharp",
-            watch_directory: "game_cs/src",
+            name: "project-csharp",
+            watch_directory: "project_cs/src",
             build_command: &[
                 "dotnet",
                 "build",
-                "game_cs/game_cs.csproj",
+                "project_cs/project_cs.csproj",
                 "-c",
                 "Release",
                 "--nologo",
             ],
-            backend: GameModuleBackend::CSharp(CSharpModuleConfig {
+            backend: ProjectModuleBackend::CSharp(CSharpModuleConfig {
                 runtime_assembly_name: "csharp_runtime",
                 runtime_output_subdirectory: "csharp_runtime/bin/Release/net8.0",
-                game_assembly_name: "game_cs",
-                game_output_subdirectory: "game_cs/bin/Release/net8.0",
+                project_assembly_name: "project_cs",
+                project_output_subdirectory: "project_cs/bin/Release/net8.0",
             }),
         }
     }
 
-    /// Configuration for the dedicated integration-test game crate.
-    pub const fn tests_game() -> Self {
+    /// Configuration for the dedicated integration-test project crate.
+    pub const fn tests_project() -> Self {
         Self {
-            name: "tests-game",
-            watch_directory: "tests/game/src",
-            build_command: &["cargo", "build", "--manifest-path", "tests/game/Cargo.toml"],
-            backend: GameModuleBackend::NativeLibrary {
-                library_name: "game",
-                output_subdirectory: "tests/game/target/debug",
+            name: "tests-project",
+            watch_directory: "tests/project/src",
+            build_command: &["cargo", "build", "--manifest-path", "tests/project/Cargo.toml"],
+            backend: ProjectModuleBackend::NativeLibrary {
+                library_name: "project",
+                output_subdirectory: "tests/project/target/debug",
             },
         }
     }
@@ -185,22 +185,22 @@ impl GameModuleConfig {
     /// Rust module, so typos cannot hide behind a working default.
     pub fn from_environment() -> Self {
         match std::env::var("ECS_HOT_RELOAD_MODULE") {
-            Ok(value) if value.eq_ignore_ascii_case("tests-game") => Self::tests_game(),
+            Ok(value) if value.eq_ignore_ascii_case("tests-project") => Self::tests_project(),
             Ok(value)
                 if value.eq_ignore_ascii_case("csharp")
-                    || value.eq_ignore_ascii_case("game-csharp") =>
+                    || value.eq_ignore_ascii_case("project-csharp") =>
             {
                 Self::csharp_default()
             }
             Ok(value)
-                if value.eq_ignore_ascii_case("rust") || value.eq_ignore_ascii_case("game-rs") =>
+                if value.eq_ignore_ascii_case("rust") || value.eq_ignore_ascii_case("project-rs") =>
             {
                 Self::rust_default()
             }
             Ok(value) => {
                 eprintln!(
                     "[host] Unknown ECS_HOT_RELOAD_MODULE value {value:?}; using the Rust module. \
-                     Expected one of: rust, game-rs, csharp, game-csharp, tests-game."
+                     Expected one of: rust, project-rs, csharp, project-csharp, tests-project."
                 );
                 Self::rust_default()
             }

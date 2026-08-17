@@ -1,13 +1,13 @@
 // Collectible managed gameplay loader and ECS system discovery.
 //
 // Responsibilities:
-// - Loads game assemblies without locking their build output.
+// - Loads project assemblies without locking their build output.
 // - Discovers and deterministically orders methods marked with EcsSystem.
 // - Derives scheduler access from each method's single query parameter.
 // - Reloads behavior while rejecting scheduler-signature changes.
 //
 // Design:
-// - Every game version lives in a collectible AssemblyLoadContext and is read
+// - Every project version lives in a collectible AssemblyLoadContext and is read
 //   from bytes so the compiler can replace the source DLL on Windows.
 // - Rust builds its execution graph once. A reload may replace method bodies,
 //   but names and access signatures must remain stable until host restart.
@@ -54,7 +54,7 @@ internal enum PollStatus : byte
 }
 
 // =============================================================================
-// GameHost
+// ProjectHost
 // =============================================================================
 
 /// <summary>
@@ -62,27 +62,27 @@ internal enum PollStatus : byte
 /// <see cref="EcsSystemAttribute"/>. Each method's single query parameter is
 /// both its executable iterator and the authoritative scheduler access list.
 /// </summary>
-internal sealed class GameHost
+internal sealed class ProjectHost
 {
     /// <summary>
-    /// Collectible context for one game version. Requests for csharp_runtime types
+    /// Collectible context for one project version. Requests for csharp_runtime types
     /// resolve to the already-loaded stable runtime assembly.
     /// </summary>
-    private sealed class GameContext : AssemblyLoadContext
+    private sealed class ProjectContext : AssemblyLoadContext
     {
-        public GameContext() : base(isCollectible: true) { }
+        public ProjectContext() : base(isCollectible: true) { }
 
         protected override Assembly? Load(AssemblyName assemblyName)
         {
             if (assemblyName.Name == "csharp_runtime")
-                return typeof(GameHost).Assembly;
+                return typeof(ProjectHost).Assembly;
             return null;
         }
     }
 
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(500);
     private readonly string _assemblyPath;
-    private GameContext? _context;
+    private ProjectContext? _context;
     private ManagedSystem[] _systems = [];
     private ManagedStartup[] _startups = [];
     private byte[] _componentManifest = [];
@@ -91,9 +91,9 @@ internal sealed class GameHost
     private DateTime _lastPollUtc;
 
     /// <summary>Create a loader for the configured gameplay assembly.</summary>
-    public GameHost(string assemblyPath) => _assemblyPath = assemblyPath;
+    public ProjectHost(string assemblyPath) => _assemblyPath = assemblyPath;
 
-    /// <summary>Number of systems exposed by the active game version.</summary>
+    /// <summary>Number of systems exposed by the active project version.</summary>
     public int SystemCount => _systems.Length;
     public int StartupCount => _startups.Length;
     public ReadOnlySpan<byte> ComponentManifest => _componentManifest;
@@ -113,7 +113,7 @@ internal sealed class GameHost
     public int GetAccessCount(int systemIndex) => _systems[systemIndex].Accesses.Length;
     public bool UsesCommands(int systemIndex) => _systems[systemIndex].UsesCommands;
 
-    /// <summary>Load the initial game assembly and compile its runners.</summary>
+    /// <summary>Load the initial project assembly and compile its runners.</summary>
     public void Init() => Load(isReload: false);
 
     /// <summary>Invoke a discovered system by its stable index.</summary>
@@ -136,7 +136,7 @@ internal sealed class GameHost
     }
 
     /// <summary>
-    /// Poll the game DLL timestamp and reload a newer build.
+    /// Poll the project DLL timestamp and reload a newer build.
     /// Returns the swap outcome so the Rust host can distinguish a clean
     /// behavior reload from a rejection that requires a host restart.
     /// </summary>
@@ -180,7 +180,7 @@ internal sealed class GameHost
     private void Load(bool isReload)
     {
         var bytes = ReadAllBytesWithRetry(_assemblyPath);
-        var context = new GameContext();
+        var context = new ProjectContext();
         try
         {
             Assembly assembly;

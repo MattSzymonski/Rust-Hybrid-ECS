@@ -339,7 +339,7 @@ export -f invoke_launcher
 # ---------------------------------------------------------------------------
 # assert_ok - Run a launcher command and expect exit 0
 # Usage: assert_ok "test description" <launcher args...>
-#   Example: assert_ok "create project" create -n MyGame -p /tmp
+#   Example: assert_ok "create project" create -n MyProject -p /tmp
 # ---------------------------------------------------------------------------
 assert_ok() {
     local test_description="$1"; shift

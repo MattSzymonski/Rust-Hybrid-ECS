@@ -9,12 +9,12 @@ scriptable components.
 | Feature                     | Description                                                                                                                                                    |
 | --------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Archetype storage       | Components of the same type stored contiguously (Structure-of-Arrays) for cache-friendly bulk iteration                                                        |
-| Bevy-style systems      | `fn my_system(q: Query<(&mut Transform, &Velocity)>, time: Res<GameTime>)` - parameters resolved automatically                                                 |
+| Bevy-style systems      | `fn my_system(q: Query<(&mut Transform, &Velocity)>, time: Res<ProjectTime>)` - parameters resolved automatically                                                 |
 | Automatic parallelism   | Scheduler builds a dependency graph from component/resource access patterns; systems with disjoint access run concurrently via Rayon                           |
 | Change detection        | `Changed<T>` and `Added<T>` filters skip entities whose data hasn't changed since the system last ran                                                          |
 | Deferred commands       | Structural changes (create/destroy entities, add/remove components) are queued during system execution and applied at the frame boundary - no mid-iteration UB |
 | Script components       | Components with an `update()` method called every frame with safe, deferred-command-only World access                                                          |
-| Resources               | Global singleton data (`GameTime`, `InputState`, `AssetStore`) accessed via `Res<T>` / `ResMut<T>` with scheduler-tracked access                               |
+| Resources               | Global singleton data (`ProjectTime`, `InputState`, `AssetStore`) accessed via `Res<T>` / `ResMut<T>` with scheduler-tracked access                               |
 | Deterministic iteration | Queries and scripts iterate entities in a stable, sorted order regardless of HashMap layout                                                                    |
 
 ## Quick Start
@@ -73,7 +73,7 @@ Systems declare what they need as function parameters - the engine resolves them
 ```rust
 fn example(
     mut q: Query<(&mut Transform, &Velocity), Changed<Transform>>,  // filtered query
-    time: Res<GameTime>,          // immutable resource
+    time: Res<ProjectTime>,          // immutable resource
     mut score: ResMut<Score>,     // mutable resource (change-tracked)
     mut commands: Commands,       // deferred entity operations
 ) {
@@ -100,14 +100,14 @@ Global singleton data stored in the World, not attached to entities:
 
 ```rust
 #[derive(Debug)]
-struct GameTime { delta: f32, elapsed: f32 }
-impl Resource for GameTime {}
+struct ProjectTime { delta: f32, elapsed: f32 }
+impl Resource for ProjectTime {}
 
 // Insert
-engine.world_mut().insert_resource(GameTime { delta: 0.016, elapsed: 0.0 });
+engine.world_mut().insert_resource(ProjectTime { delta: 0.016, elapsed: 0.0 });
 
 // Access in systems
-fn time_system(mut time: ResMut<GameTime>) {
+fn time_system(mut time: ResMut<ProjectTime>) {
     if let Some(mut t) = time.get_mut() {
         t.elapsed += t.delta;  // bumps changed tick via DerefMut
     }
@@ -118,7 +118,7 @@ Lightweight handles (`ResHandle<T>`) allow storing typed resource references
 without borrowing the World:
 
 ```rust
-let handle = ResHandle::<GameTime>::new();
+let handle = ResHandle::<ProjectTime>::new();
 let time = handle.get(&world).unwrap();
 ```
 

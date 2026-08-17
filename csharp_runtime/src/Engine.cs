@@ -8,7 +8,7 @@
 //
 // Design:
 // - Closed Query<T...> types build and validate their descriptor once.
-// - GameHost consumes IQueryDescriptor without knowing query arity or shape.
+// - ProjectHost consumes IQueryDescriptor without knowing query arity or shape.
 // - QueryRow is a ref struct. Typed accessors validate the declared term before
 //   returning a writable or read-only reference into the active native chunk.
 

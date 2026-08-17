@@ -8,7 +8,7 @@ REQUIREMENTS
 
 DESCRIPTION
     This script launches the standalone host and executes a table-driven migration
-    suite by editing tests/game/src/lib.rs. Every scenario waits for hot-reload,
+    suite by editing tests/project/src/lib.rs. Every scenario waits for hot-reload,
     checks crash signals, verifies expected migration logs, and optionally
     validates that the counter system still ticks.
 
@@ -40,10 +40,10 @@ from typing import List, Optional, Sequence, Tuple
 # =============================================================================
 
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
-GAME_PROJECT_ROOT = WORKSPACE_ROOT / "tests" / "game"
-GAME_LIB_RS = GAME_PROJECT_ROOT / "src" / "lib.rs"
+TEST_PROJECT_ROOT = WORKSPACE_ROOT / "tests" / "project"
+PROJECT_LIB_RS = TEST_PROJECT_ROOT / "src" / "lib.rs"
 
-STARTUP_TOKEN = "Entering game loop"
+STARTUP_TOKEN = "Entering project loop"
 RELOAD_COMPLETE_TOKEN = "Hot-reload complete"
 COUNTER_TICK_TOKEN = "counter tick"
 PANIC_TOKEN = "panicked at"
@@ -51,9 +51,9 @@ ACCESS_VIOLATION_TOKEN = "STATUS_ACCESS_VIOLATION"
 FAST_PATH_TOKEN = "Schema unchanged for all persistable component types"
 SELECTIVE_START_TOKEN = "[persistence] Selective migration starting"
 SELECTIVE_FINISHED_TOKEN = "[persistence] Selective migration finished"
-FRAMECOUNTER_MIGRATE_LOG_TOKEN = "'game::FrameCounter' -> migrating"
-SPATIAL_POSITION_MIGRATE_LOG_TOKEN = "'game::SpatialPosition' -> migrating"
-LINEAR_VELOCITY_MIGRATE_LOG_TOKEN = "'game::LinearVelocity' -> migrating"
+FRAMECOUNTER_MIGRATE_LOG_TOKEN = "'project::FrameCounter' -> migrating"
+SPATIAL_POSITION_MIGRATE_LOG_TOKEN = "'project::SpatialPosition' -> migrating"
+LINEAR_VELOCITY_MIGRATE_LOG_TOKEN = "'project::LinearVelocity' -> migrating"
 
 STARTUP_TIMEOUT = 60
 RELOAD_TIMEOUT = 45
@@ -285,8 +285,8 @@ class Scenario:
 
 
 def read_source() -> str:
-    """Reads game/src/lib.rs as UTF-8 text."""
-    return GAME_LIB_RS.read_text(encoding="utf-8")
+    """Reads project/src/lib.rs as UTF-8 text."""
+    return PROJECT_LIB_RS.read_text(encoding="utf-8")
 
 
 def atomic_write(content: str) -> None:
@@ -294,9 +294,9 @@ def atomic_write(content: str) -> None:
     if not content.endswith("\n"):
         content += "\n"
 
-    temporary_path = GAME_LIB_RS.with_suffix(".rs.tmp")
+    temporary_path = PROJECT_LIB_RS.with_suffix(".rs.tmp")
     temporary_path.write_text(content, encoding="utf-8")
-    os.replace(str(temporary_path), str(GAME_LIB_RS))
+    os.replace(str(temporary_path), str(PROJECT_LIB_RS))
 
 
 def restore_original() -> None:
@@ -519,7 +519,7 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
 def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
     """Starts standalone process and returns process + monitor."""
     process_environment = os.environ.copy()
-    process_environment["ECS_HOT_RELOAD_MODULE"] = "tests-game"
+    process_environment["ECS_HOT_RELOAD_MODULE"] = "tests-project"
 
     process = subprocess.Popen(
         ["cargo", "run", "-p", "standalone"],
@@ -586,7 +586,7 @@ def build_scenarios() -> List[Scenario]:
                 SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
                 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("game::FrameCounter", 6)],
+            expected_migration_entity_counts=[("project::FrameCounter", 6)],
         ),
         Scenario(
             name="Revert FrameCounter: remove migrated bool",
@@ -606,7 +606,7 @@ def build_scenarios() -> List[Scenario]:
                 SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
                 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("game::FrameCounter", 9)],
+            expected_migration_entity_counts=[("project::FrameCounter", 9)],
         ),
         Scenario(
             name="Modify SpatialPosition: add depth coordinate",
@@ -626,7 +626,7 @@ def build_scenarios() -> List[Scenario]:
                 FRAMECOUNTER_MIGRATE_LOG_TOKEN,
                 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("game::SpatialPosition", 12)],
+            expected_migration_entity_counts=[("project::SpatialPosition", 12)],
         ),
         Scenario(
             name="Modify LinearVelocity: rename vertical_speed field",
@@ -645,7 +645,7 @@ def build_scenarios() -> List[Scenario]:
                 FRAMECOUNTER_MIGRATE_LOG_TOKEN,
                 SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
             ],
-            expected_migration_entity_counts=[("game::LinearVelocity", 10)],
+            expected_migration_entity_counts=[("project::LinearVelocity", 10)],
         ),
         Scenario(
             name="Remove LinearVelocity from registered/seeded components",
@@ -763,28 +763,28 @@ def build_workspace() -> bool:
 
     print("  [OK] Workspace built.")
 
-    print("  [PREP] Building tests/game crate...")
+    print("  [PREP] Building tests/project crate...")
     try:
-        tests_game_result = subprocess.run(
-            ["cargo", "build", "--manifest-path", "tests/game/Cargo.toml"],
+        tests_project_result = subprocess.run(
+            ["cargo", "build", "--manifest-path", "tests/project/Cargo.toml"],
             cwd=str(WORKSPACE_ROOT),
             capture_output=True,
             text=True,
             timeout=BUILD_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        print(f"  [FAIL] tests/game build timed out after {BUILD_TIMEOUT} seconds.")
+        print(f"  [FAIL] tests/project build timed out after {BUILD_TIMEOUT} seconds.")
         return False
     except FileNotFoundError:
         print("  [FAIL] 'cargo' not found. Is Rust installed and on PATH?")
         return False
 
-    if tests_game_result.returncode != 0:
-        print("  [FAIL] tests/game build failed:")
-        print(tests_game_result.stderr[-2000:])
+    if tests_project_result.returncode != 0:
+        print("  [FAIL] tests/project build failed:")
+        print(tests_project_result.stderr[-2000:])
         return False
 
-    print("  [OK] tests/game built.")
+    print("  [OK] tests/project built.")
     return True
 
 
@@ -828,8 +828,8 @@ def main() -> None:
         print("ERROR: --timeout-scale must be > 0")
         sys.exit(1)
 
-    if not GAME_LIB_RS.exists():
-        print(f"ERROR: Missing source file: {GAME_LIB_RS}")
+    if not PROJECT_LIB_RS.exists():
+        print(f"ERROR: Missing source file: {PROJECT_LIB_RS}")
         sys.exit(1)
 
     apply_timeout_scale(args.timeout_scale)
@@ -850,7 +850,7 @@ def main() -> None:
     try:
         passed = run_suite(args.cycles)
     finally:
-        print("\n  [CLEANUP] Restoring original game source...")
+        print("\n  [CLEANUP] Restoring original project source...")
         restore_original()
         print("  [OK] Source restored.")
 

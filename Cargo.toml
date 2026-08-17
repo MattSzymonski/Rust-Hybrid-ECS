@@ -4,7 +4,7 @@ members = [
     "engine",
     "pill_core",
     "pill_core_macros",
-    "game_rs",
+    "project_rs",
     "host",
     "standalone",
 ]

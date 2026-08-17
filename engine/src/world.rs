@@ -2084,13 +2084,13 @@ mod tests {
     fn dynamic_components_coexist_and_survive_archetype_migration() {
         let mut world = World::new();
         let a = world
-            .register_dynamic_component(0xA1, "Game.A", 4, 4, 11)
+            .register_dynamic_component(0xA1, "Project.A", 4, 4, 11)
             .unwrap();
         let b = world
-            .register_dynamic_component(0xB2, "Game.B", 4, 4, 22)
+            .register_dynamic_component(0xB2, "Project.B", 4, 4, 22)
             .unwrap();
         let c = world
-            .register_dynamic_component(0xC3, "Game.C", 8, 8, 33)
+            .register_dynamic_component(0xC3, "Project.C", 8, 8, 33)
             .unwrap();
         let entity = world
             .create_dynamic_entity(&[
@@ -2138,13 +2138,13 @@ mod tests {
 
         let mut world = World::new();
         let retained = world
-            .register_dynamic_component(0xA1, "Game.Retained", 4, 4, 11)
+            .register_dynamic_component(0xA1, "Project.Retained", 4, 4, 11)
             .unwrap();
         let removed = world
-            .register_dynamic_component(0xB2, "Game.Removed", 4, 4, 22)
+            .register_dynamic_component(0xB2, "Project.Removed", 4, 4, 22)
             .unwrap();
         let added = world
-            .register_dynamic_component(0xC3, "Game.Added", 8, 8, 33)
+            .register_dynamic_component(0xC3, "Project.Added", 8, 8, 33)
             .unwrap();
         let entity = world
             .create_dynamic_entity(&[

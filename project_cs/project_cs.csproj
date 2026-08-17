@@ -18,7 +18,7 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- For Engine.cs's safe generic query facade. Game-specific component
+    <!-- For Engine.cs's safe generic query facade. Project-specific component
          structs live in this reloadable project. -->
     <ProjectReference Include="../csharp_runtime/csharp_runtime.csproj" />
   </ItemGroup>

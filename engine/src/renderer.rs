@@ -357,7 +357,7 @@ mod tests {
         );
     }
 
-    /// A configured game coordinate space remains stable as the panel changes.
+    /// A configured project coordinate space remains stable as the panel changes.
     #[test]
     fn virtual_resolution_is_independent_of_physical_viewport_size() {
         let configured = VirtualResolution::new(800.0, 600.0);

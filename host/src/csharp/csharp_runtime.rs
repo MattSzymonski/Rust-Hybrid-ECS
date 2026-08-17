@@ -1,4 +1,4 @@
-//! Low-level .NET hosting bootstrap used by the C# game backend.
+//! Low-level .NET hosting bootstrap used by the C# project backend.
 //!
 //! # Responsibilities
 //!

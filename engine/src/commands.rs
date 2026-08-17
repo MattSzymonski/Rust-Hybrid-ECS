@@ -883,10 +883,10 @@ mod tests {
         let mut world = World::new();
         world.register_component::<Position>();
         let dynamic_a = world
-            .register_dynamic_component(0xA1, "Game.DynamicA", 4, 4, 1)
+            .register_dynamic_component(0xA1, "Project.DynamicA", 4, 4, 1)
             .unwrap();
         let dynamic_b = world
-            .register_dynamic_component(0xB2, "Game.DynamicB", 4, 4, 2)
+            .register_dynamic_component(0xB2, "Project.DynamicB", 4, 4, 2)
             .unwrap();
         let entity = world.reserve_entity();
         let mut queue = CommandQueue::new();

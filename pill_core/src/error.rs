@@ -358,7 +358,7 @@ impl miette::ReportHandler for EngineReportHandler {
 // Subsystem Errors
 // =============================================================================
 
-/// Configuration-validation failures for game-module setups.
+/// Configuration-validation failures for project-module setups.
 ///
 /// Raised before any build work begins, so a misconfigured module fails fast
 /// with a precise diagnostic instead of a confusing runtime error.
@@ -377,10 +377,10 @@ pub enum ConfigError {
     EmptyBuildCommand,
 }
 
-/// Game-module build execution failures.
+/// Project-module build execution failures.
 ///
 /// Covers spawn, wait, timeout, cancellation, and missing-artifact failures
-/// of the external command that builds a game module.
+/// of the external command that builds a project module.
 #[engine_error(namespace = host::build)]
 pub enum BuildError {
     /// The build command list is empty.
@@ -431,14 +431,14 @@ pub enum BuildError {
 
     /// The build succeeded but no artifact appeared at the configured path.
     #[message("shared library not found at expected path: ", name_style(path))]
-    #[diagnostic(help("check the selected backend output directory in GameModuleConfig"))]
+    #[diagnostic(help("check the selected backend output directory in ProjectModuleConfig"))]
     OutputMissing { path: String },
 }
 
-/// Native game-library loading and initialization failures.
+/// Native project-library loading and initialization failures.
 ///
 /// Covers the temporary-directory staging, the copy into place, dynamic
-/// loading, and the `game_init` entry-point contract.
+/// loading, and the `project_init` entry-point contract.
 #[engine_error(namespace = host::library)]
 pub enum LibraryError {
     /// The per-process temporary directory could not be created.
@@ -467,7 +467,7 @@ pub enum LibraryError {
     },
 
     /// The temporary copy is not a loadable native library.
-    #[message("failed to load native game library from ", name_style(path))]
+    #[message("failed to load native project library from ", name_style(path))]
     LoadFailed {
         path: String,
         #[source]
@@ -475,15 +475,15 @@ pub enum LibraryError {
     },
 
     /// The library does not export a required entry point.
-    #[message("native game library is missing required export ", name_style(symbol))]
+    #[message("native project library is missing required export ", name_style(symbol))]
     MissingExport {
         symbol: String,
         #[source]
         source: libloading::Error,
     },
 
-    /// `game_init` reported a failed generation.
-    #[message("game module initialization failed with status ", value(status))]
+    /// `project_init` reported a failed generation.
+    #[message("project module initialization failed with status ", value(status))]
     InitializationFailed { status: u32 },
 }
 
@@ -616,7 +616,7 @@ pub enum CSharpError {
     StartupCommandsFailed { details: String },
 
     /// The managed assembly contains no schedulable systems.
-    #[message("game_cs contains no [EcsSystem] methods")]
+    #[message("project_cs contains no [EcsSystem] methods")]
     NoSystems,
 
     /// The managed runtime refused to copy one system access declaration.
@@ -692,7 +692,7 @@ pub enum HostError {
     #[transparent]
     Config(#[from] ConfigError),
 
-    /// The game-module build failed.
+    /// The project-module build failed.
     #[transparent]
     Build(#[from] BuildError),
 
@@ -798,12 +798,12 @@ mod tests {
     #[test]
     fn plain_renderer_ignores_roles_and_keeps_values() {
         let error = BuildError::TimedOut {
-            name: "game-rs".to_string(),
+            name: "project-rs".to_string(),
             seconds: 120,
         };
         assert_eq!(
             error.to_plain_message(),
-            "build command for game-rs timed out after 120 seconds"
+            "build command for project-rs timed out after 120 seconds"
         );
     }
 
@@ -833,7 +833,7 @@ mod tests {
     #[test]
     fn styled_static_tokens_carry_their_role() {
         let error = BuildError::OutputMissing {
-            path: "target/debug/game.dll".to_string(),
+            path: "target/debug/project.dll".to_string(),
         };
         let mut renderer = RecordingRenderer { parts: Vec::new() };
         error.render_message(&mut renderer).unwrap();
@@ -843,7 +843,7 @@ mod tests {
                 RecordedPart::Text("shared library not found at expected path: ".to_string()),
                 RecordedPart::Styled {
                     role: SemanticRole::Name,
-                    text: "target/debug/game.dll".to_string(),
+                    text: "target/debug/project.dll".to_string(),
                 },
             ]
         );
@@ -869,7 +869,7 @@ mod tests {
     fn source_chain_preserves_the_underlying_error() {
         let source = std::io::Error::new(std::io::ErrorKind::NotFound, "missing program");
         let error = BuildError::SpawnFailed {
-            name: "game-rs".to_string(),
+            name: "project-rs".to_string(),
             source,
         };
         assert!(std::error::Error::source(&error).is_some());
@@ -892,11 +892,11 @@ mod tests {
     #[test]
     fn terminal_renderer_quotes_name_tokens() {
         let error = WatcherError::WatchDirectoryMissing {
-            path: "game_rs/src".to_string(),
+            path: "project_rs/src".to_string(),
         };
         let mut output = String::new();
         let mut renderer = TerminalMessageRenderer::new(&mut output);
         error.render_message(&mut renderer).unwrap();
-        assert!(output.contains("\"game_rs/src\""));
+        assert!(output.contains("\"project_rs/src\""));
     }
 }

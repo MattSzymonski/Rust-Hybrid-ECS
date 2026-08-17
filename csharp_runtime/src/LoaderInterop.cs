@@ -1,7 +1,7 @@
 // Stable unmanaged exports consumed by the Rust C# backend.
 //
 // Responsibilities:
-// - Initializes the managed Engine facade and collectible game loader.
+// - Initializes the managed Engine facade and collectible project loader.
 // - Exposes discovered system counts and access declarations to Rust.
 // - Dispatches scheduled system calls and polls assembly hot reload.
 // - Converts managed exceptions into diagnostics and failure status codes.
@@ -50,8 +50,8 @@ public static unsafe class LoaderInterop
     [UnmanagedCallersOnly]
     public static uint InteropVersion() => InteropContractVersion;
 
-    // The stable runtime owns exactly one active collectible game loader.
-    private static GameHost? _host;
+    // The stable runtime owns exactly one active collectible project loader.
+    private static ProjectHost? _host;
 
     /// <summary>Bind the native API and load the initial gameplay assembly.</summary>
     /// <returns>One on success; zero after reporting an initialization error.</returns>
@@ -61,11 +61,11 @@ public static unsafe class LoaderInterop
         try
         {
             Engine.Bind(api);
-            var dir = Environment.GetEnvironmentVariable("ECS_CSHARP_GAME_DIR")
+            var dir = Environment.GetEnvironmentVariable("ECS_CSHARP_PROJECT_DIR")
                 ?? AppContext.BaseDirectory;
-            var assembly = Environment.GetEnvironmentVariable("ECS_CSHARP_GAME_ASSEMBLY")
-                ?? "game_cs.dll";
-            _host = new GameHost(Path.Combine(dir, assembly));
+            var assembly = Environment.GetEnvironmentVariable("ECS_CSHARP_PROJECT_ASSEMBLY")
+                ?? "project_cs.dll";
+            _host = new ProjectHost(Path.Combine(dir, assembly));
             _host.Init();
             return 1;
         }
@@ -76,7 +76,7 @@ public static unsafe class LoaderInterop
         }
     }
 
-    /// <summary>Return the number of systems in the active game version.</summary>
+    /// <summary>Return the number of systems in the active project version.</summary>
     [UnmanagedCallersOnly]
     public static uint SystemCount() => (uint)(_host?.SystemCount ?? 0);
 

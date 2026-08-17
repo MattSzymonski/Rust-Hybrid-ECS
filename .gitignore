@@ -1,6 +1,6 @@
 # Rust build artifacts
 /target
-/tests/game/target
+/tests/project/target
 
 # Hot-reload runtime temp copies
 standalone_temp/

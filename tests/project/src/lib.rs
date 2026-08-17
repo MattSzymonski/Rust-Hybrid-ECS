@@ -1,15 +1,15 @@
-//! Hot-reloadable game module for migration integration testing.
+//! Hot-reloadable project module for migration integration testing.
 //!
 //! # Responsibilities
 //!
 //! - Defines three persistable components used by migration tests.
 //! - Implements a single `counter_system` that prints a timestamp at threshold.
-//! - Exports `game_init` and `game_update` for the standalone host.
+//! - Exports `project_init` and `project_update` for the standalone host.
 //!
 //! # Design
 //!
 //! This crate is compiled as a `cdylib` (dynamic library). The standalone
-//! host loads it at runtime and calls `game_init` to register the component
+//! host loads it at runtime and calls `project_init` to register the component
 //! and system. When source files change, the host rebuilds and reloads this
 //! module without restarting. Component data is preserved across reloads
 //! via JSON serialization and matched by type name.
@@ -95,7 +95,7 @@ fn counter_system(mut query: Query<&mut FrameCounter>) {
 /// `api` must be a valid [`EngineApi`] pointer owned by the host for the
 /// complete duration of this call.
 #[no_mangle]
-pub unsafe extern "C" fn game_init(api: *const EngineApi) -> u32 {
+pub unsafe extern "C" fn project_init(api: *const EngineApi) -> u32 {
     let api = unsafe { &*api };
     let engine: &mut Engine = unsafe { &mut *(api.engine_handle as *mut Engine) };
 
@@ -160,13 +160,13 @@ pub unsafe extern "C" fn game_init(api: *const EngineApi) -> u32 {
 }
 
 #[no_mangle]
-pub extern "C" fn game_update(api: *const EngineApi) {
+pub extern "C" fn project_update(api: *const EngineApi) {
     let _ = api;
 }
 
 /// Returns a hash of persistable component TypeIds and sizes.
 #[no_mangle]
-pub extern "C" fn game_schema_fingerprint() -> u64 {
+pub extern "C" fn project_schema_fingerprint() -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 

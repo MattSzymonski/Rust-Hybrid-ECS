@@ -212,14 +212,14 @@ impl RenderViewport {
 
 /// Logical coordinate space mapped into a physical [`RenderViewport`].
 ///
-/// Keeping this separate from the swapchain dimensions lets an embedded game
+/// Keeping this separate from the swapchain dimensions lets an embedded project
 /// keep a stable coordinate system while its dock panel is resized. The GPU
 /// viewport performs the final scaling into the panel rectangle.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VirtualResolution {
-    /// Horizontal extent of the game coordinate space.
+    /// Horizontal extent of the project coordinate space.
     pub width: f32,
-    /// Vertical extent of the game coordinate space.
+    /// Vertical extent of the project coordinate space.
     pub height: f32,
 }
 
@@ -532,9 +532,9 @@ impl SpriteRenderer {
 // Free Functions
 // =============================================================================
 
-/// Collect renderer components across the native game-module ABI boundary.
+/// Collect renderer components across the native project-module ABI boundary.
 ///
-/// A hot-loaded Rust game and the host executable can assign different
+/// A hot-loaded Rust project and the host executable can assign different
 /// `TypeId` values to the same `pill_engine` type. Renderer components are a
 /// deliberately shared ABI, so resolve their columns by stable type name and
 /// verify their C layouts instead of issuing a host-typed ECS query.

@@ -368,7 +368,7 @@ impl Engine {
     }
     /// Removes all registered systems, clearing the scheduler state.
     ///
-    /// This is used during hot-reload: the old game DLL's system function
+    /// This is used during hot-reload: the old project DLL's system function
     /// pointers become invalid after unloading, so all systems must be
     /// dropped and re-registered from the newly loaded DLL.
     ///

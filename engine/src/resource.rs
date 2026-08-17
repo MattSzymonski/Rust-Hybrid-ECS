@@ -20,21 +20,21 @@
 //! # use pill_engine::*;
 //! // Define a resource
 //! #[derive(Debug)]
-//! struct GameTime { delta: f32, elapsed: f32 }
-//! impl Resource for GameTime {}
+//! struct ProjectTime { delta: f32, elapsed: f32 }
+//! impl Resource for ProjectTime {}
 //!
 //! // Insert into world
 //! # let mut world = World::new();
-//! world.insert_resource(GameTime { delta: 0.016, elapsed: 0.0 });
+//! world.insert_resource(ProjectTime { delta: 0.016, elapsed: 0.0 });
 //!
 //! // Get a handle (cheap, copyable)
-//! let handle = ResHandle::<GameTime>::new();
+//! let handle = ResHandle::<ProjectTime>::new();
 //!
 //! // Use handle to access the resource later
 //! let time = handle.get(&world).unwrap();
 //!
 //! // Use in systems via Res/ResMut
-//! fn my_system(time: Res<GameTime>) {
+//! fn my_system(time: Res<ProjectTime>) {
 //!     println!("Elapsed: {}", time.get().unwrap().elapsed);
 //! }
 //! ```
@@ -63,12 +63,12 @@ use crate::world::World;
 /// ```
 /// use pill_engine::Resource;
 ///
-/// struct GameTime {
+/// struct ProjectTime {
 ///     delta: f32,
 ///     elapsed: f32,
 /// }
 ///
-/// impl Resource for GameTime {}
+/// impl Resource for ProjectTime {}
 /// ```
 pub trait Resource: Send + Sync + 'static {}
 
@@ -219,18 +219,18 @@ mod tests {
     impl Resource for Score {}
 
     #[derive(Debug, PartialEq)]
-    struct GameTime {
+    struct ProjectTime {
         delta: f32,
         elapsed: f32,
     }
-    impl Resource for GameTime {}
+    impl Resource for ProjectTime {}
 
     /// Verifies that `ResourceId` stores the correct TypeId internally.
     #[test]
     fn test_resource_id() {
         let id1 = ResourceId::of::<Score>();
         let id2 = ResourceId::of::<Score>();
-        let id3 = ResourceId::of::<GameTime>();
+        let id3 = ResourceId::of::<ProjectTime>();
 
         assert_eq!(id1, id2);
         assert_ne!(id1, id3);
@@ -320,10 +320,10 @@ mod tests {
         let mut world = World::new();
 
         let score_handle = ResHandle::<Score>::new();
-        let time_handle = ResHandle::<GameTime>::new();
+        let time_handle = ResHandle::<ProjectTime>::new();
 
         world.insert_resource(Score(100));
-        world.insert_resource(GameTime {
+        world.insert_resource(ProjectTime {
             delta: 0.016,
             elapsed: 0.0,
         });

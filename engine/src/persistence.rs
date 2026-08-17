@@ -24,7 +24,7 @@
 //! | `deserialize`   | `fn(&[u8]) → Option<Box<dyn Component>>` | Decode JSON bytes back into a component; returns None on schema mismatch |
 //! | `insert_boxed`  | `fn(&mut TraitTypeMap, Box<dyn Component>)` | Downcast and push into the concrete VecStorage |
 //!
-//! These functions are monomorphized in the game DLL (where the concrete
+//! These functions are monomorphized in the project DLL (where the concrete
 //! types are defined).  They are stored as plain function pointers in the
 //! engine's `World`, so replacing them on reload (via `HashMap::insert`)
 //! does not call any destructors through old vtables — function pointers
@@ -79,8 +79,8 @@ pub(crate) type InsertComponentFn =
 
 /// Captured component data for all entities at a point in time.
 ///
-/// Used to preserve game state across hot-reloads.  Components are
-/// matched by type **name** (a string like `"game::Position"`), not by
+/// Used to preserve project state across hot-reloads.  Components are
+/// matched by type **name** (a string like `"project::Position"`), not by
 /// `TypeId`, so schema changes (added/removed fields) are handled by
 /// serde's default-value / ignore-unknown behaviour.
 ///
@@ -90,7 +90,7 @@ pub(crate) type InsertComponentFn =
 /// use pill_engine::ComponentSnapshot;
 ///
 /// let snapshot = ComponentSnapshot {
-///     entries: vec![vec![("game::Position".to_string(), b"{}".to_vec())]],
+///     entries: vec![vec![("project::Position".to_string(), b"{}".to_vec())]],
 /// };
 /// assert_eq!(snapshot.entity_count(), 1);
 /// ```
@@ -444,7 +444,7 @@ impl World {
         );
         if skipped_type_removed > 0 {
             println!(
-                "[persistence]   {} components skipped (type removed from game)",
+                "[persistence]   {} components skipped (type removed from project)",
                 skipped_type_removed,
             );
         }
@@ -525,7 +525,7 @@ impl World {
     /// Migrate only changed persistable components.
     ///
     /// For each changed type name, this uses the old serializer (captured before
-    /// reload) and the new deserializer/inserter (registered by new game_init)
+    /// reload) and the new deserializer/inserter (registered by new project_init)
     /// to rewrite only the affected component columns.
     pub fn migrate_changed_persistable_components(
         &mut self,
@@ -913,7 +913,7 @@ impl World {
 // =============================================================================
 //
 // These generic functions are monomorphized once per concrete component type
-// inside the game DLL.  They are stored as plain `fn` pointers in the engine's
+// inside the project DLL.  They are stored as plain `fn` pointers in the engine's
 // HashMaps, so replacing them on hot-reload simply overwrites the pointer —
 // no destructors, no vtable calls, no DLL-unload issues.
 

@@ -28,7 +28,7 @@ static ALLOC: tracy_client::ProfiledAllocator<std::alloc::System> =
 
 // ===== Public Modules =====
 
-/// Language-agnostic engine API for external hot-reloadable game consumers.
+/// Language-agnostic engine API for external hot-reloadable project consumers.
 pub mod api;
 
 /// Archetype-based component storage with structure-of-arrays layout.

@@ -1,4 +1,4 @@
-//! Scheduler-aware C# backend for the native game host.
+//! Scheduler-aware C# backend for the native project host.
 //!
 //! # Responsibilities
 //!
@@ -15,7 +15,7 @@
 
 /// C-compatible data structures and callback table shared with the managed runtime.
 mod abi;
-/// High-level C# game startup, discovery, and scheduler registration.
+/// High-level C# project startup, discovery, and scheduler registration.
 mod backend;
 /// Native callbacks that translate C# lifecycle requests into deferred ECS commands.
 mod commands;
@@ -23,7 +23,7 @@ mod commands;
 mod components;
 /// Thread-local access scope installed around one scheduled C# system.
 mod context;
-/// Low-level .NET hosting bootstrap used by the C# game backend.
+/// Low-level .NET hosting bootstrap used by the C# project backend.
 mod csharp_runtime;
 /// Native callbacks used by C# query enumerators.
 mod queries;

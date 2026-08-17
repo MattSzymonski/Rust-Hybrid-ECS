@@ -1,4 +1,4 @@
-//! High-level C# game startup, discovery, and scheduler registration.
+//! High-level C# project startup, discovery, and scheduler registration.
 //!
 //! # Responsibilities
 //!
@@ -102,7 +102,7 @@ type RunSystemFn = extern "system" fn(u32) -> u8;
 type SystemErrorMessageLengthFn = extern "system" fn(u32) -> u32;
 /// Signature copying one system's last error message into a caller buffer.
 type CopySystemErrorMessageFn = extern "system" fn(u32, *mut u8, u32) -> u8;
-/// Signature polling the collectible loader for a new game assembly and
+/// Signature polling the collectible loader for a new project assembly and
 /// reporting the swap outcome through the status codes below.
 type PollReloadFn = extern "system" fn() -> u8;
 
@@ -165,16 +165,16 @@ impl CSharpRuntime {
 
         // Step 1: Resolve assembly paths, start .NET, and load managed exports.
         let runtime_dir = workspace_root.join(config.runtime_output_subdirectory);
-        let game_dir = workspace_root.join(config.game_output_subdirectory);
+        let project_dir = workspace_root.join(config.project_output_subdirectory);
         let assembly = runtime_dir.join(format!("{}.dll", config.runtime_assembly_name));
         let runtime_config = runtime_dir.join(format!(
             "{}.runtimeconfig.json",
             config.runtime_assembly_name
         ));
-        std::env::set_var("ECS_CSHARP_GAME_DIR", &game_dir);
+        std::env::set_var("ECS_CSHARP_PROJECT_DIR", &project_dir);
         std::env::set_var(
-            "ECS_CSHARP_GAME_ASSEMBLY",
-            format!("{}.dll", config.game_assembly_name),
+            "ECS_CSHARP_PROJECT_ASSEMBLY",
+            format!("{}.dll", config.project_assembly_name),
         );
 
         let runtime = DotnetRuntimeContext::new(&runtime_config)?;
@@ -439,7 +439,7 @@ impl CSharpRuntime {
         status
     }
 
-    /// Re-reflect the active game assembly and verify that its system metadata
+    /// Re-reflect the active project assembly and verify that its system metadata
     /// still matches the snapshot captured at startup.
     ///
     /// The managed loader already rejects swaps whose system signatures

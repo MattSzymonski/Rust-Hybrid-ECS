@@ -1,10 +1,10 @@
-//! Shared game-module host for every engine frontend.
+//! Shared project-module host for every engine frontend.
 //!
 //! # Responsibilities
 //!
 //! - Creates and owns the [`pill_engine::Engine`] instance.
-//! - Builds and loads native or C# game modules.
-//! - Watches game sources and coordinates safe hot reloads.
+//! - Builds and loads native or C# project modules.
+//! - Watches project sources and coordinates safe hot reloads.
 //! - Exposes [`setup`] and [`run_one_frame`] to embedding frontends.
 //! - Owns the standalone headless or windowed application runner.
 //!
@@ -14,20 +14,20 @@
 //! With `rendering` enabled that includes the window, event loop, and engine renderer.
 //! Embedding frontends such as `editor` can instead provide their own window and
 //! event loop through [`setup_rendering`].
-//! Configuration is externalized in [`GameModuleConfig`],
+//! Configuration is externalized in [`ProjectModuleConfig`],
 //! keeping backend selection out of executable crates.
 
 // ===== Module Declarations =====
 
-/// Game-module build execution and output-path resolution.
+/// Project-module build execution and output-path resolution.
 mod build_runner;
-/// Game-module configuration shared by every host frontend.
+/// Project-module configuration shared by every host frontend.
 mod config;
-/// Scheduler-aware C# backend for the native game host.
+/// Scheduler-aware C# backend for the native project host.
 mod csharp;
-/// Lifecycle management for the active native or managed game module.
-mod game_module;
-/// Native game-library loading and Windows-safe temporary-copy handling.
+/// Lifecycle management for the active native or managed project module.
+mod project_module;
+/// Native project-library loading and Windows-safe temporary-copy handling.
 mod native_library;
 /// Complete standalone application runner owned by the host crate.
 mod runner;
@@ -41,7 +41,7 @@ mod watcher;
 // ===== Re-exports =====
 
 // Local host modules and the shared crate-root error surface.
-pub use config::{CSharpModuleConfig, GameModuleBackend, GameModuleConfig};
+pub use config::{CSharpModuleConfig, ProjectModuleBackend, ProjectModuleConfig};
 #[cfg(feature = "rendering")]
 pub use pill_core::error::FrontendError;
 pub use pill_core::error::{

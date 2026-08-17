@@ -1,4 +1,4 @@
-//! Game-module build execution and output-path resolution.
+//! Project-module build execution and output-path resolution.
 //!
 //! Build processes inherit the host's standard streams so compiler progress
 //! and diagnostics remain visible in the terminal that launched the host.
@@ -11,8 +11,8 @@
 //!
 //! # Design
 //!
-//! [`build_game_module`] is the host's single entry point for compiling a
-//! game module. It treats the build as an opaque process: it never inspects
+//! [`build_project_module`] is the host's single entry point for compiling a
+//! project module. It treats the build as an opaque process: it never inspects
 //! compiler output, and instead decides success from the child's exit status
 //! plus a backend-specific output-path resolution step. Cancellation is
 //! cooperative: the caller advances a generation counter on newer source
@@ -29,7 +29,7 @@ use pill_core::error::BuildError;
 use pill_core::info;
 
 // Current crate
-use crate::{GameModuleBackend, GameModuleConfig};
+use crate::{ProjectModuleBackend, ProjectModuleConfig};
 
 // =============================================================================
 // Constants
@@ -45,27 +45,27 @@ const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(100);
 // Free Functions
 // =============================================================================
 
-/// Build the selected game module and return its expected output artifact.
+/// Build the selected project module and return its expected output artifact.
 ///
 /// # Errors
 ///
 /// Returns an error if the build command is empty, fails to spawn, exits with
 /// a non-zero status, times out, is cancelled by a newer source change, or
 /// the resolved output artifact does not exist at the configured path.
-pub(crate) fn build_game_module(
+pub(crate) fn build_project_module(
     workspace_root: &Path,
-    config: &GameModuleConfig,
+    config: &ProjectModuleConfig,
     cancel_flag: Option<(&AtomicU64, u64)>,
 ) -> Result<PathBuf, BuildError> {
     info!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
         module = config.name,
-        "building game module"
+        "building project module"
     );
 
     // Step 1: Split the configured command into its executable and arguments.
     //
-    // GameModuleConfig stores commands as static slices so callers can define
+    // ProjectModuleConfig stores commands as static slices so callers can define
     // both Cargo and dotnet builds without shell-specific quoting. The first
     // item is always the executable; every remaining item is passed verbatim.
     let (program, arguments) = config
@@ -126,7 +126,7 @@ pub(crate) fn build_game_module(
     // Step 4: Reject a non-zero exit status.
     //
     // A failed compiler must stop the load transaction. During hot reload the
-    // caller handles this error by leaving the current game module untouched.
+    // caller handles this error by leaving the current project module untouched.
     if !status.success() {
         return Err(BuildError::CommandFailed {
             name: config.name.to_string(),
@@ -140,15 +140,15 @@ pub(crate) fn build_game_module(
     // locates its loadable artifact differently. Native outputs use platform
     // naming conventions; managed outputs always use an assembly `.dll`.
     let output_path = match &config.backend {
-        GameModuleBackend::NativeLibrary {
+        ProjectModuleBackend::NativeLibrary {
             library_name,
             output_subdirectory,
         } => workspace_root
             .join(output_subdirectory)
             .join(native_library_filename(library_name)),
-        GameModuleBackend::CSharp(config) => workspace_root
-            .join(config.game_output_subdirectory)
-            .join(format!("{}.dll", config.game_assembly_name)),
+        ProjectModuleBackend::CSharp(config) => workspace_root
+            .join(config.project_output_subdirectory)
+            .join(format!("{}.dll", config.project_assembly_name)),
     };
 
     // Step 6: Confirm the resolved artifact exists before reporting success.

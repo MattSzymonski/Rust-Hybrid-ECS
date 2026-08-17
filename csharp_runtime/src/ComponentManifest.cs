@@ -1,8 +1,8 @@
 // C# component discovery and native manifest generation.
 //
-// Every unmanaged query component and supported game-declared struct is
+// Every unmanaged query component and supported project-declared struct is
 // described before Rust registers managed systems or runs startup commands.
-// Native-owned mirrors and game-owned structs use the same schema format and
+// Native-owned mirrors and project-owned structs use the same schema format and
 // stable 128-bit identity.
 
 using System.Runtime.InteropServices;
@@ -31,18 +31,18 @@ internal static class ComponentManifestBuilder
         public T Value;
     }
 
-    internal static byte[] Build(IEnumerable<ManagedSystem> systems, Assembly? gameAssembly = null)
+    internal static byte[] Build(IEnumerable<ManagedSystem> systems, Assembly? projectAssembly = null)
     {
         IEnumerable<Type> queryComponents = systems
             .Where(system => system.QueryDescriptor is not null)
             .SelectMany(system => system.QueryDescriptor!.Terms)
             .Where(term => !term.IsEntity)
             .Select(term => term.ComponentType!);
-        IEnumerable<Type> declaredGameComponents = gameAssembly is null
+        IEnumerable<Type> declaredProjectComponents = projectAssembly is null
             ? []
-            : gameAssembly.GetTypes().Where(IsGameComponentCandidate);
+            : projectAssembly.GetTypes().Where(IsProjectComponentCandidate);
         ComponentManifest[] components = queryComponents
-            .Concat(declaredGameComponents)
+            .Concat(declaredProjectComponents)
             .Distinct()
             .Select(Describe)
             .OrderBy(component => component.StableIdHigh)
@@ -55,11 +55,11 @@ internal static class ComponentManifestBuilder
     }
 
     /// <summary>
-    /// Include supported unmanaged structs declared by the game even when
+    /// Include supported unmanaged structs declared by the project even when
     /// they currently appear only in Commands.With/Add/Remove calls. Query
     /// terms remain authoritative for shared runtime component discovery.
     /// </summary>
-    private static bool IsGameComponentCandidate(Type type)
+    private static bool IsProjectComponentCandidate(Type type)
     {
         if (!type.IsValueType || type.IsEnum || type.IsPrimitive || type.IsGenericType ||
             type.IsDefined(typeof(CompilerGeneratedAttribute), inherit: false))

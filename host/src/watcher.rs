@@ -33,7 +33,7 @@ use pill_core::error::WatcherError;
 use pill_core::{debug, error, info};
 
 // Current crate
-use crate::GameModuleConfig;
+use crate::ProjectModuleConfig;
 
 // =============================================================================
 // Constants
@@ -143,7 +143,7 @@ fn is_relevant_relative_path(relative: &Path) -> bool {
 /// be created, or the watch path cannot be registered.
 pub(crate) fn spawn_file_watcher(
     workspace_root: PathBuf,
-    config: &GameModuleConfig,
+    config: &ProjectModuleConfig,
     reload_generation: Arc<AtomicU64>,
 ) -> Result<(), WatcherError> {
     // Step 1: Resolve and validate the configured watch directory.
@@ -300,10 +300,10 @@ mod tests {
     #[test]
     fn build_output_directories_are_filtered_only_at_the_watch_root() {
         assert!(!is_relevant_relative_path(Path::new(
-            "target/debug/libgame.so"
+            "target/debug/libproject.so"
         )));
         assert!(!is_relevant_relative_path(Path::new(
-            "bin/Release/game_cs.dll"
+            "bin/Release/project_cs.dll"
         )));
         assert!(!is_relevant_relative_path(Path::new(
             "obj/x64/project.cache"
@@ -344,7 +344,7 @@ mod tests {
         std::fs::create_dir_all(&watch_root).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
 
-        let outside_file = outside.join("game.rs");
+        let outside_file = outside.join("project.rs");
         std::fs::write(&outside_file, "// test").unwrap();
         assert!(!is_relevant_path(&outside_file, &watch_root));
 

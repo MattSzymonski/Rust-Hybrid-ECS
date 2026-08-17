@@ -1,4 +1,4 @@
-//! Dioxus editor with a live engine-rendered game viewport.
+//! Dioxus editor with a live engine-rendered project viewport.
 //!
 //! # Design
 //!
@@ -26,7 +26,7 @@ use dioxus::desktop::{use_wry_event_handler, window, Config};
 use dioxus::prelude::*;
 use futures_util::StreamExt;
 use host::{
-    engine_report, install_engine_report_handler, setup_rendering, FrameReport, GameModuleConfig,
+    engine_report, install_engine_report_handler, setup_rendering, FrameReport, ProjectModuleConfig,
     RenderViewport, RenderingHost, VirtualResolution,
 };
 use pill_core::error::EngineMessage;
@@ -41,8 +41,8 @@ use popout::PopoutManager;
 /// Maximum frequency at which live host statistics invalidate the Dioxus UI.
 const STATS_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Stable coordinate space used by the bouncing-ball game systems.
-const GAME_VIRTUAL_RESOLUTION: VirtualResolution = VirtualResolution::new(800.0, 600.0);
+/// Stable coordinate space used by the bouncing-ball project systems.
+const PROJECT_VIRTUAL_RESOLUTION: VirtualResolution = VirtualResolution::new(800.0, 600.0);
 
 /// Install the shared telemetry stack (terminal, optional file, optional
 /// Tracy) before Dioxus takes over the event loop.
@@ -304,13 +304,13 @@ impl EditorContext {
     fn new(window: Arc<Window>) -> Result<Self, EditorError> {
         let size = window.inner_size();
         let mut host = setup_rendering(
-            GameModuleConfig::from_environment(),
+            ProjectModuleConfig::from_environment(),
             Arc::clone(&window),
             size.width,
             size.height,
         )?;
         host.set_render_viewport(Some(RenderViewport::default()));
-        host.set_render_virtual_resolution(Some(GAME_VIRTUAL_RESOLUTION));
+        host.set_render_virtual_resolution(Some(PROJECT_VIRTUAL_RESOLUTION));
 
         Ok(Self {
             host: RefCell::new(host),
@@ -356,7 +356,7 @@ impl EditorContext {
         let mut host = self.host.borrow_mut();
         host.retarget_render_window(window, size.width, size.height)
             .map_err(|source| EditorError::Retarget { source })?;
-        host.set_render_virtual_resolution(Some(GAME_VIRTUAL_RESOLUTION));
+        host.set_render_virtual_resolution(Some(PROJECT_VIRTUAL_RESOLUTION));
         host.set_render_viewport(Some(RenderViewport::full(size.width, size.height)));
         self.detached_scene_window.set(Some(window_id));
         Ok(())
@@ -380,7 +380,7 @@ impl EditorContext {
         let mut host = self.host.borrow_mut();
         host.retarget_render_window(Arc::clone(&self.window), size.width, size.height)
             .map_err(|source| EditorError::Retarget { source })?;
-        host.set_render_virtual_resolution(Some(GAME_VIRTUAL_RESOLUTION));
+        host.set_render_virtual_resolution(Some(PROJECT_VIRTUAL_RESOLUTION));
         host.set_render_viewport(Some(self.main_scene_viewport.get()));
         self.detached_scene_window.set(None);
         Ok(())

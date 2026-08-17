@@ -7,8 +7,8 @@
 //!
 //! # Responsibilities
 //!
-//! - Run the configured game in a headless loop when rendering is disabled.
-//! - Run the configured game in a `winit` window when rendering is enabled.
+//! - Run the configured project in a headless loop when rendering is disabled.
+//! - Run the configured project in a `winit` window when rendering is enabled.
 //!
 //! # Design
 //!
@@ -40,7 +40,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 // Current crate
-use crate::GameModuleConfig;
+use crate::ProjectModuleConfig;
 
 // =============================================================================
 // WindowedApplication
@@ -48,12 +48,12 @@ use crate::GameModuleConfig;
 
 /// State retained by `winit` for the lifetime of the standalone application.
 ///
-/// Owns the configured game, the native window, and the rendering host, and
+/// Owns the configured project, the native window, and the rendering host, and
 /// defers window-creation and host-setup failures until the loop exits so
 /// they can be surfaced through [`run`]'s error path.
 #[cfg(feature = "rendering")]
 struct WindowedApplication {
-    module_config: GameModuleConfig,
+    module_config: ProjectModuleConfig,
     window: Option<Arc<Window>>,
     host: Option<crate::RenderingHost>,
     /// Failure recorded during `resumed`; surfaced after the loop exits.
@@ -168,15 +168,15 @@ impl WindowedApplication {
 // Free Functions
 // =============================================================================
 
-/// Run the configured game continuously without creating a native window.
+/// Run the configured project continuously without creating a native window.
 ///
 /// # Errors
 ///
-/// Returns [`HostError`] if host setup fails, such as when the game module
+/// Returns [`HostError`] if host setup fails, such as when the project module
 /// cannot be built or loaded, or when the source watcher cannot start. Frame
 /// execution never returns an error; the loop runs until the process exits.
 #[cfg(not(feature = "rendering"))]
-pub fn run(module_config: GameModuleConfig) -> Result<(), HostError> {
+pub fn run(module_config: ProjectModuleConfig) -> Result<(), HostError> {
     let mut host = crate::setup(module_config)?;
 
     loop {
@@ -189,14 +189,14 @@ pub fn run(module_config: GameModuleConfig) -> Result<(), HostError> {
     }
 }
 
-/// Run the configured game in the host-owned native window and render loop.
+/// Run the configured project in the host-owned native window and render loop.
 ///
 /// # Errors
 ///
 /// Returns [`EngineError`] if the event loop cannot be created or run, or if
 /// window creation or host/renderer setup fails inside the event loop.
 #[cfg(feature = "rendering")]
-pub fn run(module_config: GameModuleConfig) -> Result<(), EngineError> {
+pub fn run(module_config: ProjectModuleConfig) -> Result<(), EngineError> {
     // Step 1: Create a new event loop for the windowed application.
     let event_loop =
         EventLoop::new().map_err(|source| FrontendError::EventLoopCreation { source })?;

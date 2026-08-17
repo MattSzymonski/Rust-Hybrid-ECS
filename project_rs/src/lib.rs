@@ -1,15 +1,37 @@
-//! Hot-reloadable bouncing-ball game implemented with ECS systems.
+//! Hot-reloadable bouncing-ball project implemented with ECS systems.
+//!
+//! # Responsibilities
+//!
+//! - Owns the simulation-time resource and the ball-physics systems that run
+//!   every frame.
+//! - Exposes the `project_init` / `project_update` entry points the host loads
+//!   through the project-module ABI.
+//!
+//! # Design
+//!
+//! The project is a plain `cdylib` that registers ECS components, resources,
+//! and systems through the [`EngineApi`] during `project_init`. Hot reload
+//! preserves entities, so initialization fills the world only up to the target
+//! ball count instead of spawning fresh entities on every rebuild.
 
+// Standard library
+use std::time::Instant;
+
+// External crates
 use pill_core::error;
 use pill_engine::*;
 use serde::{Deserialize, Serialize};
-use std::time::Instant;
 use trait_type_map::impl_trait_accessible;
 
 // =============================================================================
 // Ball physics component
 // =============================================================================
 
+/// A rigid ball that bounces inside a fixed box, simulated each frame.
+///
+/// The host serializes this component across hot-reload generations, so the
+/// struct layout is pinned with `#[repr(C)]` and every field stays
+/// `Serialize` / `Deserialize` compatible.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct PhysicsState {
@@ -50,7 +72,7 @@ impl Resource for SimulationTime {}
 
 fn update_time_system(mut time: ResMut<SimulationTime>) -> Result<(), SystemError> {
     let now = Instant::now();
-    // A missing resource means the game module and host disagree about
+    // A missing resource means the project module and host disagree about
     // initialization; report it through the system result so the frame
     // continues while the host logs the failure.
     let Some(mut time) = time.get_mut() else {
@@ -163,7 +185,7 @@ fn physics_system(
 }
 
 // =============================================================================
-// Game module entry points
+// Project module entry points
 // =============================================================================
 
 /// Registers components, resources, and systems; returns zero on success.
@@ -178,7 +200,7 @@ fn physics_system(
 /// `api` must be a valid [`EngineApi`] pointer owned by the host for the
 /// complete duration of this call.
 #[no_mangle]
-pub unsafe extern "C" fn game_init(api: *const EngineApi) -> u32 {
+pub unsafe extern "C" fn project_init(api: *const EngineApi) -> u32 {
     let api = unsafe { &*api };
     let engine = unsafe { &mut *(api.engine_handle as *mut Engine) };
 
@@ -237,11 +259,11 @@ pub unsafe extern "C" fn game_init(api: *const EngineApi) -> u32 {
             Ok(_) => {}
             Err(error) => {
                 // Report the failure and abort the generation: the host keeps
-                // the previously loaded module when game_init returns non-zero.
+                // the previously loaded module when project_init returns non-zero.
                 error!(
                     target: pill_core::telemetry::telemetry_target::ECS,
                     error = %error,
-                    "failed to build a ball entity; aborting this game generation"
+                    "failed to build a ball entity; aborting this project generation"
                 );
                 return 1;
             }
@@ -253,12 +275,12 @@ pub unsafe extern "C" fn game_init(api: *const EngineApi) -> u32 {
 }
 
 #[no_mangle]
-pub extern "C" fn game_update(_api: *const EngineApi) {
+pub extern "C" fn project_update(_api: *const EngineApi) {
     // Gameplay is executed entirely by scheduler-managed ECS systems.
 }
 
 #[no_mangle]
-pub extern "C" fn game_schema_fingerprint() -> u64 {
+pub extern "C" fn project_schema_fingerprint() -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
