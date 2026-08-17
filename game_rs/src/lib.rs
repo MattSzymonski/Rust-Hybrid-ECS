@@ -29,6 +29,11 @@ const GRAVITY: f32 = 800.0;
 const BOUNCE_VELOCITY_Y: f32 = -500.0;
 const BOUNCE_VELOCITY_X: f32 = 150.0;
 const RESTITUTION: f32 = 0.7;
+/// Upward speed restored when a floor bounce would otherwise decay to rest.
+///
+/// Keeps every ball visibly bouncing for the whole lifetime of the scene
+/// instead of settling on the floor after a few seconds.
+const MINIMUM_BOUNCE_VELOCITY_Y: f32 = 300.0;
 const FLOOR_Y: f32 = 580.0;
 const CEILING_Y: f32 = 20.0;
 const LEFT_WALL: f32 = 20.0;
@@ -88,8 +93,10 @@ fn simulate_ball(state: &mut PhysicsState) {
     if state.position_y + state.radius >= FLOOR_Y {
         state.position_y = FLOOR_Y - state.radius;
         state.velocity_y = -state.velocity_y.abs() * RESTITUTION;
-        if state.velocity_y.abs() < 10.0 {
-            state.velocity_y = 0.0;
+        // Restitution alone decays each bounce towards rest; restore a
+        // minimum upward speed so balls bounce forever.
+        if state.velocity_y.abs() < MINIMUM_BOUNCE_VELOCITY_Y {
+            state.velocity_y = -MINIMUM_BOUNCE_VELOCITY_Y;
         }
     }
     if state.position_y - state.radius <= CEILING_Y {
@@ -284,5 +291,17 @@ mod tests {
         assert_eq!(state.position_y, before.position_y);
         assert_eq!(state.velocity_x, before.velocity_x);
         assert_eq!(state.velocity_y, before.velocity_y);
+    }
+
+    /// A weak floor bounce is restored so balls never settle on the floor.
+    #[test]
+    fn ball_never_rests_on_the_floor() {
+        let mut state = initial_physics_state();
+        state.position_y = FLOOR_Y - state.radius;
+        state.velocity_y = 5.0;
+
+        simulate_ball(&mut state);
+
+        assert!(state.velocity_y <= -MINIMUM_BOUNCE_VELOCITY_Y);
     }
 }
