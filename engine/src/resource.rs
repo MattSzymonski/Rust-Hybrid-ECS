@@ -57,6 +57,19 @@ use crate::world::World;
 /// global/shared state such as time, input, configuration, etc.
 ///
 /// Resources must be Send + Sync to support parallel system access.
+///
+/// # Examples
+///
+/// ```
+/// use pill_engine::Resource;
+///
+/// struct GameTime {
+///     delta: f32,
+///     elapsed: f32,
+/// }
+///
+/// impl Resource for GameTime {}
+/// ```
 pub trait Resource: Send + Sync + 'static {}
 
 // =============================================================================
@@ -67,14 +80,18 @@ pub trait Resource: Send + Sync + 'static {}
 ///
 /// Can be viewed as a native [`TypeKey`] by generic resource metadata code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ResourceId(pub TypeId);
+pub struct ResourceId(
+    /// The [`TypeId`] of the resource type this id identifies.
+    pub TypeId,
+);
 
 impl ResourceId {
+    /// Returns the [`ResourceId`] identifying the resource type `T`.
     pub fn of<T: Resource>() -> Self {
         ResourceId(TypeId::of::<T>())
     }
 
-    /// View as a [`TypeKey`] for generic type-id code.
+    /// Views this id as a [`TypeKey`] for generic type-id code.
     pub fn as_type_key(self) -> TypeKey {
         TypeKey(self.0)
     }
@@ -101,7 +118,7 @@ impl From<ResourceId> for TypeKey {
 /// - Pass resource type information between systems or phases
 /// - Defer resource access to a later point
 ///
-/// # Example
+/// # Examples
 /// ```no_run
 /// # use pill_engine::*;
 /// #[derive(Debug)]
@@ -124,37 +141,38 @@ impl From<ResourceId> for TypeKey {
 /// score.0 += 10;
 /// ```
 pub struct ResHandle<T: Resource> {
+    /// Type-level marker carrying no data; the handle is zero-sized at runtime.
     _phantom: PhantomData<T>,
 }
 
 impl<T: Resource> ResHandle<T> {
-    /// Create a new handle for a resource type.
+    /// Creates a new handle for a resource type.
     pub fn new() -> Self {
         Self {
             _phantom: PhantomData,
         }
     }
 
-    /// Get the `ResourceId` for this handle's resource type.
+    /// Gets the [`ResourceId`] for this handle's resource type.
     pub fn id(&self) -> ResourceId {
         ResourceId::of::<T>()
     }
 
-    /// Get an immutable reference to the resource from the World.
+    /// Gets an immutable reference to the resource from the [`World`].
     ///
     /// Returns `None` if the resource has not been inserted.
     pub fn get<'w>(&self, world: &'w World) -> Option<&'w T> {
         world.get_resource::<T>()
     }
 
-    /// Get a mutable reference to the resource from the World.
+    /// Gets a mutable reference to the resource from the [`World`].
     ///
     /// Returns `None` if the resource has not been inserted.
     pub fn get_mut<'w>(&self, world: &'w mut World) -> Option<&'w mut T> {
         world.get_resource_mut::<T>()
     }
 
-    /// Check if the resource exists in the World.
+    /// Checks whether the resource exists in the [`World`].
     pub fn exists(&self, world: &World) -> bool {
         world.has_resource::<T>()
     }
@@ -174,8 +192,11 @@ impl<T: Resource> Clone for ResHandle<T> {
 
 impl<T: Resource> Copy for ResHandle<T> {}
 
-// SAFETY: ResHandle contains only PhantomData and carries no actual data.
-// It is purely a type-level marker.
+// SAFETY: `ResHandle<T>` stores only `PhantomData<T>` and never owns or
+// references a value of type `T`, so no `T` data is moved, shared, or
+// aliased through a handle. Marking every handle `Send` and `Sync` is
+// therefore sound for any `T`: handles are inert, zero-sized type-level
+// markers with no data to race on, alias, or invalidate.
 unsafe impl<T: Resource> Send for ResHandle<T> {}
 unsafe impl<T: Resource> Sync for ResHandle<T> {}
 

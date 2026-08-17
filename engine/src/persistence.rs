@@ -83,6 +83,17 @@ pub(crate) type InsertComponentFn =
 /// matched by type **name** (a string like `"game::Position"`), not by
 /// `TypeId`, so schema changes (added/removed fields) are handled by
 /// serde's default-value / ignore-unknown behaviour.
+///
+/// # Examples
+///
+/// ```
+/// use pill_engine::ComponentSnapshot;
+///
+/// let snapshot = ComponentSnapshot {
+///     entries: vec![vec![("game::Position".to_string(), b"{}".to_vec())]],
+/// };
+/// assert_eq!(snapshot.entity_count(), 1);
+/// ```
 #[derive(Debug, Default)]
 pub struct ComponentSnapshot {
     /// Each entry represents one entity to recreate.
@@ -105,6 +116,9 @@ pub struct PersistTypeMetadata {
 }
 
 /// Lightweight manifest entry for current persistable component registrations.
+///
+/// Produced by [`World::persist_type_manifest`] so the host can compare pre-
+/// and post-reload registrations and decide which types need migration.
 #[derive(Clone)]
 pub struct PersistTypeManifestEntry {
     /// Fully-qualified Rust type name.
@@ -116,6 +130,10 @@ pub struct PersistTypeManifestEntry {
 }
 
 /// Result of selective migration.
+///
+/// Aggregates how many component types and entities were migrated by
+/// [`World::migrate_changed_persistable_components`], plus the names of the
+/// types that could not be migrated selectively.
 #[derive(Debug, Default)]
 pub struct SelectiveMigrationReport {
     /// Number of component types that were migrated.
@@ -146,7 +164,7 @@ impl World {
     /// during hot-reload.
     ///
     /// The type `T` must implement `serde::Serialize + serde::DeserializeOwned`
-    /// so that bincode can round-trip its data.  When the struct shape changes
+    /// so that JSON can round-trip its data.  When the struct shape changes
     /// between reloads, serde matches fields by **name** — new fields get
     /// `Default::default()`, removed fields are silently ignored.
     pub fn register_persistable_component<T>(&mut self)
@@ -159,16 +177,17 @@ impl World {
             + Default
             + 'static,
     {
-        // Standard component registration (bit, storage factory, copier).
+        // Step 1: Perform the standard component registration (bit index,
+        // storage factory, copier).
         self.register_component::<T>();
 
         let component_id = ComponentId::of::<T>();
         let type_name = std::any::type_name::<T>().to_string();
 
-        // Remove stale persist entries from previous registrations of
-        // the same type name.  This handles the case where a component
-        // struct is changed and then changed back — the compiler may
-        // assign the same TypeId, but old entries from intermediate
+        // Step 2: Purge stale persist entries left over from previous
+        // registrations of the same type name.  This handles the case where
+        // a component struct is changed and then changed back — the compiler
+        // may assign the same TypeId, but old entries from intermediate
         // shapes still pollute the persist maps.
         let stale_ids: Vec<ComponentId> = self
             .component_registry
@@ -185,7 +204,8 @@ impl World {
         // re-inserted below with the new function.
         self.persist_deserializers.remove(&type_name);
 
-        // Store the monomorphized serialize function.
+        // Step 3: Store the fresh monomorphized serialize, deserialize, and
+        // insert function pointers plus the schema hash for the new shape.
         self.persist_serializers.insert(
             component_id,
             serialize_component::<T> as SerializeComponentFn,
@@ -207,166 +227,6 @@ impl World {
 }
 
 // =============================================================================
-// Per-Type Monomorphized Functions
-// =============================================================================
-//
-// These generic functions are monomorphized once per concrete component type
-// inside the game DLL.  They are stored as plain `fn` pointers in the engine's
-// HashMaps, so replacing them on hot-reload simply overwrites the pointer —
-// no destructors, no vtable calls, no DLL-unload issues.
-
-/// Serialize a single component at `index` from storage into JSON bytes.
-fn serialize_component<T>(storage: &TraitTypeMap<dyn Component, VecFamily>, index: usize) -> Vec<u8>
-where
-    T: Component + TraitAccessible<dyn Component> + Serialize,
-{
-    let typed_storage = storage.get_storage::<T>();
-    let value: &T = typed_storage.get(index);
-    serde_json::to_vec(value).expect("JSON serialization failed")
-}
-
-/// Deserialize JSON bytes into a heap-allocated component.
-///
-/// If the schema changed (e.g. a field was added), missing fields are
-/// filled from `T::default()` by merging the default JSON with the
-/// snapshot JSON before deserializing.  Unknown fields (removed in the
-/// new schema) are silently ignored by serde.
-///
-/// Returns `None` only on truly incompatible changes (field type changed).
-fn deserialize_component<T>(bytes: &[u8]) -> Option<Box<dyn Component>>
-where
-    T: Component + Serialize + DeserializeOwned + Default + 'static,
-{
-    // Deserialize the snapshot data into a generic JSON Value.
-    let snapshot_json: serde_json::Value = serde_json::from_slice(bytes)
-        .map_err(|error| {
-            eprintln!(
-                "[persistence] Failed to parse JSON for '{}': {}",
-                std::any::type_name::<T>(),
-                error
-            );
-        })
-        .ok()?;
-
-    // Build the default instance and serialize it to JSON.
-    let default_instance = T::default();
-    let default_json: serde_json::Value = serde_json::to_value(&default_instance)
-        .map_err(|error| {
-            eprintln!(
-                "[persistence] Failed to serialize default for '{}': {}",
-                std::any::type_name::<T>(),
-                error
-            );
-        })
-        .ok()?;
-
-    // Merge: default fields fill in where the snapshot is missing.
-    // Snapshot values override defaults where present.
-    let merged = merge_json(default_json, snapshot_json);
-
-    match serde_json::from_value::<T>(merged) {
-        Ok(value) => Some(Box::new(value)),
-        Err(error) => {
-            eprintln!(
-                "[persistence] Failed to deserialize '{}': {}. Component data skipped.",
-                std::any::type_name::<T>(),
-                error
-            );
-            None
-        }
-    }
-}
-
-/// Deep-merge two JSON values: `base` provides defaults, `override_json`
-/// provides the actual data.  Fields present in `override_json` take
-/// precedence; fields only in `base` are kept as defaults.
-fn merge_json(mut base: serde_json::Value, override_json: serde_json::Value) -> serde_json::Value {
-    match (&mut base, override_json) {
-        (serde_json::Value::Object(base_map), serde_json::Value::Object(override_map)) => {
-            for (key, value) in override_map {
-                match base_map.get_mut(&key) {
-                    Some(base_val) => {
-                        // Recursively merge nested objects.
-                        let merged = merge_json(base_val.clone(), value);
-                        *base_val = merged;
-                    }
-                    None => {
-                        // Field in snapshot but not in default — keep it
-                        // (handles fields that were removed from the struct).
-                        base_map.insert(key, value);
-                    }
-                }
-            }
-            serde_json::Value::Object(base_map.clone())
-        }
-        // For non-object values (primitives, arrays), override wins.
-        (_, ov) => ov,
-    }
-}
-
-/// Build a normalized schema-shape JSON tree where values are replaced by
-/// stable kind markers. This avoids false negatives from default value changes.
-fn normalize_schema_shape(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Null => serde_json::Value::String("null".to_string()),
-        serde_json::Value::Bool(_) => serde_json::Value::String("bool".to_string()),
-        serde_json::Value::Number(_) => serde_json::Value::String("number".to_string()),
-        serde_json::Value::String(_) => serde_json::Value::String("string".to_string()),
-        serde_json::Value::Array(values) => {
-            let normalized_values: Vec<serde_json::Value> =
-                values.iter().map(normalize_schema_shape).collect();
-            serde_json::Value::Array(normalized_values)
-        }
-        serde_json::Value::Object(map) => {
-            let mut normalized_map = serde_json::Map::new();
-            let mut sorted_keys: Vec<&String> = map.keys().collect();
-            sorted_keys.sort();
-
-            for key in sorted_keys {
-                if let Some(entry_value) = map.get(key) {
-                    normalized_map.insert(key.clone(), normalize_schema_shape(entry_value));
-                }
-            }
-
-            serde_json::Value::Object(normalized_map)
-        }
-    }
-}
-
-/// Compute schema hash for one persistable component type.
-fn calculate_schema_hash<T>() -> u64
-where
-    T: Component + Serialize + Default + 'static,
-{
-    let default_value = T::default();
-    let default_json = serde_json::to_value(default_value).unwrap_or(serde_json::Value::Null);
-    let normalized_schema = normalize_schema_shape(&default_json);
-    let normalized_schema_string = serde_json::to_string(&normalized_schema)
-        .unwrap_or_else(|_| "<schema-serialization-failed>".to_string());
-
-    let mut hasher = DefaultHasher::new();
-    std::any::type_name::<T>().hash(&mut hasher);
-    std::mem::size_of::<T>().hash(&mut hasher);
-    normalized_schema_string.hash(&mut hasher);
-    hasher.finish()
-}
-
-/// Downcast and push a boxed component into the concrete VecStorage.
-fn insert_boxed_component<T>(
-    storage: &mut TraitTypeMap<dyn Component, VecFamily>,
-    component: Box<dyn Component>,
-) where
-    T: Component + TraitAccessible<dyn Component> + 'static,
-{
-    // SAFETY: This function is only called when the concrete type of
-    // `component` matches `T`, as guaranteed by the type-name lookup
-    // in `restore_from_snapshot`.  We transmute the fat pointer.
-    let raw = Box::into_raw(component);
-    let typed: Box<T> = unsafe { Box::from_raw(raw as *mut T) };
-    storage.get_storage_mut::<T>().push(*typed);
-}
-
-// =============================================================================
 // World — Snapshot and Restore
 // =============================================================================
 
@@ -380,8 +240,8 @@ impl World {
     ///
     /// # Panics
     ///
-    /// Panics if a persistable component's bincode serialization fails
-    /// (should never happen for valid component types).
+    /// Panics if a persistable component's JSON serialization fails (should
+    /// never happen for valid component types).
     pub fn snapshot_components(&self) -> ComponentSnapshot {
         let total_entities = self.entity_locations.len();
         let total_archetypes = self.archetypes.len();
@@ -396,6 +256,8 @@ impl World {
         let mut total_components_serialized: usize = 0;
         let mut skipped_non_persistable: usize = 0;
 
+        // Serialize every persistable component across all archetypes
+        // and entities; non-persistable components are counted and skipped.
         for archetype in self.archetypes.values() {
             let entity_count = archetype.entities.len();
             if entity_count == 0 {
@@ -465,7 +327,8 @@ impl World {
             snapshot_entity_count,
         );
 
-        // Phase 1: Destroy all existing entities.
+        // Step 1: Destroy all existing entities so stale TypeIds cannot
+        // alias new registrations.
         let all_entity_ids: Vec<Entity> = self.entity_locations.keys().copied().collect();
         let destroyed_count = all_entity_ids.len();
         for entity in all_entity_ids {
@@ -476,7 +339,7 @@ impl World {
             destroyed_count,
         );
 
-        // Phase 2: Recreate entities from snapshot data.
+        // Step 2: Recreate entities from snapshot data.
         let mut restored_entity_count: usize = 0;
         let mut restored_component_total: usize = 0;
         let mut skipped_type_removed: usize = 0;
@@ -531,6 +394,9 @@ impl World {
                 continue;
             }
 
+            // Place the entity in the archetype that owns its exact set of
+            // restored component types, inserting each restored component and
+            // seeding change ticks.
             let entity = self.allocate_entity();
             restored_component_ids.sort();
 
@@ -723,6 +589,21 @@ impl World {
         report
     }
 
+    /// Migrate one persistable component type from its previous registration
+    /// to the current one.
+    ///
+    /// Chooses between an in-place column swap (when the [`ComponentId`] is
+    /// unchanged) and a full archetype remap (when the component id changed
+    /// after a reload).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::ComponentTypeUnregistered`] when the type
+    /// name is no longer registered, [`PersistenceError::DeserializerMissing`]
+    /// when no deserializer is registered for the type name, and
+    /// [`PersistenceError::InserterMissing`] when no inserter is registered
+    /// for the resolved component id.  Errors from the underlying in-place or
+    /// cross-archetype migration propagate unchanged.
     fn migrate_single_component_type(
         &mut self,
         type_name: &str,
@@ -772,6 +653,23 @@ impl World {
         }
     }
 
+    /// Rewrite one component column in place inside every archetype that
+    /// contains the old component id.
+    ///
+    /// Serializes each old value, deserializes it with the new schema
+    /// (falling back to `{}` when the snapshot bytes no longer parse),
+    /// removes the old storage column, recreates it through the registered
+    /// storage factory, and inserts the migrated values.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::DeserializationFailed`] when a value cannot
+    /// be decoded with either the snapshot bytes or `{}`,
+    /// [`PersistenceError::StorageRemovalFailed`] when the old storage column
+    /// cannot be removed, [`PersistenceError::StorageFactoryMissing`] when no
+    /// storage factory is registered, and
+    /// [`PersistenceError::NativeStorageExpected`] when the registered
+    /// factory is not a native storage factory.
     fn migrate_component_column_in_place(
         &mut self,
         component_id: ComponentId,
@@ -779,6 +677,8 @@ impl World {
         deserialize_new_component: DeserializeComponentFn,
         insert_new_component: InsertComponentFn,
     ) -> Result<usize, PersistenceError> {
+        // Step 1: Collect the archetypes whose columns contain the old
+        // component id.
         let archetype_ids: Vec<_> = self
             .archetypes
             .iter()
@@ -789,6 +689,8 @@ impl World {
         let mut migrated_entity_count: usize = 0;
 
         for archetype_id in archetype_ids {
+            // Step 2: Serialize every old value before the storage column is
+            // removed.
             let serialized_components: Vec<Vec<u8>> = {
                 let Some(archetype) = self.archetypes.get(&archetype_id) else {
                     continue;
@@ -801,6 +703,8 @@ impl World {
                     .collect()
             };
 
+            // Step 3: Decode each value with the new schema, falling back to
+            // an empty `{}` object when the snapshot bytes no longer parse.
             let mut migrated_components: Vec<Box<dyn Component>> =
                 Vec::with_capacity(serialized_components.len());
 
@@ -811,6 +715,9 @@ impl World {
                 migrated_components.push(component);
             }
 
+            // Step 4: Swap the storage column: remove the old one, recreate it
+            // through the registered storage factory, and insert the migrated
+            // values.
             let Some(archetype) = self.archetypes.get_mut(&archetype_id) else {
                 continue;
             };
@@ -845,6 +752,21 @@ impl World {
         Ok(migrated_entity_count)
     }
 
+    /// Move every entity from archetypes containing the old component id into
+    /// archetypes containing the new component id.
+    ///
+    /// Serializes each old component value, deserializes it with the new
+    /// schema (falling back to `{}`), copies the unchanged components through
+    /// their registered copiers, and re-inserts the migrated component.  Used
+    /// when a reload changes the [`ComponentId`] assigned to a type name.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistenceError::DeserializationFailed`] when a migrated
+    /// value cannot be decoded with either the snapshot bytes or `{}`,
+    /// [`PersistenceError::DestinationArchetypeMissing`] when the destination
+    /// archetype cannot be created, and [`PersistenceError::CopierMissing`]
+    /// when an unchanged component has no registered copier.
     fn migrate_component_across_archetypes(
         &mut self,
         old_component_id: ComponentId,
@@ -853,6 +775,7 @@ impl World {
         deserialize_new_component: DeserializeComponentFn,
         insert_new_component: InsertComponentFn,
     ) -> Result<usize, PersistenceError> {
+        // Step 1: Locate every archetype that contains the old component id.
         let source_archetype_ids: Vec<_> = self
             .archetypes
             .iter()
@@ -863,6 +786,8 @@ impl World {
         let mut migrated_entity_count: usize = 0;
 
         for source_archetype_id in source_archetype_ids {
+            // Step 2: Remove the source archetype and compute its destination
+            // component set with the old id replaced by the new one.
             let Some(source_archetype) = self.archetypes.remove(&source_archetype_id) else {
                 continue;
             };
@@ -884,6 +809,8 @@ impl World {
 
             let destination_archetype_id = self.get_or_create_archetype(destination_component_ids);
 
+            // Step 3: Serialize the old component values and decode them with
+            // the new schema, falling back to `{}`.
             let serialized_components: Vec<Vec<u8>> = (0..source_archetype.entities.len())
                 .map(|entity_index| {
                     serialize_old_component(&source_archetype.component_storages, entity_index)
@@ -902,6 +829,9 @@ impl World {
                 migrated_components.push(component);
             }
 
+            // Step 4: Move each entity into the destination archetype,
+            // copying the unchanged components and inserting the migrated
+            // one, then re-record its location and per-component ticks.
             let Some(destination_archetype) = self.archetypes.get_mut(&destination_archetype_id)
             else {
                 return Err(PersistenceError::DestinationArchetypeMissing);
@@ -971,9 +901,182 @@ impl World {
             migrated_entity_count += source_archetype.entities.len();
         }
 
+        // Step 5: Bump the archetype generation so cached query plans observe
+        // the new archetype layout.
         self.archetype_generation = self.archetype_generation.wrapping_add(1);
         Ok(migrated_entity_count)
     }
+}
+
+// =============================================================================
+// Per-Type Monomorphized Functions
+// =============================================================================
+//
+// These generic functions are monomorphized once per concrete component type
+// inside the game DLL.  They are stored as plain `fn` pointers in the engine's
+// HashMaps, so replacing them on hot-reload simply overwrites the pointer —
+// no destructors, no vtable calls, no DLL-unload issues.
+
+/// Serialize a single component at `index` from storage into JSON bytes.
+fn serialize_component<T>(storage: &TraitTypeMap<dyn Component, VecFamily>, index: usize) -> Vec<u8>
+where
+    T: Component + TraitAccessible<dyn Component> + Serialize,
+{
+    let typed_storage = storage.get_storage::<T>();
+    let value: &T = typed_storage.get(index);
+    serde_json::to_vec(value).expect("JSON serialization failed")
+}
+
+/// Deserialize JSON bytes into a heap-allocated component.
+///
+/// If the schema changed (e.g. a field was added), missing fields are
+/// filled from `T::default()` by merging the default JSON with the
+/// snapshot JSON before deserializing.  Unknown fields (removed in the
+/// new schema) are silently ignored by serde.
+///
+/// Returns `None` only on truly incompatible changes (field type changed).
+fn deserialize_component<T>(bytes: &[u8]) -> Option<Box<dyn Component>>
+where
+    T: Component + Serialize + DeserializeOwned + Default + 'static,
+{
+    // Step 1: Deserialize the snapshot bytes into a generic JSON Value.
+    let snapshot_json: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| {
+            eprintln!(
+                "[persistence] Failed to parse JSON for '{}': {}",
+                std::any::type_name::<T>(),
+                error
+            );
+        })
+        .ok()?;
+
+    // Step 2: Serialize a default instance to JSON as the schema baseline
+    // for fields missing from the snapshot.
+    let default_instance = T::default();
+    let default_json: serde_json::Value = serde_json::to_value(&default_instance)
+        .map_err(|error| {
+            eprintln!(
+                "[persistence] Failed to serialize default for '{}': {}",
+                std::any::type_name::<T>(),
+                error
+            );
+        })
+        .ok()?;
+
+    // Step 3: Merge the defaults with the snapshot data; snapshot values
+    // override defaults where both are present.
+    let merged = merge_json(default_json, snapshot_json);
+
+    match serde_json::from_value::<T>(merged) {
+        Ok(value) => Some(Box::new(value)),
+        Err(error) => {
+            eprintln!(
+                "[persistence] Failed to deserialize '{}': {}. Component data skipped.",
+                std::any::type_name::<T>(),
+                error
+            );
+            None
+        }
+    }
+}
+
+/// Deep-merge two JSON values: `base` provides defaults, `override_json`
+/// provides the actual data.  Fields present in `override_json` take
+/// precedence; fields only in `base` are kept as defaults.
+fn merge_json(mut base: serde_json::Value, override_json: serde_json::Value) -> serde_json::Value {
+    match (&mut base, override_json) {
+        (serde_json::Value::Object(base_map), serde_json::Value::Object(override_map)) => {
+            for (key, value) in override_map {
+                match base_map.get_mut(&key) {
+                    Some(base_val) => {
+                        // Recursively merge nested objects.
+                        let merged = merge_json(base_val.clone(), value);
+                        *base_val = merged;
+                    }
+                    None => {
+                        // Field in snapshot but not in default — keep it
+                        // (handles fields that were removed from the struct).
+                        base_map.insert(key, value);
+                    }
+                }
+            }
+            serde_json::Value::Object(base_map.clone())
+        }
+        // For non-object values (primitives, arrays), override wins.
+        (_, ov) => ov,
+    }
+}
+
+/// Build a normalized schema-shape JSON tree where values are replaced by
+/// stable kind markers. This avoids false negatives from default value changes.
+fn normalize_schema_shape(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Null => serde_json::Value::String("null".to_string()),
+        serde_json::Value::Bool(_) => serde_json::Value::String("bool".to_string()),
+        serde_json::Value::Number(_) => serde_json::Value::String("number".to_string()),
+        serde_json::Value::String(_) => serde_json::Value::String("string".to_string()),
+        serde_json::Value::Array(values) => {
+            let normalized_values: Vec<serde_json::Value> =
+                values.iter().map(normalize_schema_shape).collect();
+            serde_json::Value::Array(normalized_values)
+        }
+        serde_json::Value::Object(map) => {
+            let mut normalized_map = serde_json::Map::new();
+            let mut sorted_keys: Vec<&String> = map.keys().collect();
+            sorted_keys.sort();
+
+            for key in sorted_keys {
+                if let Some(entry_value) = map.get(key) {
+                    normalized_map.insert(key.clone(), normalize_schema_shape(entry_value));
+                }
+            }
+
+            serde_json::Value::Object(normalized_map)
+        }
+    }
+}
+
+/// Compute schema hash for one persistable component type.
+fn calculate_schema_hash<T>() -> u64
+where
+    T: Component + Serialize + Default + 'static,
+{
+    // Step 1: Serialize a default instance and normalize it to stable kind
+    // markers so default-value changes do not alter the schema hash.
+    let default_value = T::default();
+    let default_json = serde_json::to_value(default_value).unwrap_or(serde_json::Value::Null);
+    let normalized_schema = normalize_schema_shape(&default_json);
+    let normalized_schema_string = serde_json::to_string(&normalized_schema)
+        .unwrap_or_else(|_| "<schema-serialization-failed>".to_string());
+
+    // Step 2: Combine the type name, size, and normalized schema into a
+    // stable 64-bit hash for comparing schemas across reloads.
+    let mut hasher = DefaultHasher::new();
+    std::any::type_name::<T>().hash(&mut hasher);
+    std::mem::size_of::<T>().hash(&mut hasher);
+    normalized_schema_string.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Downcast and push a boxed component into the concrete VecStorage.
+fn insert_boxed_component<T>(
+    storage: &mut TraitTypeMap<dyn Component, VecFamily>,
+    component: Box<dyn Component>,
+) where
+    T: Component + TraitAccessible<dyn Component> + 'static,
+{
+    // SAFETY: `raw` is produced by `Box::into_raw` above, so it is valid,
+    // correctly aligned, and uniquely owned with no aliasing references
+    // outstanding, and `Box::from_raw` takes ownership back exactly once.
+    // The `*mut T` cast is sound because the concrete type of `component`
+    // is guaranteed to match `T`: the caller resolves this function pointer
+    // via the type-name lookup in `restore_from_snapshot`, so the fat
+    // pointer's data and vtable are valid for `T`.  `*typed` is moved out
+    // and pushed into storage, ending the box's ownership without a
+    // double-free.
+    let raw = Box::into_raw(component);
+    let typed: Box<T> = unsafe { Box::from_raw(raw as *mut T) };
+    storage.get_storage_mut::<T>().push(*typed);
 }
 
 // =============================================================================

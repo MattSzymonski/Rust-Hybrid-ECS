@@ -8,7 +8,7 @@
 //!
 //! # Design
 //!
-//! Scripts receive a [`ScriptContext`] instead of direct [`Engine`] access.
+//! Scripts receive a [`ScriptContext`] instead of direct [`crate::Engine`] access.
 //! This ensures all structural changes (add/remove component, destroy entity)
 //! are automatically deferred, preventing use-after-free bugs that would
 //! occur if a script migrated its own entity while holding `&mut self`.
@@ -56,7 +56,7 @@ pub struct ScriptContext<'a> {
 }
 
 impl<'a> ScriptContext<'a> {
-    /// Create a new script context
+    /// Creates a new script context.
     pub(crate) fn new(
         world: &'a mut World,
         commands: &'a mut CommandQueue,
@@ -69,7 +69,7 @@ impl<'a> ScriptContext<'a> {
         }
     }
 
-    /// Get the entity this script is attached to
+    /// Gets the entity this script is attached to.
     #[inline]
     pub fn get_owning_entity(&self) -> Entity {
         self.self_entity
@@ -79,7 +79,7 @@ impl<'a> ScriptContext<'a> {
     // Read-Only World Access (Safe - no structural changes)
     // ----------------------------------------------------------------------------
 
-    /// Get immutable reference to a component on any entity
+    /// Gets an immutable reference to a component on any entity.
     pub fn get_component<T>(&self, entity: Entity) -> Option<&T>
     where
         T: Component + TraitAccessible<dyn Component>,
@@ -87,7 +87,7 @@ impl<'a> ScriptContext<'a> {
         self.world.get_component::<T>(entity)
     }
 
-    /// Get mutable reference to a component on any entity
+    /// Gets a mutable reference to a component on any entity.
     ///
     /// IMPORTANT:
     /// This function uses raw pointers internally to avoid Rust's aliasing restrictions,
@@ -104,16 +104,31 @@ impl<'a> ScriptContext<'a> {
     where
         T: Component + TraitAccessible<dyn Component>,
     {
+        // Step 1: Acquire a raw pointer to the component storage slot. The
+        // lookup returns `None` when the entity is missing or does not carry `T`.
         let component_pointer = self.world.get_component_ptr_mut::<T>(entity)?;
+
+        // Step 2: Reborrow the raw pointer as a `&mut T` reference.
+        // SAFETY: `World::get_component_ptr_mut` either returns `None` (already
+        // handled by `?`) or a valid, aligned, non-null pointer to a live `T`
+        // component. This call holds the exclusive `&mut self` borrow of the
+        // world for the whole lifetime of the returned reference, and every
+        // structural change (add/remove component, destroy entity) is deferred
+        // to the command queue, so the storage slot cannot be migrated or
+        // deallocated while the reference is alive. Deliberately creating a
+        // second `&mut T` for the script's own component type is the documented
+        // purpose of this API (see the doc comment above); it is sound in
+        // practice because no structural mutation can invalidate either
+        // reference during the borrow.
         Some(unsafe { &mut *component_pointer })
     }
 
-    /// Check if an entity exists
+    /// Checks whether an entity exists.
     pub fn entity_exists(&self, entity: Entity) -> bool {
         self.world.is_entity_valid(entity)
     }
 
-    /// Get immutable reference to a resource
+    /// Gets an immutable reference to a resource.
     pub fn get_resource<T: Resource>(&self) -> Option<&T> {
         self.world.get_resource::<T>()
     }
@@ -122,7 +137,7 @@ impl<'a> ScriptContext<'a> {
     // Deferred Commands (Safe - executed after all scripts complete)
     // ----------------------------------------------------------------------------
 
-    /// Queue spawning a new entity (deferred)
+    /// Queues spawning a new entity (deferred).
     ///
     /// The entity will be created after all scripts finish updating.
     /// Returns a DeferredEntityBuilder to add components.
@@ -130,7 +145,7 @@ impl<'a> ScriptContext<'a> {
         crate::commands::DeferredEntityBuilder::new(self.commands, self.world)
     }
 
-    /// Queue destroying an entity (deferred)
+    /// Queues destroying an entity (deferred).
     ///
     /// The entity will be destroyed after all scripts finish updating.
     /// Safe to call on the owning entity - the script will complete before destruction.
@@ -138,7 +153,7 @@ impl<'a> ScriptContext<'a> {
         self.commands.destroy_entity(entity);
     }
 
-    /// Queue adding a component to an entity (deferred)
+    /// Queues adding a component to an entity (deferred).
     ///
     /// The component will be added after all scripts finish updating.
     pub fn add_component<T>(&mut self, entity: Entity, component: T)
@@ -148,25 +163,29 @@ impl<'a> ScriptContext<'a> {
         self.commands.add_component_to_entity(entity, component);
     }
 
-    /// Queue removing a component from an entity (deferred)
+    /// Queues removing a component from an entity (deferred).
     ///
     /// The component will be removed after all scripts finish updating.
     pub fn remove_component<T: Component>(&mut self, entity: Entity) {
         self.commands.remove_component_from_entity::<T>(entity);
     }
 
-    /// Get direct access to the command queue for advanced usage
+    /// Gets direct access to the command queue for advanced usage.
     pub fn get_commands(&mut self) -> &mut CommandQueue {
         self.commands
     }
 }
+
+// =============================================================================
+// ScriptComponent
+// =============================================================================
 
 /// Trait for components that can execute logic each frame
 ///
 /// Script components have an update() method that gets called by the scripting system.
 /// They receive a `ScriptContext` which provides safe, deferred access to the ECS.
 ///
-/// # Safety
+/// # Design
 ///
 /// The `ScriptContext` only exposes read-only world access and deferred commands.
 /// This prevents scripts from accidentally causing use-after-free by:
@@ -175,7 +194,7 @@ impl<'a> ScriptContext<'a> {
 ///
 /// All structural changes are queued and executed after ALL scripts complete.
 ///
-/// # Example
+/// # Examples
 ///
 /// ```ignore
 /// struct PlayerController {
@@ -200,7 +219,7 @@ impl<'a> ScriptContext<'a> {
 /// }
 /// ```
 pub trait ScriptComponent: Component {
-    /// Update this script component
+    /// Updates this script component.
     ///
     /// Called once per frame by the scripting system.
     /// Use `script_context.get_owning_entity()` to get the entity this script is attached to.

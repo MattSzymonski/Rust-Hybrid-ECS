@@ -32,6 +32,10 @@ use crate::{ComponentId, Entity};
 // =============================================================================
 
 /// Storage and migration failures of the archetype world.
+///
+/// Raised when entity or dynamic-component operations violate storage
+/// invariants, such as unregistered IDs, malformed byte layouts, or
+/// exceeding the component-type limit.
 #[engine_error(namespace = engine::world, runtime = ::pill_core::error)]
 pub enum WorldError {
     /// The stable ID of a dynamic component cannot be zero.
@@ -147,6 +151,9 @@ pub enum CommandError {
 // =============================================================================
 
 /// Error type for `add_component` operations.
+///
+/// Returned by the typed component insertion paths when the target entity
+/// is missing or already carries the component being added.
 #[engine_error(namespace = engine::world, runtime = ::pill_core::error)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum AddComponentError {
@@ -160,6 +167,9 @@ pub enum AddComponentError {
 }
 
 /// Error type for `remove_component` operations.
+///
+/// Returned by the typed component removal paths when the target entity
+/// is missing or does not carry the component being removed.
 #[engine_error(namespace = engine::world, runtime = ::pill_core::error)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum RemoveComponentError {
@@ -173,6 +183,10 @@ pub enum RemoveComponentError {
 }
 
 /// Error type for `EntityBuilder::build` when a component was not registered.
+///
+/// Returned when the builder writes a component type the world has never
+/// seen; each offending type must first be registered with
+/// `world.register_component::<T>()`.
 #[engine_error(namespace = engine::world, runtime = ::pill_core::error)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BuildError {
@@ -191,6 +205,10 @@ pub enum BuildError {
 // =============================================================================
 
 /// Migration failures of persistable component columns.
+///
+/// Raised while moving persisted component data between schemas: missing
+/// deserializers, storage factories, or copiers, or bytes that fail to
+/// decode into the new layout.
 #[engine_error(namespace = engine::persistence, runtime = ::pill_core::error)]
 pub enum PersistenceError {
     /// The component type is not registered in the current world.
@@ -256,6 +274,9 @@ pub enum PersistenceError {
 // =============================================================================
 
 /// Rendering initialization or presentation failures of the wgpu backend.
+///
+/// Compiled only when the `rendering` feature is enabled; covers surface,
+/// adapter, device, and frame-acquisition failures.
 #[cfg(feature = "rendering")]
 #[engine_error(namespace = engine::renderer, runtime = ::pill_core::error)]
 pub enum RendererError {
@@ -337,6 +358,23 @@ pub struct SystemFailure {
 
 impl SystemFailure {
     /// Pair one failing system name with its error.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pill_engine::{SystemError, SystemFailure};
+    ///
+    /// let failure = SystemFailure::new(
+    ///     String::from("ball_physics"),
+    ///     SystemError::MissingResource {
+    ///         name: String::from("SimulationTime"),
+    ///     },
+    /// );
+    /// assert_eq!(
+    ///     failure.to_string(),
+    ///     "system ball_physics failed: resource SimulationTime is missing from the world"
+    /// );
+    /// ```
     pub fn new(system: String, error: SystemError) -> Self {
         Self { system, error }
     }

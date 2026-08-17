@@ -14,36 +14,36 @@
 //! copying the address. Actual dereference requires `unsafe` blocks that
 //! the query system protects through the scheduler's disjoint-access guarantee.
 
-// Standard library
-
 // =============================================================================
 // SendPtr
 // =============================================================================
 
-/// A wrapper for `*const T` that implements [`Send`] and [`Sync`].
+/// Thread-safe wrapper around a `*const T` used to share read-only component
+/// pointers across worker threads.
 ///
-/// SAFETY:
-///
-/// Raw pointers carry no ownership - the wrapper just holds a plain address.  
-/// Moving it between threads is harmless, and sharing `&SendPtr<T>`
-/// only allows copying the address (dereference requires `unsafe`).
-/// The standard library omits these impls as a lint; they are not fundamentally unsound.
-/// The actual data-race-prevention obligation rests on the `unsafe` blocks that dereference the pointer,
-/// which the query system enforces through the scheduler's disjoint-access guarantee.
+/// The wrapper holds a plain address with no ownership semantics; moving it
+/// between threads is harmless and sharing `&SendPtr<T>` only allows copying
+/// the address. Dereference requires `unsafe` and is protected by the query
+/// scheduler's disjoint-access guarantee.
 #[derive(Clone, Copy)]
 pub struct SendPtr<T>(*const T);
 
-// SAFETY: Raw pointer - no ownership transferred when moved across threads.
+// SAFETY: `SendPtr<T>` owns a raw `*const T` with no ownership semantics, so
+// transferring it across threads moves only an address; no data race or
+// aliasing violation can arise from the move itself.
 unsafe impl<T> Send for SendPtr<T> {}
-// SAFETY: `&SendPtr<T>` only grants access to a copyable address; no
-// data race is possible through the wrapper itself.
+// SAFETY: Shared access `&SendPtr<T>` only permits copying the stored address
+// out; the wrapper never dereferences the pointer, so no `&mut` aliasing or
+// data race is reachable through the wrapper itself.
 unsafe impl<T> Sync for SendPtr<T> {}
 
 impl<T> SendPtr<T> {
+    /// Wraps a raw read-only pointer in a [`SendPtr`].
     pub fn new(ptr: *const T) -> Self {
         Self(ptr)
     }
 
+    /// Returns the wrapped raw read-only pointer.
     pub fn as_ptr(&self) -> *const T {
         self.0
     }
@@ -53,24 +53,33 @@ impl<T> SendPtr<T> {
 // SendPtrMut
 // =============================================================================
 
-/// A wrapper for `*mut T` that implements [`Send`] and [`Sync`].
+/// Thread-safe wrapper around a `*mut T` used to share mutable component
+/// pointers across worker threads.
 ///
-/// SAFETY: The same rationale as [`SendPtr`] applies - raw pointers carry no ownership.  
-/// The `*mut` vs `*const` distinction only matters at the dereference site,
-/// which requires `unsafe` and is guarded by the scheduler's disjoint-access guarantee.
+/// As with [`SendPtr`], the wrapper holds a plain address with no ownership
+/// semantics. The `*mut` versus `*const` distinction matters only at the
+/// dereference site, which requires `unsafe` and is guarded by the query
+/// scheduler's disjoint-access guarantee.
 #[derive(Clone, Copy)]
 pub struct SendPtrMut<T>(*mut T);
 
-// SAFETY: See [`SendPtr`].
+// SAFETY: `SendPtrMut<T>` owns a raw `*mut T` and moving it between threads
+// transfers only the address; the wrapper itself performs no dereference, so
+// no data race is introduced by the move.
 unsafe impl<T> Send for SendPtrMut<T> {}
-// SAFETY: See [`SendPtr`].
+// SAFETY: Sharing `&SendPtrMut<T>` only allows copying the stored `*mut T`
+// address; dereference is deferred to `unsafe` blocks that the query
+// scheduler's disjoint-access guarantee protects, so no data race is reachable
+// through the wrapper itself.
 unsafe impl<T> Sync for SendPtrMut<T> {}
 
 impl<T> SendPtrMut<T> {
+    /// Wraps a raw mutable pointer in a [`SendPtrMut`].
     pub fn new(ptr: *mut T) -> Self {
         Self(ptr)
     }
 
+    /// Returns the wrapped raw mutable pointer.
     pub fn as_ptr(&self) -> *mut T {
         self.0
     }

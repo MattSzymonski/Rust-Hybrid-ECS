@@ -14,8 +14,23 @@
 //! [`Renderer::resize`] and [`Renderer::render`]. No frontend needs a direct
 //! dependency on wgpu or an async executor.
 
+// Current crate
 use crate::engine::Engine;
 use crate::render::{RenderViewport, SpriteRenderer, VirtualResolution};
+
+// =============================================================================
+// Re-exports
+// =============================================================================
+
+/// Rendering initialization or presentation failure without exposed wgpu types.
+///
+/// The semantic error enum is declared in [`crate::error::RendererError`] and
+/// re-exported here for the pre-existing module path.
+pub use crate::error::RendererError;
+
+// =============================================================================
+// RendererWindow
+// =============================================================================
 
 /// Window-handle capability accepted by the engine renderer.
 ///
@@ -25,14 +40,29 @@ pub trait RendererWindow: wgpu::WindowHandle {}
 
 impl<T> RendererWindow for T where T: wgpu::WindowHandle {}
 
+// =============================================================================
+// Renderer
+// =============================================================================
+
 /// Engine-owned GPU state associated with one frontend window surface.
+///
+/// Holds every wgpu resource the engine needs to draw one frame — the surface,
+/// device, queue, and sprite renderer — plus the optional viewport and
+/// logical-resolution overrides installed by frontends.
 pub struct Renderer {
+    /// The GPU surface bound to the frontend's window handle.
     surface: wgpu::Surface<'static>,
+    /// Logical GPU device used for all rendering commands.
     device: wgpu::Device,
+    /// Command queue that submits rendered frames to the device.
     queue: wgpu::Queue,
+    /// Surface configuration reapplied after creation, resize, or loss.
     surface_config: wgpu::SurfaceConfiguration,
+    /// Draws the sprite entities into a texture view each frame.
     sprite_renderer: SpriteRenderer,
+    /// Physical-pixel crop rectangle, or `None` for full-surface rendering.
     viewport: Option<RenderViewport>,
+    /// Logical scene size filling the viewport, or `None` for one-to-one pixels.
     virtual_resolution: Option<VirtualResolution>,
 }
 
@@ -42,15 +72,26 @@ impl Renderer {
     /// The supplied handle is retained by wgpu for the surface lifetime. An
     /// `Arc<winit::window::Window>` satisfies this API without making the engine
     /// depend on winit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RendererError::SurfaceCreation`] when the window handle cannot
+    /// be bound to a wgpu surface, [`RendererError::AdapterRequest`] when no
+    /// compatible GPU adapter exists, and [`RendererError::DeviceCreation`]
+    /// when the device cannot be created from the adapter. A surface exposing
+    /// no texture formats or no alpha modes yields
+    /// [`RendererError::NoTextureFormats`] or [`RendererError::NoAlphaModes`].
     pub fn new<W>(window: W, width: u32, height: u32) -> Result<Self, RendererError>
     where
         W: RendererWindow + 'static,
     {
+        // Step 1: create the wgpu instance and bind it to the frontend window.
         let instance = wgpu::Instance::default();
         let surface = instance
             .create_surface(window)
             .map_err(|error| RendererError::SurfaceCreation { source: error })?;
 
+        // Step 2: acquire an adapter compatible with the surface.
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
             force_fallback_adapter: false,
@@ -58,6 +99,7 @@ impl Renderer {
         }))
         .map_err(|error| RendererError::AdapterRequest { source: error })?;
 
+        // Step 3: request the device and queue from the adapter.
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("ECS renderer device"),
             required_features: wgpu::Features::empty(),
@@ -68,6 +110,7 @@ impl Renderer {
         }))
         .map_err(|error| RendererError::DeviceCreation { source: error })?;
 
+        // Step 4: derive the surface format, alpha mode, and presentation mode.
         let capabilities = surface.get_capabilities(&adapter);
         let format = capabilities
             .formats
@@ -91,6 +134,7 @@ impl Renderer {
         };
         surface.configure(&device, &surface_config);
 
+        // Step 5: build the sprite renderer and assemble the renderer state.
         let sprite_renderer = SpriteRenderer::new(&device, format);
         Ok(Self {
             surface,
@@ -143,7 +187,15 @@ impl Renderer {
     /// Lost or outdated surfaces are reconfigured and skipped for one frame.
     /// Timeouts are transient and also skip the frame. Fatal allocation and
     /// generic surface failures are returned to the frontend for reporting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RendererError::SurfaceTextureFailed`] when the frame texture
+    /// cannot be acquired due to an out-of-memory condition or an unknown
+    /// backend failure. Lost, outdated, and timed-out surfaces are recovered
+    /// internally and never produce an error.
     pub fn render(&mut self, engine: &mut Engine) -> Result<(), RendererError> {
+        // Step 1: acquire the next frame texture, recovering transient errors.
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
@@ -156,6 +208,7 @@ impl Renderer {
             }
         };
 
+        // Step 2: build the texture view and resolve the viewport and projection.
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -169,6 +222,7 @@ impl Renderer {
 
         let virtual_resolution = resolve_virtual_resolution(self.virtual_resolution, viewport);
 
+        // Step 3: draw the sprite world into the view and present the frame.
         self.sprite_renderer.render_in_viewport_with_resolution(
             engine.world_mut(),
             &self.device,
@@ -186,6 +240,10 @@ impl Renderer {
         self.surface.configure(&self.device, &self.surface_config);
     }
 }
+
+// =============================================================================
+// Free Functions
+// =============================================================================
 
 /// Resolve the logical projection without coupling it to surface dimensions.
 fn resolve_virtual_resolution(
@@ -229,11 +287,9 @@ fn select_alpha_mode(supported: &[wgpu::CompositeAlphaMode]) -> Option<wgpu::Com
         .or_else(|| supported.first().copied())
 }
 
-/// Rendering initialization or presentation failure without exposed wgpu types.
-///
-/// The semantic error enum is declared in [`crate::error::RendererError`] and
-/// re-exported here for the pre-existing module path.
-pub use crate::error::RendererError;
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {

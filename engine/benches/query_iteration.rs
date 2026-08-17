@@ -5,6 +5,20 @@
 //! nearly all its time inside a query loop. These benchmarks cover every
 //! meaningful iteration variant to build a complete performance profile.
 //!
+//! # Responsibilities
+//!
+//! - Owns the criterion benchmark harness for every query iteration variant.
+//! - Covers sequential, filtered, parallel, access-pattern, and cache-pressure
+//!   paths so a regression in any query mode is caught at commit time.
+//!
+//! # Design
+//!
+//! Each `bench_*` function registers a fresh [`World`] and iterates a typed
+//! [`Query`] inside a criterion closure, isolating the cost of one variant.
+//! Shared worlds come from [`setup_world`] and [`setup_filtered_world`];
+//! filtered worlds tag every 4th entity [`Enemy`] and every 7th entity
+//! [`Frozen`] to exercise realistic `With`/`Without`/`Or` match rates.
+//!
 //! ## Categories
 //!
 //! Sequential - baseline per-row cost with no parallelism overhead.
@@ -27,10 +41,21 @@
 
 #![allow(dead_code)]
 
+// External crates
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use pill_engine::*;
 use trait_type_map::impl_trait_accessible;
 
+// Current crate
+use pill_engine::*;
+
+// =============================================================================
+// Components
+// =============================================================================
+
+/// Two-dimensional position component.
+///
+/// The canonical position data for the iteration benchmarks; nearly every
+/// query in this suite reads or writes it.
 #[derive(Debug, Clone)]
 struct Position {
     x: f32,
@@ -38,6 +63,10 @@ struct Position {
 }
 impl Component for Position {}
 
+/// Two-dimensional velocity component.
+///
+/// Paired with [`Position`] in the two-component queries that form the
+/// sequential and parallel baselines.
 #[derive(Debug, Clone)]
 struct Velocity {
     x: f32,
@@ -45,38 +74,67 @@ struct Velocity {
 }
 impl Component for Velocity {}
 
+/// Scalar hit-point component.
+///
+/// Serves as the third component in the multi-component query benchmark and
+/// as a companion component in the cache-pressure benchmarks.
 #[derive(Debug, Clone)]
 struct Health(f32);
 impl Component for Health {}
 
-/// Tag component for With/Without filter benchmarks
+/// Tag component for the `With`/`Without` filter benchmarks.
+///
+/// Applied to every 4th entity so filtered queries match roughly 25% of the
+/// population.
 #[derive(Debug, Clone)]
 struct Enemy;
 impl Component for Enemy {}
 
-/// Tag component for Or filter benchmarks
+/// Tag component for the `Or` filter benchmarks.
+///
+/// Applied to every 7th entity so the `Or<(With<Enemy>, With<Frozen>)>` query
+/// exercises a multi-pair match.
 #[derive(Debug, Clone)]
 struct Frozen;
 impl Component for Frozen {}
 
 /// Large component - 64 bytes, spans 2 cache lines per entity.
+///
+/// Sized to exercise cache-line utilization when iterating at high entity
+/// counts in the parallel cache-pressure benchmark.
 #[derive(Debug, Clone)]
 struct LargeData([[f32; 4]; 4]); // 4×4 matrix = 16 × 4B = 64 B
 impl Component for LargeData {}
 
 /// Massive component - 256 bytes, spans 4 cache lines per entity.
+///
+/// Sized to stress memory bandwidth and cache-miss rates at extreme entity
+/// counts in the parallel cache-pressure benchmark.
 #[derive(Debug, Clone)]
 struct MassiveData([[f64; 4]; 8]); // 8×4 f64 = 32 × 8B = 256 B
 impl Component for MassiveData {}
 
+// Marks the shared components as trait-accessible for the ECS storage layer.
 impl_trait_accessible!(dyn Component; Position, Velocity, Health, Enemy, Frozen, LargeData, MassiveData);
 
+// =============================================================================
+// Benchmarks
+// =============================================================================
+
+/// Builds a [`World`] populated with `entity_count` entities carrying
+/// [`Position`], [`Velocity`], and [`Health`] components.
+///
+/// Shared starting state for the unfiltered, mutable, parallel, and
+/// change-detection benchmarks. Component data is deterministic so iterations
+/// produce identical work across entity counts.
 fn setup_world(entity_count: usize) -> World {
+    // Step 1: Register the three components every benchmark world needs.
     let mut world = World::new();
     world.register_component::<Position>();
     world.register_component::<Velocity>();
     world.register_component::<Health>();
 
+    // Step 2: Spawn `entity_count` entities with deterministic component values.
     for i in 0..entity_count {
         world
             .create_entity()
@@ -92,8 +150,13 @@ fn setup_world(entity_count: usize) -> World {
     world
 }
 
-/// Setup with Enemy tag on every 4th entity, Frozen on every 7th.
+/// Builds a [`World`] like [`setup_world`], tagging every 4th entity
+/// [`Enemy`] and every 7th entity [`Frozen`].
+///
+/// Used by the `With`/`Without`/`Or` filter benchmarks, which need a
+/// non-uniform archetype distribution to exercise the archetype-skipping path.
 fn setup_filtered_world(entity_count: usize) -> World {
+    // Step 1: Register all five components, including the two tag types.
     let mut world = World::new();
     world.register_component::<Position>();
     world.register_component::<Velocity>();
@@ -101,6 +164,7 @@ fn setup_filtered_world(entity_count: usize) -> World {
     world.register_component::<Enemy>();
     world.register_component::<Frozen>();
 
+    // Step 2: Spawn entities, tagging every 4th with `Enemy` and every 7th with `Frozen`.
     for i in 0..entity_count {
         let mut builder = world
             .create_entity()
@@ -593,6 +657,10 @@ fn bench_multi_component(criterion: &mut Criterion) {
     }
     group.finish();
 }
+
+// =============================================================================
+// Criterion Entry Point
+// =============================================================================
 
 criterion_group!(
     benches,

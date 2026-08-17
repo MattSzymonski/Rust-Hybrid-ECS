@@ -14,193 +14,14 @@
 //! Re-exported at the crate root via `crate::config`.
 
 // =============================================================================
-// Free Functions
-// =============================================================================
-
-/// Default number of entities per parallel work slice, clamped by component size.
-///
-/// Returns a value between [`MINIMUM_SLICE_SIZE`] (256) and
-/// [`DEFAULT_ITERATOR_SLICE_SIZE`] (4096).  The slice scales inversely
-/// with the total bytes per entity so that larger components get smaller
-/// slices, keeping per-slice overhead bounded.
-///
-/// Set the `ECS_SLICE_SIZE` environment variable to override at runtime.
-pub fn default_entities_per_slice(bytes_per_entity: usize) -> usize {
-    if let Ok(val) = std::env::var("ECS_SLICE_SIZE") {
-        if let Ok(n) = val.parse::<usize>() {
-            if n > 0 {
-                return n;
-            }
-        }
-    }
-    let default = ParallelProcessingConfig::DEFAULT_ITERATOR_SLICE_SIZE;
-    let min = ParallelProcessingConfig::MINIMUM_SLICE_SIZE;
-    // Scale: keep total data per slice constant (~32 KiB for 8 B baseline).
-    // bytes_per_entity is already clamped to at least 8 in the caller.
-    (default * 8 / bytes_per_entity).clamp(min, default)
-}
-
-/// Print a summary of detected system hardware to stdout.
-///
-/// Includes CPU, core/thread count, RAM, swap, disks, OS, and uptime.
-/// GPU detection requires a rendering backend.
-///
-/// Called during [`Engine::new`](crate::Engine::new).
-pub fn print_system_specs() {
-    use sysinfo::{Disks, System};
-
-    let system = System::new_all();
-    let disks = Disks::new_with_refreshed_list();
-
-    let total_ram_gb = system.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
-    let used_ram_gb =
-        (system.total_memory() - system.available_memory()) as f64 / (1024.0 * 1024.0 * 1024.0);
-    let ram_pct = if system.total_memory() > 0 {
-        (used_ram_gb / total_ram_gb) * 100.0
-    } else {
-        0.0
-    };
-
-    let total_swap_gb = system.total_swap() as f64 / (1024.0 * 1024.0 * 1024.0);
-    let used_swap_gb = system.used_swap() as f64 / (1024.0 * 1024.0 * 1024.0);
-    let swap_pct = if total_swap_gb > 0.0 {
-        (used_swap_gb / total_swap_gb) * 100.0
-    } else {
-        0.0
-    };
-
-    let cpu_name = system
-        .cpus()
-        .first()
-        .map(|cpu| cpu.brand().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
-
-    let physical_cores = sysinfo::System::physical_core_count().unwrap_or(0);
-    let logical_threads = system.cpus().len();
-
-    let uptime_secs = System::uptime();
-    let uptime_str = format_uptime(uptime_secs);
-
-    println!();
-    println!("System specs");
-    println!("├─ CPU: {}", cpu_name);
-    println!(
-        "│  └─ Cores: {} physical, {} logical threads",
-        physical_cores, logical_threads
-    );
-    println!("├─ Memory");
-    println!(
-        "│  ├─ RAM: {:.1} / {:.1} GiB used ({:.0}%)",
-        used_ram_gb, total_ram_gb, ram_pct
-    );
-    if total_swap_gb > 0.0 {
-        println!(
-            "│  └─ Swap: {:.1} / {:.1} GiB used ({:.0}%)",
-            used_swap_gb, total_swap_gb, swap_pct
-        );
-    } else {
-        println!("│  └─ Swap: none");
-    }
-    print_disk_info(&disks);
-    println!("├─ OS: {}", os_pretty_name());
-    println!("│  └─ Uptime: {}", uptime_str);
-    println!("└─ GPU: use external tools (dxdiag / lspci)");
-    println!();
-}
-
-/// Print the active parallel-iterator configuration to stdout.
-///
-/// Shows the Rayon thread-pool size and every tunable in
-/// [`ParallelProcessingConfig`].
-///
-/// Called after [`print_system_specs`] during [`Engine::new`](crate::Engine::new).
-pub fn print_parallel_config() {
-    let threads = rayon::current_num_threads();
-
-    println!("Parallel execution config");
-    println!("├─ Rayon threads: {}", threads);
-    println!(
-        "├─ Target work-group duration: {} µs",
-        ParallelProcessingConfig::TARGET_ITERATOR_WORK_GROUP_DURATION / 1000
-    );
-    println!(
-        "├─ Splitting-hint averaging window: {} frames",
-        ParallelProcessingConfig::SPLITTING_HINT_WINDOW
-    );
-    println!(
-        "├─ Default entities per slice: {}",
-        default_entities_per_slice(8)
-    );
-    println!(
-        "└─ Minimum slice size: {}",
-        ParallelProcessingConfig::MINIMUM_SLICE_SIZE
-    );
-    println!();
-}
-
-fn print_disk_info(disks: &sysinfo::Disks) {
-    if disks.is_empty() {
-        println!("├─ Storage: no disks detected");
-        return;
-    }
-    println!("├─ Storage");
-    let count = disks.len();
-    for (i, disk) in disks.iter().enumerate() {
-        let total_gb = disk.total_space() as f64 / (1024.0 * 1024.0 * 1024.0);
-        let avail_gb = disk.available_space() as f64 / (1024.0 * 1024.0 * 1024.0);
-        let used_gb = total_gb - avail_gb;
-        let pct = if total_gb > 0.0 {
-            (used_gb / total_gb) * 100.0
-        } else {
-            0.0
-        };
-        let kind = match disk.kind() {
-            sysinfo::DiskKind::SSD => "SSD",
-            sysinfo::DiskKind::HDD => "HDD",
-            _ => "?",
-        };
-        let mount = disk.mount_point().to_string_lossy();
-        // Disk name can be long; just show mount point.
-        let branch = if i == count - 1 { "└─" } else { "├─" };
-        println!(
-            "│  {} {}  {:.0} / {:.0} GiB used ({:.0}%)  [{}]",
-            branch, mount, used_gb, total_gb, pct, kind
-        );
-    }
-}
-
-fn format_uptime(seconds: u64) -> String {
-    if seconds == 0 {
-        return "unknown".to_string();
-    }
-    let days = seconds / 86400;
-    let hours = (seconds % 86400) / 3600;
-    let minutes = (seconds % 3600) / 60;
-    if days > 0 {
-        format!("{}d {}h {}m", days, hours, minutes)
-    } else if hours > 0 {
-        format!("{}h {}m", hours, minutes)
-    } else {
-        format!("{}m", minutes)
-    }
-}
-
-/// Human-readable OS name.
-fn os_pretty_name() -> String {
-    let name = sysinfo::System::name().unwrap_or_else(|| "unknown".to_string());
-    let version = sysinfo::System::os_version().unwrap_or_default();
-    let arch = std::env::consts::ARCH;
-    if version.is_empty() {
-        format!("{name} ({arch})")
-    } else {
-        format!("{name} {version} ({arch})")
-    }
-}
-
-// =============================================================================
 // ProfilingConfig
 // =============================================================================
 
+/// Zero-sized struct grouping profiling-related configuration constants.
+///
+/// Holds the allocation-sampling frequency consumed by the Tracy profiler
+/// integration; kept in its own type so callers can reference the knob via
+/// `crate::config::ProfilingConfig::MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY`.
 pub struct ProfilingConfig;
 
 impl ProfilingConfig {
@@ -211,6 +32,7 @@ impl ProfilingConfig {
     /// `100` = track 1 in 100 allocations (minimal overhead, statistical).
     pub const MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY: u16 = 10;
 }
+
 // =============================================================================
 // ParallelProcessingConfig
 // =============================================================================
@@ -304,4 +126,213 @@ impl QueryConfig {
     /// Initial `Vec::with_capacity` for filter-pair combinations in
     /// `Or` filter expansions.
     pub const DEFAULT_FILTER_PAIRS_CAPACITY: usize = 4;
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Default number of entities per parallel work slice, clamped by component size.
+///
+/// Returns a value between [`MINIMUM_SLICE_SIZE`] (256) and
+/// [`DEFAULT_ITERATOR_SLICE_SIZE`] (4096).  The slice scales inversely
+/// with the total bytes per entity so that larger components get smaller
+/// slices, keeping per-slice overhead bounded.
+///
+/// Set the `ECS_SLICE_SIZE` environment variable to override at runtime.
+///
+/// # Examples
+///
+/// ```
+/// use pill_engine::config::default_entities_per_slice;
+///
+/// // Larger components yield smaller slices, keeping per-slice byte volume bounded.
+/// let small_components = default_entities_per_slice(8);
+/// let large_components = default_entities_per_slice(64);
+/// assert!(large_components <= small_components);
+/// ```
+pub fn default_entities_per_slice(bytes_per_entity: usize) -> usize {
+    // Step 1: Honour a runtime override from the `ECS_SLICE_SIZE` environment variable.
+    if let Ok(val) = std::env::var("ECS_SLICE_SIZE") {
+        if let Ok(n) = val.parse::<usize>() {
+            if n > 0 {
+                return n;
+            }
+        }
+    }
+
+    // Step 2: Fall back to the size-scaled default, clamped to the configured range.
+    let default = ParallelProcessingConfig::DEFAULT_ITERATOR_SLICE_SIZE;
+    let min = ParallelProcessingConfig::MINIMUM_SLICE_SIZE;
+    // Scale: keep total data per slice constant (~32 KiB for 8 B baseline).
+    // bytes_per_entity is already clamped to at least 8 in the caller.
+    (default * 8 / bytes_per_entity).clamp(min, default)
+}
+
+/// Print a summary of detected system hardware to stdout.
+///
+/// Includes CPU, core/thread count, RAM, swap, disks, OS, and uptime.
+/// GPU detection requires a rendering backend.
+///
+/// Called during [`Engine::new`](crate::Engine::new).
+pub fn print_system_specs() {
+    use sysinfo::{Disks, System};
+
+    // Step 1: Snapshot system state and derive RAM, swap, and CPU figures.
+    let system = System::new_all();
+    let disks = Disks::new_with_refreshed_list();
+
+    let total_ram_gb = system.total_memory() as f64 / (1024.0 * 1024.0 * 1024.0);
+    let used_ram_gb =
+        (system.total_memory() - system.available_memory()) as f64 / (1024.0 * 1024.0 * 1024.0);
+    let ram_pct = if system.total_memory() > 0 {
+        (used_ram_gb / total_ram_gb) * 100.0
+    } else {
+        0.0
+    };
+
+    let total_swap_gb = system.total_swap() as f64 / (1024.0 * 1024.0 * 1024.0);
+    let used_swap_gb = system.used_swap() as f64 / (1024.0 * 1024.0 * 1024.0);
+    let swap_pct = if total_swap_gb > 0.0 {
+        (used_swap_gb / total_swap_gb) * 100.0
+    } else {
+        0.0
+    };
+
+    let cpu_name = system
+        .cpus()
+        .first()
+        .map(|cpu| cpu.brand().to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let physical_cores = sysinfo::System::physical_core_count().unwrap_or(0);
+    let logical_threads = system.cpus().len();
+
+    let uptime_secs = System::uptime();
+    let uptime_str = format_uptime(uptime_secs);
+
+    // Step 2: Emit the formatted hardware report.
+    println!();
+    println!("System specs");
+    println!("├─ CPU: {}", cpu_name);
+    println!(
+        "│  └─ Cores: {} physical, {} logical threads",
+        physical_cores, logical_threads
+    );
+    println!("├─ Memory");
+    println!(
+        "│  ├─ RAM: {:.1} / {:.1} GiB used ({:.0}%)",
+        used_ram_gb, total_ram_gb, ram_pct
+    );
+    if total_swap_gb > 0.0 {
+        println!(
+            "│  └─ Swap: {:.1} / {:.1} GiB used ({:.0}%)",
+            used_swap_gb, total_swap_gb, swap_pct
+        );
+    } else {
+        println!("│  └─ Swap: none");
+    }
+    print_disk_info(&disks);
+    println!("├─ OS: {}", os_pretty_name());
+    println!("│  └─ Uptime: {}", uptime_str);
+    println!("└─ GPU: use external tools (dxdiag / lspci)");
+    println!();
+}
+
+/// Print the active parallel-iterator configuration to stdout.
+///
+/// Shows the Rayon thread-pool size and every tunable in
+/// [`ParallelProcessingConfig`].
+///
+/// Called after [`print_system_specs`] during [`Engine::new`](crate::Engine::new).
+pub fn print_parallel_config() {
+    let threads = rayon::current_num_threads();
+
+    println!("Parallel execution config");
+    println!("├─ Rayon threads: {}", threads);
+    println!(
+        "├─ Target work-group duration: {} µs",
+        ParallelProcessingConfig::TARGET_ITERATOR_WORK_GROUP_DURATION / 1000
+    );
+    println!(
+        "├─ Splitting-hint averaging window: {} frames",
+        ParallelProcessingConfig::SPLITTING_HINT_WINDOW
+    );
+    println!(
+        "├─ Default entities per slice: {}",
+        default_entities_per_slice(8)
+    );
+    println!(
+        "└─ Minimum slice size: {}",
+        ParallelProcessingConfig::MINIMUM_SLICE_SIZE
+    );
+    println!();
+}
+
+/// Print one line per detected storage device under the `Storage` heading.
+///
+/// Each line shows the mount point, used/total space, usage percentage, and
+/// disk kind (SSD/HDD).  Emits a single "no disks detected" line when the
+/// list is empty.
+fn print_disk_info(disks: &sysinfo::Disks) {
+    if disks.is_empty() {
+        println!("├─ Storage: no disks detected");
+        return;
+    }
+    println!("├─ Storage");
+    let count = disks.len();
+    for (i, disk) in disks.iter().enumerate() {
+        let total_gb = disk.total_space() as f64 / (1024.0 * 1024.0 * 1024.0);
+        let avail_gb = disk.available_space() as f64 / (1024.0 * 1024.0 * 1024.0);
+        let used_gb = total_gb - avail_gb;
+        let pct = if total_gb > 0.0 {
+            (used_gb / total_gb) * 100.0
+        } else {
+            0.0
+        };
+        let kind = match disk.kind() {
+            sysinfo::DiskKind::SSD => "SSD",
+            sysinfo::DiskKind::HDD => "HDD",
+            _ => "?",
+        };
+        let mount = disk.mount_point().to_string_lossy();
+        // Disk name can be long; just show mount point.
+        let branch = if i == count - 1 { "└─" } else { "├─" };
+        println!(
+            "│  {} {}  {:.0} / {:.0} GiB used ({:.0}%)  [{}]",
+            branch, mount, used_gb, total_gb, pct, kind
+        );
+    }
+}
+
+/// Format a duration in seconds as a compact `Nd Nh Nm` human-readable string.
+///
+/// Omits the days component when it is zero and returns `"unknown"` for a
+/// zero-second input, matching `sysinfo`'s behaviour on unsupported systems.
+fn format_uptime(seconds: u64) -> String {
+    if seconds == 0 {
+        return "unknown".to_string();
+    }
+    let days = seconds / 86400;
+    let hours = (seconds % 86400) / 3600;
+    let minutes = (seconds % 3600) / 60;
+    if days > 0 {
+        format!("{}d {}h {}m", days, hours, minutes)
+    } else if hours > 0 {
+        format!("{}h {}m", hours, minutes)
+    } else {
+        format!("{}m", minutes)
+    }
+}
+
+/// Human-readable OS name.
+fn os_pretty_name() -> String {
+    let name = sysinfo::System::name().unwrap_or_else(|| "unknown".to_string());
+    let version = sysinfo::System::os_version().unwrap_or_default();
+    let arch = std::env::consts::ARCH;
+    if version.is_empty() {
+        format!("{name} ({arch})")
+    } else {
+        format!("{name} {version} ({arch})")
+    }
 }

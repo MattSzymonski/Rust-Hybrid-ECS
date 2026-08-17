@@ -16,8 +16,6 @@
 //! last-run baseline. `Or` produces multiple pairs - an archetype matches if
 //! any pair passes.
 
-// Standard library
-
 // Current crate
 use crate::archetype::Archetype;
 use crate::component::{Component, ComponentId, ComponentTicks, Tick};
@@ -51,10 +49,6 @@ use super::ptr::SendPtr;
 /// [`excluded_component_ids`]: QueryFilter::excluded_component_ids
 /// [`init_state`]: QueryFilter::init_state
 /// [`matches`]: QueryFilter::matches
-
-// =============================================================================
-// QueryFilter
-// =============================================================================
 
 pub trait QueryFilter {
     /// Per-archetype cached state used by [`Self::matches`].
@@ -94,8 +88,11 @@ pub trait QueryFilter {
     /// [`excluded_component_ids`]: QueryFilter::excluded_component_ids
     /// [`Or`]: Or
     fn archetype_filter_pairs() -> Vec<(Vec<ComponentId>, Vec<ComponentId>)> {
+        // Collect this filter's include and exclude component sets.
         let included = Self::included_component_ids();
         let excluded = Self::excluded_component_ids();
+        // A filter with no restrictions matches every archetype and so
+        // contributes no pairs; otherwise it contributes exactly one pair.
         if included.is_empty() && excluded.is_empty() {
             Vec::new()
         } else {
@@ -175,7 +172,7 @@ impl<T: Component> QueryFilter for Without<T> {
 }
 
 // =============================================================================
-// Changed<T> / Added<T>
+// TickFilterState
 // =============================================================================
 
 /// Per-row state shared by `Changed<T>` and `Added<T>`: a `Send` pointer to
@@ -185,12 +182,18 @@ impl<T: Component> QueryFilter for Without<T> {
 /// `Changed<T>` appears inside an [`Or`] whose other branch matched),
 /// `ticks` is `None` and all rows are rejected.
 pub struct TickFilterState {
+    /// Raw pointer to the archetype's `Vec<ComponentTicks>` for the filtered
+    /// component; `None` when the component is absent from the archetype.
     ticks: Option<SendPtr<Vec<ComponentTicks>>>,
+    /// Tick recorded when the owning system last ran.
     last_run: Tick,
+    /// Tick recorded for the current run of the owning system.
     this_run: Tick,
 }
 
 impl TickFilterState {
+    /// Builds state pointing at the archetype's tick vector for the component
+    /// that is present in that archetype.
     fn new(ticks_vec: &Vec<ComponentTicks>, last_run: Tick, this_run: Tick) -> Self {
         Self {
             ticks: Some(SendPtr::new(ticks_vec as *const Vec<ComponentTicks>)),
@@ -220,6 +223,15 @@ impl TickFilterState {
     #[inline]
     unsafe fn ticks_at(&self, index: usize) -> &ComponentTicks {
         debug_assert!(self.is_present(), "ticks_at called on missing component");
+        // SAFETY: `is_present()` returned `true` (enforced by the caller
+        // contract in `/// # Safety` and the `debug_assert!` above), so the
+        // `Option` is `Some` and `unwrap_unchecked` cannot panic. The stored
+        // pointer was created in `new` from a `&Vec<ComponentTicks>` owned by
+        // the archetype, which outlives this state - state lives for one query
+        // iteration during which the archetype is neither mutated nor
+        // deallocated - so dereferencing it yields a valid `Vec`. `index` is
+        // a row index into that archetype, and the tick vector is kept in
+        // lockstep with the archetype's row count, so `index` is in bounds.
         unsafe { (&*self.ticks.as_ref().unwrap_unchecked().as_ptr()).get_unchecked(index) }
     }
 }
@@ -252,9 +264,14 @@ impl<T: Component> QueryFilter for Changed<T> {
 
     #[inline]
     fn matches(state: &Self::State, index: usize) -> bool {
+        // A row can never match when the component is absent from the
+        // archetype (possible inside an `Or` whose other branch matched).
         if !state.is_present() {
             return false;
         }
+        // SAFETY: `is_present()` returned `true` in the check above, so
+        // `ticks_at`'s documented precondition is satisfied. The returned
+        // reference is valid for the duration of the call and is only read.
         unsafe {
             state
                 .ticks_at(index)
@@ -287,9 +304,14 @@ impl<T: Component> QueryFilter for Added<T> {
 
     #[inline]
     fn matches(state: &Self::State, index: usize) -> bool {
+        // A row can never match when the component is absent from the
+        // archetype (possible inside an `Or` whose other branch matched).
         if !state.is_present() {
             return false;
         }
+        // SAFETY: `is_present()` returned `true` in the check above, so
+        // `ticks_at`'s documented precondition is satisfied. The returned
+        // reference is valid for the duration of the call and is only read.
         unsafe {
             state
                 .ticks_at(index)
@@ -301,41 +323,6 @@ impl<T: Component> QueryFilter for Added<T> {
 // =============================================================================
 // Tuple Filters (AND)
 // =============================================================================
-
-/// Compute the cross-product of filter pairs for AND semantics.
-///
-/// Given a list of filter-pair lists (one per conjunct), returns all
-/// combinations where each conjunct contributes one of its pairs.
-/// For `(FilterA, FilterB)` this is the Cartesian product of A's pairs
-/// and B's pairs, with includes/excludes merged within each combination.
-///
-/// If any conjunct has zero pairs (meaning "no archetype restrictions"),
-/// it is skipped (does not restrict the result).
-fn and_filter_pairs(
-    all_pairs: &[Vec<(Vec<ComponentId>, Vec<ComponentId>)>],
-) -> Vec<(Vec<ComponentId>, Vec<ComponentId>)> {
-    // Start with one empty pair (no restrictions).
-    let mut acc: Vec<(Vec<ComponentId>, Vec<ComponentId>)> = vec![(Vec::new(), Vec::new())];
-
-    for inner_pairs in all_pairs {
-        if inner_pairs.is_empty() {
-            // No archetype restrictions from this conjunct - skip.
-            continue;
-        }
-        let mut next = Vec::with_capacity(acc.len() * inner_pairs.len());
-        for (included, excluded) in &acc {
-            for (inner_included, inner_excluded) in inner_pairs {
-                let mut merged_included = included.clone();
-                let mut merged_excluded = excluded.clone();
-                merged_included.extend_from_slice(inner_included);
-                merged_excluded.extend_from_slice(inner_excluded);
-                next.push((merged_included, merged_excluded));
-            }
-        }
-        acc = next;
-    }
-    acc
-}
 
 macro_rules! impl_query_filter_tuple {
     ($($T:ident),*) => {
@@ -365,6 +352,14 @@ macro_rules! impl_query_filter_tuple {
             #[allow(non_snake_case)]
             fn init_state(archetype: &mut Archetype, last_run: Tick, this_run: Tick) -> Self::State {
                 let archetype_ptr = archetype as *mut Archetype;
+                // SAFETY: `archetype_ptr` derives from the live `&mut
+                // Archetype` parameter, so it stays valid for this call. Each
+                // tuple element's `&mut *archetype_ptr` is a temporary that is
+                // dropped as soon as that element's call returns, so the
+                // borrows are sequential and never simultaneously alive. Every
+                // filter `init_state` implementation only reads archetype
+                // metadata (e.g. the `component_ticks` map), never mutating
+                // it, so no aliasing or mutation violation can occur.
                 unsafe { ($($T::init_state(&mut *archetype_ptr, last_run, this_run),)*) }
             }
 
@@ -384,7 +379,7 @@ impl_query_filter_tuple!(A, B, C);
 impl_query_filter_tuple!(A, B, C, D);
 
 // =============================================================================
-// Or<F> (Disjunction)
+// Or
 // =============================================================================
 
 /// Disjunction over a tuple of filters: a row matches if at least one
@@ -397,11 +392,6 @@ impl_query_filter_tuple!(A, B, C, D);
 ///
 /// [`archetype_filter_pairs`]: QueryFilter::archetype_filter_pairs
 /// [`matches`]: QueryFilter::matches
-
-// =============================================================================
-// Or
-// =============================================================================
-
 pub struct Or<F>(std::marker::PhantomData<F>);
 
 macro_rules! impl_query_filter_or {
@@ -444,6 +434,14 @@ macro_rules! impl_query_filter_or {
             #[allow(non_snake_case)]
             fn init_state(archetype: &mut Archetype, last_run: Tick, this_run: Tick) -> Self::State {
                 let archetype_ptr = archetype as *mut Archetype;
+                // SAFETY: `archetype_ptr` derives from the live `&mut
+                // Archetype` parameter, so it stays valid for this call. Each
+                // tuple element's `&mut *archetype_ptr` is a temporary that is
+                // dropped as soon as that element's call returns, so the
+                // borrows are sequential and never simultaneously alive. Every
+                // filter `init_state` implementation only reads archetype
+                // metadata (e.g. the `component_ticks` map), never mutating
+                // it, so no aliasing or mutation violation can occur.
                 unsafe { ($($T::init_state(&mut *archetype_ptr, last_run, this_run),)*) }
             }
 
@@ -460,3 +458,45 @@ macro_rules! impl_query_filter_or {
 impl_query_filter_or!(A, B);
 impl_query_filter_or!(A, B, C);
 impl_query_filter_or!(A, B, C, D);
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Compute the cross-product of filter pairs for AND semantics.
+///
+/// Given a list of filter-pair lists (one per conjunct), returns all
+/// combinations where each conjunct contributes one of its pairs.
+/// For `(FilterA, FilterB)` this is the Cartesian product of A's pairs
+/// and B's pairs, with includes/excludes merged within each combination.
+///
+/// If any conjunct has zero pairs (meaning "no archetype restrictions"),
+/// it is skipped (does not restrict the result).
+fn and_filter_pairs(
+    all_pairs: &[Vec<(Vec<ComponentId>, Vec<ComponentId>)>],
+) -> Vec<(Vec<ComponentId>, Vec<ComponentId>)> {
+    // Step 1: Seed the accumulator with a single unrestricted pair so the
+    // fold below starts from a neutral value.
+    let mut accumulator: Vec<(Vec<ComponentId>, Vec<ComponentId>)> = vec![(Vec::new(), Vec::new())];
+
+    // Step 2: Fold every conjunct's pairs into the accumulator, merging the
+    // include and exclude sets of each combination.
+    for inner_pairs in all_pairs {
+        if inner_pairs.is_empty() {
+            // No archetype restrictions from this conjunct - skip.
+            continue;
+        }
+        let mut next = Vec::with_capacity(accumulator.len() * inner_pairs.len());
+        for (included, excluded) in &accumulator {
+            for (inner_included, inner_excluded) in inner_pairs {
+                let mut merged_included = included.clone();
+                let mut merged_excluded = excluded.clone();
+                merged_included.extend_from_slice(inner_included);
+                merged_excluded.extend_from_slice(inner_excluded);
+                next.push((merged_included, merged_excluded));
+            }
+        }
+        accumulator = next;
+    }
+    accumulator
+}

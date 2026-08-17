@@ -18,14 +18,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 // Current crate
+use super::filter::QueryFilter;
+use super::target::QueryTarget;
+use super::FilteredArchetypeRange;
 use crate::archetype::{Archetype, ArchetypeId};
 use crate::component::Tick;
 use crate::config;
 use crate::world::World;
-
-use super::filter::QueryFilter;
-use super::target::QueryTarget;
-use super::FilteredArchetypeRange;
 
 // =============================================================================
 // BatchStats
@@ -71,6 +70,11 @@ impl std::fmt::Display for BatchStats {
 // =============================================================================
 
 /// Sequential iterator for mutable queries.
+///
+/// Walks the query's cached matching-archetype list in order, visiting every
+/// row of each archetype while the filter admits it. Component storage
+/// pointers and filter state are cached per archetype to avoid repeated
+/// lookups during the hot iteration loop.
 pub struct QueryIterMut<'w, Q: QueryTarget, F: QueryFilter = ()> {
     world_ptr: *mut World,
     matching_archetypes: Vec<ArchetypeId>,
@@ -125,10 +129,15 @@ impl<'w, Q: QueryTarget, F: QueryFilter> QueryIterMut<'w, Q, F> {
         }
     }
 
-    /// Advance to the next archetype (cold path, separated for better branch prediction)
+    /// Advance to the next matching archetype, caching its component storage
+    /// pointers and filter state.
+    ///
+    /// Returns `None` once every matching archetype has been visited. Kept
+    /// cold via `#[inline(never)]` so the hot path in [`Iterator::next`]
+    /// stays small for better branch prediction.
     #[inline(never)]
     fn advance_archetype(&mut self) -> Option<()> {
-        // Check if all archetypes have been exhausted
+        // Step 1: check whether every matching archetype has been visited.
         if self.current_archetype_idx >= self.matching_archetypes.len() {
             return None;
         }
@@ -142,16 +151,17 @@ impl<'w, Q: QueryTarget, F: QueryFilter> QueryIterMut<'w, Q, F> {
             )]
         );
 
-        // SAFETY: This function is safe because:
-        // 1. world_ptr was created from a valid &mut World reference in iter_mut()
-        // 2. The QueryIterMut holds exclusive access to World through its lifetime 'w
-        // 3. We never yield references that outlive the iterator itself
-        // 4. Each archetype_id comes from matching_archetypes which was populated from valid archetypes
-        // 5. The HashMap lookup can fail (returning None) but that's handled by the ? operator
-        // 6. init_state() caches raw pointers to component storage, which remain valid because:
-        //    - We hold exclusive access to World
-        //    - Archetypes are not moved/reallocated during iteration
-        //    - Component storage vectors maintain stable addresses while we iterate
+        // SAFETY: `world_ptr` was created from a valid `&mut World` in
+        // [`Query::iter_mut`] and this iterator holds exclusive access to that
+        // world for its lifetime `'w`, so the reference derived here is valid
+        // and never aliased. Every `archetype_id` comes from the cached
+        // matching-archetype list populated from live archetypes, so the
+        // unchecked indexing is in bounds; the `HashMap` lookup may still fail
+        // and is handled by `?`. `init_state` caches raw pointers to component
+        // storage that remain valid because the world is exclusively borrowed
+        // and archetypes (and their storage vectors) are neither moved nor
+        // reallocated while the iterator is alive. References yielded from
+        // these cached pointers never outlive the iterator itself.
         unsafe {
             let _zone_pointers = crate::profile_scope!(
                 "get world and archetype id",
@@ -197,15 +207,20 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Iterator for QueryIterMut<'w, Q, F> {
 
     fn next(&mut self) -> Option<Self::Item> {
         loop {
-            // Hot path: iterate within current archetype.
+            // Step 1: hot path - iterate rows within the current archetype.
             while self.current_entity_idx < self.current_archetype_len {
                 let index = self.current_entity_idx;
                 self.current_entity_idx += 1;
 
-                // SAFETY: both states are Some during iteration in the hot path.
+                // SAFETY: `current_state` is always `Some` while iterating in
+                // the hot path; it is only reset when advancing archetypes,
+                // which happens on the cold path below.
                 let state = unsafe { self.current_state.as_ref().unwrap_unchecked() };
 
                 if !F::ACCEPTS_ALL {
+                    // SAFETY: `current_filter_state` is `Some` whenever
+                    // `current_state` is, because both are initialized together
+                    // in `advance_archetype` and only ever cleared there.
                     let filter_state =
                         unsafe { self.current_filter_state.as_ref().unwrap_unchecked() };
                     if !F::matches(filter_state, index) {
@@ -216,7 +231,7 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Iterator for QueryIterMut<'w, Q, F> {
                 return Some(Q::fetch_with_state(state, index));
             }
 
-            // Cold path: advance to next archetype.
+            // Step 2: cold path - advance to the next archetype.
             self.advance_archetype()?;
         }
     }
@@ -245,17 +260,25 @@ pub struct ParQueryIter<'w, Q: QueryTarget, F: QueryFilter = ()> {
     _phantom: std::marker::PhantomData<&'w mut (Q, F)>,
 }
 
-// SAFETY: ParQueryIter can be sent between threads because:
-// - archetype_ranges contains owned data (Vec) and raw pointers in Q::State
-// - The raw pointers in Q::State point to component storage that remains valid
-//   for the lifetime of the query (exclusive World access)
-// - Each thread accesses different entity indices, so no data races occur
+// SAFETY: `ParQueryIter` can be moved between threads because
+// `archetype_ranges` holds owned data plus the raw pointers cached in
+// `Q::State` and `F::State`, which point into component storage that remains
+// valid for the query's lifetime (the iterator holds exclusive `World` access,
+// so archetypes and their storage are neither reallocated nor aliased).
+// Parallel execution assigns each thread disjoint entity ranges, and the
+// `Send` bounds below guarantee the pointed-to data can be transferred between
+// threads, so no data race is possible.
 unsafe impl<'w, Q: QueryTarget, F: QueryFilter> Send for ParQueryIter<'w, Q, F>
 where
     Q::State: Send,
     F::State: Send,
 {
 }
+// SAFETY: `ParQueryIter` is `Sync` because the raw pointers in `Q::State` and
+// `F::State` reference component storage that is exclusively borrowed from the
+// `World` for the iterator's lifetime, and the `Sync` bounds below ensure the
+// pointed-to data is safe to share across threads. Each thread reads disjoint
+// entity indices, so concurrent access through the shared state never races.
 unsafe impl<'w, Q: QueryTarget, F: QueryFilter> Sync for ParQueryIter<'w, Q, F>
 where
     Q::State: Sync,
@@ -346,7 +369,7 @@ where
     where
         Func: Fn(Q::Item<'_>) + Send + Sync,
     {
-        // Resolve timing hint from per-label splitting hint.
+        // Step 1: resolve the per-label splitting hint recorded by prior runs.
         let hint_ns = self
             .label
             .and_then(|label| {
@@ -359,10 +382,11 @@ where
             })
             .unwrap_or(0);
 
-        // Capture before self is moved into execute_*.
+        // Step 2: capture shared state before `self` is moved into the execute_* methods.
         let label = self.label;
         let iterator_timings = std::sync::Arc::clone(&self.iterator_timings);
 
+        // Step 3: dispatch to tracked or untracked parallel execution.
         let started = std::time::Instant::now();
         let result = if self.tracked {
             ParForEachResult::Tracked(self.execute_tracked(f, hint_ns))
@@ -372,7 +396,8 @@ where
         };
         let elapsed_ns = started.elapsed().as_nanos() as u64;
 
-        // Store per-label splitting hint and track seen labels for duplicate detection.
+        // Step 4: record the measured duration as the splitting hint for this
+        // label, and track duplicate labels for diagnostics.
         if let Some(label) = label {
             if let Ok(mut timing) = iterator_timings.lock() {
                 let entry = timing
@@ -408,15 +433,15 @@ where
     where
         Func: Fn(Q::Item<'_>) + Send + Sync,
     {
-        // Sum precomputed entity counts - O(archetypes), negligible.
+        // Step 1: sum precomputed entity counts - O(archetypes), negligible.
         let total: usize = self.archetype_ranges.iter().map(|(_, _, _, len)| len).sum();
         let threshold =
             rayon::current_num_threads() * config::ParallelProcessingConfig::MINIMUM_SLICE_SIZE;
 
+        // Step 2: adaptive fallback - run sequentially for tiny workloads,
+        // where the overhead of spawning Rayon tasks exceeds the work itself,
+        // especially with many tiny archetypes.
         if total < threshold {
-            // Adaptive fallback: sequential loop.  For small N the
-            // overhead of spawning Rayon tasks exceeds the work itself,
-            // especially with many tiny archetypes.
             for (_, q_state, f_state, len) in &self.archetype_ranges {
                 for index in 0..*len {
                     if F::matches(f_state, index) {
@@ -427,7 +452,7 @@ where
             return;
         }
 
-        // Parallel path: flat work slices distributed via rayon::scope.
+        // Step 3: build flat work slices distributed via rayon::scope.
         //
         // We pre-build equal-sized entity-range slices, then group them
         // into num_threads × 2 chunks. Spawning all chunks at once
@@ -440,8 +465,8 @@ where
                 self.total_components_size,
             ));
 
-        // Build flat work slices: each is (archetype_index, start_entity, end_entity).
-        // Precompute capacity so the Vec never reallocates during push.
+        // Each flat work slice is an (archetype_index, start_entity, end_entity)
+        // range; precompute the capacity so the Vec never reallocates on push.
         let iterator_slice_count: usize = self
             .archetype_ranges
             .iter()
@@ -460,7 +485,11 @@ where
 
         let pool_threads = rayon::current_num_threads();
 
-        // Choose group count from timing feedback when available.
+        // Step 4: choose the work-group count from timing feedback when
+        // available, then pre-assign contiguous groups of slices so every
+        // thread processes ALL its work back-to-back. Groups are stored as
+        // (start_index, count) ranges into the flat iterator_slices array
+        // instead of copying slices with to_vec().
         let iterator_work_group_count = if hint_ns > 0 {
             let target = (hint_ns
                 / config::ParallelProcessingConfig::TARGET_ITERATOR_WORK_GROUP_DURATION)
@@ -470,10 +499,6 @@ where
             pool_threads.min(iterator_slices.len()).max(1)
         };
 
-        // Pre-assign contiguous groups of slices so every
-        // thread processes ALL its work back-to-back.
-        // Store (start_index, count) ranges into the flat iterator_slices
-        // array instead of copying slices with to_vec().
         let base = iterator_slices.len() / iterator_work_group_count;
         let remainder = iterator_slices.len() % iterator_work_group_count;
         let mut iterator_work_groups: Vec<(usize, usize)> =
@@ -507,7 +532,7 @@ where
         let scope_label = self.label;
         let iterator_slices_ref = &iterator_slices;
 
-        // Wrap the scope itself so the whole parallel section appears
+        // Step 5: wrap the scope itself so the whole parallel section appears
         // as a single named zone in Tracy.
         let _zone_scope = if let Some(sys) = scope_label {
             crate::profile_scope!(
@@ -567,7 +592,7 @@ where
         let total_entities: usize = self.archetype_ranges.iter().map(|(_, _, _, len)| len).sum();
         let threshold = num_threads * config::ParallelProcessingConfig::MINIMUM_SLICE_SIZE;
 
-        // Adaptive fallback: sequential for tiny workloads.
+        // Step 1: adaptive fallback - run sequentially for tiny workloads.
         if total_entities < threshold {
             let mut processed = 0usize;
             for (_, q_state, f_state, len) in &self.archetype_ranges {
@@ -601,7 +626,7 @@ where
             ]
         );
 
-        // Parallel path: flat work slices distributed via rayon::scope.
+        // Step 2: build flat work slices distributed via rayon::scope.
         //
         // Pre-building equal-sized slices and spawning them as scope tasks
         // lets every thread pull work from a shared pool simultaneously,
@@ -613,8 +638,8 @@ where
             ));
         let system_label = self.label;
 
-        // Build flat work slices: each is (archetype_index, start_entity, end_entity).
-        // Precompute capacity so the Vec never reallocates during push.
+        // Each flat work slice is an (archetype_index, start_entity, end_entity)
+        // range; precompute the capacity so the Vec never reallocates on push.
         let iterator_slice_count: usize = self
             .archetype_ranges
             .iter()
@@ -631,7 +656,12 @@ where
             }
         }
 
-        // Choose group count from timing feedback when available.
+        // Step 3: choose the work-group count from timing feedback when
+        // available, then pre-assign contiguous groups so every thread
+        // processes ALL its work back-to-back - no per-chunk queue
+        // contention, no 90µs gaps between chunks on the same thread.
+        // Groups are stored as (start_index, count) ranges into the flat
+        // iterator_slices array instead of copying slices with to_vec().
         let iterator_work_group_count = if hint_ns > 0 {
             let target = (hint_ns
                 / config::ParallelProcessingConfig::TARGET_ITERATOR_WORK_GROUP_DURATION)
@@ -641,11 +671,6 @@ where
             num_threads.min(iterator_slices.len()).max(1)
         };
 
-        // Pre-assign contiguous groups so every thread processes
-        // ALL its work back-to-back - no per-chunk queue contention,
-        // no 90µs gaps between chunks on the same thread.
-        // Store (start_index, count) ranges into the flat iterator_slices
-        // array instead of copying slices with to_vec().
         let base = iterator_slices.len() / iterator_work_group_count;
         let remainder = iterator_slices.len() % iterator_work_group_count;
         let mut iterator_work_groups: Vec<(usize, usize)> =
@@ -689,7 +714,7 @@ where
         let func_ref = &f;
         let iterator_slices_ref = &iterator_slices;
 
-        // Wrap the scope itself so the whole parallel section appears
+        // Step 4: wrap the scope itself so the whole parallel section appears
         // as a single named zone in Tracy.
         let _zone_scope = if let Some(sys) = system_label {
             crate::profile_scope!(
@@ -797,8 +822,10 @@ where
 /// Result of parallel for_each execution.
 #[derive(Debug, Clone, Default)]
 pub enum ParForEachResult {
+    /// Parallel iteration ran without collecting batch statistics.
     #[default]
     Untracked,
+    /// Parallel iteration collected [`BatchStats`] about work distribution.
     Tracked(BatchStats),
 }
 
@@ -811,7 +838,12 @@ impl ParForEachResult {
         }
     }
 
-    /// Unwrap batch stats, panicking if not tracked.
+    /// Unwrap the batch stats, panicking if the iteration was not tracked.
+    ///
+    /// # Panics
+    ///
+    /// Panics if this value is [`ParForEachResult::Untracked`], i.e. the
+    /// iteration was not executed via [`ParQueryIter::tracked`].
     pub fn unwrap(self) -> BatchStats {
         match self {
             ParForEachResult::Tracked(stats) => stats,

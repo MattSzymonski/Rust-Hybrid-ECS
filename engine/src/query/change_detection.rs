@@ -42,18 +42,20 @@ use crate::component::{ComponentTicks, Tick};
 /// }
 /// ```
 ///
-/// # Safety
-///
-/// The wrapper stores raw mutable pointers; safety relies on the scheduler's
-/// guarantee that no two threads obtain `Mut<T>` for the same component row.
+/// Soundness relies on the scheduler's guarantee that no two threads ever
+/// obtain a `Mut<T>` for the same component row, so the per-row tick update
+/// in `DerefMut` requires no synchronization.
 
 // =============================================================================
 // Mut
 // =============================================================================
 
 pub struct Mut<'a, T: ?Sized> {
+    /// The underlying component value wrapped by this `Mut`.
     pub(crate) value: &'a mut T,
+    /// Change-detection ticks shared with the owning component row.
     pub(crate) ticks: &'a mut ComponentTicks,
+    /// The world tick against which mutations through this `Mut` are recorded.
     pub(crate) this_run: Tick,
 }
 

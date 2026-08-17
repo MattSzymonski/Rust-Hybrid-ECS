@@ -39,9 +39,14 @@ use crate::world::{set_per_thread_last_run_tick, World};
 // RegisteredSystem
 // =============================================================================
 
-/// Wrapper for a registered system with its name
+/// Wrapper pairing a registered system with its runtime bookkeeping.
+///
+/// Holds the system's name, boxed instance, enabled state, and the per-frame
+/// timing data that feeds adaptive parallelism and profiling.
 struct RegisteredSystem {
+    /// Name used for registration, debugging, and profiling.
     name: String,
+    /// Boxed system instance, invoked with the world and command queue.
     system: Box<dyn System>,
     /// World tick at which this system was last executed.
     ///
@@ -49,6 +54,7 @@ struct RegisteredSystem {
     /// (`Changed<T>`, `Added<T>`) inside the system see only mutations
     /// that happened since its last run.
     last_run: u32,
+    /// Whether this system participates in frame execution.
     enabled: bool,
     /// Exponential moving average of this system's wall-clock execution
     /// duration (nanoseconds).  Fed to the query iterator so it can pick
@@ -61,9 +67,18 @@ struct RegisteredSystem {
     last_duration: u64,
 }
 
-/// The main Engine that drives the ECS
+// =============================================================================
+// Engine
+// =============================================================================
+
+/// The main engine that drives the ECS.
 ///
-/// # Example
+/// Owns the [`World`], [`SystemScheduler`], and [`CommandQueue`] and drives
+/// the two-phase frame: systems execute (in parallel batches when enabled),
+/// then deferred commands are applied. Systems are registered by name and can
+/// be enabled or disabled at runtime.
+///
+/// # Examples
 /// ```no_run
 /// # use pill_engine::*;
 /// # fn movement_system() {}
@@ -75,10 +90,6 @@ struct RegisteredSystem {
 /// // Every frame:
 /// engine.process_frame().unwrap();
 /// ```
-
-// =============================================================================
-// Engine
-// =============================================================================
 
 pub struct Engine {
     /// All registered systems with their names and states
@@ -117,7 +128,7 @@ impl Engine {
     // Construction
     // -------------------------------------------------------------------------
 
-    /// Create a new Engine with no systems
+    /// Creates a new engine with no registered systems.
     pub fn new() -> Self {
         // !!! Order matters: name the main thread in Tracy BEFORE any zone
         // is emitted on it.  Tracy auto-registers a thread the first time
@@ -175,28 +186,24 @@ impl Engine {
     }
 }
 
-impl Default for Engine {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Engine {
     // -------------------------------------------------------------------------
     // Configuration
     // -------------------------------------------------------------------------
 
-    /// Enable or disable parallel system execution
+    /// Enables or disables parallel system execution.
+    ///
+    /// When disabled, systems run sequentially in registration order.
     pub fn set_parallel_execution(&mut self, enabled: bool) {
         self.parallel_execution = enabled;
     }
 
-    /// Limit the frame rate to `fps` frames per second.
+    /// Limits the frame rate to `fps` frames per second.
     ///
     /// After completing the frame's work, `process_frame` sleeps the
     /// remaining budget. Pass `0.0` or `f64::INFINITY` to disable.
     ///
-    /// # Example
+    /// # Examples
     /// ```no_run
     /// # use pill_engine::*;
     /// # let mut engine = Engine::new();
@@ -210,24 +217,24 @@ impl Engine {
         };
     }
 
-    /// Enable a system by name
+    /// Enables a system by name.
     ///
-    /// Returns true if the system was found and enabled, false otherwise.
+    /// Returns `true` if the system was found and enabled, `false` otherwise.
     pub fn enable_system(&mut self, name: &str) -> bool {
         self.set_system_enabled(name, true)
     }
 
-    /// Disable a system by name
+    /// Disables a system by name.
     ///
     /// Disabled systems are skipped during frame processing.
-    /// Returns true if the system was found and disabled, false otherwise.
+    /// Returns `true` if the system was found and disabled, `false` otherwise.
     pub fn disable_system(&mut self, name: &str) -> bool {
         self.set_system_enabled(name, false)
     }
 
-    /// Set the enabled state of a system by name.
+    /// Sets the enabled state of a system by name.
     ///
-    /// Returns true if the system was found, false otherwise.
+    /// Returns `true` if the system was found, `false` otherwise.
     /// Marks the execution graph as dirty so it is rebuilt before the
     /// next frame, ensuring parallel batches reflect the new enabled set.
     pub fn set_system_enabled(&mut self, name: &str, enabled: bool) -> bool {
@@ -247,9 +254,9 @@ impl Engine {
     // Inspection
     // -------------------------------------------------------------------------
 
-    /// Check if a system is enabled
+    /// Checks whether a system is enabled.
     ///
-    /// Returns None if the system was not found.
+    /// Returns `None` if the system was not found.
     pub fn is_system_enabled(&self, name: &str) -> Option<bool> {
         self.systems
             .iter()
@@ -257,7 +264,7 @@ impl Engine {
             .map(|s| s.enabled)
     }
 
-    /// Print the execution graph for debugging
+    /// Prints the execution graph for debugging.
     pub fn print_execution_graph(&self) {
         let names: Vec<&str> = self.systems.iter().map(|s| s.name.as_str()).collect();
         self.scheduler.print_execution_graph(&names);
@@ -267,12 +274,12 @@ impl Engine {
     // World Access
     // -------------------------------------------------------------------------
 
-    /// Get a reference to the world
+    /// Returns a shared reference to the world.
     pub fn world(&self) -> &World {
         &self.world
     }
 
-    /// Get a mutable reference to the world
+    /// Returns a mutable reference to the world.
     pub fn world_mut(&mut self) -> &mut World {
         &mut self.world
     }
@@ -281,12 +288,12 @@ impl Engine {
     // System Registration
     // -------------------------------------------------------------------------
 
-    /// Register a system with a name
+    /// Registers a system with a name.
     ///
-    /// The system can be any function whose parameters all implement SystemParam.
-    /// The name is used for debugging and profiling.
+    /// The system can be any function whose parameters all implement
+    /// [`SystemParam`]. The name is used for debugging and profiling.
     ///
-    /// # Example
+    /// # Examples
     /// ```no_run
     /// # use pill_engine::*;
     /// # #[derive(Debug, Clone)] struct Position { x: f32, y: f32 }
@@ -330,7 +337,7 @@ impl Engine {
         self.scheduler.build_execution_graph();
     }
 
-    /// Register a system whose access pattern was derived outside Rust's
+    /// Registers a system whose access pattern was derived outside Rust's
     /// [`SystemParam`] machinery (for example from a managed-language system
     /// signature).
     ///
@@ -359,7 +366,7 @@ impl Engine {
         });
         self.scheduler.build_execution_graph();
     }
-    /// Remove all registered systems, clearing the scheduler state.
+    /// Removes all registered systems, clearing the scheduler state.
     ///
     /// This is used during hot-reload: the old game DLL's system function
     /// pointers become invalid after unloading, so all systems must be
@@ -375,7 +382,7 @@ impl Engine {
         self.scheduler.build_execution_graph();
     }
 
-    /// Drain the system failures recorded since the previous drain.
+    /// Drains the system failures recorded since the previous drain.
     ///
     /// The reporting boundary calls this once per frame and logs each
     /// failure's semantic message. A failed system never aborts its batch,
@@ -384,7 +391,7 @@ impl Engine {
         std::mem::take(&mut self.system_failures)
     }
 
-    /// Read the system failures recorded since the previous drain without
+    /// Reads the system failures recorded since the previous drain without
     /// clearing them.
     pub fn system_failures(&self) -> &[SystemFailure] {
         &self.system_failures
@@ -394,11 +401,15 @@ impl Engine {
     // Frame Processing
     // -------------------------------------------------------------------------
 
-    /// Run a one-shot command producer and flush its deferred mutations.
+    /// Runs a one-shot command producer and flushes its deferred mutations.
     ///
     /// This is primarily used by scripting-runtime startup hooks. The callback
     /// receives the same world/queue pair as an ordinary command-producing
     /// system, and all structural changes become visible only after it returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns one entry per command that could not be applied.
     pub fn run_deferred_commands<F>(&mut self, run: F) -> Result<(), Vec<CommandError>>
     where
         F: FnOnce(&mut World, &mut CommandQueue),
@@ -409,7 +420,7 @@ impl Engine {
         self.queue.execute_queued_commands(&mut self.world, true)
     }
 
-    /// Run a command-producing closure without applying its commands.
+    /// Runs a command-producing closure without applying its commands.
     ///
     /// The transactional counterpart of [`Self::run_deferred_commands`]: the
     /// caller commits with [`Self::flush_deferred_commands`] or rolls back
@@ -422,7 +433,7 @@ impl Engine {
         run(&mut self.world, &mut self.queue);
     }
 
-    /// Apply every command queued since the last flush.
+    /// Applies every command queued since the last flush.
     ///
     /// # Errors
     ///
@@ -431,12 +442,12 @@ impl Engine {
         self.queue.execute_queued_commands(&mut self.world, true)
     }
 
-    /// Discard every command queued since the last flush without applying it.
+    /// Discards every command queued since the last flush without applying it.
     pub fn discard_deferred_commands(&mut self) {
         self.queue.clear();
     }
 
-    /// Process one frame - execute all systems then apply deferred commands
+    /// Processes one frame: executes all systems, then applies deferred commands.
     ///
     /// This is the main loop of the ECS:
     /// 1. Execute all registered systems (in parallel batches if enabled)
@@ -467,6 +478,8 @@ impl Engine {
                 ]
             );
 
+            // Step 1: Bump the world change tick and reset per-frame debug state.
+            //
             // Bump the world tick so that any change-detection comparisons
             // performed by mutable queries during this frame use a fresh value.
             self.world.increment_change_tick();
@@ -476,14 +489,15 @@ impl Engine {
             #[cfg(debug_assertions)]
             self.world.debug_clear_resource_locks();
 
-            // Rebuild the execution graph if systems were enabled/disabled since
-            // the last frame, so parallel batches reflect the current active set.
+            // Step 2: Rebuild the execution graph when systems changed since
+            // the last frame, so parallel batches reflect the active set.
             if self.graph_dirty {
                 self.scheduler.build_execution_graph();
                 self.graph_dirty = false;
             }
 
-            // Emit per-archetype memory breakdown when archetypes are added or removed.
+            // Step 3: Emit per-archetype memory breakdowns when the archetype
+            // set changed since the last frame.
             let current_generation = self.world.archetype_generation;
             if current_generation != self.last_archetype_generation {
                 self.last_archetype_generation = current_generation;
@@ -503,7 +517,7 @@ impl Engine {
                 );
             }
 
-            // Phase 1: Run all systems
+            // Step 4: Run all systems (parallel batches or sequential fallback).
             if self.parallel_execution && self.systems.len() > 1 {
                 self.run_systems_parallel();
             } else {
@@ -522,14 +536,14 @@ impl Engine {
                 );
             }
 
-            // Scripts receive a ScriptContext with read-only world access and deferred commands
+            // Step 5: Update scripts with read-only world access and deferred commands.
             {
                 let _zone = crate::profile_scope!("update scripts");
                 self.world.update_scripts(&mut self.queue);
             }
             crate::profile_secondary_frame_mark!("scripts");
 
-            // Phase 2: Execute all deferred commands (including those from scripts)
+            // Step 6: Execute all deferred commands (including those from scripts).
             {
                 let _zone = crate::profile_scope!(
                     "execute commands",
@@ -541,7 +555,8 @@ impl Engine {
             }
             crate::profile_secondary_frame_mark!("commands");
 
-            // Check for duplicate iterator labels within this frame.
+            // Step 7: Check for duplicate iterator labels within this frame and
+            // emit the per-frame time-series plots and metrics.
             {
                 let mut timing = self
                     .world
@@ -628,7 +643,8 @@ impl Engine {
     // Internal: Sequential Execution
     // -------------------------------------------------------------------------
 
-    /// Run systems sequentially (fallback or when parallel is disabled)
+    /// Runs systems sequentially, used when parallel execution is disabled or
+    /// when only one system is registered.
     fn run_systems_sequential(&mut self) {
         let _zone = crate::profile_scope!(
             "systems sequential",
@@ -683,13 +699,19 @@ impl Engine {
     // Internal: Parallel Execution
     // -------------------------------------------------------------------------
 
-    /// Run systems in parallel batches based on dependency analysis
+    /// Runs systems in parallel batches based on the scheduler's dependency analysis.
     ///
-    /// SAFETY: This uses unsafe code to work around Rust's borrow checker.
-    /// The safety is guaranteed by the scheduler's dependency analysis:
-    /// - Systems in the same batch have been proven to access disjoint components
-    /// - No two systems in a batch can have conflicting access (write-write or read-write)
-    /// - Systems using Commands run exclusively (not in parallel with anything)
+    /// Each batch is proven by the scheduler to access disjoint components and
+    /// resources, so its systems can run concurrently on Rayon worker threads.
+    /// Systems that use [`Commands`] run exclusively (never in parallel with
+    /// anything) because they require exclusive access to the world.
+    ///
+    /// # Safety
+    ///
+    /// This function contains `unsafe` code that rebuilds `&mut` references from
+    /// raw pointers. Its soundness rests on the scheduler's guarantees: systems
+    /// in one batch access disjoint state, command-using systems run alone, and
+    /// every batch index stays within the `systems` vector.
     fn run_systems_parallel(&mut self) {
         let _zone = crate::profile_scope!(
             "run systems parallel",
@@ -762,7 +784,8 @@ impl Engine {
                 // sidestepping the world-level field for parallel batches.
                 let started_at = self.world.change_tick().get();
 
-                // Prepare stage: collect per-system data + create raw pointers
+                // Step 1: Collect per-system data and raw pointers for disjoint
+                // parallel access.
                 let _zone = crate::profile_scope!("setup systems batch ({} systems)", batch_size);
                 let last_runs: Vec<u32> = systems_batch
                     .iter()
@@ -807,7 +830,7 @@ impl Engine {
                     .collect();
                 drop(_zone);
 
-                // Dispatch stage: execute all systems in this batch via Rayon.
+                // Step 2: Dispatch all systems in the batch across Rayon workers.
                 // Use a single indexed parallel iterator instead of chained
                 // zip() - avoids deep iterator nesting that causes Rayon
                 // to spend more time splitting than executing on small batches.
@@ -844,6 +867,22 @@ impl Engine {
                     let previous_override =
                         set_per_thread_last_run_tick(Some(Tick::new(last_runs[i])));
 
+                    // SAFETY: The scheduler proved that the systems in this
+                    // batch access disjoint components and resources, so no two
+                    // worker threads alias the same world, queue, or system
+                    // state; command-using systems never share a batch. Each
+                    // pointer was derived from `self` while `&mut self` was held
+                    // for the whole batch, so the underlying allocations outlive
+                    // every closure invocation. `system_index` comes from
+                    // `systems_batch`, which the scheduler built from
+                    // `self.systems`, so `add(system_index)` stays within the
+                    // `systems` allocation. The only shared mutable buffer,
+                    // `batch_failures`, is guarded by a `Mutex`, and per-thread
+                    // last-run ticks are stored thread-locally. Rebuilding
+                    // `&mut World`, `&mut CommandQueue`, and `&mut
+                    // RegisteredSystem` from these pointers is therefore valid:
+                    // disjoint, in-bounds, alive for the duration of use, and
+                    // type-valid.
                     unsafe {
                         let world = &mut *world_ptr.as_ptr();
                         let system_start = Instant::now();
@@ -879,8 +918,9 @@ impl Engine {
                 );
                 drop(_zone);
 
-                // Fold the batch's failures into the per-frame record. The
-                // order follows the workers' completion, not the batch index.
+                // Step 3: Fold the batch's failures into the frame record and
+                // advance every system's last-run tick. The failure order follows
+                // the workers' completion, not the batch index.
                 let mut collected = batch_failures
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -903,16 +943,27 @@ impl Engine {
     }
 }
 
+impl Default for Engine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use pill_core::error::EngineMessage as _;
+    // Standard library
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Arc;
+
+    // External crates
+    use pill_core::error::EngineMessage as _;
+
+    // Current crate
+    use super::*;
 
     /// A failing system is recorded with its name and drained by the frame.
     #[test]

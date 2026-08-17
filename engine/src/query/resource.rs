@@ -7,11 +7,10 @@
 //!
 //! # Design
 //!
-//! These types implement [`SystemParam`] so they can appear as system function
-//! parameters. The scheduler tracks resource reads and writes for conflict
-//! detection, ensuring no two systems obtain `&mut` to the same resource simultaneously.
-
-// Standard library
+//! These types implement [`SystemParam`](crate::system::SystemParam) so they
+//! can appear as system function parameters. The scheduler tracks resource
+//! reads and writes for conflict detection, ensuring no two systems obtain
+//! `&mut` to the same resource simultaneously.
 
 // Current crate
 use crate::query::change_detection::Mut;
@@ -28,7 +27,7 @@ use crate::world::World;
 /// The scheduler tracks this as a read and allows multiple systems to
 /// read the same resource in parallel.
 ///
-/// # Example
+/// # Examples
 /// ```no_run
 /// # use pill_engine::*;
 /// # #[derive(Debug)] struct GameTime { elapsed: f32 }
@@ -40,11 +39,17 @@ use crate::world::World;
 /// }
 /// ```
 pub struct Res<'w, T: Resource> {
+    /// The world the resource is fetched from.
     world: &'w World,
+    /// Marks `T` as the resource type targeted by this wrapper.
     _phantom: std::marker::PhantomData<T>,
 }
 
 impl<'w, T: Resource> Res<'w, T> {
+    /// Creates a new [`Res`] wrapper around the given [`World`].
+    ///
+    /// Constructed by the system runner rather than called directly;
+    /// [`Res<T>`] parameters are built automatically when a system runs.
     pub fn new(world: &'w World) -> Self {
         Self {
             world,
@@ -52,13 +57,17 @@ impl<'w, T: Resource> Res<'w, T> {
         }
     }
 
-    /// Get immutable reference to the resource.
+    /// Returns an immutable reference to the resource.
     ///
     /// Returns `None` if the resource has not been inserted into the World.
     pub fn get(&self) -> Option<&T> {
         self.world.get_resource::<T>()
     }
 }
+
+// =============================================================================
+// ResMut
+// =============================================================================
 
 /// Mutable resource access for systems - with change-detection tracking.
 ///
@@ -70,7 +79,7 @@ impl<'w, T: Resource> Res<'w, T> {
 /// resource's `changed` tick when mutated through `DerefMut`. This lets
 /// other systems (or future frames) detect that the resource was modified.
 ///
-/// # Example
+/// # Examples
 /// ```no_run
 /// # use pill_engine::*;
 /// # #[derive(Debug)] struct GameTime { elapsed: f32, delta: f32 }
@@ -82,11 +91,17 @@ impl<'w, T: Resource> Res<'w, T> {
 /// }
 /// ```
 pub struct ResMut<'w, T: Resource> {
+    /// The world the resource is fetched from.
     world: &'w mut World,
+    /// Marks `T` as the resource type targeted by this wrapper.
     _phantom: std::marker::PhantomData<T>,
 }
 
 impl<'w, T: Resource> ResMut<'w, T> {
+    /// Creates a new [`ResMut`] wrapper around the given [`World`].
+    ///
+    /// Constructed by the system runner rather than called directly;
+    /// [`ResMut<T>`] parameters are built automatically when a system runs.
     pub fn new(world: &'w mut World) -> Self {
         Self {
             world,
@@ -94,14 +109,14 @@ impl<'w, T: Resource> ResMut<'w, T> {
         }
     }
 
-    /// Get immutable reference to the resource.
+    /// Returns an immutable reference to the resource.
     ///
     /// Returns `None` if the resource has not been inserted into the World.
     pub fn get(&self) -> Option<&T> {
         self.world.get_resource::<T>()
     }
 
-    /// Get mutable, change-tracking access to the resource.
+    /// Returns mutable, change-tracking access to the resource.
     ///
     /// Returns a [`Mut<'_, T>`] that wraps both the value and its
     /// change-detection ticks. Mutating through `DerefMut` automatically

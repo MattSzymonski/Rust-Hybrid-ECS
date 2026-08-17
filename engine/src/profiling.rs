@@ -13,4 +13,10 @@
 //! shim; the engine's own root re-exports (`pub use pill_core::{profile_scope,
 //! ...}`) additionally surface the macros at `crate::` scope for the many
 //! internal call sites.
+
+// External crates
+
+/// Re-exports the entire [`pill_core::profiling`] namespace at
+/// `crate::profiling`, giving engine code and downstream users a single
+/// profiling entry point.
 pub use pill_core::profiling::*;

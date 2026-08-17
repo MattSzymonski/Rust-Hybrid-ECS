@@ -17,33 +17,15 @@
 use trait_type_map::VecStorage;
 
 // Current crate
+use super::change_detection::Mut;
+use super::ptr::{SendPtr, SendPtrMut};
 use crate::archetype::Archetype;
 use crate::component::{Component, ComponentId, ComponentTicks, Tick};
 use crate::entity::Entity;
 
-use super::change_detection::Mut;
-use super::ptr::{SendPtr, SendPtrMut};
-
 // =============================================================================
-// Free Functions
+// QueryTarget
 // =============================================================================
-
-/// Returns `true` when `writes` contains any duplicate [`ComponentId`],
-/// which would mean a query tuple has two `&mut T` elements for the same
-/// `T`. That pattern creates aliasing `&mut` references - UB.
-#[inline]
-pub(crate) fn has_duplicate_writes(writes: &[ComponentId]) -> bool {
-    // Small-N linear scan: tuples are at most arity 4 (or 8 in the
-    // future), so O(n²) with n ≤ 8 is cheaper than allocating a HashSet.
-    for (i, a) in writes.iter().enumerate() {
-        for b in &writes[i + 1..] {
-            if a == b {
-                return true;
-            }
-        }
-    }
-    false
-}
 
 /// Trait for fetching components from archetypes.
 ///
@@ -58,13 +40,10 @@ pub(crate) fn has_duplicate_writes(writes: &[ComponentId]) -> bool {
 /// matches a query has its state initialized once via [`init_state`].
 ///
 /// [`init_state`]: QueryTarget::init_state
-
-// =============================================================================
-// QueryTarget
-// =============================================================================
-
 pub trait QueryTarget {
+    /// The type yielded per row by this query target.
     type Item<'a>;
+    /// Cached per-archetype state (e.g. storage pointers) for this target.
     type State;
 
     /// Get the component IDs required by this query.
@@ -87,8 +66,6 @@ pub trait QueryTarget {
 
 // =============================================================================
 // Entity
-// =============================================================================
-// QueryTarget
 // =============================================================================
 
 /// Allows queries to include `Entity` in the data tuple, e.g.
@@ -114,6 +91,13 @@ impl QueryTarget for Entity {
     }
 
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
+        // SAFETY: The query loop invariant guarantees `index <
+        // archetype.len()`, and the archetype's entity vector length always
+        // equals its entity count, so the unchecked index is in bounds. The
+        // pointer was captured from `&archetype.entities` in `init_state`
+        // and the entity storage is not reallocated during iteration, so
+        // the reference is valid for `'a`. `Entity` is `Copy`, so copying
+        // the value out cannot create aliasing references.
         unsafe { *(&*state.as_ptr()).get_unchecked(index) }
     }
 }
@@ -122,6 +106,9 @@ impl QueryTarget for Entity {
 // &T (Immutable Reference)
 // =============================================================================
 
+/// Allows queries to include immutable component references, e.g.
+/// `Query<(&Transform, &Velocity)>`. Read-only access yields a plain `&T`
+/// and reports the component as a read for system dependency analysis.
 impl<T: Component> QueryTarget for &T {
     type Item<'a> = &'a T;
     type State = SendPtr<VecStorage<T, dyn Component>>;
@@ -163,8 +150,12 @@ impl<T: Component> QueryTarget for &T {
 /// Cached pointers used by mutable component queries to construct `Mut<T>`
 /// without re-locating the underlying storage on every access.
 pub struct MutFetchState<T: Component> {
+    /// Raw pointer to the component values storage, cached to avoid
+    /// re-locating the storage on every row fetch.
     values: SendPtrMut<VecStorage<T, dyn Component>>,
+    /// Raw pointer to the per-entity change-detection ticks storage.
     ticks: SendPtrMut<Vec<ComponentTicks>>,
+    /// The world tick for this run, stored on `Mut<T>` at fetch time.
     this_run: Tick,
 }
 
@@ -173,6 +164,10 @@ pub struct MutFetchState<T: Component> {
 unsafe impl<T: Component> Send for MutFetchState<T> {}
 unsafe impl<T: Component> Sync for MutFetchState<T> {}
 
+/// Allows queries to include mutable component references, e.g.
+/// `Query<&mut Velocity>`. Mutable access yields [`Mut<T>`] with change
+/// detection and reports the component as a write for system dependency
+/// analysis.
 impl<T: Component> QueryTarget for &mut T {
     type Item<'a> = Mut<'a, T>;
     type State = MutFetchState<T>;
@@ -267,6 +262,14 @@ macro_rules! impl_query_target_tuple {
                     [("Entities in archetype: {}", archetype.entity_count())]
                 );
                 let archetype_ptr = archetype as *mut Archetype;
+                // SAFETY: Each tuple element re-derives its own `&mut
+                // Archetype` from the same raw pointer and uses it only
+                // within its own `init_state` call, so the mutable borrows
+                // never overlap. The archetype is a `&mut` parameter that
+                // outlives the whole call, so the pointer remains valid for
+                // every element. `init_state` only reads out storage
+                // pointers and never reallocates or otherwise invalidates
+                // the archetype, so all derived references stay valid.
                 unsafe { ($($T::init_state(&mut *archetype_ptr, this_run),)*) }
             }
 
@@ -284,3 +287,24 @@ impl_query_target_tuple!(A, B);
 impl_query_target_tuple!(A, B, C);
 impl_query_target_tuple!(A, B, C, D);
 impl_query_target_tuple!(A, B, C, D, E);
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Returns `true` when `writes` contains any duplicate [`ComponentId`],
+/// which would mean a query tuple has two `&mut T` elements for the same
+/// `T`. That pattern creates aliasing `&mut` references - UB.
+#[inline]
+pub(crate) fn has_duplicate_writes(writes: &[ComponentId]) -> bool {
+    // Small-N linear scan: tuples are at most arity 4 (or 8 in the
+    // future), so O(n²) with n ≤ 8 is cheaper than allocating a HashSet.
+    for (i, a) in writes.iter().enumerate() {
+        for b in &writes[i + 1..] {
+            if a == b {
+                return true;
+            }
+        }
+    }
+    false
+}

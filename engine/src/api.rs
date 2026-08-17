@@ -171,6 +171,8 @@ impl EngineApi {
     /// All function pointers are set to C-callable wrappers around the
     /// engine's methods. The returned struct is safe to pass across FFI.
     pub fn new(engine: &mut Engine) -> Self {
+        // Capture the engine as an opaque handle and wire every function
+        // pointer to the C-callable wrapper for that same engine.
         Self {
             engine_handle: engine as *mut Engine as *mut c_void,
 
@@ -198,6 +200,11 @@ impl EngineApi {
 // that was created by the host and has not been dropped. The host guarantees
 // this invariant.
 
+/// C-callable wrapper for raw component registration.
+///
+/// Reports an error for now: the engine does not yet implement
+/// name/size/alignment-based registration.
+///
 /// # Safety
 ///
 /// `engine` must be a valid `*mut Engine` that outlives this call.
@@ -207,9 +214,19 @@ unsafe extern "C" fn api_register_component(
     _size_in_bytes: u32,
     _alignment_in_bytes: u32,
 ) -> i32 {
-    // SAFETY: Caller guarantees the engine pointer is valid.
+    // Step 1: Recover the engine reference from the opaque handle.
+    //
+    // SAFETY: The handle was created by `EngineApi::new` via
+    // `engine as *mut Engine as *mut c_void`, so it points to a valid,
+    // correctly aligned `Engine`. The host keeps the engine alive for the
+    // entire time the game module is loaded, so the engine outlives this
+    // call. No other reference to the engine exists during this call, so
+    // the reconstructed `&mut Engine` is the only outstanding reference
+    // (no overlapping `&mut` aliasing).
     let _engine_ref: &mut Engine = unsafe { &mut *(engine as *mut Engine) };
 
+    // Step 2: Decode the component name for the diagnostic message.
+    //
     // Raw component registration by name/size/alignment is not yet
     // implemented on the Engine.  Rust consumers should use the typed
     // `engine_handle` cast + `register_component::<T>()` instead.
@@ -218,11 +235,15 @@ unsafe extern "C" fn api_register_component(
     let name_str = if type_name.is_null() {
         "(null)"
     } else {
-        // SAFETY: Caller guarantees a null-terminated C string.
+        // SAFETY: The caller promises `type_name` points to a
+        // null-terminated C string that remains valid for reads for the
+        // whole duration of this call, satisfying `CStr::from_ptr`'s
+        // validity contract.
         unsafe { std::ffi::CStr::from_ptr(type_name) }
             .to_str()
             .unwrap_or("(invalid utf-8)")
     };
+    // Step 3: Report the unimplemented operation and fail the call.
     eprintln!(
         "[engine_api] register_component_raw is not yet implemented. \
          Tried to register '{}' ({} bytes, align {}). \
@@ -235,6 +256,11 @@ unsafe extern "C" fn api_register_component(
     -1
 }
 
+/// C-callable wrapper for raw system registration.
+///
+/// Reports an error for now: the engine does not yet implement
+/// raw-function-pointer system registration.
+///
 /// # Safety
 ///
 /// `engine` must be a valid `*mut Engine` that outlives this call.
@@ -243,17 +269,31 @@ unsafe extern "C" fn api_register_system_raw(
     system_name: *const c_char,
     _system_function: unsafe extern "C" fn(*mut c_void),
 ) -> i32 {
-    // SAFETY: Caller guarantees the engine pointer is valid.
+    // Step 1: Recover the engine reference from the opaque handle.
+    //
+    // SAFETY: The handle was created by `EngineApi::new` via
+    // `engine as *mut Engine as *mut c_void`, so it points to a valid,
+    // correctly aligned `Engine`. The host keeps the engine alive for the
+    // entire time the game module is loaded, so the engine outlives this
+    // call. No other reference to the engine exists during this call, so
+    // the reconstructed `&mut Engine` is the only outstanding reference
+    // (no overlapping `&mut` aliasing).
     let _engine_ref: &mut Engine = unsafe { &mut *(engine as *mut Engine) };
 
+    // Step 2: Decode the system name for the diagnostic message.
     let name_str = if system_name.is_null() {
         "(null)"
     } else {
-        // SAFETY: Caller guarantees a null-terminated C string.
+        // SAFETY: The caller promises `system_name` points to a
+        // null-terminated C string that remains valid for reads for the
+        // whole duration of this call, satisfying `CStr::from_ptr`'s
+        // validity contract.
         unsafe { std::ffi::CStr::from_ptr(system_name) }
             .to_str()
             .unwrap_or("(invalid utf-8)")
     };
+
+    // Step 3: Report the unimplemented operation and fail the call.
     eprintln!(
         "[engine_api] register_system_raw is not yet implemented. \
          Tried to register system '{}'. \
@@ -267,11 +307,22 @@ unsafe extern "C" fn api_register_system_raw(
     -1
 }
 
+/// C-callable wrapper around `Engine::process_frame`.
+///
+/// Returns 0 on success and non-zero when a fatal command error occurs and
+/// the engine's `should_exit_on_error` flag is set.
+///
 /// # Safety
 ///
 /// `engine` must be a valid `*mut Engine` that outlives this call.
 unsafe extern "C" fn api_process_frame(engine: *mut c_void) -> i32 {
-    // SAFETY: Caller guarantees the engine pointer is valid.
+    // SAFETY: The handle was created by `EngineApi::new` via
+    // `engine as *mut Engine as *mut c_void`, so it points to a valid,
+    // correctly aligned `Engine`. The host keeps the engine alive for the
+    // entire time the game module is loaded, so the engine outlives this
+    // call. No other reference to the engine exists during this call, so
+    // the reconstructed `&mut Engine` is the only outstanding reference
+    // (no overlapping `&mut` aliasing).
     let engine_ref: &mut Engine = unsafe { &mut *(engine as *mut Engine) };
     match engine_ref.process_frame() {
         Ok(()) => 0,
@@ -284,38 +335,70 @@ unsafe extern "C" fn api_process_frame(engine: *mut c_void) -> i32 {
     }
 }
 
+/// C-callable wrapper around `Engine::set_fps_limit`.
+///
 /// # Safety
 ///
 /// `engine` must be a valid `*mut Engine` that outlives this call.
 unsafe extern "C" fn api_set_fps_limit(engine: *mut c_void, frames_per_second: f64) {
-    // SAFETY: Caller guarantees the engine pointer is valid.
+    // SAFETY: The handle was created by `EngineApi::new` via
+    // `engine as *mut Engine as *mut c_void`, so it points to a valid,
+    // correctly aligned `Engine`. The host keeps the engine alive for the
+    // entire time the game module is loaded, so the engine outlives this
+    // call. No other reference to the engine exists during this call, so
+    // the reconstructed `&mut Engine` is the only outstanding reference
+    // (no overlapping `&mut` aliasing).
     let engine_ref: &mut Engine = unsafe { &mut *(engine as *mut Engine) };
     engine_ref.set_fps_limit(frames_per_second);
 }
 
+/// C-callable wrapper around `Engine::set_parallel_execution`.
+///
 /// # Safety
 ///
 /// `engine` must be a valid `*mut Engine` that outlives this call.
 unsafe extern "C" fn api_set_parallel_execution(engine: *mut c_void, enabled: bool) {
-    // SAFETY: Caller guarantees the engine pointer is valid.
+    // SAFETY: The handle was created by `EngineApi::new` via
+    // `engine as *mut Engine as *mut c_void`, so it points to a valid,
+    // correctly aligned `Engine`. The host keeps the engine alive for the
+    // entire time the game module is loaded, so the engine outlives this
+    // call. No other reference to the engine exists during this call, so
+    // the reconstructed `&mut Engine` is the only outstanding reference
+    // (no overlapping `&mut` aliasing).
     let engine_ref: &mut Engine = unsafe { &mut *(engine as *mut Engine) };
     engine_ref.set_parallel_execution(enabled);
 }
 
+/// C-callable wrapper around `Engine::world().entity_count()`.
+///
 /// # Safety
 ///
 /// `engine` must be a valid `*mut Engine` that outlives this call.
 unsafe extern "C" fn api_entity_count(engine: *mut c_void) -> u64 {
-    // SAFETY: Caller guarantees the engine pointer is valid.
+    // SAFETY: The handle was created by `EngineApi::new` via
+    // `engine as *mut Engine as *mut c_void`, so it points to a valid,
+    // correctly aligned `Engine`. The host keeps the engine alive for the
+    // entire time the game module is loaded, so the engine outlives this
+    // call. Only a shared `&Engine` is reconstructed here, so no mutable
+    // aliasing is introduced; the caller must not mutate the engine
+    // concurrently with this call.
     let engine_ref: &Engine = unsafe { &*(engine as *const Engine) };
     engine_ref.world().entity_count() as u64
 }
 
+/// C-callable wrapper around `Engine::world_mut().reserve_entities`.
+///
 /// # Safety
 ///
 /// `engine` must be a valid `*mut Engine` that outlives this call.
 unsafe extern "C" fn api_reserve_entities(engine: *mut c_void, capacity: u64) {
-    // SAFETY: Caller guarantees the engine pointer is valid.
+    // SAFETY: The handle was created by `EngineApi::new` via
+    // `engine as *mut Engine as *mut c_void`, so it points to a valid,
+    // correctly aligned `Engine`. The host keeps the engine alive for the
+    // entire time the game module is loaded, so the engine outlives this
+    // call. No other reference to the engine exists during this call, so
+    // the reconstructed `&mut Engine` is the only outstanding reference
+    // (no overlapping `&mut` aliasing).
     let engine_ref: &mut Engine = unsafe { &mut *(engine as *mut Engine) };
     engine_ref.world_mut().reserve_entities(capacity as usize);
 }

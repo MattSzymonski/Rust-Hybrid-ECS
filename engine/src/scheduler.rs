@@ -5,7 +5,7 @@
 //! - Analyzes component read/write access patterns across registered systems.
 //! - Builds a dependency graph and groups independent systems into parallel batches.
 //! - Provides [`SystemAccess`] for declaring per-system access requirements.
-//! - Implements O(1) conflict detection via [`ComponentMask`] bitwise AND.
+//! - Implements O(1) conflict detection via [`ComponentMask`](crate::component::ComponentMask) bitwise AND.
 //! - Defines the legacy [`TypeKey`] wrapper used by native resource metadata.
 //!
 //! # Design
@@ -30,18 +30,20 @@ use crate::resource::ResourceId;
 
 /// Type-key wrapper around [`TypeId`] used by native resource metadata.
 ///
-/// Lives in the scheduler module because it's the primary consumer that
-/// Component IDs can also represent manifest-defined types and therefore use
-/// their own enum instead of this native-only wrapper.
+/// Lives in the scheduler module because it is the primary consumer: native
+/// systems identify resources by type key, while manifest-defined types are
+/// identified by [`ComponentId`] and therefore use their own enum instead of
+/// this native-only wrapper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TypeKey(pub TypeId);
 
 impl TypeKey {
+    /// Builds the [`TypeKey`] for a given type `T`.
     pub fn of<T: 'static>() -> Self {
         TypeKey(TypeId::of::<T>())
     }
 
-    /// Get the underlying [`TypeId`].
+    /// Returns the underlying [`TypeId`].
     pub fn type_id(self) -> TypeId {
         self.0
     }
@@ -70,59 +72,85 @@ pub struct SystemAccess {
     pub writes: HashSet<ComponentId>,
     /// Whether the system uses Commands (requires exclusive World access)
     pub uses_commands: bool,
-    /// Resources read immutably (Res<T>)
+    /// Resources read immutably (`Res<T>`)
     pub resource_reads: HashSet<ResourceId>,
-    /// Resources written mutably (ResMut<T>)
+    /// Resources written mutably (`ResMut<T>`)
     pub resource_writes: HashSet<ResourceId>,
 
-    // --- Precomputed bitmasks for O(1) conflict detection ---
+    /// Precomputed read bitmask for O(1) conflict detection.
+    ///
+    /// Populated by [`build_component_masks`](SystemAccess::build_component_masks)
+    /// after registration; empty until then.
     reads_mask: ComponentMask,
+    /// Precomputed write bitmask for O(1) conflict detection.
+    ///
+    /// Populated by [`build_component_masks`](SystemAccess::build_component_masks)
+    /// after registration; empty until then.
     writes_mask: ComponentMask,
 }
 
 impl SystemAccess {
+    /// Creates an empty [`SystemAccess`] with no components or resources.
+    ///
+    /// Equivalent to [`SystemAccess::default`]. Access patterns are built up
+    /// with [`add_read`](SystemAccess::add_read) and
+    /// [`add_write`](SystemAccess::add_write) before registration.
     pub fn new() -> Self {
         Self::default()
     }
 
+    /// Registers `component_id` as read-only (`&T`) access for this system.
     #[inline]
     pub fn add_read(&mut self, component_id: ComponentId) {
         self.reads.insert(component_id);
     }
 
+    /// Registers `component_id` as mutable (`&mut T`) access for this system.
+    ///
+    /// A write to a component conflicts with any other system reading or
+    /// writing the same component.
     #[inline]
     pub fn add_write(&mut self, component_id: ComponentId) {
         self.writes.insert(component_id);
     }
 
+    /// Marks whether this system uses [`Commands`](crate::Commands).
+    ///
+    /// A system that uses [`Commands`](crate::Commands) requires exclusive
+    /// world access and therefore conflicts with every other system.
     pub fn set_uses_commands(&mut self, uses: bool) {
         self.uses_commands = uses;
     }
 
+    /// Registers `resource_id` as immutable (`Res<T>`) access for this system.
     #[inline]
     pub fn add_resource_read(&mut self, resource_id: ResourceId) {
         self.resource_reads.insert(resource_id);
     }
 
+    /// Registers `resource_id` as mutable (`ResMut<T>`) access for this system.
     #[inline]
     pub fn add_resource_write(&mut self, resource_id: ResourceId) {
         self.resource_writes.insert(resource_id);
     }
 
-    /// Populate the internal [`ComponentMask`] fields from the [`HashSet`]
+    /// Populates the internal [`ComponentMask`] fields from the [`HashSet`]
     /// fields using the given [`ComponentRegistry`](crate::component::ComponentRegistry).
     ///
     /// Must be called after all `add_read` / `add_write` calls and before
-    /// the first [`conflicts_with`] call.  The scheduler calls this
-    /// automatically during graph building.
+    /// the first [`conflicts_with`](SystemAccess::conflicts_with) call.  The
+    /// scheduler calls this automatically during graph building.
     pub fn build_component_masks(&mut self, registry: &crate::component::ComponentRegistry) {
+        // Reset both masks to empty before rebuilding.
         self.reads_mask = ComponentMask::empty();
         self.writes_mask = ComponentMask::empty();
+        // Fold every read component's registry bit into the read mask.
         for id in &self.reads {
             if let Some(bit) = registry.get_bit(id) {
                 self.reads_mask.set(bit);
             }
         }
+        // Fold every write component's registry bit into the write mask.
         for id in &self.writes {
             if let Some(bit) = registry.get_bit(id) {
                 self.writes_mask.set(bit);
@@ -130,22 +158,24 @@ impl SystemAccess {
         }
     }
 
-    /// Check if this system conflicts with another.
+    /// Checks whether this system conflicts with another.
     ///
     /// Component conflicts are detected with a single bitwise AND
     /// (O(1) via [`ComponentMask`]) when masks have been built via
-    /// [`build_component_masks`].  Falls back to [`HashSet::is_disjoint`]
-    /// when masks are empty (e.g. in tests that don't have a registry).
+    /// [`build_component_masks`](SystemAccess::build_component_masks).  Falls
+    /// back to [`HashSet::is_disjoint`] when masks are empty (e.g. in tests
+    /// that don't have a registry).
     ///
     /// Resource conflicts always use [`HashSet::is_disjoint`].
     #[inline]
     pub fn conflicts_with(&self, other: &SystemAccess) -> bool {
-        // Commands require exclusive World access
+        // Step 1: Commands require exclusive world access, so a system that
+        // uses them conflicts with everything.
         if self.uses_commands || other.uses_commands {
             return true;
         }
 
-        // Component conflicts - prefer O(1) bitmasks when available,
+        // Step 2: Component conflicts - prefer O(1) bitmasks when available,
         // fall back to HashSet for tests / ad-hoc usage.
         if self.reads_mask.is_empty()
             && self.writes_mask.is_empty()
@@ -175,7 +205,7 @@ impl SystemAccess {
             }
         }
 
-        // Resource conflicts - still HashSet-based
+        // Step 3: Resource conflicts - still HashSet-based
         if !self.resource_writes.is_disjoint(&other.resource_writes) {
             return true;
         }
@@ -194,7 +224,11 @@ impl SystemAccess {
 // SystemScheduler
 // =============================================================================
 
-/// Execution scheduler that builds parallel batches from system dependencies
+/// Execution scheduler that builds parallel batches from system dependencies.
+///
+/// Systems are registered with their [`SystemAccess`] patterns, a conflict
+/// matrix is precomputed once, and [`build_execution_graph`](SystemScheduler::build_execution_graph)
+/// groups non-conflicting systems into batches that can run in parallel.
 pub struct SystemScheduler {
     /// System count
     system_count: usize,
@@ -209,7 +243,7 @@ pub struct SystemScheduler {
 }
 
 impl SystemScheduler {
-    /// Create a new scheduler
+    /// Creates an empty scheduler with no registered systems.
     pub fn new() -> Self {
         Self {
             system_count: 0,
@@ -227,7 +261,7 @@ impl Default for SystemScheduler {
 }
 
 impl SystemScheduler {
-    /// Register a system with its access pattern.
+    /// Registers a system with its access pattern.
     ///
     /// Returns the system's index for later reference.
     pub fn register_system(&mut self, access: SystemAccess) -> usize {
@@ -264,7 +298,7 @@ impl SystemScheduler {
         self.conflict_matrix.push(new_row);
     }
 
-    /// Build the execution graph based on dependencies.
+    /// Builds the execution graph based on dependencies.
     ///
     /// Uses a precomputed conflict matrix so that each pairwise check is
     /// an O(1) array lookup instead of a full `conflicts_with` call.
@@ -278,18 +312,23 @@ impl SystemScheduler {
             "build execution graph",
             [("Number of systems to schedule: {}", self.system_count)]
         );
+        // Step 1: Reset the previous graph; with no systems there is nothing
+        // to schedule.
         self.execution_graph.clear();
 
         if self.system_count == 0 {
             return;
         }
 
-        // Precompute conflict count per system and build a permutation
+        // Step 2: Precompute conflict count per system and build a permutation
         // sorted by ascending conflict count. Systems with fewest conflicts
         // are scheduled first - they pack densely into early batches.
         let mut order: Vec<usize> = (0..self.system_count).collect();
         order.sort_by_key(|&i| self.conflict_matrix[i].iter().filter(|&&c| c).count());
 
+        // Step 3: Greedily assign systems to batches. Each system joins the
+        // current batch only if it conflicts with none of the systems already
+        // in it; otherwise it is deferred to a later batch.
         let mut scheduled = vec![false; self.system_count];
         let mut scheduled_count = 0;
 
@@ -319,17 +358,20 @@ impl SystemScheduler {
         }
     }
 
-    /// Get the execution graph (batches of system indices)
+    /// Returns the execution graph: a slice of batches, where each batch
+    /// holds the indices of systems that can run in parallel.
     pub fn execution_graph(&self) -> &[Vec<usize>] {
         &self.execution_graph
     }
 
-    /// Get access pattern for a system
+    /// Returns the access pattern registered for the system at `index`.
+    ///
+    /// Returns `None` if `index` is out of range.
     pub fn get_access(&self, index: usize) -> Option<&SystemAccess> {
         self.access_patterns.get(index)
     }
 
-    /// Clear all registered systems and their access patterns.
+    /// Clears all registered systems and their access patterns.
     ///
     /// Resets the scheduler to its initial empty state. Used during
     /// hot-reload so that stale system indices and conflict data are
@@ -341,7 +383,7 @@ impl SystemScheduler {
         self.execution_graph.clear();
     }
 
-    /// Print execution graph for debugging
+    /// Prints a human-readable summary of the execution graph for debugging.
     pub fn print_execution_graph(&self, system_names: &[&str]) {
         println!("\n=== System Execution Graph ===");
         for (batch_index, batch) in self.execution_graph.iter().enumerate() {

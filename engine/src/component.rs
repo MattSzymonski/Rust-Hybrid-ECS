@@ -21,6 +21,10 @@
 use std::any::TypeId;
 use std::collections::HashMap;
 
+// =============================================================================
+// Component
+// =============================================================================
+
 /// Component marker trait - all components must be `'static` and [`Send`].
 ///
 /// # Interior Mutability Warning
@@ -36,11 +40,15 @@ use std::collections::HashMap;
 /// systems, prefer splitting the mutable portion into a separate component
 /// type and using `&mut T` queries (which the scheduler serializes
 /// correctly).
-
-// =============================================================================
-// Component
-// =============================================================================
-
+///
+/// # Examples
+///
+/// ```
+/// # use pill_engine::component::Component;
+/// struct Position { x: f32, y: f32 }
+///
+/// impl Component for Position {}
+/// ```
 pub trait Component: Send + 'static {}
 
 // =============================================================================
@@ -141,29 +149,6 @@ impl ComponentTicks {
 }
 
 // =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Verifies that `Tick` is exactly 4 bytes (a single u32).
-    #[test]
-    fn tick_size() {
-        assert_eq!(std::mem::size_of::<Tick>(), 4);
-        assert_eq!(std::mem::align_of::<Tick>(), 4);
-    }
-
-    /// Verifies that `ComponentTicks` is exactly 8 bytes (two u32 fields).
-    #[test]
-    fn component_ticks_size() {
-        assert_eq!(std::mem::size_of::<ComponentTicks>(), 8);
-        assert_eq!(std::mem::align_of::<ComponentTicks>(), 4);
-    }
-}
-
-// =============================================================================
 // ComponentId
 // =============================================================================
 
@@ -180,18 +165,24 @@ pub enum ComponentId {
 }
 
 impl ComponentId {
+    /// Returns the [`ComponentId`] for the concrete Rust type `T`.
     pub fn of<T: 'static>() -> Self {
         Self::Native(TypeId::of::<T>())
     }
 
+    /// Builds a dynamic component ID from the stable 128-bit identity
+    /// supplied by an external runtime manifest.
     pub const fn dynamic(stable_id: u128) -> Self {
         Self::Dynamic(stable_id)
     }
 
+    /// Wraps an existing Rust [`TypeId`] in a native component ID.
     pub const fn native(type_id: TypeId) -> Self {
         Self::Native(type_id)
     }
 
+    /// Returns the wrapped [`TypeId`] if this is a native component ID, or
+    /// `None` for dynamically registered components.
     pub const fn native_type_id(self) -> Option<TypeId> {
         match self {
             Self::Native(type_id) => Some(type_id),
@@ -223,6 +214,7 @@ impl ComponentId {
 pub struct ComponentMask(u128);
 
 impl ComponentMask {
+    /// Constructs a mask with no bits set.
     pub const fn empty() -> Self {
         Self(0)
     }
@@ -295,13 +287,18 @@ impl ComponentMask {
 /// Handles registration of component types and maintains the mapping needed
 /// to convert between ComponentId and bit positions for efficient mask operations.
 pub struct ComponentRegistry {
+    /// Maps each registered [`ComponentId`] to its assigned bit index.
     id_to_bit: HashMap<ComponentId, u8>,
+    /// Type name of each registered component, used for diagnostics and tooling.
     names: HashMap<ComponentId, String>,
+    /// Size in bytes of each registered component type.
     sizes: HashMap<ComponentId, usize>,
+    /// Next bit index to assign to a newly registered component.
     next_bit: u8,
 }
 
 impl ComponentRegistry {
+    /// Creates an empty registry with no components registered.
     pub fn new() -> Self {
         Self {
             id_to_bit: HashMap::new(),
@@ -321,17 +318,24 @@ impl Default for ComponentRegistry {
 impl ComponentRegistry {
     /// Register a component type and assign it a bit index.
     /// Returns the bit index, or the existing index if already registered.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the 128-component type limit has already been reached.
     pub fn register<T: Component>(&mut self) -> u8 {
+        // Step 1: Return the existing bit index when the type is already registered.
         let component_id = ComponentId::of::<T>();
         if let Some(&bit) = self.id_to_bit.get(&component_id) {
             return bit;
         }
+        // Step 2: Enforce the 128-component capacity before assigning a new bit.
         assert!(
             self.next_bit < 128,
             "Component type limit exceeded: cannot register {} (max 128 component types). \
              Consider combining related components or using a component with interior data variants.",
             std::any::type_name::<T>()
         );
+        // Step 3: Assign the next free bit and record the type's metadata.
         let bit = self.next_bit;
         self.id_to_bit.insert(component_id, bit);
         self.names
@@ -342,20 +346,29 @@ impl ComponentRegistry {
     }
 
     /// Register a component whose concrete type is defined outside Rust.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the 128-component type limit has already been reached.
     pub fn register_dynamic(
         &mut self,
         stable_id: u128,
         name: impl Into<String>,
         size: usize,
     ) -> u8 {
+        // Step 1: Return the existing bit index when the stable ID is already registered.
         let component_id = ComponentId::dynamic(stable_id);
         if let Some(&bit) = self.id_to_bit.get(&component_id) {
             return bit;
         }
+
+        // Step 2: Enforce the 128-component capacity before assigning a new bit.
         assert!(
             self.next_bit < 128,
             "Component type limit exceeded (max 128)"
         );
+
+        // Step 3: Assign the next free bit and record the dynamic component's metadata.
         let bit = self.next_bit;
         self.next_bit += 1;
         self.id_to_bit.insert(component_id, bit);
@@ -410,5 +423,28 @@ impl ComponentRegistry {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.id_to_bit.is_empty()
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verifies that `Tick` is exactly 4 bytes (a single u32).
+    #[test]
+    fn tick_size() {
+        assert_eq!(std::mem::size_of::<Tick>(), 4);
+        assert_eq!(std::mem::align_of::<Tick>(), 4);
+    }
+
+    /// Verifies that `ComponentTicks` is exactly 8 bytes (two u32 fields).
+    #[test]
+    fn component_ticks_size() {
+        assert_eq!(std::mem::size_of::<ComponentTicks>(), 8);
+        assert_eq!(std::mem::align_of::<ComponentTicks>(), 4);
     }
 }

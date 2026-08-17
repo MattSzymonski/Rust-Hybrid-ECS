@@ -1,39 +1,55 @@
-// ----------------------------------------------------------------------------
-// Demo: Resources + Components + Systems Together
-// ----------------------------------------------------------------------------
-//! Demonstrates using resources (Res/ResMut) alongside component queries
+//! Demo: Resources + Components + Systems Together.
+//!
+//! Demonstrates using resources (`Res`/`ResMut`) alongside component queries
 //! in a single frame loop. The scheduler respects resource access patterns
 //! when building the dependency graph for parallel execution.
 //!
-//! Scenario: A simple game loop with:
-//! - GameTime resource (delta time, elapsed)
-//! - Score resource   (total points)
-//! - Position / Velocity components on entities
+//! # Responsibilities
 //!
-//! Systems:
-//! - `time_system`     – updates GameTime (ResMut<GameTime>)
-//! - `movement_system` – moves entities (Query<&mut Position, &Velocity>)
-//! - `scoring_system`  – awards points based on distance from origin
-//!                       (Query<&Position>, ResMut<Score>)
-//! - `display_system`  – prints stats (Query<&Position>, Res<GameTime>, Res<Score>)
+//! - Defines two components, `Position` and `Velocity`, and two resources,
+//!   `GameTime` (delta time, elapsed) and `Score` (total points), for a
+//!   minimal game loop.
+//! - Provides four systems: `time_system` (writes `GameTime`),
+//!   `movement_system` (writes `Position`, reads `Velocity`),
+//!   `scoring_system` (reads `Position`, writes `Score`), and
+//!   `display_system` (reads `Position`, `GameTime`, and `Score`).
+//! - Registers components, resources, and systems with an `Engine`, prints the
+//!   execution graph, and runs a few frames under parallel execution.
+//!
+//! # Design
+//!
+//! The scheduler analyses each system's access pattern *before* any frame and
+//! splits batches wherever access patterns conflict: writes to `GameTime`,
+//! `Position`, and `Score` force a batch split against readers of the same
+//! storage. This demo is the smallest end-to-end illustration of that
+//! resource-aware dependency graph.
 
+// External crates
 use pill_engine::*;
 use trait_type_map::impl_trait_accessible;
 
-// ----------------------------------------------------------------------------
+// ============================================================================
 // Components
-// ----------------------------------------------------------------------------
+// ============================================================================
 
+/// Position of an entity in 2D space.
+///
+/// Updated each frame by `movement_system` based on the entity's `Velocity`.
 #[derive(Debug, Clone)]
 struct Position {
+    /// X coordinate.
     x: f32,
+    /// Y coordinate.
     y: f32,
 }
 impl Component for Position {}
 
+/// Velocity of an entity, applied to its `Position` every frame.
 #[derive(Debug, Clone)]
 struct Velocity {
+    /// Speed along the X axis.
     vx: f32,
+    /// Speed along the Y axis.
     vy: f32,
 }
 impl Component for Velocity {}
@@ -41,24 +57,30 @@ impl Component for Velocity {}
 // Required for component storage
 impl_trait_accessible!(dyn Component; Position, Velocity);
 
-// ----------------------------------------------------------------------------
+// ============================================================================
 // Resources
-// ----------------------------------------------------------------------------
+// ============================================================================
 
+/// Frame timing shared across all systems.
+///
+/// Written by `time_system` and read by `display_system` each frame.
 #[derive(Debug)]
 struct GameTime {
+    /// Seconds elapsed since the previous frame.
     delta: f32,
+    /// Total seconds since the loop started.
     elapsed: f32,
 }
 impl Resource for GameTime {}
 
+/// Total points awarded so far, written by `scoring_system`.
 #[derive(Debug)]
 struct Score(u32);
 impl Resource for Score {}
 
-// ----------------------------------------------------------------------------
+// ============================================================================
 // Systems
-// ----------------------------------------------------------------------------
+// ============================================================================
 
 /// Update the global game time.
 ///
@@ -108,28 +130,30 @@ fn display_system(mut query: Query<(Entity, &Position)>, time: Res<GameTime>, sc
     }
 }
 
-// ----------------------------------------------------------------------------
-// Main
-// ----------------------------------------------------------------------------
+// ============================================================================
+// Entry Point
+// ============================================================================
 
+/// Entry point: builds the demo world, registers components, resources, and
+/// systems, then runs a few frames to show the scheduler's batch splitting.
 fn main() {
     println!("=== Resources + Components Demo ===\n");
 
     let mut engine = Engine::new();
     engine.set_parallel_execution(true);
 
-    // --- Setup: register component & resource types ------------------------
+    // Step 1: Register component and resource types with the world.
     engine.world_mut().register_component::<Position>();
     engine.world_mut().register_component::<Velocity>();
 
-    // Insert initial resources
+    // Insert the initial resources.
     engine.world_mut().insert_resource(GameTime {
         delta: 0.016,
         elapsed: 0.0,
     });
     engine.world_mut().insert_resource(Score(0));
 
-    // --- Register systems --------------------------------------------------
+    // Step 2: Register systems and print the scheduler's execution graph.
     // The scheduler analyses each system's access pattern *before* any frame:
     //   time_system      ⇒ writes GameTime
     //   movement_system  ⇒ writes Position, reads Velocity
@@ -148,7 +172,8 @@ fn main() {
 
     engine.print_execution_graph();
 
-    // --- Spawn entities ----------------------------------------------------
+    // Step 3: Spawn three entities with distinct initial positions and
+    // velocities.
     for i in 0..3 {
         engine
             .world_mut()
@@ -165,7 +190,7 @@ fn main() {
             .unwrap();
     }
 
-    // --- Run a few frames --------------------------------------------------
+    // Step 4: Run a few frames, then report the final state.
     for _frame in 0..3 {
         engine.process_frame().unwrap();
     }

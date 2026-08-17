@@ -53,14 +53,43 @@
 //! }
 //! ```
 
+/// [`Mut`] smart pointer with tick-based change detection for components.
 pub(crate) mod change_detection;
 mod filter;
 mod iter;
+
+/// Thread-safe raw-pointer wrappers for parallel query iteration.
 pub(crate) mod ptr;
 #[allow(clippy::module_inception)]
 mod query;
 mod resource;
 mod target;
+
+// Current crate
+use crate::archetype::ArchetypeId;
+
+// =============================================================================
+// Re-exports
+// =============================================================================
+
+// Filter predicates and the query filter trait.
+pub use filter::{Added, Changed, Or, QueryFilter, With, Without};
+
+// Sequential and parallel query iterators.
+pub use iter::{BatchStats, ParForEachResult, ParQueryIter, QueryIterMut};
+
+// Core query type and resource accessors.
+pub use query::Query;
+pub use resource::{Res, ResMut};
+pub use target::QueryTarget;
+
+// =============================================================================
+// Types
+// =============================================================================
+
+/// Cached archetype state for filtered parallel iteration:
+/// `(archetype_id, target_state, filter_state, entity_count)`.
+pub(crate) type FilteredArchetypeRange<QS, FS> = (ArchetypeId, QS, FS, usize);
 
 // =============================================================================
 // Tests
@@ -68,16 +97,3 @@ mod target;
 
 #[cfg(test)]
 mod tests;
-
-// Current crate
-use crate::archetype::ArchetypeId;
-
-pub use filter::{Added, Changed, Or, QueryFilter, With, Without};
-pub use iter::{BatchStats, ParForEachResult, ParQueryIter, QueryIterMut};
-pub use query::Query;
-pub use resource::{Res, ResMut};
-pub use target::QueryTarget;
-
-/// Cached archetype state for filtered parallel iteration:
-/// `(archetype_id, target_state, filter_state, entity_count)`.
-pub(crate) type FilteredArchetypeRange<QS, FS> = (ArchetypeId, QS, FS, usize);

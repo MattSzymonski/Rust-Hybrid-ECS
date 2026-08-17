@@ -1,13 +1,44 @@
-//! Unit tests for the query system - covers basic queries, parallel
-//! iteration, change detection, and filters.
+//! Unit tests for the query system: basic queries, parallel iteration,
+//! change detection, and filter predicates.
+//!
+//! # Responsibilities
+//!
+//! - Defines the test-only [`Position`], [`Velocity`], and [`Health`]
+//!   component types shared by the whole suite.
+//! - Verifies sequential and parallel query iteration, including tracked
+//!   batch statistics.
+//! - Verifies change-detection semantics of [`Mut`] and the [`Added`] and
+//!   [`Changed`] filters.
+//! - Verifies archetype-scoping behaviour of the [`With`], [`Without`], and
+//!   [`Or`] filter combinators.
+//!
+//! # Design
+//!
+//! Every test builds a fresh [`World`] through [`setup_world`] with the three
+//! fixture components registered, populates entities, and asserts on the
+//! results of [`Query`] iteration. Filters are exercised at the archetype
+//! level ([`With`], [`Without`], [`Or`]) and the row level ([`Added`],
+//! [`Changed`]), including nested and mixed combinations that stress the
+//! [`Or`] short-circuiting and duplicate-write detection logic.
 
+// External crates
+use trait_type_map::impl_trait_accessible;
+
+// Current crate
 use super::*;
 use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
 use crate::world::World;
-use trait_type_map::impl_trait_accessible;
+
+// =============================================================================
+// Types
+// =============================================================================
 
 // Test components
+/// 2D position component used as a test fixture across the query suite.
+///
+/// Plain `f32` fields keep the fixture minimal so tests focus on query
+/// semantics rather than component behaviour.
 #[derive(Debug, Clone, PartialEq)]
 struct Position {
     x: f32,
@@ -15,6 +46,10 @@ struct Position {
 }
 impl Component for Position {}
 
+/// 2D velocity component used as a test fixture across the query suite.
+///
+/// Paired with [`Position`] in tests that exercise multi-component queries
+/// and parallel mutation.
 #[derive(Debug, Clone, PartialEq)]
 struct Velocity {
     x: f32,
@@ -22,12 +57,24 @@ struct Velocity {
 }
 impl Component for Velocity {}
 
+/// Health value component used as a test fixture across the query suite.
+///
+/// A tuple-struct component that creates archetypes distinct from the
+/// `Position`/`Velocity` pair, giving filters disjoint sets to match.
 #[derive(Debug, Clone, PartialEq)]
 struct Health(i32);
 impl Component for Health {}
 
+// Registers the three fixture components with the `trait_type_map` dispatch
+// table so queries and the scheduler can access them by type.
 impl_trait_accessible!(dyn Component; Position, Velocity, Health);
 
+// =============================================================================
+// Test Helpers
+// =============================================================================
+
+/// Creates a fresh [`World`] with the `Position`, `Velocity`, and `Health`
+/// components registered, ready for tests to populate with entities.
 fn setup_world() -> World {
     let mut world = World::new();
     world.register_component::<Position>();
@@ -35,6 +82,10 @@ fn setup_world() -> World {
     world.register_component::<Health>();
     world
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 // =============================================================================
 // Basic Query Tests
@@ -127,7 +178,7 @@ fn test_query_mutable_modification() {
         .build()
         .unwrap();
 
-    // Modify position based on velocity
+    // Step 1: integrate velocity into position through a mutable query.
     {
         let mut query = Query::<(&mut Position, &Velocity)>::new(&mut world);
         for (mut pos, vel) in query.iter_mut() {
@@ -136,7 +187,8 @@ fn test_query_mutable_modification() {
         }
     }
 
-    // Verify modification
+    // Step 2: read the modified position back through a fresh query and
+    // assert the integration result.
     let mut query = Query::<(&Position,)>::new(&mut world);
     let (pos,) = query.first().unwrap();
     assert_eq!(pos.x, 1.0);
@@ -388,6 +440,12 @@ fn test_report_component_access_mixed() {
     assert_eq!(writes.len(), 1);
 }
 
+/// Verifies that `report_component_access` panics on duplicate mutable
+/// component types in debug builds.
+///
+/// A `Query<(&mut Position, &mut Position)>` would create aliasing `&mut`
+/// references to the same storage, which is undefined behaviour; the
+/// `debug_assert!` inside `report_component_access` must reject it.
 #[test]
 #[cfg(debug_assertions)]
 #[should_panic(expected = "duplicate mutable component types")]
@@ -435,7 +493,7 @@ fn test_mut_deref_bumps_changed_tick() {
         .build()
         .unwrap();
 
-    // Capture the tick at which the component was added (insert
+    // Step 1: capture the tick at which the component was added (insert
     // happened with whatever world.change_tick was at the time).
     let added_tick = {
         let mut q = Query::<(&mut Position,)>::new(&mut world);
@@ -443,8 +501,8 @@ fn test_mut_deref_bumps_changed_tick() {
         m.last_added()
     };
 
-    // Mutate via DerefMut - should bump `changed` to the iterator's
-    // this_run, which is strictly newer than `added`.
+    // Step 2: mutate via DerefMut - should bump `changed` to the
+    // iterator's this_run, which is strictly newer than `added`.
     let changed_tick = {
         let mut q = Query::<(&mut Position,)>::new(&mut world);
         let (mut m,) = q.first().unwrap();
@@ -470,13 +528,15 @@ fn test_immutable_deref_does_not_bump_changed_tick() {
         .build()
         .unwrap();
 
+    // Step 1: record the changed tick before any dereference.
     let baseline = {
         let mut q = Query::<(&mut Position,)>::new(&mut world);
         let (m,) = q.first().unwrap();
         m.last_changed()
     };
 
-    // Read-only deref must not advance the changed tick.
+    // Step 2: read through an immutable deref - the changed tick must
+    // not advance.
     let after_read = {
         let mut q = Query::<(&mut Position,)>::new(&mut world);
         let (m,) = q.first().unwrap();
@@ -497,12 +557,15 @@ fn test_bypass_change_detection_does_not_bump_tick() {
         .build()
         .unwrap();
 
+    // Step 1: record the changed tick before any mutation.
     let baseline = {
         let mut q = Query::<(&mut Position,)>::new(&mut world);
         let (m,) = q.first().unwrap();
         m.last_changed()
     };
 
+    // Step 2: mutate through `bypass_change_detection` - the changed
+    // tick must not advance.
     let after_bypass = {
         let mut q = Query::<(&mut Position,)>::new(&mut world);
         let (mut m,) = q.first().unwrap();
@@ -512,7 +575,7 @@ fn test_bypass_change_detection_does_not_bump_tick() {
 
     assert_eq!(baseline, after_bypass);
 
-    // Verify the actual mutation still happened.
+    // Step 3: verify the raw mutation still took effect.
     let mut verify = Query::<(&Position,)>::new(&mut world);
     let (pos,) = verify.first().unwrap();
     assert_eq!(pos.x, 99.0);
@@ -528,18 +591,21 @@ fn test_added_tick_preserved_across_archetype_migration() {
         .build()
         .unwrap();
 
+    // Step 1: record the `added` tick of Position before migration.
     let original_added = {
         let mut q = Query::<(&mut Position,)>::new(&mut world);
         let (m,) = q.first().unwrap();
         m.last_added()
     };
 
-    // Migrate to a new archetype by adding a component. The Position
-    // component carries over and its `added` tick must be preserved.
+    // Step 2: migrate to a new archetype by adding a component. The
+    // Position component carries over and its `added` tick must be
+    // preserved.
     world
         .add_component(entity, Velocity { x: 1.0, y: 1.0 })
         .unwrap();
 
+    // Step 3: verify the migrated Position preserves its `added` tick.
     let after_migration = {
         let mut q = Query::<(&mut Position,)>::new(&mut world);
         let (m,) = q.first().unwrap();
@@ -548,8 +614,8 @@ fn test_added_tick_preserved_across_archetype_migration() {
 
     assert_eq!(original_added, after_migration);
 
-    // The newly attached Velocity should have an `added` tick that is
-    // at least as new as the original Position's added tick.
+    // Step 4: verify the newly attached Velocity has an `added` tick at
+    // least as new as the original Position's.
     let velocity_added = {
         let mut q = Query::<(&mut Velocity,)>::new(&mut world);
         let (m,) = q.first().unwrap();
@@ -625,10 +691,10 @@ fn test_filter_changed_detects_mutated_rows_only() {
         .build()
         .unwrap();
 
-    // Set the baseline so all "Added" ticks are in the past.
+    // Step 1: set the baseline so all "Added" ticks are in the past.
     world.set_system_last_run(world.change_tick());
 
-    // Mutate only e1.
+    // Step 2: mutate only e1 so its `changed` tick advances.
     {
         let mut q = Query::<(Entity, &mut Position)>::new(&mut world);
         for (entity, mut pos) in q.iter_mut() {
@@ -638,7 +704,7 @@ fn test_filter_changed_detects_mutated_rows_only() {
         }
     }
 
-    // Filter on Changed<Position>: only e1 should appear.
+    // Step 3: filter on `Changed<Position>` - only e1 should appear.
     let mut q = Query::<(Entity, &Position), Changed<Position>>::new(&mut world);
     let hits: Vec<Entity> = q.iter_mut().map(|(e, _)| e).collect();
     assert_eq!(hits, vec![e1]);
@@ -654,12 +720,12 @@ fn test_filter_added_detects_newly_inserted_components() {
         .build()
         .unwrap();
 
-    // Lock in the current tick as the baseline so the existing entity
-    // is NOT considered "added" relative to it.
+    // Step 1: lock in the current tick as the baseline so the existing
+    // entity is NOT considered "added" relative to it.
     world.set_system_last_run(world.change_tick());
 
-    // Bump the tick (simulating a frame boundary) and insert a new
-    // entity - it should be the only `Added<Position>` hit.
+    // Step 2: bump the tick (simulating a frame boundary) and insert a
+    // new entity - it should be the only `Added<Position>` hit.
     world.increment_change_tick();
     let new_entity = world
         .create_entity()
@@ -691,7 +757,8 @@ fn test_filter_or_combines_predicates() {
 
     world.set_system_last_run(world.change_tick());
 
-    // Mutate Position on e1, Velocity on e2.
+    // Step 1: mutate Position on e1 and Velocity on e2 so each entity
+    // triggers a different `Changed` branch.
     {
         let mut q = Query::<(Entity, &mut Position, &mut Velocity)>::new(&mut world);
         for (entity, mut pos, mut vel) in q.iter_mut() {
@@ -703,6 +770,8 @@ fn test_filter_or_combines_predicates() {
         }
     }
 
+    // Step 2: query with `Or<(Changed<Position>, Changed<Velocity>)>` -
+    // both entities should match via their respective branches.
     let mut q = Query::<(Entity,), Or<(Changed<Position>, Changed<Velocity>)>>::new(&mut world);
     let mut hits: Vec<Entity> = q.iter_mut().map(|(e,)| e).collect();
     hits.sort_by_key(|e| e.id());

@@ -5,6 +5,22 @@
 //! every spawned enemy, bullet, or particle pays these costs. These benchmarks
 //! isolate the allocation paths that live outside the hot query loop.
 //!
+//! # Responsibilities
+//!
+//! - Benchmarks entity creation with and without pre-allocation.
+//! - Benchmarks entity destruction, covering HashMap removal and free-list
+//!   push.
+//! - Benchmarks free-list ID recycling through a create-destroy-recreate
+//!   cycle.
+//! - Benchmarks wide-archetype spawning with many components per entity.
+//!
+//! # Design
+//!
+//! Each benchmark registers the shared [`Transform`], [`Velocity`], and
+//! [`Health`] components on a fresh [`World`] so every measurement starts from
+//! an empty state. The destroy and reuse-cycle benches use Criterion's
+//! `iter_batched` harness to keep setup outside the measured section.
+//!
 //! What each benchmark isolates:
 //!
 //! - Create: fresh `World`, no pre-allocation - raw allocation + HashMap
@@ -20,10 +36,21 @@
 
 #![allow(dead_code)]
 
+// External crates
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use pill_engine::*;
 use trait_type_map::impl_trait_accessible;
 
+// Current crate
+use pill_engine::*;
+
+// =============================================================================
+// Components
+// =============================================================================
+
+/// Position of an entity in 3D space.
+///
+/// Shared by the create, destroy, and reuse-cycle benchmarks as a
+/// representative spatial component.
 #[derive(Debug, Clone)]
 struct Transform {
     x: f32,
@@ -32,6 +59,10 @@ struct Transform {
 }
 impl Component for Transform {}
 
+/// Linear velocity of an entity in 3D space.
+///
+/// Used alongside [`Transform`] so the benchmarks exercise multi-component
+/// entity construction.
 #[derive(Debug, Clone)]
 struct Velocity {
     x: f32,
@@ -40,12 +71,25 @@ struct Velocity {
 }
 impl Component for Velocity {}
 
+/// Flat hit-point value carried by spawned entities.
+///
+/// Tuple-style component that complements the struct-style [`Transform`] and
+/// [`Velocity`] layouts.
 #[derive(Debug, Clone)]
 struct Health(f32);
 impl Component for Health {}
 
+// Marks the shared components as trait-accessible for the ECS storage layer.
 impl_trait_accessible!(dyn Component; Transform, Velocity, Health);
 
+// =============================================================================
+// Benchmarks
+// =============================================================================
+
+/// Spawns `count` entities with three components each into the given `world`.
+///
+/// Shared helper for the create benches so every measurement exercises the
+/// same entity-building path.
 fn create_entities(world: &mut World, count: usize) {
     for _ in 0..count {
         world
@@ -172,7 +216,7 @@ fn bench_reuse_cycle(criterion: &mut Criterion) {
                         world
                     },
                     |mut world| {
-                        // Create entities
+                        // Step 1: Create `cycle_count` entities, retaining their handles.
                         let mut handles = Vec::with_capacity(cycle_count);
                         for i in 0..cycle_count {
                             handles.push(
@@ -192,11 +236,11 @@ fn bench_reuse_cycle(criterion: &mut Criterion) {
                                     .unwrap(),
                             );
                         }
-                        // Destroy all
+                        // Step 2: Destroy every entity, pushing their freed IDs onto the free list.
                         for &entity in &handles {
                             let _ = world.destroy_entity(entity);
                         }
-                        // Re-create (should reuse freed IDs via the free list)
+                        // Step 3: Re-create the same count, reusing freed IDs via the free list.
                         for i in 0..cycle_count {
                             black_box(
                                 world
@@ -281,6 +325,10 @@ fn bench_create_many_components(criterion: &mut Criterion) {
     }
     group.finish();
 }
+
+// =============================================================================
+// Criterion Entry Point
+// =============================================================================
 
 criterion_group!(
     benches,

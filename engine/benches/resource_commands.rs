@@ -1,31 +1,47 @@
-//! Resource & Commands Benchmarks
-//! =============================
+//! Resource and Commands benchmarks for the `pill_engine` world API.
 //!
 //! Resources are singleton data (time, input, config) stored in the `World`
 //! and accessed via `Res<T>` / `ResMut<T>` system parameters. Commands are
 //! the deferred-operation queue that lets systems schedule structural changes
-//! (create/destroy entities, add/remove components) without holding a `&mut World`.
+//! (create/destroy entities, add/remove components) without holding a
+//! `&mut World`.
 //!
-//! Resources: measures the four CRUD operations - insert (HashMap + Box
-//! allocation), get (immutable downcast), get_mut (mutable downcast + change
-//! tick update), and remove (HashMap removal + deallocation).
+//! # Responsibilities
 //!
-//! Commands: measures the full deferred pipeline - queue the operation
-//! during system execution, then apply it during the post-frame command flush.
-//! Covers entity creation (2 components), entity destruction, and component
-//! addition via `add_component_to_entity`.
+//! - Measure the four resource CRUD operations: insert (HashMap + Box
+//!   allocation), get (immutable downcast), get_mut (mutable downcast + change
+//!   tick update), and remove (HashMap removal + deallocation).
+//! - Measure the full deferred-command pipeline: queue the operation during
+//!   system execution, then apply it during the post-frame command flush.
+//! - Cover entity creation (2 components), entity destruction, and component
+//!   addition via `add_component_to_entity`.
+//!
+//! # Design
 //!
 //! Together these cover the two main ways systems interact with the `World`
-//! outside of component queries.
+//! outside of component queries. Resource benchmarks drive a fresh [`World`]
+//! directly through the four CRUD methods, while command benchmarks register
+//! a system that queues work and flush it through `Engine::process_frame`.
+//! Fixture component and resource types are defined here so every harness
+//! shares one set of registrations.
 
 #![allow(dead_code)]
 
+// External crates
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use pill_engine::*;
 use trait_type_map::impl_trait_accessible;
 
-// ---- Components ----
+// Current crate
+use pill_engine::*;
 
+// =============================================================================
+// Components
+// =============================================================================
+
+/// Two-dimensional position of an entity in world space.
+///
+/// Bench fixture component used by the entity-spawning and archetype-migration
+/// command benchmarks.
 #[derive(Debug, Clone)]
 struct Position {
     x: f32,
@@ -33,6 +49,10 @@ struct Position {
 }
 impl Component for Position {}
 
+/// Two-dimensional velocity of an entity in world space.
+///
+/// Bench fixture component paired with `Position` when spawning entities with
+/// two components through the command queue.
 #[derive(Debug, Clone)]
 struct Velocity {
     x: f32,
@@ -40,14 +60,26 @@ struct Velocity {
 }
 impl Component for Velocity {}
 
+/// Flat health value carried by an entity.
+///
+/// Bench fixture component used to measure `add_component_to_entity` through
+/// the deferred command queue.
 #[derive(Debug, Clone)]
 struct Health(f32);
 impl Component for Health {}
 
+// Registers the fixture components for dynamic trait-object access, which the
+// command queue's component storage relies on.
 impl_trait_accessible!(dyn Component; Position, Velocity, Health);
 
-// ---- Resources ----
+// =============================================================================
+// Resources
+// =============================================================================
 
+/// Accumulated game clock singleton resource.
+///
+/// Holds the per-frame delta and total elapsed time; the target of the
+/// resource insert/get/get_mut/remove benchmarks.
 #[derive(Debug)]
 struct GameTime {
     delta: f32,
@@ -55,6 +87,10 @@ struct GameTime {
 }
 impl Resource for GameTime {}
 
+/// Mouse position and button state singleton resource.
+///
+/// Unused fixture type that exercises the world's ability to store multiple
+/// distinct resource types alongside `GameTime`.
 #[derive(Debug)]
 struct InputState {
     mouse_x: f32,
@@ -63,12 +99,20 @@ struct InputState {
 }
 impl Resource for InputState {}
 
+/// Global simulation configuration singleton resource.
+///
+/// Third resource fixture type; not measured directly but confirms the world
+/// holds several resources without interference.
 #[derive(Debug)]
 struct Config {
     gravity: f32,
     max_entities: u32,
 }
 impl Resource for Config {}
+
+// =============================================================================
+// Benchmarks
+// =============================================================================
 
 /// Inserts the same `GameTime` resource `count` times into a fresh `World` (last write wins).
 /// Measures HashMap insertion overhead for singleton resources, including the `Any` box allocation.
@@ -193,11 +237,12 @@ fn bench_commands_create_entity(criterion: &mut Criterion) {
             &count,
             |benchmark, &count| {
                 benchmark.iter(|| {
+                    // Step 1: Set up a fresh engine with the component types the spawner writes.
                     let mut engine = Engine::new();
                     engine.world_mut().register_component::<Position>();
                     engine.world_mut().register_component::<Velocity>();
 
-                    // System that queues entity creation via Commands
+                    // Step 2: Register the system that queues entity creations via `Commands`.
                     engine.register_system("spawner", move |mut commands: Commands| {
                         for i in 0..count {
                             commands
@@ -211,6 +256,7 @@ fn bench_commands_create_entity(criterion: &mut Criterion) {
                         }
                     });
 
+                    // Step 3: Flush the deferred queue and measure the resulting entity count.
                     engine.process_frame().unwrap();
                     black_box(engine.world().entity_count());
                 });
@@ -231,9 +277,9 @@ fn bench_commands_destroy_entity(criterion: &mut Criterion) {
             |benchmark, &count| {
                 benchmark.iter_batched(
                     || {
+                        // Step 1: Pre-spawn the entities the despawner system will destroy.
                         let mut engine = Engine::new();
                         engine.world_mut().register_component::<Position>();
-                        // Pre-spawn entities to destroy
                         for i in 0..count {
                             engine
                                 .world_mut()
@@ -248,7 +294,7 @@ fn bench_commands_destroy_entity(criterion: &mut Criterion) {
                         engine
                     },
                     |mut engine| {
-                        // System that queues all entities for destruction
+                        // Step 2: Register the system that queues every live entity for destruction.
                         engine.register_system(
                             "despawner",
                             move |mut query: Query<Entity>, mut commands: Commands| {
@@ -257,6 +303,7 @@ fn bench_commands_destroy_entity(criterion: &mut Criterion) {
                                 }
                             },
                         );
+                        // Step 3: Flush the queue and measure whether the frame succeeded.
                         black_box(engine.process_frame().is_ok());
                     },
                     criterion::BatchSize::LargeInput,
@@ -278,6 +325,7 @@ fn bench_commands_add_component(criterion: &mut Criterion) {
             |benchmark, &count| {
                 benchmark.iter_batched(
                     || {
+                        // Step 1: Pre-spawn the entities that will gain a `Health` component.
                         let mut engine = Engine::new();
                         engine.world_mut().register_component::<Position>();
                         engine.world_mut().register_component::<Health>();
@@ -295,6 +343,7 @@ fn bench_commands_add_component(criterion: &mut Criterion) {
                         engine
                     },
                     |mut engine| {
+                        // Step 2: Register the system that queues a `Health` addition per entity.
                         engine.register_system(
                             "adder",
                             move |mut query: Query<(Entity, &Position)>, mut commands: Commands| {
@@ -303,6 +352,7 @@ fn bench_commands_add_component(criterion: &mut Criterion) {
                                 }
                             },
                         );
+                        // Step 3: Flush the queue and measure whether the frame succeeded.
                         black_box(engine.process_frame().is_ok());
                     },
                     criterion::BatchSize::LargeInput,
@@ -312,6 +362,10 @@ fn bench_commands_add_component(criterion: &mut Criterion) {
     }
     group.finish();
 }
+
+// =============================================================================
+// Benchmark Harness
+// =============================================================================
 
 criterion_group!(
     benches,

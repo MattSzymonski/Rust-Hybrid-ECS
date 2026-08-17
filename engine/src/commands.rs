@@ -75,27 +75,29 @@ use crate::world::World;
 ///
 /// Must be `Send` to support parallel execution of systems.
 pub trait ComponentAdder: Send {
+    /// Returns the [`ComponentId`] of the component this adder will insert.
+    ///
+    /// Used to compute the target archetype before the component value itself
+    /// is written into storage.
     fn component_id(&self) -> ComponentId;
+
+    /// Writes the held component into the given type-erased storage.
+    ///
+    /// The caller is responsible for having created the storage row for this
+    /// adder's component type before invoking this method.
     fn add_component_to_storage(
         self: Box<Self>,
         new_storage: &mut TraitTypeMap<dyn Component, VecFamily>,
     );
 }
 
-/// Typed component adder that knows the concrete type T
-struct TypedComponentAdder<T: Component + TraitAccessible<dyn Component>> {
-    component: T,
-}
-
-/// Preserve a native component's concrete Rust type in a type-erased command.
+/// Typed component adder that knows the concrete type `T`.
 ///
-/// Foreign-language adapters use this after validating and decoding an ABI
-/// component blob against an explicitly shared native component binding.
-pub fn boxed_component_adder<T>(component: T) -> Box<dyn ComponentAdder>
-where
-    T: Component + TraitAccessible<dyn Component> + Send,
-{
-    Box::new(TypedComponentAdder { component })
+/// Wraps the concrete component value so it can be transported through the
+/// type-erased [`DeferredCommand`] queue without losing its native type.
+struct TypedComponentAdder<T: Component + TraitAccessible<dyn Component>> {
+    /// The concrete component value to insert when the command executes.
+    component: T,
 }
 
 impl<T: Component + TraitAccessible<dyn Component> + Send> ComponentAdder
@@ -109,32 +111,49 @@ impl<T: Component + TraitAccessible<dyn Component> + Send> ComponentAdder
         self: Box<Self>,
         new_storage: &mut TraitTypeMap<dyn Component, VecFamily>,
     ) {
-        // Add the new component
+        // The storage row for `T` was allocated by the caller; append the
+        // component value to it to finish the insertion.
         new_storage.get_storage_mut::<T>().push(self.component);
     }
 }
 
 /// Deferred command to be executed later
 enum DeferredCommand {
+    /// Create a new entity carrying native and type-erased components.
     CreateEntity {
+        /// The pre-allocated entity handle to materialize.
         entity: Entity,
+        /// Native components to insert into the new archetype's storage.
         component_adders: Vec<Box<dyn ComponentAdder>>,
+        /// Type-erased runtime components to write after the row exists.
         dynamic_components: Vec<(ComponentId, Vec<u8>)>,
     },
+    /// Add a native component to an existing entity.
     AddComponentToEntity {
+        /// The target entity.
         entity: Entity,
+        /// The typed adder that writes the component during execution.
         component_adder: Box<dyn ComponentAdder>,
     },
+    /// Add a type-erased runtime component to an existing entity.
     AddDynamicComponentToEntity {
+        /// The target entity.
         entity: Entity,
+        /// Runtime ID of the component type to write.
         component_id: ComponentId,
+        /// Serialized component blob to store.
         bytes: Vec<u8>,
     },
+    /// Remove a component from an existing entity.
     RemoveComponentFromEntity {
+        /// The target entity.
         entity: Entity,
+        /// Runtime ID of the component type to remove.
         component_id: ComponentId,
     },
+    /// Destroy an entity entirely.
     DestroyEntity {
+        /// The entity to remove from the world.
         entity: Entity,
     },
 }
@@ -154,10 +173,12 @@ pub use crate::error::CommandError;
 /// Systems that want to modify entities use Commands to queue changes.
 /// These changes are applied in a separate phase after all systems run.
 pub struct CommandQueue {
+    /// The deferred operations queued this frame, in submission order.
     commands: Vec<DeferredCommand>,
 }
 
 impl CommandQueue {
+    /// Creates an empty command queue.
     pub fn new() -> Self {
         Self {
             commands: Vec::new(),
@@ -170,12 +191,6 @@ impl CommandQueue {
     /// command-producing phase.
     pub(crate) fn clear(&mut self) {
         self.commands.clear();
-    }
-}
-
-impl Default for CommandQueue {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -208,7 +223,7 @@ impl CommandQueue {
         });
     }
 
-    /// Queue adding a component to an entity
+    /// Queue adding a component to an entity.
     pub fn add_component_to_entity<T>(&mut self, entity: Entity, component: T)
     where
         T: Component + TraitAccessible<dyn Component> + Send,
@@ -282,12 +297,15 @@ impl CommandQueue {
         world: &mut World,
         exit_on_error: bool,
     ) -> Result<(), Vec<CommandError>> {
+        // Step 1: Record the pending count for diagnostics and open the profiling scope.
         let pending = self.commands.len();
         world.commands_executed_this_frame = pending;
         let zone = crate::profile_scope!(
             "execute commands",
             [("Deferred commands to execute: {}", pending)]
         );
+
+        // Step 2: Drain the queue and dispatch each command to its executor.
         let mut errors = Vec::new();
         let mut succeeded = 0usize;
 
@@ -345,12 +363,14 @@ impl CommandQueue {
             }
         }
 
+        // Step 3: Report success/failure totals to the profiler.
         zone.text(format_args!(
             "{} succeeded, {} errors",
             succeeded - errors.len(),
             errors.len(),
         ));
 
+        // Step 4: Surface failures - hard-stop with `Err` or log-and-continue.
         if errors.is_empty() {
             Ok(())
         } else if exit_on_error {
@@ -368,23 +388,32 @@ impl CommandQueue {
         }
     }
 
+    /// Executes a queued entity-creation command.
+    ///
+    /// Creates the archetype row for the entity and writes both its native
+    /// and type-erased components. Component data is trusted because managed
+    /// command blobs are validated before being queued.
     fn execute_create_entity(
         world: &mut World,
         entity: Entity,
         component_adders: Vec<Box<dyn ComponentAdder>>,
         dynamic_components: Vec<(ComponentId, Vec<u8>)>,
     ) {
+        // Step 1: Collect the full component-ID set that defines the new archetype.
         let mut component_ids: Vec<ComponentId> = component_adders
             .iter()
             .map(|adder| adder.component_id())
             .collect();
         component_ids.extend(dynamic_components.iter().map(|(id, _)| *id));
 
+        // Step 2: Insert the entity row and write its native components into storage.
         world.insert_entity_with_components(entity, component_ids, |storage| {
             for component_adder in component_adders {
                 component_adder.add_component_to_storage(storage);
             }
         });
+
+        // Step 3: Write type-erased components once the entity row exists.
         for (component_id, bytes) in dynamic_components {
             world
                 .set_dynamic_component_bytes(entity, component_id, &bytes)
@@ -392,6 +421,10 @@ impl CommandQueue {
         }
     }
 
+    /// Executes a queued type-erased component addition.
+    ///
+    /// Rejects stale entities and duplicate components, then writes the blob
+    /// into the entity's component storage.
     fn execute_add_dynamic_component(
         world: &mut World,
         entity: Entity,
@@ -399,6 +432,7 @@ impl CommandQueue {
         bytes: Vec<u8>,
         errors: &mut Vec<CommandError>,
     ) {
+        // Step 1: Reject commands that reference an entity which no longer exists.
         if !world.is_entity_valid(entity) {
             errors.push(CommandError::EntityNotFound {
                 entity,
@@ -406,6 +440,7 @@ impl CommandQueue {
             });
             return;
         }
+        // Step 2: Reject components the entity already carries.
         let already_present = world
             .entity_locations
             .get(&entity)
@@ -418,17 +453,23 @@ impl CommandQueue {
             });
             return;
         }
+        // Step 3: Write the serialized blob into the component storage.
         world
             .add_dynamic_component(entity, component_id, &bytes)
             .expect("managed command blobs are validated before being queued");
     }
 
+    /// Executes a queued native component addition.
+    ///
+    /// Migrates the entity to a new archetype that includes the component,
+    /// copying every existing component and writing the new one.
     fn execute_add_component(
         world: &mut World,
         entity: Entity,
         component_adder: Box<dyn ComponentAdder>,
         errors: &mut Vec<CommandError>,
     ) {
+        // Step 1: Locate the entity and reject stale handles.
         let entity_location = match world.entity_locations.get(&entity) {
             Some(location) => *location,
             None => {
@@ -440,6 +481,8 @@ impl CommandQueue {
             }
         };
 
+        // Step 2: Compute the target archetype's component-ID set, rejecting
+        // components the entity already has.
         let old_archetype = world
             .archetypes
             .get(&entity_location.archetype_id)
@@ -458,13 +501,16 @@ impl CommandQueue {
         new_component_ids.push(new_component_id);
         new_component_ids.sort();
 
-        // Collect copiers by iterating old_archetype.component_types directly
+        // Step 3: Collect the copiers that preserve each surviving component
+        // during the archetype migration.
         let component_copiers: Vec<_> = old_archetype
             .component_types
             .iter()
             .filter_map(|component_id| world.component_copiers.get(component_id).copied())
             .collect();
 
+        // Step 4: Migrate the entity row, copying surviving components and
+        // writing the new component into the destination storage.
         world.move_entity_to_archetype(
             entity,
             new_component_ids,
@@ -477,12 +523,17 @@ impl CommandQueue {
         );
     }
 
+    /// Executes a queued component removal.
+    ///
+    /// Migrates the entity to a new archetype without the component, or
+    /// destroys it outright when no components remain.
     fn execute_remove_component(
         world: &mut World,
         entity: Entity,
         component_id: ComponentId,
         errors: &mut Vec<CommandError>,
     ) {
+        // Step 1: Locate the entity and reject stale handles.
         let entity_location = match world.entity_locations.get(&entity) {
             Some(location) => *location,
             None => {
@@ -494,6 +545,8 @@ impl CommandQueue {
             }
         };
 
+        // Step 2: Reject removal of a component the entity does not have, and
+        // compute the surviving component-ID set.
         let old_archetype = world.archetypes.get(&entity_location.archetype_id).unwrap();
 
         if !old_archetype.component_types.contains(&component_id) {
@@ -511,6 +564,7 @@ impl CommandQueue {
             .cloned()
             .collect();
 
+        // Step 3: An entity with no remaining components is destroyed outright.
         if new_component_ids.is_empty() {
             // If destroy_entity fails (entity already gone) we still want to
             // bail out - no components remain to migrate.
@@ -518,6 +572,7 @@ impl CommandQueue {
             return;
         }
 
+        // Step 4: Migrate surviving components to the new archetype.
         let component_copiers: Vec<_> = new_component_ids
             .iter()
             .filter_map(|component_id| world.component_copiers.get(component_id).copied())
@@ -534,6 +589,10 @@ impl CommandQueue {
         );
     }
 
+    /// Executes a queued entity destruction.
+    ///
+    /// Records `CommandError::EntityNotFound` when the entity is already gone,
+    /// matching the behaviour of the other command executors.
     fn execute_destroy_entity(world: &mut World, entity: Entity, errors: &mut Vec<CommandError>) {
         if !world.destroy_entity(entity) {
             errors.push(CommandError::EntityNotFound {
@@ -543,8 +602,23 @@ impl CommandQueue {
         }
     }
 
+    /// Returns whether no commands are currently queued.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use pill_engine::commands::CommandQueue;
+    /// let queue = CommandQueue::new();
+    /// assert!(queue.is_empty());
+    /// ```
     pub fn is_empty(&self) -> bool {
         self.commands.is_empty()
+    }
+}
+
+impl Default for CommandQueue {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -559,11 +633,14 @@ impl CommandQueue {
 /// `build()` time so the caller can track them immediately, even though
 /// the entity won't exist in the world until deferred commands are flushed.
 pub struct Commands<'a> {
+    /// The queue that deferred operations are appended to.
     command_queue: &'a mut CommandQueue,
+    /// The world entities are allocated from, and later mutated through, the queue.
     world: &'a mut World,
 }
 
 impl<'a> Commands<'a> {
+    /// Wraps a command queue and a world for one frame's system execution.
     pub(crate) fn new(command_queue: &'a mut CommandQueue, world: &'a mut World) -> Self {
         Self {
             command_queue,
@@ -621,8 +698,11 @@ impl<'a> Commands<'a> {
 /// it immediately - the entity just won't be queryable until after the
 /// current frame's deferred commands are flushed.
 pub struct DeferredEntityBuilder<'a> {
+    /// The queue the finished create command is appended to.
     command_queue: &'a mut CommandQueue,
+    /// The entity handle allocated from the free list at construction time.
     allocated_entity: Entity,
+    /// Native components accumulated via [`with`](Self::with).
     components: Vec<Box<dyn ComponentAdder>>,
 }
 
@@ -660,6 +740,21 @@ impl<'a> DeferredEntityBuilder<'a> {
         self.command_queue.create_entity(entity, self.components);
         entity
     }
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Preserve a native component's concrete Rust type in a type-erased command.
+///
+/// Foreign-language adapters use this after validating and decoding an ABI
+/// component blob against an explicitly shared native component binding.
+pub fn boxed_component_adder<T>(component: T) -> Box<dyn ComponentAdder>
+where
+    T: Component + TraitAccessible<dyn Component> + Send,
+{
+    Box::new(TypedComponentAdder { component })
 }
 
 // =============================================================================

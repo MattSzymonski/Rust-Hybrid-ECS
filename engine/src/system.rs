@@ -9,6 +9,23 @@
 //! - Implements the [`System`] trait for registered functions, enabling
 //!   the engine to call them generically.
 //!
+//! # Design
+//!
+//! System functions are layered into four cooperating traits:
+//!
+//! - [`SystemParam`] extracts each argument from the [`World`] and
+//!   [`CommandQueue`] at call time and reports its access pattern to the
+//!   scheduler for dependency analysis.
+//! - [`SystemParamFunction`] adapts a plain `FnMut` closure with `SystemParam`
+//!   arguments into a uniform runnable form.
+//! - [`IntoSystem`] boxes that adapted function into a [`System`] trait object
+//!   the engine can store and invoke generically.
+//! - [`SystemOutput`] normalizes the function's return value (`()` or
+//!   `Result<(), SystemError>`) into a single error-reporting result.
+//!
+//! The [`System`] trait is the uniform invocation surface the engine drives;
+//! everything else exists to convert user functions into that surface.
+//!
 //! SAFETY: Warning: Lifetime Transmutation
 //!
 //! This module uses `std::mem::transmute` to convert references with actual
@@ -70,6 +87,7 @@
 //! }
 //! ```
 
+// Current crate
 use crate::commands::{CommandQueue, Commands};
 use crate::error::SystemError;
 use crate::query::{Query, QueryFilter, QueryTarget, Res, ResMut};
@@ -91,7 +109,7 @@ use crate::world::World;
 ///
 /// Must be Send to support parallel execution.
 pub trait System: Send {
-    /// Execute one system invocation, returning its failure when it aborted.
+    /// Executes one system invocation, returning its failure when it aborted.
     fn run(&mut self, world: &mut World, queue: &mut CommandQueue) -> Result<(), SystemError>;
 }
 
@@ -101,7 +119,7 @@ pub trait System: Send {
 /// when they can. The engine converts both into the uniform result type used
 /// by the execution loops.
 pub trait SystemOutput: 'static {
-    /// Convert one system return value into the uniform result type.
+    /// Converts one system return value into the uniform result type.
     fn into_system_result(self) -> Result<(), SystemError>;
 }
 
@@ -146,7 +164,7 @@ where
 ///
 /// The returned parameter must not escape the system function scope.
 pub trait SystemParam: Sized {
-    /// Fetch the parameter from world state.
+    /// Fetches the parameter from world state.
     ///
     /// SAFETY: Contract
     ///
@@ -160,10 +178,10 @@ pub trait SystemParam: Sized {
     /// Violating these invariants is undefined behavior.
     fn fetch(world: &mut World, queue: &mut CommandQueue) -> Self;
 
-    /// Report component access pattern for dependency analysis
+    /// Reports the component access pattern for dependency analysis.
     ///
-    /// This is called during system registration to build the execution graph.
-    /// Default implementation reports no access (for things like State).
+    /// Called during system registration to build the execution graph. The
+    /// default implementation reports no access (for things like `State`).
     fn report_access(_access: &mut SystemAccess) {
         // Default: no component access
     }
@@ -340,6 +358,10 @@ pub trait SystemParamFunction<Input: SystemParam>: 'static {
     /// The function's return value, `()` or `Result<(), SystemError>`.
     type Output: SystemOutput;
 
+    /// Runs the wrapped function with the resolved parameters.
+    ///
+    /// The `input` tuple carries the parameters fetched from the [`World`] and
+    /// [`CommandQueue`]; the return value is normalized by [`SystemOutput`].
     fn run(&mut self, input: Input) -> Self::Output;
 }
 
@@ -393,6 +415,8 @@ impl_system_param_function!(A, B, C, D, E, F1);
 /// When you call engine.register_system(name, function), this trait handles
 /// the conversion from a plain function to a boxed System trait object.
 pub trait IntoSystem<Input: SystemParam> {
+    /// Boxes this function into a [`System`] trait object the engine can store
+    /// and invoke generically.
     fn into_system(self) -> Box<dyn System>;
 }
 
@@ -410,7 +434,9 @@ where
 {
     fn into_system(mut self) -> Box<dyn System> {
         Box::new(move |world: &mut World, queue: &mut CommandQueue| {
+            // Resolve the system's parameters from the world and queue.
             let input = Input::fetch(world, queue);
+            // Invoke the wrapped function and normalize its return value.
             self.run(input).into_system_result()
         })
     }

@@ -1,11 +1,10 @@
-//! Archetype Migration Benchmarks
-//! ===============================
+//! Archetype migration benchmarks for adding and removing components.
 //!
 //! Every time a component is added to or removed from an entity, the ECS must
 //! move that entity to a different archetype - cloning all existing components
 //! into the destination storage and updating internal lookup tables.
 //!
-//! These benchmarks isolate the migration hot path by measuring:
+//! # Responsibilities
 //!
 //! - Single add/remove: the baseline cost of a one-step archetype transition.
 //! - Multi add/remove: three consecutive migrations per entity, stressing
@@ -14,15 +13,31 @@
 //!   create many distinct archetypes, stressing HashMap lookups and storage
 //!   fragmentation.
 //!
+//! # Design
+//!
 //! All benchmarks use `iter_batched` so setup (entity spawning, pre-adding
-//! components for removal tests) is excluded from the measured time.
+//! components for removal tests) is excluded from the measured time. The
+//! fixture components ([`Position`], [`Velocity`], [`Health`], [`Armor`],
+//! [`Mana`], [`Stamina`]) are cheap `Clone` structs so the measured work is
+//! dominated by archetype migration itself, not component construction.
 
 #![allow(dead_code)]
 
+// External crates
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use pill_engine::*;
 use trait_type_map::impl_trait_accessible;
 
+// Current crate
+use pill_engine::*;
+
+// =============================================================================
+// Components
+// =============================================================================
+
+/// Two-dimensional position fixture carried by every spawned entity.
+///
+/// Serves as the baseline component so archetype migrations always have
+/// existing storage to clone and move.
 #[derive(Debug, Clone)]
 struct Position {
     x: f32,
@@ -30,6 +45,10 @@ struct Position {
 }
 impl Component for Position {}
 
+/// Two-dimensional velocity fixture paired with [`Position`] on every entity.
+///
+/// Gives spawned entities a second component so archetype migrations move
+/// more than a single piece of storage.
 #[derive(Debug, Clone)]
 struct Velocity {
     x: f32,
@@ -37,25 +56,50 @@ struct Velocity {
 }
 impl Component for Velocity {}
 
+/// Flat health-points fixture.
+///
+/// Used as the component added and removed by the single-component benches.
 #[derive(Debug, Clone)]
 struct Health(f32);
 impl Component for Health {}
 
+/// Flat armor-points fixture.
+///
+/// Used alongside [`Health`] and [`Mana`] by the multi-component benches.
 #[derive(Debug, Clone)]
 struct Armor(f32);
 impl Component for Armor {}
 
+/// Flat mana-points fixture.
+///
+/// Used alongside [`Health`] and [`Armor`] by the multi-component benches.
 #[derive(Debug, Clone)]
 struct Mana(f32);
 impl Component for Mana {}
 
+/// Flat stamina-points fixture.
+///
+/// Used by the archetype-explosion bench to create distinct component
+/// subsets across spawned entities.
 #[derive(Debug, Clone)]
 struct Stamina(f32);
 impl Component for Stamina {}
 
+// Registers every fixture type with the trait-object type map so the
+// benchmarked [`World`] can store them behind `dyn Component`.
 impl_trait_accessible!(dyn Component; Position, Velocity, Health, Armor, Mana, Stamina);
 
+// =============================================================================
+// Benchmarks
+// =============================================================================
+
+/// Builds a fresh [`World`] with every fixture component registered and spawns
+/// `entity_count` entities carrying [`Position`] + [`Velocity`].
+///
+/// Returns the world alongside the entity handles so benchmarks can migrate
+/// each spawned entity during their measured phase.
 fn setup_world(entity_count: usize) -> (World, Vec<Entity>) {
+    // Step 1: Register every component type the benchmarks will touch.
     let mut world = World::new();
     world.register_component::<Position>();
     world.register_component::<Velocity>();
@@ -64,6 +108,7 @@ fn setup_world(entity_count: usize) -> (World, Vec<Entity>) {
     world.register_component::<Mana>();
     world.register_component::<Stamina>();
 
+    // Step 2: Spawn `entity_count` entities, each carrying Position + Velocity.
     let mut handles = Vec::with_capacity(entity_count);
     for i in 0..entity_count {
         handles.push(
@@ -78,6 +123,8 @@ fn setup_world(entity_count: usize) -> (World, Vec<Entity>) {
                 .unwrap(),
         );
     }
+
+    // Step 3: Hand the populated world and its handles to the caller.
     (world, handles)
 }
 
@@ -120,6 +167,9 @@ fn bench_remove_component(criterion: &mut Criterion) {
             |benchmark, &count| {
                 benchmark.iter_batched(
                     || {
+                        // Setup phase: pre-add the component so the measured
+                        // removal has something to migrate. Excluded from the
+                        // timing window by `iter_batched`.
                         let (mut world, handles) = setup_world(count);
                         for &entity in &handles {
                             world
@@ -179,6 +229,8 @@ fn bench_remove_multi_component(criterion: &mut Criterion) {
             |benchmark, &count| {
                 benchmark.iter_batched(
                     || {
+                        // Setup phase: pre-add the three components so the
+                        // measured removals have something to migrate.
                         let (mut world, handles) = setup_world(count);
                         for &entity in &handles {
                             world.add_component(entity, Health(100.0)).unwrap();
@@ -251,6 +303,10 @@ fn bench_archetype_explosion(criterion: &mut Criterion) {
     }
     group.finish();
 }
+
+// =============================================================================
+// Criterion Entry Point
+// =============================================================================
 
 criterion_group!(
     benches,

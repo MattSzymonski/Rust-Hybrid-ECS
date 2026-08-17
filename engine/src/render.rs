@@ -24,32 +24,102 @@ use crate::component::Component;
 use crate::world::World;
 
 // =============================================================================
+// Constants
+// =============================================================================
+
+/// WGSL source for the sprite render pipeline.
+///
+/// Declares the `Viewport` uniform, the per-instance vertex inputs, and both
+/// the vertex and fragment entry points for instanced quad rendering.
+const SHADER_SOURCE: &str = r#"
+struct Viewport {
+    size: vec2<f32>,
+};
+@group(0) @binding(0) var<uniform> viewport: Viewport;
+
+struct InstanceInput {
+    @location(0) position: vec2<f32>,
+    @location(1) size: vec2<f32>,
+    @location(2) color: vec4<f32>,
+};
+
+struct VertexOutput {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+// Unit quad corners, expanded per-instance by `size` and offset by `position`.
+var<private> CORNERS: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
+    vec2<f32>(0.0, 0.0),
+    vec2<f32>(1.0, 0.0),
+    vec2<f32>(0.0, 1.0),
+    vec2<f32>(0.0, 1.0),
+    vec2<f32>(1.0, 0.0),
+    vec2<f32>(1.0, 1.0),
+);
+
+@vertex
+fn vs_main(@builtin(vertex_index) vertex_index: u32, instance: InstanceInput) -> VertexOutput {
+    let corner = CORNERS[vertex_index];
+    let pixel_position = instance.position + corner * instance.size;
+    // Pixel space (origin top-left, +y down) -> NDC (origin center, +y up).
+    let ndc = vec2<f32>(
+        (pixel_position.x / viewport.size.x) * 2.0 - 1.0,
+        1.0 - (pixel_position.y / viewport.size.y) * 2.0,
+    );
+
+    var out: VertexOutput;
+    out.clip_position = vec4<f32>(ndc, 0.0, 1.0);
+    out.color = instance.color;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return in.color;
+}
+"#;
+
+// =============================================================================
 // Components
 // =============================================================================
 
 /// World-space position of an entity's top-left draw origin, in pixels.
+///
+/// Position is a renderer component, resolved by the sprite pipeline through
+/// the shared ABI by stable type name rather than by Rust `TypeId`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Position {
+    /// Horizontal pixel coordinate of the draw origin.
     pub x: f32,
+    /// Vertical pixel coordinate of the draw origin.
     pub y: f32,
 }
 impl Component for Position {}
 impl_trait_accessible!(dyn Component; Position);
 
 /// Plain RGBA color, backend-agnostic (0.0-1.0 per channel).
+///
+/// `#[repr(C)]` with normalized float channels so the byte layout is shared
+/// with the C# runtime as part of the renderer ABI.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Color {
+    /// Red channel.
     pub r: f32,
+    /// Green channel.
     pub g: f32,
+    /// Blue channel.
     pub b: f32,
+    /// Alpha channel.
     pub a: f32,
 }
 impl Component for Color {}
 impl_trait_accessible!(dyn Component; Color);
 
 impl Color {
+    /// Opaque white, the default fill color of [`Sprite`].
     pub const WHITE: Color = Color {
         r: 1.0,
         g: 1.0,
@@ -57,6 +127,7 @@ impl Color {
         a: 1.0,
     };
 
+    /// Construct a color from its red, green, blue, and alpha channels.
     pub const fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
         Self { r, g, b, a }
     }
@@ -69,11 +140,17 @@ impl Default for Color {
 }
 
 /// Axis-aligned colored rectangle drawn at an entity's [`Position`].
+///
+/// The quad spans `width` by `height` pixels starting at the entity's draw
+/// origin and is filled with `color`.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Sprite {
+    /// Quad width in pixels.
     pub width: f32,
+    /// Quad height in pixels.
     pub height: f32,
+    /// Fill color of the quad.
     pub color: Color,
 }
 impl Component for Sprite {}
@@ -96,9 +173,13 @@ impl Default for Sprite {
 /// while a matching scissor prevents drawing outside it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RenderViewport {
+    /// Left edge of the rectangle, in physical pixels.
     pub x: u32,
+    /// Top edge of the rectangle, in physical pixels.
     pub y: u32,
+    /// Horizontal extent of the rectangle, in physical pixels.
     pub width: u32,
+    /// Vertical extent of the rectangle, in physical pixels.
     pub height: u32,
 }
 
@@ -175,59 +256,13 @@ struct SpriteInstance {
 #[repr(C)]
 #[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct ViewportUniform {
+    /// Viewport width in pixels.
     width: f32,
+    /// Viewport height in pixels.
     height: f32,
+    /// Padding to 16-byte alignment required by WGSL uniform buffers.
     _padding: [f32; 2],
 }
-
-const SHADER_SOURCE: &str = r#"
-struct Viewport {
-    size: vec2<f32>,
-};
-@group(0) @binding(0) var<uniform> viewport: Viewport;
-
-struct InstanceInput {
-    @location(0) position: vec2<f32>,
-    @location(1) size: vec2<f32>,
-    @location(2) color: vec4<f32>,
-};
-
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) color: vec4<f32>,
-};
-
-// Unit quad corners, expanded per-instance by `size` and offset by `position`.
-var<private> CORNERS: array<vec2<f32>, 6> = array<vec2<f32>, 6>(
-    vec2<f32>(0.0, 0.0),
-    vec2<f32>(1.0, 0.0),
-    vec2<f32>(0.0, 1.0),
-    vec2<f32>(0.0, 1.0),
-    vec2<f32>(1.0, 0.0),
-    vec2<f32>(1.0, 1.0),
-);
-
-@vertex
-fn vs_main(@builtin(vertex_index) vertex_index: u32, instance: InstanceInput) -> VertexOutput {
-    let corner = CORNERS[vertex_index];
-    let pixel_position = instance.position + corner * instance.size;
-    // Pixel space (origin top-left, +y down) -> NDC (origin center, +y up).
-    let ndc = vec2<f32>(
-        (pixel_position.x / viewport.size.x) * 2.0 - 1.0,
-        1.0 - (pixel_position.y / viewport.size.y) * 2.0,
-    );
-
-    var out: VertexOutput;
-    out.clip_position = vec4<f32>(ndc, 0.0, 1.0);
-    out.color = instance.color;
-    return out;
-}
-
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return in.color;
-}
-"#;
 
 // =============================================================================
 // SpriteRenderer
@@ -238,10 +273,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 /// Owns a render pipeline and reusable GPU buffers; does not own a window,
 /// surface, device, or queue - callers create those and pass them in.
 pub struct SpriteRenderer {
+    /// Compiled render pipeline for the sprite shader.
     pipeline: wgpu::RenderPipeline,
+    /// GPU buffer holding the viewport uniform.
     viewport_buffer: wgpu::Buffer,
+    /// Bind group exposing the viewport uniform to the vertex stage.
     viewport_bind_group: wgpu::BindGroup,
+    /// GPU vertex buffer holding per-instance sprite data.
     instance_buffer: wgpu::Buffer,
+    /// Number of `SpriteInstance` slots currently allocated on the GPU.
     instance_capacity: usize,
 }
 
@@ -407,8 +447,12 @@ impl SpriteRenderer {
         virtual_resolution: VirtualResolution,
     ) {
         debug_assert!(virtual_resolution.is_valid());
+
+        // Step 1: Collect the instanced quad data for every sprite in the world.
         let instances = collect_sprite_instances(world);
 
+        // Step 2: Upload the viewport uniform so the vertex shader can map
+        // pixel coordinates into normalized device coordinates.
         queue.write_buffer(
             &self.viewport_buffer,
             0,
@@ -419,6 +463,8 @@ impl SpriteRenderer {
             }),
         );
 
+        // Step 3: Upload the instance data, growing the GPU buffer to a power
+        // of two when the world grows beyond the current capacity.
         if !instances.is_empty() {
             if instances.len() > self.instance_capacity {
                 self.instance_capacity = instances.len().next_power_of_two();
@@ -433,6 +479,8 @@ impl SpriteRenderer {
             }
         }
 
+        // Step 4: Encode and submit a render pass that clears the target and
+        // draws the instanced quads inside the scissored viewport region.
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("sprite render encoder"),
         });
@@ -480,6 +528,10 @@ impl SpriteRenderer {
     }
 }
 
+// =============================================================================
+// Free Functions
+// =============================================================================
+
 /// Collect renderer components across the native game-module ABI boundary.
 ///
 /// A hot-loaded Rust game and the host executable can assign different
@@ -505,9 +557,10 @@ fn collect_sprite_instances_named(
     let mut instances = Vec::new();
 
     for archetype in world.archetypes.values() {
-        // Resolve each column among the components actually present in this
-        // archetype. This also supports entities retained from older DLL
-        // generations whose component IDs differ from the current module.
+        // Step 1: Resolve each column among the components actually present in
+        // this archetype by shared type name and size. This also supports
+        // entities retained from older DLL generations whose component IDs
+        // differ from the current module.
         let position_id = archetype.component_types.iter().copied().find(|id| {
             registry.get_name(id) == Some(position_name)
                 && registry.get_size(id) == Some(std::mem::size_of::<Position>())
@@ -519,6 +572,9 @@ fn collect_sprite_instances_named(
         let (Some(position_id), Some(sprite_id)) = (position_id, sprite_id) else {
             continue;
         };
+
+        // Step 2: Fetch the type-erased trait storage backing each resolved
+        // component column so rows can be read without a host-typed query.
         let (Some(position_type_id), Some(sprite_type_id)) =
             (position_id.native_type_id(), sprite_id.native_type_id())
         else {
@@ -537,9 +593,15 @@ fn collect_sprite_instances_named(
             continue;
         };
 
-        // Both shared types are repr(C), Copy, and size-checked above. Reading
-        // from the data pointer of the type-erased trait reference therefore
-        // remains valid even when its Rust TypeId originated in another DLL.
+        // Step 3: Copy each row's layout-validated component data into an
+        // instance record for the GPU.
+        //
+        // SAFETY: Both shared types are `#[repr(C)]` and `Copy`, and their
+        // sizes were verified against this crate's `Position`/`Sprite` above,
+        // so each read from the type-erased trait storage yields a valid value
+        // of the target type even when its native TypeId originated in another
+        // DLL. `row_count` caps the loop at every storage length, keeping the
+        // `get(row)` accesses in bounds.
         let row_count = archetype
             .entity_count()
             .min(position_storage.len())
@@ -575,6 +637,10 @@ unsafe fn read_shared_component<T: Copy>(component: &dyn Component) -> T {
     // on alignment information that is not present in ComponentRegistry.
     unsafe { data.read_unaligned() }
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod shared_component_tests {

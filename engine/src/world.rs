@@ -35,57 +35,14 @@ use crate::query::change_detection::Mut;
 use crate::resource::{Resource, ResourceId};
 use crate::scripting::{ScriptComponent, ScriptContext};
 
-/// Function that copies a component from one storage to another at given indices.
-type ComponentCopier = fn(
-    source: &TraitTypeMap<dyn Component, VecFamily>,
-    destination: &mut TraitTypeMap<dyn Component, VecFamily>,
-    index: usize,
-);
-
-/// Function that updates a script component.
-///
-/// Takes: (storage, index, entity, world_ptr, commands_ptr).
-/// Uses raw pointers to create a `ScriptContext` inside `update_scripts`.
-///
-/// SAFETY: The raw-pointer arguments (`world_ptr`, `commands_ptr`) are only
-/// valid during the `update_scripts` call. Using a plain function pointer
-/// (not a closure) guarantees that no state is captured and the callee
-/// cannot stash the pointers for later use.
-type ScriptUpdater =
-    fn(&mut TraitTypeMap<dyn Component, VecFamily>, usize, Entity, *mut World, *mut CommandQueue);
-
-/// EntityLocation tracks where an entity is stored in the archetype system
-#[derive(Clone, Copy)]
-pub(crate) struct EntityLocation {
-    pub(crate) archetype_id: ArchetypeId,
-    pub(crate) index_in_archetype: usize,
-}
-
 // =============================================================================
-// EntityLocation - Layout Tests
-// =============================================================================
-
-#[cfg(test)]
-mod layout_tests {
-    use super::*;
-
-    /// Verifies that `EntityLocation` is 32 bytes with 16-byte alignment.
-    #[test]
-    fn entity_location_size() {
-        assert_eq!(std::mem::size_of::<EntityLocation>(), 32);
-        assert_eq!(std::mem::align_of::<EntityLocation>(), 16);
-    }
-}
-
-// =============================================================================
-// =============================================================================
-// Component Add/Remove Errors
+// Re-exports
 // =============================================================================
 
 pub use crate::error::{AddComponentError, BuildError, RemoveComponentError, WorldError};
 
 // =============================================================================
-// Per-Thread Last-Run Tick
+// Per-Thread Last-Run Tick (thread-local statics)
 // =============================================================================
 //
 // In parallel mode, multiple systems run on different threads simultaneously.
@@ -123,7 +80,52 @@ pub(crate) fn set_per_thread_last_run_tick(value: Option<Tick>) -> Option<Tick> 
 }
 
 // =============================================================================
-// Per-Label Iterator Timing
+// Component Copier Type
+// =============================================================================
+
+/// Function that copies a component from one storage to another at given indices.
+type ComponentCopier = fn(
+    source: &TraitTypeMap<dyn Component, VecFamily>,
+    destination: &mut TraitTypeMap<dyn Component, VecFamily>,
+    index: usize,
+);
+
+// =============================================================================
+// Script Updater Type
+// =============================================================================
+
+/// Function that updates a script component.
+///
+/// Takes: (storage, index, entity, world_ptr, commands_ptr).
+/// Uses raw pointers to create a `ScriptContext` inside `update_scripts`.
+///
+/// SAFETY: The raw-pointer arguments (`world_ptr`, `commands_ptr`) are only
+/// valid during the `update_scripts` call. Using a plain function pointer
+/// (not a closure) guarantees that no state is captured and the callee
+/// cannot stash the pointers for later use.
+type ScriptUpdater =
+    fn(&mut TraitTypeMap<dyn Component, VecFamily>, usize, Entity, *mut World, *mut CommandQueue);
+
+// =============================================================================
+// EntityLocation
+// =============================================================================
+
+/// Tracks where an entity is stored in the archetype system.
+///
+/// Maps an [`Entity`] handle to the [`Archetype`] that owns its component
+/// columns plus the row index within that archetype. Updated on every entity
+/// creation, migration, and destruction so that random-access component
+/// lookups stay O(1).
+#[derive(Clone, Copy)]
+pub(crate) struct EntityLocation {
+    /// The archetype that currently stores the entity's components.
+    pub(crate) archetype_id: ArchetypeId,
+    /// Row of the entity inside its archetype's parallel columns.
+    pub(crate) index_in_archetype: usize,
+}
+
+// =============================================================================
+// IteratorTimings
 // =============================================================================
 
 /// Shared state for per-label iterator timing feedback.
@@ -137,6 +139,7 @@ pub(crate) struct IteratorTimings {
 }
 
 impl IteratorTimings {
+    /// Creates an empty [`IteratorTimings`] with no labels recorded.
     pub fn new() -> Self {
         Self {
             per_iterator_label_average_duration: std::collections::HashMap::new(),
@@ -150,19 +153,14 @@ impl IteratorTimings {
 // World
 // =============================================================================
 
-// =============================================================================
-// World
-// =============================================================================
-
-/// World manages all entities, archetypes, and resources
+/// Manages all entities, archetypes, and resources in the ECS.
 ///
-/// This is the central hub of the ECS. It:
-/// - Allocates entity IDs
-/// - Manages archetype storage
-/// - Tracks entity locations
-/// - Stores resources (singleton data)
-/// - Maintains component type registry for creating archetype storage
+/// The central hub of the engine. It allocates entity IDs with generation
+/// counters, owns the archetype storage for every component combination,
+/// tracks entity-to-archetype locations, stores singleton resources, and
+/// maintains the component type registry used to build archetype storage.
 pub struct World {
+    /// Next fresh entity ID handed out when the free list is empty.
     next_free_entity_id: u64,
     /// Free list of recycled entity IDs with their next generation. Stored as (id, next_generation) pairs
     pub(crate) free_entity_ids: Vec<(u64, u32)>,
@@ -383,20 +381,6 @@ impl Default for World {
     }
 }
 
-// =============================================================================
-// Free Functions
-// =============================================================================
-
-/// Copies a single component instance from source to destination storage.
-fn copy_component<T: Component + TraitAccessible<dyn Component> + Clone>(
-    source: &TraitTypeMap<dyn Component, VecFamily>,
-    destination: &mut TraitTypeMap<dyn Component, VecFamily>,
-    index: usize,
-) {
-    let component = source.get_storage::<T>().get(index);
-    destination.get_storage_mut::<T>().push(component.clone());
-}
-
 impl World {
     /// Register a component type with the World
     ///
@@ -434,6 +418,19 @@ impl World {
     }
 
     /// Register an unmanaged component described by an external language.
+    ///
+    /// Re-registering an identical layout and name for the same `stable_id`
+    /// is idempotent and returns the existing [`ComponentId`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::DynamicStableIdZero`] for a zero `stable_id`,
+    /// [`WorldError::DynamicSizeZero`] for a zero `size`,
+    /// [`WorldError::DynamicAlignmentInvalid`] for a zero or non-power-of-two
+    /// `align`, [`WorldError::DynamicLayoutInvalid`] for an oversized layout,
+    /// [`WorldError::DynamicAlreadyRegistered`] when the `stable_id` is
+    /// already taken by a different layout or name, and
+    /// [`WorldError::ComponentTypeLimitExceeded`] when the registry is full.
     pub fn register_dynamic_component(
         &mut self,
         stable_id: u128,
@@ -511,10 +508,21 @@ impl World {
     }
 
     /// Create an entity consisting entirely of runtime-defined components.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::DynamicEntityEmpty`] if `components` is empty,
+    /// [`WorldError::DynamicDuplicateComponent`] if a component appears more
+    /// than once, [`WorldError::DynamicComponentNotRegistered`] if a
+    /// component was never registered, and
+    /// [`WorldError::DynamicByteLengthMismatch`] if a byte payload does not
+    /// match its registered layout size.
     pub fn create_dynamic_entity(
         &mut self,
         components: &[(ComponentId, Vec<u8>)],
     ) -> Result<Entity, WorldError> {
+        // Step 1: Validate the component set - non-empty, unique, registered,
+        // and every payload matches its registered layout.
         if components.is_empty() {
             return Err(WorldError::DynamicEntityEmpty);
         }
@@ -533,11 +541,16 @@ impl World {
             }
         }
 
+        // Step 2: Allocate an entity handle and get or create the archetype
+        // for this component set.
         let entity = self.allocate_entity();
         let archetype_id = self.get_or_create_archetype(component_ids);
         let archetype = self.archetypes.get_mut(&archetype_id).unwrap();
         let index = archetype.entities.len();
         archetype.entities.push(entity);
+
+        // Step 3: Push each raw byte payload and a fresh change tick into
+        // the entity's new row.
         for (id, bytes) in components {
             archetype
                 .dynamic_component_storages
@@ -550,6 +563,8 @@ impl World {
                 .unwrap()
                 .push(ComponentTicks::new(Tick::new(self.change_tick)));
         }
+
+        // Step 4: Record where the entity lives so random access stays O(1).
         self.entity_locations.insert(
             entity,
             EntityLocation {
@@ -644,8 +659,8 @@ impl World {
                 self.script_components.len()
             )]
         );
-        // Pre-allocate the work list.  We recycle this Vec across script
-        // types via `.drain(..)`, so only one allocation per frame.
+        // Step 1: Reserve the per-frame work list and capture raw pointers to
+        // self and the command queue before any field borrows on self.
         let total_entities = self.entity_locations.len();
         let mut entities_to_update: Vec<(Entity, ArchetypeId, usize)> =
             Vec::with_capacity(total_entities);
@@ -654,6 +669,8 @@ impl World {
         let world_ptr = self as *mut World;
         let commands_ptr = commands as *mut CommandQueue;
 
+        // Step 2: For each script component type, gather every entity that
+        // carries it.
         for &(component_id, comp_bit) in &self.script_components {
             // Get the updater for this component type.
             // Function pointers are Copy - no allocation here.
@@ -676,8 +693,9 @@ impl World {
                 }
             }
 
-            // Now update each entity's script component.
-            // Sort by (archetype_id, index) for deterministic order across runs.
+            // Step 3: Sort the gathered entities for deterministic order
+            // across runs, then dispatch each one to its updater with the
+            // captured raw pointers.
             entities_to_update.sort_by_key(|(_, aid, idx)| (*aid, *idx));
 
             for (entity, archetype_id, index) in entities_to_update.drain(..) {
@@ -1136,6 +1154,7 @@ impl World {
             "insert entity",
             [("Target entity being inserted: {:?}", entity)]
         );
+        // Step 1: Get or create the archetype for this component set.
         let archetype_id = self.get_or_create_archetype(component_ids);
         let current_tick = Tick::new(self.change_tick);
 
@@ -1145,23 +1164,24 @@ impl World {
             .expect("archetype must exist after get_or_create_archetype");
         let index: usize = archetype.entities.len();
 
-        // Add entity to archetype
+        // Step 2: Append the entity row, then let the closure push each
+        // component's concrete value into its column.
         archetype.entities.push(entity);
 
         // Use the provided closure to insert components with their concrete types
         insert_fn(&mut archetype.component_storages);
 
-        // Type-erased components have no concrete Rust value for `insert_fn`
-        // to push. Allocate their rows here; the command executor overwrites
-        // the zero bytes before the newly created entity becomes observable.
+        // Step 3: Type-erased components have no concrete Rust value for
+        // `insert_fn` to push. Allocate their rows here; the command executor
+        // overwrites the zero bytes before the new entity becomes observable.
         for &component_id in &archetype.component_types {
             if let Some(column) = archetype.dynamic_component_storages.get_mut(&component_id) {
                 column.push_zeroed();
             }
         }
 
-        // Maintain change-detection ticks: every component_id in the archetype
-        // got exactly one push by the closure above, so push one fresh tick.
+        // Step 4: Maintain change-detection ticks - every component_id in the
+        // archetype got exactly one push above, so push one fresh tick.
         for &component_id in &archetype.component_types {
             archetype
                 .component_ticks
@@ -1170,6 +1190,7 @@ impl World {
                 .push(ComponentTicks::new(current_tick));
         }
 
+        // Step 5: Record where the entity lives so random access stays O(1).
         self.entity_locations.insert(
             entity,
             EntityLocation {
@@ -1206,7 +1227,7 @@ impl World {
                 new_component_ids.len()
             )]
         );
-        // Get current location
+        // Step 1: Resolve where the entity currently lives.
         let old_location = match self.entity_locations.get(&entity) {
             Some(loc) => *loc,
             None => {
@@ -1218,7 +1239,8 @@ impl World {
         let old_archetype_id = old_location.archetype_id;
         let old_index = old_location.index_in_archetype;
 
-        // Get or create new archetype
+        // Step 2: Get or create the destination archetype and bail out if
+        // the entity already lives there.
         let new_archetype_id = self.get_or_create_archetype(new_component_ids);
 
         // If same archetype, nothing to do (shouldn't happen for add_component)
@@ -1230,17 +1252,13 @@ impl World {
             return;
         }
 
-        // We need to:
-        // 1. Copy components from old to new archetype
-        // 2. Remove entity from old archetype
-        // 3. Add entity to new archetype
-
-        // SAFETY: We need to access two archetypes simultaneously.
-        // The early-return above ensures old_archetype_id != new_archetype_id,
-        // so the two HashMap entries are disjoint allocations.
-        // The debug_assert_ne! inside the unsafe block acts as a second
-        // line of defense against a future refactor accidentally removing
-        // or moving the early-return without updating this block.
+        // Step 3: Migrate the entity. We need simultaneous access to two
+        // archetypes, which the borrow checker cannot express through the
+        // HashMap, so take raw pointers to both entries. The early-return
+        // above guarantees the two ArchetypeIds differ, so the entries are
+        // disjoint allocations; the debug_assert_ne! below re-checks this
+        // inside the unsafe block as a second line of defense against a
+        // future refactor removing the early-return.
         let old_archetype_ptr = self
             .archetypes
             .get(&old_archetype_id)
@@ -1252,11 +1270,14 @@ impl World {
             .expect("destination archetype must exist after get_or_create_archetype")
             as *mut Archetype;
 
+        // SAFETY: old_archetype_id != new_archetype_id is proven by the
+        // early-return above and re-checked below. Different ArchetypeId
+        // values map to different HashMap entries, so old_archetype and
+        // new_archetype point to non-overlapping allocations, making the
+        // simultaneous `&` and `&mut` access sound. Both pointers stay valid
+        // for the duration of this block because the archetypes map is not
+        // mutated until after the references derived here are dropped.
         unsafe {
-            // SAFETY: old_archetype_id != new_archetype_id is proven by the
-            // early-return above and re-checked here. Different ArchetypeId
-            // values map to different HashMap entries, so old_archetype and
-            // new_archetype point to non-overlapping allocations.
             debug_assert_ne!(
                 old_archetype_id, new_archetype_id,
                 "move_entity_to_archetype: old and new archetype IDs must differ"
@@ -1265,8 +1286,8 @@ impl World {
             let new_archetype = &mut *new_archetype_ptr;
 
             // Read component_types via raw pointer - avoids a Vec clone.
-            // SAFETY: new_archetype_ptr is valid; component_types is only
-            // read (not mutated) in this loop.
+            // The block-level SAFETY above establishes that new_archetype_ptr
+            // is valid; component_types is only read (never mutated) here.
             let new_component_ids = &(*new_archetype_ptr).component_types;
 
             let new_index = new_archetype.entities.len();
@@ -1328,7 +1349,8 @@ impl World {
             );
         }
 
-        // Remove entity from old archetype using swap_remove for O(1) removal
+        // Step 4: Remove the entity from the old archetype with swap_remove
+        // for O(1) removal, keeping every column in lockstep.
         let old_archetype = self.archetypes.get_mut(&old_archetype_id).unwrap();
 
         if old_index < old_archetype.entities.len() {
@@ -1368,7 +1390,8 @@ impl World {
             }
         }
 
-        // Clean up empty archetype - remove it from world to prevent memory leaks
+        // Step 5: If the old archetype is now empty, remove it entirely to
+        // prevent memory leaks.
         if old_archetype.entities.is_empty() {
             self.archetypes.remove(&old_archetype_id);
             self.archetype_generation = self.archetype_generation.wrapping_add(1);
@@ -1385,7 +1408,8 @@ impl World {
             "destroy entity",
             [("Target entity being destroyed: {:?}", entity)]
         );
-        // Get current location
+        // Step 1: Remove the entity's location record; a missing record
+        // means the entity is already gone.
         let location = match self.entity_locations.remove(&entity) {
             Some(loc) => loc,
             None => return false, // Entity doesn't exist
@@ -1398,7 +1422,8 @@ impl World {
 
         let old_index = location.index_in_archetype;
 
-        // Use swap_remove for O(1) removal
+        // Step 2: swap_remove the entity and its component rows for O(1)
+        // removal, updating the location of the entity swapped into its place.
         if old_index < archetype.entities.len() {
             archetype.entities.swap_remove(old_index);
 
@@ -1440,26 +1465,32 @@ impl World {
             }
         }
 
-        // Clean up empty archetype - remove it from world to prevent memory leaks
+        // Step 3: If the archetype is now empty, remove it entirely to
+        // prevent memory leaks.
         let archetype_id = location.archetype_id;
         if archetype.entities.is_empty() {
             self.archetypes.remove(&archetype_id);
             self.archetype_generation = self.archetype_generation.wrapping_add(1);
         }
 
-        // Add entity ID to free list with incremented generation for recycling.
-        // This allows the ID to be reused, but with a new generation to invalidate old handles.
+        // Step 4: Recycle the entity ID with an incremented generation so
+        // the ID can be reused while stale handles are invalidated.
         self.free_entity_ids
             .push((entity.id, entity.generation.wrapping_add(1)));
 
         true
     }
 
-    /// Remove a component from an entity, moving it to a new archetype
+    /// Remove a component from an entity, moving it to a new archetype.
     ///
-    /// Returns `Ok(())` if the component was removed successfully.
-    /// Returns `Err(RemoveComponentError::EntityNotFound)` if the entity doesn't exist.
-    /// Returns `Err(RemoveComponentError::ComponentNotFound)` if the entity doesn't have the component.
+    /// If the entity's last component is removed, the entity is destroyed
+    /// instead of migrated to an empty archetype.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RemoveComponentError::EntityNotFound`] if the entity does
+    /// not exist, and [`RemoveComponentError::ComponentNotFound`] if the
+    /// entity does not carry the component `T`.
     #[must_use]
     pub fn remove_component<T: Component>(
         &mut self,
@@ -1475,7 +1506,7 @@ impl World {
         );
         let component_id = ComponentId::of::<T>();
 
-        // Get current location
+        // Step 1: Validate - the entity must exist and currently carry T.
         let location = match self.entity_locations.get(&entity) {
             Some(loc) => *loc,
             None => return Err(RemoveComponentError::EntityNotFound),
@@ -1491,7 +1522,9 @@ impl World {
             return Err(RemoveComponentError::ComponentNotFound);
         }
 
-        // Build new component list without the removed component
+        // Step 2: Build the destination component set without T. If no
+        // components remain, destroy the entity instead of migrating it to
+        // an empty archetype.
         let new_component_ids: Vec<ComponentId> = old_archetype
             .component_types
             .iter()
@@ -1507,7 +1540,8 @@ impl World {
             return Ok(());
         }
 
-        // Collect copiers for all components except the one being removed
+        // Step 3: Migrate the entity to the new archetype, copying every
+        // remaining component through its registered copier.
         let copiers: Vec<_> = new_component_ids
             .iter()
             .filter_map(|component_id| self.component_copiers.get(component_id).copied())
@@ -1528,11 +1562,15 @@ impl World {
         Ok(())
     }
 
-    /// Add a component to an existing entity, moving it to a new archetype
+    /// Add a component to an existing entity, moving it to a new archetype.
     ///
-    /// Returns `Ok(())` if the component was added successfully.
-    /// Returns `Err(AddComponentError::EntityNotFound)` if the entity doesn't exist.
-    /// Returns `Err(AddComponentError::ComponentAlreadyExists)` if the entity already has the component.
+    /// Existing components are preserved during the migration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AddComponentError::EntityNotFound`] if the entity does not
+    /// exist, and [`AddComponentError::ComponentAlreadyExists`] if the entity
+    /// already carries the component `T`.
     #[must_use]
     pub fn add_component<T>(
         &mut self,
@@ -1552,7 +1590,8 @@ impl World {
         );
         let component_id = ComponentId::of::<T>();
 
-        // Get current location
+        // Step 1: Validate - the entity must exist and must not already
+        // carry T.
         let location = match self.entity_locations.get(&entity) {
             Some(loc) => *loc,
             None => return Err(AddComponentError::EntityNotFound),
@@ -1568,13 +1607,14 @@ impl World {
             return Err(AddComponentError::ComponentAlreadyExists);
         }
 
-        // Build new component list with the added component
+        // Step 2: Build the destination component set with T appended.
         let mut new_component_ids = Vec::with_capacity(old_archetype.component_types.len() + 1);
         new_component_ids.extend_from_slice(&old_archetype.component_types);
         new_component_ids.push(component_id);
         new_component_ids.sort();
 
-        // Collect copiers for existing components
+        // Step 3: Migrate the entity, copying existing components through
+        // their copiers and pushing the new component value.
         let copiers: Vec<_> = old_archetype
             .component_types
             .iter()
@@ -1599,6 +1639,15 @@ impl World {
     }
 
     /// Add a runtime-defined component and migrate the entity's other columns.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::EntityNotFound`] if the entity does not exist,
+    /// [`WorldError::DynamicComponentAlreadyPresent`] if the entity already
+    /// carries the component, [`WorldError::DynamicComponentNotRegistered`]
+    /// if the component was never registered, and
+    /// [`WorldError::DynamicByteLengthMismatch`] if `bytes` does not match
+    /// the registered layout size.
     pub fn add_dynamic_component(
         &mut self,
         entity: Entity,
@@ -1663,6 +1712,12 @@ impl World {
     }
 
     /// Add a zero-initialized runtime-defined component.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::DynamicComponentNotRegistered`] if the component
+    /// was never registered, plus any error reported by
+    /// [`add_dynamic_component`](Self::add_dynamic_component).
     pub fn add_dynamic_component_default(
         &mut self,
         entity: Entity,
@@ -1676,6 +1731,15 @@ impl World {
     }
 
     /// Remove a runtime-defined component while preserving every other column.
+    ///
+    /// If the entity's last component is removed, the entity is destroyed
+    /// instead of migrated to an empty archetype.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::EntityNotFound`] if the entity does not exist,
+    /// and [`WorldError::DynamicComponentMissing`] if the entity does not
+    /// carry the component.
     pub fn remove_dynamic_component(
         &mut self,
         entity: Entity,
@@ -1789,12 +1853,15 @@ impl World {
         total
     }
 
-    /// Generate a Graphviz DOT representation of archetypes and their components.
+    /// Generate a Graphviz DOT representation of the world for debugging.
     ///
     /// Useful for debugging archetype fragmentation and visualizing the
-    /// relationship between component sets and entity counts.
+    /// relationship between component sets and entity counts. The output is
+    /// a `digraph` with one node per archetype, labelled with its component
+    /// names and entity count.
     ///
     /// # Example output
+    ///
     /// ```dot
     /// digraph World {
     ///     rankdir=LR;
@@ -1803,7 +1870,6 @@ impl World {
     ///     "arch_1" [label="Position, Health | 1 entity"];
     /// }
     /// ```
-    /// Generate a DOT graph representation of the world for debugging.
     #[cold]
     pub fn to_dot_graph(&self) -> String {
         let mut dot = String::from("digraph World {\n    rankdir=LR;\n    node [shape=record];\n");
@@ -1840,14 +1906,25 @@ impl World {
     }
 }
 
-/// Trait for inserting a component into storage
+// =============================================================================
+// ComponentInserter
+// =============================================================================
+
+/// Type-erased interface for pushing a single component value into storage.
+///
+/// `EntityBuilder` boxes one `ComponentInserter` per `.with(...)` call so
+/// that the concrete component type is captured without the builder itself
+/// being generic over every possible component.
 trait ComponentInserter {
+    /// Push the captured component value into the given storage.
     fn insert(self: Box<Self>, storage: &mut TraitTypeMap<dyn Component, VecFamily>);
+    /// Return the [`ComponentId`] of the captured component type.
     fn component_id(&self) -> ComponentId;
 }
 
-/// Implementation that captures the concrete component type
+/// Implementation of [`ComponentInserter`] that captures a concrete component type.
 struct TypedComponentInserter<T: Component + TraitAccessible<dyn Component>> {
+    /// The component value to insert when the entity is built.
     component: T,
 }
 
@@ -1863,9 +1940,18 @@ impl<T: Component + TraitAccessible<dyn Component>> ComponentInserter
     }
 }
 
-/// Builder for constructing entities with components using a fluent API
+// =============================================================================
+// EntityBuilder
+// =============================================================================
+
+/// Builder for constructing entities with components using a fluent API.
 ///
-/// Example:
+/// Returned by [`World::create_entity`]. Components are added with
+/// [`with`](Self::with) and the entity is inserted into the world when
+/// [`build`](Self::build) is called.
+///
+/// # Example
+///
 /// ```no_run
 /// # use pill_engine::*;
 /// # use trait_type_map::impl_trait_accessible;
@@ -1880,14 +1966,12 @@ impl<T: Component + TraitAccessible<dyn Component>> ComponentInserter
 ///     .with(Velocity { x: 10.0, y: 0.0 })
 ///     .build().unwrap();
 /// ```
-
-// =============================================================================
-// EntityBuilder
-// =============================================================================
-
 pub struct EntityBuilder<'w> {
+    /// World the built entity is inserted into on [`build`](Self::build).
     world: &'w mut World,
+    /// Entity handle reserved by the free list for this build.
     entity: Entity,
+    /// Type-erased components accumulated via [`with`](Self::with).
     components: Vec<Box<dyn ComponentInserter>>,
 }
 
@@ -1904,9 +1988,11 @@ impl<'w> EntityBuilder<'w> {
 
     /// Finish building and insert the entity into the world.
     ///
-    /// Returns `Err(BuildError::ComponentNotRegistered(id))` if any of the
-    /// component types added via [`.with()`](Self::with) were not registered
-    /// with the world beforehand.
+    /// # Errors
+    ///
+    /// Returns [`BuildError::ComponentNotRegistered`] if any of the component
+    /// types added via [`.with()`](Self::with) were not registered with the
+    /// world beforehand.
     #[must_use]
     pub fn build(self) -> Result<Entity, BuildError> {
         let component_ids: Vec<ComponentId> =
@@ -1937,8 +2023,34 @@ impl<'w> EntityBuilder<'w> {
 }
 
 // =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Copies a single component instance from source to destination storage.
+fn copy_component<T: Component + TraitAccessible<dyn Component> + Clone>(
+    source: &TraitTypeMap<dyn Component, VecFamily>,
+    destination: &mut TraitTypeMap<dyn Component, VecFamily>,
+    index: usize,
+) {
+    let component = source.get_storage::<T>().get(index);
+    destination.get_storage_mut::<T>().push(component.clone());
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// Verifies that `EntityLocation` is 32 bytes with 16-byte alignment.
+    #[test]
+    fn entity_location_size() {
+        assert_eq!(std::mem::size_of::<EntityLocation>(), 32);
+        assert_eq!(std::mem::align_of::<EntityLocation>(), 16);
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -9,14 +9,15 @@
 //! # Design
 //!
 //! The crate root is a thin re-export layer. All implementation lives in
-//! submodules (`world`, `query`, `scheduler`, etc.). Users import everything
-//! from `pill_engine` without needing deep module paths.
+//! submodules ([`world`], [`query`], [`scheduler`], etc.). Users import
+//! everything from `pill_engine` without needing deep module paths.
 
-// ----------------------------------------------------------------------------
-// Tracy ProfiledAllocator - tracks allocations in Tracy's memory view.
-// Only active when the `profiling` feature is enabled.
-// Sampling rate controlled by `config::TRACY_ALLOC_SAMPLING_RATE`.
-// ----------------------------------------------------------------------------
+// ===== Constants =====
+
+/// Tracy profiled allocator that tracks allocations in Tracy's memory view.
+///
+/// Only active when the `profiling` feature is enabled. The sampling rate is
+/// controlled by [`crate::config::ProfilingConfig::MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY`].
 #[cfg(feature = "profiling")]
 #[global_allocator]
 static ALLOC: tracy_client::ProfiledAllocator<std::alloc::System> =
@@ -25,34 +26,66 @@ static ALLOC: tracy_client::ProfiledAllocator<std::alloc::System> =
         crate::config::ProfilingConfig::MEMORY_ALLOCATIONS_SAMPLING_FREQUENCY,
     );
 
-// =============================================================================
-// Public Modules
-// =============================================================================
+// ===== Public Modules =====
 
+/// Language-agnostic engine API for external hot-reloadable game consumers.
 pub mod api;
+
+/// Archetype-based component storage with structure-of-arrays layout.
 pub mod archetype;
+
+/// Deferred command queue for structural ECS mutations.
 pub mod commands;
+
+/// Component trait, type identification, and change-detection primitives.
 pub mod component;
+
+/// Centralised configuration constants and hardware detection.
 pub mod config;
+
+/// System registration, frame execution, and parallel dispatch orchestration.
 pub mod engine;
+
+/// Lightweight entity handles with generation-based invalidation.
 pub mod entity;
+
+/// Typed error system for the ECS engine.
 pub mod error;
+
+/// Component persistence and schema migration for hot-reload.
 pub mod persistence;
+
+/// Re-exports the profiling API from `pill_core`.
 pub mod profiling;
+
+/// Query system for efficient iteration over entities with specific components.
 pub mod query;
+
+/// Minimal 2D sprite renderer (wgpu-backed), gated behind the `rendering` feature.
 #[cfg(feature = "rendering")]
 pub mod render;
+
+/// Window-surface renderer owned by the engine's optional rendering feature.
 #[cfg(feature = "rendering")]
 pub mod renderer;
-pub mod resource;
-pub mod scheduler;
-pub mod scripting;
-pub mod system;
-pub mod world;
-// =============================================================================
-// Public Re-exports
-// =============================================================================
 
+/// Singleton resources stored in the [`World`], not attached to entities.
+pub mod resource;
+
+/// Dependency analysis and parallel batch scheduling for system execution.
+pub mod scheduler;
+
+/// Script components with deferred structural mutation safety.
+pub mod scripting;
+
+/// Advanced system parameter infrastructure with automatic parameter resolution.
+pub mod system;
+
+/// Central ECS state container - entities, archetypes, components, and resources.
+pub mod world;
+// ===== Public Re-exports =====
+
+// Core engine types re-exported for single-import usage.
 pub use api::EngineApi;
 pub use commands::{CommandError, Commands};
 pub use component::{Component, ComponentId, ComponentTicks, Tick};
@@ -70,8 +103,14 @@ pub use renderer::{Renderer, RendererError, RendererWindow};
 pub use resource::{ResHandle, Resource};
 pub use scheduler::{SystemAccess, SystemScheduler, TypeKey};
 pub use scripting::{ScriptComponent, ScriptContext};
+
+// Serde derives re-exported so downstream components can derive serialization without a direct dependency.
 pub use serde::{Deserialize, Serialize};
+
+// Tracing re-exported to keep telemetry under a single flat namespace.
 pub use tracing;
+
+// World container and its entity-builder and error types.
 pub use world::{AddComponentError, BuildError, EntityBuilder, RemoveComponentError, World};
 
 // ----------------------------------------------------------------------------

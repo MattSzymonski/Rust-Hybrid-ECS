@@ -63,14 +63,8 @@ pub struct Entity {
 }
 
 // =============================================================================
-// Entity - Trait Implementations
+// Entity - Inherent Implementations
 // =============================================================================
-
-impl fmt::Display for Entity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}v{}", self.id, self.generation)
-    }
-}
 
 impl Entity {
     // -------------------------------------------------------------------------
@@ -100,6 +94,16 @@ impl Entity {
     #[inline]
     pub fn generation(self) -> u32 {
         self.generation
+    }
+}
+
+// =============================================================================
+// Entity - Trait Implementations
+// =============================================================================
+
+impl fmt::Display for Entity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}v{}", self.id, self.generation)
     }
 }
 
