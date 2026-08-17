@@ -78,7 +78,10 @@ fn main() {
                 Err(error) => {
                     // The editor cannot render without its engine surface;
                     // report the typed failure once and stop the process.
-                    tracing::error!(
+                    // The local `mod error` (EditorError) occupies the module
+                    // namespace, so `use pill_core::error;` would collide with
+                    // it; call the flat-namespace macro by its full path.
+                    pill_core::error!(
                         target: pill_core::telemetry::telemetry_target::ENGINE,
                         error = %error,
                         "editor rendering host setup failed"

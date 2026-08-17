@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 // External crates
 use libloading::{Library, Symbol};
 use pill_core::error::LibraryError;
+use pill_core::{debug, info};
 use pill_engine::EngineApi;
 
 // =============================================================================
@@ -116,7 +117,7 @@ impl GameLibrary {
                 source,
             }
         })?;
-        tracing::debug!(
+        debug!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             path = %temporary_path.display(),
             "copied game DLL"
@@ -126,7 +127,7 @@ impl GameLibrary {
         // SAFETY: The configured build just produced this module and its
         // required exports are validated before the handle is returned.
         let game_library = unsafe { Self::load(&temporary_path, temporary_path.clone()) }?;
-        tracing::info!(
+        info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             "game DLL loaded successfully"
         );

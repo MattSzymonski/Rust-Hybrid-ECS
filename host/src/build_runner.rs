@@ -20,6 +20,7 @@ use crate::{GameModuleBackend, GameModuleConfig};
 
 // External crates
 use pill_core::error::BuildError;
+use pill_core::info;
 
 // =============================================================================
 // Constants
@@ -47,7 +48,7 @@ pub(crate) fn build_game_module(
     config: &GameModuleConfig,
     cancel_flag: Option<(&AtomicU64, u64)>,
 ) -> Result<PathBuf, BuildError> {
-    tracing::info!(
+    info!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
         module = config.name,
         "building game module"

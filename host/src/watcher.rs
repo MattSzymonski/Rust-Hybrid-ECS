@@ -35,6 +35,7 @@ use crate::GameModuleConfig;
 
 // External crates
 use pill_core::error::WatcherError;
+use pill_core::{debug, error, info};
 
 // =============================================================================
 // Constants
@@ -160,7 +161,7 @@ pub(crate) fn spawn_file_watcher(
         });
     }
 
-    tracing::info!(
+    info!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
         module = config.name,
         watch_directory = %watch_path.display(),
@@ -188,7 +189,7 @@ pub(crate) fn spawn_file_watcher(
             // Watching must never panic inside the callback, which some
             // backends run on their own threads; report and continue.
             Err(error) => {
-                tracing::error!(
+                error!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     error = %error,
                     "file watcher error"
@@ -246,7 +247,7 @@ pub(crate) fn spawn_file_watcher(
                     changed_paths.len() - REPORTED_PATH_LIMIT
                 ));
             }
-            tracing::debug!(
+            debug!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 changed_paths = %report,
                 "source change detected"

@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 // External crates
+use pill_core::warn;
 use rayon::prelude::*;
 
 // Current crate
@@ -553,7 +554,7 @@ impl Engine {
                         "duplicate parallel-iterator labels this frame: {:?} - two iterators sharing a .label() corrupt per-label timing",
                         duplicates
                     );
-                    tracing::warn!(
+                    warn!(
                         target: pill_core::telemetry::telemetry_target::ECS,
                         labels = ?duplicates,
                         "duplicate parallel-iterator labels this frame; two iterators sharing a .label() corrupt per-label timing"

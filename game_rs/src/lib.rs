@@ -1,5 +1,6 @@
 //! Hot-reloadable bouncing-ball game implemented with ECS systems.
 
+use pill_core::error;
 use pill_engine::*;
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
@@ -237,7 +238,7 @@ pub unsafe extern "C" fn game_init(api: *const EngineApi) -> u32 {
             Err(error) => {
                 // Report the failure and abort the generation: the host keeps
                 // the previously loaded module when game_init returns non-zero.
-                tracing::error!(
+                error!(
                     target: pill_core::telemetry::telemetry_target::ECS,
                     error = %error,
                     "failed to build a ball entity; aborting this game generation"

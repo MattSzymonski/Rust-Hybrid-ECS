@@ -4,30 +4,20 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-pill_engine = { path = "../engine" }
 pill_core = { path = "../pill_core" }
 host = { package = "pill_host", path = "../host" }
-pill_core_macros = { path = "../pill_core_macros" }
-thiserror = "2"
-miette = { version = "7", features = ["fancy"] }
+miette = "7"
 tracing = "0.1"
-wgpu = { version = "26.0.1", optional = true }
-winit = { version = "0.30", optional = true }
-pollster = { version = "0.4", optional = true }
 
 [features]
-rendering = [
-    "dep:wgpu",
-    "dep:winit",
-    "dep:pollster",
-    "pill_engine/rendering",
-    "host/rendering",
-]
+# Windowed mode: `host::run` owns the winit event loop and wgpu renderer
+# behind this feature; the binary itself contains no GPU or window code.
+rendering = ["host/rendering"]
 # Enable Tracy profiling through the shared telemetry stack.
 profiling = ["host/profiling"]
 # Investigative fine-grained profiling zones.
 profiling-fine = ["host/profiling-fine"]
 # Repeated numerical measurements through the shared metrics recorder.
 metrics = ["host/metrics"]
-# Compile the simple developer log macros (`log!`, `warn!`, `error!`).
+# Compile the simple developer log macros (`log!`, `dev_warn!`, `dev_error!`).
 dev-logs = ["host/dev-logs"]

@@ -4254,14 +4254,8 @@ version = "0.1.0"
 dependencies = [
  "miette",
  "pill_core",
- "pill_core_macros",
- "pill_engine",
  "pill_host",
- "pollster",
- "thiserror 2.0.19",
  "tracing",
- "wgpu",
- "winit",
 ]
 
 [[package]]

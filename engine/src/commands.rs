@@ -59,6 +59,7 @@
 // Standard library
 
 // External crates
+use pill_core::warn;
 use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
 
 // Current crate
@@ -357,7 +358,7 @@ impl CommandQueue {
         } else {
             for err in &errors {
                 crate::profile_error!("deferred command failed: {}", err);
-                tracing::warn!(
+                warn!(
                     target: pill_core::telemetry::telemetry_target::ECS,
                     error = %err,
                     "deferred command failed"

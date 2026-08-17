@@ -55,7 +55,7 @@ pub mod utils;
 
 // Permanent logging macros. `error` coexists with the `pub mod error` module:
 // Rust keeps the macro and module namespaces separate, so both resolve.
-pub use tracing::{debug, error, info, span, trace, trace_span};
+pub use tracing::{debug, error, info, span, trace, trace_span, warn};
 
 // Metrics macros (gated on the `metrics` feature). The leading `::` forces
 // the external `metrics` crate rather than the local `pub mod metrics`.

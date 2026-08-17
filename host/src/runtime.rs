@@ -31,6 +31,7 @@ use crate::{GameModuleBackend, GameModuleConfig};
 // External crates
 use pill_core::error::{EngineMessage, HostError};
 use pill_core::telemetry::telemetry_target;
+use pill_core::{error, info};
 #[cfg(feature = "rendering")]
 use pill_engine::EngineError;
 
@@ -108,7 +109,7 @@ impl Host {
                     "[host] Frame error ({} more occurrences): {signature}",
                     self.suppressed_error_count
                 );
-                tracing::error!(
+                error!(
                     target: telemetry_target::ENGINE,
                     suppressed = self.suppressed_error_count,
                     "frame error: {signature}"
@@ -119,7 +120,7 @@ impl Host {
             return;
         }
         eprintln!("[host] Frame error: {signature}");
-        tracing::error!(target: telemetry_target::ENGINE, "frame error: {signature}");
+        error!(target: telemetry_target::ENGINE, "frame error: {signature}");
         self.last_frame_error = Some(signature);
         self.suppressed_error_count = 0;
         self.last_error_report = now;
@@ -310,7 +311,7 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     // never lost.
     let generation = host.reload_generation.load(Ordering::Acquire);
     if generation != host.last_processed_generation {
-        tracing::info!(
+        info!(
             target: telemetry_target::HOT_RELOAD,
             generation,
             "hot reload triggered"
@@ -400,7 +401,7 @@ fn record_frame_metrics(entity_count: usize, frame_time_ms: f64, fps: f64) {
 
 /// Print the selected backend before any build output starts streaming.
 fn print_startup_configuration(workspace_root: &Path, module_config: &GameModuleConfig) {
-    tracing::info!(
+    info!(
         target: telemetry_target::ENGINE,
         workspace = %workspace_root.display(),
         module = module_config.name,

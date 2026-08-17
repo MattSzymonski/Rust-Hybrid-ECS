@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 // External crates
 use pill_core::error::CSharpError;
+use pill_core::{error, info};
 use pill_engine::commands::CommandQueue;
 use pill_engine::{Engine, SystemAccess, SystemError, World};
 
@@ -397,19 +398,19 @@ impl CSharpRuntime {
     pub(crate) fn poll_reload(&mut self) -> u8 {
         let status = (self.poll_reload)();
         if status == POLL_REJECTED && self.last_poll_status != POLL_REJECTED {
-            tracing::error!(
+            error!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 "C# reload rejected: component or system signatures changed; restart the host to rebuild the native component registry and scheduler"
             );
         }
         if status == POLL_RELOADED {
             if self.verify_systems_unchanged() {
-                tracing::info!(
+                info!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     "C# hot reload complete"
                 );
             } else {
-                tracing::error!(
+                error!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     "reloaded assembly exposes different system metadata than the registered snapshot; restart the host to re-register systems"
                 );
