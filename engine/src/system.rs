@@ -190,7 +190,8 @@ pub trait SystemParam: Sized {
 /// Commands is a SystemParam - provides deferred entity operations
 impl SystemParam for Commands<'static> {
     fn fetch(world: &mut World, queue: &mut CommandQueue) -> Self {
-        // CRITICAL RISK: Lifetime transmutation from actual borrow to 'static.
+        // CRITICAL RISK
+        // SAFETY: Lifetime transmutation from actual borrow to 'static.
         //
         // This is sound IFF the caller upholds the SystemParam safety contract:
         // - The Commands<'static> must not escape the system function
