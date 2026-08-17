@@ -11,10 +11,12 @@ parking_lot = "0.12"
 sysinfo = "0.39"
 trait_type_map = { path = "../../Trait-Type-Map" }
 tracy-client = { version = "0.18", optional = true, default-features = false }
+metrics = { version = "0.24", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 miette = { version = "7", features = ["derive"] }
+tracing = "0.1"
 wgpu = { version = "26.0.1", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 pollster = { version = "0.4", optional = true }
@@ -35,7 +37,10 @@ profiling = [
     "tracy-client/code-transfer",
     "tracy-client/callstack-inlines",
     "tracy-client/crash-handler",
+    "pill_core/tracy",
 ]
+# Investigative fine-grained zones (`profile_scope_fine!` -> profile::fine).
+profiling-fine = ["profiling"]
 # Minimal overhead: zones + frame marks only. No text, plots, messages, or threads.
 profiling-minimal = [
     "dep:tracy-client",
@@ -45,6 +50,8 @@ profiling-minimal = [
 ]
 # Debug: full profiling + instrumentation verification (~50% overhead).
 profiling-verify = ["profiling", "tracy-client/verify"]
+# Emit repeated numerical measurements through the shared `metrics` recorder.
+metrics = ["dep:metrics", "pill_core/metrics"]
 # Minimal 2D renderer (wgpu-backed): Position/Sprite components, the sprite
 # pipeline, and window-surface/device/queue lifecycle. Frontends supply only a
 # compatible window handle and drive the engine Renderer API.

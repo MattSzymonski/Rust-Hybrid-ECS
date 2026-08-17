@@ -71,4 +71,5 @@ pub use resource::{ResHandle, Resource};
 pub use scheduler::{SystemAccess, SystemScheduler, TypeKey};
 pub use scripting::{ScriptComponent, ScriptContext};
 pub use serde::{Deserialize, Serialize};
+pub use tracing;
 pub use world::{AddComponentError, BuildError, EntityBuilder, RemoveComponentError, World};

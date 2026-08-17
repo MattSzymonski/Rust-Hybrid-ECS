@@ -30,6 +30,7 @@ use crate::{GameModuleBackend, GameModuleConfig};
 
 // External crates
 use pill_core::error::{EngineMessage, HostError};
+use pill_core::telemetry::telemetry_target;
 #[cfg(feature = "rendering")]
 use pill_engine::EngineError;
 
@@ -107,12 +108,18 @@ impl Host {
                     "[host] Frame error ({} more occurrences): {signature}",
                     self.suppressed_error_count
                 );
+                tracing::error!(
+                    target: telemetry_target::ENGINE,
+                    suppressed = self.suppressed_error_count,
+                    "frame error: {signature}"
+                );
                 self.suppressed_error_count = 0;
                 self.last_error_report = now;
             }
             return;
         }
         eprintln!("[host] Frame error: {signature}");
+        tracing::error!(target: telemetry_target::ENGINE, "frame error: {signature}");
         self.last_frame_error = Some(signature);
         self.suppressed_error_count = 0;
         self.last_error_report = now;
@@ -294,14 +301,20 @@ where
 /// Returns a report roughly every three seconds for a frontend to print or
 /// display; all other frames return `None`.
 pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
+    #[cfg(feature = "metrics")]
+    let frame_start = Instant::now();
+
     // Step 1: Process a pending hot reload before running systems.
     // The watcher bumps a generation counter; reloading while it differs from
     // the last processed value means events that arrive during a reload are
     // never lost.
     let generation = host.reload_generation.load(Ordering::Acquire);
     if generation != host.last_processed_generation {
-        println!();
-        println!("[host] === Hot-reload triggered ===");
+        tracing::info!(
+            target: telemetry_target::HOT_RELOAD,
+            generation,
+            "hot reload triggered"
+        );
         host.loaded_game.reload(
             &mut host.engine,
             &host.engine_api,
@@ -347,6 +360,14 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     host.frame_count += 1;
     let elapsed = host.last_report.elapsed().as_secs_f64();
     if elapsed < 3.0 {
+        // Repeated numerical state is recorded every frame through metrics,
+        // independent of the low-frequency console report.
+        #[cfg(feature = "metrics")]
+        record_frame_metrics(
+            host.engine.world().entity_count(),
+            frame_start.elapsed().as_secs_f64() * 1000.0,
+            host.last_measured_fps,
+        );
         return None;
     }
 
@@ -358,18 +379,34 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     host.last_measured_fps = fps;
     host.frame_count = 0;
     host.last_report = Instant::now();
+
+    #[cfg(feature = "metrics")]
+    record_frame_metrics(
+        report.entity_count,
+        frame_start.elapsed().as_secs_f64() * 1000.0,
+        fps,
+    );
+
     Some(report)
+}
+
+/// Record one frame's numerical state into the shared metrics recorder.
+#[cfg(feature = "metrics")]
+fn record_frame_metrics(entity_count: usize, frame_time_ms: f64, fps: f64) {
+    metrics::gauge!("ecs.entities").set(entity_count as f64);
+    metrics::histogram!("engine.frame_time_ms").record(frame_time_ms);
+    metrics::gauge!("engine.fps").set(fps);
 }
 
 /// Print the selected backend before any build output starts streaming.
 fn print_startup_configuration(workspace_root: &Path, module_config: &GameModuleConfig) {
-    println!("=== ECS Host ===");
-    println!("Workspace:   {}", workspace_root.display());
-    println!(
-        "Game module: {} ({:?})",
-        module_config.name, module_config.backend
+    tracing::info!(
+        target: telemetry_target::ENGINE,
+        workspace = %workspace_root.display(),
+        module = module_config.name,
+        backend = ?module_config.backend,
+        build_command = %module_config.build_command.join(" "),
+        watch_directory = module_config.watch_directory,
+        "ECS host starting"
     );
-    println!("Build cmd:   {}", module_config.build_command.join(" "));
-    println!("Watch dir:   {}", module_config.watch_directory);
-    println!();
 }

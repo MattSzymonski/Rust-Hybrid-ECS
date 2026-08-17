@@ -24,6 +24,7 @@ mod game_module;
 mod native_library;
 mod runner;
 mod runtime;
+mod telemetry;
 mod watcher;
 
 pub use config::{CSharpModuleConfig, GameModuleBackend, GameModuleConfig};
@@ -37,6 +38,7 @@ pub use pill_core::error::{
 };
 pub use runner::run;
 pub use runtime::{run_one_frame, setup, FrameReport, Host};
+pub use telemetry::init_telemetry;
 
 #[cfg(feature = "rendering")]
 pub use pill_engine::{EngineError, RenderViewport, RendererError, VirtualResolution};

@@ -397,18 +397,21 @@ impl CSharpRuntime {
     pub(crate) fn poll_reload(&mut self) -> u8 {
         let status = (self.poll_reload)();
         if status == POLL_REJECTED && self.last_poll_status != POLL_REJECTED {
-            eprintln!(
-                "[host] C# reload rejected: component or system signatures changed. \
-                 Restart the host to rebuild the native component registry and scheduler."
+            tracing::error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                "C# reload rejected: component or system signatures changed; restart the host to rebuild the native component registry and scheduler"
             );
         }
         if status == POLL_RELOADED {
             if self.verify_systems_unchanged() {
-                println!("[host] C# hot reload complete.");
+                tracing::info!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    "C# hot reload complete"
+                );
             } else {
-                eprintln!(
-                    "[host] Reloaded assembly exposes different system metadata than the \
-                     registered snapshot; restart the host to re-register systems."
+                tracing::error!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    "reloaded assembly exposes different system metadata than the registered snapshot; restart the host to re-register systems"
                 );
             }
         }

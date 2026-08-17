@@ -357,7 +357,11 @@ impl CommandQueue {
         } else {
             for err in &errors {
                 crate::profile_error!("deferred command failed: {}", err);
-                eprintln!("  [Deferred] {err}");
+                tracing::warn!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    error = %err,
+                    "deferred command failed"
+                );
             }
             Ok(())
         }

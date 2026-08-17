@@ -238,10 +238,11 @@ where
     // Deserialize the snapshot data into a generic JSON Value.
     let snapshot_json: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| {
-            eprintln!(
-                "[persistence] Failed to parse JSON for '{}': {}",
-                std::any::type_name::<T>(),
-                error
+            tracing::warn!(
+                target: pill_core::telemetry::telemetry_target::RESOURCES,
+                component_type = std::any::type_name::<T>(),
+                error = %error,
+                "failed to parse persisted JSON for component; data skipped"
             );
         })
         .ok()?;
@@ -250,10 +251,11 @@ where
     let default_instance = T::default();
     let default_json: serde_json::Value = serde_json::to_value(&default_instance)
         .map_err(|error| {
-            eprintln!(
-                "[persistence] Failed to serialize default for '{}': {}",
-                std::any::type_name::<T>(),
-                error
+            tracing::warn!(
+                target: pill_core::telemetry::telemetry_target::RESOURCES,
+                component_type = std::any::type_name::<T>(),
+                error = %error,
+                "failed to serialize default component; data skipped"
             );
         })
         .ok()?;
@@ -265,10 +267,11 @@ where
     match serde_json::from_value::<T>(merged) {
         Ok(value) => Some(Box::new(value)),
         Err(error) => {
-            eprintln!(
-                "[persistence] Failed to deserialize '{}': {}. Component data skipped.",
-                std::any::type_name::<T>(),
-                error
+            tracing::warn!(
+                target: pill_core::telemetry::telemetry_target::RESOURCES,
+                component_type = std::any::type_name::<T>(),
+                error = %error,
+                "failed to deserialize persisted component; data skipped"
             );
             None
         }

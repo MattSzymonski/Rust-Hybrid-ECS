@@ -47,7 +47,11 @@ pub(crate) fn build_game_module(
     config: &GameModuleConfig,
     cancel_flag: Option<(&AtomicU64, u64)>,
 ) -> Result<PathBuf, BuildError> {
-    println!("[host] Building {} module...", config.name);
+    tracing::info!(
+        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        module = config.name,
+        "building game module"
+    );
 
     // GameModuleConfig stores commands as static slices so callers can define
     // both Cargo and dotnet builds without shell-specific quoting. The first

@@ -237,7 +237,11 @@ pub unsafe extern "C" fn game_init(api: *const EngineApi) -> u32 {
             Err(error) => {
                 // Report the failure and abort the generation: the host keeps
                 // the previously loaded module when game_init returns non-zero.
-                eprintln!("[game_rs] failed to build a ball entity: {error}");
+                tracing::error!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    error = %error,
+                    "failed to build a ball entity; aborting this game generation"
+                );
                 return 1;
             }
         }

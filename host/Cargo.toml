@@ -11,7 +11,19 @@ notify = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 trait_type_map = { path = "../../Trait-Type-Map" }
+tracing = "0.1"
+metrics = { version = "0.24", optional = true }
 winit = { version = "0.30", optional = true }
 
 [features]
 rendering = ["pill_engine/rendering", "pill_core/rendering", "dep:winit"]
+# Enable Tracy profiling: engine profiling zones plus the Tracy tracing layer.
+profiling = ["pill_engine/profiling", "pill_core/tracy"]
+# Investigative fine-grained profiling zones.
+profiling-fine = ["profiling", "pill_engine/profiling-fine"]
+# Profiling with instrumentation verification (~50% overhead).
+profiling-verify = ["profiling", "pill_engine/profiling-verify"]
+# Repeated numerical measurements through the shared metrics recorder.
+metrics = ["dep:metrics", "pill_engine/metrics"]
+# Compile the simple developer log macros (`log!`, `warn!`, `error!`).
+dev-logs = ["pill_core/dev-logs"]

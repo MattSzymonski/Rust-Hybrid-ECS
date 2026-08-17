@@ -1587,6 +1587,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -1902,8 +1903,10 @@ dependencies = [
 name = "game"
 version = "0.1.0"
 dependencies = [
+ "pill_core",
  "pill_engine",
  "serde",
+ "tracing",
  "trait_type_map",
 ]
 
@@ -3215,6 +3218,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "metrics"
+version = "0.24.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89550ee9f79e88fef3119de263694973a8adb26c21d75322164fb8c493039fe2"
+dependencies = [
+ "portable-atomic",
+ "rapidhash",
+]
+
+[[package]]
 name = "miette"
 version = "7.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4161,11 +4174,19 @@ version = "0.1.0"
 dependencies = [
  "colored",
  "libloading 0.8.9",
+ "log",
+ "metrics",
  "miette",
  "notify",
  "pill_core_macros",
  "serde_json",
  "thiserror 2.0.19",
+ "tracing",
+ "tracing-appender",
+ "tracing-log",
+ "tracing-subscriber",
+ "tracing-tracy",
+ "tracy-client",
  "winit",
 ]
 
@@ -4184,6 +4205,7 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "criterion",
+ "metrics",
  "miette",
  "parking_lot",
  "pill_core",
@@ -4194,6 +4216,7 @@ dependencies = [
  "serde_json",
  "sysinfo",
  "thiserror 2.0.19",
+ "tracing",
  "tracy-client",
  "trait_type_map",
  "wgpu",
@@ -4204,11 +4227,13 @@ name = "pill_host"
 version = "0.1.0"
 dependencies = [
  "libloading 0.8.9",
+ "metrics",
  "notify",
  "pill_core",
  "pill_engine",
  "serde",
  "serde_json",
+ "tracing",
  "trait_type_map",
  "winit",
 ]
@@ -4224,6 +4249,7 @@ dependencies = [
  "pill_host",
  "pollster",
  "thiserror 2.0.19",
+ "tracing",
  "wgpu",
  "winit",
 ]
@@ -4679,6 +4705,15 @@ name = "range-alloc"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca45419789ae5a7899559e9512e58ca889e41f04f1f2445e9f4b290ceccd1d08"
+
+[[package]]
+name = "rapidhash"
+version = "4.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5da7e78a036ce858e8d55b7e7dc8ba3a88b78350fd2155d3591bbd966b58589e"
+dependencies = [
+ "rustversion",
+]
 
 [[package]]
 name = "rav1e"
@@ -5488,6 +5523,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7401a30af6cb5818bb64852270bb722533397edcfc7344954a38f420819ece2"
 
 [[package]]
+name = "symlink"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7973cce6668464ea31f176d85b13c7ab3bba2cb3b77a2ed26abd7801688010a"
+
+[[package]]
 name = "syn"
 version = "1.0.109"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5655,7 +5696,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "230a1b821ccbd75b185820a1f1ff7b14d21da1e442e22c0863ea5f08771a8874"
 dependencies = [
  "rustix 1.1.4",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5915,6 +5956,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-appender"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "050686193eb999b4bb3bc2acfa891a13da00f79734704c4b8b4ef1a10b368a3c"
+dependencies = [
+ "crossbeam-channel",
+ "symlink",
+ "thiserror 2.0.19",
+ "time",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "tracing-attributes"
 version = "0.1.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5947,6 +6001,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tracing-serde"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "704b1aeb7be0d0a84fc9828cae51dab5970fee5088f83d1dd7ee6f6246fc6ff1"
+dependencies = [
+ "serde",
+ "tracing-core",
+]
+
+[[package]]
 name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5956,12 +6020,26 @@ dependencies = [
  "nu-ansi-term",
  "once_cell",
  "regex-automata",
+ "serde",
+ "serde_json",
  "sharded-slab",
  "smallvec",
  "thread_local",
  "tracing",
  "tracing-core",
  "tracing-log",
+ "tracing-serde",
+]
+
+[[package]]
+name = "tracing-tracy"
+version = "0.11.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0eaa1852afa96e0fe9e44caa53dc0bd2d9d05e0f2611ce09f97f8677af56e4ba"
+dependencies = [
+ "tracing-core",
+ "tracing-subscriber",
+ "tracy-client",
 ]
 
 [[package]]

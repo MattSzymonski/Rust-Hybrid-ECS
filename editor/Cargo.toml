@@ -14,3 +14,14 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 miette = { version = "7", features = ["derive"] }
+tracing = "0.1"
+
+[features]
+# Enable Tracy profiling through the shared telemetry stack.
+profiling = ["host/profiling"]
+# Investigative fine-grained profiling zones.
+profiling-fine = ["host/profiling-fine"]
+# Repeated numerical measurements through the shared metrics recorder.
+metrics = ["host/metrics"]
+# Compile the simple developer log macros (`log!`, `warn!`, `error!`).
+dev-logs = ["host/dev-logs"]

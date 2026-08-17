@@ -12,6 +12,31 @@ thiserror = "2"
 miette = { version = "7", features = ["derive", "fancy"] }
 colored = "2"
 winit = { version = "0.30", optional = true }
+tracing = "0.1"
+tracing-log = "0.2"
+# The default `tracing-log` feature would auto-bridge `log` inside
+# `SubscriberInitExt::init`; the bridge is owned explicitly in the telemetry
+# builder instead, so it is installed exactly once and its failure is reported
+# as a no-op rather than a panic.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "smallvec",
+    "fmt",
+    "ansi",
+    "std",
+    "registry",
+    "env-filter",
+    "json",
+] }
+tracing-appender = "0.2"
+tracing-tracy = { version = "0.11", optional = true }
+tracy-client = { version = "0.18", optional = true }
+metrics = { version = "0.24", optional = true }
+
+[dev-dependencies]
+log = "0.4"
 
 [features]
 rendering = ["dep:winit"]
+dev-logs = []
+tracy = ["dep:tracing-tracy", "dep:tracy-client"]
+metrics = ["dep:metrics"]

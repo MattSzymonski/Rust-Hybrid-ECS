@@ -8,8 +8,10 @@ crate-type = ["cdylib"]
 
 [dependencies]
 pill_engine = { path = "../engine" }
+pill_core = { path = "../pill_core" }
 trait_type_map = { path = "../../Trait-Type-Map" }
 serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
 
 [features]
 rendering = ["pill_engine/rendering"]

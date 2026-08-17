@@ -160,10 +160,11 @@ pub(crate) fn spawn_file_watcher(
         });
     }
 
-    println!(
-        "[host] Watching '{}' for changes in: {}",
-        config.name,
-        watch_path.display()
+    tracing::info!(
+        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        module = config.name,
+        watch_directory = %watch_path.display(),
+        "watching for source changes"
     );
 
     // Step 2: Create the watcher with a minimal callback that forwards
@@ -186,7 +187,13 @@ pub(crate) fn spawn_file_watcher(
             }
             // Watching must never panic inside the callback, which some
             // backends run on their own threads; report and continue.
-            Err(error) => eprintln!("[host] File watcher error: {error}"),
+            Err(error) => {
+                tracing::error!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    error = %error,
+                    "file watcher error"
+                );
+            }
         },
         Config::default(),
     )
@@ -239,7 +246,11 @@ pub(crate) fn spawn_file_watcher(
                     changed_paths.len() - REPORTED_PATH_LIMIT
                 ));
             }
-            println!("[host] Change detected: {report}");
+            tracing::debug!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                changed_paths = %report,
+                "source change detected"
+            );
 
             // Bump the reload generation. The main loop compares it against
             // the last processed value, so signals are never overwritten.

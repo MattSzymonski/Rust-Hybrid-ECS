@@ -553,10 +553,10 @@ impl Engine {
                         "duplicate parallel-iterator labels this frame: {:?} - two iterators sharing a .label() corrupt per-label timing",
                         duplicates
                     );
-                    eprintln!(
-                        "WARNING: duplicate parallel-iterator labels this frame: {:?}. \
-                         Two iterators sharing a .label() corrupt per-label timing.",
-                        duplicates
+                    tracing::warn!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        labels = ?duplicates,
+                        "duplicate parallel-iterator labels this frame; two iterators sharing a .label() corrupt per-label timing"
                     );
                 }
                 timing.visited_iterator_labels.clear();
@@ -586,6 +586,19 @@ impl Engine {
                 commands_executed,
                 self.world.commands_executed_this_frame as f64
             );
+
+            // Repeated numerical state also flows through the shared `metrics`
+            // recorder so it can reach HUDs, files, and remote sinks without
+            // duplicating the Tracy plots above.
+            #[cfg(feature = "metrics")]
+            {
+                metrics::gauge!("ecs.entities").set(self.world.entity_count() as f64);
+                metrics::gauge!("ecs.archetypes").set(self.world.archetypes.len() as f64);
+                metrics::gauge!("ecs.systems").set(self.systems.len() as f64);
+                metrics::gauge!("ecs.components").set(self.world.component_registry.len() as f64);
+                metrics::histogram!("engine.frame_time_ms")
+                    .record(frame_start.elapsed().as_secs_f64() * 1000.0);
+            }
         } // <- frame zone ends here
 
         // FPS limiter - sleep remaining budget OUTSIDE the frame zone

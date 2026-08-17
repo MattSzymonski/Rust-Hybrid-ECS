@@ -116,13 +116,20 @@ impl GameLibrary {
                 source,
             }
         })?;
-        println!("[host] Copied DLL to: {}", temporary_path.display());
+        tracing::debug!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            path = %temporary_path.display(),
+            "copied game DLL"
+        );
 
         // Step 3: Load the copy and validate its required exports.
         // SAFETY: The configured build just produced this module and its
         // required exports are validated before the handle is returned.
         let game_library = unsafe { Self::load(&temporary_path, temporary_path.clone()) }?;
-        println!("[host] Game DLL loaded successfully.");
+        tracing::info!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            "game DLL loaded successfully"
+        );
         Ok(game_library)
     }
 

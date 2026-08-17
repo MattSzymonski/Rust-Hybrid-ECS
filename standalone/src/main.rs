@@ -20,6 +20,23 @@ use error::StandaloneError;
 use host::{engine_report, install_engine_report_handler};
 
 // =============================================================================
+// Telemetry
+// =============================================================================
+
+/// Install the shared telemetry stack before the execution path starts.
+///
+/// Terminal logging is always active. A file lane is added when `ECS_LOG_DIR`
+/// is set. When the `profiling` feature is enabled, `profile::*` spans are
+/// routed to Tracy through an independent filter.
+fn init_telemetry() {
+    use std::path::PathBuf;
+    let file_directory = std::env::var_os("ECS_LOG_DIR").map(PathBuf::from);
+    if let Err(error) = host::init_telemetry(file_directory) {
+        eprintln!("[standalone] telemetry setup failed: {error}");
+    }
+}
+
+// =============================================================================
 // Headless Mode
 // =============================================================================
 
@@ -50,5 +67,15 @@ fn dispatch() -> Result<(), StandaloneError> {
 /// Install the report handler once and report the final error once.
 fn main() -> miette::Result<()> {
     install_engine_report_handler();
-    dispatch().map_err(engine_report)
+    init_telemetry();
+    dispatch().map_err(|error| {
+        // Error correlation: the fatal failure also enters the tracing lane
+        // so it appears inside any active spans and log files.
+        tracing::error!(
+            target: pill_core::telemetry::telemetry_target::ENGINE,
+            error = %error,
+            "host terminated with an error"
+        );
+        engine_report(error)
+    })
 }

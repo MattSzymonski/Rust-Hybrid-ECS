@@ -127,12 +127,18 @@ impl LoadedGame {
             // reports the outcome and logs any rejection.
             Self::CSharp(runtime) => match build_game_module(workspace_root, config, cancel_flag) {
                 Ok(_) => {
-                    println!("[host] C# build complete; polling managed loader.");
+                    tracing::info!(
+                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        "C# build complete; polling managed loader"
+                    );
                     runtime.poll_reload();
                 }
                 Err(error) => {
-                    eprintln!("[host] C# build failed: {error}");
-                    eprintln!("[host] Keeping the currently loaded C# game assembly.");
+                    tracing::error!(
+                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        error = %error,
+                        "C# build failed; keeping the currently loaded C# game assembly"
+                    );
                 }
             },
         }
@@ -179,8 +185,11 @@ fn reload_native(
     let output_path = match build_game_module(workspace_root, config, cancel_flag) {
         Ok(path) => path,
         Err(error) => {
-            eprintln!("[host] Build failed: {error}");
-            eprintln!("[host] Keeping old game module. Fix compilation errors and save again.");
+            tracing::error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                error = %error,
+                "build failed; keeping the old game module"
+            );
             return;
         }
     };
@@ -191,8 +200,11 @@ fn reload_native(
     let new_library = match GameLibrary::load_copy(&output_path, workspace_root) {
         Ok(library) => library,
         Err(error) => {
-            eprintln!("[host] Failed to load new library: {error}");
-            eprintln!("[host] Keeping old game module. Fix errors and save again.");
+            tracing::error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                error = %error,
+                "failed to load the new library; keeping the old game module"
+            );
             return;
         }
     };
@@ -207,23 +219,31 @@ fn reload_native(
 
     // Registered native system closures can point into the old DLL. Remove
     // them before game_init installs closures from the replacement module.
-    println!("[host] === Reload step 1/4: clearing old systems ===");
+    tracing::debug!(
+        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        "reload step 1/4: clearing old systems"
+    );
     engine.clear_systems();
-    println!("[host] === Reload step 2/4: calling game_init on new DLL ===");
+    tracing::debug!(
+        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        "reload step 2/4: calling game_init on the new module"
+    );
     if new_library.call_game_init(engine_api) != 0 {
         // The new generation failed to register itself. Roll the engine back
         // to the previous module: game_init must be idempotent, re-registering
         // the same components and systems and only filling entities up to a
         // target count.
-        eprintln!(
-            "[host] New game module failed to initialize; rolling back to the previous generation."
+        tracing::error!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            "new game module failed to initialize; rolling back to the previous generation"
         );
         engine.clear_systems();
         let rollback_status = current.call_game_init(engine_api);
         if rollback_status != 0 {
-            eprintln!(
-                "[host] Rollback of the previous generation also failed (status {rollback_status}); \
-                 the host continues without gameplay systems."
+            tracing::error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                status = rollback_status,
+                "rollback of the previous generation also failed; the host continues without gameplay systems"
             );
         }
         return;
@@ -251,29 +271,35 @@ fn reload_native(
     if changed_type_names.is_empty() {
         // Avoid touching archetype storage when every persisted layout is
         // byte-for-byte compatible with the previous generation.
-        println!("[host] Schema unchanged for all persistable component types — fast path.");
+        tracing::debug!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            "schema unchanged for all persistable component types — fast path"
+        );
     } else {
         // Migrate only changed component types. Unchanged columns keep their
         // allocations and component ticks, which makes the common reload path
         // both faster and less disruptive to change detection.
-        println!(
-            "[host] === Reload step 3/4: selectively migrating {} component type(s) ===",
-            changed_type_names.len()
+        tracing::debug!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            changed_types = changed_type_names.len(),
+            "reload step 3/4: selectively migrating changed component types"
         );
         let report = engine.world_mut().migrate_changed_persistable_components(
             &previous_metadata_by_name,
             &changed_type_names,
         );
 
-        println!(
-            "[host] Selective migration complete: {} type(s), {} entities.",
-            report.migrated_type_count, report.migrated_entity_count
+        tracing::debug!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            migrated_types = report.migrated_type_count,
+            migrated_entities = report.migrated_entity_count,
+            "selective migration complete"
         );
         if !report.skipped_type_names.is_empty() {
-            eprintln!(
-                "[host] Selective migration skipped {} type(s): {:?}",
-                report.skipped_type_names.len(),
-                report.skipped_type_names
+            tracing::warn!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                skipped_types = ?report.skipped_type_names,
+                "selective migration skipped some component types"
             );
         }
     }
@@ -281,7 +307,10 @@ fn reload_native(
     // Do not unload the previous DLL. Persist metadata, component operations,
     // or other engine-owned pointers may still reference its executable code.
     // Moving it into the graveyard keeps those addresses valid permanently.
-    println!("[host] === Reload step 4/4: archiving old DLL, swapping ===");
+    tracing::debug!(
+        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        "reload step 4/4: archiving old DLL, swapping generation"
+    );
     old_libraries.push(std::mem::replace(current, new_library));
 
     // Keep the graveyard bounded. Engine-owned pointers only reference the
@@ -292,9 +321,10 @@ fn reload_native(
         // temporary copy on disk; cleanup errors are reported by the Drop.
         drop(old_libraries.remove(0));
     }
-    println!(
-        "[host] Hot-reload complete ({} entities, {} old libs in graveyard).",
-        engine.world().entity_count(),
-        old_libraries.len()
+    tracing::info!(
+        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        entities = engine.world().entity_count(),
+        graveyard = old_libraries.len(),
+        "hot reload complete"
     );
 }

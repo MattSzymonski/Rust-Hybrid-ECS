@@ -44,9 +44,23 @@ const STATS_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 /// Stable coordinate space used by the bouncing-ball game systems.
 const GAME_VIRTUAL_RESOLUTION: VirtualResolution = VirtualResolution::new(800.0, 600.0);
 
+/// Install the shared telemetry stack (terminal, optional file, optional
+/// Tracy) before Dioxus takes over the event loop.
+///
+/// A file lane is added when `ECS_LOG_DIR` is set. The `profiling` feature
+/// routes `profile::*` spans to Tracy through an independent filter.
+fn init_telemetry() {
+    use std::path::PathBuf;
+    let file_directory = std::env::var_os("ECS_LOG_DIR").map(PathBuf::from);
+    if let Err(error) = host::init_telemetry(file_directory) {
+        eprintln!("[editor] telemetry setup failed: {error}");
+    }
+}
+
 /// Create the Dioxus window and attach a rendering host to that same window.
 fn main() {
     install_engine_report_handler();
+    init_telemetry();
 
     let config = Config::new()
         .with_disable_context_menu(true)
@@ -64,6 +78,11 @@ fn main() {
                 Err(error) => {
                     // The editor cannot render without its engine surface;
                     // report the typed failure once and stop the process.
+                    tracing::error!(
+                        target: pill_core::telemetry::telemetry_target::ENGINE,
+                        error = %error,
+                        "editor rendering host setup failed"
+                    );
                     eprintln!("{:?}", engine_report(error));
                     std::process::exit(1);
                 }

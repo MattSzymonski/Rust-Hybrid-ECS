@@ -222,6 +222,13 @@ fn lcg() -> f32 {
 // ---- Main ----
 
 fn main() {
+    // Install the telemetry stack: terminal logs plus the Tracy layer that
+    // routes `profile::*` tracing spans (the `profile_scope!` zones below)
+    // into Tracy. The direct client is also started so frame marks, plots,
+    // and messages keep working.
+    let _ = pill_core::telemetry::TelemetryBuilder::new()
+        .with_tracy(true)
+        .init();
     crate::profile_init!();
     crate::profile_thread!("main");
 

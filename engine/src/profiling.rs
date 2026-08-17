@@ -66,6 +66,22 @@
 //! ```
 
 // =============================================================================
+// Profiling Targets
+// =============================================================================
+
+/// Tracing target of coarse profiling spans (`profile::coarse`).
+///
+/// Coarse spans (frame, ECS, render, passes) are always routed to Tracy when
+/// profiling is enabled; they are never affected by terminal log verbosity.
+pub const PROFILE_COARSE_TARGET: &str = pill_core::telemetry::telemetry_target::PROFILE_COARSE;
+
+/// Tracing target of fine investigative spans (`profile::fine`).
+///
+/// Fine spans are feature-gated behind `profiling-fine` and normally stay
+/// disabled because they perturb timing measurements.
+pub const PROFILE_FINE_TARGET: &str = pill_core::telemetry::telemetry_target::PROFILE_FINE;
+
+// =============================================================================
 // Free Functions
 // =============================================================================
 
@@ -208,87 +224,138 @@ mod enabled {
         let _ = client();
     }
 
-    /// RAII guard for a static-name CPU zone. Created by `profile_scope!("name")`.
+    /// RAII guard for a tracing-backed CPU zone. Created by
+    /// `profile_scope!("name")`.
+    ///
+    /// The zone is a `tracing` span on the `profile::coarse` (or
+    /// `profile::fine`) lane. An application that installs a `TracyLayer`
+    /// with that target enabled turns the span into a Tracy zone; without
+    /// such a layer the span is a no-op. This is the single CPU-zone API.
     #[must_use = "zone closes on drop - bind to a variable"]
     pub struct TracyZone {
-        #[allow(dead_code)]
-        inner: Option<tracy_client::Span>,
+        span: Option<tracing::span::EnteredSpan>,
     }
 
     impl TracyZone {
+        /// Wrap an already-created static-name tracing span.
         #[doc(hidden)]
         #[inline]
-        pub fn new_static(
-            name: &'static str,
-            function: &'static str,
-            file: &'static str,
-            line: u32,
-        ) -> Self {
-            let inner = Client::is_running()
-                .then(|| client().span_alloc(Some(name), function, file, line, 0));
-            Self { inner }
+        pub fn new_static(_name: &'static str, span: tracing::Span) -> Self {
+            Self {
+                span: Some(span.entered()),
+            }
         }
 
+        /// Create a dynamic-name zone from an owned string.
         #[doc(hidden)]
         #[inline]
-        pub fn new_dynamic(name: &str, function: &str, file: &str, line: u32) -> Self {
-            let inner = Client::is_running()
-                .then(|| client().span_alloc(Some(name), function, file, line, 0));
-            Self { inner }
+        pub fn new_dynamic(name: &str, _function: &str, _file: &str, _line: u32) -> Self {
+            let span = tracing::trace_span!(
+                target: crate::profiling::PROFILE_COARSE_TARGET,
+                "profile",
+                name = tracing::field::Empty,
+                details = tracing::field::Empty,
+            );
+            if span.is_disabled() {
+                return Self { span: None };
+            }
+            let dynamic_name = name.to_owned();
+            let entered = span.entered();
+            entered.record("name", &dynamic_name);
+            Self {
+                span: Some(entered),
+            }
         }
 
         /// Same as [`new_dynamic`](Self::new_dynamic) but the name is
-        /// built lazily via a closure.  The closure only runs when Tracy
-        /// is running - no `format!()` allocation when profiling is off.
+        /// built lazily via a closure. The closure only runs when the span
+        /// is enabled - no `format!()` allocation when profiling is off.
         #[doc(hidden)]
         #[inline]
         pub fn new_dynamic_lazy(
             name: impl FnOnce() -> String,
-            function: &str,
-            file: &str,
-            line: u32,
+            _function: &str,
+            _file: &str,
+            _line: u32,
         ) -> Self {
-            let inner = Client::is_running().then(|| {
-                let name = name();
-                client().span_alloc(Some(&name), function, file, line, 0)
-            });
-            Self { inner }
+            let span = tracing::trace_span!(
+                target: crate::profiling::PROFILE_COARSE_TARGET,
+                "profile",
+                name = tracing::field::Empty,
+                details = tracing::field::Empty,
+            );
+            if span.is_disabled() {
+                return Self { span: None };
+            }
+            let dynamic_name = name();
+            let entered = span.entered();
+            entered.record("name", &dynamic_name);
+            Self {
+                span: Some(entered),
+            }
+        }
+
+        /// Same as [`new_dynamic_lazy`](Self::new_dynamic_lazy) but on the
+        /// `profile::fine` lane for investigative fine-grained spans.
+        #[doc(hidden)]
+        #[inline]
+        pub fn new_dynamic_lazy_fine(
+            name: impl FnOnce() -> String,
+            _function: &str,
+            _file: &str,
+            _line: u32,
+        ) -> Self {
+            let span = tracing::trace_span!(
+                target: crate::profiling::PROFILE_FINE_TARGET,
+                "profile",
+                name = tracing::field::Empty,
+                details = tracing::field::Empty,
+            );
+            if span.is_disabled() {
+                return Self { span: None };
+            }
+            let dynamic_name = name();
+            let entered = span.entered();
+            entered.record("name", &dynamic_name);
+            Self {
+                span: Some(entered),
+            }
         }
 
         /// Attach a diagnostic message to this zone. The text appears in
-        /// Tracy's zone tooltip / detail view.
-        ///
-        /// Skips formatting and allocation when no profiler is connected.
-        ///
-        /// Prefer [`text_lazy`](Self::text_lazy) when the message is
-        /// expensive to construct (e.g. calls `format!()` or
-        /// `get_archetype_info()`).  With `text`, the caller builds the
-        /// `Arguments` eagerly which can skew execution timing.
+        /// Tracy's zone tooltip / detail view through the recorded
+        /// `details` field.
+        #[cfg(feature = "profiling")]
         #[inline]
         pub fn text(&self, msg: Arguments<'_>) {
-            if let Some(span) = &self.inner {
-                if Client::is_connected() {
-                    let text = format!("{}", msg);
-                    span.emit_text(&text);
+            if let Some(span) = &self.span {
+                span.record("details", tracing::field::display(msg));
+            }
+        }
+
+        /// No-op detail recording under `profiling-minimal`.
+        #[cfg(not(feature = "profiling"))]
+        #[inline]
+        pub fn text(&self, _msg: Arguments<'_>) {}
+
+        /// Attach a lazily-built diagnostic message. The closure is only
+        /// invoked when the span is enabled, so expensive operations
+        /// (String allocation, archetype info formatting) are skipped
+        /// during normal execution.
+        #[cfg(feature = "profiling")]
+        #[inline]
+        pub fn text_lazy(&self, f: impl FnOnce() -> String) {
+            if let Some(span) = &self.span {
+                if !span.is_disabled() {
+                    span.record("details", tracing::field::display(f()));
                 }
             }
         }
 
-        /// Attach a lazily-built diagnostic message.  The closure is
-        /// only invoked when Tracy is actively connected and capturing,
-        /// so expensive operations (String allocation, archetype info
-        /// formatting, etc.) are skipped during normal execution.
-        ///
-        /// Use this instead of [`text`](Self::text) for any message
-        /// that requires an allocation or non-trivial computation.
+        /// No-op lazy detail recording under `profiling-minimal`.
+        #[cfg(not(feature = "profiling"))]
         #[inline]
-        pub fn text_lazy(&self, f: impl FnOnce() -> String) {
-            if let Some(span) = &self.inner {
-                if Client::is_connected() {
-                    span.emit_text(&f());
-                }
-            }
-        }
+        pub fn text_lazy(&self, _f: impl FnOnce() -> String) {}
     }
 
     /// Mark end of a frame for Tracy's frame-time graphs.
@@ -405,12 +472,7 @@ mod enabled {
     impl TracyZone {
         #[doc(hidden)]
         #[inline(always)]
-        pub fn new_static(
-            _name: &'static str,
-            _fn: &'static str,
-            _file: &'static str,
-            _line: u32,
-        ) -> Self {
+        pub fn new_static(_name: &'static str, _span: tracing::Span) -> Self {
             Self
         }
 
@@ -422,6 +484,16 @@ mod enabled {
 
         #[inline(always)]
         pub fn new_dynamic_lazy(
+            _name: impl FnOnce() -> String,
+            _function: &str,
+            _file: &str,
+            _line: u32,
+        ) -> Self {
+            Self
+        }
+
+        #[inline(always)]
+        pub fn new_dynamic_lazy_fine(
             _name: impl FnOnce() -> String,
             _function: &str,
             _file: &str,
@@ -483,10 +555,13 @@ macro_rules! profile_init {
     () => {};
 }
 
-/// Creates a scoped CPU profiling zone.
+/// Creates a scoped CPU profiling zone on the `profile::coarse` lane.
 ///
 /// Active under both `profiling` and `profiling-minimal`. Zone text/details
 /// (the `[...]` form) only emit under `profiling`.
+///
+/// The zone is a `tracing` span routed to Tracy through `TracyLayer` when the
+/// application installs it with the `profile::coarse` target enabled.
 ///
 /// ```ignore
 /// // Static name (zero-allocation, preferred):
@@ -498,13 +573,28 @@ macro_rules! profile_init {
 /// // Dynamic name (use sparingly - allocates):
 /// let _zone = profile_scope!("system: {}", name);
 /// ```
+#[cfg(any(feature = "profiling", feature = "profiling-minimal"))]
 #[macro_export]
 macro_rules! profile_scope {
     ($name:literal) => {
-        $crate::profiling::TracyZone::new_static($name, module_path!(), file!(), line!())
+        $crate::profiling::TracyZone::new_static(
+            $name,
+            $crate::tracing::trace_span!(
+                target: $crate::profiling::PROFILE_COARSE_TARGET,
+                $name,
+                details = $crate::tracing::field::Empty,
+            ),
+        )
     };
     ($name:literal, [ $( $detail:tt ),* $(,)? ]) => {{
-        let zone = $crate::profiling::TracyZone::new_static($name, module_path!(), file!(), line!());
+        let zone = $crate::profiling::TracyZone::new_static(
+            $name,
+            $crate::tracing::trace_span!(
+                target: $crate::profiling::PROFILE_COARSE_TARGET,
+                $name,
+                details = $crate::tracing::field::Empty,
+            ),
+        );
         $( $crate::profile_scope_detail!(zone, $detail); )*
         zone
     }};
@@ -526,6 +616,81 @@ macro_rules! profile_scope {
             line!(),
         )
     };
+}
+
+/// Compile-time no-op of [`profile_scope!`] when no profiling feature is on.
+#[cfg(not(any(feature = "profiling", feature = "profiling-minimal")))]
+#[macro_export]
+macro_rules! profile_scope {
+    ($name:literal) => {
+        $crate::profiling::TracyZone::new_static($name, $crate::tracing::Span::none())
+    };
+    ($name:literal, [ $( $detail:tt ),* $(,)? ]) => {
+        $crate::profiling::TracyZone::new_static($name, $crate::tracing::Span::none())
+    };
+    ($fmt:literal $(, $fmt_arg:expr)* ; [ $( $detail:tt ),* $(,)? ]) => {
+        $crate::profiling::TracyZone::new_dynamic_lazy(
+            || format!($fmt, $($fmt_arg),*),
+            module_path!(),
+            file!(),
+            line!(),
+        )
+    };
+    ($fmt:literal $(, $arg:expr)* $(,)?) => {
+        $crate::profiling::TracyZone::new_dynamic_lazy(
+            || format!($fmt, $($arg),*),
+            module_path!(),
+            file!(),
+            line!(),
+        )
+    };
+}
+
+/// Creates a fine-grained investigative CPU zone on the `profile::fine` lane.
+///
+/// Only active under `profiling-fine` (which implies `profiling`). Fine zones
+/// perturb timing and are intended for temporary deep investigation; they
+/// compile away completely when `profiling-fine` is disabled.
+#[cfg(feature = "profiling-fine")]
+#[macro_export]
+macro_rules! profile_scope_fine {
+    ($name:literal) => {
+        $crate::profiling::TracyZone::new_static(
+            $name,
+            $crate::tracing::trace_span!(
+                target: $crate::profiling::PROFILE_FINE_TARGET,
+                $name,
+                details = $crate::tracing::field::Empty,
+            ),
+        )
+    };
+    ($name:literal, [ $( $detail:tt ),* $(,)? ]) => {{
+        let zone = $crate::profiling::TracyZone::new_static(
+            $name,
+            $crate::tracing::trace_span!(
+                target: $crate::profiling::PROFILE_FINE_TARGET,
+                $name,
+                details = $crate::tracing::field::Empty,
+            ),
+        );
+        $( $crate::profile_scope_detail!(zone, $detail); )*
+        zone
+    }};
+    ($fmt:literal $(, $arg:expr)* $(,)?) => {
+        $crate::profiling::TracyZone::new_dynamic_lazy_fine(
+            || format!($fmt, $($arg),*),
+            module_path!(),
+            file!(),
+            line!(),
+        )
+    };
+}
+
+/// Compile-time no-op of [`profile_scope_fine!`].
+#[cfg(not(feature = "profiling-fine"))]
+#[macro_export]
+macro_rules! profile_scope_fine {
+    ($($any:tt)*) => {};
 }
 
 /// Internal helper: dispatches a single detail element to `zone.text()`.
