@@ -314,8 +314,7 @@ impl CSharpRuntime {
             }
         });
         if let Some(index) = startup_failed {
-            // Roll back the queued commands so the failure is truly
-            // transactional, even if setup ever becomes retryable.
+            // Roll back the queued commands so the failure is truly transactional.
             engine.discard_deferred_commands();
             return Err(CSharpError::StartupFailed { index });
         }
@@ -333,8 +332,9 @@ impl CSharpRuntime {
         }
         let mut system_snapshot = Vec::with_capacity(count as usize);
         for system_index in 0..count {
-            let mut managed_access = Vec::with_capacity(access_count(system_index) as usize);
-            for access_index in 0..access_count(system_index) {
+            let system_access_count = access_count(system_index);
+            let mut managed_access = Vec::with_capacity(system_access_count as usize);
+            for access_index in 0..system_access_count {
                 let mut item = NativeSystemAccess {
                     component_key: 0,
                     component_key_high: 0,

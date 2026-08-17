@@ -25,10 +25,10 @@ mod build_runner;
 mod config;
 /// Scheduler-aware C# backend for the native project host.
 mod csharp;
-/// Lifecycle management for the active native or managed project module.
-mod project_module;
 /// Native project-library loading and Windows-safe temporary-copy handling.
 mod native_library;
+/// Lifecycle management for the active native or managed project module.
+mod project_module;
 /// Complete standalone application runner owned by the host crate.
 mod runner;
 /// Engine ownership and frontend-facing frame orchestration.

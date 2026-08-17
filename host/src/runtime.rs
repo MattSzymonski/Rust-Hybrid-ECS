@@ -30,8 +30,8 @@ use pill_engine::{Engine, EngineApi};
 use pill_engine::{RenderViewport, Renderer, RendererError, RendererWindow, VirtualResolution};
 
 // Current crate
-use crate::project_module::LoadedProject;
 use crate::native_library::cleanup_temporary_files;
+use crate::project_module::LoadedProject;
 use crate::watcher::spawn_file_watcher;
 use crate::{ProjectModuleBackend, ProjectModuleConfig};
 
@@ -239,7 +239,8 @@ pub fn setup(module_config: ProjectModuleConfig) -> Result<Host, HostError> {
     let engine_api = EngineApi::new(&mut engine);
 
     // Step 4: Build and load the project module, then start its source watcher.
-    let loaded_project = LoadedProject::start(&mut engine, &engine_api, &workspace_root, &module_config)?;
+    let loaded_project =
+        LoadedProject::start(&mut engine, &engine_api, &workspace_root, &module_config)?;
 
     let reload_generation = Arc::new(AtomicU64::new(0));
     spawn_file_watcher(

@@ -411,7 +411,6 @@ fn validate_field_manifest(field: &ManagedFieldManifest, parent_size: usize) -> 
                 field.name
             ));
         }
-        // Sibling fields must not share any byte.
         validate_sibling_non_overlap(&field.fields, &field.name)?;
         for nested in &field.fields {
             worklist.push((nested, field.size, depth + 1));

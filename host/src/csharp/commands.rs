@@ -155,11 +155,17 @@ pub(super) extern "C" fn ffi_queue_create(
         if !reserved.contains(&entity) {
             return 5;
         }
-        // Step 2: view the descriptor array as a slice.
-        // SAFETY: `blobs` is non-null whenever `count` is non-zero (checked
-        // above) and `count` is capped at MAX_COMPONENTS_PER_CREATE, so the
-        // slice stays within the array the managed caller pinned for this call.
-        let blobs = unsafe { std::slice::from_raw_parts(blobs, count as usize) };
+        // Step 2: view the descriptor array as a slice. The descriptor
+        // pointer is legitimately null when the managed caller supplied no
+        // components, so the zero-count case never builds a raw slice.
+        let blobs: &[NativeComponentBlob] = if count == 0 {
+            &[]
+        } else {
+            // SAFETY: `blobs` is non-null whenever `count` is non-zero (checked
+            // above) and `count` is capped at MAX_COMPONENTS_PER_CREATE, so the
+            // slice stays within the array the managed caller pinned for this call.
+            unsafe { std::slice::from_raw_parts(blobs, count as usize) }
+        };
         // Step 3: decode every blob into a native or dynamic adder, rejecting
         // duplicate identities, undeclared bindings, and malformed payloads.
         let mut seen = HashSet::with_capacity(blobs.len());

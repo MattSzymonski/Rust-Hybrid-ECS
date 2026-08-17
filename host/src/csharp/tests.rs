@@ -35,6 +35,24 @@ use super::context::ActiveSystemGuard;
 use super::queries::{ffi_get_component_chunk, ffi_get_entity_chunk};
 
 // =============================================================================
+// Constants
+// =============================================================================
+
+// ABI status codes returned by the native callbacks under test. Every
+// callback reports `1` on success; the chunk queries report `3` when no
+// managed system is active, while the command callbacks additionally report
+// `4` when the declared command scope cannot be entered and `5` when the
+// entity generation no longer matches the live handle.
+const ABI_SUCCESS: u8 = 1;
+const ABI_OUT_OF_SCOPE: u8 = 3;
+const ABI_COMMAND_SCOPE_DENIED: u8 = 4;
+const ABI_STALE_ENTITY_GENERATION: u8 = 5;
+
+/// Number of entities populated by [`setup_test_world`]; row-count assertions
+/// must agree with this bound.
+const TEST_WORLD_ENTITY_COUNT: usize = 100;
+
+// =============================================================================
 // Test Helpers
 // =============================================================================
 
@@ -112,7 +130,7 @@ fn setup_test_world(engine: &mut Engine) -> ComponentBindings {
             .unwrap();
     let physics = bindings[&stable_id].component_id();
     // Step 2: Populate entities with both shared and dynamic components.
-    for _ in 0..100 {
+    for _ in 0..TEST_WORLD_ENTITY_COUNT {
         let entity = engine
             .world_mut()
             .create_entity()
@@ -193,7 +211,7 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
         .run_deferred_commands(|world, queue| {
             let _guard = ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
             let mut entity = std::mem::MaybeUninit::uninit();
-            assert_eq!(ffi_reserve_entity(entity.as_mut_ptr()), 1);
+            assert_eq!(ffi_reserve_entity(entity.as_mut_ptr()), ABI_SUCCESS);
             // SAFETY: successful reserve initialized the output.
             let entity = unsafe { entity.assume_init() };
             let blobs = [
@@ -212,7 +230,7 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
             ];
             assert_eq!(
                 ffi_queue_create(&entity, blobs.as_ptr(), blobs.len() as u32),
-                1
+                ABI_SUCCESS
             );
             created = Some(entity);
         })
@@ -245,7 +263,7 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
                     std::ptr::from_ref(&dynamic_b_value).cast(),
                     4,
                 ),
-                1
+                ABI_SUCCESS
             );
             assert_eq!(
                 ffi_queue_remove_component(
@@ -253,7 +271,7 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
                     dynamic_a_key.0 as u64,
                     (dynamic_a_key.0 >> 64) as u64,
                 ),
-                1
+                ABI_SUCCESS
             );
         })
         .unwrap();
@@ -274,7 +292,7 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
     engine
         .run_deferred_commands(|world, queue| {
             let _guard = ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
-            assert_eq!(ffi_queue_destroy(&entity), 1);
+            assert_eq!(ffi_queue_destroy(&entity), ABI_SUCCESS);
         })
         .unwrap();
     assert_eq!(engine.world().entity_count(), 0);
@@ -292,17 +310,19 @@ fn managed_command_abi_rejects_stale_generations_and_undeclared_commands() {
         .build()
         .unwrap();
     assert!(engine.world_mut().destroy_entity(stale));
+    // Reserve the freed slot so it is reissued with a fresh generation; the
+    // old handle must then be rejected as stale by every queue callback.
     let _replacement = engine.world_mut().reserve_entity();
     engine
         .run_deferred_commands(|world, queue| {
             let _guard = ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
-            assert_eq!(ffi_queue_destroy(&stale), 5);
+            assert_eq!(ffi_queue_destroy(&stale), ABI_STALE_ENTITY_GENERATION);
         })
         .unwrap();
     engine
         .run_deferred_commands(|world, queue| {
             let _guard = ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, false);
-            assert_eq!(ffi_queue_destroy(&stale), 4);
+            assert_eq!(ffi_queue_destroy(&stale), ABI_COMMAND_SCOPE_DENIED);
         })
         .unwrap();
 }
@@ -419,7 +439,7 @@ fn managed_manifest_registers_and_queries_a_new_dynamic_component() {
                 0,
                 &mut chunk,
             ),
-            1
+            ABI_SUCCESS
         );
         assert_eq!(chunk.len, 1);
         assert_eq!(chunk.element_size, 4);
@@ -465,7 +485,7 @@ fn csharp_world_supports_the_sprite_renderer_query() {
     setup_test_world(&mut engine);
 
     let mut query = pill_engine::Query::<(&Position, &Sprite)>::new(engine.world_mut());
-    assert_eq!(query.iter_mut().count(), 100);
+    assert_eq!(query.iter_mut().count(), TEST_WORLD_ENTITY_COUNT);
 }
 
 /// Verify writers of different components can share one parallel batch.
@@ -565,8 +585,11 @@ fn one_managed_row_write_is_visible_to_rust_changed_filter() {
     let mut entity_chunk = empty_chunk();
     {
         let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
-        assert_eq!(get_test_chunk("Position", 1, 0, &mut component_chunk), 1);
-        assert_eq!(ffi_get_entity_chunk(0, &mut entity_chunk), 1);
+        assert_eq!(
+            get_test_chunk("Position", 1, 0, &mut component_chunk),
+            ABI_SUCCESS
+        );
+        assert_eq!(ffi_get_entity_chunk(0, &mut entity_chunk), ABI_SUCCESS);
         // SAFETY: the Position chunk was fetched successfully and row `37`
         // lies within its live length, so the chunk tick pointer is valid to
         // advance by that many rows.
@@ -597,7 +620,7 @@ fn managed_read_only_chunk_does_not_trigger_changed_filter() {
     let mut chunk = empty_chunk();
     {
         let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
-        assert_eq!(get_test_chunk("Position", 0, 0, &mut chunk), 1);
+        assert_eq!(get_test_chunk("Position", 0, 0, &mut chunk), ABI_SUCCESS);
         assert!(!chunk.ticks.is_null());
     }
 
@@ -623,9 +646,12 @@ fn disjoint_managed_writes_mark_the_correct_tick_columns() {
     let mut entities = empty_chunk();
     {
         let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
-        assert_eq!(get_test_chunk("Position", 1, 0, &mut positions), 1);
-        assert_eq!(get_test_chunk("Sprite", 1, 0, &mut sprites), 1);
-        assert_eq!(ffi_get_entity_chunk(0, &mut entities), 1);
+        assert_eq!(
+            get_test_chunk("Position", 1, 0, &mut positions),
+            ABI_SUCCESS
+        );
+        assert_eq!(get_test_chunk("Sprite", 1, 0, &mut sprites), ABI_SUCCESS);
+        assert_eq!(ffi_get_entity_chunk(0, &mut entities), ABI_SUCCESS);
         assert_ne!(positions.ticks, sprites.ticks);
         // SAFETY: both chunks were fetched successfully and rows `3` and `7`
         // fall within their live lengths, so each tick pointer is valid to
@@ -664,18 +690,18 @@ fn entity_chunks_are_available_only_during_a_managed_system() {
     let bindings = setup_test_world(&mut engine);
     let mut chunk = empty_chunk();
 
-    assert_eq!(ffi_get_entity_chunk(0, &mut chunk), 3);
+    assert_eq!(ffi_get_entity_chunk(0, &mut chunk), ABI_OUT_OF_SCOPE);
     {
         let _guard = ActiveSystemGuard::set(engine.world_mut(), &[], &bindings);
-        assert_eq!(ffi_get_entity_chunk(0, &mut chunk), 1);
-        assert_eq!(chunk.len, 100);
+        assert_eq!(ffi_get_entity_chunk(0, &mut chunk), ABI_SUCCESS);
+        assert_eq!(chunk.len as usize, TEST_WORLD_ENTITY_COUNT);
         assert_eq!(
             chunk.element_size as usize,
             std::mem::size_of::<pill_engine::Entity>()
         );
         assert!(!chunk.data.is_null());
     }
-    assert_eq!(ffi_get_entity_chunk(0, &mut chunk), 3);
+    assert_eq!(ffi_get_entity_chunk(0, &mut chunk), ABI_OUT_OF_SCOPE);
 }
 
 /// Verify a managed system that reports failure is recorded as a drained

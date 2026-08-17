@@ -77,22 +77,20 @@ fn is_relevant_event(kind: &EventKind) -> bool {
 /// events from outside the watch tree, and the remaining policy is applied
 /// to the resulting relative path.
 fn is_relevant_path(path: &Path, watch_root: &Path) -> bool {
-    let canonical_root = match watch_root.canonicalize() {
-        Ok(root) => root,
-        Err(_) => return false,
+    let Ok(canonical_root) = watch_root.canonicalize() else {
+        return false;
     };
-    let canonical_path = match path.canonicalize() {
-        Ok(path) => path,
+    let Ok(canonical_path) = path.canonicalize() else {
         // Events for files deleted between notification and check carry no
         // source content; skipping them is harmless.
-        Err(_) => return false,
+        return false;
     };
     if !canonical_path.starts_with(&canonical_root) {
         return false;
     }
-    let relative = canonical_path
-        .strip_prefix(&canonical_root)
-        .unwrap_or(Path::new(""));
+    // The `starts_with` check above already verified the prefix, so this
+    // strip cannot fail.
+    let relative = canonical_path.strip_prefix(&canonical_root).unwrap();
     is_relevant_relative_path(relative)
 }
 

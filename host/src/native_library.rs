@@ -182,7 +182,8 @@ impl ProjectLibrary {
         // the lookup fails and the error is discarded, leaving `project_update`
         // as `None`. The pointer stays valid because the `library` handle
         // keeps the module mapped.
-        let project_update: Option<Symbol<ProjectUpdateFn>> = unsafe { library.get(b"project_update") }.ok();
+        let project_update: Option<Symbol<ProjectUpdateFn>> =
+            unsafe { library.get(b"project_update") }.ok();
 
         // Step 4: Copy the resolved pointers out of the borrowed Symbol
         // wrappers. The `library` field keeps the module mapped, so these raw

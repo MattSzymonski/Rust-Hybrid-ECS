@@ -171,7 +171,12 @@ impl ProjectModuleConfig {
         Self {
             name: "tests-project",
             watch_directory: "tests/project/src",
-            build_command: &["cargo", "build", "--manifest-path", "tests/project/Cargo.toml"],
+            build_command: &[
+                "cargo",
+                "build",
+                "--manifest-path",
+                "tests/project/Cargo.toml",
+            ],
             backend: ProjectModuleBackend::NativeLibrary {
                 library_name: "project",
                 output_subdirectory: "tests/project/target/debug",
@@ -193,7 +198,8 @@ impl ProjectModuleConfig {
                 Self::csharp_default()
             }
             Ok(value)
-                if value.eq_ignore_ascii_case("rust") || value.eq_ignore_ascii_case("project-rs") =>
+                if value.eq_ignore_ascii_case("rust")
+                    || value.eq_ignore_ascii_case("project-rs") =>
             {
                 Self::rust_default()
             }

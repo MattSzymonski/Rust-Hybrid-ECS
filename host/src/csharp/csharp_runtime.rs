@@ -137,9 +137,10 @@ impl DotnetRuntimeContext {
             })?
         };
 
-        // Copy the three bootstrap exports out of libloading's temporary
-        // Symbol wrappers. Their validity is tied to `library`, which is moved
-        // into the returned context and therefore outlives these pointers.
+        // Step 2: Copy the three bootstrap exports out of libloading's
+        // temporary Symbol wrappers. Their validity is tied to `library`,
+        // which is moved into the returned context and therefore outlives
+        // these pointers.
         // SAFETY: These names and signatures are fixed by the hostfxr ABI.
         let initialize: InitializeFn = unsafe {
             *library
@@ -260,7 +261,6 @@ impl DotnetRuntimeContext {
         // hostfxr assigns this sentinel meaning to the delegate-type argument;
         // it bypasses delegate thunk creation and requests the direct unmanaged
         // entry point generated for an UnmanagedCallersOnly method.
-        // `(char_t*)-1` requests a method marked `UnmanagedCallersOnly`.
         let unmanaged_callers_only = usize::MAX as *const HostChar;
 
         // No reserved state is required, so that argument remains null. The
@@ -467,8 +467,7 @@ fn host_string(value: &std::ffi::OsStr) -> Result<Vec<HostChar>, CSharpError> {
     // Windows hostfxr consumes native UTF-16 strings. Append the terminator
     // explicitly because OsStrExt yields only the encoded contents.
     let mut encoded: Vec<HostChar> = value.encode_wide().collect();
-    // An interior terminator would truncate the string at the ABI boundary,
-    // mirroring the Unix-side check for parity and future-proofing.
+    // An interior terminator would truncate the string at the ABI boundary.
     if encoded.contains(&0) {
         return Err(CSharpError::InteriorNul);
     }
@@ -496,7 +495,6 @@ fn host_string(value: &std::ffi::OsStr) -> Result<Vec<HostChar>, CSharpError> {
         return Err(CSharpError::InteriorNul);
     }
 
-    // hostfxr expects a C-style nul-terminated buffer.
     bytes.push(0);
     Ok(bytes)
 }

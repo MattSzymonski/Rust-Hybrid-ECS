@@ -40,7 +40,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 // Current crate
-use crate::ProjectModuleConfig;
+use crate::{FrameReport, ProjectModuleConfig};
 
 // =============================================================================
 // WindowedApplication
@@ -143,10 +143,7 @@ impl WindowedApplication {
             Ok(report) => {
                 // Step 3: Publish frame statistics and schedule the next redraw.
                 if let Some(report) = report {
-                    println!(
-                        "  {:>6.0} FPS | {:>5} entities",
-                        report.fps, report.entity_count
-                    );
+                    print_frame_statistics(&report);
                     window.set_title(&format!(
                         "ECS Standalone Host — {:.0} FPS | {} entities",
                         report.fps, report.entity_count
@@ -181,10 +178,7 @@ pub fn run(module_config: ProjectModuleConfig) -> Result<(), HostError> {
 
     loop {
         if let Some(report) = crate::run_one_frame(&mut host) {
-            println!(
-                "  {:>6.0} FPS | {:>5} entities",
-                report.fps, report.entity_count
-            );
+            print_frame_statistics(&report);
         }
     }
 }
@@ -224,4 +218,12 @@ pub fn run(module_config: ProjectModuleConfig) -> Result<(), EngineError> {
         return Err(error);
     }
     Ok(())
+}
+
+/// Print one frame's statistics to the host console.
+fn print_frame_statistics(report: &FrameReport) {
+    println!(
+        "  {:>6.0} FPS | {:>5} entities",
+        report.fps, report.entity_count
+    );
 }

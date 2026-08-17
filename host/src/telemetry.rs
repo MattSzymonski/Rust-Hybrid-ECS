@@ -50,8 +50,7 @@ pub fn init_telemetry(
 
     // Step 1: Add a rolling file lane when a log directory is supplied.
     if let Some(directory) = file_log_directory {
-        // Permanent engine logs land in the file; scratch `engine::dev`
-        // logs stay out of files by default.
+        // Scratch `engine::dev` logs are excluded from the file lane.
         let file_config = LoggingConfig::default_engine()
             .with_directive(DEV_LOG_TARGET, LevelFilter::OFF)
             .with_directive(telemetry_target::RENDERING, LevelFilter::DEBUG);
@@ -74,8 +73,9 @@ pub fn init_telemetry(
     // Step 4: Install the shared metrics recorder when the feature is on.
     #[cfg(feature = "metrics")]
     {
-        // Repeated numerical state flows into the shared recorder; it is
-        // process-wide, so the engine and host emit into the same store.
+        // The recorder is process-wide, so the engine and host share one
+        // store; the result is ignored because a foreign recorder that is
+        // already installed wins by design.
         let _ = pill_core::metrics::install_metrics();
     }
 

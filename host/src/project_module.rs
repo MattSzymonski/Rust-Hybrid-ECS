@@ -93,7 +93,6 @@ impl LoadedProject {
 
                 // Native modules register their components and systems through
                 // the stable EngineApi table before the first frame is run.
-                // A non-zero status means the module failed to initialize.
                 let status = library.call_project_init(engine_api);
                 if status != 0 {
                     return Err(LibraryError::InitializationFailed { status }.into());
@@ -145,22 +144,24 @@ impl LoadedProject {
             // managed loader validates the rebuilt assembly's component
             // manifest and system signatures before swapping; poll_reload
             // reports the outcome and logs any rejection.
-            Self::CSharp(runtime) => match build_project_module(workspace_root, config, cancel_flag) {
-                Ok(_) => {
-                    info!(
-                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                        "C# build complete; polling managed loader"
-                    );
-                    runtime.poll_reload();
+            Self::CSharp(runtime) => {
+                match build_project_module(workspace_root, config, cancel_flag) {
+                    Ok(_) => {
+                        info!(
+                            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                            "C# build complete; polling managed loader"
+                        );
+                        runtime.poll_reload();
+                    }
+                    Err(error) => {
+                        error!(
+                            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                            error = %error,
+                            "C# build failed; keeping the currently loaded C# project assembly"
+                        );
+                    }
                 }
-                Err(error) => {
-                    error!(
-                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                        error = %error,
-                        "C# build failed; keeping the currently loaded C# project assembly"
-                    );
-                }
-            },
+            }
         }
     }
 
@@ -199,9 +200,8 @@ fn reload_native(
     config: &ProjectModuleConfig,
     cancel_flag: Option<(&AtomicU64, u64)>,
 ) {
-    // Step 1: Compile the new module before touching engine state.
-    // Complete compilation before mutating engine state. A compiler error can
-    // therefore never remove the systems belonging to the working generation.
+    // Step 1: Compile the new module before touching engine state, so a
+    // compiler error can never remove the systems of the working generation.
     let output_path = match build_project_module(workspace_root, config, cancel_flag) {
         Ok(path) => path,
         Err(error) => {
@@ -215,8 +215,8 @@ fn reload_native(
     };
 
     // Step 2: Load and validate the replacement library transactionally.
-    // Loading and symbol validation are also transactional. Keep `current`
-    // untouched until a complete replacement library is ready to initialize.
+    // Keep `current` untouched until a complete replacement library is ready
+    // to initialize.
     let new_library = match ProjectLibrary::load_copy(&output_path, workspace_root) {
         Ok(library) => library,
         Err(error) => {
@@ -230,10 +230,9 @@ fn reload_native(
     };
 
     // Step 3: Capture old schemas, clear old systems, and initialize the new
-    // generation while both DLLs remain mapped.
-    // Capture the old generation's persistence functions and schemas while its
-    // DLL is still mapped. Migration may need those functions after project_init
-    // has registered the replacement generation's component definitions.
+    // generation while both DLLs remain mapped. Migration may need the old
+    // persistence functions after project_init registers the replacement
+    // generation's component definitions.
     let previous_metadata_by_name = engine.world().capture_persist_type_metadata();
     let previous_manifest = engine.world().persist_type_manifest();
 
