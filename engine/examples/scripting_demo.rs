@@ -40,9 +40,13 @@ impl ScriptComponent for Counter {
 
         let entity: Entity = script_context.get_owning_entity().clone();
 
-        script_context
-            .get_commands()
-            .add_component_to_entity(entity, Position { x: 42.0, y: 3.14 });
+        script_context.get_commands().add_component_to_entity(
+            entity,
+            Position {
+                x: 42.0,
+                y: std::f32::consts::PI,
+            },
+        );
     }
 }
 

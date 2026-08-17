@@ -38,7 +38,9 @@
 //! into the target archetype's storage.
 
 // Standard library
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 // External crates
 use serde::{de::DeserializeOwned, Serialize};
@@ -238,11 +240,10 @@ where
     // Deserialize the snapshot data into a generic JSON Value.
     let snapshot_json: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| {
-            tracing::warn!(
-                target: pill_core::telemetry::telemetry_target::RESOURCES,
-                component_type = std::any::type_name::<T>(),
-                error = %error,
-                "failed to parse persisted JSON for component; data skipped"
+            eprintln!(
+                "[persistence] Failed to parse JSON for '{}': {}",
+                std::any::type_name::<T>(),
+                error
             );
         })
         .ok()?;
@@ -251,11 +252,10 @@ where
     let default_instance = T::default();
     let default_json: serde_json::Value = serde_json::to_value(&default_instance)
         .map_err(|error| {
-            tracing::warn!(
-                target: pill_core::telemetry::telemetry_target::RESOURCES,
-                component_type = std::any::type_name::<T>(),
-                error = %error,
-                "failed to serialize default component; data skipped"
+            eprintln!(
+                "[persistence] Failed to serialize default for '{}': {}",
+                std::any::type_name::<T>(),
+                error
             );
         })
         .ok()?;
@@ -267,11 +267,10 @@ where
     match serde_json::from_value::<T>(merged) {
         Ok(value) => Some(Box::new(value)),
         Err(error) => {
-            tracing::warn!(
-                target: pill_core::telemetry::telemetry_target::RESOURCES,
-                component_type = std::any::type_name::<T>(),
-                error = %error,
-                "failed to deserialize persisted component; data skipped"
+            eprintln!(
+                "[persistence] Failed to deserialize '{}': {}. Component data skipped.",
+                std::any::type_name::<T>(),
+                error
             );
             None
         }
@@ -339,9 +338,6 @@ fn calculate_schema_hash<T>() -> u64
 where
     T: Component + Serialize + Default + 'static,
 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
     let default_value = T::default();
     let default_json = serde_json::to_value(default_value).unwrap_or(serde_json::Value::Null);
     let normalized_schema = normalize_schema_shape(&default_json);

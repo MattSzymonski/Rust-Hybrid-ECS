@@ -16,7 +16,7 @@
 //! The engine emits structured meaning through `tracing`; output layers
 //! decide where it goes and how it appears. The three lanes are kept apart:
 //!
-//! - `engine::dev` — scratch developer logs from the `log!`/`warn!`/`error!`
+//! - `engine::dev` — scratch developer logs from the `log!`/`dev_warn!`/`dev_error!`
 //!   macros, feature-gated behind `dev-logs`.
 //! - `engine::*` — permanent structured engine logs.
 //! - `profile::*` — profiling spans routed to Tracy through `TracyLayer`,
@@ -46,7 +46,7 @@ use tracing_subscriber::{EnvFilter, Registry};
 // Static Telemetry Targets
 // =============================================================================
 
-/// Target of the simple developer logging macros (`log!`, `warn!`, `error!`).
+/// Target of the simple developer logging macros (`log!`, `dev_warn!`, `dev_error!`).
 pub const DEV_LOG_TARGET: &str = "engine::dev";
 
 /// Static `tracing` targets used by instrumentation callsites.
@@ -724,7 +724,7 @@ mod tests {
     #[cfg(feature = "dev-logs")]
     #[test]
     fn developer_macros_emit_on_the_dev_lane() {
-        use crate::{error, log, warn};
+        use crate::{dev_error, dev_warn, log};
         use std::sync::{Arc, Mutex};
 
         let captured = Arc::new(Mutex::new(String::new()));
@@ -737,8 +737,8 @@ mod tests {
         );
         tracing::subscriber::with_default(subscriber, || {
             log!("frame = 42");
-            warn!("invalid render queue key");
-            error!("failed to create texture: disk full");
+            dev_warn!("invalid render queue key");
+            dev_error!("failed to create texture: disk full");
         });
         let output = captured.lock().unwrap().clone();
         assert!(
@@ -751,11 +751,11 @@ mod tests {
         );
         assert!(
             output.contains("WARN"),
-            "warn! should map to WARN: {output}"
+            "dev_warn! should map to WARN: {output}"
         );
         assert!(
             output.contains("ERROR"),
-            "error! should map to ERROR: {output}"
+            "dev_error! should map to ERROR: {output}"
         );
         assert!(
             output.contains("frame = 42"),
@@ -763,7 +763,7 @@ mod tests {
         );
         assert!(
             output.contains("invalid render queue key"),
-            "missing warn! message: {output}"
+            "missing dev_warn! message: {output}"
         );
     }
 

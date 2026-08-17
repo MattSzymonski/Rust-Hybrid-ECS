@@ -37,19 +37,25 @@ profiling = [
     "tracy-client/code-transfer",
     "tracy-client/callstack-inlines",
     "tracy-client/crash-handler",
+    "pill_core/profiling",
     "pill_core/tracy",
 ]
 # Investigative fine-grained zones (`profile_scope_fine!` -> profile::fine).
-profiling-fine = ["profiling"]
+profiling-fine = ["profiling", "pill_core/profiling-fine"]
 # Minimal overhead: zones + frame marks only. No text, plots, messages, or threads.
 profiling-minimal = [
     "dep:tracy-client",
     "tracy-client/enable",
     "tracy-client/sampling",
     "tracy-client/ondemand",
+    "pill_core/profiling-minimal",
 ]
 # Debug: full profiling + instrumentation verification (~50% overhead).
-profiling-verify = ["profiling", "tracy-client/verify"]
+profiling-verify = [
+    "profiling",
+    "tracy-client/verify",
+    "pill_core/profiling-verify",
+]
 # Emit repeated numerical measurements through the shared `metrics` recorder.
 metrics = ["dep:metrics", "pill_core/metrics"]
 # Minimal 2D renderer (wgpu-backed): Position/Sprite components, the sprite

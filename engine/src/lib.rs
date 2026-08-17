@@ -73,3 +73,17 @@ pub use scripting::{ScriptComponent, ScriptContext};
 pub use serde::{Deserialize, Serialize};
 pub use tracing;
 pub use world::{AddComponentError, BuildError, EntityBuilder, RemoveComponentError, World};
+
+// ----------------------------------------------------------------------------
+// Profiling macro re-exports
+//
+// The profiling implementation and all its `#[macro_export]` macros live in
+// `pill_core::profiling`. Re-exporting the macros at the crate root keeps the
+// 100+ `crate::profile_scope!` call sites inside this crate compiling while
+// preserving a single flat namespace for downstream users.
+// ----------------------------------------------------------------------------
+pub use pill_core::{
+    profile_error, profile_frame_mark, profile_init, profile_message, profile_non_continuous_frame,
+    profile_plot, profile_plot_config, profile_scope, profile_scope_detail, profile_scope_fine,
+    profile_secondary_frame_mark, profile_thread, profile_warn,
+};

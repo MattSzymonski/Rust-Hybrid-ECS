@@ -40,3 +40,27 @@ rendering = ["dep:winit"]
 dev-logs = []
 tracy = ["dep:tracing-tracy", "dep:tracy-client"]
 metrics = ["dep:metrics"]
+# Full profiling: zones, text, plots, messages, threads, frame marks,
+# plus Tracy system-level features (sampling, context switches, CPU info).
+profiling = [
+    "dep:tracy-client",
+    "tracy-client/enable",
+    "tracy-client/sampling",
+    "tracy-client/context-switch-tracing",
+    "tracy-client/system-tracing",
+    "tracy-client/ondemand",
+    "tracy-client/code-transfer",
+    "tracy-client/callstack-inlines",
+    "tracy-client/crash-handler",
+]
+# Investigative fine-grained zones (`profile_scope_fine!` -> profile::fine).
+profiling-fine = ["profiling"]
+# Minimal overhead: zones + frame marks only. No text, plots, messages, or threads.
+profiling-minimal = [
+    "dep:tracy-client",
+    "tracy-client/enable",
+    "tracy-client/sampling",
+    "tracy-client/ondemand",
+]
+# Debug: full profiling + instrumentation verification (~50% overhead).
+profiling-verify = ["profiling", "tracy-client/verify"]
