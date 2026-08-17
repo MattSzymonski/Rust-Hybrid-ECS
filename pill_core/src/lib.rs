@@ -35,23 +35,37 @@
 //! use pill_core::profile_scope;                                  // profiling
 //! ```
 
+// =============================================================================
+// Modules
+// =============================================================================
+
+/// Color palettes for debug visualization.
+pub mod color;
+/// Semantic error system shared by every workspace crate.
 pub mod error;
+/// Math type aliases over `glam` and the direction vocabulary.
+pub mod math;
+/// Metrics recording foundation, gated on the `metrics` feature.
 #[cfg(feature = "metrics")]
 pub mod metrics;
+/// Tracy profiling API with feature gating and no-op fallbacks.
 pub mod profiling;
+/// `PillStyle` string-styling vocabulary for terminal output.
 pub mod style;
+/// Telemetry foundation: static targets, formatter, and subscriber builder.
 pub mod telemetry;
-
-pub use style::PillStyle;
-pub use tracing;
-
-pub mod color;
-pub mod math;
+/// Small general-purpose helpers shared by Pill crates.
 pub mod utils;
 
-// -----------------------------------------------------------------------------
-// Flat re-exports: tracing, metrics, and tracy-client
-// -----------------------------------------------------------------------------
+// =============================================================================
+// Flat Re-exports: tracing, metrics, and tracy-client
+// =============================================================================
+
+/// The `PillStyle` string-styling vocabulary, re-exported at the crate root.
+pub use style::PillStyle;
+/// The `tracing` crate, re-exported so downstream crates import telemetry
+/// macros from `pill_core` alone.
+pub use tracing;
 
 // Permanent logging macros. `error` coexists with the `pub mod error` module:
 // Rust keeps the macro and module namespaces separate, so both resolve.

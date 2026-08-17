@@ -10,6 +10,10 @@
 //! Pure functions returning `(f32, f32, f32)` RGB tuples in the 0.0-1.0
 //! range. No engine state or external dependencies.
 
+// ============================================================================
+// Constants
+// ============================================================================
+
 /// A fixed palette of visually distinct RGB colors, for debug rendering.
 ///
 /// Each entry is an `(r, g, b)` tuple in the 0.0-1.0 range.
@@ -36,16 +40,14 @@ pub const DISTINCT_COLOR_PALETTE: &[(f32, f32, f32)] = &[
     (0.125, 0.694, 0.298), // Bright green
 ];
 
-/// Generate 100 evenly spaced HSL-derived colors.
+// ============================================================================
+// Free functions
+// ============================================================================
+
+/// Generates 100 evenly spaced HSL-derived colors.
 ///
-/// # Examples
-///
-/// ```
-/// use pill_core::color::generate_color_palette;
-///
-/// let palette = generate_color_palette();
-/// assert_eq!(palette.len(), 100);
-/// ```
+/// The saturation and lightness are fixed while the hue advances uniformly
+/// across the full circle, producing a palette that spreads colors evenly.
 pub fn generate_color_palette() -> Vec<(f32, f32, f32)> {
     (0..100)
         .map(|i| {
@@ -55,7 +57,7 @@ pub fn generate_color_palette() -> Vec<(f32, f32, f32)> {
         .collect()
 }
 
-/// Convert a hue/saturation/lightness triple (HLS) to an RGB triple.
+/// Converts a hue/saturation/lightness triple (HLS) to an RGB triple.
 ///
 /// `h` is expected in the 0.0-1.0 range; all channels come back in the
 /// 0.0-1.0 range.
@@ -71,6 +73,8 @@ pub fn generate_color_palette() -> Vec<(f32, f32, f32)> {
 /// assert!(color.2 >= 0.0 && color.2 <= 1.0);
 /// ```
 pub fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (f32, f32, f32) {
+    // Standard HSL to RGB conversion: `a` is the chroma scaled by lightness,
+    // and `f` projects a hue offset onto the red/green/blue channel axes.
     let a = s * l.min(1.0 - l);
     let f = |n: f32| {
         let k = (n + h * 12.0) % 12.0;

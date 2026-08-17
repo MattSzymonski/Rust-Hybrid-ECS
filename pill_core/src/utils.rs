@@ -6,12 +6,14 @@
 //! - Validate asset paths against a whitelist of file formats.
 //! - Construct and inspect fixed-width bitmasks.
 //! - Format project-level error chains for reporting.
+//! - Generate C-ABI project entry points for dynamic loading.
 //!
 //! # Design
 //!
 //! Pure helpers with no engine state. The single error type,
 //! [`AssetPathError`], is defined locally with `thiserror` so callers can
-//! match on variants without depending on an engine crate.
+//! match on variants without depending on an engine crate. Bitmask helpers
+//! number bits from the most significant bit (index 0) to the least.
 
 // Standard library
 use std::{
@@ -37,6 +39,7 @@ use std::{
 /// ```
 pub fn get_type_name<T>() -> String {
     let full_type_name = type_name::<T>();
+    // Strip any leading module path so only the type's short name remains.
     full_type_name
         .rsplit_once(':')
         .map_or(full_type_name, |(_, name)| name)
@@ -55,6 +58,7 @@ pub fn get_type_name<T>() -> String {
 /// ```
 pub fn get_value_type_name<T>(_: &T) -> String {
     let full_type_name = type_name::<T>();
+    // Strip any leading module path so only the type's short name remains.
     full_type_name
         .rsplit_once(':')
         .map_or(full_type_name, |(_, name)| name)
@@ -102,13 +106,15 @@ pub fn enum_variant_eq<T>(a: &T, b: &T) -> bool {
 /// assert_eq!(get_enum_variant_type_name(&Shape::Square), "Square");
 /// ```
 pub fn get_enum_variant_type_name<T: core::fmt::Debug>(value: &T) -> String {
+    // The `Debug` representation starts with the variant name, optionally
+    // followed by a parenthesised payload that is discarded here.
     let full_type_name = format!("{value:?}");
     let name = full_type_name.split('(').next().unwrap_or(&full_type_name);
     name.trim().to_string()
 }
 
 // =============================================================================
-// Asset path validation
+// Types
 // =============================================================================
 
 /// Error returned by [`validate_asset_path`].
@@ -129,6 +135,10 @@ pub enum AssetPathError {
         allowed: String,
     },
 }
+
+// =============================================================================
+// Asset path validation
+// =============================================================================
 
 /// Check that an asset path exists and has a whitelisted file extension.
 ///
@@ -204,6 +214,8 @@ pub fn validate_asset_path(
 pub fn get_project_error_message<E: std::error::Error>(result: Result<(), E>) -> Option<String> {
     result.err().map(|error| {
         let mut message = format!("Pill project error: {error}\n");
+        // Walk the error's `source` chain, indenting each cause in order so
+        // the report reads top-down from the outermost to the innermost error.
         let mut source = error.source();
         let mut index = 0usize;
         while let Some(inner_source) = source {
@@ -214,6 +226,10 @@ pub fn get_project_error_message<E: std::error::Error>(result: Result<(), E>) ->
         message
     })
 }
+
+// =============================================================================
+// Project entry-point generation
+// =============================================================================
 
 /// Generate a C-ABI project entry point plus an in-process constructor.
 ///
@@ -269,17 +285,21 @@ where
         + Add<Output = T>
         + Not<Output = T>,
 {
+    // Step 1: Compute the bit width of `T` as a `T`-typed value.
     let mask_size = T::from(std::mem::size_of::<T>() as u8 * 8);
 
+    // Step 2: Reject ranges whose end reaches or exceeds the mask width.
     if mask_range.end >= mask_size {
         panic!("Provided mask range exceeds mask size");
     }
 
+    // Step 3: Derive the run length and the shift aligning it to the MSB.
     let range_length: T = mask_range.end - mask_range.start + T::from(1);
     let mask_shift = mask_size - mask_range.end - T::from(1);
 
+    // Step 4: Build the mask, handling a full-width run separately because
+    // shifting by the full bit width would overflow.
     match range_length == mask_size {
-        // Prevent overflow (when shifting by the same value as the bit width).
         true => !(T::from(0)) << mask_shift,
         false => !(!T::from(0) << range_length) << mask_shift,
     }
@@ -299,9 +319,14 @@ where
 /// assert_eq!(create_bitmask_with_one(16), 0b0000_0000_0000_0000);
 /// ```
 pub fn create_bitmask_with_one(index: u16) -> u16 {
+    /// Most significant bit of a `u16` mask (bit index 0).
     pub const FIRST_BIT: u16 = 0b1000_0000_0000_0000;
     let mut mask: u16 = 0b0000_0000_0000_0000;
+    // Step 1: Ignore indexes outside the 16-bit mask width, leaving the
+    // all-zero mask untouched.
     if (0_u16..=15_u16).contains(&index) {
+        // Step 2: Set the MSB, then shift it right `index` times to reach
+        // the requested bit position.
         mask |= FIRST_BIT;
         for _ in 0..index {
             mask >>= 1;
@@ -323,6 +348,8 @@ pub fn create_bitmask_with_one(index: u16) -> u16 {
 /// );
 /// ```
 pub fn get_indices_of_set_elements(bitmask: u16) -> Vec<usize> {
+    // Walk the mask from the most significant bit (index 0) to the least
+    // significant (index 15), recording the position of every set bit.
     let mut test_mask: u16 = 0b1000_0000_0000_0000;
     let mut indices = Vec::<usize>::new();
     for i in 0..=15 {

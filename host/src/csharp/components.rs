@@ -5,11 +5,22 @@
 //! - Define native ABI mirrors for shared managed components.
 //! - Resolve stable managed identities to native or dynamic bindings.
 //! - Validate and register reflected component manifests.
+//!
+//! # Design
+//!
+//! In rendering builds the shared component names ([`Position`], [`Color`],
+//! [`Sprite`]) resolve to the renderer's own components through a conditional
+//! re-export; headless builds provide layout-identical local definitions
+//! instead. Every managed component is addressed by a [`StableComponentId`]
+//! hashed from its canonical full name, and [`ComponentBinding`] records
+//! whether storage is backed by a concrete Rust type or by dynamically
+//! registered bytes.
 
 // Standard library
 use std::collections::{HashMap, HashSet};
 
 // External crates
+use pill_core::error::{CSharpError, EngineMessage};
 use pill_engine::commands::{boxed_component_adder, ComponentAdder};
 use pill_engine::{Component, ComponentId, Engine, World};
 use serde::Deserialize;
@@ -20,8 +31,20 @@ use trait_type_map::TraitAccessible;
 // Current crate
 use super::abi::ComponentChunk;
 
-// External crates
-use pill_core::error::{CSharpError, EngineMessage};
+// =============================================================================
+// Constants
+// =============================================================================
+
+/// Maximum nesting depth accepted in a managed component field tree.
+///
+/// Real component layouts never exceed a handful of levels. The budget stays
+/// below `serde_json`'s own parser recursion limit so this validation, not an
+/// opaque parser error, rejects pathological manifests.
+const MAX_FIELD_NESTING_DEPTH: usize = 32;
+
+// =============================================================================
+// Types + Impls
+// =============================================================================
 
 // In rendering builds these names resolve to the renderer's components so
 // managed physics writes directly into the columns consumed by the renderer.
@@ -29,52 +52,74 @@ use pill_core::error::{CSharpError, EngineMessage};
 #[cfg(feature = "rendering")]
 pub(super) use pill_engine::{Color, Position, Sprite};
 
-// =============================================================================
-// Types
-// =============================================================================
-
-#[cfg(not(feature = "rendering"))]
 /// Headless ABI mirror of `TracyLive.Position`.
+///
+/// Layout-identical to the renderer's component so managed physics writes
+/// land in the same columns consumed by rendering builds.
+#[cfg(not(feature = "rendering"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct Position {
+    /// Horizontal position in world units.
     pub(super) x: f32,
+    /// Vertical position in world units.
     pub(super) y: f32,
 }
 #[cfg(not(feature = "rendering"))]
 impl Component for Position {}
 
-#[cfg(not(feature = "rendering"))]
 /// Headless ABI mirror of the renderer's RGBA color.
+///
+/// Stores the four channels as single-precision floats in the same order the
+/// renderer's component uses, keeping the native and managed layouts in sync.
+#[cfg(not(feature = "rendering"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct Color {
+    /// Red channel in the 0.0–1.0 range.
     pub(super) r: f32,
+    /// Green channel in the 0.0–1.0 range.
     pub(super) g: f32,
+    /// Blue channel in the 0.0–1.0 range.
     pub(super) b: f32,
+    /// Alpha channel in the 0.0–1.0 range.
     pub(super) a: f32,
 }
 #[cfg(not(feature = "rendering"))]
 impl Component for Color {}
 
-#[cfg(not(feature = "rendering"))]
 /// Headless ABI mirror of `TracyLive.Sprite`.
+///
+/// Carries the sprite's dimensions and tint color; the layout matches the
+/// renderer's component so managed code can populate sprite columns directly.
+#[cfg(not(feature = "rendering"))]
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub(super) struct Sprite {
+    /// Sprite width in world units.
     pub(super) width: f32,
+    /// Sprite height in world units.
     pub(super) height: f32,
+    /// Tint applied when the sprite is rendered.
     pub(super) color: Color,
 }
 #[cfg(not(feature = "rendering"))]
 impl Component for Sprite {}
 
+// Registers the headless mirrors as trait-accessible so the native binding
+// machinery can look them up through `dyn Component` in headless builds.
 #[cfg(not(feature = "rendering"))]
 impl_trait_accessible!(dyn Component; Position, Sprite, Color);
 
 /// Stable 128-bit identity derived from a managed component's canonical name.
+///
+/// Produced by [`stable_component_id`] from the canonical full name, so the
+/// managed runtime and the host agree on an identity without shared state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(super) struct StableComponentId(pub(super) u128);
+pub(super) struct StableComponentId(
+    /// The 128-bit canonical identity value.
+    pub(super) u128,
+);
 
 impl StableComponentId {
     /// Reconstruct the canonical 128-bit ID from the two halves carried by the
@@ -84,26 +129,43 @@ impl StableComponentId {
     }
 }
 
+/// Maps every stable managed identity to its native or dynamic binding.
 pub(super) type ComponentBindings = HashMap<StableComponentId, ComponentBinding>;
+
+/// Copies one archetype column into an ABI `ComponentChunk` for managed code.
 type NativeChunkGetter = fn(&mut World, u32, *mut ComponentChunk) -> u8;
+
+/// Decodes one managed component blob into a deferred command adder.
 type NativeBlobDecoder = fn(*const u8, usize) -> Result<Box<dyn ComponentAdder>, String>;
 
 /// Resolves a stable managed identity to native or type-erased ECS storage.
+///
+/// Native bindings carry typed callbacks for chunk access and blob decoding;
+/// dynamic bindings keep only the layout facts needed for raw byte storage.
 #[derive(Clone, Copy)]
 pub(super) enum ComponentBinding {
     /// A concrete Rust component with chunk access and a typed decoder.
     Native {
+        /// Engine ID of the registered Rust component type.
         component_id: ComponentId,
+        /// Copies the matching archetype column into an ABI chunk.
         get_chunk: NativeChunkGetter,
+        /// Size of the Rust type in bytes.
         size: usize,
+        /// Alignment of the Rust type in bytes.
         align: usize,
+        /// Hash of the managed schema the native type must match.
         schema_hash: u64,
+        /// Decodes one managed blob into a deferred command adder.
         decode: NativeBlobDecoder,
     },
     /// A dynamically registered layout stored as raw bytes.
     Dynamic {
+        /// Engine ID of the dynamically registered component type.
         component_id: ComponentId,
+        /// Size of the managed layout in bytes.
         size: usize,
+        /// Alignment of the managed layout in bytes.
         align: usize,
     },
 }
@@ -127,6 +189,8 @@ pub(super) const fn component_hash(name: &str, offset: u64) -> u64 {
     let bytes = name.as_bytes();
     let mut hash = offset;
     let mut index = 0;
+    // FNV-1a mixing keeps the hash stable across runs and runtimes, so the
+    // managed side can reproduce the same value from the canonical name.
     while index < bytes.len() {
         hash ^= bytes[index] as u64;
         hash = hash.wrapping_mul(0x100000001b3);
@@ -179,6 +243,11 @@ fn get_component_chunk<T: Component + TraitAccessible<dyn Component>>(
 ///
 /// The decoder is stored in a native binding so deferred commands can recover
 /// the correct Rust type without a hardcoded component match at the call site.
+///
+/// # Errors
+///
+/// Returns an error when `data` is null or `size` does not match the exact
+/// ABI layout of `T`.
 fn decode_native_component<T>(
     data: *const u8,
     size: usize,
@@ -189,8 +258,9 @@ where
     if data.is_null() || size != std::mem::size_of::<T>() {
         return Err("native component blob does not match its ABI layout".into());
     }
-    // SAFETY: the binding validated the exact type size. `read_unaligned`
-    // permits managed pinned buffers with no stronger alignment guarantee.
+    // SAFETY: the binding validated the exact type size and the caller keeps
+    // the managed pinned buffer alive for the duration of this call.
+    // `read_unaligned` permits buffers with no stronger alignment guarantee.
     let component = unsafe { std::ptr::read_unaligned(data.cast::<T>()) };
     Ok(boxed_component_adder(component))
 }
@@ -198,23 +268,36 @@ where
 /// Deserialized entry from the managed component manifest.
 #[derive(Deserialize)]
 struct ManagedComponentManifest {
+    /// Low 64 bits of the stable component identity.
     stable_id_low: u64,
+    /// High 64 bits of the stable component identity.
     stable_id_high: u64,
+    /// Canonical full name used to recompute and verify the identity.
     full_name: String,
+    /// Total byte size of the component layout.
     size: usize,
+    /// Required byte alignment of the component layout.
     alignment: usize,
+    /// Hash of the managed field schema used to match native mirrors.
     schema_hash: u64,
+    /// Whether the managed side expects a native engine binding.
     shared: bool,
+    /// Top-level field descriptions of the component layout.
     fields: Vec<ManagedFieldManifest>,
 }
 
 /// Deserialized field entry within a managed component manifest.
 #[derive(Deserialize)]
 struct ManagedFieldManifest {
+    /// Field name as it appears in the managed schema.
     name: String,
+    /// Byte offset of the field within its containing struct.
     offset: usize,
+    /// Byte size of the field.
     size: usize,
+    /// Canonical managed type name of the field.
     primitive_type: String,
+    /// Nested field descriptions when this field is a struct.
     fields: Vec<ManagedFieldManifest>,
 }
 
@@ -243,6 +326,9 @@ fn register_native_binding<T>(
 }
 
 /// Register native shared components and create their managed lookup table.
+///
+/// The schema strings encode the canonical managed layouts; a mismatch with
+/// the runtime's own reflection is rejected during manifest registration.
 pub(super) fn shared_component_bindings(engine: &mut Engine) -> ComponentBindings {
     let mut bindings = HashMap::new();
     register_native_binding::<Position>(
@@ -266,17 +352,14 @@ pub(super) fn shared_component_bindings(engine: &mut Engine) -> ComponentBinding
     bindings
 }
 
-/// Maximum nesting depth accepted in a managed component field tree.
-///
-/// Real component layouts never exceed a handful of levels. The budget stays
-/// below `serde_json`'s own parser recursion limit so this validation, not an
-/// opaque parser error, rejects pathological manifests.
-const MAX_FIELD_NESTING_DEPTH: usize = 32;
-
 /// Reject sibling fields that share any byte range.
 ///
 /// Conflicting interpretations of the same storage would corrupt data
 /// silently, so overlaps and duplicated offsets are invalid layouts.
+///
+/// # Errors
+///
+/// Returns an error naming the first pair of sibling fields that overlap.
 fn validate_sibling_non_overlap(
     fields: &[ManagedFieldManifest],
     parent_name: &str,
@@ -303,6 +386,11 @@ fn validate_sibling_non_overlap(
 /// The field tree is walked with an explicit worklist so deeply nested input
 /// consumes heap rather than stack, and the depth budget rejects pathological
 /// manifests before they cost real work.
+///
+/// # Errors
+///
+/// Returns an error when a field overflows its containing struct, names an
+/// empty field or type, or exceeds the maximum nesting depth.
 fn validate_field_manifest(field: &ManagedFieldManifest, parent_size: usize) -> Result<(), String> {
     // Each entry carries the field to inspect, the size of the struct that
     // directly contains it, and that branch's current nesting depth.
@@ -333,6 +421,17 @@ fn validate_field_manifest(field: &ManagedFieldManifest, parent_size: usize) -> 
 }
 
 /// Validate and register all components discovered in the managed assembly.
+///
+/// Shared components must already have a native engine binding; every other
+/// component is registered as dynamic storage before the bindings are
+/// returned to the caller.
+///
+/// # Errors
+///
+/// Returns a [`CSharpError`] when the manifest is malformed, an identity does
+/// not match its canonical name, a layout is invalid or duplicated, a shared
+/// component has no native binding, or a managed mirror disagrees with the
+/// native component's layout or field schema.
 pub(super) fn register_component_manifest(
     engine: &mut Engine,
     bytes: &[u8],
@@ -370,6 +469,7 @@ pub(super) fn register_component_manifest(
             )
             .into());
         }
+
         // Sibling fields of the component itself must not overlap either.
         validate_sibling_non_overlap(&component.fields, &component.full_name)?;
         for field in &component.fields {
@@ -402,6 +502,7 @@ pub(super) fn register_component_manifest(
             }
             continue;
         }
+
         // Step 2: Register each remaining component as dynamic storage.
         if component.shared {
             return Err(format!(

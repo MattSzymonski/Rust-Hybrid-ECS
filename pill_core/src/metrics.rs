@@ -30,6 +30,10 @@ use metrics::{Counter, Gauge, Histogram, Key, KeyName, Recorder, SharedString, U
 // =============================================================================
 
 /// One recorded metric with its latest value, for diagnostics and UI.
+///
+/// The recorder keeps only the most recent sample per metric name, so the
+/// store stays small even under high-frequency updates. Snapshots are taken
+/// on demand and sorted by name for stable rendering.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MetricSnapshot {
     /// Latest counter value.
@@ -41,6 +45,9 @@ pub enum MetricSnapshot {
 }
 
 /// Shared state behind the recorder and its delegated handles.
+///
+/// Delegated handles hold a [`Weak`] reference to this state so the store is
+/// freed once the last live handle drops, even if the recorder is gone.
 struct Inner {
     store: Mutex<HashMap<String, MetricSnapshot>>,
     #[cfg(feature = "tracy")]
@@ -50,15 +57,17 @@ struct Inner {
 }
 
 impl Inner {
-    /// Push one point into a native Tracy plot when a profiler is connected.
+    /// Pushes one point into a native Tracy plot when a profiler is connected.
     #[cfg(feature = "tracy")]
     fn emit_tracy_plot(&self, name: &str, value: f64) {
+        // Step 1: Bail out when forwarding is disabled or no profiler is running.
         if !self.forward_to_tracy || !tracy_client::Client::is_running() {
             return;
         }
         let Some(client) = tracy_client::Client::running() else {
             return;
         };
+        // Step 2: Fetch the cached plot name, creating it on first use.
         // `PlotName::new_leak` leaks one static string per distinct metric;
         // cache it so the leak happens exactly once per name.
         let mut plots = self
@@ -73,6 +82,7 @@ impl Inner {
                 created
             }
         };
+        // Step 3: Push the sample into the Tracy plot.
         client.plot(plot_name, value);
     }
 }
@@ -88,7 +98,7 @@ pub struct EngineMetricsRecorder {
 }
 
 impl EngineMetricsRecorder {
-    /// Create a recorder with a fresh recent-value store.
+    /// Creates a recorder with a fresh recent-value store.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -101,7 +111,7 @@ impl EngineMetricsRecorder {
         }
     }
 
-    /// Snapshot every metric recorded so far, sorted by name.
+    /// Snapshots every metric recorded so far, sorted by name.
     pub fn snapshot(&self) -> Vec<(String, MetricSnapshot)> {
         let mut values: Vec<_> = self
             .inner
@@ -115,7 +125,7 @@ impl EngineMetricsRecorder {
         values
     }
 
-    /// Directly record one gauge value into the store (test helper).
+    /// Directly records one gauge value into the store (test helper).
     #[cfg(test)]
     fn record_gauge(&self, name: &str, value: f64) {
         self.inner
@@ -127,7 +137,7 @@ impl EngineMetricsRecorder {
         self.inner.emit_tracy_plot(name, value);
     }
 
-    /// Directly record one counter value into the store (test helper).
+    /// Directly records one counter value into the store (test helper).
     #[cfg(test)]
     fn record_counter(&self, name: &str, value: u64) {
         self.inner
@@ -137,7 +147,7 @@ impl EngineMetricsRecorder {
             .insert(name.to_owned(), MetricSnapshot::Counter(value));
     }
 
-    /// Directly record one histogram sample into the store (test helper).
+    /// Directly records one histogram sample into the store (test helper).
     #[cfg(test)]
     fn record_histogram(&self, name: &str, value: f64) {
         self.inner
@@ -149,7 +159,7 @@ impl EngineMetricsRecorder {
         self.inner.emit_tracy_plot(name, value);
     }
 
-    /// Install this recorder as the process-wide metrics recorder.
+    /// Installs this recorder as the process-wide metrics recorder.
     ///
     /// # Errors
     ///
@@ -192,27 +202,6 @@ impl Recorder for EngineMetricsRecorder {
     }
 }
 
-/// Convert a metric name into a stable Tracy plot identifier.
-///
-/// Tracy plot names are identifiers; punctuation is replaced with underscores
-/// so `engine.frame_time_ms` becomes `engine_frame_time_ms`.
-#[cfg(feature = "tracy")]
-fn sanitize_plot_name(name: &str) -> String {
-    name.chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() || character == '_' {
-                character
-            } else {
-                '_'
-            }
-        })
-        .collect()
-}
-
-// =============================================================================
-// Delegated Handles
-// =============================================================================
-
 /// `metrics::Counter` handle delegating into the recorder store.
 struct DelegatingCounter {
     name: String,
@@ -226,6 +215,8 @@ impl metrics::CounterFn for DelegatingCounter {
                 .store
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Add to the last recorded value, defaulting to zero when no
+            // counter has been recorded for this name yet.
             let current = match store.get(&self.name) {
                 Some(MetricSnapshot::Counter(previous)) => *previous,
                 _ => 0,
@@ -257,6 +248,8 @@ impl metrics::GaugeFn for DelegatingGauge {
                 .store
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Add to the last recorded value, defaulting to zero when no
+            // gauge has been recorded for this name yet.
             let current = match store.get(&self.name) {
                 Some(MetricSnapshot::Gauge(previous)) => *previous,
                 _ => 0.0,
@@ -270,6 +263,8 @@ impl metrics::GaugeFn for DelegatingGauge {
                 .store
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Subtract from the last recorded value, defaulting to zero when
+            // no gauge has been recorded for this name yet.
             let current = match store.get(&self.name) {
                 Some(MetricSnapshot::Gauge(previous)) => *previous,
                 _ => 0.0,
@@ -328,10 +323,27 @@ impl metrics::HistogramFn for DelegatingHistogram {
 }
 
 // =============================================================================
-// Installation
+// Free Functions
 // =============================================================================
 
-/// Install the engine metrics recorder process-wide.
+/// Converts a metric name into a stable Tracy plot identifier.
+///
+/// Tracy plot names are identifiers; punctuation is replaced with underscores
+/// so `engine.frame_time_ms` becomes `engine_frame_time_ms`.
+#[cfg(feature = "tracy")]
+fn sanitize_plot_name(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Installs the engine metrics recorder process-wide.
 ///
 /// Returns `true` when the recorder was installed and `false` when another
 /// recorder was already active (a foreign metrics system wins).
@@ -339,7 +351,7 @@ pub fn install_metrics() -> bool {
     install_metrics_with(EngineMetricsRecorder::new())
 }
 
-/// Install a specific engine metrics recorder process-wide.
+/// Installs a specific engine metrics recorder process-wide.
 ///
 /// Returns `true` when the recorder was installed and `false` when another
 /// recorder was already active.

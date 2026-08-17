@@ -58,6 +58,9 @@ static TEMPORARY_COPY_COUNTER: AtomicU64 = AtomicU64::new(0);
 type GameInitFn = unsafe extern "C" fn(*const EngineApi) -> u32;
 
 /// Signature of the optional `game_update` per-frame entry point.
+///
+/// Modules that omit this export run entirely through their registered
+/// scheduler systems instead of an explicit per-frame hook.
 type GameUpdateFn = unsafe extern "C" fn(*const EngineApi);
 
 /// Owns one loaded native game module.
@@ -67,8 +70,11 @@ type GameUpdateFn = unsafe extern "C" fn(*const EngineApi);
 /// the module mapped, so frame-loop calls never perform a dynamic lookup or
 /// panic on a missing optional export.
 pub(crate) struct GameLibrary {
+    /// Loaded module handle; keeps the native library mapped in memory.
     library: Option<Library>,
+    /// Required `game_init` entry point, resolved once at load time.
     game_init: GameInitFn,
+    /// Optional `game_update` entry point; `None` when the module has none.
     game_update: Option<GameUpdateFn>,
     /// Temporary copy backing this library; deleted when the library drops.
     temporary_path: PathBuf,
@@ -124,8 +130,10 @@ impl GameLibrary {
         );
 
         // Step 3: Load the copy and validate its required exports.
-        // SAFETY: The configured build just produced this module and its
-        // required exports are validated before the handle is returned.
+        // SAFETY: `temporary_path` was just written by `std::fs::copy` from
+        // the freshly built output, so it is a complete native module on
+        // disk. `Self::load` validates the required exports before returning,
+        // and the returned `GameLibrary` owns the mapping for its lifetime.
         let game_library = unsafe { Self::load(&temporary_path, temporary_path.clone()) }?;
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -141,7 +149,11 @@ impl GameLibrary {
     /// `path` must point to a valid native library whose `game_init` export
     /// uses the expected C ABI.
     unsafe fn load(path: &Path, temporary_path: PathBuf) -> Result<Self, LibraryError> {
-        // SAFETY: The caller guarantees that `path` points to a native module.
+        // Step 1: Open the native library and map it into this process.
+        // SAFETY: The `# Safety` contract of `load` guarantees `path` names a
+        // valid native library. `Library::new` maps the module and runs its
+        // constructors; the returned handle keeps it mapped and is stored in
+        // the `GameLibrary` for the module's whole lifetime.
         let library = unsafe {
             Library::new(path).map_err(|source| LibraryError::LoadFailed {
                 path: path.display().to_string(),
@@ -149,8 +161,12 @@ impl GameLibrary {
             })?
         };
 
-        // SAFETY: Resolving the export validates its name and expected type.
-        // The symbol is not invoked until the engine API has been created.
+        // Step 2: Resolve the required `game_init` export.
+        // SAFETY: `game_init` is a mandatory export of the native ABI
+        // contract, so every supported module provides it, and it is resolved
+        // here as a pointer with the statically known C ABI signature. The
+        // pointer stays valid because the `library` handle keeps the module
+        // mapped for the lifetime of the returned `GameLibrary`.
         let game_init: Symbol<GameInitFn> = unsafe {
             library
                 .get(b"game_init")
@@ -160,13 +176,18 @@ impl GameLibrary {
                 })?
         };
 
-        // `game_update` is optional: modules without the legacy per-frame
-        // update simply run their registered scheduler systems.
+        // Step 3: Resolve the optional `game_update` export.
+        // SAFETY: `game_update` is optional; when present it is resolved as a
+        // pointer with the statically known C ABI signature, and when absent
+        // the lookup fails and the error is discarded, leaving `game_update`
+        // as `None`. The pointer stays valid because the `library` handle
+        // keeps the module mapped.
         let game_update: Option<Symbol<GameUpdateFn>> = unsafe { library.get(b"game_update") }.ok();
 
-        // Copy the resolved pointers out of the borrowed Symbol wrappers. The
-        // `library` field keeps the module mapped, so these raw pointers
-        // remain valid for the complete lifetime of the returned GameLibrary.
+        // Step 4: Copy the resolved pointers out of the borrowed Symbol
+        // wrappers. The `library` field keeps the module mapped, so these raw
+        // pointers remain valid for the complete lifetime of the returned
+        // `GameLibrary`.
         let game_init_pointer = *game_init;
         let game_update_pointer = game_update.map(|symbol| *symbol);
         Ok(Self {
@@ -183,8 +204,11 @@ impl GameLibrary {
     /// any non-zero value means the module failed to initialize and the
     /// previous generation must remain active.
     pub(crate) fn call_game_init(&self, api: &EngineApi) -> u32 {
-        // SAFETY: The export was validated while loading and `api` remains
-        // valid for the complete duration of this call.
+        // SAFETY: `game_init` was validated to exist and to use this C ABI
+        // signature when the library was loaded, and the `library` field
+        // keeps the module mapped for as long as this `GameLibrary` lives.
+        // `api` is borrowed immutably for the whole call and outlives it
+        // because the host creates the engine API before loading the module.
         unsafe { (self.game_init)(api as *const EngineApi) }
     }
 
@@ -194,8 +218,11 @@ impl GameLibrary {
     /// scheduler systems, so a missing export is a no-op rather than an error.
     pub(crate) fn call_game_update(&self, api: &EngineApi) {
         if let Some(game_update) = self.game_update {
-            // SAFETY: The export was validated while loading and `api`
-            // remains valid for the complete duration of this call.
+            // SAFETY: `game_update` was validated when the library was loaded
+            // and the `library` field keeps the module mapped for the
+            // lifetime of this `GameLibrary`. `api` is borrowed immutably for
+            // the whole call, matching the read-only access the native update
+            // hook expects.
             unsafe { game_update(api as *const EngineApi) };
         }
     }

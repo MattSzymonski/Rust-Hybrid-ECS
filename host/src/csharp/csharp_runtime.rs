@@ -23,21 +23,56 @@ use libloading::Library;
 use pill_core::error::CSharpError;
 
 // =============================================================================
+// Constants
+// =============================================================================
+
+/// `hostfxr_delegate_type::hdt_load_assembly_and_get_function_pointer`.
+///
+/// Requested when acquiring a runtime delegate so hostfxr resolves the bridge
+/// that both loads a managed assembly and returns one native-callable method.
+const LOAD_ASSEMBLY_AND_GET_FUNCTION_POINTER: i32 = 5;
+
+// =============================================================================
 // hostfxr ABI Types
 // =============================================================================
 
 /// Native character type used by `hostfxr` on the current platform.
+///
+/// `hostfxr` consumes UTF-16 code units on Windows and raw path bytes on Unix,
+/// so the character width follows the target platform.
 #[cfg(windows)]
 type HostChar = u16;
 #[cfg(not(windows))]
 type HostChar = u8;
 
+/// Opaque handle to an initialized hostfxr runtime context.
+///
+/// Created by `hostfxr_initialize_for_runtime_config` and released with
+/// `hostfxr_close`; it is never dereferenced from the Rust side.
 type RuntimeHandle = *mut std::ffi::c_void;
+
+/// Signature of the `hostfxr_initialize_for_runtime_config` export.
+///
+/// Starts a .NET runtime from a `runtimeconfig.json` file and returns an owned
+/// context handle.
 type InitializeFn =
     unsafe extern "system" fn(*const HostChar, *const std::ffi::c_void, *mut RuntimeHandle) -> i32;
+
+/// Signature of the `hostfxr_get_runtime_delegate` export.
+///
+/// Resolves a typed runtime delegate from a live context handle.
 type GetDelegateFn =
     unsafe extern "system" fn(RuntimeHandle, i32, *mut *mut std::ffi::c_void) -> i32;
+
+/// Signature of the `hostfxr_close` export.
+///
+/// Releases a previously initialized runtime context.
 type CloseFn = unsafe extern "system" fn(RuntimeHandle) -> i32;
+
+/// Signature of the `load_assembly_and_get_function_pointer` runtime delegate.
+///
+/// Loads a managed assembly and resolves one `UnmanagedCallersOnly` static
+/// method into a native entry-point pointer.
 type LoadAssemblyFn = unsafe extern "system" fn(
     *const HostChar,
     *const HostChar,
@@ -46,9 +81,6 @@ type LoadAssemblyFn = unsafe extern "system" fn(
     *const std::ffi::c_void,
     *mut *const std::ffi::c_void,
 ) -> i32;
-
-/// `hostfxr_delegate_type::hdt_load_assembly_and_get_function_pointer`.
-const LOAD_ASSEMBLY_AND_GET_FUNCTION_POINTER: i32 = 5;
 
 // =============================================================================
 // DotnetRuntimeContext
@@ -59,16 +91,34 @@ const LOAD_ASSEMBLY_AND_GET_FUNCTION_POINTER: i32 = 5;
 /// `_library` intentionally remains stored for the full lifetime of the
 /// context because `close` and `load_assembly` point into that native module.
 pub struct DotnetRuntimeContext {
+    /// Native hosting library kept alive so every resolved function pointer
+    /// below still targets mapped executable code.
     _library: Library,
+    /// Opaque hostfxr context handle returned by runtime initialization.
     handle: RuntimeHandle,
+    /// `hostfxr_close` export used to release the context in `Drop`.
     close: CloseFn,
+    /// `load_assembly_and_get_function_pointer` delegate used by `get_unmanaged_fn`.
     load_assembly: LoadAssemblyFn,
 }
 
 impl DotnetRuntimeContext {
     /// Load `hostfxr`, initialize .NET from `runtime_config`, and acquire the
     /// `load_assembly_and_get_function_pointer` runtime delegate.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CSharpError::HostfxrOverrideNotAFile`] when the
+    /// `ECS_DOTNET_HOSTFXR` override does not point at a file,
+    /// [`CSharpError::HostfxrNotFound`] when no `host/fxr` installation exists,
+    /// [`CSharpError::HostfxrLoadFailed`] when the selected library cannot be
+    /// loaded, [`CSharpError::HostfxrExportMissing`] when a required bootstrap
+    /// export is absent, [`CSharpError::InteriorNul`] when the configuration
+    /// path contains an interior NUL, and either
+    /// [`CSharpError::RuntimeInitializationFailed`] or
+    /// [`CSharpError::RuntimeDelegateFailed`] when hostfxr reports failure.
     pub fn new(runtime_config: &Path) -> Result<Self, CSharpError> {
+        // Step 1: Locate and load the newest installed hostfxr library.
         // Resolve hostfxr at runtime rather than linking against one SDK
         // installation. This lets the host follow the machine's configured
         // .NET root and use its newest compatible hosting library.
@@ -77,7 +127,9 @@ impl DotnetRuntimeContext {
         // Keep this Library inside DotnetRuntimeContext for as long as any
         // copied export or delegate can be called. Dropping it earlier would
         // invalidate every function pointer resolved below.
-        // SAFETY: The path was selected from an installed `host/fxr` version.
+        // SAFETY: `find_dotnet_host` only returns paths of real files under an
+        // installed .NET `host/fxr` directory, so the path references a valid
+        // shared-library module image.
         let library = unsafe {
             Library::new(&library_path).map_err(|source| CSharpError::HostfxrLoadFailed {
                 path: library_path.display().to_string(),
@@ -114,6 +166,7 @@ impl DotnetRuntimeContext {
                 })?
         };
 
+        // Step 3: Initialize a .NET runtime from the runtime configuration.
         // The runtimeconfig file selects the target framework and framework
         // version for csharp_runtime. hostfxr uses UTF-16 on Windows and raw native
         // path bytes on Unix, so conversion stays platform-specific.
@@ -134,6 +187,7 @@ impl DotnetRuntimeContext {
             });
         }
 
+        // Step 4: Acquire the load-assembly delegate from the live runtime.
         // Delegate kind 5 is the stable bridge that both loads a managed
         // assembly and resolves one native-callable static method from it.
         let mut delegate = std::ptr::null_mut();
@@ -155,6 +209,7 @@ impl DotnetRuntimeContext {
             });
         }
 
+        // Step 5: Cast the untyped delegate into a typed function pointer.
         // hostfxr exposes delegates as untyped pointers. The requested enum
         // value is what establishes the concrete function signature here.
         // SAFETY: Delegate kind 5 guarantees the returned pointer has the
@@ -172,18 +227,28 @@ impl DotnetRuntimeContext {
     /// Resolve an `UnmanagedCallersOnly` static method from a managed assembly.
     ///
     /// `T` must be the exact native signature declared on the managed method.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CSharpError::ManagedExportNotPointerSized`] when `T` is not
+    /// pointer-sized, [`CSharpError::InteriorNul`] when any of the three
+    /// identifiers contains an interior NUL, and
+    /// [`CSharpError::ManagedEntryPointFailed`] when hostfxr reports failure
+    /// or leaves the output pointer null.
     pub fn get_unmanaged_fn<T: Copy>(
         &self,
         assembly: &Path,
         type_name: &str,
         method_name: &str,
     ) -> Result<T, CSharpError> {
+        // Step 1: Reject function types that cannot hold a native pointer.
         // This generic API returns function pointers by value. Reject structs,
         // references, or other accidental T choices before copying raw bytes.
         if std::mem::size_of::<T>() != std::mem::size_of::<*const std::ffi::c_void>() {
             return Err(CSharpError::ManagedExportNotPointerSized);
         }
 
+        // Step 2: Encode the assembly, type, and method identifiers.
         // Keep all encoded buffers in local variables so their pointers remain
         // stable and live throughout the complete hostfxr call.
         let encoded_assembly = host_string(assembly.as_os_str())?;
@@ -191,6 +256,7 @@ impl DotnetRuntimeContext {
         let encoded_method_name = host_string(std::ffi::OsStr::new(method_name))?;
         let mut function = std::ptr::null();
 
+        // Step 3: Request the direct unmanaged entry point from hostfxr.
         // hostfxr assigns this sentinel meaning to the delegate-type argument;
         // it bypasses delegate thunk creation and requests the direct unmanaged
         // entry point generated for an UnmanagedCallersOnly method.
@@ -220,6 +286,7 @@ impl DotnetRuntimeContext {
             });
         }
 
+        // Step 4: Copy the resolved pointer into the caller's function type.
         // Copy the pointer bits into the caller's declared function-pointer
         // type. Signature correctness remains the caller's ABI obligation.
         // SAFETY: The size check above guarantees a pointer-sized target. The
@@ -242,7 +309,7 @@ impl Drop for DotnetRuntimeContext {
 }
 
 // =============================================================================
-// Runtime Discovery and String Conversion
+// HostfxrVersion
 // =============================================================================
 
 /// One installed `hostfxr` candidate with its parsed version key.
@@ -251,8 +318,13 @@ struct HostfxrVersion {
     numeric: Vec<u32>,
     /// Whether the version carries no prerelease suffix.
     stable: bool,
+    /// Absolute path to the versioned `host/fxr` directory.
     path: PathBuf,
 }
+
+// =============================================================================
+// Runtime Discovery and String Conversion
+// =============================================================================
 
 /// Locate the newest installed `hostfxr` library.
 ///
@@ -260,6 +332,13 @@ struct HostfxrVersion {
 /// .NET root is scanned and the newest `hostfxr` version is selected;
 /// prereleases only win when no stable release of the same base version
 /// exists.
+///
+/// # Errors
+///
+/// Returns [`CSharpError::HostfxrOverrideNotAFile`] when the
+/// `ECS_DOTNET_HOSTFXR` override does not point at a regular file, and
+/// [`CSharpError::HostfxrNotFound`] when no `host/fxr` version directory
+/// exists under any configured .NET root.
 fn find_dotnet_host() -> Result<PathBuf, CSharpError> {
     // An explicit override lets users pin one hostfxr regardless of what
     // other SDKs are installed.
@@ -376,6 +455,11 @@ fn parse_hostfxr_version(name: &str) -> (Vec<u32>, bool) {
 }
 
 /// Encode an OS string as nul-terminated UTF-16 for Windows hostfxr.
+///
+/// # Errors
+///
+/// Returns [`CSharpError::InteriorNul`] when the value contains an embedded
+/// NUL that would truncate the string at the ABI boundary.
 #[cfg(windows)]
 fn host_string(value: &std::ffi::OsStr) -> Result<Vec<HostChar>, CSharpError> {
     use std::os::windows::ffi::OsStrExt;
@@ -393,6 +477,11 @@ fn host_string(value: &std::ffi::OsStr) -> Result<Vec<HostChar>, CSharpError> {
 }
 
 /// Encode an OS string as nul-terminated bytes for Unix hostfxr.
+///
+/// # Errors
+///
+/// Returns [`CSharpError::InteriorNul`] when the value contains an embedded
+/// NUL that would truncate the string at the ABI boundary.
 #[cfg(not(windows))]
 fn host_string(value: &std::ffi::OsStr) -> Result<Vec<HostChar>, CSharpError> {
     use std::os::unix::ffi::OsStrExt;

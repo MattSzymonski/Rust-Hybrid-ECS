@@ -5,8 +5,14 @@
 //! - Describes how a game module is built, watched, and loaded.
 //! - Provides the standard Rust, C#, and integration-test configurations.
 //! - Selects a configuration from the host process environment.
-
+//!
 //! # Design
+//!
+//! All configuration is owned by [`GameModuleConfig`], whose `const`
+//! constructors produce consistent, valid configurations for each supported
+//! backend. [`GameModuleConfig::validate`] reports the first invalid field so
+//! callers can correct it directly, and [`GameModuleConfig::from_environment`]
+//! keeps backend selection out of executable crates.
 
 // Current crate
 use pill_core::error::ConfigError;
@@ -16,6 +22,9 @@ use pill_core::error::ConfigError;
 // =============================================================================
 
 /// Backend-specific output information for a hot-reloadable game module.
+///
+/// The variant determines how the host locates and loads the built output:
+/// a native shared library or a managed assembly hosted by `csharp_runtime`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum GameModuleBackend {
@@ -31,6 +40,10 @@ pub enum GameModuleBackend {
 }
 
 /// Output locations and assembly names used by the managed game backend.
+///
+/// The runtime assembly hosts the collectible loader; the game assembly is
+/// loaded by the runtime, so both assemblies and their output directories are
+/// needed to start the managed module.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct CSharpModuleConfig {
@@ -71,16 +84,22 @@ pub struct GameModuleConfig {
 impl GameModuleConfig {
     /// Verify that the configuration is internally consistent.
     ///
+    /// Checks every field that must be non-empty and returns on the first
+    /// violation so callers can fix one problem at a time.
+    ///
     /// # Errors
     ///
     /// Returns a typed [`ConfigError`] naming the first invalid field.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        // Step 1: Reject an empty name so log messages never reference a blank module.
         if self.name.is_empty() {
             return Err(ConfigError::EmptyModuleName);
         }
+        // Step 2: Reject an empty watch directory so the watcher has a real path to monitor.
         if self.watch_directory.is_empty() {
             return Err(ConfigError::EmptyWatchDirectory);
         }
+        // Step 3: Reject an empty build command so the runner never spawns a bare process.
         if self.build_command.is_empty() {
             return Err(ConfigError::EmptyBuildCommand);
         }

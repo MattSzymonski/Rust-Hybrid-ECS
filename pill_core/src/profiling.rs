@@ -80,118 +80,6 @@ pub const PROFILE_COARSE_TARGET: &str = crate::telemetry::telemetry_target::PROF
 /// disabled because they perturb timing measurements.
 pub const PROFILE_FINE_TARGET: &str = crate::telemetry::telemetry_target::PROFILE_FINE;
 
-// =============================================================================
-// Free Functions
-// =============================================================================
-
-/// Compute thread-utilization percentage for a single frame.
-///
-/// # Formula
-///
-/// ```text
-/// utilization = Σ(system_durations_ns) / (frame_wall_time_ns × thread_count) × 100
-/// ```
-///
-/// # Interpretation
-///
-/// | Value | Meaning |
-/// |-------|---------|
-/// | 100%  | Every thread was busy for the entire frame (perfect packing) |
-/// | 50%   | Half the available CPU-time was idle |
-/// | <100% | Batch serialization, imbalanced systems, or dispatch overhead |
-///
-/// This is a lower-bound estimate because each system's wall-clock
-/// duration already includes internal Rayon parallelism - a system that
-/// takes 10 ms on 12 threads may represent up to 120 ms of CPU work.
-/// The metric treats each system as using one thread, so actual thread
-/// saturation is always at least this number.
-#[cfg(any(feature = "profiling", feature = "profiling-minimal"))]
-pub fn compute_parallel_utilization(
-    system_durations_ns: &[u64],
-    frame_wall_time_ns: u64,
-    thread_count: usize,
-) -> f64 {
-    let total_work: u128 = system_durations_ns.iter().map(|&d| d as u128).sum();
-    let capacity = frame_wall_time_ns as u128 * thread_count as u128;
-    if capacity == 0 {
-        return 0.0;
-    }
-    (total_work as f64 / capacity as f64) * 100.0
-}
-
-/// Compute batch-packing efficiency: how evenly systems within each
-/// parallel batch balance each other.
-///
-/// # Formula
-///
-/// For each batch: `batch_score = Σ(durations) / (max_duration × batch_size)`.
-/// The frame-level score is a total-work-weighted average across batches.
-///
-/// # Interpretation
-///
-/// | Value | Meaning |
-/// |-------|---------|
-/// | 100%  | Every system in every batch has identical duration |
-/// | <100% | Some systems finish early while others in the same batch keep running |
-///
-/// A low packing score means the scheduler is grouping systems with
-/// very different execution times.  The idle threads from the shorter
-/// systems cannot be used by the longer one because Rayon work-stealing
-/// is intra-system, not inter-system.
-#[cfg(any(feature = "profiling", feature = "profiling-minimal"))]
-pub fn compute_batch_packing_efficiency(
-    system_durations_ns: &[u64],
-    execution_graph: &[Vec<usize>],
-) -> f64 {
-    let mut total_ideal: u128 = 0;
-    let mut total_actual: u128 = 0;
-
-    for batch in execution_graph {
-        if batch.is_empty() {
-            continue;
-        }
-        let max_duration = batch
-            .iter()
-            .filter_map(|&idx| system_durations_ns.get(idx).copied())
-            .max()
-            .unwrap_or(0);
-        let sum_durations: u64 = batch
-            .iter()
-            .filter_map(|&idx| system_durations_ns.get(idx).copied())
-            .sum();
-
-        total_ideal += max_duration as u128 * batch.len() as u128;
-        total_actual += sum_durations as u128;
-    }
-
-    if total_ideal == 0 {
-        return 100.0; // No systems → vacuously perfect
-    }
-    (total_actual as f64 / total_ideal as f64) * 100.0
-}
-
-/// Compute and emit parallel-utilization Tracy plots for the current frame.
-///
-/// This is the single entry-point called from the engine's frame processing.
-/// It collects the necessary inputs, computes both utilization and
-/// batch-packing percentages, and emits them as native Tracy plot points.
-///
-/// Only compiled when the `profiling` feature is active - `profiling-minimal`
-/// does not include native Tracy plots.
-#[cfg(feature = "profiling")]
-pub fn emit_parallel_utilization_plots(
-    system_durations_ns: &[u64],
-    frame_wall_time_ns: u64,
-    thread_count: usize,
-    execution_graph: &[Vec<usize>],
-) {
-    let utilization =
-        compute_parallel_utilization(system_durations_ns, frame_wall_time_ns, thread_count);
-    let batch_packing = compute_batch_packing_efficiency(system_durations_ns, execution_graph);
-    crate::profile_plot!(parallel_utilization_pct, utilization);
-    crate::profile_plot!(batch_packing_pct, batch_packing);
-}
-
 // ============================================================================
 // Compile-time safeguards
 // ============================================================================
@@ -205,10 +93,13 @@ compile_error!("`profiling` and `profiling-minimal` are mutually exclusive. Enab
 
 #[cfg(any(feature = "profiling", feature = "profiling-minimal"))]
 mod enabled {
+    // Standard library
     use std::fmt::Arguments;
+
+    // External crates
     use tracy_client::Client;
 
-    // Lazy-initialized client handle. The first call to `client()` starts Tracy.
+    /// Lazy-initialized client handle. The first call to `client()` starts Tracy.
     pub(crate) fn client() -> Client {
         use std::sync::OnceLock;
         static CLIENT: OnceLock<Client> = OnceLock::new();
@@ -398,9 +289,13 @@ mod enabled {
 
 #[cfg(feature = "profiling")]
 pub mod profiling_extras {
+    // Standard library
     use std::fmt::Arguments;
+
+    // External crates
     use tracy_client::Client;
 
+    // Current crate
     use super::enabled::client;
 
     /// Emit a data point on a named time-series plot.
@@ -467,24 +362,32 @@ pub mod profiling_extras {
 
 #[cfg(not(any(feature = "profiling", feature = "profiling-minimal")))]
 mod enabled {
+    // Standard library
     use std::fmt::Arguments;
 
+    /// Compile-time no-op CPU zone guard.
+    ///
+    /// Compiled when no profiling feature is enabled; every method is an
+    /// empty stub so instrumentation compiles away to zero cost.
     #[must_use = "zone closes on drop - bind to a variable"]
     pub struct TracyZone;
 
     impl TracyZone {
+        /// Compile-time no-op: creates an empty static-name zone guard.
         #[doc(hidden)]
         #[inline(always)]
         pub fn new_static(_name: &'static str, _span: tracing::Span) -> Self {
             Self
         }
 
+        /// Compile-time no-op: creates an empty dynamic-name zone guard.
         #[doc(hidden)]
         #[inline(always)]
         pub fn new_dynamic(_name: &str, _function: &str, _file: &str, _line: u32) -> Self {
             Self
         }
 
+        /// Compile-time no-op: creates an empty lazily-named zone guard.
         #[inline(always)]
         pub fn new_dynamic_lazy(
             _name: impl FnOnce() -> String,
@@ -495,6 +398,7 @@ mod enabled {
             Self
         }
 
+        /// Compile-time no-op: creates an empty fine-lane zone guard.
         #[inline(always)]
         pub fn new_dynamic_lazy_fine(
             _name: impl FnOnce() -> String,
@@ -505,26 +409,36 @@ mod enabled {
             Self
         }
 
+        /// Compile-time no-op: records nothing on this zone.
         #[inline(always)]
         pub fn text(&self, _msg: Arguments<'_>) {}
 
+        /// Compile-time no-op: never evaluates the lazy message closure.
         #[inline(always)]
         pub fn text_lazy(&self, _f: impl FnOnce() -> String) {}
     }
 
+    /// Compile-time no-op guard for a non-continuous frame.
+    ///
+    /// Dropping it does nothing; the real Tracy frame lifecycle does not
+    /// exist when no profiling feature is enabled.
     #[must_use = "non-continuous frame ends on drop - bind to a variable"]
     pub struct NonContinuousFrame;
 
-    // Opaque stand-in for `tracy_client::FrameName` when the crate isn't linked.
+    /// Opaque stand-in for `tracy_client::FrameName` when the crate isn't linked.
     #[doc(hidden)]
     pub struct OpaqueFrameName;
 
+    /// Compile-time no-op: Tracy is never initialized.
     #[inline(always)]
     pub fn init() {}
+    /// Compile-time no-op: no frame is ever marked.
     #[inline(always)]
     pub fn frame_mark() {}
+    /// Compile-time no-op: no secondary frame is ever marked.
     #[inline(always)]
     pub fn secondary_frame_mark(_name: OpaqueFrameName) {}
+    /// Compile-time no-op: returns a guard that ends nothing.
     #[inline(always)]
     pub fn non_continuous_frame_begin(_name: OpaqueFrameName) -> NonContinuousFrame {
         NonContinuousFrame
@@ -537,6 +451,161 @@ pub use enabled::*;
 // via `$crate::profiling::extras::*` which only exists under `#[cfg(feature = "profiling")]`.
 #[cfg(feature = "profiling")]
 pub use profiling_extras as extras;
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Compute thread-utilization percentage for a single frame.
+///
+/// # Formula
+///
+/// ```text
+/// utilization = Σ(system_durations_ns) / (frame_wall_time_ns × thread_count) × 100
+/// ```
+///
+/// # Interpretation
+///
+/// | Value | Meaning |
+/// |-------|---------|
+/// | 100%  | Every thread was busy for the entire frame (perfect packing) |
+/// | 50%   | Half the available CPU-time was idle |
+/// | <100% | Batch serialization, imbalanced systems, or dispatch overhead |
+///
+/// This is a lower-bound estimate because each system's wall-clock
+/// duration already includes internal Rayon parallelism - a system that
+/// takes 10 ms on 12 threads may represent up to 120 ms of CPU work.
+/// The metric treats each system as using one thread, so actual thread
+/// saturation is always at least this number.
+///
+/// # Examples
+///
+/// ```
+/// use pill_core::profiling::compute_parallel_utilization;
+///
+/// let system_durations_ns = [10_000_000, 20_000_000];
+/// let utilization = compute_parallel_utilization(&system_durations_ns, 20_000_000, 2);
+/// assert_eq!(utilization, 75.0);
+/// ```
+#[cfg(any(feature = "profiling", feature = "profiling-minimal"))]
+pub fn compute_parallel_utilization(
+    system_durations_ns: &[u64],
+    frame_wall_time_ns: u64,
+    thread_count: usize,
+) -> f64 {
+    // Step 1: Sum the per-system durations to obtain the total CPU work done.
+    let total_work: u128 = system_durations_ns.iter().map(|&d| d as u128).sum();
+    // Step 2: Scale the total work against the frame's full thread capacity.
+    let capacity = frame_wall_time_ns as u128 * thread_count as u128;
+    if capacity == 0 {
+        return 0.0;
+    }
+    (total_work as f64 / capacity as f64) * 100.0
+}
+
+/// Compute batch-packing efficiency: how evenly systems within each
+/// parallel batch balance each other.
+///
+/// # Formula
+///
+/// For each batch: `batch_score = Σ(durations) / (max_duration × batch_size)`.
+/// The frame-level score is a total-work-weighted average across batches.
+///
+/// # Interpretation
+///
+/// | Value | Meaning |
+/// |-------|---------|
+/// | 100%  | Every system in every batch has identical duration |
+/// | <100% | Some systems finish early while others in the same batch keep running |
+///
+/// A low packing score means the scheduler is grouping systems with
+/// very different execution times.  The idle threads from the shorter
+/// systems cannot be used by the longer one because Rayon work-stealing
+/// is intra-system, not inter-system.
+///
+/// # Examples
+///
+/// ```
+/// use pill_core::profiling::compute_batch_packing_efficiency;
+///
+/// // Two systems batched together: one takes 10 ms, the other 20 ms.
+/// let system_durations_ns = [10_000_000, 20_000_000];
+/// let execution_graph = [vec![0, 1]];
+/// let efficiency = compute_batch_packing_efficiency(&system_durations_ns, &execution_graph);
+/// assert_eq!(efficiency, 75.0);
+/// ```
+#[cfg(any(feature = "profiling", feature = "profiling-minimal"))]
+pub fn compute_batch_packing_efficiency(
+    system_durations_ns: &[u64],
+    execution_graph: &[Vec<usize>],
+) -> f64 {
+    let mut total_ideal: u128 = 0;
+    let mut total_actual: u128 = 0;
+
+    // Step 1: Accumulate ideal (max duration × batch size) and actual (sum of
+    // durations) work across every parallel batch.
+    for batch in execution_graph {
+        if batch.is_empty() {
+            continue;
+        }
+        let max_duration = batch
+            .iter()
+            .filter_map(|&idx| system_durations_ns.get(idx).copied())
+            .max()
+            .unwrap_or(0);
+        let sum_durations: u64 = batch
+            .iter()
+            .filter_map(|&idx| system_durations_ns.get(idx).copied())
+            .sum();
+
+        total_ideal += max_duration as u128 * batch.len() as u128;
+        total_actual += sum_durations as u128;
+    }
+
+    // Step 2: Convert the accumulated totals into a percentage.
+    if total_ideal == 0 {
+        return 100.0; // No systems → vacuously perfect
+    }
+    (total_actual as f64 / total_ideal as f64) * 100.0
+}
+
+/// Compute and emit parallel-utilization Tracy plots for the current frame.
+///
+/// This is the single entry-point called from the engine's frame processing.
+/// It collects the necessary inputs, computes both utilization and
+/// batch-packing percentages, and emits them as native Tracy plot points.
+///
+/// Only compiled when the `profiling` feature is active - `profiling-minimal`
+/// does not include native Tracy plots.
+///
+/// # Examples
+///
+/// ```
+/// use pill_core::profiling::emit_parallel_utilization_plots;
+///
+/// emit_parallel_utilization_plots(
+///     &[10_000_000, 20_000_000],
+///     30_000_000,
+///     2,
+///     &[vec![0], vec![1]],
+/// );
+/// ```
+#[cfg(feature = "profiling")]
+pub fn emit_parallel_utilization_plots(
+    system_durations_ns: &[u64],
+    frame_wall_time_ns: u64,
+    thread_count: usize,
+    execution_graph: &[Vec<usize>],
+) {
+    // Step 1: Compute the frame's overall thread utilization.
+    let utilization =
+        compute_parallel_utilization(system_durations_ns, frame_wall_time_ns, thread_count);
+    // Step 2: Compute how evenly systems within each batch balance out.
+    let batch_packing = compute_batch_packing_efficiency(system_durations_ns, execution_graph);
+    // Step 3: Emit both metrics as native Tracy plot points.
+    crate::profile_plot!(parallel_utilization_pct, utilization);
+    crate::profile_plot!(batch_packing_pct, batch_packing);
+}
 
 // ============================================================================
 // Public macros - the only API call sites use

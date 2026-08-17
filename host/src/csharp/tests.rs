@@ -4,6 +4,15 @@
 //!
 //! - Verify command-callback ABI behaviour against a live engine.
 //! - Verify component-chunk queries and scheduler access derivation.
+//!
+//! # Design
+//!
+//! Every test drives the [`Engine`] through the same ABI entry points the
+//! managed runtime uses, always inside an [`ActiveSystemGuard`] scope so the
+//! declared scheduler access is enforced exactly as in a live frame. Shared
+//! fixtures build a representative world of shared and dynamic components,
+//! while scheduler tests derive [`SystemAccess`] metadata from concise native
+//! access declarations.
 
 // External crates
 use pill_core::error::EngineMessage;
@@ -52,10 +61,12 @@ fn get_test_chunk(name: &str, mode: u8, index: u32, output: *mut ComponentChunk)
 
 /// Convert concise test access declarations into scheduler metadata.
 fn managed_access(entries: &[(&str, u8)]) -> SystemAccess {
+    // Step 1: Build one native access descriptor per test declaration.
     let native: Vec<_> = entries
         .iter()
         .map(|(name, mode)| native_access(name, *mode))
         .collect();
+    // Step 2: Register a dynamic binding for every component not yet shared.
     let mut engine = Engine::new();
     let mut bindings = shared_component_bindings(&mut engine);
     for (name, _) in entries {
@@ -76,12 +87,14 @@ fn managed_access(entries: &[(&str, u8)]) -> SystemAccess {
             },
         );
     }
+    // Step 3: Derive scheduler access from the bound component identities.
     derive_system_access(&native, &bindings)
         .expect("managed access should map to native components")
 }
 
 /// Populate a representative world containing shared and dynamic components.
 fn setup_test_world(engine: &mut Engine) -> ComponentBindings {
+    // Step 1: Register the shared `PhysicsState` component from a manifest.
     let shared = shared_component_bindings(engine);
     let stable_id = stable_component_id("TracyLive.PhysicsState");
     let manifest = serde_json::json!([{
@@ -98,6 +111,7 @@ fn setup_test_world(engine: &mut Engine) -> ComponentBindings {
         register_component_manifest(engine, &serde_json::to_vec(&manifest).unwrap(), shared)
             .unwrap();
     let physics = bindings[&stable_id].component_id();
+    // Step 2: Populate entities with both shared and dynamic components.
     for _ in 0..100 {
         let entity = engine
             .world_mut()
@@ -173,6 +187,8 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
     let dynamic_a_value = 41_u32;
     let mut created = None;
 
+    // Step 1: Create a mixed entity holding Position and DynamicA through the
+    // native command queue.
     engine
         .run_deferred_commands(|world, queue| {
             let _guard = ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
@@ -217,6 +233,7 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
     );
 
     let dynamic_b_value = 77_u32;
+    // Step 2: Swap DynamicA for DynamicB through the native command queue.
     engine
         .run_deferred_commands(|world, queue| {
             let _guard = ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
@@ -253,6 +270,7 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
     );
     assert!(engine.world().get_component::<Position>(entity).is_some());
 
+    // Step 3: Destroy the entity through the native command queue.
     engine
         .run_deferred_commands(|world, queue| {
             let _guard = ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
@@ -405,6 +423,9 @@ fn managed_manifest_registers_and_queries_a_new_dynamic_component() {
         );
         assert_eq!(chunk.len, 1);
         assert_eq!(chunk.element_size, 4);
+        // SAFETY: the query returned success and the asserted length and
+        // element size guarantee the chunk data pointer addresses one valid
+        // `u32` inside the component column.
         assert_eq!(unsafe { *(chunk.data as *const u32) }, 77);
     }
 }
@@ -546,9 +567,14 @@ fn one_managed_row_write_is_visible_to_rust_changed_filter() {
         let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
         assert_eq!(get_test_chunk("Position", 1, 0, &mut component_chunk), 1);
         assert_eq!(ffi_get_entity_chunk(0, &mut entity_chunk), 1);
+        // SAFETY: the Position chunk was fetched successfully and row `37`
+        // lies within its live length, so the chunk tick pointer is valid to
+        // advance by that many rows.
         unsafe { simulate_managed_write(&component_chunk, 37) };
     }
 
+    // SAFETY: the entity chunk was fetched successfully and row `37` indexes
+    // a live entity within its declared length.
     let expected = unsafe { *((entity_chunk.data as *const pill_engine::Entity).add(37)) };
     let mut changed =
         pill_engine::Query::<(pill_engine::Entity,), pill_engine::Changed<Position>>::new(
@@ -601,12 +627,17 @@ fn disjoint_managed_writes_mark_the_correct_tick_columns() {
         assert_eq!(get_test_chunk("Sprite", 1, 0, &mut sprites), 1);
         assert_eq!(ffi_get_entity_chunk(0, &mut entities), 1);
         assert_ne!(positions.ticks, sprites.ticks);
+        // SAFETY: both chunks were fetched successfully and rows `3` and `7`
+        // fall within their live lengths, so each tick pointer is valid to
+        // advance by the requested row.
         unsafe {
             simulate_managed_write(&positions, 3);
             simulate_managed_write(&sprites, 7);
         }
     }
 
+    // SAFETY: the entity chunk was fetched successfully and each queried row
+    // indexes a live entity within the chunk's declared length.
     let entity_at = |row| unsafe { *((entities.data as *const pill_engine::Entity).add(row)) };
     let mut changed_positions = pill_engine::Query::<
         (pill_engine::Entity,),

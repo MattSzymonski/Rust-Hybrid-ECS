@@ -29,13 +29,11 @@ use std::time::Duration;
 // External crates
 use notify::event::EventKind;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
+use pill_core::error::WatcherError;
+use pill_core::{debug, error, info};
 
 // Current crate
 use crate::GameModuleConfig;
-
-// External crates
-use pill_core::error::WatcherError;
-use pill_core::{debug, error, info};
 
 // =============================================================================
 // Constants

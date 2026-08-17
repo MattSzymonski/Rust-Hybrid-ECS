@@ -9,7 +9,9 @@
 //! # Design
 //!
 //! This module contains the stable API used by `standalone`, `editor`, and
-//! other host binaries. Backend-specific loading stays behind [`LoadedGame`].
+//! other host binaries. [`Host`] bundles the engine and game module for the
+//! headless path, [`RenderingHost`] adds a renderer for windowed frontends,
+//! and backend-specific loading stays behind [`LoadedGame`].
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -18,6 +20,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // External crates
+use pill_core::error::{EngineMessage, HostError};
+use pill_core::telemetry::telemetry_target;
+use pill_core::{error, info};
+#[cfg(feature = "rendering")]
+use pill_engine::EngineError;
 use pill_engine::{Engine, EngineApi};
 #[cfg(feature = "rendering")]
 use pill_engine::{RenderViewport, Renderer, RendererError, RendererWindow, VirtualResolution};
@@ -27,13 +34,6 @@ use crate::game_module::LoadedGame;
 use crate::native_library::cleanup_temporary_files;
 use crate::watcher::spawn_file_watcher;
 use crate::{GameModuleBackend, GameModuleConfig};
-
-// External crates
-use pill_core::error::{EngineMessage, HostError};
-use pill_core::telemetry::telemetry_target;
-use pill_core::{error, info};
-#[cfg(feature = "rendering")]
-use pill_engine::EngineError;
 
 // =============================================================================
 // Constants
@@ -213,10 +213,10 @@ pub struct FrameReport {
 /// Returns a typed [`HostError`] naming the failing subsystem: configuration,
 /// build, library loading, watcher startup, or managed backend startup.
 pub fn setup(module_config: GameModuleConfig) -> Result<Host, HostError> {
-    // Step 0: Reject inconsistent configurations before any build or load.
+    // Step 1: Reject inconsistent configurations before any build or load.
     module_config.validate()?;
 
-    // Step 1: Resolve the workspace root and print the selected configuration.
+    // Step 2: Resolve the workspace root and print the selected configuration.
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or(HostError::WorkspaceRootUndetermined)?
@@ -231,14 +231,14 @@ pub fn setup(module_config: GameModuleConfig) -> Result<Host, HostError> {
         cleanup_temporary_files(&workspace_root);
     }
 
-    // Step 2: Construct the engine and its stable API table.
+    // Step 3: Construct the engine and its stable API table.
     // EngineApi stores a raw pointer into this allocation, so the engine must
     // reach its final stable address before the API table is constructed.
     let mut engine = Box::new(Engine::new());
     engine.set_parallel_execution(true);
     let engine_api = EngineApi::new(&mut engine);
 
-    // Step 3: Build and load the game module, then start its source watcher.
+    // Step 4: Build and load the game module, then start its source watcher.
     let loaded_game = LoadedGame::start(&mut engine, &engine_api, &workspace_root, &module_config)?;
 
     let reload_generation = Arc::new(AtomicU64::new(0));
@@ -333,7 +333,7 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     // The managed loader watches the built assembly instead of source files.
     host.loaded_game.poll_managed_reload();
 
-    // Step 3: Execute one scheduler frame.
+    // Step 3: Execute one scheduler frame and report its failures.
     if let Err(errors) = host.engine.process_frame() {
         // Deferred command failures arrive as a batch; flatten them into one
         // rate-limited report using each error's plain semantic message.
@@ -345,9 +345,9 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
         host.report_frame_error(summary);
     }
 
-    // Step 3b: Report systems that returned an error during the frame. Each
-    // failure carries the system name and its semantic message; the rate
-    // limiter collapses repeated identical failures across frames.
+    // Systems can also fail mid-frame. Each failure carries the system name
+    // and its semantic message; the rate limiter collapses repeated identical
+    // failures across frames.
     for failure in host.engine.drain_system_failures() {
         host.report_frame_error(failure.to_plain_message());
     }

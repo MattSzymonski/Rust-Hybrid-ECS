@@ -17,12 +17,18 @@
 // Standard library
 use std::path::PathBuf;
 
+// External crates
+use tracing::level_filters::LevelFilter;
+
 // Current crate
 use pill_core::telemetry::{
     telemetry_target, LoggingConfig, TelemetryBuilder, TelemetryError, TelemetryHandles,
     DEV_LOG_TARGET,
 };
-use tracing::level_filters::LevelFilter;
+
+// =============================================================================
+// Free Functions
+// =============================================================================
 
 /// Install the engine telemetry stack and return its reload handles.
 ///
@@ -42,6 +48,7 @@ pub fn init_telemetry(
 ) -> Result<TelemetryHandles, TelemetryError> {
     let mut builder = TelemetryBuilder::new();
 
+    // Step 1: Add a rolling file lane when a log directory is supplied.
     if let Some(directory) = file_log_directory {
         // Permanent engine logs land in the file; scratch `engine::dev`
         // logs stay out of files by default.
@@ -51,6 +58,7 @@ pub fn init_telemetry(
         builder = builder.with_file_output(file_config, directory);
     }
 
+    // Step 2: Route profiling spans to Tracy when the feature is active.
     #[cfg(feature = "profiling")]
     {
         builder = builder.with_tracy(true);
@@ -60,8 +68,10 @@ pub fn init_telemetry(
         }
     }
 
+    // Step 3: Build and initialize the subscriber stack.
     let handles = builder.init()?;
 
+    // Step 4: Install the shared metrics recorder when the feature is on.
     #[cfg(feature = "metrics")]
     {
         // Repeated numerical state flows into the shared recorder; it is

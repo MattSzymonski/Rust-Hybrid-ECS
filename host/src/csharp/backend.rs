@@ -5,6 +5,17 @@
 //! - Start .NET and discover the managed interop exports.
 //! - Register reflected component manifests and startup methods.
 //! - Translate reflected system accesses into scheduler registrations.
+//!
+//! # Design
+//!
+//! Every unmanaged export is resolved once at startup into a plain function
+//! pointer held by the [`CSharpRuntime`] host. Scheduled systems never call
+//! the runtime directly: each registration captures the resolved pointers,
+//! the reflected access list, and a shared [`ComponentBindings`] arc, so the
+//! host outlives every scheduler closure it registers. After a hot reload the
+//! active assembly is re-reflected and compared against the
+//! [`ManagedSystemSnapshot`] captured at startup, so stale index bindings can
+//! never run silently.
 
 // Standard library
 use std::path::Path;
@@ -35,6 +46,13 @@ use crate::CSharpModuleConfig;
 /// managed assembly from driving a multi-gigabyte host allocation.
 pub(super) const MAX_COMPONENT_MANIFEST_BYTES: u32 = 16 * 1024 * 1024;
 
+/// Poll returned without a reload: nothing was due or the file is unchanged.
+pub(crate) const POLL_NO_CHANGE: u8 = 0;
+/// Poll swapped in a behavior-compatible assembly.
+pub(crate) const POLL_RELOADED: u8 = 1;
+/// Poll rejected the new assembly; the old version stays loaded.
+pub(crate) const POLL_REJECTED: u8 = 2;
+
 /// Maximum UTF-8 byte length accepted for a managed system name.
 const MAX_SYSTEM_NAME_BYTES: u32 = 1024;
 
@@ -48,7 +66,7 @@ const MAX_SYSTEM_ERROR_BYTES: u32 = 4096;
 const INTEROP_CONTRACT_VERSION: u32 = 3;
 
 // =============================================================================
-// Types
+// Types + Impls
 // =============================================================================
 
 /// Signature of the managed runtime entry point that receives the API table.
@@ -88,24 +106,15 @@ type CopySystemErrorMessageFn = extern "system" fn(u32, *mut u8, u32) -> u8;
 /// reporting the swap outcome through the status codes below.
 type PollReloadFn = extern "system" fn() -> u8;
 
-/// Poll returned without a reload: nothing was due or the file is unchanged.
-pub(crate) const POLL_NO_CHANGE: u8 = 0;
-/// Poll swapped in a behavior-compatible assembly.
-pub(crate) const POLL_RELOADED: u8 = 1;
-/// Poll rejected the new assembly; the old version stays loaded.
-pub(crate) const POLL_REJECTED: u8 = 2;
-
-// =============================================================================
-// Types + Impls
-// =============================================================================
-
 /// Reflected metadata of one managed system, captured at startup.
 ///
 /// The snapshot is compared against a re-reflection after every successful
 /// reload, so a managed-side bug that silently changes system metadata can
 /// never run stale index bindings unnoticed.
 struct ManagedSystemSnapshot {
+    /// Reflected native access list resolved at startup.
     accesses: Box<[NativeSystemAccess]>,
+    /// Whether the managed system declared a Commands parameter.
     uses_commands: bool,
 }
 
@@ -115,15 +124,25 @@ struct ManagedSystemSnapshot {
 /// runtime and every native function pointer remain valid for registered
 /// scheduler closures.
 pub(crate) struct CSharpRuntime {
+    /// Unmanaged export polling the collectible loader for a rebuilt assembly.
     poll_reload: PollReloadFn,
+    /// Unmanaged export reporting the number of registered scheduler systems.
     system_count: SystemCountFn,
+    /// Unmanaged export reporting how many accesses one system declared.
     access_count: SystemAccessCountFn,
+    /// Unmanaged export copying one system's reflected accesses into a buffer.
     get_access: GetSystemAccessFn,
+    /// Unmanaged export reporting whether one system declares a Commands parameter.
     system_uses_commands: SystemUsesCommandsFn,
+    /// Outcome of the most recent reload poll, for one-shot rejection logging.
     last_poll_status: u8,
+    /// Metadata snapshot the active assembly is verified against after reload.
     system_snapshot: Vec<ManagedSystemSnapshot>,
+    /// Keeps the hosted .NET runtime alive for the host's lifetime.
     _runtime: DotnetRuntimeContext,
+    /// Keeps the native API table alive so registered closures stay valid.
     _api: Box<CsEngineApi>,
+    /// Keeps the shared component bindings alive for reload verification.
     _bindings: Arc<ComponentBindings>,
 }
 

@@ -6,6 +6,15 @@
 //! - Decode managed component blobs into native or dynamic adders.
 //! - Queue create, destroy, add, and remove operations against the active
 //!   world, rejecting stale generations and undeclared scopes.
+//!
+//! # Design
+//!
+//! Every callback funnels through [`with_active_command_context`], which
+//! resolves the active world once and hands the closure a queue, a binding
+//! table, and the invocation-scope reservation set. Component blobs are
+//! decoded through [`ComponentBinding`] into either a native [`ComponentAdder`]
+//! or a type-erased [`DecodedCommandComponent`] before being handed to the
+//! queue, so managed callers never touch concrete Rust types directly.
 
 // Standard library
 use std::collections::HashSet;
@@ -30,10 +39,29 @@ use super::context::{active_world_exists, with_active_command_context};
 pub(super) const MAX_COMPONENTS_PER_CREATE: u32 = 1024;
 
 // =============================================================================
+// Types
+// =============================================================================
+
+/// A decoded command component in its native or type-erased representation.
+///
+/// The native variant carries a fully typed [`ComponentAdder`] produced by the
+/// binding's decode function; the dynamic variant carries a stable component
+/// identity plus raw bytes for late binding by the queue.
+enum DecodedCommandComponent {
+    /// A concrete Rust component decoded through its native binding.
+    Native(Box<dyn ComponentAdder>),
+    /// A type-erased byte payload for a dynamically registered component.
+    Dynamic(ComponentId, Vec<u8>),
+}
+
+// =============================================================================
 // Free Functions
 // =============================================================================
 
 /// Return the command-specific scope error used by all lifecycle callbacks.
+///
+/// Reports 3 when no world is active on this thread, or 4 when a world exists
+/// but the command scope cannot be entered.
 fn command_scope_error() -> u8 {
     if active_world_exists() {
         4
@@ -51,8 +79,12 @@ pub(super) extern "C" fn ffi_reserve_entity(output: *mut Entity) -> u8 {
         return 6;
     }
     with_active_command_context(|world, _queue, _bindings, reserved| {
+        // Step 1: allocate a fresh generation-checked entity handle.
         let entity = world.reserve_entity();
+        // Step 2: track the handle so an unconsumed reservation is returned
+        // to the allocator when the invocation scope ends.
         reserved.insert(entity);
+        // Step 3: write the handle back through the managed out pointer.
         // SAFETY: managed code supplied a checked, non-null out pointer whose
         // ABI layout is validated by the managed Entity mirror.
         unsafe { output.write(entity) };
@@ -63,6 +95,11 @@ pub(super) extern "C" fn ffi_reserve_entity(output: *mut Entity) -> u8 {
 
 /// Validate and copy a component blob into the representation understood by
 /// the native or type-erased branch of the Rust command queue.
+///
+/// # Errors
+///
+/// Returns an error string when the data pointer is null or when the blob
+/// size does not match the size declared by the resolved binding.
 fn decode_command_component(
     binding: ComponentBinding,
     data: *const u8,
@@ -98,14 +135,6 @@ fn decode_command_component(
     }
 }
 
-/// A decoded command component in its native or type-erased representation.
-enum DecodedCommandComponent {
-    /// A concrete Rust component decoded through its native binding.
-    Native(Box<dyn ComponentAdder>),
-    /// A type-erased byte payload for a dynamically registered component.
-    Dynamic(ComponentId, Vec<u8>),
-}
-
 /// Queue creation after validating every supplied component blob atomically.
 ///
 /// Rejects more than [`MAX_COMPONENTS_PER_CREATE`] blobs as part of the
@@ -119,13 +148,20 @@ pub(super) extern "C" fn ffi_queue_create(
         return 6;
     }
     with_active_command_context(|_world, queue, bindings, reserved| {
-        // SAFETY: pointers were checked above and managed pins the descriptor
-        // array for this synchronous call.
+        // Step 1: recover the reserved entity handle, rejecting unknown ones.
+        // SAFETY: the entity pointer is non-null (checked above) and managed
+        // code pins the entity storage for this synchronous call.
         let entity = unsafe { *entity };
         if !reserved.contains(&entity) {
             return 5;
         }
+        // Step 2: view the descriptor array as a slice.
+        // SAFETY: `blobs` is non-null whenever `count` is non-zero (checked
+        // above) and `count` is capped at MAX_COMPONENTS_PER_CREATE, so the
+        // slice stays within the array the managed caller pinned for this call.
         let blobs = unsafe { std::slice::from_raw_parts(blobs, count as usize) };
+        // Step 3: decode every blob into a native or dynamic adder, rejecting
+        // duplicate identities, undeclared bindings, and malformed payloads.
         let mut seen = HashSet::with_capacity(blobs.len());
         let mut native = Vec::new();
         let mut dynamic = Vec::new();
@@ -144,6 +180,8 @@ pub(super) extern "C" fn ffi_queue_create(
                 Err(_) => return 6,
             }
         }
+        // Step 4: commit the validated creation and drop the reservation so
+        // the handle can be recycled by the allocator.
         reserved.remove(&entity);
         queue.create_mixed_entity(entity, native, dynamic);
         1
@@ -157,11 +195,14 @@ pub(super) extern "C" fn ffi_queue_destroy(entity: *const Entity) -> u8 {
         return 6;
     }
     with_active_command_context(|world, queue, _bindings, _reserved| {
-        // SAFETY: pointer is checked and consumed synchronously.
+        // Step 1: validate the entity handle against the live world.
+        // SAFETY: the entity pointer is non-null (checked above) and managed
+        // code pins the entity storage for this synchronous call.
         let entity = unsafe { *entity };
         if !world.is_entity_valid(entity) {
             return 5;
         }
+        // Step 2: enqueue destruction for the validated handle.
         queue.destroy_entity(entity);
         1
     })
@@ -180,15 +221,19 @@ pub(super) extern "C" fn ffi_queue_add_component(
         return 6;
     }
     with_active_command_context(|world, queue, bindings, _reserved| {
-        // SAFETY: pointer is checked and consumed synchronously.
+        // Step 1: validate the entity handle against the live world.
+        // SAFETY: the entity pointer is non-null (checked above) and managed
+        // code pins the entity storage for this synchronous call.
         let entity = unsafe { *entity };
         if !world.is_entity_valid(entity) {
             return 5;
         }
+        // Step 2: resolve the stable component identity to a registered binding.
         let stable = StableComponentId::from_halves(key_low, key_high);
         let Some(binding) = bindings.get(&stable).copied() else {
             return 2;
         };
+        // Step 3: decode the payload and enqueue the matching command.
         match decode_command_component(binding, data, size as usize) {
             Ok(DecodedCommandComponent::Native(component)) => {
                 queue.add_component_adder_to_entity(entity, component)
@@ -213,15 +258,19 @@ pub(super) extern "C" fn ffi_queue_remove_component(
         return 6;
     }
     with_active_command_context(|world, queue, bindings, _reserved| {
-        // SAFETY: pointer is checked and consumed synchronously.
+        // Step 1: validate the entity handle against the live world.
+        // SAFETY: the entity pointer is non-null (checked above) and managed
+        // code pins the entity storage for this synchronous call.
         let entity = unsafe { *entity };
         if !world.is_entity_valid(entity) {
             return 5;
         }
+        // Step 2: resolve the stable component identity to a registered binding.
         let stable = StableComponentId::from_halves(key_low, key_high);
         let Some(binding) = bindings.get(&stable).copied() else {
             return 2;
         };
+        // Step 3: enqueue removal by the binding's native component identity.
         queue.remove_component_by_id(entity, binding.component_id());
         1
     })

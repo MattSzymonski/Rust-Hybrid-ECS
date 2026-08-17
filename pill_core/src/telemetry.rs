@@ -95,12 +95,6 @@ pub struct LoggingConfig {
     directives: Vec<(String, tracing::level_filters::LevelFilter)>,
 }
 
-impl Default for LoggingConfig {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl LoggingConfig {
     /// Create an empty logging configuration (baseline `INFO`, no overrides).
     pub fn new() -> Self {
@@ -152,6 +146,15 @@ impl LoggingConfig {
     /// Returns a [`TelemetryError::InvalidFilter`] when any directive cannot
     /// be parsed, so a mistyped configuration fails loudly instead of
     /// silently degrading.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pill_core::telemetry::LoggingConfig;
+    ///
+    /// let config = LoggingConfig::parse("engine=debug,wgpu=warn")
+    ///     .expect("valid RUST_LOG-style string");
+    /// ```
     pub fn parse(strict_filter: &str) -> Result<Self, TelemetryError> {
         EnvFilter::try_new(strict_filter).map_err(|source| TelemetryError::InvalidFilter {
             filter: strict_filter.to_owned(),
@@ -166,6 +169,17 @@ impl LoggingConfig {
     ///
     /// Returns [`TelemetryError::InvalidDirective`] when any configured
     /// directive fails to parse.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pill_core::telemetry::LoggingConfig;
+    /// use pill_core::tracing::level_filters::LevelFilter;
+    ///
+    /// let config = LoggingConfig::new()
+    ///     .with_directive("engine::ecs", LevelFilter::DEBUG);
+    /// let filter = config.build_env_filter().expect("directive must parse");
+    /// ```
     pub fn build_env_filter(&self) -> Result<EnvFilter, TelemetryError> {
         let mut filter = EnvFilter::try_new(self.baseline.to_string()).map_err(|source| {
             TelemetryError::InvalidFilter {
@@ -188,6 +202,12 @@ impl LoggingConfig {
     }
 }
 
+impl Default for LoggingConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // =============================================================================
 // Terminal Formatter
 // =============================================================================
@@ -204,6 +224,14 @@ pub struct EngineTerminalFormatter {
 
 impl EngineTerminalFormatter {
     /// Create a formatter; timestamps are included by default.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pill_core::telemetry::EngineTerminalFormatter;
+    ///
+    /// let formatter = EngineTerminalFormatter::new();
+    /// ```
     pub fn new() -> Self {
         Self {
             show_timestamps: true,
@@ -211,6 +239,14 @@ impl EngineTerminalFormatter {
     }
 
     /// Disable the timestamp prefix.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pill_core::telemetry::EngineTerminalFormatter;
+    ///
+    /// let formatter = EngineTerminalFormatter::new().without_timestamps();
+    /// ```
     pub fn without_timestamps(mut self) -> Self {
         self.show_timestamps = false;
         self
@@ -309,22 +345,6 @@ impl<W: fmt::Write> Visit for StyledFieldVisitor<'_, W> {
     }
 }
 
-/// Severity color mapping owned by the terminal formatter.
-fn styled_level(level: &Level) -> String {
-    match *level {
-        Level::TRACE => "TRACE".magenta().to_string(),
-        Level::DEBUG => "DEBUG".blue().bold().to_string(),
-        Level::INFO => "INFO".white().to_string(),
-        Level::WARN => "WARN".yellow().bold().to_string(),
-        Level::ERROR => "ERROR".red().bold().to_string(),
-    }
-}
-
-/// Target styling owned by the terminal formatter.
-fn styled_target(target: &str) -> String {
-    target.cyan().to_string()
-}
-
 // =============================================================================
 // Subscriber Builder
 // =============================================================================
@@ -380,6 +400,14 @@ pub struct TelemetryBuilder {
 
 impl TelemetryBuilder {
     /// Create a builder with the default engine logging configuration.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pill_core::telemetry::TelemetryBuilder;
+    ///
+    /// let builder = TelemetryBuilder::new();
+    /// ```
     pub fn new() -> Self {
         Self {
             logging: LoggingConfig::default_engine(),
@@ -396,6 +424,17 @@ impl TelemetryBuilder {
     }
 
     /// Add a rolling file lane with its own independent filter.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pill_core::telemetry::{LoggingConfig, TelemetryBuilder};
+    ///
+    /// let builder = TelemetryBuilder::new().with_file_output(
+    ///     LoggingConfig::new(),
+    ///     std::env::temp_dir(),
+    /// );
+    /// ```
     pub fn with_file_output(
         mut self,
         config: LoggingConfig,
@@ -427,17 +466,30 @@ impl TelemetryBuilder {
     ///
     /// Returns [`TelemetryError`] when any configured filter directive is
     /// invalid or the file appender cannot be created.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pill_core::telemetry::TelemetryBuilder;
+    ///
+    /// let handles = TelemetryBuilder::new()
+    ///     .init()
+    ///     .expect("default configuration installs cleanly");
+    /// ```
     pub fn init(self) -> Result<TelemetryHandles, TelemetryError> {
         static INSTALLED: OnceLock<TelemetryHandles> = OnceLock::new();
         static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // Step 1: Fast-path return when the subscriber is already installed.
         if let Some(handles) = INSTALLED.get() {
             return Ok(handles.clone());
         }
-        // Serialize the check-and-install so two threads cannot both set the
-        // process-wide default subscriber.
+        // Step 2: Serialize the check-and-install so two threads cannot both
+        // set the process-wide default subscriber.
         let _guard = INSTALL_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Step 3: Re-check under the lock; install only when this thread is
+        // the first to reach the installer.
         if let Some(handles) = INSTALLED.get() {
             return Ok(handles.clone());
         }
@@ -447,7 +499,12 @@ impl TelemetryBuilder {
         Ok(handles)
     }
 
+    /// Build the full subscriber stack (terminal, optional file, optional
+    /// Tracy) and install it as the process-wide default subscriber.
+    ///
+    /// Invoked exactly once by [`Self::init`] under its install lock.
     fn install(self) -> Result<TelemetryHandles, TelemetryError> {
+        // Step 1: Build the terminal lane with its own reloadable filter.
         let terminal_filter = self.logging.build_env_filter()?;
         let (terminal_reload, terminal_handle) = reload::Layer::new(terminal_filter);
         let terminal_layer: TerminalLayer = tracing_subscriber::fmt::layer()
@@ -456,8 +513,9 @@ impl TelemetryBuilder {
             .event_format(EngineTerminalFormatter::new())
             .with_filter(terminal_reload);
 
-        // The file lane is optional; `Option<L>` implements `Layer`, so a
-        // missing file lane is simply a no-op layer in the same position.
+        // Step 2: Build the optional file lane. `Option<L>` implements
+        // `Layer`, so a missing file lane is simply a no-op layer in the
+        // same position.
         let (file_layer, file_guard, file_handle): FileLaneArtifacts = match self.file_logging {
             Some((file_config, directory)) => {
                 let file_filter = file_config.build_env_filter()?;
@@ -475,6 +533,8 @@ impl TelemetryBuilder {
             None => (None, None, None),
         };
 
+        // Step 3: Build the optional Tracy lane, restricted to `profile::*`
+        // targets and controlled independently of terminal verbosity.
         #[cfg(feature = "tracy")]
         let tracy_layer = if self.tracy {
             let mut tracy_filter = EnvFilter::default();
@@ -504,17 +564,19 @@ impl TelemetryBuilder {
         #[cfg(not(feature = "tracy"))]
         let tracy_layer: Option<tracing_subscriber::layer::Identity> = None;
 
+        // Step 4: Assemble the three-layer stack and install it as the
+        // process-wide default subscriber.
         let registry = tracing_subscriber::registry()
             .with(terminal_layer)
             .with(file_layer)
             .with(tracy_layer);
         registry.init();
 
-        // Bridge the legacy `log` crate into tracing so dependencies that
-        // still emit through `log` (winit, wgpu, notify, ...) become tracing
-        // events on their own targets and fall under the EnvFilter directives
-        // above. The bridge is process-wide and installs once; a second
-        // attempt only reports that it is already active.
+        // Step 5: Bridge the legacy `log` crate into tracing so dependencies
+        // that still emit through `log` (winit, wgpu, notify, ...) become
+        // tracing events on their own targets and fall under the EnvFilter
+        // directives above. The bridge is process-wide and installs once; a
+        // second attempt only reports that it is already active.
         let _ = tracing_log::LogTracer::init();
 
         Ok(TelemetryHandles {
@@ -526,6 +588,9 @@ impl TelemetryBuilder {
 }
 
 /// Handles returned by [`TelemetryBuilder::init`] for live configuration.
+///
+/// Holds the reload handles for the terminal and file lanes plus the guard
+/// that keeps the non-blocking file writer alive for the process lifetime.
 #[derive(Debug, Clone)]
 pub struct TelemetryHandles {
     /// Reload handle for the terminal logging filter.
@@ -543,6 +608,19 @@ impl TelemetryHandles {
     ///
     /// Returns [`TelemetryError::InvalidFilter`] when the replacement string
     /// cannot be parsed; the previous filter stays active.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pill_core::telemetry::TelemetryBuilder;
+    ///
+    /// let handles = TelemetryBuilder::new()
+    ///     .init()
+    ///     .expect("default configuration installs cleanly");
+    /// handles
+    ///     .reload_logging("engine=debug,wgpu=warn")
+    ///     .expect("replacement filter must parse");
+    /// ```
     pub fn reload_logging(&self, filter: &str) -> Result<(), TelemetryError> {
         let filter =
             EnvFilter::try_new(filter).map_err(|source| TelemetryError::InvalidFilter {
@@ -587,6 +665,9 @@ impl TelemetryHandles {
 // =============================================================================
 
 /// Configuration or installation failures of the telemetry stack.
+///
+/// Every variant carries the offending input and the underlying parse or
+/// reload error so callers can render precise diagnostics.
 #[derive(Debug, thiserror::Error)]
 pub enum TelemetryError {
     /// A complete `RUST_LOG`-style filter string could not be parsed.
@@ -615,6 +696,26 @@ pub enum TelemetryError {
         /// Human-readable reload failure.
         error: String,
     },
+}
+
+// =============================================================================
+// Free Functions
+// =============================================================================
+
+/// Severity color mapping owned by the terminal formatter.
+fn styled_level(level: &Level) -> String {
+    match *level {
+        Level::TRACE => "TRACE".magenta().to_string(),
+        Level::DEBUG => "DEBUG".blue().bold().to_string(),
+        Level::INFO => "INFO".white().to_string(),
+        Level::WARN => "WARN".yellow().bold().to_string(),
+        Level::ERROR => "ERROR".red().bold().to_string(),
+    }
+}
+
+/// Target styling owned by the terminal formatter.
+fn styled_target(target: &str) -> String {
+    target.cyan().to_string()
 }
 
 // =============================================================================

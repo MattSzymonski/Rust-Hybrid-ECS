@@ -29,10 +29,13 @@
 
 extern crate proc_macro;
 
+// Standard library
+use std::collections::HashSet;
+
+// External crates
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::{quote, ToTokens};
-use std::collections::HashSet;
 use syn::parse::ParseStream;
 use syn::punctuated::Punctuated;
 use syn::{
@@ -56,6 +59,8 @@ impl syn::parse::Parse for MacroArguments {
     fn parse(input: ParseStream) -> syn::Result<Self> {
         let mut namespace: Option<Path> = None;
         let mut runtime: Option<Path> = None;
+
+        // Step 1: Consume `key = value` pairs until the argument list ends.
         while !input.is_empty() {
             let key: Ident = input.parse()?;
             input.parse::<Token![=]>()?;
@@ -73,6 +78,9 @@ impl syn::parse::Parse for MacroArguments {
                 input.parse::<Token![,]>()?;
             }
         }
+
+        // Step 2: `namespace` is mandatory; `runtime` falls back to the
+        // crate-local diagnostics module.
         let namespace = namespace
             .ok_or_else(|| input.error("missing `namespace = ...` argument for `engine_error`"))?;
         let runtime = runtime.unwrap_or_else(|| syn::parse_quote!(crate::error));
@@ -85,11 +93,18 @@ impl syn::parse::Parse for MacroArguments {
 // =============================================================================
 
 /// Semantic role of one message token.
+///
+/// Maps one-to-one onto the `SemanticRole` enum of the diagnostics runtime so
+/// generated code can address the same variants the runtime renders.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SemanticRole {
+    /// Token introduced by `general_style`.
     General,
+    /// Token introduced by `specific_style`.
     Specific,
+    /// Token introduced by `module_style`.
     Module,
+    /// Token introduced by `name_style`.
     Name,
 }
 
@@ -106,9 +121,14 @@ impl SemanticRole {
 }
 
 /// Display format of a dynamic message value.
+///
+/// Picks the formatting trait used both by the generated plain-text `Display`
+/// string and by the semantic renderer.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ValueFormat {
+    /// Render the value with `Display`.
     Display,
+    /// Render the value with `Debug` (`{:?}`).
     Debug,
 }
 
@@ -127,18 +147,25 @@ enum MessageNode {
 }
 
 /// Argument of a style DSL function: either a static string or a field name.
+///
+/// Static arguments produce constant semantic tokens; field arguments produce
+/// dynamic values rendered with the surrounding role.
 enum StyleArgument {
+    /// A string literal, e.g. `general_style("Renderer")`.
     Static(LitStr),
+    /// A field name, e.g. `name_style(variant_name)`.
     Field(Ident),
 }
 
 impl syn::parse::Parse for MessageNode {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        // Plain text nodes are string literals.
+        // Step 1: A bare string literal is a plain-text node.
         if input.peek(LitStr) {
             return Ok(MessageNode::Text(input.parse()?));
         }
 
+        // Step 2: Otherwise this is a DSL call `function(argument)` whose
+        // single argument is either a static string or a field name.
         let function: Ident = input.parse()?;
         let content;
         parenthesized!(content in input);
@@ -150,6 +177,7 @@ impl syn::parse::Parse for MessageNode {
             return Err(content.error("expected a string literal or a field name"));
         };
 
+        // Step 3: Dispatch on the function name, suggesting typos.
         match function.to_string().as_str() {
             "general_style" => Ok(styled_node(SemanticRole::General, argument)),
             "specific_style" => Ok(styled_node(SemanticRole::Specific, argument)),
@@ -527,8 +555,37 @@ fn existing_derives(item: &ItemEnum) -> HashSet<String> {
 // Entry Point
 // =============================================================================
 
-/// Generate plain messages, diagnostic codes, and semantic rendering from one
-/// `#[message(...)]` definition per variant.
+/// Generates `thiserror::Error` display output, `miette::Diagnostic` codes,
+/// and an `EngineMessage` implementation from one `#[message(...)]`
+/// definition per variant.
+///
+/// # Errors
+///
+/// Emits a compile error when:
+///
+/// - `namespace` is missing or an argument name is unknown.
+/// - A variant has neither `#[message(...)]` nor `#[transparent]`.
+/// - A variant mixes `#[message(...)]` with `#[transparent]`.
+/// - A `#[message(...)]` is empty or references an unknown field.
+/// - A `#[transparent]` variant does not wrap exactly one error field.
+///
+/// # Examples
+///
+/// ```ignore
+/// use pill_core::error::EngineMessage;
+///
+/// #[engine_error(namespace = "host::build", runtime = "pill_core::error")]
+/// pub enum BuildError {
+///     #[message("failed to link {general_style(crate_name)}")]
+///     LinkFailed { crate_name: String },
+///
+///     #[transparent]
+///     Io(std::io::Error),
+/// }
+/// ```
+///
+/// The example is marked `ignore` because proc-macro expansion cannot run
+/// inside a doc-test of the macro crate itself.
 #[proc_macro_attribute]
 pub fn engine_error(attribute: TokenStream, item: TokenStream) -> TokenStream {
     let arguments = parse_macro_input!(attribute as MacroArguments);
@@ -538,6 +595,11 @@ pub fn engine_error(attribute: TokenStream, item: TokenStream) -> TokenStream {
         .into()
 }
 
+/// Core expansion behind the `engine_error` attribute entry point.
+///
+/// Rewrites each variant (stripping consumed helper attributes and appending
+/// the generated `#[error(...)]` / `#[diagnostic(...)]` attributes), validates
+/// the message DSL, and emits the enum plus its `EngineMessage` implementation.
 fn expand(arguments: MacroArguments, item: &mut ItemEnum) -> syn::Result<TokenStream2> {
     let namespace = namespace_string(&arguments.namespace);
 

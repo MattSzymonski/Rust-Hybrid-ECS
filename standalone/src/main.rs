@@ -15,6 +15,10 @@
 //! no window, GPU, or event-loop code here: `host::run` owns those behind the
 //! `rendering` feature.
 
+// Standard library
+use std::path::PathBuf;
+
+// External crates
 use host::{engine_report, install_engine_report_handler, GameModuleConfig};
 use pill_core::error;
 
@@ -27,9 +31,13 @@ use pill_core::error;
 /// Terminal logging is always active. A file lane is added when `ECS_LOG_DIR`
 /// is set. When the `profiling` feature is enabled, `profile::*` spans are
 /// routed to Tracy through an independent filter.
+///
+/// Setup is best-effort: a failure only degrades telemetry and is reported
+/// to stderr without aborting the host.
 fn init_telemetry() {
-    use std::path::PathBuf;
+    // Step 1: resolve the optional log directory from the environment.
     let file_directory = std::env::var_os("ECS_LOG_DIR").map(PathBuf::from);
+    // Step 2: install the stack, reporting setup failures to stderr.
     if let Err(error) = host::init_telemetry(file_directory) {
         eprintln!("[standalone] telemetry setup failed: {error}");
     }
@@ -40,9 +48,21 @@ fn init_telemetry() {
 // =============================================================================
 
 /// Install the report handler once and report the final error once.
+///
+/// The telemetry stack is brought up before the run loop starts so that any
+/// failure is captured on every active lane.
+///
+/// # Errors
+///
+/// Returns the styled [`engine_report`] when [`host::run`] terminates with an
+/// error, after also recording the failure on the tracing lane for
+/// correlation with active spans and log files.
 fn main() -> miette::Result<()> {
+    // Step 1: install the miette report handler before anything can fail.
     install_engine_report_handler();
+    // Step 2: bring up the shared telemetry stack (best-effort).
     init_telemetry();
+    // Step 3: delegate to the shared run loop and convert the error once.
     host::run(GameModuleConfig::from_environment()).map_err(|error| {
         // Error correlation: the fatal failure also enters the tracing lane
         // so it appears inside any active spans and log files.

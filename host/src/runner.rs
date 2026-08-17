@@ -9,12 +9,27 @@
 //!
 //! - Run the configured game in a headless loop when rendering is disabled.
 //! - Run the configured game in a `winit` window when rendering is enabled.
+//!
+//! # Design
+//!
+//! The headless path drives frames directly through [`crate::run_one_frame`]
+//! in an unconditional loop. The windowed path (rendering builds only) owns
+//! the `winit` event loop and defers window-creation and host-setup failures
+//! until after the loop exits. Embedding frontends can reuse [`crate::setup`]
+//! and `setup_rendering` instead of [`run`] to supply their own window and
+//! event loop.
 
 // Standard library
 #[cfg(feature = "rendering")]
 use std::sync::Arc;
 
 // External crates
+#[cfg(feature = "rendering")]
+use pill_core::error::FrontendError;
+#[cfg(not(feature = "rendering"))]
+use pill_core::error::HostError;
+#[cfg(feature = "rendering")]
+use pill_engine::EngineError;
 #[cfg(feature = "rendering")]
 use winit::application::ApplicationHandler;
 #[cfg(feature = "rendering")]
@@ -27,19 +42,15 @@ use winit::window::{Window, WindowId};
 // Current crate
 use crate::GameModuleConfig;
 
-// External crates
-#[cfg(feature = "rendering")]
-use pill_core::error::FrontendError;
-#[cfg(not(feature = "rendering"))]
-use pill_core::error::HostError;
-#[cfg(feature = "rendering")]
-use pill_engine::EngineError;
-
 // =============================================================================
 // WindowedApplication
 // =============================================================================
 
 /// State retained by `winit` for the lifetime of the standalone application.
+///
+/// Owns the configured game, the native window, and the rendering host, and
+/// defers window-creation and host-setup failures until the loop exits so
+/// they can be surfaced through [`run`]'s error path.
 #[cfg(feature = "rendering")]
 struct WindowedApplication {
     module_config: GameModuleConfig,
@@ -122,12 +133,15 @@ impl ApplicationHandler for WindowedApplication {
 impl WindowedApplication {
     /// Advance, present, report statistics, and schedule the next redraw.
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+        // Step 1: Return early until the window and host have finished setup.
         let (Some(window), Some(host)) = (&self.window, &mut self.host) else {
             return;
         };
 
+        // Step 2: Advance simulation and rendering by a single frame.
         match host.run_one_frame() {
             Ok(report) => {
+                // Step 3: Publish frame statistics and schedule the next redraw.
                 if let Some(report) = report {
                     println!(
                         "  {:>6.0} FPS | {:>5} entities",
@@ -141,8 +155,8 @@ impl WindowedApplication {
                 window.request_redraw();
             }
             Err(source) => {
-                // The frame renderer failed; stop the loop and report the
-                // typed failure through the regular error boundary.
+                // Step 4: The frame renderer failed; stop the loop and report
+                // the typed failure through the regular error boundary.
                 self.setup_error = Some(source.into());
                 event_loop.exit();
             }
@@ -155,6 +169,12 @@ impl WindowedApplication {
 // =============================================================================
 
 /// Run the configured game continuously without creating a native window.
+///
+/// # Errors
+///
+/// Returns [`HostError`] if host setup fails, such as when the game module
+/// cannot be built or loaded, or when the source watcher cannot start. Frame
+/// execution never returns an error; the loop runs until the process exits.
 #[cfg(not(feature = "rendering"))]
 pub fn run(module_config: GameModuleConfig) -> Result<(), HostError> {
     let mut host = crate::setup(module_config)?;
@@ -170,17 +190,22 @@ pub fn run(module_config: GameModuleConfig) -> Result<(), HostError> {
 }
 
 /// Run the configured game in the host-owned native window and render loop.
+///
+/// # Errors
+///
+/// Returns [`EngineError`] if the event loop cannot be created or run, or if
+/// window creation or host/renderer setup fails inside the event loop.
 #[cfg(feature = "rendering")]
 pub fn run(module_config: GameModuleConfig) -> Result<(), EngineError> {
-    // Create a new event loop for the windowed application.
+    // Step 1: Create a new event loop for the windowed application.
     let event_loop =
         EventLoop::new().map_err(|source| FrontendError::EventLoopCreation { source })?;
 
-    // Set the event loop to poll continuously, so that the host can run
-    // frames as fast as possible without waiting for user input.
+    // Step 2: Poll continuously so the host runs frames as fast as possible
+    // without waiting for user input.
     event_loop.set_control_flow(ControlFlow::Poll);
 
-    // Create the application state and run the event loop.
+    // Step 3: Create the application state and run the event loop.
     let mut application = WindowedApplication {
         module_config,
         window: None,
@@ -188,7 +213,7 @@ pub fn run(module_config: GameModuleConfig) -> Result<(), EngineError> {
         setup_error: None,
     };
 
-    // Run the event loop until the window is closed.
+    // Step 4: Run the event loop until the window is closed.
     event_loop
         .run_app(&mut application)
         .map_err(|source| FrontendError::EventLoopCreation { source })?;

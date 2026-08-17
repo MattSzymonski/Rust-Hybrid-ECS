@@ -8,10 +8,16 @@
 //!
 //! # Design
 //!
-//! Pure type aliases and one unit enum; `glam` is the only dependency.
+//! Pure type aliases and one unit enum; `glam` is the only dependency. The
+//! [`Direction`] enum carries no data and exists purely as vocabulary so
+//! callers can name axes without depending on `glam`'s own terms.
 
 // External crates
 use glam::{IVec2, Mat3, Mat3A, Mat4, Vec2, Vec3, Vec4};
+
+// =============================================================================
+// Vector, matrix, and color aliases
+// =============================================================================
 
 /// 2D integer vector.
 pub type Vector2i = IVec2;
@@ -34,7 +40,15 @@ pub type Matrix3fA = Mat3A;
 /// 4x4 float matrix.
 pub type Matrix4f = Mat4;
 
+// =============================================================================
+// Direction vocabulary
+// =============================================================================
+
 /// Axis-aligned direction vocabulary.
+///
+/// Names a cardinal axis in either the local or world frame. Used by transform
+/// and input code so callers can express movement and facing without depending
+/// on `glam`'s vector constants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     /// Local forward.

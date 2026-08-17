@@ -5,6 +5,17 @@
 //! - Return validated component chunks to managed query iterators.
 //! - Return entity columns and live entity counts during scheduled systems.
 //! - Enforce the active system's declared read/write access.
+//!
+//! # Design
+//!
+//! Each `ffi_*` function is an `extern "C"` entry point invoked across the
+//! host/managed boundary by C# query iterators and scheduled systems. Access
+//! validation is delegated to [`access_is_authorized`], and world/binding
+//! lookups run through [`with_active_context`] and [`with_active_world`], so
+//! every callback fails closed with status code `3` when no managed system is
+//! active. Pointers returned in [`ComponentChunk`] remain owned by the active
+//! world's archetype and are only valid for the duration of the managed
+//! invocation.
 
 // External crates
 use pill_engine::Entity;
@@ -30,6 +41,7 @@ pub(super) extern "C" fn ffi_get_component_chunk(
     chunk_index: u32,
     output: *mut ComponentChunk,
 ) -> u8 {
+    // Step 1: Reject null output buffers and validate the declared access mode.
     if output.is_null() {
         return 0;
     }
@@ -40,6 +52,8 @@ pub(super) extern "C" fn ffi_get_component_chunk(
         Some(true) => {}
     }
 
+    // Step 2: Resolve the component binding and write the requested chunk
+    // into the managed caller's output buffer.
     with_active_context(|world, bindings| match bindings.get(&stable_id).copied() {
         Some(ComponentBinding::Native { get_chunk, .. }) => get_chunk(world, chunk_index, output),
         Some(ComponentBinding::Dynamic {
@@ -51,6 +65,8 @@ pub(super) extern "C" fn ffi_get_component_chunk(
             else {
                 return 0;
             };
+            // The archetype's 128-bit pattern is split into two `u64` halves
+            // to match the ABI layout of `ComponentChunk`.
             let bits = archetype.0;
             // SAFETY: output is non-null and all pointers remain owned by the
             // active world's archetype for the managed invocation. The managed
@@ -76,14 +92,22 @@ pub(super) extern "C" fn ffi_get_component_chunk(
 }
 
 /// Return the `chunk_index`th archetype entity column.
+///
+/// The slice written to `output` contains `Entity` values for one archetype
+/// and is only valid while the managed system that triggered the callback is
+/// active; callers must not retain it beyond the invocation.
 pub(super) extern "C" fn ffi_get_entity_chunk(chunk_index: u32, output: *mut ComponentChunk) -> u8 {
+    // Step 1: Reject a null output buffer before touching the world.
     if output.is_null() {
         return 0;
     }
+    // Step 2: Resolve the entity column and write it into the output buffer.
     with_active_world(|world| {
         let Some((archetype, entities)) = world.entity_chunk(chunk_index as usize) else {
             return 0;
         };
+        // The archetype's 128-bit pattern is split into two `u64` halves to
+        // match the ABI layout of `ComponentChunk`.
         let bits = archetype.0;
         // SAFETY: `output` was checked above and the entity slice remains
         // borrowed only for the active managed system invocation. The managed

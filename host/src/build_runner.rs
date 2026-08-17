@@ -8,6 +8,15 @@
 //! - Execute backend-specific build commands from the workspace root.
 //! - Resolve each backend's expected output artifact path.
 //! - Validate that build artifacts exist before loading is attempted.
+//!
+//! # Design
+//!
+//! [`build_game_module`] is the host's single entry point for compiling a
+//! game module. It treats the build as an opaque process: it never inspects
+//! compiler output, and instead decides success from the child's exit status
+//! plus a backend-specific output-path resolution step. Cancellation is
+//! cooperative: the caller advances a generation counter on newer source
+//! saves, and the watchdog loop aborts the build when it observes the change.
 
 // Standard library
 use std::path::{Path, PathBuf};
@@ -15,12 +24,12 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-// Current crate
-use crate::{GameModuleBackend, GameModuleConfig};
-
 // External crates
 use pill_core::error::BuildError;
 use pill_core::info;
+
+// Current crate
+use crate::{GameModuleBackend, GameModuleConfig};
 
 // =============================================================================
 // Constants
@@ -54,6 +63,8 @@ pub(crate) fn build_game_module(
         "building game module"
     );
 
+    // Step 1: Split the configured command into its executable and arguments.
+    //
     // GameModuleConfig stores commands as static slices so callers can define
     // both Cargo and dotnet builds without shell-specific quoting. The first
     // item is always the executable; every remaining item is passed verbatim.
@@ -62,6 +73,8 @@ pub(crate) fn build_game_module(
         .split_first()
         .ok_or(BuildError::EmptyCommand)?;
 
+    // Step 2: Spawn the child process from the workspace root.
+    //
     // Run from the workspace root because configured paths and Cargo package
     // selection are workspace-relative. The child inherits the host's stdout
     // and stderr instead of capturing them, which keeps compiler progress,
@@ -75,10 +88,11 @@ pub(crate) fn build_game_module(
             source,
         })?;
 
-    // Wait for the compiler under a watchdog. The host frame loop must never
-    // block indefinitely on a hung compiler or an interactive prompt, so the
-    // build is polled with a deadline and a cancellation signal driven by
-    // newer source saves.
+    // Step 3: Poll for completion, cancellation, or timeout under a watchdog.
+    //
+    // The host frame loop must never block indefinitely on a hung compiler or
+    // an interactive prompt, so the build is polled with a deadline and a
+    // cancellation signal driven by newer source saves.
     let deadline = Instant::now() + BUILD_TIMEOUT;
     let status = loop {
         // A newer save during the build advances the generation beyond the
@@ -109,6 +123,8 @@ pub(crate) fn build_game_module(
         std::thread::sleep(WATCHDOG_POLL_INTERVAL);
     };
 
+    // Step 4: Reject a non-zero exit status.
+    //
     // A failed compiler must stop the load transaction. During hot reload the
     // caller handles this error by leaving the current game module untouched.
     if !status.success() {
@@ -118,6 +134,8 @@ pub(crate) fn build_game_module(
         });
     }
 
+    // Step 5: Resolve the backend-specific output artifact path.
+    //
     // The build command itself is backend-agnostic, but each backend names and
     // locates its loadable artifact differently. Native outputs use platform
     // naming conventions; managed outputs always use an assembly `.dll`.
@@ -133,6 +151,8 @@ pub(crate) fn build_game_module(
             .join(format!("{}.dll", config.game_assembly_name)),
     };
 
+    // Step 6: Confirm the resolved artifact exists before reporting success.
+    //
     // A successful process exit does not guarantee that configuration points
     // at the artifact it produced. Validate the resolved path here so loading
     // errors identify an output-directory mismatch rather than an opaque DLL

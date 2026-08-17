@@ -6,6 +6,15 @@
 //! - Reloads native modules without dropping previously mapped libraries.
 //! - Delegates managed reload polling to `csharp_runtime`.
 //! - Keeps native component-schema migration beside the DLL swap it protects.
+//!
+//! # Design
+//!
+//! The host keeps exactly one [`LoadedGame`] alive at a time. Native backends
+//! are reloaded transactionally by [`reload_native`]: the previous DLL stays
+//! mapped in a bounded graveyard while changed persist schemas migrate, so
+//! engine-owned pointers into retired code remain valid. Managed backends
+//! delegate assembly discovery and validation to [`CSharpRuntime`], which
+//! reports success or rejection through `poll_reload`.
 
 // Standard library
 use std::collections::{HashMap, HashSet};
@@ -13,6 +22,8 @@ use std::path::Path;
 use std::sync::atomic::AtomicU64;
 
 // External crates
+use pill_core::error::{HostError, LibraryError};
+use pill_core::{debug, error, info, warn};
 use pill_engine::{Engine, EngineApi};
 
 // Current crate
@@ -20,10 +31,6 @@ use crate::build_runner::build_game_module;
 use crate::csharp::CSharpRuntime;
 use crate::native_library::GameLibrary;
 use crate::{GameModuleBackend, GameModuleConfig};
-
-// External crates
-use pill_core::error::{HostError, LibraryError};
-use pill_core::{debug, error, info, warn};
 
 // =============================================================================
 // Constants
@@ -41,18 +48,30 @@ const MAX_GRAVEYARD_GENERATIONS: usize = 2;
 // =============================================================================
 
 /// The backend-specific state kept alive by the host loop.
+///
+/// The enum lets the host hold either a mapped native library or a managed
+/// runtime behind one interface; the variant in use is fixed at startup and
+/// only changes across a full restart.
 pub(crate) enum LoadedGame {
+    /// A mapped native module plus any retired DLLs that must stay mapped.
     Native {
         current: GameLibrary,
         /// Old DLLs intentionally remain mapped because engine-owned function
         /// pointers and vtables may still refer to their code.
         old_libraries: Vec<GameLibrary>,
     },
+    /// A collectible managed runtime hosting the C# game assembly.
     CSharp(CSharpRuntime),
 }
 
 impl LoadedGame {
     /// Build and initialize the configured game backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns `HostError` when the module fails to compile, when the native
+    /// library cannot be loaded, or when the module's `game_init` reports a
+    /// non-zero initialization status.
     pub(crate) fn start(
         engine: &mut Engine,
         engine_api: &EngineApi,

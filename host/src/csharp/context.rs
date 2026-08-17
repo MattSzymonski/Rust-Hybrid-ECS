@@ -25,6 +25,10 @@ use pill_engine::{Entity, World};
 use super::abi::NativeSystemAccess;
 use super::components::{ComponentBindings, StableComponentId};
 
+// =============================================================================
+// Constants
+// =============================================================================
+
 thread_local! {
     /// Complete managed invocation scope for the current thread.
     ///
@@ -52,11 +56,16 @@ struct ActiveScopeData {
     uses_commands: bool,
 }
 
-/// Clears the thread-local native scope even if managed execution unwinds.
+/// Guards the thread-local invocation scope for exactly one scheduled managed
+/// system.
+///
+/// Created by the scope installers and dropped at the end of the managed
+/// invocation, this guard clears every raw pointer from the thread-local scope
+/// even when managed execution unwinds through a panic.
 pub(super) struct ActiveSystemGuard;
 
 impl ActiveSystemGuard {
-    /// Install a query-only invocation scope used by native bridge tests.
+    /// Installs a query-only invocation scope used by native bridge tests.
     ///
     /// Production systems use [`Self::set_with_commands`] because the scheduler
     /// always supplies a queue even when the managed signature omits Commands.
@@ -69,7 +78,7 @@ impl ActiveSystemGuard {
         Self::set_inner(world, std::ptr::null_mut(), access, bindings, false)
     }
 
-    /// Publish one scheduled system's world, command queue, bindings, and
+    /// Publishes one scheduled system's world, command queue, bindings, and
     /// reflected access declaration for synchronous managed callbacks.
     pub(super) fn set_with_commands(
         world: &mut World,
@@ -81,7 +90,7 @@ impl ActiveSystemGuard {
         Self::set_inner(world, queue, access, bindings, uses_commands)
     }
 
-    /// Install the complete scope in one assignment after rejecting nested
+    /// Installs the complete scope in one assignment after rejecting nested
     /// invocation, which would overwrite active raw pointers.
     ///
     /// The nested-invocation check is the only fallible step and it runs
@@ -123,7 +132,7 @@ impl ActiveSystemGuard {
 }
 
 impl Drop for ActiveSystemGuard {
-    /// Return unconsumed reservations to the entity allocator and clear the
+    /// Returns unconsumed reservations to the entity allocator and clears the
     /// complete scope before the scheduler's native borrows expire.
     fn drop(&mut self) {
         ACTIVE_SCOPE.with(|scope_slot| {
@@ -153,7 +162,7 @@ impl Drop for ActiveSystemGuard {
 // Free Functions
 // =============================================================================
 
-/// Run a callback with the active world, deferred queue, component bindings,
+/// Runs a callback with the active world, deferred queue, component bindings,
 /// and reservation set only when the system declared a Commands parameter.
 pub(super) fn with_active_command_context<R>(
     f: impl FnOnce(&mut World, &mut CommandQueue, &ComponentBindings, &mut HashSet<Entity>) -> R,
@@ -184,7 +193,7 @@ pub(super) fn with_active_command_context<R>(
     })
 }
 
-/// Run a callback with the world belonging to the active managed invocation,
+/// Runs a callback with the world belonging to the active managed invocation,
 /// returning `None` when called outside scheduler-controlled execution.
 pub(super) fn with_active_world<R>(f: impl FnOnce(&mut World) -> R) -> Option<R> {
     ACTIVE_SCOPE.with(|slot| {
@@ -195,12 +204,12 @@ pub(super) fn with_active_world<R>(f: impl FnOnce(&mut World) -> R) -> Option<R>
     })
 }
 
-/// Report whether a managed system scope exists without dereferencing its world.
+/// Reports whether a managed system scope exists without dereferencing its world.
 pub(super) fn active_world_exists() -> bool {
     ACTIVE_SCOPE.with(|slot| slot.get().is_some_and(|scope| !scope.world.is_null()))
 }
 
-/// Run a callback with both the active world and its stable component binding
+/// Runs a callback with both the active world and its stable component binding
 /// table, which must always be installed and cleared as one guard scope.
 pub(super) fn with_active_context<R>(
     f: impl FnOnce(&mut World, &ComponentBindings) -> R,
@@ -216,7 +225,7 @@ pub(super) fn with_active_context<R>(
     })
 }
 
-/// Check whether the active system declared the requested component mode.
+/// Checks whether the active system declared the requested component mode.
 ///
 /// A write declaration also permits reads; a read declaration never permits
 /// writes. `None` means no managed system is currently active on this thread.
