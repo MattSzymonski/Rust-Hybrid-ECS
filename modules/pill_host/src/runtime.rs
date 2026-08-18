@@ -430,10 +430,10 @@ fn print_startup_configuration(workspace_root: &Path, module_config: &ProjectMod
     info!(
         target: telemetry_target::ENGINE,
         workspace = %workspace_root.display(),
-        module = module_config.name,
+        module = module_config.name.as_str(),
         backend = ?module_config.backend,
         build_command = %module_config.build_command.join(" "),
-        watch_directory = module_config.watch_directory,
+        watch_directory = module_config.watch_directory.as_str(),
         "ECS host starting"
     );
 }

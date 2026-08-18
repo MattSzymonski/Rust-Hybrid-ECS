@@ -375,6 +375,37 @@ pub enum ConfigError {
     /// The configured build command is empty.
     #[message("build command must not be empty")]
     EmptyBuildCommand,
+
+    /// A required configuration environment variable was not set.
+    #[message("required environment variable ", value(variable), " is not set")]
+    MissingEnvironmentVariable { variable: &'static str },
+
+    /// The configured project directory does not exist.
+    #[message("project directory does not exist: ", name_style(path))]
+    ProjectDirectoryMissing { path: String },
+
+    /// The project directory contains no Cargo.toml or .csproj manifest.
+    #[message(
+        "no project manifest (Cargo.toml or .csproj) found in ",
+        name_style(path)
+    )]
+    ProjectManifestMissing { path: String },
+
+    /// The project manifest could not be read.
+    #[message("failed to read project manifest ", name_style(path))]
+    ProjectManifestReadFailed {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The project manifest does not declare a package name.
+    #[message(
+        "project manifest ",
+        name_style(path),
+        " does not declare a package name"
+    )]
+    ProjectPackageNameMissing { path: String },
 }
 
 /// Project-module build execution failures.
@@ -475,7 +506,10 @@ pub enum LibraryError {
     },
 
     /// The library does not export a required entry point.
-    #[message("native project library is missing required export ", name_style(symbol))]
+    #[message(
+        "native project library is missing required export ",
+        name_style(symbol)
+    )]
     MissingExport {
         symbol: String,
         #[source]

@@ -147,7 +147,7 @@ pub(crate) fn spawn_file_watcher(
     // Step 1: Resolve and validate the configured watch directory.
     // Watch paths are configured relative to the repository so the same
     // configuration works regardless of the process's current directory.
-    let watch_path = workspace_root.join(config.watch_directory);
+    let watch_path = workspace_root.join(&config.watch_directory);
 
     // Fail during host setup instead of silently running without hot reload
     // when a module configuration contains an outdated source path.
@@ -159,7 +159,7 @@ pub(crate) fn spawn_file_watcher(
 
     info!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-        module = config.name,
+        module = config.name.as_str(),
         watch_directory = %watch_path.display(),
         "watching for source changes"
     );

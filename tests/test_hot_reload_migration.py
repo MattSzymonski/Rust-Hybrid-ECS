@@ -519,11 +519,11 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
 def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
     """Starts standalone process and returns process + monitor."""
     process_environment = os.environ.copy()
-    process_environment["ECS_HOT_RELOAD_MODULE"] = "tests-project"
+    process_environment["PROJECT_PATH"] = "../tests/project"
 
     process = subprocess.Popen(
-        ["cargo", "run", "-p", "standalone"],
-        cwd=str(WORKSPACE_ROOT),
+        ["cargo", "run", "--package", "pill_standalone"],
+        cwd=str(WORKSPACE_ROOT / "modules"),
         env=process_environment,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

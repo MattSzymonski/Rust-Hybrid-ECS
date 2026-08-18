@@ -63,7 +63,7 @@ fn main() -> miette::Result<()> {
     // Step 2: bring up the shared telemetry stack (best-effort).
     init_telemetry();
     // Step 3: delegate to the shared run loop and convert the error once.
-    pill_host::run(ProjectModuleConfig::from_environment()).map_err(|error| {
+    pill_host::run(ProjectModuleConfig::from_environment()?).map_err(|error| {
         // Error correlation: the fatal failure also enters the tracing lane
         // so it appears inside any active spans and log files.
         error!(

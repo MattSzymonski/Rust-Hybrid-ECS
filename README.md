@@ -13,15 +13,23 @@
 
 
 
-- `cargo run --package pill_standalone` — Run the Rust project in the headless standalone host (run from `modules/`).
+The standalone host is a generic launcher: it reads one variable, `PROJECT_PATH`,
+which points at the project directory relative to the workspace root (run from
+`modules/`). Everything else — backend, name, watch directory, build command,
+and output paths — is inferred from the project's manifest, so no project
+identity is compiled into the host.
 
-- `cargo run --package pill_standalone --features rendering` — Run the Rust project in the standalone host with rendering enabled.
+Rust project (headless):
+
+- `$env:PROJECT_PATH = "../examples/project_rs"; cargo run --package pill_standalone`
+
+Rust project (windowed): same variable, run
+`cargo run --package pill_standalone --features rendering`.
+
+C# project: point `PROJECT_PATH` at the directory containing the `.csproj`,
+e.g. `$env:PROJECT_PATH = "../examples/project_cs"; cargo run --package pill_standalone`.
 
 - `cargo run --package editor` — Run the Rust project in the editor.
-
-- `$env:ECS_HOT_RELOAD_MODULE="csharp"; cargo run --package pill_standalone` — Build and run the C# project through `csharp_runtime` in the standalone host.
-
-- `$env:ECS_HOT_RELOAD_MODULE="rs"; cargo run --package pill_standalone` — Build and run the rust project in the standalone host.
 
 - `dotnet build examples/project_cs/project_cs.csproj -c Release --nologo` — Build the C# project and its `csharp_runtime` dependency.
 

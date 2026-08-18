@@ -164,8 +164,8 @@ impl CSharpRuntime {
         let shared_bindings = shared_component_bindings(engine);
 
         // Step 1: Resolve assembly paths, start .NET, and load managed exports.
-        let runtime_dir = workspace_root.join(config.runtime_output_subdirectory);
-        let project_dir = workspace_root.join(config.project_output_subdirectory);
+        let runtime_dir = workspace_root.join(&config.runtime_output_subdirectory);
+        let project_dir = workspace_root.join(&config.project_output_subdirectory);
         let assembly = runtime_dir.join(format!("{}.dll", config.runtime_assembly_name));
         let runtime_config = runtime_dir.join(format!(
             "{}.runtimeconfig.json",

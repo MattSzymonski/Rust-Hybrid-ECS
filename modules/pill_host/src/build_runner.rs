@@ -59,15 +59,15 @@ pub(crate) fn build_project_module(
 ) -> Result<PathBuf, BuildError> {
     info!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-        module = config.name,
+        module = config.name.as_str(),
         "building project module"
     );
 
     // Step 1: Split the configured command into its executable and arguments.
     //
-    // ProjectModuleConfig stores commands as static slices so callers can define
-    // both Cargo and dotnet builds without shell-specific quoting. The first
-    // item is always the executable; every remaining item is passed verbatim.
+    // ProjectModuleConfig stores commands as owned strings so callers can
+    // define both Cargo and dotnet builds without shell-specific quoting. The
+    // first item is always the executable; every remaining item is passed verbatim.
     let (program, arguments) = config
         .build_command
         .split_first()
@@ -147,7 +147,7 @@ pub(crate) fn build_project_module(
             .join(output_subdirectory)
             .join(native_library_filename(library_name)),
         ProjectModuleBackend::CSharp(config) => workspace_root
-            .join(config.project_output_subdirectory)
+            .join(&config.project_output_subdirectory)
             .join(format!("{}.dll", config.project_assembly_name)),
     };
 
