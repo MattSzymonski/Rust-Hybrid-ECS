@@ -1,30 +1,37 @@
-"""Generate nightly rustdoc JSON for every package in this Cargo workspace.
+"""Generate HTML or JSON documentation for this Cargo workspace.
 
-Unlike ``cargo doc --workspace``, ``cargo rustdoc`` accepts custom rustdoc
-arguments but operates on only one selected package target at a time. This
-script bridges that gap: it discovers the workspace members, selects the
-appropriate documentation target for each package, and invokes nightly
-rustdoc once per target.
+Without flags, the script generates classic rustdoc HTML with stable
+``cargo doc``. Passing ``--json`` switches to nightly rustdoc JSON generation
+for downstream tools such as ``generate_documentation_markdown.py``.
 
-Rustdoc's JSON format is unstable, so both a nightly toolchain and Cargo's
-``-Z unstable-options`` switch are required. The resulting files contain
-structured API data for downstream documentation tools; they are not directly
-viewable replacements for rustdoc's HTML pages.
+Unlike ``cargo doc --workspace``, ``cargo rustdoc`` accepts the unstable JSON
+output option but operates on only one selected package target at a time. JSON
+mode therefore discovers workspace members, selects each documentation target,
+and invokes nightly rustdoc once per target. HTML mode documents the workspace
+in one Cargo command.
+
+Rustdoc's JSON format is unstable, so JSON mode requires both a nightly
+toolchain and Cargo's ``-Z unstable-options`` switch. HTML mode uses the normal
+stable toolchain and produces directly browsable rustdoc pages.
 
 Requirements:
   - Python 3.8+
   - Rustup with the nightly toolchain installed
 
 Usage:
-  python devops/docs/generate_rustdoc_json.py
-  python devops/docs/generate_rustdoc_json.py --dry-run
+  python devops/docs/generate_documentation.py
+  python devops/docs/generate_documentation.py --json
+  python devops/docs/generate_documentation.py --dry-run
+  python devops/docs/generate_documentation.py --json --dry-run
 
 Output:
-  target/doc/<crate_name>.json
+  HTML: target/doc/index.html and crate subdirectories
+  JSON: target/doc/<crate_name>.json
 """
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -45,8 +52,9 @@ LIBRARY_KINDS = {"lib", "rlib", "dylib", "cdylib", "staticlib", "proc-macro"}
 # ``profiling`` and ``profiling-minimal`` deliberately configure incompatible
 # instrumentation modes in both pill_core and pill_engine. Cargo's
 # ``--all-features`` enables both and triggers their compile-time guard. Build
-# the nearly-all-features set explicitly so JSON docs cover full profiling and
-# every other declared feature while omitting only the minimal alternative.
+# the nearly-all-features set explicitly in both output modes so documentation
+# covers full profiling and every other declared feature while omitting only
+# the minimal alternative.
 EXCLUDED_DOCUMENTATION_FEATURES = {"profiling-minimal"}
 
 
@@ -208,13 +216,78 @@ def documentation_feature_arguments(package: Dict[str, Any]) -> List[str]:
     return ["--features", ",".join(selected_features)]
 
 
+# A workspace-wide Cargo command needs package-qualified feature names so
+# features belonging to different members can be enabled without ambiguity.
+def workspace_documentation_feature_arguments(
+    packages: Sequence[Dict[str, Any]],
+) -> List[str]:
+    """Select compatible features across all documented workspace packages.
+
+    Args:
+        packages: Cargo metadata objects for every selected workspace member.
+
+    Returns:
+        An empty list when the workspace declares no selectable features, or a
+        Cargo ``--features`` pair containing ``package/feature`` selectors.
+    """
+    # Qualifying every feature with its package makes the single HTML command
+    # equivalent to each JSON job's package-local feature selection.
+    selected_features = sorted(
+        "{}/{}".format(package["name"], feature)
+        for package in packages
+        for feature in package.get("features", {})
+        if feature not in EXCLUDED_DOCUMENTATION_FEATURES
+    )
+    if not selected_features:
+        return []
+
+    # Cargo accepts a comma-separated feature list as one argument. This also
+    # keeps dry-run output compact enough to paste directly into a terminal.
+    return ["--features", ",".join(selected_features)]
+
+
 # =============================================================================
-# Rustdoc command construction
+# HTML and JSON command construction
 # =============================================================================
 
-# Construct commands as argument lists, keeping Cargo's arguments before the
-# ``--`` delimiter and raw rustdoc arguments after it.
-def generate_package(
+
+# Classic HTML supports the entire workspace directly through stable Cargo.
+def generate_html_documentation(
+    packages: Sequence[Dict[str, Any]], *, dry_run: bool
+) -> None:
+    """Generate classic private-item rustdoc HTML for the whole workspace.
+
+    Args:
+        packages: Workspace packages used to construct compatible feature flags.
+        dry_run: Print the Cargo command without executing it when true.
+    """
+    # ``cargo doc`` creates the usual browsable HTML tree under target/doc. The
+    # stable toolchain is intentional; nightly is required only for JSON mode.
+    command = [
+        "cargo",
+        "doc",
+        "--manifest-path",
+        str(MANIFEST_PATH),
+        "--workspace",
+        "--no-deps",
+    ]
+
+    # Enable every compatible workspace feature, retaining full profiling while
+    # excluding only the mutually exclusive profiling-minimal alternative.
+    command.extend(workspace_documentation_feature_arguments(packages))
+
+    # Cargo exposes private-item documentation as a normal stable doc option.
+    command.append("--document-private-items")
+
+    if dry_run:
+        # Match run()'s readable Windows quoting without starting compilation.
+        print("+", subprocess.list2cmdline(command), flush=True)
+    else:
+        run(command)
+
+
+# JSON requires one nightly ``cargo rustdoc`` command per selected target.
+def generate_json_package(
     package: Dict[str, Any],
     selector: str,
     target_name: str,
@@ -282,47 +355,62 @@ def generate_package(
 # Keep main's return value as an integer so the module remains easy to call from
 # tests while the __main__ guard translates it into a process exit status.
 def main() -> int:
-    """Parse arguments, build the documentation job list, and run each job."""
+    """Parse output mode, discover the workspace, and generate documentation."""
     parser = argparse.ArgumentParser(
-        description="Generate nightly rustdoc JSON for every workspace package."
+        description=(
+            "Generate classic rustdoc HTML, or nightly rustdoc JSON with --json."
+        )
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="generate nightly rustdoc JSON instead of classic HTML",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="print the rustdoc commands without running them",
+        help="print Cargo commands without running them",
     )
     args = parser.parse_args()
 
     try:
-        # Expand package targets into a flat job list before doing any costly
-        # compilation. This gives accurate progress counts from the first job.
+        # Both modes need metadata for feature selection. JSON additionally uses
+        # it to expand every package into target-specific rustdoc jobs.
         packages = workspace_packages()
-        jobs = [
-            (package, selector, target_name)
-            for package in packages
-            for selector, target_name in documentation_targets(package)
-        ]
 
-        if not jobs:
-            # An empty successful run is usually a manifest/configuration error,
-            # so report it as failure rather than silently doing nothing.
-            print("No documentable workspace targets found.", file=sys.stderr)
-            return 1
+        if args.json:
+            # Expand JSON work before compilation so progress counts are exact
+            # and a workspace without documentable targets fails explicitly.
+            jobs = [
+                (package, selector, target_name)
+                for package in packages
+                for selector, target_name in documentation_targets(package)
+            ]
+            if not jobs:
+                print("No documentable workspace targets found.", file=sys.stderr)
+                return 1
 
-        # Run sequentially because separate Cargo processes already parallelize
-        # compilation internally and would otherwise contend for target locks.
-        for index, (package, selector, target_name) in enumerate(jobs, start=1):
-            print(
-                f"\n[{index}/{len(jobs)}] Generating {package['name']} "
-                f"({target_name})",
-                flush=True,
-            )
-            generate_package(
-                package,
-                selector,
-                target_name,
-                dry_run=args.dry_run,
-            )
+            # Run sequentially because Cargo processes already parallelize their
+            # own compilation and concurrent jobs would contend for target locks.
+            for index, (package, selector, target_name) in enumerate(
+                jobs, start=1
+            ):
+                print(
+                    f"\n[{index}/{len(jobs)}] Generating JSON for "
+                    f"{package['name']} ({target_name})",
+                    flush=True,
+                )
+                generate_json_package(
+                    package,
+                    selector,
+                    target_name,
+                    dry_run=args.dry_run,
+                )
+        else:
+            # HTML is the default and Cargo can generate it workspace-wide in a
+            # single invocation, preserving classic rustdoc's shared resources.
+            print("\nGenerating classic rustdoc HTML for the workspace", flush=True)
+            generate_html_documentation(packages, dry_run=args.dry_run)
     except FileNotFoundError as error:
         # Usually indicates that Python cannot locate cargo/rustup's proxy on
         # PATH. Include the executable name to make setup failures actionable.
@@ -342,9 +430,23 @@ def main() -> int:
     # Make dry runs unmistakable; otherwise users may look for files that the
     # script deliberately did not generate.
     if args.dry_run:
-        print("\nDry run complete; no JSON was generated.")
+        print("\nDry run complete; no documentation was generated.")
     else:
-        print(f"\nRustdoc JSON generated under {WORKSPACE_ROOT / 'target' / 'doc'}")
+        # Cargo may be redirected by the Markdown pipeline through
+        # CARGO_TARGET_DIR. Report that effective destination instead of always
+        # claiming output was written into the workspace's normal target.
+        configured_target_directory = os.environ.get("CARGO_TARGET_DIR")
+        if configured_target_directory:
+            target_directory = Path(configured_target_directory)
+            if not target_directory.is_absolute():
+                target_directory = WORKSPACE_ROOT / target_directory
+        else:
+            target_directory = WORKSPACE_ROOT / "target"
+        output_directory = target_directory.resolve() / "doc"
+        if args.json:
+            print(f"\nRustdoc JSON generated under {output_directory}")
+        else:
+            print(f"\nRustdoc HTML generated under {output_directory}")
     return 0
 
 
