@@ -114,11 +114,18 @@ impl ProjectModuleConfig {
     pub const fn rust_default() -> Self {
         Self {
             name: "project-rs",
-            watch_directory: "project_rs/src",
-            build_command: &["cargo", "build", "--package", "project"],
+            watch_directory: "../examples/project_rs/src",
+            build_command: &[
+                "cargo",
+                "build",
+                "--manifest-path",
+                "../examples/project_rs/Cargo.toml",
+                "--package",
+                "project",
+            ],
             backend: ProjectModuleBackend::NativeLibrary {
                 library_name: "project",
-                output_subdirectory: "target/debug",
+                output_subdirectory: "../examples/project_rs/target/debug",
             },
         }
     }
@@ -128,10 +135,12 @@ impl ProjectModuleConfig {
     pub const fn rust_default() -> Self {
         Self {
             name: "project-rs",
-            watch_directory: "project_rs/src",
+            watch_directory: "../examples/project_rs/src",
             build_command: &[
                 "cargo",
                 "build",
+                "--manifest-path",
+                "../examples/project_rs/Cargo.toml",
                 "--package",
                 "project",
                 "--features",
@@ -139,7 +148,7 @@ impl ProjectModuleConfig {
             ],
             backend: ProjectModuleBackend::NativeLibrary {
                 library_name: "project",
-                output_subdirectory: "target/debug",
+                output_subdirectory: "../examples/project_rs/target/debug",
             },
         }
     }
@@ -148,20 +157,20 @@ impl ProjectModuleConfig {
     pub const fn csharp_default() -> Self {
         Self {
             name: "project-csharp",
-            watch_directory: "project_cs/src",
+            watch_directory: "../examples/project_cs/src",
             build_command: &[
                 "dotnet",
                 "build",
-                "project_cs/project_cs.csproj",
+                "../examples/project_cs/project_cs.csproj",
                 "-c",
                 "Release",
                 "--nologo",
             ],
             backend: ProjectModuleBackend::CSharp(CSharpModuleConfig {
                 runtime_assembly_name: "csharp_runtime",
-                runtime_output_subdirectory: "csharp_runtime/bin/Release/net8.0",
+                runtime_output_subdirectory: "pill_csharp_runtime/bin/Release/net8.0",
                 project_assembly_name: "project_cs",
-                project_output_subdirectory: "project_cs/bin/Release/net8.0",
+                project_output_subdirectory: "../examples/project_cs/bin/Release/net8.0",
             }),
         }
     }

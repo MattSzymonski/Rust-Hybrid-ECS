@@ -1,11 +1,10 @@
 [workspace]
 members = [
-    "editor",
-    "engine",
+    "pill_editor",
+    "pill_engine",
     "pill_core",
     "pill_core_macros",
-    "project_rs",
-    "host",
-    "standalone",
+    "pill_host",
+    "pill_standalone",
 ]
 resolver = "2"

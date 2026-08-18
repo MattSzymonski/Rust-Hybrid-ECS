@@ -4,8 +4,8 @@
 //!
 //! Dioxus owns the native window and its event loop. During window creation,
 //! the editor passes an `Arc` clone of Dioxus's Tao window to
-//! [`host::setup_rendering`]. The engine creates one GPU surface for that
-//! window, while [`host::RenderingHost`] owns both engine and renderer state.
+//! [`pill_host::setup_rendering`]. The engine creates one GPU surface for that
+//! window, while [`pill_host::RenderingHost`] owns both engine and renderer state.
 //! The editor forwards resize and redraw events, keeps its center viewport
 //! transparent for the surface, and draws opaque HTML panels around it.
 
@@ -25,7 +25,7 @@ use dioxus::desktop::tao::window::{Window, WindowId};
 use dioxus::desktop::{use_wry_event_handler, window, Config};
 use dioxus::prelude::*;
 use futures_util::StreamExt;
-use host::{
+use pill_host::{
     engine_report, install_engine_report_handler, setup_rendering, FrameReport, ProjectModuleConfig,
     RenderViewport, RenderingHost, VirtualResolution,
 };
@@ -52,7 +52,7 @@ const PROJECT_VIRTUAL_RESOLUTION: VirtualResolution = VirtualResolution::new(800
 fn init_telemetry() {
     use std::path::PathBuf;
     let file_directory = std::env::var_os("ECS_LOG_DIR").map(PathBuf::from);
-    if let Err(error) = host::init_telemetry(file_directory) {
+    if let Err(error) = pill_host::init_telemetry(file_directory) {
         eprintln!("[editor] telemetry setup failed: {error}");
     }
 }
@@ -299,7 +299,7 @@ impl EditorContext {
     /// # Errors
     ///
     /// Returns the composed [`EditorError`] wrapping the host
-    /// [`host::EngineError`] when setup or GPU surface creation fails; the
+    /// [`pill_host::EngineError`] when setup or GPU surface creation fails; the
     /// caller reports it once and exits.
     fn new(window: Arc<Window>) -> Result<Self, EditorError> {
         let size = window.inner_size();

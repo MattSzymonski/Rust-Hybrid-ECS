@@ -1,9 +1,11 @@
 # Rust build artifacts
 /target
 /tests/project/target
+/modules/target
+/examples/**/target/**
 
 # Hot-reload runtime temp copies
-standalone_temp/
+modules/pill_standalone_temp/
 
 # Test infrastructure
 tests/__pycache__/

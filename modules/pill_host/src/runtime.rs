@@ -298,6 +298,31 @@ where
     Ok(RenderingHost { host, renderer })
 }
 
+/// Complete rendering setup from an already-built [`Host`], attaching the
+/// engine renderer to a supplied native window.
+///
+/// Frontends that must finish project setup (building and loading the project
+/// module) before any window exists — for example the standalone runner — call
+/// [`setup`] first and this function once a window is available, so a slow
+/// first build never shows a blank surface.
+///
+/// # Errors
+///
+/// Returns a [`RendererError`] when surface or renderer creation fails.
+#[cfg(feature = "rendering")]
+pub fn attach_renderer<W>(
+    host: Host,
+    window: W,
+    width: u32,
+    height: u32,
+) -> Result<RenderingHost, RendererError>
+where
+    W: RendererWindow + 'static,
+{
+    let renderer = Renderer::new(window, width, height)?;
+    Ok(RenderingHost { host, renderer })
+}
+
 /// Process hot reloads, execute one scheduler frame, and update FPS tracking.
 ///
 /// Returns a report roughly every three seconds for a frontend to print or

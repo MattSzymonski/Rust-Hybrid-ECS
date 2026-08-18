@@ -56,6 +56,8 @@ struct WindowedApplication {
     module_config: ProjectModuleConfig,
     window: Option<Arc<Window>>,
     host: Option<crate::RenderingHost>,
+    /// Whether the hidden startup window has been revealed after its first frame.
+    window_shown: bool,
     /// Failure recorded during `resumed`; surfaced after the loop exits.
     setup_error: Option<EngineError>,
 }
@@ -68,13 +70,33 @@ impl ApplicationHandler for WindowedApplication {
             return;
         }
 
-        // Step 1: Create the native window for the standalone host.
+        // Step 1: Build and load the project module BEFORE creating any window.
+        //
+        // The first standalone launch must compile the game, which can take
+        // tens of seconds. Creating the window first would show a blank white
+        // surface for the entire build, so project setup runs ahead of window
+        // creation. `winit` only permits creating a window while the event loop
+        // is active, which is why setup cannot happen before `resumed`.
+        let host = match crate::setup(self.module_config.clone()) {
+            Ok(host) => host,
+            Err(error) => {
+                self.setup_error = Some(error.into());
+                event_loop.exit();
+                return;
+            }
+        };
+
+        // Step 2: Create the native window for the standalone host, hidden.
         //
         // `winit` only permits creating a window while the event loop is active,
-        // so this is the first point where rendering setup can finish.
+        // so this is the first point where the surface can be created. The window
+        // starts invisible: winit 0.30 exposes no client-area background color,
+        // so revealing it only after the first frame renders prevents the OS
+        // default white surface from ever being shown.
         let attributes = Window::default_attributes()
             .with_title("ECS Standalone Host")
-            .with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0));
+            .with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0))
+            .with_visible(false);
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(source) => {
@@ -85,25 +107,20 @@ impl ApplicationHandler for WindowedApplication {
         };
         let size = window.inner_size();
 
-        // Step 2: Complete host setup with rendering enabled, attaching the engine renderer
-        // to the native window and configuring the initial viewport size.
-        //
-        // Renderer construction is part of host setup; this runner supplies
-        // only the platform window that wgpu needs for its surface.
-        match crate::setup_rendering(
-            self.module_config.clone(),
-            Arc::clone(&window),
-            size.width,
-            size.height,
-        ) {
+        // Step 3: Attach the engine renderer to the native window and complete
+        // the rendering host. The project module is already built and loaded,
+        // so the surface opens on a live world instead of a blank window.
+        match crate::attach_renderer(host, Arc::clone(&window), size.width, size.height) {
             Ok(host) => {
-                // Step 3: Store the host and window for use in the event loop.
+                // Step 4: Store the host and window, present the first frame
+                // while the window is still hidden, then reveal it already
+                // holding rendered content. See `present_first_frame_and_reveal`.
                 self.host = Some(host);
-                window.request_redraw();
                 self.window = Some(window);
+                self.present_first_frame_and_reveal(event_loop);
             }
             Err(error) => {
-                self.setup_error = Some(error);
+                self.setup_error = Some(error.into());
                 event_loop.exit();
             }
         }
@@ -131,6 +148,40 @@ impl ApplicationHandler for WindowedApplication {
 
 #[cfg(feature = "rendering")]
 impl WindowedApplication {
+    /// Present one frame while the window is still hidden, then reveal it.
+    ///
+    /// Rendering before the window is shown guarantees the surface already
+    /// holds the engine's black-cleared frame, so the OS default white
+    /// startup background is never visible. winit 0.30 exposes no client-area
+    /// background color attribute, so this is the only cross-platform way to
+    /// open on a black surface. The frame is also presented synchronously
+    /// because a hidden window never receives redraw requests on Windows.
+    fn present_first_frame_and_reveal(&mut self, event_loop: &ActiveEventLoop) {
+        // Step 1: Do nothing until the window and host are ready.
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+        let Some(host) = self.host.as_mut() else {
+            return;
+        };
+
+        // Step 2: Present one frame to the hidden window's surface.
+        match host.run_one_frame() {
+            Ok(_) => {
+                // Step 3: Reveal the window now that it holds rendered content.
+                window.set_visible(true);
+                self.window_shown = true;
+                window.request_redraw();
+            }
+            Err(source) => {
+                // Step 4: Rendering failed before the window was shown; report
+                // through the regular error boundary without revealing it.
+                self.setup_error = Some(source.into());
+                event_loop.exit();
+            }
+        }
+    }
+
     /// Advance, present, report statistics, and schedule the next redraw.
     fn redraw(&mut self, event_loop: &ActiveEventLoop) {
         // Step 1: Return early until the window and host have finished setup.
@@ -141,7 +192,17 @@ impl WindowedApplication {
         // Step 2: Advance simulation and rendering by a single frame.
         match host.run_one_frame() {
             Ok(report) => {
-                // Step 3: Publish frame statistics and schedule the next redraw.
+                // Step 3: Defensive reveal in case a platform recreates the
+                // window after setup (setup already revealed it after the
+                // first synchronous frame). The engine clears each frame to
+                // black, so the window never shows the OS default white
+                // background.
+                if !self.window_shown {
+                    window.set_visible(true);
+                    self.window_shown = true;
+                }
+
+                // Step 4: Publish frame statistics and schedule the next redraw.
                 if let Some(report) = report {
                     print_frame_statistics(&report);
                     window.set_title(&format!(
@@ -152,7 +213,7 @@ impl WindowedApplication {
                 window.request_redraw();
             }
             Err(source) => {
-                // Step 4: The frame renderer failed; stop the loop and report
+                // Step 5: The frame renderer failed; stop the loop and report
                 // the typed failure through the regular error boundary.
                 self.setup_error = Some(source.into());
                 event_loop.exit();
@@ -204,6 +265,7 @@ pub fn run(module_config: ProjectModuleConfig) -> Result<(), EngineError> {
         module_config,
         window: None,
         host: None,
+        window_shown: false,
         setup_error: None,
     };
 

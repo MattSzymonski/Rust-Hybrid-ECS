@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-host = { package = "pill_host", path = "../host", features = ["rendering"] }
+pill_host = { package = "pill_host", path = "../pill_host", features = [
+    "rendering",
+] }
 pill_core = { path = "../pill_core", features = ["rendering"] }
 pill_core_macros = { path = "../pill_core_macros" }
 dioxus = { version = "0.7", features = ["desktop"] }
@@ -18,10 +20,10 @@ tracing = "0.1"
 
 [features]
 # Enable Tracy profiling through the shared telemetry stack.
-profiling = ["host/profiling"]
+profiling = ["pill_host/profiling"]
 # Investigative fine-grained profiling zones.
-profiling-fine = ["host/profiling-fine"]
+profiling-fine = ["pill_host/profiling-fine"]
 # Repeated numerical measurements through the shared metrics recorder.
-metrics = ["host/metrics"]
+metrics = ["pill_host/metrics"]
 # Compile the simple developer log macros (`log!`, `warn!`, `error!`).
-dev-logs = ["host/dev-logs"]
+dev-logs = ["pill_host/dev-logs"]

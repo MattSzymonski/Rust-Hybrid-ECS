@@ -35,23 +35,23 @@ use crate::layout::LayoutError;
 pub enum EditorError {
     /// Host setup or GPU surface creation failed while starting the editor.
     ///
-    /// Wraps the full composed [`host::EngineError`], so the styled report
+    /// Wraps the full composed [`pill_host::EngineError`], so the styled report
     /// keeps the entire cause chain from configuration down to the GPU.
     #[transparent]
-    Host(#[from] host::EngineError),
+    Host(#[from] pill_host::EngineError),
 
     /// The engine surface could not be moved to another native window.
     #[message("failed to move the engine surface between windows")]
     Retarget {
         #[source]
-        source: host::RendererError,
+        source: pill_host::RendererError,
     },
 
     /// One editor frame failed while presenting the rendered world.
     #[message("failed to present one editor frame")]
     Frame {
         #[source]
-        source: host::RendererError,
+        source: pill_host::RendererError,
     },
 }
 

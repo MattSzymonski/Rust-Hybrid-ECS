@@ -41,7 +41,7 @@ use pill_engine::EngineApi;
 // =============================================================================
 
 /// Directory where temporary native-library copies are stored.
-const TEMPORARY_DIRECTORY: &str = "standalone_temp";
+const TEMPORARY_DIRECTORY: &str = "pill_standalone_temp";
 
 /// Monotonic suffix ensuring temporary copies never collide, even when the
 /// system clock repeats or moves backwards.

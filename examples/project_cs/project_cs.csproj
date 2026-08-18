@@ -20,7 +20,7 @@
   <ItemGroup>
     <!-- For Engine.cs's safe generic query facade. Project-specific component
          structs live in this reloadable project. -->
-    <ProjectReference Include="../csharp_runtime/csharp_runtime.csproj" />
+    <ProjectReference Include="../../modules/pill_csharp_runtime/csharp_runtime.csproj" />
   </ItemGroup>
 
 </Project>

@@ -61,4 +61,4 @@ pub use pill_engine::{EngineError, RenderViewport, RendererError, VirtualResolut
 
 // Rendering-only frontend entry points: window and event-loop setup.
 #[cfg(feature = "rendering")]
-pub use runtime::{setup_rendering, RenderingHost};
+pub use runtime::{attach_renderer, setup_rendering, RenderingHost};

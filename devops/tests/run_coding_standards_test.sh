@@ -99,7 +99,7 @@ find_rust_files() {
         -not -path '*/target/*' \
         -not -path '*/node_modules/*' \
         -not -path '*/.git/*' \
-        -not -path '*/standalone_temp/*' \
+        -not -path '*/pill_standalone_temp/*' \
         2>/dev/null | LC_ALL=C sort
 }
 

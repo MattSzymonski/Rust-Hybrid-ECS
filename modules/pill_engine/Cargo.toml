@@ -9,7 +9,7 @@ pill_core_macros = { path = "../pill_core_macros" }
 rayon = "1.10"
 parking_lot = "0.12"
 sysinfo = "0.39"
-trait_type_map = { path = "../../Trait-Type-Map" }
+trait_type_map = { path = "../../../Trait-Type-Map" }
 tracy-client = { version = "0.18", optional = true, default-features = false }
 metrics = { version = "0.24", optional = true }
 serde = { version = "1", features = ["derive"] }
