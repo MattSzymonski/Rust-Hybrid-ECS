@@ -1,8 +1,9 @@
 """Generate HTML or JSON documentation for this Cargo workspace.
 
 Without flags, the script generates classic rustdoc HTML with stable
-``cargo doc``. Passing ``--json`` switches to nightly rustdoc JSON generation
-for downstream tools such as ``generate_documentation_markdown.py``.
+``cargo doc`` and opens it in the default browser after a successful build.
+Passing ``--json`` switches to nightly rustdoc JSON generation for downstream
+tools such as ``generate_documentation_markdown.py`` and does not open a browser.
 
 Unlike ``cargo doc --workspace``, ``cargo rustdoc`` accepts the unstable JSON
 output option but operates on only one selected package target at a time. JSON
@@ -255,7 +256,7 @@ def workspace_documentation_feature_arguments(
 def generate_html_documentation(
     packages: Sequence[Dict[str, Any]], *, dry_run: bool
 ) -> None:
-    """Generate classic private-item rustdoc HTML for the whole workspace.
+    """Generate and open classic private-item HTML for the whole workspace.
 
     Args:
         packages: Workspace packages used to construct compatible feature flags.
@@ -277,7 +278,9 @@ def generate_html_documentation(
     command.extend(workspace_documentation_feature_arguments(packages))
 
     # Cargo exposes private-item documentation as a normal stable doc option.
-    command.append("--document-private-items")
+    # ``--open`` launches the generated workspace documentation only after the
+    # HTML build succeeds; JSON mode uses a separate command and remains headless.
+    command.extend(["--document-private-items", "--open"])
 
     if dry_run:
         # Match run()'s readable Windows quoting without starting compilation.
