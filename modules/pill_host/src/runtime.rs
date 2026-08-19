@@ -30,6 +30,7 @@ use pill_engine::{Engine, EngineApi};
 use pill_engine::{RenderViewport, Renderer, RendererError, RendererWindow, VirtualResolution};
 
 // Current crate
+use crate::config::project_depends_on_crate;
 use crate::native_library::cleanup_temporary_files;
 use crate::optional_module::OptionalModuleSlot;
 use crate::project_module::LoadedProject;
@@ -376,6 +377,8 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
         engine,
         engine_api,
         workspace_root,
+        reload_generation,
+        module_config,
         ..
     } = &mut *host;
     for slot in optional_modules.iter_mut() {
@@ -385,6 +388,20 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
                 module = slot.name(),
                 "optional module reload processed"
             );
+            // A module the project links directly is compiled into the project
+            // DLL as well as its own DLL, so after the module swaps, the
+            // project still runs the old embedded copy of that crate. Queue a
+            // project reload so the new code reaches the project too; the
+            // existing transaction below handles build, rollback, and schema
+            // migration. The check is cheap: one small manifest read.
+            if project_depends_on_crate(workspace_root, module_config, slot.name()) {
+                info!(
+                    target: telemetry_target::HOT_RELOAD,
+                    module = slot.name(),
+                    "module is a direct dependency of the project; queuing a project reload"
+                );
+                reload_generation.fetch_add(1, Ordering::Release);
+            }
         }
     }
 

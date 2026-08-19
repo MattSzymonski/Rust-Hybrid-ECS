@@ -124,6 +124,12 @@ pub struct ProjectModuleConfig {
     /// Human-readable name used in log messages.
     pub name: String,
 
+    /// Workspace-relative path to the project's manifest file.
+    ///
+    /// The host re-reads it at runtime to answer dependency questions, such as
+    /// whether a reloaded optional module is linked by this project.
+    pub manifest_path: Option<String>,
+
     /// Directory to watch for source changes, relative to the workspace root.
     pub watch_directory: String,
 
@@ -470,6 +476,7 @@ impl ProjectModuleConfig {
 
         Ok(Self {
             name: package_name,
+            manifest_path: Some(format!("{project_path}/Cargo.toml")),
             watch_directory,
             build_command,
             build_environment: Vec::new(),
@@ -506,6 +513,7 @@ impl ProjectModuleConfig {
 
         Ok(Self {
             name: project_assembly_name.clone(),
+            manifest_path: None,
             watch_directory,
             build_command,
             // The managed build never invokes rustc, so it needs no overrides.
@@ -590,6 +598,72 @@ fn manifest_string_value(manifest: &str, section: &str, key: &str) -> Option<Str
         }
     }
     None
+}
+
+/// Whether the project manifest declares a direct dependency on `crate_name`.
+///
+/// Reads the project's manifest again at runtime because the decision depends
+/// on the module that just changed, which is only known during the frame loop.
+/// A missing or unreadable manifest counts as "no dependency", so a transient
+/// filesystem state can never force the project through an extra reload.
+pub(crate) fn project_depends_on_crate(
+    workspace_root: &Path,
+    project: &ProjectModuleConfig,
+    crate_name: &str,
+) -> bool {
+    // Only a native Rust project can link an optional module crate; a managed
+    // project cannot reference it, so it never needs this reload.
+    if !matches!(project.backend, ProjectModuleBackend::NativeLibrary { .. }) {
+        return false;
+    }
+    let Some(manifest_path) = &project.manifest_path else {
+        return false;
+    };
+    let Ok(manifest) = std::fs::read_to_string(workspace_root.join(manifest_path)) else {
+        return false;
+    };
+    manifest_depends_on_crate(&manifest, crate_name)
+}
+
+/// Scan a `Cargo.toml` for a dependency entry naming `crate_name`.
+///
+/// Accepts both a direct entry (`pill_spline = { ... }`) and a renamed one
+/// (`my_spline = { package = "pill_spline", ... }`). Only dependency sections
+/// contribute code to the built library: `[dependencies]`, the dev and build
+/// variants, and target-specific tables that end in `.dependencies`.
+fn manifest_depends_on_crate(manifest: &str, crate_name: &str) -> bool {
+    let mut in_dependency_section = false;
+    for raw_line in manifest.lines() {
+        let line = raw_line.trim();
+
+        // Any bracketed header selects a section and ends the previous one.
+        if line.starts_with('[') {
+            let section = line.trim_start_matches('[').trim_end_matches(']').trim();
+            in_dependency_section = matches!(
+                section,
+                "dependencies" | "dev-dependencies" | "build-dependencies"
+            ) || (section.ends_with(".dependencies")
+                && !section.starts_with("workspace."));
+            continue;
+        }
+
+        if !in_dependency_section || line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        // Dependency keys may be quoted when renamed to a non-identifier.
+        let key = key.trim().trim_matches('"');
+        if key == crate_name {
+            return true;
+        }
+        // A renamed dependency keeps the real crate name in `package`.
+        if value.contains(&format!("package = \"{crate_name}\"")) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Values declared by the optional `pill_config.yaml` file.
