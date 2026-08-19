@@ -639,11 +639,14 @@ fn manifest_depends_on_crate(manifest: &str, crate_name: &str) -> bool {
         // Any bracketed header selects a section and ends the previous one.
         if line.starts_with('[') {
             let section = line.trim_start_matches('[').trim_end_matches(']').trim();
-            in_dependency_section = matches!(
-                section,
-                "dependencies" | "dev-dependencies" | "build-dependencies"
-            ) || (section.ends_with(".dependencies")
-                && !section.starts_with("workspace."));
+            // A sub-table like `[dependencies.foo]` declares the dependency
+            // `foo` itself; match its key directly and leave its body unscanned.
+            if let Some(dependency_key) = dependency_sub_table_key(section) {
+                if dependency_key == crate_name {
+                    return true;
+                }
+            }
+            in_dependency_section = is_dependency_section(section);
             continue;
         }
 
@@ -664,6 +667,33 @@ fn manifest_depends_on_crate(manifest: &str, crate_name: &str) -> bool {
         }
     }
     false
+}
+
+/// Whether `section` is one of the dependency tables that contributes linked
+/// code: the plain `[dependencies]` family or a target-specific table ending
+/// in `.dependencies`. The workspace-wide `[workspace.dependencies]` table is
+/// shared infrastructure rather than a dependency of this project, so it is
+/// excluded.
+fn is_dependency_section(section: &str) -> bool {
+    matches!(
+        section,
+        "dependencies" | "dev-dependencies" | "build-dependencies"
+    ) || (section.ends_with(".dependencies") && !section.starts_with("workspace."))
+}
+
+/// The crate name a dependency sub-table declares, for sections shaped like
+/// `[dependencies.<name>]`, `[dev-dependencies.<name>]`, or
+/// `[build-dependencies.<name>]`. Returns `None` for any other section or for
+/// a sub-table nested deeper than one level.
+fn dependency_sub_table_key(section: &str) -> Option<&str> {
+    for prefix in ["dependencies.", "dev-dependencies.", "build-dependencies."] {
+        if let Some(rest) = section.strip_prefix(prefix) {
+            if !rest.contains('.') {
+                return Some(rest);
+            }
+        }
+    }
+    None
 }
 
 /// Values declared by the optional `pill_config.yaml` file.
@@ -815,4 +845,260 @@ fn materialize_host_project_member(
     })?;
 
     Ok(())
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A native project manifest that links the optional module directly.
+    const DEPENDENT_MANIFEST: &str = r#"
+[package]
+name = "project"
+
+[dependencies]
+pill_engine = { path = "../../modules/pill_engine" }
+pill_spline = { path = "../../modules/optional/pill_spline" }
+"#;
+
+    /// A native project manifest with no optional-module dependency.
+    const INDEPENDENT_MANIFEST: &str = r#"
+[package]
+name = "project"
+
+[dependencies]
+pill_engine = { path = "../../modules/pill_engine" }
+serde = { version = "1", features = ["derive"] }
+"#;
+
+    /// A native `ProjectModuleConfig` for dependency-check tests.
+    fn native_config(manifest_path: Option<&str>) -> ProjectModuleConfig {
+        ProjectModuleConfig {
+            name: "project".to_string(),
+            manifest_path: manifest_path.map(str::to_string),
+            watch_directory: "project/src".to_string(),
+            build_command: vec!["cargo".to_string(), "build".to_string()],
+            build_environment: Vec::new(),
+            backend: ProjectModuleBackend::NativeLibrary {
+                library_name: "project".to_string(),
+                output_subdirectory: "target/debug".to_string(),
+            },
+        }
+    }
+
+    /// A managed `ProjectModuleConfig`; it carries no Rust manifest path.
+    fn csharp_config() -> ProjectModuleConfig {
+        ProjectModuleConfig {
+            name: "project_cs".to_string(),
+            manifest_path: None,
+            watch_directory: "project_cs/src".to_string(),
+            build_command: vec!["dotnet".to_string(), "build".to_string()],
+            build_environment: Vec::new(),
+            backend: ProjectModuleBackend::CSharp(CSharpModuleConfig {
+                runtime_assembly_name: "csharp_runtime".to_string(),
+                runtime_output_subdirectory: "pill_csharp_runtime/bin/Release/net8.0".to_string(),
+                project_assembly_name: "project_cs".to_string(),
+                project_output_subdirectory: "project_cs/bin/Release/net8.0".to_string(),
+            }),
+        }
+    }
+
+    /// Root of this test run's temporary files, unique per process so parallel
+    /// test binaries never collide.
+    fn temp_root() -> PathBuf {
+        std::env::temp_dir().join(format!("pill_host_dependency_test_{}", std::process::id()))
+    }
+
+    /// Write a manifest into a unique subdirectory and return its path.
+    fn write_manifest(subdirectory: &str, contents: &str) -> PathBuf {
+        let directory = temp_root().join(subdirectory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("Cargo.toml");
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
+    // =========================================================================
+    // manifest_depends_on_crate
+    // =========================================================================
+
+    /// A direct dependency declared as an inline table is detected.
+    #[test]
+    fn direct_dependency_is_detected() {
+        assert!(manifest_depends_on_crate(DEPENDENT_MANIFEST, "pill_spline"));
+    }
+
+    /// A dependency renamed through `package = "..."` is detected.
+    #[test]
+    fn renamed_dependency_is_detected() {
+        let manifest = r#"
+[dependencies]
+spline_path = { package = "pill_spline", path = "../../modules/optional/pill_spline" }
+"#;
+        assert!(manifest_depends_on_crate(manifest, "pill_spline"));
+    }
+
+    /// A dependency with a quoted key (renamed to a non-identifier) is detected
+    /// through its `package` value.
+    #[test]
+    fn quoted_key_rename_is_detected() {
+        let manifest = r#"
+[dependencies]
+"spline-path" = { package = "pill_spline", path = "../../modules/optional/pill_spline" }
+"#;
+        assert!(manifest_depends_on_crate(manifest, "pill_spline"));
+    }
+
+    /// Dev and build dependencies also link the crate into the build.
+    #[test]
+    fn dev_and_build_dependencies_are_detected() {
+        let manifest = r#"
+[dev-dependencies]
+pill_spline = { path = "../../modules/optional/pill_spline" }
+
+[build-dependencies]
+pill_spline = { path = "../../modules/optional/pill_spline" }
+"#;
+        assert!(manifest_depends_on_crate(manifest, "pill_spline"));
+    }
+
+    /// A target-specific dependency table is detected.
+    #[test]
+    fn target_specific_dependency_is_detected() {
+        let manifest = r#"
+[target.'cfg(windows)'.dependencies]
+pill_spline = { path = "../../modules/optional/pill_spline" }
+"#;
+        assert!(manifest_depends_on_crate(manifest, "pill_spline"));
+    }
+
+    /// A dependency written as its own sub-table is detected.
+    #[test]
+    fn sub_table_dependency_is_detected() {
+        let manifest = r#"
+[dependencies.pill_spline]
+path = "../../modules/optional/pill_spline"
+"#;
+        assert!(manifest_depends_on_crate(manifest, "pill_spline"));
+    }
+
+    /// A manifest that never mentions the crate reports no dependency.
+    #[test]
+    fn missing_dependency_is_not_detected() {
+        assert!(!manifest_depends_on_crate(
+            INDEPENDENT_MANIFEST,
+            "pill_spline"
+        ));
+    }
+
+    /// A crate listed only under `[workspace.dependencies]` is shared
+    /// infrastructure, not something this project links directly.
+    #[test]
+    fn workspace_shared_dependency_is_not_a_project_dependency() {
+        let manifest = r#"
+[workspace.dependencies]
+pill_spline = { path = "../../modules/optional/pill_spline" }
+
+[dependencies]
+pill_engine = { path = "../../modules/pill_engine" }
+"#;
+        assert!(!manifest_depends_on_crate(manifest, "pill_spline"));
+    }
+
+    /// A crate name appearing outside any dependency section is not a link.
+    #[test]
+    fn same_name_outside_dependency_sections_is_ignored() {
+        let manifest = r#"
+[package]
+name = "pill_spline"
+
+[features]
+pill_spline = []
+
+[dependencies]
+pill_engine = { path = "../../modules/pill_engine" }
+"#;
+        assert!(!manifest_depends_on_crate(manifest, "pill_spline"));
+    }
+
+    /// A longer crate name sharing the prefix must not match.
+    #[test]
+    fn shared_prefix_does_not_match() {
+        let manifest = r#"
+[dependencies]
+pill_spline_extra = { path = "../../modules/optional/pill_spline_extra" }
+"#;
+        assert!(!manifest_depends_on_crate(manifest, "pill_spline"));
+    }
+
+    // =========================================================================
+    // project_depends_on_crate
+    // =========================================================================
+
+    /// The project manifest is read from disk and a direct dependency found.
+    #[test]
+    fn reads_the_project_manifest() {
+        let manifest = write_manifest("dependent", DEPENDENT_MANIFEST);
+        let project = native_config(Some(manifest.to_str().unwrap()));
+        assert!(project_depends_on_crate(
+            Path::new("."),
+            &project,
+            "pill_spline"
+        ));
+        let _ = std::fs::remove_dir_all(temp_root());
+    }
+
+    /// A project that does not depend on the module is not triggered.
+    #[test]
+    fn independent_manifest_is_not_triggered() {
+        let manifest = write_manifest("independent", INDEPENDENT_MANIFEST);
+        let project = native_config(Some(manifest.to_str().unwrap()));
+        assert!(!project_depends_on_crate(
+            Path::new("."),
+            &project,
+            "pill_spline"
+        ));
+        let _ = std::fs::remove_dir_all(temp_root());
+    }
+
+    /// A managed project is never triggered, even with a manifest path set,
+    /// because it cannot link a Rust optional-module crate.
+    #[test]
+    fn managed_project_is_never_triggered() {
+        let manifest = write_manifest("managed", "# csproj contents\n");
+        let mut project = csharp_config();
+        project.manifest_path = Some(manifest.to_string_lossy().into_owned());
+        assert!(!project_depends_on_crate(
+            Path::new("."),
+            &project,
+            "pill_spline"
+        ));
+        let _ = std::fs::remove_dir_all(temp_root());
+    }
+
+    /// A missing manifest counts as "no dependency" rather than an error.
+    #[test]
+    fn missing_manifest_file_is_not_an_error() {
+        let project = native_config(Some("does/not/exist/Cargo.toml"));
+        assert!(!project_depends_on_crate(
+            Path::new("."),
+            &project,
+            "pill_spline"
+        ));
+    }
+
+    /// A config without a manifest path counts as "no dependency".
+    #[test]
+    fn missing_manifest_path_is_not_an_error() {
+        let project = native_config(None);
+        assert!(!project_depends_on_crate(
+            Path::new("."),
+            &project,
+            "pill_spline"
+        ));
+    }
 }
