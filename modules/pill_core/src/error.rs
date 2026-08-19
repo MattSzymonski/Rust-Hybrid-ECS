@@ -521,6 +521,67 @@ pub enum LibraryError {
     InitializationFailed { status: u32 },
 }
 
+/// Engine-runtime dynamic-library loading and boundary-call failures.
+///
+/// The runtime is the reloadable half of the engine: the host loads it,
+/// validates its C ABI, and drives every frame through its function table.
+/// These variants cover staging a built dylib, mapping it, refusing a
+/// mismatched contract, and reporting a failed boundary call.
+#[engine_error(namespace = host::runtime)]
+pub enum RuntimeError {
+    /// The staging directory for runtime dylibs could not be prepared.
+    #[message("failed to prepare runtime staging directory ", name_style(directory))]
+    StagingDirectory {
+        directory: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The built runtime dylib could not be copied into the staging directory.
+    ///
+    /// Mapped modules are locked by the operating system, so every generation
+    /// is loaded from its own staged copy rather than from the build output.
+    #[message(
+        "failed to stage built runtime ",
+        name_style(source_path),
+        " as ",
+        name_style(target_path)
+    )]
+    StageCopyFailed {
+        source_path: String,
+        target_path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The staged dylib could not be mapped or failed its ABI validation.
+    #[message("failed to load the engine runtime: ", value(details))]
+    #[diagnostic(help(
+        "rebuild the workspace so the host and the runtime share one ABI revision"
+    ))]
+    ModuleRejected { details: String },
+
+    /// The runtime refused to create a generation from the supplied arguments.
+    #[message("the engine runtime failed to start: ", value(details))]
+    CreateFailed { details: String },
+
+    /// A boundary call reported a failure through the runtime's error channel.
+    #[message(
+        "engine runtime call ",
+        name_style(operation),
+        " failed: ",
+        value(details)
+    )]
+    CallFailed { operation: String, details: String },
+
+    /// No runtime generation is currently loaded.
+    ///
+    /// Reported when a frontend calls into the runtime after every rollback
+    /// path has been exhausted, which the frame loop treats as fatal.
+    #[message("no engine runtime generation is currently loaded")]
+    NotLoaded,
+}
+
 /// Source-watching startup failures.
 ///
 /// Distinct from build failures: the watcher must start before any build can
@@ -733,6 +794,10 @@ pub enum HostError {
     /// Native library loading or initialization failed.
     #[transparent]
     Library(#[from] LibraryError),
+
+    /// The engine runtime dynamic library could not be loaded or driven.
+    #[transparent]
+    Runtime(#[from] RuntimeError),
 
     /// The source watcher could not start.
     #[transparent]

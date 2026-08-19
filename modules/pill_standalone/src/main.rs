@@ -13,7 +13,8 @@
 //! [`pill_host`] crate. This binary selects the module configuration from the
 //! environment, starts the loop, and reports failures exactly once. There is
 //! no window, GPU, or event-loop code here: `pill_host::run` owns those behind the
-//! `rendering` feature.
+//! `rendering` feature, and the engine itself lives in a dynamic library the
+//! host loads and swaps without restarting this process.
 
 // Standard library
 use std::path::PathBuf;

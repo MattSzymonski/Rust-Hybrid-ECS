@@ -50,6 +50,7 @@ use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
 use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
 use crate::error::PersistenceError;
+use crate::resource::Resource;
 use crate::world::World;
 
 // =============================================================================
@@ -73,6 +74,18 @@ pub(crate) type DeserializeComponentFn = fn(bytes: &[u8]) -> Option<Box<dyn Comp
 pub(crate) type InsertComponentFn =
     fn(storage: &mut TraitTypeMap<dyn Component, VecFamily>, component: Box<dyn Component>);
 
+/// Serializes one registered persistable resource into JSON bytes.
+///
+/// Returns `None` when the resource type is registered but no instance is
+/// currently inserted, which is a normal state rather than a failure.
+pub(crate) type SerializeResourceFn = fn(world: &World) -> Option<Vec<u8>>;
+
+/// Deserializes JSON bytes and re-inserts the resource into the world.
+///
+/// Returns `false` when the payload cannot be decoded with the current schema,
+/// leaving whatever instance `project_init` already created in place.
+pub(crate) type RestoreResourceFn = fn(world: &mut World, bytes: &[u8]) -> bool;
+
 // =============================================================================
 // ComponentSnapshot
 // =============================================================================
@@ -91,6 +104,7 @@ pub(crate) type InsertComponentFn =
 ///
 /// let snapshot = ComponentSnapshot {
 ///     entries: vec![vec![("project::Position".to_string(), b"{}".to_vec())]],
+///     ..Default::default()
 /// };
 /// assert_eq!(snapshot.entity_count(), 1);
 /// ```
@@ -99,6 +113,25 @@ pub struct ComponentSnapshot {
     /// Each entry represents one entity to recreate.
     /// Inner vec: list of `(component_type_name, json_bytes)`.
     pub entries: Vec<Vec<(String, Vec<u8>)>>,
+    /// Handle each entry was captured from, parallel to `entries`.
+    ///
+    /// Empty when the snapshot carries no identities, in which case restore
+    /// falls back to allocating fresh handles. Any other length mismatch is
+    /// treated the same way, so a truncated payload degrades instead of
+    /// pairing components with the wrong identity.
+    pub entity_ids: Vec<SnapshotEntityId>,
+}
+
+/// Captured identity of one snapshotted entity.
+///
+/// Restoring the exact `(id, generation)` pair keeps entity handles stored
+/// inside components, resources, and project state valid across a reload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SnapshotEntityId {
+    /// Slot identifier the entity occupied.
+    pub id: u64,
+    /// Generation counter that disambiguated recycled slots.
+    pub generation: u32,
 }
 
 /// Snapshot of one persistable component type registration.
@@ -141,6 +174,19 @@ pub struct SelectiveMigrationReport {
     /// Number of entities touched by selective migration.
     pub migrated_entity_count: usize,
     /// Component type names that could not be migrated selectively.
+    pub skipped_type_names: Vec<String>,
+}
+
+/// Result of restoring captured resources into a world.
+///
+/// A skipped resource is not a failure: the type may have been removed from
+/// the project, or its schema may have changed incompatibly. In both cases the
+/// instance created by `project_init` stays in place.
+#[derive(Debug, Default)]
+pub struct ResourceRestoreReport {
+    /// Number of resources decoded and re-inserted.
+    pub restored_count: usize,
+    /// Resource type names whose captured payload could not be restored.
     pub skipped_type_names: Vec<String>,
 }
 
@@ -224,6 +270,110 @@ impl World {
         self.persist_schema_hashes
             .insert(type_name, calculate_schema_hash::<T>());
     }
+
+    /// Register a resource type that survives engine and project reloads.
+    ///
+    /// Components live in archetype columns and are matched by type name;
+    /// resources are singletons stored by `TypeId`, so they need their own
+    /// registration to become part of a snapshot. A resource that is not
+    /// registered here is simply recreated by `project_init` after a reload,
+    /// which is the right behaviour for anything holding non-serializable
+    /// state such as an `Instant`, a file handle, or a GPU resource.
+    ///
+    /// Registrations are keyed by type name, so re-registering the same
+    /// resource from a newly loaded module replaces the previous entry rather
+    /// than leaving a stale function pointer behind.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use pill_engine::{Resource, World};
+    /// # use serde::{Deserialize, Serialize};
+    /// #[derive(Serialize, Deserialize)]
+    /// struct Score(u32);
+    /// impl Resource for Score {}
+    ///
+    /// let mut world = World::new();
+    /// world.register_persistable_resource::<Score>();
+    /// world.insert_resource(Score(42));
+    ///
+    /// let captured = world.snapshot_resources();
+    /// assert_eq!(captured.len(), 1);
+    /// ```
+    pub fn register_persistable_resource<T>(&mut self)
+    where
+        T: Resource + Serialize + DeserializeOwned + 'static,
+    {
+        let type_name = std::any::type_name::<T>().to_string();
+        self.persist_resource_serializers.insert(
+            type_name.clone(),
+            serialize_resource::<T> as SerializeResourceFn,
+        );
+        self.persist_resource_restorers
+            .insert(type_name, restore_resource::<T> as RestoreResourceFn);
+    }
+}
+
+// =============================================================================
+// World - Resource Snapshot and Restore
+// =============================================================================
+
+impl World {
+    /// Capture every registered persistable resource as JSON bytes.
+    ///
+    /// Registered types with no inserted instance are omitted rather than
+    /// captured as null, so restoring never resurrects a resource the project
+    /// deliberately removed. The result is sorted by type name to keep
+    /// captured payloads byte-stable across runs.
+    pub fn snapshot_resources(&self) -> Vec<(String, Vec<u8>)> {
+        let mut captured: Vec<(String, Vec<u8>)> = self
+            .persist_resource_serializers
+            .iter()
+            .filter_map(|(type_name, serialize)| {
+                serialize(self).map(|bytes| (type_name.clone(), bytes))
+            })
+            .collect();
+
+        captured.sort_by(|left, right| left.0.cmp(&right.0));
+        println!(
+            "[persistence] Captured {} persistable resource(s) out of {} registered type(s)",
+            captured.len(),
+            self.persist_resource_serializers.len(),
+        );
+        captured
+    }
+
+    /// Re-insert captured resources, matching them by type name.
+    ///
+    /// Types the current project no longer registers are skipped, as are
+    /// payloads that no longer decode under the current schema. Both leave the
+    /// instance `project_init` already created untouched, which is the same
+    /// degradation rule persistable components follow.
+    pub fn restore_resources(&mut self, resources: &[(String, Vec<u8>)]) -> ResourceRestoreReport {
+        let mut report = ResourceRestoreReport::default();
+
+        for (type_name, bytes) in resources {
+            let Some(&restore) = self.persist_resource_restorers.get(type_name) else {
+                println!("[persistence]   resource '{type_name}' -> SKIP (type not registered)");
+                report.skipped_type_names.push(type_name.clone());
+                continue;
+            };
+
+            if restore(self, bytes) {
+                report.restored_count += 1;
+            } else {
+                println!("[persistence]   resource '{type_name}' -> SKIP (deserialize failed)");
+                report.skipped_type_names.push(type_name.clone());
+            }
+        }
+
+        println!(
+            "[persistence] Resource restore complete: {} restored, {} skipped",
+            report.restored_count,
+            report.skipped_type_names.len(),
+        );
+        report
+    }
 }
 
 // =============================================================================
@@ -253,6 +403,7 @@ impl World {
         );
 
         let mut entries: Vec<Vec<(String, Vec<u8>)>> = Vec::with_capacity(total_entities);
+        let mut entity_ids: Vec<SnapshotEntityId> = Vec::with_capacity(total_entities);
         let mut total_components_serialized: usize = 0;
         let mut skipped_non_persistable: usize = 0;
 
@@ -292,6 +443,13 @@ impl World {
                 }
 
                 if !component_data.is_empty() {
+                    // Record the handle alongside its components so restore can
+                    // reinstate the exact identity instead of a fresh one.
+                    let entity = archetype.entities[entity_index];
+                    entity_ids.push(SnapshotEntityId {
+                        id: entity.id(),
+                        generation: entity.generation(),
+                    });
                     entries.push(component_data);
                 }
             }
@@ -304,7 +462,10 @@ impl World {
             skipped_non_persistable,
         );
 
-        ComponentSnapshot { entries }
+        ComponentSnapshot {
+            entries,
+            entity_ids,
+        }
     }
 
     /// Destroy all entities and recreate them from a snapshot.
@@ -339,7 +500,26 @@ impl World {
             destroyed_count,
         );
 
-        // Step 2: Recreate entities from snapshot data.
+        // Step 2: Clear the allocator state that would otherwise block the
+        // captured identities. Snapshots without identities (or with a
+        // truncated identity list) fall back to fresh handles.
+        let preserve_entity_ids = snapshot.entity_ids.len() == snapshot.entries.len();
+        let mut reserved_generations = if preserve_entity_ids {
+            self.reserve_explicit_entity_ids(&snapshot.entity_ids)
+        } else {
+            if !snapshot.entity_ids.is_empty() {
+                println!(
+                    "[persistence]   Ignoring {} captured entity ids: the identity list does not match the {} snapshot entries",
+                    snapshot.entity_ids.len(),
+                    snapshot.entries.len(),
+                );
+            }
+            HashMap::new()
+        };
+        let mut preserved_entity_id_count: usize = 0;
+        let mut rekeyed_entity_id_count: usize = 0;
+
+        // Step 3: Recreate entities from snapshot data.
         let mut restored_entity_count: usize = 0;
         let mut restored_component_total: usize = 0;
         let mut skipped_type_removed: usize = 0;
@@ -397,7 +577,18 @@ impl World {
             // Place the entity in the archetype that owns its exact set of
             // restored component types, inserting each restored component and
             // seeding change ticks.
-            let entity = self.allocate_entity();
+            let entity = match snapshot.entity_ids.get(entry_idx) {
+                Some(&captured) if preserve_entity_ids => {
+                    let restored = resolve_explicit_entity(captured, &mut reserved_generations);
+                    if restored.generation() == captured.generation {
+                        preserved_entity_id_count += 1;
+                    } else {
+                        rekeyed_entity_id_count += 1;
+                    }
+                    restored
+                }
+                _ => self.allocate_entity(),
+            };
             restored_component_ids.sort();
 
             let archetype_id = self.get_or_create_archetype(restored_component_ids.clone());
@@ -442,6 +633,12 @@ impl World {
             "[persistence] Restore complete: {} entities, {} components inserted",
             restored_entity_count, restored_component_total,
         );
+        if preserve_entity_ids {
+            println!(
+                "[persistence]   Entity ids: {} preserved exactly, {} re-keyed after a collision",
+                preserved_entity_id_count, rekeyed_entity_id_count,
+            );
+        }
         if skipped_type_removed > 0 {
             println!(
                 "[persistence]   {} components skipped (type removed from project)",
@@ -1058,6 +1255,77 @@ where
     hasher.finish()
 }
 
+/// Serialize the single instance of one persistable resource type.
+///
+/// Returns `None` when no instance is inserted, or when the value cannot be
+/// encoded; both cases simply leave the resource out of the snapshot.
+fn serialize_resource<T>(world: &World) -> Option<Vec<u8>>
+where
+    T: Resource + Serialize + 'static,
+{
+    let resource = world.get_resource::<T>()?;
+    match serde_json::to_vec(resource) {
+        Ok(bytes) => Some(bytes),
+        Err(error) => {
+            eprintln!(
+                "[persistence] Failed to serialize resource '{}': {}",
+                std::any::type_name::<T>(),
+                error
+            );
+            None
+        }
+    }
+}
+
+/// Decode captured bytes and re-insert one persistable resource type.
+///
+/// Missing fields are filled from the payload's own JSON shape by serde's
+/// `default` handling where the type provides it; a payload that cannot be
+/// decoded at all is reported so the caller can keep the instance
+/// `project_init` created.
+fn restore_resource<T>(world: &mut World, bytes: &[u8]) -> bool
+where
+    T: Resource + DeserializeOwned + 'static,
+{
+    match serde_json::from_slice::<T>(bytes) {
+        Ok(value) => {
+            world.insert_resource(value);
+            true
+        }
+        Err(error) => {
+            eprintln!(
+                "[persistence] Failed to deserialize resource '{}': {}. Keeping the freshly initialized instance.",
+                std::any::type_name::<T>(),
+                error
+            );
+            false
+        }
+    }
+}
+
+/// Resolve the handle a captured entity identity may safely take.
+///
+/// Returns the captured `(id, generation)` pair unless the world reserved a
+/// later generation for that id, in which case the reservation wins so the
+/// restored handle can never alias a live one.
+///
+/// The reservation map is updated as each handle is installed, so a snapshot
+/// that names the same id twice - which only a corrupted payload can do -
+/// yields two distinct handles instead of one duplicated key.
+pub(crate) fn resolve_explicit_entity(
+    captured: SnapshotEntityId,
+    reserved_generations: &mut HashMap<u64, u32>,
+) -> Entity {
+    let generation = reserved_generations
+        .get(&captured.id)
+        .copied()
+        .map_or(captured.generation, |reserved| {
+            captured.generation.max(reserved)
+        });
+    reserved_generations.insert(captured.id, generation.wrapping_add(1));
+    Entity::from_parts(captured.id, generation)
+}
+
 /// Downcast and push a boxed component into the concrete VecStorage.
 fn insert_boxed_component<T>(
     storage: &mut TraitTypeMap<dyn Component, VecFamily>,
@@ -1093,3 +1361,337 @@ fn insert_boxed_component<T>(
 // /// Per-component-type insert fn for pushing Box<dyn Component> into storage.
 // pub(crate) persist_inserters: HashMap<ComponentId, InsertComponentFn>,
 // ```
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // External crates
+    use serde::{Deserialize, Serialize};
+    use trait_type_map::impl_trait_accessible;
+
+    // Current crate
+    use crate::resource::Resource;
+
+    /// A persistable component used to exercise snapshot and restore.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+    struct SpatialPosition {
+        horizontal: f32,
+        vertical: f32,
+    }
+    impl Component for SpatialPosition {}
+
+    /// A second persistable component so multi-archetype worlds are covered.
+    #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+    struct FrameCounter {
+        count: u64,
+    }
+    impl Component for FrameCounter {}
+
+    impl_trait_accessible!(dyn Component; SpatialPosition, FrameCounter);
+
+    /// A persistable resource used to exercise resource capture and restore.
+    #[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+    struct SimulationClock {
+        elapsed_seconds: f64,
+        frame_index: u64,
+    }
+    impl Resource for SimulationClock {}
+
+    /// A resource with no serde support, recreated instead of captured.
+    struct GpuHandle {
+        _opaque: usize,
+    }
+    impl Resource for GpuHandle {}
+
+    /// Build a world with both persistable component types registered.
+    fn world_with_persistable_components() -> World {
+        let mut world = World::new();
+        world.register_persistable_component::<SpatialPosition>();
+        world.register_persistable_component::<FrameCounter>();
+        world
+    }
+
+    /// Read one entity's spatial position, if it still carries the component.
+    fn read_position(world: &World, entity: Entity) -> Option<SpatialPosition> {
+        world.get_component::<SpatialPosition>(entity).cloned()
+    }
+
+    /// A capture/restore round trip reinstates the exact captured handles.
+    #[test]
+    fn entity_identities_survive_a_snapshot_round_trip() {
+        let mut world = world_with_persistable_components();
+        let first = world
+            .create_entity()
+            .with(SpatialPosition {
+                horizontal: 1.0,
+                vertical: 2.0,
+            })
+            .build()
+            .unwrap();
+        let second = world
+            .create_entity()
+            .with(SpatialPosition {
+                horizontal: 3.0,
+                vertical: 4.0,
+            })
+            .with(FrameCounter { count: 7 })
+            .build()
+            .unwrap();
+
+        let snapshot = world.snapshot_components();
+        assert_eq!(snapshot.entity_ids.len(), snapshot.entries.len());
+
+        // Restore into a *different* world, which is what an engine swap does.
+        let mut replacement = world_with_persistable_components();
+        replacement.restore_from_snapshot(&snapshot);
+
+        assert_eq!(replacement.entity_count(), 2);
+        assert!(replacement.is_entity_valid(first));
+        assert!(replacement.is_entity_valid(second));
+        assert_eq!(
+            read_position(&replacement, second),
+            Some(SpatialPosition {
+                horizontal: 3.0,
+                vertical: 4.0
+            })
+        );
+    }
+
+    /// Entities the replacement world created before restore do not force a
+    /// generation bump, because restore destroys them first.
+    #[test]
+    fn identities_survive_a_replacement_world_that_seeded_entities_first() {
+        let mut world = world_with_persistable_components();
+        let captured_entity = world
+            .create_entity()
+            .with(FrameCounter { count: 42 })
+            .build()
+            .unwrap();
+        let snapshot = world.snapshot_components();
+
+        // Mimic `project_init` running in the replacement engine: it seeds its
+        // own entities, which restore then destroys.
+        let mut replacement = world_with_persistable_components();
+        let _seeded = replacement
+            .create_entity()
+            .with(FrameCounter { count: 0 })
+            .build()
+            .unwrap();
+        replacement.restore_from_snapshot(&snapshot);
+
+        assert_eq!(replacement.entity_count(), 1);
+        assert!(replacement.is_entity_valid(captured_entity));
+        assert_eq!(
+            replacement
+                .get_component::<FrameCounter>(captured_entity)
+                .map(|counter| counter.count),
+            Some(42)
+        );
+    }
+
+    /// A live entity at the requested id forces the next generation, so an
+    /// explicit allocation can never alias a handle still in use.
+    #[test]
+    fn explicit_allocation_bumps_past_a_live_entity() {
+        let mut world = world_with_persistable_components();
+        let live = world
+            .create_entity()
+            .with(FrameCounter { count: 1 })
+            .build()
+            .unwrap();
+
+        let reinstated = world.allocate_entity_at(live.id(), live.generation());
+        assert_eq!(reinstated.id(), live.id());
+        assert_eq!(reinstated.generation(), live.generation() + 1);
+    }
+
+    /// An explicit allocation moves the fresh-id counter past the id it took.
+    #[test]
+    fn explicit_allocation_reserves_the_id_for_good() {
+        let mut world = World::new();
+        let restored = world.allocate_entity_at(9, 4);
+        assert_eq!((restored.id(), restored.generation()), (9, 4));
+
+        let next = world.allocate_entity();
+        assert!(
+            next.id() > 9,
+            "fresh ids must not collide with restored ones"
+        );
+    }
+
+    /// A snapshot without identities still restores, using fresh handles.
+    #[test]
+    fn snapshots_without_identities_fall_back_to_fresh_handles() {
+        let snapshot = ComponentSnapshot {
+            entries: vec![vec![(
+                std::any::type_name::<FrameCounter>().to_string(),
+                serde_json::to_vec(&FrameCounter { count: 5 }).unwrap(),
+            )]],
+            entity_ids: Vec::new(),
+        };
+
+        let mut world = world_with_persistable_components();
+        world.restore_from_snapshot(&snapshot);
+        assert_eq!(world.entity_count(), 1);
+    }
+
+    /// A truncated identity list is discarded rather than mispaired.
+    #[test]
+    fn mismatched_identity_lists_are_discarded_on_restore() {
+        let type_name = std::any::type_name::<FrameCounter>().to_string();
+        let payload = serde_json::to_vec(&FrameCounter { count: 5 }).unwrap();
+        let snapshot = ComponentSnapshot {
+            entries: vec![
+                vec![(type_name.clone(), payload.clone())],
+                vec![(type_name, payload)],
+            ],
+            entity_ids: vec![SnapshotEntityId {
+                id: 40,
+                generation: 2,
+            }],
+        };
+
+        let mut world = world_with_persistable_components();
+        world.restore_from_snapshot(&snapshot);
+        assert_eq!(world.entity_count(), 2);
+        // The single captured identity must not have been applied to either
+        // entity, because it could not be paired reliably.
+        assert!(!world.is_entity_valid(Entity::from_parts(40, 2)));
+    }
+
+    /// A corrupted snapshot naming one id twice yields two distinct handles.
+    #[test]
+    fn duplicate_captured_identities_are_disambiguated() {
+        let type_name = std::any::type_name::<FrameCounter>().to_string();
+        let payload = serde_json::to_vec(&FrameCounter { count: 1 }).unwrap();
+        let duplicate = SnapshotEntityId {
+            id: 3,
+            generation: 0,
+        };
+        let snapshot = ComponentSnapshot {
+            entries: vec![
+                vec![(type_name.clone(), payload.clone())],
+                vec![(type_name, payload)],
+            ],
+            entity_ids: vec![duplicate, duplicate],
+        };
+
+        let mut world = world_with_persistable_components();
+        world.restore_from_snapshot(&snapshot);
+        assert_eq!(world.entity_count(), 2);
+        assert!(world.is_entity_valid(Entity::from_parts(3, 0)));
+        assert!(world.is_entity_valid(Entity::from_parts(3, 1)));
+    }
+
+    /// Registered resources are captured and restored; unregistered ones are not.
+    #[test]
+    fn persistable_resources_round_trip_and_others_are_left_alone() {
+        let mut world = World::new();
+        world.register_persistable_resource::<SimulationClock>();
+        world.insert_resource(SimulationClock {
+            elapsed_seconds: 12.5,
+            frame_index: 750,
+        });
+        world.insert_resource(GpuHandle { _opaque: 1 });
+
+        let captured = world.snapshot_resources();
+        assert_eq!(captured.len(), 1, "only registered resources are captured");
+
+        // Restore into a replacement world that re-created both resources the
+        // way `project_init` would.
+        let mut replacement = World::new();
+        replacement.register_persistable_resource::<SimulationClock>();
+        replacement.insert_resource(SimulationClock::default());
+        replacement.insert_resource(GpuHandle { _opaque: 2 });
+
+        let report = replacement.restore_resources(&captured);
+        assert_eq!(report.restored_count, 1);
+        assert!(report.skipped_type_names.is_empty());
+        assert_eq!(
+            replacement.get_resource::<SimulationClock>(),
+            Some(&SimulationClock {
+                elapsed_seconds: 12.5,
+                frame_index: 750,
+            })
+        );
+        // The non-serde resource keeps the instance the replacement created.
+        assert!(replacement.has_resource::<GpuHandle>());
+    }
+
+    /// A resource type the project no longer registers is skipped, not fatal.
+    #[test]
+    fn resources_of_unregistered_types_are_skipped() {
+        let mut world = World::new();
+        let captured = vec![(
+            String::from("project::RemovedResource"),
+            b"{\"value\":1}".to_vec(),
+        )];
+
+        let report = world.restore_resources(&captured);
+        assert_eq!(report.restored_count, 0);
+        assert_eq!(
+            report.skipped_type_names,
+            vec![String::from("project::RemovedResource")]
+        );
+    }
+
+    /// A registered resource whose payload no longer decodes is skipped and
+    /// the freshly initialized instance is kept.
+    #[test]
+    fn undecodable_resource_payloads_keep_the_fresh_instance() {
+        let mut world = World::new();
+        world.register_persistable_resource::<SimulationClock>();
+        world.insert_resource(SimulationClock {
+            elapsed_seconds: 3.0,
+            frame_index: 9,
+        });
+
+        let captured = vec![(
+            std::any::type_name::<SimulationClock>().to_string(),
+            b"not json at all".to_vec(),
+        )];
+        let report = world.restore_resources(&captured);
+
+        assert_eq!(report.restored_count, 0);
+        assert_eq!(report.skipped_type_names.len(), 1);
+        assert_eq!(
+            world.get_resource::<SimulationClock>(),
+            Some(&SimulationClock {
+                elapsed_seconds: 3.0,
+                frame_index: 9,
+            })
+        );
+    }
+
+    /// Re-registering a resource replaces the previous entry instead of
+    /// leaving a stale function pointer behind.
+    #[test]
+    fn resource_registration_is_idempotent_by_type_name() {
+        let mut world = World::new();
+        world.register_persistable_resource::<SimulationClock>();
+        world.register_persistable_resource::<SimulationClock>();
+        world.insert_resource(SimulationClock::default());
+
+        assert_eq!(world.snapshot_resources().len(), 1);
+    }
+
+    /// The manifest reports one entry per registered persistable component.
+    #[test]
+    fn persist_manifest_covers_every_registered_component() {
+        let world = world_with_persistable_components();
+        let manifest = world.persist_type_manifest();
+
+        assert_eq!(manifest.len(), 2);
+        assert!(manifest
+            .iter()
+            .any(|entry| entry.type_name.ends_with("SpatialPosition")));
+        assert!(manifest
+            .iter()
+            .any(|entry| entry.type_name.ends_with("FrameCounter")));
+    }
+}

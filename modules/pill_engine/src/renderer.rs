@@ -91,6 +91,57 @@ impl Renderer {
             .create_surface(window)
             .map_err(|error| RendererError::SurfaceCreation { source: error })?;
 
+        Self::from_surface(instance, surface, width, height)
+    }
+
+    /// Create the GPU surface from platform window and display handles.
+    ///
+    /// This is the constructor the hot-reloadable runtime uses: the host keeps
+    /// owning its window and passes only borrowed handles across the C ABI, so
+    /// no reference count is transferred and none can leak or be released
+    /// twice when a runtime generation is swapped.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same failures as [`Renderer::new`].
+    ///
+    /// # Safety
+    ///
+    /// The window described by `raw_window_handle` and `raw_display_handle`
+    /// must remain valid for the entire lifetime of the returned renderer.
+    /// Callers guarantee this by destroying the renderer before the window.
+    pub unsafe fn from_raw_window_handle(
+        raw_display_handle: wgpu::rwh::RawDisplayHandle,
+        raw_window_handle: wgpu::rwh::RawWindowHandle,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, RendererError> {
+        // Step 1: create the wgpu instance and bind it to the borrowed handles.
+        let instance = wgpu::Instance::default();
+        // SAFETY: The caller guarantees the described window outlives this
+        // renderer, which is exactly the contract `create_surface_unsafe`
+        // requires in exchange for a `Surface<'static>`.
+        let surface = unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle,
+                raw_window_handle,
+            })
+        }
+        .map_err(|error| RendererError::SurfaceCreation { source: error })?;
+
+        Self::from_surface(instance, surface, width, height)
+    }
+
+    /// Complete renderer setup for an already-created surface.
+    ///
+    /// Shared by both constructors so adapter selection, device creation,
+    /// format negotiation, and pipeline setup exist exactly once.
+    fn from_surface(
+        instance: wgpu::Instance,
+        surface: wgpu::Surface<'static>,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, RendererError> {
         // Step 2: acquire an adapter compatible with the surface.
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),

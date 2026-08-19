@@ -4209,6 +4209,7 @@ dependencies = [
  "parking_lot",
  "pill_core",
  "pill_core_macros",
+ "pill_runtime_api",
  "pollster",
  "rayon",
  "serde",
@@ -4225,16 +4226,36 @@ dependencies = [
 name = "pill_host"
 version = "0.1.0"
 dependencies = [
- "libloading 0.8.9",
  "metrics",
  "notify",
  "pill_core",
+ "pill_runtime_api",
+ "tracing",
+ "winit",
+]
+
+[[package]]
+name = "pill_runtime"
+version = "0.1.0"
+dependencies = [
+ "libloading 0.8.9",
+ "metrics",
+ "pill_core",
  "pill_engine",
+ "pill_runtime_api",
  "serde",
  "serde_json",
  "tracing",
+ "tracing-subscriber",
  "trait_type_map",
- "winit",
+]
+
+[[package]]
+name = "pill_runtime_api"
+version = "0.1.0"
+dependencies = [
+ "libloading 0.8.9",
+ "raw-window-handle 0.6.2",
 ]
 
 [[package]]

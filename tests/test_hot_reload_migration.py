@@ -7,18 +7,22 @@ REQUIREMENTS
   - Run from workspace root or any path (script resolves paths itself)
 
 DESCRIPTION
-    This script launches the standalone host and executes a table-driven migration
-    suite by editing tests/project/src/lib.rs. Every scenario waits for hot-reload,
-    checks crash signals, verifies expected migration logs, and optionally
-    validates that the counter system still ticks.
+    This script launches the standalone host and executes a table-driven reload
+    suite. Project scenarios edit tests/project/src/lib.rs; engine scenarios edit
+    modules/pill_engine/src so the whole engine dynamic library is rebuilt and
+    swapped underneath the running process. Every scenario waits for its reload,
+    checks crash signals, verifies expected migration and restore logs, and
+    optionally validates that the counter system still ticks.
 
 USAGE
   python tests/test_hot_reload_migration.py [--cycles N] [--timeout-scale S]
+                                            [--skip-engine-scenarios]
 
 EXAMPLE USAGE
   python tests/test_hot_reload_migration.py
   python tests/test_hot_reload_migration.py --cycles 2
   python tests/test_hot_reload_migration.py --timeout-scale 1.5
+  python tests/test_hot_reload_migration.py --skip-engine-scenarios
 
 --- SCRIPT ---
 """
@@ -42,29 +46,46 @@ from typing import List, Optional, Sequence, Tuple
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 TEST_PROJECT_ROOT = WORKSPACE_ROOT / "tests" / "project"
 PROJECT_LIB_RS = TEST_PROJECT_ROOT / "src" / "lib.rs"
+ENGINE_SOURCE_RS = WORKSPACE_ROOT / "modules" / "pill_engine" / "src" / "lib.rs"
+STAGED_RUNTIME_ROOT = WORKSPACE_ROOT / "modules" / "pill_standalone_temp"
 
 STARTUP_TOKEN = "Entering project loop"
-RELOAD_COMPLETE_TOKEN = "Hot-reload complete"
+PROJECT_RELOAD_COMPLETE_TOKEN = "project hot reload complete"
+ENGINE_RELOAD_COMPLETE_TOKEN = "engine hot reload complete"
 COUNTER_TICK_TOKEN = "counter tick"
+WITNESS_TOKEN = "reload witness marker=0xC0FFEE"
 PANIC_TOKEN = "panicked at"
 ACCESS_VIOLATION_TOKEN = "STATUS_ACCESS_VIOLATION"
-FAST_PATH_TOKEN = "Schema unchanged for all persistable component types"
+FAST_PATH_TOKEN = "project schema unchanged for all persistable component types"
+ENGINE_FAST_PATH_TOKEN = "captured schema unchanged for all persistable component types"
 SELECTIVE_START_TOKEN = "[persistence] Selective migration starting"
 SELECTIVE_FINISHED_TOKEN = "[persistence] Selective migration finished"
 FRAMECOUNTER_MIGRATE_LOG_TOKEN = "'project::FrameCounter' -> migrating"
 SPATIAL_POSITION_MIGRATE_LOG_TOKEN = "'project::SpatialPosition' -> migrating"
 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN = "'project::LinearVelocity' -> migrating"
+CAPTURE_TOKEN = "captured world state for the engine swap"
+ENGINE_RESTORE_TOKEN = "world state restored across the engine swap"
+IDS_PRESERVED_TOKEN = "preserved exactly, 0 re-keyed after a collision"
+KEPT_RUNNING_TOKEN = "keeping the running engine runtime"
+ABI_REJECTED_TOKEN = "the rebuilt engine runtime was rejected"
+ENGINE_SCHEMA_ADAPT_TOKEN = "persistable component schema changed across the engine swap"
 
 STARTUP_TIMEOUT = 60
 RELOAD_TIMEOUT = 45
+# An engine reload recompiles the whole engine dynamic library, so it needs a
+# far larger budget than a project rebuild.
+ENGINE_RELOAD_TIMEOUT = 300
 BUILD_TIMEOUT = 120
 STABILITY_SLEEP = 3
 COUNTER_TICK_TIMEOUT = 10
+WITNESS_TIMEOUT = 30
 PROCESS_KILL_TIMEOUT = 5
 CYCLE_PAUSE = 2
 MAX_BUFFERED_LINES = 7000
 
 ORIGINAL_CONTENT: str = ""
+ORIGINAL_ENGINE_CONTENT: str = ""
+RUN_ENGINE_SCENARIOS: bool = True
 
 # =============================================================================
 # Console colors
@@ -261,6 +282,15 @@ SPATIAL_AND_LINEAR_REGISTRATION_BLOCK = """register_persistable_component::<Spat
 THRESHOLD_200 = "const THRESHOLD: u64 = 200;"
 THRESHOLD_150 = "const THRESHOLD: u64 = 150;"
 
+# Engine edits append a marker comment to the engine crate root. The content is
+# irrelevant to behavior; only the file change matters, because it forces cargo
+# to rebuild the whole engine dynamic library.
+ENGINE_EDIT_MARKER = "// hot-reload integration marker"
+
+# Deliberately invalid Rust appended to the engine crate root so its build
+# fails. The host must keep the generation it already has.
+ENGINE_SYNTAX_ERROR = "fn broken_on_purpose( -> { this is not rust }"
+
 
 # =============================================================================
 # Data models
@@ -269,7 +299,19 @@ THRESHOLD_150 = "const THRESHOLD: u64 = 150;"
 
 @dataclass(frozen=True)
 class Scenario:
-    """Defines one hot-reload scenario with expected output assertions."""
+    """Defines one hot-reload scenario with expected output assertions.
+
+    `kind` selects which source tree the scenario edits and therefore which
+    reload the host performs:
+
+    - ``"project"`` edits ``tests/project/src/lib.rs`` and expects a project
+      reload, which keeps the same engine binary loaded.
+    - ``"engine"`` edits ``modules/pill_engine/src/lib.rs`` and expects a full
+      engine reload: a new dynamic library is built, staged, created, and the
+      captured world is restored into it.
+    - ``"engine_tamper"`` corrupts the staged engine dynamic library instead of
+      editing sources, and expects the host to keep the generation it has.
+    """
 
     name: str
     replacements: Sequence[Tuple[str, str]]
@@ -277,6 +319,10 @@ class Scenario:
     required_tokens: Sequence[str]
     forbidden_tokens: Sequence[str]
     expected_migration_entity_counts: Sequence[Tuple[str, int]] = ()
+    kind: str = "project"
+    expect_witness: bool = False
+    expect_witness_count_unchanged: bool = False
+    completion_token: Optional[str] = None
 
 
 # =============================================================================
@@ -311,6 +357,98 @@ def restore_original() -> None:
     atomic_write(ORIGINAL_CONTENT)
 
 
+def read_engine_source() -> str:
+    """Reads the engine crate root as UTF-8 text."""
+    return ENGINE_SOURCE_RS.read_text(encoding="utf-8")
+
+
+def atomic_write_engine(content: str) -> None:
+    """Writes engine source content atomically via temporary file + rename."""
+    if not content.endswith("\n"):
+        content += "\n"
+
+    temporary_path = ENGINE_SOURCE_RS.with_suffix(".rs.tmp")
+    temporary_path.write_text(content, encoding="utf-8")
+    os.replace(str(temporary_path), str(ENGINE_SOURCE_RS))
+
+
+def restore_original_engine() -> None:
+    """Restores the engine source captured at script startup."""
+    if not ORIGINAL_ENGINE_CONTENT:
+        return
+
+    if read_engine_source() == ORIGINAL_ENGINE_CONTENT:
+        return
+
+    atomic_write_engine(ORIGINAL_ENGINE_CONTENT)
+
+
+def touch_engine_source(marker_suffix: str) -> None:
+    """Appends a unique marker comment so cargo rebuilds the engine dylib."""
+    atomic_write_engine(
+        read_engine_source() + "\n" + ENGINE_EDIT_MARKER + " " + marker_suffix + "\n"
+    )
+
+
+def staged_runtime_directory() -> Optional[Path]:
+    """Returns the staging directory of the running host, if one exists.
+
+    The host stages one generation-numbered copy per engine reload under its own
+    process directory, and it is the only process writing there, so a single
+    populated directory identifies the live host.
+    """
+    if not STAGED_RUNTIME_ROOT.is_dir():
+        return None
+
+    candidates = [
+        process_directory / "runtime"
+        for process_directory in STAGED_RUNTIME_ROOT.iterdir()
+        if (process_directory / "runtime").is_dir()
+    ]
+    populated = [
+        directory
+        for directory in candidates
+        if any(directory.glob("pill_runtime_hot_reloaded_*.dll"))
+    ]
+    if not populated:
+        return None
+    return max(populated, key=lambda directory: directory.stat().st_mtime)
+
+
+def highest_staged_generation(directory: Path) -> int:
+    """Returns the highest generation index staged in one directory."""
+    indices = []
+    for path in directory.glob("pill_runtime_hot_reloaded_*.dll"):
+        digits = path.stem.replace("pill_runtime_hot_reloaded_", "")
+        if digits.isdigit():
+            indices.append(int(digits))
+    return max(indices) if indices else 0
+
+
+def stage_corrupt_runtime() -> bool:
+    """Stages an unloadable engine dynamic library with the next index.
+
+    The host watches its staging directory and adopts any artifact newer than
+    the one it produced, without rebuilding. Writing a corrupt file there is
+    therefore the deterministic way to drive the load-rejection path.
+    """
+    directory = staged_runtime_directory()
+    if directory is None:
+        print("  [FAIL] No staged engine runtime directory found to tamper with.")
+        return False
+
+    next_index = highest_staged_generation(directory) + 1
+    corrupt_path = directory / f"pill_runtime_hot_reloaded_{next_index}.dll"
+    try:
+        corrupt_path.write_bytes(b"MZ this is not a loadable module")
+    except OSError as error:
+        print(f"  [FAIL] Could not stage a corrupt runtime at {corrupt_path}: {error}")
+        return False
+
+    print(f"  [PREP] Staged a corrupt engine runtime as {corrupt_path.name}")
+    return True
+
+
 def apply_replacements(replacements: Sequence[Tuple[str, str]]) -> bool:
     """Applies replacements in order against current source content."""
     content = read_source()
@@ -336,6 +474,10 @@ class OutputMonitor:
     def __init__(self, process: subprocess.Popen) -> None:
         self._process = process
         self._lines: List[str] = []
+        # Lines evicted from the rolling buffer. Indices handed to callers stay
+        # absolute, so a scenario marker taken before a burst of output still
+        # refers to the same point in the stream afterwards.
+        self._dropped = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -359,7 +501,9 @@ class OutputMonitor:
                 with self._lock:
                     self._lines.append(line)
                     if len(self._lines) > MAX_BUFFERED_LINES:
-                        self._lines = self._lines[-MAX_BUFFERED_LINES:]
+                        evicted = len(self._lines) - MAX_BUFFERED_LINES
+                        self._lines = self._lines[evicted:]
+                        self._dropped += evicted
 
                 print(f"  [std] {line.rstrip()}")
         except (ValueError, OSError):
@@ -367,14 +511,18 @@ class OutputMonitor:
 
     @property
     def line_count(self) -> int:
-        """Returns number of buffered lines."""
+        """Returns the absolute index one past the newest observed line."""
         with self._lock:
-            return len(self._lines)
+            return self._dropped + len(self._lines)
+
+    def _buffer_offset(self, start_index: int) -> int:
+        """Translates an absolute stream index into a live buffer offset."""
+        return max(0, start_index - self._dropped)
 
     def output_since(self, start_index: int) -> str:
-        """Returns output concatenated since a specific buffer index."""
+        """Returns output concatenated since a specific absolute index."""
         with self._lock:
-            return "".join(self._lines[start_index:])
+            return "".join(self._lines[self._buffer_offset(start_index) :])
 
     def process_alive(self) -> bool:
         """Returns True when process is still running."""
@@ -389,7 +537,7 @@ class OutputMonitor:
                 return False
 
             with self._lock:
-                for line in self._lines[start_index:]:
+                for line in self._lines[self._buffer_offset(start_index) :]:
                     if token in line:
                         return True
 
@@ -462,15 +610,92 @@ def validate_migration_entity_counts(
     return True
 
 
+def apply_scenario_edit(scenario: Scenario) -> bool:
+    """Performs the source or artifact change one scenario is defined by."""
+    if scenario.kind == "project":
+        return apply_replacements(scenario.replacements)
+
+    if scenario.kind == "engine":
+        touch_engine_source(scenario.name)
+        return True
+
+    if scenario.kind == "engine_and_project":
+        # Edit both trees before either watcher's debounce elapses. The host
+        # must answer with exactly one engine reload, which rebuilds and loads
+        # the project inside the replacement generation.
+        if not apply_replacements(scenario.replacements):
+            return False
+        touch_engine_source(scenario.name)
+        return True
+
+    if scenario.kind == "engine_break":
+        # Appending invalid Rust makes the engine build fail, which must leave
+        # the running generation completely untouched.
+        atomic_write_engine(read_engine_source() + "\n" + ENGINE_SYNTAX_ERROR + "\n")
+        return True
+
+    if scenario.kind == "engine_repair":
+        # Restore compilable sources plus a fresh marker, so the watcher sees a
+        # change and the swap that follows can be asserted normally.
+        atomic_write_engine(
+            ORIGINAL_ENGINE_CONTENT + "\n" + ENGINE_EDIT_MARKER + " repaired\n"
+        )
+        return True
+
+    if scenario.kind == "engine_tamper":
+        return stage_corrupt_runtime()
+
+    print(f"  [FAIL] Unknown scenario kind: {scenario.kind!r}")
+    return False
+
+
+def scenario_completion_token(scenario: Scenario) -> str:
+    """Returns the log line that marks one scenario as finished.
+
+    Failure drills complete on their own diagnostic rather than on a successful
+    swap, because a successful swap is exactly what they must not produce.
+    """
+    if scenario.completion_token is not None:
+        return scenario.completion_token
+    if scenario.kind == "project":
+        return PROJECT_RELOAD_COMPLETE_TOKEN
+    return ENGINE_RELOAD_COMPLETE_TOKEN
+
+
+def scenario_reload_timeout(scenario: Scenario) -> int:
+    """Returns how long one scenario's reload may take."""
+    if scenario.kind == "project":
+        return RELOAD_TIMEOUT
+    return ENGINE_RELOAD_TIMEOUT
+
+
+def latest_witness_initializations(output: str) -> Optional[int]:
+    """Returns the initialization count from the most recent witness report.
+
+    The witness resource is persistable, so its counter is the strongest
+    available evidence that an engine swap restored singleton state rather than
+    silently keeping the instance `project_init` freshly created.
+    """
+    matches = re.findall(r"reload witness marker=0xC0FFEE initializations=(\d+)", output)
+    if not matches:
+        return None
+    return int(matches[-1])
+
+
 def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
     """Runs one scenario edit and asserts reload/log behavior."""
     print(f"\n  [TEST] {scenario.name}...")
     start_index = monitor.line_count
+    witness_before = latest_witness_initializations(monitor.output_since(0))
 
-    if not apply_replacements(scenario.replacements):
+    if not apply_scenario_edit(scenario):
         return False
 
-    if not monitor.wait_for(RELOAD_COMPLETE_TOKEN, RELOAD_TIMEOUT, start_index):
+    if not monitor.wait_for(
+        scenario_completion_token(scenario),
+        scenario_reload_timeout(scenario),
+        start_index,
+    ):
         output = monitor.output_since(start_index)
         if has_crash_signals(output):
             print(f"  [FAIL] Crash detected in scenario: {scenario.name}")
@@ -488,6 +713,13 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
     if scenario.expect_counter_tick:
         if not monitor.wait_for(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT, start_index):
             print(f"  [FAIL] Counter did not tick after scenario: {scenario.name}")
+            return False
+
+    if scenario.expect_witness:
+        if not monitor.wait_for(WITNESS_TOKEN, WITNESS_TIMEOUT, start_index):
+            print(
+                f"  [FAIL] Persisted resource witness did not report after scenario: {scenario.name}"
+            )
             return False
 
     output = monitor.output_since(start_index)
@@ -512,14 +744,26 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
     ):
         return False
 
+    if scenario.expect_witness_count_unchanged:
+        witness_after = latest_witness_initializations(output)
+        if witness_after is None:
+            print(f"  [FAIL] No witness report after scenario: {scenario.name}")
+            return False
+        if witness_before is not None and witness_after != witness_before:
+            print(
+                f"  [FAIL] Persisted resource was not restored in {scenario.name}: "
+                f"initializations {witness_before} -> {witness_after}",
+            )
+            return False
+
     print(f"  [OK] {scenario.name}")
     return True
 
 
-def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
-    """Starts standalone process and returns process + monitor."""
+def launch_standalone(project_path: str = "../tests/project") -> Tuple[subprocess.Popen, OutputMonitor]:
+    """Starts standalone process against one project and returns process + monitor."""
     process_environment = os.environ.copy()
-    process_environment["PROJECT_PATH"] = "../tests/project"
+    process_environment["PROJECT_PATH"] = project_path
 
     process = subprocess.Popen(
         ["cargo", "run", "--package", "pill_standalone"],
@@ -556,6 +800,96 @@ def terminate_process(process: subprocess.Popen, monitor: OutputMonitor) -> None
 # =============================================================================
 # Scenario suite definition
 # =============================================================================
+
+
+def build_engine_scenarios() -> List[Scenario]:
+    """Builds the engine hot-reload scenarios appended to every cycle.
+
+    These run last because they are by far the slowest - each rebuilds the whole
+    engine dynamic library - and because the failure drills deliberately leave
+    the engine sources in a broken state until the next scenario repairs them.
+    """
+    return [
+        Scenario(
+            name="Engine edit: the swap preserves the world and drops removed types",
+            replacements=[],
+            expect_counter_tick=True,
+            expect_witness=True,
+            expect_witness_count_unchanged=True,
+            kind="engine",
+            required_tokens=[
+                CAPTURE_TOKEN,
+                ENGINE_RESTORE_TOKEN,
+                IDS_PRESERVED_TOKEN,
+            ],
+            forbidden_tokens=[SELECTIVE_START_TOKEN],
+        ),
+        Scenario(
+            name="Engine edit: a second swap takes the unchanged-schema fast path",
+            replacements=[],
+            expect_counter_tick=True,
+            expect_witness=True,
+            expect_witness_count_unchanged=True,
+            kind="engine",
+            required_tokens=[
+                CAPTURE_TOKEN,
+                ENGINE_FAST_PATH_TOKEN,
+                ENGINE_RESTORE_TOKEN,
+                IDS_PRESERVED_TOKEN,
+            ],
+            forbidden_tokens=[SELECTIVE_START_TOKEN],
+        ),
+        Scenario(
+            name="Engine and project edited together: one swap, schema adapted",
+            replacements=[
+                (FRAMECOUNTER_COUNT_ONLY, FRAMECOUNTER_WITH_BOOL),
+                (FRAMECOUNTER_ENTITY_ONE_BASE, FRAMECOUNTER_ENTITY_ONE_WITH_BOOL),
+                (FRAMECOUNTER_ENTITY_TWO_BASE, FRAMECOUNTER_ENTITY_TWO_WITH_BOOL),
+                (FRAMECOUNTER_ENTITY_THREE_BASE, FRAMECOUNTER_ENTITY_THREE_WITH_BOOL),
+            ],
+            expect_counter_tick=True,
+            expect_witness=True,
+            expect_witness_count_unchanged=True,
+            kind="engine_and_project",
+            required_tokens=[
+                CAPTURE_TOKEN,
+                ENGINE_SCHEMA_ADAPT_TOKEN,
+                ENGINE_RESTORE_TOKEN,
+                IDS_PRESERVED_TOKEN,
+            ],
+            # The engine swap rebuilds the project itself, so the project
+            # reload transaction must not run in addition to it.
+            forbidden_tokens=[PROJECT_RELOAD_COMPLETE_TOKEN, SELECTIVE_START_TOKEN],
+        ),
+        Scenario(
+            name="Engine build failure keeps the running runtime",
+            replacements=[],
+            expect_counter_tick=True,
+            kind="engine_break",
+            completion_token=KEPT_RUNNING_TOKEN,
+            required_tokens=[KEPT_RUNNING_TOKEN],
+            forbidden_tokens=[ENGINE_RELOAD_COMPLETE_TOKEN, CAPTURE_TOKEN],
+        ),
+        Scenario(
+            name="Engine repair: the swap succeeds and the world is restored",
+            replacements=[],
+            expect_counter_tick=True,
+            expect_witness=True,
+            expect_witness_count_unchanged=True,
+            kind="engine_repair",
+            required_tokens=[CAPTURE_TOKEN, ENGINE_RESTORE_TOKEN, IDS_PRESERVED_TOKEN],
+            forbidden_tokens=[],
+        ),
+        Scenario(
+            name="Externally staged runtime: a corrupt artifact is refused",
+            replacements=[],
+            expect_counter_tick=True,
+            kind="engine_tamper",
+            completion_token=ABI_REJECTED_TOKEN,
+            required_tokens=[ABI_REJECTED_TOKEN],
+            forbidden_tokens=[ENGINE_RELOAD_COMPLETE_TOKEN],
+        ),
+    ]
 
 
 def build_scenarios() -> List[Scenario]:
@@ -671,7 +1005,7 @@ def build_scenarios() -> List[Scenario]:
             required_tokens=[FAST_PATH_TOKEN],
             forbidden_tokens=[SELECTIVE_START_TOKEN],
         ),
-    ]
+    ] + (build_engine_scenarios() if RUN_ENGINE_SCENARIOS else [])
 
 
 # =============================================================================
@@ -689,6 +1023,7 @@ def run_suite(cycles: int) -> bool:
         print(f"{'=' * 60}")
 
         restore_original()
+        restore_original_engine()
         time.sleep(0.3)
 
         print("\n  [TEST] Launching standalone...")
@@ -733,18 +1068,122 @@ def run_suite(cycles: int) -> bool:
     return True
 
 
+def csharp_backend_is_available() -> bool:
+    """Returns True when a managed project and the .NET SDK are both present."""
+    if not (WORKSPACE_ROOT / "examples" / "project_cs").is_dir():
+        return False
+    try:
+        result = subprocess.run(
+            ["dotnet", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def run_csharp_engine_scenario() -> bool:
+    """Swaps the engine underneath a running managed C# project.
+
+    A managed project registers dynamic components, which never enter a
+    snapshot, so its capture is empty and its world is rebuilt by the managed
+    startup methods instead of restored. What this asserts is therefore the
+    part unique to the C# backend: the swap completes, the collectible loader
+    is rebuilt against the .NET runtime that is still live, and the world comes
+    back to the same size.
+    """
+    print(f"\n{'=' * 60}")
+    print("  C# ENGINE RELOAD")
+    print(f"{'=' * 60}")
+
+    restore_original_engine()
+    time.sleep(0.3)
+
+    print("\n  [TEST] Launching standalone against examples/project_cs...")
+    try:
+        process, monitor = launch_standalone("../examples/project_cs")
+    except (OSError, subprocess.SubprocessError) as error:
+        print(f"  [FAIL] Could not launch the managed standalone: {error}")
+        return False
+
+    try:
+        if not monitor.wait_for(STARTUP_TOKEN, STARTUP_TIMEOUT):
+            print("  [FAIL] The managed standalone did not start in time.")
+            return False
+        print("  [OK] Managed standalone started.")
+
+        entities_before = latest_entity_count(monitor.output_since(0))
+        if entities_before is None:
+            if not monitor.wait_for("FPS |", COUNTER_TICK_TIMEOUT):
+                print("  [FAIL] The managed project never reported a frame.")
+                return False
+            entities_before = latest_entity_count(monitor.output_since(0))
+        if not entities_before:
+            print("  [FAIL] The managed project reported no entities before the swap.")
+            return False
+
+        start_index = monitor.line_count
+        touch_engine_source("csharp engine reload")
+
+        if not monitor.wait_for(
+            ENGINE_RELOAD_COMPLETE_TOKEN, ENGINE_RELOAD_TIMEOUT, start_index
+        ):
+            output = monitor.output_since(start_index)
+            print("  [FAIL] The engine swap did not complete for the managed project.")
+            print(f"  Output tail:\n{output[-1600:]}")
+            return False
+
+        time.sleep(STABILITY_SLEEP)
+        if not monitor.process_alive():
+            print("  [FAIL] The host died during the managed engine swap.")
+            return False
+
+        output = monitor.output_since(start_index)
+        if has_crash_signals(output):
+            print("  [FAIL] Crash token observed during the managed engine swap.")
+            print(f"  Output tail:\n{output[-1600:]}")
+            return False
+
+        entities_after = latest_entity_count(output)
+        if entities_after != entities_before:
+            print(
+                f"  [FAIL] The managed world did not come back: {entities_before} -> {entities_after}"
+            )
+            return False
+
+        print(f"  [OK] C# engine reload ({entities_before} entities rebuilt)")
+        return True
+    finally:
+        terminate_process(process, monitor)
+        restore_original_engine()
+
+
+def latest_entity_count(output: str) -> Optional[int]:
+    """Returns the entity count from the most recent frame statistics line."""
+    matches = re.findall(r"FPS \|\s*(\d+) entities", output)
+    if not matches:
+        return None
+    return int(matches[-1])
+
+
 # =============================================================================
 # Build and CLI
 # =============================================================================
 
 
 def build_workspace() -> bool:
-    """Builds workspace before integration suite starts."""
+    """Builds workspace before integration suite starts.
+
+    The Cargo workspace lives under `modules/`, so every cargo invocation runs
+    from there rather than from the repository root.
+    """
     print("\n  [PREP] Building workspace...")
     try:
         result = subprocess.run(
             ["cargo", "build", "--workspace"],
-            cwd=str(WORKSPACE_ROOT),
+            cwd=str(WORKSPACE_ROOT / "modules"),
             capture_output=True,
             text=True,
             timeout=BUILD_TIMEOUT,
@@ -802,7 +1241,7 @@ def apply_timeout_scale(scale: float) -> None:
 
 def main() -> None:
     """Parses arguments and runs the migration suite."""
-    global ORIGINAL_CONTENT
+    global ORIGINAL_CONTENT, ORIGINAL_ENGINE_CONTENT, RUN_ENGINE_SCENARIOS
 
     parser = argparse.ArgumentParser(
         description="Hot-reload migration integration suite for Rust-Hybrid-ECS"
@@ -819,6 +1258,11 @@ def main() -> None:
         default=1.0,
         help="Multiply all timeouts for slow machines (default: 1.0)",
     )
+    parser.add_argument(
+        "--skip-engine-scenarios",
+        action="store_true",
+        help="Run only the project-reload scenarios, skipping the slower engine swaps",
+    )
     args = parser.parse_args()
 
     if args.cycles < 1:
@@ -834,25 +1278,44 @@ def main() -> None:
 
     apply_timeout_scale(args.timeout_scale)
     ORIGINAL_CONTENT = read_source()
+    RUN_ENGINE_SCENARIOS = not args.skip_engine_scenarios
+    if RUN_ENGINE_SCENARIOS:
+        if not ENGINE_SOURCE_RS.exists():
+            print(f"ERROR: Missing engine source file: {ENGINE_SOURCE_RS}")
+            sys.exit(1)
+        ORIGINAL_ENGINE_CONTENT = read_engine_source()
 
     print("=" * 60)
-    print("  Hot-Reload Migration Integration Suite")
+    print("  Hot-Reload Integration Suite")
     print(f"  Workspace:  {WORKSPACE_ROOT}")
     print(f"  Cycles:     {args.cycles}")
     print(f"  Time scale: {args.timeout_scale}x")
+    print(f"  Engine:     {'enabled' if RUN_ENGINE_SCENARIOS else 'skipped'}")
     print("=" * 60)
 
     if not build_workspace():
         restore_original()
+        restore_original_engine()
         sys.exit(1)
 
     passed = False
     try:
         passed = run_suite(args.cycles)
+        # The managed backend is only exercised when it can be: it needs both a
+        # C# project and the .NET SDK, and neither is required for the native
+        # path to work.
+        if passed and RUN_ENGINE_SCENARIOS:
+            if csharp_backend_is_available():
+                passed = run_csharp_engine_scenario()
+            else:
+                print(
+                    "\n  [WARN] Skipping the C# engine reload: no managed project or no .NET SDK."
+                )
     finally:
-        print("\n  [CLEANUP] Restoring original project source...")
+        print("\n  [CLEANUP] Restoring original project and engine sources...")
         restore_original()
-        print("  [OK] Source restored.")
+        restore_original_engine()
+        print("  [OK] Sources restored.")
 
     print("\n" + "=" * 60)
     print("  ALL TESTS PASSED" if passed else "  SOME TESTS FAILED")

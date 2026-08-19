@@ -1603,6 +1603,7 @@ dependencies = [
  "parking_lot",
  "pill_core",
  "pill_core_macros",
+ "pill_runtime_api",
  "pollster",
  "rayon",
  "serde",
@@ -1613,6 +1614,10 @@ dependencies = [
  "trait_type_map",
  "wgpu",
 ]
+
+[[package]]
+name = "pill_runtime_api"
+version = "0.1.0"
 
 [[package]]
 name = "pin-project"

@@ -43,6 +43,8 @@
 pub mod color;
 /// Semantic error system shared by every workspace crate.
 pub mod error;
+/// Filesystem layout shared by every hot-reloadable module in a workspace.
+pub mod hot_reload;
 /// Math type aliases over `glam` and the direction vocabulary.
 pub mod math;
 /// Metrics recording foundation, gated on the `metrics` feature.

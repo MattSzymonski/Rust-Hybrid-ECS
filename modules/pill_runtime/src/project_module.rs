@@ -2,24 +2,48 @@
 //!
 //! # Responsibilities
 //!
-//! - Builds and loads the selected backend during startup.
+//! - Loads and initializes the selected backend when a runtime generation starts.
 //! - Reloads native modules without dropping previously mapped libraries.
 //! - Delegates managed reload polling to `csharp_runtime`.
 //! - Keeps native component-schema migration beside the DLL swap it protects.
 //!
 //! # Design
 //!
-//! The host keeps exactly one [`LoadedProject`] alive at a time. Native backends
-//! are reloaded transactionally by [`reload_native`]: the previous DLL stays
-//! mapped in a bounded graveyard while changed persist schemas migrate, so
-//! engine-owned pointers into retired code remain valid. Managed backends
-//! delegate assembly discovery and validation to [`CSharpRuntime`], which
-//! reports success or rejection through `poll_reload`.
+//! The runtime keeps exactly one [`LoadedProject`] alive at a time. Native
+//! backends are reloaded transactionally by [`reload_native`]: the previous DLL
+//! stays mapped while changed persist schemas migrate, so engine-owned pointers
+//! into retired code remain valid. Managed backends delegate assembly discovery
+//! and validation to [`CSharpRuntime`], which reports success or rejection
+//! through `poll_reload`.
+//!
+//! The project module is loaded by the runtime rather than the host because
+//! the `EngineApi` function pointers a project receives point into the
+//! runtime's own code. An engine reload therefore always carries the project
+//! with it: the replacement runtime loads the project itself as part of coming
+//! up, and old and new generations can never be mixed.
+//!
+//! ## Why retired project libraries are never unloaded
+//!
+//! A retired generation is kept mapped for the whole process lifetime rather
+//! than evicted after a fixed number of newer ones. Loading a project module
+//! plants pointers into its code all over the world: component storage vtables
+//! inside every archetype it created entities in, boxed storage factories,
+//! component copiers, persistence function pointers, registered system
+//! closures, and the drop glue for every value of a type it defined. Those
+//! references outlive the generation that installed them for as long as any
+//! entity, archetype, or registry entry from it survives - which is the normal
+//! case, because a reload preserves the world.
+//!
+//! Evicting an older generation therefore unmaps code the live world can still
+//! reach, which shows up as an access violation several reloads later, far from
+//! the eviction that caused it. Nothing tracks that reachability, so the only
+//! sound policy is to keep every generation mapped. The cost is bounded by how
+//! many times a developer saves during one session, and the staged copies on
+//! disk are cleaned up by the next host startup.
 
 // Standard library
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::atomic::AtomicU64;
 
 // External crates
 use pill_core::error::{HostError, LibraryError};
@@ -27,32 +51,22 @@ use pill_core::{debug, error, info, warn};
 use pill_engine::{Engine, EngineApi};
 
 // Current crate
-use crate::build_runner::build_project_module;
 use crate::csharp::CSharpRuntime;
 use crate::native_library::ProjectLibrary;
-use crate::{ProjectModuleBackend, ProjectModuleConfig};
-
-// =============================================================================
-// Constants
-// =============================================================================
-
-/// Maximum number of retired native generations kept mapped.
-///
-/// The immediately previous generation must stay mapped because its persist
-/// metadata drives the next migration; anything older can be evicted and its
-/// temporary file deleted.
-const MAX_GRAVEYARD_GENERATIONS: usize = 2;
+use crate::project::ProjectDescriptor;
 
 // =============================================================================
 // LoadedProject
 // =============================================================================
 
-/// The backend-specific state kept alive by the host loop.
+/// The backend-specific state kept alive by the runtime's frame loop.
 ///
-/// The enum lets the host hold either a mapped native library or a managed
-/// runtime behind one interface; the variant in use is fixed at startup and
-/// only changes across a full restart.
+/// The enum lets the runtime hold either a mapped native library, a managed
+/// runtime, or no project at all behind one interface; the variant in use is
+/// fixed when the generation starts.
 pub(crate) enum LoadedProject {
+    /// No project module is loaded; the world runs empty.
+    None,
     /// A mapped native module plus any retired DLLs that must stay mapped.
     Native {
         current: ProjectLibrary,
@@ -65,31 +79,30 @@ pub(crate) enum LoadedProject {
 }
 
 impl LoadedProject {
-    /// Build and initialize the configured project backend.
+    /// Load and initialize the configured project backend.
+    ///
+    /// The host has already built the module, so this never compiles anything:
+    /// it maps or hosts the artifact it is given and runs its registration
+    /// entry point.
     ///
     /// # Errors
     ///
-    /// Returns `HostError` when the module fails to compile, when the native
-    /// library cannot be loaded, or when the module's `project_init` reports a
-    /// non-zero initialization status.
+    /// Returns `HostError` when the native library cannot be loaded, when the
+    /// module's `project_init` reports a non-zero initialization status, or
+    /// when the managed backend fails to start.
     pub(crate) fn start(
         engine: &mut Engine,
         engine_api: &EngineApi,
         workspace_root: &Path,
-        config: &ProjectModuleConfig,
+        descriptor: &ProjectDescriptor,
     ) -> Result<Self, HostError> {
-        // Step 1: Build the module through the shared command runner.
-        // Build before branching so both backends use the same command runner,
-        // diagnostics, output validation, and initial failure behavior.
-        let output_path = build_project_module(workspace_root, config, None)?;
-
-        // Step 2: Initialize the backend-specific runtime.
-        match &config.backend {
-            ProjectModuleBackend::NativeLibrary { .. } => {
+        match descriptor {
+            ProjectDescriptor::None => Ok(Self::None),
+            ProjectDescriptor::Native { module_path } => {
                 // Native build outputs cannot be loaded in place on Windows:
                 // the OS locks a mapped DLL. Load a uniquely named copy so the
                 // next compilation remains free to replace the original.
-                let library = ProjectLibrary::load_copy(&output_path, workspace_root)?;
+                let library = ProjectLibrary::load_copy(module_path, workspace_root)?;
 
                 // Native modules register their components and systems through
                 // the stable EngineApi table before the first frame is run.
@@ -104,63 +117,81 @@ impl LoadedProject {
             }
             // The managed runtime performs assembly discovery, component
             // registration, startup commands, and system registration itself.
-            ProjectModuleBackend::CSharp(config) => Ok(Self::CSharp(CSharpRuntime::start(
-                engine,
-                workspace_root,
-                config,
-            )?)),
+            ProjectDescriptor::CSharp(paths) => {
+                Ok(Self::CSharp(CSharpRuntime::start(engine, paths)?))
+            }
         }
     }
 
-    /// Rebuild and replace the active module while preserving a working old
-    /// generation whenever compilation, loading, or registration fails.
+    /// Replace the active module with a freshly built one, preserving state.
     ///
-    /// `cancel_flag` is the watcher's reload signal: a newer save during the
-    /// build aborts the in-flight compilation and the next frame retries.
+    /// `module_path` names the artifact the host just produced. It selects the
+    /// native library to map; the managed backend ignores it because its
+    /// collectible loader watches the built assembly itself.
     pub(crate) fn reload(
         &mut self,
         engine: &mut Engine,
         engine_api: &EngineApi,
         workspace_root: &Path,
-        config: &ProjectModuleConfig,
-        cancel_flag: Option<(&AtomicU64, u64)>,
+        module_path: Option<&Path>,
     ) {
         match self {
+            // A generation that started without a project has no schema to
+            // migrate and no DLL to retire, so a reload is a plain first load.
+            Self::None => {
+                let Some(module_path) = module_path else {
+                    return;
+                };
+                match load_and_initialize_native(engine_api, module_path, workspace_root) {
+                    Ok(library) => {
+                        *self = Self::Native {
+                            current: library,
+                            old_libraries: Vec::new(),
+                        };
+                        info!(
+                            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                            "loaded the first project module generation"
+                        );
+                    }
+                    Err(message) => error!(
+                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        error = %message,
+                        "failed to load the first project module generation"
+                    ),
+                }
+            }
             // Native reload owns schema migration and DLL lifetime handling, so
             // keep that transaction isolated in one dedicated function.
             Self::Native {
                 current,
                 old_libraries,
-            } => reload_native(
-                current,
-                old_libraries,
-                engine,
-                engine_api,
-                workspace_root,
-                config,
-                cancel_flag,
-            ),
+            } => {
+                let Some(module_path) = module_path else {
+                    error!(
+                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        "native project reload requested without a built module path; keeping the old project module"
+                    );
+                    return;
+                };
+                reload_native(
+                    current,
+                    old_libraries,
+                    engine,
+                    engine_api,
+                    workspace_root,
+                    module_path,
+                );
+            }
             // C# source changes are compiled by the host. The collectible
             // managed loader validates the rebuilt assembly's component
             // manifest and system signatures before swapping; poll_reload
             // reports the outcome and logs any rejection.
             Self::CSharp(runtime) => {
-                match build_project_module(workspace_root, config, cancel_flag) {
-                    Ok(_) => {
-                        info!(
-                            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                            "C# build complete; polling managed loader"
-                        );
-                        runtime.poll_reload();
-                    }
-                    Err(error) => {
-                        error!(
-                            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                            error = %error,
-                            "C# build failed; keeping the currently loaded C# project assembly"
-                        );
-                    }
-                }
+                info!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    "C# build complete; polling managed loader"
+                );
+                runtime.poll_reload();
             }
         }
     }
@@ -189,6 +220,26 @@ impl LoadedProject {
 // Free Functions
 // =============================================================================
 
+/// Copy, map, and initialize one native project generation.
+///
+/// # Errors
+///
+/// Returns a human-readable message describing whether loading or
+/// initialization failed, so callers can log it without a typed conversion.
+fn load_and_initialize_native(
+    engine_api: &EngineApi,
+    module_path: &Path,
+    workspace_root: &Path,
+) -> Result<ProjectLibrary, String> {
+    let library = ProjectLibrary::load_copy(module_path, workspace_root)
+        .map_err(|error| format!("{error}"))?;
+    let status = library.call_project_init(engine_api);
+    if status != 0 {
+        return Err(format!("project_init reported status {status}"));
+    }
+    Ok(library)
+}
+
 /// Reload one native generation and migrate components whose persisted schema
 /// changed across the module boundary.
 fn reload_native(
@@ -197,27 +248,12 @@ fn reload_native(
     engine: &mut Engine,
     engine_api: &EngineApi,
     workspace_root: &Path,
-    config: &ProjectModuleConfig,
-    cancel_flag: Option<(&AtomicU64, u64)>,
+    module_path: &Path,
 ) {
-    // Step 1: Compile the new module before touching engine state, so a
-    // compiler error can never remove the systems of the working generation.
-    let output_path = match build_project_module(workspace_root, config, cancel_flag) {
-        Ok(path) => path,
-        Err(error) => {
-            error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                error = %error,
-                "build failed; keeping the old project module"
-            );
-            return;
-        }
-    };
-
-    // Step 2: Load and validate the replacement library transactionally.
+    // Step 1: Load and validate the replacement library transactionally.
     // Keep `current` untouched until a complete replacement library is ready
     // to initialize.
-    let new_library = match ProjectLibrary::load_copy(&output_path, workspace_root) {
+    let new_library = match ProjectLibrary::load_copy(module_path, workspace_root) {
         Ok(library) => library,
         Err(error) => {
             error!(
@@ -229,7 +265,7 @@ fn reload_native(
         }
     };
 
-    // Step 3: Capture old schemas, clear old systems, and initialize the new
+    // Step 2: Capture old schemas, clear old systems, and initialize the new
     // generation while both DLLs remain mapped. Migration may need the old
     // persistence functions after project_init registers the replacement
     // generation's component definitions.
@@ -262,7 +298,7 @@ fn reload_native(
             error!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 status = rollback_status,
-                "rollback of the previous generation also failed; the host continues without gameplay systems"
+                "rollback of the previous generation also failed; the runtime continues without gameplay systems"
             );
         }
         return;
@@ -286,13 +322,15 @@ fn reload_native(
         })
         .collect();
 
-    // Step 4: Migrate changed schemas and archive the old DLL.
+    // Step 3: Migrate changed schemas and archive the old DLL.
     if changed_type_names.is_empty() {
         // Avoid touching archetype storage when every persisted layout is
-        // byte-for-byte compatible with the previous generation.
-        debug!(
+        // byte-for-byte compatible with the previous generation. This decision
+        // is reported at info level because it is the single most useful line
+        // for telling a cheap reload apart from a migrating one.
+        info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-            "schema unchanged for all persistable component types — fast path"
+            "project schema unchanged for all persistable component types - fast path"
         );
     } else {
         // Migrate only changed component types. Unchanged columns keep their
@@ -323,27 +361,18 @@ fn reload_native(
         }
     }
 
-    // Do not unload the previous DLL. Persist metadata, component operations,
-    // or other engine-owned pointers may still reference its executable code.
-    // Moving it into the graveyard keeps those addresses valid permanently.
+    // Retire the previous DLL without ever unloading it. See the module-level
+    // note on why retired generations are kept mapped for the process lifetime.
     debug!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
         "reload step 4/4: archiving old DLL, swapping generation"
     );
     old_libraries.push(std::mem::replace(current, new_library));
 
-    // Keep the graveyard bounded. Engine-owned pointers only reference the
-    // immediately previous generation (its persist metadata drives the next
-    // migration), so anything older than the cap can be evicted safely.
-    if old_libraries.len() > MAX_GRAVEYARD_GENERATIONS {
-        // Dropping the evicted generation unmaps its module and deletes its
-        // temporary copy on disk; cleanup errors are reported by the Drop.
-        drop(old_libraries.remove(0));
-    }
     info!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
         entities = engine.world().entity_count(),
         graveyard = old_libraries.len(),
-        "hot reload complete"
+        "project hot reload complete"
     );
 }

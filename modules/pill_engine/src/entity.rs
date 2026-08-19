@@ -77,6 +77,16 @@ impl Entity {
         Self { id, generation }
     }
 
+    /// Rebuilds a handle from the parts a snapshot captured.
+    ///
+    /// Only the hot-reload restore path uses this: it reinstates identities
+    /// the world previously handed out, after the allocator has reserved the
+    /// matching slots. Constructing an arbitrary handle outside that path
+    /// would produce one the world never allocated.
+    pub(crate) fn from_parts(id: u64, generation: u32) -> Self {
+        Self { id, generation }
+    }
+
     // -------------------------------------------------------------------------
     // Property accessors
     // -------------------------------------------------------------------------

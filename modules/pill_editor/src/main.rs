@@ -3,11 +3,17 @@
 //! # Design
 //!
 //! Dioxus owns the native window and its event loop. During window creation,
-//! the editor passes an `Arc` clone of Dioxus's Tao window to
-//! [`pill_host::setup_rendering`]. The engine creates one GPU surface for that
-//! window, while [`pill_host::RenderingHost`] owns both engine and renderer state.
-//! The editor forwards resize and redraw events, keeps its center viewport
+//! the editor describes Dioxus's Tao window for [`pill_host::EngineSession`],
+//! which asks the hot-reloadable engine runtime to create one GPU surface for
+//! it. The editor forwards resize and redraw events, keeps its center viewport
 //! transparent for the surface, and draws opaque HTML panels around it.
+//!
+//! Only the window's platform handles cross into the engine, never an owned
+//! reference, so the editor keeps every window it hands over alive for as long
+//! as the engine renders into it: the main window for the whole process, and a
+//! detached Scene window for as long as it holds the surface. An engine hot
+//! reload rebuilds the renderer against the same live window, which is why the
+//! session re-applies the viewport and projection after every swap.
 
 mod dock_view;
 mod error;
@@ -25,11 +31,11 @@ use dioxus::desktop::tao::window::{Window, WindowId};
 use dioxus::desktop::{use_wry_event_handler, window, Config};
 use dioxus::prelude::*;
 use futures_util::StreamExt;
-use pill_host::{
-    engine_report, install_engine_report_handler, setup_rendering, EngineError, FrameReport,
-    HostError, ProjectModuleConfig, RenderViewport, RenderingHost, VirtualResolution,
-};
 use pill_core::error::EngineMessage;
+use pill_host::{
+    describe_window, engine_report, install_engine_report_handler, EngineSession, FrameReport,
+    HostError, ProjectModuleConfig, RenderViewport, VirtualResolution,
+};
 
 use dock_view::DockView;
 use error::EditorError;
@@ -188,7 +194,7 @@ fn app() -> Element {
                     if let Some(report) = frame.ui_report {
                         stats.set(Stats {
                             fps: report.fps,
-                            entity_count: report.entity_count,
+                            entity_count: report.entity_count as usize,
                         });
                     }
                 }
@@ -278,13 +284,22 @@ pub(crate) fn StatsWidget(stats: Signal<Stats>) -> Element {
     }
 }
 
-/// Interior-mutable rendering host used from Dioxus's shared event callbacks.
+/// Interior-mutable engine session used from Dioxus's shared event callbacks.
+///
+/// Field order is a soundness requirement: the engine surface is created from
+/// borrowed window handles, so `session` must be declared - and therefore
+/// dropped - before the windows it renders into.
 pub(crate) struct EditorContext {
-    host: RefCell<RenderingHost>,
+    session: RefCell<EngineSession>,
     window: Arc<Window>,
     last_stats_update: Cell<Instant>,
     main_scene_viewport: Cell<RenderViewport>,
-    detached_scene_window: Cell<Option<WindowId>>,
+    /// The detached Scene window while one holds the surface.
+    ///
+    /// The `Arc` is retained rather than handed to the engine, because the
+    /// engine only borrows the window's platform handles and would otherwise
+    /// render into a destroyed window.
+    detached_scene_window: RefCell<Option<(WindowId, Arc<Window>)>>,
 }
 
 /// Values produced while advancing one editor frame.
@@ -303,29 +318,31 @@ impl EditorContext {
     /// caller reports it once and exits.
     fn new(window: Arc<Window>) -> Result<Self, EditorError> {
         let size = window.inner_size();
-        let mut host = setup_rendering(
-            ProjectModuleConfig::from_environment()
-                .map_err(|source| EngineError::from(HostError::from(source)))?,
-            Arc::clone(&window),
-            size.width,
-            size.height,
+
+        // Building the engine runtime and the project happens before the
+        // surface exists, exactly as in the standalone runner, so a slow first
+        // compile never shows an empty viewport.
+        let mut session = EngineSession::start(
+            ProjectModuleConfig::from_environment().map_err(HostError::from)?,
         )?;
-        host.set_render_viewport(Some(RenderViewport::default()));
-        host.set_render_virtual_resolution(Some(PROJECT_VIRTUAL_RESOLUTION));
+        let descriptor = describe_window(window.as_ref())?;
+        session.attach_window(descriptor, size.width, size.height)?;
+        session.set_render_viewport(Some(RenderViewport::default()));
+        session.set_render_virtual_resolution(Some(PROJECT_VIRTUAL_RESOLUTION));
 
         Ok(Self {
-            host: RefCell::new(host),
+            session: RefCell::new(session),
             window,
             last_stats_update: Cell::new(Instant::now()),
             main_scene_viewport: Cell::new(RenderViewport::default()),
-            detached_scene_window: Cell::new(None),
+            detached_scene_window: RefCell::new(None),
         })
     }
 
     /// Reconfigure the renderer only when it currently targets the main window.
     fn resize_main_window(&self, width: u32, height: u32) {
-        if self.detached_scene_window.get().is_none() {
-            self.host.borrow_mut().resize(width, height);
+        if self.detached_scene_window.borrow().is_none() {
+            self.session.borrow_mut().resize(width, height);
         }
     }
 
@@ -345,67 +362,97 @@ impl EditorContext {
             .map(|rect| logical_rect_to_physical(rect, self.window.scale_factor()))
             .unwrap_or_default();
         self.main_scene_viewport.set(viewport);
-        if self.detached_scene_window.get().is_none() {
-            self.host.borrow_mut().set_render_viewport(Some(viewport));
+        if self.detached_scene_window.borrow().is_none() {
+            self.session
+                .borrow_mut()
+                .set_render_viewport(Some(viewport));
         }
     }
 
     /// Move the live engine surface from the dock to a detached Scene window.
+    ///
+    /// The window's `Arc` is retained here for as long as the engine renders
+    /// into it, because only its platform handles crossed into the runtime.
     pub(crate) fn attach_detached_scene(&self, window: Arc<Window>) -> Result<(), EditorError> {
         let size = window.inner_size();
         let window_id = window.id();
-        let mut host = self.host.borrow_mut();
-        host.retarget_render_window(window, size.width, size.height)
+        let descriptor = describe_window(window.as_ref())?;
+
+        let mut session = self.session.borrow_mut();
+        session
+            .retarget_render_window(descriptor, size.width, size.height)
             .map_err(|source| EditorError::Retarget { source })?;
-        host.set_render_virtual_resolution(Some(PROJECT_VIRTUAL_RESOLUTION));
-        host.set_render_viewport(Some(RenderViewport::full(size.width, size.height)));
-        self.detached_scene_window.set(Some(window_id));
+        session.set_render_virtual_resolution(Some(PROJECT_VIRTUAL_RESOLUTION));
+        session.set_render_viewport(Some(RenderViewport::full(size.width, size.height)));
+        drop(session);
+
+        // Only a successful retarget takes ownership of the detached window,
+        // so a failed move cannot leave the editor holding a window the engine
+        // never bound.
+        *self.detached_scene_window.borrow_mut() = Some((window_id, window));
         Ok(())
     }
 
     /// Resize the detached renderer without accepting events from stale windows.
     pub(crate) fn resize_detached_scene(&self, window_id: WindowId, width: u32, height: u32) {
-        if self.detached_scene_window.get() == Some(window_id) {
-            let mut host = self.host.borrow_mut();
-            host.resize(width, height);
-            host.set_render_viewport(Some(RenderViewport::full(width, height)));
+        let targets_this_window = self
+            .detached_scene_window
+            .borrow()
+            .as_ref()
+            .is_some_and(|(detached, _)| *detached == window_id);
+        if targets_this_window {
+            let mut session = self.session.borrow_mut();
+            session.resize(width, height);
+            session.set_render_viewport(Some(RenderViewport::full(width, height)));
         }
     }
 
     /// Return the live Scene renderer to the main editor window.
     pub(crate) fn reattach_main_scene(&self, detached_window: WindowId) -> Result<(), EditorError> {
-        if self.detached_scene_window.get() != Some(detached_window) {
+        let targets_this_window = self
+            .detached_scene_window
+            .borrow()
+            .as_ref()
+            .is_some_and(|(detached, _)| *detached == detached_window);
+        if !targets_this_window {
             return Ok(());
         }
+
         let size = self.window.inner_size();
-        let mut host = self.host.borrow_mut();
-        host.retarget_render_window(Arc::clone(&self.window), size.width, size.height)
+        let descriptor = describe_window(self.window.as_ref())?;
+        let mut session = self.session.borrow_mut();
+        session
+            .retarget_render_window(descriptor, size.width, size.height)
             .map_err(|source| EditorError::Retarget { source })?;
-        host.set_render_virtual_resolution(Some(PROJECT_VIRTUAL_RESOLUTION));
-        host.set_render_viewport(Some(self.main_scene_viewport.get()));
-        self.detached_scene_window.set(None);
+        session.set_render_virtual_resolution(Some(PROJECT_VIRTUAL_RESOLUTION));
+        session.set_render_viewport(Some(self.main_scene_viewport.get()));
+        drop(session);
+
+        // The detached window is released only after the surface has moved
+        // back, so the engine never renders into a destroyed window.
+        *self.detached_scene_window.borrow_mut() = None;
         Ok(())
     }
 
     /// Snapshot engine statistics for a detached panel's isolated VirtualDom.
     pub(crate) fn current_stats(&self) -> Stats {
-        let report = self.host.borrow().current_frame_report();
+        let report = self.session.borrow().current_frame_report();
         Stats {
             fps: report.fps,
-            entity_count: report.entity_count,
+            entity_count: report.entity_count as usize,
         }
     }
 
     /// Advance the ECS and present one frame on Dioxus's redraw event.
     fn render(&self) -> Option<EditorFrame> {
-        let mut host = self.host.borrow_mut();
-        match host.run_one_frame() {
+        let mut session = self.session.borrow_mut();
+        match session.run_one_frame() {
             Ok(console_report) => {
                 let now = Instant::now();
                 let ui_report =
                     if now.duration_since(self.last_stats_update.get()) >= STATS_UPDATE_INTERVAL {
                         self.last_stats_update.set(now);
-                        Some(host.current_frame_report())
+                        Some(session.current_frame_report())
                     } else {
                         None
                     };
@@ -417,7 +464,7 @@ impl EditorContext {
             }
             Err(error) => {
                 eprintln!(
-                    "[editor] Fatal renderer error: {}",
+                    "[editor] Fatal engine error: {}",
                     EditorError::Frame { source: error }.to_plain_message()
                 );
                 None

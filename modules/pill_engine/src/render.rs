@@ -166,74 +166,15 @@ impl Default for Sprite {
     }
 }
 
-/// Physical-pixel rectangle within a render target.
-///
-/// Sprite positions are interpreted relative to this rectangle's top-left
-/// corner. The GPU viewport maps their local coordinates into the rectangle,
-/// while a matching scissor prevents drawing outside it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct RenderViewport {
-    /// Left edge of the rectangle, in physical pixels.
-    pub x: u32,
-    /// Top edge of the rectangle, in physical pixels.
-    pub y: u32,
-    /// Horizontal extent of the rectangle, in physical pixels.
-    pub width: u32,
-    /// Vertical extent of the rectangle, in physical pixels.
-    pub height: u32,
-}
+// =============================================================================
+// Boundary geometry re-exports
+// =============================================================================
 
-impl RenderViewport {
-    /// Construct a physical-pixel viewport rectangle.
-    pub const fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
-        Self {
-            x,
-            y,
-            width,
-            height,
-        }
-    }
-
-    /// Construct a viewport covering an entire render target.
-    pub const fn full(width: u32, height: u32) -> Self {
-        Self::new(0, 0, width, height)
-    }
-
-    /// Clamp this rectangle to a render target, returning `None` when empty.
-    pub fn clamped_to(self, target_width: u32, target_height: u32) -> Option<Self> {
-        let x = self.x.min(target_width);
-        let y = self.y.min(target_height);
-        let width = self.width.min(target_width.saturating_sub(x));
-        let height = self.height.min(target_height.saturating_sub(y));
-
-        (width > 0 && height > 0).then_some(Self::new(x, y, width, height))
-    }
-}
-
-/// Logical coordinate space mapped into a physical [`RenderViewport`].
-///
-/// Keeping this separate from the swapchain dimensions lets an embedded project
-/// keep a stable coordinate system while its dock panel is resized. The GPU
-/// viewport performs the final scaling into the panel rectangle.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct VirtualResolution {
-    /// Horizontal extent of the project coordinate space.
-    pub width: f32,
-    /// Vertical extent of the project coordinate space.
-    pub height: f32,
-}
-
-impl VirtualResolution {
-    /// Construct a logical scene resolution.
-    pub const fn new(width: f32, height: f32) -> Self {
-        Self { width, height }
-    }
-
-    /// Return whether both dimensions can safely be used by the projection.
-    pub fn is_valid(self) -> bool {
-        self.width.is_finite() && self.height.is_finite() && self.width > 0.0 && self.height > 0.0
-    }
-}
+// `RenderViewport` and `VirtualResolution` cross the host↔runtime C ABI, so
+// they are owned by `pill_runtime_api` and re-exported here. Keeping the
+// original module path means engine and frontend call sites are unchanged
+// while the layout stays under the contract crate's `#[repr(C)]` guards.
+pub use pill_runtime_api::{RenderViewport, VirtualResolution};
 
 // =============================================================================
 // GPU instance data

@@ -234,6 +234,15 @@ pub struct World {
     pub(crate) persist_inserters: HashMap<ComponentId, crate::persistence::InsertComponentFn>,
     /// Per-type-name schema hash for persistable components.
     pub(crate) persist_schema_hashes: HashMap<String, u64>,
+    /// Per-type-name serialize fn for snapshotting persistable resources.
+    ///
+    /// Keyed by type name rather than [`ResourceId`] because a reload gives
+    /// the same resource type a new `TypeId`; the newest registration for a
+    /// name replaces the previous one instead of accumulating stale entries.
+    pub(crate) persist_resource_serializers:
+        HashMap<String, crate::persistence::SerializeResourceFn>,
+    /// Per-type-name restore fn for re-inserting persistable resources.
+    pub(crate) persist_resource_restorers: HashMap<String, crate::persistence::RestoreResourceFn>,
 }
 
 impl World {
@@ -262,6 +271,8 @@ impl World {
             persist_deserializers: HashMap::new(),
             persist_inserters: HashMap::new(),
             persist_schema_hashes: HashMap::new(),
+            persist_resource_serializers: HashMap::new(),
+            persist_resource_restorers: HashMap::new(),
         }
     }
 
@@ -1056,6 +1067,80 @@ impl World {
     /// used by foreign-language runtimes.
     pub fn reserve_entity(&mut self) -> Entity {
         self.allocate_entity()
+    }
+
+    /// Allocate an entity at an explicit id, bumping the generation on collision.
+    ///
+    /// Hot reload restores a captured world into a freshly created engine, and
+    /// gameplay code stores entity handles in components and resources. The
+    /// restore path therefore needs to reinstate the exact handles it captured
+    /// rather than whatever the allocator would hand out next.
+    ///
+    /// The returned handle keeps `id`, and keeps `generation` too unless an
+    /// entity is *currently live* at that id - only then would the requested
+    /// handle alias one the world is still using, and the generation is bumped
+    /// past it. A recycled id does not force a bump: an id sitting on the free
+    /// list names no live entity, and the whole point of the restore path is
+    /// to reinstate the exact handles the captured world already had.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use pill_engine::World;
+    /// let mut world = World::new();
+    /// let restored = world.allocate_entity_at(7, 3);
+    /// assert_eq!(restored.id(), 7);
+    /// assert_eq!(restored.generation(), 3);
+    /// ```
+    pub fn allocate_entity_at(&mut self, id: u64, generation: u32) -> Entity {
+        let requested = [crate::persistence::SnapshotEntityId { id, generation }];
+        let mut reserved_generations = self.reserve_explicit_entity_ids(&requested);
+        crate::persistence::resolve_explicit_entity(requested[0], &mut reserved_generations)
+    }
+
+    /// Clear the allocator state blocking a set of explicit entity ids.
+    ///
+    /// Removes every requested id from the recycling free list and advances
+    /// the fresh-id counter past the highest one, so a later
+    /// [`Self::allocate_entity`] can never hand out an id that was just
+    /// restored. Returns the lowest generation that is safe to install for
+    /// each requested id, derived from the entities that are currently live.
+    pub(crate) fn reserve_explicit_entity_ids(
+        &mut self,
+        requested_ids: &[crate::persistence::SnapshotEntityId],
+    ) -> HashMap<u64, u32> {
+        let requested_id_set: std::collections::HashSet<u64> =
+            requested_ids.iter().map(|entry| entry.id).collect();
+
+        // Step 1: Collect the lowest generation each requested id may take.
+        // Only a live entity constrains the choice, by forcing the generation
+        // after its own; recycled ids are unconstrained because they name no
+        // live entity and restoring one is reinstating the world it came from.
+        let mut reserved_generations: HashMap<u64, u32> = HashMap::new();
+        for entity in self.entity_locations.keys() {
+            if requested_id_set.contains(&entity.id) {
+                let next_generation = entity.generation.wrapping_add(1);
+                reserved_generations
+                    .entry(entity.id)
+                    .and_modify(|existing| *existing = (*existing).max(next_generation))
+                    .or_insert(next_generation);
+            }
+        }
+
+        // Step 2: Take the requested ids out of the recycling list so the
+        // allocator cannot hand the same id to an unrelated entity.
+        self.free_entity_ids
+            .retain(|(id, _)| !requested_id_set.contains(id));
+
+        // Step 3: Move the fresh-id counter past every requested id. Ids in
+        // the resulting gap are simply never handed out, which is harmless in
+        // a 64-bit id space and avoids materializing a huge free list from a
+        // sparse or corrupted snapshot.
+        if let Some(highest_id) = requested_id_set.iter().copied().max() {
+            self.next_free_entity_id = self.next_free_entity_id.max(highest_id.saturating_add(1));
+        }
+
+        reserved_generations
     }
 
     /// Return a reserved entity handle that was never created.

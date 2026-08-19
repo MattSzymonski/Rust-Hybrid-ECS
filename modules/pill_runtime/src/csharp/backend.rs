@@ -18,7 +18,6 @@
 //! never run silently.
 
 // Standard library
-use std::path::Path;
 use std::sync::Arc;
 
 // External crates
@@ -34,7 +33,7 @@ use super::components::{
 };
 use super::context::ActiveSystemGuard;
 use super::csharp_runtime::DotnetRuntimeContext;
-use crate::CSharpModuleConfig;
+use crate::project::CSharpProjectPaths;
 
 // =============================================================================
 // Constants
@@ -158,29 +157,29 @@ impl CSharpRuntime {
     /// references an unregistered component.
     pub(crate) fn start(
         engine: &mut Engine,
-        workspace_root: &Path,
-        config: &CSharpModuleConfig,
+        paths: &CSharpProjectPaths,
     ) -> Result<Self, CSharpError> {
         let shared_bindings = shared_component_bindings(engine);
 
-        // Step 1: Resolve assembly paths, start .NET, and load managed exports.
-        let runtime_dir = workspace_root.join(&config.runtime_output_subdirectory);
-        let project_dir = workspace_root.join(&config.project_output_subdirectory);
-        let assembly = runtime_dir.join(format!("{}.dll", config.runtime_assembly_name));
-        let runtime_config = runtime_dir.join(format!(
-            "{}.runtimeconfig.json",
-            config.runtime_assembly_name
-        ));
-        std::env::set_var("ECS_CSHARP_PROJECT_DIR", &project_dir);
+        // Step 1: Publish the managed loader's search configuration, start
+        // .NET, and load managed exports. Every path was already resolved by
+        // the host, so the runtime performs no manifest inference of its own.
+        let assembly = paths.runtime_assembly_path.clone();
+        std::env::set_var("ECS_CSHARP_PROJECT_DIR", &paths.project_directory);
         std::env::set_var(
             "ECS_CSHARP_PROJECT_ASSEMBLY",
-            format!("{}.dll", config.project_assembly_name),
+            &paths.project_assembly_file_name,
         );
 
-        let runtime = DotnetRuntimeContext::new(&runtime_config)?;
+        // A second engine generation re-initializes hostfxr in a process that
+        // already hosts .NET. hostfxr answers with a positive "already
+        // initialized" status and hands back a usable context, so the managed
+        // loader and its collectible assembly load context are rebuilt against
+        // the runtime that is still live.
+        let runtime = DotnetRuntimeContext::new(&paths.runtime_config_path)?;
         let type_name = format!(
             "TracyLive.Loader.LoaderInterop, {}",
-            config.runtime_assembly_name
+            paths.runtime_assembly_name
         );
 
         // Step 1a: Validate the unmanaged ABI contract before resolving any

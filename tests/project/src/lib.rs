@@ -13,6 +13,12 @@
 //! and system. When source files change, the host rebuilds and reloads this
 //! module without restarting. Component data is preserved across reloads
 //! via JSON serialization and matched by type name.
+//!
+//! An engine reload additionally swaps the whole engine binary underneath the
+//! project. [`ReloadWitness`] is registered as a persistable resource so the
+//! integration suite can prove that singleton state, not just component
+//! columns, survives that swap: it counts how many times `project_init` has
+//! run and is printed once per second by [`reload_witness_system`].
 
 // External crates
 use serde::{Deserialize, Serialize};
@@ -53,8 +59,58 @@ impl_trait_accessible!(
 );
 
 // =============================================================================
+// Resources
+// =============================================================================
+
+/// Singleton state proving persistable resources survive an engine swap.
+///
+/// `initialization_count` is incremented by every `project_init` call, so it
+/// grows on a project reload. `preserved_marker` is only ever written here on
+/// the very first initialization: after an engine swap the restored value must
+/// come back unchanged, which is what the integration suite asserts.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct ReloadWitness {
+    initialization_count: u64,
+    preserved_marker: u64,
+    reported_at_tick: u64,
+}
+impl Resource for ReloadWitness {}
+
+/// Marker value written once and expected back after every reload.
+const PRESERVED_MARKER: u64 = 0xC0FFEE;
+
+/// How many frames pass between two witness reports.
+///
+/// At the capped 60 frames per second this project runs at, the witness
+/// reports roughly every two seconds: often enough for an integration suite to
+/// observe one shortly after a reload, rare enough not to drown the log.
+const WITNESS_REPORT_INTERVAL: u64 = 120;
+
+// =============================================================================
 // Systems
 // =============================================================================
+
+/// Print the persisted witness resource at a low, steady frequency.
+///
+/// The suite matches this line to confirm that a resource survived a reload
+/// with its marker and initialization count intact.
+fn reload_witness_system(mut witness: ResMut<ReloadWitness>) -> Result<(), SystemError> {
+    let Some(mut witness) = witness.get_mut() else {
+        return Err(SystemError::MissingResource {
+            name: String::from("ReloadWitness"),
+        });
+    };
+
+    witness.reported_at_tick += 1;
+    if witness.reported_at_tick % WITNESS_REPORT_INTERVAL != 0 {
+        return Ok(());
+    }
+    println!(
+        "reload witness marker={:#X} initializations={}",
+        witness.preserved_marker, witness.initialization_count,
+    );
+    Ok(())
+}
 
 /// Increments the counter every frame. When it reaches the threshold,
 /// resets and prints a timestamp to the console.
@@ -109,7 +165,36 @@ pub unsafe extern "C" fn project_init(api: *const EngineApi) -> u32 {
         .world_mut()
         .register_persistable_component::<LinearVelocity>();
 
+    // The witness resource is registered before it is inserted so a restore
+    // performed after this call can find its deserializer by type name.
+    engine
+        .world_mut()
+        .register_persistable_resource::<ReloadWitness>();
+
+    // Only the first initialization writes the marker. Every later one bumps
+    // the counter, so a restored resource is distinguishable from a fresh one.
+    let existing_witness = engine.world().get_resource::<ReloadWitness>().cloned();
+    let witness = match existing_witness {
+        Some(mut witness) => {
+            witness.initialization_count += 1;
+            witness
+        }
+        None => ReloadWitness {
+            initialization_count: 1,
+            preserved_marker: PRESERVED_MARKER,
+            reported_at_tick: 0,
+        },
+    };
+    engine.world_mut().insert_resource(witness);
+
+    // Cap the frame rate so the counter and witness systems report at a rate a
+    // log-scraping integration suite can follow. Without a cap this headless
+    // project runs at hundreds of thousands of frames per second and floods the
+    // host's output faster than any reload trace could be read out of it.
+    engine.set_fps_limit(60.0);
+
     engine.register_system("counter", counter_system);
+    engine.register_system("reload_witness", reload_witness_system);
 
     // Seed multiple archetypes so migration tests can validate per-component behavior.
     let _ = engine

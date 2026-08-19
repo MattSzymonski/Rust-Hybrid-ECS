@@ -1,0 +1,42 @@
+[package]
+name = "pill_runtime"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pill_runtime"
+path = "src/lib.rs"
+# `cdylib` is the hot-reloadable artifact the host loads; `rlib` lets the
+# integration tests drive the same code in-process without libloading.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pill_core = { path = "../pill_core" }
+pill_engine = { path = "../pill_engine" }
+pill_runtime_api = { path = "../pill_runtime_api" }
+libloading = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+trait_type_map = { path = "../../../Trait-Type-Map" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "std",
+    "registry",
+] }
+metrics = { version = "0.24", optional = true }
+
+[features]
+# Window surface, GPU device, and sprite pipeline. Must match the host build.
+rendering = ["pill_engine/rendering", "pill_core/rendering", "pill_runtime_api/window-handle"]
+# Repeated numerical measurements forwarded through the ABI metrics sink.
+metrics = ["dep:metrics", "pill_engine/metrics", "pill_core/metrics"]
+# Tracy profiling zones forwarded through the ABI log sink.
+#
+# The runtime never opens its own Tracy connection: `profile_scope!` produces
+# plain `tracing` spans, and the forwarding subscriber relays them to the host,
+# which owns the single process-global connection.
+profiling = ["pill_core/profiling-minimal", "pill_engine/profiling-minimal"]
+# Investigative fine-grained profiling zones.
+profiling-fine = ["profiling", "pill_core/profiling-fine"]
+# Compile the simple developer log macros (`log!`, `dev_warn!`, `dev_error!`).
+dev-logs = ["pill_core/dev-logs"]

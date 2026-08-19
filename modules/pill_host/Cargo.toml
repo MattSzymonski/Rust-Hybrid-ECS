@@ -4,26 +4,31 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-pill_engine = { path = "../pill_engine" }
 pill_core = { path = "../pill_core" }
-libloading = "0.8"
+pill_runtime_api = { path = "../pill_runtime_api", features = ["loader"] }
 notify = "6"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-trait_type_map = { path = "../../../Trait-Type-Map" }
 tracing = "0.1"
 metrics = { version = "0.24", optional = true }
 winit = { version = "0.30", optional = true }
 
 [features]
-rendering = ["pill_engine/rendering", "pill_core/rendering", "dep:winit"]
-# Enable Tracy profiling: engine profiling zones plus the Tracy tracing layer.
-profiling = ["pill_engine/profiling", "pill_core/tracy"]
+# Windowed mode: the host owns a `winit` window and hands its platform handles
+# to the engine runtime, which creates the GPU surface.
+#
+# The engine runtime is a separate build artifact, not a Cargo dependency, so
+# its matching feature is passed on the build command the host runs and is
+# verified again through the ABI feature mask.
+rendering = [
+    "pill_core/rendering",
+    "pill_runtime_api/window-handle",
+    "dep:winit",
+]
+# Enable Tracy profiling: the host owns the process-global connection and the
+# engine runtime forwards its zones through the ABI log sink.
+profiling = ["pill_core/tracy"]
 # Investigative fine-grained profiling zones.
-profiling-fine = ["profiling", "pill_engine/profiling-fine"]
-# Profiling with instrumentation verification (~50% overhead).
-profiling-verify = ["profiling", "pill_engine/profiling-verify"]
+profiling-fine = ["profiling", "pill_core/profiling-fine"]
 # Repeated numerical measurements through the shared metrics recorder.
-metrics = ["dep:metrics", "pill_engine/metrics"]
+metrics = ["dep:metrics", "pill_core/metrics"]
 # Compile the simple developer log macros (`log!`, `warn!`, `error!`).
 dev-logs = ["pill_core/dev-logs"]

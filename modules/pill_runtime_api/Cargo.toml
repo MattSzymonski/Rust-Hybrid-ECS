@@ -1,0 +1,17 @@
+[package]
+name = "pill_runtime_api"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Host-side dynamic loading helper; never compiled into the runtime dylib.
+libloading = { version = "0.8", optional = true }
+# Window-handle translation helpers shared by the host and the runtime.
+raw-window-handle = { version = "0.6", optional = true }
+
+[features]
+default = []
+# Host-side runtime-dylib loading helpers (`libloading` based).
+loader = ["dep:libloading"]
+# Conversions between the C-ABI window descriptor and `raw-window-handle`.
+window-handle = ["dep:raw-window-handle"]

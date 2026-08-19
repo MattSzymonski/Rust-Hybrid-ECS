@@ -93,11 +93,16 @@ type LoadAssemblyFn = unsafe extern "system" fn(
 pub struct DotnetRuntimeContext {
     /// Native hosting library kept alive so every resolved function pointer
     /// below still targets mapped executable code.
-    _library: Library,
+    ///
+    /// Taken and leaked by [`Drop`] rather than unmapped; see the note there.
+    library: Option<Library>,
     /// Opaque hostfxr context handle returned by runtime initialization.
-    handle: RuntimeHandle,
-    /// `hostfxr_close` export used to release the context in `Drop`.
-    close: CloseFn,
+    ///
+    /// Deliberately never closed; see the note on [`Drop`].
+    _handle: RuntimeHandle,
+    /// `hostfxr_close` export, resolved so a failed initialization can release
+    /// the context it already created before returning an error.
+    _close: CloseFn,
     /// `load_assembly_and_get_function_pointer` delegate used by `get_unmanaged_fn`.
     load_assembly: LoadAssemblyFn,
 }
@@ -218,9 +223,9 @@ impl DotnetRuntimeContext {
         let load_assembly =
             unsafe { std::mem::transmute::<*mut std::ffi::c_void, LoadAssemblyFn>(delegate) };
         Ok(Self {
-            _library: library,
-            handle,
-            close,
+            library: Some(library),
+            _handle: handle,
+            _close: close,
             load_assembly,
         })
     }
@@ -296,15 +301,22 @@ impl DotnetRuntimeContext {
 }
 
 impl Drop for DotnetRuntimeContext {
-    /// Close the owned hostfxr context before unloading its native library.
+    /// Release this context's Rust-side state while leaving .NET running.
+    ///
+    /// Neither the hostfxr context nor the hostfxr module is released. The
+    /// .NET runtime cannot be unloaded from a process once it has started, and
+    /// hostfxr's own state is what a later engine generation re-initializes
+    /// against: an engine hot reload drops this context and immediately asks a
+    /// freshly loaded runtime dynamic library to initialize .NET again.
+    ///
+    /// Closing the context there made that second initialization fail with
+    /// `InvalidArgFailure` (`0x80008081`), and unmapping hostfxr would leave
+    /// the still-live CoreCLR without the hosting layer that started it. Both
+    /// are therefore leaked deliberately: the cost is one context handle and
+    /// one mapped module per process, and the operating system reclaims both
+    /// at exit.
     fn drop(&mut self) {
-        // A null handle means initialization never transferred ownership. For
-        // a live handle, close the host context before `_library` is dropped so
-        // the close function pointer still targets mapped executable code.
-        if !self.handle.is_null() {
-            // SAFETY: This object uniquely owns the live hostfxr context.
-            unsafe { (self.close)(self.handle) };
-        }
+        std::mem::forget(self.library.take());
     }
 }
 
