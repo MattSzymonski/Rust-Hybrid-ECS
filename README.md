@@ -13,21 +13,29 @@
 
 
 
-The standalone host is a generic launcher: it reads one variable, `PROJECT_PATH`,
-which points at the project directory relative to the workspace root (run from
-`modules/`). Everything else — backend, name, watch directory, build command,
-and output paths — is inferred from the project's manifest, so no project
-identity is compiled into the host.
+The standalone host is a generic launcher. It reads its configuration from
+`modules/pill_config.yaml` (run from `modules/`), which declares the project
+directory and the optional modules to load; a plain `cargo run --package
+pill_standalone` therefore needs no environment variables. Everything else —
+backend, name, watch directory, build command, and output paths — is inferred
+from the project's manifest, so no project identity is compiled into the host.
+
+The environment can still override the file for a single run:
+
+- `PROJECT_PATH` overrides `project` in `pill_config.yaml`.
+- `PILL_MODULES` overrides `modules` in `pill_config.yaml`.
 
 Rust project (headless):
 
-- `$env:PROJECT_PATH = "../examples/project_rs"; cargo run --package pill_standalone`
+- `cargo run --package pill_standalone` (uses `pill_config.yaml`)
+- or `$env:PROJECT_PATH = "../examples/project_rs"; cargo run --package pill_standalone`
 
-Rust project (windowed): same variable, run
+Rust project (windowed): run
 `cargo run --package pill_standalone --features rendering`.
 
-C# project: point `PROJECT_PATH` at the directory containing the `.csproj`,
-e.g. `$env:PROJECT_PATH = "../examples/project_cs"; cargo run --package pill_standalone`.
+C# project: point `project` in `pill_config.yaml` (or `PROJECT_PATH`) at the
+directory containing the `.csproj`,
+e.g. `../examples/project_cs`.
 
 ## Optional modules
 
@@ -36,10 +44,11 @@ and loaded by the host next to the project. Each is watched, rebuilt and swapped
 on its own, so editing one module reloads only that module and leaves the
 project and every other module running.
 
-`PILL_MODULES` selects which ones to load, as a comma-separated list of crate
-directory names. It defaults to `pill_test`; an empty value loads none.
+The `modules` list in `pill_config.yaml` selects which ones to load (in order),
+and `PILL_MODULES` overrides it as a comma-separated list of crate directory
+names. It defaults to `pill_test`; an empty value loads none.
 
-- `$env:PILL_MODULES = "pill_test"` — the default set, loaded when unset.
+- `modules: ["pill_spline"]` in `pill_config.yaml` — load the spline module.
 - `$env:PILL_MODULES = "pill_test,pill_physics"` — several modules.
 - `$env:PILL_MODULES = ""` — run with no optional modules.
 
@@ -68,16 +77,18 @@ shared `pill_core` library in agreement.
 ### Launching outside Cargo
 
 The engine workspace links `pill_core` dynamically so the host and every loaded
-module share one copy of its telemetry state. That makes the built executable
-depend on the toolchain's `std-<hash>.dll` at load time. `cargo run` adds the
-toolchain library directory to the search path automatically, but launching
-`target\debug\pill_standalone.exe` directly fails with
-`error while loading shared libraries: std-<hash>.dll`. Add the directory to
-`PATH` first when running the binary outside Cargo:
+module share one copy of its telemetry state. That also makes the built
+executable depend on the toolchain's `std-<hash>.dll` at load time. The build
+script in `pill_standalone` (and `pill_editor`) stages that dylib next to the
+executable automatically, so `target\debug\pill_standalone.exe` runs directly
+without any `PATH` adjustment:
 
 ```powershell
-$env:PATH += ";$(rustc --print sysroot)\lib\rustlib\x86_64-pc-windows-msvc\lib"
+.\target\debug\pill_standalone.exe
 ```
+
+If the staged dylib is missing (for example the toolchain was updated and the
+binary was not rebuilt), the build script re-copies it on the next `cargo build`.
 
 - `cargo run --package editor` — Run the Rust project in the editor.
 

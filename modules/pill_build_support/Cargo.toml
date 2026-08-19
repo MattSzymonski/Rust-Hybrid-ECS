@@ -1,0 +1,6 @@
+[package]
+name = "pill_build_support"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Shared build-script helpers for the Pill engine workspace."

@@ -7,6 +7,9 @@
 # Hot-reload runtime temp copies
 modules/pill_standalone_temp/
 
+# Host-generated project workspace member (created at runtime)
+modules/optional/host_project_*/
+
 # Test infrastructure
 tests/__pycache__/
 __pycache__/

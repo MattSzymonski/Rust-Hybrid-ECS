@@ -22,13 +22,14 @@
 //! other module.
 
 // Standard library
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 // External crates
 use pill_core::error::{HostError, ModuleError};
-use pill_core::{debug, error, info};
+use pill_core::{debug, error, info, warn};
 use pill_engine::{Engine, EngineApi, SystemOwner};
 
 // Current crate
@@ -230,7 +231,15 @@ impl OptionalModuleSlot {
             return;
         }
 
-        // Step 3: Swap the systems. Only this module's systems are removed, so
+        // Step 3: Capture the retiring generation's persistable metadata before
+        // its registrations are replaced. The new init below re-registers the
+        // same type names, so without this capture the old serializer pointers
+        // would be lost before migration could use them. The previous DLL stays
+        // mapped (Step 6), which keeps those function pointers valid.
+        let previous_metadata_by_name = engine.world().capture_persist_type_metadata();
+        let previous_manifest = engine.world().persist_type_manifest();
+
+        // Step 4: Swap the systems. Only this module's systems are removed, so
         // the project and every other module keep running across the swap.
         let removed = engine.clear_systems_owned_by(self.owner);
         debug!(
@@ -246,7 +255,8 @@ impl OptionalModuleSlot {
         if status != 0 {
             // The replacement failed to register. Roll back to the previous
             // generation: init is required to be idempotent, so re-running it
-            // restores the systems that were just cleared.
+            // restores the systems that were just cleared. No migration runs on
+            // the rollback path because the old registrations are intact.
             error!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 module = self.config.name.as_str(),
@@ -268,7 +278,64 @@ impl OptionalModuleSlot {
             return;
         }
 
-        // Step 4: Retire the previous library without unmapping it. Component
+        // Step 5: Migrate persistable schemas that changed across the swap.
+        // Types are matched by stable name rather than runtime ComponentId,
+        // which can differ between generations, so data follows a renamed or
+        // reshaped component. Unchanged columns keep their allocations and
+        // change-detection ticks, making the common reload path cheap.
+        let current_schema_by_name: HashMap<String, u64> = engine
+            .world()
+            .persist_type_manifest()
+            .into_iter()
+            .map(|entry| (entry.type_name, entry.schema_hash))
+            .collect();
+        let changed_type_names: HashSet<String> = previous_manifest
+            .iter()
+            .filter_map(|entry| {
+                current_schema_by_name
+                    .get(&entry.type_name)
+                    .filter(|&&current_hash| current_hash != entry.schema_hash)
+                    .map(|_| entry.type_name.clone())
+            })
+            .collect();
+
+        if changed_type_names.is_empty() {
+            // Avoid touching archetype storage when every persisted layout is
+            // byte-for-byte compatible with the previous generation.
+            debug!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = self.config.name.as_str(),
+                "schema unchanged for all persistable module types — fast path"
+            );
+        } else {
+            debug!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = self.config.name.as_str(),
+                changed_types = changed_type_names.len(),
+                "migrating changed persistable module types"
+            );
+            let report = engine.world_mut().migrate_changed_persistable_components(
+                &previous_metadata_by_name,
+                &changed_type_names,
+            );
+            debug!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = self.config.name.as_str(),
+                migrated_types = report.migrated_type_count,
+                migrated_entities = report.migrated_entity_count,
+                "persistable migration complete"
+            );
+            if !report.skipped_type_names.is_empty() {
+                warn!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    module = self.config.name.as_str(),
+                    skipped_types = ?report.skipped_type_names,
+                    "migration skipped some module component types"
+                );
+            }
+        }
+
+        // Step 6: Retire the previous library without unmapping it. Component
         // operations and persist metadata registered by that generation may
         // still be referenced by engine-owned pointers.
         self.old_libraries

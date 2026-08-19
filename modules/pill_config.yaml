@@ -1,0 +1,19 @@
+# Host configuration for the standalone host and the editor.
+#
+# Read once at startup from the engine workspace root (this directory). It
+# declares which project to run and which optional modules to load, so a normal
+# run needs no environment variables.
+#
+# Environment variables override the file for a single run:
+#   - PROJECT_PATH overrides `project`
+#   - PILL_MODULES  overrides `modules`
+#
+# `project` is relative to this workspace root; `modules` lists optional-module
+# crate directories under `optional/`, in load order.
+
+# Project module to run (native Rust or C#).
+project: "../examples/project_rs"
+
+# Optional engine modules to load, as crate directory names under `optional/`.
+modules:
+  - "pill_spline"

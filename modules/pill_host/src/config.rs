@@ -53,14 +53,20 @@ const OPTIONAL_MODULES_ENVIRONMENT_VARIABLE: &str = "PILL_MODULES";
 /// existing rather than by being listed anywhere.
 const OPTIONAL_MODULE_DIRECTORY: &str = "optional";
 
+/// Name prefix of the generated workspace member that builds a native project.
+///
+/// The member lives under [`OPTIONAL_MODULE_DIRECTORY`], so the existing
+/// `optional/*` workspace glob discovers it without any entry in the workspace
+/// manifest; only the package name differs per project.
+const HOST_PROJECT_MEMBER_PREFIX: &str = "host_project_";
+
 /// Optional modules loaded when `PILL_MODULES` is not set.
 const DEFAULT_OPTIONAL_MODULES: &str = "pill_test";
 
-/// Cargo variable that overrides the workspace-configured compiler flags.
-///
-/// Setting it takes precedence over `build.rustflags` in a Cargo config file,
-/// which the `--config` command-line override does not do.
-const RUSTFLAGS_VARIABLE: &str = "RUSTFLAGS";
+/// Optional host configuration file name, resolved in the engine workspace
+/// root. Declares the project and the optional modules; environment variables
+/// override it for a single run.
+const HOST_CONFIG_FILE: &str = "pill_config.yaml";
 
 // =============================================================================
 // Types
@@ -231,19 +237,42 @@ pub struct HostConfig {
 }
 
 impl HostConfig {
-    /// Assemble the host configuration from the environment.
+    /// Assemble the host configuration from the environment and the optional
+    /// `pill_config.yaml` file in the workspace root.
     ///
-    /// `PROJECT_PATH` selects the project module and `PILL_MODULES` selects the
-    /// optional modules; see [`ProjectModuleConfig::from_environment`] and
+    /// The file declares the project and the optional modules. `PROJECT_PATH`
+    /// overrides the file's `project` entry and `PILL_MODULES` overrides its
+    /// `modules` entry, so a single run can still opt in or out without editing
+    /// the file. See [`ProjectModuleConfig::from_environment`] and
     /// [`selected_optional_modules`].
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] when the project configuration cannot be
-    /// derived or when a configured module is invalid.
+    /// Returns a [`ConfigError`] when no project is configured, the project
+    /// configuration cannot be derived, the configuration file cannot be
+    /// parsed, or a configured module is invalid.
     pub fn from_environment() -> Result<Self, ConfigError> {
-        let project = ProjectModuleConfig::from_environment()?;
-        let optional_modules: Vec<OptionalModuleConfig> = selected_optional_modules()
+        // Step 1: Load the optional host configuration file. Environment
+        // variables take precedence over the file for per-run overrides.
+        let file_config = read_host_file_config()?;
+
+        // Step 2: Resolve the effective project path: the environment wins,
+        // then the configuration file.
+        let project_path = env::var(PROJECT_PATH_ENVIRONMENT_VARIABLE)
+            .ok()
+            .or_else(|| {
+                file_config
+                    .as_ref()
+                    .and_then(|config| config.project.clone())
+            })
+            .ok_or(ConfigError::MissingEnvironmentVariable {
+                variable: PROJECT_PATH_ENVIRONMENT_VARIABLE,
+            })?;
+        let project = ProjectModuleConfig::from_path(&project_path)?;
+
+        // Step 3: Resolve the optional modules and validate every configured
+        // module before any build work starts.
+        let optional_modules: Vec<OptionalModuleConfig> = optional_module_names(&file_config)
             .iter()
             .map(|name| OptionalModuleConfig::workspace_member(name))
             .collect();
@@ -275,10 +304,32 @@ impl From<ProjectModuleConfig> for HostConfig {
 /// engine workspace, for example `pill_test,pill_physics`. When it is not set
 /// the default set is loaded; setting it to an empty value disables optional
 /// modules entirely, which is how one run opts out without a rebuild.
+///
+/// Prefer [`HostConfig::from_environment`], which also honours the
+/// `pill_config.yaml` file; this function reads the environment only.
 pub fn selected_optional_modules() -> Vec<String> {
-    env::var(OPTIONAL_MODULES_ENVIRONMENT_VARIABLE)
-        .unwrap_or_else(|_| DEFAULT_OPTIONAL_MODULES.to_string())
-        .split(',')
+    parse_optional_module_list(
+        &env::var(OPTIONAL_MODULES_ENVIRONMENT_VARIABLE)
+            .unwrap_or_else(|_| DEFAULT_OPTIONAL_MODULES.to_string()),
+    )
+}
+
+/// Resolve the optional modules to load: the environment wins, then the host
+/// configuration file, then the default set.
+fn optional_module_names(file_config: &Option<HostFileConfig>) -> Vec<String> {
+    match env::var(OPTIONAL_MODULES_ENVIRONMENT_VARIABLE) {
+        Ok(list) => parse_optional_module_list(&list),
+        Err(_) => match file_config {
+            Some(config) if !config.modules.is_empty() => config.modules.clone(),
+            _ => parse_optional_module_list(DEFAULT_OPTIONAL_MODULES),
+        },
+    }
+}
+
+/// Split a comma-separated module list, trimming whitespace and dropping
+/// empty entries, so a trailing comma or stray spaces never load a bogus crate.
+fn parse_optional_module_list(list: &str) -> Vec<String> {
+    list.split(',')
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(str::to_string)
@@ -324,32 +375,51 @@ impl ProjectModuleConfig {
     /// cannot be inspected, no supported manifest exists, or a manifest field
     /// cannot be read.
     pub fn from_environment() -> Result<Self, ConfigError> {
-        // Step 1: Read the single project directory variable.
         let project_path = required_environment(PROJECT_PATH_ENVIRONMENT_VARIABLE)?;
+        Self::from_path(&project_path)
+    }
 
-        // Step 2: Resolve the directory against the working directory. The
+    /// Assemble the module configuration from an explicit workspace-relative
+    /// project path.
+    ///
+    /// Backend detection and path derivation are shared with
+    /// [`Self::from_environment`]; this is the entry point used by
+    /// [`HostConfig::from_environment`] so a `pill_config.yaml` value can be
+    /// honoured without the environment variable.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] when the directory cannot be inspected, no
+    /// supported manifest exists, or a manifest field cannot be read.
+    fn from_path(project_path: &str) -> Result<Self, ConfigError> {
+        // Step 1: Resolve the directory against the working directory. The
         // host is launched from the workspace root, so `cwd` matches the root
         // that every stored path is relative to.
-        let project_root = env::current_dir()
-            .map_err(|_| ConfigError::ProjectDirectoryMissing {
-                path: project_path.clone(),
-            })?
-            .join(&project_path);
+        let current_dir = env::current_dir().map_err(|_| ConfigError::ProjectDirectoryMissing {
+            path: project_path.to_string(),
+        })?;
+        let project_root = current_dir.join(project_path);
         if !project_root.is_dir() {
-            return Err(ConfigError::ProjectDirectoryMissing { path: project_path });
+            return Err(ConfigError::ProjectDirectoryMissing {
+                path: project_path.to_string(),
+            });
         }
 
-        // Step 3: Detect the backend from the manifest files in the directory.
+        // Step 2: Detect the backend from the manifest files in the directory.
         let cargo_manifest = project_root.join("Cargo.toml");
         if cargo_manifest.is_file() {
-            return Self::native_from_manifest(&project_path, &cargo_manifest);
+            return Self::native_from_manifest(&current_dir, project_path, &cargo_manifest);
         }
         let csproj_manifest = find_csproj_manifest(&project_root)?;
-        Self::csharp_from_manifest(&project_path, &csproj_manifest)
+        Self::csharp_from_manifest(project_path, &csproj_manifest)
     }
 
     /// Derive a native shared-library configuration from a `Cargo.toml`.
-    fn native_from_manifest(project_path: &str, manifest_path: &Path) -> Result<Self, ConfigError> {
+    fn native_from_manifest(
+        workspace_root: &Path,
+        project_path: &str,
+        manifest_path: &Path,
+    ) -> Result<Self, ConfigError> {
         // Step 1: Read the manifest to discover the package and library names.
         let manifest = std::fs::read_to_string(manifest_path).map_err(|source| {
             ConfigError::ProjectManifestReadFailed {
@@ -366,18 +436,30 @@ impl ProjectModuleConfig {
         let library_name =
             manifest_string_value(&manifest, "lib", "name").unwrap_or_else(|| package_name.clone());
 
-        // Step 2: Derive the source watch directory and build output location.
-        let watch_directory = format!("{project_path}/src");
-        let output_subdirectory = format!("{project_path}/target/debug");
+        // Step 2: Materialize a workspace member for the project so it compiles
+        // against the engine workspace (one Cargo.lock, one target directory,
+        // one crate-metadata set). This is what keeps `pill_spline::Spline` the
+        // same type in the project DLL and in the optional module DLLs. The
+        // member is generated under `optional/` and discovered by the existing
+        // `optional/*` glob, so the workspace manifest never names the project.
+        materialize_host_project_member(workspace_root, project_path, &package_name)?;
 
-        // Step 3: Build the Cargo command. When the host renders, the project
-        // module is built with the same feature so both sides share renderer
-        // components.
+        // Step 3: Derive the source watch directory and build output location.
+        // Sources are watched in place at the real project path, while the
+        // built artifact lands in the workspace target directory.
+        let watch_directory = format!("{project_path}/src");
+        let output_subdirectory = "target/debug".to_string();
+
+        // Step 4: Build the Cargo command. The project is a workspace member,
+        // so the build selects it by package name from the workspace root. It
+        // inherits the workspace's `-C prefer-dynamic` rustflags, matching the
+        // optional modules, because a shared crate keeps one metadata identity
+        // (and therefore one `TypeId`) only when every side is compiled with
+        // the same inputs. When the host renders, the project is built with
+        // the same feature so both sides share renderer components.
         let mut build_command = vec![
             "cargo".to_string(),
             "build".to_string(),
-            "--manifest-path".to_string(),
-            format!("{project_path}/Cargo.toml"),
             "--package".to_string(),
             package_name.clone(),
         ];
@@ -390,16 +472,7 @@ impl ProjectModuleConfig {
             name: package_name,
             watch_directory,
             build_command,
-            // Project modules live in their own workspace with their own
-            // lockfile, so they link the engine statically. The engine
-            // workspace turns on `-C prefer-dynamic` through its Cargo config,
-            // and this build inherits that config because it runs from the
-            // workspace root, so the flags are cleared explicitly here. Shared
-            // dynamic linkage would require both sides to resolve an identical
-            // dependency graph: a Rust dylib exports symbols mangled with a
-            // metadata hash derived from that graph, and a mismatch fails at
-            // load time with a missing-procedure error.
-            build_environment: vec![(RUSTFLAGS_VARIABLE.to_string(), String::new())],
+            build_environment: Vec::new(),
             backend: ProjectModuleBackend::NativeLibrary {
                 library_name,
                 output_subdirectory,
@@ -517,4 +590,155 @@ fn manifest_string_value(manifest: &str, section: &str, key: &str) -> Option<Str
         }
     }
     None
+}
+
+/// Values declared by the optional `pill_config.yaml` file.
+///
+/// Every field is optional so a file can override just the entries it cares
+/// about; anything left unset falls back to the environment or a default.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(default)]
+struct HostFileConfig {
+    /// Project directory, workspace-relative; overridden by `PROJECT_PATH`.
+    project: Option<String>,
+    /// Optional module crate names, in load order; overridden by `PILL_MODULES`.
+    modules: Vec<String>,
+}
+
+/// Read the optional host configuration file from the workspace root.
+///
+/// Returns `Ok(None)` when no file exists or the working directory cannot be
+/// determined, so a host that has no config file behaves exactly as before.
+/// A present but unreadable or malformed file is an error, so a typo cannot
+/// silently fall back to a different project.
+///
+/// # Errors
+///
+/// Returns a [`ConfigError`] when the file exists but cannot be read or is
+/// not valid YAML.
+fn read_host_file_config() -> Result<Option<HostFileConfig>, ConfigError> {
+    let Ok(workspace_root) = env::current_dir() else {
+        return Ok(None);
+    };
+    let config_path = workspace_root.join(HOST_CONFIG_FILE);
+    if !config_path.is_file() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(&config_path).map_err(|source| {
+        ConfigError::HostConfigFileReadFailed {
+            path: config_path.display().to_string(),
+            source,
+        }
+    })?;
+    serde_yaml::from_str(&contents).map(Some).map_err(|source| {
+        ConfigError::HostConfigFileParseFailed {
+            path: config_path.display().to_string(),
+            details: source.to_string(),
+        }
+    })
+}
+
+/// Materialize a temporary workspace member for the native project.
+///
+/// Cross-DLL type identity requires the project to compile as a member of the
+/// engine workspace: one Cargo.lock, one target directory, one crate-metadata
+/// set. The project source lives outside the workspace, so this writes a
+/// generated crate under `optional/` — which the existing `optional/*` glob
+/// discovers automatically, so no workspace-manifest entry is ever needed.
+///
+/// The generated `Cargo.toml` is the project's own manifest with every `path`
+/// dependency resolved to an absolute location and the `[lib]` `path` pointed
+/// at the real source file. The project source is never copied or moved, and
+/// because it is compiled from its real location, edits to it keep triggering
+/// rebuilds through the normal source watcher.
+///
+/// The member is regenerated on every startup, so a change to the project's
+/// manifest is picked up without any stale copy.
+///
+/// # Errors
+///
+/// Returns a [`ConfigError`] when the project manifest cannot be read or the
+/// generated member directory or manifest cannot be written.
+fn materialize_host_project_member(
+    workspace_root: &Path,
+    project_path: &str,
+    package_name: &str,
+) -> Result<(), ConfigError> {
+    let project_root = workspace_root.join(project_path);
+    let source_manifest =
+        std::fs::read_to_string(project_root.join("Cargo.toml")).map_err(|source| {
+            ConfigError::ProjectManifestReadFailed {
+                path: project_root.join("Cargo.toml").display().to_string(),
+                source,
+            }
+        })?;
+
+    // Step 1: Resolve every `path = "..."` value against the real project
+    // directory so the generated manifest works from any location. Forward
+    // slashes keep the TOML strings valid on Windows.
+    let mut generated_manifest = String::with_capacity(source_manifest.len() + 512);
+    let mut cursor = 0usize;
+    while let Some(relative_start) = source_manifest[cursor..].find("path = \"") {
+        let value_start = cursor + relative_start + "path = \"".len();
+        let Some(relative_end) = source_manifest[value_start..].find('"') else {
+            break;
+        };
+        let relative_end = value_start + relative_end;
+        let relative = &source_manifest[value_start..relative_end];
+        let absolute = if Path::new(relative).is_absolute() {
+            relative.to_string()
+        } else {
+            project_root
+                .join(relative)
+                .to_string_lossy()
+                .replace('\\', "/")
+        };
+        generated_manifest.push_str(&source_manifest[cursor..value_start]);
+        generated_manifest.push_str(&absolute);
+        cursor = relative_end;
+    }
+    generated_manifest.push_str(&source_manifest[cursor..]);
+
+    // Step 2: Point the generated member's library at the real source file so
+    // the project compiles from its actual location.
+    let lib_source = project_root.join("src").join("lib.rs");
+    if lib_source.is_file() {
+        let absolute_lib_path = lib_source.to_string_lossy().replace('\\', "/");
+        if let Some(lib_header) = generated_manifest.find("[lib]") {
+            // The `[lib]` section ends at the next bracketed header.
+            let section_end = generated_manifest[lib_header..]
+                .find("\n[")
+                .map(|offset| lib_header + offset)
+                .unwrap_or(generated_manifest.len());
+            let header_line_end = generated_manifest[lib_header..]
+                .find('\n')
+                .map(|offset| lib_header + offset)
+                .unwrap_or(section_end);
+            if !generated_manifest[lib_header..section_end].contains("path =") {
+                generated_manifest.insert_str(
+                    header_line_end,
+                    &format!("\npath = \"{absolute_lib_path}\""),
+                );
+            }
+        }
+    }
+
+    // Step 3: Write the generated member, replacing any previous generation.
+    let member_directory = workspace_root
+        .join(OPTIONAL_MODULE_DIRECTORY)
+        .join(format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}"));
+    std::fs::create_dir_all(&member_directory).map_err(|source| {
+        ConfigError::HostProjectMemberCreationFailed {
+            path: member_directory.display().to_string(),
+            source,
+        }
+    })?;
+    std::fs::write(member_directory.join("Cargo.toml"), generated_manifest).map_err(|source| {
+        ConfigError::HostProjectMemberCreationFailed {
+            path: member_directory.join("Cargo.toml").display().to_string(),
+            source,
+        }
+    })?;
+
+    Ok(())
 }

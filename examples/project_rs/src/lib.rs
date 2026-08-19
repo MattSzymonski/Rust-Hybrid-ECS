@@ -283,7 +283,9 @@ pub unsafe extern "C" fn project_init(api: *const EngineApi) -> u32 {
     // workspace; a separately built copy is a distinct type with its own
     // storage. Keep `pill_spline` out of PILL_MODULES while the project links
     // it directly, so there is exactly one registration of the type.
-    engine.world_mut().register_persistable_component::<Spline>();
+    engine
+        .world_mut()
+        .register_persistable_component::<Spline>();
     engine
         .world_mut()
         .insert_resource(SplineProbeState { frame_count: 0 });
@@ -302,7 +304,13 @@ pub unsafe extern "C" fn project_init(api: *const EngineApi) -> u32 {
             pill_core::math::Vector3f::new(540.0, 460.0, 0.0),
             pill_core::math::Vector3f::new(780.0, 300.0, 0.0),
         ]);
-        if engine.world_mut().create_entity().with(path).build().is_err() {
+        if engine
+            .world_mut()
+            .create_entity()
+            .with(path)
+            .build()
+            .is_err()
+        {
             error!(
                 target: pill_core::telemetry::telemetry_target::ECS,
                 "failed to build the project spline entity; aborting this generation"

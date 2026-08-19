@@ -90,14 +90,14 @@ fn module_test_processor(mut query: Query<&mut ModuleTest>) -> Result<(), System
         state.processed_frame_count += 1;
         state.accumulated_time += FIXED_DELTA_TIME;
 
-        if index == 0 && state.processed_frame_count % REPORT_INTERVAL_FRAMES == 0 {
-            info!(
-                target: pill_core::telemetry::telemetry_target::ECS,
-                frames = state.processed_frame_count,
-                seconds = state.accumulated_time,
-                "pill_test module still processing"
-            );
-        }
+        // if index == 0 && state.processed_frame_count % REPORT_INTERVAL_FRAMES == 0 {
+        //     info!(
+        //         target: pill_core::telemetry::telemetry_target::ECS,
+        //         frames = state.processed_frame_count,
+        //         seconds = state.accumulated_time,
+        //         "pill_test module still processing"
+        //     );
+        // }
     }
     Ok(())
 }

@@ -168,7 +168,8 @@ impl Spline {
                 } else {
                     end
                 };
-                catmull_rom(before_start, start, end, after_end, local_t)
+                Vector3f::new(1.0, 8.0, 1.0)
+                //catmull_rom(before_start, start, end, after_end, local_t)
             }
         }
     }
@@ -196,8 +197,7 @@ fn catmull_rom(
 
     let constant_term = start * 2.0;
     let linear_term = (end - before_start) * local_t;
-    let quadratic_term =
-        (before_start * 2.0 - start * 5.0 + end * 4.0 - after_end) * squared_t;
+    let quadratic_term = (before_start * 2.0 - start * 5.0 + end * 4.0 - after_end) * squared_t;
     let cubic_term = (start * 3.0 - before_start - end * 3.0 + after_end) * cubed_t;
 
     (constant_term + linear_term + quadratic_term + cubic_term) * 0.5
@@ -228,7 +228,9 @@ fn demo_spline() -> Spline {
 pub fn register(engine: &mut Engine) -> u32 {
     // Persistable registration is what makes the component survive a reload:
     // the host matches schemas by type name and migrates only changed layouts.
-    engine.world_mut().register_persistable_component::<Spline>();
+    engine
+        .world_mut()
+        .register_persistable_component::<Spline>();
 
     // Fill up to the target count rather than spawning a new path on every
     // rebuild, because hot reload preserves the entities already created.
@@ -376,9 +378,7 @@ mod tests {
         ];
         let spline = Spline::from_points(&points);
 
-        assert!(spline
-            .get_location_at(-5.0)
-            .abs_diff_eq(points[0], EPSILON));
+        assert!(spline.get_location_at(-5.0).abs_diff_eq(points[0], EPSILON));
         assert!(spline.get_location_at(9.0).abs_diff_eq(points[2], EPSILON));
     }
 

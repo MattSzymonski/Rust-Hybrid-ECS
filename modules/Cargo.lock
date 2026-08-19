@@ -1580,6 +1580,7 @@ dependencies = [
  "dioxus",
  "futures-util",
  "miette",
+ "pill_build_support",
  "pill_core",
  "pill_core_macros",
  "pill_host",
@@ -4167,6 +4168,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pill_build_support"
+version = "0.1.0"
+
+[[package]]
 name = "pill_core"
 version = "0.1.0"
 dependencies = [
@@ -4232,6 +4237,7 @@ dependencies = [
  "pill_engine",
  "serde",
  "serde_json",
+ "serde_yaml",
  "tracing",
  "trait_type_map",
  "winit",
@@ -4252,6 +4258,7 @@ name = "pill_standalone"
 version = "0.1.0"
 dependencies = [
  "miette",
+ "pill_build_support",
  "pill_core",
  "pill_host",
  "tracing",
@@ -4527,6 +4534,18 @@ checksum = "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb"
 dependencies = [
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "project"
+version = "0.1.0"
+dependencies = [
+ "pill_core",
+ "pill_engine",
+ "pill_spline",
+ "serde",
+ "tracing",
+ "trait_type_map",
 ]
 
 [[package]]
@@ -5035,6 +5054,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "ryu"
+version = "1.0.23"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
+
+[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5205,6 +5230,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "serde_yaml"
+version = "0.9.34+deprecated"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6a8b1a1a2ebf674015cc02edccce75287f1a0130d394307b36743c2f5d504b47"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml",
 ]
 
 [[package]]
@@ -6182,6 +6220,12 @@ name = "unicode-xid"
 version = "0.2.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ebc1c04c71510c7f702b52b7c350734c9ff1295c464a03335b00bb84fc54f853"
+
+[[package]]
+name = "unsafe-libyaml"
+version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "673aac59facbab8a9007c7f6108d11f63b603f7cabff99fabf650fea5c32b861"
 
 [[package]]
 name = "untrusted"

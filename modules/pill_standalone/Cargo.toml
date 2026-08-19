@@ -9,6 +9,9 @@ pill_host = { package = "pill_host", path = "../pill_host" }
 miette = "7"
 tracing = "0.1"
 
+[build-dependencies]
+pill_build_support = { path = "../pill_build_support" }
+
 [features]
 # Windowed mode: `host::run` owns the winit event loop and wgpu renderer
 # behind this feature; the binary itself contains no GPU or window code.

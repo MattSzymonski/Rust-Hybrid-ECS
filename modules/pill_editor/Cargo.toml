@@ -18,6 +18,9 @@ thiserror = "2"
 miette = { version = "7", features = ["derive"] }
 tracing = "0.1"
 
+[build-dependencies]
+pill_build_support = { path = "../pill_build_support" }
+
 [features]
 # Enable Tracy profiling through the shared telemetry stack.
 profiling = ["pill_host/profiling"]

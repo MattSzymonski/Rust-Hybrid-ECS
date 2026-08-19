@@ -406,6 +406,32 @@ pub enum ConfigError {
         " does not declare a package name"
     )]
     ProjectPackageNameMissing { path: String },
+
+    /// The generated host workspace member for a native project could not be
+    /// created or written.
+    #[message("failed to create generated host project member at ", name_style(path))]
+    HostProjectMemberCreationFailed {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The optional host configuration file could not be read.
+    #[message("failed to read host configuration file ", name_style(path))]
+    HostConfigFileReadFailed {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The optional host configuration file could not be parsed.
+    #[message(
+        "failed to parse host configuration file ",
+        name_style(path),
+        ": ",
+        value(details)
+    )]
+    HostConfigFileParseFailed { path: String, details: String },
 }
 
 /// Project-module build execution failures.
