@@ -19,7 +19,9 @@ use std::time::Instant;
 
 // External crates
 use pill_core::error;
+use pill_core::info;
 use pill_engine::*;
+use pill_spline::Spline;
 use serde::{Deserialize, Serialize};
 use trait_type_map::impl_trait_accessible;
 
@@ -185,6 +187,60 @@ fn physics_system(
 }
 
 // =============================================================================
+// Spline usage
+// =============================================================================
+
+/// Frame interval at which the spline probe reports what it can see.
+///
+/// Large because the headless loop runs tens of thousands of frames per second
+/// and this is only a demonstration of reading the component.
+const SPLINE_REPORT_INTERVAL_FRAMES: u64 = 30_000;
+
+/// Counts frames so the spline probe reports at a readable interval.
+struct SplineProbeState {
+    frame_count: u64,
+}
+
+impl Resource for SplineProbeState {}
+
+/// Reads every `Spline` in the world and samples its midpoint.
+///
+/// Demonstrates the project using a component type defined by the `pill_spline`
+/// crate: the type is named through a direct dependency, so the query matches
+/// only splines registered by this same compiled copy of the crate.
+fn spline_probe_system(
+    mut state: ResMut<SplineProbeState>,
+    mut splines: Query<&mut Spline>,
+) -> Result<(), SystemError> {
+    let Some(mut state) = state.get_mut() else {
+        return Err(SystemError::MissingResource {
+            name: String::from("SplineProbeState"),
+        });
+    };
+    state.frame_count += 1;
+    if state.frame_count % SPLINE_REPORT_INTERVAL_FRAMES != 0 {
+        return Ok(());
+    }
+
+    // Report how many splines this module can see, which is what reveals
+    // whether a separately loaded copy of the crate shares the component type.
+    let mut visible_spline_count = 0;
+    let mut midpoint = pill_core::math::Vector3f::ZERO;
+    for spline in splines.iter_mut() {
+        visible_spline_count += 1;
+        midpoint = spline.get_location_at(0.5);
+    }
+    // Printed rather than logged through `tracing`: the project links its own
+    // copy of `pill_core`, so its tracing dispatcher has no subscriber and log
+    // lines emitted here never reach the host's telemetry.
+    println!(
+        "[project] sees {visible_spline_count} spline(s), midpoint ({:.1}, {:.1})",
+        midpoint.x, midpoint.y
+    );
+    Ok(())
+}
+
+// =============================================================================
 // Project module entry points
 // =============================================================================
 
@@ -220,6 +276,40 @@ pub unsafe extern "C" fn project_init(api: *const EngineApi) -> u32 {
     });
     engine.register_system("simulation_time", update_time_system);
     engine.register_system("ball_physics", physics_system);
+
+    // Components defined by another crate are registered by whoever links that
+    // crate. Registration is keyed by the type, so this is the same component
+    // the crate itself would register only when both sides were compiled in one
+    // workspace; a separately built copy is a distinct type with its own
+    // storage. Keep `pill_spline` out of PILL_MODULES while the project links
+    // it directly, so there is exactly one registration of the type.
+    engine.world_mut().register_persistable_component::<Spline>();
+    engine
+        .world_mut()
+        .insert_resource(SplineProbeState { frame_count: 0 });
+    engine.register_system("spline_probe", spline_probe_system);
+
+    // Fill up to one project-owned spline instead of adding another on every
+    // reload, matching how the ball entities are kept at a target count.
+    let existing_splines = {
+        let mut query = Query::<&Spline>::new(engine.world_mut());
+        query.iter_mut().count()
+    };
+    if existing_splines == 0 {
+        let path = Spline::from_points(&[
+            pill_core::math::Vector3f::new(20.0, 300.0, 0.0),
+            pill_core::math::Vector3f::new(260.0, 120.0, 0.0),
+            pill_core::math::Vector3f::new(540.0, 460.0, 0.0),
+            pill_core::math::Vector3f::new(780.0, 300.0, 0.0),
+        ]);
+        if engine.world_mut().create_entity().with(path).build().is_err() {
+            error!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                "failed to build the project spline entity; aborting this generation"
+            );
+            return 1;
+        }
+    }
 
     // Hot reload preserves entities, so only fill the world up to the target
     // instead of adding another 100 balls on every rebuild.

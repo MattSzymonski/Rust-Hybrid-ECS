@@ -1,18 +1,18 @@
 [package]
-name = "pill_test"
+name = "pill_spline"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
 # `cdylib` is the artifact the host loads and hot swaps at runtime. `rlib` is
-# kept so a monolithic release build can link the same module statically
-# instead, with no second copy of the source.
+# kept both for monolithic release builds and so another module or the project
+# can depend on this crate directly to use the `Spline` type.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pill_core = { path = "../pill_core" }
-pill_engine = { path = "../pill_engine" }
-trait_type_map = { path = "../../../Trait-Type-Map" }
+pill_core = { path = "../../pill_core" }
+pill_engine = { path = "../../pill_engine" }
+trait_type_map = { path = "../../../../Trait-Type-Map" }
 serde = { version = "1", features = ["derive"] }
 
 [features]

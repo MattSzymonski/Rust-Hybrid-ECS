@@ -9,6 +9,9 @@ crate-type = ["cdylib"]
 [dependencies]
 pill_engine = { path = "../../modules/pill_engine" }
 pill_core = { path = "../../modules/pill_core" }
+# Linked directly so the project can name the `Spline` type. See the note in
+# `project_init` about why this crate must not also be loaded as a module.
+pill_spline = { path = "../../modules/optional/pill_spline" }
 trait_type_map = { path = "../../../Trait-Type-Map" }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"

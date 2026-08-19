@@ -31,21 +31,39 @@ e.g. `$env:PROJECT_PATH = "../examples/project_cs"; cargo run --package pill_sta
 
 ## Optional modules
 
-Optional engine modules are crates inside `modules/`, built as `cdylib` and
-loaded by the host next to the project. Each is watched, rebuilt and swapped on
-its own, so editing one module reloads only that module and leaves the project
-and every other module running.
+Optional engine modules are crates inside `modules/optional/`, built as `cdylib`
+and loaded by the host next to the project. Each is watched, rebuilt and swapped
+on its own, so editing one module reloads only that module and leaves the
+project and every other module running.
 
 `PILL_MODULES` selects which ones to load, as a comma-separated list of crate
 directory names. It defaults to `pill_test`; an empty value loads none.
 
 - `$env:PILL_MODULES = "pill_test"` — the default set, loaded when unset.
+- `$env:PILL_MODULES = "pill_test,pill_physics"` — several modules.
 - `$env:PILL_MODULES = ""` — run with no optional modules.
 
-A module crate exports `pill_module_abi_version` and `pill_module_init`, and may
-export `pill_module_update`. See `modules/pill_test` for the reference
-implementation and `local/documents/modularity_implementation_plan.md` for the
-design and its constraints.
+### Adding a module
+
+The workspace manifest globs `optional/*`, so a module is discovered by
+existing; nothing lists it by name.
+
+1. Create `modules/optional/<name>/` with a `Cargo.toml` declaring
+   `crate-type = ["cdylib", "rlib"]` and depending on `pill_engine`.
+2. Export `pill_module_abi_version` and `pill_module_init`, optionally
+   `pill_module_update`.
+3. Add `<name>` to `PILL_MODULES`.
+
+Everything else — watch directory, build command, output path — is derived from
+the directory name, so the host needs no changes. See
+`modules/optional/pill_test` for the reference implementation and
+`local/documents/modularity_implementation_plan.md` for the design and its
+constraints.
+
+Modules must live in this directory rather than anywhere on disk: sharing the
+workspace lockfile is what makes a module resolve the same dependency graph as
+the host, which keeps component type identities and the mangled symbols of the
+shared `pill_core` library in agreement.
 
 ### Launching outside Cargo
 

@@ -6,6 +6,11 @@ members = [
     "pill_core_macros",
     "pill_host",
     "pill_standalone",
-    "pill_test",
+    # Every crate under `optional/` is an optional engine module, discovered by
+    # this glob so adding one is just creating a directory. The glob is scoped
+    # to that directory rather than the workspace root because every path it
+    # matches must be a crate, and `modules/` also holds non-Rust directories
+    # plus `pill_standalone_temp/`, which the host creates at runtime.
+    "optional/*",
 ]
 resolver = "2"

@@ -4238,6 +4238,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pill_spline"
+version = "0.1.0"
+dependencies = [
+ "pill_core",
+ "pill_engine",
+ "serde",
+ "trait_type_map",
+]
+
+[[package]]
 name = "pill_standalone"
 version = "0.1.0"
 dependencies = [

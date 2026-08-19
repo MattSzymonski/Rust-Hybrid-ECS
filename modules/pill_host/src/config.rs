@@ -47,6 +47,12 @@ const CSHARP_TARGET_FRAMEWORK: &str = "net8.0";
 /// Comma-separated list of optional modules to build, watch and load.
 const OPTIONAL_MODULES_ENVIRONMENT_VARIABLE: &str = "PILL_MODULES";
 
+/// Workspace-relative directory holding every optional module crate.
+///
+/// The workspace manifest globs this directory, so a module is discovered by
+/// existing rather than by being listed anywhere.
+const OPTIONAL_MODULE_DIRECTORY: &str = "optional";
+
 /// Optional modules loaded when `PILL_MODULES` is not set.
 const DEFAULT_OPTIONAL_MODULES: &str = "pill_test";
 
@@ -154,15 +160,19 @@ pub struct OptionalModuleConfig {
 }
 
 impl OptionalModuleConfig {
-    /// Derive the configuration of a module that is a workspace member.
+    /// Derive the configuration of a module crate from its directory name.
     ///
-    /// The workspace root is the `modules` directory, so the crate directory
-    /// name determines everything: sources live in `<name>/src`, the artifact
-    /// in `target/debug`, and the build is a package selection inside the same
-    /// workspace. Building in the workspace is required rather than convenient:
-    /// it makes the module resolve the identical dependency graph as the host,
-    /// which is what keeps component type identities and the engine's exported
-    /// symbol names in agreement.
+    /// Optional modules live under [`OPTIONAL_MODULE_DIRECTORY`] inside the
+    /// engine workspace, which a glob in the workspace manifest picks up
+    /// automatically, so a new module needs no manifest edit. The directory
+    /// name determines everything else: sources in `<directory>/<name>/src`,
+    /// the artifact in the shared `target/debug`, and a plain package
+    /// selection for the build.
+    ///
+    /// Building inside the workspace is required rather than convenient. It
+    /// makes the module resolve the identical dependency graph as the host,
+    /// which is what keeps component type identities and the mangled symbol
+    /// names of the shared `pill_core` library in agreement.
     pub fn workspace_member(name: &str) -> Self {
         let mut build_command = vec![
             "cargo".to_string(),
@@ -180,7 +190,7 @@ impl OptionalModuleConfig {
         Self {
             name: name.to_string(),
             library_name: name.to_string(),
-            watch_directory: format!("{name}/src"),
+            watch_directory: format!("{OPTIONAL_MODULE_DIRECTORY}/{name}/src"),
             build_command,
             output_subdirectory: "target/debug".to_string(),
         }
