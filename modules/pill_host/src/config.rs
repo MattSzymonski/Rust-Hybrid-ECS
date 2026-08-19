@@ -44,6 +44,18 @@ const CSHARP_RUNTIME_OUTPUT_SUBDIRECTORY: &str = "pill_csharp_runtime/bin/Releas
 /// Default target framework used for the managed project output path.
 const CSHARP_TARGET_FRAMEWORK: &str = "net8.0";
 
+/// Comma-separated list of optional modules to build, watch and load.
+const OPTIONAL_MODULES_ENVIRONMENT_VARIABLE: &str = "PILL_MODULES";
+
+/// Optional modules loaded when `PILL_MODULES` is not set.
+const DEFAULT_OPTIONAL_MODULES: &str = "pill_test";
+
+/// Cargo variable that overrides the workspace-configured compiler flags.
+///
+/// Setting it takes precedence over `build.rustflags` in a Cargo config file,
+/// which the `--config` command-line override does not do.
+const RUSTFLAGS_VARIABLE: &str = "RUSTFLAGS";
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -106,8 +118,161 @@ pub struct ProjectModuleConfig {
     /// Build command whose first element is the program and rest are arguments.
     pub build_command: Vec<String>,
 
+    /// Environment variables applied to the build process.
+    ///
+    /// Used to override values the build would otherwise inherit from the
+    /// host's environment or from the workspace Cargo configuration.
+    pub build_environment: Vec<(String, String)>,
+
     /// How the built module is loaded and executed.
     pub backend: ProjectModuleBackend,
+}
+
+/// Build, watch and load description for one optional engine module.
+///
+/// Optional modules are workspace members of the engine workspace, built as
+/// `cdylib` and loaded by the host at runtime. They share the workspace's
+/// lockfile and Cargo configuration, which is what lets them link the engine
+/// dynamically and share one copy of its statics with the host.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct OptionalModuleConfig {
+    /// Crate directory name, also the log field and temporary-copy prefix.
+    pub name: String,
+
+    /// Library name without the platform prefix or suffix.
+    pub library_name: String,
+
+    /// Directory to watch for source changes, relative to the workspace root.
+    pub watch_directory: String,
+
+    /// Build command whose first element is the program and rest are arguments.
+    pub build_command: Vec<String>,
+
+    /// Output directory of the built artifact, relative to the workspace root.
+    pub output_subdirectory: String,
+}
+
+impl OptionalModuleConfig {
+    /// Derive the configuration of a module that is a workspace member.
+    ///
+    /// The workspace root is the `modules` directory, so the crate directory
+    /// name determines everything: sources live in `<name>/src`, the artifact
+    /// in `target/debug`, and the build is a package selection inside the same
+    /// workspace. Building in the workspace is required rather than convenient:
+    /// it makes the module resolve the identical dependency graph as the host,
+    /// which is what keeps component type identities and the engine's exported
+    /// symbol names in agreement.
+    pub fn workspace_member(name: &str) -> Self {
+        let mut build_command = vec![
+            "cargo".to_string(),
+            "build".to_string(),
+            "--package".to_string(),
+            name.to_string(),
+        ];
+        // Mirror the host's engine feature set. A module compiled against a
+        // differently configured engine can disagree about type layout.
+        if cfg!(feature = "rendering") {
+            build_command.push("--features".to_string());
+            build_command.push("rendering".to_string());
+        }
+
+        Self {
+            name: name.to_string(),
+            library_name: name.to_string(),
+            watch_directory: format!("{name}/src"),
+            build_command,
+            output_subdirectory: "target/debug".to_string(),
+        }
+    }
+
+    /// Verify that the configuration is internally consistent.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`ConfigError`] naming the first invalid field.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.name.is_empty() {
+            return Err(ConfigError::EmptyModuleName);
+        }
+        if self.watch_directory.is_empty() {
+            return Err(ConfigError::EmptyWatchDirectory);
+        }
+        if self.build_command.is_empty() {
+            return Err(ConfigError::EmptyBuildCommand);
+        }
+        Ok(())
+    }
+}
+
+/// Complete host configuration: the project module plus every optional module
+/// the host should build, watch and load.
+///
+/// Assembled by [`Self::from_environment`] so executable crates stay free of
+/// any project or module identity.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub struct HostConfig {
+    /// The project module selected by `PROJECT_PATH`.
+    pub project: ProjectModuleConfig,
+
+    /// Optional modules selected by `PILL_MODULES`, loaded before the project.
+    pub optional_modules: Vec<OptionalModuleConfig>,
+}
+
+impl HostConfig {
+    /// Assemble the host configuration from the environment.
+    ///
+    /// `PROJECT_PATH` selects the project module and `PILL_MODULES` selects the
+    /// optional modules; see [`ProjectModuleConfig::from_environment`] and
+    /// [`selected_optional_modules`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`ConfigError`] when the project configuration cannot be
+    /// derived or when a configured module is invalid.
+    pub fn from_environment() -> Result<Self, ConfigError> {
+        let project = ProjectModuleConfig::from_environment()?;
+        let optional_modules: Vec<OptionalModuleConfig> = selected_optional_modules()
+            .iter()
+            .map(|name| OptionalModuleConfig::workspace_member(name))
+            .collect();
+        for module in &optional_modules {
+            module.validate()?;
+        }
+        Ok(Self {
+            project,
+            optional_modules,
+        })
+    }
+}
+
+impl From<ProjectModuleConfig> for HostConfig {
+    /// Run one project with no optional modules.
+    ///
+    /// Keeps embedders that already build a `ProjectModuleConfig` compiling.
+    fn from(project: ProjectModuleConfig) -> Self {
+        Self {
+            project,
+            optional_modules: Vec::new(),
+        }
+    }
+}
+
+/// Read the selected optional modules from the environment.
+///
+/// `PILL_MODULES` is a comma-separated list of crate directory names inside the
+/// engine workspace, for example `pill_test,pill_physics`. When it is not set
+/// the default set is loaded; setting it to an empty value disables optional
+/// modules entirely, which is how one run opts out without a rebuild.
+pub fn selected_optional_modules() -> Vec<String> {
+    env::var(OPTIONAL_MODULES_ENVIRONMENT_VARIABLE)
+        .unwrap_or_else(|_| DEFAULT_OPTIONAL_MODULES.to_string())
+        .split(',')
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 impl ProjectModuleConfig {
@@ -198,8 +363,7 @@ impl ProjectModuleConfig {
         // Step 3: Build the Cargo command. When the host renders, the project
         // module is built with the same feature so both sides share renderer
         // components.
-        #[cfg(not(feature = "rendering"))]
-        let build_command = vec![
+        let mut build_command = vec![
             "cargo".to_string(),
             "build".to_string(),
             "--manifest-path".to_string(),
@@ -207,22 +371,25 @@ impl ProjectModuleConfig {
             "--package".to_string(),
             package_name.clone(),
         ];
-        #[cfg(feature = "rendering")]
-        let build_command = vec![
-            "cargo".to_string(),
-            "build".to_string(),
-            "--manifest-path".to_string(),
-            format!("{project_path}/Cargo.toml"),
-            "--package".to_string(),
-            package_name.clone(),
-            "--features".to_string(),
-            "rendering".to_string(),
-        ];
+        if cfg!(feature = "rendering") {
+            build_command.push("--features".to_string());
+            build_command.push("rendering".to_string());
+        }
 
         Ok(Self {
             name: package_name,
             watch_directory,
             build_command,
+            // Project modules live in their own workspace with their own
+            // lockfile, so they link the engine statically. The engine
+            // workspace turns on `-C prefer-dynamic` through its Cargo config,
+            // and this build inherits that config because it runs from the
+            // workspace root, so the flags are cleared explicitly here. Shared
+            // dynamic linkage would require both sides to resolve an identical
+            // dependency graph: a Rust dylib exports symbols mangled with a
+            // metadata hash derived from that graph, and a mismatch fails at
+            // load time with a missing-procedure error.
+            build_environment: vec![(RUSTFLAGS_VARIABLE.to_string(), String::new())],
             backend: ProjectModuleBackend::NativeLibrary {
                 library_name,
                 output_subdirectory,
@@ -258,6 +425,8 @@ impl ProjectModuleConfig {
             name: project_assembly_name.clone(),
             watch_directory,
             build_command,
+            // The managed build never invokes rustc, so it needs no overrides.
+            build_environment: Vec::new(),
             backend: ProjectModuleBackend::CSharp(CSharpModuleConfig {
                 runtime_assembly_name: CSHARP_RUNTIME_ASSEMBLY_NAME.to_string(),
                 runtime_output_subdirectory: CSHARP_RUNTIME_OUTPUT_SUBDIRECTORY.to_string(),

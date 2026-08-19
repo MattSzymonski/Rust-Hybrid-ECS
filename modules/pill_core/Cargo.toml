@@ -3,6 +3,17 @@ name = "pill_core"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+# `dylib` makes this one shared library that the host executable and every
+# dynamically loaded module link against instead of each embedding a private
+# copy. That is what keeps the process-global state living here
+# single-instance across the DLL boundary, most importantly the `tracing`
+# dispatcher: a module linking its own copy has no subscriber installed, so
+# every log line it emits is silently dropped.
+#
+# `rlib` is kept so a monolithic release build can link everything statically.
+crate-type = ["rlib", "dylib"]
+
 [dependencies]
 glam = { version = "0.33", features = ["serde"] }
 pill_core_macros = { path = "../pill_core_macros" }

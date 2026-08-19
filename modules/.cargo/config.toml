@@ -1,0 +1,17 @@
+# Link Rust dependencies dynamically wherever a `dylib` artifact exists, so the
+# host executable and every optional module built from this workspace share one
+# copy of `pill_engine` instead of each embedding a private one. Sharing the
+# engine is what keeps its statics, thread-locals and the tracing dispatcher
+# single-instance across the DLL boundary.
+#
+# Scope: this applies to crates built from inside `modules/`, which is every
+# crate that shares this workspace's `Cargo.lock`. Shared dynamic linkage
+# requires the exact same dependency resolution on both sides, because a Rust
+# dylib exports symbols mangled with a metadata hash derived from the resolved
+# graph. Project modules live in their own workspaces with their own lockfiles,
+# so they are built with static linkage instead; see `ProjectModuleConfig`.
+#
+# Release builds that link everything into one binary need no shared library and
+# should clear these flags, for example with `--config build.rustflags=[]`.
+[build]
+rustflags = ["-C", "prefer-dynamic"]

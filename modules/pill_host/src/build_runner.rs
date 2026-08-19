@@ -29,7 +29,7 @@ use pill_core::error::BuildError;
 use pill_core::info;
 
 // Current crate
-use crate::{ProjectModuleBackend, ProjectModuleConfig};
+use crate::{OptionalModuleConfig, ProjectModuleBackend, ProjectModuleConfig};
 
 // =============================================================================
 // Constants
@@ -45,31 +45,30 @@ const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(100);
 // Free Functions
 // =============================================================================
 
-/// Build the selected project module and return its expected output artifact.
+/// Run one module's build command to completion.
+///
+/// Shared by the project module and by optional modules so both use the same
+/// process handling, watchdog, cancellation, and failure reporting. Resolving
+/// and validating the produced artifact is left to the caller, because each
+/// module kind names and locates its output differently.
 ///
 /// # Errors
 ///
-/// Returns an error if the build command is empty, fails to spawn, exits with
-/// a non-zero status, times out, is cancelled by a newer source change, or
-/// the resolved output artifact does not exist at the configured path.
-pub(crate) fn build_project_module(
+/// Returns an error if the command is empty, fails to spawn, exits with a
+/// non-zero status, times out, or is cancelled by a newer source change.
+pub(crate) fn run_build_command(
     workspace_root: &Path,
-    config: &ProjectModuleConfig,
+    name: &str,
+    build_command: &[String],
+    build_environment: &[(String, String)],
     cancel_flag: Option<(&AtomicU64, u64)>,
-) -> Result<PathBuf, BuildError> {
-    info!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-        module = config.name.as_str(),
-        "building project module"
-    );
-
+) -> Result<(), BuildError> {
     // Step 1: Split the configured command into its executable and arguments.
     //
-    // ProjectModuleConfig stores commands as owned strings so callers can
+    // Module configuration stores commands as owned strings so callers can
     // define both Cargo and dotnet builds without shell-specific quoting. The
     // first item is always the executable; every remaining item is passed verbatim.
-    let (program, arguments) = config
-        .build_command
+    let (program, arguments) = build_command
         .split_first()
         .ok_or(BuildError::EmptyCommand)?;
 
@@ -78,13 +77,16 @@ pub(crate) fn build_project_module(
     // Run from the workspace root because configured paths and Cargo package
     // selection are workspace-relative. The child inherits the host's stdout
     // and stderr instead of capturing them, which keeps compiler progress,
-    // warnings, and errors visible during startup and hot reload.
+    // warnings, and errors visible during startup and hot reload. Configured
+    // environment overrides are applied last so they win over anything the
+    // host itself inherited.
     let mut child = Command::new(program)
         .args(arguments)
         .current_dir(workspace_root)
+        .envs(build_environment.iter().map(|(key, value)| (key, value)))
         .spawn()
         .map_err(|source| BuildError::SpawnFailed {
-            name: config.name.to_string(),
+            name: name.to_string(),
             source,
         })?;
 
@@ -107,7 +109,7 @@ pub(crate) fn build_project_module(
             return Err(BuildError::Cancelled);
         }
         if let Some(status) = child.try_wait().map_err(|source| BuildError::WaitFailed {
-            name: config.name.to_string(),
+            name: name.to_string(),
             source,
         })? {
             break status;
@@ -116,7 +118,7 @@ pub(crate) fn build_project_module(
             let _ = child.kill();
             let _ = child.wait();
             return Err(BuildError::TimedOut {
-                name: config.name.to_string(),
+                name: name.to_string(),
                 seconds: BUILD_TIMEOUT.as_secs(),
             });
         }
@@ -129,10 +131,38 @@ pub(crate) fn build_project_module(
     // caller handles this error by leaving the current project module untouched.
     if !status.success() {
         return Err(BuildError::CommandFailed {
-            name: config.name.to_string(),
+            name: name.to_string(),
             status,
         });
     }
+    Ok(())
+}
+
+/// Build the selected project module and return its expected output artifact.
+///
+/// # Errors
+///
+/// Returns an error if the build fails for any of the reasons reported by
+/// [`run_build_command`], or if the resolved output artifact does not exist at
+/// the configured path.
+pub(crate) fn build_project_module(
+    workspace_root: &Path,
+    config: &ProjectModuleConfig,
+    cancel_flag: Option<(&AtomicU64, u64)>,
+) -> Result<PathBuf, BuildError> {
+    info!(
+        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        module = config.name.as_str(),
+        "building project module"
+    );
+
+    run_build_command(
+        workspace_root,
+        &config.name,
+        &config.build_command,
+        &config.build_environment,
+        cancel_flag,
+    )?;
 
     // Step 5: Resolve the backend-specific output artifact path.
     //
@@ -163,6 +193,45 @@ pub(crate) fn build_project_module(
         });
     }
 
+    Ok(output_path)
+}
+
+/// Build one optional module and return its expected output artifact.
+///
+/// Optional modules are workspace members, so their output always follows the
+/// platform's native-library naming inside the configured output directory.
+///
+/// # Errors
+///
+/// Returns an error if the build fails for any of the reasons reported by
+/// [`run_build_command`], or if the built library is missing afterwards.
+pub(crate) fn build_optional_module(
+    workspace_root: &Path,
+    config: &OptionalModuleConfig,
+    cancel_flag: Option<(&AtomicU64, u64)>,
+) -> Result<PathBuf, BuildError> {
+    info!(
+        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        module = config.name.as_str(),
+        "building optional module"
+    );
+
+    run_build_command(
+        workspace_root,
+        &config.name,
+        &config.build_command,
+        &[],
+        cancel_flag,
+    )?;
+
+    let output_path = workspace_root
+        .join(&config.output_subdirectory)
+        .join(native_library_filename(&config.library_name));
+    if !output_path.exists() {
+        return Err(BuildError::OutputMissing {
+            path: output_path.display().to_string(),
+        });
+    }
     Ok(output_path)
 }
 

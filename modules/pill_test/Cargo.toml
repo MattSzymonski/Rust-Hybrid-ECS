@@ -1,0 +1,22 @@
+[package]
+name = "pill_test"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# `cdylib` is the artifact the host loads and hot swaps at runtime. `rlib` is
+# kept so a monolithic release build can link the same module statically
+# instead, with no second copy of the source.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pill_core = { path = "../pill_core" }
+pill_engine = { path = "../pill_engine" }
+trait_type_map = { path = "../../../Trait-Type-Map" }
+serde = { version = "1", features = ["derive"] }
+
+[features]
+# Must mirror the host's engine feature set: a module built against a
+# differently configured engine can disagree about type layout. The host passes
+# this flag automatically when it was itself built with rendering.
+rendering = ["pill_engine/rendering"]

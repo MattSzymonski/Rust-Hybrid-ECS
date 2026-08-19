@@ -24,12 +24,12 @@ use std::sync::atomic::AtomicU64;
 // External crates
 use pill_core::error::{HostError, LibraryError};
 use pill_core::{debug, error, info, warn};
-use pill_engine::{Engine, EngineApi};
+use pill_engine::{Engine, EngineApi, SystemOwner};
 
 // Current crate
 use crate::build_runner::build_project_module;
 use crate::csharp::CSharpRuntime;
-use crate::native_library::ProjectLibrary;
+use crate::native_library::{NativeLibrary, PROJECT_ENTRY_POINTS};
 use crate::{ProjectModuleBackend, ProjectModuleConfig};
 
 // =============================================================================
@@ -55,10 +55,10 @@ const MAX_GRAVEYARD_GENERATIONS: usize = 2;
 pub(crate) enum LoadedProject {
     /// A mapped native module plus any retired DLLs that must stay mapped.
     Native {
-        current: ProjectLibrary,
+        current: NativeLibrary,
         /// Old DLLs intentionally remain mapped because engine-owned function
         /// pointers and vtables may still refer to their code.
-        old_libraries: Vec<ProjectLibrary>,
+        old_libraries: Vec<NativeLibrary>,
     },
     /// A collectible managed runtime hosting the C# project assembly.
     CSharp(CSharpRuntime),
@@ -89,11 +89,16 @@ impl LoadedProject {
                 // Native build outputs cannot be loaded in place on Windows:
                 // the OS locks a mapped DLL. Load a uniquely named copy so the
                 // next compilation remains free to replace the original.
-                let library = ProjectLibrary::load_copy(&output_path, workspace_root)?;
+                let library = NativeLibrary::load_copy(
+                    &output_path,
+                    workspace_root,
+                    &config.name,
+                    &PROJECT_ENTRY_POINTS,
+                )?;
 
                 // Native modules register their components and systems through
                 // the stable EngineApi table before the first frame is run.
-                let status = library.call_project_init(engine_api);
+                let status = library.call_init(engine_api);
                 if status != 0 {
                     return Err(LibraryError::InitializationFailed { status }.into());
                 }
@@ -180,7 +185,7 @@ impl LoadedProject {
         // C# gameplay is represented entirely by registered ECS systems. Only
         // native modules retain the legacy explicit per-frame callback.
         if let Self::Native { current, .. } = self {
-            current.call_project_update(engine_api);
+            current.call_update(engine_api);
         }
     }
 }
@@ -192,8 +197,8 @@ impl LoadedProject {
 /// Reload one native generation and migrate components whose persisted schema
 /// changed across the module boundary.
 fn reload_native(
-    current: &mut ProjectLibrary,
-    old_libraries: &mut Vec<ProjectLibrary>,
+    current: &mut NativeLibrary,
+    old_libraries: &mut Vec<NativeLibrary>,
     engine: &mut Engine,
     engine_api: &EngineApi,
     workspace_root: &Path,
@@ -217,7 +222,12 @@ fn reload_native(
     // Step 2: Load and validate the replacement library transactionally.
     // Keep `current` untouched until a complete replacement library is ready
     // to initialize.
-    let new_library = match ProjectLibrary::load_copy(&output_path, workspace_root) {
+    let new_library = match NativeLibrary::load_copy(
+        &output_path,
+        workspace_root,
+        &config.name,
+        &PROJECT_ENTRY_POINTS,
+    ) {
         Ok(library) => library,
         Err(error) => {
             error!(
@@ -238,16 +248,19 @@ fn reload_native(
 
     // Registered native system closures can point into the old DLL. Remove
     // them before project_init installs closures from the replacement module.
+    // Only the project's own systems are cleared: optional modules are still
+    // running their previous generation, and their systems must survive a
+    // project reload untouched.
     debug!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
         "reload step 1/4: clearing old systems"
     );
-    engine.clear_systems();
+    engine.clear_systems_owned_by(SystemOwner::PROJECT);
     debug!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
         "reload step 2/4: calling project_init on the new module"
     );
-    if new_library.call_project_init(engine_api) != 0 {
+    if new_library.call_init(engine_api) != 0 {
         // The new generation failed to register itself. Roll the engine back
         // to the previous module: project_init must be idempotent, re-registering
         // the same components and systems and only filling entities up to a
@@ -256,8 +269,8 @@ fn reload_native(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             "new project module failed to initialize; rolling back to the previous generation"
         );
-        engine.clear_systems();
-        let rollback_status = current.call_project_init(engine_api);
+        engine.clear_systems_owned_by(SystemOwner::PROJECT);
+        let rollback_status = current.call_init(engine_api);
         if rollback_status != 0 {
             error!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,

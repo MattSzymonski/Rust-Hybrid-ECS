@@ -40,7 +40,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 // Current crate
-use crate::{FrameReport, ProjectModuleConfig};
+use crate::{FrameReport, HostConfig};
 
 // =============================================================================
 // WindowedApplication
@@ -53,7 +53,7 @@ use crate::{FrameReport, ProjectModuleConfig};
 /// they can be surfaced through [`run`]'s error path.
 #[cfg(feature = "rendering")]
 struct WindowedApplication {
-    module_config: ProjectModuleConfig,
+    module_config: HostConfig,
     window: Option<Arc<Window>>,
     host: Option<crate::RenderingHost>,
     /// Whether the hidden startup window has been revealed after its first frame.
@@ -234,7 +234,7 @@ impl WindowedApplication {
 /// cannot be built or loaded, or when the source watcher cannot start. Frame
 /// execution never returns an error; the loop runs until the process exits.
 #[cfg(not(feature = "rendering"))]
-pub fn run(module_config: ProjectModuleConfig) -> Result<(), HostError> {
+pub fn run(module_config: HostConfig) -> Result<(), HostError> {
     let mut host = crate::setup(module_config)?;
 
     loop {
@@ -251,7 +251,7 @@ pub fn run(module_config: ProjectModuleConfig) -> Result<(), HostError> {
 /// Returns [`EngineError`] if the event loop cannot be created or run, or if
 /// window creation or host/renderer setup fails inside the event loop.
 #[cfg(feature = "rendering")]
-pub fn run(module_config: ProjectModuleConfig) -> Result<(), EngineError> {
+pub fn run(module_config: HostConfig) -> Result<(), EngineError> {
     // Step 1: Create a new event loop for the windowed application.
     let event_loop =
         EventLoop::new().map_err(|source| FrontendError::EventLoopCreation { source })?;

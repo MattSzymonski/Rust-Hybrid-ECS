@@ -31,9 +31,10 @@ use pill_engine::{RenderViewport, Renderer, RendererError, RendererWindow, Virtu
 
 // Current crate
 use crate::native_library::cleanup_temporary_files;
+use crate::optional_module::OptionalModuleSlot;
 use crate::project_module::LoadedProject;
-use crate::watcher::spawn_file_watcher;
-use crate::{ProjectModuleBackend, ProjectModuleConfig};
+use crate::watcher::spawn_source_watcher;
+use crate::{HostConfig, ProjectModuleBackend, ProjectModuleConfig};
 
 // =============================================================================
 // Constants
@@ -58,6 +59,8 @@ pub struct Host {
     engine: Box<Engine>,
     engine_api: EngineApi,
     loaded_project: LoadedProject,
+    /// Optional modules, each with its own watcher and reload transaction.
+    optional_modules: Vec<OptionalModuleSlot>,
     reload_generation: Arc<AtomicU64>,
     last_processed_generation: u64,
     last_frame_error: Option<String>,
@@ -212,9 +215,14 @@ pub struct FrameReport {
 ///
 /// Returns a typed [`HostError`] naming the failing subsystem: configuration,
 /// build, library loading, watcher startup, or managed backend startup.
-pub fn setup(module_config: ProjectModuleConfig) -> Result<Host, HostError> {
+pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
     // Step 1: Reject inconsistent configurations before any build or load.
+    let host_config = host_config.into();
+    let module_config = host_config.project;
     module_config.validate()?;
+    for module in &host_config.optional_modules {
+        module.validate()?;
+    }
 
     // Step 2: Resolve the workspace root and print the selected configuration.
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -238,14 +246,39 @@ pub fn setup(module_config: ProjectModuleConfig) -> Result<Host, HostError> {
     engine.set_parallel_execution(true);
     let engine_api = EngineApi::new(&mut engine);
 
-    // Step 4: Build and load the project module, then start its source watcher.
+    // Step 4: Build, load and watch the optional modules before the project.
+    // Modules are infrastructure: loading them first means the project can rely
+    // on whatever they register. Each gets its own owner tag and its own
+    // generation counter, so later reloads stay isolated from each other.
+    let mut optional_modules = Vec::with_capacity(host_config.optional_modules.len());
+    for (index, module_config) in host_config.optional_modules.iter().enumerate() {
+        let module_generation = Arc::new(AtomicU64::new(0));
+        let slot = OptionalModuleSlot::start(
+            &mut engine,
+            &engine_api,
+            &workspace_root,
+            module_config,
+            pill_engine::SystemOwner::optional_module(index),
+            Arc::clone(&module_generation),
+        )?;
+        spawn_source_watcher(
+            workspace_root.clone(),
+            &module_config.name,
+            &module_config.watch_directory,
+            module_generation,
+        )?;
+        optional_modules.push(slot);
+    }
+
+    // Step 5: Build and load the project module, then start its source watcher.
     let loaded_project =
         LoadedProject::start(&mut engine, &engine_api, &workspace_root, &module_config)?;
 
     let reload_generation = Arc::new(AtomicU64::new(0));
-    spawn_file_watcher(
+    spawn_source_watcher(
         workspace_root.clone(),
-        &module_config,
+        &module_config.name,
+        &module_config.watch_directory,
         Arc::clone(&reload_generation),
     )?;
 
@@ -262,6 +295,7 @@ pub fn setup(module_config: ProjectModuleConfig) -> Result<Host, HostError> {
         engine,
         engine_api,
         loaded_project,
+        optional_modules,
         reload_generation,
         last_processed_generation: 0,
         last_frame_error: None,
@@ -285,7 +319,7 @@ pub fn setup(module_config: ProjectModuleConfig) -> Result<Host, HostError> {
 /// a [`HostError`] from setup or a [`RendererError`] from surface creation.
 #[cfg(feature = "rendering")]
 pub fn setup_rendering<W>(
-    module_config: ProjectModuleConfig,
+    host_config: impl Into<HostConfig>,
     window: W,
     width: u32,
     height: u32,
@@ -293,7 +327,7 @@ pub fn setup_rendering<W>(
 where
     W: RendererWindow + 'static,
 {
-    let host = setup(module_config)?;
+    let host = setup(host_config)?;
     let renderer = Renderer::new(window, width, height)?;
     Ok(RenderingHost { host, renderer })
 }
@@ -330,6 +364,29 @@ where
 pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     #[cfg(feature = "metrics")]
     let frame_start = Instant::now();
+
+    // Step 0: Reload any optional module whose sources changed. Each module
+    // owns an independent generation counter and clears only its own systems,
+    // so editing one module never rebuilds another and never disturbs the
+    // project's systems, entities, or resources.
+    // Destructure so the module list, the engine and the API table are borrowed
+    // as disjoint fields rather than through the whole host.
+    let Host {
+        optional_modules,
+        engine,
+        engine_api,
+        workspace_root,
+        ..
+    } = &mut *host;
+    for slot in optional_modules.iter_mut() {
+        if slot.reload_if_changed(engine, engine_api, workspace_root) {
+            info!(
+                target: telemetry_target::HOT_RELOAD,
+                module = slot.name(),
+                "optional module reload processed"
+            );
+        }
+    }
 
     // Step 1: Process a pending hot reload before running systems.
     // The watcher bumps a generation counter; reloading while it differs from
@@ -382,6 +439,12 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     // Managed games run entirely as scheduler systems. Native games retain
     // this compatibility update hook after their scheduled work.
     host.loaded_project.update(&host.engine_api);
+
+    // Optional modules may also export a per-frame hook. Run them after the
+    // project so a module observes the world the project's systems produced.
+    for slot in &host.optional_modules {
+        slot.update(&host.engine_api);
+    }
 
     // Step 5: Track and report FPS over the three-second window.
     host.frame_count += 1;

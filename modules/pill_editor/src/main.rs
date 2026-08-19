@@ -27,7 +27,7 @@ use dioxus::prelude::*;
 use futures_util::StreamExt;
 use pill_host::{
     engine_report, install_engine_report_handler, setup_rendering, EngineError, FrameReport,
-    HostError, ProjectModuleConfig, RenderViewport, RenderingHost, VirtualResolution,
+    HostConfig, HostError, RenderViewport, RenderingHost, VirtualResolution,
 };
 use pill_core::error::EngineMessage;
 
@@ -304,7 +304,7 @@ impl EditorContext {
     fn new(window: Arc<Window>) -> Result<Self, EditorError> {
         let size = window.inner_size();
         let mut host = setup_rendering(
-            ProjectModuleConfig::from_environment()
+            HostConfig::from_environment()
                 .map_err(|source| EngineError::from(HostError::from(source)))?,
             Arc::clone(&window),
             size.width,

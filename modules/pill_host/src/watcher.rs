@@ -32,9 +32,6 @@ use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use pill_core::error::WatcherError;
 use pill_core::{debug, error, info};
 
-// Current crate
-use crate::ProjectModuleConfig;
-
 // =============================================================================
 // Constants
 // =============================================================================
@@ -139,15 +136,16 @@ fn is_relevant_relative_path(relative: &Path) -> bool {
 ///
 /// Returns an error if the watch directory does not exist, the watcher cannot
 /// be created, or the watch path cannot be registered.
-pub(crate) fn spawn_file_watcher(
+pub(crate) fn spawn_source_watcher(
     workspace_root: PathBuf,
-    config: &ProjectModuleConfig,
+    module_name: &str,
+    watch_directory: &str,
     reload_generation: Arc<AtomicU64>,
 ) -> Result<(), WatcherError> {
     // Step 1: Resolve and validate the configured watch directory.
     // Watch paths are configured relative to the repository so the same
     // configuration works regardless of the process's current directory.
-    let watch_path = workspace_root.join(&config.watch_directory);
+    let watch_path = workspace_root.join(watch_directory);
 
     // Fail during host setup instead of silently running without hot reload
     // when a module configuration contains an outdated source path.
@@ -159,7 +157,7 @@ pub(crate) fn spawn_file_watcher(
 
     info!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-        module = config.name.as_str(),
+        module = module_name,
         watch_directory = %watch_path.display(),
         "watching for source changes"
     );

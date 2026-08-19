@@ -89,7 +89,7 @@ pub mod world;
 pub use api::EngineApi;
 pub use commands::{CommandError, Commands};
 pub use component::{Component, ComponentId, ComponentTicks, Tick};
-pub use engine::Engine;
+pub use engine::{Engine, SystemOwner};
 pub use entity::Entity;
 pub use error::{EngineError, SystemError, SystemFailure};
 pub use persistence::ComponentSnapshot;

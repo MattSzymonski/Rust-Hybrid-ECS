@@ -4248,6 +4248,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pill_test"
+version = "0.1.0"
+dependencies = [
+ "pill_core",
+ "pill_engine",
+ "serde",
+ "trait_type_map",
+]
+
+[[package]]
 name = "pin-project"
 version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"

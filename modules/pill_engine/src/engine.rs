@@ -43,9 +43,34 @@ use crate::world::{set_per_thread_last_run_tick, World};
 ///
 /// Holds the system's name, boxed instance, enabled state, and the per-frame
 /// timing data that feeds adaptive parallelism and profiling.
+/// Identifies which loaded module registered a system.
+///
+/// A hot reload replaces one module's code while the rest of the process keeps
+/// running. The systems of the module being swapped must be removed, because
+/// their function pointers refer to the retired library, but the systems of
+/// every other module and of the project must survive untouched. Tagging each
+/// registration with its owner is what makes that separation possible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SystemOwner(pub u64);
+
+impl SystemOwner {
+    /// Owner of systems registered by the host or by the project module.
+    pub const PROJECT: Self = Self(0);
+
+    /// Owner of the optional module loaded at `index`.
+    ///
+    /// Offset by one so that no optional module can collide with
+    /// [`Self::PROJECT`].
+    pub const fn optional_module(index: usize) -> Self {
+        Self(index as u64 + 1)
+    }
+}
+
 struct RegisteredSystem {
     /// Name used for registration, debugging, and profiling.
     name: String,
+    /// Module that registered this system, used to scope a hot reload.
+    owner: SystemOwner,
     /// Boxed system instance, invoked with the world and command queue.
     system: Box<dyn System>,
     /// World tick at which this system was last executed.
@@ -121,6 +146,13 @@ pub struct Engine {
     /// Last seen archetype generation, used to detect when archetypes are
     /// added or removed so we can emit per-archetype memory breakdowns.
     last_archetype_generation: u64,
+    /// Owner assigned to systems registered from now on.
+    ///
+    /// The host scopes each module's initialization between
+    /// [`Engine::begin_module_registration`] and
+    /// [`Engine::end_module_registration`], so modules register systems exactly
+    /// as before and still end up correctly attributed.
+    active_owner: SystemOwner,
 }
 
 impl Engine {
@@ -182,6 +214,7 @@ impl Engine {
             frame_budget: None,
             trace_frame_wait: true,
             last_archetype_generation: 0,
+            active_owner: SystemOwner::PROJECT,
         }
     }
 }
@@ -326,6 +359,7 @@ impl Engine {
         // Store system
         self.systems.push(RegisteredSystem {
             name: name.into(),
+            owner: self.active_owner,
             system: system.into_system(),
             enabled: true,
             last_run: 0,
@@ -358,6 +392,7 @@ impl Engine {
         self.scheduler.register_system(access);
         self.systems.push(RegisteredSystem {
             name: name.into(),
+            owner: self.active_owner,
             system: Box::new(system),
             enabled: true,
             last_run: 0,
@@ -366,6 +401,55 @@ impl Engine {
         });
         self.scheduler.build_execution_graph();
     }
+    /// Attributes every system registered from now on to `owner`.
+    ///
+    /// The host wraps a module's initialization in this call and
+    /// [`Self::end_module_registration`], so module code registers systems
+    /// exactly as it always has while the engine still records which module
+    /// each system came from.
+    pub fn begin_module_registration(&mut self, owner: SystemOwner) {
+        self.active_owner = owner;
+    }
+
+    /// Returns registration attribution to [`SystemOwner::PROJECT`].
+    pub fn end_module_registration(&mut self) {
+        self.active_owner = SystemOwner::PROJECT;
+    }
+
+    /// Removes only the systems registered by `owner`.
+    ///
+    /// Used when hot reloading one optional module: the replacement library's
+    /// systems are different function pointers, so the retiring generation's
+    /// systems must go, while the project and every other module keep running.
+    /// Component registrations, entities, and resources are untouched.
+    ///
+    /// Returns the number of systems removed.
+    pub fn clear_systems_owned_by(&mut self, owner: SystemOwner) -> usize {
+        // Build the keep mask before mutating anything, so the scheduler's
+        // access patterns can be filtered with the same indices the systems
+        // vector uses.
+        let keep: Vec<bool> = self
+            .systems
+            .iter()
+            .map(|system| system.owner != owner)
+            .collect();
+        let removed_count = keep.iter().filter(|keep_it| !**keep_it).count();
+        if removed_count == 0 {
+            return 0;
+        }
+
+        let mut index = 0;
+        self.systems.retain(|_| {
+            let keep_this = keep[index];
+            index += 1;
+            keep_this
+        });
+        self.scheduler.retain(&keep);
+        self.graph_dirty = false;
+        self.scheduler.build_execution_graph();
+        removed_count
+    }
+
     /// Removes all registered systems, clearing the scheduler state.
     ///
     /// This is used during hot-reload: the old project DLL's system function
@@ -1040,5 +1124,107 @@ mod tests {
         assert!(failures
             .iter()
             .any(|failure| failure.system == "second_failure"));
+    }
+
+    /// Clearing one module's systems leaves every other owner's systems
+    /// registered and still running, which is what makes per-module hot reload
+    /// isolated from the project and from other modules.
+    #[test]
+    fn clearing_one_owner_leaves_other_owners_running() {
+        let project_runs = Arc::new(AtomicUsize::new(0));
+        let module_runs = Arc::new(AtomicUsize::new(0));
+
+        let mut engine = Engine::new();
+        let project_counter = Arc::clone(&project_runs);
+        engine.register_system("project_system", move || {
+            project_counter.fetch_add(1, AtomicOrdering::SeqCst);
+        });
+
+        let module_owner = SystemOwner::optional_module(0);
+        engine.begin_module_registration(module_owner);
+        let module_counter = Arc::clone(&module_runs);
+        engine.register_system("module_system", move || {
+            module_counter.fetch_add(1, AtomicOrdering::SeqCst);
+        });
+        engine.end_module_registration();
+
+        engine.process_frame().unwrap();
+        assert_eq!(project_runs.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(module_runs.load(AtomicOrdering::SeqCst), 1);
+
+        // Reloading the module removes only its own system.
+        assert_eq!(engine.clear_systems_owned_by(module_owner), 1);
+        engine.process_frame().unwrap();
+        assert_eq!(project_runs.load(AtomicOrdering::SeqCst), 2);
+        assert_eq!(module_runs.load(AtomicOrdering::SeqCst), 1);
+
+        // The project keeps running after its own systems are cleared too.
+        assert_eq!(engine.clear_systems_owned_by(SystemOwner::PROJECT), 1);
+        engine.process_frame().unwrap();
+        assert_eq!(project_runs.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    /// Registration outside a module scope is attributed to the project, and
+    /// scoping is restored after the module finishes registering.
+    #[test]
+    fn registration_scope_returns_to_the_project_owner() {
+        let mut engine = Engine::new();
+        engine.begin_module_registration(SystemOwner::optional_module(3));
+        engine.register_system("owned_by_module", || {});
+        engine.end_module_registration();
+        engine.register_system("owned_by_project", || {});
+
+        // Only the module's system is removed by clearing its owner.
+        assert_eq!(
+            engine.clear_systems_owned_by(SystemOwner::optional_module(3)),
+            1
+        );
+        assert_eq!(engine.is_system_enabled("owned_by_project"), Some(true));
+        assert_eq!(engine.is_system_enabled("owned_by_module"), None);
+    }
+
+    /// Clearing an owner with no registered systems changes nothing, so a
+    /// module that failed to register cannot disturb the rest of the schedule.
+    #[test]
+    fn clearing_an_unused_owner_is_a_no_op() {
+        let mut engine = Engine::new();
+        engine.register_system("project_system", || {});
+        assert_eq!(
+            engine.clear_systems_owned_by(SystemOwner::optional_module(7)),
+            0
+        );
+        assert_eq!(engine.is_system_enabled("project_system"), Some(true));
+    }
+
+    /// After removing one system of several, the scheduler's access patterns
+    /// stay aligned with the engine's system list, so the surviving systems are
+    /// still scheduled and executed.
+    #[test]
+    fn scheduler_stays_aligned_after_removing_a_middle_system() {
+        let first_runs = Arc::new(AtomicUsize::new(0));
+        let last_runs = Arc::new(AtomicUsize::new(0));
+
+        let mut engine = Engine::new();
+        let first_counter = Arc::clone(&first_runs);
+        engine.register_system("first", move || {
+            first_counter.fetch_add(1, AtomicOrdering::SeqCst);
+        });
+
+        let middle_owner = SystemOwner::optional_module(1);
+        engine.begin_module_registration(middle_owner);
+        engine.register_system("middle", || {});
+        engine.end_module_registration();
+
+        let last_counter = Arc::clone(&last_runs);
+        engine.register_system("last", move || {
+            last_counter.fetch_add(1, AtomicOrdering::SeqCst);
+        });
+
+        engine.clear_systems_owned_by(middle_owner);
+        engine.process_frame().unwrap();
+
+        assert_eq!(first_runs.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(last_runs.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(engine.is_system_enabled("middle"), None);
     }
 }

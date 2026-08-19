@@ -27,6 +27,8 @@ mod config;
 mod csharp;
 /// Native project-library loading and Windows-safe temporary-copy handling.
 mod native_library;
+/// Lifecycle management for optional engine modules.
+mod optional_module;
 /// Lifecycle management for the active native or managed project module.
 mod project_module;
 /// Complete standalone application runner owned by the host crate.
@@ -41,12 +43,16 @@ mod watcher;
 // ===== Re-exports =====
 
 // Local host modules and the shared crate-root error surface.
-pub use config::{CSharpModuleConfig, ProjectModuleBackend, ProjectModuleConfig};
+pub use config::{
+    selected_optional_modules, CSharpModuleConfig, HostConfig, OptionalModuleConfig,
+    ProjectModuleBackend, ProjectModuleConfig,
+};
+pub use optional_module::OPTIONAL_MODULE_ABI_VERSION;
 #[cfg(feature = "rendering")]
 pub use pill_core::error::FrontendError;
 pub use pill_core::error::{
     engine_report, install_engine_report_handler, BuildError, CSharpError, ConfigError,
-    EngineMessage, EngineReportHandler, HostError, LibraryError, MessageRenderer,
+    EngineMessage, EngineReportHandler, HostError, LibraryError, MessageRenderer, ModuleError,
     PlainMessageRenderer, SemanticRole, StyledDiagnosticProxy, TerminalMessageRenderer,
     WatcherError,
 };

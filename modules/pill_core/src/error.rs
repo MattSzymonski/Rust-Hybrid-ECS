@@ -521,6 +521,53 @@ pub enum LibraryError {
     InitializationFailed { status: u32 },
 }
 
+/// Optional-module loading and compatibility failures.
+///
+/// Distinct from [`LibraryError`], which covers the mechanics of mapping a
+/// library: these report a broken contract between the host and a module.
+#[engine_error(namespace = host::module)]
+pub enum ModuleError {
+    /// The module was built against a different module ABI revision.
+    #[message(
+        "optional module ",
+        name_style(module),
+        " reports ABI version ",
+        value(module_version),
+        " but the host requires ",
+        value(host_version)
+    )]
+    #[diagnostic(help("rebuild the module against the current engine sources"))]
+    AbiVersionMismatch {
+        module: String,
+        module_version: u32,
+        host_version: u32,
+    },
+
+    /// The module does not export an ABI revision at all.
+    #[message(
+        "optional module ",
+        name_style(module),
+        " does not export pill_module_abi_version"
+    )]
+    #[diagnostic(help(
+        "an optional module must export pill_module_abi_version, pill_module_init and, optionally, pill_module_update"
+    ))]
+    AbiVersionMissing { module: String },
+
+    /// The module's registration entry point reported a failed generation.
+    #[message(
+        "optional module ",
+        name_style(module),
+        " initialization failed with status ",
+        value(status)
+    )]
+    InitializationFailed { module: String, status: u32 },
+
+    /// Two configured modules share one name.
+    #[message("optional module name ", name_style(module), " is configured twice")]
+    DuplicateName { module: String },
+}
+
 /// Source-watching startup failures.
 ///
 /// Distinct from build failures: the watcher must start before any build can
@@ -737,6 +784,10 @@ pub enum HostError {
     /// The source watcher could not start.
     #[transparent]
     Watcher(#[from] WatcherError),
+
+    /// An optional module failed to load or is incompatible.
+    #[transparent]
+    Module(#[from] ModuleError),
 
     /// The managed backend failed to start.
     #[transparent]

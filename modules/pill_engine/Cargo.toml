@@ -94,6 +94,14 @@ harness = false
 [lib]
 name = "pill_engine"
 path = "src/lib.rs"
+# Deliberately not a `dylib`. Sharing one engine library across the host and
+# every loaded module would remove the duplicated statics described in
+# `local/documents/modularity_implementation_plan.md`, but a Rust dylib must
+# export every symbol, and with the `rendering` feature the wgpu, naga and winit
+# instantiations push the export table past the Windows limit of 65535
+# (`LINK : fatal error LNK1189`). The shared boundary is `pill_core` instead,
+# which carries the telemetry and logging globals without the graphics stack.
+crate-type = ["rlib"]
 
 [[bin]]
 name = "pill_engine"

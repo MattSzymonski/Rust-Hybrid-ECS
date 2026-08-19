@@ -298,6 +298,40 @@ impl SystemScheduler {
         self.conflict_matrix.push(new_row);
     }
 
+    /// Keeps only the systems whose entry in `keep` is true.
+    ///
+    /// `keep` is indexed the same way as the engine's system vector, so the two
+    /// stay aligned after the filter. The conflict matrix is rebuilt from the
+    /// surviving access patterns rather than filtered in place, because
+    /// removing a row and its column leaves the remaining indices shifted.
+    ///
+    /// Used by hot reload to drop one module's systems while every other
+    /// module keeps running.
+    pub fn retain(&mut self, keep: &[bool]) {
+        let mut index = 0;
+        self.access_patterns.retain(|_| {
+            // Entries beyond `keep` cannot exist while the caller keeps the
+            // two collections aligned, but defaulting to keeping them means a
+            // mismatch drops no system silently.
+            let keep_this = keep.get(index).copied().unwrap_or(true);
+            index += 1;
+            keep_this
+        });
+        self.system_count = self.access_patterns.len();
+
+        // Recompute conflicts pairwise for the systems that remain.
+        self.conflict_matrix = vec![vec![false; self.system_count]; self.system_count];
+        for first in 0..self.system_count {
+            for second in 0..first {
+                let conflict =
+                    self.access_patterns[first].conflicts_with(&self.access_patterns[second]);
+                self.conflict_matrix[first][second] = conflict;
+                self.conflict_matrix[second][first] = conflict;
+            }
+        }
+        self.execution_graph.clear();
+    }
+
     /// Builds the execution graph based on dependencies.
     ///
     /// Uses a precomputed conflict matrix so that each pairwise check is
