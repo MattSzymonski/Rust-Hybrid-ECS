@@ -20,10 +20,12 @@ pill_standalone` therefore needs no environment variables. Everything else —
 backend, name, watch directory, build command, and output paths — is inferred
 from the project's manifest, so no project identity is compiled into the host.
 
-The environment can still override the file for a single run:
+The environment can still override the project for a single run:
 
 - `PROJECT_PATH` overrides `project` in `pill_config.yaml`.
-- `PILL_MODULES` overrides `modules` in `pill_config.yaml`.
+
+There is no environment override for `modules`: it is always read from
+`pill_config.yaml`.
 
 Rust project (headless):
 
@@ -44,13 +46,12 @@ and loaded by the host next to the project. Each is watched, rebuilt and swapped
 on its own, so editing one module reloads only that module and leaves the
 project and every other module running.
 
-The `modules` list in `pill_config.yaml` selects which ones to load (in order),
-and `PILL_MODULES` overrides it as a comma-separated list of crate directory
-names. It defaults to `pill_test`; an empty value loads none.
+The `modules` list in `pill_config.yaml` selects which ones to load, in order.
+An absent or empty list loads none.
 
 - `modules: ["pill_spline"]` in `pill_config.yaml` — load the spline module.
-- `$env:PILL_MODULES = "pill_test,pill_physics"` — several modules.
-- `$env:PILL_MODULES = ""` — run with no optional modules.
+- `modules: ["pill_spline", "pill_physics"]` — several modules.
+- `modules: []` (or omitting the key) — run with no optional modules.
 
 ### Adding a module
 
@@ -61,7 +62,7 @@ existing; nothing lists it by name.
    `crate-type = ["cdylib", "rlib"]` and depending on `pill_engine`.
 2. Export `pill_module_abi_version` and `pill_module_init`, optionally
    `pill_module_update`.
-3. Add `<name>` to `PILL_MODULES`.
+3. Add `<name>` to the `modules` list in `pill_config.yaml`.
 
 Everything else — watch directory, build command, output path — is derived from
 the directory name, so the host needs no changes. See

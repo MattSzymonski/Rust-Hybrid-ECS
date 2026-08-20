@@ -44,8 +44,8 @@ mod watcher;
 
 // Local host modules and the shared crate-root error surface.
 pub use config::{
-    selected_optional_modules, CSharpModuleConfig, HostConfig, OptionalModuleConfig,
-    ProjectModuleBackend, ProjectModuleConfig,
+    CSharpModuleConfig, HostConfig, OptionalModuleConfig, ProjectModuleBackend,
+    ProjectModuleConfig,
 };
 pub use optional_module::OPTIONAL_MODULE_ABI_VERSION;
 #[cfg(feature = "rendering")]

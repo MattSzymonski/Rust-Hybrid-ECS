@@ -44,9 +44,6 @@ const CSHARP_RUNTIME_OUTPUT_SUBDIRECTORY: &str = "pill_csharp_runtime/bin/Releas
 /// Default target framework used for the managed project output path.
 const CSHARP_TARGET_FRAMEWORK: &str = "net8.0";
 
-/// Comma-separated list of optional modules to build, watch and load.
-const OPTIONAL_MODULES_ENVIRONMENT_VARIABLE: &str = "PILL_MODULES";
-
 /// Workspace-relative directory holding every optional module crate.
 ///
 /// The workspace manifest globs this directory, so a module is discovered by
@@ -59,9 +56,6 @@ const OPTIONAL_MODULE_DIRECTORY: &str = "optional";
 /// `optional/*` workspace glob discovers it without any entry in the workspace
 /// manifest; only the package name differs per project.
 const HOST_PROJECT_MEMBER_PREFIX: &str = "host_project_";
-
-/// Optional modules loaded when `PILL_MODULES` is not set.
-const DEFAULT_OPTIONAL_MODULES: &str = "pill_test";
 
 /// Optional host configuration file name, resolved in the engine workspace
 /// root. Declares the project and the optional modules; environment variables
@@ -238,7 +232,7 @@ pub struct HostConfig {
     /// The project module selected by `PROJECT_PATH`.
     pub project: ProjectModuleConfig,
 
-    /// Optional modules selected by `PILL_MODULES`, loaded before the project.
+    /// Optional modules selected by `pill_config.yaml`, loaded before the project.
     pub optional_modules: Vec<OptionalModuleConfig>,
 }
 
@@ -247,10 +241,9 @@ impl HostConfig {
     /// `pill_config.yaml` file in the workspace root.
     ///
     /// The file declares the project and the optional modules. `PROJECT_PATH`
-    /// overrides the file's `project` entry and `PILL_MODULES` overrides its
-    /// `modules` entry, so a single run can still opt in or out without editing
-    /// the file. See [`ProjectModuleConfig::from_environment`] and
-    /// [`selected_optional_modules`].
+    /// overrides the file's `project` entry for a single run; the optional
+    /// module list comes from the file alone, so which modules load is always
+    /// visible in one place instead of depending on shell state.
     ///
     /// # Errors
     ///
@@ -258,8 +251,7 @@ impl HostConfig {
     /// configuration cannot be derived, the configuration file cannot be
     /// parsed, or a configured module is invalid.
     pub fn from_environment() -> Result<Self, ConfigError> {
-        // Step 1: Load the optional host configuration file. Environment
-        // variables take precedence over the file for per-run overrides.
+        // Step 1: Load the optional host configuration file.
         let file_config = read_host_file_config()?;
 
         // Step 2: Resolve the effective project path: the environment wins,
@@ -304,42 +296,15 @@ impl From<ProjectModuleConfig> for HostConfig {
     }
 }
 
-/// Read the selected optional modules from the environment.
+/// Resolve the optional modules to load from the host configuration file.
 ///
-/// `PILL_MODULES` is a comma-separated list of crate directory names inside the
-/// engine workspace, for example `pill_test,pill_physics`. When it is not set
-/// the default set is loaded; setting it to an empty value disables optional
-/// modules entirely, which is how one run opts out without a rebuild.
-///
-/// Prefer [`HostConfig::from_environment`], which also honours the
-/// `pill_config.yaml` file; this function reads the environment only.
-pub fn selected_optional_modules() -> Vec<String> {
-    parse_optional_module_list(
-        &env::var(OPTIONAL_MODULES_ENVIRONMENT_VARIABLE)
-            .unwrap_or_else(|_| DEFAULT_OPTIONAL_MODULES.to_string()),
-    )
-}
-
-/// Resolve the optional modules to load: the environment wins, then the host
-/// configuration file, then the default set.
+/// An absent file or an empty `modules` list both mean no optional modules,
+/// so leaving `pill_config.yaml` unwritten is equivalent to opting out.
 fn optional_module_names(file_config: &Option<HostFileConfig>) -> Vec<String> {
-    match env::var(OPTIONAL_MODULES_ENVIRONMENT_VARIABLE) {
-        Ok(list) => parse_optional_module_list(&list),
-        Err(_) => match file_config {
-            Some(config) if !config.modules.is_empty() => config.modules.clone(),
-            _ => parse_optional_module_list(DEFAULT_OPTIONAL_MODULES),
-        },
-    }
-}
-
-/// Split a comma-separated module list, trimming whitespace and dropping
-/// empty entries, so a trailing comma or stray spaces never load a bogus crate.
-fn parse_optional_module_list(list: &str) -> Vec<String> {
-    list.split(',')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_string)
-        .collect()
+    file_config
+        .as_ref()
+        .map(|config| config.modules.clone())
+        .unwrap_or_default()
 }
 
 impl ProjectModuleConfig {
@@ -705,7 +670,9 @@ fn dependency_sub_table_key(section: &str) -> Option<&str> {
 struct HostFileConfig {
     /// Project directory, workspace-relative; overridden by `PROJECT_PATH`.
     project: Option<String>,
-    /// Optional module crate names, in load order; overridden by `PILL_MODULES`.
+    /// Optional module crate names, in load order. The only source for this
+    /// list: there is no environment-variable override, so the file is always
+    /// the complete answer to "which modules load".
     modules: Vec<String>,
 }
 

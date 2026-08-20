@@ -226,18 +226,75 @@ fn spline_probe_system(
     // whether a separately loaded copy of the crate shares the component type.
     let mut visible_spline_count = 0;
     let mut midpoint = pill_core::math::Vector3f::ZERO;
+    let mut color: f32 = 0.1;
     for spline in splines.iter_mut() {
         visible_spline_count += 1;
         midpoint = spline.get_location_at(0.5);
+        color = spline.get_color_a();
+
     }
     // Printed rather than logged through `tracing`: the project links its own
     // copy of `pill_core`, so its tracing dispatcher has no subscriber and log
     // lines emitted here never reach the host's telemetry.
     println!(
-        "[project] sees {visible_spline_count} spline(s), midpoint ({:.1}, {:.1})",
-        midpoint.x, midpoint.y
+        "[project] xxsees {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), color {:.2}",
+        midpoint.x, midpoint.y, color
     );
+
     Ok(())
+}
+
+// =============================================================================
+// Dummy optional module usage
+// =============================================================================
+
+/// Exercises each dummy optional module once, purely to demonstrate that the
+/// project can depend on and call into them directly.
+fn run_dummy_module_demo() {
+    let mut adder = pill_dummy_math::Adder::default();
+    adder.add(2);
+    adder.add(3);
+    println!(
+        "[project] pill_dummy_math: total={}, double(total)={}",
+        adder.total,
+        pill_dummy_math::double(adder.total)
+    );
+
+    let greeter = pill_dummy_text::Greeter {
+        name: String::from("World"),
+    };
+    println!(
+        "[project] pill_dummy_text: {} / {} / shouted: {}",
+        greeter.greeting(),
+        greeter.farewell(),
+        pill_dummy_text::shout(&greeter.greeting())
+    );
+
+    let tint = pill_dummy_color::Tint {
+        r: 0.2,
+        g: 0.4,
+        b: 0.6,
+    };
+    let mixed = tint.mix(tint.invert());
+    println!(
+        "[project] pill_dummy_color: mixed={:?}, grayscale={:.2}",
+        mixed,
+        pill_dummy_color::grayscale(tint)
+    );
+
+    let mut stopwatch = pill_dummy_timer::Stopwatch::default();
+    stopwatch.tick(0.5);
+    stopwatch.tick(0.25);
+    println!(
+        "[project] pill_dummy_timer: elapsed={:.2}s ({}ms)",
+        stopwatch.elapsed_seconds,
+        pill_dummy_timer::seconds_to_millis(stopwatch.elapsed_seconds)
+    );
+
+    let mut random = pill_dummy_random::seed_from_u32(42);
+    let first = random.next_u32();
+    let second = random.next_f32();
+    println!("[project] pill_dummy_random: next_u32={first}, next_f32={second:.4}");
 }
 
 // =============================================================================
@@ -281,8 +338,9 @@ pub unsafe extern "C" fn project_init(api: *const EngineApi) -> u32 {
     // crate. Registration is keyed by the type, so this is the same component
     // the crate itself would register only when both sides were compiled in one
     // workspace; a separately built copy is a distinct type with its own
-    // storage. Keep `pill_spline` out of PILL_MODULES while the project links
-    // it directly, so there is exactly one registration of the type.
+    // storage. Keep `pill_spline` out of `pill_config.yaml`'s `modules:` list
+    // while the project links it directly, so there is exactly one
+    // registration of the type.
     engine
         .world_mut()
         .register_persistable_component::<Spline>();
@@ -367,6 +425,8 @@ pub unsafe extern "C" fn project_init(api: *const EngineApi) -> u32 {
             }
         }
     }
+
+    run_dummy_module_demo();
 
     // Report successful registration so the host keeps this generation.
     0

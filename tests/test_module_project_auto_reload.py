@@ -45,6 +45,19 @@ from typing import List, Optional, Tuple
 WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 MODULES_ROOT = WORKSPACE_ROOT / "modules"
 MODULE_LIB_RS = MODULES_ROOT / "optional" / "pill_spline" / "src" / "lib.rs"
+HOST_CONFIG_YAML = MODULES_ROOT / "pill_config.yaml"
+
+# The host has no environment-variable override for the optional-module list,
+# so this test drives it the same way a person would: by writing the config
+# file the host actually reads. The real file is backed up and restored around
+# the run so this test never leaves a developer's `pill_config.yaml` changed.
+TEST_HOST_CONFIG = """\
+project: "../examples/project_rs"
+modules:
+  - "pill_spline"
+"""
+
+ORIGINAL_HOST_CONFIG: Optional[str] = None
 
 STARTUP_TOKEN = "Entering project loop"
 PROBE_PREFIX = "midpoint ("
@@ -171,6 +184,34 @@ class OutputMonitor:
 
 
 # =============================================================================
+# Host config helpers
+# =============================================================================
+
+
+def install_test_host_config() -> None:
+    """Backs up the real `pill_config.yaml` and installs the test's own.
+
+    The host reads `modules` only from this file, so the test writes a minimal
+    config that loads just `pill_spline`, keeping the scenario independent of
+    whatever optional modules a developer's real config currently lists.
+    """
+    global ORIGINAL_HOST_CONFIG
+    if HOST_CONFIG_YAML.exists():
+        ORIGINAL_HOST_CONFIG = HOST_CONFIG_YAML.read_text(encoding="utf-8")
+    else:
+        ORIGINAL_HOST_CONFIG = None
+    HOST_CONFIG_YAML.write_text(TEST_HOST_CONFIG, encoding="utf-8")
+
+
+def restore_host_config() -> None:
+    """Restores the real `pill_config.yaml`, or removes the test's own."""
+    if ORIGINAL_HOST_CONFIG is None:
+        HOST_CONFIG_YAML.unlink(missing_ok=True)
+    else:
+        HOST_CONFIG_YAML.write_text(ORIGINAL_HOST_CONFIG, encoding="utf-8")
+
+
+# =============================================================================
 # Process helpers
 # =============================================================================
 
@@ -189,9 +230,11 @@ def kill_stray_hosts() -> None:
 
 def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
     """Starts the host with the module-project setup and returns process + monitor."""
+    # The optional-module list comes only from `pill_config.yaml`
+    # (installed by `install_test_host_config`); `PROJECT_PATH` is still a
+    # supported override and pins the project explicitly for this test.
     process_environment = os.environ.copy()
     process_environment["PROJECT_PATH"] = "../examples/project_rs"
-    process_environment["PILL_MODULES"] = "pill_spline"
 
     process = subprocess.Popen(
         ["cargo", "run", "--package", "pill_standalone"],
@@ -358,18 +401,21 @@ def main() -> None:
     print("=" * 60)
 
     kill_stray_hosts()
+    install_test_host_config()
 
     if not build_workspace():
         restore_original()
+        restore_host_config()
         sys.exit(1)
 
     passed = False
     try:
         passed = run_suite(expected_midpoint)
     finally:
-        print("\n  [CLEANUP] Restoring original module source...")
+        print("\n  [CLEANUP] Restoring original module source and host config...")
         restore_original()
-        print("  [OK] Source restored.")
+        restore_host_config()
+        print("  [OK] Source and host config restored.")
     print("\n" + "=" * 60)
     print("  TEST PASSED" if passed else "  TEST FAILED")
     print("=" * 60)
