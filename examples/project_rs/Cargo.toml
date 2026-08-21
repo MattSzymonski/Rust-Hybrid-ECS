@@ -11,7 +11,21 @@ pill_engine = { path = "../../modules/pill_engine" }
 pill_core = { path = "../../modules/pill_core" }
 # Linked directly so the project can name the `Spline` type. See the note in
 # `project_init` about why this crate must not also be loaded as a module.
-pill_spline = { path = "../../modules/optional/pill_spline" }
+# `default-features = false` drops `module-abi`, same reasoning as the dummy
+# modules below.
+pill_spline = { path = "../../modules/optional/pill_spline", default-features = false }
+# Dummy optional modules, linked directly purely to exercise their structs and
+# free functions from the project. `default-features = false` drops each
+# crate's `module-abi` feature, which is what strips its `#[no_mangle]`
+# `pill_module_*` exports; linking more than one crate that defines those same
+# symbol names into this one `cdylib` would otherwise be a linker error. Each
+# crate can still be built standalone (`module-abi` on by default) for the
+# host to hot-load independently via `pill_config.yaml`.
+pill_dummy_math = { path = "../../modules/optional/pill_dummy_math", default-features = false }
+pill_dummy_text = { path = "../../modules/optional/pill_dummy_text", default-features = false }
+pill_dummy_color = { path = "../../modules/optional/pill_dummy_color", default-features = false }
+pill_dummy_timer = { path = "../../modules/optional/pill_dummy_timer", default-features = false }
+pill_dummy_random = { path = "../../modules/optional/pill_dummy_random", default-features = false }
 trait_type_map = { path = "../../../Trait-Type-Map" }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"

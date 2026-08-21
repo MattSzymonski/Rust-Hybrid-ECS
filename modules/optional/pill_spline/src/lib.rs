@@ -28,7 +28,9 @@
 //! component's type identity the same on both sides.
 
 // Standard library
+#[cfg(feature = "module-abi")]
 use std::ffi::c_char;
+#[cfg(feature = "module-abi")]
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 // External crates
@@ -43,6 +45,7 @@ use trait_type_map::impl_trait_accessible;
 // =============================================================================
 
 /// Optional-module ABI revision this crate was built against.
+#[cfg(feature = "module-abi")]
 const MODULE_ABI_VERSION: u32 = 1;
 
 /// Maximum number of control points one spline can hold.
@@ -54,6 +57,7 @@ pub const MAX_CONTROL_POINTS: usize = 16;
 const DEMO_SPLINE_COUNT: usize = 1;
 
 /// Name reported to the host for diagnostics; null terminated for the C ABI.
+#[cfg(feature = "module-abi")]
 const MODULE_NAME: &[u8] = b"pill_spline\0";
 
 // =============================================================================
@@ -168,10 +172,15 @@ impl Spline {
                 } else {
                     end
                 };
-                Vector3f::new(2122.0, 2.0, 1.0)
+                Vector3f::new(1.0, 6.0, 1.0)
                 //catmull_rom(before_start, start, end, after_end, local_t)
             }
         }
+    }
+
+    /// Dummy alpha channel, delegated straight through to `pill_dummy_color`.
+    pub fn get_color_a(&self) -> f32 {
+        pill_dummy_color::get_color_a()
     }
 }
 
@@ -225,6 +234,7 @@ fn demo_spline() -> Spline {
 ///
 /// The module registers no system: it contributes a component type and the math
 /// to sample it, leaving movement along a path to whoever owns that behaviour.
+#[cfg(feature = "module-abi")]
 pub fn register(engine: &mut Engine) -> u32 {
     // Persistable registration is what makes the component survive a reload:
     // the host matches schemas by type name and migrates only changed layouts.
@@ -265,14 +275,21 @@ pub fn register(engine: &mut Engine) -> u32 {
 // =============================================================================
 // Optional-module ABI exports
 // =============================================================================
+//
+// Gated behind `module-abi` (on by default) so a crate linked directly into
+// another binary, such as the project, can disable it: two crates exporting
+// the same `#[no_mangle]` symbol names into one binary is a linker error. The
+// standalone build the host hot-loads keeps the feature enabled.
 
 /// Module ABI revision, checked by the host before anything else is called.
+#[cfg(feature = "module-abi")]
 #[no_mangle]
 pub extern "C" fn pill_module_abi_version() -> u32 {
     MODULE_ABI_VERSION
 }
 
 /// Human-readable module name used in host log messages.
+#[cfg(feature = "module-abi")]
 #[no_mangle]
 pub extern "C" fn pill_module_name() -> *const c_char {
     MODULE_NAME.as_ptr() as *const c_char
@@ -284,6 +301,7 @@ pub extern "C" fn pill_module_name() -> *const c_char {
 ///
 /// `api` must be a valid [`EngineApi`] pointer owned by the host and kept alive
 /// for the whole duration of this call.
+#[cfg(feature = "module-abi")]
 #[no_mangle]
 pub unsafe extern "C" fn pill_module_init(api: *const EngineApi) -> u32 {
     // A panic must never unwind across the C ABI boundary, so it is converted

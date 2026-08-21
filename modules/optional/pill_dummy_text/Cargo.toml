@@ -1,26 +1,17 @@
 [package]
-name = "pill_spline"
+name = "pill_dummy_text"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
 # `cdylib` is the artifact the host loads and hot swaps at runtime. `rlib` is
-# kept both for monolithic release builds and so another module or the project
-# can depend on this crate directly to use the `Spline` type.
+# kept so a monolithic release build can link the same module statically
+# instead, with no second copy of the source.
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pill_core = { path = "../../pill_core" }
 pill_engine = { path = "../../pill_engine" }
-trait_type_map = { path = "../../../../Trait-Type-Map" }
-serde = { version = "1", features = ["derive"] }
-# `default-features = false` drops `module-abi`, which is what strips
-# `pill_dummy_color`'s `#[no_mangle]` `pill_module_*` exports. Cargo unifies a
-# dependency's enabled features across every crate that reaches it within one
-# build, so leaving this on default features here would re-enable them for
-# `project_rs` too (which also links `pill_dummy_color` directly) and bring
-# back the duplicate-symbol linker error the feature exists to avoid.
-pill_dummy_color = { path = "../pill_dummy_color", default-features = false }
 
 [features]
 default = ["module-abi"]
