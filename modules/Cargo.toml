@@ -15,3 +15,33 @@ members = [
     "optional/*",
 ]
 resolver = "2"
+
+# Release profiles are defined here, at the workspace root, so every member
+# builds with the same optimization settings. They used to live in
+# `pill_engine/Cargo.toml`, where Cargo ignored them because profiles must be
+# declared by the root package; the host now logs the intent instead of a
+# "profiles for the non root package will be ignored" warning.
+#
+# NOTE: `panic = "abort"` disables the `catch_unwind` guards that optional
+# modules use across the C ABI boundary. That is fine for a monolithic release
+# binary, but a panicking module aborts the whole host in a `--release` build
+# with hot reload; drop this line if release hot reload must survive module
+# panics.
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# Speed-optimized release profile: trades binary size for maximum throughput.
+# Uses opt-level=3 (aggressive inlining, loop unrolling, auto-vectorization)
+# instead of opt-level="s" (size-optimized). Recommended for production
+# deployments where throughput matters more than binary size.
+[profile.release-fast]
+inherits = "release"
+opt-level = 3
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true

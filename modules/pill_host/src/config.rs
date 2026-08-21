@@ -828,6 +828,12 @@ fn materialize_host_project_member(
     }
 
     // Step 3: Write the generated member, replacing any previous generation.
+    //
+    // When the generated content is unchanged the existing file is left
+    // untouched so its modification time survives. Cargo fingerprints the
+    // manifest by content, so this is not required for correctness, but the
+    // host's own up-to-date build check compares modification times and would
+    // otherwise see a freshly rewritten manifest as newer than every artifact.
     let member_directory = workspace_root
         .join(OPTIONAL_MODULE_DIRECTORY)
         .join(format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}"));
@@ -837,12 +843,18 @@ fn materialize_host_project_member(
             source,
         }
     })?;
-    std::fs::write(member_directory.join("Cargo.toml"), generated_manifest).map_err(|source| {
-        ConfigError::HostProjectMemberCreationFailed {
-            path: member_directory.join("Cargo.toml").display().to_string(),
-            source,
-        }
-    })?;
+    let member_manifest = member_directory.join("Cargo.toml");
+    let content_changed = std::fs::read_to_string(&member_manifest)
+        .map(|existing| existing != generated_manifest)
+        .unwrap_or(true);
+    if content_changed {
+        std::fs::write(&member_manifest, generated_manifest).map_err(|source| {
+            ConfigError::HostProjectMemberCreationFailed {
+                path: member_manifest.display().to_string(),
+                source,
+            }
+        })?;
+    }
 
     Ok(())
 }
@@ -913,9 +925,14 @@ serde = { version = "1", features = ["derive"] }
         std::env::temp_dir().join(format!("pill_host_dependency_test_{}", std::process::id()))
     }
 
-    /// Write a manifest into a unique subdirectory and return its path.
+    /// Write a manifest into a subdirectory and return its path.
+    ///
+    /// Each call starts from a clean subdirectory and tests remove only their
+    /// own subdirectory when done, so parallel tests never delete a manifest
+    /// another test is still reading.
     fn write_manifest(subdirectory: &str, contents: &str) -> PathBuf {
         let directory = temp_root().join(subdirectory);
+        let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("Cargo.toml");
         std::fs::write(&path, contents).unwrap();
@@ -1049,7 +1066,7 @@ pill_spline_extra = { path = "../../modules/optional/pill_spline_extra" }
             &project,
             "pill_spline"
         ));
-        let _ = std::fs::remove_dir_all(temp_root());
+        let _ = std::fs::remove_dir_all(temp_root().join("dependent"));
     }
 
     /// A project that does not depend on the module is not triggered.
@@ -1062,7 +1079,7 @@ pill_spline_extra = { path = "../../modules/optional/pill_spline_extra" }
             &project,
             "pill_spline"
         ));
-        let _ = std::fs::remove_dir_all(temp_root());
+        let _ = std::fs::remove_dir_all(temp_root().join("independent"));
     }
 
     /// A managed project is never triggered, even with a manifest path set,
@@ -1077,7 +1094,7 @@ pill_spline_extra = { path = "../../modules/optional/pill_spline_extra" }
             &project,
             "pill_spline"
         ));
-        let _ = std::fs::remove_dir_all(temp_root());
+        let _ = std::fs::remove_dir_all(temp_root().join("managed"));
     }
 
     /// A missing manifest counts as "no dependency" rather than an error.

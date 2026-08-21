@@ -168,7 +168,7 @@ impl Spline {
                 } else {
                     end
                 };
-                Vector3f::new(1.0, 2.0, 1.0)
+                Vector3f::new(2122.0, 2.0, 1.0)
                 //catmull_rom(before_start, start, end, after_end, local_t)
             }
         }

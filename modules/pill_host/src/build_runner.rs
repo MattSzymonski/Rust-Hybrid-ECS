@@ -19,9 +19,11 @@
 //! saves, and the watchdog loop aborts the build when it observes the change.
 
 // Standard library
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 // External crates
@@ -40,6 +42,245 @@ const BUILD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// How often the build watchdog checks for completion and cancellation.
 const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Marker file recording the toolchain and host feature set that produced the
+/// current module artifacts.
+///
+/// Lives directly under the temporary directory rather than inside a
+/// per-process subdirectory, so the startup cleanup leaves it in place and
+/// every host run against this workspace shares the same record.
+const BUILD_INFO_MARKER: &str = "pill_standalone_temp/build_info.txt";
+
+/// Host feature set that module builds must mirror.
+///
+/// Modules are compiled with the same engine features as the host so type
+/// layouts stay identical across the DLL boundary; a host rebuilt with a
+/// different feature set therefore invalidates every cached module artifact.
+const HOST_MODULE_FEATURE_SET: &str = if cfg!(feature = "rendering") {
+    "rendering"
+} else {
+    "no-rendering"
+};
+
+// =============================================================================
+// Up-to-Date Build Detection
+// =============================================================================
+
+/// The toolchain version line and host feature set of the running host.
+///
+/// Resolved once per process because spawning `rustc` on every check would
+/// dwarf the few milliseconds the check itself saves.
+fn current_build_info() -> String {
+    static CURRENT_BUILD_INFO: OnceLock<String> = OnceLock::new();
+    CURRENT_BUILD_INFO
+        .get_or_init(|| {
+            // `rustc -vV` prints one version line, for example
+            // `rustc 1.95.0 (59807616e 2026-04-14)`, followed by the
+            // configuration table. Cargo embeds the same version into every
+            // crate's metadata hash, so the first line is enough to detect a
+            // toolchain change that would break symbol resolution at load.
+            let rustc_version = Command::new("rustc")
+                .arg("-vV")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .and_then(|output| String::from_utf8(output.stdout).ok())
+                .and_then(|stdout| stdout.lines().next().map(str::to_string))
+                .unwrap_or_default();
+            format!("{rustc_version}\n{HOST_MODULE_FEATURE_SET}")
+        })
+        .clone()
+}
+
+/// Read the build-info record written by the last real module build.
+fn recorded_build_info(workspace_root: &Path) -> Option<String> {
+    std::fs::read_to_string(workspace_root.join(BUILD_INFO_MARKER)).ok()
+}
+
+/// Record the toolchain and host feature set that produced the current
+/// artifacts.
+///
+/// Best-effort by design: a failed write simply leaves the marker missing,
+/// which makes the next run fall back to a real build.
+fn record_build_info(workspace_root: &Path) {
+    let marker_path = workspace_root.join(BUILD_INFO_MARKER);
+    if let Some(parent) = marker_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(marker_path, current_build_info());
+}
+
+/// Whether a module's build artifact is already newer than every input a
+/// rebuild could depend on, letting the host skip cargo entirely.
+///
+/// The host still runs the build whenever this check is uncertain: a missing
+/// artifact, an unknown toolchain, a changed host feature set, or any input
+/// file newer than the artifact all fall through to a real cargo invocation.
+/// Path dependencies are followed recursively, so editing an engine crate or
+/// an external path crate invalidates every module that links it, not just the
+/// module's own sources.
+fn is_build_up_to_date(
+    workspace_root: &Path,
+    output_path: &Path,
+    module_manifest: &Path,
+    watch_directory: &str,
+) -> bool {
+    // Step 1: A missing artifact, or a missing source directory to compare
+    // against, can never be up to date.
+    let Ok(artifact_metadata) = std::fs::metadata(output_path) else {
+        return false;
+    };
+    let Ok(artifact_mtime) = artifact_metadata.modified() else {
+        return false;
+    };
+    if !workspace_root.join(watch_directory).is_dir() {
+        return false;
+    }
+
+    // Step 2: The artifact must have been produced by the current toolchain
+    // and host feature set. A toolchain change alters crate-metadata hashes,
+    // so a module built by an older rustc can no longer resolve the engine's
+    // symbols at load time, and a feature change shifts type layouts.
+    if recorded_build_info(workspace_root).as_deref() != Some(current_build_info().as_str()) {
+        return false;
+    }
+
+    // Step 3: Every input file must be strictly older than the artifact.
+    // Equal timestamps count as stale so a same-instant write is rebuilt.
+    for input in collect_build_inputs(workspace_root, module_manifest, watch_directory) {
+        let Ok(input_metadata) = std::fs::metadata(&input) else {
+            return false;
+        };
+        let Ok(input_mtime) = input_metadata.modified() else {
+            return false;
+        };
+        if input_mtime >= artifact_mtime {
+            return false;
+        }
+    }
+    true
+}
+
+/// Collect every file a module rebuild could depend on: the module's own
+/// watched sources, the workspace-level manifests and lockfile, and the source
+/// trees of every path dependency, resolved recursively.
+fn collect_build_inputs(
+    workspace_root: &Path,
+    module_manifest: &Path,
+    watch_directory: &str,
+) -> Vec<PathBuf> {
+    let mut inputs = Vec::new();
+    let mut visited_manifests = HashSet::new();
+
+    // Step 1: The module's own source tree, watched in place.
+    collect_tree_files(&workspace_root.join(watch_directory), &mut inputs);
+
+    // Step 2: Workspace-wide inputs shared by every member build.
+    inputs.push(workspace_root.join("Cargo.toml"));
+    inputs.push(workspace_root.join("Cargo.lock"));
+    inputs.push(workspace_root.join(".cargo").join("config.toml"));
+
+    // Step 3: Path dependencies, followed recursively from the module manifest.
+    collect_manifest_dependencies(
+        workspace_root,
+        module_manifest,
+        &mut inputs,
+        &mut visited_manifests,
+    );
+
+    inputs
+}
+
+/// Walk a directory tree, collecting every file.
+///
+/// Build-output directories are skipped so the walk never descends into a
+/// crate's `target/` directory.
+fn collect_tree_files(directory: &Path, inputs: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if file_type.is_dir() {
+            if entry.file_name() != "target" {
+                collect_tree_files(&path, inputs);
+            }
+        } else if file_type.is_file() {
+            inputs.push(path);
+        }
+    }
+}
+
+/// Recursively collect the source trees of every path dependency reachable
+/// from `manifest`, guarding against cycles with a visited set keyed on
+/// canonical manifest paths.
+fn collect_manifest_dependencies(
+    workspace_root: &Path,
+    manifest: &Path,
+    inputs: &mut Vec<PathBuf>,
+    visited_manifests: &mut HashSet<PathBuf>,
+) {
+    // The manifest itself is an input to the build, and is canonicalized so
+    // the same crate reached through different spellings is only processed once.
+    let canonical_manifest = manifest
+        .canonicalize()
+        .unwrap_or_else(|_| manifest.to_path_buf());
+    if !visited_manifests.insert(canonical_manifest) {
+        return;
+    }
+    inputs.push(manifest.to_path_buf());
+
+    // Parse every `path = "..."` value. This lightweight scan matches the
+    // project-member materialization and needs no TOML dependency; every
+    // occurrence is resolved against the manifest directory, which covers
+    // `[dependencies]`, `[patch]`, and a `[lib]` `path` alike.
+    let Ok(content) = std::fs::read_to_string(manifest) else {
+        return;
+    };
+    let manifest_directory = manifest.parent().unwrap_or(workspace_root);
+    let mut cursor = 0usize;
+    while let Some(relative_start) = content[cursor..].find("path = \"") {
+        let value_start = cursor + relative_start + "path = \"".len();
+        let Some(relative_end) = content[value_start..].find('"') else {
+            break;
+        };
+        let relative_end = value_start + relative_end;
+        let dependency_path = Path::new(&content[value_start..relative_end]);
+        let dependency_path = if dependency_path.is_absolute() {
+            dependency_path.to_path_buf()
+        } else {
+            manifest_directory.join(dependency_path)
+        };
+
+        // A `path` pointing at a file (a `[lib]` source) is an input as-is; a
+        // directory is a dependency crate, so its tree is walked and its
+        // manifest is parsed for further path dependencies.
+        if dependency_path.is_dir() {
+            let dependency_manifest = dependency_path.join("Cargo.toml");
+            let canonical_dependency = dependency_manifest
+                .canonicalize()
+                .unwrap_or_else(|_| dependency_manifest.clone());
+            // Avoid a second walk of a dependency reached through several
+            // parents; the recursion below performs the insert for its own
+            // cycle guard.
+            if !visited_manifests.contains(&canonical_dependency) {
+                collect_tree_files(&dependency_path, inputs);
+            }
+            collect_manifest_dependencies(
+                workspace_root,
+                &dependency_manifest,
+                inputs,
+                visited_manifests,
+            );
+        } else {
+            inputs.push(dependency_path);
+        }
+        cursor = relative_end;
+    }
+}
 
 // =============================================================================
 // Free Functions
@@ -156,15 +397,7 @@ pub(crate) fn build_project_module(
         "building project module"
     );
 
-    run_build_command(
-        workspace_root,
-        &config.name,
-        &config.build_command,
-        &config.build_environment,
-        cancel_flag,
-    )?;
-
-    // Step 5: Resolve the backend-specific output artifact path.
+    // Step 1: Resolve the backend-specific output artifact path.
     //
     // The build command itself is backend-agnostic, but each backend names and
     // locates its loadable artifact differently. Native outputs use platform
@@ -181,7 +414,46 @@ pub(crate) fn build_project_module(
             .join(format!("{}.dll", config.project_assembly_name)),
     };
 
-    // Step 6: Confirm the resolved artifact exists before reporting success.
+    // Step 2: Skip cargo entirely for a native module whose artifact is
+    // already newer than every build input. The project's own manifest is the
+    // effective source of truth: when it changes, the materialized workspace
+    // member is regenerated and cargo rebuilds, so its modification time is a
+    // reliable staleness signal. Any uncertainty in the check falls through to
+    // a real build below.
+    if matches!(&config.backend, ProjectModuleBackend::NativeLibrary { .. }) {
+        if let Some(manifest_path) = &config.manifest_path {
+            let manifest_path = workspace_root.join(manifest_path);
+            if is_build_up_to_date(
+                workspace_root,
+                &output_path,
+                &manifest_path,
+                &config.watch_directory,
+            ) {
+                info!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    module = config.name.as_str(),
+                    "project module already up to date, skipping build"
+                );
+                return Ok(output_path);
+            }
+        }
+    }
+
+    run_build_command(
+        workspace_root,
+        &config.name,
+        &config.build_command,
+        &config.build_environment,
+        cancel_flag,
+    )?;
+
+    // Step 3: Record the toolchain and host feature set that produced this
+    // artifact so later runs can recognize it as up to date.
+    if matches!(&config.backend, ProjectModuleBackend::NativeLibrary { .. }) {
+        record_build_info(workspace_root);
+    }
+
+    // Step 4: Confirm the resolved artifact exists before reporting success.
     //
     // A successful process exit does not guarantee that configuration points
     // at the artifact it produced. Validate the resolved path here so loading
@@ -216,6 +488,35 @@ pub(crate) fn build_optional_module(
         "building optional module"
     );
 
+    let output_path = workspace_root
+        .join(&config.output_subdirectory)
+        .join(native_library_filename(&config.library_name));
+
+    // The module manifest sits next to the watched source directory, so its
+    // path is derived from the watch directory rather than stored separately.
+    let module_manifest = workspace_root
+        .join(&config.watch_directory)
+        .parent()
+        .map(|parent| parent.join("Cargo.toml"));
+
+    // Skip cargo when the artifact is already newer than every build input;
+    // any uncertainty in the check falls through to a real build below.
+    if let Some(manifest_path) = module_manifest {
+        if is_build_up_to_date(
+            workspace_root,
+            &output_path,
+            &manifest_path,
+            &config.watch_directory,
+        ) {
+            info!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = config.name.as_str(),
+                "optional module already up to date, skipping build"
+            );
+            return Ok(output_path);
+        }
+    }
+
     run_build_command(
         workspace_root,
         &config.name,
@@ -224,9 +525,10 @@ pub(crate) fn build_optional_module(
         cancel_flag,
     )?;
 
-    let output_path = workspace_root
-        .join(&config.output_subdirectory)
-        .join(native_library_filename(&config.library_name));
+    // Record the toolchain and host feature set that produced this artifact so
+    // later runs can recognize it as up to date.
+    record_build_info(workspace_root);
+
     if !output_path.exists() {
         return Err(BuildError::OutputMissing {
             path: output_path.display().to_string(),
@@ -246,5 +548,191 @@ fn native_library_filename(library_name: &str) -> String {
         format!("lib{library_name}.dylib")
     } else {
         format!("lib{library_name}.so")
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a throwaway workspace containing one module, a path dependency,
+    /// and a freshly produced artifact, and return the workspace root plus the
+    /// module's manifest path.
+    ///
+    /// The artifact is written after a short pause so its modification time is
+    /// strictly newer than every input, matching the invariant a real build
+    /// leaves behind.
+    fn test_workspace() -> (PathBuf, PathBuf) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "pill_build_runner_test_{}_{unique}",
+            std::process::id()
+        ));
+
+        // Workspace-level inputs shared by every member build.
+        fs_write(&root.join("Cargo.toml"), "[workspace]\nmembers = []\n");
+        fs_write(&root.join("Cargo.lock"), "# lockfile\n");
+        fs_write(&root.join(".cargo/config.toml"), "");
+
+        // The module itself, plus a path dependency it links.
+        fs_write(&root.join("module/Cargo.toml"), DEPENDENT_MANIFEST);
+        fs_write(
+            &root.join("module/src/lib.rs"),
+            "pub fn answer() -> u32 { 42 }\n",
+        );
+        fs_write(
+            &root.join("dependency/Cargo.toml"),
+            "[package]\nname = \"dependency\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        fs_write(
+            &root.join("dependency/src/lib.rs"),
+            "pub fn helper() -> u32 { 7 }\n",
+        );
+
+        // The artifact is produced last so it is newer than every input.
+        std::thread::sleep(Duration::from_millis(30));
+        let output = root.join("target/debug/module.dll");
+        fs_write(&output, "fake native library");
+        record_build_info(&root);
+
+        let module_manifest = root.join("module/Cargo.toml");
+        (root, module_manifest)
+    }
+
+    /// Write a file, creating parent directories as needed.
+    fn fs_write(path: &Path, content: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// A module manifest that links the local path dependency.
+    const DEPENDENT_MANIFEST: &str = r#"
+[package]
+name = "module"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+dependency = { path = "../dependency" }
+"#;
+
+    /// A freshly built artifact with unchanged inputs is up to date.
+    #[test]
+    fn fresh_artifact_is_up_to_date() {
+        let (root, module_manifest) = test_workspace();
+        let output = root.join("target/debug/module.dll");
+        let watch = "module/src";
+
+        assert!(is_build_up_to_date(&root, &output, &module_manifest, watch));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A source edit newer than the artifact makes the module stale.
+    #[test]
+    fn edited_source_is_stale() {
+        let (root, module_manifest) = test_workspace();
+        let output = root.join("target/debug/module.dll");
+
+        std::thread::sleep(Duration::from_millis(30));
+        fs_write(
+            &root.join("module/src/lib.rs"),
+            "pub fn answer() -> u32 { 43 }\n",
+        );
+
+        assert!(!is_build_up_to_date(
+            &root,
+            &output,
+            &module_manifest,
+            "module/src"
+        ));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An edit to a path dependency is visible to the dependent module.
+    #[test]
+    fn edited_path_dependency_is_stale() {
+        let (root, module_manifest) = test_workspace();
+        let output = root.join("target/debug/module.dll");
+
+        std::thread::sleep(Duration::from_millis(30));
+        fs_write(
+            &root.join("dependency/src/lib.rs"),
+            "pub fn helper() -> u32 { 8 }\n",
+        );
+
+        assert!(!is_build_up_to_date(
+            &root,
+            &output,
+            &module_manifest,
+            "module/src"
+        ));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A workspace lockfile update invalidates every cached artifact.
+    #[test]
+    fn edited_lockfile_is_stale() {
+        let (root, module_manifest) = test_workspace();
+        let output = root.join("target/debug/module.dll");
+
+        std::thread::sleep(Duration::from_millis(30));
+        fs_write(&root.join("Cargo.lock"), "# updated lockfile\n");
+
+        assert!(!is_build_up_to_date(
+            &root,
+            &output,
+            &module_manifest,
+            "module/src"
+        ));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A missing toolchain marker disables the fast path.
+    #[test]
+    fn missing_build_info_is_stale() {
+        let (root, module_manifest) = test_workspace();
+        let output = root.join("target/debug/module.dll");
+
+        std::fs::remove_file(root.join(BUILD_INFO_MARKER)).unwrap();
+
+        assert!(!is_build_up_to_date(
+            &root,
+            &output,
+            &module_manifest,
+            "module/src"
+        ));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A missing artifact can never be up to date.
+    #[test]
+    fn missing_artifact_is_stale() {
+        let (root, module_manifest) = test_workspace();
+        let output = root.join("target/debug/module.dll");
+
+        std::fs::remove_file(&output).unwrap();
+
+        assert!(!is_build_up_to_date(
+            &root,
+            &output,
+            &module_manifest,
+            "module/src"
+        ));
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
