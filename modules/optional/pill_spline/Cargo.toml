@@ -14,20 +14,27 @@ pill_core = { path = "../../pill_core" }
 pill_engine = { path = "../../pill_engine" }
 trait_type_map = { path = "../../../../Trait-Type-Map" }
 serde = { version = "1", features = ["derive"] }
-# `default-features = false` drops `module-abi`, which is what strips
-# `pill_dummy_color`'s `#[no_mangle]` `pill_module_*` exports. Cargo unifies a
-# dependency's enabled features across every crate that reaches it within one
-# build, so leaving this on default features here would re-enable them for
-# `project_rs` too (which also links `pill_dummy_color` directly) and bring
-# back the duplicate-symbol linker error the feature exists to avoid.
+# `default-features = false` keeps `pill_dummy_color`'s `pill_module_*` exports
+# off in this build. Since `module-abi` is opt-in (not a default) this is a
+# no-op today, but it stays as a defensive guard so a future change cannot
+# accidentally pull the exports into this cdylib and duplicate the symbols this
+# crate itself exports.
 pill_dummy_color = { path = "../pill_dummy_color", default-features = false }
 
 [features]
-default = ["module-abi"]
+# `module-abi` is opt-in, not a default: building every member in one cargo
+# invocation (e.g. `cargo build --workspace`) must not turn on the
+# `#[no_mangle]` `pill_module_*` exports for a module's dependency copies.
+# Cargo's feature unification would otherwise leak the default onto those
+# copies and produce duplicate symbols whenever one module links another (e.g.
+# pill_spline -> pill_dummy_color) in the same build. The host passes
+# `--features module-abi` itself when it builds the loadable module.
+default = []
 # Gates the `pill_module_*` C-ABI exports. A crate linked directly into another
-# binary (e.g. the project) disables this, since two crates exporting the same
+# binary (e.g. the project) keeps this off, since two crates exporting the same
 # `#[no_mangle]` symbol names into one binary is a linker error; the standalone
-# build the host hot-loads keeps it enabled so it stays discoverable.
+# build the host hot-loads passes `--features module-abi` so it stays
+# discoverable.
 module-abi = []
 # Must mirror the host's engine feature set: a module built against a
 # differently configured engine can disagree about type layout. The host passes

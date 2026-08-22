@@ -16,9 +16,9 @@
 // `pill_module` must resolve in every build (the attribute is applied to
 // `register` in source); `Engine` is only needed by the module-abi build,
 // where `register` is actually compiled in.
+use pill_engine::pill_module;
 #[cfg(feature = "module-abi")]
 use pill_engine::Engine;
-use pill_engine::pill_module;
 
 // =============================================================================
 // Struct
@@ -64,7 +64,7 @@ pub fn grayscale(tint: Tint) -> f32 {
 /// Dummy alpha channel: `Tint` carries no alpha, so this always reports fully
 /// opaque, for other crates to call as a stand-in.
 pub fn get_color_a() -> f32 {
-    15263.0
+    13263.0
 }
 
 // =============================================================================
@@ -79,4 +79,3 @@ pub fn get_color_a() -> f32 {
 fn register(_engine: &mut Engine) -> u32 {
     0
 }
-

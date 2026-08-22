@@ -199,12 +199,18 @@ impl OptionalModuleConfig {
             // stretches) and halves the fixed per-build cargo overhead.
             "--offline".to_string(),
         ];
+        // Enable the module's C-ABI exports explicitly. The feature is opt-in
+        // (not a default) so that building every member in one cargo
+        // invocation never leaks the `#[no_mangle]` `pill_module_*` exports
+        // onto a module's dependency copies via feature unification.
+        let mut module_features = vec!["module-abi".to_string()];
         // Mirror the host's engine feature set. A module compiled against a
         // differently configured engine can disagree about type layout.
         if cfg!(feature = "rendering") {
-            build_command.push("--features".to_string());
-            build_command.push("rendering".to_string());
+            module_features.push("rendering".to_string());
         }
+        build_command.push("--features".to_string());
+        build_command.push(module_features.join(","));
 
         Self {
             name: name.to_string(),

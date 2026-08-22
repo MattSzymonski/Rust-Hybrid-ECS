@@ -16,6 +16,12 @@ trait_type_map = { path = "../../../../Trait-Type-Map" }
 serde = { version = "1", features = ["derive"] }
 
 [features]
+# `module-abi` is opt-in, not a default (see the other optional modules): the
+# host passes `--features module-abi` when it builds the loadable module, and
+# the feature keeps the `#[no_mangle]` exports out of any build that links
+# this crate statically.
+default = []
+module-abi = []
 # Must mirror the host's engine feature set: a module built against a
 # differently configured engine can disagree about type layout. The host passes
 # this flag automatically when it was itself built with rendering.
