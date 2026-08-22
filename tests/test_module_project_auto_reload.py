@@ -13,10 +13,10 @@ DESCRIPTION
     project's embedded copy of the module's code picks up the change.
 
     The project's spline probe prints the sampled midpoint every frame batch.
-    The test edits the module's hardcoded sample value, then waits for the
-    probe to report the NEW value with no manual project trigger. It also
-    asserts the log sequence: module reload -> queued project reload -> hot
-    reload complete.
+    The test edits the module's sample-offset constant (a code-level knob that
+    shifts every sampled position), then waits for the probe to report the NEW
+    value with no manual project trigger. It also asserts the log sequence:
+    module reload -> queued project reload -> hot reload complete.
 
 USAGE
   python tests/test_module_project_auto_reload.py [--timeout-scale S]
@@ -76,12 +76,16 @@ PROBE_UPDATE_TIMEOUT = 60
 PROCESS_KILL_TIMEOUT = 5
 MAX_BUFFERED_LINES = 7000
 
-# Matches the module's hardcoded sample return inside `get_location_at`. The
-# 1.0 x and z coordinates make it unique: demo-spline control points use other
-# values, so exactly one line in the file matches.
-HARDCODED_RETURN_PATTERN = re.compile(
-    r"^(\s*)Vector3f::new\(1\.0,\s*([0-9.]+),\s*1\.0\)\s*$", re.MULTILINE
+# Matches the module's sample-offset constant used inside `get_location_at`.
+# The value is a plain `f32` literal, so exactly one line in the file matches.
+SAMPLE_OFFSET_PATTERN = re.compile(
+    r"^(\s*)const SAMPLE_VERTICAL_OFFSET:\s*f32\s*=\s*([0-9.]+)\s*;?\s*$", re.MULTILINE
 )
+
+# Vertical position the probe reports before any offset is applied: the
+# project-owned spline's Catmull-Rom midpoint at t = 0.5 (the probe formats it
+# to one decimal). The offset adds directly to this value.
+BASE_PROBE_MIDPOINT_Y = 288.75
 
 ORIGINAL_CONTENT: str = ""
 
@@ -115,17 +119,18 @@ def restore_original() -> None:
 
 def plan_value_edit(content: str) -> Tuple[str, str, str]:
     """Returns (old line, replacement line, expected new probe midpoint)."""
-    matches = list(HARDCODED_RETURN_PATTERN.finditer(content))
+    matches = list(SAMPLE_OFFSET_PATTERN.finditer(content))
     if len(matches) != 1:
         raise RuntimeError(
-            f"Expected exactly one hardcoded return line, found {len(matches)}"
+            f"Expected exactly one SAMPLE_VERTICAL_OFFSET line, found {len(matches)}"
         )
     match = matches[0]
-    current_y = float(match.group(2))
-    new_y = (current_y + 1.0) % 10.0
-    new_y_text = f"{new_y:.1f}"
-    new_line = f"{match.group(1)}Vector3f::new(1.0, {new_y_text}, 1.0)"
-    return match.group(0), new_line, f"midpoint (1.0, {new_y_text})"
+    current_offset = float(match.group(2))
+    new_offset = (current_offset + 1.0) % 10.0
+    new_offset_text = f"{new_offset:.1f}"
+    new_line = f"{match.group(1)}const SAMPLE_VERTICAL_OFFSET: f32 = {new_offset_text};"
+    new_y = BASE_PROBE_MIDPOINT_Y + new_offset
+    return match.group(0), new_line, f"midpoint (400.0, {new_y:.1f})"
 
 
 # =============================================================================

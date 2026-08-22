@@ -48,6 +48,15 @@ pub const MAX_CONTROL_POINTS: usize = 16;
 #[cfg(feature = "module-abi")]
 const DEMO_SPLINE_COUNT: usize = 1;
 
+/// Extra vertical offset applied to every sampled position.
+///
+/// Zero in normal operation. It is a named, code-level constant so the
+/// hot-reload integration suites have a single value to edit in this module's
+/// source and observe the change propagate through a cascade reload to a
+/// dependent project's probe (module *data* persists across reloads, so only
+/// code like this is observable that way).
+const SAMPLE_VERTICAL_OFFSET: f32 = 0.0;
+
 // =============================================================================
 // Component
 // =============================================================================
@@ -141,25 +150,25 @@ impl Spline {
                 let segment_count = points.len() - 1;
                 let scaled = t.clamp(0.0, 1.0) * segment_count as f32;
                 let segment_index = (scaled.floor() as usize).min(segment_count - 1);
-                let _local_t = scaled - segment_index as f32;
+                let local_t = scaled - segment_index as f32;
 
                 let start = points[segment_index];
                 let end = points[segment_index + 1];
                 // The outermost segments have no neighbour beyond the endpoint.
                 // Duplicating the endpoint makes the curve begin and end exactly
                 // on the first and last control points.
-                let _before_start = if segment_index == 0 {
+                let before_start = if segment_index == 0 {
                     start
                 } else {
                     points[segment_index - 1]
                 };
-                let _after_end = if segment_index + 2 < points.len() {
+                let after_end = if segment_index + 2 < points.len() {
                     points[segment_index + 2]
                 } else {
                     end
                 };
-                Vector3f::new(1.0, 26.0, 1.0)
-                //catmull_rom(_before_start, start, end, _after_end, _local_t)
+                let base = catmull_rom(before_start, start, end, after_end, local_t);
+                Vector3f::new(base.x, base.y + SAMPLE_VERTICAL_OFFSET, base.z)
             }
         }
     }
@@ -174,10 +183,6 @@ impl Spline {
 // Free Functions
 // =============================================================================
 
-// The interpolation call in `get_location_at` is temporarily disabled (it
-// returns a fixed demo point), so this evaluator is dead until the call is
-// re-enabled; the allow goes away with it.
-#[allow(dead_code)]
 /// Evaluate one Catmull-Rom segment between `start` and `end`.
 ///
 /// `before_start` and `after_end` are the neighbouring control points that give

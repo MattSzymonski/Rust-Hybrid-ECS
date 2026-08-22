@@ -815,8 +815,8 @@ SESSION_B_SCENARIOS = [
                 SPLINE_LIB_RS,
                 [
                     (
-                        "Vector3f::new(1.0, 26.0, 1.0)",
-                        "Vector3f::new(2.0, 26.0, 1.0)",
+                        "SAMPLE_VERTICAL_OFFSET: f32 = 0.0",
+                        "SAMPLE_VERTICAL_OFFSET: f32 = 10.0",
                     )
                 ],
             )
@@ -829,7 +829,7 @@ SESSION_B_SCENARIOS = [
             RELOAD_PROJECT_TOKEN,
         ],
         forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
-        wait_after=[("midpoint (2.0, 26.0", PROBE_TIMEOUT)],
+        wait_after=[("midpoint (400.0, 298.8", PROBE_TIMEOUT)],
         restore_after=[SPLINE_LIB_RS],
     ),
 ]

@@ -4601,16 +4601,8 @@ dependencies = [
 name = "project"
 version = "0.1.0"
 dependencies = [
- "pill_core",
- "pill_dummy_color",
- "pill_dummy_math",
- "pill_dummy_random",
- "pill_dummy_text",
- "pill_dummy_timer",
  "pill_engine",
- "pill_spline",
  "serde",
- "tracing",
  "trait_type_map",
 ]
 
