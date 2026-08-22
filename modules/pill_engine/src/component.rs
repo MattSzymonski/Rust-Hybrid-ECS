@@ -458,4 +458,35 @@ mod tests {
         assert_eq!(std::mem::size_of::<ComponentTicks>(), 8);
         assert_eq!(std::mem::align_of::<ComponentTicks>(), 4);
     }
+
+    /// `ComponentRegistry::remove` fully unregisters a type so a later
+    /// re-registration works again; the entry is completely gone in between.
+    /// Pins the registry cleanup behind drop-at-detection (audit 3.2).
+    #[test]
+    fn remove_unregisters_and_reregistration_works() {
+        #[derive(Clone, Debug)]
+        struct ReRegisterTestComponent;
+        impl Component for ReRegisterTestComponent {}
+        trait_type_map::impl_trait_accessible!(dyn Component; ReRegisterTestComponent);
+
+        let mut registry = ComponentRegistry::new();
+        let component_id = ComponentId::of::<ReRegisterTestComponent>();
+
+        let first_bit = registry.register::<ReRegisterTestComponent>();
+        assert!(registry.is_registered::<ReRegisterTestComponent>());
+        assert_eq!(registry.get_bit(&component_id), Some(first_bit));
+
+        registry.remove(&component_id);
+        assert!(!registry.is_registered::<ReRegisterTestComponent>());
+        assert_eq!(registry.get_bit(&component_id), None);
+        assert_eq!(registry.get_name(&component_id), None);
+        assert_eq!(registry.get_size(&component_id), None);
+
+        // Re-registering works and, per the documented contract, allocates a
+        // fresh bit (bits are never reused).
+        let second_bit = registry.register::<ReRegisterTestComponent>();
+        assert!(registry.is_registered::<ReRegisterTestComponent>());
+        assert_eq!(registry.get_bit(&component_id), Some(second_bit));
+        assert_ne!(first_bit, second_bit);
+    }
 }

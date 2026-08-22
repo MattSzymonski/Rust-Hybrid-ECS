@@ -24,33 +24,30 @@ EXAMPLE USAGE
 """
 
 import argparse
-import builtins
 import os
 import re
 import subprocess
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
+
+# Shared paths, tokens, print wrapper, OutputMonitor, process helpers. The
+# host's log tokens live in one place (audit opportunity 5.14).
+from suite_common import *  # noqa: F401,F403
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
-WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
 TEST_PROJECT_ROOT = WORKSPACE_ROOT / "tests" / "project"
 PROJECT_LIB_RS = TEST_PROJECT_ROOT / "src" / "lib.rs"
 
-STARTUP_TOKEN = "Entering project loop"
 RELOAD_COMPLETE_TOKEN = "hot reload complete"
-COUNTER_TICK_TOKEN = "counter tick"
-PANIC_TOKEN = "panicked at"
-ACCESS_VIOLATION_TOKEN = "STATUS_ACCESS_VIOLATION"
 FAST_PATH_TOKEN = "schema unchanged for all persistable component types"
-SELECTIVE_START_TOKEN = "[persistence] Selective migration starting"
-SELECTIVE_FINISHED_TOKEN = "[persistence] Selective migration finished"
+SELECTIVE_START_TOKEN = MIGRATION_START_TOKEN
+SELECTIVE_FINISHED_TOKEN = MIGRATION_FINISHED_TOKEN
 FRAMECOUNTER_MIGRATE_LOG_TOKEN = "'project::FrameCounter' -> migrating"
 SPATIAL_POSITION_MIGRATE_LOG_TOKEN = "'project::SpatialPosition' -> migrating"
 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN = "'project::LinearVelocity' -> migrating"
@@ -60,106 +57,9 @@ RELOAD_TIMEOUT = 45
 BUILD_TIMEOUT = 120
 STABILITY_SLEEP = 3
 COUNTER_TICK_TIMEOUT = 10
-PROCESS_KILL_TIMEOUT = 5
 CYCLE_PAUSE = 2
-MAX_BUFFERED_LINES = 7000
-# Counter-tick lines are captured in a dedicated small tail so the flood can
-# never evict the reload lines the scenarios assert on.
-MAX_TICK_TAIL = 200
 
 ORIGINAL_CONTENT: str = ""
-
-# =============================================================================
-# Console colors
-# =============================================================================
-
-ANSI_RESET = "\033[0m"
-ANSI_BOLD = "\033[1m"
-ANSI_DIM = "\033[2m"
-ANSI_RED = "\033[31m"
-ANSI_GREEN = "\033[32m"
-ANSI_YELLOW = "\033[33m"
-ANSI_BLUE = "\033[34m"
-ANSI_MAGENTA = "\033[35m"
-ANSI_CYAN = "\033[36m"
-
-
-def _enable_windows_ansi() -> bool:
-    """Enables ANSI color processing on Windows terminals when possible."""
-    if os.name != "nt":
-        return True
-
-    try:
-        import ctypes
-
-        kernel32 = ctypes.windll.kernel32
-        standard_output_handle = -11
-        enable_virtual_terminal_processing = 0x0004
-
-        handle = kernel32.GetStdHandle(standard_output_handle)
-        if handle == 0:
-            return False
-
-        mode = ctypes.c_uint32()
-        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)) == 0:
-            return False
-
-        new_mode = mode.value | enable_virtual_terminal_processing
-        if kernel32.SetConsoleMode(handle, new_mode) == 0:
-            return False
-
-        return True
-    except Exception:
-        return False
-
-
-def _detect_color_support() -> bool:
-    """Returns True when stdout supports ANSI colors and NO_COLOR is not set."""
-    if os.getenv("NO_COLOR"):
-        return False
-    if not sys.stdout.isatty():
-        return False
-    return _enable_windows_ansi()
-
-
-USE_COLOR = _detect_color_support()
-
-TAG_COLOR_MAP = {
-    "[FAIL]": ANSI_BOLD + ANSI_RED,
-    "[OK]": ANSI_BOLD + ANSI_GREEN,
-    "[WARN]": ANSI_YELLOW,
-    "[TEST]": ANSI_BOLD + ANSI_BLUE,
-    "[PREP]": ANSI_BOLD + ANSI_CYAN,
-    "[PASS]": ANSI_BOLD + ANSI_GREEN,
-    "[CLEANUP]": ANSI_BOLD + ANSI_MAGENTA,
-    "[std]": ANSI_DIM + ANSI_CYAN,
-}
-
-
-def _colorize_message(message: str) -> str:
-    """Applies color to known status tags in one output line."""
-    if not USE_COLOR:
-        return message
-
-    colored_message = message
-    for tag, color_code in TAG_COLOR_MAP.items():
-        colored_message = colored_message.replace(tag, f"{color_code}{tag}{ANSI_RESET}")
-    return colored_message
-
-
-def print(*args, **kwargs) -> None:  # type: ignore[override]
-    """Print wrapper that colors status tags while preserving normal behavior."""
-    output_file = kwargs.get("file", sys.stdout)
-    if output_file is not sys.stdout:
-        builtins.print(*args, **kwargs)
-        return
-
-    separator = kwargs.get("sep", " ")
-    end = kwargs.get("end", "\n")
-    flush = kwargs.get("flush", False)
-
-    message = separator.join(str(argument) for argument in args)
-    builtins.print(_colorize_message(message), end=end, flush=flush)
 
 # =============================================================================
 # Source edit patterns
@@ -325,111 +225,8 @@ def apply_replacements(replacements: Sequence[Tuple[str, str]]) -> bool:
 
 
 # =============================================================================
-# Output monitor
-# =============================================================================
-
-
-class OutputMonitor:
-    """Captures merged stdout/stderr lines from standalone in a background thread."""
-
-    def __init__(self, process: subprocess.Popen) -> None:
-        self._process = process
-        # Lines are stored as (sequence, line) pairs so waiters stay correct
-        # even after the rolling buffer drops old entries. Counter-tick lines
-        # go to a small dedicated tail: the host floods thousands of them a
-        # second, which would otherwise roll the buffer (and with it every
-        # reload line) before the scenarios can assert on them.
-        self._lines: List[Tuple[int, str]] = []
-        self._tick_tail: List[Tuple[int, str]] = []
-        self._sequence = 0
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self) -> None:
-        """Starts asynchronous output capture."""
-        self._thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        """Signals output thread to stop."""
-        self._stop.set()
-
-    def _read_loop(self) -> None:
-        """Reads process output line by line and maintains a rolling buffer."""
-        try:
-            for line in iter(self._process.stdout.readline, ""):
-                if self._stop.is_set():
-                    break
-
-                with self._lock:
-                    sequence = self._sequence
-                    self._sequence += 1
-                    if COUNTER_TICK_TOKEN in line:
-                        self._tick_tail.append((sequence, line))
-                        if len(self._tick_tail) > MAX_TICK_TAIL:
-                            self._tick_tail = self._tick_tail[-MAX_TICK_TAIL:]
-                    else:
-                        self._lines.append((sequence, line))
-                        if len(self._lines) > MAX_BUFFERED_LINES:
-                            self._lines = self._lines[-MAX_BUFFERED_LINES:]
-
-                # Forward to the console, but not the counter-tick flood.
-                if COUNTER_TICK_TOKEN not in line:
-                    print(f"  [std] {line.rstrip()}")
-        except (ValueError, OSError):
-            pass
-
-    def _iter_since(self, start_index: int):
-        """Yields buffered lines with sequence number >= start_index."""
-        for sequence, line in self._lines:
-            if sequence >= start_index:
-                yield line
-        for sequence, line in self._tick_tail:
-            if sequence >= start_index:
-                yield line
-
-    @property
-    def line_count(self) -> int:
-        """Returns the sequence number of the next line to arrive."""
-        with self._lock:
-            return self._sequence
-
-    def output_since(self, start_index: int) -> str:
-        """Returns output concatenated since a specific sequence number."""
-        with self._lock:
-            return "".join(self._iter_since(start_index))
-
-    def process_alive(self) -> bool:
-        """Returns True when process is still running."""
-        return self._process.poll() is None
-
-    def wait_for(self, token: str, timeout_seconds: float, start_index: int = 0) -> bool:
-        """Waits until token appears in output or timeout/process exit happens."""
-        deadline = time.monotonic() + timeout_seconds
-
-        while time.monotonic() < deadline:
-            if self._process.poll() is not None:
-                return False
-
-            with self._lock:
-                for line in self._iter_since(start_index):
-                    if token in line:
-                        return True
-
-            time.sleep(0.1)
-
-        return False
-
-
-# =============================================================================
 # Scenario execution helpers
 # =============================================================================
-
-
-def has_crash_signals(output: str) -> bool:
-    """Checks output for known crash signatures."""
-    return PANIC_TOKEN in output or ACCESS_VIOLATION_TOKEN in output
 
 
 def validate_tokens(
@@ -541,40 +338,14 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
 
 
 def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
-    """Starts standalone process and returns process + monitor."""
+    """Starts the standalone host via cargo and returns process + monitor."""
     process_environment = os.environ.copy()
     process_environment["PROJECT_PATH"] = "../tests/project"
-
-    process = subprocess.Popen(
+    return launch_process(
         ["cargo", "run", "--package", "pill_standalone"],
-        cwd=str(WORKSPACE_ROOT / "modules"),
-        env=process_environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
+        WORKSPACE_ROOT / "modules",
+        process_environment,
     )
-
-    monitor = OutputMonitor(process)
-    monitor.start()
-
-    return process, monitor
-
-
-def terminate_process(process: subprocess.Popen, monitor: OutputMonitor) -> None:
-    """Stops monitor and terminates standalone safely."""
-    monitor.stop()
-
-    try:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=PROCESS_KILL_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-    except (OSError, subprocess.SubprocessError):
-        pass
 
 
 # =============================================================================

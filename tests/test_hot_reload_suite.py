@@ -19,17 +19,28 @@ DESCRIPTION
                                      runs selective migration, data survives.
         3. project_forgotten_type  - dropping a component registration emits the
                                      orphaned-data warning on the project path.
-        4. module_hot_reload       - editing an optional module reloads it.
-        5. module_forgotten_type   - a module that stops registering a type
-                                     emits the orphaned-data warning.
-        6. init_failure_rollback   - an init that returns non-zero keeps the
+        4. module_hot_reload       - editing an optional module reloads it and
+                                     its persistable data survives (existing=1).
+        5. module_double_reload    - two consecutive same-config reloads stay
+                                     stable: the module re-seeds nothing
+                                     (existing stays 1), pinning per-artifact
+                                     TypeId stability (no per-reload growth).
+        6. module_forgotten_type   - a module that stops registering a type
+                                     emits the orphaned-data warning; after the
+                                     restore-driven reload the data is re-seeded
+                                     from scratch (existing=0), pinning
+                                     drop-at-detection end-to-end.
+        7. init_failure_rollback   - an init that returns non-zero keeps the
                                      previous generation and the host alive.
 
       Session B (project = examples/project_rs, module = pill_spline)
         8. cascade_reload          - editing a module the project links triggers
                                      the module reload AND a project reload, and
                                      the new value reaches the running project
-                                     (probe midpoint changes).
+                                     (probe midpoint changes). The project probe
+                                     still sees exactly ONE spline (xxsees 1),
+                                     proving the project's embedded copy and the
+                                     module's own copy coexist as distinct types.
 
     Every file the suite touches (pill_config.yaml, module/project sources) is
     backed up at startup and restored afterwards, so a normal developer
@@ -47,25 +58,23 @@ EXAMPLE USAGE
 """
 
 import argparse
-import builtins
 import os
 import re
 import subprocess
 import sys
-import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import List, Sequence, Tuple
+
+# Shared paths, tokens, print wrapper, OutputMonitor, process helpers. The
+# host's log tokens live in one place (audit opportunity 5.14).
+from suite_common import *  # noqa: F401,F403
 
 # =============================================================================
-# Configuration
+# Session configuration
 # =============================================================================
 
-WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
-MODULES_ROOT = WORKSPACE_ROOT / "modules"
-HOST_EXE = MODULES_ROOT / "target" / "debug" / "pill_standalone.exe"
-HOST_CONFIG_YAML = MODULES_ROOT / "pill_config.yaml"
 PROJECT_SANDBOX_LIB_RS = WORKSPACE_ROOT / "tests" / "project" / "src" / "lib.rs"
 SPLINE_LIB_RS = MODULES_ROOT / "optional" / "pill_spline" / "src" / "lib.rs"
 
@@ -82,297 +91,10 @@ modules:
   - "pill_dummy_color"
 """
 
-# --- Output tokens ------------------------------------------------------------
+# --- Suite-specific output tokens --------------------------------------------
 
-STARTUP_TOKEN = "Entering project loop"
-MODULE_LOADED_TOKEN = "module DLL loaded successfully"
-ANALYTICS_REPORT_TOKEN = "BUILD / LINK / HOT-RELOAD ANALYTICS"
-FAST_PATH_TOKEN = "up to date, skipping build"
-RELOAD_PROJECT_TOKEN = "[analytics] reload project"
-RELOAD_MODULE_TOKEN = "[analytics] reload pill_spline"
-MODULE_RELOAD_COMPLETE_TOKEN = "optional module hot reload complete"
-CASCADE_TOKEN = "queuing a project reload"
-COUNTER_TICK_TOKEN = "counter tick"
-MIGRATION_START_TOKEN = "[persistence] Selective migration starting"
 PROJECT_FORGOTTEN_WARN_TOKEN = "no longer registered by the project"
 MODULE_FORGOTTEN_WARN_TOKEN = "no longer registered by this module"
-ROLLBACK_TOKEN = "rolling back"
-PANIC_TOKEN = "panicked at"
-ACCESS_VIOLATION_TOKEN = "STATUS_ACCESS_VIOLATION"
-
-# --- Timeouts (seconds) -------------------------------------------------------
-
-STARTUP_TIMEOUT = 90
-RELOAD_TIMEOUT = 60
-PROBE_TIMEOUT = 25
-COUNTER_TICK_TIMEOUT = 15
-SETTLE_TIMEOUT = 30
-STABILITY_SLEEP = 2
-SETTLE_SLEEP = 1
-PROCESS_KILL_TIMEOUT = 5
-BUILD_TIMEOUT = 180
-MAX_BUFFERED_LINES = 8000
-# Counter-tick lines are captured in a dedicated small tail so the flood can
-# never evict the reload lines the scenarios assert on; 200 ticks is still far
-# more than enough for any waiter to observe a fresh one.
-MAX_TICK_TAIL = 200
-
-# =============================================================================
-# Console colors
-# =============================================================================
-
-ANSI_RESET = "\033[0m"
-ANSI_BOLD = "\033[1m"
-ANSI_DIM = "\033[2m"
-ANSI_RED = "\033[31m"
-ANSI_GREEN = "\033[32m"
-ANSI_YELLOW = "\033[33m"
-ANSI_BLUE = "\033[34m"
-ANSI_MAGENTA = "\033[35m"
-ANSI_CYAN = "\033[36m"
-
-
-def _detect_color_support() -> bool:
-    """Returns True when stdout supports ANSI colors and NO_COLOR is not set."""
-    if os.getenv("NO_COLOR"):
-        return False
-    if not sys.stdout.isatty():
-        return False
-    if os.name == "nt":
-        try:
-            import ctypes
-
-            kernel32 = ctypes.windll.kernel32
-            handle = kernel32.GetStdHandle(-11)
-            mode = ctypes.c_uint32()
-            if kernel32.GetConsoleMode(handle, ctypes.byref(mode)) == 0:
-                return False
-            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
-            return True
-        except Exception:
-            return False
-    return True
-
-
-USE_COLOR = _detect_color_support()
-
-TAG_COLOR_MAP = {
-    "[FAIL]": ANSI_BOLD + ANSI_RED,
-    "[OK]": ANSI_BOLD + ANSI_GREEN,
-    "[WARN]": ANSI_YELLOW,
-    "[TEST]": ANSI_BOLD + ANSI_BLUE,
-    "[PASS]": ANSI_BOLD + ANSI_GREEN,
-    "[PREP]": ANSI_BOLD + ANSI_CYAN,
-    "[CLEANUP]": ANSI_BOLD + ANSI_MAGENTA,
-    "[std]": ANSI_DIM + ANSI_CYAN,
-}
-
-
-def _colorize_message(message: str) -> str:
-    """Applies color to known status tags in one output line."""
-    if not USE_COLOR:
-        return message
-    colored_message = message
-    for tag, color_code in TAG_COLOR_MAP.items():
-        colored_message = colored_message.replace(tag, f"{color_code}{tag}{ANSI_RESET}")
-    return colored_message
-
-
-def print(*args, **kwargs) -> None:  # type: ignore[override]
-    """Print wrapper that colors status tags while preserving normal behaviour."""
-    output_file = kwargs.get("file", sys.stdout)
-    if output_file is not sys.stdout:
-        builtins.print(*args, **kwargs)
-        return
-    separator = kwargs.get("sep", " ")
-    end = kwargs.get("end", "\n")
-    flush = kwargs.get("flush", False)
-    message = separator.join(str(argument) for argument in args)
-    builtins.print(_colorize_message(message), end=end, flush=flush)
-
-# =============================================================================
-# Backup / restore
-# =============================================================================
-
-
-class BackupRegistry:
-    """Captures original file bytes and restores them all at the end."""
-
-    def __init__(self) -> None:
-        self._originals: Dict[Path, bytes] = {}
-
-    def capture(self, path: Path) -> None:
-        """Records the original content of a file exactly once."""
-        if path not in self._originals and path.exists():
-            self._originals[path] = path.read_bytes()
-
-    def restore_all(self) -> None:
-        """Writes every captured file back to its original bytes."""
-        for path, original_bytes in self._originals.items():
-            try:
-                path.write_bytes(original_bytes)
-                print(f"  [CLEANUP] restored {path.relative_to(WORKSPACE_ROOT)}")
-            except OSError as error:
-                print(f"  [CLEANUP] failed to restore {path}: {error}")
-
-    def restore_one(self, path: Path) -> None:
-        """Restores a single captured file to its original bytes."""
-        if path in self._originals:
-            path.write_bytes(self._originals[path])
-
-
-BACKUP = BackupRegistry()
-
-# =============================================================================
-# Source edit helpers
-# =============================================================================
-
-
-def read_source(path: Path) -> str:
-    """Reads a source file as UTF-8 text."""
-    return path.read_text(encoding="utf-8")
-
-
-def atomic_write(path: Path, content: str) -> None:
-    """Writes source content atomically via temporary file + rename."""
-    if not content.endswith("\n"):
-        content += "\n"
-    temporary_path = path.with_suffix(path.suffix + ".tmp")
-    temporary_path.write_text(content, encoding="utf-8")
-    os.replace(str(temporary_path), str(path))
-
-
-def apply_replacements(path: Path, replacements: Sequence[Tuple[str, str]]) -> bool:
-    """Applies ordered replacements against the current source content."""
-    content = read_source(path)
-    for old_text, new_text in replacements:
-        if old_text not in content:
-            print(
-                f"  [FAIL] Edit pattern not found in {path.relative_to(WORKSPACE_ROOT)}: "
-                f"{old_text[:80].strip()!r}...",
-            )
-            return False
-        content = content.replace(old_text, new_text, 1)
-    atomic_write(path, content)
-    return True
-
-# =============================================================================
-# Output monitor
-# =============================================================================
-
-
-class OutputMonitor:
-    """Captures merged stdout/stderr lines from the host in a background thread.
-
-    Lines are stored as ``(sequence, line)`` pairs with a monotonically
-    increasing sequence number, so ``wait_for`` / ``output_since`` stay correct
-    even after the rolling buffer drops old entries.
-
-    The host's counter system floods thousands of identical "counter tick"
-    lines per second. Those ticks would roll the buffer (and with it every
-    reload line) within a second, so tick lines go into a small dedicated tail
-    instead of the main buffer: they stay findable for waiters (they are always
-    fresh under the flood) without evicting the lines the scenarios assert on.
-    """
-
-    def __init__(self, process: subprocess.Popen) -> None:
-        self._process = process
-        self._lines: List[Tuple[int, str]] = []
-        self._tick_tail: List[Tuple[int, str]] = []
-        self._sequence = 0
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self) -> None:
-        """Starts asynchronous output capture."""
-        self._thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        """Signals the output thread to stop."""
-        self._stop.set()
-
-    def _read_loop(self) -> None:
-        """Reads process output line by line and keeps the rolling buffers."""
-        try:
-            for line in iter(self._process.stdout.readline, ""):
-                if self._stop.is_set():
-                    break
-                with self._lock:
-                    sequence = self._sequence
-                    self._sequence += 1
-                    if COUNTER_TICK_TOKEN in line:
-                        self._tick_tail.append((sequence, line))
-                        if len(self._tick_tail) > MAX_TICK_TAIL:
-                            self._tick_tail = self._tick_tail[-MAX_TICK_TAIL:]
-                    else:
-                        self._lines.append((sequence, line))
-                        if len(self._lines) > MAX_BUFFERED_LINES:
-                            self._lines = self._lines[-MAX_BUFFERED_LINES:]
-                # Forward to the console for visibility, but not the counter
-                # tick flood — thousands of identical lines a second drown the
-                # log without adding information.
-                if COUNTER_TICK_TOKEN not in line:
-                    print(f"  [std] {line.rstrip()}")
-        except (ValueError, OSError):
-            pass
-
-    def _iter_since(self, start_index: int):
-        """Yields buffered lines with sequence number >= start_index."""
-        for sequence, line in self._lines:
-            if sequence >= start_index:
-                yield line
-        for sequence, line in self._tick_tail:
-            if sequence >= start_index:
-                yield line
-
-    @property
-    def line_count(self) -> int:
-        """Returns the sequence number of the next line to arrive."""
-        with self._lock:
-            return self._sequence
-
-    def output_since(self, start_index: int) -> str:
-        """Returns output buffered for sequence numbers >= start_index."""
-        with self._lock:
-            return "".join(self._iter_since(start_index))
-
-    def process_alive(self) -> bool:
-        """Returns True while the process is still running."""
-        return self._process.poll() is None
-
-    def wait_for(self, token: str, timeout_seconds: float, start_index: int = 0) -> bool:
-        """Waits until a token appears in the output (or timeout / exit)."""
-        deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline:
-            if self._process.poll() is not None:
-                return False
-            with self._lock:
-                for line in self._iter_since(start_index):
-                    if token in line:
-                        return True
-            time.sleep(0.1)
-        return False
-
-    def wait_for_any(
-        self,
-        tokens: Sequence[str],
-        timeout_seconds: float,
-        start_index: int = 0,
-    ) -> Optional[str]:
-        """Waits until any of the given tokens appears; returns it or None."""
-        deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline:
-            if self._process.poll() is not None:
-                return None
-            with self._lock:
-                for line in self._iter_since(start_index):
-                    for token in tokens:
-                        if token in line:
-                            return token
-            time.sleep(0.1)
-        return None
 
 # =============================================================================
 # Host session
@@ -405,50 +127,7 @@ def launch_host():
     """Launches the standalone host exe with a clean environment."""
     environment = os.environ.copy()
     environment.pop("PROJECT_PATH", None)
-
-    process = subprocess.Popen(
-        [str(HOST_EXE)],
-        cwd=str(MODULES_ROOT),
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-    monitor = OutputMonitor(process)
-    monitor.start()
-    return process, monitor
-
-
-def terminate_process(process: subprocess.Popen, monitor: OutputMonitor) -> None:
-    """Stops the monitor and terminates the host safely."""
-    monitor.stop()
-    try:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=PROCESS_KILL_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-    except (OSError, subprocess.SubprocessError):
-        pass
-
-
-def kill_stale_hosts() -> None:
-    """Best-effort cleanup of leftover host processes that lock shared DLLs."""
-    if os.name == "nt":
-        subprocess.run(
-            ["taskkill", "/IM", "pill_standalone.exe", "/F"],
-            capture_output=True,
-        )
-    else:
-        subprocess.run(["pkill", "-f", "pill_standalone"], capture_output=True)
-
-
-def write_host_config(content: str) -> None:
-    """Writes the host config the standalone reads at startup."""
-    atomic_write(HOST_CONFIG_YAML, content)
+    return launch_process([str(HOST_EXE)], MODULES_ROOT, environment)
 
 # =============================================================================
 # Scenario model
@@ -456,21 +135,29 @@ def write_host_config(content: str) -> None:
 
 
 @dataclass
-class Scenario:
-    """One hot-reload scenario: edits, expected output, and cleanup."""
+class ScenarioPhase:
+    """One edit+wait step inside a scenario.
 
-    name: str
+    A scenario runs its phases in order; each phase applies its edits, waits
+    for ``wait_token``, then (after all phases) the whole scenario window is
+    checked for required / forbidden tokens and secondary wait tokens.
+    """
+
     edits: Sequence[Tuple[Path, Sequence[Tuple[str, str]]]]
     wait_token: str
     required_tokens: Sequence[str] = ()
     forbidden_tokens: Sequence[str] = ()
     wait_after: Sequence[Tuple[str, float]] = ()
+
+
+@dataclass
+class Scenario:
+    """One hot-reload scenario: sequential phases, expected output, cleanup."""
+
+    name: str
+    phases: Sequence[ScenarioPhase]
     restore_after: Sequence[Path] = field(default_factory=list)
-
-
-def has_crash_signals(output: str) -> bool:
-    """Checks output for known crash signatures."""
-    return PANIC_TOKEN in output or ACCESS_VIOLATION_TOKEN in output
+    restore_required_tokens: Sequence[str] = ()
 
 
 def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
@@ -478,32 +165,36 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
     print(f"\n  [TEST] {scenario.name}...")
     start_index = monitor.line_count
 
-    for path, replacements in scenario.edits:
-        if not apply_replacements(path, replacements):
+    for phase in scenario.phases:
+        for path, replacements in phase.edits:
+            if not apply_replacements(path, replacements):
+                return False
+
+        if not monitor.wait_for(phase.wait_token, RELOAD_TIMEOUT, start_index):
+            output = monitor.output_since(start_index)
+            if has_crash_signals(output):
+                print(f"  [FAIL] Crash detected in scenario: {scenario.name}")
+                print(f"  Output tail:\n{output[-1600:]}")
+            else:
+                print(
+                    f"  [FAIL] Timeout waiting for {phase.wait_token!r} in scenario: "
+                    f"{scenario.name}"
+                )
+                print(f"  Output tail:\n{output[-1600:]}")
             return False
 
-    if not monitor.wait_for(scenario.wait_token, RELOAD_TIMEOUT, start_index):
-        output = monitor.output_since(start_index)
-        if has_crash_signals(output):
-            print(f"  [FAIL] Crash detected in scenario: {scenario.name}")
-            print(f"  Output tail:\n{output[-1600:]}")
-        else:
-            print(f"  [FAIL] Timeout waiting for {scenario.wait_token!r} in scenario: {scenario.name}")
-            print(f"  Output tail:\n{output[-1600:]}")
-        return False
+        time.sleep(STABILITY_SLEEP)
 
-    time.sleep(STABILITY_SLEEP)
-
-    if not monitor.process_alive():
-        print(f"  [FAIL] Process died after scenario: {scenario.name}")
-        return False
-
-    # Wait for any secondary tokens (counter ticks, probe values, ...).
-    for token, timeout in scenario.wait_after:
-        if not monitor.wait_for(token, timeout, start_index):
-            print(f"  [FAIL] Missing expected token {token!r} in scenario: {scenario.name}")
-            print(f"  Output tail:\n{monitor.output_since(start_index)[-1600:]}")
+        if not monitor.process_alive():
+            print(f"  [FAIL] Process died after scenario: {scenario.name}")
             return False
+
+        # Wait for any secondary tokens (counter ticks, probe values, ...).
+        for token, timeout in phase.wait_after:
+            if not monitor.wait_for(token, timeout, start_index):
+                print(f"  [FAIL] Missing expected token {token!r} in scenario: {scenario.name}")
+                print(f"  Output tail:\n{monitor.output_since(start_index)[-1600:]}")
+                return False
 
     output = monitor.output_since(start_index)
     if has_crash_signals(output):
@@ -511,16 +202,17 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
         print(f"  Output tail:\n{output[-1600:]}")
         return False
 
-    for token in scenario.required_tokens:
-        if token not in output:
-            print(f"  [FAIL] Missing required token in {scenario.name}: {token!r}")
-            print(f"  Output tail:\n{output[-1600:]}")
-            return False
-    for token in scenario.forbidden_tokens:
-        if token in output:
-            print(f"  [FAIL] Forbidden token found in {scenario.name}: {token!r}")
-            print(f"  Output tail:\n{output[-1600:]}")
-            return False
+    for phase in scenario.phases:
+        for token in phase.required_tokens:
+            if token not in output:
+                print(f"  [FAIL] Missing required token in {scenario.name}: {token!r}")
+                print(f"  Output tail:\n{output[-1600:]}")
+                return False
+        for token in phase.forbidden_tokens:
+            if token in output:
+                print(f"  [FAIL] Forbidden token found in {scenario.name}: {token!r}")
+                print(f"  Output tail:\n{output[-1600:]}")
+                return False
 
     print(f"  [OK] {scenario.name}")
 
@@ -541,6 +233,14 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
                 f"  [WARN] Restore of {path.name} did not settle with {settle_token!r}"
             )
         time.sleep(STABILITY_SLEEP)
+
+    # Post-restore assertions (e.g. the module re-seeding fresh data after a
+    # forgotten-type drop: the restore-driven reload logs existing=0).
+    for token in scenario.restore_required_tokens:
+        if not monitor.wait_for(token, SETTLE_TIMEOUT, settle_start):
+            print(f"  [FAIL] Missing post-restore token in {scenario.name}: {token!r}")
+            print(f"  Output tail:\n{monitor.output_since(settle_start)[-1600:]}")
+            return False
 
     return True
 
@@ -708,99 +408,172 @@ PROJECT_FORGOTTEN_EDITS = [
 SESSION_A_SCENARIOS = [
     Scenario(
         name="project_hot_reload",
-        edits=[
-            (
-                PROJECT_SANDBOX_LIB_RS,
-                [("const THRESHOLD: u64 = 200;", "const THRESHOLD: u64 = 150;")],
+        phases=[
+            ScenarioPhase(
+                edits=[
+                    (
+                        PROJECT_SANDBOX_LIB_RS,
+                        [("const THRESHOLD: u64 = 200;", "const THRESHOLD: u64 = 150;")],
+                    )
+                ],
+                wait_token=RELOAD_PROJECT_TOKEN,
+                required_tokens=[RELOAD_PROJECT_TOKEN, "crates rebuilt by cargo"],
+                forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
+                wait_after=[(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT)],
             )
         ],
-        wait_token=RELOAD_PROJECT_TOKEN,
-        required_tokens=[RELOAD_PROJECT_TOKEN, "crates rebuilt by cargo"],
-        forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
-        wait_after=[(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT)],
         restore_after=[PROJECT_SANDBOX_LIB_RS],
     ),
     Scenario(
         name="schema_migration",
-        edits=[(PROJECT_SANDBOX_LIB_RS, FRAMECOUNTER_MIGRATION_EDITS)],
-        wait_token=RELOAD_PROJECT_TOKEN,
-        required_tokens=[
-            MIGRATION_START_TOKEN,
-            "'project::FrameCounter' -> OK",
+        phases=[
+            ScenarioPhase(
+                edits=[(PROJECT_SANDBOX_LIB_RS, FRAMECOUNTER_MIGRATION_EDITS)],
+                wait_token=RELOAD_PROJECT_TOKEN,
+                required_tokens=[
+                    MIGRATION_START_TOKEN,
+                    "'project::FrameCounter' -> OK",
+                ],
+                forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
+                wait_after=[(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT)],
+            )
         ],
-        forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
-        wait_after=[(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT)],
         restore_after=[PROJECT_SANDBOX_LIB_RS],
     ),
     Scenario(
         name="project_forgotten_type",
-        edits=[(PROJECT_SANDBOX_LIB_RS, PROJECT_FORGOTTEN_EDITS)],
-        wait_token=RELOAD_PROJECT_TOKEN,
-        required_tokens=[
-            PROJECT_FORGOTTEN_WARN_TOKEN,
-            "LinearVelocity",
+        phases=[
+            ScenarioPhase(
+                edits=[(PROJECT_SANDBOX_LIB_RS, PROJECT_FORGOTTEN_EDITS)],
+                wait_token=RELOAD_PROJECT_TOKEN,
+                required_tokens=[
+                    PROJECT_FORGOTTEN_WARN_TOKEN,
+                    "LinearVelocity",
+                ],
+                forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
+                wait_after=[(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT)],
+            )
         ],
-        forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
-        wait_after=[(COUNTER_TICK_TOKEN, COUNTER_TICK_TIMEOUT)],
         restore_after=[PROJECT_SANDBOX_LIB_RS],
     ),
     Scenario(
         name="module_hot_reload",
-        edits=[
-            (
-                SPLINE_LIB_RS,
-                [
+        phases=[
+            ScenarioPhase(
+                edits=[
                     (
-                        '"pill_spline module registered"',
-                        '"pill_spline module registered v2"',
+                        SPLINE_LIB_RS,
+                        [
+                            (
+                                '"pill_spline module registered"',
+                                '"pill_spline module registered v2"',
+                            )
+                        ],
                     )
                 ],
+                wait_token=RELOAD_MODULE_TOKEN,
+                # `existing=1` pins that the module's persistable data survives
+                # a same-config reload (per-artifact TypeId stability).
+                required_tokens=[
+                    RELOAD_MODULE_TOKEN,
+                    MODULE_RELOAD_COMPLETE_TOKEN,
+                    "crates rebuilt by cargo",
+                    "pill_spline module registered v2",
+                    "existing=1",
+                ],
+                forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
             )
         ],
-        wait_token=RELOAD_MODULE_TOKEN,
-        required_tokens=[
-            RELOAD_MODULE_TOKEN,
-            MODULE_RELOAD_COMPLETE_TOKEN,
-            "crates rebuilt by cargo",
-            "pill_spline module registered v2",
+        restore_after=[SPLINE_LIB_RS],
+    ),
+    Scenario(
+        name="module_double_reload",
+        phases=[
+            ScenarioPhase(
+                edits=[
+                    (
+                        SPLINE_LIB_RS,
+                        [
+                            (
+                                '"pill_spline module registered"',
+                                '"pill_spline module registered v2"',
+                            )
+                        ],
+                    )
+                ],
+                wait_token=RELOAD_MODULE_TOKEN,
+                # Two consecutive same-config reloads must stay stable: the
+                # module re-seeds nothing (existing stays 1), which pins that
+                # a same-config rebuild keeps the same TypeId - accumulation
+                # is per distinct artifact, not per reload (audit 3.2/C3).
+                required_tokens=["pill_spline module registered v2", "existing=1"],
+                forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
+            ),
+            ScenarioPhase(
+                edits=[
+                    (
+                        SPLINE_LIB_RS,
+                        [
+                            (
+                                '"pill_spline module registered v2"',
+                                '"pill_spline module registered v3"',
+                            )
+                        ],
+                    )
+                ],
+                wait_token=RELOAD_MODULE_TOKEN,
+                required_tokens=["pill_spline module registered v3", "existing=1"],
+                forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
+            ),
         ],
-        forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
         restore_after=[SPLINE_LIB_RS],
     ),
     Scenario(
         name="module_forgotten_type",
-        edits=[
-            (
-                SPLINE_LIB_RS,
-                [
+        phases=[
+            ScenarioPhase(
+                edits=[
                     (
-                        SPLINE_REGISTER_ORIGINAL,
-                        SPLINE_REGISTER_STUB_NO_REGISTRATION,
+                        SPLINE_LIB_RS,
+                        [
+                            (
+                                SPLINE_REGISTER_ORIGINAL,
+                                SPLINE_REGISTER_STUB_NO_REGISTRATION,
+                            )
+                        ],
                     )
                 ],
+                wait_token=RELOAD_MODULE_TOKEN,
+                required_tokens=[MODULE_FORGOTTEN_WARN_TOKEN, "pill_spline::Spline"],
+                forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
             )
         ],
-        wait_token=RELOAD_MODULE_TOKEN,
-        required_tokens=[MODULE_FORGOTTEN_WARN_TOKEN, "pill_spline::Spline"],
-        forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
         restore_after=[SPLINE_LIB_RS],
+        # After the restore-driven reload the module re-registers Spline and
+        # re-seeds from scratch: the orphaned data was dropped, so existing=0.
+        # This pins drop-at-detection end-to-end (audit 3.2 drop behavior).
+        restore_required_tokens=["existing=0"],
     ),
     Scenario(
         name="init_failure_rollback",
-        edits=[
-            (
-                SPLINE_LIB_RS,
-                [
+        phases=[
+            ScenarioPhase(
+                edits=[
                     (
-                        SPLINE_REGISTER_ORIGINAL,
-                        SPLINE_REGISTER_STUB_INIT_FAILURE,
+                        SPLINE_LIB_RS,
+                        [
+                            (
+                                SPLINE_REGISTER_ORIGINAL,
+                                SPLINE_REGISTER_STUB_INIT_FAILURE,
+                            )
+                        ],
                     )
                 ],
+                wait_token=ROLLBACK_TOKEN,
+                required_tokens=[ROLLBACK_TOKEN],
+                forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
             )
         ],
-        wait_token=ROLLBACK_TOKEN,
-        required_tokens=[ROLLBACK_TOKEN],
-        forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
         restore_after=[SPLINE_LIB_RS],
     ),
 ]
@@ -810,26 +583,35 @@ SESSION_A_SCENARIOS = [
 SESSION_B_SCENARIOS = [
     Scenario(
         name="cascade_reload",
-        edits=[
-            (
-                SPLINE_LIB_RS,
-                [
+        phases=[
+            ScenarioPhase(
+                edits=[
                     (
-                        "SAMPLE_VERTICAL_OFFSET: f32 = 0.0",
-                        "SAMPLE_VERTICAL_OFFSET: f32 = 10.0",
+                        SPLINE_LIB_RS,
+                        [
+                            (
+                                "SAMPLE_VERTICAL_OFFSET: f32 = 0.0",
+                                "SAMPLE_VERTICAL_OFFSET: f32 = 10.0",
+                            )
+                        ],
                     )
                 ],
+                wait_token=RELOAD_MODULE_TOKEN,
+                # `xxsees 1 spline(s)` pins module<->project coexistence: the
+                # project probe matches only the project's embedded Spline (its
+                # own TypeId), so after both reloads it still sees exactly one -
+                # the module DLL's copy is a distinct type (audit 3.1/C1).
+                required_tokens=[
+                    RELOAD_MODULE_TOKEN,
+                    MODULE_RELOAD_COMPLETE_TOKEN,
+                    CASCADE_TOKEN,
+                    RELOAD_PROJECT_TOKEN,
+                    "xxsees 1 spline(s)",
+                ],
+                forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
+                wait_after=[("midpoint (400.0, 298.8", PROBE_TIMEOUT)],
             )
         ],
-        wait_token=RELOAD_MODULE_TOKEN,
-        required_tokens=[
-            RELOAD_MODULE_TOKEN,
-            MODULE_RELOAD_COMPLETE_TOKEN,
-            CASCADE_TOKEN,
-            RELOAD_PROJECT_TOKEN,
-        ],
-        forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
-        wait_after=[("midpoint (400.0, 298.8", PROBE_TIMEOUT)],
         restore_after=[SPLINE_LIB_RS],
     ),
 ]

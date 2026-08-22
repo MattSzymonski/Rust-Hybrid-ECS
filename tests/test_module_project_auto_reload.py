@@ -33,19 +33,18 @@ import os
 import re
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Tuple
+
+import suite_common as common
+from suite_common import *  # noqa: F401,F403
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
-WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
-MODULES_ROOT = WORKSPACE_ROOT / "modules"
 MODULE_LIB_RS = MODULES_ROOT / "optional" / "pill_spline" / "src" / "lib.rs"
-HOST_CONFIG_YAML = MODULES_ROOT / "pill_config.yaml"
 
 # The host has no environment-variable override for the optional-module list,
 # so this test drives it the same way a person would: by writing the config
@@ -57,14 +56,12 @@ modules:
   - "pill_spline"
 """
 
-ORIGINAL_HOST_CONFIG: Optional[str] = None
+ORIGINAL_HOST_CONFIG = None
 
-STARTUP_TOKEN = "Entering project loop"
 PROBE_PREFIX = "midpoint ("
 MODULE_RELOAD_TOKEN = "optional module reload processed"
 QUEUED_PROJECT_RELOAD_TOKEN = "queuing a project reload"
 PROJECT_RELOAD_TOKEN = "hot reload complete"
-PANIC_TOKEN = "panicked at"
 
 STARTUP_TIMEOUT = 90
 PREBUILD_TIMEOUT = 300
@@ -73,8 +70,6 @@ MODULE_RELOAD_TIMEOUT = 60
 QUEUED_PROJECT_TIMEOUT = 60
 PROJECT_RELOAD_TIMEOUT = 60
 PROBE_UPDATE_TIMEOUT = 60
-PROCESS_KILL_TIMEOUT = 5
-MAX_BUFFERED_LINES = 7000
 
 # Matches the module's sample-offset constant used inside `get_location_at`.
 # The value is a plain `f32` literal, so exactly one line in the file matches.
@@ -134,61 +129,6 @@ def plan_value_edit(content: str) -> Tuple[str, str, str]:
 
 
 # =============================================================================
-# Output monitor
-# =============================================================================
-
-
-class OutputMonitor:
-    """Captures merged stdout/stderr lines from standalone in a background thread."""
-
-    def __init__(self, process: subprocess.Popen) -> None:
-        self._process = process
-        self._lines: List[str] = []
-        self._lock = threading.Lock()
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    def start(self) -> None:
-        self._thread = threading.Thread(target=self._read_loop, daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-
-    def _read_loop(self) -> None:
-        try:
-            for line in iter(self._process.stdout.readline, ""):
-                if self._stop.is_set():
-                    break
-                with self._lock:
-                    self._lines.append(line)
-                    if len(self._lines) > MAX_BUFFERED_LINES:
-                        self._lines = self._lines[-MAX_BUFFERED_LINES:]
-                print(f"  [std] {line.rstrip()}")
-        except (ValueError, OSError):
-            pass
-
-    def output_since(self, start_index: int) -> str:
-        with self._lock:
-            return "".join(self._lines[start_index:])
-
-    def process_alive(self) -> bool:
-        return self._process.poll() is None
-
-    def wait_for(self, token: str, timeout_seconds: float, start_index: int = 0) -> bool:
-        deadline = time.monotonic() + timeout_seconds
-        while time.monotonic() < deadline:
-            if self._process.poll() is not None:
-                return False
-            with self._lock:
-                for line in self._lines[start_index:]:
-                    if token in line:
-                        return True
-            time.sleep(0.1)
-        return False
-
-
-# =============================================================================
 # Host config helpers
 # =============================================================================
 
@@ -240,34 +180,16 @@ def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
     # supported override and pins the project explicitly for this test.
     process_environment = os.environ.copy()
     process_environment["PROJECT_PATH"] = "../examples/project_rs"
-
-    process = subprocess.Popen(
+    return launch_process(
         ["cargo", "run", "--package", "pill_standalone"],
-        cwd=str(MODULES_ROOT),
-        env=process_environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
+        MODULES_ROOT,
+        process_environment,
     )
-    monitor = OutputMonitor(process)
-    monitor.start()
-    return process, monitor
 
 
 def terminate_process(process: subprocess.Popen, monitor: OutputMonitor) -> None:
-    """Stops the monitor and terminates the host safely, including any child."""
-    monitor.stop()
-    try:
-        if process.poll() is None:
-            process.terminate()
-            try:
-                process.wait(timeout=PROCESS_KILL_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-    except (OSError, subprocess.SubprocessError):
-        pass
+    """Stops the monitor, terminates the host safely, then cleans stray hosts."""
+    common.terminate_process(process, monitor)
     kill_stray_hosts()
 
 

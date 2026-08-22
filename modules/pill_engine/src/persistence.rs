@@ -1337,4 +1337,27 @@ mod tests {
             .iter()
             .any(|name| name.contains("DropTestKeptComponent")));
     }
+
+    /// Re-registering the same persistable type is idempotent across the
+    /// persist maps: one serializer/inserter per ComponentId and one
+    /// deserializer/schema hash per name. Pins the invariant the unified
+    /// registration struct (audit 4.2) must preserve.
+    #[test]
+    fn persistable_registration_is_idempotent_across_repeated_calls() {
+        let mut world = World::new();
+        let component_id = ComponentId::of::<DropTestForgottenComponent>();
+        world.register_persistable_component::<DropTestForgottenComponent>();
+        world.register_persistable_component::<DropTestForgottenComponent>();
+
+        assert_eq!(world.persist_serializers.len(), 1);
+        assert!(world.persist_serializers.contains_key(&component_id));
+        assert_eq!(world.persist_inserters.len(), 1);
+        assert!(world.persist_inserters.contains_key(&component_id));
+
+        let type_name = std::any::type_name::<DropTestForgottenComponent>().to_string();
+        assert_eq!(world.persist_deserializers.len(), 1);
+        assert!(world.persist_deserializers.contains_key(&type_name));
+        assert_eq!(world.persist_schema_hashes.len(), 1);
+        assert!(world.persist_schema_hashes.contains_key(&type_name));
+    }
 }

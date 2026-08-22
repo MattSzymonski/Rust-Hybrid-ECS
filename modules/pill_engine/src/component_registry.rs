@@ -154,4 +154,36 @@ mod tests {
         let second = persistable_schema_fingerprint();
         assert_eq!(first, second);
     }
+
+    /// Registering the same type first as plain, then as persistable, stays
+    /// idempotent: one registry entry, one bit. This pins the invariant the
+    /// unified per-type registration (audit 4.2) must preserve.
+    #[test]
+    fn plain_then_persistable_registration_stays_idempotent() {
+        let mut world = World::new();
+        world.register_component::<TestPersistableComponent>();
+        let bit_before = world
+            .component_registry
+            .get_bit(&ComponentId::of::<TestPersistableComponent>());
+        assert!(bit_before.is_some(), "plain registration must assign a bit");
+
+        world.register_persistable_component::<TestPersistableComponent>();
+        let bit_after = world
+            .component_registry
+            .get_bit(&ComponentId::of::<TestPersistableComponent>());
+        assert_eq!(
+            bit_before, bit_after,
+            "persistable re-registration must reuse the existing bit"
+        );
+
+        let entry_count = world
+            .component_registry
+            .registered_components()
+            .filter(|(id, _, _)| *id == ComponentId::of::<TestPersistableComponent>())
+            .count();
+        assert_eq!(
+            entry_count, 1,
+            "one logical type must occupy exactly one registry entry"
+        );
+    }
 }

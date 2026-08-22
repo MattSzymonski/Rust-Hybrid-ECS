@@ -5,18 +5,22 @@
 #               it needs a working native toolchain (it builds
 #               `pill_standalone` first unless --skip-build is given).
 
-# DESCRIPTION: Run the full hot-reload integration suite
-#   (tests/test_hot_reload_suite.py). The suite launches the standalone host,
-#   drives live source edits against a real project and an optional module,
-#   and asserts the host's reload behaviour (reloads, schema migration,
-#   forgotten-type detection, rollback, cascade) from its console output.
+# DESCRIPTION: Run the full hot-reload regression net
+#   (1) tests/test_hot_reload_suite.py            - full suite (sessions A/B:
+#        reloads, schema migration, forgotten-type detection, drop-at-detection
+#        re-seed, repeated-reload stability, rollback, cascade, coexistence)
+#   (2) tests/test_hot_reload_migration.py        - table-driven migration suite
+#        (fast path, add/revert fields, rename field, downgrade)
+#   (3) tests/test_module_project_auto_reload.py  - module->project cascade
 #
-#   The suite temporarily modifies - and automatically restores - the files
-#   modules/pill_config.yaml, tests/project/src/lib.rs and
-#   modules/optional/pill_spline/src/lib.rs, so a normal developer workspace
-#   is left exactly as it was.
+#   Each suite launches the standalone host and drives live source edits
+#   against a real project and an optional module, asserting the host's reload
+#   behaviour from its console output. The suites temporarily modify - and
+#   automatically restore - modules/pill_config.yaml, tests/project/src/lib.rs,
+#   examples/project_rs/src/lib.rs and modules/optional/pill_spline/src/lib.rs,
+#   so a normal developer workspace is left exactly as it was.
 #
-#   Expected runtime: ~3-5 minutes (plus the initial host build unless
+#   Expected runtime: ~8-12 minutes (plus the initial host build unless
 #   --skip-build is used).
 #
 #   Designed for both local development and GitHub Actions CI.
@@ -24,7 +28,9 @@
 # USAGE: bash devops/tests/run_hot_reload_tests.sh [--skip-build] [--timeout-scale S]
 #
 #   --skip-build          skip the initial host build (assume pill_standalone
-#                         is already built; fastest lane for CI)
+#                         is already built; fastest lane for CI). Only the
+#                         main suite honours it; the migration and cascade
+#                         suites always build what they need.
 #   --timeout-scale S     multiply all suite timeouts by S (default 1.5)
 
 # EXAMPLE USAGE:
@@ -82,31 +88,61 @@ esac
 
 echo ""
 echo -e "${BOLD}${CYAN}===============================================================================${NC}"
-echo -e "${BOLD}${CYAN}Hot-reload integration suite (tests/test_hot_reload_suite.py)${NC}"
+echo -e "${BOLD}${CYAN}Hot-reload regression net (3 suites)${NC}"
 echo "  timeout scale:  ${TIMEOUT_SCALE}"
 if [ "$SKIP_BUILD" = 1 ]; then
-    echo "  host build:     skipped (assumed up to date)"
-    extra_args=(--skip-build)
+    echo "  host build:     skipped (assumed up to date; main suite only)"
 else
     echo "  host build:     yes"
-    extra_args=()
 fi
 echo ""
 
-# Run the suite. set -e is suspended so the exit code can be reported and
-# propagated explicitly.
+overall_exit=0
+
+# --- 1. Main hot-reload suite (sessions A/B) ---------------------------------
+echo -e "${BOLD}${CYAN}--- Suite 1/3: test_hot_reload_suite.py ---${NC}"
+if [ "$SKIP_BUILD" = 1 ]; then
+    extra_args=(--skip-build)
+else
+    extra_args=()
+fi
 set +e
 python tests/test_hot_reload_suite.py --timeout-scale "$TIMEOUT_SCALE" "${extra_args[@]}"
 suite_exit=$?
 set -e
+if [ "$suite_exit" -ne 0 ]; then
+    overall_exit="$suite_exit"
+fi
+
+# --- 2. Migration suite -------------------------------------------------------
+echo ""
+echo -e "${BOLD}${CYAN}--- Suite 2/3: test_hot_reload_migration.py ---${NC}"
+set +e
+python tests/test_hot_reload_migration.py --timeout-scale "$TIMEOUT_SCALE"
+migration_exit=$?
+set -e
+if [ "$migration_exit" -ne 0 ]; then
+    overall_exit="$migration_exit"
+fi
+
+# --- 3. Module->project cascade suite -----------------------------------------
+echo ""
+echo -e "${BOLD}${CYAN}--- Suite 3/3: test_module_project_auto_reload.py ---${NC}"
+set +e
+python tests/test_module_project_auto_reload.py --timeout-scale "$TIMEOUT_SCALE"
+cascade_exit=$?
+set -e
+if [ "$cascade_exit" -ne 0 ]; then
+    overall_exit="$cascade_exit"
+fi
 
 echo ""
 echo -e "${BOLD}${CYAN}===============================================================================${NC}"
-if [ "$suite_exit" -eq 0 ]; then
-    echo -e "${BOLD}${CYAN}Hot-reload suite PASSED${NC}"
+if [ "$overall_exit" -eq 0 ]; then
+    echo -e "${BOLD}${CYAN}Hot-reload regression net PASSED (all 3 suites)${NC}"
 else
-    echo -e "${BOLD}${RED}Hot-reload suite FAILED (exit $suite_exit)${NC}"
+    echo -e "${BOLD}${RED}Hot-reload regression net FAILED (exit $overall_exit)${NC}"
 fi
 echo -e "${BOLD}${CYAN}===============================================================================${NC}"
 
-exit "$suite_exit"
+exit "$overall_exit"
