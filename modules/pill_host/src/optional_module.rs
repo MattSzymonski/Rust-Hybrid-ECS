@@ -74,6 +74,9 @@ pub(crate) struct OptionalModuleSlot {
     reload_generation: Arc<AtomicU64>,
     /// Last generation the frame loop acted on.
     last_processed_generation: u64,
+    /// Persistable component type names the last `init` registered, used to
+    /// detect types the next generation forgets to re-register.
+    registered_type_names: Vec<String>,
 }
 
 impl OptionalModuleSlot {
@@ -109,6 +112,9 @@ impl OptionalModuleSlot {
         // Step 4: Register the module's components and systems under its own
         // owner, so a later reload can remove exactly these systems.
         let init_started = Instant::now();
+        // Capture the registration sequence before init so the exact set of
+        // persistable types this generation registered can be recorded.
+        let registration_sequence = engine.world().persist_registration_sequence();
         engine.begin_module_registration(owner);
         let status = library.call_init(engine_api);
         engine.end_module_registration();
@@ -120,6 +126,9 @@ impl OptionalModuleSlot {
             }
             .into());
         }
+        let registered_type_names = engine
+            .world()
+            .persist_type_names_registered_since(registration_sequence);
 
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -135,6 +144,7 @@ impl OptionalModuleSlot {
             old_libraries: Vec::new(),
             reload_generation,
             last_processed_generation: 0,
+            registered_type_names,
         })
     }
 
@@ -254,10 +264,16 @@ impl OptionalModuleSlot {
         );
 
         let init_started = Instant::now();
+        // Capture the registration sequence before init so the types this new
+        // generation registered can be compared against the previous ones.
+        let registration_sequence = engine.world().persist_registration_sequence();
         engine.begin_module_registration(self.owner);
         let status = new_library.call_init(engine_api);
         engine.end_module_registration();
-        analytics::record_init(&self.config.name, init_started.elapsed().as_secs_f64() * 1000.0);
+        analytics::record_init(
+            &self.config.name,
+            init_started.elapsed().as_secs_f64() * 1000.0,
+        );
         if status != 0 {
             // The replacement failed to register. Roll back to the previous
             // generation: init is required to be idempotent, so re-running it
@@ -283,6 +299,38 @@ impl OptionalModuleSlot {
             }
             return;
         }
+
+        // Detect persistable component types the new generation stopped
+        // registering. Such data is NOT wiped by migration — the type is
+        // absent from the changed-name set, so its column and metadata linger
+        // while the new generation cannot read them. Surface it instead of
+        // letting the type silently orphan.
+        let newly_registered = engine
+            .world()
+            .persist_type_names_registered_since(registration_sequence);
+        let forgotten_type_names: Vec<String> = self
+            .registered_type_names
+            .iter()
+            .filter(|name| !newly_registered.iter().any(|current| current == *name))
+            .cloned()
+            .collect();
+        if !forgotten_type_names.is_empty() {
+            warn!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = self.config.name.as_str(),
+                forgotten_types = ?forgotten_type_names,
+                "component type(s) no longer registered by this module; their data stays in the \
+                 world but is orphaned (the new generation cannot read it)"
+            );
+        }
+        self.registered_type_names = newly_registered;
+
+        // Step 4b: Re-home every native storage column to the freshly loaded
+        // generation's function table. Columns created by older generations
+        // hold function pointers into their own DLL; refreshing them here (the
+        // old DLLs are still mapped) keeps drops and upcasts valid when those
+        // DLLs are later evicted from the reload graveyard.
+        engine.world_mut().rehome_native_columns();
 
         // Step 5: Migrate persistable schemas that changed across the swap.
         // Types are matched by stable name rather than runtime ComponentId,

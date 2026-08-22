@@ -730,6 +730,41 @@ fn read_host_file_config() -> Result<Option<HostFileConfig>, ConfigError> {
     })
 }
 
+/// Remove the project's own `[workspace]` (and `[workspace.*]`) tables from a
+/// generated member manifest.
+///
+/// A standalone project declares itself a workspace root; a member of the
+/// engine workspace cannot be one too, so every `[workspace...]` header —
+/// including `[workspace.dependencies]` — is dropped before the member is
+/// written. The header scan is line-oriented so table names inside string
+/// values are never touched.
+fn strip_workspace_tables(manifest: &str) -> String {
+    let mut result = String::with_capacity(manifest.len());
+    let mut cursor = 0usize;
+    loop {
+        // Find the next `[workspace...]` header at the start of a line.
+        let relative = if manifest[cursor..].starts_with("[workspace") {
+            Some(0)
+        } else {
+            manifest[cursor..]
+                .find("\n[workspace")
+                .map(|offset| offset + 1)
+        };
+        let Some(header) = relative else { break };
+        let header = cursor + header;
+        // The whole table runs from its header to the next bracketed header
+        // (or the end of the manifest); drop it wholesale.
+        let table_end = manifest[header..]
+            .find("\n[")
+            .map(|offset| header + offset)
+            .unwrap_or(manifest.len());
+        result.push_str(&manifest[cursor..header]);
+        cursor = table_end;
+    }
+    result.push_str(&manifest[cursor..]);
+    result
+}
+
 /// Materialize a temporary workspace member for the native project.
 ///
 /// Cross-DLL type identity requires the project to compile as a member of the
@@ -791,7 +826,13 @@ fn materialize_host_project_member(
     }
     generated_manifest.push_str(&source_manifest[cursor..]);
 
-    // Step 2: Point the generated member's library at the real source file so
+    // Step 2: Drop the project's own `[workspace]` tables. A standalone
+    // project declares itself a workspace root; as a member of the engine
+    // workspace that table would make Cargo report "multiple workspace roots
+    // found in the same workspace" and fail every rebuild.
+    let mut generated_manifest = strip_workspace_tables(&generated_manifest);
+
+    // Step 3: Point the generated member's library at the real source file so
     // the project compiles from its actual location.
     let lib_source = project_root.join("src").join("lib.rs");
     if lib_source.is_file() {
@@ -815,7 +856,7 @@ fn materialize_host_project_member(
         }
     }
 
-    // Step 3: Write the generated member, replacing any previous generation.
+    // Step 4: Write the generated member, replacing any previous generation.
     //
     // When the generated content is unchanged the existing file is left
     // untouched so its modification time survives. Cargo fingerprints the
@@ -1043,6 +1084,35 @@ pill_spline_extra = { path = "../../modules/optional/pill_spline_extra" }
     // =========================================================================
     // project_depends_on_crate
     // =========================================================================
+
+    /// A project manifest with its own workspace tables, like `tests/project`.
+    const WORKSPACE_MANIFEST: &str = r#"
+[package]
+name = "project"
+edition = "2021"
+
+[dependencies]
+pill_engine = { path = "../../modules/pill_engine" }
+serde = { version = "1", features = ["derive"] }
+
+[workspace.dependencies]
+shared = { version = "1" }
+
+[workspace]
+"#;
+
+    /// The `[workspace]` and `[workspace.dependencies]` tables are dropped so
+    /// the generated member is not mistaken for a nested workspace root.
+    #[test]
+    fn strips_workspace_tables_from_project_manifest() {
+        let stripped = strip_workspace_tables(WORKSPACE_MANIFEST);
+        assert!(
+            !stripped.contains("[workspace"),
+            "workspace table still present"
+        );
+        assert!(stripped.contains("[package]"), "package table was dropped");
+        assert!(stripped.contains("serde ="), "dependency was dropped");
+    }
 
     /// The project manifest is read from disk and a direct dependency found.
     #[test]

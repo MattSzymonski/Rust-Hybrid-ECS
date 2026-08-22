@@ -61,6 +61,9 @@ pub(crate) enum LoadedProject {
         /// Old DLLs intentionally remain mapped because engine-owned function
         /// pointers and vtables may still refer to their code.
         old_libraries: Vec<NativeLibrary>,
+        /// Persistable component type names the last `project_init` registered,
+        /// used to detect types the next generation forgets to re-register.
+        registered_type_names: Vec<String>,
     },
     /// A collectible managed runtime hosting the C# project assembly.
     CSharp(CSharpRuntime),
@@ -101,14 +104,21 @@ impl LoadedProject {
                 // Native modules register their components and systems through
                 // the stable EngineApi table before the first frame is run.
                 let init_started = Instant::now();
+                // Capture the registration sequence before init so the exact set
+                // of persistable types this generation registered is recorded.
+                let registration_sequence = engine.world().persist_registration_sequence();
                 let status = library.call_init(engine_api);
                 analytics::record_init(&config.name, init_started.elapsed().as_secs_f64() * 1000.0);
                 if status != 0 {
                     return Err(LibraryError::InitializationFailed { status }.into());
                 }
+                let registered_type_names = engine
+                    .world()
+                    .persist_type_names_registered_since(registration_sequence);
                 Ok(Self::Native {
                     current: library,
                     old_libraries: Vec::new(),
+                    registered_type_names,
                 })
             }
             // The managed runtime performs assembly discovery, component
@@ -140,9 +150,11 @@ impl LoadedProject {
             Self::Native {
                 current,
                 old_libraries,
+                registered_type_names,
             } => reload_native(
                 current,
                 old_libraries,
+                registered_type_names,
                 engine,
                 engine_api,
                 workspace_root,
@@ -203,6 +215,7 @@ impl LoadedProject {
 fn reload_native(
     current: &mut NativeLibrary,
     old_libraries: &mut Vec<NativeLibrary>,
+    registered_type_names: &mut Vec<String>,
     engine: &mut Engine,
     engine_api: &EngineApi,
     workspace_root: &Path,
@@ -265,6 +278,9 @@ fn reload_native(
         "reload step 2/4: calling project_init on the new module"
     );
     let init_started = Instant::now();
+    // Capture the registration sequence before init so the types this new
+    // generation registered can be compared against the previous ones.
+    let registration_sequence = engine.world().persist_registration_sequence();
     if new_library.call_init(engine_api) != 0 {
         // The new generation failed to register itself. Roll the engine back
         // to the previous module: project_init must be idempotent, re-registering
@@ -286,6 +302,37 @@ fn reload_native(
         return;
     }
     analytics::record_init(&config.name, init_started.elapsed().as_secs_f64() * 1000.0);
+
+    // Detect persistable component types the new generation stopped
+    // registering. Such data is NOT wiped by migration — the type is absent
+    // from the changed-name set, so its column and metadata linger while the
+    // new generation cannot read them. Surface it instead of letting the type
+    // silently orphan.
+    let newly_registered = engine
+        .world()
+        .persist_type_names_registered_since(registration_sequence);
+    let forgotten_type_names: Vec<String> = registered_type_names
+        .iter()
+        .filter(|name| !newly_registered.iter().any(|current| current == *name))
+        .cloned()
+        .collect();
+    if !forgotten_type_names.is_empty() {
+        warn!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            module = config.name.as_str(),
+            forgotten_types = ?forgotten_type_names,
+            "component type(s) no longer registered by the project; their data stays in the world \
+             but is orphaned (the new generation cannot read it)"
+        );
+    }
+    *registered_type_names = newly_registered;
+
+    // Step 3b: Re-home every native storage column to the freshly loaded
+    // generation's function table. Columns created by older generations hold
+    // function pointers into their own DLL; refreshing them here (the old
+    // DLLs are still mapped) keeps drops and upcasts valid when those DLLs
+    // are later evicted from the reload graveyard.
+    engine.world_mut().rehome_native_columns();
 
     // Match schemas by stable type name rather than runtime ComponentId: IDs
     // can differ across dynamically loaded generations, while names persist.
@@ -310,9 +357,9 @@ fn reload_native(
     if changed_type_names.is_empty() {
         // Avoid touching archetype storage when every persisted layout is
         // byte-for-byte compatible with the previous generation.
-        debug!(
+        info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-            "schema unchanged for all persistable component types — fast path"
+            "schema unchanged for all persistable component types - fast path"
         );
     } else {
         // Migrate only changed component types. Unchanged columns keep their
@@ -342,7 +389,10 @@ fn reload_native(
             );
         }
     }
-    analytics::record_migrate(&config.name, migrate_started.elapsed().as_secs_f64() * 1000.0);
+    analytics::record_migrate(
+        &config.name,
+        migrate_started.elapsed().as_secs_f64() * 1000.0,
+    );
 
     // Do not unload the previous DLL. Persist metadata, component operations,
     // or other engine-owned pointers may still reference its executable code.

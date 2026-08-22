@@ -14,7 +14,7 @@
 //! `Send + Sync` so it can be shared across Rayon threads.
 
 // External crates
-use trait_type_map::VecStorage;
+use trait_type_map::ErasedVecStorage;
 
 // Current crate
 use super::change_detection::Mut;
@@ -111,7 +111,7 @@ impl QueryTarget for Entity {
 /// and reports the component as a read for system dependency analysis.
 impl<T: Component> QueryTarget for &T {
     type Item<'a> = &'a T;
-    type State = SendPtr<VecStorage<T, dyn Component>>;
+    type State = SendPtr<ErasedVecStorage<dyn Component>>;
 
     fn component_ids() -> Vec<ComponentId> {
         vec![ComponentId::of::<T>()]
@@ -130,7 +130,7 @@ impl<T: Component> QueryTarget for &T {
             ]
         );
         SendPtr::new(
-            archetype.component_storages.get_storage::<T>() as *const VecStorage<T, dyn Component>
+            archetype.component_storages.get_storage::<T>() as *const ErasedVecStorage<dyn Component>
         )
     }
 
@@ -139,7 +139,7 @@ impl<T: Component> QueryTarget for &T {
         // and the ECS invariant guarantees `archetype.len() == storage.len()`
         // for every component type in the archetype. Therefore `index` is
         // always in bounds for this storage.
-        unsafe { (*state.as_ptr()).get_unchecked(index) }
+        unsafe { (*state.as_ptr()).get_unchecked::<T>(index) }
     }
 }
 
@@ -152,11 +152,13 @@ impl<T: Component> QueryTarget for &T {
 pub struct MutFetchState<T: Component> {
     /// Raw pointer to the component values storage, cached to avoid
     /// re-locating the storage on every row fetch.
-    values: SendPtrMut<VecStorage<T, dyn Component>>,
+    values: SendPtrMut<ErasedVecStorage<dyn Component>>,
     /// Raw pointer to the per-entity change-detection ticks storage.
     ticks: SendPtrMut<Vec<ComponentTicks>>,
     /// The world tick for this run, stored on `Mut<T>` at fetch time.
     this_run: Tick,
+    /// Ties the state to the queried component type.
+    _marker: std::marker::PhantomData<T>,
 }
 
 // SAFETY: Both inner pointers wrap raw addresses backed by storage that
@@ -189,7 +191,7 @@ impl<T: Component> QueryTarget for &mut T {
             ]
         );
         let values = SendPtrMut::new(archetype.component_storages.get_storage_mut::<T>()
-            as *mut VecStorage<T, dyn Component>);
+            as *mut ErasedVecStorage<dyn Component>);
         let ticks_vec = archetype
             .component_ticks
             .get_mut(&ComponentId::of::<T>())
@@ -200,6 +202,7 @@ impl<T: Component> QueryTarget for &mut T {
             values,
             ticks,
             this_run,
+            _marker: std::marker::PhantomData,
         }
     }
 
@@ -211,7 +214,7 @@ impl<T: Component> QueryTarget for &mut T {
         // updates ticks[index].changed without requiring atomics because
         // no other thread observes this row.
         unsafe {
-            let value: &'a mut T = (*state.values.as_ptr()).get_mut_unchecked(index);
+            let value: &'a mut T = (*state.values.as_ptr()).get_mut_unchecked::<T>(index);
             let ticks: &'a mut ComponentTicks =
                 &mut *(*state.ticks.as_ptr()).as_mut_ptr().add(index);
             Mut::new(value, ticks, state.this_run)

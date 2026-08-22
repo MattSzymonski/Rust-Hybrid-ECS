@@ -20,6 +20,7 @@ __pycache__/
 .vscode/settings.json
 .idea/
 .github/skills
+.claude/
 
 
 # Profiling and benchmark artifacts

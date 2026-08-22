@@ -44,7 +44,7 @@ use std::hash::{Hash, Hasher};
 
 // External crates
 use serde::{de::DeserializeOwned, Serialize};
-use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
+use trait_type_map::{ErasedVecStorage, TraitAccessible, TraitTypeMap, VecFamily};
 
 // Current crate
 use crate::component::{Component, ComponentId};
@@ -221,8 +221,15 @@ impl World {
             insert_boxed_component::<T> as InsertComponentFn,
         );
 
-        self.persist_schema_hashes
-            .insert(type_name, calculate_schema_hash::<T>());
+        let schema_hash = calculate_schema_hash::<T>();
+        self.persist_schema_hashes.insert(type_name.clone(), schema_hash);
+
+        // Record the registration chronologically so the host can enumerate
+        // exactly which types one module's init registered, which is how a
+        // component type dropped from a reloaded module is detected.
+        self.persist_registration_log
+            .push((type_name, self.persist_registration_sequence));
+        self.persist_registration_sequence += 1;
     }
 }
 
@@ -502,6 +509,30 @@ impl World {
         entries
     }
 
+    /// Sequence marker to capture before a module's `init` so the exact set of
+    /// persistable types that `init` registers can be enumerated afterwards.
+    pub fn persist_registration_sequence(&self) -> u64 {
+        self.persist_registration_sequence
+    }
+
+    /// Names of persistable components registered after `sequence`.
+    ///
+    /// Used by the host to compare what a module's new generation registered
+    /// against what the previous generation registered, so a component type
+    /// that was accidentally dropped from the module is detected instead of
+    /// silently orphaned.
+    ///
+    /// The comparison is `>=`: a registration reads the current sequence value
+    /// and then increments it, so a registration that happened immediately
+    /// after the capture carries exactly the captured value.
+    pub fn persist_type_names_registered_since(&self, sequence: u64) -> Vec<String> {
+        self.persist_registration_log
+            .iter()
+            .filter(|(_, registration_sequence)| *registration_sequence >= sequence)
+            .map(|(type_name, _)| type_name.clone())
+            .collect()
+    }
+
     /// Capture old persistable component metadata before hot-reload.
     pub fn capture_persist_type_metadata(&self) -> HashMap<String, PersistTypeMetadata> {
         let mut metadata_by_name: HashMap<String, PersistTypeMetadata> = HashMap::new();
@@ -734,13 +765,17 @@ impl World {
                 return Err(PersistenceError::StorageRemovalFailed { component_id });
             }
 
-            let Some(storage_factory) = self.storage_factories.get(&component_id) else {
+            let Some(factory) = self.storage_factories.get(&component_id) else {
                 return Err(PersistenceError::StorageFactoryMissing { component_id });
             };
-            let crate::archetype::StorageFactory::Native(storage_factory) = storage_factory else {
+            let crate::archetype::StorageFactory::Native(info) = factory else {
                 return Err(PersistenceError::NativeStorageExpected { component_id });
             };
-            storage_factory(&mut archetype.component_storages);
+            // Build the replacement column as a concrete erased column (no
+            // trait-object vtable) so it stays valid across module unloads.
+            archetype
+                .component_storages
+                .insert_erased(ErasedVecStorage::<dyn Component>::new(*info));
 
             for component in migrated_components {
                 insert_new_component(&mut archetype.component_storages, component);
@@ -923,7 +958,7 @@ where
     T: Component + TraitAccessible<dyn Component> + Serialize,
 {
     let typed_storage = storage.get_storage::<T>();
-    let value: &T = typed_storage.get(index);
+    let value: &T = typed_storage.get::<T>(index);
     serde_json::to_vec(value).expect("JSON serialization failed")
 }
 
@@ -1076,7 +1111,7 @@ fn insert_boxed_component<T>(
     // double-free.
     let raw = Box::into_raw(component);
     let typed: Box<T> = unsafe { Box::from_raw(raw as *mut T) };
-    storage.get_storage_mut::<T>().push(*typed);
+    storage.get_storage_mut::<T>().push::<T>(*typed);
 }
 
 // =============================================================================

@@ -22,7 +22,7 @@ use std::any::Any;
 use std::collections::HashMap;
 
 // External crates
-use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
+use trait_type_map::{ErasedVecStorageInfo, TraitAccessible, TraitTypeMap, VecFamily};
 
 // Current crate
 use crate::archetype::{Archetype, ArchetypeId, DynamicComponentLayout, StorageFactory};
@@ -234,6 +234,11 @@ pub struct World {
     pub(crate) persist_inserters: HashMap<ComponentId, crate::persistence::InsertComponentFn>,
     /// Per-type-name schema hash for persistable components.
     pub(crate) persist_schema_hashes: HashMap<String, u64>,
+    /// Monotonic counter bumped on every persistable registration, letting the
+    /// host enumerate exactly which types one module's `init` registered.
+    pub(crate) persist_registration_sequence: u64,
+    /// Chronological `(type_name, sequence)` log of persistable registrations.
+    pub(crate) persist_registration_log: Vec<(String, u64)>,
 }
 
 impl World {
@@ -262,6 +267,8 @@ impl World {
             persist_deserializers: HashMap::new(),
             persist_inserters: HashMap::new(),
             persist_schema_hashes: HashMap::new(),
+            persist_registration_sequence: 0,
+            persist_registration_log: Vec::new(),
         }
     }
 
@@ -304,7 +311,7 @@ impl World {
         for archetype in self.archetypes.values_mut() {
             if archetype.component_types.contains(&component_id) {
                 let storage = archetype.component_storages.get_storage_mut::<T>();
-                storage.data.reserve(additional);
+                storage.reserve::<T>(additional);
                 if let Some(ticks) = archetype.component_ticks.get_mut(&component_id) {
                     ticks.reserve(additional);
                 }
@@ -329,7 +336,7 @@ impl World {
             .nth(chunk_index)?;
         let archetype_id = archetype.id;
         let storage = archetype.component_storages.get_storage_mut::<T>();
-        Some((archetype_id, storage.data.as_mut_slice()))
+        Some((archetype_id, storage.as_mut_slice::<T>()))
     }
 
     /// Return one component chunk together with its parallel change-tick column.
@@ -354,8 +361,7 @@ impl World {
         let components = archetype
             .component_storages
             .get_storage_mut::<T>()
-            .data
-            .as_mut_slice();
+            .as_mut_slice::<T>();
         let ticks = archetype
             .component_ticks
             .get_mut(&component_id)
@@ -401,13 +407,15 @@ impl World {
         // Register component (bit index + name)
         self.component_registry.register::<T>();
 
+        // Register the storage factory as plain DATA (type id, layout, and a
+        // per-type function table) instead of a closure that would be
+        // monomorphized into this generation's DLL. The engine builds the
+        // actual column in `Archetype::new` as a concrete `Box<ErasedVecStorage>`
+        // with no trait-object vtable, and re-homes its function table on
+        // every reload, so columns survive DLL unloads.
         self.storage_factories.insert(
             component_id,
-            StorageFactory::Native(Box::new(
-                |map: &mut TraitTypeMap<dyn Component, VecFamily>| {
-                    map.register_type_storage::<T>();
-                },
-            )),
+            StorageFactory::Native(ErasedVecStorageInfo::<dyn Component>::of::<T>()),
         );
 
         // Register copier function for this component type.
@@ -415,6 +423,47 @@ impl World {
         // requires no heap allocation or vtable dispatch.
         self.component_copiers
             .insert(component_id, copy_component::<T>);
+    }
+
+    /// Re-home every native column's per-type function table.
+    ///
+    /// Called by the host after each generation's `init` and before migration.
+    /// Columns store function pointers into the DLL that created them; when
+    /// that DLL is evicted from the reload graveyard the pointers dangle. This
+    /// pass refreshes each column from the latest factory registered for its
+    /// component id, so:
+    ///
+    /// - unchanged types point at the freshly loaded generation (still mapped),
+    /// - schema-changed types point at the previous generation (still mapped
+    ///   while the migration consumes and drops their columns),
+    /// - type-erased (foreign-language) columns are untouched.
+    pub fn rehome_native_columns(&mut self) {
+        // Step 1: Snapshot the current per-type function tables first so the
+        // immutable borrow of `storage_factories` cannot conflict with the
+        // mutable borrow of `archetypes` below.
+        let factory_ops: HashMap<ComponentId, trait_type_map::ErasedVecStorageOps<dyn Component>> =
+            self.storage_factories
+                .iter()
+                .filter_map(|(component_id, factory)| match factory {
+                    StorageFactory::Native(info) => Some((*component_id, info.ops)),
+                    StorageFactory::Dynamic(_) => None,
+                })
+                .collect();
+
+        // Step 2: Refresh every column whose component id has a native factory.
+        for archetype in self.archetypes.values_mut() {
+            for &component_id in &archetype.component_types {
+                let Some(&ops) = factory_ops.get(&component_id) else {
+                    continue;
+                };
+                let Some(type_id) = component_id.native_type_id() else {
+                    continue;
+                };
+                if let Some(column) = archetype.component_storages.get_trait_storage_mut(type_id) {
+                    column.refresh_ops(ops);
+                }
+            }
+        }
     }
 
     /// Register an unmanaged component described by an external language.
@@ -625,7 +674,7 @@ impl World {
                   world_ptr: *mut World,
                   commands_ptr: *mut CommandQueue| {
                     // Get mutable reference to the component
-                    let component = storage.get_storage_mut::<T>().get_mut(index);
+                    let component = storage.get_storage_mut::<T>().get_mut::<T>(index);
                     // SAFETY: `world_ptr` and `commands_ptr` are derived from
                     // `&mut World` / `&mut CommandQueue` that are valid for the
                     // entire duration of `update_scripts`, which is the sole
@@ -939,7 +988,7 @@ impl World {
             archetype
                 .component_storages
                 .get_storage::<T>()
-                .get(location.index_in_archetype),
+                .get::<T>(location.index_in_archetype),
         )
     }
 
@@ -980,7 +1029,7 @@ impl World {
             archetype
                 .component_storages
                 .get_storage_mut::<T>()
-                .get_mut(index),
+                .get_mut::<T>(index),
         )
     }
 
@@ -1014,7 +1063,7 @@ impl World {
 
         // Get raw pointer to component - avoids creating intermediate &mut
         let storage = archetype.component_storages.get_storage_mut::<T>();
-        Some(storage.get_mut(index) as *mut T)
+        Some(storage.get_mut::<T>(index) as *mut T)
     }
 
     /// Allocate a new unique entity ID
@@ -1372,7 +1421,7 @@ impl World {
                             .component_storages
                             .get_trait_storage_mut(type_id)
                         {
-                            storage.swap_remove(old_index);
+                            storage.swap_remove_discard(old_index);
                         }
                     }
                     None => old_archetype
@@ -1453,7 +1502,7 @@ impl World {
                         if let Some(storage) =
                             archetype.component_storages.get_trait_storage_mut(type_id)
                         {
-                            storage.swap_remove(old_index);
+                            storage.swap_remove_discard(old_index);
                         }
                     }
                     None => archetype
@@ -1631,7 +1680,7 @@ impl World {
                     copier(old_storage, new_storage, old_index);
                 }
                 // Add the new component
-                new_storage.get_storage_mut::<T>().push(component);
+                new_storage.get_storage_mut::<T>().push::<T>(component);
             },
         );
 
@@ -1932,7 +1981,7 @@ impl<T: Component + TraitAccessible<dyn Component>> ComponentInserter
     for TypedComponentInserter<T>
 {
     fn insert(self: Box<Self>, storage: &mut TraitTypeMap<dyn Component, VecFamily>) {
-        storage.get_storage_mut::<T>().push(self.component);
+        storage.get_storage_mut::<T>().push::<T>(self.component);
     }
 
     fn component_id(&self) -> ComponentId {
@@ -2032,8 +2081,10 @@ fn copy_component<T: Component + TraitAccessible<dyn Component> + Clone>(
     destination: &mut TraitTypeMap<dyn Component, VecFamily>,
     index: usize,
 ) {
-    let component = source.get_storage::<T>().get(index);
-    destination.get_storage_mut::<T>().push(component.clone());
+    let component = source.get_storage::<T>().get::<T>(index);
+    destination
+        .get_storage_mut::<T>()
+        .push::<T>(component.clone());
 }
 
 // =============================================================================

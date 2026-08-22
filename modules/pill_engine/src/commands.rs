@@ -113,7 +113,7 @@ impl<T: Component + TraitAccessible<dyn Component> + Send> ComponentAdder
     ) {
         // The storage row for `T` was allocated by the caller; append the
         // component value to it to finish the insertion.
-        new_storage.get_storage_mut::<T>().push(self.component);
+        new_storage.get_storage_mut::<T>().push::<T>(self.component);
     }
 }
 

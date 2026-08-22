@@ -46,7 +46,7 @@ use std::collections::HashMap;
 use std::ptr::NonNull;
 
 // External crates
-use trait_type_map::{TraitTypeMap, VecFamily};
+use trait_type_map::{ErasedVecStorage, ErasedVecStorageInfo, TraitTypeMap, VecFamily};
 
 // Current crate
 use crate::component::{Component, ComponentId, ComponentMask, ComponentTicks};
@@ -63,9 +63,14 @@ use crate::error::WorldError;
 /// created so the archetype can allocate storage without knowing the
 /// concrete component types.
 pub enum StorageFactory {
-    /// Creates a native, type-erased storage column inside the archetype's
+    /// Creates a type-erased native storage column inside the archetype's
     /// [`TraitTypeMap`].
-    Native(Box<dyn Fn(&mut TraitTypeMap<dyn Component, VecFamily>) + Send + Sync>),
+    ///
+    /// Carries only data (type id, layout, per-type function table), never a
+    /// closure: the column is stored as a concrete `Box<ErasedVecStorage>`
+    /// with no trait-object vtable, so it survives module unloads; the engine
+    /// refreshes its function table on every reload.
+    Native(ErasedVecStorageInfo<dyn Component>),
     /// Carries the runtime layout of a component owned by another language.
     Dynamic(DynamicComponentLayout),
 }
@@ -420,7 +425,14 @@ impl Archetype {
                     component_id
                 ));
             match factory {
-                StorageFactory::Native(factory) => factory(&mut component_storages),
+                StorageFactory::Native(info) => {
+                    // Build the erased column from the registered type
+                    // description and store it as a concrete
+                    // `Box<ErasedVecStorage>` (no trait-object vtable), so
+                    // the column stays valid across module unloads.
+                    component_storages
+                        .insert_erased(ErasedVecStorage::<dyn Component>::new(*info));
+                }
                 StorageFactory::Dynamic(layout) => {
                     dynamic_component_storages
                         .insert(component_id, DynamicColumn::new(layout.clone()));

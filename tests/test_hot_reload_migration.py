@@ -44,11 +44,11 @@ TEST_PROJECT_ROOT = WORKSPACE_ROOT / "tests" / "project"
 PROJECT_LIB_RS = TEST_PROJECT_ROOT / "src" / "lib.rs"
 
 STARTUP_TOKEN = "Entering project loop"
-RELOAD_COMPLETE_TOKEN = "Hot-reload complete"
+RELOAD_COMPLETE_TOKEN = "hot reload complete"
 COUNTER_TICK_TOKEN = "counter tick"
 PANIC_TOKEN = "panicked at"
 ACCESS_VIOLATION_TOKEN = "STATUS_ACCESS_VIOLATION"
-FAST_PATH_TOKEN = "Schema unchanged for all persistable component types"
+FAST_PATH_TOKEN = "schema unchanged for all persistable component types"
 SELECTIVE_START_TOKEN = "[persistence] Selective migration starting"
 SELECTIVE_FINISHED_TOKEN = "[persistence] Selective migration finished"
 FRAMECOUNTER_MIGRATE_LOG_TOKEN = "'project::FrameCounter' -> migrating"
@@ -63,6 +63,9 @@ COUNTER_TICK_TIMEOUT = 10
 PROCESS_KILL_TIMEOUT = 5
 CYCLE_PAUSE = 2
 MAX_BUFFERED_LINES = 7000
+# Counter-tick lines are captured in a dedicated small tail so the flood can
+# never evict the reload lines the scenarios assert on.
+MAX_TICK_TAIL = 200
 
 ORIGINAL_CONTENT: str = ""
 
@@ -335,7 +338,14 @@ class OutputMonitor:
 
     def __init__(self, process: subprocess.Popen) -> None:
         self._process = process
-        self._lines: List[str] = []
+        # Lines are stored as (sequence, line) pairs so waiters stay correct
+        # even after the rolling buffer drops old entries. Counter-tick lines
+        # go to a small dedicated tail: the host floods thousands of them a
+        # second, which would otherwise roll the buffer (and with it every
+        # reload line) before the scenarios can assert on them.
+        self._lines: List[Tuple[int, str]] = []
+        self._tick_tail: List[Tuple[int, str]] = []
+        self._sequence = 0
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -357,24 +367,42 @@ class OutputMonitor:
                     break
 
                 with self._lock:
-                    self._lines.append(line)
-                    if len(self._lines) > MAX_BUFFERED_LINES:
-                        self._lines = self._lines[-MAX_BUFFERED_LINES:]
+                    sequence = self._sequence
+                    self._sequence += 1
+                    if COUNTER_TICK_TOKEN in line:
+                        self._tick_tail.append((sequence, line))
+                        if len(self._tick_tail) > MAX_TICK_TAIL:
+                            self._tick_tail = self._tick_tail[-MAX_TICK_TAIL:]
+                    else:
+                        self._lines.append((sequence, line))
+                        if len(self._lines) > MAX_BUFFERED_LINES:
+                            self._lines = self._lines[-MAX_BUFFERED_LINES:]
 
-                print(f"  [std] {line.rstrip()}")
+                # Forward to the console, but not the counter-tick flood.
+                if COUNTER_TICK_TOKEN not in line:
+                    print(f"  [std] {line.rstrip()}")
         except (ValueError, OSError):
             pass
 
+    def _iter_since(self, start_index: int):
+        """Yields buffered lines with sequence number >= start_index."""
+        for sequence, line in self._lines:
+            if sequence >= start_index:
+                yield line
+        for sequence, line in self._tick_tail:
+            if sequence >= start_index:
+                yield line
+
     @property
     def line_count(self) -> int:
-        """Returns number of buffered lines."""
+        """Returns the sequence number of the next line to arrive."""
         with self._lock:
-            return len(self._lines)
+            return self._sequence
 
     def output_since(self, start_index: int) -> str:
-        """Returns output concatenated since a specific buffer index."""
+        """Returns output concatenated since a specific sequence number."""
         with self._lock:
-            return "".join(self._lines[start_index:])
+            return "".join(self._iter_since(start_index))
 
     def process_alive(self) -> bool:
         """Returns True when process is still running."""
@@ -389,7 +417,7 @@ class OutputMonitor:
                 return False
 
             with self._lock:
-                for line in self._lines[start_index:]:
+                for line in self._iter_since(start_index):
                     if token in line:
                         return True
 
@@ -739,12 +767,16 @@ def run_suite(cycles: int) -> bool:
 
 
 def build_workspace() -> bool:
-    """Builds workspace before integration suite starts."""
-    print("\n  [PREP] Building workspace...")
+    """Builds the standalone host before the integration suite starts."""
+    print("\n  [PREP] Building standalone host...")
     try:
         result = subprocess.run(
-            ["cargo", "build", "--workspace"],
-            cwd=str(WORKSPACE_ROOT),
+            # `--package pill_standalone` instead of `--workspace`: building
+            # every optional module together re-enables `module-abi` on crates
+            # like `pill_dummy_color` that other modules depend on with it
+            # disabled, which collides with their `pill_module_*` exports.
+            ["cargo", "build", "--package", "pill_standalone"],
+            cwd=str(WORKSPACE_ROOT / "modules"),
             capture_output=True,
             text=True,
             timeout=BUILD_TIMEOUT,
