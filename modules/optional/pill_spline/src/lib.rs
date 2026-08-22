@@ -27,25 +27,14 @@
 //! provided it is built in the same workspace, which is what keeps the
 //! component's type identity the same on both sides.
 
-// Standard library
-#[cfg(feature = "module-abi")]
-use std::ffi::c_char;
-#[cfg(feature = "module-abi")]
-use std::panic::{catch_unwind, AssertUnwindSafe};
-
 // External crates
 use pill_core::math::Vector3f;
 use pill_engine::*;
 use serde::{Deserialize, Serialize};
-use trait_type_map::impl_trait_accessible;
 
 // =============================================================================
 // Constants
 // =============================================================================
-
-/// Optional-module ABI revision this crate was built against.
-#[cfg(feature = "module-abi")]
-const MODULE_ABI_VERSION: u32 = 1;
 
 /// Maximum number of control points one spline can hold.
 ///
@@ -58,10 +47,6 @@ pub const MAX_CONTROL_POINTS: usize = 16;
 /// that path out, so the constant is gated with it to stay warning-free.
 #[cfg(feature = "module-abi")]
 const DEMO_SPLINE_COUNT: usize = 1;
-
-/// Name reported to the host for diagnostics; null terminated for the C ABI.
-#[cfg(feature = "module-abi")]
-const MODULE_NAME: &[u8] = b"pill_spline\0";
 
 // =============================================================================
 // Component
@@ -76,7 +61,8 @@ const MODULE_NAME: &[u8] = b"pill_spline\0";
 /// The host serializes this component across hot-reload generations, so the
 /// layout is pinned with `#[repr(C)]` and every field stays serde compatible.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PillComponent)]
+#[pill(persistable)]
 pub struct Spline {
     /// Control points the curve passes through, in order.
     pub control_points: [Vector3f; MAX_CONTROL_POINTS],
@@ -93,9 +79,6 @@ impl Default for Spline {
         }
     }
 }
-
-impl Component for Spline {}
-impl_trait_accessible!(dyn Component; Spline);
 
 impl Spline {
     /// Build a spline from control points, in order.
@@ -245,14 +228,8 @@ fn demo_spline() -> Spline {
 ///
 /// The module registers no system: it contributes a component type and the math
 /// to sample it, leaving movement along a path to whoever owns that behaviour.
-#[cfg(feature = "module-abi")]
-pub fn register(engine: &mut Engine) -> u32 {
-    // Persistable registration is what makes the component survive a reload:
-    // the host matches schemas by type name and migrates only changed layouts.
-    engine
-        .world_mut()
-        .register_persistable_component::<Spline>();
-
+#[pill_module]
+fn register(engine: &mut Engine) -> u32 {
     // Fill up to the target count rather than spawning a new path on every
     // rebuild, because hot reload preserves the entities already created.
     let existing_spline_count = {
@@ -283,52 +260,6 @@ pub fn register(engine: &mut Engine) -> u32 {
         "pill_spline module registered"
     );
     0
-}
-
-// =============================================================================
-// Optional-module ABI exports
-// =============================================================================
-//
-// Gated behind `module-abi` (on by default) so a crate linked directly into
-// another binary, such as the project, can disable it: two crates exporting
-// the same `#[no_mangle]` symbol names into one binary is a linker error. The
-// standalone build the host hot-loads keeps the feature enabled.
-
-/// Module ABI revision, checked by the host before anything else is called.
-#[cfg(feature = "module-abi")]
-#[no_mangle]
-pub extern "C" fn pill_module_abi_version() -> u32 {
-    MODULE_ABI_VERSION
-}
-
-/// Human-readable module name used in host log messages.
-#[cfg(feature = "module-abi")]
-#[no_mangle]
-pub extern "C" fn pill_module_name() -> *const c_char {
-    MODULE_NAME.as_ptr() as *const c_char
-}
-
-/// Registers the module against the host engine; returns zero on success.
-///
-/// # Safety
-///
-/// `api` must be a valid [`EngineApi`] pointer owned by the host and kept alive
-/// for the whole duration of this call.
-#[cfg(feature = "module-abi")]
-#[no_mangle]
-pub unsafe extern "C" fn pill_module_init(api: *const EngineApi) -> u32 {
-    // A panic must never unwind across the C ABI boundary, so it is converted
-    // into a non-zero status and the host keeps the previous generation.
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        // SAFETY: The host guarantees `api` points at a live `EngineApi` whose
-        // `engine_handle` addresses the single engine instance, and that both
-        // outlive this call. The engine is not otherwise borrowed while a
-        // module initializes, so the reconstructed `&mut Engine` is unique.
-        let api = unsafe { &*api };
-        let engine = unsafe { &mut *(api.engine_handle as *mut Engine) };
-        register(engine)
-    }));
-    result.unwrap_or(u32::MAX)
 }
 
 // =============================================================================

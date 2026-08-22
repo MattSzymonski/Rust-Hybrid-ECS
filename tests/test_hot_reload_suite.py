@@ -551,13 +551,8 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
 # --- pill_spline module edits (all applied from the original source) ---------
 
 SPLINE_REGISTER_ORIGINAL = """\
-pub fn register(engine: &mut Engine) -> u32 {
-    // Persistable registration is what makes the component survive a reload:
-    // the host matches schemas by type name and migrates only changed layouts.
-    engine
-        .world_mut()
-        .register_persistable_component::<Spline>();
-
+#[pill_module]
+fn register(engine: &mut Engine) -> u32 {
     // Fill up to the target count rather than spawning a new path on every
     // rebuild, because hot reload preserves the entities already created.
     let existing_spline_count = {
@@ -591,11 +586,42 @@ pub fn register(engine: &mut Engine) -> u32 {
 }"""
 
 SPLINE_REGISTER_STUB_NO_REGISTRATION = """\
-pub fn register(engine: &mut Engine) -> u32 {
-    // Suite stub: the persistable registration and demo-spline fill are
-    // disabled so the module loads WITHOUT registering `Spline`. The items
-    // below are referenced only to keep the dead-code lint quiet in this
-    // stub build (the real register is their only other user).
+// Suite stub: the persistable registration is disabled so the module loads
+// WITHOUT registering `Spline`. The `#[pill_module]` attribute is dropped too,
+// so no compile-time auto-registration runs; the ABI exports are written out
+// by hand to keep the module loadable. `DEMO_SPLINE_COUNT`/`demo_spline` are
+// referenced only to keep the dead-code lint quiet in this stub build.
+#[cfg(feature = "module-abi")]
+const PILL_MODULE_ABI_VERSION: u32 = ::pill_engine::module_abi::MODULE_ABI_VERSION;
+
+#[cfg(feature = "module-abi")]
+const PILL_MODULE_NAME: &[u8] = b"pill_spline\0";
+
+#[cfg(feature = "module-abi")]
+#[no_mangle]
+pub extern "C" fn pill_module_abi_version() -> u32 {
+    PILL_MODULE_ABI_VERSION
+}
+
+#[cfg(feature = "module-abi")]
+#[no_mangle]
+pub extern "C" fn pill_module_name() -> *const ::core::ffi::c_char {
+    PILL_MODULE_NAME.as_ptr() as *const ::core::ffi::c_char
+}
+
+#[cfg(feature = "module-abi")]
+#[no_mangle]
+pub unsafe extern "C" fn pill_module_init(api: *const ::pill_engine::EngineApi) -> u32 {
+    let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+        let api = unsafe { &*api };
+        let engine = unsafe { &mut *(api.engine_handle as *mut ::pill_engine::Engine) };
+        register(engine)
+    }));
+    result.unwrap_or(u32::MAX)
+}
+
+#[cfg(feature = "module-abi")]
+fn register(engine: &mut Engine) -> u32 {
     let _ = engine;
     let _ = (DEMO_SPLINE_COUNT, demo_spline());
     pill_core::info!(
@@ -606,10 +632,41 @@ pub fn register(engine: &mut Engine) -> u32 {
 }"""
 
 SPLINE_REGISTER_STUB_INIT_FAILURE = """\
-pub fn register(engine: &mut Engine) -> u32 {
-    // Suite stub: deliberately fail init so the host rolls back to the
-    // previous generation. `DEMO_SPLINE_COUNT`/`demo_spline` are referenced
-    // only to keep the dead-code lint quiet in this stub build.
+// Suite stub: deliberately fail init so the host rolls back to the previous
+// generation. The `#[pill_module]` attribute is dropped (hand-written exports
+// below), and `DEMO_SPLINE_COUNT`/`demo_spline` are referenced only to keep
+// the dead-code lint quiet in this stub build.
+#[cfg(feature = "module-abi")]
+const PILL_MODULE_ABI_VERSION: u32 = ::pill_engine::module_abi::MODULE_ABI_VERSION;
+
+#[cfg(feature = "module-abi")]
+const PILL_MODULE_NAME: &[u8] = b"pill_spline\0";
+
+#[cfg(feature = "module-abi")]
+#[no_mangle]
+pub extern "C" fn pill_module_abi_version() -> u32 {
+    PILL_MODULE_ABI_VERSION
+}
+
+#[cfg(feature = "module-abi")]
+#[no_mangle]
+pub extern "C" fn pill_module_name() -> *const ::core::ffi::c_char {
+    PILL_MODULE_NAME.as_ptr() as *const ::core::ffi::c_char
+}
+
+#[cfg(feature = "module-abi")]
+#[no_mangle]
+pub unsafe extern "C" fn pill_module_init(api: *const ::pill_engine::EngineApi) -> u32 {
+    let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+        let api = unsafe { &*api };
+        let engine = unsafe { &mut *(api.engine_handle as *mut ::pill_engine::Engine) };
+        register(engine)
+    }));
+    result.unwrap_or(u32::MAX)
+}
+
+#[cfg(feature = "module-abi")]
+fn register(engine: &mut Engine) -> u32 {
     let _ = engine;
     let _ = (DEMO_SPLINE_COUNT, demo_spline());
     1
@@ -638,15 +695,11 @@ FRAMECOUNTER_MIGRATION_EDITS = [
 
 PROJECT_FORGOTTEN_EDITS = [
     (
-        "        .register_persistable_component::<SpatialPosition>();\n"
-        "    engine\n"
-        "        .world_mut()\n"
-        "        .register_persistable_component::<LinearVelocity>();\n"
-        "\n"
-        "    engine.register_system",
-        "        .register_persistable_component::<SpatialPosition>();\n"
-        "\n"
-        "    engine.register_system",
+        "#[derive(Debug, Clone, Serialize, Deserialize, Default, PillComponent)]\n"
+        "#[pill(persistable)]\n"
+        "struct LinearVelocity {",
+        "#[derive(Debug, Clone, Serialize, Deserialize, Default, PillComponent)]\n"
+        "struct LinearVelocity {",
     ),
 ]
 

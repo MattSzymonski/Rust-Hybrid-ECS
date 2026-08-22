@@ -40,6 +40,9 @@ pub mod commands;
 /// Component trait, type identification, and change-detection primitives.
 pub mod component;
 
+/// Compile-time component registry driven by `#[derive(PillComponent)]`.
+pub mod component_registry;
+
 /// Centralised configuration constants and hardware detection.
 pub mod config;
 
@@ -51,6 +54,9 @@ pub mod entity;
 
 /// Typed error system for the ECS engine.
 pub mod error;
+
+/// Constants shared between the host and optional engine modules.
+pub mod module_abi;
 
 /// Component persistence and schema migration for hot-reload.
 pub mod persistence;
@@ -109,6 +115,11 @@ pub use serde::{Deserialize, Serialize};
 
 // Tracing re-exported to keep telemetry under a single flat namespace.
 pub use tracing;
+
+// Registration macros + the inventory submit macro they expand to, re-exported
+// so module/project crates need no dependency beyond `pill_engine` itself.
+pub use inventory::submit;
+pub use pill_engine_macros::{PillComponent, pill_module, pill_project};
 
 // World container and its entity-builder and error types.
 pub use world::{AddComponentError, BuildError, EntityBuilder, RemoveComponentError, World};

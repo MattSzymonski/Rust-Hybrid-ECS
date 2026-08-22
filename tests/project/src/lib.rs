@@ -13,10 +13,13 @@
 //! and system. When source files change, the host rebuilds and reloads this
 //! module without restarting. Component data is preserved across reloads
 //! via JSON serialization and matched by type name.
+//!
+//! Components are declared with `#[derive(PillComponent)]`, which registers
+//! them at init automatically; `#[pill_project]` generates the `project_*`
+//! entry points from the `init` function below.
 
 // External crates
 use serde::{Deserialize, Serialize};
-use trait_type_map::impl_trait_accessible;
 
 // Current crate
 use pill_engine::*;
@@ -25,32 +28,25 @@ use pill_engine::*;
 // Components
 // =============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PillComponent)]
+#[pill(persistable)]
 struct FrameCounter {
     count: u64,
 }
-impl Component for FrameCounter {}
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PillComponent)]
+#[pill(persistable)]
 struct SpatialPosition {
     horizontal: f32,
     vertical: f32,
 }
-impl Component for SpatialPosition {}
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PillComponent)]
+#[pill(persistable)]
 struct LinearVelocity {
     horizontal_speed: f32,
     vertical_speed: f32,
 }
-impl Component for LinearVelocity {}
-
-impl_trait_accessible!(
-    dyn Component;
-    FrameCounter,
-    SpatialPosition,
-    LinearVelocity
-);
 
 // =============================================================================
 // Systems
@@ -88,27 +84,10 @@ fn counter_system(mut query: Query<&mut FrameCounter>) {
 // FFI Entry Points
 // =============================================================================
 
-/// Registers test components, systems, and seed entities; returns zero.
-///
-/// # Safety
-///
-/// `api` must be a valid [`EngineApi`] pointer owned by the host for the
-/// complete duration of this call.
-#[no_mangle]
-pub unsafe extern "C" fn project_init(api: *const EngineApi) -> u32 {
-    let api = unsafe { &*api };
-    let engine: &mut Engine = unsafe { &mut *(api.engine_handle as *mut Engine) };
-
-    engine
-        .world_mut()
-        .register_persistable_component::<FrameCounter>();
-    engine
-        .world_mut()
-        .register_persistable_component::<SpatialPosition>();
-    engine
-        .world_mut()
-        .register_persistable_component::<LinearVelocity>();
-
+/// Registers systems and seed entities; component registration happens
+/// automatically from the `PillComponent` derives before this runs.
+#[pill_project]
+fn init(engine: &mut Engine) -> u32 {
     engine.register_system("counter", counter_system);
 
     // Seed multiple archetypes so migration tests can validate per-component behavior.
@@ -157,28 +136,4 @@ pub unsafe extern "C" fn project_init(api: *const EngineApi) -> u32 {
 
     // Report successful registration so the host keeps this generation.
     0
-}
-
-#[no_mangle]
-pub extern "C" fn project_update(api: *const EngineApi) {
-    let _ = api;
-}
-
-/// Returns a hash of persistable component TypeIds and sizes.
-#[no_mangle]
-pub extern "C" fn project_schema_fingerprint() -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = DefaultHasher::new();
-
-    // --- Persistable components: hash TypeId + size ---
-    std::any::TypeId::of::<FrameCounter>().hash(&mut hasher);
-    std::mem::size_of::<FrameCounter>().hash(&mut hasher);
-    std::any::TypeId::of::<SpatialPosition>().hash(&mut hasher);
-    std::mem::size_of::<SpatialPosition>().hash(&mut hasher);
-    std::any::TypeId::of::<LinearVelocity>().hash(&mut hasher);
-    std::mem::size_of::<LinearVelocity>().hash(&mut hasher);
-
-    hasher.finish()
 }

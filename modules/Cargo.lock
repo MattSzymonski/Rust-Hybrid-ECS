@@ -2633,6 +2633,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "inventory"
+version = "0.3.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4f0c30c76f2f4ccee3fe55a2435f691ca00c0e4bd87abe4f4a851b1d4dac39b"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "is-terminal"
 version = "0.4.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4249,11 +4258,13 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "criterion",
+ "inventory",
  "metrics",
  "miette",
  "parking_lot",
  "pill_core",
  "pill_core_macros",
+ "pill_engine_macros",
  "pollster",
  "rayon",
  "serde",
@@ -4264,6 +4275,15 @@ dependencies = [
  "tracy-client",
  "trait_type_map",
  "wgpu",
+]
+
+[[package]]
+name = "pill_engine_macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

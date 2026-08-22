@@ -47,7 +47,10 @@ use crate::OptionalModuleConfig;
 ///
 /// A module reporting anything else is rejected before it is handed a pointer
 /// into engine memory, because the two sides then disagree about the contract.
-pub const OPTIONAL_MODULE_ABI_VERSION: u32 = 1;
+///
+/// Read from `pill_engine` so the host and every module (whose ABI export is
+/// generated from the same constant by `#[pill_module]`) can never drift.
+pub use pill_engine::module_abi::MODULE_ABI_VERSION as OPTIONAL_MODULE_ABI_VERSION;
 
 /// Maximum number of retired generations kept mapped per module.
 ///

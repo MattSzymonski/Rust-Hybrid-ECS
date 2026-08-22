@@ -2,6 +2,7 @@
 members = [
     "pill_editor",
     "pill_engine",
+    "pill_engine_macros",
     "pill_core",
     "pill_core_macros",
     "pill_host",

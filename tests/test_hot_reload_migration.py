@@ -256,10 +256,6 @@ LINEAR_VELOCITY_ENTITY_TWO_RENAMED = """.with(LinearVelocity {
             upward_speed: 0.75,
         })"""
 
-SPATIAL_AND_LINEAR_REGISTRATION_BLOCK = """register_persistable_component::<SpatialPosition>();
-    engine
-        .world_mut()
-        .register_persistable_component::<LinearVelocity>();"""
 
 THRESHOLD_200 = "const THRESHOLD: u64 = 200;"
 THRESHOLD_150 = "const THRESHOLD: u64 = 150;"
@@ -679,11 +675,12 @@ def build_scenarios() -> List[Scenario]:
             name="Remove LinearVelocity from registered/seeded components",
             replacements=[
                 (
-                    SPATIAL_AND_LINEAR_REGISTRATION_BLOCK,
-                    "register_persistable_component::<SpatialPosition>();",
+                    "#[derive(Debug, Clone, Serialize, Deserialize, Default, PillComponent)]\n"
+                    "#[pill(persistable)]\n"
+                    "struct LinearVelocity {",
+                    "#[derive(Debug, Clone, Serialize, Deserialize, Default, PillComponent)]\n"
+                    "struct LinearVelocity {",
                 ),
-                (LINEAR_VELOCITY_ENTITY_ONE_RENAMED, ""),
-                (LINEAR_VELOCITY_ENTITY_TWO_RENAMED, ""),
             ],
             expect_counter_tick=True,
             required_tokens=[FAST_PATH_TOKEN],

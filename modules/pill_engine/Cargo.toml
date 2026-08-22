@@ -6,6 +6,8 @@ edition = "2021"
 [dependencies]
 pill_core = { path = "../pill_core" }
 pill_core_macros = { path = "../pill_core_macros" }
+pill_engine_macros = { path = "../pill_engine_macros" }
+inventory = "0.3"
 rayon = "1.10"
 parking_lot = "0.12"
 sysinfo = "0.39"
