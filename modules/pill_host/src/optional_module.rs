@@ -270,6 +270,7 @@ impl OptionalModuleSlot {
         // Capture the registration sequence before init so the types this new
         // generation registered can be compared against the previous ones.
         let registration_sequence = engine.world().persist_registration_sequence();
+        let component_registration_sequence = engine.world().component_registration_sequence();
         engine.begin_module_registration(self.owner);
         let status = new_library.call_init(engine_api);
         engine.end_module_registration();
@@ -311,6 +312,9 @@ impl OptionalModuleSlot {
         let newly_registered = engine
             .world()
             .persist_type_names_registered_since(registration_sequence);
+        let all_registered = engine
+            .world()
+            .registered_component_names_since(component_registration_sequence);
         let forgotten_type_names: Vec<String> = self
             .registered_type_names
             .iter()
@@ -325,6 +329,28 @@ impl OptionalModuleSlot {
                 "component type(s) no longer registered by this module; their data stays in the \
                  world but is orphaned (the new generation cannot read it)"
             );
+
+            // Drop the orphaned columns only for types the new generation does
+            // not register at all (not even as a plain component). A type merely
+            // downgraded from persistable to plain keeps live data, so its
+            // columns must survive. This runs while the generation that last
+            // registered the type is still mapped, so the drop is safe.
+            let truly_forgotten: Vec<String> = forgotten_type_names
+                .iter()
+                .filter(|name| !all_registered.iter().any(|current| current == *name))
+                .cloned()
+                .collect();
+            if !truly_forgotten.is_empty() {
+                let dropped_entities = engine
+                    .world_mut()
+                    .drop_forgotten_components(&truly_forgotten);
+                debug!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    module = self.config.name.as_str(),
+                    dropped_entities,
+                    "dropped orphaned columns for component types no longer registered"
+                );
+            }
         }
         self.registered_type_names = newly_registered;
 

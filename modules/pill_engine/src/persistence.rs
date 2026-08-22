@@ -222,7 +222,8 @@ impl World {
         );
 
         let schema_hash = calculate_schema_hash::<T>();
-        self.persist_schema_hashes.insert(type_name.clone(), schema_hash);
+        self.persist_schema_hashes
+            .insert(type_name.clone(), schema_hash);
 
         // Record the registration chronologically so the host can enumerate
         // exactly which types one module's init registered, which is how a
@@ -531,6 +532,94 @@ impl World {
             .filter(|(_, registration_sequence)| *registration_sequence >= sequence)
             .map(|(type_name, _)| type_name.clone())
             .collect()
+    }
+
+    /// Sequence marker to capture before a module's `init` so the exact set of
+    /// component types (plain or persistable) that `init` registers can be
+    /// enumerated afterwards.
+    pub fn component_registration_sequence(&self) -> u64 {
+        self.component_registration_sequence
+    }
+
+    /// Names of all component types registered after `sequence`.
+    ///
+    /// Unlike [`Self::persist_type_names_registered_since`], this covers plain
+    /// components too, so the host can tell a type a reloaded module dropped
+    /// entirely apart from one merely downgraded from persistable to plain
+    /// (whose data is still live).
+    pub fn registered_component_names_since(&self, sequence: u64) -> Vec<String> {
+        self.component_registration_log
+            .iter()
+            .filter(|(_, registration_sequence)| *registration_sequence >= sequence)
+            .map(|(type_name, _)| type_name.clone())
+            .collect()
+    }
+
+    /// Drop every column belonging to component types that no module or
+    /// project generation registers anymore.
+    ///
+    /// Called by the host right after a reloaded module/project stopped
+    /// registering a persistable type entirely (it is not even registered as a
+    /// plain component, so its data is truly orphaned). Removing the component
+    /// from every entity frees its columns now, while the generation that last
+    /// registered the type is still mapped, so the drop can never call into an
+    /// evicted DLL. Returns the number of entities whose data was removed.
+    pub fn drop_forgotten_components(&mut self, type_names: &[String]) -> usize {
+        let mut dropped_entities = 0;
+        for type_name in type_names {
+            let Some(component_id) = self.resolve_component_id_by_name(type_name) else {
+                continue;
+            };
+            // Native columns only; type-erased foreign-language columns are
+            // not part of the native forgotten-type path.
+            if component_id.native_type_id().is_none() {
+                continue;
+            }
+
+            // Collect the entities carrying this component up front so the
+            // mutable borrows during removal never overlap the iteration.
+            let entities: Vec<Entity> = self
+                .entity_locations
+                .iter()
+                .filter(|(_, location)| {
+                    self.archetypes
+                        .get(&location.archetype_id)
+                        .is_some_and(|archetype| archetype.component_types.contains(&component_id))
+                })
+                .map(|(entity, _)| *entity)
+                .collect();
+
+            for entity in entities {
+                if self.remove_component_by_id(entity, component_id).is_ok() {
+                    dropped_entities += 1;
+                }
+            }
+
+            self.forget_component_type(type_name);
+        }
+        dropped_entities
+    }
+
+    /// Remove every registration artifact for one forgotten component type so
+    /// it stops appearing in the persistable manifest and registry.
+    fn forget_component_type(&mut self, type_name: &str) {
+        // The registry accumulates one entry per generation (each with a
+        // distinct `TypeId`); purge every entry that shares this type name.
+        let stale_ids: Vec<ComponentId> = self
+            .component_registry
+            .registered_components()
+            .filter(|(_, _, name)| *name == type_name)
+            .map(|(id, _, _)| id)
+            .collect();
+        for stale_id in &stale_ids {
+            self.component_registry.remove(stale_id);
+            self.storage_factories.remove(stale_id);
+            self.component_copiers.remove(stale_id);
+            self.persist_serializers.remove(stale_id);
+            self.persist_inserters.remove(stale_id);
+        }
+        self.persist_deserializers.remove(type_name);
+        self.persist_schema_hashes.remove(type_name);
     }
 
     /// Capture old persistable component metadata before hot-reload.
@@ -1128,3 +1217,124 @@ fn insert_boxed_component<T>(
 // /// Per-component-type insert fn for pushing Box<dyn Component> into storage.
 // pub(crate) persist_inserters: HashMap<ComponentId, InsertComponentFn>,
 // ```
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    struct DropTestForgottenComponent {
+        value: u32,
+    }
+    impl Component for DropTestForgottenComponent {}
+    trait_type_map::impl_trait_accessible!(dyn Component; DropTestForgottenComponent);
+
+    #[derive(Clone, Debug)]
+    struct DropTestKeptComponent {
+        value: u32,
+    }
+    impl Component for DropTestKeptComponent {}
+    trait_type_map::impl_trait_accessible!(dyn Component; DropTestKeptComponent);
+
+    /// Dropping a forgotten type removes its columns from every entity while
+    /// entities that carry other components survive with those intact.
+    #[test]
+    fn drop_forgotten_components_removes_only_the_forgotten_data() {
+        let mut world = World::new();
+        world.register_persistable_component::<DropTestForgottenComponent>();
+        world.register_component::<DropTestKeptComponent>();
+
+        let forgotten_id = ComponentId::of::<DropTestForgottenComponent>();
+        let kept_id = ComponentId::of::<DropTestKeptComponent>();
+
+        let entity_only_forgotten = world
+            .create_entity()
+            .with(DropTestForgottenComponent { value: 1 })
+            .build()
+            .unwrap();
+        let entity_with_both = world
+            .create_entity()
+            .with(DropTestForgottenComponent { value: 2 })
+            .with(DropTestKeptComponent { value: 3 })
+            .build()
+            .unwrap();
+
+        // The data is readable before the drop.
+        assert_eq!(
+            world
+                .get_component::<DropTestForgottenComponent>(entity_with_both)
+                .unwrap()
+                .value,
+            2
+        );
+
+        let type_name = std::any::type_name::<DropTestForgottenComponent>().to_string();
+        let dropped = world.drop_forgotten_components(&[type_name.clone()]);
+        assert_eq!(dropped, 2, "both entities carried the forgotten component");
+
+        // The entity that only carried the forgotten component is destroyed;
+        // the entity that also carries a kept component survives.
+        assert!(!world.entity_locations.contains_key(&entity_only_forgotten));
+        assert!(world.entity_locations.contains_key(&entity_with_both));
+        assert_eq!(world.entity_locations.len(), 1);
+
+        // The surviving entity's archetype keeps the kept component and no
+        // longer contains the forgotten one.
+        let location = world.entity_locations[&entity_with_both];
+        let archetype = &world.archetypes[&location.archetype_id];
+        assert!(archetype.component_types.contains(&kept_id));
+        assert!(!archetype.component_types.contains(&forgotten_id));
+
+        // The kept component's value survives untouched.
+        let kept = world
+            .get_component::<DropTestKeptComponent>(entity_with_both)
+            .expect("kept component should still be readable");
+        assert_eq!(kept.value, 3);
+
+        // The persistable manifest no longer knows the forgotten type.
+        assert!(world
+            .persist_type_manifest()
+            .iter()
+            .all(|entry| entry.type_name != type_name));
+
+        // Re-registering the forgotten type works and fresh data can be seeded.
+        world.register_persistable_component::<DropTestForgottenComponent>();
+        let reseeded = world
+            .create_entity()
+            .with(DropTestForgottenComponent { value: 9 })
+            .build()
+            .unwrap();
+        assert!(world.entity_locations.contains_key(&reseeded));
+    }
+
+    /// The registration log distinguishes a type that was dropped entirely
+    /// from one merely downgraded to a plain component.
+    #[test]
+    fn registered_component_names_since_covers_plain_components() {
+        let mut world = World::new();
+        let sequence = world.component_registration_sequence();
+
+        world.register_persistable_component::<DropTestForgottenComponent>();
+        world.register_component::<DropTestKeptComponent>();
+
+        let registered = world.registered_component_names_since(sequence);
+        assert!(registered
+            .iter()
+            .any(|name| name.contains("DropTestForgottenComponent")));
+        assert!(registered
+            .iter()
+            .any(|name| name.contains("DropTestKeptComponent")));
+
+        let persistable = world.persist_type_names_registered_since(sequence);
+        assert!(persistable
+            .iter()
+            .any(|name| name.contains("DropTestForgottenComponent")));
+        assert!(!persistable
+            .iter()
+            .any(|name| name.contains("DropTestKeptComponent")));
+    }
+}

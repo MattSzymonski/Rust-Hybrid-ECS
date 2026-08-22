@@ -378,6 +378,17 @@ impl ComponentRegistry {
     }
 
     /// Get the bit index for a component ID, if registered.
+    /// Forget a previously registered component type.
+    ///
+    /// Called when a reloaded module or project stops registering a type
+    /// entirely and the host drops its orphaned data. Re-registering the same
+    /// `TypeId` later simply allocates a fresh bit index again.
+    pub fn remove(&mut self, component_id: &ComponentId) {
+        self.id_to_bit.remove(component_id);
+        self.names.remove(component_id);
+        self.sizes.remove(component_id);
+    }
+
     pub fn get_bit(&self, component_id: &ComponentId) -> Option<u8> {
         self.id_to_bit.get(component_id).copied()
     }

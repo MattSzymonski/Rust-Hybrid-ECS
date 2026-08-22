@@ -95,9 +95,7 @@ mod tests {
     }
 
     #[derive(Clone, Debug)]
-    struct TestPlainComponent {
-        value: u32,
-    }
+    struct TestPlainComponent;
     impl Component for TestPlainComponent {}
     trait_type_map::impl_trait_accessible!(dyn Component; TestPlainComponent);
 

@@ -239,6 +239,14 @@ pub struct World {
     pub(crate) persist_registration_sequence: u64,
     /// Chronological `(type_name, sequence)` log of persistable registrations.
     pub(crate) persist_registration_log: Vec<(String, u64)>,
+    /// Monotonic counter bumped on every component registration (plain or
+    /// persistable), letting the host enumerate which types one module's
+    /// `init` registered at all — the distinction between a type that was
+    /// dropped entirely and one merely downgraded to a plain component.
+    pub(crate) component_registration_sequence: u64,
+    /// Chronological `(type_name, sequence)` log of every component
+    /// registration, plain and persistable alike.
+    pub(crate) component_registration_log: Vec<(String, u64)>,
 }
 
 impl World {
@@ -269,6 +277,8 @@ impl World {
             persist_schema_hashes: HashMap::new(),
             persist_registration_sequence: 0,
             persist_registration_log: Vec::new(),
+            component_registration_sequence: 0,
+            component_registration_log: Vec::new(),
         }
     }
 
@@ -403,9 +413,18 @@ impl World {
             )]
         );
         let component_id = ComponentId::of::<T>();
+        let type_name = std::any::type_name::<T>().to_string();
 
         // Register component (bit index + name)
         self.component_registry.register::<T>();
+
+        // Record the registration chronologically so the host can enumerate
+        // which types one module's init registered at all (plain or
+        // persistable), which is how a type dropped from a reloaded module is
+        // told apart from one merely downgraded to a plain component.
+        self.component_registration_log
+            .push((type_name, self.component_registration_sequence));
+        self.component_registration_sequence = self.component_registration_sequence.wrapping_add(1);
 
         // Register the storage factory as plain DATA (type id, layout, and a
         // per-type function table) instead of a closure that would be
@@ -1545,17 +1564,24 @@ impl World {
         &mut self,
         entity: Entity,
     ) -> Result<(), RemoveComponentError> {
-        let _zone = crate::profile_scope!(
-            "remove component",
-            [(
-                "Target entity: {:?}, Component type being removed: {}",
-                entity,
-                std::any::type_name::<T>()
-            )]
-        );
-        let component_id = ComponentId::of::<T>();
+        self.remove_component_by_id(entity, ComponentId::of::<T>())
+    }
 
-        // Step 1: Validate - the entity must exist and currently carry T.
+    /// Remove a component identified by [`ComponentId`] from one entity.
+    ///
+    /// This is the non-generic core of [`Self::remove_component`]; the host
+    /// uses it when dropping data for a type it can no longer name statically
+    /// (a component a reloaded module stopped registering).
+    pub(crate) fn remove_component_by_id(
+        &mut self,
+        entity: Entity,
+        component_id: ComponentId,
+    ) -> Result<(), RemoveComponentError> {
+        let _zone =
+            crate::profile_scope!("remove component", [("Entity being mutated: {:?}", entity)]);
+
+        // Step 1: Validate - the entity must exist and currently carry the
+        // component.
         let location = match self.entity_locations.get(&entity) {
             Some(loc) => *loc,
             None => return Err(RemoveComponentError::EntityNotFound),
