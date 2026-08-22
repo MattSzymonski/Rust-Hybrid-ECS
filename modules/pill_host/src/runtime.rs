@@ -30,6 +30,7 @@ use pill_engine::{Engine, EngineApi};
 use pill_engine::{RenderViewport, Renderer, RendererError, RendererWindow, VirtualResolution};
 
 // Current crate
+use crate::analytics;
 use crate::config::project_depends_on_crate;
 use crate::native_library::cleanup_temporary_files;
 use crate::optional_module::OptionalModuleSlot;
@@ -283,6 +284,12 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
         Arc::clone(&reload_generation),
     )?;
 
+    // Step 6: Snapshot host memory and print the startup analytics report.
+    // Every module has been built, staged, loaded and initialized by now, so
+    // the table carries the complete startup picture.
+    analytics::record_host_memory();
+    analytics::print_startup_report();
+
     println!();
     println!(
         "[host] Entering project loop. Edit {}/**/* to hot-reload.",
@@ -428,6 +435,12 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
         );
         host.last_processed_generation = host.reload_generation.load(Ordering::Acquire);
     }
+
+    // Print the analytics line for every reload completed this frame (optional
+    // modules from Step 0, the project from Step 1). The events were recorded
+    // with their build/stage/load/init/migrate breakdowns already populated,
+    // so this is a pure drain-and-print.
+    analytics::print_reload_events();
 
     // Step 2: Poll the managed loader for an assembly swap.
     // The managed loader watches the built assembly instead of source files.

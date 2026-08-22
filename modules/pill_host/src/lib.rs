@@ -19,6 +19,8 @@
 
 // ===== Module Declarations =====
 
+/// Build, link, and hot-reload analytics collector and console reports.
+mod analytics;
 /// Project-module build execution and output-path resolution.
 mod build_runner;
 /// Project-module configuration shared by every host frontend.

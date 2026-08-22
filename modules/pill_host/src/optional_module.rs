@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 // External crates
 use pill_core::error::{HostError, ModuleError};
@@ -33,6 +34,7 @@ use pill_core::{debug, error, info, warn};
 use pill_engine::{Engine, EngineApi, SystemOwner};
 
 // Current crate
+use crate::analytics;
 use crate::build_runner::build_optional_module;
 use crate::native_library::{NativeLibrary, OPTIONAL_MODULE_ENTRY_POINTS};
 use crate::OptionalModuleConfig;
@@ -106,9 +108,11 @@ impl OptionalModuleSlot {
 
         // Step 4: Register the module's components and systems under its own
         // owner, so a later reload can remove exactly these systems.
+        let init_started = Instant::now();
         engine.begin_module_registration(owner);
         let status = library.call_init(engine_api);
         engine.end_module_registration();
+        analytics::record_init(&config.name, init_started.elapsed().as_secs_f64() * 1000.0);
         if status != 0 {
             return Err(ModuleError::InitializationFailed {
                 module: config.name.clone(),
@@ -249,9 +253,11 @@ impl OptionalModuleSlot {
             "cleared the retiring generation's systems"
         );
 
+        let init_started = Instant::now();
         engine.begin_module_registration(self.owner);
         let status = new_library.call_init(engine_api);
         engine.end_module_registration();
+        analytics::record_init(&self.config.name, init_started.elapsed().as_secs_f64() * 1000.0);
         if status != 0 {
             // The replacement failed to register. Roll back to the previous
             // generation: init is required to be idempotent, so re-running it
@@ -283,6 +289,7 @@ impl OptionalModuleSlot {
         // which can differ between generations, so data follows a renamed or
         // reshaped component. Unchanged columns keep their allocations and
         // change-detection ticks, making the common reload path cheap.
+        let migrate_started = Instant::now();
         let current_schema_by_name: HashMap<String, u64> = engine
             .world()
             .persist_type_manifest()
@@ -334,6 +341,10 @@ impl OptionalModuleSlot {
                 );
             }
         }
+        analytics::record_migrate(
+            &self.config.name,
+            migrate_started.elapsed().as_secs_f64() * 1000.0,
+        );
 
         // Step 6: Retire the previous library without unmapping it. Component
         // operations and persist metadata registered by that generation may
@@ -345,6 +356,8 @@ impl OptionalModuleSlot {
             // temporary file on disk.
             drop(self.old_libraries.remove(0));
         }
+
+        analytics::record_reload(&self.config.name);
 
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,

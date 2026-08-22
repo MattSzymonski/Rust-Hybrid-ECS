@@ -29,12 +29,16 @@
 // Standard library
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 // External crates
 use libloading::{Library, Symbol};
 use pill_core::error::LibraryError;
 use pill_core::{debug, info};
 use pill_engine::EngineApi;
+
+// Current crate
+use crate::analytics;
 
 // =============================================================================
 // Constants
@@ -171,8 +175,10 @@ impl NativeLibrary {
         // the freshly built output, so it is a complete native module on
         // disk. `Self::load` validates the required exports before returning,
         // and the returned `ProjectLibrary` owns the mapping for its lifetime.
+        let load_started = Instant::now();
         let native_library =
             unsafe { Self::load(&temporary_path, temporary_path.clone(), entry_points) }?;
+        analytics::record_load(module_name, load_started.elapsed().as_secs_f64() * 1000.0);
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             module = module_name,

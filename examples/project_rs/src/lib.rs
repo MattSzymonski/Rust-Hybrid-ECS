@@ -19,7 +19,6 @@ use std::time::Instant;
 
 // External crates
 use pill_core::error;
-use pill_core::info;
 use pill_engine::*;
 use pill_spline::Spline;
 use serde::{Deserialize, Serialize};

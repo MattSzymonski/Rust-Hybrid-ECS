@@ -161,7 +161,12 @@ pub struct OptionalModuleConfig {
     /// Build command whose first element is the program and rest are arguments.
     pub build_command: Vec<String>,
 
-    /// Output directory of the built artifact, relative to the workspace root.
+    /// Directory of the hot-load artifact, relative to the workspace root.
+    ///
+    /// Cargo writes the freshly built standalone library into the shared
+    /// output slot first; the host stages it into this private directory and
+    /// loads from there, so a project build overwriting the shared slot
+    /// cannot corrupt the loaded module.
     pub output_subdirectory: String,
 }
 
@@ -172,8 +177,8 @@ impl OptionalModuleConfig {
     /// engine workspace, which a glob in the workspace manifest picks up
     /// automatically, so a new module needs no manifest edit. The directory
     /// name determines everything else: sources in `<directory>/<name>/src`,
-    /// the artifact in the shared `target/debug`, and a plain package
-    /// selection for the build.
+    /// the loadable artifact staged into the private `target/hot` hot-load
+    /// directory, and a plain package selection for the build.
     ///
     /// Building inside the workspace is required rather than convenient. It
     /// makes the module resolve the identical dependency graph as the host,
@@ -185,6 +190,14 @@ impl OptionalModuleConfig {
             "build".to_string(),
             "--package".to_string(),
             name.to_string(),
+            // Emit a cargo timing report so the analytics collector can show
+            // per-crate compile+link wall time for every host-driven build.
+            "--timings".to_string(),
+            // Never touch the registry: every dependency is already cached in
+            // the workspace. Skipping the index avoids the ~/.cargo package
+            // cache lock (which rust-analyzer's cargo check can hold for long
+            // stretches) and halves the fixed per-build cargo overhead.
+            "--offline".to_string(),
         ];
         // Mirror the host's engine feature set. A module compiled against a
         // differently configured engine can disagree about type layout.
@@ -198,7 +211,7 @@ impl OptionalModuleConfig {
             library_name: name.to_string(),
             watch_directory: format!("{OPTIONAL_MODULE_DIRECTORY}/{name}/src"),
             build_command,
-            output_subdirectory: "target/debug".to_string(),
+            output_subdirectory: "target/hot".to_string(),
         }
     }
 
@@ -433,6 +446,14 @@ impl ProjectModuleConfig {
             "build".to_string(),
             "--package".to_string(),
             package_name.clone(),
+            // Emit a cargo timing report so the analytics collector can show
+            // per-crate compile+link wall time for every host-driven build.
+            "--timings".to_string(),
+            // Never touch the registry: every dependency is already cached in
+            // the workspace. Skipping the index avoids the ~/.cargo package
+            // cache lock (which rust-analyzer's cargo check can hold for long
+            // stretches) and halves the fixed per-build cargo overhead.
+            "--offline".to_string(),
         ];
         if cfg!(feature = "rendering") {
             build_command.push("--features".to_string());

@@ -31,6 +31,7 @@ use pill_core::error::BuildError;
 use pill_core::info;
 
 // Current crate
+use crate::analytics::{self, BuildStatus, ModuleKind};
 use crate::{OptionalModuleConfig, ProjectModuleBackend, ProjectModuleConfig};
 
 // =============================================================================
@@ -50,6 +51,15 @@ const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// per-process subdirectory, so the startup cleanup leaves it in place and
 /// every host run against this workspace shares the same record.
 const BUILD_INFO_MARKER: &str = "pill_standalone_temp/build_info.txt";
+
+/// Subdirectory, relative to the workspace root, where cargo writes a freshly
+/// compiled module `cdylib`.
+///
+/// The host never loads from this shared per-crate slot: the project's build
+/// can overwrite it with the module's export-stripped dependency variant (the
+/// "one crate name, two feature sets" collision). The standalone artifact is
+/// staged into the module's private hot-load directory instead.
+const CARGO_MODULE_OUTPUT_SUBDIRECTORY: &str = "target/debug";
 
 /// Host feature set that module builds must mirror.
 ///
@@ -335,7 +345,11 @@ pub(crate) fn run_build_command(
     //
     // The host frame loop must never block indefinitely on a hung compiler or
     // an interactive prompt, so the build is polled with a deadline and a
-    // cancellation signal driven by newer source saves.
+    // cancellation signal driven by newer source saves. The build's wall time
+    // and the cargo child's peak working set are sampled for the analytics
+    // report.
+    let build_started = Instant::now();
+    let mut cargo_peak_bytes: u64 = 0;
     let deadline = Instant::now() + BUILD_TIMEOUT;
     let status = loop {
         // A newer save during the build advances the generation beyond the
@@ -354,6 +368,10 @@ pub(crate) fn run_build_command(
             source,
         })? {
             break status;
+        }
+        // `PeakWorkingSetSize` is monotonic, so the latest sample is the peak.
+        if let Some((_, peak)) = analytics::process_memory(Some(child.id())) {
+            cargo_peak_bytes = cargo_peak_bytes.max(peak);
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
@@ -376,6 +394,11 @@ pub(crate) fn run_build_command(
             status,
         });
     }
+    analytics::record_build_command(
+        name,
+        build_started.elapsed().as_millis() as u64,
+        cargo_peak_bytes,
+    );
     Ok(())
 }
 
@@ -434,6 +457,14 @@ pub(crate) fn build_project_module(
                     module = config.name.as_str(),
                     "project module already up to date, skipping build"
                 );
+                analytics::record_module_artifact(
+                    &config.name,
+                    ModuleKind::Project,
+                    BuildStatus::Fresh,
+                    0.0,
+                    workspace_root,
+                    &output_path,
+                );
                 return Ok(output_path);
             }
         }
@@ -452,7 +483,6 @@ pub(crate) fn build_project_module(
     if matches!(&config.backend, ProjectModuleBackend::NativeLibrary { .. }) {
         record_build_info(workspace_root);
     }
-
     // Step 4: Confirm the resolved artifact exists before reporting success.
     //
     // A successful process exit does not guarantee that configuration points
@@ -464,6 +494,15 @@ pub(crate) fn build_project_module(
             path: output_path.display().to_string(),
         });
     }
+
+    analytics::record_module_artifact(
+        &config.name,
+        ModuleKind::Project,
+        BuildStatus::Built,
+        0.0,
+        workspace_root,
+        &output_path,
+    );
 
     Ok(output_path)
 }
@@ -488,7 +527,16 @@ pub(crate) fn build_optional_module(
         "building optional module"
     );
 
-    let output_path = workspace_root
+    // Cargo writes the freshly compiled cdylib into the shared per-crate
+    // output slot, while the host loads from the private hot-load copy.
+    // Keeping these paths distinct is what resolves the "one crate name, two
+    // feature sets" collision: the project build may overwrite the shared
+    // slot with the module's export-stripped dependency variant, but the
+    // loaded generation always comes from the untouched hot copy.
+    let build_output = workspace_root
+        .join(CARGO_MODULE_OUTPUT_SUBDIRECTORY)
+        .join(native_library_filename(&config.library_name));
+    let hot_output = workspace_root
         .join(&config.output_subdirectory)
         .join(native_library_filename(&config.library_name));
 
@@ -499,12 +547,12 @@ pub(crate) fn build_optional_module(
         .parent()
         .map(|parent| parent.join("Cargo.toml"));
 
-    // Skip cargo when the artifact is already newer than every build input;
-    // any uncertainty in the check falls through to a real build below.
+    // Skip cargo when the hot-load artifact is already newer than every build
+    // input; any uncertainty in the check falls through to a real build below.
     if let Some(manifest_path) = module_manifest {
         if is_build_up_to_date(
             workspace_root,
-            &output_path,
+            &hot_output,
             &manifest_path,
             &config.watch_directory,
         ) {
@@ -513,7 +561,15 @@ pub(crate) fn build_optional_module(
                 module = config.name.as_str(),
                 "optional module already up to date, skipping build"
             );
-            return Ok(output_path);
+            analytics::record_module_artifact(
+                &config.name,
+                ModuleKind::Optional,
+                BuildStatus::Fresh,
+                0.0,
+                workspace_root,
+                &hot_output,
+            );
+            return Ok(hot_output);
         }
     }
 
@@ -529,12 +585,50 @@ pub(crate) fn build_optional_module(
     // later runs can recognize it as up to date.
     record_build_info(workspace_root);
 
-    if !output_path.exists() {
+    // Stage the freshly built standalone library into the hot-load directory.
+    // The build command produced the module-abi variant (with its
+    // `pill_module_*` exports); the shared slot may later be overwritten by
+    // the project's build of the export-stripped dependency variant, which is
+    // exactly why the loadable copy lives apart from it.
+    if !build_output.exists() {
         return Err(BuildError::OutputMissing {
-            path: output_path.display().to_string(),
+            path: build_output.display().to_string(),
         });
     }
-    Ok(output_path)
+    let Some(hot_directory) = hot_output.parent() else {
+        return Err(BuildError::OutputMissing {
+            path: hot_output.display().to_string(),
+        });
+    };
+    let stage_started = Instant::now();
+    std::fs::create_dir_all(hot_directory).map_err(|source| BuildError::HotArtifactCopyFailed {
+        source_path: build_output.display().to_string(),
+        target_path: hot_output.display().to_string(),
+        source,
+    })?;
+    std::fs::copy(&build_output, &hot_output).map_err(|source| {
+        BuildError::HotArtifactCopyFailed {
+            source_path: build_output.display().to_string(),
+            target_path: hot_output.display().to_string(),
+            source,
+        }
+    })?;
+    let stage_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
+
+    if !hot_output.exists() {
+        return Err(BuildError::OutputMissing {
+            path: hot_output.display().to_string(),
+        });
+    }
+    analytics::record_module_artifact(
+        &config.name,
+        ModuleKind::Optional,
+        BuildStatus::Built,
+        stage_ms,
+        workspace_root,
+        &hot_output,
+    );
+    Ok(hot_output)
 }
 
 /// Return the platform-specific filename produced for a native library.

@@ -490,6 +490,20 @@ pub enum BuildError {
     #[message("shared library not found at expected path: ", name_style(path))]
     #[diagnostic(help("check the selected backend output directory in ProjectModuleConfig"))]
     OutputMissing { path: String },
+
+    /// The built library could not be staged into its hot-load directory.
+    #[message(
+        "failed to copy built library ",
+        name_style(source_path),
+        " to hot-load path ",
+        name_style(target_path)
+    )]
+    HotArtifactCopyFailed {
+        source_path: String,
+        target_path: String,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Native project-library loading and initialization failures.

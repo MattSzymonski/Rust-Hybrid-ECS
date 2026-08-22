@@ -34,7 +34,6 @@ use std::ffi::c_char;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
 // External crates
-use pill_core::info;
 use pill_core::math::Vector3f;
 use pill_engine::*;
 use serde::{Deserialize, Serialize};
@@ -54,6 +53,10 @@ const MODULE_ABI_VERSION: u32 = 1;
 pub const MAX_CONTROL_POINTS: usize = 16;
 
 /// Number of demo splines the module keeps in the world.
+///
+/// Used only by the module-abi registration path; the project build compiles
+/// that path out, so the constant is gated with it to stay warning-free.
+#[cfg(feature = "module-abi")]
 const DEMO_SPLINE_COUNT: usize = 1;
 
 /// Name reported to the host for diagnostics; null terminated for the C ABI.
@@ -155,25 +158,25 @@ impl Spline {
                 let segment_count = points.len() - 1;
                 let scaled = t.clamp(0.0, 1.0) * segment_count as f32;
                 let segment_index = (scaled.floor() as usize).min(segment_count - 1);
-                let local_t = scaled - segment_index as f32;
+                let _local_t = scaled - segment_index as f32;
 
                 let start = points[segment_index];
                 let end = points[segment_index + 1];
                 // The outermost segments have no neighbour beyond the endpoint.
                 // Duplicating the endpoint makes the curve begin and end exactly
                 // on the first and last control points.
-                let before_start = if segment_index == 0 {
+                let _before_start = if segment_index == 0 {
                     start
                 } else {
                     points[segment_index - 1]
                 };
-                let after_end = if segment_index + 2 < points.len() {
+                let _after_end = if segment_index + 2 < points.len() {
                     points[segment_index + 2]
                 } else {
                     end
                 };
-                Vector3f::new(1.0, 6.0, 1.0)
-                //catmull_rom(before_start, start, end, after_end, local_t)
+                Vector3f::new(1.0, 26.0, 1.0)
+                //catmull_rom(_before_start, start, end, _after_end, _local_t)
             }
         }
     }
@@ -188,6 +191,10 @@ impl Spline {
 // Free Functions
 // =============================================================================
 
+// The interpolation call in `get_location_at` is temporarily disabled (it
+// returns a fixed demo point), so this evaluator is dead until the call is
+// re-enabled; the allow goes away with it.
+#[allow(dead_code)]
 /// Evaluate one Catmull-Rom segment between `start` and `end`.
 ///
 /// `before_start` and `after_end` are the neighbouring control points that give
@@ -213,6 +220,10 @@ fn catmull_rom(
 }
 
 /// A demonstration path used to populate the world on first load.
+///
+/// Like [`DEMO_SPLINE_COUNT`], this exists for the module-abi registration path
+/// and is compiled out of the project build with it.
+#[cfg(feature = "module-abi")]
 fn demo_spline() -> Spline {
     Spline::from_points(&[
         Vector3f::new(0.0, 0.0, 0.0),
@@ -262,7 +273,9 @@ pub fn register(engine: &mut Engine) -> u32 {
         }
     }
 
-    info!(
+    // Fully qualified: the import would be unused in the project build, where
+    // this module-abi registration path is compiled out.
+    pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ECS,
         splines = DEMO_SPLINE_COUNT,
         existing = existing_spline_count,

@@ -20,6 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
+use std::time::Instant;
 
 // External crates
 use pill_core::error::{HostError, LibraryError};
@@ -27,6 +28,7 @@ use pill_core::{debug, error, info, warn};
 use pill_engine::{Engine, EngineApi, SystemOwner};
 
 // Current crate
+use crate::analytics;
 use crate::build_runner::build_project_module;
 use crate::csharp::CSharpRuntime;
 use crate::native_library::{NativeLibrary, PROJECT_ENTRY_POINTS};
@@ -98,7 +100,9 @@ impl LoadedProject {
 
                 // Native modules register their components and systems through
                 // the stable EngineApi table before the first frame is run.
+                let init_started = Instant::now();
                 let status = library.call_init(engine_api);
+                analytics::record_init(&config.name, init_started.elapsed().as_secs_f64() * 1000.0);
                 if status != 0 {
                     return Err(LibraryError::InitializationFailed { status }.into());
                 }
@@ -260,6 +264,7 @@ fn reload_native(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
         "reload step 2/4: calling project_init on the new module"
     );
+    let init_started = Instant::now();
     if new_library.call_init(engine_api) != 0 {
         // The new generation failed to register itself. Roll the engine back
         // to the previous module: project_init must be idempotent, re-registering
@@ -280,9 +285,11 @@ fn reload_native(
         }
         return;
     }
+    analytics::record_init(&config.name, init_started.elapsed().as_secs_f64() * 1000.0);
 
     // Match schemas by stable type name rather than runtime ComponentId: IDs
     // can differ across dynamically loaded generations, while names persist.
+    let migrate_started = Instant::now();
     let current_schema_by_name: HashMap<String, u64> = engine
         .world()
         .persist_type_manifest()
@@ -335,6 +342,7 @@ fn reload_native(
             );
         }
     }
+    analytics::record_migrate(&config.name, migrate_started.elapsed().as_secs_f64() * 1000.0);
 
     // Do not unload the previous DLL. Persist metadata, component operations,
     // or other engine-owned pointers may still reference its executable code.
@@ -353,6 +361,7 @@ fn reload_native(
         // temporary copy on disk; cleanup errors are reported by the Drop.
         drop(old_libraries.remove(0));
     }
+    analytics::record_reload(&config.name);
     info!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
         entities = engine.world().entity_count(),
