@@ -37,8 +37,13 @@ import time
 from pathlib import Path
 from typing import Tuple
 
-import suite_common as common
-from suite_common import *  # noqa: F401,F403
+# Standalone-runnable: put `devops/` on `sys.path` before reaching `core`, so
+# the suite works from any working directory without a package import.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# Shared paths, tokens, print wrapper, OutputMonitor, process helpers.
+from core import suite_common as common  # noqa: E402
+from core.suite_common import *  # noqa: E402,F401,F403
 
 # =============================================================================
 # Configuration

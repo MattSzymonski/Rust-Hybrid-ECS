@@ -5,12 +5,16 @@ REQUIREMENTS
   - Python 3.8+
 
 DESCRIPTION
-    Single source of truth for the low-level machinery the three integration
-    suites all need:
+    Single source of truth for the low-level machinery every host-driving
+    script needs, under `devops/core/` because both the tests and the
+    benchmarks import it:
 
-      * `test_hot_reload_suite.py`     - full hot-reload suite (sessions A/B)
-      * `test_hot_reload_migration.py` - schema-migration table-driven suite
-      * `test_module_project_auto_reload.py` - module->project cascade
+      * `devops/tests/test_hot_reload_suite.py`     - full suite (sessions A/B)
+      * `devops/tests/test_hot_reload_migration.py` - schema-migration suite
+      * `devops/tests/test_module_project_auto_reload.py` - cascade
+      * `devops/tests/test_csharp_bridge.py`        - C# bridge suite
+      * `devops/benchmarks/hot_reload_harness.py`   - reload timing harness
+      * `devops/benchmarks/cold_start.py`           - host startup timing
 
     Shared here: path resolution, the console-color `print` wrapper, the
     rolling output monitor with a dedicated counter-tick tail, atomic source
@@ -22,7 +26,9 @@ DESCRIPTION
     rolling-buffer / tick-tail behavior cannot drift between suites.
 
 USAGE
-  from suite_common import *   # paths, tokens, print, OutputMonitor, helpers
+  from core.suite_common import *   # paths, tokens, print, OutputMonitor, ...
+
+  with `devops/` on sys.path; see `core.paths.ensure_devops_on_path`.
 
 --- SCRIPT ---
 """
@@ -40,7 +46,8 @@ from typing import Dict, List, Optional, Sequence, Tuple
 # Paths
 # =============================================================================
 
-WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
+# devops/core/suite_common.py -> devops -> repository root.
+WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 MODULES_ROOT = WORKSPACE_ROOT / "modules"
 HOST_EXE = MODULES_ROOT / "target" / "debug" / "pill_standalone.exe"
 HOST_CONFIG_YAML = MODULES_ROOT / "pill_config.yaml"

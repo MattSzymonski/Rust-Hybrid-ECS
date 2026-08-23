@@ -6,35 +6,77 @@ opportunities (`local/documents/data_audit.md`, critical review in
 `local/documents/data_audit_review.md`) are implemented. Every fix lands behind
 these tests.
 
+This directory holds **pass/fail tests only**, and every suite in it runs
+standalone from a console. Performance measurement lives in
+`devops/benchmarks/`, because it reports numbers rather than asserting on them
+- see "Performance measurement (moved)" below. Both sides share
+`devops/core/`; see `devops/README.md` for the full layout.
+
 ## Suites
 
 | Suite | Covers |
 | --- | --- |
-| `test_hot_reload_suite.py` | Full suite, two sessions. Session A (tests/project + pill_spline): project reload + data survival, schema migration, project forgotten-type, module reload with data survival (`existing=1`), **repeated same-config reload stability** (`module_double_reload`, pins per-artifact TypeId stability / no per-reload growth), module forgotten-type with **drop→re-seed** (`existing=0` after restore, pins drop-at-detection end-to-end), init-failure rollback. Session B (examples/project_rs + pill_spline): module→project **cascade** plus **module↔project coexistence** (`xxsees 1 spline(s)` after both reloads). Also verifies the up-to-date build fast path on restart. |
+| `test_hot_reload_suite.py` | Full suite, two sessions. Session A (devops/tests/project + pill_spline): project reload + data survival, schema migration, project forgotten-type, module reload with data survival (`existing=1`), **repeated same-config reload stability** (`module_double_reload`, pins per-artifact TypeId stability / no per-reload growth), module forgotten-type with **drop→re-seed** (`existing=0` after restore, pins drop-at-detection end-to-end), init-failure rollback. Session B (examples/project_rs + pill_spline): module→project **cascade** plus **module↔project coexistence** (`xxsees 1 spline(s)` after both reloads). Also verifies the up-to-date build fast path on restart. |
 | `test_hot_reload_migration.py` | Table-driven schema-migration suite: fast path (shape unchanged), add field, remove field, rename field, downgrade persistable→plain, with per-component migrated entity-count assertions. Cycles repeatable (`--cycles N`). |
 | `test_module_project_auto_reload.py` | The module→project cascade in isolation: editing `pill_spline` reloads the module, the host queues a project reload, and the project probe reports the new value. |
 | `test_csharp_bridge.py` | The C# ↔ Rust connection (needs .NET SDK 8 on PATH). Launches the host with `examples/project_cs` + `pill_spline` + a component-less dummy module and asserts: the host auto-generates the module's C# mirror with the exact layout (`Size = 196`, alignment pad), a component-less module writes **no** mirror, the managed build is warning-free (`0 Warning(s)`, no `warning CS`), the bridge probe proves **both directions** (Rust→C# reads the module-seeded spline; C#→Rust sees its own spline in the same native column), a **behavior-only C# hot reload** (`[csharp_runtime] reloaded project_cs.dll` + `C# hot reload complete`, post-reload probe `sees 3 spline(s)`), and **mirror regeneration** when the file is deleted and the host restarts. |
-| `suite_common.py` | Single source of truth for paths, log tokens, timeouts, the color `print` wrapper, the `OutputMonitor` (rolling buffer + counter-tick tail), atomic source editing, and host process helpers. Shared by all three suites (audit opportunity 5.14). |
+| `test_basic.py` | The CI fast checks: `cargo fmt --check` and `cargo clippy -D warnings` over the workspace, plus launcher-driven native/WASM builds, the WASM size budget, a dev-server smoke test and the native performance benchmark. Ported from `run_basic_tests.sh`, which now just invokes it. The three launcher-driven checks SKIP in this repository (no PillLauncher project layout); fmt and clippy run for real. |
+| `test_coding_standards.py` | Pill comment & layout lint over every `.rs` file: `//!` module header with a `# Responsibilities` section, `// SAFETY:` above unsafe blocks, `///` docs on public items, ordered import-group headers, and `mod tests` as the last top-level section. Ported from `run_coding_standards_test.sh`, which now just invokes it. Exit 0 clean / 1 violations / 2 usage error. |
+| `test_examples.py` | Builds every example under `examples/` in release and reports artifact sizes. Examples are discovered by convention (a `Cargo.toml` or a `*.csproj`), so adding one needs no edit. Ported from `run_examples_tests.sh`, which now just invokes it. |
+| `devops/core/suite_common.py` | Not a test, and not in this directory. Single source of truth for paths, log tokens, timeouts, the color `print` wrapper, the `OutputMonitor` (rolling buffer + counter-tick tail), atomic source editing, and host process helpers. Shared by all four suites (audit opportunity 5.14) **and** by the hot-reload harness and cold-start startup timing in `devops/benchmarks/`, which is why it lives in `devops/core/`. A reworded host log token must keep both sides working. |
 
 ## Quick start
 
 ```powershell
 # Full net via one entry point (recommended)
-bash devops/tests/run_hot_reload_tests.sh                 # 4 suites
-bash devops/tests/run_hot_reload_tests.sh --skip-build    # fastest lane
+bash devops/ci_cd/run_hot_reload_tests.sh                 # 4 suites
+bash devops/ci_cd/run_hot_reload_tests.sh --skip-build    # fastest lane
 
 # Individual suites
-python tests/test_hot_reload_suite.py
-python tests/test_hot_reload_migration.py --cycles 2
-python tests/test_module_project_auto_reload.py
-python tests/test_csharp_bridge.py
+python devops/tests/test_hot_reload_suite.py
+python devops/tests/test_hot_reload_migration.py --cycles 2
+python devops/tests/test_module_project_auto_reload.py
+python devops/tests/test_csharp_bridge.py
+
+# Static, build and CI checks (no host launch)
+python devops/tests/test_coding_standards.py
+python devops/tests/test_examples.py
+python devops/tests/test_basic.py code_linting
 ```
 
+The shell wrappers in `devops/ci_cd/` forward every argument through, so
+`bash devops/ci_cd/run_coding_standards_test.sh --root modules` and
+`python devops/tests/test_coding_standards.py --root modules` are equivalent.
+
 All suites accept `--timeout-scale S` for slow machines. Every file the suites
-touch (`modules/pill_config.yaml`, `tests/project/src/lib.rs`,
+touch (`modules/pill_config.yaml`, `devops/tests/project/src/lib.rs`,
 `examples/project_rs/src/lib.rs`, `examples/project_cs/src/Systems.cs`,
 `modules/optional/pill_spline/src/lib.rs`, the generated mirror files) is
 backed up at startup and restored afterwards.
+
+## Performance measurement (moved)
+
+Hot-reload **performance measurement** is not a test and no longer lives here.
+It reports timings rather than asserting on them, so it lives with the other
+benchmarks:
+
+    devops/benchmarks/hot_reload.py            (stores a measurement)
+    devops/benchmarks/hot_reload_harness.py    (the raw harness)
+
+```powershell
+# Store a measurement and browse/compare it
+python devops/pill_lab/pill_lab.py hot-reload --iterations 5
+python devops/pill_lab/pill_lab.py compare hot_reload
+python devops/pill_lab/pill_lab.py serve
+
+# Or run the harness directly, for the flags Pill Lab does not surface
+python devops/benchmarks/hot_reload_harness.py --iterations 5 --csv perf.csv
+python devops/benchmarks/hot_reload_harness.py --csharp-only --max-wall-ms 5000
+```
+
+Both the suites here and that harness import `devops/core/suite_common.py`
+for the host process plumbing, so a reworded host log token has to keep both
+working. See `devops/pill_lab/README.md` for what the benchmarks measure.
 
 ## Rust unit tests
 
@@ -63,7 +105,7 @@ The suites were reviewed and expanded before starting the audit fixes:
 3. Module↔project coexistence (same type name, two TypeIds) was only implicit.
    → Session B asserts `xxsees 1 spline(s)` after the cascade.
 4. Token / monitor / process plumbing was copy-pasted across three suites and
-   had already drifted. → extracted into `suite_common.py`.
+   had already drifted. → extracted into `devops/core/suite_common.py`.
 5. The devops runner only ran one of the three suites. → now runs all three.
 
 **Things intentionally NOT asserted (so fixes can land cleanly):**
@@ -97,8 +139,8 @@ See the module docstring at the top of `test_hot_reload_migration.py`
 for full documentation.
 
 ```powershell
-python tests/test_hot_reload_migration.py
-python tests/test_hot_reload_migration.py --cycles 5
+python devops/tests/test_hot_reload_migration.py
+python devops/tests/test_hot_reload_migration.py --cycles 5
 ```
 
 ## Module-project auto-reload test
@@ -108,5 +150,5 @@ the project links directly (for example `pill_spline`) reloads the project as
 well, so the project's embedded copy of the module code picks up the change.
 
 ```powershell
-python tests/test_module_project_auto_reload.py
+python devops/tests/test_module_project_auto_reload.py
 ```

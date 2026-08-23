@@ -1,0 +1,21 @@
+{
+  "name": "pill-lab",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Local performance measurement dashboard for Rust-Hybrid-ECS",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "chart.js": "^4.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7"
+  }
+}

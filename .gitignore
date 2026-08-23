@@ -1,6 +1,6 @@
 # Rust build artifacts
 /target
-/tests/project/target
+/devops/tests/project/target
 /modules/target
 /examples/**/target/**
 
@@ -11,7 +11,7 @@ modules/pill_standalone_temp/
 modules/optional/host_project_*/
 
 # Test infrastructure
-tests/__pycache__/
+devops/tests/__pycache__/
 __pycache__/
 *.pyc
 *.pyo
@@ -27,6 +27,8 @@ __pycache__/
 graphify-out/
 benchmarks/
 performance_benchmarks/cache/artifacts/
+
+/devops/pill_lab/measurements/
 
 # Local developer notes
 local/

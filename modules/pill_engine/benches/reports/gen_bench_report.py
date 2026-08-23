@@ -39,74 +39,55 @@ SCRIPT ---
 """
 
 import argparse
-import dataclasses
 import json
-import math
-import os
 import pathlib
-import platform
-import subprocess
 import sys
-from datetime import datetime, timezone
 from typing import Any, Optional
 
+# Criterion parsing and machine detection live in the shared devops core
+# (`devops/core/`), the single implementation used by this HTML generator, the
+# benchmark scripts and `pill_lab.py`. Importing it here is what keeps one
+# benchmark parser in the repository instead of two that can drift. The path
+# is resolved from this file's location so the script still runs from any
+# working directory.
+_REPOSITORY_ROOT = pathlib.Path(__file__).resolve().parents[4]
+_DEVOPS_ROOT = _REPOSITORY_ROOT / "devops"
+if str(_DEVOPS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_DEVOPS_ROOT))
+
+from core.criterion import (  # noqa: E402
+    BenchmarkData,
+    BenchmarkGroup,
+    build_leaderboard,
+    compute_outliers,
+    detect_regressions,
+    discover_benchmarks,
+    extract_ci,
+    extract_estimate,
+    group_benchmarks,
+    json_load,
+    parse_entity_count,
+)
+from core.environment import collect_system_info  # noqa: E402
+
+__all__ = [
+    "BenchmarkData",
+    "BenchmarkGroup",
+    "build_leaderboard",
+    "compute_outliers",
+    "detect_regressions",
+    "discover_benchmarks",
+    "extract_ci",
+    "extract_estimate",
+    "group_benchmarks",
+    "json_load",
+    "parse_entity_count",
+    "collect_system_info",
+]
 
 # =============================================================================
-# Data Structures
+# Formatting (presentation only - the shared parser deals in raw numbers)
 # =============================================================================
-
-
-@dataclasses.dataclass
-class BenchmarkData:
-    """All parsed data for a single Criterion benchmark."""
-
-    group: str
-    parameter: str
-    full_id: str
-    group_prefix: str
-    entity_count: Optional[int]
-    new_estimates: dict[str, Any]
-    new_sample: Optional[dict[str, Any]]
-    base_estimates: Optional[dict[str, Any]]
-    base_sample: Optional[dict[str, Any]]
-    change: Optional[dict[str, Any]]
-    # Computed fields
-    mean_ns: float = 0.0
-    median_ns: float = 0.0
-    std_dev_ns: float = 0.0
-    min_ns: Optional[float] = None
-    max_ns: Optional[float] = None
-    outlier_count: int = 0
-    iteration_count: int = 0
-    throughput: Optional[float] = None
-    throughput_unit: str = ""
-    change_percent: Optional[float] = None
-    change_direction: str = "unchanged"
-    run_timestamp: str = ""
-
-
-@dataclasses.dataclass
-class BenchmarkGroup:
-    """A group of benchmarks from the same source file."""
-
-    prefix: str
-    label: str
-    benchmarks: list[BenchmarkData]
-
-
-# =============================================================================
-# Utility Functions
-# =============================================================================
-
-
-def json_load(path: pathlib.Path) -> Any:
-    """Load a JSON file, returning None if missing or malformed."""
-    try:
-        with open(path, encoding="utf-8") as file_handle:
-            return json.load(file_handle)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
-
 
 def format_duration(nanoseconds: float) -> str:
     """Format a nanosecond value to a human-readable duration."""
@@ -136,286 +117,21 @@ def format_throughput(value: float) -> str:
     return f"{value:.2f} /s"
 
 
-def parse_entity_count(parameter: str) -> Optional[int]:
-    """Extract entity count from a benchmark parameter string.
-
-    Handles patterns like '1000', '100000', 'standard/1000', 'parallel/50000'.
-    Returns the last numeric segment, or None.
-    """
-    if not parameter:
-        return None
-    # Split on common delimiters and try each segment as an integer
-    segments = parameter.replace("/", " ").replace("_", " ").split()
-    for segment in reversed(segments):
-        try:
-            return int(segment)
-        except ValueError:
-            continue
-    return None
-
-
-def extract_estimate(estimates: dict[str, Any], key: str) -> Optional[float]:
-    """Extract a point estimate value from a Criterion estimates dict."""
-    if not estimates or key not in estimates:
-        return None
-    entry = estimates[key]
-    if isinstance(entry, dict):
-        return entry.get("point_estimate")
-    return None
-
-
-def extract_ci(estimates: dict[str, Any], key: str) -> tuple[float, float]:
-    """Extract confidence interval (lower, upper) from estimates."""
-    if not estimates or key not in estimates:
-        return (0.0, 0.0)
-    entry = estimates[key]
-    if isinstance(entry, dict):
-        ci = entry.get("confidence_interval", {})
-        if isinstance(ci, dict):
-            return (ci.get("lower_bound", 0.0), ci.get("upper_bound", 0.0))
-    return (0.0, 0.0)
-
-
-def compute_outliers(sample_times: list[float]) -> tuple[int, list[bool]]:
-    """Detect outliers using the IQR method (1.5×IQR fences).
-
-    Returns (count, list_of_is_outlier_bools).
-    """
-    if len(sample_times) < 4:
-        return (0, [False] * len(sample_times))
-    sorted_times = sorted(sample_times)
-    n = len(sorted_times)
-    q1 = sorted_times[n // 4]
-    q3 = sorted_times[(3 * n) // 4]
-    iqr = q3 - q1
-    lower_fence = q1 - 1.5 * iqr
-    upper_fence = q3 + 1.5 * iqr
-    flags = [(t < lower_fence or t > upper_fence) for t in sample_times]
-    return (sum(flags), flags)
-
-
 # =============================================================================
 # System Information Collection
+#
+# `collect_system_info` is imported from `core.environment`; it
+# returns the same flat label -> value mapping this report has always used.
 # =============================================================================
-
-
-def collect_system_info() -> dict[str, str]:
-    """Collect detailed system configuration for the report header.
-
-    Returns a flat dict of label → value pairs organized by category.
-    """
-    info: dict[str, str] = {}
-
-    # ---- Operating System ----
-    info["OS"] = f"{platform.system()} {platform.release()}"
-    info["OS Version"] = platform.version()
-    info["Architecture"] = platform.machine()
-
-    # ---- CPU ----
-    processor = platform.processor() or "Unknown"
-    # Try to get more detailed CPU name on Windows
-    if platform.system() == "Windows" and (not processor or processor == "Intel64 Family 6 Model"):
-        try:
-            result = subprocess.run(
-                ["wmic", "cpu", "get", "name"],
-                capture_output=True, text=True, timeout=5,
-            )
-            lines = result.stdout.strip().split("\n")
-            if len(lines) >= 2:
-                processor = lines[1].strip()
-        except Exception:
-            pass
-    # Try lscpu on Linux
-    elif platform.system() == "Linux":
-        try:
-            result = subprocess.run(
-                ["lscpu"],
-                capture_output=True, text=True, timeout=5,
-            )
-            for line in result.stdout.split("\n"):
-                if "Model name" in line:
-                    processor = line.split(":", 1)[1].strip()
-                    break
-        except Exception:
-            pass
-    info["CPU"] = processor
-    logical_cores = os.cpu_count() or 0
-    info["Logical Processors"] = str(logical_cores)
-
-    # ---- Physical Cores / Threads per Core ----
-    physical_cores = 0
-    if platform.system() == "Windows":
-        try:
-            result = subprocess.run(
-                ["wmic", "cpu", "get", "NumberOfCores,NumberOfLogicalProcessors"],
-                capture_output=True, text=True, timeout=5,
-            )
-            lines = [l.strip() for l in result.stdout.strip().split("\n") if l.strip()]
-            if len(lines) >= 2:
-                parts = lines[1].split()
-                if len(parts) >= 2:
-                    physical_cores = int(parts[0])
-                    logical_from_wmic = int(parts[1])
-                    if logical_from_wmic > 0 and logical_cores == 0:
-                        logical_cores = logical_from_wmic
-        except Exception:
-            pass
-    elif platform.system() == "Linux":
-        try:
-            result = subprocess.run(
-                ["lscpu"],
-                capture_output=True, text=True, timeout=5,
-            )
-            cores_per_socket = 0
-            sockets = 0
-            for line in result.stdout.split("\n"):
-                if "Core(s) per socket" in line:
-                    cores_per_socket = int(line.split(":", 1)[1].strip())
-                if "Socket(s)" in line:
-                    sockets = int(line.split(":", 1)[1].strip())
-            # Physical cores = sockets * cores_per_socket
-            if cores_per_socket > 0 and sockets > 0:
-                physical_cores = sockets * cores_per_socket
-        except Exception:
-            pass
-
-    if physical_cores > 0:
-        info["Physical Cores"] = str(physical_cores)
-        if logical_cores > 0 and physical_cores > 0:
-            threads_per_core = logical_cores // physical_cores
-            info["Threads per Core"] = str(threads_per_core)
-
-    # ---- CPU Cache Sizes ----
-    if platform.system() == "Windows":
-        try:
-            result = subprocess.run(
-                ["wmic", "cpu", "get", "L2CacheSize,L3CacheSize"],
-                capture_output=True, text=True, timeout=5,
-            )
-            lines = [l.strip() for l in result.stdout.strip().split("\n") if l.strip()]
-            if len(lines) >= 2:
-                parts = lines[1].split()
-                if len(parts) >= 1 and parts[0].isdigit():
-                    l2_kb = int(parts[0])
-                    if l2_kb > 0:
-                        if l2_kb >= 1024:
-                            info["L2 Cache"] = f"{l2_kb // 1024} MB"
-                        else:
-                            info["L2 Cache"] = f"{l2_kb} KB"
-                if len(parts) >= 2 and parts[1].isdigit():
-                    l3_kb = int(parts[1])
-                    if l3_kb > 0:
-                        if l3_kb >= 1024:
-                            info["L3 Cache"] = f"{l3_kb // 1024} MB"
-                        else:
-                            info["L3 Cache"] = f"{l3_kb} KB"
-        except Exception:
-            pass
-    elif platform.system() == "Linux":
-        try:
-            result = subprocess.run(
-                ["lscpu"],
-                capture_output=True, text=True, timeout=5,
-            )
-            for line in result.stdout.split("\n"):
-                if "L1d cache" in line:
-                    info["L1 Data Cache"] = line.split(":", 1)[1].strip()
-                if "L1i cache" in line:
-                    info["L1 Instruction Cache"] = line.split(":", 1)[1].strip()
-                if "L2 cache" in line:
-                    info["L2 Cache"] = line.split(":", 1)[1].strip()
-                if "L3 cache" in line:
-                    info["L3 Cache"] = line.split(":", 1)[1].strip()
-        except Exception:
-            pass
-
-    # ---- Memory ----
-    try:
-        import ctypes
-        import ctypes.wintypes
-
-        class MEMORYSTATUSEX(ctypes.Structure):
-            _fields_ = [
-                ("length", ctypes.wintypes.DWORD),
-                ("memory_load", ctypes.wintypes.DWORD),
-                ("total_physical", ctypes.c_uint64),
-                ("available_physical", ctypes.c_uint64),
-                ("total_page_file", ctypes.c_uint64),
-                ("available_page_file", ctypes.c_uint64),
-                ("total_virtual", ctypes.c_uint64),
-                ("available_virtual", ctypes.c_uint64),
-                ("available_extended_virtual", ctypes.c_uint64),
-            ]
-
-        meminfo = MEMORYSTATUSEX()
-        meminfo.length = ctypes.sizeof(MEMORYSTATUSEX)
-        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(meminfo)):
-            total_gb = meminfo.total_physical / (1024 ** 3)
-            info["RAM"] = f"{total_gb:.1f} GB"
-    except Exception:
-        pass
-    if "RAM" not in info:
-        try:
-            total_bytes = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-            total_gb = total_bytes / (1024 ** 3)
-            info["RAM"] = f"{total_gb:.1f} GB"
-        except Exception:
-            pass
-
-    # ---- Rust Toolchain ----
-    try:
-        result = subprocess.run(
-            ["rustc", "--version"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            info["rustc"] = result.stdout.strip()
-    except Exception:
-        pass
-
-    try:
-        result = subprocess.run(
-            ["cargo", "--version"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            info["cargo"] = result.stdout.strip()
-    except Exception:
-        pass
-
-    try:
-        result = subprocess.run(
-            ["rustup", "show", "active-toolchain"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            info["Active Toolchain"] = result.stdout.strip()
-    except Exception:
-        pass
-
-    # ---- Python ----
-    info["Python"] = sys.version.split()[0]
-
-    # ---- Benchmark Target ----
-    try:
-        result = subprocess.run(
-            ["rustc", "--version", "--verbose"],
-            capture_output=True, text=True, timeout=5,
-        )
-        for line in result.stdout.split("\n"):
-            if line.startswith("host:"):
-                info["Host Triple"] = line.split(":", 1)[1].strip()
-            if line.startswith("commit-hash:"):
-                info["rustc Commit"] = line.split(":", 1)[1].strip()[:10]
-    except Exception:
-        pass
-
-    return info
 
 
 def build_system_info_html(system_info: dict[str, str]) -> str:
     """Build an HTML table for system configuration display."""
-    # Define display order with labels
+    # Display order and labels. The keys are the ones `collect_system_info`
+    # produces; a key that is absent on the current machine is skipped, so
+    # listing both the Windows (KB-suffixed) and Linux cache spellings is
+    # harmless. `Hostname` is deliberately not listed: this report is a
+    # self-contained file that gets shared, unlike the local Pill Lab UI.
     order = [
         ("OS", "OS"),
         ("OS Version", "OS Version"),
@@ -423,17 +139,18 @@ def build_system_info_html(system_info: dict[str, str]) -> str:
         ("CPU", "CPU"),
         ("Physical Cores", "Physical Cores"),
         ("Logical Processors", "Logical Processors"),
-        ("Threads per Core", "Threads per Core"),
-        ("L1 Data Cache", "L1 Data Cache"),
-        ("L1 Instruction Cache", "L1 Instruction Cache"),
+        ("Max Clock (MHz)", "Max Clock (MHz)"),
+        ("L2 Cache (KB)", "L2 Cache (KB)"),
+        ("L3 Cache (KB)", "L3 Cache (KB)"),
         ("L2 Cache", "L2 Cache"),
         ("L3 Cache", "L3 Cache"),
-        ("RAM", "RAM"),
+        ("RAM (GB)", "RAM (GB)"),
         ("Host Triple", "Host Triple"),
         ("rustc", "rustc"),
         ("rustc Commit", "rustc Commit"),
         ("cargo", "cargo"),
         ("Active Toolchain", "Active Toolchain"),
+        (".NET SDK", ".NET SDK"),
         ("Python", "Python"),
     ]
 
@@ -461,146 +178,10 @@ def build_system_info_html(system_info: dict[str, str]) -> str:
 
 # =============================================================================
 # Data Discovery & Processing
+#
+# `discover_benchmarks`, `group_benchmarks`, `build_leaderboard` and
+# `detect_regressions` are imported from `core.criterion`.
 # =============================================================================
-
-
-def discover_benchmarks(criterion_directory: pathlib.Path) -> list[BenchmarkData]:
-    """Walk the Criterion output tree and collect all benchmark metadata and data."""
-    benchmarks: list[BenchmarkData] = []
-
-    for benchmark_json_path in sorted(criterion_directory.rglob("new/benchmark.json")):
-        parameter_directory = benchmark_json_path.parent.parent
-        benchmark_metadata = json_load(benchmark_json_path)
-        if not benchmark_metadata:
-            continue
-
-        group = benchmark_metadata.get("group_id", "unknown")
-        parameter = benchmark_metadata.get("value_str") or str(
-            benchmark_metadata.get("value_str", "")
-        )
-        full_id = benchmark_metadata.get("full_id", f"{group}/{parameter}")
-
-        # Determine group prefix (everything before the first '/')
-        group_prefix = full_id.split("/")[0] if "/" in full_id else group
-
-        new_estimates_path = parameter_directory / "new" / "estimates.json"
-        new_sample_path = parameter_directory / "new" / "sample.json"
-        base_estimates_path = parameter_directory / "base" / "estimates.json"
-        base_sample_path = parameter_directory / "base" / "sample.json"
-        change_estimates_path = parameter_directory / "change" / "estimates.json"
-
-        new_estimates = json_load(new_estimates_path) or {}
-        if not new_estimates:
-            continue
-
-        new_sample = json_load(new_sample_path)
-        base_estimates = json_load(base_estimates_path)
-        base_sample = json_load(base_sample_path)
-        change_estimates = json_load(change_estimates_path)
-
-        entity_count = parse_entity_count(parameter)
-
-        # Extract core statistics
-        mean_ns = extract_estimate(new_estimates, "mean") or 0.0
-        median_ns = extract_estimate(new_estimates, "median") or 0.0
-        std_dev_ns = extract_estimate(new_estimates, "std_dev") or 0.0
-
-        # Compute min/max/outliers from sample data
-        sample_times: list[float] = []
-        min_ns: Optional[float] = None
-        max_ns: Optional[float] = None
-        outlier_count = 0
-        iteration_count = 0
-
-        if new_sample and "times" in new_sample:
-            sample_times = new_sample["times"]
-            iteration_count = len(sample_times)
-            if sample_times:
-                min_ns = min(sample_times)
-                max_ns = max(sample_times)
-            outlier_count, _ = compute_outliers(sample_times)
-
-        # Compute throughput
-        throughput: Optional[float] = None
-        throughput_unit = ""
-        if entity_count and mean_ns > 0:
-            throughput = entity_count / (mean_ns / 1_000_000_000)
-            throughput_unit = "entities/s"
-
-        # Compute change
-        change_percent: Optional[float] = None
-        change_direction = "unchanged"
-        if change_estimates:
-            change_mean = change_estimates.get("mean", {})
-            if isinstance(change_mean, dict):
-                change_percent = change_mean.get("point_estimate")
-                if change_percent is not None:
-                    if change_percent < -0.02:
-                        change_direction = "improved"
-                    elif change_percent > 0.02:
-                        change_direction = "regressed"
-                    else:
-                        change_direction = "unchanged"
-
-        # Extract run timestamp from file modification time
-        run_timestamp = ""
-        try:
-            mtime = os.path.getmtime(new_estimates_path)
-            run_timestamp = datetime.fromtimestamp(mtime, tz=timezone.utc).strftime(
-                "%Y-%m-%d %H:%M UTC"
-            )
-        except OSError:
-            pass
-
-        benchmarks.append(
-            BenchmarkData(
-                group=group,
-                parameter=parameter,
-                full_id=full_id,
-                group_prefix=group_prefix,
-                entity_count=entity_count,
-                new_estimates=new_estimates,
-                new_sample=new_sample,
-                base_estimates=base_estimates,
-                base_sample=base_sample,
-                change=change_estimates,
-                mean_ns=mean_ns,
-                median_ns=median_ns,
-                std_dev_ns=std_dev_ns,
-                min_ns=min_ns,
-                max_ns=max_ns,
-                outlier_count=outlier_count,
-                iteration_count=iteration_count,
-                throughput=throughput,
-                throughput_unit=throughput_unit,
-                change_percent=change_percent,
-                change_direction=change_direction,
-                run_timestamp=run_timestamp,
-            )
-        )
-
-    return benchmarks
-
-
-def group_benchmarks(benchmarks: list[BenchmarkData]) -> list[BenchmarkGroup]:
-    """Group benchmarks by their file prefix for section organization."""
-    groups: dict[str, list[BenchmarkData]] = {}
-    for benchmark in benchmarks:
-        groups.setdefault(benchmark.group_prefix, []).append(benchmark)
-    return [
-        BenchmarkGroup(prefix=prefix, label=prefix, benchmarks=list(group_benchmarks))
-        for prefix, group_benchmarks in groups.items()
-    ]
-
-
-def build_leaderboard(benchmarks: list[BenchmarkData]) -> list[BenchmarkData]:
-    """Return benchmarks sorted slowest-first by mean time."""
-    return sorted(benchmarks, key=lambda b: b.mean_ns, reverse=True)
-
-
-def detect_regressions(benchmarks: list[BenchmarkData]) -> list[BenchmarkData]:
-    """Return benchmarks that regressed more than 2%."""
-    return [b for b in benchmarks if b.change_direction == "regressed"]
 
 
 # =============================================================================

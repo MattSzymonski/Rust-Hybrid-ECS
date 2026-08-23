@@ -1,0 +1,384 @@
+/* ================================================================
+   RESET, PAGE SHELL AND SIDEBAR
+
+   The two-column shell (sticky sidebar + scrolling main) and the
+   sidebar styling are ported from the previous benchmark report. The
+   sidebar now also carries the category / measurement / baseline
+   pickers above the benchmark table of contents.
+   ================================================================ */
+
+*,
+*::before,
+*::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+/* The `hidden` attribute must always win. `.page-wrapper` sets `display: flex`,
+   and an author display rule would otherwise override the UA stylesheet's
+   `[hidden] { display: none }`, leaving the inactive tab's layout visible. */
+[hidden] {
+    display: none !important;
+}
+
+html {
+    scroll-behavior: smooth;
+}
+
+body {
+    font-family: var(--font-sans);
+    font-size: 13px;
+    line-height: 1.6;
+    background: var(--surface-base);
+    color: var(--text-primary);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+}
+
+a {
+    color: var(--text-brand);
+    text-decoration: none;
+}
+a:hover {
+    text-decoration: underline;
+}
+
+code,
+.mono {
+    font-family: var(--font-code);
+    font-size: 11px;
+}
+
+.page-wrapper {
+    display: flex;
+    max-width: 1700px;
+    margin: 0 auto;
+    min-height: 100vh;
+}
+
+/* ================================================================
+   SIDEBAR
+   ================================================================ */
+
+.sidebar {
+    position: sticky;
+    top: 0;
+    width: var(--sidebar-width);
+    min-width: var(--sidebar-width);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    background: var(--surface-base);
+    border-right: 1px solid var(--border-subtle);
+    padding: 26px 18px;
+    font-size: 12px;
+    z-index: 10;
+}
+
+.sidebar-brand {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+    margin-bottom: 24px;
+}
+.sidebar-logo {
+    width: 55%;
+    height: auto;
+    display: block;
+    flex-shrink: 0;
+}
+.sidebar-lab {
+    font-size: 26px;
+    font-weight: 800;
+    letter-spacing: -0.05em;
+    color: var(--text-muted);
+    white-space: nowrap;
+    margin-bottom: 7px;
+}
+
+.sidebar-section {
+    margin-bottom: 24px;
+}
+.sidebar-section-label {
+    font-weight: 700;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.09em;
+    margin-bottom: 8px;
+}
+
+/* Scroll region holding the benchmark table of contents. The scrollbar
+   is invisible until hover, matching the original report. */
+.sidebar-scroll {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 0;
+    scrollbar-width: thin;
+    scrollbar-color: transparent transparent;
+}
+.sidebar-scroll:hover {
+    scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+.sidebar-scroll::-webkit-scrollbar {
+    width: 4px;
+}
+.sidebar-scroll::-webkit-scrollbar-track {
+    background: transparent;
+}
+.sidebar-scroll::-webkit-scrollbar-thumb {
+    background-color: transparent;
+    border-radius: 4px;
+    transition: background-color 0.35s ease;
+}
+.sidebar-scroll:hover::-webkit-scrollbar-thumb {
+    background-color: rgba(255, 255, 255, 0.1);
+}
+
+/* ---- Category picker ---- */
+
+.category-picker {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.category-option {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 7px 10px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    background: var(--glass-idle);
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-family: inherit;
+    font-size: 12px;
+    font-weight: 500;
+    text-align: left;
+    transition: all 0.15s ease;
+}
+.category-option:hover {
+    background: var(--glass-hover);
+    color: var(--text-primary);
+}
+.category-option.active {
+    background: var(--glass-active);
+    color: var(--text-primary);
+    font-weight: 700;
+    border-color: var(--border-brand);
+}
+.category-option .count {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-weight: 500;
+}
+.category-option.empty {
+    opacity: 0.45;
+}
+
+/* ---- Measurement + baseline pickers ---- */
+
+.run-select {
+    width: 100%;
+    padding: 12px 14px;
+    border: 1px solid var(--border-default);
+    border-radius: 10px;
+    background: var(--surface-base);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    outline: none;
+    cursor: pointer;
+    transition: border-color 0.2s ease, background 0.2s ease;
+}
+.run-select:hover {
+    background: var(--glass-hover);
+}
+.run-select:focus {
+    border-color: var(--border-brand);
+}
+.run-select:disabled {
+    opacity: 0.45;
+    cursor: default;
+}
+.baseline-hint {
+    margin-top: 9px;
+    font-size: 12px;
+    color: var(--text-muted);
+    line-height: 1.5;
+}
+
+.search-input {
+    width: 100%;
+    padding: 7px 12px;
+    border: 1px solid var(--border-default);
+    border-radius: 8px;
+    background: var(--surface-elevated);
+    color: var(--text-primary);
+    font-family: inherit;
+    font-size: 12px;
+    margin-bottom: 10px;
+    outline: none;
+    transition: border-color 0.2s ease;
+}
+/* The filter stays reachable while a long table of contents scrolls. */
+.sidebar-scroll .search-input {
+    position: sticky;
+    top: 0;
+    z-index: 2;
+}
+.search-input::placeholder {
+    color: var(--text-muted);
+}
+.search-input:focus {
+    border-color: var(--border-brand);
+}
+
+/* ---- Table of contents ---- */
+
+.toc-group {
+    margin-bottom: 16px;
+}
+.toc-group-header {
+    font-weight: 700;
+    margin-bottom: 4px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    transition: color 0.2s ease;
+}
+.toc-group-header.active {
+    color: var(--text-brand);
+}
+.toc-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    text-decoration: none;
+    font-size: 11px;
+    color: var(--text-primary);
+    transition: all 0.15s ease;
+}
+.toc-item span {
+    color: inherit;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.toc-item:hover {
+    background: var(--glass-hover);
+    text-decoration: none;
+}
+.toc-item.active {
+    background: rgba(255, 255, 255, 0.08);
+    font-weight: 700;
+}
+.toc-item.hidden {
+    display: none;
+}
+.sparkline-svg {
+    flex-shrink: 0;
+    color: var(--text-muted);
+}
+
+.direction-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    display: inline-block;
+}
+.direction-dot.improved {
+    background: var(--improved);
+}
+.direction-dot.regressed {
+    background: var(--regressed);
+}
+.direction-dot.unchanged {
+    background: var(--text-muted);
+}
+
+/* ================================================================
+   MAIN COLUMN
+   ================================================================ */
+
+.main {
+    flex: 1;
+    padding: 34px 40px 56px;
+    max-width: calc(100vw - var(--sidebar-width));
+    overflow-x: clip;
+}
+.main h1 {
+    font-size: 34px;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    line-height: 1.15;
+    margin-bottom: 6px;
+}
+.main .subtitle {
+    color: var(--text-secondary);
+    font-size: 14px;
+    margin-bottom: 26px;
+}
+
+.empty-state {
+    border: 1px dashed var(--border-strong);
+    border-radius: 12px;
+    padding: 32px;
+    color: var(--text-secondary);
+    background: var(--glass-idle);
+}
+.empty-state h2 {
+    font-size: 18px;
+    font-weight: 700;
+    margin-bottom: 10px;
+    color: var(--text-primary);
+}
+.empty-state pre {
+    margin-top: 12px;
+    padding: 12px 14px;
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    color: var(--text-secondary);
+    font-family: var(--font-code);
+    font-size: 11px;
+    overflow-x: auto;
+    white-space: pre;
+}
+.error-state {
+    border-color: var(--warning-border);
+    background: var(--warning-bg);
+    color: var(--warning-text);
+}
+
+/* ================================================================
+   RESPONSIVE
+   ================================================================ */
+
+@media (max-width: 980px) {
+    .page-wrapper {
+        flex-direction: column;
+    }
+    .sidebar {
+        position: relative;
+        width: 100%;
+        min-width: 100%;
+        height: auto;
+        max-height: 55vh;
+        border-right: none;
+        border-bottom: 1px solid var(--border-subtle);
+    }
+    .main {
+        max-width: 100%;
+        padding: 20px 16px 32px;
+    }
+}

@@ -1,0 +1,234 @@
+/* ═══════════════════════════════════════════════════════════════════════
+   PILL DESIGN SYSTEM - Shared styles for the whole Pill website
+   ═══════════════════════════════════════════════════════════════════════
+   Single source of truth for colors, fonts, sizes, roundness, gradients,
+   text colors, shadows, glass and syntax accents. Imported by:
+     - landing_page/src/main.jsx           (Vite + Tailwind)
+     - guide/.vitepress/theme/index.ts     (VitePress)
+
+   The rustdoc API docs consume this same file via --extend-css (see the
+   RUSTDOC THEME MAPPING section at the bottom).
+   ═══════════════════════════════════════════════════════════════════════ */
+
+/* Layer order declaration. Shared utilities below live in the custom
+   `shared` layer, slotted between base and components, so Tailwind
+   utilities keep winning the cascade on the landing page (this file is
+   imported before the Tailwind directives). A custom layer name is used
+   because Tailwind rejects `@layer components` in files without matching
+   @tailwind directives. Empty layers are harmless for VitePress and
+   rustdoc. */
+@layer theme, base, shared, components, utilities;
+
+:root {
+    /* ── Brand colors ── */
+    --brand-50: #fff5f5;
+    --brand-100: #ffe0e0;
+    --brand-200: #ffc2c2;
+    --brand-300: #ff9494;
+    --brand-400: #ff6363;
+    --brand-500: #ff4444;
+    --brand-600: #e62e2e;
+    --brand-700: #c41c1c;
+    --brand-800: #a31818;
+    --brand-900: #871919;
+    --brand: var(--brand-500);
+
+    /* Brand as raw RGB triplets so Tailwind alpha modifiers (e.g. /10)
+       keep working on the landing page */
+    --brand-300-rgb: 255 148 148;
+    --brand-400-rgb: 255 99 99;
+    --brand-500-rgb: 255 68 68;
+    --brand-600-rgb: 230 46 46;
+
+    /* ── Surfaces ── */
+    --surface: #0a0a0a;
+    --surface-elevated: #111111;
+    --surface-hover: #1a1a1a;
+    --background-alt: #161618;
+    --background-docs: #1e1e20;
+    --background-elevated: #202127;
+    --border: rgba(255, 255, 255, 0.06);
+    --border-hover: rgba(255, 255, 255, 0.12);
+    --border-docs: rgba(60, 60, 67, 0.29);
+
+    /* ── Text colors ── */
+    --text-primary: #ffffff;
+    --text-primary-docs: rgba(255, 255, 245, 0.86);
+    --text-secondary: rgba(235, 235, 245, 0.6);
+    --text-muted: #9ca3af;
+
+    /* ── Fonts ── */
+    --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+    --font-display: 'Chillax', 'Inter', sans-serif;
+    --font-docs: 'Poppins', ui-sans-serif, system-ui, sans-serif;
+    --font-code: 'Cascadia Mono', Consolas, ui-monospace, monospace;
+
+    /* ── Sizes ── */
+    --container-max: 1280px;
+    --scrollbar-width: 6px;
+    --scrollbar-height: 10px;
+
+    /* ── Roundness ── */
+    --radius-sm: 4px;
+    --radius-md: 10px;
+    --radius-lg: 12px;
+    --radius-xl: 16px;
+    --radius-full: 9999px;
+
+    /* ── Gradients ── */
+    --gradient-brand: linear-gradient(135deg, #ff6363, #ff9494);
+    --gradient-hero-text: linear-gradient(135deg, #ffffff 0%, #bac2de 100%);
+    --gradient-hero-text-light: linear-gradient(135deg, #1e293b 0%, #475569 100%);
+
+    /* ── Shadows ── */
+    --shadow-soft: 0 4px 12px rgba(0, 0, 0, 0.2);
+    --shadow-soft-hover: 0 6px 20px rgba(0, 0, 0, 0.3);
+    --shadow-card: 0 4px 16px rgba(0, 0, 0, 0.3);
+    --shadow-card-hover: 0 8px 24px rgba(0, 0, 0, 0.4);
+    --shadow-lift: 0 12px 30px rgba(0, 0, 0, 0.3);
+    --shadow-navbar: 0 2px 16px rgba(0, 0, 0, 0.3);
+    --shadow-navbar-scrolled: 0 4px 32px rgba(0, 0, 0, 0.5);
+    --shadow-overlay: 0 24px 80px rgba(0, 0, 0, 0.5);
+
+    /* ── Glass ── */
+    --glass-background: rgba(255, 255, 255, 0.03);
+    --glass-background-hover: rgba(255, 255, 255, 0.05);
+    --glass-background-navbar: rgba(255, 255, 255, 0.02);
+    --glass-background-navbar-scrolled: rgba(255, 255, 255, 0.03);
+    --glass-border: rgba(255, 255, 255, 0.06);
+    --glass-border-hover: rgba(255, 255, 255, 0.1);
+    --glass-border-navbar: rgba(255, 255, 255, 0.05);
+    --glass-border-navbar-scrolled: rgba(255, 255, 255, 0.08);
+    --glass-blur: 12px;
+    --glass-blur-navbar: 16px;
+    --glass-blur-navbar-scrolled: 32px;
+
+    /* ── Syntax accents (Shiki + rustdoc) ── */
+    --syntax-keyword: #ff7ab6;
+    --syntax-function: #7dd3fc;
+    --syntax-string: #a7f3d0;
+    --syntax-number: #f6c177;
+    --syntax-type: #b4a7f8;
+    --syntax-comment: #a6adc8;
+    --syntax-selection: rgba(125, 211, 252, 0.12);
+
+    /* ── Selection & scrollbars (landing values; the guide overrides
+         these in .vitepress/theme/styles.css) ── */
+    --selection-background: rgba(255, 99, 99, 0.3);
+    --selection-text: #ffffff;
+    --scrollbar-track: transparent;
+    --scrollbar-thumb: rgba(255, 255, 255, 0.1);
+    --scrollbar-thumb-hover: rgba(255, 255, 255, 0.2);
+    --scrollbar-thumb-radius: 3px;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   BASE
+   ═══════════════════════════════════════════════════════════════════════ */
+html {
+    scroll-behavior: smooth;
+}
+
+::selection {
+    background: var(--selection-background);
+    color: var(--selection-text);
+}
+
+::-webkit-scrollbar {
+    width: var(--scrollbar-width);
+    height: var(--scrollbar-height);
+}
+
+::-webkit-scrollbar-track {
+    background: var(--scrollbar-track);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--scrollbar-thumb);
+    border-radius: var(--scrollbar-thumb-radius);
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--scrollbar-thumb-hover);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   SHARED UTILITIES
+   ═══════════════════════════════════════════════════════════════════════ */
+@layer shared {
+    /* Glass card - the signature frosted card surface */
+    .glass-card {
+        background: var(--glass-background);
+        border: 1px solid var(--glass-border);
+        backdrop-filter: blur(var(--glass-blur));
+        border-radius: var(--radius-xl);
+        transition: all 0.3s ease;
+    }
+
+    .glass-card:hover {
+        background: var(--glass-background-hover);
+        border-color: var(--glass-border-hover);
+        transform: translateY(-2px);
+    }
+
+    /* Brand gradient text */
+    .text-gradient {
+        background: var(--gradient-brand);
+        -webkit-background-clip: text;
+        -webkit-text-fill-color: transparent;
+        background-clip: text;
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   RUSTDOC THEME MAPPING
+   ═══════════════════════════════════════════════════════════════════════
+   rustdoc consumes this file with --extend-css (see
+   Rust-Hybrid-ECS/.cargo/config.toml). rustdoc scopes its themes as
+   :root[data-theme="..."], so these selectors repeat that specificity to
+   reliably win the cascade for every theme. The result is that the API
+   docs always show the guide's dark look.
+   ═══════════════════════════════════════════════════════════════════════ */
+:root:not([data-theme]),
+:root[data-theme="light"],
+:root[data-theme="dark"],
+:root[data-theme="ayu"] {
+    --main-background-color: var(--background-docs);
+    --main-color: var(--text-primary-docs);
+    --sidebar-background-color: var(--background-alt);
+    --sidebar-background-color-hover: var(--background-elevated);
+    --sidebar-current-link-background-color: var(--brand-700);
+    --sidebar-link-color: var(--text-secondary);
+    --sidebar-border-color: var(--border-docs);
+    --border-color: var(--border-docs);
+    --headings-border-bottom-color: var(--border-docs);
+    --code-block-background-color: var(--background-alt);
+    --table-alt-row-background-color: var(--background-elevated);
+    --scrollbar-thumb-background-color: var(--brand-600);
+    --scrollbar-track-background-color: var(--background-alt);
+    --search-input-focused-border-color: var(--brand);
+    --font-family: var(--font-docs);
+    --font-family-code: var(--font-code);
+
+    /* Syntax highlighting mirrors the Shiki palette of the guide */
+    --code-highlight-comment-color: var(--syntax-comment);
+    --code-highlight-doc-comment-color: var(--syntax-comment);
+    --code-highlight-kw-color: var(--syntax-keyword);
+    --code-highlight-kw-2-color: var(--syntax-keyword);
+    --code-highlight-string-color: var(--syntax-string);
+    --code-highlight-number-color: var(--syntax-number);
+    --code-highlight-literal-color: var(--syntax-number);
+    --code-highlight-attribute-color: var(--syntax-type);
+    --code-highlight-macro-color: var(--syntax-function);
+    --code-highlight-lifetime-color: var(--syntax-number);
+
+    /* Item links share the guide's accent colors */
+    --function-link-color: var(--syntax-function);
+    --mod-link-color: var(--syntax-function);
+    --macro-link-color: var(--syntax-function);
+    --assoc-item-link-color: var(--syntax-function);
+    --trait-link-color: var(--syntax-type);
+    --type-link-color: var(--syntax-type);
+    --keyword-link-color: var(--syntax-keyword);
+    --attribute-link-color: var(--syntax-number);
+}

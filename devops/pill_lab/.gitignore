@@ -1,0 +1,10 @@
+# Frontend build artifacts and dependencies.
+node_modules/
+dist/
+__pycache__/
+*.pyc
+
+# Measurement history is machine-specific and is ignored at the repository
+# root (`/devops/pill_lab/measurements/`). Nothing here depends on it being
+# committed: `index.json` is regenerated from whatever is on disk, so a fresh
+# clone simply starts with an empty history.

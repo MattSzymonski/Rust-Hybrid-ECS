@@ -1,0 +1,730 @@
+/* ================================================================
+   TESTS TAB - tab bar, suite cards, and live step spinners.
+
+   The tab bar switches between Benchmarks and Tests. Each suite card
+   shows its steps as circles: a running step spins, ok shows a green
+   check, failed a red cross, pending a dim dot. Uses the tokens from
+   tokens.css so it matches the rest of Pill Lab.
+   ================================================================ */
+
+/* ------------------------------------------------------------------
+   Tab switcher (sidebar, under the brand)
+   ------------------------------------------------------------------ */
+
+.tab-switcher {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 24px;
+}
+
+.tab-switcher .tab-button {
+    flex: 1;
+    text-align: center;
+    font-size: 12px;
+    padding: 7px 10px;
+    background: var(--glass-idle);
+}
+
+.tab-button {
+    font: inherit;
+    font-weight: 700;
+    font-size: 13px;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 7px 16px;
+    cursor: pointer;
+    transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.tab-button:hover {
+    color: var(--text-primary);
+    background: var(--glass-hover);
+}
+
+.tab-button.active {
+    color: var(--text-primary);
+    background: var(--glass-active);
+    border-color: var(--border-brand);
+}
+
+/* ------------------------------------------------------------------
+   Tests page shell
+   ------------------------------------------------------------------ */
+
+.tests-view {
+    max-width: 1700px;
+    margin: 0 auto;
+    padding: 24px 20px 48px;
+    width: 100%;
+}
+
+.tests-toolbar {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin-bottom: 20px;
+}
+
+.tests-toolbar h1 {
+    font-size: 26px;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+}
+
+.tests-actions {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+}
+
+.tests-note {
+    color: var(--text-muted);
+    font-size: 12px;
+    max-width: 380px;
+}
+
+/* ------------------------------------------------------------------
+   Suite cards
+   ------------------------------------------------------------------ */
+
+.tests-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(380px, 1fr));
+    gap: 14px;
+}
+
+.test-card {
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-lg);
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    transition: border-color 150ms ease;
+}
+
+.test-card.phase-running {
+    border-color: var(--border-brand);
+}
+
+.test-card.phase-passed {
+    border-color: var(--improved-bg);
+}
+
+.test-card.phase-failed,
+.test-card.phase-error {
+    border-color: var(--regressed-bg);
+}
+
+.test-card-head {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+}
+
+.test-status-dot {
+    width: 10px;
+    height: 10px;
+    min-width: 10px;
+    border-radius: 50%;
+    margin-top: 5px;
+    background: var(--border-strong);
+}
+
+.test-status-dot.running {
+    background: var(--text-brand);
+    box-shadow: 0 0 8px var(--brand-500);
+    animation: pulse 1.2s ease-in-out infinite;
+}
+
+.test-status-dot.passed {
+    background: var(--improved);
+}
+
+.test-status-dot.failed,
+.test-status-dot.error {
+    background: var(--regressed);
+}
+
+.test-card-titles {
+    flex: 1;
+    min-width: 0;
+}
+
+.test-card-titles h3 {
+    font-size: 14px;
+    font-weight: 700;
+    line-height: 1.35;
+}
+
+.test-file {
+    color: var(--text-muted);
+    font-size: 11px;
+}
+
+.test-description {
+    color: var(--text-secondary);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+/* ------------------------------------------------------------------
+   Run button
+   ------------------------------------------------------------------ */
+
+.test-run-button {
+    font: inherit;
+    font-weight: 700;
+    font-size: 12px;
+    color: var(--text-primary);
+    background: var(--glass-default);
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    padding: 7px 14px;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: background 120ms ease, border-color 120ms ease;
+}
+
+.test-run-button:hover:not(:disabled) {
+    background: var(--glass-hover);
+    border-color: var(--border-hover);
+}
+
+.test-run-button:disabled {
+    opacity: 0.45;
+    cursor: default;
+}
+
+.test-run-button.primary {
+    background: var(--brand-600);
+    border-color: var(--brand-500);
+}
+
+.test-run-button.primary:hover:not(:disabled) {
+    background: var(--brand-500);
+}
+
+/* ------------------------------------------------------------------
+   Steps (spinning circles)
+   ------------------------------------------------------------------ */
+
+.test-steps {
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 0;
+    margin: 4px 0 0;
+}
+
+.test-step {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.test-step-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.test-step-indicator {
+    width: 14px;
+    height: 14px;
+    min-width: 14px;
+    border-radius: 50%;
+    border: 2px solid var(--border-strong);
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 9px;
+    line-height: 1;
+    color: var(--surface-base);
+    flex-shrink: 0;
+}
+
+.test-step.running .test-step-indicator {
+    border-color: var(--border-strong);
+    border-top-color: var(--text-brand);
+    animation: spin 0.8s linear infinite;
+}
+
+.test-step.ok .test-step-indicator {
+    border-color: var(--improved);
+    background: var(--improved);
+}
+
+.test-step.ok .test-step-indicator::after {
+    content: '\2713';
+    font-weight: 800;
+}
+
+.test-step.failed .test-step-indicator {
+    border-color: var(--regressed);
+    background: var(--regressed);
+}
+
+.test-step.failed .test-step-indicator::after {
+    content: '\2715';
+    font-weight: 800;
+}
+
+.test-step.pending .test-step-indicator {
+    border-color: var(--border-subtle);
+}
+
+/* ------------------------------------------------------------------
+   Live log and outcome
+   ------------------------------------------------------------------ */
+
+.test-log {
+    border-top: 1px solid var(--border-subtle);
+    padding-top: 8px;
+}
+
+.test-log summary {
+    cursor: pointer;
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 600;
+}
+
+.test-log-content {
+    margin-top: 6px;
+    max-height: 260px;
+    overflow: auto;
+    background: var(--surface-base);
+    border: 1px solid var(--border-subtle);
+    border-radius: 8px;
+    padding: 10px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    color: var(--text-secondary);
+}
+
+.test-outcome {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 800;
+    font-size: 12px;
+    border-radius: 8px;
+    padding: 8px 12px;
+}
+
+.test-outcome.passed {
+    color: var(--improved);
+    background: var(--improved-bg);
+}
+
+.test-outcome.failed {
+    color: var(--regressed);
+    background: var(--regressed-bg);
+}
+
+.test-error {
+    color: var(--regressed);
+    font-size: 12px;
+}
+
+/* ------------------------------------------------------------------
+   Tests tab (page-wrapper layout: sidebar list + main detail)
+   ------------------------------------------------------------------ */
+
+.tests-sidebar,
+.tests-main {
+    width: 100%;
+}
+
+.tests-sidebar-actions {
+    margin-bottom: 12px;
+}
+
+.tests-run-all {
+    width: 100%;
+}
+
+.tests-picker {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.test-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    width: 100%;
+    font: inherit;
+    font-size: 12px;
+    color: var(--text-secondary);
+    background: var(--glass-idle);
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 7px 10px;
+    cursor: pointer;
+    text-align: left;
+    transition: background 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+
+.test-row:hover {
+    color: var(--text-primary);
+    background: var(--glass-hover);
+}
+
+.test-row.active {
+    color: var(--text-primary);
+    background: var(--glass-active);
+    border-color: var(--border-brand);
+    font-weight: 700;
+}
+
+.test-row-main {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.test-row-phase {
+    font-size: 10px;
+    color: var(--text-muted);
+    font-weight: 500;
+    white-space: nowrap;
+}
+
+.test-row-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    /* Inherit the sans-serif row font so suite rows match the category pills. */
+    font-size: 12px;
+}
+
+.tests-detail {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+    max-width: 1200px;
+    padding-bottom: 56px;
+}
+
+.tests-detail-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 20px;
+    flex-wrap: wrap;
+}
+
+.tests-detail-titles {
+    min-width: 0;
+}
+
+.tests-detail-titles h1 {
+    font-size: 22px;
+    font-weight: 800;
+    letter-spacing: -0.03em;
+    line-height: 1.25;
+}
+
+.tests-detail-header .test-file {
+    display: inline-block;
+    margin-top: 4px;
+}
+
+.tests-state-chips {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.tests-state-chips .meta-chip.state-running {
+    border-color: var(--border-brand);
+    color: var(--text-brand);
+}
+
+.tests-state-chips .meta-chip.state-passed {
+    border-color: var(--improved);
+    color: var(--improved);
+    background: var(--improved-bg);
+}
+
+.tests-state-chips .meta-chip.state-failed,
+.tests-state-chips .meta-chip.state-error {
+    border-color: var(--regressed);
+    color: var(--regressed);
+    background: var(--regressed-bg);
+}
+
+.tests-state-chips .meta-chip.state-idle {
+    color: var(--text-muted);
+}
+
+.test-error-chip {
+    color: var(--regressed);
+    border-color: var(--regressed);
+    background: var(--regressed-bg);
+}
+
+/* ------------------------------------------------------------------
+   Terminal (live log in the main column)
+   ------------------------------------------------------------------ */
+
+.tests-terminal {
+    margin-top: 0;
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-md);
+    overflow: hidden;
+    background: var(--surface);
+}
+
+.tests-terminal-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 9px 14px;
+    background: var(--surface-elevated);
+    border-bottom: 1px solid var(--border-subtle);
+    color: var(--text-muted);
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    user-select: none;
+}
+.tests-terminal-head-left {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    min-width: 0;
+}
+.tests-terminal-toggle {
+    font-size: 9px;
+    color: var(--text-muted);
+    transition: transform 0.25s ease;
+    flex-shrink: 0;
+}
+.tests-terminal.collapsed .tests-terminal-toggle {
+    transform: rotate(-90deg);
+}
+.tests-terminal.collapsed .tests-terminal-body {
+    display: none;
+}
+
+.tests-terminal-dot {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.06em;
+}
+
+.tests-terminal-dot::before {
+    content: '';
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--border-strong);
+}
+
+.tests-terminal-dot.running::before {
+    background: var(--text-brand);
+    box-shadow: 0 0 8px var(--brand-500);
+    animation: pulse 1.2s ease-in-out infinite;
+}
+
+.tests-terminal-dot.passed::before {
+    background: var(--improved);
+}
+
+.tests-terminal-dot.failed::before,
+.tests-terminal-dot.error::before {
+    background: var(--regressed);
+}
+
+.tests-terminal-body {
+    height: 360px;
+    overflow: auto;
+    padding: 12px 14px;
+    margin: 0;
+    font-family: var(--font-code);
+    font-size: 11px;
+    line-height: 1.55;
+    color: var(--text-primary-docs);
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: transparent;
+}
+
+/* ------------------------------------------------------------------
+   Benchmark Run (sidebar section)
+   ------------------------------------------------------------------ */
+
+.benchmark-run-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.benchmark-run-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    background: var(--glass-idle);
+    border: 1px solid transparent;
+    border-radius: 8px;
+    padding: 7px 10px;
+}
+
+.benchmark-run-button {
+    flex: 1;
+    min-width: 0;
+    font: inherit;
+    font-weight: 700;
+    font-size: 12px;
+    color: var(--text-primary);
+    background: var(--glass-default);
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    padding: 6px 10px;
+    cursor: pointer;
+    text-align: left;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: background 120ms ease, border-color 120ms ease;
+}
+
+.benchmark-run-button:hover:not(:disabled) {
+    background: var(--glass-hover);
+    border-color: var(--border-hover);
+}
+
+.benchmark-run-button:disabled {
+    opacity: 0.45;
+    cursor: default;
+}
+
+.benchmark-run-note {
+    color: var(--text-muted);
+    font-size: 11px;
+    line-height: 1.4;
+    width: 100%;
+}
+
+.benchmark-run-error {
+    color: var(--regressed);
+    font-size: 11px;
+    line-height: 1.4;
+    width: 100%;
+}
+
+.benchmark-run-label {
+    font-weight: 600;
+    font-size: 12px;
+}
+
+.benchmark-run-phase {
+    color: var(--text-muted);
+    font-size: 11px;
+}
+
+/* The run panel at the top of the main column: Run button top-right, state
+   chips, and the live terminal below the head. */
+.benchmark-run-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    margin-bottom: 22px;
+    padding-bottom: 20px;
+    border-bottom: 1px solid var(--border-subtle);
+}
+
+.benchmark-run-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+}
+
+.benchmark-run-titles {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+}
+
+.benchmark-run-title {
+    font-weight: 800;
+    font-size: 22px;
+    letter-spacing: -0.03em;
+    line-height: 1.25;
+    color: var(--text-primary);
+}
+
+/* Measurement / compare pickers: the main setup interface, so it gets the
+   largest controls on the page. The two selectors sit side by side and the
+   card spans the full main width. */
+.benchmark-pickers {
+    margin-bottom: 28px;
+    padding: 26px 28px;
+    background: var(--surface-elevated);
+    border: 1px solid var(--border-default);
+    border-radius: var(--radius-lg);
+    box-shadow: var(--shadow-card);
+}
+
+.measurement-picker-grid {
+    display: flex;
+    gap: 30px;
+    flex-wrap: wrap;
+}
+
+.measurement-picker-grid .sidebar-section {
+    flex: 1 1 360px;
+    min-width: 0;
+    margin-bottom: 0;
+}
+
+.measurement-picker-grid .sidebar-section-label {
+    font-size: 12px;
+    letter-spacing: 0.1em;
+    margin-bottom: 10px;
+}
+
+/* ------------------------------------------------------------------
+   Animations
+   ------------------------------------------------------------------ */
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+@keyframes pulse {
+    0%,
+    100% {
+        opacity: 1;
+    }
+    50% {
+        opacity: 0.35;
+    }
+}

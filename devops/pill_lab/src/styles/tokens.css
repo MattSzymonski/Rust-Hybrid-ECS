@@ -1,0 +1,61 @@
+/* ================================================================
+   PILL LAB - DESIGN TOKENS
+
+   Token values come from the shared Pill design system
+   (`pill_style.css` - the single source of truth for colors, fonts,
+   radii, glass, gradients and shadows across the whole Pill website).
+   That file is imported here and never edited; this file only re-maps
+   the handful of names Pill Lab needs onto the shared variables and
+   keeps the measurement-domain tokens (improved / regressed / the
+   reload phase palette / sidebar width) the design system does not
+   define. Everything downstream references these variables, never
+   literal colors.
+   ================================================================ */
+
+/* The shared design system - referenced, not modified. */
+@import './pill_style.css';
+
+:root {
+    /* Surfaces: `--surface-base` is Pill Lab's alias for the shared
+       `--surface`; the elevated / hover surfaces are the shared ones. */
+    --surface-base: var(--surface);
+
+    /* Glass: default / hover map onto the shared glass stops; idle and
+       active are extra stops Pill Lab's controls need. */
+    --glass-idle: rgba(255, 255, 255, 0.02);
+    --glass-default: var(--glass-background);
+    --glass-hover: var(--glass-background-hover);
+    --glass-active: rgba(255, 255, 255, 0.08);
+
+    /* Borders: default / hover come from the shared system; subtle and
+       strong are the lab's lighter/darker stops, the brand border is the
+       shared brand color at low alpha. */
+    --border-subtle: rgba(255, 255, 255, 0.05);
+    --border-default: var(--border);
+    --border-strong: rgba(255, 255, 255, 0.08);
+    --border-brand: rgba(var(--brand-400-rgb) / 0.2);
+
+    /* Text: primary / secondary / muted come from the shared system; the
+       brand accent is the shared brand-400. */
+    --text-brand: var(--brand-400);
+
+    /* Semantic: improvement / regression indicators */
+    --improved: #2ecc71;
+    --improved-bg: rgba(46, 204, 113, 0.08);
+    --regressed: var(--brand-500);
+    --regressed-bg: rgba(255, 68, 68, 0.1);
+    --warning-bg: rgba(255, 193, 7, 0.08);
+    --warning-border: rgba(255, 193, 7, 0.2);
+    --warning-text: #ffc107;
+
+    /* Phase palette: one stable color per reload/build phase, so the same
+       phase keeps the same color across every chart and legend. */
+    --phase-build: #4a90d9;
+    --phase-stage: #7b68ee;
+    --phase-load: #45b7a4;
+    --phase-init: #e5a442;
+    --phase-migrate: #d96b8f;
+
+    /* Layout */
+    --sidebar-width: 300px;
+}

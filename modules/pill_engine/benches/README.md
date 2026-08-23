@@ -4,12 +4,49 @@ Criterion benchmarks for the Hybrid ECS engine. Each file targets a specific sub
 
 ## Running
 
+The simplest way is through Pill Lab, which runs the benchmarks, applies the
+profile overrides described below, and stores the result as a JSON measurement
+you can browse and compare:
+
+```bash
+python devops/pill_lab/pill_lab.py engine                          # everything
+python devops/pill_lab/pill_lab.py engine --bench minimal --quick  # fast check
+python devops/pill_lab/pill_lab.py serve                           # view results
+```
+
+Running cargo directly:
+
 ```bash
 cargo bench                          # all benchmarks
 cargo bench --bench <name>           # single benchmark
 cargo bench --bench <name> -- --quick  # quick check, no saved results
 cargo bench --bench <name> --no-run  # build only
 ```
+
+### Profile overrides (required on Windows)
+
+A bare `cargo bench` currently fails in this workspace, for two independent
+reasons:
+
+1. `modules/.cargo/config.toml` sets `-C prefer-dynamic` so the host and every
+   optional module share one `pill_core`. rustc refuses to combine that with
+   the release profile's `lto = "fat"`:
+   `linker plugin based LTO is not supported together with -C prefer-dynamic
+   when targeting Windows-like targets`.
+2. The release profile (which `bench` inherits) sets `panic = "abort"`, while
+   Criterion's harness links the unwinding panic runtime:
+   `the linked panic runtime panic_unwind is not compiled with this crate's
+   panic strategy abort`.
+
+Clear both for the benchmark invocation only - no file needs changing:
+
+```powershell
+$env:RUSTFLAGS = " "
+cargo bench --package pill_engine --config 'profile.release.panic="unwind"'
+```
+
+`pill_lab.py engine` does exactly this automatically (opt out with
+`--no-profile-overrides`).
 
 To run the `minimal` benchmark 10 times and write the averaged Criterion tree
 to `target/criterion/`:
@@ -104,3 +141,16 @@ For higher-throughput testing: `cargo bench --profile release-fast` (`opt-level 
 ## HTML reports
 
 Criterion outputs to `target/criterion/`. Open `target/criterion/report/index.html`.
+
+`reports/gen_bench_report.py` still generates its richer self-contained HTML
+report from the same directory. Its Criterion parsing and machine detection now
+come from `devops/core/`, so there is one parser shared with
+Pill Lab rather than two that can drift:
+
+```bash
+python pill_engine/benches/reports/gen_bench_report.py --criterion-dir target/criterion
+```
+
+For browsing history and comparing runs, prefer Pill Lab
+(`python devops/pill_lab/pill_lab.py serve`); its Engine Performance view is
+the port of that report.

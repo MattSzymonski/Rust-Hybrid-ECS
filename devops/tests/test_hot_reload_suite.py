@@ -11,7 +11,7 @@ DESCRIPTION
     real source edits against the live project and an optional module, then
     asserts the host's behaviour from its console output:
 
-      Session A (project = tests/project, module = pill_spline)
+      Session A (project = devops/tests/project, module = pill_spline)
         1. project_hot_reload      - editing the project triggers a reload and
                                      the counter system keeps ticking (data
                                      survives).
@@ -69,17 +69,22 @@ from typing import List, Sequence, Tuple
 
 # Shared paths, tokens, print wrapper, OutputMonitor, process helpers. The
 # host's log tokens live in one place (audit opportunity 5.14).
-from suite_common import *  # noqa: F401,F403
+# Standalone-runnable: put `devops/` on `sys.path` before reaching `core`, so
+# the suite works from any working directory without a package import.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# Shared paths, tokens, print wrapper, OutputMonitor, process helpers.
+from core.suite_common import *  # noqa: E402,F401,F403
 
 # =============================================================================
 # Session configuration
 # =============================================================================
 
-PROJECT_SANDBOX_LIB_RS = WORKSPACE_ROOT / "tests" / "project" / "src" / "lib.rs"
+PROJECT_SANDBOX_LIB_RS = WORKSPACE_ROOT / "devops" / "tests" / "project" / "src" / "lib.rs"
 SPLINE_LIB_RS = MODULES_ROOT / "optional" / "pill_spline" / "src" / "lib.rs"
 
 SESSION_A_YAML = """\
-project: "../tests/project"
+project: "../devops/tests/project"
 modules:
   - "pill_spline"
 """
@@ -372,7 +377,7 @@ fn register(engine: &mut Engine) -> u32 {
     1
 }"""
 
-# --- tests/project edits (all applied from the original source) ---------------
+# --- devops/tests/project edits (applied from the original source) ------------
 
 FRAMECOUNTER_MIGRATION_EDITS = [
     (
@@ -403,7 +408,7 @@ PROJECT_FORGOTTEN_EDITS = [
     ),
 ]
 
-# --- Session A scenarios (project = tests/project, module = pill_spline) -----
+# --- Session A scenarios (project = devops/tests/project, module = pill_spline) -----
 
 SESSION_A_SCENARIOS = [
     Scenario(
@@ -770,7 +775,7 @@ def main() -> None:
 
         results.append(
             (
-                "A (tests/project + pill_spline)",
+                "A (devops/tests/project + pill_spline)",
                 run_session("A", SESSION_A_YAML, SESSION_A_SCENARIOS),
             )
         )

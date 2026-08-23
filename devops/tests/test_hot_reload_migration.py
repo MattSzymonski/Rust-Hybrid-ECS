@@ -8,7 +8,7 @@ REQUIREMENTS
 
 DESCRIPTION
     This script launches the standalone host and executes a table-driven migration
-    suite by editing tests/project/src/lib.rs. Every scenario waits for hot-reload,
+    suite by editing devops/tests/project/src/lib.rs. Every scenario waits for hot-reload,
     checks crash signals, verifies expected migration logs, and optionally
     validates that the counter system still ticks.
 
@@ -35,13 +35,18 @@ from typing import List, Sequence, Tuple
 
 # Shared paths, tokens, print wrapper, OutputMonitor, process helpers. The
 # host's log tokens live in one place (audit opportunity 5.14).
-from suite_common import *  # noqa: F401,F403
+# Standalone-runnable: put `devops/` on `sys.path` before reaching `core`, so
+# the suite works from any working directory without a package import.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# Shared paths, tokens, print wrapper, OutputMonitor, process helpers.
+from core.suite_common import *  # noqa: E402,F401,F403
 
 # =============================================================================
 # Configuration
 # =============================================================================
 
-TEST_PROJECT_ROOT = WORKSPACE_ROOT / "tests" / "project"
+TEST_PROJECT_ROOT = WORKSPACE_ROOT / "devops" / "tests" / "project"
 PROJECT_LIB_RS = TEST_PROJECT_ROOT / "src" / "lib.rs"
 
 RELOAD_COMPLETE_TOKEN = "hot reload complete"
@@ -340,7 +345,7 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
 def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
     """Starts the standalone host via cargo and returns process + monitor."""
     process_environment = os.environ.copy()
-    process_environment["PROJECT_PATH"] = "../tests/project"
+    process_environment["PROJECT_PATH"] = "../devops/tests/project"
     return launch_process(
         ["cargo", "run", "--package", "pill_standalone"],
         WORKSPACE_ROOT / "modules",
@@ -563,28 +568,28 @@ def build_workspace() -> bool:
 
     print("  [OK] Workspace built.")
 
-    print("  [PREP] Building tests/project crate...")
+    print("  [PREP] Building devops/tests/project crate...")
     try:
         tests_project_result = subprocess.run(
-            ["cargo", "build", "--manifest-path", "tests/project/Cargo.toml"],
+            ["cargo", "build", "--manifest-path", "devops/tests/project/Cargo.toml"],
             cwd=str(WORKSPACE_ROOT),
             capture_output=True,
             text=True,
             timeout=BUILD_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        print(f"  [FAIL] tests/project build timed out after {BUILD_TIMEOUT} seconds.")
+        print(f"  [FAIL] devops/tests/project build timed out after {BUILD_TIMEOUT} seconds.")
         return False
     except FileNotFoundError:
         print("  [FAIL] 'cargo' not found. Is Rust installed and on PATH?")
         return False
 
     if tests_project_result.returncode != 0:
-        print("  [FAIL] tests/project build failed:")
+        print("  [FAIL] devops/tests/project build failed:")
         print(tests_project_result.stderr[-2000:])
         return False
 
-    print("  [OK] tests/project built.")
+    print("  [OK] devops/tests/project built.")
     return True
 
 
