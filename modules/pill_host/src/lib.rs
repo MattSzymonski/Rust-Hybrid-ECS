@@ -25,6 +25,8 @@ mod analytics;
 mod build_runner;
 /// Project-module configuration shared by every host frontend.
 mod config;
+/// ANSI console helpers for the hot-reload log (colors, VT enabling).
+mod console;
 /// Scheduler-aware C# backend for the native project host.
 mod csharp;
 /// Native project-library loading and Windows-safe temporary-copy handling.
@@ -46,8 +48,7 @@ mod watcher;
 
 // Local host modules and the shared crate-root error surface.
 pub use config::{
-    CSharpModuleConfig, HostConfig, OptionalModuleConfig, ProjectModuleBackend,
-    ProjectModuleConfig,
+    CSharpModuleConfig, HostConfig, OptionalModuleConfig, ProjectModuleBackend, ProjectModuleConfig,
 };
 pub use optional_module::OPTIONAL_MODULE_ABI_VERSION;
 #[cfg(feature = "rendering")]

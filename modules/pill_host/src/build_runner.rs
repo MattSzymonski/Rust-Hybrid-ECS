@@ -399,6 +399,10 @@ pub(crate) fn run_build_command(
         build_started.elapsed().as_millis() as u64,
         cargo_peak_bytes,
     );
+    // Separate this build's compiler output from whatever the host prints
+    // next (load/init logs, the next module's build, or the analytics block),
+    // so each compilation in a cascade is visually distinct.
+    println!();
     Ok(())
 }
 

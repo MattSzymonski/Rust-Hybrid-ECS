@@ -25,7 +25,6 @@ __pycache__/
 
 # Profiling and benchmark artifacts
 graphify-out/
-benchmarks/
 performance_benchmarks/cache/artifacts/
 
 /devops/pill_lab/measurements/

@@ -64,7 +64,7 @@ pub fn grayscale(tint: Tint) -> f32 {
 /// Dummy alpha channel: `Tint` carries no alpha, so this always reports fully
 /// opaque, for other crates to call as a stand-in.
 pub fn get_color_a() -> f32 {
-    13263.0
+    1333.0
 }
 
 // =============================================================================

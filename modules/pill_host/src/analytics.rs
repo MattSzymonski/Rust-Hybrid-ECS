@@ -29,6 +29,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Instant, UNIX_EPOCH};
 
+// Crate-internal
+use crate::console;
+
 // External crates
 use serde_json::Value;
 
@@ -960,33 +963,51 @@ pub(crate) fn print_startup_report() {
     println!();
 }
 
-/// Print one line per completed hot reload, draining the pending events.
+/// Print one line per completed hot reload plus one aggregate total line.
 ///
 /// Called by the frame loop right after reloads are processed, so the console
 /// shows the rebuild → stage → load → init → migrate breakdown as it happens.
-pub(crate) fn print_reload_events() {
+/// `reload_started` is the moment the reload transaction began (before the
+/// first build), so the total spans the whole cascade - the edited module
+/// plus the queued project reload - rather than one transaction. Returns the
+/// number of reload events printed.
+pub(crate) fn print_reload_events(reload_started: std::time::Instant) -> usize {
     let events = drain_reload_events();
-    for event in events {
+    let count = events.len();
+    if count == 0 {
+        return 0;
+    }
+    // A blank line and a dim rule separate the reload analytics from the
+    // cargo / INFO output above them, so a cascade's lines stand out. The
+    // lines themselves keep the exact `[analytics] reload ...` format the
+    // benchmark harness parses; colors are ANSI-wrapped only in a terminal.
+    println!();
+    println!(
+        "{}",
+        console::dim("============ reload analytics ============")
+    );
+    for event in &events {
         println!(
-            "[analytics] reload {} (reload #{}) | build={} | stage={:.1}ms | load={:.1}ms | \
-             init={:.1}ms | migrate={:.1}ms | size={} | exports={}",
-            event.name,
-            event.reload_count,
-            if event.build_ms > 0 {
+            "{} reload {} {} | build={} | stage={}ms | load={}ms | init={}ms | \
+             migrate={}ms | size={} | exports={}",
+            console::bold_cyan("[analytics]"),
+            console::bold_cyan(&event.name),
+            console::dim(&format!("(reload #{})", event.reload_count)),
+            console::yellow(&if event.build_ms > 0 {
                 format_ms(event.build_ms)
             } else {
                 "-".to_string()
-            },
-            event.stage_ms,
-            event.load_ms,
-            event.init_ms,
-            event.migrate_ms,
-            if event.artifact_bytes > 0 {
+            }),
+            console::yellow(&format!("{:.1}", event.stage_ms)),
+            console::yellow(&format!("{:.1}", event.load_ms)),
+            console::yellow(&format!("{:.1}", event.init_ms)),
+            console::yellow(&format!("{:.1}", event.migrate_ms)),
+            console::yellow(&if event.artifact_bytes > 0 {
                 format_bytes(event.artifact_bytes)
             } else {
                 "-".to_string()
-            },
-            event.exports,
+            }),
+            console::yellow(&event.exports.to_string()),
         );
         // The module line above is only the transaction's own timings; the
         // cargo `--timings` breakdown shows every crate the build actually
@@ -996,12 +1017,66 @@ pub(crate) fn print_reload_events() {
                 .cargo_crates
                 .iter()
                 .map(|(crate_name, duration_ms)| {
-                    format!("{crate_name} {}", format_ms(*duration_ms))
+                    format!(
+                        "{} {}",
+                        console::green(crate_name),
+                        console::yellow(&format_ms(*duration_ms))
+                    )
                 })
                 .collect();
-            println!("    crates rebuilt by cargo: {}", parts.join(" | "));
+            println!(
+                "    {} {}",
+                console::bold("crates rebuilt by cargo:"),
+                parts.join(&console::dim(" | "))
+            );
         }
     }
+    // One aggregate number for the whole transaction (module + project for a
+    // cascade, or a single reload otherwise), reconciled against the visible
+    // phase sums so the unaccounted remainder - the gap between the two
+    // reloads plus scheduling - is shown explicitly instead of silently
+    // missing. Integer milliseconds, so the parts add up exactly to the total.
+    let total_ms = reload_started.elapsed().as_millis() as u64;
+    let segment_ms: Vec<u64> = events
+        .iter()
+        .map(|event| {
+            event.build_ms
+                + (event.stage_ms + event.load_ms + event.init_ms + event.migrate_ms) as u64
+        })
+        .collect();
+    let phases_ms: u64 = segment_ms.iter().sum();
+    let gap_ms = total_ms.saturating_sub(phases_ms);
+    let label = if count > 1 {
+        "cascade total"
+    } else {
+        "reload total"
+    };
+    println!(
+        "{} {}: {} ({}ms)",
+        console::bold_cyan("[analytics]"),
+        console::bold(label),
+        console::yellow(&format_ms(total_ms)),
+        console::dim(&total_ms.to_string()),
+    );
+    let parts: Vec<String> = events
+        .iter()
+        .zip(&segment_ms)
+        .map(|(event, segment)| {
+            format!(
+                "{} {}ms",
+                console::cyan(&event.name),
+                console::yellow(&segment.to_string())
+            )
+        })
+        .collect();
+    println!(
+        "    = {} + {} {}ms",
+        parts.join(&console::dim(" + ")),
+        console::dim("gap/scheduling"),
+        console::yellow(&gap_ms.to_string()),
+    );
+    println!();
+    count
 }
 
 /// Take and clear the pending reload events for the current frame.

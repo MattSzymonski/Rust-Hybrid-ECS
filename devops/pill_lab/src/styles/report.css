@@ -686,6 +686,18 @@
     padding: 12px 0;
 }
 
+/* Explanatory note on a case card (e.g. the cascade's two-reload structure). */
+.case-note {
+    font-size: 12px;
+    line-height: 1.55;
+    color: var(--text-secondary);
+    background: var(--glass-idle);
+    border: 1px solid var(--border-subtle);
+    border-left: 3px solid var(--warning-text);
+    border-radius: 8px;
+    padding: 10px 12px;
+}
+
 #footer {
     margin-top: 44px;
     padding: 14px;

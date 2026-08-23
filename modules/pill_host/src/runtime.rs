@@ -419,6 +419,10 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     // owns an independent generation counter and clears only its own systems,
     // so editing one module never rebuilds another and never disturbs the
     // project's systems, entities, or resources.
+    // The reload transaction begins here so the analytics total line spans
+    // the whole cascade (edited module + queued project reload), not just the
+    // last transaction.
+    let reload_started = Instant::now();
     // Destructure so the module list, the engine and the API table are borrowed
     // as disjoint fields rather than through the whole host.
     let Host {
@@ -479,10 +483,10 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     }
 
     // Print the analytics line for every reload completed this frame (optional
-    // modules from Step 0, the project from Step 1). The events were recorded
-    // with their build/stage/load/init/migrate breakdowns already populated,
-    // so this is a pure drain-and-print.
-    analytics::print_reload_events();
+    // modules from Step 0, the project from Step 1), plus one aggregate total.
+    // The events were recorded with their build/stage/load/init/migrate
+    // breakdowns already populated, so this is a pure drain-and-print.
+    analytics::print_reload_events(reload_started);
 
     // Step 2: Poll the managed loader for an assembly swap.
     // The managed loader watches the built assembly instead of source files.
