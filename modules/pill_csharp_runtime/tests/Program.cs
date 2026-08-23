@@ -285,11 +285,14 @@ internal static class Program
             Test("current project discovers native and dynamic component systems", () =>
             {
                 var systems = ProjectHost.DiscoverSystems(typeof(BallPhysicsSystem).Assembly);
-                Equal(systems.Length, 2, "unexpected project system count");
+                // BallPhysicsSystem + BallTagSystem + the module-spline bridge demo.
+                Equal(systems.Length, 3, "unexpected project system count");
                 Assert(systems.Any(system => system.Name == "TracyLive.BallPhysicsSystem.Run"),
                     "ball physics system was not discovered");
                 Assert(systems.Any(system => system.Name == "TracyLive.BallTagSystem.Observe"),
                     "dynamic component system was not discovered");
+                Assert(systems.Any(system => system.Name == "TracyLive.ModuleSplineBridgeDemo.Run"),
+                    "module-spline bridge demo system was not discovered");
             });
 
             Test("component manifest separates runtime mirrors from project components", () =>
@@ -298,7 +301,8 @@ internal static class Program
                 using var json = System.Text.Json.JsonDocument.Parse(
                     ComponentManifestBuilder.Build(systems));
                 var components = json.RootElement.EnumerateArray().ToArray();
-                Equal(components.Length, 4, "unexpected manifest component count");
+                // Position, Sprite, PhysicsState, BallTag + the module Spline mirror.
+                Equal(components.Length, 5, "unexpected manifest component count");
                 var position = components.Single(component =>
                     component.GetProperty("full_name").GetString() == "TracyLive.Position");
                 var sprite = components.Single(component =>
@@ -307,6 +311,8 @@ internal static class Program
                     component.GetProperty("full_name").GetString() == "TracyLive.PhysicsState");
                 var tag = components.Single(component =>
                     component.GetProperty("full_name").GetString() == "TracyLive.BallTag");
+                var spline = components.Single(component =>
+                    component.GetProperty("full_name").GetString() == "pill_spline.Spline");
                 Assert(position.GetProperty("shared").GetBoolean(),
                     "runtime Position mirror must be shared");
                 Assert(sprite.GetProperty("shared").GetBoolean(),
@@ -320,6 +326,13 @@ internal static class Program
                     "BallTag alignment mismatch");
                 Equal(tag.GetProperty("fields").GetArrayLength(), 1,
                     "BallTag field schema mismatch");
+                // The module mirror is declared in the project (not shared on
+                // the managed side); the Rust host resolves it to the module's
+                // native binding by stable identity instead.
+                Assert(!spline.GetProperty("shared").GetBoolean(),
+                    "module Spline mirror must be project-owned on the managed side");
+                Equal(spline.GetProperty("size").GetInt32(), 196,
+                    "Spline mirror size mismatch (16 * Vector3f + uint)");
             });
 
             Test("manifest includes project structs used only by commands", () =>
@@ -802,7 +815,8 @@ internal static class Program
                     (delegate* unmanaged<uint, uint>)&LoaderInterop.SystemErrorMessageLength;
 
                 Equal(init((IntPtr)(&api)), 1, "loader init failed");
-                Equal(systemCount(), 2u, "unexpected managed system count");
+                // BallPhysicsSystem + BallTagSystem + the module-spline bridge demo.
+                Equal(systemCount(), 3u, "unexpected managed system count");
                 Equal(runSystem(1), 1, "healthy system reported failure");
                 Equal(errorLength(1), 0u,
                     "healthy system carries a stale error message");

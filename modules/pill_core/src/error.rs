@@ -689,6 +689,10 @@ pub enum CSharpError {
     #[message("csharp_runtime initialization failed")]
     RuntimeInitFailed,
 
+    /// The host-side C# mirror codegen step failed.
+    #[message("C# component mirror generation failed: ", value(message))]
+    CodegenFailed { message: String },
+
     /// The managed runtime was built for a different ABI contract version.
     #[message(
         "csharp_runtime interop version mismatch: host expects ",

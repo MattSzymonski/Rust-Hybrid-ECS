@@ -20,7 +20,7 @@
 use std::collections::HashSet;
 
 // External crates
-use pill_engine::commands::ComponentAdder;
+use pill_engine::commands::{ByteComponentAdder, ComponentAdder};
 use pill_engine::{ComponentId, Entity};
 
 // Current crate
@@ -131,6 +131,21 @@ fn decode_command_component(
             // bytes for this callback; the bytes are copied before returning.
             let bytes = unsafe { std::slice::from_raw_parts(data, size) }.to_vec();
             Ok(DecodedCommandComponent::Dynamic(component_id, bytes))
+        }
+        ComponentBinding::ModuleNative {
+            component_id,
+            size: expected,
+            ..
+        } => {
+            if size != expected {
+                return Err("module component blob has the wrong size".into());
+            }
+            // SAFETY: the managed caller pins a buffer of exactly `size`
+            // bytes for this callback; the bytes are copied before returning.
+            let bytes = unsafe { std::slice::from_raw_parts(data, size) }.to_vec();
+            Ok(DecodedCommandComponent::Native(Box::new(
+                ByteComponentAdder::new(component_id, bytes),
+            )))
         }
     }
 }

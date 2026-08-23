@@ -86,6 +86,34 @@ pub(super) extern "C" fn ffi_get_component_chunk(
             }
             1
         }
+        Some(ComponentBinding::ModuleNative {
+            component_id, size, ..
+        }) => {
+            let change_tick = world.change_tick().get();
+            // The native twin of the dynamic path: serve the module's native
+            // column as raw bytes so managed code and Rust share one storage.
+            let Some((archetype, data, len, element_size, ticks)) =
+                world.native_component_chunk_mut(component_id, chunk_index as usize)
+            else {
+                return 0;
+            };
+            debug_assert_eq!(element_size, size, "module native binding size must match the column");
+            let bits = archetype.0;
+            // SAFETY: identical to the dynamic arm above - pointers stay owned
+            // by the active world's archetype for the managed invocation.
+            unsafe {
+                output.write(ComponentChunk {
+                    archetype_low: bits as u64,
+                    archetype_high: (bits >> 64) as u64,
+                    data: data.cast(),
+                    len: len as u32,
+                    element_size: element_size as u32,
+                    ticks: ticks.as_mut_ptr(),
+                    change_tick,
+                });
+            }
+            1
+        }
         None => 2,
     })
     .unwrap_or(3)

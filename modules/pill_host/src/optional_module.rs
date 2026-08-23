@@ -80,6 +80,10 @@ pub(crate) struct OptionalModuleSlot {
     /// Persistable component type names the last `init` registered, used to
     /// detect types the next generation forgets to re-register.
     registered_type_names: Vec<String>,
+    /// Every component type name (plain or persistable) the last `init`
+    /// registered, exposed to the C# backend so `project_cs` can use the
+    /// module's native components through byte-level bindings.
+    exposed_component_names: Vec<String>,
 }
 
 impl OptionalModuleSlot {
@@ -118,6 +122,7 @@ impl OptionalModuleSlot {
         // Capture the registration sequence before init so the exact set of
         // persistable types this generation registered can be recorded.
         let registration_sequence = engine.world().persist_registration_sequence();
+        let component_registration_sequence = engine.world().component_registration_sequence();
         engine.begin_module_registration(owner);
         let status = library.call_init(engine_api);
         engine.end_module_registration();
@@ -132,6 +137,11 @@ impl OptionalModuleSlot {
         let registered_type_names = engine
             .world()
             .persist_type_names_registered_since(registration_sequence);
+        // The general registration log covers plain and persistable types, so
+        // every component this generation registered is exposed to C#.
+        let exposed_component_names = engine
+            .world()
+            .registered_component_names_since(component_registration_sequence);
 
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -148,6 +158,7 @@ impl OptionalModuleSlot {
             reload_generation,
             last_processed_generation: 0,
             registered_type_names,
+            exposed_component_names,
         })
     }
 
@@ -189,6 +200,12 @@ impl OptionalModuleSlot {
     /// Name of this module, used for reporting.
     pub(crate) fn name(&self) -> &str {
         &self.config.name
+    }
+
+    /// Every component type name the current generation registered, exposed
+    /// to the C# backend for byte-level bindings.
+    pub(crate) fn exposed_component_names(&self) -> &[String] {
+        &self.exposed_component_names
     }
 
     /// Rebuild and swap one generation, keeping the previous one on any failure.
@@ -353,6 +370,9 @@ impl OptionalModuleSlot {
             }
         }
         self.registered_type_names = newly_registered;
+        // Refresh the C#-exposed component set to the new generation's
+        // registrations (plain and persistable alike).
+        self.exposed_component_names = all_registered;
 
         // Step 4b: Re-home every native storage column to the freshly loaded
         // generation's function table. Columns created by older generations

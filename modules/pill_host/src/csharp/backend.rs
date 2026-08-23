@@ -30,7 +30,8 @@ use pill_engine::{Engine, SystemAccess, SystemError, World};
 // Current crate
 use super::abi::{CsEngineApi, NativeSystemAccess};
 use super::components::{
-    register_component_manifest, shared_component_bindings, ComponentBindings, StableComponentId,
+    module_native_bindings, register_component_manifest, shared_component_bindings,
+    ComponentBindings, ModuleExposedComponent, StableComponentId,
 };
 use super::context::ActiveSystemGuard;
 use super::csharp_runtime::DotnetRuntimeContext;
@@ -160,8 +161,15 @@ impl CSharpRuntime {
         engine: &mut Engine,
         workspace_root: &Path,
         config: &CSharpModuleConfig,
+        module_exposed: &[ModuleExposedComponent],
     ) -> Result<Self, CSharpError> {
+        // Step 0: Merge the hardcoded shared renderer bindings with byte-level
+        // bindings for every native component the optional modules exposed, so
+        // a `project_cs` mirror whose full name matches a module component
+        // resolves to the module's native storage.
         let shared_bindings = shared_component_bindings(engine);
+        let mut bindings = shared_bindings;
+        bindings.extend(module_native_bindings(engine, module_exposed));
 
         // Step 1: Resolve assembly paths, start .NET, and load managed exports.
         let runtime_dir = workspace_root.join(&config.runtime_output_subdirectory);
@@ -288,7 +296,7 @@ impl CSharpRuntime {
         let bindings = Arc::new(register_component_manifest(
             engine,
             &manifest,
-            shared_bindings,
+            bindings,
         )?);
 
         // Step 3: Run every reflected managed startup method transactionally.

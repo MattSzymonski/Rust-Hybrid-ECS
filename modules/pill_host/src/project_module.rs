@@ -82,6 +82,7 @@ impl LoadedProject {
         engine_api: &EngineApi,
         workspace_root: &Path,
         config: &ProjectModuleConfig,
+        module_exposed_components: &[crate::csharp::ModuleExposedComponent],
     ) -> Result<Self, HostError> {
         // Step 1: Build the module through the shared command runner.
         // Build before branching so both backends use the same command runner,
@@ -127,6 +128,7 @@ impl LoadedProject {
                 engine,
                 workspace_root,
                 config,
+                module_exposed_components,
             )?)),
         }
     }

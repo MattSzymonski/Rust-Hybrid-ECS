@@ -14,7 +14,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <ProjectReference Include="../../project_cs/project_cs.csproj" />
+    <!-- The gameplay assembly moved from modules/project_cs to examples/project_cs;
+         keep the nested test -> project -> C# runtime chain pointing at it. -->
+    <ProjectReference Include="../../../examples/project_cs/project_cs.csproj" />
   </ItemGroup>
 
 </Project>

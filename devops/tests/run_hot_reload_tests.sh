@@ -12,16 +12,24 @@
 #   (2) tests/test_hot_reload_migration.py        - table-driven migration suite
 #        (fast path, add/revert fields, rename field, downgrade)
 #   (3) tests/test_module_project_auto_reload.py  - module->project cascade
+#   (4) tests/test_csharp_bridge.py               - C# <-> Rust bridge suite
+#        (managed backend startup, codegen mirror content, empty-exposure
+#        handling, clean managed build, Rust->C# and C#->Rust bridge probes,
+#        behavior-only C# hot reload, mirror regeneration on restart)
 #
 #   Each suite launches the standalone host and drives live source edits
 #   against a real project and an optional module, asserting the host's reload
 #   behaviour from its console output. The suites temporarily modify - and
 #   automatically restore - modules/pill_config.yaml, tests/project/src/lib.rs,
-#   examples/project_rs/src/lib.rs and modules/optional/pill_spline/src/lib.rs,
-#   so a normal developer workspace is left exactly as it was.
+#   examples/project_rs/src/lib.rs, examples/project_cs/src/Systems.cs and
+#   modules/optional/pill_spline/src/lib.rs, so a normal developer workspace
+#   is left exactly as it was.
 #
-#   Expected runtime: ~8-12 minutes (plus the initial host build unless
+#   Expected runtime: ~10-15 minutes (plus the initial host build unless
 #   --skip-build is used).
+#
+#   NOTE: suite (4) needs the .NET SDK on PATH (the host runs `dotnet build`
+#   for the managed project).
 #
 #   Designed for both local development and GitHub Actions CI.
 
@@ -88,7 +96,7 @@ esac
 
 echo ""
 echo -e "${BOLD}${CYAN}===============================================================================${NC}"
-echo -e "${BOLD}${CYAN}Hot-reload regression net (3 suites)${NC}"
+echo -e "${BOLD}${CYAN}Hot-reload regression net (4 suites)${NC}"
 echo "  timeout scale:  ${TIMEOUT_SCALE}"
 if [ "$SKIP_BUILD" = 1 ]; then
     echo "  host build:     skipped (assumed up to date; main suite only)"
@@ -136,10 +144,21 @@ if [ "$cascade_exit" -ne 0 ]; then
     overall_exit="$cascade_exit"
 fi
 
+# --- 4. C# <-> Rust bridge suite ---------------------------------------------
+echo ""
+echo -e "${BOLD}${CYAN}--- Suite 4/4: test_csharp_bridge.py ---${NC}"
+set +e
+python tests/test_csharp_bridge.py --timeout-scale "$TIMEOUT_SCALE" "${extra_args[@]}"
+csharp_exit=$?
+set -e
+if [ "$csharp_exit" -ne 0 ]; then
+    overall_exit="$csharp_exit"
+fi
+
 echo ""
 echo -e "${BOLD}${CYAN}===============================================================================${NC}"
 if [ "$overall_exit" -eq 0 ]; then
-    echo -e "${BOLD}${CYAN}Hot-reload regression net PASSED (all 3 suites)${NC}"
+    echo -e "${BOLD}${CYAN}Hot-reload regression net PASSED (all 4 suites)${NC}"
 else
     echo -e "${BOLD}${RED}Hot-reload regression net FAILED (exit $overall_exit)${NC}"
 fi

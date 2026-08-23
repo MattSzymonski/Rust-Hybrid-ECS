@@ -117,6 +117,51 @@ impl<T: Component + TraitAccessible<dyn Component> + Send> ComponentAdder
     }
 }
 
+/// Type-erased component adder that writes raw bytes into a native column.
+///
+/// Used by the C# backend to create or add components that an optional Rust
+/// module registered as native, so the host never names the concrete type.
+/// The byte payload must match the component's ABI layout exactly; the
+/// binding validates the size before this adder is queued.
+pub struct ByteComponentAdder {
+    /// Native component identity the bytes belong to.
+    component_id: ComponentId,
+    /// Serialized component value in its native ABI layout.
+    bytes: Vec<u8>,
+}
+
+impl ComponentAdder for ByteComponentAdder {
+    fn component_id(&self) -> ComponentId {
+        self.component_id
+    }
+
+    fn add_component_to_storage(
+        self: Box<Self>,
+        new_storage: &mut TraitTypeMap<dyn Component, VecFamily>,
+    ) {
+        // The storage row for the native component was allocated by the
+        // caller; copy the raw ABI bytes into it.
+        let type_id = self
+            .component_id
+            .native_type_id()
+            .expect("byte component adder requires a native component id");
+        let column = new_storage
+            .get_trait_storage_mut(type_id)
+            .expect("native column must exist for a registered component");
+        column.push_bytes(self.bytes.as_ptr(), self.bytes.len());
+    }
+}
+
+impl ByteComponentAdder {
+    /// Create a byte adder for a native component and its ABI payload.
+    pub fn new(component_id: ComponentId, bytes: Vec<u8>) -> Self {
+        Self {
+            component_id,
+            bytes,
+        }
+    }
+}
+
 /// Deferred command to be executed later
 enum DeferredCommand {
     /// Create a new entity carrying native and type-erased components.

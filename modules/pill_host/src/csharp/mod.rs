@@ -27,6 +27,8 @@ mod context;
 mod csharp_runtime;
 /// Native callbacks used by C# query enumerators.
 mod queries;
+/// Host-side generation of the C# mirror structs for exposed module components.
+mod codegen;
 
 // =============================================================================
 // Types + Impls
@@ -36,6 +38,12 @@ mod queries;
 // exposes the type as `csharp::CSharpRuntime` so the parent host module has a
 // single, stable import path.
 pub(crate) use backend::CSharpRuntime;
+
+/// Aggregate of the native components optional modules exposed to managed code.
+pub(crate) use components::ModuleExposedComponent;
+
+/// Generate the C# mirror file for optional-module components.
+pub(crate) use codegen::generate_module_components_csharp;
 
 // =============================================================================
 // Tests

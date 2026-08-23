@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // External crates
-use pill_core::error::{EngineMessage, HostError};
+use pill_core::error::{CSharpError, EngineMessage, HostError};
 use pill_core::telemetry::telemetry_target;
 use pill_core::{error, info};
 #[cfg(feature = "rendering")]
@@ -32,6 +32,7 @@ use pill_engine::{RenderViewport, Renderer, RendererError, RendererWindow, Virtu
 // Current crate
 use crate::analytics;
 use crate::config::project_depends_on_crate;
+use crate::csharp::ModuleExposedComponent;
 use crate::native_library::cleanup_temporary_files;
 use crate::optional_module::OptionalModuleSlot;
 use crate::project_module::LoadedProject;
@@ -273,8 +274,49 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
     }
 
     // Step 5: Build and load the project module, then start its source watcher.
-    let loaded_project =
-        LoadedProject::start(&mut engine, &engine_api, &workspace_root, &module_config)?;
+    // Optional modules load first, so the C# backend can be handed every
+    // native component the modules exposed to managed code: each module's
+    // registered type names resolve to its native components, and the
+    // C#-facing name is the Rust path with `::` replaced by `.` so a
+    // `project_cs` mirror struct reproduces the same stable identity.
+    // The generated C# mirror files must exist before the project build
+    // compiles `project_cs`, so write them here (managed backend only), one
+    // per optional module that exposes components, derived from each module's
+    // real registered layout. Nothing is hand-written in the project.
+    let mut module_exposed_components: Vec<ModuleExposedComponent> = Vec::new();
+    if let ProjectModuleBackend::CSharp(_) = &module_config.backend {
+        for slot in &optional_modules {
+            let exposed: Vec<ModuleExposedComponent> = slot
+                .exposed_component_names()
+                .iter()
+                .filter_map(|type_name| {
+                    let component_id =
+                        engine.world().resolve_component_id_by_name_any(type_name)?;
+                    let (size, align) = engine.world().component_layout(component_id)?;
+                    Some(ModuleExposedComponent {
+                        csharp_name: type_name.replace("::", "."),
+                        component_id,
+                        size,
+                        align,
+                    })
+                })
+                .collect();
+            crate::csharp::generate_module_components_csharp(
+                &workspace_root,
+                slot.name(),
+                &exposed,
+            )
+            .map_err(|message| CSharpError::CodegenFailed { message })?;
+            module_exposed_components.extend(exposed);
+        }
+    }
+    let loaded_project = LoadedProject::start(
+        &mut engine,
+        &engine_api,
+        &workspace_root,
+        &module_config,
+        &module_exposed_components,
+    )?;
 
     let reload_generation = Arc::new(AtomicU64::new(0));
     spawn_source_watcher(

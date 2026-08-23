@@ -13,24 +13,27 @@ these tests.
 | `test_hot_reload_suite.py` | Full suite, two sessions. Session A (tests/project + pill_spline): project reload + data survival, schema migration, project forgotten-type, module reload with data survival (`existing=1`), **repeated same-config reload stability** (`module_double_reload`, pins per-artifact TypeId stability / no per-reload growth), module forgotten-type with **drop→re-seed** (`existing=0` after restore, pins drop-at-detection end-to-end), init-failure rollback. Session B (examples/project_rs + pill_spline): module→project **cascade** plus **module↔project coexistence** (`xxsees 1 spline(s)` after both reloads). Also verifies the up-to-date build fast path on restart. |
 | `test_hot_reload_migration.py` | Table-driven schema-migration suite: fast path (shape unchanged), add field, remove field, rename field, downgrade persistable→plain, with per-component migrated entity-count assertions. Cycles repeatable (`--cycles N`). |
 | `test_module_project_auto_reload.py` | The module→project cascade in isolation: editing `pill_spline` reloads the module, the host queues a project reload, and the project probe reports the new value. |
+| `test_csharp_bridge.py` | The C# ↔ Rust connection (needs .NET SDK 8 on PATH). Launches the host with `examples/project_cs` + `pill_spline` + a component-less dummy module and asserts: the host auto-generates the module's C# mirror with the exact layout (`Size = 196`, alignment pad), a component-less module writes **no** mirror, the managed build is warning-free (`0 Warning(s)`, no `warning CS`), the bridge probe proves **both directions** (Rust→C# reads the module-seeded spline; C#→Rust sees its own spline in the same native column), a **behavior-only C# hot reload** (`[csharp_runtime] reloaded project_cs.dll` + `C# hot reload complete`, post-reload probe `sees 3 spline(s)`), and **mirror regeneration** when the file is deleted and the host restarts. |
 | `suite_common.py` | Single source of truth for paths, log tokens, timeouts, the color `print` wrapper, the `OutputMonitor` (rolling buffer + counter-tick tail), atomic source editing, and host process helpers. Shared by all three suites (audit opportunity 5.14). |
 
 ## Quick start
 
 ```powershell
 # Full net via one entry point (recommended)
-bash devops/tests/run_hot_reload_tests.sh                 # 3 suites
+bash devops/tests/run_hot_reload_tests.sh                 # 4 suites
 bash devops/tests/run_hot_reload_tests.sh --skip-build    # fastest lane
 
 # Individual suites
 python tests/test_hot_reload_suite.py
 python tests/test_hot_reload_migration.py --cycles 2
 python tests/test_module_project_auto_reload.py
+python tests/test_csharp_bridge.py
 ```
 
 All suites accept `--timeout-scale S` for slow machines. Every file the suites
 touch (`modules/pill_config.yaml`, `tests/project/src/lib.rs`,
-`examples/project_rs/src/lib.rs`, `modules/optional/pill_spline/src/lib.rs`) is
+`examples/project_rs/src/lib.rs`, `examples/project_cs/src/Systems.cs`,
+`modules/optional/pill_spline/src/lib.rs`, the generated mirror files) is
 backed up at startup and restored afterwards.
 
 ## Rust unit tests

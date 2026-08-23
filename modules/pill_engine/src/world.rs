@@ -575,6 +575,68 @@ impl World {
         Some((archetype_id, data, len, ticks))
     }
 
+    /// Return a raw native component column for language bindings.
+    ///
+    /// The native twin of [`Self::dynamic_component_chunk_mut`]: returns the
+    /// contiguous row buffer of a native (Rust-registered) component as raw
+    /// bytes, so the C# backend can expose components that an optional module
+    /// registered without naming their concrete Rust type. Only native
+    /// components are served; dynamic components must use the dynamic variant.
+    /// The returned pointer is only valid for the active managed-system
+    /// invocation and must not be retained beyond it.
+    pub fn native_component_chunk_mut(
+        &mut self,
+        component_id: ComponentId,
+        chunk_index: usize,
+    ) -> Option<(ArchetypeId, *mut u8, usize, usize, &mut [ComponentTicks])> {
+        let type_id = component_id.native_type_id()?;
+        let archetype = self
+            .archetypes
+            .values_mut()
+            .filter(|archetype| archetype.component_types.contains(&component_id))
+            .nth(chunk_index)?;
+        let archetype_id = archetype.id;
+        let column = archetype
+            .component_storages
+            .get_trait_storage_mut(type_id)?;
+        let len = column.len();
+        let data = column.as_mut_ptr();
+        let element_size = column.elem_size();
+        let ticks = archetype
+            .component_ticks
+            .get_mut(&component_id)?
+            .as_mut_slice();
+        debug_assert_eq!(len, ticks.len());
+        Some((archetype_id, data, len, element_size, ticks))
+    }
+
+    /// Resolve a component ID from its registered type name, without the
+    /// persistable-only filter.
+    ///
+    /// Used by the C# backend to map an optional module's exposed component
+    /// name (e.g. `pill_spline::Spline`) to its native [`ComponentId`] so a
+    /// byte-level binding can be created without naming the concrete type.
+    pub fn resolve_component_id_by_name_any(&self, type_name: &str) -> Option<ComponentId> {
+        self.component_registry
+            .registered_components()
+            .filter(|(_, _, name)| *name == type_name)
+            .max_by_key(|(_, bit, _)| *bit)
+            .map(|(id, _, _)| id)
+    }
+
+    /// Return the byte size and alignment of a registered component's layout.
+    ///
+    /// Works for both native (Rust) and dynamic (foreign-language) components.
+    /// Used by the C# backend to validate that a managed mirror struct has the
+    /// same ABI layout as the component an optional module registered.
+    pub fn component_layout(&self, component_id: ComponentId) -> Option<(usize, usize)> {
+        match self.storage_factories.get(&component_id) {
+            Some(StorageFactory::Native(info)) => Some((info.size, info.align)),
+            Some(StorageFactory::Dynamic(layout)) => Some((layout.size, layout.align)),
+            None => None,
+        }
+    }
+
     /// Create an entity consisting entirely of runtime-defined components.
     ///
     /// # Errors
@@ -2275,6 +2337,83 @@ mod tests {
         assert_eq!(added_after_remove.added, added_after_add.added);
         assert_eq!(added_after_remove.changed, added_after_add.changed);
         assert!(world.dynamic_component_bytes(entity, removed).is_none());
+    }
+
+    /// The native byte-chunk accessor exposes a native column's rows as raw
+    /// bytes with the correct element size, mirroring the dynamic path used by
+    /// the C# backend for optional-module components. Dynamic components are
+    /// rejected by it.
+    #[test]
+    fn native_component_chunk_mut_exposes_raw_rows() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let entity = world
+            .create_entity()
+            .with(Position { x: 1.0, y: 2.0 })
+            .build()
+            .unwrap();
+        let component_id = ComponentId::of::<Position>();
+        // Copy the raw facts out while the mutable chunk borrow is still
+        // scoped, so the world can be re-borrowed below.
+        let (archetype_id, data, len, element_size, ticks_len) = {
+            let (archetype_id, data, len, element_size, ticks) = world
+                .native_component_chunk_mut(component_id, 0)
+                .expect("one archetype column should exist");
+            (archetype_id, data, len, element_size, ticks.len())
+        };
+        assert_eq!(archetype_id, world.entity_locations[&entity].archetype_id);
+        assert_eq!(len, 1);
+        assert_eq!(element_size, std::mem::size_of::<Position>());
+        assert_eq!(ticks_len, 1);
+        // SAFETY: `len` is 1 and `element_size` is the Position size, so the
+        // returned buffer holds exactly one valid Position.
+        let row = unsafe { &*data.cast::<Position>() };
+        assert_eq!(row.x, 1.0);
+        assert_eq!(row.y, 2.0);
+
+        // Dynamic components are served by the dynamic accessor, not this one.
+        let dynamic = world
+            .register_dynamic_component(0xD1, "NativeChunkTest.Dynamic", 4, 4, 1)
+            .unwrap();
+        assert!(world.native_component_chunk_mut(dynamic, 0).is_none());
+        // An unknown native id is rejected too.
+        let unknown = world
+            .register_dynamic_component(0xD2, "NativeChunkTest.Unknown", 4, 4, 2)
+            .unwrap();
+        assert!(world.native_component_chunk_mut(unknown, 0).is_none());
+    }
+
+    /// A byte component adder writes raw ABI bytes into a native column, which
+    /// is how the C# backend creates or adds optional-module components whose
+    /// concrete Rust type the host never names.
+    #[test]
+    fn byte_component_adder_writes_native_bytes() {
+        use crate::commands::{ByteComponentAdder, CommandQueue, ComponentAdder};
+
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let entity = world.reserve_entity();
+        let component_id = ComponentId::of::<Position>();
+
+        // ABI payload: x = 7.5, y = -3.25, little-endian f32s.
+        let mut bytes = Vec::with_capacity(std::mem::size_of::<Position>());
+        bytes.extend_from_slice(&7.5_f32.to_ne_bytes());
+        bytes.extend_from_slice(&(-3.25_f32).to_ne_bytes());
+
+        let adder = ByteComponentAdder::new(component_id, bytes);
+        let mut queue = CommandQueue::new();
+        queue.create_mixed_entity(
+            entity,
+            vec![Box::new(adder) as Box<dyn ComponentAdder>],
+            Vec::new(),
+        );
+        queue.execute_queued_commands(&mut world, true).unwrap();
+
+        let position = world
+            .get_component::<Position>(entity)
+            .expect("row was created");
+        assert_eq!(position.x, 7.5);
+        assert_eq!(position.y, -3.25);
     }
 
     #[test]

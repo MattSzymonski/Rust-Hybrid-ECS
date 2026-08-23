@@ -23,4 +23,13 @@
     <ProjectReference Include="../../modules/pill_csharp_runtime/csharp_runtime.csproj" />
   </ItemGroup>
 
+  <ItemGroup>
+    <!-- Auto-generated mirrors of components exposed by optional Rust modules.
+         The Rust host writes generated/<module>_Components.g.cs inside each
+         optional module before the project build, deriving every declaration
+         from the module's real registered layout; nothing is hand-written in
+         this project. A committed copy bootstraps standalone builds. -->
+    <Compile Include="../../modules/optional/*/generated/*.g.cs" />
+  </ItemGroup>
+
 </Project>

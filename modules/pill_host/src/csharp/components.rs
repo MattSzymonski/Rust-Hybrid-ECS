@@ -168,6 +168,21 @@ pub(super) enum ComponentBinding {
         /// Alignment of the managed layout in bytes.
         align: usize,
     },
+    /// A native component registered by an optional Rust module, exposed to
+    /// managed code through the raw byte view of its column.
+    ///
+    /// The host never names the concrete Rust type; reads and writes go
+    /// through the type-erased native column accessors, exactly like dynamic
+    /// storage, but the column is the module's own native storage so managed
+    /// and Rust code share one source of truth.
+    ModuleNative {
+        /// Engine ID of the module-registered native component type.
+        component_id: ComponentId,
+        /// Size of the native layout in bytes.
+        size: usize,
+        /// Alignment of the native layout in bytes.
+        align: usize,
+    },
 }
 
 impl ComponentBinding {
@@ -175,7 +190,9 @@ impl ComponentBinding {
     /// by a concrete Rust type or a dynamically registered managed layout.
     pub(super) fn component_id(self) -> ComponentId {
         match self {
-            Self::Native { component_id, .. } | Self::Dynamic { component_id, .. } => component_id,
+            Self::Native { component_id, .. }
+            | Self::Dynamic { component_id, .. }
+            | Self::ModuleNative { component_id, .. } => component_id,
         }
     }
 }
@@ -352,6 +369,61 @@ pub(super) fn shared_component_bindings(engine: &mut Engine) -> ComponentBinding
     bindings
 }
 
+/// One native component an optional Rust module registered, exposed to managed
+/// code under a derived C#-facing name.
+///
+/// The host aggregates these after the optional modules load and hands them to
+/// the C# backend, which creates a byte-level [`ComponentBinding::ModuleNative`]
+/// for each one so `project_cs` can query and write the module's real storage.
+#[derive(Debug, Clone)]
+pub(crate) struct ModuleExposedComponent {
+    /// C#-facing name derived from the registered Rust type name
+    /// (`pill_spline::Spline` -> `pill_spline.Spline`). Managed code declares
+    /// its mirror struct under exactly this full name so the stable 128-bit
+    /// identity matches.
+    pub(crate) csharp_name: String,
+    /// Engine ID of the module-registered native component.
+    pub(crate) component_id: ComponentId,
+    /// Size in bytes of the native layout.
+    pub(crate) size: usize,
+    /// Alignment in bytes of the native layout.
+    pub(crate) align: usize,
+}
+
+/// Build byte-level bindings for every optional-module component exposed to
+/// managed code, keyed by the stable identity of its derived C# name.
+///
+/// The bindings are merged into the shared table before the managed manifest
+/// is registered, so a `project_cs` mirror whose full name matches a module
+/// component resolves to the module's native storage instead of being
+/// registered as an unrelated dynamic component.
+pub(super) fn module_native_bindings(
+    engine: &mut Engine,
+    exposed: &[ModuleExposedComponent],
+) -> ComponentBindings {
+    let mut bindings = HashMap::new();
+    for component in exposed {
+        bindings.insert(
+            stable_component_id(&component.csharp_name),
+            ComponentBinding::ModuleNative {
+                component_id: component.component_id,
+                size: component.size,
+                align: component.align,
+            },
+        );
+    }
+    // Validate that every exposed component is still registered in the live
+    // engine; an unknown id would surface only later as an empty column.
+    bindings.retain(|_, binding| match binding {
+        ComponentBinding::ModuleNative { component_id, .. } => engine
+            .world()
+            .component_layout(*component_id)
+            .is_some(),
+        _ => true,
+    });
+    bindings
+}
+
 /// Reject sibling fields that share any byte range.
 ///
 /// Conflicting interpretations of the same storage would corrupt data
@@ -483,7 +555,8 @@ pub(super) fn register_component_manifest(
                     schema_hash,
                     ..
                 } => (size, align, Some(schema_hash)),
-                ComponentBinding::Dynamic { size, align, .. } => (size, align, None),
+                ComponentBinding::Dynamic { size, align, .. }
+                | ComponentBinding::ModuleNative { size, align, .. } => (size, align, None),
             };
             if size != component.size || align != component.alignment {
                 return Err(format!(
