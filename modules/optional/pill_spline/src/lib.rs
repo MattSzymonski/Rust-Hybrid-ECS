@@ -174,8 +174,9 @@ impl Spline {
     }
 
     /// Dummy alpha channel, delegated straight through to `pill_dummy_color`.
+    #[pill_hot_fn]
     pub fn get_color_a(&self) -> f32 {
-        pill_dummy_color::get_color_a()
+        pill_dummy_color::get_color_a() + 1.0
     }
 }
 
@@ -398,5 +399,61 @@ mod tests {
         }
         assert!(!spline.push_control_point(Vector3f::ZERO));
         assert_eq!(spline.control_points().len(), MAX_CONTROL_POINTS);
+    }
+    /// An inherent method carries a redirect slot exactly as a free function
+    /// does, and callers of the public name follow an installed replacement.
+    ///
+    /// One test rather than three: the slot is a process-wide `static` and the
+    /// harness runs tests on several threads, so separate tests would observe
+    /// each other's installs in whatever order the threads interleaved.
+    #[test]
+    fn a_method_dispatches_installs_and_resets() {
+        // The receiver is the replacement's first argument, which is what makes
+        // a method patchable through the same mechanism as a free function.
+        fn replacement(_spline: &Spline) -> f32 {
+            777.0
+        }
+
+        let spline = Spline::default();
+        let original = spline.get_color_a();
+
+        let signature =
+            pill_engine::hot_patch::plain_function_signature("pill_spline::get_color_a")
+                .expect("the method must be registered under its module path");
+
+        pill_engine::hot_patch::install_plain_function(
+            "pill_spline::get_color_a",
+            replacement as *const () as usize,
+            signature,
+        )
+        .expect("install with the recorded signature must be accepted");
+        assert_eq!(
+            spline.get_color_a(),
+            777.0,
+            "callers of the method must see the replacement"
+        );
+
+        pill_engine::hot_patch::reset_plain_function("pill_spline::get_color_a")
+            .expect("reset must find the registered method");
+        assert_eq!(
+            spline.get_color_a(),
+            original,
+            "a reset must return the method to its own body"
+        );
+    }
+
+    /// A reshaped method is refused, so a replacement can never be installed
+    /// behind call sites compiled for the old receiver or return type.
+    #[test]
+    fn a_method_with_a_different_shape_is_refused() {
+        fn replacement(_spline: &Spline) -> f32 {
+            0.0
+        }
+        let result = pill_engine::hot_patch::install_plain_function(
+            "pill_spline::get_color_a",
+            replacement as *const () as usize,
+            "(&Spline,)-> f64",
+        );
+        assert!(result.is_err(), "a changed signature must be refused");
     }
 }

@@ -280,12 +280,31 @@ pub enum HotFunctionKind {
     /// `#[pill_hot]` - an ECS system, redirected through the engine's registry
     /// in this process.
     System,
-    /// `#[pill_hot_fn]` - a plain function, redirected through a slot that
-    /// exists once per artifact linking the crate.
+    /// `#[pill_hot_fn]` - a plain function or inherent method, redirected
+    /// through a slot that exists once per artifact linking the crate.
     PlainFunction,
 }
 
-/// Names of the functions this file marks with `#[pill_hot]`.
+/// One function a source file marks as hot-patchable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HotFunction {
+    /// The function's own name, which is also the last segment of the name the
+    /// running artifact registered it under.
+    pub name: String,
+    /// Which attribute marked it.
+    pub kind: HotFunctionKind,
+    /// The type whose inherent `impl` block encloses it, for a method.
+    ///
+    /// `None` for a free function, and also for a method the scanner could not
+    /// attribute to a simple named type - a generic or trait `impl`. A patch
+    /// for a method must name the receiver type, so classification refuses the
+    /// second case rather than generating something that cannot compile.
+    pub self_type: Option<String>,
+    /// Whether the declaration takes a receiver.
+    pub takes_receiver: bool,
+}
+
+/// Names of the functions this file marks as hot-patchable.
 ///
 /// The attribute is the developer's opt-in, so it also defines the set of
 /// bodies a classification is allowed to treat as replaceable. Everything else
@@ -294,19 +313,21 @@ pub enum HotFunctionKind {
 pub fn hot_function_names(source: &str) -> Vec<String> {
     hot_functions(source)
         .into_iter()
-        .map(|(name, _kind)| name)
+        .map(|function| function.name)
         .collect()
 }
 
-/// Every hot function in this file, paired with the attribute that marked it.
-pub fn hot_functions(source: &str) -> Vec<(String, HotFunctionKind)> {
+/// Every hot function in this file, with the attribute that marked it and the
+/// type whose `impl` block encloses it.
+pub fn hot_functions(source: &str) -> Vec<HotFunction> {
     let mask = code_mask(source);
     let bytes = source.as_bytes();
-    let mut names: Vec<(String, HotFunctionKind)> = Vec::new();
+    let blocks = inherent_impl_blocks(source, &mask);
+    let mut found: Vec<HotFunction> = Vec::new();
     let mut index = 0usize;
 
-    while let Some(found) = source[index..].find("#[pill_hot") {
-        let attribute_start = index + found;
+    while let Some(offset) = source[index..].find("#[pill_hot") {
+        let attribute_start = index + offset;
         if !mask[attribute_start] {
             index = attribute_start + 1;
             continue;
@@ -319,18 +340,19 @@ pub fn hot_functions(source: &str) -> Vec<(String, HotFunctionKind)> {
         } else {
             HotFunctionKind::System
         };
+
         // The declaration follows the attribute (and any further attributes).
         // Scan forward for the next real-code `fn ` and take its name.
         let mut cursor = attribute_start;
         let mut name = None;
+        let mut declaration_start = attribute_start;
         while cursor + 3 <= bytes.len() {
             if mask[cursor] && source[cursor..].starts_with("fn ") {
+                declaration_start = cursor;
                 let name_start = cursor + 3;
                 let name_end = source[name_start..]
-                    .find(|character: char| {
-                        !character.is_alphanumeric() && character != '_'
-                    })
-                    .map(|offset| name_start + offset)
+                    .find(|character: char| !character.is_alphanumeric() && character != '_')
+                    .map(|end| name_start + end)
                     .unwrap_or(source.len());
                 if name_end > name_start {
                     name = Some(source[name_start..name_end].to_string());
@@ -344,14 +366,136 @@ pub fn hot_functions(source: &str) -> Vec<(String, HotFunctionKind)> {
             }
             cursor += 1;
         }
+
         if let Some(name) = name {
-            if !names.iter().any(|(existing, _)| *existing == name) {
-                names.push((name, kind));
+            if !found.iter().any(|existing| existing.name == name) {
+                // The innermost `impl` body containing this declaration, which
+                // is the type a generated patch must name.
+                let self_type = blocks
+                    .iter()
+                    .filter(|block| block.body.0 < declaration_start && declaration_start < block.body.1)
+                    .min_by_key(|block| block.body.1 - block.body.0)
+                    .map(|block| block.type_name.clone());
+                found.push(HotFunction {
+                    name,
+                    kind,
+                    self_type,
+                    takes_receiver: declaration_takes_receiver(source, &mask, declaration_start),
+                });
             }
         }
         index = attribute_start + 1;
     }
-    names
+    found
+}
+
+/// One `impl` block whose methods can be attributed to a named type.
+struct ImplBlock {
+    /// Byte range of the block's body, braces included.
+    body: (usize, usize),
+    /// The type the block implements methods on.
+    type_name: String,
+}
+
+/// Every inherent `impl` block in the file whose type is a simple name.
+///
+/// Generic blocks (`impl<T> Foo<T>`) and trait blocks are deliberately skipped:
+/// a patch replaces one concrete implementation, and neither has a single
+/// receiver type a generated patch could name. A method inside one is reported
+/// with no `self_type`, which classification then refuses with a clear reason
+/// instead of emitting a patch that cannot compile.
+fn inherent_impl_blocks(source: &str, mask: &[bool]) -> Vec<ImplBlock> {
+    let bytes = source.as_bytes();
+    let mut blocks = Vec::new();
+    let mut index = 0usize;
+
+    while let Some(offset) = source[index..].find("impl") {
+        let start = index + offset;
+        index = start + 4;
+        if !mask[start] {
+            continue;
+        }
+        // Must be the whole word, not the tail of an identifier.
+        if start > 0 && is_identifier_byte(bytes[start - 1]) {
+            continue;
+        }
+        if start + 4 < bytes.len() && is_identifier_byte(bytes[start + 4]) {
+            continue;
+        }
+        let Some(open) = next_open_brace(bytes, mask, start + 4) else {
+            continue;
+        };
+        let Some(close) = matching_brace(bytes, mask, open) else {
+            continue;
+        };
+        // The header between `impl` and the opening brace names the type.
+        let header = &source[start + 4..open];
+        if let Some(type_name) = inherent_type_name(header) {
+            blocks.push(ImplBlock {
+                body: (open, close),
+                type_name,
+            });
+        }
+    }
+    blocks
+}
+
+/// The type a simple inherent `impl` header names, if it is one.
+fn inherent_type_name(header: &str) -> Option<String> {
+    let header = header.trim();
+    // A trait implementation, a generic block, or a `where` clause all mean
+    // there is no single concrete receiver type to name.
+    if header.is_empty()
+        || header.starts_with('<')
+        || header.contains(" for ")
+        || header.contains("where")
+        || header.contains('<')
+    {
+        return None;
+    }
+    let candidate = header.trim_end_matches(|character: char| character.is_whitespace());
+    if candidate.is_empty()
+        || !candidate
+            .chars()
+            .all(|character| character.is_alphanumeric() || character == '_' || character == ':')
+    {
+        return None;
+    }
+    Some(candidate.to_string())
+}
+
+/// Whether the declaration beginning at `fn` takes a receiver.
+fn declaration_takes_receiver(source: &str, mask: &[bool], declaration_start: usize) -> bool {
+    let bytes = source.as_bytes();
+    let mut cursor = declaration_start;
+    // Find the opening parenthesis of the parameter list.
+    while cursor < bytes.len() {
+        if mask[cursor] && bytes[cursor] == b'(' {
+            break;
+        }
+        if mask[cursor] && bytes[cursor] == b'{' {
+            return false;
+        }
+        cursor += 1;
+    }
+    let rest = &source[cursor.saturating_add(1)..];
+    let rest = rest.trim_start();
+    let rest = rest.strip_prefix('&').unwrap_or(rest).trim_start();
+    // A lifetime on the receiver, as in `&'a self`.
+    let rest = if let Some(after) = rest.strip_prefix('\'') {
+        after
+            .trim_start_matches(|character: char| character.is_alphanumeric() || character == '_')
+            .trim_start()
+    } else {
+        rest
+    };
+    let rest = rest.strip_prefix("mut ").unwrap_or(rest).trim_start();
+    rest.starts_with("self")
+}
+
+/// Whether a byte can appear inside a Rust identifier.
+fn is_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 // =============================================================================

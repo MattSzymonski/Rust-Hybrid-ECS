@@ -126,6 +126,8 @@ pub(crate) mod refusal_code {
     pub const MULTIPLE_HOT_BODIES: &str = "multiple-hot-bodies";
     /// More than one source file changed in the same edit.
     pub const MULTIPLE_FILES: &str = "multiple-files";
+    /// A method was edited whose `impl` block names no simple receiver type.
+    pub const UNRESOLVED_RECEIVER: &str = "unresolved-receiver";
 }
 
 /// The change was in scope, but the attempt to deliver it did not complete.
@@ -406,11 +408,12 @@ impl HotPatchSession {
         let classified = self.classify();
         stages.classify = classify_started.elapsed().as_secs_f64() * 1000.0;
 
-        let (path, function, kind, new_contents) = match classified {
+        let (path, declaration, new_contents) = match classified {
             Ok(Some(found)) => found,
             Ok(None) => return PatchOutcome::Unchanged,
             Err(refusal) => return PatchOutcome::NotPatchable { refusal },
         };
+        let function = declaration.name.clone();
 
         // The path the running artifact recorded for this function, which is
         // what both the engine registry and a plain function's slot are keyed
@@ -425,8 +428,7 @@ impl HotPatchSession {
             engine,
             targets,
             &new_contents,
-            &function,
-            kind,
+            &declaration,
             &qualified,
             &mut stages,
         ) {
@@ -586,8 +588,8 @@ impl HotPatchSession {
     #[allow(clippy::type_complexity)]
     fn classify(
         &mut self,
-    ) -> Result<Option<(PathBuf, String, source::HotFunctionKind, String)>, PatchRefusal> {
-        let mut result: Option<(PathBuf, String, source::HotFunctionKind, String)> = None;
+    ) -> Result<Option<(PathBuf, source::HotFunction, String)>, PatchRefusal> {
+        let mut result: Option<(PathBuf, source::HotFunction, String)> = None;
 
         for path in rust_sources(&self.source_root) {
             let Ok(new_contents) = std::fs::read_to_string(&path) else {
@@ -605,8 +607,10 @@ impl HotPatchSession {
             }
 
             // Only the functions the developer annotated may be patched.
-            let hot: HashMap<String, source::HotFunctionKind> =
-                source::hot_functions(&new_contents).into_iter().collect();
+            let hot: HashMap<String, source::HotFunction> = source::hot_functions(&new_contents)
+                .into_iter()
+                .map(|function| (function.name.clone(), function))
+                .collect();
             if hot.is_empty() {
                 return Err(PatchRefusal::new(
                     refusal_code::NO_HOT_FUNCTION,
@@ -667,8 +671,21 @@ impl HotPatchSession {
                 ));
             }
             let function = changed.remove(0);
-            let kind = hot[&function];
-            result = Some((path, function, kind, new_contents));
+            let declaration = hot[&function].clone();
+
+            // A method needs its receiver type to be patchable: the generated
+            // replacement is a trait implementation for that concrete type.
+            // A generic or trait `impl` block has no single type to name, so it
+            // is refused here rather than producing a patch that cannot compile.
+            if declaration.takes_receiver && declaration.self_type.is_none() {
+                return Err(PatchRefusal::new(
+                    refusal_code::UNRESOLVED_RECEIVER,
+                    format!(
+                        "`{function}` takes a receiver but its `impl` block does not name a                          simple type; a generic or trait implementation cannot be patched"
+                    ),
+                ));
+            }
+            result = Some((path, declaration, new_contents));
         }
 
         Ok(result)
@@ -684,18 +701,19 @@ impl HotPatchSession {
         engine: &mut Engine,
         targets: &[(&str, &NativeLibrary)],
         new_contents: &str,
-        function: &str,
-        kind: source::HotFunctionKind,
+        declaration: &source::HotFunction,
         qualified: &str,
         stages: &mut PatchStages,
     ) -> Result<Installed, PatchRefusal> {
+        let function = declaration.name.as_str();
+        let kind = declaration.kind;
         self.counter += 1;
         let crate_name = format!("pill_hotpatch_{}", self.counter);
 
         // Generate.
         let generate_started = Instant::now();
         let generated = self
-            .generate(new_contents, function, kind, qualified)
+            .generate(new_contents, declaration, qualified)
             .map_err(|detail| PatchRefusal::new(failure_code::GENERATE, detail))?;
         let source_path = std::env::temp_dir().join(format!("{crate_name}.rs"));
         std::fs::write(&source_path, generated.as_bytes()).map_err(|error| {
@@ -791,7 +809,14 @@ impl HotPatchSession {
             // of them - which is exactly what makes the cascading project reload
             // this edit would otherwise trigger unnecessary.
             source::HotFunctionKind::PlainFunction => {
-                let lookup_name = format!("{crate_name}::{function}");
+                // A method patch is filed under the prefixed running name,
+                // because its body lives in a local trait rather than under the
+                // patch crate's own module path.
+                let lookup_name = if declaration.takes_receiver {
+                    format!("{PATCH_NAME_PREFIX}{qualified}")
+                } else {
+                    format!("{crate_name}::{function}")
+                };
                 let (found, found_signature) = resolve_plain_in(&library, &lookup_name)
                     .map_err(|detail| PatchRefusal::new(failure_code::RESOLVE, detail))?;
                 install_everywhere(targets, qualified, found, &found_signature)
@@ -848,15 +873,52 @@ impl HotPatchSession {
     fn generate(
         &self,
         new_contents: &str,
-        function: &str,
-        kind: source::HotFunctionKind,
+        declaration: &source::HotFunction,
         qualified: &str,
     ) -> Result<String, String> {
+        let function = declaration.name.as_str();
+        let kind = declaration.kind;
         let found = source::find_function(new_contents, function)
             .ok_or_else(|| format!("cannot locate `{function}` in the changed source"))?;
 
         let imports = source::top_level_use_statements(new_contents).join("\n");
         let package = &self.package;
+
+        // An inherent method. Its body names `self`, so it cannot be copied
+        // into a free function - the attribute is told the receiver type and
+        // carries the body into a local trait implemented for it instead. The
+        // signature text is computed by the same macro the running artifact
+        // used, so the two are comparable by construction rather than by the
+        // host reproducing a string.
+        if kind == source::HotFunctionKind::PlainFunction && declaration.takes_receiver {
+            let self_type = declaration
+                .self_type
+                .as_deref()
+                .ok_or_else(|| format!("`{function}` has no known receiver type"))?;
+            return Ok(format!(
+                "// GENERATED by pill_host hot patching - do not edit.\n\
+                 //\n\
+                 // One edited method, compiled against the same artifacts the\n\
+                 // running module linked. The body is carried into a local trait\n\
+                 // implemented for the receiver type, which is what lets it keep\n\
+                 // using `self`.\n\
+                 #![allow(unused_imports, dead_code, unused_mut)]\n\
+                 \n\
+                 {imports}\n\
+                 use {package}::*;\n\
+                 \n\
+                 #[::pill_engine::pill_hot_fn(\n\
+                 name = \"{PATCH_NAME_PREFIX}{qualified}\",\n\
+                 self_type = {self_type}\n\
+                 )]\n\
+                 {body}\n\
+                 \n\
+                 // A distinct export name: the linked rlib already provides\n\
+                 // `pill_hot_resolve`.\n\
+                 ::pill_engine::pill_hot_resolver!(pill_patch_resolve);\n",
+                body = found.text
+            ));
+        }
 
         // A plain function needs no registry entry, so it keeps the attribute
         // it already carries and is looked up under the patch crate's own name.
@@ -1173,8 +1235,7 @@ mod tests {
         let generated = session
             .generate(
                 contents,
-                "movement",
-                source::HotFunctionKind::System,
+                &system_declaration("movement"),
                 "project::movement",
             )
             .expect("generated");
@@ -1202,8 +1263,7 @@ mod tests {
         let generated = session
             .generate(
                 PLAIN_SOURCE,
-                "get_color_a",
-                source::HotFunctionKind::PlainFunction,
+                &plain_declaration("get_color_a"),
                 "project::get_color_a",
             )
             .expect("a plain function must generate");
@@ -1230,9 +1290,9 @@ mod tests {
         std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
 
         let classified = session.classify().expect("body-only edit must be accepted");
-        let (_, function, kind, _) = classified.expect("a change must be reported");
-        assert_eq!(function, "get_color_a");
-        assert_eq!(kind, source::HotFunctionKind::PlainFunction);
+        let (_, declaration, _) = classified.expect("a change must be reported");
+        assert_eq!(declaration.name, "get_color_a");
+        assert_eq!(declaration.kind, source::HotFunctionKind::PlainFunction);
 
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -1259,6 +1319,26 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A `#[pill_hot]` system declaration, as classification would report it.
+    fn system_declaration(name: &str) -> source::HotFunction {
+        source::HotFunction {
+            name: name.to_string(),
+            kind: source::HotFunctionKind::System,
+            self_type: None,
+            takes_receiver: false,
+        }
+    }
+
+    /// A `#[pill_hot_fn]` free-function declaration.
+    fn plain_declaration(name: &str) -> source::HotFunction {
+        source::HotFunction {
+            name: name.to_string(),
+            kind: source::HotFunctionKind::PlainFunction,
+            self_type: None,
+            takes_receiver: false,
+        }
     }
 
     /// A session over a throwaway source tree, so classification can be driven
@@ -1337,9 +1417,9 @@ fn helper(value: f32) -> f32 {
         std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
 
         let classified = session.classify().expect("body-only edit must be accepted");
-        let (_, function, kind, contents) = classified.expect("a change must be reported");
-        assert_eq!(function, "movement");
-        assert_eq!(kind, source::HotFunctionKind::System);
+        let (_, declaration, contents) = classified.expect("a change must be reported");
+        assert_eq!(declaration.name, "movement");
+        assert_eq!(declaration.kind, source::HotFunctionKind::System);
         assert!(contents.contains("value * SPEED * 2.0"));
 
         let _ = std::fs::remove_dir_all(&directory);
@@ -1498,8 +1578,7 @@ fn helper(value: f32) -> f32 {
         assert!(session
             .generate(
                 "fn other() {}",
-                "movement",
-                source::HotFunctionKind::System,
+                &system_declaration("movement"),
                 "project::movement",
             )
             .is_err());

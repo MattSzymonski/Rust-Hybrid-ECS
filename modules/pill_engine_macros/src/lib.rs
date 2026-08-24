@@ -235,6 +235,48 @@ pub fn pill_hot(attribute: TokenStream, item: TokenStream) -> TokenStream {
 
     expanded.into()
 }
+/// Arguments `#[pill_hot_fn]` accepts when it is generating a patch body.
+///
+/// A patch for an inherent method cannot copy the method into a free function,
+/// because the body names `self`. It is instead placed in a LOCAL trait
+/// implemented for the receiver type: a trait method has the same call shape as
+/// the inherent one it replaces, so its address drops straight into the slot.
+///
+/// The host supplies both values; a developer never writes them.
+#[derive(Default)]
+struct PatchArguments {
+    /// Registry name the generated descriptor is filed under.
+    name: Option<String>,
+    /// Concrete receiver type the local trait is implemented for.
+    self_type: Option<syn::Type>,
+}
+
+/// Parse `name = "...", self_type = Path` from an attribute argument list.
+///
+/// An empty list is the ordinary case: the attribute is being applied by a
+/// developer to their own function or method.
+fn parse_patch_arguments(attribute: TokenStream) -> Result<PatchArguments, syn::Error> {
+    let mut parsed = PatchArguments::default();
+    if attribute.is_empty() {
+        return Ok(parsed);
+    }
+    let attribute = proc_macro2::TokenStream::from(attribute);
+    let parser = syn::meta::parser(|meta| {
+        if meta.path.is_ident("name") {
+            let value: syn::LitStr = meta.value()?.parse()?;
+            parsed.name = Some(value.value());
+            return Ok(());
+        }
+        if meta.path.is_ident("self_type") {
+            parsed.self_type = Some(meta.value()?.parse()?);
+            return Ok(());
+        }
+        Err(meta.error("expected `name` or `self_type`"))
+    });
+    syn::parse::Parser::parse2(parser, attribute)?;
+    Ok(parsed)
+}
+
 
 /// Makes an ordinary function hot-patchable.
 ///
@@ -262,35 +304,39 @@ pub fn pill_hot(attribute: TokenStream, item: TokenStream) -> TokenStream {
 /// code in each, so each copy has its own slot and must be patched separately.
 /// The host installs into every loaded artifact that declares the name.
 #[proc_macro_attribute]
-pub fn pill_hot_fn(_attribute: TokenStream, item: TokenStream) -> TokenStream {
+pub fn pill_hot_fn(attribute: TokenStream, item: TokenStream) -> TokenStream {
+    let patch = match parse_patch_arguments(attribute) {
+        Ok(parsed) => parsed,
+        Err(error) => return error.to_compile_error().into(),
+    };
     let item_fn = parse_macro_input!(item as ItemFn);
     let signature = &item_fn.sig;
     let fn_ident = &signature.ident;
     let visibility = &item_fn.vis;
     let attributes = &item_fn.attrs;
+    let body = &item_fn.block;
 
     // A generic function has one instantiation per set of type arguments, so
     // there is no single address a slot could hold.
     if !signature.generics.params.is_empty() {
         return syn::Error::new_spanned(
             &signature.generics,
-            "`#[pill_hot_fn]` cannot be applied to a generic function: patching \
-             replaces one concrete implementation, and a generic has one per \
-             instantiation",
+            concat!(
+                "`#[pill_hot_fn]` cannot be applied to a generic function: ",
+                "patching replaces one concrete implementation, and a generic ",
+                "has one per instantiation"
+            ),
         )
         .to_compile_error()
         .into();
     }
-    // `self` would make this a method, whose dispatcher cannot be a free fn.
-    if signature.receiver().is_some() {
-        return syn::Error::new_spanned(
-            signature,
-            "`#[pill_hot_fn]` cannot be applied to a method; move the body into \
-             a free function and call it from the method",
-        )
-        .to_compile_error()
-        .into();
-    }
+
+    // An inherent method is supported, and takes a different shape: its body
+    // stays inline in the dispatcher rather than being hoisted into a function
+    // of its own. Hoisting is impossible for a method, because every item
+    // inside a method body is barred from naming `Self` (error E0401), and a
+    // hoisted body would have to name the receiver type.
+    let receiver = signature.receiver().cloned();
 
     // Rebuild the argument list: the dispatcher needs plain names to forward,
     // and a pattern like `mut value` or `(a, b)` cannot be forwarded as-is.
@@ -309,85 +355,197 @@ pub fn pill_hot_fn(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     }
 
     let return_type = &signature.output;
-    let implementation_ident = format_ident!("__pill_hot_impl_{}", fn_ident);
     let slot_ident = format_ident!("__PILL_HOT_SLOT_{}", fn_ident.to_string().to_uppercase());
-    let address_ident = format_ident!("__pill_hot_address_{}", fn_ident);
-    let qualified_name = quote! {
-        ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#fn_ident))
+
+    // The name a host addresses this function by. The receiver type is
+    // deliberately absent: a method-level attribute cannot learn it, because
+    // the descriptor is an item and items may not name `Self`. Two hot
+    // functions sharing a name in one module therefore collide, which the
+    // host source scanner detects and refuses with a clear message.
+    let qualified_name = match &patch.name {
+        // A generated patch is filed under the name the host asks for, which is
+        // the running function's own path behind a prefix that cannot collide
+        // with the copy the linked rlib also contributes.
+        Some(name) => quote! { #name },
+        None => quote! {
+            ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#fn_ident))
+        },
     };
 
-    // The gate: the signature exactly as written. A patch derives the same text
-    // from the same source, so a reshaped function is refused rather than
-    // installed behind call sites compiled for the old shape.
+    // The gate: the signature exactly as written, receiver included. A patch
+    // derives the same text from the same source through this same shape, so a
+    // reshaped function is refused rather than installed behind call sites
+    // compiled for the old shape.
+    let receiver_type = receiver.as_ref().map(|receiver| receiver.ty.clone());
+    let mut signature_parts: Vec<proc_macro2::TokenStream> = Vec::new();
+    if let Some(receiver_type) = &receiver_type {
+        signature_parts.push(quote! { ::core::stringify!(#receiver_type), "," });
+    }
+    for parameter_type in &parameter_types {
+        signature_parts.push(quote! { ::core::stringify!(#parameter_type), "," });
+    }
     let signature_text = quote! {
-        ::core::concat!(
-            "(", #(::core::stringify!(#parameter_types), ",",)* ")",
-            ::core::stringify!(#return_type)
-        )
+        ::core::concat!("(", #(#signature_parts,)* ")", ::core::stringify!(#return_type))
     };
 
-    let mut renamed = item_fn.clone();
-    renamed.sig.ident = implementation_ident.clone();
-    renamed.vis = syn::Visibility::Inherited;
-    renamed.attrs.clear();
-
-    // Optimized builds get the function exactly as written: no slot, no
-    // descriptor, no indirection, and nothing to strip out later. Hot patching
-    // is a development facility, and this is what makes its cost provably zero
-    // in a shipped artifact rather than merely small.
-    let expanded = quote! {
-        #[cfg(not(debug_assertions))]
-        #item_fn
-
-        /// The original body, renamed so the public name can dispatch.
-        #[cfg(debug_assertions)]
-        #[doc(hidden)]
-        #[inline(never)]
-        #renamed
-
-        /// Redirect slot for this function, private to this artifact.
-        #[cfg(debug_assertions)]
-        #[doc(hidden)]
-        #[allow(non_upper_case_globals)]
-        static #slot_ident: ::pill_engine::hot_patch::PlainSlot =
-            ::pill_engine::hot_patch::PlainSlot::new();
-
-        /// Address of the body above.
-        ///
-        /// A function rather than a constant because casting a fn item to
-        /// `usize` is not allowed while building the `static` descriptor below.
-        #[cfg(debug_assertions)]
-        #[doc(hidden)]
-        fn #address_ident() -> usize {
-            #implementation_ident as *const () as usize
+    // The pointer type an installed replacement is called through. A method
+    // receiver is simply its first argument.
+    let dispatch_type = match &receiver_type {
+        Some(receiver_type) => {
+            quote! { fn(#receiver_type #(, #parameter_types)*) #return_type }
         }
+        None => quote! { fn(#(#parameter_types),*) #return_type },
+    };
+    let dispatch_arguments = match &receiver {
+        Some(_) => quote! { self #(, #parameter_names)* },
+        None => quote! { #(#parameter_names),* },
+    };
+    let declarations = match &receiver {
+        Some(receiver) => quote! { #receiver #(, #parameter_declarations)* },
+        None => quote! { #(#parameter_declarations),* },
+    };
 
-        #[cfg(debug_assertions)]
-        #(#attributes)*
-        #visibility fn #fn_ident(#(#parameter_declarations),*) #return_type {
-            // One acquire load from a hot cache line, then a call. Measured at
-            // under 0.2 ns against a direct call - below the noise floor.
-            let address = #slot_ident.current_or(
-                #implementation_ident as *const () as usize
-            );
-            // SAFETY: the slot holds either the original address written just
-            // above - exactly this signature - or a replacement accepted by
-            // `install_plain_function`, which refuses any whose signature text
-            // differs. A replacement lives in a patch library the host never
-            // unloads, so it stays executable for the process lifetime.
-            let implementation: fn(#(#parameter_types),*) #return_type =
-                unsafe { ::core::mem::transmute(address) };
-            implementation(#(#parameter_names),*)
+    // A generated patch for an inherent method. The body names `self`, so it
+    // cannot be copied into a free function - but a LOCAL trait may be
+    // implemented for a foreign type, and a trait method has the same call
+    // shape as the inherent one it replaces: the receiver is simply its first
+    // argument. So the body is carried verbatim into a trait implementation for
+    // the concrete receiver type, and that method's address drops straight into
+    // the running artifact's slot.
+    //
+    // No dispatcher is generated: nothing ever calls a patch through a slot of
+    // its own. The signature text comes from the same computation the running
+    // artifact used, which is what keeps the two comparable.
+    if let Some(self_type) = &patch.self_type {
+        if receiver.is_none() {
+            return syn::Error::new_spanned(
+                signature,
+                "a `self_type` patch requires a method, but this function takes no receiver",
+            )
+            .to_compile_error()
+            .into();
         }
-
-        #[cfg(debug_assertions)]
-        ::pill_engine::submit! {
-            ::pill_engine::hot_patch::PillHotSlotDescriptor {
-                qualified_name: #qualified_name,
-                slot: &#slot_ident,
-                signature: #signature_text,
-                implementation_address: #address_ident,
+        let slot_ident = format_ident!("__PILL_PATCH_SLOT_{}", fn_ident.to_string().to_uppercase());
+        let address_ident = format_ident!("__pill_patch_address_{}", fn_ident);
+        let expanded = quote! {
+            /// The replacement body, in a local trait so it keeps using `self`.
+            trait PillHotMethodPatch {
+                fn #fn_ident(#declarations) #return_type;
             }
+
+            impl PillHotMethodPatch for #self_type {
+                #[inline(never)]
+                fn #fn_ident(#declarations) #return_type #body
+            }
+
+            /// Address of the replacement, reported through the descriptor.
+            #[doc(hidden)]
+            fn #address_ident() -> usize {
+                <#self_type as PillHotMethodPatch>::#fn_ident as *const () as usize
+            }
+
+            /// Unused here; a patch is never itself patched.
+            #[doc(hidden)]
+            #[allow(non_upper_case_globals)]
+            static #slot_ident: ::pill_engine::hot_patch::PlainSlot =
+                ::pill_engine::hot_patch::PlainSlot::new();
+
+            ::pill_engine::submit! {
+                ::pill_engine::hot_patch::PillHotSlotDescriptor {
+                    qualified_name: #qualified_name,
+                    slot: &#slot_ident,
+                    signature: #signature_text,
+                    implementation_address:
+                        ::core::option::Option::Some(#address_ident as fn() -> usize),
+                }
+            }
+        };
+        return expanded.into();
+    }
+
+    // Only the slot machinery is conditional. The body is emitted exactly once,
+    // unconditionally, so an optimized build compiles the function as written
+    // and an editor never greys the source out as inactive code.
+    let (implementation_item, implementation_address, fallback) = match &receiver {
+        // A method keeps its body inline; there is nothing to address, and only
+        // a patch - which names the receiver type concretely - ever needs one.
+        Some(_) => (
+            quote! {},
+            quote! { ::core::option::Option::None },
+            quote! { #body },
+        ),
+        // A free function hoists its body, so a patch built from this same
+        // attribute has a symbol to report.
+        None => {
+            let implementation_ident = format_ident!("__pill_hot_impl_{}", fn_ident);
+            let address_ident = format_ident!("__pill_hot_address_{}", fn_ident);
+            let mut renamed = item_fn.clone();
+            renamed.sig.ident = implementation_ident.clone();
+            renamed.vis = syn::Visibility::Inherited;
+            renamed.attrs.clear();
+            (
+                quote! {
+                    /// The original body, renamed so the public name can dispatch.
+                    ///
+                    /// `inline(never)` only where its address is taken; an
+                    /// optimized build folds it back into the caller.
+                    #[doc(hidden)]
+                    #[cfg_attr(debug_assertions, inline(never))]
+                    #renamed
+
+                    /// Address of the body above.
+                    ///
+                    /// A function rather than a constant because casting a fn
+                    /// item to `usize` is not allowed while building a `static`.
+                    #[doc(hidden)]
+                    #[cfg(debug_assertions)]
+                    fn #address_ident() -> usize {
+                        #implementation_ident as *const () as usize
+                    }
+                },
+                quote! { ::core::option::Option::Some(#address_ident as fn() -> usize) },
+                quote! { #implementation_ident(#(#parameter_names),*) },
+            )
+        }
+    };
+
+    let expanded = quote! {
+        #implementation_item
+
+        #(#attributes)*
+        #visibility fn #fn_ident(#declarations) #return_type {
+            #[cfg(debug_assertions)]
+            {
+                /// Redirect slot for this function, private to this artifact.
+                #[doc(hidden)]
+                #[allow(non_upper_case_globals)]
+                static #slot_ident: ::pill_engine::hot_patch::PlainSlot =
+                    ::pill_engine::hot_patch::PlainSlot::new();
+
+                ::pill_engine::submit! {
+                    ::pill_engine::hot_patch::PillHotSlotDescriptor {
+                        qualified_name: #qualified_name,
+                        slot: &#slot_ident,
+                        signature: #signature_text,
+                        implementation_address: #implementation_address,
+                    }
+                }
+
+                // One acquire load from a hot cache line, then a call. Measured
+                // at under 0.2 ns against a direct call - below the noise floor.
+                let installed = #slot_ident.installed();
+                if installed != 0 {
+                    // SAFETY: the slot holds an address accepted by
+                    // `install_plain_function`, which refuses any whose
+                    // signature text differs from the one recorded above. A
+                    // replacement lives in a patch library the host never
+                    // unloads, so it stays executable for the process lifetime.
+                    let implementation: #dispatch_type =
+                        unsafe { ::core::mem::transmute(installed) };
+                    return implementation(#dispatch_arguments);
+                }
+            }
+            #fallback
         }
     };
 

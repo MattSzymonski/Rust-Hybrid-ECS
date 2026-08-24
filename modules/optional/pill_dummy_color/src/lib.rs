@@ -65,7 +65,7 @@ pub fn grayscale(tint: Tint) -> f32 {
 /// opaque, for other crates to call as a stand-in.
 #[pill_hot_fn]
 pub fn get_color_a() -> f32 {
-    173.0
+    113.0
 }
 
 // =============================================================================
@@ -132,11 +132,10 @@ mod tests {
             999.0
         }
 
-        assert_eq!(
-            get_color_a(),
-            133.0,
-            "an empty slot must fall through to the compiled-in body"
-        );
+        // Read rather than hardcode: this function's whole purpose is to have
+        // its value edited, so asserting the literal made the test break every
+        // time someone used it for what it is for.
+        let original = get_color_a();
 
         // The recorded text, not a hand-written guess: the spelling comes from
         // `stringify!` inside the macro.
@@ -156,7 +155,7 @@ mod tests {
             .expect("reset must find the registered function");
         assert_eq!(
             get_color_a(),
-            133.0,
+            original,
             "a reset must return the function to its own body"
         );
     }

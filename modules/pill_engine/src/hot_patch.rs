@@ -408,6 +408,16 @@ impl PlainSlot {
         self.current.store(address, Ordering::Release);
     }
 
+    /// The installed replacement, or zero when the slot has never been filled.
+    ///
+    /// Callers that own their fallback inline - a dispatcher generated around a
+    /// method body, which has no separate implementation to name - branch on
+    /// this rather than passing an address to [`Self::current_or`].
+    #[inline]
+    pub fn installed(&self) -> usize {
+        self.current.load(Ordering::Acquire)
+    }
+
     /// Empty the slot, so calls fall back to the body compiled into this
     /// artifact.
     ///
@@ -448,7 +458,14 @@ pub struct PillHotSlotDescriptor {
     /// The body and not the dispatcher: a patch hands this address to every
     /// artifact holding a copy of the function, and naming the dispatcher would
     /// make each call take an extra hop through a slot that is never installed.
-    pub implementation_address: fn() -> usize,
+    ///
+    /// `None` for an inherent method declared in a running artifact. A method's
+    /// body cannot be hoisted into a separately addressable function, because
+    /// every item inside a method body is barred from naming `Self`
+    /// (`error[E0401]`) - so the body stays inline in the dispatcher and has no
+    /// symbol of its own. Only a patch needs an address, and a patch names the
+    /// receiver type concretely, so it always supplies one.
+    pub implementation_address: Option<fn() -> usize>,
 }
 
 inventory::collect!(PillHotSlotDescriptor);
@@ -535,10 +552,14 @@ pub fn plain_function_signature(qualified_name: &str) -> Option<&'static str> {
 /// address to jump to, and the signature text that copy compares against its
 /// own before accepting it.
 pub fn plain_function_entry(qualified_name: &str) -> Option<(usize, &'static str)> {
-    inventory::iter::<PillHotSlotDescriptor>
+    let descriptor = inventory::iter::<PillHotSlotDescriptor>
         .into_iter()
-        .find(|descriptor| descriptor.qualified_name == qualified_name)
-        .map(|descriptor| ((descriptor.implementation_address)(), descriptor.signature))
+        .find(|descriptor| descriptor.qualified_name == qualified_name)?;
+    // `None` means this artifact declares the function but cannot address its
+    // body - true of every inherent method outside a patch. Reporting nothing
+    // is correct: the caller is asking a patch where its replacement lives.
+    let address = descriptor.implementation_address?;
+    Some((address(), descriptor.signature))
 }
 
 /// Stable hash of a signature string, used only to report a mismatch.
