@@ -450,6 +450,20 @@ impl Engine {
         slot.install(name, address, signature_hash)
     }
 
+    /// The implementation a system was registered with, and its signature.
+    ///
+    /// A host uses this to roll a patched system back to generation zero: the
+    /// code the running artifact was actually built with. `None` when no such
+    /// system is registered, or when it is not hot-patchable.
+    pub fn hot_patch_baseline(&self, name: &str) -> Option<(usize, u64)> {
+        let slot = self.hot_patch_registry.get(name)?;
+        let original = slot.original();
+        if original == 0 {
+            return None;
+        }
+        Some((original, slot.signature_hash()))
+    }
+
     /// Read-only access to the hot-patch registry, for hosts and tooling.
     pub fn hot_patch_registry(&self) -> &crate::hot_patch::HotPatchRegistry {
         &self.hot_patch_registry

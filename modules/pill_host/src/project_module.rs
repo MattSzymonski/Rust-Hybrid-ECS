@@ -70,6 +70,18 @@ pub(crate) enum LoadedProject {
 }
 
 impl LoadedProject {
+    /// The project's currently loaded native library, as a patch target.
+    ///
+    /// `None` for the C# backend, which has no native redirect slots to install
+    /// into.
+    #[cfg(feature = "hot_patch")]
+    pub(crate) fn native_library(&self) -> Option<&NativeLibrary> {
+        match self {
+            Self::Native { current, .. } => Some(current),
+            Self::CSharp(_) => None,
+        }
+    }
+
     /// Build and initialize the configured project backend.
     ///
     /// # Errors

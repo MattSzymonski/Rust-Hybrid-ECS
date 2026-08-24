@@ -73,6 +73,13 @@ pub struct Host {
     /// existing whole-module reload as the only path.
     #[cfg(feature = "hot_patch")]
     hot_patch: Option<crate::hot_patch::HotPatchSession>,
+    /// Per-function fast path for each optional module, positionally paired
+    /// with `optional_modules`.
+    ///
+    /// An entry is `None` when that module annotated nothing, so a module that
+    /// has not opted in costs nothing beyond one source scan at startup.
+    #[cfg(feature = "hot_patch")]
+    module_hot_patch: Vec<Option<crate::hot_patch::HotPatchSession>>,
     last_frame_error: Option<String>,
     last_error_report: Instant,
     suppressed_error_count: u64,
@@ -82,6 +89,73 @@ pub struct Host {
 }
 
 impl Host {
+    /// Every patch generation this process has installed, newest last.
+    ///
+    /// Generation zero - the code each artifact was built with - has no entry
+    /// because it needs no loaded library; [`Self::rollback_patch`] still
+    /// accepts it.
+    #[cfg(feature = "hot_patch")]
+    pub fn patch_generations(&self) -> Vec<crate::hot_patch::PatchGeneration> {
+        let mut all = Vec::new();
+        if let Some(session) = &self.hot_patch {
+            all.extend(session.generations());
+        }
+        for session in self.module_hot_patch.iter().flatten() {
+            all.extend(session.generations());
+        }
+        all
+    }
+
+    /// Reinstall an earlier generation of one patched function.
+    ///
+    /// `generation` is one-based in the order patches were applied; zero
+    /// restores the code the running artifact was built with. This is a pointer
+    /// store per artifact - nothing is rebuilt, reloaded or unloaded, which is
+    /// what dispatching through a slot buys over rewriting a function prologue.
+    ///
+    /// Call it between frames. It is safe from a frontend because it borrows
+    /// the host mutably, and the frame loop cannot be running concurrently.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when no session has patched `function`, when the
+    /// generation does not exist, or when an artifact refuses the address. On
+    /// any error the currently running implementation is left in place.
+    #[cfg(feature = "hot_patch")]
+    pub fn rollback_patch(&mut self, function: &str, generation: u32) -> Result<(), String> {
+        let Host {
+            hot_patch,
+            module_hot_patch,
+            optional_modules,
+            loaded_project,
+            engine,
+            ..
+        } = self;
+
+        // The owning session is whichever one patched this function; searching
+        // avoids making callers know whether it came from the project or a
+        // module.
+        let session = hot_patch
+            .iter_mut()
+            .chain(module_hot_patch.iter_mut().flatten())
+            .find(|session| session.knows_function(function))
+            .ok_or_else(|| {
+                format!("`{function}` has not been patched in this session")
+            })?;
+
+        let targets = patch_targets(loaded_project, optional_modules);
+        let result = session.rollback(engine, &targets, function, generation);
+        drop(targets);
+        if result.is_ok() {
+            println!(
+                "{} {function} {}",
+                crate::console::bold_cyan("[hot]"),
+                crate::console::green(&format!("ROLLED BACK to generation {generation}"))
+            );
+        }
+        result
+    }
+
     /// Read-only engine access for rendering and diagnostics.
     pub fn engine(&self) -> &Engine {
         &self.engine
@@ -354,8 +428,28 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
         &workspace_root,
         &module_config.name,
         &module_config.watch_directory,
+        crate::build_runner::PROJECT_HOT_OUTPUT_SUBDIRECTORY,
         &module_config.build_command,
     );
+
+    // The same fast path for each optional module. A module's `#[pill_hot_fn]`
+    // functions are compiled into every artifact that links the crate, so this
+    // is what lets an edit reach the project's embedded copy without the
+    // cascading project reload a module swap would otherwise queue.
+    #[cfg(feature = "hot_patch")]
+    let module_hot_patch: Vec<Option<crate::hot_patch::HotPatchSession>> = host_config
+        .optional_modules
+        .iter()
+        .map(|configuration| {
+            crate::hot_patch::HotPatchSession::new(
+                &workspace_root,
+                &configuration.name,
+                &configuration.watch_directory,
+                &configuration.output_subdirectory,
+                &configuration.build_command,
+            )
+        })
+        .collect();
 
     Ok(Host {
         workspace_root,
@@ -368,6 +462,8 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
         last_processed_generation: 0,
         #[cfg(feature = "hot_patch")]
         hot_patch,
+        #[cfg(feature = "hot_patch")]
+        module_hot_patch,
         last_frame_error: None,
         last_error_report: Instant::now(),
         suppressed_error_count: 0,
@@ -443,6 +539,42 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     // the whole cascade (edited module + queued project reload), not just the
     // last transaction.
     let reload_started = Instant::now();
+
+    // Step 0b: Try the per-function fast path for the optional modules, before
+    // the loop below turns a pending change into a full module rebuild.
+    //
+    // A module's plain functions are compiled into every artifact that links
+    // the crate, so one patch is offered to all of them at once. That is what
+    // makes the cascading project reload a module swap normally queues
+    // unnecessary: the project's embedded copy is redirected too.
+    #[cfg(feature = "hot_patch")]
+    {
+        let Host {
+            optional_modules,
+            module_hot_patch,
+            loaded_project,
+            engine,
+            ..
+        } = &mut *host;
+
+        for index in 0..module_hot_patch.len() {
+            if !optional_modules[index].has_pending_reload() {
+                continue;
+            }
+            let Some(session) = module_hot_patch[index].as_mut() else {
+                continue;
+            };
+            let targets = patch_targets(loaded_project, optional_modules);
+            let outcome = session.try_patch(engine, &targets);
+            // The borrow of the module list ends here, so the slot below can be
+            // updated.
+            drop(targets);
+            if report_patch_outcome(outcome) {
+                optional_modules[index].consume_pending_reload();
+            }
+        }
+    }
+
     // Destructure so the module list, the engine and the API table are borrowed
     // as disjoint fields rather than through the whole host.
     let Host {
@@ -491,47 +623,22 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
         if pending != host.last_processed_generation {
             // Disjoint field borrows, as Step 0 above does.
             let Host {
-                hot_patch, engine, ..
+                hot_patch,
+                optional_modules,
+                loaded_project,
+                engine,
+                ..
             } = &mut *host;
+            let mut patched = false;
             if let Some(session) = hot_patch {
-                match session.try_patch(engine) {
-                    crate::hot_patch::PatchOutcome::Patched {
-                        function,
-                        elapsed_milliseconds,
-                        stages,
-                    } => {
-                        println!(
-                            "{} {function} {}\n      {}",
-                            crate::console::bold_cyan("[hot]"),
-                            crate::console::green(&format!("LIVE {elapsed_milliseconds:.0} ms")),
-                            crate::console::dim(&stages.to_string())
-                        );
-                        info!(
-                            target: telemetry_target::HOT_RELOAD,
-                            function = function.as_str(),
-                            elapsed_milliseconds,
-                            "per-function patch applied"
-                        );
-                        // The edit is fully accounted for; skip the rebuild.
-                        host.last_processed_generation =
-                            host.reload_generation.load(Ordering::Acquire);
-                    }
-                    crate::hot_patch::PatchOutcome::NotPatchable { reason } => {
-                        println!(
-                            "{} {}\n      reason: {reason}\n      falling back to module reload",
-                            crate::console::bold_cyan("[hot]"),
-                            crate::console::yellow("FAST PATCH NOT POSSIBLE")
-                        );
-                    }
-                    crate::hot_patch::PatchOutcome::Failed { function, detail } => {
-                        eprintln!(
-                            "{} {function} patch failed\n      {detail}\n      \
-                             falling back to module reload",
-                            crate::console::bold_cyan("[hot]")
-                        );
-                    }
-                    crate::hot_patch::PatchOutcome::Unchanged => {}
-                }
+                let targets = patch_targets(loaded_project, optional_modules);
+                let outcome = session.try_patch(engine, &targets);
+                drop(targets);
+                patched = report_patch_outcome(outcome);
+            }
+            if patched {
+                // The edit is fully accounted for; skip the rebuild.
+                host.last_processed_generation = host.reload_generation.load(Ordering::Acquire);
             }
         }
     }
@@ -632,6 +739,121 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     );
 
     Some(report)
+}
+
+/// Every loaded artifact a plain-function patch must be offered to.
+///
+/// One entry per currently loaded library: the project and each optional
+/// module. A crate linked into several of them is compiled into each, so each
+/// holds an independent redirect slot for the same function and all of them
+/// have to be told about the replacement.
+///
+/// Retired generations are deliberately left out. They stay mapped only so
+/// outstanding pointers into their code remain valid, and their systems have
+/// already been cleared, so nothing calls their copy of the function.
+#[cfg(feature = "hot_patch")]
+fn patch_targets<'a>(
+    loaded_project: &'a LoadedProject,
+    optional_modules: &'a [OptionalModuleSlot],
+) -> Vec<(&'a str, &'a crate::native_library::NativeLibrary)> {
+    let mut targets = Vec::with_capacity(optional_modules.len() + 1);
+    if let Some(library) = loaded_project.native_library() {
+        targets.push(("project", library));
+    }
+    for slot in optional_modules {
+        targets.push((slot.name(), slot.current_library()));
+    }
+    targets
+}
+
+/// Report one patch attempt, and say whether it fully handled the change.
+///
+/// `true` means the edit is live and the pending reload has nothing left to do.
+/// Every other outcome falls through to the normal rebuild, so the worst case
+/// is exactly the behaviour that existed before the fast path.
+#[cfg(feature = "hot_patch")]
+fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
+    match outcome {
+        crate::hot_patch::PatchOutcome::Patched {
+            function,
+            generation,
+            elapsed_milliseconds,
+            stages,
+            artifact_bytes,
+            exports,
+        } => {
+            println!(
+                "{} {function} {} {}\n      {}",
+                crate::console::bold_cyan("[hot]"),
+                crate::console::green(&format!("LIVE {elapsed_milliseconds:.0} ms")),
+                crate::console::dim(&format!("(generation {generation})")),
+                crate::console::dim(&stages.to_string())
+            );
+            info!(
+                target: telemetry_target::HOT_RELOAD,
+                function = function.as_str(),
+                generation,
+                elapsed_milliseconds,
+                "per-function patch applied"
+            );
+            // Recorded in the same shape a module reload is, so one parser in
+            // `devops/benchmarks/hot_reload_harness.py` reads both.
+            analytics::record_patch(
+                &function,
+                generation,
+                stages.classify + stages.generate + stages.flags,
+                stages.compile as u64,
+                stages.load,
+                stages.activate,
+                artifact_bytes,
+                exports,
+            );
+            true
+        }
+        crate::hot_patch::PatchOutcome::NotPatchable { refusal } => {
+            println!(
+                "{} {} {}\n      reason: {}\n      falling back to module reload",
+                crate::console::bold_cyan("[hot]"),
+                crate::console::yellow("FAST PATCH NOT POSSIBLE"),
+                crate::console::dim(&format!("({})", refusal.code)),
+                refusal.detail
+            );
+            info!(
+                target: telemetry_target::HOT_RELOAD,
+                code = refusal.code,
+                detail = refusal.detail.as_str(),
+                "fast patch refused; falling back to a reload"
+            );
+            analytics::record_patch_refusal();
+            false
+        }
+        crate::hot_patch::PatchOutcome::Failed {
+            function,
+            active_generation,
+            failure,
+        } => {
+            // The running implementation is intact, so the message says what is
+            // still executing rather than only what did not happen.
+            eprintln!(
+                "{} {function} patch failed {}\n      {}\n      \
+                 still running generation {active_generation}; falling back to module reload",
+                crate::console::bold_cyan("[hot]"),
+                crate::console::dim(&format!("({})", failure.code)),
+                failure.detail
+            );
+            pill_core::warn!(
+                target: telemetry_target::HOT_RELOAD,
+                function = function.as_str(),
+                code = failure.code,
+                detail = failure.detail.as_str(),
+                active_generation,
+                "fast patch failed; the previous implementation is still running"
+            );
+            analytics::record_patch_failure();
+            false
+        }
+        crate::hot_patch::PatchOutcome::Unchanged => false,
+    }
 }
 
 /// Record one frame's numerical state into the shared metrics recorder.

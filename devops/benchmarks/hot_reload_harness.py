@@ -268,11 +268,15 @@ def verify_prerequisites(run_native: bool, run_csharp: bool) -> bool:
 # =============================================================================
 
 # [analytics] reload <name> (reload #N) | build=<..> | stage=..ms | load=..ms
-#   | init=..ms | migrate=..ms | size=.. | exports=N
+#   | init=..ms | migrate=..ms | size=.. | exports=N | kind=reload|patch
+#
+# `kind` distinguishes a whole-artifact reload from an in-place function patch.
+# Both print the same line on purpose, so this one parser reads both; the group
+# is optional so the harness still reads output from a host predating the field.
 RELOAD_LINE_RE = re.compile(
     r"\[analytics\] reload (\S+) \(reload #\d+\) \| build=(\S+) \| stage=([\d.]+)ms"
     r" \| load=([\d.]+)ms \| init=([\d.]+)ms \| migrate=([\d.]+)ms \| size=(\S+)"
-    r" \| exports=(\d+)"
+    r" \| exports=(\d+)(?: \| kind=(\w+))?"
 )
 #     crates rebuilt by cargo: <crate> <ms> | <crate> <ms> | ...
 CRATES_LINE_RE = re.compile(r"crates rebuilt by cargo: (.*)")
@@ -325,6 +329,8 @@ class ReloadTiming:
     init_ms: Optional[float] = None
     migrate_ms: Optional[float] = None
     crates: Optional[str] = None
+    # "reload" for a rebuilt artifact, "patch" for an in-place function patch.
+    kind: str = "reload"
 
 
 def parse_reload_breakdown(
@@ -352,6 +358,8 @@ def parse_reload_breakdown(
     timing.load_ms = float(match.group(4))
     timing.init_ms = float(match.group(5))
     timing.migrate_ms = float(match.group(6))
+    # Absent on a host built before the field existed; a plain reload then.
+    timing.kind = match.group(9) or "reload"
     following = output[line_end + 1 :]
     next_reload = following.find("[analytics] reload ")
     window = following[: next_reload if next_reload >= 0 else 2000]

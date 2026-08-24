@@ -33,6 +33,11 @@ mod csharp;
 #[cfg(feature = "hot_patch")]
 mod hot_patch;
 
+/// One entry in a patched function's history, as returned by
+/// [`Host::patch_generations`](runtime::Host::patch_generations).
+#[cfg(feature = "hot_patch")]
+pub use hot_patch::PatchGeneration;
+
 /// Native project-library loading and Windows-safe temporary-copy handling.
 mod native_library;
 /// Lifecycle management for optional engine modules.

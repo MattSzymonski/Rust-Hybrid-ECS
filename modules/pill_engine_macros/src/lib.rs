@@ -236,6 +236,164 @@ pub fn pill_hot(attribute: TokenStream, item: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+/// Makes an ordinary function hot-patchable.
+///
+/// Use this for a plain `pub fn`; use `#[pill_hot]` for an ECS system. The two
+/// differ because a system already has an indirection - the engine holds its
+/// boxed closure and can swap what it calls - while an ordinary function is
+/// called directly by its callers, so the indirection has to live inside the
+/// function itself.
+///
+/// ```ignore
+/// #[pill_hot_fn]
+/// pub fn get_color_a() -> f32 {
+///     133.0
+/// }
+/// ```
+///
+/// The real body is renamed and the public name becomes a dispatcher that reads
+/// a slot, so every caller - including ones in other crates that linked this one
+/// statically - goes through the redirect.
+///
+/// # A crate linked into several artifacts
+///
+/// The slot is a `static` in whichever artifact compiled the function. A crate
+/// linked into both a module DLL and the project has an independent copy of its
+/// code in each, so each copy has its own slot and must be patched separately.
+/// The host installs into every loaded artifact that declares the name.
+#[proc_macro_attribute]
+pub fn pill_hot_fn(_attribute: TokenStream, item: TokenStream) -> TokenStream {
+    let item_fn = parse_macro_input!(item as ItemFn);
+    let signature = &item_fn.sig;
+    let fn_ident = &signature.ident;
+    let visibility = &item_fn.vis;
+    let attributes = &item_fn.attrs;
+
+    // A generic function has one instantiation per set of type arguments, so
+    // there is no single address a slot could hold.
+    if !signature.generics.params.is_empty() {
+        return syn::Error::new_spanned(
+            &signature.generics,
+            "`#[pill_hot_fn]` cannot be applied to a generic function: patching \
+             replaces one concrete implementation, and a generic has one per \
+             instantiation",
+        )
+        .to_compile_error()
+        .into();
+    }
+    // `self` would make this a method, whose dispatcher cannot be a free fn.
+    if signature.receiver().is_some() {
+        return syn::Error::new_spanned(
+            signature,
+            "`#[pill_hot_fn]` cannot be applied to a method; move the body into \
+             a free function and call it from the method",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    // Rebuild the argument list: the dispatcher needs plain names to forward,
+    // and a pattern like `mut value` or `(a, b)` cannot be forwarded as-is.
+    let mut parameter_names = Vec::new();
+    let mut parameter_declarations = Vec::new();
+    let mut parameter_types = Vec::new();
+    for (index, argument) in signature.inputs.iter().enumerate() {
+        let syn::FnArg::Typed(typed) = argument else {
+            continue;
+        };
+        let name = format_ident!("argument_{index}");
+        let argument_type = &*typed.ty;
+        parameter_names.push(quote! { #name });
+        parameter_declarations.push(quote! { #name: #argument_type });
+        parameter_types.push(quote! { #argument_type });
+    }
+
+    let return_type = &signature.output;
+    let implementation_ident = format_ident!("__pill_hot_impl_{}", fn_ident);
+    let slot_ident = format_ident!("__PILL_HOT_SLOT_{}", fn_ident.to_string().to_uppercase());
+    let address_ident = format_ident!("__pill_hot_address_{}", fn_ident);
+    let qualified_name = quote! {
+        ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#fn_ident))
+    };
+
+    // The gate: the signature exactly as written. A patch derives the same text
+    // from the same source, so a reshaped function is refused rather than
+    // installed behind call sites compiled for the old shape.
+    let signature_text = quote! {
+        ::core::concat!(
+            "(", #(::core::stringify!(#parameter_types), ",",)* ")",
+            ::core::stringify!(#return_type)
+        )
+    };
+
+    let mut renamed = item_fn.clone();
+    renamed.sig.ident = implementation_ident.clone();
+    renamed.vis = syn::Visibility::Inherited;
+    renamed.attrs.clear();
+
+    // Optimized builds get the function exactly as written: no slot, no
+    // descriptor, no indirection, and nothing to strip out later. Hot patching
+    // is a development facility, and this is what makes its cost provably zero
+    // in a shipped artifact rather than merely small.
+    let expanded = quote! {
+        #[cfg(not(debug_assertions))]
+        #item_fn
+
+        /// The original body, renamed so the public name can dispatch.
+        #[cfg(debug_assertions)]
+        #[doc(hidden)]
+        #[inline(never)]
+        #renamed
+
+        /// Redirect slot for this function, private to this artifact.
+        #[cfg(debug_assertions)]
+        #[doc(hidden)]
+        #[allow(non_upper_case_globals)]
+        static #slot_ident: ::pill_engine::hot_patch::PlainSlot =
+            ::pill_engine::hot_patch::PlainSlot::new();
+
+        /// Address of the body above.
+        ///
+        /// A function rather than a constant because casting a fn item to
+        /// `usize` is not allowed while building the `static` descriptor below.
+        #[cfg(debug_assertions)]
+        #[doc(hidden)]
+        fn #address_ident() -> usize {
+            #implementation_ident as *const () as usize
+        }
+
+        #[cfg(debug_assertions)]
+        #(#attributes)*
+        #visibility fn #fn_ident(#(#parameter_declarations),*) #return_type {
+            // One acquire load from a hot cache line, then a call. Measured at
+            // under 0.2 ns against a direct call - below the noise floor.
+            let address = #slot_ident.current_or(
+                #implementation_ident as *const () as usize
+            );
+            // SAFETY: the slot holds either the original address written just
+            // above - exactly this signature - or a replacement accepted by
+            // `install_plain_function`, which refuses any whose signature text
+            // differs. A replacement lives in a patch library the host never
+            // unloads, so it stays executable for the process lifetime.
+            let implementation: fn(#(#parameter_types),*) #return_type =
+                unsafe { ::core::mem::transmute(address) };
+            implementation(#(#parameter_names),*)
+        }
+
+        #[cfg(debug_assertions)]
+        ::pill_engine::submit! {
+            ::pill_engine::hot_patch::PillHotSlotDescriptor {
+                qualified_name: #qualified_name,
+                slot: &#slot_ident,
+                signature: #signature_text,
+                implementation_address: #address_ident,
+            }
+        }
+    };
+
+    expanded.into()
+}
+
 /// Emits the hot-patch resolver export on its own.
 ///
 /// `#[pill_project]` and `#[pill_module]` already include it, so this exists for
@@ -264,7 +422,7 @@ pub fn pill_hot_resolver(item: TokenStream) -> TokenStream {
             Err(error) => return error.to_compile_error().into(),
         }
     };
-    hot_patch_resolver_export(&export_name).into()
+    hot_patch_resolver_export(&export_name, &quote! { #[cfg(debug_assertions)] }).into()
 }
 
 /// The exported resolver every loadable artifact provides.
@@ -272,8 +430,139 @@ pub fn pill_hot_resolver(item: TokenStream) -> TokenStream {
 /// One export rather than one per hot function, for the same reason the module
 /// ABI keeps its surface small: a Windows DLL cannot exceed 65535 exports, and
 /// a name-keyed lookup costs nothing at reload time.
-fn hot_patch_resolver_export(export_name: &proc_macro2::Ident) -> proc_macro2::TokenStream {
+fn hot_patch_resolver_export(
+    export_name: &proc_macro2::Ident,
+    gate: &proc_macro2::TokenStream,
+) -> proc_macro2::TokenStream {
+    let install_name = format_ident!("{}_install", export_name);
+    let plain_name = format_ident!("{}_plain", export_name);
+    let reset_name = format_ident!("{}_reset", export_name);
     quote! {
+        /// Return a `#[pill_hot_fn]` declared in THIS artifact to its own body.
+        ///
+        /// The counterpart of the install export, used to roll a patch back to
+        /// generation zero. A plain function has no single baseline address a
+        /// host could reinstall - every artifact linking the crate holds its own
+        /// copy - so each artifact is asked to empty its own slot instead.
+        ///
+        /// Returns 0 on success and 1 when this artifact declares no such
+        /// function.
+        ///
+        /// # Safety
+        ///
+        /// `qualified_name` must be a valid NUL-terminated C string that stays
+        /// readable for the call.
+        #gate
+        #[no_mangle]
+        pub unsafe extern "C" fn #reset_name(
+            qualified_name: *const ::core::ffi::c_char,
+        ) -> u32 {
+            if qualified_name.is_null() {
+                return 1;
+            }
+            // SAFETY: the caller guarantees a NUL-terminated string readable
+            // for the duration of this call.
+            let name = unsafe { ::std::ffi::CStr::from_ptr(qualified_name) };
+            let Ok(name) = name.to_str() else {
+                return 1;
+            };
+            match ::pill_engine::hot_patch::reset_plain_function(name) {
+                Ok(()) => 0,
+                Err(_) => 1,
+            }
+        }
+
+        /// Report where a `#[pill_hot_fn]` declared in THIS artifact lives.
+        ///
+        /// Returns the implementation's address, or zero when this artifact
+        /// declares no such function. On success the signature text is written
+        /// through `out_signature` and `out_signature_length` as a pointer and
+        /// byte count, because the text comes from `concat!` and is therefore
+        /// not NUL-terminated.
+        ///
+        /// # Safety
+        ///
+        /// `qualified_name` must be a valid NUL-terminated C string readable
+        /// for the call. `out_signature` and `out_signature_length` must be
+        /// null or point at writable slots. The reported signature borrows
+        /// static storage inside this artifact and stays valid while it is
+        /// loaded.
+        #gate
+        #[no_mangle]
+        pub unsafe extern "C" fn #plain_name(
+            qualified_name: *const ::core::ffi::c_char,
+            out_signature: *mut *const u8,
+            out_signature_length: *mut usize,
+        ) -> usize {
+            if qualified_name.is_null() {
+                return 0;
+            }
+            // SAFETY: the caller guarantees a NUL-terminated string readable
+            // for the duration of this call.
+            let name = unsafe { ::std::ffi::CStr::from_ptr(qualified_name) };
+            let Ok(name) = name.to_str() else {
+                return 0;
+            };
+            match ::pill_engine::hot_patch::plain_function_entry(name) {
+                Some((address, signature)) => {
+                    if !out_signature.is_null() && !out_signature_length.is_null() {
+                        // SAFETY: both pointers were checked non-null and the
+                        // caller guarantees they address writable slots.
+                        unsafe {
+                            *out_signature = signature.as_ptr();
+                            *out_signature_length = signature.len();
+                        }
+                    }
+                    address
+                }
+                None => 0,
+            }
+        }
+
+        /// Redirect a `#[pill_hot_fn]` declared in THIS artifact.
+        ///
+        /// A crate linked into several artifacts has an independent copy of its
+        /// code in each, so the host calls this on every loaded artifact rather
+        /// than assuming one of them owns the function.
+        ///
+        /// Returns 0 on success, 1 when this artifact declares no such function,
+        /// and 2 when the signature no longer matches. A non-zero result always
+        /// means the running implementation was left untouched.
+        ///
+        /// # Safety
+        ///
+        /// `qualified_name` and `signature` must be valid NUL-terminated C
+        /// strings that stay readable for the call, and `address` must point at
+        /// a function with the signature `signature` describes, in a library
+        /// that outlives the process's use of it.
+        #gate
+        #[no_mangle]
+        pub unsafe extern "C" fn #install_name(
+            qualified_name: *const ::core::ffi::c_char,
+            address: usize,
+            signature: *const ::core::ffi::c_char,
+        ) -> u32 {
+            if qualified_name.is_null() || signature.is_null() {
+                return 1;
+            }
+            // SAFETY: the caller guarantees NUL-terminated strings readable for
+            // the duration of this call.
+            let (name, signature) = unsafe {
+                (
+                    ::std::ffi::CStr::from_ptr(qualified_name),
+                    ::std::ffi::CStr::from_ptr(signature),
+                )
+            };
+            let (Ok(name), Ok(signature)) = (name.to_str(), signature.to_str()) else {
+                return 1;
+            };
+            match ::pill_engine::hot_patch::install_plain_function(name, address, signature) {
+                Ok(()) => 0,
+                Err(::pill_engine::hot_patch::HotPatchError::UnknownSystem { .. }) => 1,
+                Err(_) => 2,
+            }
+        }
+
         /// Resolves a `#[pill_hot]` function's dispatch address by qualified
         /// name, writing its signature hash through `out_signature_hash`.
         ///
@@ -285,6 +574,7 @@ fn hot_patch_resolver_export(export_name: &proc_macro2::Ident) -> proc_macro2::T
         /// `qualified_name` must be a valid NUL-terminated C string that stays
         /// readable for the call. `out_signature_hash` must be null or point at
         /// a writable `u64`.
+        #gate
         #[no_mangle]
         pub unsafe extern "C" fn #export_name(
             qualified_name: *const ::core::ffi::c_char,
@@ -342,15 +632,19 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
     let fn_ident = &item_fn.sig.ident;
 
-    // Gated with the rest of the module ABI: a crate linked directly into
+    // Gated twice over. `module-abi`, because a crate linked directly into
     // another binary must not export these `#[no_mangle]` symbols twice.
-    let hot_patch_resolver = hot_patch_resolver_export(&format_ident!("pill_hot_resolve"));
+    // `debug_assertions`, because hot patching is a development facility and a
+    // shipped artifact should carry no trace of it.
+    let hot_patch_resolver = hot_patch_resolver_export(
+        &format_ident!("pill_hot_resolve"),
+        &quote! { #[cfg(all(feature = "module-abi", debug_assertions))] },
+    );
 
     let expanded = quote! {
         #[cfg(feature = "module-abi")]
         #item_fn
 
-        #[cfg(feature = "module-abi")]
         #hot_patch_resolver
 
         /// Optional-module ABI revision this crate was built against.
@@ -430,7 +724,11 @@ pub fn pill_project(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
     let fn_ident = &item_fn.sig.ident;
 
-    let hot_patch_resolver = hot_patch_resolver_export(&format_ident!("pill_hot_resolve"));
+    // Debug-only: a released project keeps no hot-patching surface.
+    let hot_patch_resolver = hot_patch_resolver_export(
+        &format_ident!("pill_hot_resolve"),
+        &quote! { #[cfg(debug_assertions)] },
+    );
 
     let expanded = quote! {
         #item_fn

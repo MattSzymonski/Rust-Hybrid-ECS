@@ -61,15 +61,36 @@ const BUILD_INFO_MARKER: &str = "pill_standalone_temp/build_info.txt";
 /// staged into the module's private hot-load directory instead.
 const CARGO_MODULE_OUTPUT_SUBDIRECTORY: &str = "target/debug";
 
+/// Private directory the host stages the project's loadable artifacts into,
+/// and the default an optional module's configuration also names.
+///
+/// The same protection optional modules have always had, extended to the
+/// project. Cargo writes `project.dll` to a shared per-crate slot that any
+/// other `cargo build` of the same package overwrites - with a different
+/// feature set, and therefore a differently configured `pill_engine` compiled
+/// into it. Loading that produces an access violation inside `LoadLibrary`,
+/// before any of the host's own diagnostics can run.
+pub(crate) const PROJECT_HOT_OUTPUT_SUBDIRECTORY: &str = "target/hot";
+
+/// Directory holding one stamp per module, recording what the host built.
+const ARTIFACT_STAMP_DIRECTORY: &str = "pill_standalone_temp/artifact_stamps";
+
 /// Host feature set that module builds must mirror.
 ///
 /// Modules are compiled with the same engine features as the host so type
 /// layouts stay identical across the DLL boundary; a host rebuilt with a
 /// different feature set therefore invalidates every cached module artifact.
-const HOST_MODULE_FEATURE_SET: &str = if cfg!(feature = "rendering") {
-    "rendering"
-} else {
-    "no-rendering"
+///
+/// `hot_patch` belongs here for exactly the same reason `rendering` does: the
+/// host mirrors it into every module and project build, so it changes the
+/// engine's crate metadata on both sides of the boundary. Leaving it out let a
+/// host rebuilt with the feature go on trusting artifacts built without it.
+const HOST_MODULE_FEATURE_SET: &str = match (cfg!(feature = "rendering"), cfg!(feature = "hot_patch"))
+{
+    (true, true) => "rendering+hot_patch",
+    (true, false) => "rendering",
+    (false, true) => "no-rendering+hot_patch",
+    (false, false) => "no-rendering",
 };
 
 // =============================================================================
@@ -118,6 +139,82 @@ fn record_build_info(workspace_root: &Path) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(marker_path, current_build_info());
+}
+
+/// Path of the stamp recording what the host built for one module.
+fn artifact_stamp_path(workspace_root: &Path, module_name: &str) -> PathBuf {
+    workspace_root
+        .join(ARTIFACT_STAMP_DIRECTORY)
+        .join(format!("{module_name}.txt"))
+}
+
+/// Describe the artifacts a build produced, together with the command that
+/// produced them.
+///
+/// Returns `None` when any artifact is missing or unreadable, which the callers
+/// treat as "not host-built" and therefore as a reason to run cargo.
+fn artifact_stamp(build_command: &[String], artifacts: &[PathBuf]) -> Option<String> {
+    // The separator cannot appear in a command argument, so two different
+    // argument lists can never produce the same line.
+    let mut lines = vec![build_command.join("\u{1}")];
+    for path in artifacts {
+        let metadata = std::fs::metadata(path).ok()?;
+        let modified = metadata
+            .modified()
+            .ok()?
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?;
+        lines.push(format!(
+            "{}|{}|{}",
+            path.display(),
+            metadata.len(),
+            modified.as_nanos()
+        ));
+    }
+    Some(lines.join("\n"))
+}
+
+/// Record that the host itself produced these artifacts with this command.
+///
+/// Best-effort by design, like the toolchain marker: a failed write leaves the
+/// stamp missing, which makes the next run rebuild rather than trust an
+/// artifact it cannot identify.
+fn record_artifact_stamp(
+    workspace_root: &Path,
+    module_name: &str,
+    build_command: &[String],
+    artifacts: &[PathBuf],
+) {
+    let Some(stamp) = artifact_stamp(build_command, artifacts) else {
+        return;
+    };
+    let path = artifact_stamp_path(workspace_root, module_name);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, stamp);
+}
+
+/// Whether the artifacts on disk are the ones this host built with this command.
+///
+/// The modification-time check alone cannot tell a host-built artifact from one
+/// an unrelated `cargo build` wrote to the same path moments later: both are
+/// newer than every source file, so both look up to date. Recording the build
+/// command alongside each artifact's size and modification time closes that
+/// gap. Anything the host did not write itself - a different feature set, a
+/// plain `cargo build`, a `cargo build --workspace` - no longer matches, and
+/// falls through to a real build instead of being loaded.
+fn artifacts_are_host_built(
+    workspace_root: &Path,
+    module_name: &str,
+    build_command: &[String],
+    artifacts: &[PathBuf],
+) -> bool {
+    let Some(current) = artifact_stamp(build_command, artifacts) else {
+        return false;
+    };
+    let recorded = std::fs::read_to_string(artifact_stamp_path(workspace_root, module_name));
+    recorded.is_ok_and(|recorded| recorded == current)
 }
 
 /// Whether a module's build artifact is already newer than every input a
@@ -424,22 +521,53 @@ pub(crate) fn build_project_module(
         "building project module"
     );
 
-    // Step 1: Resolve the backend-specific output artifact path.
+    // Step 1: Resolve the backend-specific artifact paths.
     //
     // The build command itself is backend-agnostic, but each backend names and
     // locates its loadable artifact differently. Native outputs use platform
     // naming conventions; managed outputs always use an assembly `.dll`.
-    let output_path = match &config.backend {
+    //
+    // A native project has two: the slot cargo writes into, and the private
+    // copy the host loads from. They are kept apart for the reason optional
+    // modules already keep them apart - any other `cargo build` of the same
+    // package overwrites cargo's slot, and for the project that means a DLL
+    // carrying a differently configured `pill_engine`, which access-violates
+    // inside `LoadLibrary`. The managed backend has no such collision and
+    // loads from where its build wrote.
+    let (build_output, output_path) = match &config.backend {
         ProjectModuleBackend::NativeLibrary {
             library_name,
             output_subdirectory,
-        } => workspace_root
-            .join(output_subdirectory)
-            .join(native_library_filename(library_name)),
-        ProjectModuleBackend::CSharp(config) => workspace_root
-            .join(&config.project_output_subdirectory)
-            .join(format!("{}.dll", config.project_assembly_name)),
+        } => (
+            workspace_root
+                .join(output_subdirectory)
+                .join(native_library_filename(library_name)),
+            workspace_root
+                .join(PROJECT_HOT_OUTPUT_SUBDIRECTORY)
+                .join(native_library_filename(library_name)),
+        ),
+        ProjectModuleBackend::CSharp(config) => {
+            let path = workspace_root
+                .join(&config.project_output_subdirectory)
+                .join(format!("{}.dll", config.project_assembly_name));
+            (path.clone(), path)
+        }
     };
+
+    // The crate's `rlib`, which a generated patch links to reach the project's
+    // types. Staged alongside the library so a patch cannot link a copy some
+    // other build replaced, which would compile it against a differently
+    // configured engine and give every type a different `TypeId`.
+    #[cfg(feature = "hot_patch")]
+    let (rlib_build_output, rlib_output) = (
+        workspace_root
+            .join("target")
+            .join("debug")
+            .join(format!("lib{}.rlib", config.name)),
+        workspace_root
+            .join(PROJECT_HOT_OUTPUT_SUBDIRECTORY)
+            .join(format!("lib{}.rlib", config.name)),
+    );
 
     // Step 2: Skip cargo entirely for a native module whose artifact is
     // already newer than every build input. The project's own manifest is the
@@ -451,22 +579,24 @@ pub(crate) fn build_project_module(
         if let Some(manifest_path) = &config.manifest_path {
             let manifest_path = workspace_root.join(manifest_path);
 
-            // Hot patching adds a second artifact, the crate's `rlib`, which a
-            // generated patch links to reach the project's types. The staleness
-            // check below only knows about the shared library, so without this
-            // an existing, up-to-date DLL makes cargo be skipped forever and the
-            // rlib is never produced - leaving hot patching permanently idle
-            // with nothing obviously wrong.
+            // Every artifact this build must have produced. Hot patching adds
+            // the crate's `rlib`: the staleness check only knows about the
+            // library, so without naming the rlib here an existing, up-to-date
+            // DLL makes cargo be skipped forever and the rlib is never produced
+            // - leaving hot patching permanently idle with nothing obviously
+            // wrong.
             #[cfg(feature = "hot_patch")]
-            let required_artifacts_present = workspace_root
-                .join("target")
-                .join("debug")
-                .join(format!("lib{}.rlib", config.name))
-                .is_file();
+            let required_artifacts = vec![output_path.clone(), rlib_output.clone()];
             #[cfg(not(feature = "hot_patch"))]
-            let required_artifacts_present = true;
+            let required_artifacts = vec![output_path.clone()];
 
-            if required_artifacts_present
+            if required_artifacts.iter().all(|path| path.is_file())
+                && artifacts_are_host_built(
+                    workspace_root,
+                    &config.name,
+                    &config.build_command,
+                    &required_artifacts,
+                )
                 && is_build_up_to_date(
                     workspace_root,
                     &output_path,
@@ -500,11 +630,35 @@ pub(crate) fn build_project_module(
         cancel_flag,
     )?;
 
-    // Step 3: Record the toolchain and host feature set that produced this
-    // artifact so later runs can recognize it as up to date.
+    // Step 3: Stage the freshly built artifacts into the private hot-load
+    // directory, so what the host loads is never the slot other builds write
+    // to. The managed backend loads from where its build wrote, so its two
+    // paths are the same and the copy is skipped.
+    let mut stage_ms = 0.0;
     if matches!(&config.backend, ProjectModuleBackend::NativeLibrary { .. }) {
+        let stage_started = Instant::now();
+        stage_artifact(&build_output, &output_path)?;
+        #[cfg(feature = "hot_patch")]
+        stage_artifact(&rlib_build_output, &rlib_output)?;
+        stage_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
+
+        // Record the toolchain and host feature set that produced these
+        // artifacts, then the artifacts themselves, so later runs can both
+        // recognize them as up to date and tell them apart from anything
+        // another build writes to the same paths.
         record_build_info(workspace_root);
+        #[cfg(feature = "hot_patch")]
+        let produced = vec![output_path.clone(), rlib_output.clone()];
+        #[cfg(not(feature = "hot_patch"))]
+        let produced = vec![output_path.clone()];
+        record_artifact_stamp(
+            workspace_root,
+            &config.name,
+            &config.build_command,
+            &produced,
+        );
     }
+
     // Step 4: Confirm the resolved artifact exists before reporting success.
     //
     // A successful process exit does not guarantee that configuration points
@@ -521,12 +675,45 @@ pub(crate) fn build_project_module(
         &config.name,
         ModuleKind::Project,
         BuildStatus::Built,
-        0.0,
+        stage_ms,
         workspace_root,
         &output_path,
     );
 
     Ok(output_path)
+}
+
+/// Copy one freshly built artifact into its private hot-load location.
+///
+/// # Errors
+///
+/// Returns [`BuildError::OutputMissing`] when the build did not produce the
+/// source artifact, and [`BuildError::HotArtifactCopyFailed`] when the copy
+/// itself fails.
+fn stage_artifact(build_output: &Path, hot_output: &Path) -> Result<(), BuildError> {
+    if !build_output.exists() {
+        return Err(BuildError::OutputMissing {
+            path: build_output.display().to_string(),
+        });
+    }
+    let Some(hot_directory) = hot_output.parent() else {
+        return Err(BuildError::OutputMissing {
+            path: hot_output.display().to_string(),
+        });
+    };
+    std::fs::create_dir_all(hot_directory).map_err(|source| BuildError::HotArtifactCopyFailed {
+        source_path: build_output.display().to_string(),
+        target_path: hot_output.display().to_string(),
+        source,
+    })?;
+    std::fs::copy(build_output, hot_output).map_err(|source| {
+        BuildError::HotArtifactCopyFailed {
+            source_path: build_output.display().to_string(),
+            target_path: hot_output.display().to_string(),
+            source,
+        }
+    })?;
+    Ok(())
 }
 
 /// Build one optional module and return its expected output artifact.
@@ -562,6 +749,22 @@ pub(crate) fn build_optional_module(
         .join(&config.output_subdirectory)
         .join(native_library_filename(&config.library_name));
 
+    // The module's `rlib`, staged for the same reason the project's is: a
+    // generated patch links it to reach the module's types, and cargo writes it
+    // to an unhashed per-crate path that any other build of the same package
+    // overwrites - including with a different feature set. Optional, because a
+    // module that declares only a `cdylib` has none, which simply leaves the
+    // fast path idle for that module.
+    #[cfg(feature = "hot_patch")]
+    let (rlib_build_output, rlib_output) = (
+        workspace_root
+            .join(CARGO_MODULE_OUTPUT_SUBDIRECTORY)
+            .join(format!("lib{}.rlib", config.name)),
+        workspace_root
+            .join(&config.output_subdirectory)
+            .join(format!("lib{}.rlib", config.name)),
+    );
+
     // The module manifest sits next to the watched source directory, so its
     // path is derived from the watch directory rather than stored separately.
     let module_manifest = workspace_root
@@ -572,7 +775,20 @@ pub(crate) fn build_optional_module(
     // Skip cargo when the hot-load artifact is already newer than every build
     // input; any uncertainty in the check falls through to a real build below.
     if let Some(manifest_path) = module_manifest {
-        if is_build_up_to_date(
+        #[cfg_attr(not(feature = "hot_patch"), allow(unused_mut))]
+        let mut required_artifacts = vec![hot_output.clone()];
+        // Listed only when it is actually there, so the set matches what the
+        // stamp recorded for a module that produces no `rlib`.
+        #[cfg(feature = "hot_patch")]
+        if rlib_output.is_file() {
+            required_artifacts.push(rlib_output.clone());
+        }
+        if artifacts_are_host_built(
+            workspace_root,
+            &config.name,
+            &config.build_command,
+            &required_artifacts,
+        ) && is_build_up_to_date(
             workspace_root,
             &hot_output,
             &manifest_path,
@@ -612,30 +828,25 @@ pub(crate) fn build_optional_module(
     // `pill_module_*` exports); the shared slot may later be overwritten by
     // the project's build of the export-stripped dependency variant, which is
     // exactly why the loadable copy lives apart from it.
-    if !build_output.exists() {
-        return Err(BuildError::OutputMissing {
-            path: build_output.display().to_string(),
-        });
-    }
-    let Some(hot_directory) = hot_output.parent() else {
-        return Err(BuildError::OutputMissing {
-            path: hot_output.display().to_string(),
-        });
-    };
     let stage_started = Instant::now();
-    std::fs::create_dir_all(hot_directory).map_err(|source| BuildError::HotArtifactCopyFailed {
-        source_path: build_output.display().to_string(),
-        target_path: hot_output.display().to_string(),
-        source,
-    })?;
-    std::fs::copy(&build_output, &hot_output).map_err(|source| {
-        BuildError::HotArtifactCopyFailed {
-            source_path: build_output.display().to_string(),
-            target_path: hot_output.display().to_string(),
-            source,
-        }
-    })?;
+    stage_artifact(&build_output, &hot_output)?;
+    #[cfg_attr(not(feature = "hot_patch"), allow(unused_mut))]
+    let mut produced = vec![hot_output.clone()];
+    #[cfg(feature = "hot_patch")]
+    if rlib_build_output.is_file() {
+        stage_artifact(&rlib_build_output, &rlib_output)?;
+        produced.push(rlib_output.clone());
+    }
     let stage_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
+
+    // Stamp the staged copies so a later run can tell them apart from anything
+    // another build writes to the same paths.
+    record_artifact_stamp(
+        workspace_root,
+        &config.name,
+        &config.build_command,
+        &produced,
+    );
 
     if !hot_output.exists() {
         return Err(BuildError::OutputMissing {
@@ -682,6 +893,115 @@ mod tests {
     /// The artifact is written after a short pause so its modification time is
     /// strictly newer than every input, matching the invariant a real build
     /// leaves behind.
+    /// The scenario that produced an access violation in the field: the host
+    /// builds an artifact, an unrelated `cargo build` overwrites it moments
+    /// later with a different feature set, and every timestamp still looks
+    /// fresh. The stamp is what tells the two apart.
+    #[test]
+    fn an_artifact_another_build_overwrote_is_not_host_built() {
+        let (root, _) = test_workspace();
+        let output = root.join("target/debug/module.dll");
+        let command = vec![
+            "cargo".to_string(),
+            "build".to_string(),
+            "--features".to_string(),
+            "pill_engine/hot_patch".to_string(),
+        ];
+
+        record_artifact_stamp(&root, "module", &command, &[output.clone()]);
+        assert!(
+            artifacts_are_host_built(&root, "module", &command, &[output.clone()]),
+            "the host's own artifact must be recognized"
+        );
+
+        // Another build writes a different library to the same path. It is
+        // newer than every source, so the modification-time check alone would
+        // accept it.
+        std::thread::sleep(Duration::from_millis(30));
+        fs_write(&output, "a differently configured native library");
+        assert!(
+            !artifacts_are_host_built(&root, "module", &command, &[output.clone()]),
+            "an artifact the host did not write must be rebuilt, not loaded"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The same artifact built by a different command is a different artifact,
+    /// which is what makes the check feature-aware.
+    #[test]
+    fn a_different_build_command_is_not_host_built() {
+        let (root, _) = test_workspace();
+        let output = root.join("target/debug/module.dll");
+        let with_feature = vec![
+            "cargo".to_string(),
+            "build".to_string(),
+            "--features".to_string(),
+            "pill_engine/hot_patch".to_string(),
+        ];
+        let without_feature = vec!["cargo".to_string(), "build".to_string()];
+
+        record_artifact_stamp(&root, "module", &with_feature, &[output.clone()]);
+        assert!(!artifacts_are_host_built(
+            &root,
+            "module",
+            &without_feature,
+            &[output.clone()]
+        ));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A missing stamp, or a missing artifact, can never be host-built - both
+    /// fall through to a real build rather than being trusted.
+    #[test]
+    fn a_missing_stamp_or_artifact_is_not_host_built() {
+        let (root, _) = test_workspace();
+        let output = root.join("target/debug/module.dll");
+        let command = vec!["cargo".to_string(), "build".to_string()];
+
+        assert!(
+            !artifacts_are_host_built(&root, "module", &command, &[output.clone()]),
+            "no stamp has been recorded yet"
+        );
+
+        record_artifact_stamp(&root, "module", &command, &[output.clone()]);
+        std::fs::remove_file(&output).unwrap();
+        assert!(
+            !artifacts_are_host_built(&root, "module", &command, &[output.clone()]),
+            "a stamped artifact that no longer exists must be rebuilt"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Every artifact a build produced is covered, not just the first: the
+    /// project's `rlib` is overwritten by the same builds that overwrite its
+    /// library, and a patch linking the wrong one compiles against a
+    /// differently configured engine.
+    #[test]
+    fn every_recorded_artifact_is_checked() {
+        let (root, _) = test_workspace();
+        let library = root.join("target/debug/module.dll");
+        let rlib = root.join("target/debug/libmodule.rlib");
+        fs_write(&rlib, "fake rlib");
+        let command = vec!["cargo".to_string(), "build".to_string()];
+        let artifacts = vec![library.clone(), rlib.clone()];
+
+        record_artifact_stamp(&root, "module", &command, &artifacts);
+        assert!(artifacts_are_host_built(&root, "module", &command, &artifacts));
+
+        // Only the second artifact moves.
+        std::thread::sleep(Duration::from_millis(30));
+        fs_write(&rlib, "a differently configured rlib");
+        assert!(
+            !artifacts_are_host_built(&root, "module", &command, &artifacts),
+            "a replaced rlib must invalidate the build as surely as a replaced library"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     fn test_workspace() -> (PathBuf, PathBuf) {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

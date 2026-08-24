@@ -16,9 +16,9 @@
 // `pill_module` must resolve in every build (the attribute is applied to
 // `register` in source); `Engine` is only needed by the module-abi build,
 // where `register` is actually compiled in.
-use pill_engine::pill_module;
 #[cfg(feature = "module-abi")]
 use pill_engine::Engine;
+use pill_engine::{pill_hot_fn, pill_module};
 
 // =============================================================================
 // Struct
@@ -63,8 +63,9 @@ pub fn grayscale(tint: Tint) -> f32 {
 
 /// Dummy alpha channel: `Tint` carries no alpha, so this always reports fully
 /// opaque, for other crates to call as a stand-in.
+#[pill_hot_fn]
 pub fn get_color_a() -> f32 {
-    1133.0
+    173.0
 }
 
 // =============================================================================
@@ -78,4 +79,85 @@ pub fn get_color_a() -> f32 {
 #[pill_module]
 fn register(_engine: &mut Engine) -> u32 {
     0
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The function must be discoverable by its qualified path, which is how a
+    /// host addresses it across the ABI.
+    #[test]
+    fn function_is_registered_under_its_qualified_path() {
+        assert!(
+            pill_engine::hot_patch::plain_function_names()
+                .any(|name| name == "pill_dummy_color::get_color_a"),
+            "declared functions: {:?}",
+            pill_engine::hot_patch::plain_function_names().collect::<Vec<_>>()
+        );
+    }
+
+    /// A signature that does not match is refused, leaving the original
+    /// implementation in place. This is what stops a reshaped function being
+    /// installed behind call sites compiled for the old shape.
+    #[test]
+    fn a_mismatched_signature_is_refused() {
+        fn replacement() -> f32 {
+            42.0
+        }
+        let result = pill_engine::hot_patch::install_plain_function(
+            "pill_dummy_color::get_color_a",
+            replacement as *const () as usize,
+            "(some other shape)",
+        );
+        assert!(result.is_err(), "a changed signature must be refused");
+    }
+
+    /// The dispatcher forwards to the original body, an installed replacement
+    /// redirects every caller of the public name, and a reset returns the
+    /// function to its own code.
+    ///
+    /// One test rather than three, because the slot is a process-wide `static`
+    /// and the test harness runs tests on several threads: separate tests would
+    /// observe each other's installs in whatever order the threads happened to
+    /// interleave. Asserting the sequence in one body is what makes it
+    /// deterministic.
+    #[test]
+    fn the_slot_dispatches_installs_and_resets() {
+        fn replacement() -> f32 {
+            999.0
+        }
+
+        assert_eq!(
+            get_color_a(),
+            133.0,
+            "an empty slot must fall through to the compiled-in body"
+        );
+
+        // The recorded text, not a hand-written guess: the spelling comes from
+        // `stringify!` inside the macro.
+        let signature =
+            pill_engine::hot_patch::plain_function_signature("pill_dummy_color::get_color_a")
+                .expect("the function must be registered");
+
+        pill_engine::hot_patch::install_plain_function(
+            "pill_dummy_color::get_color_a",
+            replacement as *const () as usize,
+            signature,
+        )
+        .expect("install with the recorded signature must be accepted");
+        assert_eq!(get_color_a(), 999.0, "callers must see the replacement");
+
+        pill_engine::hot_patch::reset_plain_function("pill_dummy_color::get_color_a")
+            .expect("reset must find the registered function");
+        assert_eq!(
+            get_color_a(),
+            133.0,
+            "a reset must return the function to its own body"
+        );
+    }
 }

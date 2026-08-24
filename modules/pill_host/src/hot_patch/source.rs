@@ -271,6 +271,20 @@ pub fn top_level_use_statements(source: &str) -> Vec<String> {
 // Hot function discovery
 // =============================================================================
 
+/// Which hot-patching attribute a function carries.
+///
+/// The two are redirected through different machinery, so a patch has to know
+/// which one it is replacing before it can be generated or installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotFunctionKind {
+    /// `#[pill_hot]` - an ECS system, redirected through the engine's registry
+    /// in this process.
+    System,
+    /// `#[pill_hot_fn]` - a plain function, redirected through a slot that
+    /// exists once per artifact linking the crate.
+    PlainFunction,
+}
+
 /// Names of the functions this file marks with `#[pill_hot]`.
 ///
 /// The attribute is the developer's opt-in, so it also defines the set of
@@ -278,9 +292,17 @@ pub fn top_level_use_statements(source: &str) -> Vec<String> {
 /// in the file - including other functions' bodies - counts as a structural
 /// change and forces a full reload.
 pub fn hot_function_names(source: &str) -> Vec<String> {
+    hot_functions(source)
+        .into_iter()
+        .map(|(name, _kind)| name)
+        .collect()
+}
+
+/// Every hot function in this file, paired with the attribute that marked it.
+pub fn hot_functions(source: &str) -> Vec<(String, HotFunctionKind)> {
     let mask = code_mask(source);
     let bytes = source.as_bytes();
-    let mut names = Vec::new();
+    let mut names: Vec<(String, HotFunctionKind)> = Vec::new();
     let mut index = 0usize;
 
     while let Some(found) = source[index..].find("#[pill_hot") {
@@ -289,6 +311,14 @@ pub fn hot_function_names(source: &str) -> Vec<String> {
             index = attribute_start + 1;
             continue;
         }
+        // `#[pill_hot_fn]` shares its prefix with `#[pill_hot]`, so the longer
+        // name is tested first; anything else starting with the prefix (a
+        // `#[pill_hot(name = "...")]` override, for instance) is a system.
+        let kind = if source[attribute_start..].starts_with("#[pill_hot_fn") {
+            HotFunctionKind::PlainFunction
+        } else {
+            HotFunctionKind::System
+        };
         // The declaration follows the attribute (and any further attributes).
         // Scan forward for the next real-code `fn ` and take its name.
         let mut cursor = attribute_start;
@@ -315,8 +345,8 @@ pub fn hot_function_names(source: &str) -> Vec<String> {
             cursor += 1;
         }
         if let Some(name) = name {
-            if !names.contains(&name) {
-                names.push(name);
+            if !names.iter().any(|(existing, _)| *existing == name) {
+                names.push((name, kind));
             }
         }
         index = attribute_start + 1;

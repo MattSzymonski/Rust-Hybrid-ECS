@@ -202,6 +202,33 @@ impl OptionalModuleSlot {
         &self.config.name
     }
 
+    /// Whether this module's watcher has signalled a change not yet acted on.
+    ///
+    /// Lets the per-function fast path look at a pending change before
+    /// [`Self::reload_if_changed`] turns it into a full rebuild.
+    #[cfg(feature = "hot_patch")]
+    pub(crate) fn has_pending_reload(&self) -> bool {
+        self.reload_generation.load(Ordering::Acquire) != self.last_processed_generation
+    }
+
+    /// Mark the pending change as handled without rebuilding.
+    ///
+    /// Called only when a patch has already delivered the edit, so the reload
+    /// it would otherwise trigger has nothing left to do.
+    #[cfg(feature = "hot_patch")]
+    pub(crate) fn consume_pending_reload(&mut self) {
+        // Re-read rather than storing an earlier value, for the same reason
+        // `reload_if_changed` does: a save during the patch advances the
+        // counter again and the next frame must retry.
+        self.last_processed_generation = self.reload_generation.load(Ordering::Acquire);
+    }
+
+    /// The module's currently loaded library, as a patch target.
+    #[cfg(feature = "hot_patch")]
+    pub(crate) fn current_library(&self) -> &NativeLibrary {
+        &self.current
+    }
+
     /// Every component type name the current generation registered, exposed
     /// to the C# backend for byte-level bindings.
     pub(crate) fn exposed_component_names(&self) -> &[String] {

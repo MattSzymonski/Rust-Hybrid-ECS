@@ -26,6 +26,20 @@
 //! Patch libraries are never unloaded. A slot may hold an address inside one
 //! for the rest of the process, and nothing re-homes those addresses.
 
+// A development-only facility, refused at compile time in an optimized build.
+//
+// Hot patching shells out to `rustc`, writes DLLs into the temp directory and
+// loads them into the running process, and every annotated function pays an
+// indirection. None of that belongs in a shipped binary, and the failure mode
+// of shipping it by accident is silent rather than loud - so the build stops
+// here instead. Enable it only in a debug profile.
+#[cfg(not(debug_assertions))]
+compile_error!(
+    "the `hot_patch` feature is a development facility and cannot be built with \
+     optimizations: it invokes `rustc` at runtime and loads generated libraries \
+     into the process. Build without `--release`, or drop the feature."
+);
+
 // Standard library
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -39,6 +53,8 @@ use pill_engine::Engine;
 // Current crate
 pub(crate) mod compile;
 pub(crate) mod source;
+
+use crate::native_library::NativeLibrary;
 
 use compile::CargoRustcLine;
 
@@ -63,9 +79,71 @@ const PATCH_RESOLVER_EXPORT: &[u8] = b"pill_patch_resolve";
 /// and changed nothing.
 const PATCH_NAME_PREFIX: &str = "pill_patch::";
 
+/// Export that reports where a patched plain function lives.
+///
+/// Named from `PATCH_RESOLVER_EXPORT` by the same macro that generates it, and
+/// distinct from the crate's own `pill_hot_resolve_plain` for the same reason.
+const PATCH_PLAIN_EXPORT: &[u8] = b"pill_patch_resolve_plain";
+
 // =============================================================================
 // Outcome
 // =============================================================================
+
+/// Why a change could not be satisfied by a patch, or why an attempt failed.
+///
+/// The `code` is a stable kebab-case tag and the `detail` is the sentence a
+/// developer reads. Splitting them means a test can assert a specific reason
+/// without matching prose that is free to improve, which is what makes the
+/// per-reason cases in `devops/tests/` meaningful rather than brittle.
+#[derive(Debug, Clone)]
+pub(crate) struct PatchRefusal {
+    /// Stable tag, printed in parentheses after the headline.
+    pub code: &'static str,
+    /// Human explanation, printed on its own line.
+    pub detail: String,
+}
+
+impl PatchRefusal {
+    /// A refusal with a stable code and a formatted explanation.
+    fn new(code: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            code,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// The change touched something a patch cannot express.
+pub(crate) mod refusal_code {
+    /// A source file appeared that was not in the baseline snapshot.
+    pub const NEW_SOURCE_FILE: &str = "new-source-file";
+    /// The changed file marks no function as hot-patchable.
+    pub const NO_HOT_FUNCTION: &str = "no-hot-function";
+    /// Something outside a hot body moved: a signature, type, constant, import
+    /// or another function.
+    pub const OUTSIDE_HOT_BODY: &str = "outside-hot-body";
+    /// More than one hot body changed in the same edit.
+    pub const MULTIPLE_HOT_BODIES: &str = "multiple-hot-bodies";
+    /// More than one source file changed in the same edit.
+    pub const MULTIPLE_FILES: &str = "multiple-files";
+}
+
+/// The change was in scope, but the attempt to deliver it did not complete.
+pub(crate) mod failure_code {
+    /// The edited function could not be located in the changed source.
+    pub const GENERATE: &str = "generate";
+    /// Writing the generated source, or capturing the compiler flags, failed.
+    pub const PREPARE: &str = "prepare";
+    /// `rustc` rejected the generated patch.
+    pub const COMPILE: &str = "compile";
+    /// The compiled patch could not be mapped into the process.
+    pub const LOAD: &str = "load";
+    /// The patch did not report the replacement the host asked for.
+    pub const RESOLVE: &str = "resolve";
+    /// A running artifact refused the replacement, typically because the
+    /// signature no longer matches.
+    pub const INSTALL: &str = "install";
+}
 
 /// What one attempt at a fast patch did.
 #[derive(Debug)]
@@ -74,26 +152,36 @@ pub(crate) enum PatchOutcome {
     Patched {
         /// Qualified name of the patched function.
         function: String,
+        /// Which generation this became; generation zero is the original code
+        /// the running artifact was built with.
+        generation: u32,
         /// Wall time from noticing the change to the slot being installed.
         elapsed_milliseconds: f64,
         /// Per-stage breakdown, so the dominant cost is visible rather than
         /// guessed at. Without this a slow patch is just a number.
         stages: PatchStages,
+        /// Size of the compiled patch, for the analytics line.
+        artifact_bytes: u64,
+        /// Exports the compiled patch carries, for the analytics line.
+        exports: usize,
     },
     /// Nothing relevant changed.
     Unchanged,
     /// The change is real but out of scope; the caller should reload normally.
     NotPatchable {
-        /// Why, phrased for a developer reading the console.
-        reason: String,
+        /// Stable code and the sentence explaining it.
+        refusal: PatchRefusal,
     },
     /// A patch was attempted and failed. The previous implementation is intact
     /// and the caller should reload normally.
     Failed {
         /// Which function was being patched.
         function: String,
-        /// First line of the failure, already trimmed for the console.
-        detail: String,
+        /// Which generation is still running, so the console says what the
+        /// process is executing rather than only what did not happen.
+        active_generation: u32,
+        /// Stable code and the first line of the failure.
+        failure: PatchRefusal,
     },
 }
 
@@ -131,11 +219,52 @@ impl std::fmt::Display for PatchStages {
 // =============================================================================
 
 /// One loaded patch library, kept mapped for the process lifetime.
+///
+/// Never unloaded, unlike the module graveyard: a slot holds an address inside
+/// this image and nothing re-homes those addresses. That is also what makes
+/// rollback a single pointer store rather than a rebuild.
 struct Generation {
     /// Qualified name of the function this generation replaced.
     function: String,
+    /// One-based position in this function's history. Generation zero is the
+    /// original code the running artifact was built with, which has no entry
+    /// here because it needs no library.
+    number: u32,
+    /// Address to install to make this generation active again.
+    address: usize,
+    /// How the replacement is delivered, which decides what rollback does.
+    kind: source::HotFunctionKind,
+    /// Signature identity a system's slot checks before accepting the address.
+    signature_hash: u64,
+    /// Signature text a plain function's slot checks before accepting it.
+    signature: String,
+    /// When this generation went live, for `patch_generations` listings.
+    installed_at: Instant,
     /// Keeps the library mapped; a dispatch slot points into its code.
     _library: Library,
+}
+
+/// What one successful `apply` produced, for the outcome and analytics line.
+struct Installed {
+    /// Which generation this became.
+    generation: u32,
+    /// Size of the compiled patch on disk.
+    artifact_bytes: u64,
+    /// Exports the compiled patch carries.
+    exports: usize,
+}
+
+/// One entry in a function's patch history, for hosts and tooling.
+#[derive(Debug, Clone)]
+pub struct PatchGeneration {
+    /// Qualified name of the patched function.
+    pub function: String,
+    /// One-based position in the history; zero is the original code.
+    pub number: u32,
+    /// Address currently associated with this generation.
+    pub address: usize,
+    /// Seconds since this generation was installed.
+    pub age_seconds: f64,
 }
 
 /// Drives the fast path for one project.
@@ -144,8 +273,9 @@ pub(crate) struct HotPatchSession {
     package: String,
     crate_root: PathBuf,
     source_root: PathBuf,
-    /// The patched crate's own rlib, so generated sources can `use <crate>::*`
-    /// and get the identical types the running module holds.
+    /// The patched crate's own rlib - the staged copy the host built, so
+    /// generated sources can `use <crate>::*` and get the identical types the
+    /// running module holds.
     package_rlib: PathBuf,
     /// The host's own build command for this crate, feature flags included.
     ///
@@ -160,6 +290,10 @@ pub(crate) struct HotPatchSession {
     rustc_line: Option<CargoRustcLine>,
     /// Loaded patches, never unloaded.
     generations: Vec<Generation>,
+    /// Which generation each patched function is currently running, so a
+    /// failure can report what the process is still executing and a rollback
+    /// knows where it started. Absent means generation zero, the original.
+    active_generations: HashMap<String, u32>,
     /// Makes each patch's crate name and artifact unique within the process.
     counter: u64,
 }
@@ -173,13 +307,19 @@ impl HotPatchSession {
         workspace_root: &Path,
         package: &str,
         watch_directory: &str,
+        staging_subdirectory: &str,
         build_command: &[String],
     ) -> Option<Self> {
         let source_root = workspace_root.join(watch_directory);
         let crate_root = source_root.join("lib.rs");
+        // The staged copy, not cargo's per-crate slot. Both the project and
+        // every optional module write their `rlib` to an unhashed path that any
+        // other build of the same package overwrites, and a patch that linked
+        // the wrong one would be compiled against a differently configured
+        // engine - giving every type a different `TypeId` than the running
+        // world holds. The host stages what it built and links only that.
         let package_rlib = workspace_root
-            .join("target")
-            .join("debug")
+            .join(staging_subdirectory)
             .join(format!("lib{package}.rlib"));
 
         let mut session = Self {
@@ -192,6 +332,7 @@ impl HotPatchSession {
             snapshots: HashMap::new(),
             rustc_line: None,
             generations: Vec::new(),
+            active_generations: HashMap::new(),
             counter: 0,
         };
         session.refresh_snapshots();
@@ -213,7 +354,7 @@ impl HotPatchSession {
             // thing a developer needs to know, and a `tracing` line at INFO is
             // easy to lose among the startup output.
             println!(
-                "{} hot patching OFF - the project rlib is missing ({})",
+                "{} hot patching OFF for {package} - its rlib is missing ({})",
                 crate::console::bold_cyan("[hot]"),
                 session.package_rlib.display()
             );
@@ -227,7 +368,7 @@ impl HotPatchSession {
         }
 
         println!(
-            "{} hot patching ON - {annotated} #[pill_hot] function(s)",
+            "{} hot patching ON for {package} - {annotated} hot function(s)",
             crate::console::bold_cyan("[hot]")
         );
         info!(
@@ -251,7 +392,11 @@ impl HotPatchSession {
     ///
     /// Called at the frame boundary, before the normal reload transaction, so
     /// no system is executing when a slot is written.
-    pub(crate) fn try_patch(&mut self, engine: &mut Engine) -> PatchOutcome {
+    pub(crate) fn try_patch(
+        &mut self,
+        engine: &mut Engine,
+        targets: &[(&str, &NativeLibrary)],
+    ) -> PatchOutcome {
         let started = Instant::now();
         let mut stages = PatchStages::default();
 
@@ -261,32 +406,172 @@ impl HotPatchSession {
         let classified = self.classify();
         stages.classify = classify_started.elapsed().as_secs_f64() * 1000.0;
 
-        let (path, function, new_contents) = match classified {
+        let (path, function, kind, new_contents) = match classified {
             Ok(Some(found)) => found,
             Ok(None) => return PatchOutcome::Unchanged,
-            Err(reason) => return PatchOutcome::NotPatchable { reason },
+            Err(refusal) => return PatchOutcome::NotPatchable { refusal },
         };
 
-        let qualified = format!("{}::{}", self.package, function);
+        // The path the running artifact recorded for this function, which is
+        // what both the engine registry and a plain function's slot are keyed
+        // by. Derived from the file's position under the source root, so a
+        // function in a submodule resolves as `crate::module::function` rather
+        // than being looked up under a name nothing registered.
+        let qualified = self.qualified_name(&path, &function);
 
         // Step 2: Generate, compile, load and install. Any failure here leaves
         // the running implementation untouched.
-        match self.apply(engine, &new_contents, &function, &qualified, &mut stages) {
-            Ok(()) => {
+        match self.apply(
+            engine,
+            targets,
+            &new_contents,
+            &function,
+            kind,
+            &qualified,
+            &mut stages,
+        ) {
+            Ok(installed) => {
                 // Only record the new contents once the patch is live, so a
                 // failed attempt is retried on the next change rather than
                 // silently treated as applied.
                 self.snapshots.insert(path, new_contents);
                 PatchOutcome::Patched {
                     function: qualified,
+                    generation: installed.generation,
                     elapsed_milliseconds: started.elapsed().as_secs_f64() * 1000.0,
                     stages,
+                    artifact_bytes: installed.artifact_bytes,
+                    exports: installed.exports,
                 }
             }
-            Err(detail) => PatchOutcome::Failed {
+            // The running implementation is untouched, so the console reports
+            // which generation is still executing rather than only what failed.
+            Err(failure) => PatchOutcome::Failed {
+                active_generation: self.active_generation(&qualified),
                 function: qualified,
-                detail,
+                failure,
             },
+        }
+    }
+
+    /// The generation currently running for one function.
+    ///
+    /// Zero means the original code the artifact was built with, which is also
+    /// the answer when nothing has ever been patched.
+    fn active_generation(&self, qualified: &str) -> u32 {
+        self.active_generations
+            .get(qualified)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Every generation recorded for every function this session has patched.
+    pub(crate) fn generations(&self) -> Vec<PatchGeneration> {
+        self.generations
+            .iter()
+            .map(|generation| PatchGeneration {
+                function: generation.function.clone(),
+                number: generation.number,
+                address: generation.address,
+                age_seconds: generation.installed_at.elapsed().as_secs_f64(),
+            })
+            .collect()
+    }
+
+    /// Whether this session has ever patched `qualified`.
+    pub(crate) fn knows_function(&self, qualified: &str) -> bool {
+        self.active_generations.contains_key(qualified)
+    }
+
+    /// Reinstall an earlier generation of one function.
+    ///
+    /// Generation zero is the original code the running artifact was built
+    /// with; one and up are patches, in the order they were applied. This is a
+    /// single pointer store per artifact - no rebuild, no reload, and nothing
+    /// is unloaded, which is the concrete payoff of dispatching through a slot
+    /// rather than overwriting a function's prologue.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message when the function was never patched by this session,
+    /// when the generation does not exist, or when an artifact refuses the
+    /// address. On any error the currently running implementation is kept.
+    pub(crate) fn rollback(
+        &mut self,
+        engine: &mut Engine,
+        targets: &[(&str, &NativeLibrary)],
+        qualified: &str,
+        number: u32,
+    ) -> Result<(), String> {
+        if !self.knows_function(qualified) {
+            return Err(format!(
+                "`{qualified}` has not been patched in this session, so it has \
+                 no history to roll back to"
+            ));
+        }
+
+        if number == 0 {
+            self.restore_baseline(engine, targets, qualified)?;
+        } else {
+            let generation = self
+                .generations
+                .iter()
+                .find(|candidate| candidate.function == qualified && candidate.number == number)
+                .ok_or_else(|| {
+                    format!("`{qualified}` has no generation {number}")
+                })?;
+            match generation.kind {
+                source::HotFunctionKind::System => engine
+                    .hot_patch(qualified, generation.address, generation.signature_hash)
+                    .map_err(|error| error.to_string())?,
+                source::HotFunctionKind::PlainFunction => install_everywhere(
+                    targets,
+                    qualified,
+                    generation.address,
+                    &generation.signature,
+                )?,
+            }
+        }
+
+        self.active_generations.insert(qualified.to_string(), number);
+        info!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            function = qualified,
+            generation = number,
+            "patch generation rolled back"
+        );
+        Ok(())
+    }
+
+    /// Return one function to the code its artifact was built with.
+    ///
+    /// A system has one baseline address, held by the engine's slot. A plain
+    /// function has one per artifact, so each artifact is asked to empty its
+    /// own slot instead of being handed an address that belongs to another.
+    fn restore_baseline(
+        &self,
+        engine: &mut Engine,
+        targets: &[(&str, &NativeLibrary)],
+        qualified: &str,
+    ) -> Result<(), String> {
+        let kind = self
+            .generations
+            .iter()
+            .find(|candidate| candidate.function == qualified)
+            .map(|generation| generation.kind)
+            .ok_or_else(|| format!("`{qualified}` has no recorded generation"))?;
+
+        match kind {
+            source::HotFunctionKind::System => {
+                let (address, signature_hash) =
+                    engine.hot_patch_baseline(qualified).ok_or_else(|| {
+                        format!("`{qualified}` records no baseline implementation")
+                    })?;
+                engine
+                    .hot_patch(qualified, address, signature_hash)
+                    .map_err(|error| error.to_string())
+            }
+            source::HotFunctionKind::PlainFunction => reset_everywhere(targets, qualified),
         }
     }
 
@@ -299,8 +584,10 @@ impl HotPatchSession {
     /// `Ok(None)` means nothing changed. `Err` carries the reason the change is
     /// out of scope, phrased for the console.
     #[allow(clippy::type_complexity)]
-    fn classify(&mut self) -> Result<Option<(PathBuf, String, String)>, String> {
-        let mut result: Option<(PathBuf, String, String)> = None;
+    fn classify(
+        &mut self,
+    ) -> Result<Option<(PathBuf, String, source::HotFunctionKind, String)>, PatchRefusal> {
+        let mut result: Option<(PathBuf, String, source::HotFunctionKind, String)> = None;
 
         for path in rust_sources(&self.source_root) {
             let Ok(new_contents) = std::fs::read_to_string(&path) else {
@@ -308,30 +595,40 @@ impl HotPatchSession {
             };
             let Some(old_contents) = self.snapshots.get(&path) else {
                 // A new file is a structural change by definition.
-                return Err(format!("new source file {}", path.display()));
+                return Err(PatchRefusal::new(
+                    refusal_code::NEW_SOURCE_FILE,
+                    format!("new source file {}", path.display()),
+                ));
             };
             if *old_contents == new_contents {
                 continue;
             }
 
             // Only the functions the developer annotated may be patched.
-            let hot_names: std::collections::HashSet<String> =
-                source::hot_function_names(&new_contents).into_iter().collect();
-            if hot_names.is_empty() {
-                return Err(format!(
-                    "{} changed but declares no #[pill_hot] function",
-                    file_label(&path)
+            let hot: HashMap<String, source::HotFunctionKind> =
+                source::hot_functions(&new_contents).into_iter().collect();
+            if hot.is_empty() {
+                return Err(PatchRefusal::new(
+                    refusal_code::NO_HOT_FUNCTION,
+                    format!(
+                        "{} changed but declares no #[pill_hot] or #[pill_hot_fn] function",
+                        file_label(&path)
+                    ),
                 ));
             }
+            let hot_names: std::collections::HashSet<String> = hot.keys().cloned().collect();
 
             // Anything outside those bodies must be byte-identical.
             let old_stripped = source::strip_function_bodies(old_contents, &hot_names);
             let new_stripped = source::strip_function_bodies(&new_contents, &hot_names);
             if old_stripped != new_stripped {
-                return Err(format!(
-                    "{} changed outside a #[pill_hot] body (signature, type, \
+                return Err(PatchRefusal::new(
+                    refusal_code::OUTSIDE_HOT_BODY,
+                    format!(
+                    "{} changed outside a hot function body (signature, type, \
                      constant, import or another function)",
-                    file_label(&path)
+                        file_label(&path)
+                    ),
                 ));
             }
 
@@ -350,20 +647,28 @@ impl HotPatchSession {
                 1 => {}
                 _ => {
                     changed.sort();
-                    return Err(format!(
+                    return Err(PatchRefusal::new(
+                        refusal_code::MULTIPLE_HOT_BODIES,
+                        format!(
                         "{} changed {} hot bodies at once ({}); the fast path \
                          patches one function per edit",
-                        file_label(&path),
-                        changed.len(),
-                        changed.join(", ")
+                            file_label(&path),
+                            changed.len(),
+                            changed.join(", ")
+                        ),
                     ));
                 }
             }
 
             if result.is_some() {
-                return Err("more than one source file changed".to_string());
+                return Err(PatchRefusal::new(
+                    refusal_code::MULTIPLE_FILES,
+                    "more than one source file changed",
+                ));
             }
-            result = Some((path, changed.remove(0), new_contents));
+            let function = changed.remove(0);
+            let kind = hot[&function];
+            result = Some((path, function, kind, new_contents));
         }
 
         Ok(result)
@@ -377,20 +682,28 @@ impl HotPatchSession {
     fn apply(
         &mut self,
         engine: &mut Engine,
+        targets: &[(&str, &NativeLibrary)],
         new_contents: &str,
         function: &str,
+        kind: source::HotFunctionKind,
         qualified: &str,
         stages: &mut PatchStages,
-    ) -> Result<(), String> {
+    ) -> Result<Installed, PatchRefusal> {
         self.counter += 1;
         let crate_name = format!("pill_hotpatch_{}", self.counter);
 
         // Generate.
         let generate_started = Instant::now();
-        let generated = self.generate(new_contents, function, qualified)?;
+        let generated = self
+            .generate(new_contents, function, kind, qualified)
+            .map_err(|detail| PatchRefusal::new(failure_code::GENERATE, detail))?;
         let source_path = std::env::temp_dir().join(format!("{crate_name}.rs"));
-        std::fs::write(&source_path, generated.as_bytes())
-            .map_err(|error| format!("cannot write the generated patch: {error}"))?;
+        std::fs::write(&source_path, generated.as_bytes()).map_err(|error| {
+            PatchRefusal::new(
+                failure_code::PREPARE,
+                format!("cannot write the generated patch: {error}"),
+            )
+        })?;
         stages.generate = generate_started.elapsed().as_secs_f64() * 1000.0;
 
         // Compile, replaying cargo's own flags plus the crate's rlib. The
@@ -403,13 +716,17 @@ impl HotPatchSession {
             self.package_rlib.display()
         )];
         let flags_started = Instant::now();
-        let line = self.rustc_line()?;
+        let line = self
+            .rustc_line()
+            .map_err(|detail| PatchRefusal::new(failure_code::PREPARE, detail))?;
         stages.flags = flags_started.elapsed().as_secs_f64() * 1000.0;
         let compile_started = Instant::now();
         let output = line
             .replay(&source_path, &artifact, &crate_name, &extra_externs)
             .output()
-            .map_err(|error| format!("cannot run rustc: {error}"))?;
+            .map_err(|error| {
+                PatchRefusal::new(failure_code::COMPILE, format!("cannot run rustc: {error}"))
+            })?;
         stages.compile = compile_started.elapsed().as_secs_f64() * 1000.0;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -417,41 +734,109 @@ impl HotPatchSession {
                 .lines()
                 .find(|line| line.starts_with("error"))
                 .unwrap_or("rustc rejected the generated patch");
-            return Err(first.to_string());
+            return Err(PatchRefusal::new(failure_code::COMPILE, first));
         }
 
         // Load. Never unloaded: a slot will hold an address inside this image.
         // SAFETY: the file was just produced by rustc from a generated source
         // and is a complete native module.
         let load_started = Instant::now();
-        let library = unsafe { Library::new(&artifact) }
-            .map_err(|error| format!("cannot load the patch library: {error}"))?;
+        let library = unsafe { Library::new(&artifact) }.map_err(|error| {
+            PatchRefusal::new(
+                failure_code::LOAD,
+                format!("cannot load the patch library: {error}"),
+            )
+        })?;
         stages.load = load_started.elapsed().as_secs_f64() * 1000.0;
         let activate_started = Instant::now();
 
-        // Resolve the replacement through the patch's own resolver export.
-        let lookup_name = format!("{PATCH_NAME_PREFIX}{qualified}");
-        let (address, signature_hash) = resolve_in(&library, &lookup_name)?;
+        // Measured before installing, so the analytics line carries the same
+        // two numbers a module reload does. Both are best-effort: a patch is
+        // still correct when its size or export table cannot be read.
+        let artifact_bytes = std::fs::metadata(&artifact)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let exports = crate::analytics::inspect_pe(&artifact)
+            .map(|inspection| inspection.exports.len())
+            .unwrap_or(0);
 
-        // Install at the frame boundary. The engine refuses a signature that no
-        // longer matches, so a shape change can never be applied behind a call
-        // site compiled for the old one.
-        engine
-            .hot_patch(qualified, address, signature_hash)
-            .map_err(|error| error.to_string())?;
+        // Filled in by whichever route runs below, and recorded on the
+        // generation so a rollback can reinstall exactly this address without
+        // recompiling anything.
+        let address;
+        let mut signature_hash = 0u64;
+        let mut signature = String::new();
+
+        // Install at the frame boundary. Both routes refuse a signature that no
+        // longer matches, so a reshaped function can never be applied behind a
+        // call site compiled for the old shape.
+        match kind {
+            // A system is dispatched through the engine's own registry, which
+            // lives once in this process because the engine is one shared
+            // library. One install reaches every caller.
+            source::HotFunctionKind::System => {
+                let lookup_name = format!("{PATCH_NAME_PREFIX}{qualified}");
+                let (found, hash) = resolve_in(&library, &lookup_name)
+                    .map_err(|detail| PatchRefusal::new(failure_code::RESOLVE, detail))?;
+                engine.hot_patch(qualified, found, hash).map_err(|error| {
+                    PatchRefusal::new(failure_code::INSTALL, error.to_string())
+                })?;
+                address = found;
+                signature_hash = hash;
+            }
+            // A plain function has no registry: its redirect slot is a static
+            // compiled into each artifact that links the crate. The project DLL
+            // embeds its own copy of a module it depends on, and so does every
+            // other module linking it, so the same replacement is offered to all
+            // of them - which is exactly what makes the cascading project reload
+            // this edit would otherwise trigger unnecessary.
+            source::HotFunctionKind::PlainFunction => {
+                let lookup_name = format!("{crate_name}::{function}");
+                let (found, found_signature) = resolve_plain_in(&library, &lookup_name)
+                    .map_err(|detail| PatchRefusal::new(failure_code::RESOLVE, detail))?;
+                install_everywhere(targets, qualified, found, &found_signature)
+                    .map_err(|detail| PatchRefusal::new(failure_code::INSTALL, detail))?;
+                address = found;
+                signature = found_signature;
+            }
+        }
         stages.activate = activate_started.elapsed().as_secs_f64() * 1000.0;
 
+        // One past the highest number this function already carries, so each
+        // function is numbered independently and a rollback does not renumber
+        // the history it rolled back over.
+        let generation = self
+            .generations
+            .iter()
+            .filter(|existing| existing.function == qualified)
+            .map(|existing| existing.number)
+            .max()
+            .unwrap_or(0)
+            + 1;
         self.generations.push(Generation {
             function: qualified.to_string(),
+            number: generation,
+            address,
+            kind,
+            signature_hash,
+            signature,
+            installed_at: Instant::now(),
             _library: library,
         });
+        self.active_generations
+            .insert(qualified.to_string(), generation);
         debug!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             function = qualified,
+            generation,
             generations = self.generations.len(),
             "patch generation installed"
         );
-        Ok(())
+        Ok(Installed {
+            generation,
+            artifact_bytes,
+            exports,
+        })
     }
 
     /// Produce the patch source for one edited function.
@@ -464,6 +849,7 @@ impl HotPatchSession {
         &self,
         new_contents: &str,
         function: &str,
+        kind: source::HotFunctionKind,
         qualified: &str,
     ) -> Result<String, String> {
         let found = source::find_function(new_contents, function)
@@ -471,6 +857,34 @@ impl HotPatchSession {
 
         let imports = source::top_level_use_statements(new_contents).join("\n");
         let package = &self.package;
+
+        // A plain function needs no registry entry, so it keeps the attribute
+        // it already carries and is looked up under the patch crate's own name.
+        // That name is unique per patch, so it cannot be confused with the copy
+        // of the same function the linked rlib also contributes.
+        if kind == source::HotFunctionKind::PlainFunction {
+            return Ok(format!(
+                "// GENERATED by pill_host hot patching - do not edit.\n\
+                 //\n\
+                 // One edited function, compiled against the same artifacts the\n\
+                 // running module linked.\n\
+                 #![allow(unused_imports, dead_code, unused_mut)]\n\
+                 \n\
+                 {imports}\n\
+                 use {package}::*;\n\
+                 \n\
+                 // The same attribute the module itself uses, so the signature\n\
+                 // text the two sides compare is produced by one macro from one\n\
+                 // piece of source rather than reconstructed by hand.\n\
+                 #[::pill_engine::pill_hot_fn]\n\
+                 {body}\n\
+                 \n\
+                 // A distinct export name: the linked rlib already provides\n\
+                 // `pill_hot_resolve`.\n\
+                 ::pill_engine::pill_hot_resolver!(pill_patch_resolve);\n",
+                body = found.text
+            ));
+        }
 
         Ok(format!(
             "// GENERATED by pill_host hot patching - do not edit.\n\
@@ -492,6 +906,37 @@ impl HotPatchSession {
              ::pill_engine::pill_hot_resolver!(pill_patch_resolve);\n",
             body = found.text
         ))
+    }
+
+    /// The path the running artifact recorded for a function in `path`.
+    ///
+    /// `module_path!()` inside the crate follows the file tree, so the name a
+    /// slot or a registry entry is keyed by is the crate name plus the
+    /// directories between the source root and the file. A function in
+    /// `src/lib.rs` is therefore `crate::function`, and one in `src/color.rs`
+    /// is `crate::color::function`.
+    fn qualified_name(&self, path: &Path, function: &str) -> String {
+        let mut segments = vec![self.package.clone()];
+        if let Ok(relative) = path.strip_prefix(&self.source_root) {
+            let components: Vec<_> = relative.components().collect();
+            for (index, component) in components.iter().enumerate() {
+                let name = component.as_os_str().to_string_lossy();
+                let last = index + 1 == components.len();
+                let name = if last {
+                    name.strip_suffix(".rs").unwrap_or(&name).to_string()
+                } else {
+                    name.into_owned()
+                };
+                // `lib.rs` and `mod.rs` name the module their location already
+                // implies, so they contribute no segment of their own.
+                if name == "lib" || name == "mod" {
+                    continue;
+                }
+                segments.push(name);
+            }
+        }
+        segments.push(function.to_string());
+        segments.join("::")
     }
 
     /// The captured compiler flags, asking cargo on first use.
@@ -556,6 +1001,119 @@ fn resolve_in(library: &Library, lookup_name: &str) -> Result<(usize, u64), Stri
     Ok((address, signature_hash))
 }
 
+/// Ask a loaded patch where its replacement for a plain function lives.
+///
+/// Returns the address to jump to and the signature text the patch compiled it
+/// with, which every receiving artifact checks against its own before
+/// accepting the replacement.
+fn resolve_plain_in(library: &Library, lookup_name: &str) -> Result<(usize, String), String> {
+    type ResolvePlainFn =
+        unsafe extern "C" fn(*const std::ffi::c_char, *mut *const u8, *mut usize) -> usize;
+
+    // SAFETY: the export is generated by `pill_hot_resolver!` with exactly this
+    // C ABI signature, and the borrow ends before the library is moved.
+    let resolve: Symbol<ResolvePlainFn> =
+        unsafe { library.get(PATCH_PLAIN_EXPORT) }.map_err(|_| {
+            format!(
+                "the patch does not export `{}`",
+                String::from_utf8_lossy(PATCH_PLAIN_EXPORT)
+            )
+        })?;
+
+    let encoded = std::ffi::CString::new(lookup_name)
+        .map_err(|_| "the function name contains a NUL byte".to_string())?;
+    let mut signature_pointer: *const u8 = std::ptr::null();
+    let mut signature_length: usize = 0;
+    // SAFETY: a NUL-terminated name and two writable slots, as the export
+    // requires. On success it writes a pointer into the patch's own static
+    // storage, which stays mapped because patches are never unloaded.
+    let address = unsafe {
+        resolve(
+            encoded.as_ptr(),
+            &mut signature_pointer,
+            &mut signature_length,
+        )
+    };
+
+    if address == 0 {
+        return Err(format!("the patch does not define `{lookup_name}`"));
+    }
+    if signature_pointer.is_null() {
+        return Err(format!("the patch reported no signature for `{lookup_name}`"));
+    }
+    // SAFETY: the export wrote a pointer and length describing a `&'static str`
+    // inside the loaded patch, so the bytes are readable and valid UTF-8.
+    let signature = unsafe { std::slice::from_raw_parts(signature_pointer, signature_length) };
+    let signature = std::str::from_utf8(signature)
+        .map_err(|_| "the patch reported a signature that is not UTF-8".to_string())?;
+    Ok((address, signature.to_string()))
+}
+
+/// Offer one replacement to every loaded artifact, and report how many took it.
+///
+/// A crate linked into several artifacts is compiled into each of them, so the
+/// project DLL runs its own embedded copy of a module it depends on. Installing
+/// only into the module's own DLL would leave that copy running the old code,
+/// which is exactly the situation that forces a cascading project reload today.
+fn install_everywhere(
+    targets: &[(&str, &NativeLibrary)],
+    qualified: &str,
+    address: usize,
+    signature: &str,
+) -> Result<(), String> {
+    let mut installed = Vec::new();
+    for (label, artifact) in targets {
+        match artifact.install_plain_function(qualified, address, signature) {
+            Ok(true) => installed.push(*label),
+            // This artifact simply does not link the crate.
+            Ok(false) => {}
+            // A refusal is reported rather than tolerated: leaving some
+            // artifacts patched and others not would be worse than not
+            // patching at all, and the caller falls back to a full reload.
+            Err(detail) => return Err(format!("{label}: {detail}")),
+        }
+    }
+    if installed.is_empty() {
+        return Err(format!(
+            "no loaded artifact declares `{qualified}`; it may live in a crate \
+             nothing has loaded yet"
+        ));
+    }
+    debug!(
+        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        function = qualified,
+        artifacts = installed.join(", ").as_str(),
+        "plain function redirected in every artifact that links it"
+    );
+    Ok(())
+}
+
+/// Return one function to its own body in every artifact that declares it.
+///
+/// The counterpart of [`install_everywhere`] for a rollback to generation zero.
+/// A plain function has one baseline per artifact, so each is asked to empty
+/// its own slot rather than being handed an address belonging to another.
+fn reset_everywhere(targets: &[(&str, &NativeLibrary)], qualified: &str) -> Result<(), String> {
+    let mut restored = Vec::new();
+    for (label, artifact) in targets {
+        match artifact.reset_plain_function(qualified) {
+            Ok(true) => restored.push(*label),
+            Ok(false) => {}
+            Err(detail) => return Err(format!("{label}: {detail}")),
+        }
+    }
+    if restored.is_empty() {
+        return Err(format!("no loaded artifact declares `{qualified}`"));
+    }
+    debug!(
+        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        function = qualified,
+        artifacts = restored.join(", ").as_str(),
+        "plain function restored to its original body in every artifact"
+    );
+    Ok(())
+}
+
 /// Every `.rs` file under `root`, in stable order.
 fn rust_sources(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
@@ -607,12 +1165,18 @@ mod tests {
             snapshots: HashMap::new(),
             rustc_line: None,
             generations: Vec::new(),
+            active_generations: HashMap::new(),
             counter: 0,
         };
 
         let contents = "use pill_engine::*;\n\n#[pill_hot]\nfn movement(value: i32) -> i32 { value * 2 }\n";
         let generated = session
-            .generate(contents, "movement", "project::movement")
+            .generate(
+                contents,
+                "movement",
+                source::HotFunctionKind::System,
+                "project::movement",
+            )
             .expect("generated");
 
         assert!(generated.contains("name = \"pill_patch::project::movement\""));
@@ -624,6 +1188,77 @@ mod tests {
         // The original attribute must NOT be duplicated.
         assert_eq!(generated.matches("#[").filter(|_| true).count() >= 1, true);
         assert_eq!(generated.matches("pill_hot(name").count(), 1);
+    }
+
+    /// A plain function is generated with its own attribute and no registry
+    /// override, because it is redirected through per-artifact slots rather
+    /// than through the engine's registry.
+    #[test]
+    fn a_plain_function_keeps_its_own_attribute() {
+        let directory = std::env::temp_dir().join("pill_generate_plain");
+        let _ = std::fs::remove_dir_all(&directory);
+        let session = session_over(&directory, PLAIN_SOURCE);
+
+        let generated = session
+            .generate(
+                PLAIN_SOURCE,
+                "get_color_a",
+                source::HotFunctionKind::PlainFunction,
+                "project::get_color_a",
+            )
+            .expect("a plain function must generate");
+
+        assert!(generated.contains("#[::pill_engine::pill_hot_fn]"));
+        // A `name` override belongs to the system path only: a plain function
+        // is found under the patch crate's own unique name.
+        assert!(!generated.contains("pill_hot(name"));
+        assert!(generated.contains("pill_hot_resolver!(pill_patch_resolve)"));
+        assert!(generated.contains("133.0"));
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Classification must report which attribute marked the changed function,
+    /// because the two are installed through entirely different machinery.
+    #[test]
+    fn classify_reports_the_plain_function_kind() {
+        let directory = std::env::temp_dir().join("pill_classify_plain");
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut session = session_over(&directory, PLAIN_SOURCE);
+
+        let edited = PLAIN_SOURCE.replace("133.0", "999.0");
+        std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
+
+        let classified = session.classify().expect("body-only edit must be accepted");
+        let (_, function, kind, _) = classified.expect("a change must be reported");
+        assert_eq!(function, "get_color_a");
+        assert_eq!(kind, source::HotFunctionKind::PlainFunction);
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The name a slot is keyed by follows the file tree, so a function in a
+    /// submodule must not be looked up under the crate root's name.
+    #[test]
+    fn qualified_names_follow_the_source_tree() {
+        let directory = std::env::temp_dir().join("pill_qualified_names");
+        let _ = std::fs::remove_dir_all(&directory);
+        let session = session_over(&directory, PLAIN_SOURCE);
+
+        assert_eq!(
+            session.qualified_name(&directory.join("lib.rs"), "get_color_a"),
+            "project::get_color_a"
+        );
+        assert_eq!(
+            session.qualified_name(&directory.join("color.rs"), "get_color_a"),
+            "project::color::get_color_a"
+        );
+        assert_eq!(
+            session.qualified_name(&directory.join("color").join("mod.rs"), "get_color_a"),
+            "project::color::get_color_a"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// A session over a throwaway source tree, so classification can be driven
@@ -643,11 +1278,37 @@ mod tests {
             snapshots: HashMap::new(),
             rustc_line: None,
             generations: Vec::new(),
+            active_generations: HashMap::new(),
             counter: 0,
         };
         session.refresh_snapshots();
         session
     }
+
+    const PLAIN_SOURCE: &str = r#"
+use pill_engine::pill_hot_fn;
+
+#[pill_hot_fn]
+pub fn get_color_a() -> f32 {
+    133.0
+}
+"#;
+
+    const TWO_HOT_SOURCE: &str = r#"
+use pill_engine::*;
+
+const SPEED: f32 = 1.0;
+
+#[pill_hot]
+fn movement(value: f32) -> f32 {
+    value * SPEED
+}
+
+#[pill_hot]
+fn other_movement(value: f32) -> f32 {
+    value - 1.0
+}
+"#;
 
     const HOT_SOURCE: &str = r#"
 use pill_engine::*;
@@ -676,8 +1337,9 @@ fn helper(value: f32) -> f32 {
         std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
 
         let classified = session.classify().expect("body-only edit must be accepted");
-        let (_, function, contents) = classified.expect("a change must be reported");
+        let (_, function, kind, contents) = classified.expect("a change must be reported");
         assert_eq!(function, "movement");
+        assert_eq!(kind, source::HotFunctionKind::System);
         assert!(contents.contains("value * SPEED * 2.0"));
 
         let _ = std::fs::remove_dir_all(&directory);
@@ -716,14 +1378,88 @@ fn helper(value: f32) -> f32 {
             assert_ne!(edited, HOT_SOURCE, "{label}: the fixture edit must apply");
             std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
 
-            let outcome = session.classify();
-            assert!(
-                outcome.is_err(),
-                "{label}: a change outside a hot body must be refused, got {outcome:?}"
+            let refusal = session
+                .classify()
+                .expect_err(&format!("{label}: a change outside a hot body must be refused"));
+            assert_eq!(
+                refusal.code,
+                refusal_code::OUTSIDE_HOT_BODY,
+                "{label}: {}",
+                refusal.detail
             );
 
             let _ = std::fs::remove_dir_all(&directory);
         }
+    }
+
+    /// Two hot bodies in one edit are refused with their own code: the fast
+    /// path deliberately patches one function per edit.
+    #[test]
+    fn classify_refuses_two_changed_bodies() {
+        let directory = std::env::temp_dir().join("pill_classify_two_bodies");
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut session = session_over(&directory, TWO_HOT_SOURCE);
+
+        let edited = TWO_HOT_SOURCE
+            .replace("value * SPEED", "value * SPEED * 2.0")
+            .replace("value - 1.0", "value - 9.0");
+        std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
+
+        let refusal = session.classify().expect_err("two bodies must be refused");
+        assert_eq!(refusal.code, refusal_code::MULTIPLE_HOT_BODIES, "{}", refusal.detail);
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Two changed files in one edit are refused with their own code.
+    #[test]
+    fn classify_refuses_two_changed_files() {
+        let directory = std::env::temp_dir().join("pill_classify_two_files");
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut session = session_over(&directory, HOT_SOURCE);
+        // A second file that is part of the baseline, so changing it later is
+        // an edit rather than a new file.
+        std::fs::write(directory.join("other.rs"), HOT_SOURCE).expect("write second file");
+        session.refresh_snapshots();
+
+        let edited = HOT_SOURCE.replace("value * SPEED", "value * SPEED * 2.0");
+        std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
+        std::fs::write(directory.join("other.rs"), &edited).expect("write second edit");
+
+        let refusal = session.classify().expect_err("two files must be refused");
+        assert_eq!(refusal.code, refusal_code::MULTIPLE_FILES, "{}", refusal.detail);
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A file that was not in the baseline is a structural change by
+    /// definition, and says so with its own code.
+    #[test]
+    fn classify_refuses_a_new_source_file() {
+        let directory = std::env::temp_dir().join("pill_classify_new_file");
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut session = session_over(&directory, HOT_SOURCE);
+
+        std::fs::write(directory.join("appeared.rs"), HOT_SOURCE).expect("write new file");
+
+        let refusal = session.classify().expect_err("a new file must be refused");
+        assert_eq!(refusal.code, refusal_code::NEW_SOURCE_FILE, "{}", refusal.detail);
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Rolling back a function this session never patched is refused rather
+    /// than silently doing nothing, and names the function.
+    #[test]
+    fn rollback_refuses_an_unknown_function() {
+        let directory = std::env::temp_dir().join("pill_rollback_unknown");
+        let _ = std::fs::remove_dir_all(&directory);
+        let session = session_over(&directory, HOT_SOURCE);
+
+        assert!(!session.knows_function("project::movement"));
+        assert!(session.generations().is_empty());
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// A file with no annotation is refused rather than silently ignored, so a
@@ -738,8 +1474,8 @@ fn helper(value: f32) -> f32 {
         std::fs::write(directory.join("lib.rs"), "fn ordinary(value: f32) -> f32 { value * 2.0 }\n")
             .expect("write edit");
 
-        let error = session.classify().expect_err("must be refused");
-        assert!(error.contains("no #[pill_hot]"), "unexpected reason: {error}");
+        let refusal = session.classify().expect_err("must be refused");
+        assert_eq!(refusal.code, refusal_code::NO_HOT_FUNCTION);
 
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -756,10 +1492,16 @@ fn helper(value: f32) -> f32 {
             snapshots: HashMap::new(),
             rustc_line: None,
             generations: Vec::new(),
+            active_generations: HashMap::new(),
             counter: 0,
         };
         assert!(session
-            .generate("fn other() {}", "movement", "project::movement")
+            .generate(
+                "fn other() {}",
+                "movement",
+                source::HotFunctionKind::System,
+                "project::movement",
+            )
             .is_err());
     }
 }

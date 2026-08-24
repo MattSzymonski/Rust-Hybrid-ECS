@@ -557,8 +557,34 @@ impl ModuleAnalytics {
     }
 }
 
+/// How a generation of code reached the running process.
+///
+/// Both kinds print the same `[analytics] reload ...` line so one parser reads
+/// both; the `kind=` field is what separates them. A patch is not a second
+/// format, it is a reload whose phases happen to be much cheaper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "hot_patch"), allow(dead_code))]
+pub(crate) enum EventKind {
+    /// A module or project DLL was rebuilt, reloaded and re-registered.
+    Reload,
+    /// One function's implementation was replaced in place.
+    Patch,
+}
+
+impl EventKind {
+    /// The value printed after `kind=`.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Reload => "reload",
+            Self::Patch => "patch",
+        }
+    }
+}
+
 /// A snapshot of one completed hot reload, printed on the next frame.
 struct ReloadEvent {
+    /// Whether this was a whole-artifact reload or an in-place patch.
+    kind: EventKind,
     name: String,
     build_ms: u64,
     stage_ms: f64,
@@ -593,6 +619,13 @@ struct Analytics {
     skips: u64,
     /// Total wall time of the newest cargo `--timings` report, in seconds.
     last_cargo_total_seconds: f64,
+    /// Function patches that went live in this process.
+    patches: u64,
+    /// Changes the fast path declined to patch, which fell through to a reload.
+    patch_refusals: u64,
+    /// Patches that were attempted and failed, leaving the previous
+    /// implementation running.
+    patch_failures: u64,
 }
 
 /// The process-wide collector, initialized on first use.
@@ -610,6 +643,9 @@ fn analytics() -> &'static Mutex<Analytics> {
             builds: 0,
             skips: 0,
             last_cargo_total_seconds: 0.0,
+            patches: 0,
+            patch_refusals: 0,
+            patch_failures: 0,
         })
     })
 }
@@ -753,6 +789,7 @@ pub(crate) fn record_reload(name: &str) {
     let snapshot = {
         let module = &collector.modules[index];
         ReloadEvent {
+            kind: EventKind::Reload,
             name: name.to_string(),
             build_ms: module.build_wall_ms,
             stage_ms: module.stage_ms,
@@ -766,6 +803,86 @@ pub(crate) fn record_reload(name: &str) {
         }
     };
     collector.pending_reload_events.push(snapshot);
+}
+
+/// Record one function patch, in the same shape a module reload is recorded.
+///
+/// The phase mapping is deliberate rather than approximate. `build` is `rustc`,
+/// the patch's analogue of a module's cargo build; `stage` is everything that
+/// prepares the thing to build (classification, source generation and the flag
+/// capture); `load` is `LoadLibrary`; and `init` is the install that makes the
+/// new code live, which is what `project_init` does for a reload. `migrate` is
+/// always zero because a patch cannot change a component schema - that is
+/// precisely the kind of edit it refuses.
+#[cfg(feature = "hot_patch")]
+pub(crate) fn record_patch(
+    function: &str,
+    generation: u32,
+    stage_ms: f64,
+    build_ms: u64,
+    load_ms: f64,
+    activate_ms: f64,
+    artifact_bytes: u64,
+    exports: usize,
+) {
+    let mut collector = analytics()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    collector.patches += 1;
+    collector.pending_reload_events.push(ReloadEvent {
+        kind: EventKind::Patch,
+        name: function.to_string(),
+        build_ms,
+        stage_ms,
+        load_ms,
+        init_ms: activate_ms,
+        migrate_ms: 0.0,
+        artifact_bytes,
+        exports,
+        // A function's generation IS its patch count, so the shared
+        // `(reload #N)` column stays meaningful for both kinds.
+        reload_count: generation,
+        // No cargo invocation ran, so there is no per-crate breakdown to show.
+        cargo_crates: Vec::new(),
+    });
+}
+
+/// Record that the fast path declined a change and fell through to a reload.
+#[cfg(feature = "hot_patch")]
+pub(crate) fn record_patch_refusal() {
+    let mut collector = analytics()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    collector.patch_refusals += 1;
+}
+
+/// Record that a patch was attempted and failed, keeping the previous code.
+#[cfg(feature = "hot_patch")]
+pub(crate) fn record_patch_failure() {
+    let mut collector = analytics()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    collector.patch_failures += 1;
+}
+
+/// Print the running patch / refusal / failure tally, when there is one.
+///
+/// Takes its own lock rather than borrowing the caller's, because
+/// `print_reload_events` has already released it by the time it prints.
+fn print_patch_tally() {
+    let collector = analytics()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if collector.patches == 0 && collector.patch_refusals == 0 && collector.patch_failures == 0 {
+        return;
+    }
+    println!(
+        "{} fast path: patches {} | refused {} | failed {}",
+        console::bold_cyan("[analytics]"),
+        console::yellow(&collector.patches.to_string()),
+        console::yellow(&collector.patch_refusals.to_string()),
+        console::yellow(&collector.patch_failures.to_string()),
+    );
 }
 
 /// Record the host process's current and peak memory (called at setup end).
@@ -989,7 +1106,7 @@ pub(crate) fn print_reload_events(reload_started: std::time::Instant) -> usize {
     for event in &events {
         println!(
             "{} reload {} {} | build={} | stage={}ms | load={}ms | init={}ms | \
-             migrate={}ms | size={} | exports={}",
+             migrate={}ms | size={} | exports={} | kind={}",
             console::bold_cyan("[analytics]"),
             console::bold_cyan(&event.name),
             console::dim(&format!("(reload #{})", event.reload_count)),
@@ -1008,6 +1125,7 @@ pub(crate) fn print_reload_events(reload_started: std::time::Instant) -> usize {
                 "-".to_string()
             }),
             console::yellow(&event.exports.to_string()),
+            console::yellow(event.kind.label()),
         );
         // The module line above is only the transaction's own timings; the
         // cargo `--timings` breakdown shows every crate the build actually
@@ -1046,6 +1164,12 @@ pub(crate) fn print_reload_events(reload_started: std::time::Instant) -> usize {
         .collect();
     let phases_ms: u64 = segment_ms.iter().sum();
     let gap_ms = total_ms.saturating_sub(phases_ms);
+    // The running fast-path tally, printed alongside the transaction it belongs
+    // to rather than in the startup report, where these are always zero.
+    // Suppressed entirely until the fast path has done something, so a project
+    // that has not opted in sees no extra noise.
+    print_patch_tally();
+
     let label = if count > 1 {
         "cascade total"
     } else {

@@ -129,6 +129,13 @@ pub struct HotSlot {
     current: AtomicUsize,
     /// Signature identity of the system this slot was created for.
     signature_hash: AtomicU64,
+    /// The implementation recorded at registration, kept so a patch can be
+    /// rolled back to the code the running artifact was actually built with.
+    ///
+    /// Separate from `current` because `current` is overwritten by every
+    /// install, and without this the original address would be unrecoverable
+    /// after the first patch.
+    original: AtomicUsize,
 }
 
 impl HotSlot {
@@ -137,6 +144,7 @@ impl HotSlot {
         Self {
             current: AtomicUsize::new(0),
             signature_hash: AtomicU64::new(0),
+            original: AtomicUsize::new(0),
         }
     }
 
@@ -147,6 +155,18 @@ impl HotSlot {
     pub fn initialize(&self, address: usize, signature_hash: u64) {
         self.current.store(address, Ordering::Release);
         self.signature_hash.store(signature_hash, Ordering::Release);
+        // Unconditionally, not only when unset: a reload builds a fresh slot
+        // for the new artifact, and its baseline is that artifact's code.
+        self.original.store(address, Ordering::Release);
+    }
+
+    /// The implementation recorded at registration.
+    ///
+    /// This is what a rollback to generation zero installs, and it stays valid
+    /// for as long as the artifact that registered the system is loaded - which
+    /// the host guarantees by never unmapping a retired generation.
+    pub fn original(&self) -> usize {
+        self.original.load(Ordering::Acquire)
     }
 
     /// The implementation to call now.
@@ -338,6 +358,195 @@ where
     Input: SystemParam,
 {
     <F as SystemParamFunction<Input>>::run as *const () as usize
+}
+
+// =============================================================================
+// Plain-function slots
+// =============================================================================
+
+/// A dispatch slot for an ordinary function marked `#[pill_hot_fn]`.
+///
+/// Systems get their indirection for free: the engine holds their boxed closure
+/// and can swap what it calls. An ordinary `pub fn` has no such holder - callers
+/// call it directly - so the indirection has to live inside the function itself.
+/// `#[pill_hot_fn]` renames the real body and turns the public name into a
+/// dispatcher that reads this slot.
+///
+/// Unlike [`HotSlot`], this is a `static` inside whichever artifact compiled the
+/// function, not a registry entry on the engine. That is deliberate: a crate
+/// linked into several artifacts has an independent copy of its code in each,
+/// and each copy's callers must be redirected separately.
+#[derive(Debug)]
+pub struct PlainSlot {
+    /// Installed replacement, or zero while the original is still current.
+    current: AtomicUsize,
+}
+
+impl PlainSlot {
+    /// A slot holding no replacement.
+    pub const fn new() -> Self {
+        Self {
+            current: AtomicUsize::new(0),
+        }
+    }
+
+    /// The address to call: the installed replacement, or `original`.
+    ///
+    /// `Relaxed` would be enough on x86-64, but the acquire pairs with
+    /// `install`'s release so a freshly loaded patch's code is visible to
+    /// whichever thread calls next on weaker orderings too.
+    #[inline]
+    pub fn current_or(&self, original: usize) -> usize {
+        match self.current.load(Ordering::Acquire) {
+            0 => original,
+            installed => installed,
+        }
+    }
+
+    /// Install a replacement implementation.
+    pub fn install(&self, address: usize) {
+        self.current.store(address, Ordering::Release);
+    }
+
+    /// Empty the slot, so calls fall back to the body compiled into this
+    /// artifact.
+    ///
+    /// A plain function has no single baseline address the host could reinstall:
+    /// every artifact linking the crate holds its own copy. Emptying the slot is
+    /// how each of them returns to its own original code.
+    pub fn reset(&self) {
+        self.current.store(0, Ordering::Release);
+    }
+
+    /// Whether a replacement is currently installed.
+    pub fn is_patched(&self) -> bool {
+        self.current.load(Ordering::Acquire) != 0
+    }
+}
+
+impl Default for PlainSlot {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// One `#[pill_hot_fn]` declared in this artifact.
+pub struct PillHotSlotDescriptor {
+    /// Fully-qualified path, as `module_path!() + "::" + fn name`.
+    pub qualified_name: &'static str,
+    /// The dispatcher's slot, so a host can redirect it.
+    pub slot: &'static PlainSlot,
+    /// The signature as written, used as the compatibility gate.
+    ///
+    /// Text rather than a `TypeId`, because a patch is a separately compiled
+    /// artifact and both sides must derive the same value from the same source.
+    pub signature: &'static str,
+    /// Address of the body itself, reached through a fn pointer because casting
+    /// a function to `usize` is not permitted in the constant context that
+    /// builds this struct.
+    ///
+    /// The body and not the dispatcher: a patch hands this address to every
+    /// artifact holding a copy of the function, and naming the dispatcher would
+    /// make each call take an extra hop through a slot that is never installed.
+    pub implementation_address: fn() -> usize,
+}
+
+inventory::collect!(PillHotSlotDescriptor);
+
+/// Redirect a `#[pill_hot_fn]` declared in THIS artifact.
+///
+/// # Errors
+///
+/// Returns [`HotPatchError::UnknownSystem`] when this artifact declares no such
+/// function, [`HotPatchError::NullAddress`] for a null replacement, and
+/// [`HotPatchError::SignatureMismatch`] when the signature text differs - which
+/// is what stops a reshaped function being installed behind call sites compiled
+/// for the old shape.
+pub fn install_plain_function(
+    qualified_name: &str,
+    address: usize,
+    signature: &str,
+) -> Result<(), HotPatchError> {
+    let descriptor = inventory::iter::<PillHotSlotDescriptor>
+        .into_iter()
+        .find(|descriptor| descriptor.qualified_name == qualified_name)
+        .ok_or_else(|| HotPatchError::UnknownSystem {
+            name: qualified_name.to_string(),
+        })?;
+
+    if address == 0 {
+        return Err(HotPatchError::NullAddress {
+            name: qualified_name.to_string(),
+        });
+    }
+    if descriptor.signature != signature {
+        return Err(HotPatchError::SignatureMismatch {
+            name: qualified_name.to_string(),
+            expected: text_hash(descriptor.signature),
+            found: text_hash(signature),
+        });
+    }
+    descriptor.slot.install(address);
+    Ok(())
+}
+
+/// Return one `#[pill_hot_fn]` to the body compiled into this artifact.
+///
+/// # Errors
+///
+/// Returns [`HotPatchError::UnknownSystem`] when this artifact declares no such
+/// function.
+pub fn reset_plain_function(qualified_name: &str) -> Result<(), HotPatchError> {
+    let descriptor = inventory::iter::<PillHotSlotDescriptor>
+        .into_iter()
+        .find(|descriptor| descriptor.qualified_name == qualified_name)
+        .ok_or_else(|| HotPatchError::UnknownSystem {
+            name: qualified_name.to_string(),
+        })?;
+    descriptor.slot.reset();
+    Ok(())
+}
+
+/// Names of every `#[pill_hot_fn]` this artifact declares.
+pub fn plain_function_names() -> impl Iterator<Item = &'static str> {
+    inventory::iter::<PillHotSlotDescriptor>
+        .into_iter()
+        .map(|descriptor| descriptor.qualified_name)
+}
+
+/// The signature text this artifact recorded for a `#[pill_hot_fn]`.
+///
+/// Callers pass this straight back to [`install_plain_function`] rather than
+/// reconstructing it: the exact spelling comes from `stringify!` inside the
+/// macro, so writing it by hand is guesswork that fails the gate on a stray
+/// space. A patch artifact derives its own copy from the same source through
+/// the same macro, which is what makes the two comparable.
+pub fn plain_function_signature(qualified_name: &str) -> Option<&'static str> {
+    inventory::iter::<PillHotSlotDescriptor>
+        .into_iter()
+        .find(|descriptor| descriptor.qualified_name == qualified_name)
+        .map(|descriptor| descriptor.signature)
+}
+
+/// Address and signature of a `#[pill_hot_fn]` this artifact declares.
+///
+/// This is the pair a host needs in order to install this artifact's
+/// implementation into another artifact's copy of the same function: the
+/// address to jump to, and the signature text that copy compares against its
+/// own before accepting it.
+pub fn plain_function_entry(qualified_name: &str) -> Option<(usize, &'static str)> {
+    inventory::iter::<PillHotSlotDescriptor>
+        .into_iter()
+        .find(|descriptor| descriptor.qualified_name == qualified_name)
+        .map(|descriptor| ((descriptor.implementation_address)(), descriptor.signature))
+}
+
+/// Stable hash of a signature string, used only to report a mismatch.
+fn text_hash(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
 // =============================================================================
@@ -661,6 +870,7 @@ mod integration_tests {
     isolated_systems!(unknown_refused);
     isolated_systems!(cleared_slots);
     isolated_systems!(second_patch);
+    isolated_systems!(rolled_back);
 
     /// A different signature, used to prove the gate refuses it.
     fn differently_shaped_system() -> Result<(), SystemError> {
@@ -837,6 +1047,77 @@ mod integration_tests {
         // Clearing through one name must retire the other too.
         engine.clear_systems();
         assert!(engine.hot_patch_registry().is_empty());
+    }
+
+    /// A system can be returned to the code its artifact was built with, after
+    /// any number of patches.
+    ///
+    /// This is generation zero of a rollback. It works because the slot records
+    /// the registration address separately from the current one - without that,
+    /// the first patch would make the original unreachable.
+    #[test]
+    fn a_system_can_be_rolled_back_to_its_baseline() {
+        use rolled_back as systems;
+        let mut engine = sequential_engine();
+        engine.register_system("counter", systems::original);
+
+        let (baseline, baseline_hash) = engine
+            .hot_patch_baseline("counter")
+            .expect("a registered system must record a baseline");
+
+        // Three generations, as a live-coding session produces.
+        for _ in 0..3 {
+            engine
+                .hot_patch(
+                    "counter",
+                    local_implementation_address::<_, ()>(&systems::replacement),
+                    signature_hash_of::<_, ()>(&systems::replacement),
+                )
+                .expect("patch");
+        }
+        engine.process_frame().expect("frame");
+        assert_eq!(systems::observed(), 10, "the patch must be running");
+
+        // The baseline is still reachable and still installable.
+        engine
+            .hot_patch("counter", baseline, baseline_hash)
+            .expect("rollback to the baseline must be accepted");
+        engine.process_frame().expect("frame");
+        assert_eq!(
+            systems::observed(),
+            11,
+            "generation zero must run the original body"
+        );
+    }
+
+    /// A plain function's slot falls back to the artifact's own body once
+    /// emptied, which is how a plain function rolls back to generation zero.
+    #[test]
+    fn an_emptied_plain_slot_falls_back_to_the_original() {
+        fn original() -> u32 {
+            1
+        }
+        fn replacement() -> u32 {
+            2
+        }
+
+        let slot = PlainSlot::new();
+        let original_address = original as *const () as usize;
+        assert_eq!(slot.current_or(original_address), original_address);
+
+        slot.install(replacement as *const () as usize);
+        assert_eq!(
+            slot.current_or(original_address),
+            replacement as *const () as usize,
+            "an installed replacement must win"
+        );
+
+        slot.reset();
+        assert_eq!(
+            slot.current_or(original_address),
+            original_address,
+            "an emptied slot must fall back to the artifact's own body"
+        );
     }
 
     /// Patching twice runs the newest implementation, which is what a second
