@@ -1466,20 +1466,36 @@ const CONCURRENCY_DATA = [
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// When a real cargo `--timings` report exists in the workspace, the
-    /// parser must find at least one executed crate (the host always builds
-    /// with `--timings`, so any recent report has one). Skipped when the
-    /// workspace has never produced a report (fresh CI checkout).
+    /// The parser reads a real report from this workspace without choking on
+    /// it, and every crate it names carries a duration.
+    ///
+    /// Two states are skipped rather than asserted on, because neither says
+    /// anything about the parser. The workspace may never have produced a report
+    /// (a fresh checkout), and - the case that used to fail this test - the
+    /// newest report may come from a build where nothing needed recompiling. An
+    /// up-to-date build still writes a full report, but every unit in it has
+    /// `"duration": 0`, and the parser deliberately keeps only units that
+    /// actually ran. Asserting on a non-empty result therefore made this test
+    /// depend on what the developer happened to build last.
     #[test]
     fn parses_real_workspace_timings_when_present() {
         let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let Some(timing) = parse_latest_cargo_timings(workspace_root) else {
             return;
         };
-        assert!(
-            !timing.crate_durations_ms.is_empty(),
-            "a real --timings report must name at least one executed crate"
-        );
+        if timing.crate_durations_ms.is_empty() {
+            // A no-op build: a real report, correctly parsed, with nothing in it
+            // that executed.
+            return;
+        }
+        // What the parser promises about the entries it does return.
+        for (crate_name, duration_ms) in &timing.crate_durations_ms {
+            assert!(!crate_name.is_empty(), "a named unit must have a name");
+            assert!(
+                *duration_ms > 0,
+                "`{crate_name}` was kept, so it must have a non-zero duration"
+            );
+        }
     }
 
     /// The dependency reader extracts names from the fingerprint's

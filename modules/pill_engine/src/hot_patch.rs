@@ -893,6 +893,13 @@ pub unsafe fn restore_prologue(target: usize, original: &[u8]) -> Result<(), Str
     if target == 0 {
         return Err("cannot restore a null address".to_string());
     }
+    // The same guard `patch_prologue` carries, for the same reason: this writes
+    // twelve bytes over live code and no twelve-byte write is atomic, so a
+    // thread executing inside those bytes could observe a torn instruction
+    // stream. Restoring is not the gentler operation it sounds like - it is the
+    // identical hazard in the other direction, and the doc comment above already
+    // claims the contract. Enforced here rather than assumed.
+    check_patching_thread()?;
     // The same bound the patch was checked against. A restore aimed at an
     // address whose image has since been replaced would otherwise write into
     // whatever now occupies it, so the extent is re-read rather than trusted.

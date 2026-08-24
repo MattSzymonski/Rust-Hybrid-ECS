@@ -186,9 +186,16 @@ impl OptionalModuleSlot {
         );
         self.reload(engine, engine_api, workspace_root, generation);
 
-        // Re-read rather than storing the captured value: a save during the
-        // build advances the counter again, and the next frame must retry.
-        self.last_processed_generation = self.reload_generation.load(Ordering::Acquire);
+        // The generation observed BEFORE the reload, deliberately, not a fresh
+        // read. A save during the build advances the counter past this value,
+        // and recording the newer one would mark that save as handled when
+        // nothing built it - the edit would then sit on disk, never compiled,
+        // until something else happened to touch the crate. Recording the
+        // baseline instead leaves the newer save pending, so the next frame
+        // rebuilds with it. This is also what makes the build cancellation in
+        // `run_build_command` mean anything: it aborts the moment the counter
+        // moves, precisely so the newer sources win.
+        self.last_processed_generation = generation;
         true
     }
 
@@ -202,25 +209,32 @@ impl OptionalModuleSlot {
         &self.config.name
     }
 
-    /// Whether this module's watcher has signalled a change not yet acted on.
+    /// The generation this module's watcher has signalled but nothing has acted
+    /// on yet, if any.
     ///
     /// Lets the per-function fast path look at a pending change before
-    /// [`Self::reload_if_changed`] turns it into a full rebuild.
+    /// [`Self::reload_if_changed`] turns it into a full rebuild. The value is
+    /// returned rather than just a flag so the caller can hand the exact
+    /// generation it acted on back to [`Self::consume_pending_reload`].
     #[cfg(feature = "hot_patch")]
-    pub(crate) fn has_pending_reload(&self) -> bool {
-        self.reload_generation.load(Ordering::Acquire) != self.last_processed_generation
+    pub(crate) fn pending_reload_generation(&self) -> Option<u64> {
+        let generation = self.reload_generation.load(Ordering::Acquire);
+        (generation != self.last_processed_generation).then_some(generation)
     }
 
-    /// Mark the pending change as handled without rebuilding.
+    /// Mark one observed generation as handled without rebuilding.
     ///
-    /// Called only when a patch has already delivered the edit, so the reload
+    /// Called only when a patch has already delivered that edit, so the reload
     /// it would otherwise trigger has nothing left to do.
+    ///
+    /// Takes the generation the caller acted on rather than reading a fresh one,
+    /// for the same reason [`Self::reload_if_changed`] records its baseline: a
+    /// save that lands while the patch is compiling advances the counter past
+    /// it, and that save has not been delivered by anything. Recording it as
+    /// handled would strand the edit on disk.
     #[cfg(feature = "hot_patch")]
-    pub(crate) fn consume_pending_reload(&mut self) {
-        // Re-read rather than storing an earlier value, for the same reason
-        // `reload_if_changed` does: a save during the patch advances the
-        // counter again and the next frame must retry.
-        self.last_processed_generation = self.reload_generation.load(Ordering::Acquire);
+    pub(crate) fn consume_pending_reload(&mut self, generation: u64) {
+        self.last_processed_generation = generation;
     }
 
     /// The module's currently loaded library, as a patch target.
@@ -334,6 +348,17 @@ impl OptionalModuleSlot {
                 "new generation failed to initialize; rolling back"
             );
             engine.clear_systems_owned_by(self.owner);
+
+            // What the failed generation managed to register before giving up.
+            // `clear_systems_owned_by` retires systems and their dispatch slots
+            // but not component registrations, and a component's storage factory
+            // holds function pointers into the image that registered it - the
+            // one about to be dropped and unmapped at the end of this branch.
+            let failed_registrations = engine
+                .world()
+                .registered_component_names_since(component_registration_sequence);
+
+            let rollback_sequence = engine.world().component_registration_sequence();
             engine.begin_module_registration(self.owner);
             let rollback_status = self.current.call_init(engine_api);
             engine.end_module_registration();
@@ -344,6 +369,30 @@ impl OptionalModuleSlot {
                     status = rollback_status,
                     "rollback also failed; this module now contributes no systems"
                 );
+            }
+
+            // Anything the rollback re-registered is safe: registering a type
+            // overwrites its factory with pointers into the still-mapped
+            // generation. What is left over is a type only the failed generation
+            // knew about, whose factory would keep pointing into an unmapped
+            // image. No entity can carry such a type - the module that defines
+            // it never finished initialising - so this frees registry entries
+            // rather than data.
+            let rollback_registrations = engine
+                .world()
+                .registered_component_names_since(rollback_sequence);
+            let stranded: Vec<String> = failed_registrations
+                .into_iter()
+                .filter(|name| !rollback_registrations.contains(name))
+                .collect();
+            if !stranded.is_empty() {
+                warn!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    module = self.config.name.as_str(),
+                    types = stranded.join(", ").as_str(),
+                    "dropping registrations from the failed generation; their                      storage factories point into the image being unmapped"
+                );
+                engine.world_mut().drop_forgotten_components(&stranded);
             }
             return;
         }

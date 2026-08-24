@@ -70,7 +70,7 @@ pub fn grayscale(tint: Tint) -> f32 {
 /// opaque, for other crates to call as a stand-in.
 #[pill_hot_fn]
 pub fn get_color_a() -> f32 {
-    113.0
+    11.0
 }
 
 // =============================================================================

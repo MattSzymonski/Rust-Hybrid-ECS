@@ -180,7 +180,7 @@ impl Spline {
     /// Dummy alpha channel, delegated straight through to `pill_dummy_color`.
     #[pill_hot_fn]
     pub fn get_color_a(&self) -> f32 {
-        pill_dummy_color::get_color_a() + 1.0
+        pill_dummy_color::get_color_a() + 30.0
     }
 }
 

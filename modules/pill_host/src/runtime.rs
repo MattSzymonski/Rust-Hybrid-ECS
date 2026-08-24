@@ -595,9 +595,12 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
         } = &mut *host;
 
         for index in 0..module_hot_patch.len() {
-            if !optional_modules[index].has_pending_reload() {
+            // Captured before the patch runs: a save that lands while it
+            // compiles advances the counter past this value and must stay
+            // pending, because nothing has delivered it.
+            let Some(pending) = optional_modules[index].pending_reload_generation() else {
                 continue;
-            }
+            };
             let Some(session) = module_hot_patch[index].as_mut() else {
                 continue;
             };
@@ -607,7 +610,7 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
             // updated.
             drop(targets);
             if report_patch_outcome(outcome) {
-                optional_modules[index].consume_pending_reload();
+                optional_modules[index].consume_pending_reload(pending);
             }
         }
     }
@@ -690,8 +693,11 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
                 patched = report_patch_outcome(outcome);
             }
             if patched {
-                // The edit is fully accounted for; skip the rebuild.
-                host.last_processed_generation = host.reload_generation.load(Ordering::Acquire);
+                // The edit is fully accounted for; skip the rebuild. Recorded as
+                // the generation observed above rather than a fresh read: a save
+                // that arrived while the patch compiled is a different edit that
+                // nothing has delivered, and must stay pending.
+                host.last_processed_generation = pending;
             }
         }
     }
@@ -733,7 +739,13 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
             // frame observes the newer generation and rebuilds.
             Some((&host.reload_generation, generation)),
         );
-        host.last_processed_generation = host.reload_generation.load(Ordering::Acquire);
+        // The baseline the reload ran against, not a fresh read. A save during
+        // the build advances the counter past it and cancels the compilation
+        // above; recording the newer value would mark that save as handled when
+        // the build it cancelled produced nothing, stranding the edit on disk.
+        // Recording the baseline is what lets the next frame observe it and
+        // rebuild - which is what the cancellation is for.
+        host.last_processed_generation = generation;
     }
 
     // Print the analytics line for every reload completed this frame (optional
