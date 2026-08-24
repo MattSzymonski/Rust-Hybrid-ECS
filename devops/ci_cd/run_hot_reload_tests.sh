@@ -16,6 +16,13 @@
 #        (managed backend startup, codegen mirror content, empty-exposure
 #        handling, clean managed build, Rust->C# and C#->Rust bridge probes,
 #        behavior-only C# hot reload, mirror regeneration on restart)
+#   (5) devops/tests/test_hot_patch_coverage.py          - live-patch coverage
+#        Asserts every crate that CAN be live-patched actually is. A patch that
+#        cannot be built falls back to a full reload, so the fast path can die
+#        for an entire crate without any test noticing - the edit still lands,
+#        just seconds later. This suite reads the host's own verdict per crate
+#        and fails when one loses its fast path, and reports crates that have
+#        no fast path at all.
 #
 #   Each suite launches the standalone host and drives live source edits
 #   against a real project and an optional module, asserting the host's reload
@@ -25,7 +32,7 @@
 #   modules/optional/pill_spline/src/lib.rs, so a normal developer workspace
 #   is left exactly as it was.
 #
-#   Expected runtime: ~10-15 minutes (plus the initial host build unless
+#   Expected runtime: ~15-20 minutes (plus the initial host build unless
 #   --skip-build is used).
 #
 #   NOTE: suite (4) needs the .NET SDK on PATH (the host runs `dotnet build`
@@ -96,7 +103,7 @@ esac
 
 echo ""
 echo -e "${BOLD}${CYAN}===============================================================================${NC}"
-echo -e "${BOLD}${CYAN}Hot-reload regression net (4 suites)${NC}"
+echo -e "${BOLD}${CYAN}Hot-reload regression net (5 suites)${NC}"
 echo "  timeout scale:  ${TIMEOUT_SCALE}"
 if [ "$SKIP_BUILD" = 1 ]; then
     echo "  host build:     skipped (assumed up to date; main suite only)"
@@ -108,7 +115,7 @@ echo ""
 overall_exit=0
 
 # --- 1. Main hot-reload suite (sessions A/B) ---------------------------------
-echo -e "${BOLD}${CYAN}--- Suite 1/3: test_hot_reload_suite.py ---${NC}"
+echo -e "${BOLD}${CYAN}--- Suite 1/5: test_hot_reload_suite.py ---${NC}"
 if [ "$SKIP_BUILD" = 1 ]; then
     extra_args=(--skip-build)
 else
@@ -124,7 +131,7 @@ fi
 
 # --- 2. Migration suite -------------------------------------------------------
 echo ""
-echo -e "${BOLD}${CYAN}--- Suite 2/3: test_hot_reload_migration.py ---${NC}"
+echo -e "${BOLD}${CYAN}--- Suite 2/5: test_hot_reload_migration.py ---${NC}"
 set +e
 python devops/tests/test_hot_reload_migration.py --timeout-scale "$TIMEOUT_SCALE"
 migration_exit=$?
@@ -135,7 +142,7 @@ fi
 
 # --- 3. Module->project cascade suite -----------------------------------------
 echo ""
-echo -e "${BOLD}${CYAN}--- Suite 3/3: test_module_project_auto_reload.py ---${NC}"
+echo -e "${BOLD}${CYAN}--- Suite 3/5: test_module_project_auto_reload.py ---${NC}"
 set +e
 python devops/tests/test_module_project_auto_reload.py --timeout-scale "$TIMEOUT_SCALE"
 cascade_exit=$?
@@ -146,7 +153,7 @@ fi
 
 # --- 4. C# <-> Rust bridge suite ---------------------------------------------
 echo ""
-echo -e "${BOLD}${CYAN}--- Suite 4/4: test_csharp_bridge.py ---${NC}"
+echo -e "${BOLD}${CYAN}--- Suite 4/5: test_csharp_bridge.py ---${NC}"
 set +e
 python devops/tests/test_csharp_bridge.py --timeout-scale "$TIMEOUT_SCALE" "${extra_args[@]}"
 csharp_exit=$?
@@ -155,10 +162,24 @@ if [ "$csharp_exit" -ne 0 ]; then
     overall_exit="$csharp_exit"
 fi
 
+# --- 5. Live-patch coverage ---------------------------------------------------
+# Runs last because it needs the host built and every module loadable, which the
+# suites above have already proven by this point. It also leaves the workspace
+# exactly as it found it, so its position does not affect the others.
+echo ""
+echo -e "${BOLD}${CYAN}--- Suite 5/5: test_hot_patch_coverage.py ---${NC}"
+set +e
+python devops/tests/test_hot_patch_coverage.py --timeout-scale "$TIMEOUT_SCALE" "${extra_args[@]}"
+coverage_exit=$?
+set -e
+if [ "$coverage_exit" -ne 0 ]; then
+    overall_exit="$coverage_exit"
+fi
+
 echo ""
 echo -e "${BOLD}${CYAN}===============================================================================${NC}"
 if [ "$overall_exit" -eq 0 ]; then
-    echo -e "${BOLD}${CYAN}Hot-reload regression net PASSED (all 4 suites)${NC}"
+    echo -e "${BOLD}${CYAN}Hot-reload regression net PASSED (all 5 suites)${NC}"
 else
     echo -e "${BOLD}${RED}Hot-reload regression net FAILED (exit $overall_exit)${NC}"
 fi

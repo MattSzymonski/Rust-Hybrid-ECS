@@ -33,6 +33,14 @@ use std::process::Command;
 
 /// Flags whose value is a SEPARATE following token (`-C` `opt-level=0`), so the
 /// parser must consume two tokens to keep pairs together.
+/// Identifies how a cached compiler line was tokenized.
+///
+/// Bump this whenever [`tokenize`] changes, so caches written by the previous
+/// parser are re-captured instead of replayed. Nothing else in the cache key can
+/// detect that: a parser fix leaves the manifests, the lockfile and the build
+/// command exactly as they were.
+const CACHE_FORMAT_VERSION: &str = "pill-hotpatch-flags-v2";
+
 const TWO_TOKEN_FLAGS: &[&str] = &[
     "-C",
     "-L",
@@ -348,6 +356,13 @@ impl CargoRustcLine {
     /// are paths and flags), so no escaping is needed.
     pub fn save(&self, path: &Path, build_command: &[String]) -> std::io::Result<()> {
         let mut text = String::with_capacity(4096);
+        // How the tokens in this file were produced. A cache written by an older
+        // tokenizer holds tokens split the wrong way, and nothing else in the key
+        // would notice: the manifests, the lockfile and the build command are all
+        // unchanged by fixing the parser. Bumping this is what makes a stale
+        // cache be re-captured rather than replayed.
+        text.push_str(CACHE_FORMAT_VERSION);
+        text.push('\n');
         // The command this was captured for, so a feature change invalidates it.
         text.push_str(&build_command.join("\u{1}"));
         text.push('\n');
@@ -385,7 +400,11 @@ impl CargoRustcLine {
         let text = std::fs::read_to_string(path).ok()?;
         let mut lines = text.lines();
 
-        // First line is the command this was captured for.
+        // Written by a different tokenizer, so its tokens cannot be trusted.
+        if lines.next()? != CACHE_FORMAT_VERSION {
+            return None;
+        }
+        // Then the command this was captured for.
         let recorded_command = lines.next()?;
         if recorded_command != build_command.join("\u{1}") {
             return None;
@@ -473,17 +492,50 @@ fn extract_backticked(line: &str) -> Option<String> {
 fn tokenize(command: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
-    let mut inside_quotes = false;
+    // Which quote character opened the group being read, if any. Cargo uses
+    // single quotes for most arguments but switches to double quotes with
+    // backslash escapes when the value itself contains a double quote - which
+    // `--check-cfg 'cfg(feature, values("rendering"))'` does. Treating only
+    // single quotes as grouping split that one argument in half and handed
+    // rustc `values(\"rendering\"))"` as a second input filename, so every
+    // patch of a crate with features failed with "multiple input filenames
+    // provided" and fell back to a full reload.
+    let mut opened_by: Option<char> = None;
+    let mut escaped = false;
     let mut has_content = false;
 
     for character in command.chars() {
+        // A backslash inside double quotes escapes the next character; inside
+        // single quotes cargo does not escape, so a backslash is literal - which
+        // matters because every Windows path in this command line is full of
+        // them.
+        if escaped {
+            current.push(character);
+            has_content = true;
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && opened_by == Some('"') {
+            escaped = true;
+            continue;
+        }
+
         match character {
-            '\'' => {
-                inside_quotes = !inside_quotes;
+            '\'' | '"' => match opened_by {
+                // Closing the group this character opened.
+                Some(opener) if opener == character => opened_by = None,
+                // Inside the other kind of quote, so it is literal content.
+                Some(_) => {
+                    current.push(character);
+                    has_content = true;
+                }
                 // An empty '' is still a real (empty) argument.
-                has_content = true;
-            }
-            character if character.is_whitespace() && !inside_quotes => {
+                None => {
+                    opened_by = Some(character);
+                    has_content = true;
+                }
+            },
+            character if character.is_whitespace() && opened_by.is_none() => {
                 if has_content {
                     tokens.push(std::mem::take(&mut current));
                     has_content = false;
@@ -531,6 +583,198 @@ mod tests {
             program: tokens[0].clone(),
             args: tokens[1..].to_vec(),
         }
+    }
+
+    /// Cargo double-quotes an argument whose value contains a double quote, and
+    /// escapes the inner ones - which `--check-cfg` does for any crate that has
+    /// features.
+    ///
+    /// This is the bug that made the project crate unpatchable. Treating only
+    /// single quotes as grouping split the argument in half, and rustc received
+    /// the tail as a second input filename: "multiple input filenames provided".
+    /// Every project edit fell back to a full reload, with the real cause buried
+    /// in a message that never mentioned quoting.
+    #[test]
+    fn tokenizer_handles_double_quoted_arguments_with_escapes() {
+        let tokens = tokenize(
+            r#"--check-cfg "cfg(feature, values(\"rendering\"))" --edition=2021"#,
+        );
+        assert_eq!(
+            tokens,
+            vec![
+                "--check-cfg".to_string(),
+                r#"cfg(feature, values("rendering"))"#.to_string(),
+                "--edition=2021".to_string(),
+            ],
+            "the check-cfg value must stay one argument"
+        );
+    }
+
+    /// A backslash is literal inside single quotes, which every Windows path in
+    /// this command line depends on.
+    #[test]
+    fn tokenizer_keeps_backslashes_in_single_quoted_paths() {
+        let tokens = tokenize(r"'D:\\proj\\target\\debug\\deps' next");
+        assert_eq!(
+            tokens,
+            vec![
+                r"D:\\proj\\target\\debug\\deps".to_string(),
+                "next".to_string()
+            ]
+        );
+    }
+
+    /// One kind of quote inside the other is literal content, not a delimiter.
+    #[test]
+    fn tokenizer_treats_the_other_quote_as_content() {
+        assert_eq!(
+            tokenize(r#"'it\"s one token' after"#),
+            vec![r#"it\"s one token"#.to_string(), "after".to_string()]
+        );
+    }
+
+    /// Quote one argument the way cargo does, in either style.
+    ///
+    /// Cargo quotes an argument that contains whitespace or a backslash. It
+    /// usually reaches for single quotes, but switches to double quotes with
+    /// backslash escapes for some values - both spellings were observed in this
+    /// workspace for `--check-cfg`, from the same cargo. The tokenizer has to
+    /// read both, so the round-trip below drives both.
+    fn quote_like_cargo(argument: &str, double: bool) -> String {
+        if double {
+            format!("\"{}\"", argument.replace('\\', "\\\\").replace('"', "\\\""))
+        } else {
+            format!("'{argument}'")
+        }
+    }
+
+    /// Every argument shape this command line actually carries must survive a
+    /// quote-then-tokenize round trip, in both quoting styles.
+    ///
+    /// This is the general form of the bug that made every crate with features
+    /// unpatchable: one argument was split in two, rustc took the tail as a
+    /// second input filename, and the patch failed with a message that never
+    /// mentioned quoting. A single hand-written case would not have caught it,
+    /// because the broken shape only appears for `--check-cfg` on a crate that
+    /// has features - so the shapes are enumerated instead.
+    #[test]
+    fn every_argument_shape_survives_a_quoting_round_trip() {
+        let arguments = [
+            // The shape that broke: nested double quotes inside the value.
+            r#"cfg(feature, values("rendering"))"#,
+            r#"cfg(feature, values("default", "module-abi", "rendering"))"#,
+            // No features: no nested quotes, which is why some crates worked.
+            "cfg(docsrs,test)",
+            // Windows paths - backslashes everywhere, and spaces in some.
+            r"D:\\proj\\target\\debug\\deps",
+            r"dependency=D:\\proj\\target\\debug\\deps",
+            r"C:\\Program Files\\rustc\\lib",
+            r"incremental=D:\\proj\\target\\debug\\incremental",
+            // Ordinary flags and values.
+            "--edition=2021",
+            "embed-bitcode=no",
+            "pill_engine=D:\\proj\\libpill_engine-190d6c0e2d2eaf24.rlib",
+            // A lone apostrophe inside a double-quoted value.
+            r#"it's one argument"#,
+        ];
+
+        for argument in arguments {
+            for double in [false, true] {
+                // A single-quoted group cannot carry a single quote, and cargo
+                // would not produce one - skip that impossible pairing.
+                if !double && argument.contains('\'') {
+                    continue;
+                }
+                let quoted = quote_like_cargo(argument, double);
+                let tokens = tokenize(&quoted);
+                assert_eq!(
+                    tokens,
+                    vec![argument.to_string()],
+                    "round trip failed for {argument:?} quoted with {}",
+                    if double { "double quotes" } else { "single quotes" }
+                );
+            }
+        }
+    }
+
+    /// A whole command line tokenizes into flags and values, never into
+    /// fragments.
+    ///
+    /// The failure this guards is specific and silent: a split argument leaves a
+    /// token that is a piece of a value, and rustc treats a token it cannot
+    /// recognize as an input filename. Asserting the count is what makes a split
+    /// visible - a fragment is always one token too many.
+    #[test]
+    fn a_realistic_command_line_yields_no_fragments() {
+        let line = concat!(
+            r#"C:\rustc.exe --crate-name project --edition=2021 "#,
+            r#"'D:\proj\src\lib.rs' --check-cfg 'cfg(docsrs,test)' "#,
+            r#"--check-cfg "cfg(feature, values(\"rendering\"))" "#,
+            r#"-C 'incremental=D:\proj\target\debug\incremental' "#,
+            r#"-L 'dependency=D:\proj\target\debug\deps'"#,
+        );
+        let tokens = tokenize(line);
+
+        assert_eq!(
+            tokens.len(),
+            13,
+            "a fragment would show up as an extra token: {tokens:#?}"
+        );
+        // The value that used to be split in half.
+        assert!(
+            tokens.contains(&r#"cfg(feature, values("rendering"))"#.to_string()),
+            "the check-cfg value must be one token: {tokens:#?}"
+        );
+        // Nothing that rustc would mistake for an input file. Only the real
+        // source path may end in `.rs`, and only quoted paths may contain a
+        // separator, so anything else ending in `.rs` is a fragment.
+        let source_paths: Vec<&String> = tokens
+            .iter()
+            .filter(|token| token.ends_with(".rs"))
+            .collect();
+        assert_eq!(
+            source_paths.len(),
+            1,
+            "exactly one token may look like a source file: {source_paths:#?}"
+        );
+        // A leftover quote in any token means a group was not closed.
+        for token in &tokens {
+            assert!(
+                !token.contains('\'') && !token.starts_with('"'),
+                "token carries an unbalanced quote, so grouping went wrong: {token:?}"
+            );
+        }
+    }
+
+    /// The cache is rejected when it was written by a different tokenizer.
+    ///
+    /// Without this the parser fix would not have reached anyone: the cache key
+    /// is the manifests, the lockfile and the build command, and fixing a parser
+    /// changes none of them, so every existing cache would replay the tokens the
+    /// old parser produced.
+    #[test]
+    fn a_cache_from_a_different_tokenizer_is_rejected() {
+        let directory = std::env::temp_dir().join("pill_flags_cache_version");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create cache dir");
+        let cache = directory.join("flags");
+        let inputs: Vec<std::path::PathBuf> = Vec::new();
+        let command = vec!["cargo".to_string(), "build".to_string()];
+
+        // Written by the current tokenizer: accepted.
+        parsed().save(&cache, &command).expect("save");
+        assert!(CargoRustcLine::load_if_fresh(&cache, &inputs, &command).is_some());
+
+        // The same content with an older version marker: refused.
+        let text = std::fs::read_to_string(&cache).expect("read");
+        let older = text.replacen(CACHE_FORMAT_VERSION, "pill-hotpatch-flags-v1", 1);
+        std::fs::write(&cache, older).expect("write");
+        assert!(
+            CargoRustcLine::load_if_fresh(&cache, &inputs, &command).is_none(),
+            "a cache from another tokenizer must be re-captured, not replayed"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
