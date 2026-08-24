@@ -37,7 +37,32 @@ use pill_core::{error, info};
 // =============================================================================
 
 /// File events arriving within this window are coalesced into one reload.
-const DEBOUNCE_DURATION: Duration = Duration::from_millis(300);
+///
+/// This is pure latency: it is spent sleeping, on every edit, before any work
+/// starts. At 300 ms it was 40% of a ~700 ms save-to-live, chosen before that
+/// number was ever measured.
+///
+/// It exists because one save produces several notifications - editors write,
+/// rename and touch metadata - and each would otherwise start its own rebuild.
+/// The window only has to outlast that burst, which is a few milliseconds, not
+/// hundreds. Override with `PILL_WATCH_DEBOUNCE_MS` when an editor's save
+/// pattern needs more room.
+const DEFAULT_DEBOUNCE_MILLISECONDS: u64 = 60;
+
+/// Environment variable overriding the debounce window.
+const DEBOUNCE_OVERRIDE_VARIABLE: &str = "PILL_WATCH_DEBOUNCE_MS";
+
+/// How long to coalesce a burst of file events, resolved once per process.
+fn debounce_duration() -> Duration {
+    static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| {
+        let milliseconds = std::env::var(DEBOUNCE_OVERRIDE_VARIABLE)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_DEBOUNCE_MILLISECONDS);
+        Duration::from_millis(milliseconds)
+    })
+}
 
 /// Directory names that never contain source code worth rebuilding for.
 const IGNORED_DIRECTORY_NAMES: [&str; 3] = ["target", "bin", "obj"];
@@ -217,7 +242,7 @@ pub(crate) fn spawn_source_watcher(
             // Wait for the burst to settle, deduplicate all signals in a set,
             // and report the trigger before signalling the main loop in the host.
             let mut changed_paths = HashSet::from([first_path]);
-            std::thread::sleep(DEBOUNCE_DURATION);
+            std::thread::sleep(debounce_duration());
             while let Ok(path) = receiver.try_recv() {
                 changed_paths.insert(path);
             }
@@ -261,7 +286,7 @@ pub(crate) fn spawn_source_watcher(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 changed_paths = %report,
                 detection_delay_ms = format!("{detection_delay_ms:.0}").as_str(),
-                debounce_ms = DEBOUNCE_DURATION.as_millis() as u64,
+                debounce_ms = debounce_duration().as_millis() as u64,
                 "source change detected"
             );
 

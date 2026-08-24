@@ -122,8 +122,6 @@ pub(crate) mod refusal_code {
     /// Something outside a hot body moved: a signature, type, constant, import
     /// or another function.
     pub const OUTSIDE_HOT_BODY: &str = "outside-hot-body";
-    /// More than one hot body changed in the same edit.
-    pub const MULTIPLE_HOT_BODIES: &str = "multiple-hot-bodies";
     /// More than one source file changed in the same edit.
     pub const MULTIPLE_FILES: &str = "multiple-files";
     /// The edit landed before this session took its baseline snapshot.
@@ -449,53 +447,70 @@ impl HotPatchSession {
         let classified = self.classify();
         stages.classify = classify_started.elapsed().as_secs_f64() * 1000.0;
 
-        let (path, declaration, new_contents) = match classified {
+        let (path, declarations, new_contents) = match classified {
             Ok(Some(found)) => found,
             Ok(None) => return PatchOutcome::Unchanged,
             Err(refusal) => return PatchOutcome::NotPatchable { refusal },
         };
-        // The path the running artifact recorded for this function, which is
-        // what both the engine registry and a plain function's slot are keyed
-        // by. Derived from the file's position under the source root, so a
-        // function in a submodule resolves as `crate::module::function` rather
-        // than being looked up under a name nothing registered.
-        let qualified = self.qualified_name(&path, &declaration);
-        // The slot route asks under a different name; see `slot_lookup_name`.
-        let slot_name = self.slot_lookup_name(&path, &declaration);
 
-        // Step 2: Generate, compile, load and install. Any failure here leaves
-        // the running implementation untouched.
-        match self.apply(
-            engine,
-            targets,
-            patches,
-            &new_contents,
-            &declaration,
-            &qualified,
-            &slot_name,
-            &mut stages,
-        ) {
-            Ok(installed) => {
-                // Only record the new contents once the patch is live, so a
-                // failed attempt is retried on the next change rather than
-                // silently treated as applied.
-                self.snapshots.insert(path, new_contents);
-                PatchOutcome::Patched {
-                    function: qualified,
-                    generation: installed.generation,
-                    elapsed_milliseconds: started.elapsed().as_secs_f64() * 1000.0,
-                    stages,
-                    artifact_bytes: installed.artifact_bytes,
-                    exports: installed.exports,
+        // Step 2: Generate, compile, load and install each changed body in
+        // turn. A failure part-way leaves the bodies already installed live -
+        // they are independent replacements, and undoing them would discard
+        // work that succeeded - but the snapshot is not advanced, so the next
+        // change retries the whole file.
+        let mut last: Option<Installed> = None;
+        let mut patched_names: Vec<String> = Vec::new();
+        for declaration in &declarations {
+            // The path the running artifact recorded for this function, which
+            // is what both the engine registry and a slot are keyed by.
+            // Derived from the file's position under the source root, so a
+            // function in a submodule resolves as `crate::module::function`.
+            let qualified = self.qualified_name(&path, declaration);
+            // The slot route asks under a different name; see
+            // `slot_lookup_name`.
+            let slot_name = self.slot_lookup_name(&path, declaration);
+
+            match self.apply(
+                engine,
+                targets,
+                patches,
+                &new_contents,
+                declaration,
+                &qualified,
+                &slot_name,
+                &mut stages,
+            ) {
+                Ok(installed) => {
+                    patched_names.push(qualified);
+                    last = Some(installed);
+                }
+                // The running implementation is untouched, so the console
+                // reports which generation is still executing rather than only
+                // what failed.
+                Err(failure) => {
+                    return PatchOutcome::Failed {
+                        active_generation: self.active_generation(&qualified),
+                        function: qualified,
+                        failure,
+                    };
                 }
             }
-            // The running implementation is untouched, so the console reports
-            // which generation is still executing rather than only what failed.
-            Err(failure) => PatchOutcome::Failed {
-                active_generation: self.active_generation(&qualified),
-                function: qualified,
-                failure,
-            },
+        }
+
+        let Some(installed) = last else {
+            return PatchOutcome::Unchanged;
+        };
+
+        // Only record the new contents once every body is live, so a partial
+        // failure is retried on the next change rather than treated as done.
+        self.snapshots.insert(path, new_contents);
+        PatchOutcome::Patched {
+            function: patched_names.join(", "),
+            generation: installed.generation,
+            elapsed_milliseconds: started.elapsed().as_secs_f64() * 1000.0,
+            stages,
+            artifact_bytes: installed.artifact_bytes,
+            exports: installed.exports,
         }
     }
 
@@ -749,8 +764,8 @@ impl HotPatchSession {
     #[allow(clippy::type_complexity)]
     fn classify(
         &mut self,
-    ) -> Result<Option<(PathBuf, source::HotFunction, String)>, PatchRefusal> {
-        let mut result: Option<(PathBuf, source::HotFunction, String)> = None;
+    ) -> Result<Option<(PathBuf, Vec<source::HotFunction>, String)>, PatchRefusal> {
+        let mut result: Option<(PathBuf, Vec<source::HotFunction>, String)> = None;
 
         for path in rust_sources(&self.source_root) {
             let Ok(new_contents) = std::fs::read_to_string(&path) else {
@@ -811,46 +826,43 @@ impl HotPatchSession {
                     changed.push(name.clone());
                 }
             }
-            match changed.len() {
-                0 => continue,
-                1 => {}
-                _ => {
-                    changed.sort();
-                    return Err(PatchRefusal::new(
-                        refusal_code::MULTIPLE_HOT_BODIES,
-                        format!(
-                        "{} changed {} hot bodies at once ({}); the fast path \
-                         patches one function per edit",
-                            file_label(&path),
-                            changed.len(),
-                            changed.join(", ")
-                        ),
-                    ));
-                }
+            if changed.is_empty() {
+                continue;
             }
-
             if result.is_some() {
                 return Err(PatchRefusal::new(
                     refusal_code::MULTIPLE_FILES,
                     "more than one source file changed",
                 ));
             }
-            let function = changed.remove(0);
-            let declaration = hot[&function].clone();
 
-            // A method needs its receiver type to be patchable: the generated
-            // replacement is a trait implementation for that concrete type.
-            // A generic or trait `impl` block has no single type to name, so it
-            // is refused here rather than producing a patch that cannot compile.
-            if declaration.takes_receiver && declaration.self_type.is_none() {
-                return Err(PatchRefusal::new(
-                    refusal_code::UNRESOLVED_RECEIVER,
-                    format!(
-                        "`{function}` takes a receiver but its `impl` block does not name a                          simple type; a generic or trait implementation cannot be patched"
-                    ),
-                ));
+            // Several bodies in one save are patched in sequence rather than
+            // refused. Each is an independent replacement, so the cost is one
+            // compile apiece - still cheaper than the full reload this used to
+            // fall back to, and the world is never torn down.
+            changed.sort();
+            let mut declarations = Vec::with_capacity(changed.len());
+            for function in changed {
+                let declaration = hot[&function].clone();
+
+                // A method needs its receiver type to be patchable: the
+                // generated replacement is a trait implementation for that
+                // concrete type. A generic or trait `impl` block has no single
+                // type to name, so it is refused rather than producing a patch
+                // that cannot compile.
+                if declaration.takes_receiver && declaration.self_type.is_none() {
+                    return Err(PatchRefusal::new(
+                        refusal_code::UNRESOLVED_RECEIVER,
+                        format!(
+                            "`{function}` takes a receiver but its `impl` block does \
+                             not name a simple type; a generic or trait implementation \
+                             cannot be patched"
+                        ),
+                    ));
+                }
+                declarations.push(declaration);
             }
-            result = Some((path, declaration, new_contents));
+            result = Some((path, declarations, new_contents));
         }
 
         // Nothing changed - but if a watched file is newer than the baseline,
@@ -1979,8 +1991,9 @@ mod tests {
 
         let classified = session.classify().expect("body-only edit must be accepted");
         let (_, declaration, _) = classified.expect("a change must be reported");
-        assert_eq!(declaration.name, "get_color_a");
-        assert_eq!(declaration.kind, source::HotFunctionKind::PlainFunction);
+        assert_eq!(declaration.len(), 1, "one body changed");
+        assert_eq!(declaration[0].name, "get_color_a");
+        assert_eq!(declaration[0].kind, source::HotFunctionKind::PlainFunction);
 
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -2029,6 +2042,7 @@ mod tests {
             takes_receiver: true,
             signature: "fn mix(&self, other: Tint) -> Tint".to_string(),
             cfg_gated: false,
+            inline_always: false,
             annotated: false,
         };
 
@@ -2062,6 +2076,7 @@ mod tests {
             takes_receiver: true,
             signature: "fn get_color_a(&self) -> f32".to_string(),
             cfg_gated: false,
+            inline_always: false,
             annotated: true,
         };
 
@@ -2088,6 +2103,7 @@ mod tests {
             takes_receiver: false,
             signature: format!("fn {name}()"),
             cfg_gated: false,
+            inline_always: false,
             annotated: true,
         }
     }
@@ -2101,6 +2117,7 @@ mod tests {
             takes_receiver: false,
             signature: format!("fn {name}()"),
             cfg_gated: false,
+            inline_always: false,
             annotated: true,
         }
     }
@@ -2291,8 +2308,9 @@ fn helper(value: f32) -> f32 {
 
         let classified = session.classify().expect("body-only edit must be accepted");
         let (_, declaration, contents) = classified.expect("a change must be reported");
-        assert_eq!(declaration.name, "movement");
-        assert_eq!(declaration.kind, source::HotFunctionKind::System);
+        assert_eq!(declaration.len(), 1, "one body changed");
+        assert_eq!(declaration[0].name, "movement");
+        assert_eq!(declaration[0].kind, source::HotFunctionKind::System);
         assert!(contents.contains("value * SPEED * 2.0"));
 
         let _ = std::fs::remove_dir_all(&directory);
@@ -2344,10 +2362,13 @@ fn helper(value: f32) -> f32 {
         }
     }
 
-    /// Two hot bodies in one edit are refused with their own code: the fast
-    /// path deliberately patches one function per edit.
+    /// Two bodies changed in one save are both reported, in a stable order.
+    ///
+    /// This used to be a refusal. Each body is an independent replacement, so
+    /// the only cost of taking both is one compile apiece - cheaper than the
+    /// full reload the refusal fell back to, and the world is never torn down.
     #[test]
-    fn classify_refuses_two_changed_bodies() {
+    fn classify_reports_every_changed_body() {
         let directory = std::env::temp_dir().join("pill_classify_two_bodies");
         let _ = std::fs::remove_dir_all(&directory);
         let mut session = session_over(&directory, TWO_HOT_SOURCE);
@@ -2357,8 +2378,19 @@ fn helper(value: f32) -> f32 {
             .replace("value - 1.0", "value - 9.0");
         std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
 
-        let refusal = session.classify().expect_err("two bodies must be refused");
-        assert_eq!(refusal.code, refusal_code::MULTIPLE_HOT_BODIES, "{}", refusal.detail);
+        let (_, declarations, _) = session
+            .classify()
+            .expect("two body-only edits are in scope")
+            .expect("a change must be reported");
+        let names: Vec<&str> = declarations
+            .iter()
+            .map(|declaration| declaration.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["movement", "other_movement"],
+            "both bodies, sorted so the order does not depend on scan order"
+        );
 
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -2434,8 +2466,9 @@ fn helper(value: f32) -> f32 {
             .classify()
             .expect("an un-annotated body edit is in scope")
             .expect("a change must be reported");
-        assert_eq!(declaration.name, "ordinary");
-        assert_eq!(declaration.kind, source::HotFunctionKind::PlainFunction);
+        assert_eq!(declaration.len(), 1, "one body changed");
+        assert_eq!(declaration[0].name, "ordinary");
+        assert_eq!(declaration[0].kind, source::HotFunctionKind::PlainFunction);
 
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -2472,7 +2505,8 @@ fn helper(value: f32) -> f32 {
             .classify()
             .expect("a body-only edit is in scope")
             .expect("a change must be reported");
-        assert_eq!(declaration.name, "helper");
+        assert_eq!(declaration.len(), 1, "one body changed");
+        assert_eq!(declaration[0].name, "helper");
 
         let _ = std::fs::remove_dir_all(&directory);
     }

@@ -622,6 +622,59 @@ pub fn function_addresses() -> impl Iterator<Item = (&'static str, usize)> {
 // Prologue patching (SPIKE, Windows x86-64 only)
 // =============================================================================
 
+/// The thread allowed to rewrite live code, claimed by the first patch.
+///
+/// Patching assumes no thread is executing inside the bytes being overwritten.
+/// The host upholds that by patching at a frame boundary with no system
+/// running - but that is a convention, and a convention that is only ever
+/// stated in a comment is one that quietly stops being true. Recording the
+/// thread turns it into something checkable: a second thread attempting a patch
+/// is refused rather than racing the first.
+static PATCHING_THREAD: AtomicU64 = AtomicU64::new(0);
+
+/// A stable-ish numeric identity for the current thread.
+///
+/// `ThreadId` has no stable integer form on stable Rust, so the address of a
+/// thread-local is used instead: distinct per thread, constant within one.
+fn current_thread_token() -> u64 {
+    thread_local! {
+        static MARKER: u8 = const { 0 };
+    }
+    MARKER.with(|marker| marker as *const u8 as u64)
+}
+
+/// Declare the calling thread the only one permitted to rewrite live code.
+///
+/// A host calls this from its frame loop. Idempotent, and cheap enough to call
+/// every frame: one relaxed load in the common case.
+///
+/// Nothing forces a host to call it - a process that never does keeps the older
+/// behaviour of allowing any thread, which is what tests and offline tools want.
+pub fn declare_patching_thread() {
+    let token = current_thread_token();
+    if PATCHING_THREAD.load(Ordering::Relaxed) != token {
+        PATCHING_THREAD.store(token, Ordering::Release);
+    }
+}
+
+/// Refuse a patch attempted from anywhere but the declared thread.
+///
+/// # Errors
+///
+/// Returns the message to refuse with. Undeclared means unrestricted.
+fn check_patching_thread() -> Result<(), String> {
+    let declared = PATCHING_THREAD.load(Ordering::Acquire);
+    if declared == 0 || declared == current_thread_token() {
+        return Ok(());
+    }
+    Err(
+        "a patch was attempted from a thread other than the one the host \
+         declared; rewriting live code is only sound from the thread that owns \
+         the frame boundary, where no system is executing"
+            .to_string(),
+    )
+}
+
 /// Bytes an absolute jump occupies: `mov rax, imm64` then `jmp rax`.
 ///
 /// The absolute form is used rather than a 5-byte `E9 rel32` because ASLR
@@ -632,6 +685,7 @@ pub fn function_addresses() -> impl Iterator<Item = (&'static str, usize)> {
 const ABSOLUTE_JUMP_LENGTH: usize = 12;
 
 /// Read/write/execute page protection.
+#[cfg(all(windows, target_arch = "x86_64"))]
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 
 /// One entry in the x86-64 exception directory: a function's exact extent.
@@ -639,6 +693,7 @@ const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 /// Windows requires every function that touches the stack to publish one of
 /// these so the unwinder can walk it, which makes the table an authoritative
 /// map of where each function begins and ends - no disassembler needed.
+#[cfg(all(windows, target_arch = "x86_64"))]
 #[repr(C)]
 struct RuntimeFunction {
     /// Offset of the function's first byte from the image base.
@@ -649,6 +704,7 @@ struct RuntimeFunction {
     _unwind_data: u32,
 }
 
+#[cfg(all(windows, target_arch = "x86_64"))]
 extern "system" {
     fn VirtualProtect(
         address: *mut core::ffi::c_void,
@@ -694,6 +750,7 @@ pub fn functions_with_known_extent() -> (usize, usize) {
 /// permits omitting its unwind data - exactly the functions too short to
 /// overwrite safely, so an absent entry is treated as "refuse", never as
 /// "assume it is long enough".
+#[cfg(all(windows, target_arch = "x86_64"))]
 pub fn function_extent(address: usize) -> Option<(usize, usize)> {
     let mut image_base: u64 = 0;
     // SAFETY: `RtlLookupFunctionEntry` reads the loaded image's exception
@@ -733,6 +790,7 @@ pub fn function_extent(address: usize) -> Option<(usize, usize)> {
 /// The caller guarantees the second condition by patching at a frame boundary,
 /// on the thread that runs the frame loop, while no other thread is inside the
 /// function. `target` is validated here rather than assumed.
+#[cfg(all(windows, target_arch = "x86_64"))]
 pub unsafe fn patch_prologue(target: usize, replacement: usize) -> Result<Vec<u8>, String> {
     if target == 0 || replacement == 0 {
         return Err("cannot patch a null address".to_string());
@@ -740,6 +798,7 @@ pub unsafe fn patch_prologue(target: usize, replacement: usize) -> Result<Vec<u8
     if target == replacement {
         return Err("refusing to patch a function to itself".to_string());
     }
+    check_patching_thread()?;
 
     // How much room there actually is. Without this the write runs past a short
     // function and into whatever the linker placed after it, which is usually
@@ -829,6 +888,7 @@ pub unsafe fn patch_prologue(target: usize, replacement: usize) -> Result<Vec<u8
 ///
 /// The same contract as [`patch_prologue`]: `target` must be the address the
 /// bytes came from, and no thread may be executing inside them.
+#[cfg(all(windows, target_arch = "x86_64"))]
 pub unsafe fn restore_prologue(target: usize, original: &[u8]) -> Result<(), String> {
     if target == 0 {
         return Err("cannot restore a null address".to_string());
@@ -880,6 +940,64 @@ pub unsafe fn restore_prologue(target: usize, original: &[u8]) -> Result<(), Str
         );
     }
     Ok(())
+}
+
+// =============================================================================
+// Prologue patching (other targets)
+// =============================================================================
+//
+// The implementation above is Windows x86-64 only: it hand-encodes an absolute
+// jump and reads the exception directory through `RtlLookupFunctionEntry`, and
+// neither has a portable equivalent. Declaring those imports unconditionally
+// broke the build for every other target, which is why this exists.
+//
+// The stubs refuse rather than pretend. Everything that does not depend on
+// rewriting live code - the dispatch slots, the registries, whole-module
+// reloading - is portable Rust and works unchanged, so a non-Windows target
+// keeps `#[pill_hot]` and `#[pill_hot_fn]` and loses only the macro-free route.
+
+/// Where the function containing `address` begins and how long it is.
+///
+/// Always `None` off Windows x86-64: no supported way to establish a function's
+/// extent, and guessing is how a patch corrupts the function after it.
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+pub fn function_extent(_address: usize) -> Option<(usize, usize)> {
+    None
+}
+
+/// Overwrite a function's first bytes with a jump to `replacement`.
+///
+/// # Errors
+///
+/// Always, off Windows x86-64. Annotating the function with `#[pill_hot_fn]`
+/// gives it a dispatch slot, which is portable and needs no code rewriting.
+///
+/// # Safety
+///
+/// Nothing is written, so there is no contract to uphold - the signature
+/// matches the Windows one so callers need no `cfg` of their own.
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+pub unsafe fn patch_prologue(_target: usize, _replacement: usize) -> Result<Vec<u8>, String> {
+    Err(
+        "prologue patching is implemented for Windows x86-64 only; annotate the function \
+         with #[pill_hot_fn] to patch it through a dispatch slot instead"
+            .to_string(),
+    )
+}
+
+/// Write saved prologue bytes back.
+///
+/// # Errors
+///
+/// Always, off Windows x86-64: nothing can have been patched, so there is
+/// nothing to restore.
+///
+/// # Safety
+///
+/// Nothing is written, so there is no contract to uphold.
+#[cfg(not(all(windows, target_arch = "x86_64")))]
+pub unsafe fn restore_prologue(_target: usize, _original: &[u8]) -> Result<(), String> {
+    Err("prologue patching is implemented for Windows x86-64 only".to_string())
 }
 
 /// Stable hash of a signature string, used only to report a mismatch.

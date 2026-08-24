@@ -324,6 +324,15 @@ pub struct HotFunction {
     /// prologue patch overwrites anything. Both sides normalize the same way, so
     /// reformatting is not mistaken for a change of shape.
     pub signature: String,
+    /// Whether the declaration asks to be inlined at every call site.
+    ///
+    /// `#[inline(always)]` is honoured even at `opt-level = 0`, so such a
+    /// function may have no body left to redirect: callers hold their own copy
+    /// and a prologue patch reaches none of them. That is the silent-miss case,
+    /// and it is the one thing about it a scanner can see, so the inventory
+    /// leaves those functions out rather than promising a patch it cannot
+    /// deliver.
+    pub inline_always: bool,
     /// Whether a `#[cfg(…)]` decides if this declaration exists at all.
     ///
     /// A byte scanner cannot evaluate `cfg`, so a conditionally compiled
@@ -420,6 +429,12 @@ pub fn hot_functions(source: &str) -> Vec<HotFunction> {
                     takes_receiver: declaration_takes_receiver(source, &mask, declaration_start),
                     signature: normalized_signature(source, &mask, declaration_start),
                     cfg_gated: declaration_is_cfg_gated(source, &mask, declaration_start),
+                    inline_always: declaration_has_attribute(
+                        source,
+                        &mask,
+                        declaration_start,
+                        "#[inline(always)]",
+                    ),
                     annotated: true,
                 });
             }
@@ -490,6 +505,12 @@ pub fn all_functions(source: &str) -> Vec<HotFunction> {
                             takes_receiver: declaration_takes_receiver(source, &mask, index),
                             signature: normalized_signature(source, &mask, index),
                             cfg_gated: declaration_is_cfg_gated(source, &mask, index),
+                            inline_always: declaration_has_attribute(
+                                source,
+                                &mask,
+                                index,
+                                "#[inline(always)]",
+                            ),
                             annotated: annotated.contains_key(&name),
                         });
                     }
@@ -602,6 +623,19 @@ pub fn normalized_signature(source: &str, mask: &[bool], declaration_start: usiz
 /// The block is everything back to the previous item's end - a `}` or `;` at
 /// code level - which is exactly where attributes and doc comments live.
 pub fn declaration_is_cfg_gated(source: &str, mask: &[bool], declaration_start: usize) -> bool {
+    declaration_has_attribute(source, mask, declaration_start, "#[cfg")
+}
+
+/// Whether `attribute` appears in the block above this declaration.
+///
+/// The block is everything back to the previous item's end - a `}` or `;` at
+/// code level - which is exactly where attributes and doc comments live.
+pub fn declaration_has_attribute(
+    source: &str,
+    mask: &[bool],
+    declaration_start: usize,
+    attribute: &str,
+) -> bool {
     let bytes = source.as_bytes();
     let mut start = declaration_start;
     while start > 0 {
@@ -612,8 +646,8 @@ pub fn declaration_is_cfg_gated(source: &str, mask: &[bool], declaration_start: 
         start = candidate;
     }
     let mut index = start;
-    while index + 5 <= declaration_start {
-        if mask[index] && source[index..].starts_with("#[cfg") {
+    while index + attribute.len() <= declaration_start {
+        if mask[index] && source[index..].starts_with(attribute) {
             return true;
         }
         index += 1;
@@ -812,6 +846,16 @@ pub fn generate_function_inventory() {
             // from the very build being scanned; registering an address for an
             // item that does not exist would not compile.
             if function.cfg_gated {
+                continue;
+            }
+            // Inlined at every call site, so there may be no body left to
+            // redirect. Registering it would promise a patch that silently
+            // reaches nobody, which is worse than saying it is not patchable.
+            if function.inline_always {
+                println!(
+                    "cargo:warning=pill: `{}` is #[inline(always)] and is not registered                      for hot patching; callers hold their own copy, so redirecting it                      would reach none of them",
+                    function.name
+                );
                 continue;
             }
             let mut path_segments = segments.clone();

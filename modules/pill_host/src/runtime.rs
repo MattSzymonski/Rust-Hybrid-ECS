@@ -562,6 +562,13 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     // last transaction.
     let reload_started = Instant::now();
 
+    // This is the thread that owns the frame boundary, and therefore the only
+    // one allowed to rewrite live code. Declared here rather than at setup
+    // because setup may run elsewhere; idempotent and a single relaxed load
+    // once declared.
+    #[cfg(feature = "hot_patch")]
+    pill_engine::hot_patch::declare_patching_thread();
+
     // Step 0a2: Honour a rollback request, at the same frame boundary the
     // patch installs use - the prologue route rewrites live code, so this is a
     // requirement rather than a convenience.
