@@ -166,6 +166,12 @@ pub(crate) enum PatchOutcome {
         artifact_bytes: u64,
         /// Exports the compiled patch carries, for the analytics line.
         exports: usize,
+        /// Which mechanisms delivered this edit. More than one when a single
+        /// save changed both an annotated and an un-annotated body.
+        routes: Vec<crate::analytics::PatchRoute>,
+        /// How many running copies of the changed functions were reached in
+        /// total, so a fan-out is visible rather than assumed.
+        copies: usize,
     },
     /// Nothing relevant changed.
     Unchanged,
@@ -267,6 +273,14 @@ struct Installed {
     artifact_bytes: u64,
     /// Exports the compiled patch carries.
     exports: usize,
+    /// Which of the three mechanisms delivered it. Reported rather than
+    /// inferred downstream: an annotated and an un-annotated plain function are
+    /// the same `HotFunctionKind` but take completely different routes.
+    route: crate::analytics::PatchRoute,
+    /// How many running copies the install reached. One for the engine
+    /// registry, which is process-wide; otherwise one per artifact that links
+    /// the crate.
+    copies: usize,
 }
 
 impl Generation {
@@ -486,6 +500,12 @@ impl HotPatchSession {
         // change retries the whole file.
         let mut last: Option<Installed> = None;
         let mut patched_names: Vec<String> = Vec::new();
+        // Several bodies in one file are patched in sequence and need not share
+        // a route: an annotated and an un-annotated function in the same save
+        // take different ones. Both are reported, because an edit is only as
+        // provable as its weakest body.
+        let mut routes: Vec<crate::analytics::PatchRoute> = Vec::new();
+        let mut copies = 0usize;
         for declaration in &declarations {
             // The path the running artifact recorded for this function, which
             // is what both the engine registry and a slot are keyed by.
@@ -508,6 +528,10 @@ impl HotPatchSession {
             ) {
                 Ok(installed) => {
                     patched_names.push(qualified);
+                    if !routes.contains(&installed.route) {
+                        routes.push(installed.route);
+                    }
+                    copies += installed.copies;
                     last = Some(installed);
                 }
                 // The running implementation is untouched, so the console
@@ -545,6 +569,8 @@ impl HotPatchSession {
             stages,
             artifact_bytes: installed.artifact_bytes,
             exports: installed.exports,
+            routes,
+            copies,
         }
     }
 
@@ -709,13 +735,18 @@ impl HotPatchSession {
                     source::HotFunctionKind::System => engine
                         .hot_patch(qualified, generation.address, generation.signature_hash)
                         .map_err(|error| error.to_string())?,
-                    source::HotFunctionKind::PlainFunction => install_everywhere(
-                        targets,
-                        patches,
-                        &generation.lookup_name,
-                        generation.address,
-                        &generation.signature,
-                    )?,
+                    // The fan-out count is only reported for a fresh patch;
+                    // a rollback re-installs the same set and has nothing new
+                    // to say about it.
+                    source::HotFunctionKind::PlainFunction => {
+                        install_everywhere(
+                            targets,
+                            patches,
+                            &generation.lookup_name,
+                            generation.address,
+                            &generation.signature,
+                        )?;
+                    }
                 }
             }
         }
@@ -1032,6 +1063,13 @@ impl HotPatchSession {
             self.package,
             self.package_rlib.display()
         )];
+        // Dependency rlibs staged when the host last built this package, which
+        // is the only set guaranteed to match the module rlib being linked. The
+        // shared `deps` slots they were copied from are overwritten by any build
+        // of the same crate name, a differently-featured one included.
+        let staged_dependencies = self
+            .workspace_root
+            .join(crate::build_runner::STAGED_DEPENDENCY_SUBDIRECTORY);
         let flags_started = Instant::now();
         let line = self
             .rustc_line()
@@ -1039,7 +1077,13 @@ impl HotPatchSession {
         stages.flags = flags_started.elapsed().as_secs_f64() * 1000.0;
         let compile_started = Instant::now();
         let output = line
-            .replay(&source_path, &artifact, &crate_name, &extra_externs)
+            .replay(
+                &source_path,
+                &artifact,
+                &crate_name,
+                &extra_externs,
+                Some(staged_dependencies.as_path()),
+            )
             .output()
             .map_err(|error| {
                 PatchRefusal::new(failure_code::COMPILE, format!("cannot run rustc: {error}"))
@@ -1078,7 +1122,13 @@ impl HotPatchSession {
             debug!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 command = line
-                    .replay_args(&source_path, &artifact, &crate_name, &extra_externs)
+                    .replay_args(
+                        &source_path,
+                        &artifact,
+                        &crate_name,
+                        &extra_externs,
+                        Some(staged_dependencies.as_path()),
+                    )
                     .join(" ")
                     .as_str(),
                 "the patch compile that failed"
@@ -1116,6 +1166,10 @@ impl HotPatchSession {
         let mut signature_hash = 0u64;
         let mut signature = String::new();
         let mut prologue_restores: Vec<PrologueRestore> = Vec::new();
+        // Both are set by whichever arm of the install below runs; the compiler
+        // proves that, so there is no placeholder value to get wrong.
+        let route: crate::analytics::PatchRoute;
+        let copies: usize;
 
         // Install at the frame boundary. Both routes refuse a signature that no
         // longer matches, so a reshaped function can never be applied behind a
@@ -1133,6 +1187,10 @@ impl HotPatchSession {
                 })?;
                 address = found;
                 signature_hash = hash;
+                // The registry lives once per process, so this single install
+                // is every caller.
+                route = crate::analytics::PatchRoute::EngineSlot;
+                copies = 1;
             }
             // A plain function has no registry: its redirect slot is a static
             // compiled into each artifact that links the crate. The project DLL
@@ -1154,6 +1212,8 @@ impl HotPatchSession {
                 )
                     .map_err(|detail| PatchRefusal::new(failure_code::INSTALL, detail))?;
                 address = found;
+                route = crate::analytics::PatchRoute::Prologue;
+                copies = prologue_restores.len();
             }
             source::HotFunctionKind::PlainFunction => {
                 // A method patch is filed under the prefixed running name,
@@ -1166,10 +1226,12 @@ impl HotPatchSession {
                 };
                 let (found, found_signature) = resolve_plain_in(&library, &lookup_name)
                     .map_err(|detail| PatchRefusal::new(failure_code::RESOLVE, detail))?;
-                install_everywhere(targets, patches, slot_name, found, &found_signature)
-                    .map_err(|detail| PatchRefusal::new(failure_code::INSTALL, detail))?;
+                copies =
+                    install_everywhere(targets, patches, slot_name, found, &found_signature)
+                        .map_err(|detail| PatchRefusal::new(failure_code::INSTALL, detail))?;
                 address = found;
                 signature = found_signature;
+                route = crate::analytics::PatchRoute::ArtifactSlot;
             }
         }
         stages.activate = activate_started.elapsed().as_secs_f64() * 1000.0;
@@ -1224,6 +1286,8 @@ impl HotPatchSession {
             generation,
             artifact_bytes,
             exports,
+            route,
+            copies,
         })
     }
 
@@ -1241,8 +1305,25 @@ impl HotPatchSession {
     ) -> Result<String, String> {
         let function = declaration.name.as_str();
         let kind = declaration.kind;
-        let found = source::find_function(new_contents, function)
-            .ok_or_else(|| format!("cannot locate `{function}` in the changed source"))?;
+        // A method is located through its own `impl` block, not by bare name.
+        // Two types may each implement `Default::default`, and a type may carry
+        // an inherent `draw` beside a trait `draw`; taking the first `fn draw`
+        // in the file would compile the wrong body and install it silently.
+        let found = match (&declaration.self_type, declaration.takes_receiver) {
+            (Some(self_type), true) => source::find_method(
+                new_contents,
+                function,
+                self_type,
+                declaration.trait_name.as_deref(),
+            )
+            .ok_or_else(|| {
+                format!(
+                    "cannot locate `{function}` in the `impl` block for `{self_type}`                      in the changed source"
+                )
+            })?,
+            _ => source::find_function(new_contents, function)
+                .ok_or_else(|| format!("cannot locate `{function}` in the changed source"))?,
+        };
 
         let imports = source::top_level_use_statements(new_contents).join("\n");
         let package = &self.package;
@@ -1423,12 +1504,13 @@ impl HotPatchSession {
     /// `impl` block - so it is the name the prologue route looks up, and the one
     /// used for display and generation bookkeeping.
     fn qualified_name(&self, path: &Path, declaration: &source::HotFunction) -> String {
-        let mut segments = self.module_segments(path);
-        if let Some(self_type) = &declaration.self_type {
-            segments.push(self_type.clone());
-        }
-        segments.push(declaration.name.clone());
-        segments.join("::")
+        let segments = self.module_segments(path);
+        // Built by the scanner rather than here, so the host asks for exactly
+        // the name the build script recorded. When the two were separate
+        // implementations every inherent method silently failed to patch, and a
+        // trait method - whose name carries both the type and the trait - has
+        // more to disagree about, not less.
+        source::inventory_name(&self.package, &segments[1..], declaration)
     }
 
     /// The path a dispatch slot is registered under, which omits the type.
@@ -1623,7 +1705,7 @@ fn install_everywhere(
     qualified: &str,
     address: usize,
     signature: &str,
-) -> Result<(), String> {
+) -> Result<usize, String> {
     let mut installed = Vec::new();
     for (label, artifact) in targets {
         match artifact.install_plain_function(qualified, address, signature) {
@@ -1658,7 +1740,9 @@ fn install_everywhere(
         artifacts = installed.join(", ").as_str(),
         "plain function redirected in every artifact that links it"
     );
-    Ok(())
+    // How many copies were reached, which is what makes a fan-out visible in
+    // the analytics line rather than assumed.
+    Ok(installed.len())
 }
 
 /// Export a generated prologue patch carries so the host can find its new body.
@@ -2130,10 +2214,12 @@ mod tests {
             name: "mix".to_string(),
             kind: source::HotFunctionKind::PlainFunction,
             self_type: Some("Tint".to_string()),
+            trait_name: None,
             takes_receiver: true,
             signature: "fn mix(&self, other: Tint) -> Tint".to_string(),
             cfg_gated: false,
             inline_always: false,
+            abi_entry_point: false,
             annotated: false,
         };
 
@@ -2145,6 +2231,122 @@ mod tests {
             session.qualified_name(&directory.join("color.rs"), &method),
             "project::color::Tint::mix"
         );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A trait method is named through both its type and its trait, because
+    /// neither alone identifies it.
+    ///
+    /// A type may carry an inherent `draw` beside a trait `draw`, and two traits
+    /// may each define `draw` for it. `Type::draw` names all of them.
+    #[test]
+    fn a_trait_method_is_named_through_its_trait() {
+        let directory = std::env::temp_dir().join("pill_trait_method_naming");
+        let _ = std::fs::remove_dir_all(&directory);
+        let session = session_over(&directory, PLAIN_SOURCE);
+        let via_trait = source::HotFunction {
+            name: "default".to_string(),
+            kind: source::HotFunctionKind::PlainFunction,
+            self_type: Some("Spline".to_string()),
+            trait_name: Some("Default".to_string()),
+            takes_receiver: false,
+            signature: "fn default() -> Self".to_string(),
+            cfg_gated: false,
+            inline_always: false,
+            abi_entry_point: false,
+            annotated: false,
+        };
+
+        assert_eq!(
+            session.qualified_name(&directory.join("lib.rs"), &via_trait),
+            "project::<Spline as Default>::default"
+        );
+        assert_eq!(
+            session.qualified_name(&directory.join("spline.rs"), &via_trait),
+            "project::spline::<Spline as Default>::default"
+        );
+
+        // And the inherent method of the same name stays a different key.
+        let inherent = source::HotFunction {
+            trait_name: None,
+            ..via_trait
+        };
+        assert_eq!(
+            session.qualified_name(&directory.join("lib.rs"), &inherent),
+            "project::Spline::default"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// An edit to a trait method body classifies as patchable and reports the
+    /// trait, so the generated patch and the address lookup agree.
+    #[test]
+    fn classify_accepts_a_trait_method_body() {
+        let directory = std::env::temp_dir().join("pill_classify_trait_method");
+        let _ = std::fs::remove_dir_all(&directory);
+        let source = "pub struct Spline(u32);\n\nimpl Default for Spline {\n                          fn default() -> Self { Spline(1) }\n}\n";
+        let mut session = session_over(&directory, source);
+
+        std::fs::write(
+            directory.join("lib.rs"),
+            source.replace("Spline(1)", "Spline(2)"),
+        )
+        .expect("write edit");
+
+        let (_, declarations, contents) = session
+            .classify()
+            .expect("a trait method body is in scope")
+            .expect("the change must be reported");
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].name, "default");
+        assert_eq!(declarations[0].self_type.as_deref(), Some("Spline"));
+        assert_eq!(declarations[0].trait_name.as_deref(), Some("Default"));
+        assert!(contents.contains("Spline(2)"));
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// The generated patch carries the body from the right `impl` block.
+    ///
+    /// Two types implementing one trait method is the case that made a bare-name
+    /// search unsafe: it would compile the first `fn default` in the file and
+    /// install it for whichever type was patched.
+    #[test]
+    fn a_generated_trait_patch_carries_the_right_body() {
+        let directory = std::env::temp_dir().join("pill_generate_trait_method");
+        let _ = std::fs::remove_dir_all(&directory);
+        let source = "pub struct Alpha(u32);\npub struct Beta(u32);\n\n                      impl Shape for Alpha {\n    fn size(&self) -> u32 { 111 }\n}\n\n                      impl Shape for Beta {\n    fn size(&self) -> u32 { 222 }\n}\n";
+        let session = session_over(&directory, source);
+
+        let beta = source::HotFunction {
+            name: "size".to_string(),
+            kind: source::HotFunctionKind::PlainFunction,
+            self_type: Some("Beta".to_string()),
+            trait_name: Some("Shape".to_string()),
+            takes_receiver: true,
+            signature: "fn size(&self) -> u32".to_string(),
+            cfg_gated: false,
+            inline_always: false,
+            abi_entry_point: false,
+            annotated: false,
+        };
+        let generated = session
+            .generate(source, &beta, "project::<Beta as Shape>::size")
+            .expect("a trait method generates a patch");
+
+        assert!(
+            generated.contains("222"),
+            "the patch must carry Beta's body, not Alpha's:\n{generated}"
+        );
+        assert!(
+            !generated.contains("111"),
+            "Alpha's body must not appear:\n{generated}"
+        );
+        // The body keeps `self`, so it is carried into a local trait implemented
+        // for the concrete type - exactly as an inherent method is.
+        assert!(generated.contains("impl PillHotMethodPatch for Beta"));
 
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -2164,10 +2366,12 @@ mod tests {
             name: "get_color_a".to_string(),
             kind: source::HotFunctionKind::PlainFunction,
             self_type: Some("Spline".to_string()),
+            trait_name: None,
             takes_receiver: true,
             signature: "fn get_color_a(&self) -> f32".to_string(),
             cfg_gated: false,
             inline_always: false,
+            abi_entry_point: false,
             annotated: true,
         };
 
@@ -2191,10 +2395,12 @@ mod tests {
             name: name.to_string(),
             kind: source::HotFunctionKind::System,
             self_type: None,
+            trait_name: None,
             takes_receiver: false,
             signature: format!("fn {name}()"),
             cfg_gated: false,
             inline_always: false,
+            abi_entry_point: false,
             annotated: true,
         }
     }
@@ -2205,10 +2411,12 @@ mod tests {
             name: name.to_string(),
             kind: source::HotFunctionKind::PlainFunction,
             self_type: None,
+            trait_name: None,
             takes_receiver: false,
             signature: format!("fn {name}()"),
             cfg_gated: false,
             inline_always: false,
+            abi_entry_point: false,
             annotated: true,
         }
     }

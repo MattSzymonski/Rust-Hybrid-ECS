@@ -11,10 +11,21 @@
 # graph. Project modules live in their own workspaces with their own lockfiles,
 # so they are built with static linkage instead; see `ProjectModuleConfig`.
 #
-# Release builds that link everything into one binary need no shared library and
-# should clear these flags, for example with `--config build.rustflags=[]`.
+# Release builds link everything into one binary, need no shared library, and
+# cannot combine `-C prefer-dynamic` with the release profile's `lto = "fat"` -
+# rustc refuses that pairing outright on Windows. Use the `release-build` alias
+# below, which clears the flag, rather than remembering to do it by hand.
 [build]
 rustflags = ["-C", "prefer-dynamic"]
+
+# Release builds must clear this flag, and no cargo setting can do it: cargo
+# MERGES config arrays under the same key, so `--config build.rustflags=[]`
+# joins with the list above and changes nothing, and a `target.<triple>` list
+# does not replace `build.rustflags` either. Only an empty `RUSTFLAGS` in the
+# environment works, which a cargo alias cannot set.
+#
+# Use `devops/ci_cd/build_release.sh` instead. It forwards its arguments, so it
+# is a drop-in replacement for `cargo build --release`.
 
 # Use the LLD linker (bundled with the Rust toolchain) instead of MSVC's
 # `link.exe` on Windows. LLD is typically 2-4x faster at linking, which

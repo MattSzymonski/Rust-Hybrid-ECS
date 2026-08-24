@@ -29,6 +29,8 @@ use std::time::{Duration, Instant};
 // External crates
 use pill_core::error::BuildError;
 use pill_core::info;
+#[cfg(feature = "hot_patch")]
+use pill_core::debug;
 
 // Current crate
 use crate::analytics::{self, BuildStatus, ModuleKind};
@@ -638,6 +640,10 @@ pub(crate) fn build_project_module(
     if matches!(&config.backend, ProjectModuleBackend::NativeLibrary { .. }) {
         let stage_started = Instant::now();
         stage_artifact(&build_output, &output_path)?;
+        // The build just produced a consistent set in `deps`; snapshot it
+        // before anything else can write to those shared per-crate slots.
+        #[cfg(feature = "hot_patch")]
+        stage_shared_dependency_rlibs(workspace_root);
         #[cfg(feature = "hot_patch")]
         stage_artifact(&rlib_build_output, &rlib_output)?;
         stage_ms = stage_started.elapsed().as_secs_f64() * 1000.0;
@@ -714,6 +720,119 @@ fn stage_artifact(build_output: &Path, hot_output: &Path) -> Result<(), BuildErr
         }
     })?;
     Ok(())
+}
+
+/// Where the shared per-crate dependency rlibs are staged for patch linking.
+///
+/// A sibling of the artifacts already staged in `target/hot`, and private to the
+/// host for the same reason they are.
+#[cfg(feature = "hot_patch")]
+pub(crate) const STAGED_DEPENDENCY_SUBDIRECTORY: &str = "target/hot/deps";
+
+/// Copy every shared per-crate rlib out of cargo's `deps` directory.
+///
+/// Cargo gives a workspace crate's rlib an unhashed, per-crate path -
+/// `deps/libpill_dummy_color.rlib` - and *overwrites it in place* on every
+/// build. Third-party crates get a metadata hash in their filename and are
+/// therefore safe; workspace crates share one slot per crate name across every
+/// feature configuration of that crate.
+///
+/// That slot is the whole problem. The host builds modules with
+/// `--features pill_engine/hot_patch`; a developer running a plain
+/// `cargo build` in a terminal writes a differently-featured artifact to the
+/// same path. A generated patch then links a module rlib built against one
+/// variant while the `--extern` for its dependency names the other, and rustc
+/// refuses with `error[E0463]: can't find crate for <the module>` - which names
+/// the module rather than the dependency that actually moved.
+///
+/// Copying them here, immediately after a host build produced a consistent set,
+/// makes the patch link closure immune to anything written to those slots
+/// afterwards. It is the same protection [`stage_artifact`] already gives the
+/// module's own rlib, extended to what that rlib links against.
+///
+/// Only files whose staged copy is out of date are copied, so the steady-state
+/// cost is a handful of `stat` calls. Failures are reported and not fatal: a
+/// missing staged dependency only means the patch links the shared slot as
+/// before.
+#[cfg(feature = "hot_patch")]
+pub(crate) fn stage_shared_dependency_rlibs(workspace_root: &Path) -> usize {
+    let source_directory = workspace_root
+        .join(CARGO_MODULE_OUTPUT_SUBDIRECTORY)
+        .join("deps");
+    let staged_directory = workspace_root.join(STAGED_DEPENDENCY_SUBDIRECTORY);
+    let Ok(entries) = std::fs::read_dir(&source_directory) else {
+        return 0;
+    };
+    if std::fs::create_dir_all(&staged_directory).is_err() {
+        return 0;
+    }
+
+    let mut copied = 0usize;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !is_shared_slot_rlib(file_name) {
+            continue;
+        }
+        let staged = staged_directory.join(file_name);
+        if staged_copy_is_current(&path, &staged) {
+            continue;
+        }
+        if std::fs::copy(&path, &staged).is_ok() {
+            copied += 1;
+        }
+    }
+    if copied > 0 {
+        debug!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            copied,
+            directory = %staged_directory.display(),
+            "staged shared dependency rlibs for patch linking"
+        );
+    }
+    copied
+}
+
+/// Whether a `deps` filename is a shared per-crate slot rather than a
+/// hash-qualified artifact.
+///
+/// Cargo appends `-<16 hex digits>` to a crate's filename when the artifact is
+/// specific to one resolved configuration. A name without that suffix is the
+/// shared slot every build of that crate name writes to, and is the only kind
+/// another build can silently replace.
+#[cfg(feature = "hot_patch")]
+fn is_shared_slot_rlib(file_name: &str) -> bool {
+    let Some(stem) = file_name.strip_suffix(".rlib") else {
+        return false;
+    };
+    match stem.rsplit_once('-') {
+        Some((_, suffix)) => {
+            !(suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        }
+        None => true,
+    }
+}
+
+/// Whether a staged copy already matches its source.
+///
+/// Same size and no older, which is the comparison the module rlib staging
+/// already uses. Anything unknown counts as out of date, so the copy happens.
+#[cfg(feature = "hot_patch")]
+fn staged_copy_is_current(source: &Path, staged: &Path) -> bool {
+    let (Ok(source_metadata), Ok(staged_metadata)) =
+        (std::fs::metadata(source), std::fs::metadata(staged))
+    else {
+        return false;
+    };
+    if source_metadata.len() != staged_metadata.len() {
+        return false;
+    }
+    match (source_metadata.modified(), staged_metadata.modified()) {
+        (Ok(source_time), Ok(staged_time)) => staged_time >= source_time,
+        _ => false,
+    }
 }
 
 /// Build one optional module and return its expected output artifact.
@@ -830,6 +949,9 @@ pub(crate) fn build_optional_module(
     // exactly why the loadable copy lives apart from it.
     let stage_started = Instant::now();
     stage_artifact(&build_output, &hot_output)?;
+    // As above: the dependency closure is consistent exactly now.
+    #[cfg(feature = "hot_patch")]
+    stage_shared_dependency_rlibs(workspace_root);
     #[cfg_attr(not(feature = "hot_patch"), allow(unused_mut))]
     let mut produced = vec![hot_output.clone()];
     #[cfg(feature = "hot_patch")]

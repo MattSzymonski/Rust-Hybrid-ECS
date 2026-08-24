@@ -986,12 +986,36 @@ fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
             stages,
             artifact_bytes,
             exports,
+            routes,
+            copies,
         } => {
+            // How the replacement was delivered, said out loud rather than left
+            // to the analytics line. A slot route is provable - the install is
+            // one atomic pointer store and every call that reaches the
+            // dispatcher runs the new code. The prologue route cannot make that
+            // promise: it overwrites a live function's first bytes, so a caller
+            // that inlined the body still runs the old one. A developer
+            // watching a change not take effect needs to know which they got.
+            let delivery = routes
+                .iter()
+                .map(|route| route.label())
+                .collect::<Vec<_>>()
+                .join("+");
+            let best_effort = !routes.iter().all(|route| route.is_provable());
+            let note = format!(
+                "(generation {generation} via {delivery}, {copies} {}{})",
+                if copies == 1 { "copy" } else { "copies" },
+                if best_effort { " - best effort" } else { "" }
+            );
             println!(
                 "{} {function} {} {}\n      {}",
                 crate::console::bold_cyan("[hot]"),
                 crate::console::green(&format!("LIVE {elapsed_milliseconds:.0} ms")),
-                crate::console::dim(&format!("(generation {generation})")),
+                if best_effort {
+                    crate::console::yellow(&note)
+                } else {
+                    crate::console::dim(&note)
+                },
                 crate::console::dim(&stages.to_string())
             );
             info!(
@@ -1012,6 +1036,8 @@ fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
                 stages.activate,
                 artifact_bytes,
                 exports,
+                &routes,
+                copies,
             );
             true
         }

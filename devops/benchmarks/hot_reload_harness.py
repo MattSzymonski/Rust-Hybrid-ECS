@@ -269,15 +269,29 @@ def verify_prerequisites(run_native: bool, run_csharp: bool) -> bool:
 
 # [analytics] reload <name> (reload #N) | build=<..> | stage=..ms | load=..ms
 #   | init=..ms | migrate=..ms | size=.. | exports=N | kind=reload|patch
+#   [ | route=<route>[+<route>] | copies=N ]
 #
 # `kind` distinguishes a whole-artifact reload from an in-place function patch.
 # Both print the same line on purpose, so this one parser reads both; the group
 # is optional so the harness still reads output from a host predating the field.
+#
+# `route` and `copies` appear on patch lines only, and say which of the three
+# mechanisms delivered the change and how many running copies it reached. The
+# distinction matters for a benchmark: a slot route is provable, while the
+# prologue route overwrites live code and cannot reach a caller that inlined
+# the body, so averaging the two averages a guarantee with an approximation.
+# More than one route appears, joined by `+`, when a single save changed both
+# an annotated and an un-annotated body.
 RELOAD_LINE_RE = re.compile(
     r"\[analytics\] reload (\S+) \(reload #\d+\) \| build=(\S+) \| stage=([\d.]+)ms"
     r" \| load=([\d.]+)ms \| init=([\d.]+)ms \| migrate=([\d.]+)ms \| size=(\S+)"
     r" \| exports=(\d+)(?: \| kind=(\w+))?"
+    r"(?: \| route=([\w+-]+) \| copies=(\d+))?"
 )
+
+# Routes whose replacement is a single atomic pointer store, so any call that
+# reaches the dispatcher runs the new code. Anything else is best-effort.
+PROVABLE_ROUTES = frozenset({"engine-slot", "artifact-slot"})
 #     crates rebuilt by cargo: <crate> <ms> | <crate> <ms> | ...
 CRATES_LINE_RE = re.compile(r"crates rebuilt by cargo: (.*)")
 # The host's startup report spans TWO lines:
@@ -331,6 +345,11 @@ class ReloadTiming:
     crates: Optional[str] = None
     # "reload" for a rebuilt artifact, "patch" for an in-place function patch.
     kind: str = "reload"
+    # Which mechanism(s) delivered a patch, joined by "+"; None for a reload or
+    # for a host predating the field.
+    route: Optional[str] = None
+    # How many running copies the patch reached in total.
+    copies: Optional[int] = None
 
 
 def parse_reload_breakdown(
@@ -360,6 +379,8 @@ def parse_reload_breakdown(
     timing.migrate_ms = float(match.group(6))
     # Absent on a host built before the field existed; a plain reload then.
     timing.kind = match.group(9) or "reload"
+    timing.route = match.group(10)
+    timing.copies = int(match.group(11)) if match.group(11) else None
     following = output[line_end + 1 :]
     next_reload = following.find("[analytics] reload ")
     window = following[: next_reload if next_reload >= 0 else 2000]
@@ -624,6 +645,58 @@ def run_session(
 # =============================================================================
 
 
+def print_delivery_summary(results: Dict[str, List[ReloadTiming]]) -> None:
+    """Prints how each category's change actually reached the running process.
+
+    A wall time means different things depending on the mechanism behind it, so
+    reporting the number without the mechanism invites comparing a guarantee
+    against an approximation. A slot route replaces code with one atomic pointer
+    store, and any call reaching the dispatcher runs the new version. The
+    prologue route overwrites a live function's first bytes: it cannot reach a
+    caller that inlined the body, and its twelve-byte write is not atomic.
+
+    `copies` is the fan-out - how many running copies of the function the
+    install reached. A crate linked into several artifacts is compiled into each
+    of them, so a patch that reached one copy and left two stale is a different
+    result from one that reached all three.
+    """
+    print(f"\n{'=' * 64}")
+    print("  HOW EACH CHANGE REACHED THE PROCESS")
+    print(f"{'=' * 64}")
+    any_printed = False
+    for label, timings in results.items():
+        patched = [timing for timing in timings if timing.route]
+        if not patched:
+            continue
+        any_printed = True
+        routes: Dict[str, int] = {}
+        for timing in patched:
+            routes[timing.route] = routes.get(timing.route, 0) + 1
+        # Best-effort wins the summary: an edit is only as provable as its
+        # weakest body, and a single "+"-joined entry can mix the two.
+        provable = all(
+            part in PROVABLE_ROUTES
+            for timing in patched
+            for part in timing.route.split("+")
+        )
+        copies = [timing.copies for timing in patched if timing.copies is not None]
+        detail = ", ".join(
+            f"{route} x{count}" for route, count in sorted(routes.items())
+        )
+        guarantee = "provable" if provable else "BEST EFFORT"
+        print(f"\n  {label}: {detail}")
+        print(f"    guarantee: {guarantee}")
+        if copies:
+            print(f"    copies reached: avg {sum(copies) / len(copies):.1f}")
+        # Only a whole-artifact reload has nothing to report here, so a mix
+        # means some iterations fell back - worth seeing.
+        fell_back = len(timings) - len(patched)
+        if fell_back:
+            print(f"    fell back to a full reload: {fell_back} of {len(timings)}")
+    if not any_printed:
+        print("\n  (no in-place patches measured - every category was a full reload)")
+
+
 def print_crates_summary(results: Dict[str, List[ReloadTiming]]) -> None:
     """Prints which crates each category recompiled and their average times.
 
@@ -682,6 +755,7 @@ def print_summary(results: Dict[str, List[ReloadTiming]], max_wall_ms: Optional[
             )
             all_passed = False
     print_crates_summary(results)
+    print_delivery_summary(results)
     if max_wall_ms is None:
         print("\n  (report only - no threshold set; pass --max-wall-ms to enforce one)")
     else:
@@ -694,7 +768,7 @@ def write_csv(results: Dict[str, List[ReloadTiming]], csv_path: Path) -> None:
     with csv_path.open("w", encoding="utf-8", newline="") as csv_file:
         csv_file.write(
             "category,iteration,wall_ms,build_ms,stage_ms,load_ms,init_ms,"
-            "migrate_ms,crates\n"
+            "migrate_ms,kind,route,copies,crates\n"
         )
         for label, timings in results.items():
             for iteration, timing in enumerate(timings, start=1):
@@ -706,6 +780,9 @@ def write_csv(results: Dict[str, List[ReloadTiming]], csv_path: Path) -> None:
                     f"{timing.load_ms if timing.load_ms is not None else ''},"
                     f"{timing.init_ms if timing.init_ms is not None else ''},"
                     f"{timing.migrate_ms if timing.migrate_ms is not None else ''},"
+                    f"{timing.kind},"
+                    f"{timing.route or ''},"
+                    f"{timing.copies if timing.copies is not None else ''},"
                     f"{crates}\n"
                 )
     print(f"  [OK] Wrote {csv_path}")

@@ -205,23 +205,52 @@ impl CargoRustcLine {
         output: &Path,
         crate_name: &str,
         extra_externs: &[String],
+        staged_dependencies: Option<&Path>,
     ) -> Command {
         let mut command = Command::new(&self.program);
-        command.args(self.replay_args(input, output, crate_name, extra_externs));
+        command.args(self.replay_args(
+            input,
+            output,
+            crate_name,
+            extra_externs,
+            staged_dependencies,
+        ));
         command
     }
 
     /// The argument vector `replay` passes to `rustc`, exposed for tests and
     /// for logging a reproducible command line.
+    ///
+    /// `staged_dependencies`, when given, redirects every `--extern` that names
+    /// a shared per-crate slot to the copy staged there. Those slots are
+    /// overwritten in place by any build of the same crate name, feature set
+    /// included, so linking them directly is what made a patch fail with
+    /// `error[E0463]` after an unrelated `cargo build`. Hash-qualified paths are
+    /// left alone: they already name one exact configuration.
     pub fn replay_args(
         &self,
         input: &Path,
         output: &Path,
         crate_name: &str,
         extra_externs: &[String],
+        staged_dependencies: Option<&Path>,
     ) -> Vec<String> {
-        let mut arguments = Vec::with_capacity(self.args.len() + 6);
+        let mut arguments = Vec::with_capacity(self.args.len() + 8);
         let mut index = 0;
+
+        // Ahead of everything cargo recorded, so rustc finds the staged copies
+        // first. This is not the same job as redirecting `--extern` below, and
+        // both are needed: `--extern` only maps crates the patch source names
+        // itself, while the module rlib's own dependencies are resolved by
+        // searching the `-L` paths for a crate with the right name and metadata
+        // hash. Leave the shared `deps` directory first and rustc finds whatever
+        // variant was last written there, rejects it, and reports
+        // `error[E0463]: can't find crate for <the module>` - blaming the module
+        // rather than the dependency that actually moved.
+        if let Some(directory) = staged_dependencies {
+            arguments.push("-L".to_string());
+            arguments.push(format!("dependency={}", directory.display()));
+        }
 
         while index < self.args.len() {
             let token = &self.args[index];
@@ -257,7 +286,11 @@ impl CargoRustcLine {
 
             arguments.push(token.clone());
             if has_separate_value {
-                arguments.push(self.args[index + 1].clone());
+                let value = &self.args[index + 1];
+                arguments.push(match (token.as_str(), staged_dependencies) {
+                    ("--extern", Some(directory)) => redirect_extern(value, directory),
+                    _ => value.clone(),
+                });
             }
             index += if has_separate_value { 2 } else { 1 };
         }
@@ -267,6 +300,31 @@ impl CargoRustcLine {
         for extern_entry in extra_externs {
             arguments.push("--extern".to_string());
             arguments.push(extern_entry.clone());
+        }
+
+        // No PDB for the patch.
+        //
+        // Measured, not guessed: this is 22% of the compile. Linking is 75% of a
+        // patch's wall time - a body that references nothing links in 90 ms
+        // against 360 ms for a real one - because the linker reads the whole
+        // engine closure, 21 MB of `pill_engine` and 12 MB of `pill_core`, to
+        // emit one function. Most of that bulk is debug info, and building a PDB
+        // from it costs 80 ms and writes 18 MB per patch. `-C debuginfo=0` does
+        // NOT avoid it: the debug info lives in the inputs, not in the patch, so
+        // only telling the linker to skip the PDB entirely helps.
+        //
+        // The trade is real and deliberate: patched code has no debugger
+        // symbols. A patch is generated code that exists for a few seconds, and
+        // a prologue-patched function already defeats breakpoints set on it -
+        // so the symbols were of little use, while the 80 ms is paid on every
+        // save.
+        //
+        // MSVC-only because `/DEBUG:NONE` is a link.exe/lld-link flag. Other
+        // targets keep whatever cargo recorded.
+        #[cfg(target_env = "msvc")]
+        {
+            arguments.push("-C".to_string());
+            arguments.push("link-arg=/DEBUG:NONE".to_string());
         }
 
         // The patch's own identity and output.
@@ -344,6 +402,48 @@ impl CargoRustcLine {
 // Free functions
 // =============================================================================
 
+/// Point one `--extern name=path` at its staged copy, when there is one.
+///
+/// Only a shared per-crate slot is redirected - a `.rlib` whose filename carries
+/// no `-<16 hex digits>` metadata suffix. Everything else is returned unchanged,
+/// including entries this cannot parse: linking the original path is what
+/// happened before staging existed, so an unrecognized entry degrades to the old
+/// behaviour rather than to a broken command line.
+fn redirect_extern(entry: &str, staged_dependencies: &Path) -> String {
+    let Some((name, path)) = entry.split_once('=') else {
+        return entry.to_string();
+    };
+    let Some(file_name) = Path::new(path).file_name().and_then(|name| name.to_str()) else {
+        return entry.to_string();
+    };
+    if !is_shared_slot_rlib(file_name) {
+        return entry.to_string();
+    }
+    let staged = staged_dependencies.join(file_name);
+    if !staged.is_file() {
+        return entry.to_string();
+    }
+    format!("{name}={}", staged.display())
+}
+
+/// Whether a `deps` filename is a shared per-crate slot rather than one
+/// qualified by a metadata hash.
+///
+/// Kept beside [`redirect_extern`] and mirrored by the staging side in
+/// `build_runner`: the two must agree about which files are shared, or a file
+/// is staged and never linked, or linked and never staged.
+fn is_shared_slot_rlib(file_name: &str) -> bool {
+    let Some(stem) = file_name.strip_suffix(".rlib") else {
+        return false;
+    };
+    match stem.rsplit_once('-') {
+        Some((_, suffix)) => {
+            !(suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        }
+        None => true,
+    }
+}
+
 /// Bump a file's modification time without touching its contents.
 ///
 /// Rewriting the same bytes is enough for cargo's mtime-based freshness check
@@ -419,6 +519,8 @@ mod tests {
          -C linker=rust-lld -C 'incremental=D:\\proj\\target\\debug\\incremental' \
          -L 'dependency=D:\\proj\\target\\debug\\deps' \
          --extern 'pill_engine=D:\\proj\\target\\debug\\deps\\libpill_engine-319.rlib' \
+         --extern 'serde=D:\\proj\\target\\debug\\deps\\libserde-1094916a36d6bb5e.rlib' \
+         --extern 'pill_dummy_color=D:\\proj\\target\\debug\\deps\\libpill_dummy_color.rlib' \
          -C prefer-dynamic -L 'native=C:\\reg\\windows_x86_64_msvc-0.52.6\\lib'`"
     }
 
@@ -445,6 +547,108 @@ mod tests {
         assert!(line.args.contains(&"-C".to_string()));
     }
 
+    /// A shared per-crate slot is one cargo overwrites in place; a
+    /// hash-qualified name belongs to one exact configuration.
+    ///
+    /// The distinction decides which `--extern` entries get redirected to a
+    /// staged copy, and the staging side in `build_runner` must agree with it -
+    /// disagree and a file is either staged and never linked, or linked and
+    /// never staged.
+    #[test]
+    fn shared_slots_are_told_apart_from_hash_qualified_artifacts() {
+        // Workspace crates: one slot per crate name, overwritten by any build.
+        assert!(is_shared_slot_rlib("libpill_dummy_color.rlib"));
+        assert!(is_shared_slot_rlib("libpill_core.rlib"));
+        // A crate name containing a hyphen is still a shared slot; only a
+        // trailing 16-hex-digit suffix marks a configuration.
+        assert!(is_shared_slot_rlib("libtrait_type-map.rlib"));
+        // Hash-qualified, so it already names one configuration.
+        assert!(!is_shared_slot_rlib("libpill_engine-190d6c0e2d2eaf24.rlib"));
+        // A suffix of the wrong length or with non-hex digits is not a hash.
+        assert!(is_shared_slot_rlib("libthing-190d6c0e2d2eaf2.rlib"));
+        assert!(is_shared_slot_rlib("libthing-190d6c0e2d2eaf2z.rlib"));
+        // Not an rlib at all.
+        assert!(!is_shared_slot_rlib("pill_core.dll"));
+    }
+
+    /// Only a shared slot with a staged copy is redirected. Everything else is
+    /// returned unchanged, so an unrecognized entry degrades to the behaviour
+    /// that existed before staging rather than to a broken command line.
+    #[test]
+    fn only_staged_shared_slots_are_redirected() {
+        let staged = std::env::temp_dir().join("pill_staged_externs_test");
+        let _ = std::fs::remove_dir_all(&staged);
+        std::fs::create_dir_all(&staged).expect("create staging dir");
+        std::fs::write(staged.join("libpill_dummy_color.rlib"), b"staged")
+            .expect("write staged copy");
+
+        // Staged shared slot: redirected.
+        let redirected = redirect_extern(
+            "pill_dummy_color=D:\\proj\\target\\debug\\deps\\libpill_dummy_color.rlib",
+            &staged,
+        );
+        assert!(
+            redirected.ends_with("libpill_dummy_color.rlib"),
+            "got: {redirected}"
+        );
+        assert!(redirected.starts_with("pill_dummy_color="));
+        assert!(
+            redirected.contains("pill_staged_externs_test"),
+            "must point into the staging directory: {redirected}"
+        );
+
+        // Shared slot with nothing staged: left alone.
+        let untouched = redirect_extern(
+            "pill_spline=D:\\proj\\target\\debug\\deps\\libpill_spline.rlib",
+            &staged,
+        );
+        assert!(untouched.ends_with("deps\\libpill_spline.rlib"), "got: {untouched}");
+
+        // Hash-qualified: never redirected, even if a same-named file exists.
+        let hashed = "pill_engine=D:\\proj\\deps\\libpill_engine-190d6c0e2d2eaf24.rlib";
+        assert_eq!(redirect_extern(hashed, &staged), hashed);
+
+        // Unparseable entries are returned verbatim.
+        assert_eq!(redirect_extern("no_equals_sign", &staged), "no_equals_sign");
+
+        let _ = std::fs::remove_dir_all(&staged);
+    }
+
+    /// The redirect reaches `replay_args`, which is where it has to happen.
+    #[test]
+    fn replay_redirects_a_staged_dependency() {
+        let staged = std::env::temp_dir().join("pill_staged_replay_test");
+        let _ = std::fs::remove_dir_all(&staged);
+        std::fs::create_dir_all(&staged).expect("create staging dir");
+        std::fs::write(staged.join("libpill_dummy_color.rlib"), b"staged")
+            .expect("write staged copy");
+
+        let line = parsed();
+        let joined = line
+            .replay_args(
+                Path::new("patch.rs"),
+                Path::new("patch.dll"),
+                "pill_hotpatch_1",
+                &[],
+                Some(staged.as_path()),
+            )
+            .join(" ");
+
+        assert!(
+            joined.contains(&format!(
+                "pill_dummy_color={}",
+                staged.join("libpill_dummy_color.rlib").display()
+            )),
+            "the staged copy must be linked: {joined}"
+        );
+        // A genuinely hash-qualified dependency is untouched.
+        assert!(joined.contains(
+            "serde=D:\\proj\\target\\debug\\deps\\libserde-1094916a36d6bb5e.rlib"
+        ));
+
+        let _ = std::fs::remove_dir_all(&staged);
+    }
+
     #[test]
     fn replay_keeps_every_dependency_flag() {
         let line = parsed();
@@ -453,6 +657,7 @@ mod tests {
             Path::new("patch.dll"),
             "pill_hotpatch_1",
             &[],
+            None,
         );
         let joined = arguments.join(" ");
 
@@ -475,6 +680,7 @@ mod tests {
             Path::new("patch.dll"),
             "pill_hotpatch_1",
             &[],
+            None,
         );
         let joined = arguments.join(" ");
 
@@ -497,6 +703,7 @@ mod tests {
             Path::new("out.dll"),
             "pill_hotpatch_7",
             &[],
+            None,
         );
 
         let name_index = arguments.iter().position(|a| a == "--crate-name").unwrap();

@@ -581,10 +581,58 @@ impl EventKind {
     }
 }
 
+/// Which of the three mechanisms delivered a patch.
+///
+/// `kind=patch` alone conflates two very different guarantees, which is why this
+/// is reported separately. A slot route is provable: the replacement is one
+/// atomic pointer store, and any call that reaches the dispatcher runs the new
+/// code. The prologue route is best-effort by construction - it overwrites a
+/// live function's first bytes, so it cannot reach a caller that inlined the
+/// body, and the twelve-byte write is not atomic. A benchmark that averages the
+/// two is averaging a guarantee with an approximation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(feature = "hot_patch"), allow(dead_code))]
+pub(crate) enum PatchRoute {
+    /// A `#[pill_hot]` system, replaced through the engine's own registry. The
+    /// registry lives once per process, so one install reaches every caller.
+    EngineSlot,
+    /// A `#[pill_hot_fn]` function, replaced through the redirect slot compiled
+    /// into each artifact that links the crate.
+    ArtifactSlot,
+    /// An un-annotated function, redirected by overwriting its first bytes in
+    /// every artifact that carries a copy.
+    Prologue,
+}
+
+impl PatchRoute {
+    /// The value printed after `route=`, and after `via` on the console line.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::EngineSlot => "engine-slot",
+            Self::ArtifactSlot => "artifact-slot",
+            Self::Prologue => "prologue",
+        }
+    }
+
+    /// Whether a call that reaches the function is guaranteed to run the new
+    /// code, as opposed to possibly running an inlined or unreached copy.
+    ///
+    /// Only the patch path asks, so without `hot_patch` this has no caller -
+    /// the same reason [`EventKind`] carries the allow on its own declaration.
+    #[cfg_attr(not(feature = "hot_patch"), allow(dead_code))]
+    pub(crate) fn is_provable(self) -> bool {
+        matches!(self, Self::EngineSlot | Self::ArtifactSlot)
+    }
+}
+
 /// A snapshot of one completed hot reload, printed on the next frame.
 struct ReloadEvent {
     /// Whether this was a whole-artifact reload or an in-place patch.
     kind: EventKind,
+    /// Which mechanisms delivered a patch, and how many copies they reached in
+    /// total. `None` for a reload, which has no route: it replaces the whole
+    /// artifact rather than redirecting anything.
+    route: Option<(Vec<PatchRoute>, usize)>,
     name: String,
     build_ms: u64,
     stage_ms: f64,
@@ -790,6 +838,7 @@ pub(crate) fn record_reload(name: &str) {
         let module = &collector.modules[index];
         ReloadEvent {
             kind: EventKind::Reload,
+            route: None,
             name: name.to_string(),
             build_ms: module.build_wall_ms,
             stage_ms: module.stage_ms,
@@ -815,6 +864,7 @@ pub(crate) fn record_reload(name: &str) {
 /// always zero because a patch cannot change a component schema - that is
 /// precisely the kind of edit it refuses.
 #[cfg(feature = "hot_patch")]
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn record_patch(
     function: &str,
     generation: u32,
@@ -824,6 +874,8 @@ pub(crate) fn record_patch(
     activate_ms: f64,
     artifact_bytes: u64,
     exports: usize,
+    routes: &[PatchRoute],
+    copies: usize,
 ) {
     let mut collector = analytics()
         .lock()
@@ -831,6 +883,7 @@ pub(crate) fn record_patch(
     collector.patches += 1;
     collector.pending_reload_events.push(ReloadEvent {
         kind: EventKind::Patch,
+        route: Some((routes.to_vec(), copies)),
         name: function.to_string(),
         build_ms,
         stage_ms,
@@ -1106,7 +1159,7 @@ pub(crate) fn print_reload_events(reload_started: std::time::Instant) -> usize {
     for event in &events {
         println!(
             "{} reload {} {} | build={} | stage={}ms | load={}ms | init={}ms | \
-             migrate={}ms | size={} | exports={} | kind={}",
+             migrate={}ms | size={} | exports={} | kind={}{}",
             console::bold_cyan("[analytics]"),
             console::bold_cyan(&event.name),
             console::dim(&format!("(reload #{})", event.reload_count)),
@@ -1126,6 +1179,24 @@ pub(crate) fn print_reload_events(reload_started: std::time::Instant) -> usize {
             }),
             console::yellow(&event.exports.to_string()),
             console::yellow(event.kind.label()),
+            // Appended rather than folded into `kind=`, so the field the
+            // harness already parses keeps its exact meaning and vocabulary.
+            // A reload has no route, and prints none.
+            match &event.route {
+                Some((routes, copies)) => {
+                    let joined = routes
+                        .iter()
+                        .map(|route| route.label())
+                        .collect::<Vec<_>>()
+                        .join("+");
+                    format!(
+                        " | route={} | copies={}",
+                        console::yellow(&joined),
+                        console::yellow(&copies.to_string())
+                    )
+                }
+                None => String::new(),
+            },
         );
         // The module line above is only the transaction's own timings; the
         // cargo `--timings` breakdown shows every crate the build actually
@@ -1279,6 +1350,70 @@ const CONCURRENCY_DATA = [
 
     /// Build a throwaway workspace whose `target/cargo-timings` holds the
     /// fixture, and return the workspace root.
+    /// The two slot routes promise something the prologue route cannot, and the
+    /// benchmark harness keys off exactly this.
+    ///
+    /// A slot install is one atomic pointer store, so any call reaching the
+    /// dispatcher runs the new code. The prologue route overwrites a live
+    /// function's first bytes: a caller that inlined the body still runs the old
+    /// one, and the twelve-byte write is not atomic. Reporting both as `patch`
+    /// is what made a benchmark average a guarantee with an approximation.
+    #[test]
+    fn only_the_slot_routes_are_provable() {
+        assert!(PatchRoute::EngineSlot.is_provable());
+        assert!(PatchRoute::ArtifactSlot.is_provable());
+        assert!(!PatchRoute::Prologue.is_provable());
+    }
+
+    /// The labels are the harness's vocabulary, so they are pinned rather than
+    /// left free to drift. `PROVABLE_ROUTES` in
+    /// `devops/benchmarks/hot_reload_harness.py` names these exact strings, and
+    /// its `route=([\w+-]+)` group accepts them joined by `+`.
+    #[test]
+    fn route_labels_match_what_the_harness_parses() {
+        assert_eq!(PatchRoute::EngineSlot.label(), "engine-slot");
+        assert_eq!(PatchRoute::ArtifactSlot.label(), "artifact-slot");
+        assert_eq!(PatchRoute::Prologue.label(), "prologue");
+        // Every label must survive the harness's character class, or a route
+        // silently stops being parsed.
+        for route in [
+            PatchRoute::EngineSlot,
+            PatchRoute::ArtifactSlot,
+            PatchRoute::Prologue,
+        ] {
+            assert!(
+                route
+                    .label()
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '-'),
+                "`{}` would not match the harness regex",
+                route.label()
+            );
+        }
+    }
+
+    /// A reload prints no route, because it has none: it replaces the whole
+    /// artifact rather than redirecting any single function.
+    #[test]
+    fn a_reload_carries_no_route() {
+        let event = ReloadEvent {
+            kind: EventKind::Reload,
+            route: None,
+            name: "project".to_string(),
+            build_ms: 100,
+            stage_ms: 1.0,
+            load_ms: 1.0,
+            init_ms: 1.0,
+            migrate_ms: 0.0,
+            artifact_bytes: 1024,
+            exports: 4,
+            reload_count: 1,
+            cargo_crates: Vec::new(),
+        };
+        assert!(event.route.is_none());
+        assert_eq!(event.kind.label(), "reload");
+    }
+
     fn fixture_workspace() -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)

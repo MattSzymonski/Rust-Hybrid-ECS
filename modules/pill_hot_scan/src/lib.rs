@@ -197,6 +197,40 @@ pub struct FunctionText {
     pub body: String,
 }
 
+/// Find the body of one method, scoped to the `impl` block that owns it.
+///
+/// [`find_function`] searches by bare name and returns the first match, which
+/// stopped being sufficient once trait blocks were registered: a file may hold
+/// `impl Default for Alpha` and `impl Default for Beta`, or a type may carry
+/// both an inherent `draw` and a trait `draw`. Generating a patch from the first
+/// `fn draw` in the file would compile and install the wrong body - a silent
+/// wrong answer, which is the one outcome this subsystem must not produce.
+///
+/// `trait_name` of `None` selects the inherent block, so an inherent and a trait
+/// method of the same name stay distinguishable.
+pub fn find_method(
+    source: &str,
+    name: &str,
+    self_type: &str,
+    trait_name: Option<&str>,
+) -> Option<FunctionText> {
+    let mask = code_mask(source);
+    let block = inherent_impl_blocks(source, &mask)
+        .into_iter()
+        .find(|block| block.type_name == self_type && block.trait_name.as_deref() == trait_name)?;
+
+    // Search only inside the block's body, then translate the offsets back so
+    // the caller receives positions in the original source.
+    let (open, close) = block.body;
+    let found = find_function(&source[open..=close], name)?;
+    Some(FunctionText {
+        start: found.start + open,
+        end: found.end + open,
+        text: found.text,
+        body: found.body,
+    })
+}
+
 /// Find `fn <name>` at the top level and return its full text.
 ///
 /// Returns `None` when the name does not appear as a function declaration, or
@@ -219,7 +253,10 @@ pub fn find_function(source: &str, name: &str) -> Option<FunctionText> {
             // The character before must be a boundary, so `fn movement` does not
             // match inside `fn movement_extra`.
             let preceded_ok = search == 0
-                || matches!(bytes[search - 1], b'\n' | b'\r' | b'\t' | b' ' | b'}' | b';');
+                || matches!(
+                    bytes[search - 1],
+                    b'\n' | b'\r' | b'\t' | b' ' | b'}' | b';'
+                );
             let after = search + needle_bytes.len();
             let followed_ok = after >= bytes.len()
                 || matches!(bytes[after], b'(' | b' ' | b'<' | b'\n' | b'\r' | b'\t');
@@ -263,8 +300,8 @@ pub fn top_level_use_statements(source: &str) -> Vec<String> {
                 b'}' => depth -= 1,
                 b'u' if depth == 0 => {
                     let line_start = index;
-                    let preceded_ok = index == 0
-                        || matches!(bytes[index - 1], b'\n' | b'\r' | b'\t' | b' ');
+                    let preceded_ok =
+                        index == 0 || matches!(bytes[index - 1], b'\n' | b'\r' | b'\t' | b' ');
                     if preceded_ok && source[index..].starts_with("use ") {
                         // A `use` statement ends at its terminating semicolon.
                         if let Some(offset) = source[index..].find(';') {
@@ -316,6 +353,13 @@ pub struct HotFunction {
     /// for a method must name the receiver type, so classification refuses the
     /// second case rather than generating something that cannot compile.
     pub self_type: Option<String>,
+    /// The trait whose `impl` block encloses it, for a trait method.
+    ///
+    /// `None` for a free function and for an inherent method. Two traits may
+    /// define the same method name for one type, and a type may have both an
+    /// inherent and a trait method of the same name, so a trait method is only
+    /// unambiguous when named as `<Type as Trait>::method`.
+    pub trait_name: Option<String>,
     /// Whether the declaration takes a receiver.
     pub takes_receiver: bool,
     /// The declaration as written, from `fn` to the body, whitespace collapsed.
@@ -333,6 +377,13 @@ pub struct HotFunction {
     /// leaves those functions out rather than promising a patch it cannot
     /// deliver.
     pub inline_always: bool,
+    /// Whether this function is the module ABI's entry point.
+    ///
+    /// The host calls it through the loaded library's export table at load time,
+    /// never through a redirect, so it is left out of the inventory. Determined
+    /// by the attribute that generates the export rather than by the function's
+    /// name, which is only a convention and one a module may break.
+    pub abi_entry_point: bool,
     /// Whether a `#[cfg(…)]` decides if this declaration exists at all.
     ///
     /// A byte scanner cannot evaluate `cfg`, so a conditionally compiled
@@ -417,15 +468,19 @@ pub fn hot_functions(source: &str) -> Vec<HotFunction> {
             if !found.iter().any(|existing| existing.name == name) {
                 // The innermost `impl` body containing this declaration, which
                 // is the type a generated patch must name.
-                let self_type = blocks
+                let enclosing = blocks
                     .iter()
-                    .filter(|block| block.body.0 < declaration_start && declaration_start < block.body.1)
-                    .min_by_key(|block| block.body.1 - block.body.0)
-                    .map(|block| block.type_name.clone());
+                    .filter(|block| {
+                        block.body.0 < declaration_start && declaration_start < block.body.1
+                    })
+                    .min_by_key(|block| block.body.1 - block.body.0);
+                let self_type = enclosing.map(|block| block.type_name.clone());
+                let trait_name = enclosing.and_then(|block| block.trait_name.clone());
                 found.push(HotFunction {
                     name,
                     kind,
                     self_type,
+                    trait_name,
                     takes_receiver: declaration_takes_receiver(source, &mask, declaration_start),
                     signature: normalized_signature(source, &mask, declaration_start),
                     cfg_gated: declaration_is_cfg_gated(source, &mask, declaration_start),
@@ -434,6 +489,11 @@ pub fn hot_functions(source: &str) -> Vec<HotFunction> {
                         &mask,
                         declaration_start,
                         "#[inline(always)]",
+                    ),
+                    abi_entry_point: declaration_is_abi_entry_point(
+                        source,
+                        &mask,
+                        declaration_start,
                     ),
                     annotated: true,
                 });
@@ -486,14 +546,24 @@ pub fn all_functions(source: &str) -> Vec<HotFunction> {
                     .unwrap_or(source.len());
                 if name_end > name_start {
                     let name = source[name_start..name_end].to_string();
-                    let self_type = blocks
+                    let enclosing = blocks
                         .iter()
                         .filter(|block| block.body.0 < index && index < block.body.1)
-                        .min_by_key(|block| block.body.1 - block.body.0)
-                        .map(|block| block.type_name.clone());
-                    // Module level, or directly inside an inherent `impl`.
+                        .min_by_key(|block| block.body.1 - block.body.0);
+                    let self_type = enclosing.map(|block| block.type_name.clone());
+                    let trait_name = enclosing.and_then(|block| block.trait_name.clone());
+                    // Module level, or directly inside an `impl`.
                     let addressable = depth == 0 || (self_type.is_some() && depth == 1);
-                    if addressable && !found.iter().any(|existing| existing.name == name) {
+                    // Keyed by the whole path, not the bare name: a type may
+                    // carry an inherent `draw` and a trait `draw`, and two
+                    // traits may each define `draw` for it. Deduplicating by
+                    // name alone silently dropped all but the first.
+                    let already = found.iter().any(|existing| {
+                        existing.name == name
+                            && existing.self_type == self_type
+                            && existing.trait_name == trait_name
+                    });
+                    if addressable && !already {
                         let kind = annotated
                             .get(&name)
                             .copied()
@@ -502,6 +572,7 @@ pub fn all_functions(source: &str) -> Vec<HotFunction> {
                             name: name.clone(),
                             kind,
                             self_type,
+                            trait_name,
                             takes_receiver: declaration_takes_receiver(source, &mask, index),
                             signature: normalized_signature(source, &mask, index),
                             cfg_gated: declaration_is_cfg_gated(source, &mask, index),
@@ -510,6 +581,9 @@ pub fn all_functions(source: &str) -> Vec<HotFunction> {
                                 &mask,
                                 index,
                                 "#[inline(always)]",
+                            ),
+                            abi_entry_point: declaration_is_abi_entry_point(
+                                source, &mask, index,
                             ),
                             annotated: annotated.contains_key(&name),
                         });
@@ -528,15 +602,25 @@ pub struct ImplBlock {
     pub body: (usize, usize),
     /// The type the block implements methods on.
     pub type_name: String,
+    /// The trait being implemented, for `impl Trait for Type`.
+    ///
+    /// `None` for an inherent block. Two traits may define the same method name
+    /// for one type, so a trait method is only unambiguous when named through
+    /// the trait - which is why this is carried rather than discarded.
+    pub trait_name: Option<String>,
 }
 
-/// Every inherent `impl` block in the file whose type is a simple name.
+/// Every `impl` block in the file that names one concrete type.
 ///
-/// Generic blocks (`impl<T> Foo<T>`) and trait blocks are deliberately skipped:
-/// a patch replaces one concrete implementation, and neither has a single
-/// receiver type a generated patch could name. A method inside one is reported
-/// with no `self_type`, which classification then refuses with a clear reason
-/// instead of emitting a patch that cannot compile.
+/// Both inherent blocks (`impl Spline`) and non-generic trait blocks
+/// (`impl Drawable for Spline`) qualify: each has exactly one receiver type and
+/// one address per method, which is what a patch needs.
+///
+/// Generic blocks (`impl<T> Foo<T>`, `impl Trait for Foo<T>`) are still skipped,
+/// and unavoidably so: a generic has one instantiation per set of type
+/// arguments, so there is no single address to redirect. A method inside one is
+/// reported with no `self_type`, which classification then refuses with a clear
+/// reason instead of emitting a patch that cannot compile.
 pub fn inherent_impl_blocks(source: &str, mask: &[bool]) -> Vec<ImplBlock> {
     let bytes = source.as_bytes();
     let mut blocks = Vec::new();
@@ -561,32 +645,52 @@ pub fn inherent_impl_blocks(source: &str, mask: &[bool]) -> Vec<ImplBlock> {
         let Some(close) = matching_brace(bytes, mask, open) else {
             continue;
         };
-        // The header between `impl` and the opening brace names the type.
+        // The header between `impl` and the opening brace names the type, and
+        // for a trait block the trait as well.
         let header = &source[start + 4..open];
-        if let Some(type_name) = inherent_type_name(header) {
+        if let Some((trait_name, type_name)) = impl_header_names(header) {
             blocks.push(ImplBlock {
                 body: (open, close),
                 type_name,
+                trait_name,
             });
         }
     }
     blocks
 }
 
-/// The type a simple inherent `impl` header names, if it is one.
-fn inherent_type_name(header: &str) -> Option<String> {
+/// The trait and type an `impl` header names, if it names exactly one of each.
+///
+/// Returns `(None, Type)` for an inherent block and `(Some(Trait), Type)` for a
+/// non-generic trait block. Returns `None` when the header has no single
+/// concrete receiver type, which is the case that cannot be patched at all.
+fn impl_header_names(header: &str) -> Option<(Option<String>, String)> {
     let header = header.trim();
-    // A trait implementation, a generic block, or a `where` clause all mean
-    // there is no single concrete receiver type to name.
-    if header.is_empty()
-        || header.starts_with('<')
-        || header.contains(" for ")
-        || header.contains("where")
-        || header.contains('<')
-    {
+    // `impl<T>` introduces type parameters, so every method inside has one
+    // instantiation per set of type arguments and no single address. A `where`
+    // clause means the same thing.
+    if header.is_empty() || header.starts_with('<') || header.contains("where") {
         return None;
     }
-    let candidate = header.trim_end_matches(|character: char| character.is_whitespace());
+
+    // Split a trait block into its two halves. ` for ` cannot appear inside a
+    // simple path, so a plain find is sufficient for the headers that reach
+    // here - anything with type arguments is rejected by `simple_path` below.
+    let (trait_name, type_name) = match header.find(" for ") {
+        Some(position) => (
+            Some(simple_path(&header[..position])?),
+            simple_path(&header[position + 5..])?,
+        ),
+        None => (None, simple_path(header)?),
+    };
+    Some((trait_name, type_name))
+}
+
+/// One path with no type arguments, or `None`.
+///
+/// Angle brackets anywhere mean a generic, which has no single address.
+fn simple_path(candidate: &str) -> Option<String> {
+    let candidate = candidate.trim();
     if candidate.is_empty()
         || !candidate
             .chars()
@@ -731,9 +835,32 @@ pub fn strip_function_bodies(source: &str, names: &HashSet<String>) -> String {
 // Build-script entry point
 // =============================================================================
 
-/// Functions never registered: load-time plumbing whose address the host has no
-/// business redirecting.
-const INVENTORY_BLOCKLIST: &[&str] = &["register"];
+/// Whether a declaration carries an attribute that makes it the module ABI's
+/// entry point.
+///
+/// This is the convention-driven replacement for a list that named `register`
+/// literally. A module is free to call its entry point anything; what makes it
+/// one is `#[pill_module]` or `#[pill_project]`, which is what generates the
+/// `#[no_mangle]` export the host calls at load time.
+pub fn declaration_is_abi_entry_point(
+    source: &str,
+    mask: &[bool],
+    declaration_start: usize,
+) -> bool {
+    ABI_ENTRY_POINT_ATTRIBUTES
+        .iter()
+        .any(|attribute| declaration_has_attribute(source, mask, declaration_start, attribute))
+}
+
+/// Attributes that turn a function into the module ABI's entry point.
+///
+/// The host calls these through the loaded library's export table at load time,
+/// never through a redirect, so registering an address for one would offer a
+/// patch that nothing can use.
+///
+/// Matched as a suffix so both `#[pill_module]` and a path-qualified
+/// `#[pill_engine::pill_module]` are recognized.
+const ABI_ENTRY_POINT_ATTRIBUTES: &[&str] = &["pill_module]", "pill_project]"];
 
 /// Generate this crate's function-address inventory into `OUT_DIR`.
 ///
@@ -837,7 +964,12 @@ pub fn generate_function_inventory() {
         }
 
         for function in all_functions(&contents) {
-            if INVENTORY_BLOCKLIST.contains(&function.name.as_str()) {
+            // The module ABI's own entry point, which the host calls through
+            // the export table at load time rather than through any redirect.
+            // Recognized by the attribute that makes it one, not by its name:
+            // the name is a convention a module is free to break, while the
+            // attribute is what actually generates the export.
+            if function.abi_entry_point {
                 continue;
             }
             // A `cfg` this scanner cannot evaluate may have removed the function
@@ -858,19 +990,46 @@ pub fn generate_function_inventory() {
                 );
                 continue;
             }
-            let mut path_segments = segments.clone();
-            // An inherent method is named through its type, so two types in one
-            // module may both have a `new` without colliding.
-            if let Some(owner) = &function.self_type {
-                path_segments.push(owner.clone());
+            // A trait method's `impl` may rely on a `use` that is scoped to its
+            // own file, and the inventory is included at the crate root. Naming
+            // it there would not compile, so it is skipped and said out loud.
+            if let Some(trait_name) = &function.trait_name {
+                if !trait_is_nameable_from_crate_root(trait_name, &segments, &contents) {
+                    println!(
+                        "cargo:warning=pill: `{}::{}` is not registered for hot                          patching: the trait `{trait_name}` is named through a                          `use` in its own module, which the generated inventory                          at the crate root cannot see. Write the trait's full                          path in the `impl` header to make it patchable",
+                        function.self_type.as_deref().unwrap_or("?"),
+                        function.name
+                    );
+                    continue;
+                }
             }
-            path_segments.push(function.name.clone());
 
-            let qualified = std::iter::once(crate_name.clone())
-                .chain(path_segments.iter().cloned())
-                .collect::<Vec<_>>()
-                .join("::");
-            let local_path = path_segments.join("::");
+            let qualified = inventory_name(&crate_name, &segments, &function);
+            // The same path as an expression this crate can evaluate. A trait
+            // method needs the qualified form: an inherent and a trait method of
+            // the same name would otherwise be ambiguous at the call site, which
+            // is an error rather than a silent wrong answer, but an error all
+            // the same.
+            let mut owner_segments = segments.clone();
+            let local_path = match (&function.self_type, &function.trait_name) {
+                (Some(owner), Some(trait_name)) => {
+                    owner_segments.push(owner.clone());
+                    format!(
+                        "<{} as {trait_name}>::{}",
+                        owner_segments.join("::"),
+                        function.name
+                    )
+                }
+                (Some(owner), None) => {
+                    owner_segments.push(owner.clone());
+                    owner_segments.push(function.name.clone());
+                    owner_segments.join("::")
+                }
+                _ => {
+                    owner_segments.push(function.name.clone());
+                    owner_segments.join("::")
+                }
+            };
             let signature = function.signature;
 
             generated.push_str(&format!(
@@ -887,6 +1046,92 @@ pub fn generate_function_inventory() {
     }
 
     write_inventory(&inventory_path, &generated);
+}
+
+/// The name one function is registered and looked up under.
+///
+/// Three shapes, one per kind of function:
+///
+/// - `crate::module::free_function`
+/// - `crate::module::Type::method` for an inherent method
+/// - `crate::module::<Type as Trait>::method` for a trait method
+///
+/// The trait form is not decoration. A type may carry an inherent `draw` and a
+/// trait `draw`, and two traits may each define `draw` for it; naming a trait
+/// method through its type alone would collide with all of them.
+///
+/// This is the single definition both sides use. The build script records
+/// addresses under these names and the host asks for them under these names,
+/// and when the two were separate implementations every inherent method
+/// silently failed to patch.
+pub fn inventory_name(
+    crate_name: &str,
+    module_segments: &[String],
+    function: &HotFunction,
+) -> String {
+    let mut prefix = vec![crate_name.to_string()];
+    prefix.extend(module_segments.iter().cloned());
+    format!("{}::{}", prefix.join("::"), receiver_path(function))
+}
+
+/// The trailing part of an inventory name: everything after the module path.
+fn receiver_path(function: &HotFunction) -> String {
+    match (&function.self_type, &function.trait_name) {
+        (Some(owner), Some(trait_name)) => {
+            format!("<{owner} as {trait_name}>::{}", function.name)
+        }
+        (Some(owner), None) => format!("{owner}::{}", function.name),
+        _ => function.name.clone(),
+    }
+}
+
+/// Whether a trait method's `impl` can be named from the crate root, where the
+/// generated inventory is included.
+///
+/// The problem is real and not about naming: `impl Display for Spline` in a
+/// submodule relies on that file's `use std::fmt::Display;`, and a `use` is
+/// scoped to its own module. Emitting `<sub::Spline as Display>::fmt` into
+/// `lib.rs` would simply not compile.
+///
+/// Three cases can be named, and anything else is skipped rather than guessed:
+///
+/// 1. The `impl` is in the crate root file, so the same `use` declarations are
+///    already in scope where the inventory is included.
+/// 2. The trait path is already qualified (`crate::Drawable`, `pill_engine::Resource`).
+/// 3. The trait is declared in the same file, so it can be reached through that
+///    file's own module path.
+fn trait_is_nameable_from_crate_root(
+    trait_name: &str,
+    module_segments: &[String],
+    source: &str,
+) -> bool {
+    module_segments.is_empty() || trait_name.contains("::") || declares_trait(source, trait_name)
+}
+
+/// Whether this file declares a trait by that name.
+fn declares_trait(source: &str, trait_name: &str) -> bool {
+    let mask = code_mask(source);
+    let bytes = source.as_bytes();
+    let needle = format!("trait {trait_name}");
+    let mut index = 0usize;
+    while let Some(offset) = source[index..].find(&needle) {
+        let start = index + offset;
+        index = start + needle.len();
+        if !mask[start] {
+            continue;
+        }
+        // `trait` must be a whole word, and the name must end where it ends -
+        // otherwise `trait DrawableExt` matches a search for `Drawable`.
+        if start > 0 && is_identifier_byte(bytes[start - 1]) {
+            continue;
+        }
+        let after = start + needle.len();
+        if after < bytes.len() && is_identifier_byte(bytes[after]) {
+            continue;
+        }
+        return true;
+    }
+    false
 }
 
 /// Every `.rs` file under `root`, in stable order so the generated file does not
@@ -948,6 +1193,183 @@ fn movement_system(mut query: Query<&mut PhysicsState>) -> Result<(), SystemErro
 fn movement_system_extra() {}
 "#;
 
+    /// The ABI entry point is recognized by the attribute that generates it,
+    /// not by being called `register`.
+    ///
+    /// A module may name its entry point anything; what makes it one is
+    /// `#[pill_module]`. Keying off the name meant a module that renamed it got
+    /// an inventory entry for a function the host only ever calls through the
+    /// export table - and that any function actually named `register` was
+    /// silently excluded from patching for no reason.
+    #[test]
+    fn the_abi_entry_point_is_found_by_its_attribute() {
+        let source = "\
+#[pill_module]
+fn set_up(engine: &mut Engine) -> u32 { 0 }
+
+#[pill_engine::pill_project]
+fn boot(engine: &mut Engine) -> u32 { 0 }
+
+fn register(value: u32) -> u32 { value }
+";
+        let functions = all_functions(source);
+        let by_name = |name: &str| {
+            functions
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("`{name}` must be scanned: {functions:?}"))
+        };
+
+        // Both attribute spellings mark an entry point, path-qualified included.
+        assert!(by_name("set_up").abi_entry_point);
+        assert!(by_name("boot").abi_entry_point);
+        // And an ordinary function called `register` is now patchable, which
+        // the literal blocklist made impossible.
+        assert!(!by_name("register").abi_entry_point);
+    }
+
+    /// A non-generic trait `impl` names one concrete type and one trait, so
+    /// each of its methods has a single address - which is all a patch needs.
+    #[test]
+    fn a_non_generic_trait_impl_is_scanned() {
+        let source = "\
+impl Default for Spline {
+    fn default() -> Self { Spline::new() }
+}
+";
+        let functions = all_functions(source);
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0].name, "default");
+        assert_eq!(functions[0].self_type.as_deref(), Some("Spline"));
+        assert_eq!(functions[0].trait_name.as_deref(), Some("Default"));
+    }
+
+    /// A generic block still has no single address, and that is not a naming
+    /// problem: there is one instantiation per set of type arguments.
+    #[test]
+    fn generic_impl_blocks_are_still_refused() {
+        for source in [
+            "impl<T> Holder<T> {\n    fn get(&self) -> u32 { 1 }\n}\n",
+            "impl Draw for Holder<u32> {\n    fn draw(&self) -> u32 { 1 }\n}\n",
+            "impl<T> Draw for Holder<T> {\n    fn draw(&self) -> u32 { 1 }\n}\n",
+        ] {
+            let functions = all_functions(source);
+            assert!(
+                functions
+                    .iter()
+                    .all(|function| function.self_type.is_none()),
+                "a generic impl must not be attributed to a concrete type: {source}"
+            );
+        }
+    }
+
+    /// The whole reason a trait method carries its trait: without it, these two
+    /// are the same name.
+    #[test]
+    fn an_inherent_and_a_trait_method_of_one_name_stay_distinct() {
+        let source = "\
+impl Spline {
+    fn draw(&self) -> u32 { 1 }
+}
+impl Renderer for Spline {
+    fn draw(&self) -> u32 { 2 }
+}
+";
+        let functions = all_functions(source);
+        assert_eq!(functions.len(), 2, "both must be reported: {functions:?}");
+
+        let inherent = &functions[0];
+        let via_trait = &functions[1];
+        assert_eq!(inherent.trait_name, None);
+        assert_eq!(via_trait.trait_name.as_deref(), Some("Renderer"));
+        assert_ne!(
+            inventory_name("pill_spline", &[], inherent),
+            inventory_name("pill_spline", &[], via_trait),
+            "the two must not collide in the inventory"
+        );
+        assert_eq!(
+            inventory_name("pill_spline", &[], via_trait),
+            "pill_spline::<Spline as Renderer>::draw"
+        );
+    }
+
+    /// Two types implementing the same trait method: taking the first `fn` of
+    /// that name in the file would patch the wrong body.
+    #[test]
+    fn a_method_is_located_through_its_own_impl_block() {
+        let source = "\
+impl Default for Alpha {
+    fn default() -> Self { Alpha(1) }
+}
+impl Default for Beta {
+    fn default() -> Self { Beta(2) }
+}
+";
+        let alpha =
+            find_method(source, "default", "Alpha", Some("Default")).expect("Alpha's method");
+        let beta = find_method(source, "default", "Beta", Some("Default")).expect("Beta's method");
+        assert!(alpha.text.contains("Alpha(1)"), "got: {}", alpha.text);
+        assert!(beta.text.contains("Beta(2)"), "got: {}", beta.text);
+
+        // The bare-name search is what this exists to avoid.
+        let first = find_function(source, "default").expect("some method");
+        assert!(first.text.contains("Alpha(1)"));
+    }
+
+    /// An inherent block is selected by asking for no trait, so the two blocks
+    /// on one type do not shadow each other.
+    #[test]
+    fn find_method_separates_inherent_from_trait() {
+        let source = "\
+impl Spline {
+    fn draw(&self) -> u32 { 11 }
+}
+impl Renderer for Spline {
+    fn draw(&self) -> u32 { 22 }
+}
+";
+        let inherent = find_method(source, "draw", "Spline", None).expect("inherent");
+        let via_trait =
+            find_method(source, "draw", "Spline", Some("Renderer")).expect("trait method");
+        assert!(inherent.text.contains("11"), "got: {}", inherent.text);
+        assert!(via_trait.text.contains("22"), "got: {}", via_trait.text);
+    }
+
+    /// A trait reached through a `use` in a submodule cannot be named from the
+    /// crate root, where the generated inventory is included.
+    #[test]
+    fn a_trait_is_only_registered_when_the_crate_root_can_name_it() {
+        let source = "use std::fmt::Display;\nimpl Display for Spline {}\n";
+        // The crate root itself: the same `use` is in scope where the inventory
+        // is included.
+        assert!(trait_is_nameable_from_crate_root("Display", &[], source));
+        // A submodule: the `use` is scoped to that file and does not reach the
+        // crate root.
+        assert!(!trait_is_nameable_from_crate_root(
+            "Display",
+            &["spline".to_string()],
+            source
+        ));
+        // Already qualified, so it needs nothing from any module's scope.
+        assert!(trait_is_nameable_from_crate_root(
+            "pill_engine::Resource",
+            &["spline".to_string()],
+            source
+        ));
+        // Declared here, so it can be reached through this file's module path.
+        assert!(trait_is_nameable_from_crate_root(
+            "Renderer",
+            &["spline".to_string()],
+            "pub trait Renderer { fn draw(&self); }\n"
+        ));
+        // A near-miss must not count as a declaration.
+        assert!(!trait_is_nameable_from_crate_root(
+            "Render",
+            &["spline".to_string()],
+            "pub trait Renderer { fn draw(&self); }\n"
+        ));
+    }
+
     #[test]
     fn finds_a_function_and_its_body() {
         let found = find_function(SAMPLE, "movement_system").expect("found");
@@ -990,7 +1412,8 @@ fn movement_system_extra() {}
     fn stripping_hides_body_edits_only() {
         let names: HashSet<String> = ["movement_system".to_string()].into_iter().collect();
 
-        let edited_body = SAMPLE.replace("physics.position_x += 1.0;", "physics.position_x += 9.0;");
+        let edited_body =
+            SAMPLE.replace("physics.position_x += 1.0;", "physics.position_x += 9.0;");
         assert_eq!(
             strip_function_bodies(SAMPLE, &names),
             strip_function_bodies(&edited_body, &names),
@@ -1024,7 +1447,10 @@ fn movement_system_extra() {}
 
     #[test]
     fn finds_hot_functions_by_attribute() {
-        assert_eq!(hot_function_names(SAMPLE), vec!["movement_system".to_string()]);
+        assert_eq!(
+            hot_function_names(SAMPLE),
+            vec!["movement_system".to_string()]
+        );
     }
 
     /// The signature a prologue patch is gated on ignores formatting but not
