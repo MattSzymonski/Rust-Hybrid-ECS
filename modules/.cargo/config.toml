@@ -15,3 +15,12 @@
 # should clear these flags, for example with `--config build.rustflags=[]`.
 [build]
 rustflags = ["-C", "prefer-dynamic"]
+
+# Use the LLD linker (bundled with the Rust toolchain) instead of MSVC's
+# `link.exe` on Windows. LLD is typically 2-4x faster at linking, which
+# matters for the hot-reload loop: every module and project reload relinks a
+# cdylib, and `link.exe` was the slowest step in the build. `rust-lld` is the
+# lld-link-compatible driver, so it drops in for the MSVC target without any
+# extra install.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"

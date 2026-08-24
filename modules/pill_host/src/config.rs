@@ -209,6 +209,13 @@ impl OptionalModuleConfig {
         if cfg!(feature = "rendering") {
             module_features.push("rendering".to_string());
         }
+        // Hot patching must be mirrored for a different reason: `pill_engine` is
+        // an rlib, so the module links its own copy of `register_system`. Built
+        // without the feature, that copy creates no dispatch slot and every
+        // patch is refused with "no hot-patchable system registered".
+        if cfg!(feature = "hot_patch") {
+            module_features.push("pill_engine/hot_patch".to_string());
+        }
         build_command.push("--features".to_string());
         build_command.push(module_features.join(","));
 
@@ -461,9 +468,22 @@ impl ProjectModuleConfig {
             // stretches) and halves the fixed per-build cargo overhead.
             "--offline".to_string(),
         ];
+        // Mirror the host's engine feature set into the project build, for the
+        // same reason optional modules do: `pill_engine` is an rlib, so the
+        // project links its own copy and must be configured identically.
+        let mut project_features: Vec<String> = Vec::new();
         if cfg!(feature = "rendering") {
+            project_features.push("rendering".to_string());
+        }
+        // Without this the project's copy of `register_system` compiles the
+        // no-slot path, and every patch is refused with "no hot-patchable
+        // system registered" - which is exactly how this was found.
+        if cfg!(feature = "hot_patch") {
+            project_features.push("pill_engine/hot_patch".to_string());
+        }
+        if !project_features.is_empty() {
             build_command.push("--features".to_string());
-            build_command.push("rendering".to_string());
+            build_command.push(project_features.join(","));
         }
 
         Ok(Self {
@@ -836,6 +856,7 @@ fn materialize_host_project_member(
     // project declares itself a workspace root; as a member of the engine
     // workspace that table would make Cargo report "multiple workspace roots
     // found in the same workspace" and fail every rebuild.
+    #[allow(unused_mut)]
     let mut generated_manifest = strip_workspace_tables(&generated_manifest);
 
     // Step 3: Point the generated member's library at the real source file so
@@ -860,6 +881,19 @@ fn materialize_host_project_member(
                 );
             }
         }
+    }
+
+    // Step 3b: Add an `rlib` artifact when the host can hot patch.
+    //
+    // A generated patch does `use <project>::*` so it gets the SAME types the
+    // running world holds - identical layout and identical `TypeId` - and that
+    // needs the crate as an rlib. It is added here rather than in the project's
+    // own manifest because it costs a measured ~109 ms on every project rebuild
+    // (1241 ms vs 1132 ms, best of three), which no one should pay for a
+    // development feature they have not enabled.
+    #[cfg(feature = "hot_patch")]
+    {
+        generated_manifest = add_rlib_crate_type(&generated_manifest);
     }
 
     // Step 4: Write the generated member, replacing any previous generation.
@@ -1181,5 +1215,81 @@ shared = { version = "1" }
             &project,
             "pill_spline"
         ));
+    }
+}
+
+/// Ensure the generated member's `[lib]` section builds an `rlib` as well.
+///
+/// A hot patch links the project crate to name its types, which requires an
+/// rlib. Only called when the host was built with `hot_patch`, so a project
+/// that never gets patched keeps building one artifact.
+///
+/// Rewrites an existing `crate-type` list in place and leaves a manifest that
+/// already asks for `rlib` untouched, so the transform is idempotent.
+#[cfg(feature = "hot_patch")]
+fn add_rlib_crate_type(manifest: &str) -> String {
+    let Some(lib_header) = manifest.find("[lib]") else {
+        return manifest.to_string();
+    };
+    // The `[lib]` section ends at the next bracketed header.
+    let section_end = manifest[lib_header..]
+        .find("\n[")
+        .map(|offset| lib_header + offset)
+        .unwrap_or(manifest.len());
+    let section = &manifest[lib_header..section_end];
+
+    let Some(key_offset) = section.find("crate-type") else {
+        // No crate-type at all: the default is `rlib` already.
+        return manifest.to_string();
+    };
+    let Some(open) = section[key_offset..].find('[').map(|o| key_offset + o) else {
+        return manifest.to_string();
+    };
+    let Some(close) = section[open..].find(']').map(|o| open + o) else {
+        return manifest.to_string();
+    };
+
+    let list = &section[open + 1..close];
+    if list.contains("rlib") {
+        return manifest.to_string();
+    }
+
+    let mut rewritten = String::with_capacity(manifest.len() + 8);
+    rewritten.push_str(&manifest[..lib_header + close]);
+    rewritten.push_str(", \"rlib\"");
+    rewritten.push_str(&manifest[lib_header + close..]);
+    rewritten
+}
+
+#[cfg(all(test, feature = "hot_patch"))]
+mod hot_patch_manifest_tests {
+    use super::add_rlib_crate_type;
+
+    #[test]
+    fn adds_rlib_to_an_existing_crate_type_list() {
+        let manifest = "[package]\nname = \"project\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\n";
+        let rewritten = add_rlib_crate_type(manifest);
+        assert!(rewritten.contains("crate-type = [\"cdylib\", \"rlib\"]"));
+        assert!(rewritten.contains("[dependencies]"));
+    }
+
+    #[test]
+    fn is_idempotent() {
+        let manifest = "[lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n";
+        assert_eq!(add_rlib_crate_type(manifest), manifest);
+        assert_eq!(add_rlib_crate_type(&add_rlib_crate_type(manifest)), manifest);
+    }
+
+    #[test]
+    fn leaves_a_manifest_without_crate_type_alone() {
+        // No `crate-type` means the default, which already includes `rlib`.
+        let manifest = "[lib]\npath = \"src/lib.rs\"\n";
+        assert_eq!(add_rlib_crate_type(manifest), manifest);
+    }
+
+    #[test]
+    fn leaves_a_manifest_without_a_lib_section_alone() {
+        let manifest = "[package]\nname = \"project\"\n";
+        assert_eq!(add_rlib_crate_type(manifest), manifest);
     }
 }

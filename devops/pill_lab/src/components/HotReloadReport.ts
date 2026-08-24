@@ -307,12 +307,28 @@ function renderCaseCard(
   // ---- Phase breakdown ----
   const phases = reloadCase.summary.phase_averages;
   if (phases && Object.keys(phases).length > 0) {
-    card.appendChild(renderPhaseBar(phases, reloadCase.summary.avg_ms));
+    card.appendChild(renderPhaseBar(phases, reloadCase.summary.avg_ms, reloadCase.name));
   } else {
     card.appendChild(
       element('p', {
         class: 'no-data',
         text: 'No host phase analytics for this category - wall time only.',
+      }),
+    );
+  }
+
+  // The cascade spans two reloads; spell that out so the phase bar's
+  // "module reload + watcher + scheduling" segment is not misread as I/O wait.
+  if (reloadCase.name === 'cascade_total') {
+    card.appendChild(
+      element('p', {
+        class: 'case-note',
+        text:
+          'A module edit triggers TWO reloads back-to-back: the module ' +
+          '(pill_spline) first, then the project, which statically re-embeds ' +
+          'the module and is rebuilt too. The phases and crate table below ' +
+          'cover the LAST (project) transaction; the preceding module reload ' +
+          'is the amber "module reload + watcher + scheduling" segment.',
       }),
     );
   }
@@ -327,9 +343,17 @@ function renderCaseCard(
  *
  * The measured phases rarely sum to the wall time - detection latency and
  * process scheduling live outside them - so the remainder is shown as its own
- * "unaccounted" segment instead of being silently absorbed.
+ * segment instead of being silently absorbed. For the cascade, the remainder
+ * is not just scheduling: it also holds the preceding module reload (the host
+ * builds the module first, then the project that re-embeds it), so it is
+ * labelled and coloured as a build to make that second reload visible.
  */
-function renderPhaseBar(phases: PhaseValues, averageWallMs: number): HTMLElement {
+function renderPhaseBar(
+  phases: PhaseValues,
+  averageWallMs: number,
+  caseName: string,
+): HTMLElement {
+  const isCascade = caseName === 'cascade_total';
   const container = element('div');
   const bar = element('div', { class: 'phase-bar' });
   const legend = element('div', { class: 'phase-legend' });
@@ -340,11 +364,12 @@ function renderPhaseBar(phases: PhaseValues, averageWallMs: number): HTMLElement
     const value = phases[phase.key];
     if (value === undefined) continue;
     accounted += value;
+    const percent = (value / total) * 100;
     const color = cssColor(phase.variable);
     const segment = element('div', { class: 'phase-segment' });
-    segment.style.width = `${(value / total) * 100}%`;
+    segment.style.width = `${percent}%`;
     segment.style.background = color;
-    segment.title = `${phase.label}: ${formatMilliseconds(value)}`;
+    segment.title = `${phase.label}: ${formatMilliseconds(value)} (${percent.toFixed(1)}%)`;
     bar.appendChild(segment);
 
     const swatch = element('span', { class: 'legend-swatch' });
@@ -354,28 +379,37 @@ function renderPhaseBar(phases: PhaseValues, averageWallMs: number): HTMLElement
         'span',
         { class: 'legend-entry' },
         swatch,
-        element('span', { text: `${phase.label} ${formatMilliseconds(value)}` }),
+        element('span', {
+          text: `${phase.label} ${formatMilliseconds(value)} · ${percent.toFixed(1)}%`,
+        }),
       ),
     );
   }
 
   const remainder = total - accounted;
   if (remainder > 0.5) {
+    const percent = (remainder / total) * 100;
+    // The cascade's remainder is the preceding module reload (build + load),
+    // so it gets a build-like amber colour instead of looking like I/O wait.
+    const color = isCascade ? 'rgba(255, 193, 7, 0.30)' : 'rgba(255, 255, 255, 0.08)';
+    const label = isCascade
+      ? 'module reload + watcher + scheduling'
+      : 'watcher + scheduling';
     const segment = element('div', { class: 'phase-segment' });
-    segment.style.width = `${(remainder / total) * 100}%`;
-    segment.style.background = 'rgba(255, 255, 255, 0.08)';
-    segment.title = `unaccounted: ${formatMilliseconds(remainder)}`;
+    segment.style.width = `${percent}%`;
+    segment.style.background = color;
+    segment.title = `${label}: ${formatMilliseconds(remainder)} (${percent.toFixed(1)}%)`;
     bar.appendChild(segment);
 
     const swatch = element('span', { class: 'legend-swatch' });
-    swatch.style.background = 'rgba(255, 255, 255, 0.12)';
+    swatch.style.background = color;
     legend.appendChild(
       element(
         'span',
         { class: 'legend-entry' },
         swatch,
         element('span', {
-          text: `watcher + scheduling ${formatMilliseconds(remainder)}`,
+          text: `${label} ${formatMilliseconds(remainder)} · ${percent.toFixed(1)}%`,
         }),
       ),
     );
@@ -415,25 +449,102 @@ function renderIterationTable(reloadCase: HotReloadCase): HTMLElement {
 
   const container = element('div');
   container.appendChild(element('div', { class: 'table-scroll' }, table));
+  // The crates cargo rebuilt explain a slow build phase, so each case shows
+  // them as a per-iteration table instead of only the newest iteration.
+  container.appendChild(renderCratesTable(reloadCase));
+  return container;
+}
 
-  // The crates cargo rebuilt explain a slow build phase, so the newest
-  // iteration's list is shown directly under the table.
-  const lastWithCrates = [...reloadCase.iterations]
-    .reverse()
-    .find((iteration) => iteration.rebuilt_crates?.length);
-  if (lastWithCrates?.rebuilt_crates) {
-    const crateList = element('div', { class: 'crate-list' });
-    for (const crate of lastWithCrates.rebuilt_crates) {
-      crateList.appendChild(element('span', { class: 'crate-pill', text: crate }));
-    }
-    container.appendChild(
-      element('div', {
-        class: 'sidebar-section-label',
-        text: `Crates rebuilt by cargo (iteration ${lastWithCrates.index})`,
-      }),
-    );
-    container.appendChild(crateList);
+// =============================================================================
+// Crates rebuilt by cargo
+// =============================================================================
+
+/** One crate's recompilation time within a single iteration. */
+interface CrateTime {
+  name: string;
+  durationMs: number;
+}
+
+/** Parses a raw `rebuilt_crates` fragment like `pill_spline 120ms` or `crate 1.20s`. */
+function parseCrateTimes(fragments: string[] | undefined): CrateTime[] {
+  if (!fragments) return [];
+  const crates: CrateTime[] = [];
+  for (const fragment of fragments) {
+    const match = /^(.*?)\s+([\d.]+)(ms|s)$/.exec(fragment.trim());
+    if (!match) continue;
+    const durationMs = Number(match[2]) * (match[3] === 's' ? 1000 : 1);
+    crates.push({ name: match[1], durationMs });
   }
+  return crates;
+}
+
+/**
+ * Renders a per-crate recompilation table: one row per crate cargo rebuilt,
+ * with its time in every iteration and the average across them. This turns
+ * the harness's `crates rebuilt by cargo:` breakdown into a comparable table
+ * instead of a single flattened list.
+ */
+function renderCratesTable(reloadCase: HotReloadCase): HTMLElement {
+  const crateNames = new Set<string>();
+  const perIteration = reloadCase.iterations.map((iteration) => {
+    const times = new Map<string, number>();
+    for (const crate of parseCrateTimes(iteration.rebuilt_crates)) {
+      times.set(crate.name, crate.durationMs);
+      crateNames.add(crate.name);
+    }
+    return times;
+  });
+
+  const container = element('div');
+  container.appendChild(
+    element('div', {
+      class: 'sidebar-section-label',
+      text: 'Crates rebuilt by cargo (per iteration)',
+    }),
+  );
+  if (crateNames.size === 0) {
+    container.appendChild(
+      element('p', { class: 'no-data', text: 'No per-crate breakdown in this measurement.' }),
+    );
+    return container;
+  }
+
+  const rows: { name: string; times: (number | undefined)[]; average: number }[] = [];
+  for (const name of crateNames) {
+    const times = perIteration.map((entry) => entry.get(name));
+    const present = times.filter((time): time is number => time !== undefined);
+    const average = present.length
+      ? present.reduce((sum, time) => sum + time, 0) / present.length
+      : 0;
+    rows.push({ name, times, average });
+  }
+  // Slowest crate first, matching the harness's terminal summary.
+  rows.sort((a, b) => b.average - a.average);
+
+  const headers: (string | { text: string; class?: string })[] = [{ text: 'Crate' }];
+  for (let index = 1; index <= perIteration.length; index += 1) {
+    headers.push({ text: `Iter ${index}`, class: 'numeric' });
+  }
+  headers.push({ text: 'Avg', class: 'numeric' });
+
+  const table = element('table', { class: 'data-table' });
+  table.appendChild(tableHead(headers));
+  const body = element('tbody');
+  for (const row of rows) {
+    body.appendChild(
+      tableRow([
+        element('span', { class: 'crate-pill', text: row.name }),
+        ...row.times.map((time) =>
+          time !== undefined
+            ? { text: formatMilliseconds(time), class: 'numeric' }
+            : { text: '-', class: 'numeric' },
+        ),
+        { text: formatMilliseconds(row.average), class: 'numeric' },
+      ]),
+    );
+  }
+  table.appendChild(body);
+  container.appendChild(element('div', { class: 'table-scroll' }, table));
   return container;
 }
 

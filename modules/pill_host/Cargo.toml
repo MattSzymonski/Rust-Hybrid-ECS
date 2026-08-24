@@ -26,5 +26,9 @@ profiling-fine = ["profiling", "pill_engine/profiling-fine"]
 profiling-verify = ["profiling", "pill_engine/profiling-verify"]
 # Repeated numerical measurements through the shared metrics recorder.
 metrics = ["dep:metrics", "pill_engine/metrics"]
+# Per-function hot patching: a body-only edit to a `#[pill_hot]` system is
+# compiled on its own and swapped into the running engine, instead of rebuilding
+# and re-registering the whole module. Development only.
+hot_patch = ["pill_engine/hot_patch"]
 # Compile the simple developer log macros (`log!`, `warn!`, `error!`).
 dev-logs = ["pill_core/dev-logs"]

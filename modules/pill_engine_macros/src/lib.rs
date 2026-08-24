@@ -122,6 +122,199 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
 }
 
 // =============================================================================
+// #[pill_hot]
+// =============================================================================
+
+/// Marks a system function as hot-patchable, so the host can replace its
+/// implementation without re-registering it.
+///
+/// The function itself is emitted unchanged; the macro only adds a descriptor
+/// carrying its fully-qualified path, its dispatch address and its signature
+/// identity, submitted into this artifact's compile-time registry. Nothing has
+/// to be listed by hand, exactly as with `#[derive(PillComponent)]`.
+///
+/// ```ignore
+/// #[pill_hot]
+/// fn movement_system(mut query: Query<(&mut Position, &Velocity)>) {
+///     for (mut position, velocity) in query.iter_mut() {
+///         position.x += velocity.x;
+///     }
+/// }
+/// ```
+///
+/// The name the host patches by is `module_path!() + "::" + fn name`, matching
+/// how `PillComponent` derives its type name.
+///
+/// The address and signature are computed through the function VALUE rather
+/// than from its syntax: a concrete function-item type satisfies exactly one
+/// arity of `SystemParamFunction`, so the parameter tuple is inferred. Rebuilding
+/// that tuple from tokens would mean stripping patterns like `mut query` and
+/// guessing elided lifetimes.
+/// Supported argument:
+/// - `#[pill_hot(name = "project::movement_system")]` — override the derived
+///   qualified name. A generated patch library is its own crate, so
+///   `module_path!()` there would report the patch's name rather than the
+///   original's; the host passes the name it is patching so the two agree.
+#[proc_macro_attribute]
+pub fn pill_hot(attribute: TokenStream, item: TokenStream) -> TokenStream {
+    let item_fn = parse_macro_input!(item as ItemFn);
+    let fn_ident = &item_fn.sig.ident;
+
+    // Parse the optional `name = "..."` override.
+    let mut name_override: Option<String> = None;
+    if !attribute.is_empty() {
+        let parsed = syn::parse::<syn::MetaNameValue>(attribute);
+        match parsed {
+            Ok(meta) if meta.path.is_ident("name") => match &meta.value {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Str(literal),
+                    ..
+                }) => name_override = Some(literal.value()),
+                other => {
+                    return syn::Error::new_spanned(
+                        other,
+                        "`#[pill_hot(name = ...)]` expects a string literal",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+            },
+            Ok(meta) => {
+                return syn::Error::new_spanned(
+                    meta.path,
+                    "unknown `pill_hot` argument; expected `name = \"...\"`",
+                )
+                .to_compile_error()
+                .into();
+            }
+            Err(error) => return error.to_compile_error().into(),
+        }
+    }
+
+    // Generic systems are not supported: the engine patches one concrete
+    // monomorphization, so a generic function has no single address to swap.
+    if !item_fn.sig.generics.params.is_empty() {
+        return syn::Error::new_spanned(
+            &item_fn.sig.generics,
+            "`#[pill_hot]` cannot be applied to a generic function: hot patching \
+             replaces one concrete implementation, and a generic has one per \
+             instantiation",
+        )
+        .to_compile_error()
+        .into();
+    }
+
+    let descriptor_fn = format_ident!("__pill_hot_descriptor_{}", fn_ident);
+    let qualified_name = match &name_override {
+        Some(name) => quote! { #name },
+        None => quote! {
+            ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#fn_ident))
+        },
+    };
+
+    let expanded = quote! {
+        #item_fn
+
+        /// Resolves this function's dispatch address and signature identity for
+        /// the artifact-wide hot-patch registry.
+        #[allow(non_snake_case)]
+        fn #descriptor_fn() -> (usize, u64) {
+            (
+                ::pill_engine::hot_patch::local_implementation_address(&#fn_ident),
+                ::pill_engine::hot_patch::signature_hash_of(&#fn_ident),
+            )
+        }
+
+        ::pill_engine::submit! {
+            ::pill_engine::hot_patch::PillHotFunctionDescriptor {
+                qualified_name: #qualified_name,
+                resolve: #descriptor_fn,
+            }
+        }
+    };
+
+    expanded.into()
+}
+
+/// Emits the hot-patch resolver export on its own.
+///
+/// `#[pill_project]` and `#[pill_module]` already include it, so this exists for
+/// artifacts that carry hot functions but neither entry point — in particular
+/// the small patch libraries the host generates, which contain one edited
+/// function and nothing else.
+///
+/// Takes an optional export name, defaulting to `pill_hot_resolve`:
+///
+/// ```ignore
+/// pill_engine::pill_hot_resolver!();                    // pill_hot_resolve
+/// pill_engine::pill_hot_resolver!(pill_patch_resolve);  // custom
+/// ```
+///
+/// A generated patch **must** pass a different name. It links the project's
+/// rlib to reach that crate's types and helpers, and that rlib already exports
+/// `pill_hot_resolve`; two `#[no_mangle]` definitions of one symbol in a single
+/// artifact is a linker error.
+#[proc_macro]
+pub fn pill_hot_resolver(item: TokenStream) -> TokenStream {
+    let export_name = if item.is_empty() {
+        format_ident!("pill_hot_resolve")
+    } else {
+        match syn::parse::<syn::Ident>(item) {
+            Ok(identifier) => identifier,
+            Err(error) => return error.to_compile_error().into(),
+        }
+    };
+    hot_patch_resolver_export(&export_name).into()
+}
+
+/// The exported resolver every loadable artifact provides.
+///
+/// One export rather than one per hot function, for the same reason the module
+/// ABI keeps its surface small: a Windows DLL cannot exceed 65535 exports, and
+/// a name-keyed lookup costs nothing at reload time.
+fn hot_patch_resolver_export(export_name: &proc_macro2::Ident) -> proc_macro2::TokenStream {
+    quote! {
+        /// Resolves a `#[pill_hot]` function's dispatch address by qualified
+        /// name, writing its signature hash through `out_signature_hash`.
+        ///
+        /// Returns zero when this artifact declares no such function, in which
+        /// case `out_signature_hash` is left untouched.
+        ///
+        /// # Safety
+        ///
+        /// `qualified_name` must be a valid NUL-terminated C string that stays
+        /// readable for the call. `out_signature_hash` must be null or point at
+        /// a writable `u64`.
+        #[no_mangle]
+        pub unsafe extern "C" fn #export_name(
+            qualified_name: *const ::core::ffi::c_char,
+            out_signature_hash: *mut u64,
+        ) -> usize {
+            if qualified_name.is_null() {
+                return 0;
+            }
+            // SAFETY: the caller guarantees a NUL-terminated string readable
+            // for the duration of this call.
+            let name = unsafe { ::std::ffi::CStr::from_ptr(qualified_name) };
+            let Ok(name) = name.to_str() else {
+                return 0;
+            };
+            match ::pill_engine::hot_patch::resolve_hot_function(name) {
+                Some((address, signature_hash)) => {
+                    if !out_signature_hash.is_null() {
+                        // SAFETY: the caller guarantees a writable `u64` when
+                        // the pointer is non-null.
+                        unsafe { *out_signature_hash = signature_hash };
+                    }
+                    address
+                }
+                None => 0,
+            }
+        }
+    }
+}
+
+// =============================================================================
 // #[pill_module]
 // =============================================================================
 
@@ -149,9 +342,16 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
     let fn_ident = &item_fn.sig.ident;
 
+    // Gated with the rest of the module ABI: a crate linked directly into
+    // another binary must not export these `#[no_mangle]` symbols twice.
+    let hot_patch_resolver = hot_patch_resolver_export(&format_ident!("pill_hot_resolve"));
+
     let expanded = quote! {
         #[cfg(feature = "module-abi")]
         #item_fn
+
+        #[cfg(feature = "module-abi")]
+        #hot_patch_resolver
 
         /// Optional-module ABI revision this crate was built against.
         #[cfg(feature = "module-abi")]
@@ -230,8 +430,12 @@ pub fn pill_project(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
     let fn_ident = &item_fn.sig.ident;
 
+    let hot_patch_resolver = hot_patch_resolver_export(&format_ident!("pill_hot_resolve"));
+
     let expanded = quote! {
         #item_fn
+
+        #hot_patch_resolver
 
         /// Registers the project's components, resources, and systems; returns
         /// zero on success.

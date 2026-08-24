@@ -66,6 +66,13 @@ pub struct Host {
     optional_modules: Vec<OptionalModuleSlot>,
     reload_generation: Arc<AtomicU64>,
     last_processed_generation: u64,
+    /// Per-function fast path, when the project opted in with `#[pill_hot]`.
+    ///
+    /// `None` when the feature is off, when no function is annotated, or when
+    /// the project does not also build an `rlib` - all of which simply leave the
+    /// existing whole-module reload as the only path.
+    #[cfg(feature = "hot_patch")]
+    hot_patch: Option<crate::hot_patch::HotPatchSession>,
     last_frame_error: Option<String>,
     last_error_report: Instant,
     suppressed_error_count: u64,
@@ -339,6 +346,17 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
     );
     println!();
 
+    // Arm the per-function fast path. It reads the project's sources for
+    // `#[pill_hot]` annotations and returns `None` when there is nothing to do,
+    // so a project that has not opted in pays nothing.
+    #[cfg(feature = "hot_patch")]
+    let hot_patch = crate::hot_patch::HotPatchSession::new(
+        &workspace_root,
+        &module_config.name,
+        &module_config.watch_directory,
+        &module_config.build_command,
+    );
+
     Ok(Host {
         workspace_root,
         module_config,
@@ -348,6 +366,8 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
         optional_modules,
         reload_generation,
         last_processed_generation: 0,
+        #[cfg(feature = "hot_patch")]
+        hot_patch,
         last_frame_error: None,
         last_error_report: Instant::now(),
         suppressed_error_count: 0,
@@ -454,6 +474,64 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
                     "module is a direct dependency of the project; queuing a project reload"
                 );
                 reload_generation.fetch_add(1, Ordering::Release);
+            }
+        }
+    }
+
+    // Step 0c: Try the per-function fast path before the reload transaction.
+    //
+    // This is a frame boundary: reloads are already processed here, before
+    // `process_frame`, so no system is executing while a dispatch slot is
+    // written. A successful patch consumes the pending generation, which is what
+    // skips the full rebuild below; anything it refuses falls straight through
+    // to that rebuild, so the worst case is the behavior that existed before.
+    #[cfg(feature = "hot_patch")]
+    {
+        let pending = host.reload_generation.load(Ordering::Acquire);
+        if pending != host.last_processed_generation {
+            // Disjoint field borrows, as Step 0 above does.
+            let Host {
+                hot_patch, engine, ..
+            } = &mut *host;
+            if let Some(session) = hot_patch {
+                match session.try_patch(engine) {
+                    crate::hot_patch::PatchOutcome::Patched {
+                        function,
+                        elapsed_milliseconds,
+                        stages,
+                    } => {
+                        println!(
+                            "{} {function} {}\n      {}",
+                            crate::console::bold_cyan("[hot]"),
+                            crate::console::green(&format!("LIVE {elapsed_milliseconds:.0} ms")),
+                            crate::console::dim(&stages.to_string())
+                        );
+                        info!(
+                            target: telemetry_target::HOT_RELOAD,
+                            function = function.as_str(),
+                            elapsed_milliseconds,
+                            "per-function patch applied"
+                        );
+                        // The edit is fully accounted for; skip the rebuild.
+                        host.last_processed_generation =
+                            host.reload_generation.load(Ordering::Acquire);
+                    }
+                    crate::hot_patch::PatchOutcome::NotPatchable { reason } => {
+                        println!(
+                            "{} {}\n      reason: {reason}\n      falling back to module reload",
+                            crate::console::bold_cyan("[hot]"),
+                            crate::console::yellow("FAST PATCH NOT POSSIBLE")
+                        );
+                    }
+                    crate::hot_patch::PatchOutcome::Failed { function, detail } => {
+                        eprintln!(
+                            "{} {function} patch failed\n      {detail}\n      \
+                             falling back to module reload",
+                            crate::console::bold_cyan("[hot]")
+                        );
+                    }
+                    crate::hot_patch::PatchOutcome::Unchanged => {}
+                }
             }
         }
     }

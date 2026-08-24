@@ -153,6 +153,16 @@ pub struct Engine {
     /// [`Engine::end_module_registration`], so modules register systems exactly
     /// as before and still end up correctly attributed.
     active_owner: SystemOwner,
+    /// Dispatch slots for hot-patchable systems, keyed by registration name.
+    ///
+    /// Deliberately NOT behind `#[cfg(feature = "hot_patch")]`. Gating the field
+    /// would change this struct's layout between feature configurations, and a
+    /// module built with the other configuration reconstructs `&mut Engine` from
+    /// a raw pointer through [`EngineApi`](crate::EngineApi) - so a layout
+    /// difference would be memory corruption rather than a compile error. An
+    /// unused empty map costs a few bytes once; the divergence would cost
+    /// correctness.
+    hot_patch_registry: crate::hot_patch::HotPatchRegistry,
 }
 
 impl Engine {
@@ -215,6 +225,7 @@ impl Engine {
             trace_frame_wait: true,
             last_archetype_generation: 0,
             active_owner: SystemOwner::PROJECT,
+            hot_patch_registry: crate::hot_patch::HotPatchRegistry::new(),
         }
     }
 }
@@ -356,11 +367,39 @@ impl Engine {
         // Register with scheduler
         self.scheduler.register_system(access);
 
+        let system_name: String = name.into();
+
+        // Box the system. With hot patching enabled the call to the user's
+        // function goes through a dispatch slot the engine keeps a handle to,
+        // so a later patch is one atomic store rather than a re-registration.
+        #[cfg(feature = "hot_patch")]
+        let boxed_system = {
+            let slot = std::sync::Arc::new(crate::hot_patch::HotSlot::new());
+            let boxed = system.into_hot_system(std::sync::Arc::clone(&slot));
+
+            // Registered under BOTH names. The display name is what callers and
+            // logs use; the function's real path is what `#[pill_hot]` derives
+            // and what a generated patch reports. They routinely differ - the
+            // example project registers `physics_system` as `"ball_physics"` -
+            // and a patch pipeline that only knew one of them would fail to
+            // find the slot.
+            self.hot_patch_registry
+                .insert(system_name.clone(), std::sync::Arc::clone(&slot));
+            if let Some(path) = crate::hot_patch::function_path::<F>() {
+                if path != system_name {
+                    self.hot_patch_registry.insert(path, slot);
+                }
+            }
+            boxed
+        };
+        #[cfg(not(feature = "hot_patch"))]
+        let boxed_system = system.into_system();
+
         // Store system
         self.systems.push(RegisteredSystem {
-            name: name.into(),
+            name: system_name,
             owner: self.active_owner,
-            system: system.into_system(),
+            system: boxed_system,
             enabled: true,
             last_run: 0,
             average_duration: 0,
@@ -369,6 +408,51 @@ impl Engine {
 
         // Rebuild execution graph
         self.scheduler.build_execution_graph();
+    }
+
+    // -------------------------------------------------------------------------
+    // Hot patching
+    // -------------------------------------------------------------------------
+
+    /// Replace one registered system's implementation without re-registering it.
+    ///
+    /// The system keeps its identity, its position in the scheduler graph, its
+    /// access metadata and its change-detection ticks; the `World` is untouched.
+    /// The replacement takes effect on the system's next invocation, so callers
+    /// should apply patches at a frame boundary, where no system is running.
+    ///
+    /// `signature_hash` must be the value
+    /// [`hot_patch::signature_hash`](crate::hot_patch::signature_hash) produces
+    /// for the replacement's parameter tuple and return type. A mismatch is
+    /// refused, because the running call site was compiled for the old shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HotPatchError::UnknownSystem`] when no hot-patchable system is
+    /// registered under `name`, [`HotPatchError::SignatureMismatch`] when the
+    /// signature moved, and [`HotPatchError::NullAddress`] for a null
+    /// replacement. In every case the running implementation stays in place.
+    ///
+    /// [`HotPatchError::UnknownSystem`]: crate::hot_patch::HotPatchError::UnknownSystem
+    /// [`HotPatchError::SignatureMismatch`]: crate::hot_patch::HotPatchError::SignatureMismatch
+    /// [`HotPatchError::NullAddress`]: crate::hot_patch::HotPatchError::NullAddress
+    pub fn hot_patch(
+        &mut self,
+        name: &str,
+        address: usize,
+        signature_hash: u64,
+    ) -> Result<(), crate::hot_patch::HotPatchError> {
+        let slot = self.hot_patch_registry.get(name).ok_or_else(|| {
+            crate::hot_patch::HotPatchError::UnknownSystem {
+                name: name.to_string(),
+            }
+        })?;
+        slot.install(name, address, signature_hash)
+    }
+
+    /// Read-only access to the hot-patch registry, for hosts and tooling.
+    pub fn hot_patch_registry(&self) -> &crate::hot_patch::HotPatchRegistry {
+        &self.hot_patch_registry
     }
 
     /// Registers a system whose access pattern was derived outside Rust's
@@ -438,6 +522,14 @@ impl Engine {
             return 0;
         }
 
+        // Forget the dispatch slots of the systems about to be removed, so a
+        // later patch can never install into a system that no longer runs.
+        for (position, system) in self.systems.iter().enumerate() {
+            if !keep[position] {
+                self.hot_patch_registry.remove(&system.name);
+            }
+        }
+
         let mut index = 0;
         self.systems.retain(|_| {
             let keep_this = keep[index];
@@ -460,6 +552,8 @@ impl Engine {
     /// only systems are affected. The world state persists across reloads.
     pub fn clear_systems(&mut self) {
         self.systems.clear();
+        // Every system is gone, so no dispatch slot may remain patchable.
+        self.hot_patch_registry = crate::hot_patch::HotPatchRegistry::new();
         self.scheduler.clear();
         self.graph_dirty = false;
         // Reset the execution graph so it does not reference stale indices.
@@ -1228,3 +1322,4 @@ mod tests {
         assert_eq!(engine.is_system_enabled("middle"), None);
     }
 }
+

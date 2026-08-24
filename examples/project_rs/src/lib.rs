@@ -61,9 +61,11 @@ const LEFT_WALL: f32 = 20.0;
 const RIGHT_WALL: f32 = 780.0;
 const BALL_COUNT: usize = 100;
 
-struct SimulationTime {
-    last_frame: Instant,
-    delta_seconds: f32,
+/// Public so a hot patch can name it: a patched system's signature must be
+/// expressible from outside the crate.
+pub struct SimulationTime {
+    pub last_frame: Instant,
+    pub delta_seconds: f32,
 }
 
 impl Resource for SimulationTime {}
@@ -101,7 +103,9 @@ impl Default for PhysicsState {
     }
 }
 
-fn simulate_ball(state: &mut PhysicsState) {
+/// Public so a hot patch of `physics_system` can call it without the patch
+/// having to duplicate the physics constants.
+pub fn simulate_ball(state: &mut PhysicsState) {
     if !state.active {
         return;
     }
@@ -135,6 +139,7 @@ fn simulate_ball(state: &mut PhysicsState) {
 }
 
 #[cfg(not(feature = "rendering"))]
+#[pill_hot]
 fn physics_system(
     time: Res<SimulationTime>,
     mut query: Query<&mut PhysicsState>,
@@ -146,13 +151,14 @@ fn physics_system(
     };
     let delta_seconds = time.delta_seconds;
     for mut physics in query.iter_mut() {
-        physics.delta_time = delta_seconds;
+        physics.delta_time = delta_seconds + 2.0;
         simulate_ball(&mut physics);
     }
     Ok(())
 }
 
 #[cfg(feature = "rendering")]
+#[pill_hot]
 fn physics_system(
     time: Res<SimulationTime>,
     mut query: Query<(&mut PhysicsState, &mut Position, &mut Sprite)>,
@@ -232,7 +238,7 @@ fn spline_probe_system(
     // copy of `pill_core`, so its tracing dispatcher has no subscriber and log
     // lines emitted here never reach the host's telemetry.
     println!(
-        "[project] xxsees {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), color {:.2}",
+        "[project] xxsees {visible_spline_count} spline(s), midpoixntxx ({:.1}, {:.1}), color {:.2}",
         midpoint.x, midpoint.y, color
     );
 
@@ -266,7 +272,7 @@ fn run_dummy_module_demo() {
     );
 
     let tint = pill_dummy_color::Tint {
-        r: 0.2,
+        r: 0.5,
         g: 0.4,
         b: 0.6,
     };

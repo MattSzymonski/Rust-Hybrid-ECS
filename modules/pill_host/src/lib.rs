@@ -29,6 +29,10 @@ mod config;
 mod console;
 /// Scheduler-aware C# backend for the native project host.
 mod csharp;
+/// Per-function hot patching: classify, generate, compile and activate a patch.
+#[cfg(feature = "hot_patch")]
+mod hot_patch;
+
 /// Native project-library loading and Windows-safe temporary-copy handling.
 mod native_library;
 /// Lifecycle management for optional engine modules.

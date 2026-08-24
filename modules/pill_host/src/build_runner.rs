@@ -450,12 +450,30 @@ pub(crate) fn build_project_module(
     if matches!(&config.backend, ProjectModuleBackend::NativeLibrary { .. }) {
         if let Some(manifest_path) = &config.manifest_path {
             let manifest_path = workspace_root.join(manifest_path);
-            if is_build_up_to_date(
-                workspace_root,
-                &output_path,
-                &manifest_path,
-                &config.watch_directory,
-            ) {
+
+            // Hot patching adds a second artifact, the crate's `rlib`, which a
+            // generated patch links to reach the project's types. The staleness
+            // check below only knows about the shared library, so without this
+            // an existing, up-to-date DLL makes cargo be skipped forever and the
+            // rlib is never produced - leaving hot patching permanently idle
+            // with nothing obviously wrong.
+            #[cfg(feature = "hot_patch")]
+            let required_artifacts_present = workspace_root
+                .join("target")
+                .join("debug")
+                .join(format!("lib{}.rlib", config.name))
+                .is_file();
+            #[cfg(not(feature = "hot_patch"))]
+            let required_artifacts_present = true;
+
+            if required_artifacts_present
+                && is_build_up_to_date(
+                    workspace_root,
+                    &output_path,
+                    &manifest_path,
+                    &config.watch_directory,
+                )
+            {
                 info!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     module = config.name.as_str(),

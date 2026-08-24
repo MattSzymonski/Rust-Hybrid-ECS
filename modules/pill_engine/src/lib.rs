@@ -84,6 +84,9 @@ pub mod scheduler;
 /// Script components with deferred structural mutation safety.
 pub mod scripting;
 
+/// Per-function hot patching: stable dispatch slots for registered systems.
+pub mod hot_patch;
+
 /// Advanced system parameter infrastructure with automatic parameter resolution.
 pub mod system;
 
@@ -96,6 +99,7 @@ pub use api::EngineApi;
 pub use commands::{CommandError, Commands};
 pub use component::{Component, ComponentId, ComponentTicks, Tick};
 pub use engine::{Engine, SystemOwner};
+pub use hot_patch::{HotPatchError, HotPatchRegistry, HotSlot, PillHotFunctionDescriptor};
 pub use entity::Entity;
 pub use error::{EngineError, SystemError, SystemFailure};
 pub use persistence::ComponentSnapshot;
@@ -119,7 +123,7 @@ pub use tracing;
 // Registration macros + the inventory submit macro they expand to, re-exported
 // so module/project crates need no dependency beyond `pill_engine` itself.
 pub use inventory::submit;
-pub use pill_engine_macros::{PillComponent, pill_module, pill_project};
+pub use pill_engine_macros::{PillComponent, pill_hot, pill_hot_resolver, pill_module, pill_project};
 
 // World container and its entity-builder and error types.
 pub use world::{AddComponentError, BuildError, EntityBuilder, RemoveComponentError, World};
