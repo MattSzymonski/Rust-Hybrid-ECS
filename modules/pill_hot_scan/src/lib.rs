@@ -449,8 +449,8 @@ pub fn hot_functions(source: &str) -> Vec<HotFunction> {
 /// This is the discovery half of macro-free patching, and it deliberately
 /// mirrors what each crate's build script registers: module-level functions and
 /// inherent methods, named through their type. Anything the build script skips
-/// - a function nested inside another, or one in a generic or trait `impl` -
-/// is skipped here too, because the running artifact would have no entry for it
+/// (a function nested inside another, or one in a generic or trait `impl`) is
+/// skipped here too, because the running artifact would have no entry for it
 /// and the lookup would simply fail.
 ///
 /// The artifact remains the source of truth: the host asks it for an address by
@@ -720,7 +720,7 @@ pub fn strip_function_bodies(source: &str, names: &HashSet<String>) -> String {
         stripped.push_str(&source[cursor..=body_open]);
         stripped.push_str("/*body*/");
         stripped.push('}');
-        cursor = cursor + found.end;
+        cursor += found.end;
     }
 
     stripped.push_str(&source[cursor..]);
@@ -740,9 +740,7 @@ const INVENTORY_BLOCKLIST: &[&str] = &["register"];
 /// The whole of a participating crate's build script:
 ///
 /// ```no_run
-/// fn main() {
-///     pill_hot_scan::generate_function_inventory();
-/// }
+/// pill_hot_scan::generate_function_inventory();
 /// ```
 ///
 /// and one line in its `lib.rs`:
@@ -853,7 +851,9 @@ pub fn generate_function_inventory() {
             // reaches nobody, which is worse than saying it is not patchable.
             if function.inline_always {
                 println!(
-                    "cargo:warning=pill: `{}` is #[inline(always)] and is not registered                      for hot patching; callers hold their own copy, so redirecting it                      would reach none of them",
+                    "cargo:warning=pill: `{}` is #[inline(always)] and is not \
+                     registered for hot patching; callers hold their own copy, \
+                     so redirecting it would reach none of them",
                     function.name
                 );
                 continue;

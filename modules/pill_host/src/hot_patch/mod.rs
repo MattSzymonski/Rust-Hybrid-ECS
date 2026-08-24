@@ -246,6 +246,15 @@ struct Generation {
     /// Bytes overwritten in each artifact, when this generation was delivered
     /// by prologue patching. Empty for a slot-delivered generation.
     prologue_restores: Vec<PrologueRestore>,
+    /// Whether [`Self::prologue_restores`] was emptied by a reload rather than
+    /// never having been filled.
+    ///
+    /// The two are indistinguishable once the list is empty, and they need
+    /// opposite answers: a slot-delivered generation is rolled back through its
+    /// slot, while one whose addresses a reload invalidated cannot be rolled
+    /// back at all. Without this the second case took the first case's route and
+    /// failed claiming the crate was not loaded, which is not what went wrong.
+    prologue_history_dropped: bool,
     /// When this generation went live, for `patch_generations` listings.
     installed_at: Instant,
 }
@@ -304,6 +313,15 @@ pub(crate) struct HotPatchSession {
     build_command: Vec<String>,
     /// Last seen contents of every watched source file.
     snapshots: HashMap<PathBuf, String>,
+    /// The modification time each snapshot was read at.
+    ///
+    /// Compared against the file's current modification time to decide whether
+    /// it needs re-reading. Both sides are filesystem timestamps, which matters:
+    /// comparing a file time against `SystemTime::now()` is not sound on
+    /// Windows, where file times come from the coarse system clock and can lag
+    /// `now()` by a scheduler tick - a file written *after* a snapshot can
+    /// report an earlier time, and the edit is then missed.
+    snapshot_mtimes: HashMap<PathBuf, SystemTime>,
     /// When those contents were read.
     ///
     /// Used to tell two very different "nothing changed" cases apart: a reload
@@ -355,6 +373,7 @@ impl HotPatchSession {
             package_rlib,
             build_command: build_command.to_vec(),
             snapshots: HashMap::new(),
+            snapshot_mtimes: HashMap::new(),
             snapshot_taken_at: SystemTime::UNIX_EPOCH,
             rustc_line: None,
             generations: Vec::new(),
@@ -420,6 +439,13 @@ impl HotPatchSession {
     fn refresh_snapshots(&mut self) {
         for path in rust_sources(&self.source_root) {
             if let Ok(contents) = std::fs::read_to_string(&path) {
+                if let Ok(modified) = std::fs::metadata(&path).and_then(|meta| meta.modified()) {
+                    self.snapshot_mtimes.insert(path.clone(), modified);
+                } else {
+                    // Unknown time means "always re-read", which is the safe
+                    // direction: a redundant read costs microseconds.
+                    self.snapshot_mtimes.remove(&path);
+                }
                 self.snapshots.insert(path, contents);
             }
         }
@@ -503,6 +529,14 @@ impl HotPatchSession {
 
         // Only record the new contents once every body is live, so a partial
         // failure is retried on the next change rather than treated as done.
+        // The recorded modification time moves with the contents: leaving the
+        // two out of step would not be wrong - a mismatched time only forces a
+        // redundant read - but it would make the pair mean two different things.
+        if let Ok(modified) = std::fs::metadata(&path).and_then(|meta| meta.modified()) {
+            self.snapshot_mtimes.insert(path.clone(), modified);
+        } else {
+            self.snapshot_mtimes.remove(&path);
+        }
         self.snapshots.insert(path, new_contents);
         PatchOutcome::Patched {
             function: patched_names.join(", "),
@@ -553,6 +587,7 @@ impl HotPatchSession {
         for generation in &mut self.generations {
             if generation.overwrote_prologues() {
                 generation.prologue_restores.clear();
+                generation.prologue_history_dropped = true;
                 if !functions.contains(&generation.function) {
                     functions.push(generation.function.clone());
                 }
@@ -637,6 +672,18 @@ impl HotPatchSession {
                 .iter()
                 .find(|candidate| candidate.function == qualified && candidate.number == number)
                 .ok_or_else(|| format!("`{qualified}` has no generation {number}"))?;
+
+            // Its addresses pointed into an image a reload has since replaced,
+            // so there is nothing left to re-aim. Saying so is the point: the
+            // slot route below would refuse too, but for the wrong reason.
+            if generation.prologue_history_dropped {
+                return Err(format!(
+                    "generation {number} of `{qualified}` was written into the \
+                     artifact's own code, and a reload has replaced that code \
+                     since; it can no longer be rolled back to. The reloaded \
+                     artifact already carries the current source"
+                ));
+            }
 
             if generation.overwrote_prologues() {
                 // Re-aim every copy at this generation's body. The bytes each
@@ -767,10 +814,37 @@ impl HotPatchSession {
     ) -> Result<Option<(PathBuf, Vec<source::HotFunction>, String)>, PatchRefusal> {
         let mut result: Option<(PathBuf, Vec<source::HotFunction>, String)> = None;
 
-        for path in rust_sources(&self.source_root) {
-            let Ok(new_contents) = std::fs::read_to_string(&path) else {
+        // One directory walk, reused below. Reading every file in the crate on
+        // every attempt made classification proportional to crate size rather
+        // than to the edit - measured at 53 ms and 72 ms on small crates.
+        let sources = rust_sources(&self.source_root);
+        let mut any_newer_than_snapshot = false;
+
+        for path in &sources {
+            let modified = std::fs::metadata(path)
+                .and_then(|metadata| metadata.modified())
+                .ok();
+            if modified.is_some_and(|modified| modified > self.snapshot_taken_at) {
+                any_newer_than_snapshot = true;
+            }
+
+            // A file whose modification time still matches the one recorded when
+            // it was read cannot differ from the snapshot, so it needs no read.
+            // Both sides are filesystem timestamps, so this comparison is exact.
+            // Anything unknown - a new file, or a time the filesystem would not
+            // report - falls through to a read.
+            let unchanged = match (modified, self.snapshot_mtimes.get(path)) {
+                (Some(current), Some(recorded)) => current == *recorded,
+                _ => false,
+            };
+            if unchanged && self.snapshots.contains_key(path) {
+                continue;
+            }
+
+            let Ok(new_contents) = std::fs::read_to_string(path) else {
                 continue;
             };
+            let path = path.clone();
             let Some(old_contents) = self.snapshots.get(&path) else {
                 // A new file is a structural change by definition.
                 return Err(PatchRefusal::new(
@@ -871,21 +945,15 @@ impl HotPatchSession {
         // change is real, it simply reached the snapshot before the snapshot
         // was taken, so the fast path has nothing to compare against and the
         // edit falls through to a full reload in silence.
-        if result.is_none() {
-            let edited_before_arming = rust_sources(&self.source_root).into_iter().any(|path| {
-                std::fs::metadata(&path)
-                    .and_then(|metadata| metadata.modified())
-                    .is_ok_and(|modified| modified > self.snapshot_taken_at)
-            });
-            if edited_before_arming {
-                return Err(PatchRefusal::new(
-                    refusal_code::EDITED_BEFORE_ARMING,
-                    format!(
-                        "a source file changed before `{}` armed, so the edit was captured                          as the baseline; this reload will pick it up",
-                        self.package
-                    ),
-                ));
-            }
+        if result.is_none() && any_newer_than_snapshot {
+            return Err(PatchRefusal::new(
+                refusal_code::EDITED_BEFORE_ARMING,
+                format!(
+                    "a source file changed before `{}` armed, so the edit was \
+                     captured as the baseline; this reload will pick it up",
+                    self.package
+                ),
+            ));
         }
 
         Ok(result)
@@ -896,6 +964,11 @@ impl HotPatchSession {
     // -------------------------------------------------------------------------
 
     /// Build and install the replacement for one function.
+    // Nine arguments, each a distinct collaborator rather than a field of some
+    // implicit struct: the engine, the artifacts, the loaded patches, the source,
+    // the declaration, its two names, and the stage timings. Grouping them would
+    // hide what they are rather than clarify it.
+    #[allow(clippy::too_many_arguments)]
     fn apply(
         &mut self,
         engine: &mut Engine,
@@ -922,7 +995,19 @@ impl HotPatchSession {
         let generated = self
             .generate(new_contents, declaration, qualified)
             .map_err(|detail| PatchRefusal::new(failure_code::GENERATE, detail))?;
-        let source_path = std::env::temp_dir().join(format!("{crate_name}.rs"));
+        // Written into the per-process temporary directory rather than the
+        // system one, because that directory already has a cleanup path: a later
+        // run sweeps the directories of processes that have exited. Patch images
+        // are never unloaded, so without this they accumulated on disk for every
+        // edit of every session, forever.
+        let scratch = crate::native_library::process_temporary_directory(&self.workspace_root);
+        if let Err(error) = std::fs::create_dir_all(&scratch) {
+            return Err(PatchRefusal::new(
+                failure_code::PREPARE,
+                format!("cannot create the patch scratch directory: {error}"),
+            ));
+        }
+        let source_path = scratch.join(format!("{crate_name}.rs"));
         std::fs::write(&source_path, generated.as_bytes()).map_err(|error| {
             PatchRefusal::new(
                 failure_code::PREPARE,
@@ -941,7 +1026,7 @@ impl HotPatchSession {
         // Cloned before the cached compiler line is borrowed mutably below.
         let package = self.package.clone();
 
-        let artifact = std::env::temp_dir().join(format!("{crate_name}.dll"));
+        let artifact = scratch.join(format!("{crate_name}.dll"));
         let extra_externs = vec![format!(
             "{}={}",
             self.package,
@@ -981,7 +1066,9 @@ impl HotPatchSession {
                 // there; it no longer matches the dependency rlibs the replayed
                 // line points at, because one of them was rebuilt.
                 None if first.contains("E0463") && first.contains(package) => format!(
-                    "{first} - the staged rlib no longer matches the dependency                      rlibs it links against; a crate `{package}` depends on was                      rebuilt after it was staged"
+                    "{first} - the staged rlib no longer matches the dependency \
+                     rlibs it links against; a crate `{package}` depends on was \
+                     rebuilt after it was staged"
                 ),
                 None => first.to_string(),
             };
@@ -1099,6 +1186,7 @@ impl HotPatchSession {
             .unwrap_or(0)
             + 1;
         self.generations.push(Generation {
+            prologue_history_dropped: false,
             function: qualified.to_string(),
             // Whichever form the route that delivered this generation looks up,
             // so a rollback asks the same question the install did.
@@ -1779,7 +1867,9 @@ fn prologue_patch_everywhere(
         // changed signature; this is what catches it having been wrong.
         if !signature.is_empty() && signature != expected_signature {
             return Err(format!(
-                "{label}: `{qualified}` was built as `{signature}` but the edit                  declares `{expected_signature}`; refusing to redirect callers                  compiled for the old shape"
+                "{label}: `{qualified}` was built as `{signature}` but the edit \
+                 declares `{expected_signature}`; refusing to redirect callers \
+                 compiled for the old shape"
             ));
         }
         // SAFETY: `address` came from the artifact's own inventory, so it names
@@ -1924,6 +2014,7 @@ mod tests {
             package_rlib: PathBuf::from("libproject.rlib"),
             build_command: vec!["cargo".to_string(), "build".to_string()],
             snapshots: HashMap::new(),
+            snapshot_mtimes: HashMap::new(),
             snapshot_taken_at: SystemTime::UNIX_EPOCH,
             rustc_line: None,
             generations: Vec::new(),
@@ -1947,7 +2038,7 @@ mod tests {
         // The function is copied verbatim, body included.
         assert!(generated.contains("fn movement(value: i32) -> i32 { value * 2 }"));
         // The original attribute must NOT be duplicated.
-        assert_eq!(generated.matches("#[").filter(|_| true).count() >= 1, true);
+        assert!(generated.contains("#["));
         assert_eq!(generated.matches("pill_hot(name").count(), 1);
     }
 
@@ -2153,6 +2244,82 @@ mod tests {
         let _ = std::fs::remove_dir_all(&second);
     }
 
+    /// An untouched file is not re-read, so classification costs what the edit
+    /// costs rather than what the crate weighs.
+    ///
+    /// The gate compares the file's modification time against the one recorded
+    /// when it was read - filesystem time against filesystem time. Comparing
+    /// against `SystemTime::now()` is not sound on Windows, where file times come
+    /// from the coarse system clock and a file written after a snapshot can
+    /// report an earlier time; that mistake made every classification miss.
+    #[test]
+    fn an_untouched_file_is_not_re_read() {
+        let directory = std::env::temp_dir().join("pill_classify_mtime_gate");
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut session = session_over(&directory, HOT_SOURCE);
+
+        // A second file that never changes.
+        let untouched = directory.join("untouched.rs");
+        fs_write(&untouched, "pub fn stable() {}\n");
+        session.refresh_snapshots();
+        assert!(session.snapshot_mtimes.contains_key(&untouched));
+
+        // Its recorded contents are then replaced with a different set of
+        // functions, without touching the file. Nothing on disk changed, so the
+        // gate must skip it - and if it does not, the re-read sees a renamed
+        // function, which is a structural change and refuses the whole
+        // classification. That makes the skip observable rather than asserted.
+        session.snapshots.insert(
+            untouched.clone(),
+            "pub fn renamed_since_the_snapshot() {}\n".to_string(),
+        );
+
+        // Only the edited file is re-read, so the classification succeeds and
+        // names it.
+        let edited = HOT_SOURCE.replace("value * SPEED", "value * SPEED * 3.0");
+        std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
+
+        let (path, declarations, _) = session
+            .classify()
+            .expect("the untouched file must be skipped, not re-read")
+            .expect("a change must be reported");
+        assert_eq!(path.file_name().unwrap(), "lib.rs");
+        assert_eq!(declarations[0].name, "movement");
+
+        // And the stale snapshot is still there: proof the file was never read.
+        assert!(
+            session.snapshots[&untouched].contains("renamed_since_the_snapshot"),
+            "the untouched file was re-read despite an unchanged modification time"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A file whose content changes is re-read even though it was in the
+    /// snapshot, because its modification time moved.
+    #[test]
+    fn a_touched_file_is_re_read() {
+        let directory = std::env::temp_dir().join("pill_classify_mtime_touch");
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut session = session_over(&directory, PLAIN_SOURCE);
+
+        // Sleep past the filesystem's timestamp granularity, so the write is
+        // guaranteed to produce a different modification time rather than
+        // relying on it.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let edited = PLAIN_SOURCE.replace("133.0", "144.0");
+        std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
+
+        let (_, declarations, contents) = session
+            .classify()
+            .expect("a body-only edit is in scope")
+            .expect("the changed file must be re-read and reported");
+        assert_eq!(declarations[0].name, "get_color_a");
+        assert!(contents.contains("144.0"));
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     /// The staged rlib is brought back in step with cargo's output before a
     /// patch is compiled, so the two halves of the link closure agree.
     ///
@@ -2245,6 +2412,7 @@ mod tests {
             package_rlib: directory.join("libproject.rlib"),
             build_command: vec!["cargo".to_string(), "build".to_string()],
             snapshots: HashMap::new(),
+            snapshot_mtimes: HashMap::new(),
             snapshot_taken_at: SystemTime::UNIX_EPOCH,
             rustc_line: None,
             generations: Vec::new(),
@@ -2446,6 +2614,81 @@ fn helper(value: f32) -> f32 {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// A prologue generation a reload has invalidated says so, rather than
+    /// failing as though the crate were never loaded.
+    ///
+    /// Dropping the addresses is what keeps a rollback from writing into a
+    /// retired image, but it also makes the generation indistinguishable from a
+    /// slot-delivered one - and the slot route then refuses for a reason that is
+    /// not what went wrong. This pins the message a developer actually reads.
+    #[test]
+    fn a_prologue_generation_a_reload_invalidated_says_so() {
+        let directory = std::env::temp_dir().join("pill_rollback_dropped_history");
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut session = session_over(&directory, HOT_SOURCE);
+
+        // A generation delivered by overwriting code, as `apply` would record it.
+        session.generations.push(Generation {
+            function: "project::ordinary".to_string(),
+            number: 1,
+            address: 0x1000,
+            kind: source::HotFunctionKind::PlainFunction,
+            signature_hash: 0,
+            lookup_name: "project::ordinary".to_string(),
+            signature: "fn ordinary()".to_string(),
+            prologue_restores: vec![PrologueRestore {
+                artifact: "project".to_string(),
+                address: 0x2000,
+                original: vec![0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0],
+            }],
+            prologue_history_dropped: false,
+            installed_at: Instant::now(),
+        });
+        session
+            .active_generations
+            .insert("project::ordinary".to_string(), 1);
+
+        // The reload that invalidates every recorded address.
+        session.forget_prologue_patches();
+        assert!(session.generations[0].prologue_history_dropped);
+        assert!(session.generations[0].prologue_restores.is_empty());
+
+        // Patching the same function again is what makes generation 1 reachable
+        // for a rollback at all: the reload cleared the active entry, and the
+        // new generation restores it. This is the sequence the refusal is for -
+        // edit, reload, edit, then ask for the generation from before.
+        session.generations.push(Generation {
+            function: "project::ordinary".to_string(),
+            number: 2,
+            address: 0x3000,
+            kind: source::HotFunctionKind::PlainFunction,
+            lookup_name: "project::ordinary".to_string(),
+            signature: "fn ordinary()".to_string(),
+            signature_hash: 0,
+            prologue_restores: vec![PrologueRestore {
+                artifact: "project".to_string(),
+                address: 0x2000,
+                original: vec![0x48, 0xB8, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xE0],
+            }],
+            prologue_history_dropped: false,
+            installed_at: Instant::now(),
+        });
+        session
+            .active_generations
+            .insert("project::ordinary".to_string(), 2);
+
+        let mut engine = Engine::new();
+        let detail = session
+            .rollback(&mut engine, &[], &[], "project::ordinary", 1)
+            .expect_err("an invalidated generation cannot be rolled back to");
+        assert!(
+            detail.contains("a reload has replaced that code"),
+            "the refusal must name the reload, not a missing crate: {detail}"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     /// An un-annotated function is patchable: the attribute chooses which
     /// mechanism delivers the replacement, not whether one is possible at all.
     ///
@@ -2521,6 +2764,7 @@ fn helper(value: f32) -> f32 {
             package_rlib: PathBuf::from("libproject.rlib"),
             build_command: vec!["cargo".to_string(), "build".to_string()],
             snapshots: HashMap::new(),
+            snapshot_mtimes: HashMap::new(),
             snapshot_taken_at: SystemTime::UNIX_EPOCH,
             rustc_line: None,
             generations: Vec::new(),

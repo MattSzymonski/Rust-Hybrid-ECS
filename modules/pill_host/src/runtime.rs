@@ -433,7 +433,8 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
     // itself - an interface nothing mentions is one nobody uses.
     #[cfg(feature = "hot_patch")]
     println!(
-        "{} rollback: write `function@generation`, `function@previous` or `list`          to {}",
+        "{} rollback: write `function@generation`, `function@previous` or `list` \
+         to {}",
         crate::console::bold_cyan("[hot]"),
         crate::console::dim(ROLLBACK_REQUEST_FILE)
     );
@@ -706,6 +707,22 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
             generation,
             "hot reload triggered"
         );
+
+        // The project image is about to be replaced, and the graveyard unmaps it
+        // two generations later. Every recorded prologue address points into the
+        // image being retired, so the records are dropped here for the same
+        // reason the module path drops them: writing saved bytes back to a
+        // retired - or worse, re-used - address is not a rollback.
+        #[cfg(feature = "hot_patch")]
+        {
+            if let Some(session) = host.hot_patch.as_mut() {
+                session.forget_prologue_patches();
+            }
+            for session in host.module_hot_patch.iter_mut().flatten() {
+                session.forget_prologue_patches();
+            }
+        }
+
         host.loaded_project.reload(
             &mut host.engine,
             &host.engine_api,

@@ -910,6 +910,25 @@ pub unsafe fn restore_prologue(target: usize, original: &[u8]) -> Result<(), Str
         ));
     }
     let target_pointer = target as *mut u8;
+
+    // The bytes there now must be the jump this module installed. Extent alone
+    // is not enough: an image can be unloaded and a different one mapped over
+    // the same address, and that lookup would succeed. Writing the saved bytes
+    // then corrupts an unrelated live function - during a rollback, when the
+    // developer is already recovering from something.
+    //
+    // SAFETY: the extent check above established that `target` is the entry of a
+    // mapped function at least `original.len()` bytes long, so this many bytes
+    // are readable.
+    let installed = unsafe { core::slice::from_raw_parts(target_pointer, original.len()) };
+    if installed.len() < 2 || installed[0] != 0x48 || installed[1] != 0xB8 {
+        return Err(format!(
+            "0x{target:016x} does not begin with the jump this patch installed, so \
+             it is no longer the function those bytes came from; refusing to \
+             write over it"
+        ));
+    }
+
     let mut previous_protection: u32 = 0;
     // SAFETY: as documented on this function.
     let changed = unsafe {
@@ -1303,6 +1322,8 @@ mod integration_tests {
     /// how many times a system ran meaningless.
     macro_rules! isolated_systems {
         ($name:ident) => {
+            // Each instantiation uses only the helpers its own test needs.
+            #[allow(dead_code)]
             mod $name {
                 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1689,6 +1710,42 @@ mod integration_tests {
     #[inline(never)]
     fn patch_target_twice(value: u32) -> u32 {
         value + 1
+    }
+
+    /// A restore is refused when the bytes there are not the jump this module
+    /// installed.
+    ///
+    /// Extent alone is not enough: an image can be unloaded and another mapped
+    /// over the same address, and the extent lookup would succeed. Writing the
+    /// saved bytes then corrupts an unrelated live function - during a rollback,
+    /// when the developer is already recovering from something.
+    #[test]
+    fn restoring_over_code_that_is_not_our_jump_is_refused() {
+        let target = patch_restore_guard as *const () as usize;
+        assert_eq!(std::hint::black_box(patch_restore_guard)(1), 3);
+
+        // Bytes shaped like a saved prologue, but the function was never
+        // patched, so what is there now is its own code.
+        let pretend_original = vec![0x90u8; ABSOLUTE_JUMP_LENGTH];
+
+        // SAFETY: expected to refuse before writing, which is what this asserts.
+        let result = unsafe { restore_prologue(target, &pretend_original) };
+        let detail = result.expect_err("an unpatched function must be refused");
+        assert!(
+            detail.contains("does not begin with the jump"),
+            "unexpected reason: {detail}"
+        );
+        assert_eq!(
+            std::hint::black_box(patch_restore_guard)(1),
+            3,
+            "a refused restore must not have written anything"
+        );
+    }
+
+    /// Its own target, so a refused restore cannot disturb the other tests.
+    #[inline(never)]
+    fn patch_restore_guard(value: u32) -> u32 {
+        value + 2
     }
 
     /// The guard that P0-1 was about: an address the exception directory does

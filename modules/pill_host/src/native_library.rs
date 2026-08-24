@@ -523,7 +523,7 @@ impl Drop for NativeLibrary {
 /// Scoping the directory per process id means one host instance can never
 /// delete or overwrite the copies of another instance running against the
 /// same workspace.
-fn process_temporary_directory(workspace_root: &Path) -> PathBuf {
+pub(crate) fn process_temporary_directory(workspace_root: &Path) -> PathBuf {
     workspace_root
         .join(TEMPORARY_DIRECTORY)
         .join(std::process::id().to_string())
