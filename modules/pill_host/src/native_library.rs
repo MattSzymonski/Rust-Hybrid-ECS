@@ -94,6 +94,26 @@ type PlainFunctionResetFn = unsafe extern "C" fn(*const std::ffi::c_char) -> u32
 #[cfg(feature = "hot_patch")]
 const PLAIN_FUNCTION_INSTALL_SYMBOL: &[u8] = b"pill_hot_resolve_install";
 
+/// SPIKE: signature of the build-script-backed address resolver.
+#[cfg(feature = "hot_patch")]
+type FunctionAddressFn = unsafe extern "C" fn(
+    *const std::ffi::c_char,
+    *mut *const u8,
+    *mut usize,
+) -> usize;
+
+/// Export that reports any function address in this artifact.
+#[cfg(feature = "hot_patch")]
+const FUNCTION_ADDRESS_SYMBOL: &[u8] = b"pill_hot_resolve_address";
+
+/// Signature of the extent-coverage diagnostic export.
+#[cfg(feature = "hot_patch")]
+type ExtentCoverageFn = unsafe extern "C" fn() -> u64;
+
+/// Export reporting how many of an artifact's functions have a known length.
+#[cfg(feature = "hot_patch")]
+const EXTENT_COVERAGE_SYMBOL: &[u8] = b"pill_hot_resolve_extent_coverage";
+
 /// Export that returns one redirect slot to the artifact's own body.
 #[cfg(feature = "hot_patch")]
 const PLAIN_FUNCTION_RESET_SYMBOL: &[u8] = b"pill_hot_resolve_reset";
@@ -382,6 +402,68 @@ impl NativeLibrary {
                 "`{qualified_name}` changed shape; the running implementation was kept"
             )),
         }
+    }
+
+    /// How many of this artifact's functions have a length the exception
+    /// directory records, and how many it declares in total.
+    ///
+    /// Only a function with a known extent can be prologue-patched, so this
+    /// turns a refusal into a diagnosis: whether one function happens to be a
+    /// leaf, or the whole artifact is out of reach.
+    #[cfg(feature = "hot_patch")]
+    pub(crate) fn extent_coverage(&self) -> Option<(usize, usize)> {
+        let library = self.library.as_ref()?;
+        // SAFETY: the symbol is looked up by the name the ABI macros generate,
+        // with the signature they define, in a module this handle keeps mapped.
+        let coverage: Symbol<ExtentCoverageFn> =
+            unsafe { library.get(EXTENT_COVERAGE_SYMBOL) }.ok()?;
+        // SAFETY: the export takes no arguments and only reads static tables.
+        let packed = unsafe { coverage() };
+        Some(((packed >> 32) as usize, (packed & 0xFFFF_FFFF) as usize))
+    }
+
+    /// Report the address and recorded declaration of any function in this
+    /// artifact, from the build-script-generated inventory rather than an
+    /// attribute.
+    ///
+    /// The declaration is the compatibility gate for the prologue route: it is
+    /// the only chance to refuse a reshaped function, because overwriting the
+    /// first bytes of a function can check nothing about what it jumps to.
+    ///
+    /// Returns `None` when this artifact exports no address resolver or has no
+    /// entry for the name.
+    #[cfg(feature = "hot_patch")]
+    pub(crate) fn function_address(&self, qualified_name: &str) -> Option<(usize, String)> {
+        let library = self.library.as_ref()?;
+        // SAFETY: the symbol is looked up by the name the ABI macros generate,
+        // with the signature they define. The pointer stays valid because
+        // `library` keeps the module mapped for this `NativeLibrary`'s lifetime.
+        let resolve: Symbol<FunctionAddressFn> =
+            unsafe { library.get(FUNCTION_ADDRESS_SYMBOL) }.ok()?;
+        let name = std::ffi::CString::new(qualified_name).ok()?;
+        let mut signature_pointer: *const u8 = std::ptr::null();
+        let mut signature_length: usize = 0;
+        // SAFETY: the string is NUL-terminated and lives until the call returns,
+        // and both out-parameters are writable locals. On success the artifact
+        // writes a pointer into its own static storage, which stays valid while
+        // it is loaded.
+        let address = unsafe {
+            resolve(name.as_ptr(), &mut signature_pointer, &mut signature_length)
+        };
+        if address == 0 {
+            return None;
+        }
+        let signature = if signature_pointer.is_null() {
+            String::new()
+        } else {
+            // SAFETY: the artifact wrote a pointer and length describing a
+            // `&'static str` inside its own image.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(signature_pointer, signature_length)
+            };
+            String::from_utf8_lossy(bytes).into_owned()
+        };
+        Some((address, signature))
     }
 
     /// Return this artifact's copy of one `#[pill_hot_fn]` to its own body.

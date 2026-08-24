@@ -562,6 +562,326 @@ pub fn plain_function_entry(qualified_name: &str) -> Option<(usize, &'static str
     Some((address(), descriptor.signature))
 }
 
+// =============================================================================
+// Macro-free function inventory (SPIKE)
+// =============================================================================
+
+/// One function this artifact can report the address of, contributed by a
+/// crate's build script rather than by an attribute.
+///
+/// This is the macro-free half of the Live++ style approach: a build script
+/// scans the crate's own sources, finds every function, and emits one of these
+/// per function. Nothing in the source is annotated, and because `inventory`
+/// collects per artifact, a DLL ends up with an entry for every function in
+/// every crate linked into it - which is exactly the fan-out a multi-artifact
+/// engine needs.
+pub struct PillFunctionAddress {
+    /// Fully-qualified path, as `module_path!() + "::" + fn name`.
+    pub qualified_name: &'static str,
+    /// The function's address in THIS artifact.
+    ///
+    /// A fn pointer rather than a `usize` because casting a function to an
+    /// integer is not permitted in the constant context that builds this.
+    pub address: fn() -> usize,
+    /// The declaration as written, with whitespace collapsed.
+    ///
+    /// The compatibility gate for the prologue route, which has no other one:
+    /// overwriting a function's first bytes cannot check anything about the
+    /// replacement, so the check has to happen before the write. A host compares
+    /// this against the signature it read from the edited source and refuses
+    /// when they differ.
+    pub signature: &'static str,
+}
+
+inventory::collect!(PillFunctionAddress);
+
+/// Address of one function inside this artifact, by qualified path.
+pub fn function_address(qualified_name: &str) -> Option<usize> {
+    inventory::iter::<PillFunctionAddress>
+        .into_iter()
+        .find(|entry| entry.qualified_name == qualified_name)
+        .map(|entry| (entry.address)())
+}
+
+/// The declaration this artifact was built with, by qualified path.
+pub fn function_signature(qualified_name: &str) -> Option<&'static str> {
+    inventory::iter::<PillFunctionAddress>
+        .into_iter()
+        .find(|entry| entry.qualified_name == qualified_name)
+        .map(|entry| entry.signature)
+}
+
+/// Every function this artifact can report, for diagnostics.
+pub fn function_addresses() -> impl Iterator<Item = (&'static str, usize)> {
+    inventory::iter::<PillFunctionAddress>
+        .into_iter()
+        .map(|entry| (entry.qualified_name, (entry.address)()))
+}
+
+// =============================================================================
+// Prologue patching (SPIKE, Windows x86-64 only)
+// =============================================================================
+
+/// Bytes an absolute jump occupies: `mov rax, imm64` then `jmp rax`.
+///
+/// The absolute form is used rather than a 5-byte `E9 rel32` because ASLR
+/// routinely places a freshly loaded patch image several gigabytes from the
+/// base image - measured at +7.4 GB during the original research - so the
+/// relative form would need a trampoline on essentially every patch anyway.
+/// Twelve bytes is more of the function to overwrite, which is the trade.
+const ABSOLUTE_JUMP_LENGTH: usize = 12;
+
+/// Read/write/execute page protection.
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+
+/// One entry in the x86-64 exception directory: a function's exact extent.
+///
+/// Windows requires every function that touches the stack to publish one of
+/// these so the unwinder can walk it, which makes the table an authoritative
+/// map of where each function begins and ends - no disassembler needed.
+#[repr(C)]
+struct RuntimeFunction {
+    /// Offset of the function's first byte from the image base.
+    begin_address: u32,
+    /// Offset one past the function's last byte.
+    end_address: u32,
+    /// Offset of the unwind data; unused here.
+    _unwind_data: u32,
+}
+
+extern "system" {
+    fn VirtualProtect(
+        address: *mut core::ffi::c_void,
+        size: usize,
+        new_protection: u32,
+        old_protection: *mut u32,
+    ) -> i32;
+    fn GetCurrentProcess() -> *mut core::ffi::c_void;
+    fn FlushInstructionCache(
+        process: *mut core::ffi::c_void,
+        base: *const core::ffi::c_void,
+        size: usize,
+    ) -> i32;
+    fn RtlLookupFunctionEntry(
+        control_address: u64,
+        image_base: *mut u64,
+        history_table: *mut core::ffi::c_void,
+    ) -> *const RuntimeFunction;
+}
+
+/// How many of this artifact's registered functions have a known extent.
+///
+/// Diagnostic: a prologue patch can only overwrite a function whose length the
+/// exception directory records, so this says how much of an artifact is
+/// reachable by that route at all.
+pub fn functions_with_known_extent() -> (usize, usize) {
+    let mut known = 0usize;
+    let mut total = 0usize;
+    for (_, address) in function_addresses() {
+        total += 1;
+        if function_extent(address).is_some() {
+            known += 1;
+        }
+    }
+    (known, total)
+}
+
+/// Where the function containing `address` begins and how long it is.
+///
+/// Read from the running image's exception directory, so the answer is the
+/// linker's own record rather than a guess. Returns `None` when the address has
+/// no entry, which is the case for a leaf function small enough that Windows
+/// permits omitting its unwind data - exactly the functions too short to
+/// overwrite safely, so an absent entry is treated as "refuse", never as
+/// "assume it is long enough".
+pub fn function_extent(address: usize) -> Option<(usize, usize)> {
+    let mut image_base: u64 = 0;
+    // SAFETY: `RtlLookupFunctionEntry` reads the loaded image's exception
+    // directory for an arbitrary address and reports a null entry when it finds
+    // none. `image_base` is a writable local, and passing a null history table
+    // asks for no caching.
+    let entry = unsafe {
+        RtlLookupFunctionEntry(address as u64, &mut image_base, core::ptr::null_mut())
+    };
+    if entry.is_null() {
+        return None;
+    }
+    // SAFETY: the pointer is non-null and points into the image's static
+    // exception directory, which stays mapped for as long as the module is.
+    let entry = unsafe { &*entry };
+    let begin = image_base as usize + entry.begin_address as usize;
+    let end = image_base as usize + entry.end_address as usize;
+    if end <= begin {
+        return None;
+    }
+    Some((begin, end - begin))
+}
+
+/// Overwrite a function's first bytes with an absolute jump to `replacement`.
+///
+/// Returns the original bytes, so the patch can be undone by writing them back.
+///
+/// The function's own length is checked against the exception directory first,
+/// so a function too short to hold the jump is refused rather than overwritten
+/// past its end - which would corrupt whichever function the linker placed
+/// next.
+///
+/// # Safety
+///
+/// `replacement` must be a function with a signature compatible with the one at
+/// `target`, and **no thread may be executing inside the overwritten bytes**.
+/// The caller guarantees the second condition by patching at a frame boundary,
+/// on the thread that runs the frame loop, while no other thread is inside the
+/// function. `target` is validated here rather than assumed.
+pub unsafe fn patch_prologue(target: usize, replacement: usize) -> Result<Vec<u8>, String> {
+    if target == 0 || replacement == 0 {
+        return Err("cannot patch a null address".to_string());
+    }
+    if target == replacement {
+        return Err("refusing to patch a function to itself".to_string());
+    }
+
+    // How much room there actually is. Without this the write runs past a short
+    // function and into whatever the linker placed after it, which is usually
+    // another live function - a corruption that surfaces far from its cause.
+    let Some((begin, length)) = function_extent(target) else {
+        return Err(format!(
+            "0x{target:016x} is a leaf function with no entry in the exception \
+             directory, so its length cannot be established and overwriting it \
+             is unsafe; annotate it with #[pill_hot_fn] to patch it through a \
+             dispatch slot instead, which needs no length at all"
+        ));
+    };
+    if begin != target {
+        return Err(format!(
+            "0x{target:016x} is not a function entry point (the function containing \
+             it begins at 0x{begin:016x})"
+        ));
+    }
+    if length < ABSOLUTE_JUMP_LENGTH {
+        return Err(format!(
+            "the function at 0x{target:016x} is {length} bytes, too short for the \
+             {ABSOLUTE_JUMP_LENGTH}-byte jump a patch installs"
+        ));
+    }
+
+    let target_pointer = target as *mut u8;
+    let mut previous_protection: u32 = 0;
+
+    // SAFETY: the caller guarantees `target` addresses executable code; making
+    // its page writable is exactly what this function exists to do.
+    let changed = unsafe {
+        VirtualProtect(
+            target_pointer as *mut core::ffi::c_void,
+            ABSOLUTE_JUMP_LENGTH,
+            PAGE_EXECUTE_READWRITE,
+            &mut previous_protection,
+        )
+    };
+    if changed == 0 {
+        return Err("VirtualProtect refused to make the page writable".to_string());
+    }
+
+    // SAFETY: the page is now writable and the range was validated above.
+    let original = unsafe { core::slice::from_raw_parts(target_pointer, ABSOLUTE_JUMP_LENGTH) }
+        .to_vec();
+
+    // mov rax, imm64 ; jmp rax
+    let mut instructions = [0u8; ABSOLUTE_JUMP_LENGTH];
+    instructions[0] = 0x48;
+    instructions[1] = 0xB8;
+    instructions[2..10].copy_from_slice(&(replacement as u64).to_le_bytes());
+    instructions[10] = 0xFF;
+    instructions[11] = 0xE0;
+
+    // SAFETY: the page is writable and the slice length matches exactly.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            instructions.as_ptr(),
+            target_pointer,
+            ABSOLUTE_JUMP_LENGTH,
+        );
+    }
+
+    // SAFETY: restoring the protection the call above reported.
+    unsafe {
+        let mut discarded: u32 = 0;
+        VirtualProtect(
+            target_pointer as *mut core::ffi::c_void,
+            ABSOLUTE_JUMP_LENGTH,
+            previous_protection,
+            &mut discarded,
+        );
+        // Required on any core whose instruction cache may hold the old bytes.
+        FlushInstructionCache(
+            GetCurrentProcess(),
+            target_pointer as *const core::ffi::c_void,
+            ABSOLUTE_JUMP_LENGTH,
+        );
+    }
+
+    Ok(original)
+}
+
+/// Write saved prologue bytes back, undoing a patch.
+///
+/// # Safety
+///
+/// The same contract as [`patch_prologue`]: `target` must be the address the
+/// bytes came from, and no thread may be executing inside them.
+pub unsafe fn restore_prologue(target: usize, original: &[u8]) -> Result<(), String> {
+    if target == 0 {
+        return Err("cannot restore a null address".to_string());
+    }
+    // The same bound the patch was checked against. A restore aimed at an
+    // address whose image has since been replaced would otherwise write into
+    // whatever now occupies it, so the extent is re-read rather than trusted.
+    let Some((begin, length)) = function_extent(target) else {
+        return Err(format!(
+            "0x{target:016x} has no entry in the exception directory; refusing to \
+             write over it"
+        ));
+    };
+    if begin != target || length < original.len() {
+        return Err(format!(
+            "0x{target:016x} no longer names a function long enough for the {} saved \
+             bytes; the image was probably replaced",
+            original.len()
+        ));
+    }
+    let target_pointer = target as *mut u8;
+    let mut previous_protection: u32 = 0;
+    // SAFETY: as documented on this function.
+    let changed = unsafe {
+        VirtualProtect(
+            target_pointer as *mut core::ffi::c_void,
+            original.len(),
+            PAGE_EXECUTE_READWRITE,
+            &mut previous_protection,
+        )
+    };
+    if changed == 0 {
+        return Err("VirtualProtect refused to make the page writable".to_string());
+    }
+    // SAFETY: the page is writable and the length matches the saved slice.
+    unsafe {
+        core::ptr::copy_nonoverlapping(original.as_ptr(), target_pointer, original.len());
+        let mut discarded: u32 = 0;
+        VirtualProtect(
+            target_pointer as *mut core::ffi::c_void,
+            original.len(),
+            previous_protection,
+            &mut discarded,
+        );
+        FlushInstructionCache(
+            GetCurrentProcess(),
+            target_pointer as *const core::ffi::c_void,
+            original.len(),
+        );
+    }
+    Ok(())
+}
+
 /// Stable hash of a signature string, used only to report a mismatch.
 fn text_hash(text: &str) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -1138,6 +1458,171 @@ mod integration_tests {
             slot.current_or(original_address),
             original_address,
             "an emptied slot must fall back to the artifact's own body"
+        );
+    }
+
+    // =========================================================================
+    // Prologue patching
+    // =========================================================================
+
+    /// A function whose prologue gets overwritten and put back.
+    ///
+    /// `inline(never)` because the test needs a real symbol with a real entry in
+    /// the exception directory; an inlined body has neither.
+    #[inline(never)]
+    fn patch_target(value: u32) -> u32 {
+        value + 1
+    }
+
+    /// Its stand-in, with the same call shape.
+    #[inline(never)]
+    fn patch_replacement(value: u32) -> u32 {
+        value + 1000
+    }
+
+    /// The headline behaviour: callers of a patched function reach the
+    /// replacement, and restoring the saved bytes puts the original back.
+    ///
+    /// One test rather than three, because the bytes are process-wide state and
+    /// the harness runs tests on several threads.
+    #[test]
+    fn a_patched_prologue_redirects_and_restores() {
+        let target = patch_target as *const () as usize;
+        let replacement = patch_replacement as *const () as usize;
+        assert_eq!(std::hint::black_box(patch_target)(1), 2);
+
+        // SAFETY: both addresses name real functions in this binary with the
+        // same call shape, and no other thread calls `patch_target`.
+        let original = unsafe { patch_prologue(target, replacement) }
+            .expect("a normal function must be patchable");
+        assert_eq!(original.len(), ABSOLUTE_JUMP_LENGTH);
+        assert_eq!(
+            std::hint::black_box(patch_target)(1),
+            1001,
+            "callers must reach the replacement"
+        );
+
+        // SAFETY: the same address the bytes were saved from, unchanged since.
+        unsafe { restore_prologue(target, &original) }.expect("restore must succeed");
+        assert_eq!(
+            std::hint::black_box(patch_target)(1),
+            2,
+            "restoring must bring the original body back"
+        );
+    }
+
+    /// A second stand-in, so a function can be patched twice.
+    #[inline(never)]
+    fn patch_second_replacement(value: u32) -> u32 {
+        value + 2000
+    }
+
+    /// Patching twice and rolling back needs the FIRST generation's saved
+    /// bytes, not the newest.
+    ///
+    /// This is the assumption `restore_prologue_baseline` rests on: generation
+    /// two overwrote the jump generation one had written, so its "original" is a
+    /// jump. Restoring from it would reinstate a patch instead of removing one.
+    #[test]
+    fn the_first_generation_holds_the_artifacts_own_code() {
+        let target = patch_target_twice as *const () as usize;
+        let first_replacement = patch_replacement as *const () as usize;
+        let second_replacement = patch_second_replacement as *const () as usize;
+        assert_eq!(std::hint::black_box(patch_target_twice)(1), 2);
+
+        // SAFETY: real functions in this binary with the same call shape, and
+        // no other thread calls `patch_target_twice`.
+        let generation_one = unsafe { patch_prologue(target, first_replacement) }
+            .expect("first patch");
+        assert_eq!(std::hint::black_box(patch_target_twice)(1), 1001);
+
+        // SAFETY: as above. What this returns is generation one's jump.
+        let generation_two = unsafe { patch_prologue(target, second_replacement) }
+            .expect("second patch");
+        assert_eq!(std::hint::black_box(patch_target_twice)(1), 2001);
+
+        assert_ne!(
+            generation_one, generation_two,
+            "the second patch must have saved the first patch's jump, not the original"
+        );
+
+        // Restoring from the NEWEST saved bytes reinstates generation one - the
+        // mistake this test exists to pin down.
+        // SAFETY: the address these bytes were saved from, unchanged since.
+        unsafe { restore_prologue(target, &generation_two) }.expect("restore");
+        assert_eq!(
+            std::hint::black_box(patch_target_twice)(1),
+            1001,
+            "restoring the newest saved bytes brings back generation one, not the original"
+        );
+
+        // Restoring from the FIRST saved bytes is what actually reaches
+        // generation zero.
+        // SAFETY: as above.
+        unsafe { restore_prologue(target, &generation_one) }.expect("restore");
+        assert_eq!(
+            std::hint::black_box(patch_target_twice)(1),
+            2,
+            "the first generation's bytes are the artifact's own code"
+        );
+    }
+
+    /// Its own target, so the test above cannot disturb the round-trip test.
+    #[inline(never)]
+    fn patch_target_twice(value: u32) -> u32 {
+        value + 1
+    }
+
+    /// The guard that P0-1 was about: an address the exception directory does
+    /// not describe has no known length, so patching it is refused rather than
+    /// writing twelve bytes over whatever happens to be there.
+    #[test]
+    fn an_address_with_no_function_entry_is_refused() {
+        static NOT_A_FUNCTION: [u8; 64] = [0x90; 64];
+        let target = NOT_A_FUNCTION.as_ptr() as usize;
+        let replacement = patch_replacement as *const () as usize;
+
+        // SAFETY: the call is expected to refuse before writing anything, which
+        // is exactly what this asserts.
+        let result = unsafe { patch_prologue(target, replacement) };
+        let detail = result.expect_err("a non-function address must be refused");
+        assert!(
+            detail.contains("exception directory"),
+            "unexpected reason: {detail}"
+        );
+        assert_eq!(
+            NOT_A_FUNCTION[..ABSOLUTE_JUMP_LENGTH],
+            [0x90; ABSOLUTE_JUMP_LENGTH],
+            "a refused patch must not have written anything"
+        );
+    }
+
+    /// Patching the middle of a function is refused: the saved bytes would not
+    /// be a prologue, and a later restore would corrupt the body.
+    #[test]
+    fn an_address_inside_a_function_is_refused() {
+        let target = patch_target as *const () as usize + 1;
+        let replacement = patch_replacement as *const () as usize;
+
+        // SAFETY: expected to refuse before writing.
+        let result = unsafe { patch_prologue(target, replacement) };
+        let detail = result.expect_err("an interior address must be refused");
+        assert!(
+            detail.contains("not a function entry point"),
+            "unexpected reason: {detail}"
+        );
+    }
+
+    /// The extent lookup reports the linker's own record, so a real function is
+    /// described and its reported start is the address the caller holds.
+    #[test]
+    fn the_exception_directory_describes_a_real_function() {
+        let target = patch_target as *const () as usize;
+        let (begin, length) = function_extent(target).expect("a real function must be described");
+        assert_eq!(begin, target, "the entry must start where the symbol does");
+        assert!(
+            length >= ABSOLUTE_JUMP_LENGTH,
+            "an ordinary function should have room for the jump, got {length} bytes"
         );
     }
 

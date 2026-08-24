@@ -30,6 +30,10 @@
 // External crates
 use pill_core::math::Vector3f;
 use pill_engine::*;
+
+// The build script scans this crate and submits one address entry per function,
+// so the host can resolve any of them by qualified path with nothing annotated.
+include!(concat!(env!("OUT_DIR"), "/function_inventory.rs"));
 use serde::{Deserialize, Serialize};
 
 // =============================================================================

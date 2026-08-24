@@ -80,6 +80,14 @@ pub struct Host {
     /// has not opted in costs nothing beyond one source scan at startup.
     #[cfg(feature = "hot_patch")]
     module_hot_patch: Vec<Option<crate::hot_patch::HotPatchSession>>,
+    /// Every patch library loaded in this process, newest last.
+    ///
+    /// Process-wide rather than per-session on purpose: a patch links its own
+    /// copy of everything its body calls, so patching one crate has to redirect
+    /// the copies sitting inside another crate's patches too. Never unloaded - a
+    /// jump or a slot may point into any of them for the rest of the run.
+    #[cfg(feature = "hot_patch")]
+    loaded_patches: Vec<crate::hot_patch::LoadedPatch>,
     last_frame_error: Option<String>,
     last_error_report: Instant,
     suppressed_error_count: u64,
@@ -126,6 +134,7 @@ impl Host {
         let Host {
             hot_patch,
             module_hot_patch,
+            loaded_patches,
             optional_modules,
             loaded_project,
             engine,
@@ -144,7 +153,7 @@ impl Host {
             })?;
 
         let targets = patch_targets(loaded_project, optional_modules);
-        let result = session.rollback(engine, &targets, function, generation);
+        let result = session.rollback(engine, &targets, loaded_patches, function, generation);
         drop(targets);
         if result.is_ok() {
             println!(
@@ -420,6 +429,15 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
     );
     println!();
 
+    // Say how to drive rollback, once, next to where the fast path announces
+    // itself - an interface nothing mentions is one nobody uses.
+    #[cfg(feature = "hot_patch")]
+    println!(
+        "{} rollback: write `function@generation`, `function@previous` or `list`          to {}",
+        crate::console::bold_cyan("[hot]"),
+        crate::console::dim(ROLLBACK_REQUEST_FILE)
+    );
+
     // Arm the per-function fast path. It reads the project's sources for
     // `#[pill_hot]` annotations and returns `None` when there is nothing to do,
     // so a project that has not opted in pays nothing.
@@ -451,7 +469,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
         })
         .collect();
 
-    Ok(Host {
+    let host = Host {
         workspace_root,
         module_config,
         engine,
@@ -464,13 +482,17 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
         hot_patch,
         #[cfg(feature = "hot_patch")]
         module_hot_patch,
+        #[cfg(feature = "hot_patch")]
+        loaded_patches: Vec::new(),
         last_frame_error: None,
         last_error_report: Instant::now(),
         suppressed_error_count: 0,
         frame_count: 0,
         last_report: Instant::now(),
         last_measured_fps: 0.0,
-    })
+    };
+
+    Ok(host)
 }
 
 /// Set up the engine, project module, hot reload, and renderer together.
@@ -540,6 +562,12 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     // last transaction.
     let reload_started = Instant::now();
 
+    // Step 0a2: Honour a rollback request, at the same frame boundary the
+    // patch installs use - the prologue route rewrites live code, so this is a
+    // requirement rather than a convenience.
+    #[cfg(feature = "hot_patch")]
+    process_rollback_request(host);
+
     // Step 0b: Try the per-function fast path for the optional modules, before
     // the loop below turns a pending change into a full module rebuild.
     //
@@ -552,6 +580,7 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
         let Host {
             optional_modules,
             module_hot_patch,
+            loaded_patches,
             loaded_project,
             engine,
             ..
@@ -565,7 +594,7 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
                 continue;
             };
             let targets = patch_targets(loaded_project, optional_modules);
-            let outcome = session.try_patch(engine, &targets);
+            let outcome = session.try_patch(engine, &targets, loaded_patches);
             // The borrow of the module list ends here, so the slot below can be
             // updated.
             drop(targets);
@@ -584,10 +613,25 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
         workspace_root,
         reload_generation,
         module_config,
+        #[cfg(feature = "hot_patch")]
+        hot_patch,
+        #[cfg(feature = "hot_patch")]
+        module_hot_patch,
         ..
     } = &mut *host;
     for slot in optional_modules.iter_mut() {
         if slot.reload_if_changed(engine, engine_api, workspace_root) {
+            // The reloaded image is unpatched and the recorded addresses point
+            // into the previous one, so every prologue record is now stale.
+            #[cfg(feature = "hot_patch")]
+            {
+                if let Some(session) = hot_patch.as_mut() {
+                    session.forget_prologue_patches();
+                }
+                for session in module_hot_patch.iter_mut().flatten() {
+                    session.forget_prologue_patches();
+                }
+            }
             info!(
                 target: telemetry_target::HOT_RELOAD,
                 module = slot.name(),
@@ -625,6 +669,7 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
             let Host {
                 hot_patch,
                 optional_modules,
+                loaded_patches,
                 loaded_project,
                 engine,
                 ..
@@ -632,7 +677,7 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
             let mut patched = false;
             if let Some(session) = hot_patch {
                 let targets = patch_targets(loaded_project, optional_modules);
-                let outcome = session.try_patch(engine, &targets);
+                let outcome = session.try_patch(engine, &targets, loaded_patches);
                 drop(targets);
                 patched = report_patch_outcome(outcome);
             }
@@ -739,6 +784,142 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     );
 
     Some(report)
+}
+
+/// File a developer or a script drops to drive live patching, relative to the
+/// workspace root.
+///
+/// A file rather than an environment variable because the request has to reach a
+/// process that is already running, and rather than a console command because
+/// the standalone host has no input loop and its stdout is routinely redirected.
+///
+/// One line, either:
+///
+/// - `list` - print every generation this session has installed
+/// - `<function>@<generation>` - reinstall that generation
+/// - `<function>@previous` - step back one from whatever is running
+/// - `<function>@0` - the code the artifact was built with
+///
+/// It is deleted as soon as it is read, so a request is honoured exactly once.
+#[cfg(feature = "hot_patch")]
+const ROLLBACK_REQUEST_FILE: &str = "target/hot/rollback.request";
+
+/// Honour a pending request, if one was dropped.
+///
+/// Called at the frame boundary, where no system is executing - the same
+/// guarantee a patch install relies on, and a requirement rather than a
+/// convenience for the prologue route, which rewrites live code.
+#[cfg(feature = "hot_patch")]
+fn process_rollback_request(host: &mut Host) {
+    let request_path = host.workspace_root.join(ROLLBACK_REQUEST_FILE);
+    let Ok(request) = std::fs::read_to_string(&request_path) else {
+        return;
+    };
+    let request = request.trim();
+
+    // An empty read is almost always a partial write: this runs every frame, so
+    // it routinely observes the file between creation and the writer flushing.
+    // Leave it and look again next frame rather than reporting nonsense.
+    if request.is_empty() {
+        return;
+    }
+
+    // Removed before acting, so a request that fails is not retried on every
+    // subsequent frame - and so a malformed one is reported exactly once.
+    let request = request.to_string();
+    let _ = std::fs::remove_file(&request_path);
+
+    if request.eq_ignore_ascii_case("list") {
+        print_patch_generations(host);
+        return;
+    }
+
+    let Some((function, wanted)) = request.rsplit_once('@') else {
+        eprintln!(
+            "{} request `{request}` is malformed; expected `function@generation`, \
+             `function@previous`, or `list`",
+            crate::console::bold_cyan("[hot]")
+        );
+        return;
+    };
+    let function = function.trim();
+    let wanted = wanted.trim();
+
+    // `previous` saves a developer looking up numbers to undo the last edit,
+    // which is what a rollback is wanted for almost every time.
+    let generation = if wanted.eq_ignore_ascii_case("previous") {
+        match host
+            .patch_generations()
+            .iter()
+            .filter(|generation| generation.function == function)
+            .map(|generation| generation.number)
+            .max()
+        {
+            Some(newest) => newest.saturating_sub(1),
+            None => {
+                eprintln!(
+                    "{} `{function}` has no recorded generations",
+                    crate::console::bold_cyan("[hot]")
+                );
+                print_patch_generations(host);
+                return;
+            }
+        }
+    } else {
+        match wanted.parse::<u32>() {
+            Ok(generation) => generation,
+            Err(_) => {
+                eprintln!(
+                    "{} `{wanted}` is not a generation number or `previous`",
+                    crate::console::bold_cyan("[hot]")
+                );
+                return;
+            }
+        }
+    };
+
+    if let Err(detail) = host.rollback_patch(function, generation) {
+        eprintln!(
+            "{} rollback of `{function}` to generation {generation} failed\n      {detail}",
+            crate::console::bold_cyan("[hot]")
+        );
+        // A rollback usually fails because the generation does not exist, so
+        // show what does rather than making the developer guess.
+        print_patch_generations(host);
+    }
+}
+
+/// Print every generation this session has installed.
+///
+/// Rollback is unusable without it: the request needs a number, and nothing
+/// else in the host ever reports which numbers exist.
+#[cfg(feature = "hot_patch")]
+fn print_patch_generations(host: &Host) {
+    let generations = host.patch_generations();
+    if generations.is_empty() {
+        println!(
+            "{} no patch generations yet; edit a function body to create one",
+            crate::console::bold_cyan("[hot]")
+        );
+        return;
+    }
+    println!(
+        "{} patch generations ({} total)",
+        crate::console::bold_cyan("[hot]"),
+        generations.len()
+    );
+    for generation in &generations {
+        println!(
+            "      {:<48} generation {:<3} {}",
+            generation.function,
+            generation.number,
+            crate::console::dim(&format!("{:.0}s ago", generation.age_seconds))
+        );
+    }
+    println!(
+        "      {}",
+        crate::console::dim("generation 0 is the code each artifact was built with")
+    );
 }
 
 /// Every loaded artifact a plain-function patch must be offered to.

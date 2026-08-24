@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+pill_hot_scan = { path = "../pill_hot_scan" }
 pill_engine = { path = "../pill_engine" }
 pill_core = { path = "../pill_core" }
 libloading = "0.8"

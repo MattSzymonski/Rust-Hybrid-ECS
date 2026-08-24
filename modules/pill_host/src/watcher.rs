@@ -24,13 +24,13 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 // External crates
 use notify::event::EventKind;
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use pill_core::error::WatcherError;
-use pill_core::{debug, error, info};
+use pill_core::{error, info};
 
 // =============================================================================
 // Constants
@@ -241,9 +241,27 @@ pub(crate) fn spawn_source_watcher(
                     changed_paths.len() - REPORTED_PATH_LIMIT
                 ));
             }
-            debug!(
+            // How long the edit sat before this thread saw it, measured from
+            // the file's own modification time. Reported at INFO, and reported
+            // at all, because a slow save-to-live is dominated by this number
+            // rather than by the patch that follows it - and until now the only
+            // way to know that was to time it from outside the process.
+            //
+            // The debounce below is part of it by construction, so a healthy
+            // reading is a little over DEBOUNCE_DURATION, not zero.
+            let detection_delay_ms = changed_paths
+                .iter()
+                .filter_map(|path| std::fs::metadata(path).ok())
+                .filter_map(|metadata| metadata.modified().ok())
+                .max()
+                .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+                .map(|elapsed| elapsed.as_secs_f64() * 1000.0)
+                .unwrap_or(f64::NAN);
+            info!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 changed_paths = %report,
+                detection_delay_ms = format!("{detection_delay_ms:.0}").as_str(),
+                debounce_ms = DEBOUNCE_DURATION.as_millis() as u64,
                 "source change detected"
             );
 

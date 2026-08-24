@@ -4218,6 +4218,7 @@ version = "0.1.0"
 dependencies = [
  "pill_core",
  "pill_engine",
+ "pill_hot_scan",
 ]
 
 [[package]]
@@ -4295,6 +4296,7 @@ dependencies = [
  "notify",
  "pill_core",
  "pill_engine",
+ "pill_hot_scan",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -4304,12 +4306,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pill_hot_scan"
+version = "0.1.0"
+
+[[package]]
 name = "pill_spline"
 version = "0.1.0"
 dependencies = [
  "pill_core",
  "pill_dummy_color",
  "pill_engine",
+ "pill_hot_scan",
  "serde",
  "trait_type_map",
 ]

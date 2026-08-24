@@ -9,6 +9,9 @@ edition = "2021"
 # can depend on this crate directly to use the `Spline` type.
 crate-type = ["cdylib", "rlib"]
 
+[build-dependencies]
+pill_hot_scan = { path = "../../pill_hot_scan" }
+
 [dependencies]
 pill_core = { path = "../../pill_core" }
 pill_engine = { path = "../../pill_engine" }

@@ -595,7 +595,68 @@ fn hot_patch_resolver_export(
     let install_name = format_ident!("{}_install", export_name);
     let plain_name = format_ident!("{}_plain", export_name);
     let reset_name = format_ident!("{}_reset", export_name);
+    let address_name = format_ident!("{}_address", export_name);
+    let coverage_name = format_ident!("{}_extent_coverage", export_name);
     quote! {
+        /// SPIKE: report the address of ANY function in this artifact, by
+        /// qualified path, from the build-script-generated inventory.
+        ///
+        /// Unlike the slot exports this needs no annotation on the function -
+        /// discovery is mechanical - which is what makes prologue patching
+        /// macro-free. Returns zero when this artifact has no such entry.
+        ///
+        /// # Safety
+        ///
+        /// `qualified_name` must be a valid NUL-terminated C string that stays
+        /// readable for the call.
+        #gate
+        #[no_mangle]
+        pub unsafe extern "C" fn #address_name(
+            qualified_name: *const ::core::ffi::c_char,
+            out_signature: *mut *const u8,
+            out_signature_length: *mut usize,
+        ) -> usize {
+            if qualified_name.is_null() {
+                return 0;
+            }
+            // SAFETY: the caller guarantees a NUL-terminated string readable
+            // for the duration of this call.
+            let name = unsafe { ::std::ffi::CStr::from_ptr(qualified_name) };
+            let Ok(name) = name.to_str() else {
+                return 0;
+            };
+            let Some(address) = ::pill_engine::hot_patch::function_address(name) else {
+                return 0;
+            };
+            // The declaration this artifact was built with, so the caller can
+            // refuse a replacement whose shape no longer matches.
+            if let Some(signature) = ::pill_engine::hot_patch::function_signature(name) {
+                if !out_signature.is_null() && !out_signature_length.is_null() {
+                    // SAFETY: both pointers were checked non-null and the caller
+                    // guarantees they address writable slots.
+                    unsafe {
+                        *out_signature = signature.as_ptr();
+                        *out_signature_length = signature.len();
+                    }
+                }
+            }
+            address
+        }
+
+        /// How many of this artifact's functions have a length the exception
+        /// directory records, packed as `(known << 32) | total`.
+        ///
+        /// A prologue patch can only overwrite a function whose extent is
+        /// known, so this is what a host reports when one is refused: it
+        /// separates "this function happens to be a leaf" from "nothing in this
+        /// artifact is reachable by that route".
+        #gate
+        #[no_mangle]
+        pub extern "C" fn #coverage_name() -> u64 {
+            let (known, total) = ::pill_engine::hot_patch::functions_with_known_extent();
+            ((known as u64) << 32) | (total as u64 & 0xFFFF_FFFF)
+        }
+
         /// Return a `#[pill_hot_fn]` declared in THIS artifact to its own body.
         ///
         /// The counterpart of the install export, used to roll a patch back to

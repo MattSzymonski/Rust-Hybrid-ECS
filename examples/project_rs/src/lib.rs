@@ -229,17 +229,20 @@ fn spline_probe_system(
     let mut visible_spline_count = 0;
     let mut midpoint = pill_core::math::Vector3f::ZERO;
     let mut color: f32 = 0.1;
+    let mut gray: f32 = 0.0;
     for spline in splines.iter_mut() {
         visible_spline_count += 1;
         midpoint = spline.get_location_at(0.5);
         color = spline.get_color_a();
+        let base = pill_dummy_color::Tint { r: 0.5, g: 0.5, b: 0.5 };
+        gray = base.mix(pill_dummy_color::Tint { r: 0.1, g: 0.1, b: 0.1 }).r;
     }
     // Printed rather than logged through `tracing`: the project links its own
     // copy of `pill_core`, so its tracing dispatcher has no subscriber and log
     // lines emitted here never reach the host's telemetry.
     println!(
-        "[project] xxsees {visible_spline_count} spline(s), midpoixntxx ({:.1}, {:.1}), color {:.2}",
-        midpoint.x, midpoint.y, color
+        "[project] xxsees {visible_spline_count} spline(s), midpoixntxx ({:.1}, {:.1}), color {:.2}, gray {:.4}",
+        midpoint.x, midpoint.y, color, gray
     );
 
     Ok(())
