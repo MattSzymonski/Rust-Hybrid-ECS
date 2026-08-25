@@ -87,6 +87,12 @@ internal sealed class ProjectHost
     private ManagedStartup[] _startups = [];
     private byte[] _componentManifest = [];
     private string?[] _lastSystemErrors = [];
+    /// <summary>
+    /// Write time of the assembly this loader last EXAMINED, accepted or not.
+    /// Not "the write time of the loaded assembly": after a rejection the loaded
+    /// assembly is the previous one, and the point of the field is to stop the
+    /// poll re-examining bytes it has already judged.
+    /// </summary>
     private DateTime _lastWriteUtc;
     private DateTime _lastPollUtc;
 
@@ -169,6 +175,14 @@ internal sealed class ProjectHost
         catch (Exception e)
         {
             Console.Error.WriteLine($"[csharp_runtime] reload failed: {e}");
+            // Remember the rejected build too. Without this the same bytes are
+            // re-examined every poll interval for as long as the source stays
+            // broken - reading the whole assembly, creating a collectible
+            // context, reflecting over it and unloading it again, twice a
+            // second, forever. The Rust host logs the rejection only once, so
+            // the churn is invisible. A genuinely new build has a later write
+            // time and is examined normally.
+            _lastWriteUtc = written;
             return (byte)PollStatus.Rejected;
         }
     }

@@ -72,6 +72,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # =============================================================================
 
 PROJECT_CS_SYSTEMS_CS = WORKSPACE_ROOT / "examples" / "project_cs" / "src" / "Systems.cs"
+PROJECT_CS_COMPONENTS_CS = WORKSPACE_ROOT / "examples" / "project_cs" / "src" / "Components.cs"
 SPLINE_GENERATED_FILE = (
     MODULES_ROOT / "optional" / "pill_spline" / "generated" / "pill_spline_Components.g.cs"
 )
@@ -98,6 +99,14 @@ CSHARP_RELOADED_TOKEN = "[csharp_runtime] reloaded project_cs.dll"
 # identity is unchanged (behavior-only reload).
 CSHARP_RELOAD_COMPLETE_TOKEN = "C# hot reload complete"
 CSHARP_RELOAD_REJECTED_TOKEN = "C# reload rejected"
+
+# The managed loader prints the SPECIFIC reason to stderr before the Rust side
+# prints its single generic line. Asserting on these is what tells a developer
+# which of the three contracts they broke, and pins the wording that tells them.
+CSHARP_LOAD_FAILED_TOKEN = "[csharp_runtime] reload failed:"
+CSHARP_REJECT_SIGNATURE_REASON = "C# system names or query signatures changed"
+CSHARP_REJECT_COMPONENT_REASON = "C# component identities or layouts changed"
+CSHARP_REJECT_STARTUP_REASON = "C# startup methods changed"
 # The bridge probe emitted by ModuleSplineBridgeDemo in project_cs.
 BRIDGE_PROBE_PREFIX = "cs spline bridge: sees"
 BRIDGE_PROBE_V2_PREFIX = "cs spline bridge v2: sees"
@@ -119,6 +128,16 @@ class ScenarioPhase:
     required_tokens: Sequence[str] = ()
     forbidden_tokens: Sequence[str] = ()
     wait_after: Sequence[Tuple[str, float]] = ()
+    # Tokens that must appear AFTER `wait_token` was observed, not merely
+    # somewhere in the scenario's output.
+    #
+    # `wait_after` searches from the start of the scenario, so it is satisfied by
+    # a line printed before the edit even happened - fine for a token whose text
+    # is new, useless for asking "is the previous assembly still running?", where
+    # the expected line was already streaming beforehand. These are waited for
+    # from a fresh index taken once `wait_token` lands, which is the only way to
+    # tell "still alive" from "was alive".
+    alive_tokens: Sequence[Tuple[str, float]] = ()
 
 
 @dataclass
@@ -136,11 +155,25 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
     start_index = monitor.line_count
 
     for phase in scenario.phases:
+        # Captured per phase, not per scenario. Waiting from the scenario's start
+        # index makes every phase after the first match the PREVIOUS phase's line
+        # and return immediately, so a multi-phase scenario silently asserted
+        # nothing about phases 2..n.
+        phase_index = monitor.line_count
+
         for path, replacements in phase.edits:
+            # Captured here rather than relying on the startup list. `restore_one`
+            # silently does nothing for a path it never captured, so a scenario
+            # touching a file the list did not name left that file modified - and
+            # every scenario after it then ran against the wrong sources and
+            # failed for reasons that had nothing to do with what it tested.
+            # Capturing at the point of edit makes that impossible to get wrong,
+            # and `capture` is idempotent so the startup list still stands.
+            BACKUP.capture(path)
             if not apply_replacements(path, replacements):
                 return False
 
-        if not monitor.wait_for(phase.wait_token, RELOAD_TIMEOUT, start_index):
+        if not monitor.wait_for(phase.wait_token, RELOAD_TIMEOUT, phase_index):
             output = monitor.output_since(start_index)
             if has_crash_signals(output):
                 print(f"  [FAIL] Crash detected in scenario: {scenario.name}")
@@ -162,6 +195,17 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
         for token, timeout in phase.wait_after:
             if not monitor.wait_for(token, timeout, start_index):
                 print(f"  [FAIL] Missing expected token {token!r} in scenario: {scenario.name}")
+                print(f"  Output tail:\n{monitor.output_since(start_index)[-1600:]}")
+                return False
+
+        # Proof of life measured from after the phase's outcome, so a line
+        # that was already streaming before the edit cannot satisfy it.
+        alive_index = monitor.line_count
+        for token, timeout in phase.alive_tokens:
+            if not monitor.wait_for(token, timeout, alive_index):
+                print(f"  [FAIL] {token!r} did not appear AFTER the reload outcome "
+                      f"in scenario: {scenario.name}")
+                print("         The previously loaded assembly should still be running.")
                 print(f"  Output tail:\n{monitor.output_since(start_index)[-1600:]}")
                 return False
 
@@ -334,6 +378,80 @@ BRIDGE_PROBE_PREFIX_EDIT = (
     "cs spline bridge v2: sees {visibleSplines} spline(s), ",
 )
 
+# Each of the three contracts the managed loader refuses to let a reload break.
+# All three edits are valid C# that compiles cleanly - the build must succeed and
+# the LOADER must refuse, which is the whole point. A compile error would prove
+# nothing about the loader.
+
+# Adds a field to a project-owned component, changing its layout and therefore
+# the manifest the native component registry was built from.
+COMPONENT_LAYOUT_EDIT = (
+    "public struct BallTag\n{\n    public uint Kind;\n}",
+    "public struct BallTag\n{\n    public uint Kind;\n    public uint Extra;\n}",
+)
+
+# Renames an [EcsSystem] method. Rust builds its execution graph once at startup
+# from these names, so the set has to stay stable until a restart.
+SYSTEM_NAME_EDIT = (
+    "public static void Observe(Query<Read<BallTag>> query)",
+    "public static void ObserveRenamed(Query<Read<BallTag>> query)",
+)
+
+# Renames an [EcsStartup] method. Startups are not re-run on reload, so a change
+# to the set is refused rather than silently ignored.
+STARTUP_NAME_EDIT = (
+    "public static void Start(Commands commands)",
+    "public static void StartRenamed(Commands commands)",
+)
+
+# Behavior-only edits chained so each phase is a distinct change to the same
+# line. Used to reload repeatedly in one session.
+BRIDGE_PROBE_V2_TO_V3_EDIT = (
+    "cs spline bridge v2: sees {visibleSplines} spline(s), ",
+    "cs spline bridge v3: sees {visibleSplines} spline(s), ",
+)
+BRIDGE_PROBE_V3_TO_V4_EDIT = (
+    "cs spline bridge v3: sees {visibleSplines} spline(s), ",
+    "cs spline bridge v4: sees {visibleSplines} spline(s), ",
+)
+
+BRIDGE_PROBE_V3_PREFIX = "cs spline bridge v3: sees"
+BRIDGE_PROBE_V4_PREFIX = "cs spline bridge v4: sees"
+
+
+def rejection_scenario(name, path, edit, reason, still_running_prefix):
+    """One scenario asserting the loader refuses a contract-breaking change.
+
+    Three things have to hold, and each has been wrong at some point in a system
+    like this: the reload is refused, the refusal names the contract that was
+    broken, and the assembly that was already running keeps running. The third
+    is what `alive_tokens` exists for - the probe line was streaming before the
+    edit, so only an occurrence AFTER the refusal proves anything.
+    """
+    return Scenario(
+        name=name,
+        phases=[
+            ScenarioPhase(
+                edits=[(path, [edit])],
+                wait_token=CSHARP_RELOAD_REJECTED_TOKEN,
+                required_tokens=[
+                    CSHARP_RELOAD_REJECTED_TOKEN,
+                    CSHARP_LOAD_FAILED_TOKEN,
+                    reason,
+                ],
+                forbidden_tokens=[
+                    # The swap must NOT have happened.
+                    CSHARP_RELOAD_COMPLETE_TOKEN,
+                    PANIC_TOKEN,
+                    ACCESS_VIOLATION_TOKEN,
+                ],
+                alive_tokens=[(still_running_prefix, PROBE_TIMEOUT)],
+            )
+        ],
+        restore_after=[path],
+    )
+
+
 SESSION_SCENARIOS = [
     Scenario(
         name="csharp_hot_reload",
@@ -359,6 +477,67 @@ SESSION_SCENARIOS = [
             )
         ],
         restore_after=[PROJECT_CS_SYSTEMS_CS],
+    ),
+    # Reloading repeatedly in one session. Each phase is a distinct edit to the
+    # same line, so every swap is real work rather than a no-op rebuild.
+    #
+    # What this is for: every accepted reload calls `oldContext.Unload()` on a
+    # collectible AssemblyLoadContext. If a context were ever retained - by a
+    # cached delegate, a static, or a live reference into the old assembly - the
+    # unload would not complete and versions would accumulate silently. A swap
+    # that still works on the third consecutive reload, with the world's entity
+    # count intact, is the observable end of that.
+    Scenario(
+        name="csharp_repeated_reload_stability",
+        phases=[
+            ScenarioPhase(
+                edits=[(PROJECT_CS_SYSTEMS_CS, [BRIDGE_PROBE_PREFIX_EDIT])],
+                wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
+                forbidden_tokens=[CSHARP_RELOAD_REJECTED_TOKEN, PANIC_TOKEN,
+                                  ACCESS_VIOLATION_TOKEN],
+                alive_tokens=[(BRIDGE_PROBE_V2_PREFIX, PROBE_TIMEOUT)],
+            ),
+            ScenarioPhase(
+                edits=[(PROJECT_CS_SYSTEMS_CS, [BRIDGE_PROBE_V2_TO_V3_EDIT])],
+                wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
+                forbidden_tokens=[CSHARP_RELOAD_REJECTED_TOKEN, PANIC_TOKEN,
+                                  ACCESS_VIOLATION_TOKEN],
+                alive_tokens=[(BRIDGE_PROBE_V3_PREFIX, PROBE_TIMEOUT)],
+            ),
+            ScenarioPhase(
+                edits=[(PROJECT_CS_SYSTEMS_CS, [BRIDGE_PROBE_V3_TO_V4_EDIT])],
+                wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
+                forbidden_tokens=[CSHARP_RELOAD_REJECTED_TOKEN, PANIC_TOKEN,
+                                  ACCESS_VIOLATION_TOKEN],
+                alive_tokens=[(BRIDGE_PROBE_V4_PREFIX, PROBE_TIMEOUT)],
+            ),
+        ],
+        restore_after=[PROJECT_CS_SYSTEMS_CS],
+    ),
+    # The three refusals. C# hot reload is behavior-only by design, and these
+    # pin what "behavior-only" actually means at the boundary - previously the
+    # rejection token appeared in this suite only as something that must NEVER
+    # happen, so nothing checked that it happens when it should.
+    rejection_scenario(
+        "csharp_rejects_component_layout_change",
+        PROJECT_CS_COMPONENTS_CS,
+        COMPONENT_LAYOUT_EDIT,
+        CSHARP_REJECT_COMPONENT_REASON,
+        BRIDGE_PROBE_PREFIX,
+    ),
+    rejection_scenario(
+        "csharp_rejects_system_signature_change",
+        PROJECT_CS_SYSTEMS_CS,
+        SYSTEM_NAME_EDIT,
+        CSHARP_REJECT_SIGNATURE_REASON,
+        BRIDGE_PROBE_PREFIX,
+    ),
+    rejection_scenario(
+        "csharp_rejects_startup_change",
+        PROJECT_CS_SYSTEMS_CS,
+        STARTUP_NAME_EDIT,
+        CSHARP_REJECT_STARTUP_REASON,
+        BRIDGE_PROBE_PREFIX,
     ),
 ]
 
