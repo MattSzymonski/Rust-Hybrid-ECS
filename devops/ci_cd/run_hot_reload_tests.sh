@@ -6,6 +6,11 @@
 #               `pill_standalone` first unless --skip-build is given).
 
 # DESCRIPTION: Run the full hot-reload regression net
+#   (0) devops/tests/test_harness_parsing.py             - harness unit tests
+#        Tests the parsing logic the suites below use to decide pass or fail,
+#        against real captured host output. Sub-second, no toolchain needed.
+#        Runs first: a broken matcher fails these suites for the wrong reason,
+#        and its failure mode is silence rather than an error.
 #   (1) devops/tests/test_hot_reload_suite.py            - full suite (sessions A/B:
 #        reloads, schema migration, forgotten-type detection, drop-at-detection
 #        re-seed, repeated-reload stability, rollback, cascade, coexistence)
@@ -107,7 +112,7 @@ esac
 
 echo ""
 echo -e "${BOLD}${CYAN}===============================================================================${NC}"
-echo -e "${BOLD}${CYAN}Hot-reload regression net (6 suites)${NC}"
+echo -e "${BOLD}${CYAN}Hot-reload regression net (7 suites)${NC}"
 echo "  timeout scale:  ${TIMEOUT_SCALE}"
 if [ "$SKIP_BUILD" = 1 ]; then
     echo "  host build:     skipped (assumed up to date; main suite only)"
@@ -118,8 +123,22 @@ echo ""
 
 overall_exit=0
 
+# --- 0. Harness unit tests ----------------------------------------------------
+# First and fastest: the parsing logic every suite below depends on to decide
+# pass or fail. Runs in under a second and needs no toolchain, so a broken
+# matcher is caught before twenty minutes of end-to-end runs use it.
+echo -e "${BOLD}${CYAN}--- Suite 0/7: test_harness_parsing.py ---${NC}"
+set +e
+python devops/tests/test_harness_parsing.py
+harness_exit=$?
+set -e
+if [ "$harness_exit" -ne 0 ]; then
+    overall_exit="$harness_exit"
+fi
+echo ""
+
 # --- 1. Main hot-reload suite (sessions A/B) ---------------------------------
-echo -e "${BOLD}${CYAN}--- Suite 1/6: test_hot_reload_suite.py ---${NC}"
+echo -e "${BOLD}${CYAN}--- Suite 1/7: test_hot_reload_suite.py ---${NC}"
 if [ "$SKIP_BUILD" = 1 ]; then
     extra_args=(--skip-build)
 else
@@ -135,7 +154,7 @@ fi
 
 # --- 2. Migration suite -------------------------------------------------------
 echo ""
-echo -e "${BOLD}${CYAN}--- Suite 2/6: test_hot_reload_migration.py ---${NC}"
+echo -e "${BOLD}${CYAN}--- Suite 2/7: test_hot_reload_migration.py ---${NC}"
 set +e
 python devops/tests/test_hot_reload_migration.py --timeout-scale "$TIMEOUT_SCALE"
 migration_exit=$?
@@ -146,7 +165,7 @@ fi
 
 # --- 3. Module->project cascade suite -----------------------------------------
 echo ""
-echo -e "${BOLD}${CYAN}--- Suite 3/6: test_module_project_auto_reload.py ---${NC}"
+echo -e "${BOLD}${CYAN}--- Suite 3/7: test_module_project_auto_reload.py ---${NC}"
 set +e
 python devops/tests/test_module_project_auto_reload.py --timeout-scale "$TIMEOUT_SCALE"
 cascade_exit=$?
@@ -157,7 +176,7 @@ fi
 
 # --- 4. C# <-> Rust bridge suite ---------------------------------------------
 echo ""
-echo -e "${BOLD}${CYAN}--- Suite 4/6: test_csharp_bridge.py ---${NC}"
+echo -e "${BOLD}${CYAN}--- Suite 4/7: test_csharp_bridge.py ---${NC}"
 set +e
 python devops/tests/test_csharp_bridge.py --timeout-scale "$TIMEOUT_SCALE" "${extra_args[@]}"
 csharp_exit=$?
@@ -170,7 +189,7 @@ fi
 # Ordered before the coverage suite because it is the cheaper of the two and
 # exercises the reload bookkeeping the coverage suite depends on.
 echo ""
-echo -e "${BOLD}${CYAN}--- Suite 5/6: test_reload_edit_during_build.py ---${NC}"
+echo -e "${BOLD}${CYAN}--- Suite 5/7: test_reload_edit_during_build.py ---${NC}"
 set +e
 python devops/tests/test_reload_edit_during_build.py --timeout-scale "$TIMEOUT_SCALE" "${extra_args[@]}"
 edit_during_build_exit=$?
@@ -184,7 +203,7 @@ fi
 # suites above have already proven by this point. It also leaves the workspace
 # exactly as it found it, so its position does not affect the others.
 echo ""
-echo -e "${BOLD}${CYAN}--- Suite 6/6: test_hot_patch_coverage.py ---${NC}"
+echo -e "${BOLD}${CYAN}--- Suite 6/7: test_hot_patch_coverage.py ---${NC}"
 set +e
 python devops/tests/test_hot_patch_coverage.py --timeout-scale "$TIMEOUT_SCALE" "${extra_args[@]}"
 coverage_exit=$?
@@ -196,7 +215,7 @@ fi
 echo ""
 echo -e "${BOLD}${CYAN}===============================================================================${NC}"
 if [ "$overall_exit" -eq 0 ]; then
-    echo -e "${BOLD}${CYAN}Hot-reload regression net PASSED (all 6 suites)${NC}"
+    echo -e "${BOLD}${CYAN}Hot-reload regression net PASSED (all 7 suites)${NC}"
 else
     echo -e "${BOLD}${RED}Hot-reload regression net FAILED (exit $overall_exit)${NC}"
 fi

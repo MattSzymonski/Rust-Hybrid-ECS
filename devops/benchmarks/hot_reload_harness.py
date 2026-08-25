@@ -282,8 +282,18 @@ def verify_prerequisites(run_native: bool, run_csharp: bool) -> bool:
 # the body, so averaging the two averages a guarantee with an approximation.
 # More than one route appears, joined by `+`, when a single save changed both
 # an annotated and an un-annotated body.
+# The name is matched non-greedily up to ` (reload #`, NOT as `\S+`. Two real
+# names contain whitespace and would otherwise be dropped silently, taking the
+# whole line's phase breakdown with them:
+#
+#   pill_spline::<Spline as ColorTweak>::tweak          a trait method
+#   pill_dummy_color::get_color_a, pill_dummy_color::Tint::mix   two bodies, one save
+#
+# Both were unparseable until this was widened, and the failure was invisible:
+# an unmatched line just leaves build/stage/load/init as None, so the category
+# silently degrades to wall-time-only and looks like the C# case.
 RELOAD_LINE_RE = re.compile(
-    r"\[analytics\] reload (\S+) \(reload #\d+\) \| build=(\S+) \| stage=([\d.]+)ms"
+    r"\[analytics\] reload (.+?) \(reload #\d+\) \| build=(\S+) \| stage=([\d.]+)ms"
     r" \| load=([\d.]+)ms \| init=([\d.]+)ms \| migrate=([\d.]+)ms \| size=(\S+)"
     r" \| exports=(\d+)(?: \| kind=(\w+))?"
     r"(?: \| route=([\w+-]+) \| copies=(\d+))?"
