@@ -23,7 +23,6 @@
 //!     .output()?;
 //! ```
 
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -389,7 +388,11 @@ impl CargoRustcLine {
     /// `TypeId`, while leaving `Cargo.toml`, `Cargo.lock` and the sources
     /// untouched. Keying on mtimes alone would happily replay flags for a
     /// differently-configured engine.
-    pub fn load_if_fresh(path: &Path, inputs: &[PathBuf], build_command: &[String]) -> Option<Self> {
+    pub fn load_if_fresh(
+        path: &Path,
+        inputs: &[PathBuf],
+        build_command: &[String],
+    ) -> Option<Self> {
         let cached_at = std::fs::metadata(path).ok()?.modified().ok()?;
         for input in inputs {
             let modified = std::fs::metadata(input).ok()?.modified().ok()?;
@@ -596,9 +599,8 @@ mod tests {
     /// in a message that never mentioned quoting.
     #[test]
     fn tokenizer_handles_double_quoted_arguments_with_escapes() {
-        let tokens = tokenize(
-            r#"--check-cfg "cfg(feature, values(\"rendering\"))" --edition=2021"#,
-        );
+        let tokens =
+            tokenize(r#"--check-cfg "cfg(feature, values(\"rendering\"))" --edition=2021"#);
         assert_eq!(
             tokens,
             vec![
@@ -642,7 +644,10 @@ mod tests {
     /// read both, so the round-trip below drives both.
     fn quote_like_cargo(argument: &str, double: bool) -> String {
         if double {
-            format!("\"{}\"", argument.replace('\\', "\\\\").replace('"', "\\\""))
+            format!(
+                "\"{}\"",
+                argument.replace('\\', "\\\\").replace('"', "\\\"")
+            )
         } else {
             format!("'{argument}'")
         }
@@ -691,7 +696,11 @@ mod tests {
                     tokens,
                     vec![argument.to_string()],
                     "round trip failed for {argument:?} quoted with {}",
-                    if double { "double quotes" } else { "single quotes" }
+                    if double {
+                        "double quotes"
+                    } else {
+                        "single quotes"
+                    }
                 );
             }
         }
@@ -846,7 +855,10 @@ mod tests {
             "pill_spline=D:\\proj\\target\\debug\\deps\\libpill_spline.rlib",
             &staged,
         );
-        assert!(untouched.ends_with("deps\\libpill_spline.rlib"), "got: {untouched}");
+        assert!(
+            untouched.ends_with("deps\\libpill_spline.rlib"),
+            "got: {untouched}"
+        );
 
         // Hash-qualified: never redirected, even if a same-named file exists.
         let hashed = "pill_engine=D:\\proj\\deps\\libpill_engine-190d6c0e2d2eaf24.rlib";
@@ -886,9 +898,9 @@ mod tests {
             "the staged copy must be linked: {joined}"
         );
         // A genuinely hash-qualified dependency is untouched.
-        assert!(joined.contains(
-            "serde=D:\\proj\\target\\debug\\deps\\libserde-1094916a36d6bb5e.rlib"
-        ));
+        assert!(
+            joined.contains("serde=D:\\proj\\target\\debug\\deps\\libserde-1094916a36d6bb5e.rlib")
+        );
 
         let _ = std::fs::remove_dir_all(&staged);
     }
@@ -908,7 +920,9 @@ mod tests {
         // The dependency graph must survive verbatim - this is what keeps
         // TypeId identical between host and patch.
         assert!(joined.contains("dependency=D:\\proj\\target\\debug\\deps"));
-        assert!(joined.contains("pill_engine=D:\\proj\\target\\debug\\deps\\libpill_engine-319.rlib"));
+        assert!(
+            joined.contains("pill_engine=D:\\proj\\target\\debug\\deps\\libpill_engine-319.rlib")
+        );
         assert!(joined.contains("native=C:\\reg\\windows_x86_64_msvc-0.52.6\\lib"));
         assert!(joined.contains("prefer-dynamic"));
         assert!(joined.contains("linker=rust-lld"));

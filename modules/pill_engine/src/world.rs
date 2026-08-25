@@ -1621,7 +1621,6 @@ impl World {
     /// Returns [`RemoveComponentError::EntityNotFound`] if the entity does
     /// not exist, and [`RemoveComponentError::ComponentNotFound`] if the
     /// entity does not carry the component `T`.
-    #[must_use]
     pub fn remove_component<T: Component>(
         &mut self,
         entity: Entity,
@@ -1708,7 +1707,6 @@ impl World {
     /// Returns [`AddComponentError::EntityNotFound`] if the entity does not
     /// exist, and [`AddComponentError::ComponentAlreadyExists`] if the entity
     /// already carries the component `T`.
-    #[must_use]
     pub fn add_component<T>(
         &mut self,
         entity: Entity,
@@ -2130,7 +2128,6 @@ impl<'w> EntityBuilder<'w> {
     /// Returns [`BuildError::ComponentNotRegistered`] if any of the component
     /// types added via [`.with()`](Self::with) were not registered with the
     /// world beforehand.
-    #[must_use]
     pub fn build(self) -> Result<Entity, BuildError> {
         let component_ids: Vec<ComponentId> =
             self.components.iter().map(|c| c.component_id()).collect();

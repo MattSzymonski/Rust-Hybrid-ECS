@@ -112,7 +112,7 @@ mod tests {
     fn layout_persistence_messages_render_plain_paths() {
         let error = LayoutPersistenceError::Filesystem {
             path: String::from("C:\\tmp\\editor_layout.json"),
-            source: io::Error::new(io::ErrorKind::Other, "disk full"),
+            source: io::Error::other("disk full"),
         };
         assert_eq!(
             error.to_plain_message(),

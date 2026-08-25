@@ -27,10 +27,10 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 // External crates
-use pill_core::error::BuildError;
-use pill_core::info;
 #[cfg(feature = "hot_patch")]
 use pill_core::debug;
+use pill_core::error::BuildError;
+use pill_core::info;
 
 // Current crate
 use crate::analytics::{self, BuildStatus, ModuleKind};
@@ -87,13 +87,13 @@ const ARTIFACT_STAMP_DIRECTORY: &str = "pill_standalone_temp/artifact_stamps";
 /// host mirrors it into every module and project build, so it changes the
 /// engine's crate metadata on both sides of the boundary. Leaving it out let a
 /// host rebuilt with the feature go on trusting artifacts built without it.
-const HOST_MODULE_FEATURE_SET: &str = match (cfg!(feature = "rendering"), cfg!(feature = "hot_patch"))
-{
-    (true, true) => "rendering+hot_patch",
-    (true, false) => "rendering",
-    (false, true) => "no-rendering+hot_patch",
-    (false, false) => "no-rendering",
-};
+const HOST_MODULE_FEATURE_SET: &str =
+    match (cfg!(feature = "rendering"), cfg!(feature = "hot_patch")) {
+        (true, true) => "rendering+hot_patch",
+        (true, false) => "rendering",
+        (false, true) => "no-rendering+hot_patch",
+        (false, false) => "no-rendering",
+    };
 
 // =============================================================================
 // Up-to-Date Build Detection
@@ -1030,9 +1030,9 @@ mod tests {
             "pill_engine/hot_patch".to_string(),
         ];
 
-        record_artifact_stamp(&root, "module", &command, &[output.clone()]);
+        record_artifact_stamp(&root, "module", &command, std::slice::from_ref(&output));
         assert!(
-            artifacts_are_host_built(&root, "module", &command, &[output.clone()]),
+            artifacts_are_host_built(&root, "module", &command, std::slice::from_ref(&output)),
             "the host's own artifact must be recognized"
         );
 
@@ -1042,7 +1042,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(30));
         fs_write(&output, "a differently configured native library");
         assert!(
-            !artifacts_are_host_built(&root, "module", &command, &[output.clone()]),
+            !artifacts_are_host_built(&root, "module", &command, std::slice::from_ref(&output)),
             "an artifact the host did not write must be rebuilt, not loaded"
         );
 
@@ -1063,12 +1063,17 @@ mod tests {
         ];
         let without_feature = vec!["cargo".to_string(), "build".to_string()];
 
-        record_artifact_stamp(&root, "module", &with_feature, &[output.clone()]);
+        record_artifact_stamp(
+            &root,
+            "module",
+            &with_feature,
+            std::slice::from_ref(&output),
+        );
         assert!(!artifacts_are_host_built(
             &root,
             "module",
             &without_feature,
-            &[output.clone()]
+            std::slice::from_ref(&output)
         ));
 
         std::fs::remove_dir_all(&root).unwrap();
@@ -1083,14 +1088,14 @@ mod tests {
         let command = vec!["cargo".to_string(), "build".to_string()];
 
         assert!(
-            !artifacts_are_host_built(&root, "module", &command, &[output.clone()]),
+            !artifacts_are_host_built(&root, "module", &command, std::slice::from_ref(&output)),
             "no stamp has been recorded yet"
         );
 
-        record_artifact_stamp(&root, "module", &command, &[output.clone()]);
+        record_artifact_stamp(&root, "module", &command, std::slice::from_ref(&output));
         std::fs::remove_file(&output).unwrap();
         assert!(
-            !artifacts_are_host_built(&root, "module", &command, &[output.clone()]),
+            !artifacts_are_host_built(&root, "module", &command, std::slice::from_ref(&output)),
             "a stamped artifact that no longer exists must be rebuilt"
         );
 
@@ -1111,7 +1116,9 @@ mod tests {
         let artifacts = vec![library.clone(), rlib.clone()];
 
         record_artifact_stamp(&root, "module", &command, &artifacts);
-        assert!(artifacts_are_host_built(&root, "module", &command, &artifacts));
+        assert!(artifacts_are_host_built(
+            &root, "module", &command, &artifacts
+        ));
 
         // Only the second artifact moves.
         std::thread::sleep(Duration::from_millis(30));

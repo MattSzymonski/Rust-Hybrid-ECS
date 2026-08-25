@@ -148,9 +148,7 @@ impl Host {
             .iter_mut()
             .chain(module_hot_patch.iter_mut().flatten())
             .find(|session| session.knows_function(function))
-            .ok_or_else(|| {
-                format!("`{function}` has not been patched in this session")
-            })?;
+            .ok_or_else(|| format!("`{function}` has not been patched in this session"))?;
 
         let targets = patch_targets(loaded_project, optional_modules);
         let result = session.rollback(engine, &targets, loaded_patches, function, generation);

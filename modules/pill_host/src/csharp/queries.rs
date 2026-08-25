@@ -97,7 +97,10 @@ pub(super) extern "C" fn ffi_get_component_chunk(
             else {
                 return 0;
             };
-            debug_assert_eq!(element_size, size, "module native binding size must match the column");
+            debug_assert_eq!(
+                element_size, size,
+                "module native binding size must match the column"
+            );
             let bits = archetype.0;
             // SAFETY: identical to the dynamic arm above - pointers stay owned
             // by the active world's archetype for the managed invocation.

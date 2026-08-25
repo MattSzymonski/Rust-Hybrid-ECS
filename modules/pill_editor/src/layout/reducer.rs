@@ -322,9 +322,9 @@ fn normalize(model: &mut LayoutModel) -> Result<(), LayoutError> {
         .unwrap_or(0)
         .saturating_add(1);
 
-    if !model
+    if model
         .active_tabset
-        .is_some_and(|id| model.tabset(id).is_some())
+        .is_none_or(|id| model.tabset(id).is_none())
     {
         model.active_tabset = model
             .nodes

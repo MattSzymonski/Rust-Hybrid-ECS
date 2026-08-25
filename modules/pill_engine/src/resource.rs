@@ -255,7 +255,7 @@ mod tests {
     fn test_res_handle_copy_clone() {
         let handle = ResHandle::<Score>::new();
         let handle2 = handle;
-        let handle3 = handle.clone();
+        let handle3 = handle;
         // All handles refer to the same resource type
         assert_eq!(handle.id(), handle2.id());
         assert_eq!(handle.id(), handle3.id());

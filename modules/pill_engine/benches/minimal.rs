@@ -1,12 +1,21 @@
-//! Minimal benchmarks for the main query and archetype-migration hot paths.
+//! The smoke-test benchmark: one hot path, one size, fast to run.
+//!
+//! This is the target the documentation reaches for when it wants a quick check
+//! that the benchmark harness itself works - `--bench minimal --quick`. It is
+//! deliberately NOT a coverage target. `query_iteration.rs` measures query
+//! iteration across sixteen groups and three entity counts, and
+//! `archetype_migration.rs` covers migration; anything added here would
+//! duplicate them at a single hardcoded size.
+//!
+//! It previously declared four benchmarks in its documentation while three of
+//! them sat commented out of `criterion_group!`, so it measured a quarter of
+//! what it claimed. Those three duplicated groups that the dedicated targets
+//! already cover more thoroughly, and were removed rather than re-enabled.
 //!
 //! # Responsibilities
 //!
-//! - Benchmarks sequential unfiltered and change-filtered query iteration.
-//! - Benchmarks parallel (Rayon) query iteration.
-//! - Benchmarks archetype migration triggered by [`World::add_component`].
-//! - Defines the [`Position`], [`Velocity`], and [`Health`] component types
-//!   shared by every benchmark.
+//! - Benchmarks sequential unfiltered query iteration at a fixed size.
+//! - Defines the [`Position`] and [`Velocity`] component types it uses.
 //!
 //! # Design
 //!
@@ -19,8 +28,8 @@
 //! cost out of the measurement.
 
 // External crates
-use criterion::{black_box, criterion_group, criterion_main, BatchSize, Criterion};
-use pill_engine::{Changed, Component, Entity, Query, World};
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use pill_engine::{Component, Entity, Query, World};
 use trait_type_map::impl_trait_accessible;
 
 // =============================================================================
@@ -29,9 +38,6 @@ use trait_type_map::impl_trait_accessible;
 
 /// Number of entities populated for the query iteration benchmarks.
 const QUERY_ENTITIES: usize = 100_000;
-
-/// Number of entities populated for the archetype-migration benchmark.
-const MIGRATION_ENTITIES: usize = 10_000;
 
 // =============================================================================
 // Position
@@ -68,23 +74,12 @@ struct Velocity {
 impl Component for Velocity {}
 
 // =============================================================================
-// Health
-// =============================================================================
-
-/// Single-field health component used by the archetype-migration benchmark.
-///
-/// Added to entities after creation to force an archetype migration.
-#[derive(Clone)]
-struct Health(f32);
-impl Component for Health {}
-
-// =============================================================================
 // Trait Accessibility
 // =============================================================================
 
-// Registers the three component types as trait-accessible so the type-erased
+// Registers the component types as trait-accessible so the type-erased
 // query machinery can downcast to them at runtime.
-impl_trait_accessible!(dyn Component; Position, Velocity, Health);
+impl_trait_accessible!(dyn Component; Position, Velocity);
 
 // =============================================================================
 // Free Functions
@@ -103,7 +98,6 @@ fn setup_world(entity_count: usize) -> (World, Vec<Entity>) {
     let mut world = World::new();
     world.register_component::<Position>();
     world.register_component::<Velocity>();
-    world.register_component::<Health>();
 
     // Step 2: Create `entity_count` entities, each carrying Position and Velocity.
     let mut entities = Vec::with_capacity(entity_count);
@@ -141,85 +135,9 @@ fn query_iter_unfiltered(criterion: &mut Criterion) {
     });
 }
 
-/// Benchmarks sequential iteration with a [`Changed`] filter.
-///
-/// Every entity is mutated and the world tick is bumped before measuring so
-/// the `Changed` filter matches the full entity set.
-fn query_iter_changed(criterion: &mut Criterion) {
-    let (mut world, _) = setup_world(QUERY_ENTITIES);
-    // Step 1: Mutate every Position so all entities appear changed; the block
-    // scope releases the mutable query borrow before the tick is bumped.
-    {
-        let mut query = Query::<&mut Position>::new(&mut world);
-        for mut position in query.iter_mut() {
-            position.x += 1.0;
-        }
-    }
-    // Step 2: Bump the world tick so the mutations form the newest change set.
-    world.increment_change_tick();
-
-    criterion.bench_function("query_iter_changed", |benchmark| {
-        benchmark.iter(|| {
-            let mut matched = 0;
-            let mut query = Query::<(&Position,), Changed<Position>>::new(&mut world);
-            for (position,) in query.iter_mut() {
-                black_box(position.x);
-                matched += 1;
-            }
-            black_box(matched);
-        });
-    });
-}
-
-/// Benchmarks parallel (Rayon) unfiltered iteration over every entity.
-///
-/// Work is distributed across the Rayon thread pool; the per-entity result is
-/// passed through [`black_box`] to prevent dead-code elimination.
-fn query_par_iter_unfiltered(criterion: &mut Criterion) {
-    let (mut world, _) = setup_world(QUERY_ENTITIES);
-    criterion.bench_function("query_par_iter_unfiltered", |benchmark| {
-        benchmark.iter(|| {
-            let mut query = Query::<(&Position, &Velocity)>::new(&mut world);
-            query.par_iter_mut().for_each(|(position, velocity)| {
-                black_box(position.x + position.y + velocity.x + velocity.y);
-            });
-        });
-    });
-}
-
-/// Benchmarks archetype migration caused by adding a component at runtime.
-///
-/// Uses `iter_batched` with [`BatchSize::LargeInput`] so each iteration
-/// rebuilds the world in the setup closure, keeping setup cost out of the
-/// measurement.
-fn archetype_add_component(criterion: &mut Criterion) {
-    criterion.bench_function("archetype_add_component", |benchmark| {
-        benchmark.iter_batched(
-            || setup_world(MIGRATION_ENTITIES),
-            |(mut world, entities)| {
-                for entity in entities {
-                    // Adding Health forces an archetype migration for that entity.
-                    black_box(
-                        world
-                            .add_component(entity, Health(entity.id() as f32))
-                            .is_ok(),
-                    );
-                }
-            },
-            BatchSize::LargeInput,
-        );
-    });
-}
-
 // =============================================================================
 // Benchmark Registration
 // =============================================================================
 
-criterion_group!(
-    benches,
-    query_iter_unfiltered,
-    // query_iter_changed,
-    // query_par_iter_unfiltered,
-    // archetype_add_component,
-);
+criterion_group!(benches, query_iter_unfiltered);
 criterion_main!(benches);

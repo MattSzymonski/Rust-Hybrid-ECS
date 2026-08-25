@@ -39,8 +39,7 @@ use trait_type_map::impl_trait_accessible;
 
 /// Two-dimensional position of an entity in world space.
 ///
-/// Updated each frame by `movement_system` and `enemy_ai_system`, and read
-/// by `collision_damage_system` and `render_system`.
+/// Updated each frame by `movement_system` and read by `render_system`.
 #[derive(Debug, Clone)]
 struct Position {
     /// Horizontal coordinate in world units.
@@ -56,7 +55,7 @@ impl Component for Position {}
 
 /// Two-dimensional velocity of an entity in world units per frame.
 ///
-/// Produced by `enemy_ai_system` and consumed by `movement_system`.
+/// Consumed by `movement_system` and updated by `gravity_system`.
 #[derive(Debug, Clone)]
 struct Velocity {
     /// Horizontal speed in world units per frame.
@@ -73,7 +72,7 @@ impl Component for Velocity {}
 /// Current hit points of an entity.
 ///
 /// Decayed each frame by `health_decay_system`, damaged by
-/// `collision_damage_system`, and destroyed by `cleanup_system` at zero.
+/// `health_decay_system`, and destroyed by `cleanup_system` at zero.
 #[derive(Debug, Clone)]
 struct Health(f32);
 impl Component for Health {}
@@ -82,7 +81,10 @@ impl Component for Health {}
 // Enemy
 // =============================================================================
 
-/// Marker component tagging entities as enemies for `enemy_ai_system`.
+/// Marker component tagging entities as enemies.
+///
+/// Carried by the entities seeded at startup so the world contains a mix of
+/// archetypes for the scheduler to batch, which is what this demo profiles.
 #[derive(Debug, Clone)]
 struct Enemy;
 impl Component for Enemy {}
@@ -164,24 +166,6 @@ fn health_decay_system(mut query: Query<&mut Health>) {
             health.0 = (health.0 + 0.1).max(0.0);
         });
 }
-
-/// Applies damage to any entity pushed outside the 900-unit play area bounds.
-fn collision_damage_system(mut query: Query<(&mut Health, &Position)>) {
-    for (mut health, pos) in query.iter_mut() {
-        if pos.x.abs() > 900.0 || pos.y.abs() > 900.0 {
-            health.0 -= 10.0;
-        }
-    }
-}
-
-/// Steers enemy velocity along a sine/cosine wave driven by their position.
-fn enemy_ai_system(mut query: Query<(&mut Position, &mut Velocity), With<Enemy>>) {
-    for (pos, mut vel) in query.iter_mut() {
-        vel.x = (pos.y * 0.01).sin() * 0.5;
-        vel.y = (pos.x * 0.01).cos() * 0.5;
-    }
-}
-
 /// Runs a heavy parallel pre-pass, then destroys entities at or below zero health.
 ///
 /// The pre-pass adds CPU work to stress the scheduler's automatic parallelism
@@ -201,7 +185,7 @@ fn cleanup_system(mut commands: Commands, mut query: Query<(Entity, &Health)>) {
     // Actual cleanup - destroy entities at or below zero health.
     for (entity, health) in query.iter_mut() {
         if health.0 <= 0.0 {
-            let _ = commands.destroy_entity(entity);
+            commands.destroy_entity(entity);
         }
     }
 }
@@ -213,7 +197,7 @@ fn cleanup_system(mut commands: Commands, mut query: Query<(Entity, &Health)>) {
 fn gravity_system(mut query: Query<(&mut GravityForce, &Mass)>) {
     let _zone = crate::profile_scope!("gravity_system");
 
-    let stats = query
+    let _stats = query
         .par_iter_mut()
         .tracked()
         .label("gravity_system")
@@ -255,26 +239,6 @@ fn physics_system(mut query: Query<(&PhysicsData, &mut Velocity)>) {
             vel.y = (vel.y + ay * 0.01).clamp(-5.0, 5.0);
         });
 }
-
-/// Spawns a single enemy entity at a random position with random velocity.
-///
-/// The `Enemy` marker makes the spawned entity visible to `enemy_ai_system`.
-fn spawner_system(mut commands: Commands) {
-    commands
-        .create_entity()
-        .with(Position {
-            x: (lcg() - 0.5) * 1000.0,
-            y: (lcg() - 0.5) * 1000.0,
-        })
-        .with(Velocity {
-            x: (lcg() - 0.5) * 0.2,
-            y: (lcg() - 0.5) * 0.2,
-        })
-        .with(Health(100.0))
-        .with(Enemy)
-        .build();
-}
-
 /// Fast LCG random f32 - seeded from CPU counter, no syscalls.
 fn lcg() -> f32 {
     #[cfg(target_arch = "x86_64")]

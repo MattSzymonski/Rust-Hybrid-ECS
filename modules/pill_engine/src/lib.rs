@@ -99,12 +99,12 @@ pub use api::EngineApi;
 pub use commands::{CommandError, Commands};
 pub use component::{Component, ComponentId, ComponentTicks, Tick};
 pub use engine::{Engine, SystemOwner};
+pub use entity::Entity;
+pub use error::{EngineError, SystemError, SystemFailure};
 pub use hot_patch::{
     HotPatchError, HotPatchRegistry, HotSlot, PillHotFunctionDescriptor, PillHotSlotDescriptor,
     PlainSlot,
 };
-pub use entity::Entity;
-pub use error::{EngineError, SystemError, SystemFailure};
 pub use persistence::ComponentSnapshot;
 pub use query::{
     Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,
@@ -127,7 +127,7 @@ pub use tracing;
 // so module/project crates need no dependency beyond `pill_engine` itself.
 pub use inventory::submit;
 pub use pill_engine_macros::{
-    PillComponent, pill_hot, pill_hot_fn, pill_hot_resolver, pill_module, pill_project,
+    pill_hot, pill_hot_fn, pill_hot_resolver, pill_module, pill_project, PillComponent,
 };
 
 // World container and its entity-builder and error types.

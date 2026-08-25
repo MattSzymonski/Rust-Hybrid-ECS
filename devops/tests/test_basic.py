@@ -213,7 +213,7 @@ def failure_excerpt(completed: subprocess.CompletedProcess) -> str:
 
 def code_formatting(tally: ResultTally) -> None:
     """Checks the workspace is rustfmt-clean."""
-    section("(1/5) Code formatting check")
+    section("(1/6) Code formatting check")
     print(f"Running cargo fmt --check on {WORKSPACE_MANIFEST.relative_to(REPOSITORY_ROOT).as_posix()}")
     if not WORKSPACE_MANIFEST.is_file():
         tally.report_skip("code formatting", f"{WORKSPACE_MANIFEST} not found")
@@ -242,7 +242,7 @@ def code_formatting(tally: ResultTally) -> None:
 
 def code_linting(tally: ResultTally) -> None:
     """Checks the workspace is clippy-clean with warnings denied."""
-    section("(2/5) Code linting check")
+    section("(2/6) Code linting check")
     print(f"Running clippy on {WORKSPACE_MANIFEST.relative_to(REPOSITORY_ROOT).as_posix()}")
     if not WORKSPACE_MANIFEST.is_file():
         tally.report_skip("code linting", f"{WORKSPACE_MANIFEST} not found")
@@ -267,13 +267,76 @@ def code_linting(tally: ResultTally) -> None:
 
 
 # =============================================================================
-# 3. Native example build
+# 3. Rust tests
+# =============================================================================
+
+
+def rust_tests(tally: ResultTally) -> None:
+    """Runs the workspace's Rust test suite in both feature configurations.
+
+    Two runs, deliberately. `hot_patch` is an additive cargo feature, so the
+    default run never compiles the live-patching code at all - at the time this
+    check was added that left 47 tests in `pill_host` and 5 in `pill_engine`
+    outside every automated lane, including the ones covering code that rewrites
+    a running process's instructions.
+
+    The second run is not a superset in principle either: a feature can change
+    behaviour on paths the default build also takes, so a suite that passes with
+    the feature can still fail without it. Both configurations are checked.
+    """
+    section("(3/6) Rust tests")
+    if not WORKSPACE_MANIFEST.is_file():
+        tally.report_skip("rust tests", f"{WORKSPACE_MANIFEST} not found")
+        return
+
+    for label, extra_arguments in (
+        ("default features", []),
+        ("hot_patch", ["--features", "pill_host/hot_patch,pill_engine/hot_patch"]),
+    ):
+        print(f"Running cargo test --workspace ({label})")
+        completed = run_command(
+            [
+                find_executable("cargo"),
+                "test",
+                "--workspace",
+                "--manifest-path",
+                str(WORKSPACE_MANIFEST),
+                *extra_arguments,
+            ],
+            timeout=BUILD_TIMEOUT_SECONDS,
+        )
+        if completed.returncode != 0:
+            tally.report_fail(f"rust tests ({label})", failure_excerpt(completed))
+            return
+        print(summarize_test_results(completed.stdout))
+    tally.report_pass("rust tests")
+
+
+def summarize_test_results(output: str) -> str:
+    """Total the per-binary `test result:` lines cargo prints.
+
+    Cargo reports one line per test binary, so a run spanning a dozen crates
+    scrolls the interesting number off the screen. This collapses them into the
+    single figure a developer actually wants.
+    """
+    passed = failed = ignored = 0
+    for match in re.finditer(
+        r"test result: \w+\. (\d+) passed; (\d+) failed; (\d+) ignored", output
+    ):
+        passed += int(match.group(1))
+        failed += int(match.group(2))
+        ignored += int(match.group(3))
+    return f"  {passed} passed, {failed} failed, {ignored} ignored"
+
+
+# =============================================================================
+# 4. Native example build
 # =============================================================================
 
 
 def native_example_build(tally: ResultTally) -> None:
     """Builds the native example in release and reports its artifact sizes."""
-    section("(3/5) Native build")
+    section("(4/6) Native build")
     launcher = launcher_prerequisites("native example build", NATIVE_EXAMPLE, tally)
     if launcher is None:
         return
@@ -313,7 +376,7 @@ def native_example_build(tally: ResultTally) -> None:
 
 def wasm_example_build(tally: ResultTally) -> None:
     """Builds the WASM target, enforces its size budget, and serves it once."""
-    section("(4/5) WASM build")
+    section("(5/6) WASM build")
     launcher = launcher_prerequisites("WASM example build", WASM_EXAMPLE, tally)
     if launcher is None:
         return
@@ -453,7 +516,7 @@ def native_performance_benchmark(tally: ResultTally) -> None:
     directly; with a display, windowed is tried first and headless is the
     fallback when it fails (typically no usable GPU).
     """
-    section("(5/5) Performance benchmark")
+    section("(6/6) Performance benchmark")
     launcher = launcher_prerequisites(
         "native performance benchmark", BENCHMARK_EXAMPLE, tally
     )
@@ -630,6 +693,7 @@ def print_benchmark_summary(
 CHECKS: Dict[str, Callable[[ResultTally], None]] = {
     "code_formatting": code_formatting,
     "code_linting": code_linting,
+    "rust_tests": rust_tests,
     "native_example_build": native_example_build,
     "wasm_example_build": wasm_example_build,
     "native_performance_benchmark": native_performance_benchmark,
@@ -638,6 +702,7 @@ CHECKS: Dict[str, Callable[[ResultTally], None]] = {
 CHECK_DESCRIPTIONS = {
     "code_formatting": "cargo fmt --check over the workspace",
     "code_linting": "cargo clippy -D warnings over the workspace",
+    "rust_tests": "cargo test --workspace, with and without hot_patch",
     "native_example_build": "launcher release build + artifact size report",
     "wasm_example_build": "launcher WASM build + size budget + dev server smoke test",
     "native_performance_benchmark": "build + run the benchmark project (release)",

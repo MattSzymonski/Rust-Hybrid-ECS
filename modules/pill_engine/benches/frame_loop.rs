@@ -409,7 +409,7 @@ fn bench_frame_loop(criterion: &mut Criterion) {
             // Sequential baseline (parallel execution disabled) isolates the
             // speedup gained from parallelism.
             group.bench_with_input(
-                BenchmarkId::new(&format!("{}_sequential", label), entity_count),
+                BenchmarkId::new(format!("{}_sequential", label), entity_count),
                 &entity_count,
                 |benchmark, &entity_count| {
                     let mut engine = build_engine(entity_count, profile, false);

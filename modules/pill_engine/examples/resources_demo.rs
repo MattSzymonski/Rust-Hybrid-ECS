@@ -119,7 +119,11 @@ fn scoring_system(mut query: Query<&Position>, mut score: ResMut<Score>) {
 /// - `Query<(Entity, &Position)>` ⇒ reads Position (and entity id).
 /// - `Res<ProjectTime>`              ⇒ reads ProjectTime.
 /// - `Res<Score>`                 ⇒ reads Score.
-fn display_system(mut query: Query<(Entity, &Position)>, time: Res<ProjectTime>, score: Res<Score>) {
+fn display_system(
+    mut query: Query<(Entity, &Position)>,
+    time: Res<ProjectTime>,
+    score: Res<Score>,
+) {
     let t = time.get().unwrap();
     let s = score.get().unwrap();
 

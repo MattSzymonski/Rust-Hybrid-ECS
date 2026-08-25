@@ -277,7 +277,6 @@ fn parse_patch_arguments(attribute: TokenStream) -> Result<PatchArguments, syn::
     Ok(parsed)
 }
 
-
 /// Makes an ordinary function hot-patchable.
 ///
 /// Use this for a plain `pub fn`; use `#[pill_hot]` for an ECS system. The two

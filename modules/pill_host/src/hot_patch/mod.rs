@@ -579,10 +579,7 @@ impl HotPatchSession {
     /// Zero means the original code the artifact was built with, which is also
     /// the answer when nothing has ever been patched.
     fn active_generation(&self, qualified: &str) -> u32 {
-        self.active_generations
-            .get(qualified)
-            .copied()
-            .unwrap_or(0)
+        self.active_generations.get(qualified).copied().unwrap_or(0)
     }
 
     /// Every generation recorded for every function this session has patched.
@@ -723,10 +720,7 @@ impl HotPatchSession {
                     // re-validates the function's extent before writing. No
                     // system is executing: rollback runs between frames.
                     unsafe {
-                        pill_engine::hot_patch::patch_prologue(
-                            restore.address,
-                            generation.address,
-                        )
+                        pill_engine::hot_patch::patch_prologue(restore.address, generation.address)
                     }
                     .map_err(|detail| format!("{}: {detail}", restore.artifact))?;
                 }
@@ -751,7 +745,8 @@ impl HotPatchSession {
             }
         }
 
-        self.active_generations.insert(qualified.to_string(), number);
+        self.active_generations
+            .insert(qualified.to_string(), number);
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             function = qualified,
@@ -785,10 +780,8 @@ impl HotPatchSession {
             // generation was installed, and `restore_prologue` re-reads the
             // function's extent before writing so a replaced image is refused
             // rather than overwritten. No system is executing.
-            unsafe {
-                pill_engine::hot_patch::restore_prologue(restore.address, &restore.original)
-            }
-            .map_err(|detail| format!("{}: {detail}", restore.artifact))?;
+            unsafe { pill_engine::hot_patch::restore_prologue(restore.address, &restore.original) }
+                .map_err(|detail| format!("{}: {detail}", restore.artifact))?;
         }
         Ok(())
     }
@@ -817,10 +810,9 @@ impl HotPatchSession {
 
         match kind {
             source::HotFunctionKind::System => {
-                let (address, signature_hash) =
-                    engine.hot_patch_baseline(qualified).ok_or_else(|| {
-                        format!("`{qualified}` records no baseline implementation")
-                    })?;
+                let (address, signature_hash) = engine
+                    .hot_patch_baseline(qualified)
+                    .ok_or_else(|| format!("`{qualified}` records no baseline implementation"))?;
                 engine
                     .hot_patch(qualified, address, signature_hash)
                     .map_err(|error| error.to_string())
@@ -914,7 +906,7 @@ impl HotPatchSession {
                 return Err(PatchRefusal::new(
                     refusal_code::OUTSIDE_HOT_BODY,
                     format!(
-                    "{} changed outside a hot function body (signature, type, \
+                        "{} changed outside a hot function body (signature, type, \
                      constant, import or another function)",
                         file_label(&path)
                     ),
@@ -1058,11 +1050,7 @@ impl HotPatchSession {
         let package = self.package.clone();
 
         let artifact = scratch.join(format!("{crate_name}.dll"));
-        let extra_externs = vec![format!(
-            "{}={}",
-            self.package,
-            self.package_rlib.display()
-        )];
+        let extra_externs = vec![format!("{}={}", self.package, self.package_rlib.display())];
         // Dependency rlibs staged when the host last built this package, which
         // is the only set guaranteed to match the module rlib being linked. The
         // shared `deps` slots they were copied from are overwritten by any build
@@ -1182,9 +1170,9 @@ impl HotPatchSession {
                 let lookup_name = format!("{PATCH_NAME_PREFIX}{qualified}");
                 let (found, hash) = resolve_in(&library, &lookup_name)
                     .map_err(|detail| PatchRefusal::new(failure_code::RESOLVE, detail))?;
-                engine.hot_patch(qualified, found, hash).map_err(|error| {
-                    PatchRefusal::new(failure_code::INSTALL, error.to_string())
-                })?;
+                engine
+                    .hot_patch(qualified, found, hash)
+                    .map_err(|error| PatchRefusal::new(failure_code::INSTALL, error.to_string()))?;
                 address = found;
                 signature_hash = hash;
                 // The registry lives once per process, so this single install
@@ -1210,7 +1198,7 @@ impl HotPatchSession {
                     found,
                     &declaration.signature,
                 )
-                    .map_err(|detail| PatchRefusal::new(failure_code::INSTALL, detail))?;
+                .map_err(|detail| PatchRefusal::new(failure_code::INSTALL, detail))?;
                 address = found;
                 route = crate::analytics::PatchRoute::Prologue;
                 copies = prologue_restores.len();
@@ -1226,9 +1214,8 @@ impl HotPatchSession {
                 };
                 let (found, found_signature) = resolve_plain_in(&library, &lookup_name)
                     .map_err(|detail| PatchRefusal::new(failure_code::RESOLVE, detail))?;
-                copies =
-                    install_everywhere(targets, patches, slot_name, found, &found_signature)
-                        .map_err(|detail| PatchRefusal::new(failure_code::INSTALL, detail))?;
+                copies = install_everywhere(targets, patches, slot_name, found, &found_signature)
+                    .map_err(|detail| PatchRefusal::new(failure_code::INSTALL, detail))?;
                 address = found;
                 signature = found_signature;
                 route = crate::analytics::PatchRoute::ArtifactSlot;
@@ -1597,7 +1584,8 @@ impl HotPatchSession {
                 self.workspace_root.join("Cargo.toml"),
                 self.workspace_root.join("Cargo.lock"),
             ];
-            let line = match CargoRustcLine::load_if_fresh(&cache, &freshness, &self.build_command) {
+            let line = match CargoRustcLine::load_if_fresh(&cache, &freshness, &self.build_command)
+            {
                 Some(cached) => cached,
                 None => {
                     let captured = CargoRustcLine::capture(
@@ -1626,12 +1614,13 @@ fn resolve_in(library: &Library, lookup_name: &str) -> Result<(usize, u64), Stri
 
     // SAFETY: the export is generated by `pill_hot_resolver!` with exactly this
     // C ABI signature, and the borrow ends before the library is moved.
-    let resolve: Symbol<ResolveFn> = unsafe { library.get(PATCH_RESOLVER_EXPORT) }.map_err(|_| {
-        format!(
-            "the patch does not export `{}`",
-            String::from_utf8_lossy(PATCH_RESOLVER_EXPORT)
-        )
-    })?;
+    let resolve: Symbol<ResolveFn> =
+        unsafe { library.get(PATCH_RESOLVER_EXPORT) }.map_err(|_| {
+            format!(
+                "the patch does not export `{}`",
+                String::from_utf8_lossy(PATCH_RESOLVER_EXPORT)
+            )
+        })?;
 
     let encoded = std::ffi::CString::new(lookup_name)
         .map_err(|_| "the function name contains a NUL byte".to_string())?;
@@ -1683,7 +1672,9 @@ fn resolve_plain_in(library: &Library, lookup_name: &str) -> Result<(usize, Stri
         return Err(format!("the patch does not define `{lookup_name}`"));
     }
     if signature_pointer.is_null() {
-        return Err(format!("the patch reported no signature for `{lookup_name}`"));
+        return Err(format!(
+            "the patch reported no signature for `{lookup_name}`"
+        ));
     }
     // SAFETY: the export wrote a pointer and length describing a `&'static str`
     // inside the loaded patch, so the bytes are readable and valid UTF-8.
@@ -1723,7 +1714,9 @@ fn install_everywhere(
     // the version of this function that existed when it was compiled.
     for patch in patches {
         match patch.install_plain_function(qualified, address, signature) {
-            Ok(true) => installed.push(format!("{} patch gen {}", patch.function, patch.generation)),
+            Ok(true) => {
+                installed.push(format!("{} patch gen {}", patch.function, patch.generation))
+            }
             Ok(false) => {}
             Err(detail) => return Err(detail),
         }
@@ -1790,14 +1783,10 @@ impl LoadedPatch {
         address: usize,
         signature: &str,
     ) -> Result<bool, String> {
-        type InstallFn = unsafe extern "C" fn(
-            *const std::ffi::c_char,
-            usize,
-            *const std::ffi::c_char,
-        ) -> u32;
+        type InstallFn =
+            unsafe extern "C" fn(*const std::ffi::c_char, usize, *const std::ffi::c_char) -> u32;
         // SAFETY: generated by `pill_hot_resolver!` with this exact C ABI.
-        let Ok(install) = (unsafe { self.library.get::<InstallFn>(PATCH_INSTALL_RESOLVER) })
-        else {
+        let Ok(install) = (unsafe { self.library.get::<InstallFn>(PATCH_INSTALL_RESOLVER) }) else {
             return Ok(false);
         };
         let Ok(name) = std::ffi::CString::new(qualified) else {
@@ -1835,11 +1824,8 @@ impl LoadedPatch {
 
     /// Address and recorded declaration of one function inside this patch.
     fn function_address(&self, qualified: &str) -> Option<(usize, String)> {
-        type AddressFn = unsafe extern "C" fn(
-            *const std::ffi::c_char,
-            *mut *const u8,
-            *mut usize,
-        ) -> usize;
+        type AddressFn =
+            unsafe extern "C" fn(*const std::ffi::c_char, *mut *const u8, *mut usize) -> usize;
         // SAFETY: the export is generated by `pill_hot_resolver!` with exactly
         // this C ABI signature, and the borrow ends before the library moves.
         let resolve: Symbol<AddressFn> =
@@ -1850,9 +1836,8 @@ impl LoadedPatch {
         // SAFETY: a NUL-terminated name and two writable slots, as the export
         // requires. A patch is never unloaded, so anything it reports stays
         // valid for the process lifetime.
-        let address = unsafe {
-            resolve(name.as_ptr(), &mut signature_pointer, &mut signature_length)
-        };
+        let address =
+            unsafe { resolve(name.as_ptr(), &mut signature_pointer, &mut signature_length) };
         if address == 0 {
             return None;
         }
@@ -1861,9 +1846,7 @@ impl LoadedPatch {
         } else {
             // SAFETY: the export wrote a pointer and length describing a
             // `&'static str` inside the loaded patch.
-            let bytes = unsafe {
-                std::slice::from_raw_parts(signature_pointer, signature_length)
-            };
+            let bytes = unsafe { std::slice::from_raw_parts(signature_pointer, signature_length) };
             String::from_utf8_lossy(bytes).into_owned()
         };
         Some((address, signature))
@@ -1891,12 +1874,13 @@ fn resolve_patch_address(library: &Library) -> Result<usize, String> {
     type AddressFn = unsafe extern "C" fn() -> usize;
     // SAFETY: the export is generated by this module with exactly this C ABI
     // signature, and the borrow ends before the library is moved.
-    let resolve: Symbol<AddressFn> = unsafe { library.get(PATCH_ADDRESS_EXPORT) }.map_err(|_| {
-        format!(
-            "the patch does not export `{}`",
-            String::from_utf8_lossy(PATCH_ADDRESS_EXPORT)
-        )
-    })?;
+    let resolve: Symbol<AddressFn> =
+        unsafe { library.get(PATCH_ADDRESS_EXPORT) }.map_err(|_| {
+            format!(
+                "the patch does not export `{}`",
+                String::from_utf8_lossy(PATCH_ADDRESS_EXPORT)
+            )
+        })?;
     // SAFETY: the export takes no arguments and returns the address of a
     // function inside the patch image, which is never unloaded.
     let address = unsafe { resolve() };
@@ -1975,7 +1959,9 @@ fn prologue_patch_everywhere(
                     .find(|(candidate, _)| *candidate == label)
                     .and_then(|(_, artifact)| artifact.extent_coverage())
                     .map(|(known, total)| {
-                        format!(" ({known} of {total} functions in this artifact have a known length)")
+                        format!(
+                            " ({known} of {total} functions in this artifact have a known length)"
+                        )
                     })
                     .unwrap_or_default();
                 // Undo whatever already landed, so a failure never leaves the
@@ -1984,10 +1970,7 @@ fn prologue_patch_everywhere(
                     // SAFETY: the same contract, with bytes this function saved
                     // moments ago from that exact address.
                     let _ = unsafe {
-                        pill_engine::hot_patch::restore_prologue(
-                            restore.address,
-                            &restore.original,
-                        )
+                        pill_engine::hot_patch::restore_prologue(restore.address, &restore.original)
                     };
                 }
                 return Err(format!("{label}: {detail}{coverage}"));
@@ -2106,7 +2089,8 @@ mod tests {
             counter: 0,
         };
 
-        let contents = "use pill_engine::*;\n\n#[pill_hot]\nfn movement(value: i32) -> i32 { value * 2 }\n";
+        let contents =
+            "use pill_engine::*;\n\n#[pill_hot]\nfn movement(value: i32) -> i32 { value * 2 }\n";
         let generated = session
             .generate(
                 contents,
@@ -2541,7 +2525,10 @@ mod tests {
         let session = session_over(&directory, PLAIN_SOURCE);
 
         // What cargo produced, and the older copy the host staged from it.
-        let built = directory.join("target").join("debug").join("libproject.rlib");
+        let built = directory
+            .join("target")
+            .join("debug")
+            .join("libproject.rlib");
         fs_write(&built, "rebuilt against the current dependencies");
         fs_write(&session.package_rlib, "stale");
 
@@ -2565,12 +2552,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
         let session = session_over(&directory, PLAIN_SOURCE);
 
-        let built = directory.join("target").join("debug").join("libproject.rlib");
+        let built = directory
+            .join("target")
+            .join("debug")
+            .join("libproject.rlib");
         fs_write(&built, "same length!!");
         std::thread::sleep(std::time::Duration::from_millis(20));
         fs_write(&session.package_rlib, "same length!!");
 
-        session.refresh_staged_rlib().expect("refreshing must succeed");
+        session
+            .refresh_staged_rlib()
+            .expect("refreshing must succeed");
         assert_eq!(
             std::fs::read_to_string(&session.package_rlib).expect("read staged"),
             "same length!!"
@@ -2709,8 +2701,16 @@ fn helper(value: f32) -> f32 {
     #[test]
     fn classify_refuses_everything_outside_a_hot_body() {
         let cases: &[(&str, &str, &str)] = &[
-            ("constant", "const SPEED: f32 = 1.0;", "const SPEED: f32 = 2.0;"),
-            ("signature", "fn movement(value: f32)", "fn movement(value: f64)"),
+            (
+                "constant",
+                "const SPEED: f32 = 1.0;",
+                "const SPEED: f32 = 2.0;",
+            ),
+            (
+                "signature",
+                "fn movement(value: f32)",
+                "fn movement(value: f64)",
+            ),
             ("import", "use pill_engine::*;", "use pill_engine::Engine;"),
         ];
 
@@ -2724,9 +2724,9 @@ fn helper(value: f32) -> f32 {
             assert_ne!(edited, HOT_SOURCE, "{label}: the fixture edit must apply");
             std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
 
-            let refusal = session
-                .classify()
-                .expect_err(&format!("{label}: a change outside a hot body must be refused"));
+            let refusal = session.classify().expect_err(&format!(
+                "{label}: a change outside a hot body must be refused"
+            ));
             assert_eq!(
                 refusal.code,
                 refusal_code::OUTSIDE_HOT_BODY,
@@ -2787,7 +2787,12 @@ fn helper(value: f32) -> f32 {
         std::fs::write(directory.join("other.rs"), &edited).expect("write second edit");
 
         let refusal = session.classify().expect_err("two files must be refused");
-        assert_eq!(refusal.code, refusal_code::MULTIPLE_FILES, "{}", refusal.detail);
+        assert_eq!(
+            refusal.code,
+            refusal_code::MULTIPLE_FILES,
+            "{}",
+            refusal.detail
+        );
 
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -2803,7 +2808,12 @@ fn helper(value: f32) -> f32 {
         std::fs::write(directory.join("appeared.rs"), HOT_SOURCE).expect("write new file");
 
         let refusal = session.classify().expect_err("a new file must be refused");
-        assert_eq!(refusal.code, refusal_code::NEW_SOURCE_FILE, "{}", refusal.detail);
+        assert_eq!(
+            refusal.code,
+            refusal_code::NEW_SOURCE_FILE,
+            "{}",
+            refusal.detail
+        );
 
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -2910,8 +2920,11 @@ fn helper(value: f32) -> f32 {
         let plain = "fn ordinary(value: f32) -> f32 { value }\n";
         let mut session = session_over(&directory, plain);
 
-        std::fs::write(directory.join("lib.rs"), "fn ordinary(value: f32) -> f32 { value * 2.0 }\n")
-            .expect("write edit");
+        std::fs::write(
+            directory.join("lib.rs"),
+            "fn ordinary(value: f32) -> f32 { value * 2.0 }\n",
+        )
+        .expect("write edit");
 
         let (_, declaration, _) = session
             .classify()

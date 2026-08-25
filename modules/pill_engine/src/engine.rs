@@ -115,7 +115,6 @@ struct RegisteredSystem {
 /// // Every frame:
 /// engine.process_frame().unwrap();
 /// ```
-
 pub struct Engine {
     /// All registered systems with their names and states
     systems: Vec<RegisteredSystem>,
@@ -1336,4 +1335,3 @@ mod tests {
         assert_eq!(engine.is_system_enabled("middle"), None);
     }
 }
-

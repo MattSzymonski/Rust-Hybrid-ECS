@@ -415,10 +415,9 @@ pub(super) fn module_native_bindings(
     // Validate that every exposed component is still registered in the live
     // engine; an unknown id would surface only later as an empty column.
     bindings.retain(|_, binding| match binding {
-        ComponentBinding::ModuleNative { component_id, .. } => engine
-            .world()
-            .component_layout(*component_id)
-            .is_some(),
+        ComponentBinding::ModuleNative { component_id, .. } => {
+            engine.world().component_layout(*component_id).is_some()
+        }
         _ => true,
     });
     bindings

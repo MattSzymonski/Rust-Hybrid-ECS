@@ -45,11 +45,6 @@ use crate::component::{ComponentTicks, Tick};
 /// Soundness relies on the scheduler's guarantee that no two threads ever
 /// obtain a `Mut<T>` for the same component row, so the per-row tick update
 /// in `DerefMut` requires no synchronization.
-
-// =============================================================================
-// Mut
-// =============================================================================
-
 pub struct Mut<'a, T: ?Sized> {
     /// The underlying component value wrapped by this `Mut`.
     pub(crate) value: &'a mut T,

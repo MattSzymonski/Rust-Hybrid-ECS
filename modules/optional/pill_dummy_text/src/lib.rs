@@ -16,9 +16,9 @@
 // `pill_module` must resolve in every build (the attribute is applied to
 // `register` in source); `Engine` is only needed by the module-abi build,
 // where `register` is actually compiled in.
+use pill_engine::pill_module;
 #[cfg(feature = "module-abi")]
 use pill_engine::Engine;
-use pill_engine::pill_module;
 
 // =============================================================================
 // Struct
@@ -63,4 +63,3 @@ pub fn shout(text: &str) -> String {
 fn register(_engine: &mut Engine) -> u32 {
     0
 }
-

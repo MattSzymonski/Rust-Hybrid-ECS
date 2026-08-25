@@ -58,12 +58,33 @@ python engine/run_minimal_benchmark.py
 Individual runs use an isolated temporary directory and are deleted after a
 successful average. Pass `--keep-runs target/minimal-runs` to retain them.
 
+## Measured-region rule
+
+Engine construction is setup, never workload. `Engine::new()` warms the Rayon
+pool and prints a system-spec banner, so leaving it inside `iter()` measures
+startup rather than the operation under test.
+
+`commands_create_entity` did exactly that, and reported ~90 ms at every input
+size - 100 entities came out *slower* than 1,000, because the number was engine
+startup either way. Moved into an `iter_batched` setup closure it reports
+80 us / 370 us / 3.7 ms for 100 / 1,000 / 10,000, which scales linearly as
+entity creation should.
+
+Use `iter_batched` with a setup closure whenever an iteration needs a fresh
+world; keep only the operation being measured in the routine closure.
+
 ## Files
 
 ### `minimal.rs`
-Four focused hot-path cases at fixed sizes: `query_iter_unfiltered`,
-`query_iter_changed`, `query_par_iter_unfiltered`, and
-`archetype_add_component`.
+The smoke-test target: one benchmark, `query_iter_unfiltered`, at a single
+fixed size. Use it to check the harness works (`--bench minimal --quick`), not
+for coverage.
+
+It is deliberately not a coverage target. It used to document four benchmarks
+while three of them were commented out of its `criterion_group!`, so it measured
+a quarter of what it claimed - and those three duplicated groups that
+`query_iteration.rs` and `archetype_migration.rs` already cover across three
+entity counts instead of one. They were removed rather than re-enabled.
 
 ### `entity_lifecycle.rs`
 | Group | Counts | Description |

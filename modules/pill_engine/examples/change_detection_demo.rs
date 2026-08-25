@@ -128,7 +128,7 @@ fn movement_system(frame: ResMut<FrameCounter>, mut q: Query<(&mut Position, &Ve
     // Step 1: read the current frame and skip odd frames entirely so the
     // reactive systems observe a genuine "unchanged" frame.
     let frame_no = frame.get().map(|f| f.0).unwrap_or(0);
-    if frame_no % 2 != 0 {
+    if !frame_no.is_multiple_of(2) {
         return; // odd frames: skip mutation entirely
     }
 
@@ -142,6 +142,10 @@ fn movement_system(frame: ResMut<FrameCounter>, mut q: Query<(&mut Position, &Ve
 /// Reacts only to entities whose Position was mutated since this system
 /// last ran. Combines a row-level filter (`Changed<Position>`) with an
 /// archetype-level filter (`With<Player>`) to scope the result.
+// The full query type is spelled out on purpose: combining a row filter with
+// an archetype filter is exactly what this example exists to show, and hiding
+// it behind a type alias would move the demonstration out of view.
+#[allow(clippy::type_complexity)]
 fn react_to_movement_system(mut q: Query<(Entity, &Position), (Changed<Position>, With<Player>)>) {
     let mut count = 0;
     for (entity, pos) in q.iter_mut() {

@@ -25,11 +25,11 @@ use dioxus::desktop::tao::window::{Window, WindowId};
 use dioxus::desktop::{use_wry_event_handler, window, Config};
 use dioxus::prelude::*;
 use futures_util::StreamExt;
+use pill_core::error::EngineMessage;
 use pill_host::{
     engine_report, install_engine_report_handler, setup_rendering, EngineError, FrameReport,
     HostConfig, HostError, RenderViewport, RenderingHost, VirtualResolution,
 };
-use pill_core::error::EngineMessage;
 
 use dock_view::DockView;
 use error::EditorError;
@@ -73,6 +73,14 @@ fn main() {
         .with_on_window(|window, dom| {
             // Dioxus retains event-loop ownership. The cloned Arc is passed to
             // the engine only so wgpu can keep the native surface alive.
+            //
+            // `EditorContext` is not `Send + Sync` - it owns a wgpu surface tied
+            // to this window - so clippy suggests `Rc`. `Arc` is kept because
+            // this handle travels through Dioxus's `provide_context` /
+            // `consume_context` plumbing, and the atomic refcount is paid once
+            // per window rather than on any hot path. Switching it would touch
+            // GUI wiring that no automated test here can exercise.
+            #[allow(clippy::arc_with_non_send_sync)]
             let context = match EditorContext::new(window) {
                 Ok(context) => Arc::new(context),
                 Err(error) => {

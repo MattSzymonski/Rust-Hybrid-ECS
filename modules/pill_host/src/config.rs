@@ -1267,7 +1267,8 @@ mod hot_patch_manifest_tests {
 
     #[test]
     fn adds_rlib_to_an_existing_crate_type_list() {
-        let manifest = "[package]\nname = \"project\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\n";
+        let manifest =
+            "[package]\nname = \"project\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\n";
         let rewritten = add_rlib_crate_type(manifest);
         assert!(rewritten.contains("crate-type = [\"cdylib\", \"rlib\"]"));
         assert!(rewritten.contains("[dependencies]"));
@@ -1277,7 +1278,10 @@ mod hot_patch_manifest_tests {
     fn is_idempotent() {
         let manifest = "[lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n";
         assert_eq!(add_rlib_crate_type(manifest), manifest);
-        assert_eq!(add_rlib_crate_type(&add_rlib_crate_type(manifest)), manifest);
+        assert_eq!(
+            add_rlib_crate_type(&add_rlib_crate_type(manifest)),
+            manifest
+        );
     }
 
     #[test]

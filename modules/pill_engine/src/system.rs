@@ -455,7 +455,10 @@ where
     }
 
     #[cfg(feature = "hot_patch")]
-    fn into_hot_system(mut self, slot: std::sync::Arc<crate::hot_patch::HotSlot>) -> Box<dyn System> {
+    fn into_hot_system(
+        mut self,
+        slot: std::sync::Arc<crate::hot_patch::HotSlot>,
+    ) -> Box<dyn System> {
         // The baseline implementation and the signature to gate replacements
         // against. This is the only place the concrete `F` and `Input` exist.
         slot.initialize(

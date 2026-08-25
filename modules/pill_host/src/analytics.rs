@@ -427,9 +427,7 @@ pub(crate) fn parse_latest_cargo_timings(workspace_root: &Path) -> Option<CargoT
     // bracket is the terminator because no interior value in the pretty-printed
     // JSON ever ends with a `]` immediately followed by `;`. The slice keeps
     // both brackets so serde sees a JSON array, not the bare contents.
-    let Some(open) = content.find("const UNIT_DATA = [") else {
-        return None;
-    };
+    let open = content.find("const UNIT_DATA = [")?;
     let array_start = open + "const UNIT_DATA = [".len() - 1;
     let array_end = content[array_start..].find("];")? + array_start;
     let units: Vec<Value> = serde_json::from_str(&content[array_start..=array_end]).ok()?;
@@ -832,7 +830,7 @@ pub(crate) fn record_reload(name: &str) {
         .iter()
         .map(|(crate_name, duration_ms)| (crate_name.clone(), *duration_ms))
         .collect();
-    cargo_crates.sort_by(|left, right| right.1.cmp(&left.1));
+    cargo_crates.sort_by_key(|(_, duration_ms)| std::cmp::Reverse(*duration_ms));
     collector.pending_cargo_crates.clear();
     let snapshot = {
         let module = &collector.modules[index];

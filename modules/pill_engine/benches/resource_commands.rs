@@ -236,30 +236,42 @@ fn bench_commands_create_entity(criterion: &mut Criterion) {
             BenchmarkId::from_parameter(count),
             &count,
             |benchmark, &count| {
-                benchmark.iter(|| {
-                    // Step 1: Set up a fresh engine with the component types the spawner writes.
-                    let mut engine = Engine::new();
-                    engine.world_mut().register_component::<Position>();
-                    engine.world_mut().register_component::<Velocity>();
-
-                    // Step 2: Register the system that queues entity creations via `Commands`.
-                    engine.register_system("spawner", move |mut commands: Commands| {
-                        for i in 0..count {
-                            commands
-                                .create_entity()
-                                .with(Position {
-                                    x: i as f32,
-                                    y: 0.0,
-                                })
-                                .with(Velocity { x: 0.1, y: 0.2 })
-                                .build();
-                        }
-                    });
-
-                    // Step 3: Flush the deferred queue and measure the resulting entity count.
-                    engine.process_frame().unwrap();
-                    black_box(engine.world().entity_count());
-                });
+                // Engine construction is setup, not workload. `Engine::new`
+                // warms the Rayon pool and prints a system-spec banner, and
+                // leaving it inside the measured closure made this benchmark
+                // report ~90 ms at every size - MORE entities came out FASTER,
+                // because the number was engine startup rather than the command
+                // pipeline this is meant to measure. The two benchmarks below
+                // already use `iter_batched` for exactly this reason.
+                benchmark.iter_batched(
+                    || {
+                        // Setup: a fresh engine with the component types the
+                        // spawner writes. Excluded from the measurement.
+                        let mut engine = Engine::new();
+                        engine.world_mut().register_component::<Position>();
+                        engine.world_mut().register_component::<Velocity>();
+                        engine
+                    },
+                    |mut engine| {
+                        // Measured: queue `count` creations through `Commands`,
+                        // then flush them in `process_frame`.
+                        engine.register_system("spawner", move |mut commands: Commands| {
+                            for i in 0..count {
+                                commands
+                                    .create_entity()
+                                    .with(Position {
+                                        x: i as f32,
+                                        y: 0.0,
+                                    })
+                                    .with(Velocity { x: 0.1, y: 0.2 })
+                                    .build();
+                            }
+                        });
+                        engine.process_frame().unwrap();
+                        black_box(engine.world().entity_count());
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
             },
         );
     }

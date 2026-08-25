@@ -131,6 +131,11 @@ impl DynamicColumn {
         self.len
     }
 
+    /// Whether this column holds no rows.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
     /// Returns the size in bytes of a single stored component instance.
     pub fn element_size(&self) -> usize {
         self.layout.size
@@ -430,8 +435,7 @@ impl Archetype {
                     // description and store it as a concrete
                     // `Box<ErasedVecStorage>` (no trait-object vtable), so
                     // the column stays valid across module unloads.
-                    component_storages
-                        .insert_erased(ErasedVecStorage::<dyn Component>::new(*info));
+                    component_storages.insert_erased(ErasedVecStorage::<dyn Component>::new(*info));
                 }
                 StorageFactory::Dynamic(layout) => {
                     dynamic_component_storages

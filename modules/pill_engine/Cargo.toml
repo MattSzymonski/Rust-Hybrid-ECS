@@ -80,6 +80,10 @@ name = "entity_lifecycle"
 harness = false
 
 [[bench]]
+name = "minimal"
+harness = false
+
+[[bench]]
 name = "query_iteration"
 harness = false
 
@@ -97,10 +101,6 @@ harness = false
 
 [[bench]]
 name = "resource_commands"
-harness = false
-
-[[bench]]
-name = "minimal"
 harness = false
 
 [lib]

@@ -607,7 +607,8 @@ fn collect_sprite_instances_named(
             .min(position_storage.len())
             .min(sprite_storage.len());
         for row in 0..row_count {
-            let position = unsafe { read_shared_component::<Position>(position_storage.get_dyn(row)) };
+            let position =
+                unsafe { read_shared_component::<Position>(position_storage.get_dyn(row)) };
             let sprite = unsafe { read_shared_component::<Sprite>(sprite_storage.get_dyn(row)) };
             instances.push(SpriteInstance {
                 position: [position.x, position.y],

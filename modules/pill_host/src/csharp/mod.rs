@@ -17,6 +17,8 @@
 mod abi;
 /// High-level C# project startup, discovery, and scheduler registration.
 mod backend;
+/// Host-side generation of the C# mirror structs for exposed module components.
+mod codegen;
 /// Native callbacks that translate C# lifecycle requests into deferred ECS commands.
 mod commands;
 /// C# component identities, native bindings, and manifest registration.
@@ -27,8 +29,6 @@ mod context;
 mod csharp_runtime;
 /// Native callbacks used by C# query enumerators.
 mod queries;
-/// Host-side generation of the C# mirror structs for exposed module components.
-mod codegen;
 
 // =============================================================================
 // Types + Impls

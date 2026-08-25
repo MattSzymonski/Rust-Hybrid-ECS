@@ -470,7 +470,7 @@ where
         let iterator_slice_count: usize = self
             .archetype_ranges
             .iter()
-            .map(|(_, _, _, len)| (len + min_len - 1) / min_len)
+            .map(|(_, _, _, len)| len.div_ceil(min_len))
             .sum();
         let mut iterator_slices: Vec<(usize, usize, usize)> =
             Vec::with_capacity(iterator_slice_count);
@@ -643,7 +643,7 @@ where
         let iterator_slice_count: usize = self
             .archetype_ranges
             .iter()
-            .map(|(_, _, _, len)| (len + min_len - 1) / min_len)
+            .map(|(_, _, _, len)| len.div_ceil(min_len))
             .sum();
         let mut iterator_slices: Vec<(usize, usize, usize)> =
             Vec::with_capacity(iterator_slice_count);

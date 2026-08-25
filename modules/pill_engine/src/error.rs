@@ -442,7 +442,6 @@ pub enum EngineError {
 mod tests {
     use super::*;
     use miette::Diagnostic as _;
-    use pill_core::error::EngineMessage as _;
 
     /// Plain rendering preserves the semantic values of a world error.
     #[test]

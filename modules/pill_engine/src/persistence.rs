@@ -1273,7 +1273,7 @@ mod tests {
         );
 
         let type_name = std::any::type_name::<DropTestForgottenComponent>().to_string();
-        let dropped = world.drop_forgotten_components(&[type_name.clone()]);
+        let dropped = world.drop_forgotten_components(std::slice::from_ref(&type_name));
         assert_eq!(dropped, 2, "both entities carried the forgotten component");
 
         // The entity that only carried the forgotten component is destroyed;

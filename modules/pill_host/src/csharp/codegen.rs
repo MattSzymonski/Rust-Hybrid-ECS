@@ -178,11 +178,8 @@ mod tests {
 
     /// Create a fresh temp workspace and the module directory under it.
     fn temp_workspace(test_name: &str, module_name: &str) -> PathBuf {
-        let root = std::env::temp_dir().join(format!(
-            "pill_codegen_{}_{}",
-            test_name,
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("pill_codegen_{}_{}", test_name, std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("optional").join(module_name))
             .expect("create temp module dir");

@@ -226,6 +226,12 @@ impl LoadedProject {
 
 /// Reload one native generation and migrate components whose persisted schema
 /// changed across the module boundary.
+// Eight parameters, and they are eight distinct collaborators rather than
+// fields of an implicit struct: the three pieces of generation state this
+// mutates, the engine and its API table, where to build, what to build, and the
+// cancellation signal. Grouping them would name a type that exists only to
+// satisfy the lint, and would hide which of them this function mutates.
+#[allow(clippy::too_many_arguments)]
 fn reload_native(
     current: &mut NativeLibrary,
     old_libraries: &mut Vec<NativeLibrary>,

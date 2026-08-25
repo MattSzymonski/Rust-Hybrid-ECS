@@ -163,6 +163,10 @@ impl ByteComponentAdder {
 }
 
 /// Deferred command to be executed later
+// Every variant ends in `Entity` because every deferred command acts on one;
+// the suffix is the subject, not noise. Dropping it would leave `Create`,
+// `AddComponentTo` and `Destroy`, which read worse at the match sites.
+#[allow(clippy::enum_variant_names)]
 enum DeferredCommand {
     /// Create a new entity carrying native and type-erased components.
     CreateEntity {

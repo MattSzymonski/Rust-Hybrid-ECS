@@ -70,7 +70,7 @@ impl ScriptComponent for Counter {
         }
 
         // Step 5: Queue a component addition through the command buffer.
-        let entity: Entity = script_context.get_owning_entity().clone();
+        let entity: Entity = script_context.get_owning_entity();
 
         script_context.get_commands().add_component_to_entity(
             entity,

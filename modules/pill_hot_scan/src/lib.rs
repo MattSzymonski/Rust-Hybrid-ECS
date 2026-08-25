@@ -582,9 +582,7 @@ pub fn all_functions(source: &str) -> Vec<HotFunction> {
                                 index,
                                 "#[inline(always)]",
                             ),
-                            abi_entry_point: declaration_is_abi_entry_point(
-                                source, &mask, index,
-                            ),
+                            abi_entry_point: declaration_is_abi_entry_point(source, &mask, index),
                             annotated: annotated.contains_key(&name),
                         });
                     }

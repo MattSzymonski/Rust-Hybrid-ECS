@@ -18,9 +18,9 @@
 // `pill_module` must resolve in every build (the attribute is applied to
 // `register` in source); `Engine` is only needed by the module-abi build,
 // where `register` is actually compiled in.
+use pill_engine::pill_module;
 #[cfg(feature = "module-abi")]
 use pill_engine::Engine;
-use pill_engine::pill_module;
 
 // =============================================================================
 // Struct
@@ -36,7 +36,10 @@ impl LcgRandom {
     /// Advances the generator and returns the next value in its sequence.
     pub fn next_u32(&mut self) -> u32 {
         // Numeric Recipes LCG constants; fine for a dummy deterministic stream.
-        self.state = self.state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        self.state = self
+            .state
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
         self.state
     }
 
@@ -67,4 +70,3 @@ pub fn seed_from_u32(seed: u32) -> LcgRandom {
 fn register(_engine: &mut Engine) -> u32 {
     0
 }
-

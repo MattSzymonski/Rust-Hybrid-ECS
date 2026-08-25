@@ -288,6 +288,10 @@ impl SystemScheduler {
         let new_idx = self.system_count - 1;
         // Add a row for the new system.
         let mut new_row = vec![false; self.system_count];
+        // Indexed rather than iterated: each step writes `new_row[j]` AND
+        // pushes to `conflict_matrix[j]`, keeping the symmetric matrix in step.
+        // A zip over one of them would hide that the same index addresses both.
+        #[allow(clippy::needless_range_loop)]
         for j in 0..new_idx {
             let conflict = self.access_patterns[new_idx].conflicts_with(&self.access_patterns[j]);
             new_row[j] = conflict;
@@ -931,7 +935,7 @@ mod tests {
         assert_eq!(scheduler.execution_graph()[0].len(), 5);
     }
 
-    /// Resource Conflict Tests
+    // Resource Conflict Tests
     // ----------------------------------------------------------------------------
 
     /// Verifies that two systems reading the same resource can run in parallel.
@@ -1150,7 +1154,7 @@ mod tests {
         );
     }
 
-    /// Empirical verification: exhaustive enumeration + random fuzz
+    // Empirical verification: exhaustive enumeration + random fuzz
     // ----------------------------------------------------------------------------
     //
     // These tests do NOT constitute a mathematical proof. They are empirical
@@ -1201,10 +1205,10 @@ mod tests {
 
     /// Exhaustive verification for small system counts.
     ///
-    /// Enumerates every possible n-tuple of access kinds for n = 1..=6.
-    /// With 10 access kinds, that's 10 + 100 + 1,000 + 10,000 + 100,000
-    /// + 1,000,000 = 1,111,110 unique input configurations. Each one runs
-    /// through `build_execution_graph` and is checked for two invariants:
+    /// Enumerates every possible n-tuple of access kinds for n = 1..=6. With 10
+    /// access kinds that is 10 + 100 + 1,000 + 10,000 + 100,000 + 1,000,000 =
+    /// 1,111,110 unique input configurations. Each one runs through
+    /// `build_execution_graph` and is checked for two invariants:
     ///
     /// 1. No batch contains conflicting systems (the core safety guarantee).
     /// 2. Every system appears in exactly one batch (no omissions, no
@@ -1240,6 +1244,9 @@ mod tests {
             // Enumerate all n-tuples by counting in base kinds.len()
             for counter in 0..total {
                 let mut counter_value = counter;
+                // `i` is the digit position being decoded out of `counter`, so
+                // it is the subject of the loop rather than an index artifact.
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..n as usize {
                     tuple[i] = (counter_value % kinds.len() as u32) as u8;
                     counter_value /= kinds.len() as u32;

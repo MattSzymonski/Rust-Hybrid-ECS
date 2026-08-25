@@ -49,7 +49,6 @@ use super::ptr::SendPtr;
 /// [`excluded_component_ids`]: QueryFilter::excluded_component_ids
 /// [`init_state`]: QueryFilter::init_state
 /// [`matches`]: QueryFilter::matches
-
 pub trait QueryFilter {
     /// Per-archetype cached state used by [`Self::matches`].
     type State: Send + Sync;

@@ -129,9 +129,8 @@ impl<T: Component> QueryTarget for &T {
                 ("Component type: {}", std::any::type_name::<T>())
             ]
         );
-        SendPtr::new(
-            archetype.component_storages.get_storage::<T>() as *const ErasedVecStorage<dyn Component>
-        )
+        SendPtr::new(archetype.component_storages.get_storage::<T>()
+            as *const ErasedVecStorage<dyn Component>)
     }
 
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {

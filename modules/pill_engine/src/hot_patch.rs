@@ -757,9 +757,8 @@ pub fn function_extent(address: usize) -> Option<(usize, usize)> {
     // directory for an arbitrary address and reports a null entry when it finds
     // none. `image_base` is a writable local, and passing a null history table
     // asks for no caching.
-    let entry = unsafe {
-        RtlLookupFunctionEntry(address as u64, &mut image_base, core::ptr::null_mut())
-    };
+    let entry =
+        unsafe { RtlLookupFunctionEntry(address as u64, &mut image_base, core::ptr::null_mut()) };
     if entry.is_null() {
         return None;
     }
@@ -842,8 +841,8 @@ pub unsafe fn patch_prologue(target: usize, replacement: usize) -> Result<Vec<u8
     }
 
     // SAFETY: the page is now writable and the range was validated above.
-    let original = unsafe { core::slice::from_raw_parts(target_pointer, ABSOLUTE_JUMP_LENGTH) }
-        .to_vec();
+    let original =
+        unsafe { core::slice::from_raw_parts(target_pointer, ABSOLUTE_JUMP_LENGTH) }.to_vec();
 
     // mov rax, imm64 ; jmp rax
     let mut instructions = [0u8; ABSOLUTE_JUMP_LENGTH];
@@ -855,11 +854,7 @@ pub unsafe fn patch_prologue(target: usize, replacement: usize) -> Result<Vec<u8
 
     // SAFETY: the page is writable and the slice length matches exactly.
     unsafe {
-        core::ptr::copy_nonoverlapping(
-            instructions.as_ptr(),
-            target_pointer,
-            ABSOLUTE_JUMP_LENGTH,
-        );
+        core::ptr::copy_nonoverlapping(instructions.as_ptr(), target_pointer, ABSOLUTE_JUMP_LENGTH);
     }
 
     // SAFETY: restoring the protection the call above reported.
@@ -1527,7 +1522,10 @@ mod integration_tests {
             .expect("the function path must be registered alongside the display name");
 
         assert!(
-            engine.hot_patch_registry().get(function_path_entry).is_some(),
+            engine
+                .hot_patch_registry()
+                .get(function_path_entry)
+                .is_some(),
             "both names must resolve to a slot"
         );
 
@@ -1678,13 +1676,13 @@ mod integration_tests {
 
         // SAFETY: real functions in this binary with the same call shape, and
         // no other thread calls `patch_target_twice`.
-        let generation_one = unsafe { patch_prologue(target, first_replacement) }
-            .expect("first patch");
+        let generation_one =
+            unsafe { patch_prologue(target, first_replacement) }.expect("first patch");
         assert_eq!(std::hint::black_box(patch_target_twice)(1), 1001);
 
         // SAFETY: as above. What this returns is generation one's jump.
-        let generation_two = unsafe { patch_prologue(target, second_replacement) }
-            .expect("second patch");
+        let generation_two =
+            unsafe { patch_prologue(target, second_replacement) }.expect("second patch");
         assert_eq!(std::hint::black_box(patch_target_twice)(1), 2001);
 
         assert_ne!(

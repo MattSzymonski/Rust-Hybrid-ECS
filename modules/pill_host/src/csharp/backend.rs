@@ -293,11 +293,7 @@ impl CSharpRuntime {
         if copy_manifest(manifest.as_mut_ptr(), manifest_length) == 0 {
             return Err(CSharpError::ManifestCopyFailed);
         }
-        let bindings = Arc::new(register_component_manifest(
-            engine,
-            &manifest,
-            bindings,
-        )?);
+        let bindings = Arc::new(register_component_manifest(engine, &manifest, bindings)?);
 
         // Step 3: Run every reflected managed startup method transactionally.
         // Commands are queued first and applied only when every startup
