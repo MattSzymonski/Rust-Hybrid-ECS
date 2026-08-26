@@ -10,7 +10,7 @@ miette = "7"
 tracing = "0.1"
 
 [build-dependencies]
-pill_build_support = { path = "../pill_build_support" }
+pill_hot_scan = { path = "../pill_hot_scan" }
 
 [features]
 # Windowed mode: `host::run` owns the winit event loop and wgpu renderer

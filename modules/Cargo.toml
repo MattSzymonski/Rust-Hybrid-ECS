@@ -6,10 +6,8 @@ members = [
     "pill_core",
     "pill_core_macros",
     "pill_host",
-    "pill_hot_runtime",
     "pill_hot_scan",
     "pill_standalone",
-    "pill_build_support",
     # Every crate under `optional/` is an optional engine module, discovered by
     # this glob so adding one is just creating a directory. The glob is scoped
     # to that directory rather than the workspace root because every path it

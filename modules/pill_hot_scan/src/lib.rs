@@ -11,7 +11,8 @@
 //! from both, removes that class of bug rather than documenting it.
 //!
 //! It has no dependencies on purpose: build scripts run before everything else,
-//! so anything pulled in here is paid on every clean build.
+//! so anything pulled in here is paid on every clean build. That constraint is
+//! what makes this the right home for any other build-script helper too.
 //!
 //! # Responsibilities
 //!
@@ -20,6 +21,12 @@
 //! - Produce the normalized declaration both sides compare.
 //! - Collect a file's top-level `use` statements.
 //! - Strip named function bodies, so a body-only edit can be told from any other.
+//! - Stage the toolchain's `std-*.dll` beside a binary built with
+//!   `-C prefer-dynamic`, so it runs without the toolchain on `PATH`.
+//!
+//! The last one is unrelated to scanning and lives here for one reason: it is
+//! also build-script-only and also has to be dependency-free, so a separate
+//! crate for one small function bought a workspace member and nothing else.
 //!
 //! # Design
 //!
@@ -37,6 +44,8 @@
 // Standard library
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
+use std::process::Command;
 
 // =============================================================================
 // Code mask
@@ -1158,6 +1167,142 @@ fn rust_files(root: &Path) -> Vec<PathBuf> {
 fn write_inventory(path: &Path, contents: &str) {
     std::fs::write(path, contents.as_bytes())
         .unwrap_or_else(|error| panic!("cannot write {}: {error}", path.display()));
+}
+
+// =============================================================================
+// Standard-library dylib staging
+// =============================================================================
+
+/// Stage the toolchain's std dylib next to the binary being built.
+///
+/// Call this from a `build.rs` `main`. It resolves the output directory from
+/// `OUT_DIR`, so it must run as a build script. Failures degrade to
+/// `cargo:warning` messages and never fail the build, and the copy is
+/// idempotent. On non-Windows platforms this is a no-op.
+pub fn stage_std_dylib() {
+    // The std dylib is a Windows artifact; other platforms either find the
+    // dynamic library through the executable's own directory or have no
+    // dylib std at all.
+    #[cfg(windows)]
+    stage_std_dylib_windows();
+}
+
+// =============================================================================
+// Windows Staging
+// =============================================================================
+
+/// Copy every `std-*.dll` from the active toolchain into the output directory.
+///
+/// Warnings instead of hard errors: a missing or moved toolchain should not
+/// break the build, it should only leave the old `PATH` requirement in place.
+#[cfg(windows)]
+fn stage_std_dylib_windows() {
+    // Step 1: Resolve the toolchain sysroot through the compiler cargo used,
+    // so the copy follows toolchain switches instead of a hardcoded path.
+    let sysroot = match rust_sysroot() {
+        Ok(sysroot) => sysroot,
+        Err(reason) => {
+            println!("cargo:warning=std dylib not staged: {reason}");
+            return;
+        }
+    };
+
+    // Step 2: Build the sysroot path that holds the host's std dylib.
+    let host = std::env::var("HOST").unwrap_or_else(|_| "x86_64-pc-windows-msvc".to_string());
+    let std_lib_directory = PathBuf::from(&sysroot)
+        .join("lib")
+        .join("rustlib")
+        .join(host)
+        .join("lib");
+
+    // Step 3: Resolve the output directory that will hold the executable.
+    // `OUT_DIR` is `<target>/<profile>/build/<package>-<hash>/out`, so three
+    // parents up is the same directory the built executable lands in.
+    let Some(output_directory) =
+        std::env::var_os("OUT_DIR")
+            .map(PathBuf::from)
+            .and_then(|out_directory| {
+                out_directory
+                    .parent()
+                    .and_then(Path::parent)
+                    .and_then(Path::parent)
+                    .map(PathBuf::from)
+            })
+    else {
+        println!("cargo:warning=std dylib not staged: cannot locate the output directory");
+        return;
+    };
+
+    // Step 4: Copy each matching dylib beside the executable. A locked file
+    // (the binary is running) simply skips with a warning; the next build
+    // retries.
+    let entries = match std::fs::read_dir(&std_lib_directory) {
+        Ok(entries) => entries,
+        Err(error) => {
+            println!(
+                "cargo:warning=std dylib not staged: cannot read {} ({error})",
+                std_lib_directory.display()
+            );
+            return;
+        }
+    };
+
+    // Counted separately so the warning can say which of the two things went
+    // wrong. They are not the same problem: no candidates means the toolchain
+    // layout is not what this expects, while a failed copy is almost always a
+    // destination file locked by a running binary, which the next build fixes
+    // by itself. Reporting the second as the first sends a reader looking for
+    // a missing file that was there all along.
+    let mut candidate_count = 0usize;
+    let mut staged_count = 0usize;
+    let mut last_error = String::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if file_name.starts_with("std-") && file_name.ends_with(".dll") {
+            candidate_count += 1;
+            let destination = output_directory.join(file_name);
+            match std::fs::copy(entry.path(), &destination) {
+                Ok(_) => staged_count += 1,
+                Err(error) => last_error = error.to_string(),
+            }
+        }
+    }
+
+    if candidate_count == 0 {
+        println!(
+            "cargo:warning=std dylib not staged: no std-*.dll found in {}",
+            std_lib_directory.display()
+        );
+    } else if staged_count == 0 {
+        println!(
+            "cargo:warning=std dylib not staged: found {candidate_count} in {}, but no copy into {} succeeded ({last_error}); a running binary usually holds the lock",
+            std_lib_directory.display(),
+            output_directory.display()
+        );
+    }
+}
+
+/// Run `rustc --print sysroot` and return the toolchain's root directory.
+#[cfg(windows)]
+fn rust_sysroot() -> Result<String, String> {
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let output = Command::new(&rustc)
+        .arg("--print")
+        .arg("sysroot")
+        .output()
+        .map_err(|error| error.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "`{rustc} --print sysroot` exited with {:?}",
+            output.status
+        ));
+    }
+    String::from_utf8(output.stdout)
+        .map(|sysroot| sysroot.trim().to_string())
+        .map_err(|error| error.to_string())
 }
 
 // =============================================================================

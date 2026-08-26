@@ -19,7 +19,7 @@ miette = { version = "7", features = ["derive"] }
 tracing = "0.1"
 
 [build-dependencies]
-pill_build_support = { path = "../pill_build_support" }
+pill_hot_scan = { path = "../pill_hot_scan" }
 
 [features]
 # Enable Tracy profiling through the shared telemetry stack.

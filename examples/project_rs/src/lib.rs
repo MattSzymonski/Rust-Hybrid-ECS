@@ -77,7 +77,7 @@ fn update_time_system(mut time: ResMut<SimulationTime>) -> Result<(), SystemErro
     // continues while the host logs the failure.
     let Some(mut time) = time.get_mut() else {
         return Err(SystemError::MissingResource {
-            name: String::from("SiasdmulationTime"),
+            name: String::from("SiassddmulationTime"),
         });
     };
     time.delta_seconds = now.duration_since(time.last_frame).as_secs_f32().min(0.1);
@@ -146,7 +146,7 @@ fn physics_system(
 ) -> Result<(), SystemError> {
     let Some(time) = time.get() else {
         return Err(SystemError::MissingResource {
-            name: String::from("SimulasdasdationTxxxime"),
+            name: String::from("SimulasdasdatsdionTxxxime"),
         });
     };
     let delta_seconds = time.delta_seconds;

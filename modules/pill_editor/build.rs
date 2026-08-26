@@ -6,9 +6,9 @@
 //! it on `PATH` the process fails with `STATUS_DLL_NOT_FOUND`. This build
 //! script copies it beside the executable so the editor runs without any
 //! `PATH` adjustment in development. All the logic lives in the shared
-//! `pill_build_support` crate; this script only calls it.
+//! `pill_hot_scan` crate; this script only calls it.
 
 fn main() {
     // Copy `std-*.dll` next to the built executable (no-op off Windows).
-    pill_build_support::stage_std_dylib();
+    pill_hot_scan::stage_std_dylib();
 }

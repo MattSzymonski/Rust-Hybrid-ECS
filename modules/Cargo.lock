@@ -1580,10 +1580,10 @@ dependencies = [
  "dioxus",
  "futures-util",
  "miette",
- "pill_build_support",
  "pill_core",
  "pill_core_macros",
  "pill_host",
+ "pill_hot_scan",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
@@ -4177,10 +4177,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pill_build_support"
-version = "0.1.0"
-
-[[package]]
 name = "pill_core"
 version = "0.1.0"
 dependencies = [
@@ -4266,7 +4262,6 @@ dependencies = [
  "pill_core",
  "pill_core_macros",
  "pill_engine_macros",
- "pill_hot_runtime",
  "pollster",
  "rayon",
  "serde",
@@ -4307,13 +4302,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pill_hot_runtime"
-version = "0.1.0"
-dependencies = [
- "inventory",
-]
-
-[[package]]
 name = "pill_hot_scan"
 version = "0.1.0"
 
@@ -4334,9 +4322,9 @@ name = "pill_standalone"
 version = "0.1.0"
 dependencies = [
  "miette",
- "pill_build_support",
  "pill_core",
  "pill_host",
+ "pill_hot_scan",
  "tracing",
 ]
 
