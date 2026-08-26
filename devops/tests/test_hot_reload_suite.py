@@ -606,6 +606,16 @@ SESSION_B_SCENARIOS = [
                 # project probe matches only the project's embedded Spline (its
                 # own TypeId), so after both reloads it still sees exactly one -
                 # the module DLL's copy is a distinct type (audit 3.1/C1).
+                #
+                # Only `1 spline(s)` carries that meaning. `xxsees` is incidental
+                # text from `examples/project_rs/src/lib.rs`, and this token is
+                # matched as a plain substring of the host's stdout - so editing
+                # that probe string, which the demo exists to encourage, fails
+                # this scenario with "Missing required token" even though the
+                # cascade worked perfectly. If that happens, read the analytics
+                # lines just above the failure: two reloads and a `1 spline(s)`
+                # in the output mean the behaviour is fine and only the wording
+                # moved. Widening this to `1 spline(s)` is the better fix.
                 required_tokens=[
                     RELOAD_MODULE_TOKEN,
                     MODULE_RELOAD_COMPLETE_TOKEN,

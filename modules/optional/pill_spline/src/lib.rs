@@ -262,6 +262,14 @@ fn register(engine: &mut Engine) -> u32 {
 
     // Fully qualified: the import would be unused in the project build, where
     // this module-abi registration path is compiled out.
+    //
+    // NOTE: this line is asserted on. `MODULE_REGISTERED_MESSAGE` in
+    // `devops/core/suite_common.py` matches the message text against the
+    // host's stdout, and scenarios in `devops/tests/test_hot_reload_suite.py`
+    // additionally require the `existing=` field - which is what proves a
+    // reload preserved the entities the previous generation created rather
+    // than spawning a fresh set. Reword either and those suites fail with
+    // "Missing required token", which reads like a reload failure and is not.
     pill_core::info!(
         target: pill_core::telemetry::telemetry_target::ECS,
         splines = DEMO_SPLINE_COUNT,

@@ -57,6 +57,24 @@ HOST_CONFIG_YAML = MODULES_ROOT / "pill_config.yaml"
 #
 # The host's log lines are a test contract: the suites assert on literal
 # substrings. Keep every token here so a reword is fixed in one place.
+#
+# HOW THE ASSERTION WORKS, because the failure message does not say so: the
+# harness captures the host's merged stdout/stderr into one string, and each
+# token is checked with `token not in output`. Nothing is compared against a
+# source file. So a token fails for exactly one reason - the host did not print
+# that text - and the fix is either to reword the token or to find out why the
+# host went quiet.
+#
+# THE TRAP. Most tokens below are printed by `pill_host`, which nobody edits
+# casually. Two are not: MODULE_REGISTERED_MESSAGE and PROJECT_PROBE_PREFIX
+# come from the example project and the example module - the two files the
+# whole hot-reload demo invites you to type into. Editing the probe string
+# breaks these suites with a "Missing required token" that reads like a reload
+# failure and is not: the reload worked, the text just moved.
+#
+# Prefer matching the part of a line that carries meaning - a count, a computed
+# value - over the part that is only there to be edited. Where a token still
+# pins incidental text, say why at the assertion that uses it.
 # =============================================================================
 
 STARTUP_TOKEN = "Entering project loop"
@@ -78,6 +96,12 @@ ACCESS_VIOLATION_TOKEN = "STATUS_ACCESS_VIOLATION"
 # "pill_spline module registered splines=1 existing=0 max_control_points=16").
 MODULE_REGISTERED_MESSAGE = "pill_spline module registered"
 # The project probe line ("[project] xxsees N spline(s), midpoint (...)").
+#
+# `xxsees` is not a word: it is `sees` with characters typed into it during a
+# live-coding session, and it survives only because these suites pin it. That
+# is the trap above in miniature - the prefix carries no meaning. If this breaks
+# again, prefer widening it to "[project] " and asserting on the spline count,
+# rather than restoring whatever the demo happens to print today.
 PROJECT_PROBE_PREFIX = "[project] xxsees"
 
 # =============================================================================

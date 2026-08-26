@@ -237,6 +237,18 @@ fn spline_probe_system(
     // Printed rather than logged through `tracing`: the project links its own
     // copy of `pill_core`, so its tracing dispatcher has no subscriber and log
     // lines emitted here never reach the host's telemetry.
+    //
+    // NOTE: parts of this line are asserted on. `devops/core/suite_common.py`
+    // matches `PROJECT_PROBE_PREFIX` against the host's stdout, and the
+    // cascade scenario in `devops/tests/test_hot_reload_suite.py` requires
+    // `1 spline(s)` - that count is what proves the project and the separately
+    // loaded `pill_spline` module keep distinct `TypeId`s across a reload.
+    //
+    // Editing the surrounding words is exactly what this file is for, but it
+    // does break those suites, and the failure reads as "Missing required
+    // token" rather than as a wording change. Keep `{visible_spline_count}
+    // spline(s)` and the `midpoint ({:.1}, {:.1})` shape intact, or update the
+    // tokens in the two files above to match.
     println!(
         "[project] dawdxxseaasdadwwdes {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), colawdoxxxxrx {:.2}",
         midpoint.x, midpoint.y, color
