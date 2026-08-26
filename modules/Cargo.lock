@@ -4266,6 +4266,7 @@ dependencies = [
  "pill_core",
  "pill_core_macros",
  "pill_engine_macros",
+ "pill_hot_runtime",
  "pollster",
  "rayon",
  "serde",
@@ -4303,6 +4304,13 @@ dependencies = [
  "tracing",
  "trait_type_map",
  "winit",
+]
+
+[[package]]
+name = "pill_hot_runtime"
+version = "0.1.0"
+dependencies = [
+ "inventory",
 ]
 
 [[package]]

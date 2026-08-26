@@ -994,7 +994,7 @@ pub fn generate_function_inventory() {
             if let Some(trait_name) = &function.trait_name {
                 if !trait_is_nameable_from_crate_root(trait_name, &segments, &contents) {
                     println!(
-                        "cargo:warning=pill: `{}::{}` is not registered for hot                          patching: the trait `{trait_name}` is named through a                          `use` in its own module, which the generated inventory                          at the crate root cannot see. Write the trait's full                          path in the `impl` header to make it patchable",
+                        "cargo:warning=pill: `{}::{}` is not registered for hot patching: the trait `{trait_name}` is named through a `use` in its own module, which the generated inventory at the crate root cannot see. Write the trait's full path in the `impl` header to make it patchable",
                         function.self_type.as_deref().unwrap_or("?"),
                         function.name
                     );

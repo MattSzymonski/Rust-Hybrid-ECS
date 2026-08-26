@@ -831,8 +831,10 @@ fn materialize_host_project_member(
     // slashes keep the TOML strings valid on Windows.
     let mut generated_manifest = String::with_capacity(source_manifest.len() + 512);
     let mut cursor = 0usize;
+    let mut rewritten_paths: Vec<(String, String)> = Vec::new();
     while let Some(relative_start) = source_manifest[cursor..].find("path = \"") {
-        let value_start = cursor + relative_start + "path = \"".len();
+        let key_offset = cursor + relative_start;
+        let value_start = key_offset + "path = \"".len();
         let Some(relative_end) = source_manifest[value_start..].find('"') else {
             break;
         };
@@ -846,11 +848,36 @@ fn materialize_host_project_member(
                 .to_string_lossy()
                 .replace('\\', "/")
         };
+        rewritten_paths.push((
+            manifest_entry_name(&source_manifest, key_offset),
+            absolute.clone(),
+        ));
         generated_manifest.push_str(&source_manifest[cursor..value_start]);
         generated_manifest.push_str(&absolute);
         cursor = relative_end;
     }
     generated_manifest.push_str(&source_manifest[cursor..]);
+
+    // Step 1b: Refuse to write a member Cargo cannot load. The generated member
+    // is picked up by the `optional/*` glob, so a single unresolvable path in
+    // it stops Cargo loading the workspace at all - which breaks every build,
+    // test and lint in the repository, including the build that would replace
+    // the member. Report the offending path instead, and clear any member an
+    // earlier run left behind so the workspace stays loadable either way.
+    if let Some((dependency, resolved_path)) = rewritten_paths
+        .into_iter()
+        .find(|(_, absolute)| !Path::new(absolute).exists())
+    {
+        let member_directory = workspace_root
+            .join(OPTIONAL_MODULE_DIRECTORY)
+            .join(format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}"));
+        let _ = std::fs::remove_dir_all(&member_directory);
+        return Err(ConfigError::ProjectDependencyPathMissing {
+            manifest_path: project_root.join("Cargo.toml").display().to_string(),
+            dependency,
+            resolved_path,
+        });
+    }
 
     // Step 2: Drop the project's own `[workspace]` tables. A standalone
     // project declares itself a workspace root; as a member of the engine
@@ -912,6 +939,7 @@ fn materialize_host_project_member(
             source,
         }
     })?;
+    prune_stale_host_project_members(workspace_root, &member_directory);
     let member_manifest = member_directory.join("Cargo.toml");
     let content_changed = std::fs::read_to_string(&member_manifest)
         .map(|existing| existing != generated_manifest)
@@ -926,6 +954,73 @@ fn materialize_host_project_member(
     }
 
     Ok(())
+}
+
+/// Names the manifest entry that owns the `path = "..."` at `key_offset`.
+///
+/// Used only to make an error message actionable: it reports which dependency
+/// (or which section, for a `[lib]` path) has an unresolvable path, rather than
+/// leaving the reader to work that out from the resolved path alone. Falls back
+/// to the enclosing section header when the line carries no key of its own, and
+/// to `"unknown"` when neither can be determined.
+fn manifest_entry_name(manifest: &str, key_offset: usize) -> String {
+    let line_start = manifest[..key_offset]
+        .rfind('\n')
+        .map_or(0, |index| index + 1);
+
+    // `pill_engine = { path = "..." }` names the dependency on the same line.
+    if let Some(name) = manifest[line_start..key_offset].split('=').next() {
+        let name = name.trim().trim_start_matches('[');
+        if !name.is_empty() {
+            return name.to_string();
+        }
+    }
+
+    // A bare `path = "..."` belongs to whatever section it sits under.
+    manifest[..key_offset]
+        .rfind('[')
+        .and_then(|open| {
+            manifest[open..]
+                .find(']')
+                .map(|close| &manifest[open..=open + close])
+        })
+        .map_or_else(|| "unknown".to_string(), str::to_string)
+}
+
+/// Removes host-generated workspace members left behind by earlier runs.
+///
+/// Every directory under `optional/` whose name carries
+/// [`HOST_PROJECT_MEMBER_PREFIX`] was written by this function, so any one that
+/// is not the member being materialized now belongs to a project the host is no
+/// longer pointed at. Leaving it in place is not harmless: the `optional/*`
+/// glob still picks it up as a workspace member, and its dependency paths point
+/// into the previous project's directory. Once that directory moves or is
+/// deleted, Cargo fails to load the workspace at all, so every build, test and
+/// lint in the repository stops working with an error naming a crate nobody
+/// asked for.
+///
+/// Failures are ignored rather than propagated. A stale member the host cannot
+/// remove (a file lock, a permission problem) is a housekeeping problem, not a
+/// reason to refuse to start; the build that follows either succeeds or reports
+/// the real error itself.
+fn prune_stale_host_project_members(workspace_root: &Path, keep: &Path) {
+    let optional_root = workspace_root.join(OPTIONAL_MODULE_DIRECTORY);
+    let Ok(entries) = std::fs::read_dir(&optional_root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path == keep || !path.is_dir() {
+            continue;
+        }
+        let is_generated = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(HOST_PROJECT_MEMBER_PREFIX));
+        if is_generated {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
 }
 
 // =============================================================================
@@ -1259,6 +1354,183 @@ fn add_rlib_crate_type(manifest: &str) -> String {
     rewritten.push_str(", \"rlib\"");
     rewritten.push_str(&manifest[lib_header + close..]);
     rewritten
+}
+
+#[cfg(test)]
+mod host_project_member_validation_tests {
+    use super::{
+        manifest_entry_name, materialize_host_project_member, HOST_PROJECT_MEMBER_PREFIX,
+        OPTIONAL_MODULE_DIRECTORY,
+    };
+    use pill_core::error::ConfigError;
+
+    /// A project manifest whose one path dependency is filled in per test, so
+    /// each case differs only in whether that path resolves.
+    fn manifest_with_dependency(dependency_path: &str) -> String {
+        format!(
+            "[package]\nname = \"project\"\nversion = \"0.1.0\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\npill_engine = {{ path = \"{dependency_path}\" }}\n"
+        )
+    }
+
+    /// Lays out a workspace with a project at `project/` and returns its root.
+    ///
+    /// The project directory is a sibling of `optional/`, matching the real
+    /// layout closely enough that relative paths behave the same way.
+    fn workspace(test_name: &str, dependency_path: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("pill_member_{test_name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(OPTIONAL_MODULE_DIRECTORY)).unwrap();
+        std::fs::create_dir_all(root.join("project").join("src")).unwrap();
+        std::fs::write(
+            root.join("project").join("Cargo.toml"),
+            manifest_with_dependency(dependency_path),
+        )
+        .unwrap();
+        std::fs::write(root.join("project").join("src").join("lib.rs"), "").unwrap();
+        root
+    }
+
+    /// Path of the member `materialize_host_project_member` would generate.
+    fn member_directory(root: &std::path::Path) -> std::path::PathBuf {
+        root.join(OPTIONAL_MODULE_DIRECTORY)
+            .join(format!("{HOST_PROJECT_MEMBER_PREFIX}project"))
+    }
+
+    #[test]
+    fn writes_the_member_when_every_path_resolves() {
+        let root = workspace("resolves", "../real_dependency");
+        std::fs::create_dir_all(root.join("real_dependency")).unwrap();
+
+        materialize_host_project_member(&root, "project", "project").unwrap();
+
+        assert!(member_directory(&root).join("Cargo.toml").is_file());
+    }
+
+    #[test]
+    fn refuses_to_write_a_member_with_an_unresolvable_path() {
+        let root = workspace("unresolvable", "../../modules/pill_engine");
+
+        let error = materialize_host_project_member(&root, "project", "project")
+            .expect_err("a dependency path that does not exist must be reported");
+
+        match error {
+            ConfigError::ProjectDependencyPathMissing {
+                ref dependency,
+                ref resolved_path,
+                ..
+            } => {
+                assert_eq!(dependency, "pill_engine");
+                assert!(
+                    resolved_path.contains("pill_engine"),
+                    "the message must name the path that failed, got {resolved_path}"
+                );
+            }
+            other => panic!("expected ProjectDependencyPathMissing, got {other:?}"),
+        }
+        assert!(
+            !member_directory(&root).join("Cargo.toml").exists(),
+            "a member Cargo cannot load must never reach the workspace"
+        );
+    }
+
+    #[test]
+    fn clears_a_member_an_earlier_run_left_behind() {
+        // The failure this guards against: a member written when the paths did
+        // resolve, then invalidated by the project moving. Cargo then refuses
+        // to load the workspace, so the build that would rewrite the member
+        // cannot run - the host has to clear it on the way out.
+        let root = workspace("clears_stale", "../gone");
+        let stale = member_directory(&root);
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("Cargo.toml"), "[package]\nname = \"stale\"\n").unwrap();
+
+        let _ = materialize_host_project_member(&root, "project", "project")
+            .expect_err("the dependency path does not exist");
+
+        assert!(!stale.exists(), "the unloadable member must be removed");
+    }
+
+    #[test]
+    fn names_the_dependency_that_owns_a_path() {
+        let manifest = manifest_with_dependency("../x");
+        let offset = manifest.find("path = \"").unwrap();
+        assert_eq!(manifest_entry_name(&manifest, offset), "pill_engine");
+    }
+
+    #[test]
+    fn falls_back_to_the_section_for_a_bare_path() {
+        let manifest = "[lib]\npath = \"src/lib.rs\"\n";
+        let offset = manifest.find("path = \"").unwrap();
+        assert_eq!(manifest_entry_name(manifest, offset), "[lib]");
+    }
+}
+
+#[cfg(test)]
+mod host_project_member_pruning_tests {
+    use super::{prune_stale_host_project_members, OPTIONAL_MODULE_DIRECTORY};
+
+    /// Creates `optional/<name>/Cargo.toml` under `root` and returns its
+    /// directory, so a test can assert on the directory rather than the file.
+    fn seed_member(root: &std::path::Path, name: &str) -> std::path::PathBuf {
+        let directory = root.join(OPTIONAL_MODULE_DIRECTORY).join(name);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("Cargo.toml"),
+            "[package]
+name = \"x\"
+",
+        )
+        .unwrap();
+        directory
+    }
+
+    /// Builds an empty temporary workspace root, removing any previous run's.
+    fn workspace(test_name: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("pill_prune_{test_name}"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(OPTIONAL_MODULE_DIRECTORY)).unwrap();
+        root
+    }
+
+    #[test]
+    fn removes_a_member_left_by_a_previous_project() {
+        let root = workspace("previous");
+        let stale = seed_member(&root, "host_project_old");
+        let keep = seed_member(&root, "host_project_current");
+
+        prune_stale_host_project_members(&root, &keep);
+
+        assert!(
+            !stale.exists(),
+            "the previous project's member must be gone"
+        );
+        assert!(keep.exists(), "the member being materialized must survive");
+    }
+
+    #[test]
+    fn leaves_real_optional_modules_alone() {
+        let root = workspace("real_modules");
+        let module = seed_member(&root, "pill_spline");
+        let keep = seed_member(&root, "host_project_current");
+
+        prune_stale_host_project_members(&root, &keep);
+
+        assert!(
+            module.exists(),
+            "only host-generated members carry the prefix; a real module must not be deleted"
+        );
+    }
+
+    #[test]
+    fn tolerates_a_missing_optional_directory() {
+        let root = std::env::temp_dir().join("pill_prune_missing");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // Must not panic: a workspace with no `optional/` directory yet is
+        // valid, and refusing to start over it would be worse than the stale
+        // member this function exists to clean up.
+        prune_stale_host_project_members(&root, &root.join("nothing"));
+    }
 }
 
 #[cfg(all(test, feature = "hot_patch"))]

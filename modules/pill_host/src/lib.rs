@@ -44,6 +44,8 @@ mod native_library;
 mod optional_module;
 /// Lifecycle management for the active native or managed project module.
 mod project_module;
+/// The sequence every reload runs once its replacement image is loaded.
+mod reload;
 /// Complete standalone application runner owned by the host crate.
 mod runner;
 /// Engine ownership and frontend-facing frame orchestration.

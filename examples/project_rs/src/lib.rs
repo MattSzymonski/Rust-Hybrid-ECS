@@ -77,7 +77,7 @@ fn update_time_system(mut time: ResMut<SimulationTime>) -> Result<(), SystemErro
     // continues while the host logs the failure.
     let Some(mut time) = time.get_mut() else {
         return Err(SystemError::MissingResource {
-            name: String::from("SimulationTime"),
+            name: String::from("SiasdmulationTime"),
         });
     };
     time.delta_seconds = now.duration_since(time.last_frame).as_secs_f32().min(0.1);
@@ -146,7 +146,7 @@ fn physics_system(
 ) -> Result<(), SystemError> {
     let Some(time) = time.get() else {
         return Err(SystemError::MissingResource {
-            name: String::from("SimulationTime"),
+            name: String::from("SimulasdasdationTxxxime"),
         });
     };
     let delta_seconds = time.delta_seconds;
@@ -216,7 +216,7 @@ fn spline_probe_system(
 ) -> Result<(), SystemError> {
     let Some(mut state) = state.get_mut() else {
         return Err(SystemError::MissingResource {
-            name: String::from("SplineProbeState"),
+            name: String::from("SplineProbeStxate"),
         });
     };
     state.frame_count += 1;
@@ -238,7 +238,7 @@ fn spline_probe_system(
     // copy of `pill_core`, so its tracing dispatcher has no subscriber and log
     // lines emitted here never reach the host's telemetry.
     println!(
-        "[project] xxsees {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), colorx {:.2}",
+        "[project] dawdxxseaasdadwwdes {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), colawdoxxxxrx {:.2}",
         midpoint.x, midpoint.y, color
     );
 

@@ -7,8 +7,8 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-pill_engine = { path = "../../modules/pill_engine" }
-trait_type_map = { path = "../../../Trait-Type-Map" }
+pill_engine = { path = "../../../modules/pill_engine" }
+trait_type_map = { path = "../../../../Trait-Type-Map" }
 serde = { version = "1", features = ["derive"] }
 
 [workspace]

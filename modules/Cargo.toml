@@ -6,6 +6,7 @@ members = [
     "pill_core",
     "pill_core_macros",
     "pill_host",
+    "pill_hot_runtime",
     "pill_hot_scan",
     "pill_standalone",
     "pill_build_support",

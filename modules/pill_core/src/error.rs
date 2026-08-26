@@ -416,6 +416,26 @@ pub enum ConfigError {
         source: std::io::Error,
     },
 
+    /// A `path` dependency in the project manifest does not resolve to an
+    /// existing directory once rewritten for the generated workspace member.
+    ///
+    /// Reported instead of writing the member, because a member Cargo cannot
+    /// load breaks every build in the workspace - including the one that would
+    /// replace it.
+    #[message(
+        "project manifest ",
+        name_style(manifest_path),
+        " declares dependency ",
+        name_style(dependency),
+        " at a path that does not exist: ",
+        name_style(resolved_path)
+    )]
+    ProjectDependencyPathMissing {
+        manifest_path: String,
+        dependency: String,
+        resolved_path: String,
+    },
+
     /// The optional host configuration file could not be read.
     #[message("failed to read host configuration file ", name_style(path))]
     HostConfigFileReadFailed {

@@ -560,6 +560,7 @@ dependencies = [
  "pill_core",
  "pill_core_macros",
  "pill_engine_macros",
+ "pill_hot_runtime",
  "rayon",
  "serde",
  "serde_json",
@@ -576,6 +577,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "pill_hot_runtime"
+version = "0.1.0"
+dependencies = [
+ "inventory",
 ]
 
 [[package]]

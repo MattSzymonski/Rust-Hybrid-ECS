@@ -46,13 +46,40 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime};
 
 // External crates
-use libloading::{Library, Symbol};
+use libloading::Library;
 use pill_core::{debug, info, warn};
 use pill_engine::Engine;
 
 // Current crate
 pub(crate) mod compile;
-pub(crate) mod source;
+pub(crate) mod generations;
+pub(crate) mod routes;
+
+// A function's patch history and the routes back through it.
+pub(crate) use generations::Generation;
+pub use generations::PatchGeneration;
+
+// The three install routes and the patch-image plumbing they share. Re-exported
+// rather than referenced through `routes::` at every call site, so the session
+// below reads the same as it did when these lived in this file.
+use routes::{
+    install_everywhere, prologue_patch_everywhere, reset_everywhere, resolve_in,
+    resolve_patch_address, resolve_plain_in,
+};
+pub(crate) use routes::{LoadedPatch, PrologueRestore};
+/// The source scanner, shared with every crate's build script.
+///
+/// The implementation lives in `pill_hot_scan` because the host and the build
+/// scripts must agree byte for byte about where a function starts and what its
+/// declaration says. They previously had separate scanners, and the moment they
+/// disagreed - a build script naming a method through its type while the host
+/// did not - every method silently failed to patch.
+///
+/// Re-exported under this name so `source::` call sites read as what they are:
+/// a question about source text, not about the scanning crate.
+pub(crate) mod source {
+    pub use pill_hot_scan::*;
+}
 
 use crate::native_library::NativeLibrary;
 
@@ -67,7 +94,7 @@ use compile::CargoRustcLine;
 /// Deliberately NOT `pill_hot_resolve`: a patch links the patched crate's rlib
 /// to reach its types, and that rlib already exports that symbol. Two
 /// `#[no_mangle]` definitions of one name in a single artifact is a link error.
-const PATCH_RESOLVER_EXPORT: &[u8] = b"pill_patch_resolve";
+pub(super) const PATCH_RESOLVER_EXPORT: &[u8] = b"pill_patch_resolve";
 
 /// Prefix that namespaces a patch's registry entry.
 ///
@@ -83,7 +110,7 @@ const PATCH_NAME_PREFIX: &str = "pill_patch::";
 ///
 /// Named from `PATCH_RESOLVER_EXPORT` by the same macro that generates it, and
 /// distinct from the crate's own `pill_hot_resolve_plain` for the same reason.
-const PATCH_PLAIN_EXPORT: &[u8] = b"pill_patch_resolve_plain";
+pub(super) const PATCH_PLAIN_EXPORT: &[u8] = b"pill_patch_resolve_plain";
 
 // =============================================================================
 // Outcome
@@ -226,47 +253,12 @@ impl std::fmt::Display for PatchStages {
 // HotPatchSession
 // =============================================================================
 
-/// One loaded patch library, kept mapped for the process lifetime.
+/// What one successful [`HotPatchSession::apply`] produced.
 ///
-/// Never unloaded, unlike the module graveyard: a slot holds an address inside
-/// this image and nothing re-homes those addresses. That is also what makes
-/// rollback a single pointer store rather than a rebuild.
-struct Generation {
-    /// Qualified name of the function this generation replaced.
-    function: String,
-    /// One-based position in this function's history. Generation zero is the
-    /// original code the running artifact was built with, which has no entry
-    /// here because it needs no library.
-    number: u32,
-    /// Address to install to make this generation active again.
-    address: usize,
-    /// How the replacement is delivered, which decides what rollback does.
-    kind: source::HotFunctionKind,
-    /// Signature identity a system's slot checks before accepting the address.
-    signature_hash: u64,
-    /// The name the delivering route looks this function up by, which is not
-    /// always [`Self::function`] - see `slot_lookup_name`.
-    lookup_name: String,
-    /// Signature text a plain function's slot checks before accepting it.
-    signature: String,
-    /// Bytes overwritten in each artifact, when this generation was delivered
-    /// by prologue patching. Empty for a slot-delivered generation.
-    prologue_restores: Vec<PrologueRestore>,
-    /// Whether [`Self::prologue_restores`] was emptied by a reload rather than
-    /// never having been filled.
-    ///
-    /// The two are indistinguishable once the list is empty, and they need
-    /// opposite answers: a slot-delivered generation is rolled back through its
-    /// slot, while one whose addresses a reload invalidated cannot be rolled
-    /// back at all. Without this the second case took the first case's route and
-    /// failed claiming the crate was not loaded, which is not what went wrong.
-    prologue_history_dropped: bool,
-    /// When this generation went live, for `patch_generations` listings.
-    installed_at: Instant,
-}
-
-/// What one successful `apply` produced, for the outcome and analytics line.
-struct Installed {
+/// Named for the call that returns it rather than for the act of installing:
+/// the installation is one step inside `apply`, and the generation number,
+/// artifact size and route below describe the whole attempt.
+struct ApplyResult {
     /// Which generation this became.
     generation: u32,
     /// Size of the compiled patch on disk.
@@ -283,29 +275,49 @@ struct Installed {
     copies: usize,
 }
 
-impl Generation {
-    /// Whether this generation was delivered by overwriting code rather than by
-    /// installing into a slot.
+/// One watched source file as this session last read it.
+///
+/// Contents and modification time are one value because they are one fact: the
+/// time is when *these* contents were read. Held as two parallel maps they had
+/// to be written together by hand, and a patch that updated the contents while
+/// leaving the time behind is a bug that happened. The pairing is now the
+/// type's job rather than the caller's.
+struct Snapshot {
+    /// The file's contents at the moment it was read.
+    contents: String,
+    /// The file's modification time then, or `None` when the filesystem would
+    /// not report one.
     ///
-    /// The distinction is recorded rather than inferred from the function's
-    /// kind, because an un-annotated plain function and an annotated one are the
-    /// same kind but are undone in completely different ways.
-    fn overwrote_prologues(&self) -> bool {
-        !self.prologue_restores.is_empty()
-    }
+    /// `None` means "always re-read", which is the safe direction: a redundant
+    /// read costs microseconds, a missed edit costs a reload.
+    ///
+    /// Compared against the file's *current* modification time, never against
+    /// `SystemTime::now()`. Both sides are filesystem timestamps, which matters:
+    /// on Windows file times come from the coarse system clock and can lag
+    /// `now()` by a scheduler tick, so a file written after a snapshot can
+    /// report an earlier time and the edit is then missed.
+    modified: Option<SystemTime>,
 }
 
-/// One entry in a function's patch history, for hosts and tooling.
-#[derive(Debug, Clone)]
-pub struct PatchGeneration {
-    /// Qualified name of the patched function.
-    pub function: String,
-    /// One-based position in the history; zero is the original code.
-    pub number: u32,
-    /// Address currently associated with this generation.
-    pub address: usize,
-    /// Seconds since this generation was installed.
-    pub age_seconds: f64,
+impl Snapshot {
+    /// Read one file into a snapshot, or `None` when it cannot be read.
+    ///
+    /// The time is taken from the same file in the same moment as the contents,
+    /// so the two cannot describe different reads.
+    fn read(path: &Path) -> Option<Self> {
+        let contents = std::fs::read_to_string(path).ok()?;
+        let modified = std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        Some(Self { contents, modified })
+    }
+
+    /// Whether the file on disk still matches what this snapshot recorded.
+    ///
+    /// An unknown time on either side answers `false`, so the caller re-reads.
+    fn is_current(&self, modified: Option<SystemTime>) -> bool {
+        matches!((self.modified, modified), (Some(recorded), Some(current)) if recorded == current)
+    }
 }
 
 /// Drives the fast path for one project.
@@ -325,17 +337,9 @@ pub(crate) struct HotPatchSession {
     /// metadata - so a patch built from a bare `cargo build -p <pkg>` line
     /// disagrees with the running world about every `TypeId`.
     build_command: Vec<String>,
-    /// Last seen contents of every watched source file.
-    snapshots: HashMap<PathBuf, String>,
-    /// The modification time each snapshot was read at.
-    ///
-    /// Compared against the file's current modification time to decide whether
-    /// it needs re-reading. Both sides are filesystem timestamps, which matters:
-    /// comparing a file time against `SystemTime::now()` is not sound on
-    /// Windows, where file times come from the coarse system clock and can lag
-    /// `now()` by a scheduler tick - a file written *after* a snapshot can
-    /// report an earlier time, and the edit is then missed.
-    snapshot_mtimes: HashMap<PathBuf, SystemTime>,
+    /// Last seen contents of every watched source file, with the modification
+    /// time each was read at.
+    snapshots: HashMap<PathBuf, Snapshot>,
     /// When those contents were read.
     ///
     /// Used to tell two very different "nothing changed" cases apart: a reload
@@ -387,7 +391,6 @@ impl HotPatchSession {
             package_rlib,
             build_command: build_command.to_vec(),
             snapshots: HashMap::new(),
-            snapshot_mtimes: HashMap::new(),
             snapshot_taken_at: SystemTime::UNIX_EPOCH,
             rustc_line: None,
             generations: Vec::new(),
@@ -405,7 +408,7 @@ impl HotPatchSession {
         let addressable: usize = session
             .snapshots
             .values()
-            .map(|contents| source::all_functions(contents).len())
+            .map(|snapshot| source::all_functions(&snapshot.contents).len())
             .sum();
         if addressable == 0 {
             return None;
@@ -413,7 +416,7 @@ impl HotPatchSession {
         let annotated: usize = session
             .snapshots
             .values()
-            .map(|contents| source::hot_function_names(contents).len())
+            .map(|snapshot| source::hot_function_names(&snapshot.contents).len())
             .sum();
 
         // Without the crate's own rlib a generated patch cannot name the
@@ -450,17 +453,18 @@ impl HotPatchSession {
     }
 
     /// Re-read every `.rs` file under the source root into the snapshot map.
-    fn refresh_snapshots(&mut self) {
+    ///
+    /// The snapshot is the baseline [`classify`](Self::classify) diffs against,
+    /// so it must always describe **what is currently running**. Two things make
+    /// that true: a successful patch records the new contents itself, and a full
+    /// reload re-syncs through this method. Without the second, one unpatchable
+    /// edit pins the baseline forever - every later edit is then diffed against
+    /// stale contents, reports changes outside a hot body, and is refused for a
+    /// change the reload already absorbed.
+    pub(crate) fn refresh_snapshots(&mut self) {
         for path in rust_sources(&self.source_root) {
-            if let Ok(contents) = std::fs::read_to_string(&path) {
-                if let Ok(modified) = std::fs::metadata(&path).and_then(|meta| meta.modified()) {
-                    self.snapshot_mtimes.insert(path.clone(), modified);
-                } else {
-                    // Unknown time means "always re-read", which is the safe
-                    // direction: a redundant read costs microseconds.
-                    self.snapshot_mtimes.remove(&path);
-                }
-                self.snapshots.insert(path, contents);
+            if let Some(snapshot) = Snapshot::read(&path) {
+                self.snapshots.insert(path, snapshot);
             }
         }
         // Stamped after the reads, so a file written during them counts as
@@ -498,7 +502,7 @@ impl HotPatchSession {
         // they are independent replacements, and undoing them would discard
         // work that succeeded - but the snapshot is not advanced, so the next
         // change retries the whole file.
-        let mut last: Option<Installed> = None;
+        let mut last: Option<ApplyResult> = None;
         let mut patched_names: Vec<String> = Vec::new();
         // Several bodies in one file are patched in sequence and need not share
         // a route: an annotated and an un-annotated function in the same save
@@ -553,15 +557,19 @@ impl HotPatchSession {
 
         // Only record the new contents once every body is live, so a partial
         // failure is retried on the next change rather than treated as done.
-        // The recorded modification time moves with the contents: leaving the
-        // two out of step would not be wrong - a mismatched time only forces a
-        // redundant read - but it would make the pair mean two different things.
-        if let Ok(modified) = std::fs::metadata(&path).and_then(|meta| meta.modified()) {
-            self.snapshot_mtimes.insert(path.clone(), modified);
-        } else {
-            self.snapshot_mtimes.remove(&path);
-        }
-        self.snapshots.insert(path, new_contents);
+        // The modification time is re-read here rather than carried from
+        // classification: the file may have been written again since, and a
+        // stale time only costs one redundant read on the next attempt.
+        let modified = std::fs::metadata(&path)
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        self.snapshots.insert(
+            path,
+            Snapshot {
+                contents: new_contents,
+                modified,
+            },
+        );
         PatchOutcome::Patched {
             function: patched_names.join(", "),
             generation: installed.generation,
@@ -571,255 +579,6 @@ impl HotPatchSession {
             exports: installed.exports,
             routes,
             copies,
-        }
-    }
-
-    /// The generation currently running for one function.
-    ///
-    /// Zero means the original code the artifact was built with, which is also
-    /// the answer when nothing has ever been patched.
-    fn active_generation(&self, qualified: &str) -> u32 {
-        self.active_generations.get(qualified).copied().unwrap_or(0)
-    }
-
-    /// Every generation recorded for every function this session has patched.
-    pub(crate) fn generations(&self) -> Vec<PatchGeneration> {
-        self.generations
-            .iter()
-            .map(|generation| PatchGeneration {
-                function: generation.function.clone(),
-                number: generation.number,
-                address: generation.address,
-                age_seconds: generation.installed_at.elapsed().as_secs_f64(),
-            })
-            .collect()
-    }
-
-    /// Forget every prologue patch, because the images they refer to are gone.
-    ///
-    /// A reload replaces an artifact's image, so the addresses recorded when a
-    /// prologue was overwritten no longer name that function - and the freshly
-    /// loaded copy is unpatched, so the redirect is lost anyway. Writing saved
-    /// bytes back to a stale address would corrupt whatever now occupies it, so
-    /// the record is dropped rather than kept.
-    ///
-    /// Slot-delivered generations are untouched: a slot is re-created by the
-    /// new artifact and re-installed through the registry, not by address.
-    pub(crate) fn forget_prologue_patches(&mut self) {
-        let mut functions: Vec<String> = Vec::new();
-        for generation in &mut self.generations {
-            if generation.overwrote_prologues() {
-                generation.prologue_restores.clear();
-                generation.prologue_history_dropped = true;
-                if !functions.contains(&generation.function) {
-                    functions.push(generation.function.clone());
-                }
-            }
-        }
-        if functions.is_empty() {
-            return;
-        }
-
-        // The history no longer describes anything: the new image was compiled
-        // from the current sources, so it already behaves like the newest
-        // generation, and none of the recorded addresses point into it.
-        for function in &functions {
-            self.active_generations.remove(function);
-        }
-
-        // Said out loud rather than logged, because a developer who just rolled
-        // back would otherwise watch the rollback silently undo itself.
-        println!(
-            "{} reload rebuilt from source; live-patch history reset for {}",
-            crate::console::bold_cyan("[hot]"),
-            functions.join(", ")
-        );
-        info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-            functions = functions.join(", ").as_str(),
-            "prologue patch history dropped: the reloaded image supersedes it"
-        );
-    }
-
-    /// Whether this session has ever patched `qualified`.
-    pub(crate) fn knows_function(&self, qualified: &str) -> bool {
-        self.active_generations.contains_key(qualified)
-    }
-
-    /// Reinstall an earlier generation of one function.
-    ///
-    /// Generation zero is the original code the running artifact was built
-    /// with; one and up are patches, in the order they were applied. This is a
-    /// single pointer store per artifact - no rebuild, no reload, and nothing
-    /// is unloaded, which is the concrete payoff of dispatching through a slot
-    /// rather than overwriting a function's prologue.
-    ///
-    /// # Errors
-    ///
-    /// Returns a message when the function was never patched by this session,
-    /// when the generation does not exist, or when an artifact refuses the
-    /// address. On any error the currently running implementation is kept.
-    pub(crate) fn rollback(
-        &mut self,
-        engine: &mut Engine,
-        targets: &[(&str, &NativeLibrary)],
-        patches: &[LoadedPatch],
-        qualified: &str,
-        number: u32,
-    ) -> Result<(), String> {
-        if !self.knows_function(qualified) {
-            return Err(format!(
-                "`{qualified}` has not been patched in this session, so it has \
-                 no history to roll back to"
-            ));
-        }
-
-        // How the generation was delivered decides how to undo it, and that is
-        // not the same question as what kind of function it is: an un-annotated
-        // function has no slot to install into, so its generations were written
-        // over the code itself.
-        let delivered_by_prologue = self
-            .generations
-            .iter()
-            .any(|candidate| candidate.function == qualified && candidate.overwrote_prologues());
-
-        if number == 0 {
-            if delivered_by_prologue {
-                self.restore_prologue_baseline(qualified)?;
-            } else {
-                self.restore_baseline(engine, targets, patches, qualified)?;
-            }
-        } else {
-            let generation = self
-                .generations
-                .iter()
-                .find(|candidate| candidate.function == qualified && candidate.number == number)
-                .ok_or_else(|| format!("`{qualified}` has no generation {number}"))?;
-
-            // Its addresses pointed into an image a reload has since replaced,
-            // so there is nothing left to re-aim. Saying so is the point: the
-            // slot route below would refuse too, but for the wrong reason.
-            if generation.prologue_history_dropped {
-                return Err(format!(
-                    "generation {number} of `{qualified}` was written into the \
-                     artifact's own code, and a reload has replaced that code \
-                     since; it can no longer be rolled back to. The reloaded \
-                     artifact already carries the current source"
-                ));
-            }
-
-            if generation.overwrote_prologues() {
-                // Re-aim every copy at this generation's body. The bytes each
-                // call returns are deliberately discarded: they are the jump its
-                // predecessor wrote, not the artifact's own code, and overwriting
-                // the saved originals with them would lose the only way back to
-                // generation zero.
-                for restore in &generation.prologue_restores {
-                    // SAFETY: the address came from this artifact's inventory
-                    // when the generation was installed, and `patch_prologue`
-                    // re-validates the function's extent before writing. No
-                    // system is executing: rollback runs between frames.
-                    unsafe {
-                        pill_engine::hot_patch::patch_prologue(restore.address, generation.address)
-                    }
-                    .map_err(|detail| format!("{}: {detail}", restore.artifact))?;
-                }
-            } else {
-                match generation.kind {
-                    source::HotFunctionKind::System => engine
-                        .hot_patch(qualified, generation.address, generation.signature_hash)
-                        .map_err(|error| error.to_string())?,
-                    // The fan-out count is only reported for a fresh patch;
-                    // a rollback re-installs the same set and has nothing new
-                    // to say about it.
-                    source::HotFunctionKind::PlainFunction => {
-                        install_everywhere(
-                            targets,
-                            patches,
-                            &generation.lookup_name,
-                            generation.address,
-                            &generation.signature,
-                        )?;
-                    }
-                }
-            }
-        }
-
-        self.active_generations
-            .insert(qualified.to_string(), number);
-        info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-            function = qualified,
-            generation = number,
-            "patch generation rolled back"
-        );
-        Ok(())
-    }
-
-    /// Put a prologue-patched function back to the code its artifact was built
-    /// with.
-    ///
-    /// The bytes to write are the ones the FIRST generation saved. Every later
-    /// generation saved the jump its predecessor had written, so restoring from
-    /// the newest would reinstate a patch rather than remove one.
-    fn restore_prologue_baseline(&self, qualified: &str) -> Result<(), String> {
-        let first = self
-            .generations
-            .iter()
-            .filter(|candidate| candidate.function == qualified && candidate.overwrote_prologues())
-            .min_by_key(|candidate| candidate.number)
-            .ok_or_else(|| {
-                format!(
-                    "`{qualified}` has no saved prologue bytes; the artifact was reloaded \
-                     after it was patched, which already restored its own code"
-                )
-            })?;
-
-        for restore in &first.prologue_restores {
-            // SAFETY: the bytes and the address were recorded together when this
-            // generation was installed, and `restore_prologue` re-reads the
-            // function's extent before writing so a replaced image is refused
-            // rather than overwritten. No system is executing.
-            unsafe { pill_engine::hot_patch::restore_prologue(restore.address, &restore.original) }
-                .map_err(|detail| format!("{}: {detail}", restore.artifact))?;
-        }
-        Ok(())
-    }
-
-    /// Return one function to the code its artifact was built with.
-    ///
-    /// A system has one baseline address, held by the engine's slot. A plain
-    /// function has one per artifact, so each artifact is asked to empty its
-    /// own slot instead of being handed an address that belongs to another.
-    fn restore_baseline(
-        &self,
-        engine: &mut Engine,
-        targets: &[(&str, &NativeLibrary)],
-        patches: &[LoadedPatch],
-        qualified: &str,
-    ) -> Result<(), String> {
-        // The route's own lookup name, not the canonical one: a slot for a
-        // method is registered without its type, so asking under the canonical
-        // name would miss it.
-        let (kind, lookup_name) = self
-            .generations
-            .iter()
-            .find(|candidate| candidate.function == qualified)
-            .map(|generation| (generation.kind, generation.lookup_name.clone()))
-            .ok_or_else(|| format!("`{qualified}` has no recorded generation"))?;
-
-        match kind {
-            source::HotFunctionKind::System => {
-                let (address, signature_hash) = engine
-                    .hot_patch_baseline(qualified)
-                    .ok_or_else(|| format!("`{qualified}` records no baseline implementation"))?;
-                engine
-                    .hot_patch(qualified, address, signature_hash)
-                    .map_err(|error| error.to_string())
-            }
-            source::HotFunctionKind::PlainFunction => {
-                reset_everywhere(targets, patches, &lookup_name)
-            }
         }
     }
 
@@ -851,16 +610,14 @@ impl HotPatchSession {
                 any_newer_than_snapshot = true;
             }
 
-            // A file whose modification time still matches the one recorded when
-            // it was read cannot differ from the snapshot, so it needs no read.
-            // Both sides are filesystem timestamps, so this comparison is exact.
-            // Anything unknown - a new file, or a time the filesystem would not
-            // report - falls through to a read.
-            let unchanged = match (modified, self.snapshot_mtimes.get(path)) {
-                (Some(current), Some(recorded)) => current == *recorded,
-                _ => false,
-            };
-            if unchanged && self.snapshots.contains_key(path) {
+            // A file whose modification time still matches the one recorded
+            // when it was read cannot differ from the snapshot, so it needs no
+            // read. A file with no snapshot at all is new, and falls through.
+            if self
+                .snapshots
+                .get(path)
+                .is_some_and(|snapshot| snapshot.is_current(modified))
+            {
                 continue;
             }
 
@@ -868,13 +625,14 @@ impl HotPatchSession {
                 continue;
             };
             let path = path.clone();
-            let Some(old_contents) = self.snapshots.get(&path) else {
+            let Some(old_snapshot) = self.snapshots.get(&path) else {
                 // A new file is a structural change by definition.
                 return Err(PatchRefusal::new(
                     refusal_code::NEW_SOURCE_FILE,
                     format!("new source file {}", path.display()),
                 ));
             };
+            let old_contents = &old_snapshot.contents;
             if *old_contents == new_contents {
                 continue;
             }
@@ -1002,7 +760,7 @@ impl HotPatchSession {
         qualified: &str,
         slot_name: &str,
         stages: &mut PatchStages,
-    ) -> Result<Installed, PatchRefusal> {
+    ) -> Result<ApplyResult, PatchRefusal> {
         let function = declaration.name.as_str();
         let kind = declaration.kind;
         self.counter += 1;
@@ -1269,7 +1027,7 @@ impl HotPatchSession {
             generations = self.generations.len(),
             "patch generation installed"
         );
-        Ok(Installed {
+        Ok(ApplyResult {
             generation,
             artifact_bytes,
             exports,
@@ -1608,430 +1366,6 @@ impl HotPatchSession {
 // Free functions
 // =============================================================================
 
-/// Ask a loaded patch for one function's address and signature hash.
-fn resolve_in(library: &Library, lookup_name: &str) -> Result<(usize, u64), String> {
-    type ResolveFn = unsafe extern "C" fn(*const std::ffi::c_char, *mut u64) -> usize;
-
-    // SAFETY: the export is generated by `pill_hot_resolver!` with exactly this
-    // C ABI signature, and the borrow ends before the library is moved.
-    let resolve: Symbol<ResolveFn> =
-        unsafe { library.get(PATCH_RESOLVER_EXPORT) }.map_err(|_| {
-            format!(
-                "the patch does not export `{}`",
-                String::from_utf8_lossy(PATCH_RESOLVER_EXPORT)
-            )
-        })?;
-
-    let encoded = std::ffi::CString::new(lookup_name)
-        .map_err(|_| "the function name contains a NUL byte".to_string())?;
-    let mut signature_hash: u64 = 0;
-    // SAFETY: a NUL-terminated name and a writable u64, as the export requires.
-    let address = unsafe { resolve(encoded.as_ptr(), &mut signature_hash) };
-
-    if address == 0 {
-        return Err(format!("the patch does not define `{lookup_name}`"));
-    }
-    Ok((address, signature_hash))
-}
-
-/// Ask a loaded patch where its replacement for a plain function lives.
-///
-/// Returns the address to jump to and the signature text the patch compiled it
-/// with, which every receiving artifact checks against its own before
-/// accepting the replacement.
-fn resolve_plain_in(library: &Library, lookup_name: &str) -> Result<(usize, String), String> {
-    type ResolvePlainFn =
-        unsafe extern "C" fn(*const std::ffi::c_char, *mut *const u8, *mut usize) -> usize;
-
-    // SAFETY: the export is generated by `pill_hot_resolver!` with exactly this
-    // C ABI signature, and the borrow ends before the library is moved.
-    let resolve: Symbol<ResolvePlainFn> =
-        unsafe { library.get(PATCH_PLAIN_EXPORT) }.map_err(|_| {
-            format!(
-                "the patch does not export `{}`",
-                String::from_utf8_lossy(PATCH_PLAIN_EXPORT)
-            )
-        })?;
-
-    let encoded = std::ffi::CString::new(lookup_name)
-        .map_err(|_| "the function name contains a NUL byte".to_string())?;
-    let mut signature_pointer: *const u8 = std::ptr::null();
-    let mut signature_length: usize = 0;
-    // SAFETY: a NUL-terminated name and two writable slots, as the export
-    // requires. On success it writes a pointer into the patch's own static
-    // storage, which stays mapped because patches are never unloaded.
-    let address = unsafe {
-        resolve(
-            encoded.as_ptr(),
-            &mut signature_pointer,
-            &mut signature_length,
-        )
-    };
-
-    if address == 0 {
-        return Err(format!("the patch does not define `{lookup_name}`"));
-    }
-    if signature_pointer.is_null() {
-        return Err(format!(
-            "the patch reported no signature for `{lookup_name}`"
-        ));
-    }
-    // SAFETY: the export wrote a pointer and length describing a `&'static str`
-    // inside the loaded patch, so the bytes are readable and valid UTF-8.
-    let signature = unsafe { std::slice::from_raw_parts(signature_pointer, signature_length) };
-    let signature = std::str::from_utf8(signature)
-        .map_err(|_| "the patch reported a signature that is not UTF-8".to_string())?;
-    Ok((address, signature.to_string()))
-}
-
-/// Offer one replacement to every loaded artifact, and report how many took it.
-///
-/// A crate linked into several artifacts is compiled into each of them, so the
-/// project DLL runs its own embedded copy of a module it depends on. Installing
-/// only into the module's own DLL would leave that copy running the old code,
-/// which is exactly the situation that forces a cascading project reload today.
-fn install_everywhere(
-    targets: &[(&str, &NativeLibrary)],
-    patches: &[LoadedPatch],
-    qualified: &str,
-    address: usize,
-    signature: &str,
-) -> Result<usize, String> {
-    let mut installed = Vec::new();
-    for (label, artifact) in targets {
-        match artifact.install_plain_function(qualified, address, signature) {
-            Ok(true) => installed.push((*label).to_string()),
-            // This artifact simply does not link the crate.
-            Ok(false) => {}
-            // A refusal is reported rather than tolerated: leaving some
-            // artifacts patched and others not would be worse than not
-            // patching at all, and the caller falls back to a full reload.
-            Err(detail) => return Err(format!("{label}: {detail}")),
-        }
-    }
-    // Patches already in the process carry their own copies of whatever their
-    // bodies called, so a caller patched earlier would otherwise keep calling
-    // the version of this function that existed when it was compiled.
-    for patch in patches {
-        match patch.install_plain_function(qualified, address, signature) {
-            Ok(true) => {
-                installed.push(format!("{} patch gen {}", patch.function, patch.generation))
-            }
-            Ok(false) => {}
-            Err(detail) => return Err(detail),
-        }
-    }
-    if installed.is_empty() {
-        return Err(format!(
-            "no loaded artifact declares `{qualified}`; it may live in a crate \
-             nothing has loaded yet"
-        ));
-    }
-    debug!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-        function = qualified,
-        artifacts = installed.join(", ").as_str(),
-        "plain function redirected in every artifact that links it"
-    );
-    // How many copies were reached, which is what makes a fan-out visible in
-    // the analytics line rather than assumed.
-    Ok(installed.len())
-}
-
-/// Export a generated prologue patch carries so the host can find its new body.
-///
-/// One export, not a registry: a prologue patch replaces exactly one function,
-/// so there is nothing to look up by name.
-const PATCH_ADDRESS_EXPORT: &[u8] = b"pill_patch_address";
-
-/// Address resolver a generated patch exports, distinct from an artifact's.
-const PATCH_ADDRESS_RESOLVER: &[u8] = b"pill_patch_resolve_address";
-
-/// Slot installer a generated patch exports.
-const PATCH_INSTALL_RESOLVER: &[u8] = b"pill_patch_resolve_install";
-
-/// Slot reset a generated patch exports.
-const PATCH_RESET_RESOLVER: &[u8] = b"pill_patch_resolve_reset";
-
-/// One previously loaded patch, offered as a target for later patches.
-///
-/// A patch links its own copy of everything its body calls, and those copies are
-/// as stale as any other artifact's the moment a callee is patched. Without
-/// this, a chain of hot functions freezes at whatever the callee looked like
-/// when the caller's patch was compiled: patch `Spline::get_color_a`, then patch
-/// `pill_dummy_color::get_color_a`, and the first patch keeps calling the old
-/// second one.
-pub(crate) struct LoadedPatch {
-    /// The function this patch replaced, used as its label.
-    pub function: String,
-    /// Which generation it was.
-    pub generation: u32,
-    /// The loaded image. Never unloaded: a slot or a jump may point into it for
-    /// the rest of the process, and nothing re-homes those addresses.
-    pub library: Library,
-}
-
-impl LoadedPatch {
-    /// Offer a replacement to this patch's own copy of one `#[pill_hot_fn]`.
-    ///
-    /// A patch links its own copy of whatever its body calls, slots included,
-    /// and those slots start empty. Skipping them is what made a patched caller
-    /// keep calling the compiled-in version of a callee patched afterwards.
-    fn install_plain_function(
-        &self,
-        qualified: &str,
-        address: usize,
-        signature: &str,
-    ) -> Result<bool, String> {
-        type InstallFn =
-            unsafe extern "C" fn(*const std::ffi::c_char, usize, *const std::ffi::c_char) -> u32;
-        // SAFETY: generated by `pill_hot_resolver!` with this exact C ABI.
-        let Ok(install) = (unsafe { self.library.get::<InstallFn>(PATCH_INSTALL_RESOLVER) }) else {
-            return Ok(false);
-        };
-        let Ok(name) = std::ffi::CString::new(qualified) else {
-            return Ok(false);
-        };
-        let Ok(signature) = std::ffi::CString::new(signature) else {
-            return Ok(false);
-        };
-        // SAFETY: both strings are NUL-terminated and live until the call
-        // returns, and `address` points into an image that is never unloaded.
-        let status = unsafe { install(name.as_ptr(), address, signature.as_ptr()) };
-        match status {
-            0 => Ok(true),
-            1 => Ok(false),
-            _ => Err(format!(
-                "`{qualified}` changed shape inside the {} patch",
-                self.function
-            )),
-        }
-    }
-
-    /// Return this patch's copy of one `#[pill_hot_fn]` to its own body.
-    fn reset_plain_function(&self, qualified: &str) -> bool {
-        type ResetFn = unsafe extern "C" fn(*const std::ffi::c_char) -> u32;
-        // SAFETY: generated by `pill_hot_resolver!` with this exact C ABI.
-        let Ok(reset) = (unsafe { self.library.get::<ResetFn>(PATCH_RESET_RESOLVER) }) else {
-            return false;
-        };
-        let Ok(name) = std::ffi::CString::new(qualified) else {
-            return false;
-        };
-        // SAFETY: the string is NUL-terminated and lives until the call returns.
-        unsafe { reset(name.as_ptr()) == 0 }
-    }
-
-    /// Address and recorded declaration of one function inside this patch.
-    fn function_address(&self, qualified: &str) -> Option<(usize, String)> {
-        type AddressFn =
-            unsafe extern "C" fn(*const std::ffi::c_char, *mut *const u8, *mut usize) -> usize;
-        // SAFETY: the export is generated by `pill_hot_resolver!` with exactly
-        // this C ABI signature, and the borrow ends before the library moves.
-        let resolve: Symbol<AddressFn> =
-            unsafe { self.library.get(PATCH_ADDRESS_RESOLVER) }.ok()?;
-        let name = std::ffi::CString::new(qualified).ok()?;
-        let mut signature_pointer: *const u8 = std::ptr::null();
-        let mut signature_length: usize = 0;
-        // SAFETY: a NUL-terminated name and two writable slots, as the export
-        // requires. A patch is never unloaded, so anything it reports stays
-        // valid for the process lifetime.
-        let address =
-            unsafe { resolve(name.as_ptr(), &mut signature_pointer, &mut signature_length) };
-        if address == 0 {
-            return None;
-        }
-        let signature = if signature_pointer.is_null() {
-            String::new()
-        } else {
-            // SAFETY: the export wrote a pointer and length describing a
-            // `&'static str` inside the loaded patch.
-            let bytes = unsafe { std::slice::from_raw_parts(signature_pointer, signature_length) };
-            String::from_utf8_lossy(bytes).into_owned()
-        };
-        Some((address, signature))
-    }
-}
-
-/// One artifact's copy of a prologue-patched function, and the bytes it had.
-///
-/// Saved so a rollback can put the function back exactly as the artifact was
-/// built, which is the only way back for a mechanism that overwrites code in
-/// place. Keyed by address rather than by artifact name because an artifact
-/// that reloads gets a new image, and the old addresses must then be forgotten.
-#[derive(Debug, Clone)]
-pub(crate) struct PrologueRestore {
-    /// Artifact the patched copy lives in, for diagnostics.
-    pub artifact: String,
-    /// Address of the function that was overwritten.
-    pub address: usize,
-    /// The bytes that were there before.
-    pub original: Vec<u8>,
-}
-
-/// Ask a loaded prologue patch where its replacement body lives.
-fn resolve_patch_address(library: &Library) -> Result<usize, String> {
-    type AddressFn = unsafe extern "C" fn() -> usize;
-    // SAFETY: the export is generated by this module with exactly this C ABI
-    // signature, and the borrow ends before the library is moved.
-    let resolve: Symbol<AddressFn> =
-        unsafe { library.get(PATCH_ADDRESS_EXPORT) }.map_err(|_| {
-            format!(
-                "the patch does not export `{}`",
-                String::from_utf8_lossy(PATCH_ADDRESS_EXPORT)
-            )
-        })?;
-    // SAFETY: the export takes no arguments and returns the address of a
-    // function inside the patch image, which is never unloaded.
-    let address = unsafe { resolve() };
-    if address == 0 {
-        return Err("the patch reported a null address".to_string());
-    }
-    Ok(address)
-}
-
-/// Redirect every loaded copy of one function by overwriting its prologue.
-///
-/// This is the macro-free route. Nothing in the running artifact was prepared
-/// for the patch: the host asks each artifact for the function's address
-/// through its build-script inventory and writes a jump over the first bytes.
-///
-/// The safety contract is the caller's: this must run at a frame boundary, on
-/// the thread that runs the frame loop, with no system executing - which is
-/// exactly where the fast path is invoked from.
-fn prologue_patch_everywhere(
-    targets: &[(&str, &NativeLibrary)],
-    patches: &[LoadedPatch],
-    qualified: &str,
-    replacement: usize,
-    expected_signature: &str,
-) -> Result<Vec<PrologueRestore>, String> {
-    // Loaded artifacts, then every patch already in the process. A patch links
-    // its own copy of whatever its body calls, so leaving those out is what made
-    // chained hot functions freeze at their compile-time callee.
-    let mut candidates: Vec<(String, Option<(usize, String)>)> = Vec::new();
-    for (label, artifact) in targets {
-        candidates.push(((*label).to_string(), artifact.function_address(qualified)));
-    }
-    for patch in patches {
-        candidates.push((
-            format!("{} patch gen {}", patch.function, patch.generation),
-            patch.function_address(qualified),
-        ));
-    }
-
-    let mut restores: Vec<PrologueRestore> = Vec::new();
-    for (label, resolved) in candidates {
-        let label = label.as_str();
-        let Some((address, signature)) = resolved else {
-            // This image simply does not link the crate.
-            continue;
-        };
-
-        // The gate. Overwriting a function's first bytes can check nothing
-        // about what it jumps to, so the shape has to be checked before the
-        // write - and checked against what THIS artifact was built with, not
-        // against another copy. Classification should already have refused a
-        // changed signature; this is what catches it having been wrong.
-        if !signature.is_empty() && signature != expected_signature {
-            return Err(format!(
-                "{label}: `{qualified}` was built as `{signature}` but the edit \
-                 declares `{expected_signature}`; refusing to redirect callers \
-                 compiled for the old shape"
-            ));
-        }
-        // SAFETY: `address` came from the artifact's own inventory, so it names
-        // a real function in a library the host keeps mapped; `replacement`
-        // points into a patch image that is never unloaded. No thread is inside
-        // the overwritten bytes, because this runs at the frame boundary on the
-        // frame-loop thread with no system executing.
-        match unsafe { pill_engine::hot_patch::patch_prologue(address, replacement) } {
-            Ok(original) => restores.push(PrologueRestore {
-                artifact: (*label).to_string(),
-                address,
-                original,
-            }),
-            Err(detail) => {
-                // Say how widespread the cause is, so a refusal reads as a
-                // diagnosis rather than a dead end.
-                let coverage = targets
-                    .iter()
-                    .find(|(candidate, _)| *candidate == label)
-                    .and_then(|(_, artifact)| artifact.extent_coverage())
-                    .map(|(known, total)| {
-                        format!(
-                            " ({known} of {total} functions in this artifact have a known length)"
-                        )
-                    })
-                    .unwrap_or_default();
-                // Undo whatever already landed, so a failure never leaves the
-                // process half-patched.
-                for restore in restores.iter().rev() {
-                    // SAFETY: the same contract, with bytes this function saved
-                    // moments ago from that exact address.
-                    let _ = unsafe {
-                        pill_engine::hot_patch::restore_prologue(restore.address, &restore.original)
-                    };
-                }
-                return Err(format!("{label}: {detail}{coverage}"));
-            }
-        }
-    }
-    if restores.is_empty() {
-        return Err(format!(
-            "no loaded artifact reports an address for `{qualified}`; its crate may not \
-             generate the function inventory"
-        ));
-    }
-    debug!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-        function = qualified,
-        artifacts = restores
-            .iter()
-            .map(|restore| restore.artifact.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-            .as_str(),
-        "prologue redirected in every artifact that links it"
-    );
-    Ok(restores)
-}
-
-/// Return one function to its own body in every artifact that declares it.
-///
-/// The counterpart of [`install_everywhere`] for a rollback to generation zero.
-/// A plain function has one baseline per artifact, so each is asked to empty
-/// its own slot rather than being handed an address belonging to another.
-fn reset_everywhere(
-    targets: &[(&str, &NativeLibrary)],
-    patches: &[LoadedPatch],
-    qualified: &str,
-) -> Result<(), String> {
-    let mut restored = Vec::new();
-    for (label, artifact) in targets {
-        match artifact.reset_plain_function(qualified) {
-            Ok(true) => restored.push((*label).to_string()),
-            Ok(false) => {}
-            Err(detail) => return Err(format!("{label}: {detail}")),
-        }
-    }
-    for patch in patches {
-        if patch.reset_plain_function(qualified) {
-            restored.push(format!("{} patch gen {}", patch.function, patch.generation));
-        }
-    }
-    if restored.is_empty() {
-        return Err(format!("no loaded artifact declares `{qualified}`"));
-    }
-    debug!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-        function = qualified,
-        artifacts = restored.join(", ").as_str(),
-        "plain function restored to its original body in every artifact"
-    );
-    Ok(())
-}
-
 /// Every `.rs` file under `root`, in stable order.
 fn rust_sources(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
@@ -2081,7 +1415,6 @@ mod tests {
             package_rlib: PathBuf::from("libproject.rlib"),
             build_command: vec!["cargo".to_string(), "build".to_string()],
             snapshots: HashMap::new(),
-            snapshot_mtimes: HashMap::new(),
             snapshot_taken_at: SystemTime::UNIX_EPOCH,
             rustc_line: None,
             generations: Vec::new(),
@@ -2270,7 +1603,8 @@ mod tests {
     fn classify_accepts_a_trait_method_body() {
         let directory = std::env::temp_dir().join("pill_classify_trait_method");
         let _ = std::fs::remove_dir_all(&directory);
-        let source = "pub struct Spline(u32);\n\nimpl Default for Spline {\n                          fn default() -> Self { Spline(1) }\n}\n";
+        let source = "pub struct Spline(u32);\n\nimpl Default for Spline {
+fn default() -> Self { Spline(1) }\n}\n";
         let mut session = session_over(&directory, source);
 
         std::fs::write(
@@ -2301,7 +1635,11 @@ mod tests {
     fn a_generated_trait_patch_carries_the_right_body() {
         let directory = std::env::temp_dir().join("pill_generate_trait_method");
         let _ = std::fs::remove_dir_all(&directory);
-        let source = "pub struct Alpha(u32);\npub struct Beta(u32);\n\n                      impl Shape for Alpha {\n    fn size(&self) -> u32 { 111 }\n}\n\n                      impl Shape for Beta {\n    fn size(&self) -> u32 { 222 }\n}\n";
+        let source = "pub struct Alpha(u32);\npub struct Beta(u32);\n
+impl Shape for Alpha {
+fn size(&self) -> u32 { 111 }\n}\n
+impl Shape for Beta {
+fn size(&self) -> u32 { 222 }\n}\n";
         let session = session_over(&directory, source);
 
         let beta = source::HotFunction {
@@ -2454,16 +1792,25 @@ mod tests {
         let untouched = directory.join("untouched.rs");
         fs_write(&untouched, "pub fn stable() {}\n");
         session.refresh_snapshots();
-        assert!(session.snapshot_mtimes.contains_key(&untouched));
+        assert!(
+            session.snapshots[&untouched].modified.is_some(),
+            "the snapshot must record when it was read"
+        );
 
         // Its recorded contents are then replaced with a different set of
         // functions, without touching the file. Nothing on disk changed, so the
         // gate must skip it - and if it does not, the re-read sees a renamed
         // function, which is a structural change and refuses the whole
         // classification. That makes the skip observable rather than asserted.
+        // The recorded time is kept, so the gate still sees the file as
+        // unchanged; only the contents are made to disagree.
+        let recorded = session.snapshots[&untouched].modified;
         session.snapshots.insert(
             untouched.clone(),
-            "pub fn renamed_since_the_snapshot() {}\n".to_string(),
+            Snapshot {
+                contents: "pub fn renamed_since_the_snapshot() {}\n".to_string(),
+                modified: recorded,
+            },
         );
 
         // Only the edited file is re-read, so the classification succeeds and
@@ -2480,7 +1827,9 @@ mod tests {
 
         // And the stale snapshot is still there: proof the file was never read.
         assert!(
-            session.snapshots[&untouched].contains("renamed_since_the_snapshot"),
+            session.snapshots[&untouched]
+                .contents
+                .contains("renamed_since_the_snapshot"),
             "the untouched file was re-read despite an unchanged modification time"
         );
 
@@ -2612,7 +1961,6 @@ mod tests {
             package_rlib: directory.join("libproject.rlib"),
             build_command: vec!["cargo".to_string(), "build".to_string()],
             snapshots: HashMap::new(),
-            snapshot_mtimes: HashMap::new(),
             snapshot_taken_at: SystemTime::UNIX_EPOCH,
             rustc_line: None,
             generations: Vec::new(),
@@ -2620,6 +1968,22 @@ mod tests {
             counter: 0,
         };
         session.refresh_snapshots();
+
+        // Put the recorded modification time firmly in the past before the
+        // caller edits the file.
+        //
+        // `classify` skips a file whose modification time still equals the one
+        // recorded when it was read. Filesystem timestamps are coarse, so a test
+        // that writes its edit within the same tick as this snapshot produces a
+        // file that looks unchanged - and the test then fails intermittently,
+        // reporting "no change detected" for an edit that is plainly there. It
+        // surfaced under the parallel harness, where the write lands sooner.
+        //
+        // The gate's imprecision is harmless in production: a missed edit falls
+        // through to a full reload, which still delivers it. It is only a
+        // problem for a test that asserts on classification itself, so the wait
+        // lives here - once, for all 27 sessions - rather than in each test.
+        std::thread::sleep(std::time::Duration::from_millis(20));
         session
     }
 
@@ -2736,6 +2100,59 @@ fn helper(value: f32) -> f32 {
 
             let _ = std::fs::remove_dir_all(&directory);
         }
+    }
+
+    /// A refused edit must not disable patching for the rest of the session.
+    ///
+    /// This is the bug that made live patching look broken: `classify` diffs
+    /// against a snapshot of what is running, and only a *successful* patch
+    /// advanced it. A refusal was followed by a full reload, which picked the
+    /// edit up without telling the session - so the refused change stayed in
+    /// every later diff, and each subsequent body-only edit was refused for a
+    /// change that had already shipped. One unpatchable edit disabled the fast
+    /// path until the host restarted.
+    ///
+    /// `refresh_snapshots` is what the frame loop calls after a reload to close
+    /// that gap; this test pins the behaviour that depends on it.
+    #[test]
+    fn a_reload_resyncs_the_baseline_so_later_body_edits_still_patch() {
+        let directory = std::env::temp_dir().join("pill_classify_resync_after_reload");
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut session = session_over(&directory, HOT_SOURCE);
+
+        // Step 1: an edit the fast path must refuse. In the host this falls
+        // back to a full reload, which leaves the file running as written.
+        let after_reload = HOT_SOURCE.replace("const SPEED: f32 = 1.0;", "const SPEED: f32 = 2.0;");
+        assert_ne!(after_reload, HOT_SOURCE, "the fixture edit must apply");
+        std::fs::write(directory.join("lib.rs"), &after_reload).expect("write the refused edit");
+        let refusal = session
+            .classify()
+            .expect_err("a constant change must be refused");
+        assert_eq!(refusal.code, refusal_code::OUTSIDE_HOT_BODY);
+
+        // Step 2: the reload the host performs, and the re-sync that goes with
+        // it. Without this call the assertion below fails with OUTSIDE_HOT_BODY,
+        // because the constant change is still in the diff.
+        session.refresh_snapshots();
+
+        // Step 3: a clean body-only edit on top must now be patchable.
+        let body_edited = after_reload.replace("value * SPEED", "value * SPEED + 1.0");
+        assert_ne!(body_edited, after_reload, "the body edit must apply");
+        std::fs::write(directory.join("lib.rs"), &body_edited).expect("write the body edit");
+
+        let classified = session
+            .classify()
+            .expect("a body-only edit after a reload must not be refused")
+            .expect("the changed body must be detected");
+        assert!(
+            classified
+                .1
+                .iter()
+                .any(|declaration| declaration.name == "movement"),
+            "the edited body should be the one reported"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// Two bodies changed in one save are both reported, in a stable order.
@@ -2985,7 +2402,6 @@ fn helper(value: f32) -> f32 {
             package_rlib: PathBuf::from("libproject.rlib"),
             build_command: vec!["cargo".to_string(), "build".to_string()],
             snapshots: HashMap::new(),
-            snapshot_mtimes: HashMap::new(),
             snapshot_taken_at: SystemTime::UNIX_EPOCH,
             rustc_line: None,
             generations: Vec::new(),

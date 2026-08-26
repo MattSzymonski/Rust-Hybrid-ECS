@@ -548,11 +548,176 @@ where
 ///
 /// Returns a report roughly every three seconds for a frontend to print or
 /// display; all other frames return `None`.
+/// Drop every recorded prologue address, because an image was just replaced.
+///
+/// A prologue patch overwrote bytes inside a loaded artifact. When that artifact
+/// is replaced, the recorded addresses point into an image the graveyard will
+/// unmap, and writing saved bytes back to one is not a rollback - it is a write
+/// into retired, possibly re-used memory.
+///
+/// Every session is cleared, not only the one whose artifact reloaded: patches
+/// fan out across every loaded artifact, so a module's records include addresses
+/// inside the project image and cannot be cleared selectively. A partial restore
+/// would leave two copies of one function disagreeing, which is worse than none.
+///
+/// Idempotent, so calling it once after several reloads is the same as calling
+/// it after each.
+#[cfg(feature = "hot_patch")]
+fn forget_prologue_records(host: &mut Host) {
+    if let Some(session) = host.hot_patch.as_mut() {
+        session.forget_prologue_patches();
+    }
+    for session in host.module_hot_patch.iter_mut().flatten() {
+        session.forget_prologue_patches();
+    }
+}
+
+/// See the `hot_patch` version above; without the feature nothing is recorded.
+#[cfg(not(feature = "hot_patch"))]
+fn forget_prologue_records(_host: &mut Host) {}
+
+/// Arm the thread that owns the frame boundary as the only one allowed to
+/// rewrite live code.
+///
+/// Declared per frame rather than at setup because setup may run on a different
+/// thread; idempotent, and a single relaxed load once declared.
+#[cfg(feature = "hot_patch")]
+fn arm_patching_thread() {
+    pill_engine::hot_patch::declare_patching_thread();
+}
+
+/// See the `hot_patch` version above; without the feature nothing patches.
+#[cfg(not(feature = "hot_patch"))]
+fn arm_patching_thread() {}
+
+/// Try to deliver every pending optional-module edit by patching, not rebuilding.
+///
+/// A module's plain functions are compiled into every artifact that links the
+/// crate, so one patch is offered to all of them at once. That is what makes the
+/// cascading project reload a module swap normally queues unnecessary: the
+/// project's embedded copy is redirected too.
+///
+/// Anything patching refuses falls straight through to the full rebuild the
+/// frame loop performs next, so the worst case is the behaviour that existed
+/// before the fast path.
+///
+/// A no-op without the `hot_patch` feature, so the frame loop reads the same in
+/// both configurations rather than carrying a `cfg` of its own.
+#[cfg(feature = "hot_patch")]
+fn try_module_fast_path(host: &mut Host) {
+    let Host {
+        optional_modules,
+        module_hot_patch,
+        loaded_patches,
+        loaded_project,
+        engine,
+        ..
+    } = &mut *host;
+
+    for index in 0..module_hot_patch.len() {
+        // Captured before the patch runs: a save that lands while it compiles
+        // advances the counter past this value and must stay pending, because
+        // nothing has delivered it.
+        let Some(pending) = optional_modules[index].pending_reload_generation() else {
+            continue;
+        };
+        let Some(session) = module_hot_patch[index].as_mut() else {
+            continue;
+        };
+        let targets = patch_targets(loaded_project, optional_modules);
+        let outcome = session.try_patch(engine, &targets, loaded_patches);
+        // The borrow of the module list ends here, so the slot below can be
+        // updated.
+        drop(targets);
+        if report_patch_outcome(outcome) {
+            optional_modules[index].consume_pending_reload(pending);
+        }
+    }
+}
+
+/// See the `hot_patch` version above; without the feature there is no fast path.
+#[cfg(not(feature = "hot_patch"))]
+fn try_module_fast_path(_host: &mut Host) {}
+
+/// Try to deliver a pending project edit by patching, not rebuilding.
+///
+/// This runs at a frame boundary: reloads are already processed here, before
+/// `process_frame`, so no system is executing while a dispatch slot is written.
+/// A successful patch consumes the pending generation, which is what skips the
+/// full rebuild; anything refused falls through to it.
+#[cfg(feature = "hot_patch")]
+fn try_project_fast_path(host: &mut Host) {
+    let pending = host.reload_generation.load(Ordering::Acquire);
+    if pending == host.last_processed_generation {
+        return;
+    }
+
+    // Disjoint field borrows, as the module path does.
+    let Host {
+        hot_patch,
+        optional_modules,
+        loaded_patches,
+        loaded_project,
+        engine,
+        ..
+    } = &mut *host;
+    let mut patched = false;
+    if let Some(session) = hot_patch {
+        let targets = patch_targets(loaded_project, optional_modules);
+        let outcome = session.try_patch(engine, &targets, loaded_patches);
+        drop(targets);
+        patched = report_patch_outcome(outcome);
+    }
+    if patched {
+        // The edit is fully accounted for; skip the rebuild. Recorded as the
+        // generation observed above rather than a fresh read: a save that
+        // arrived while the patch compiled is a different edit that nothing has
+        // delivered, and must stay pending.
+        host.last_processed_generation = pending;
+    }
+}
+
+/// See the `hot_patch` version above; without the feature there is no fast path.
+#[cfg(not(feature = "hot_patch"))]
+fn try_project_fast_path(_host: &mut Host) {}
+
+/// Re-sync the patch baselines of every subject a reload has just rebuilt.
+///
+/// `classify` decides "body-only" by diffing the file against a snapshot of
+/// what is currently running, and that snapshot only advances when a patch
+/// succeeds. A reload advances what is running without touching it, so an edit
+/// the fast path refused stays in the diff forever: the next edit is compared
+/// against a baseline that is now two edits stale, reports a change outside a
+/// hot function body, and is refused for a change the reload already absorbed.
+/// One unpatchable edit would otherwise turn patching off for the rest of the
+/// run, which reads as "live patching stopped working".
+///
+/// Called after the reload rather than before it, so a save that lands during
+/// the build is not folded into the baseline: that save has advanced the
+/// generation counter, the next frame observes it, and it gets its own reload.
+#[cfg(feature = "hot_patch")]
+fn resync_patch_baselines(host: &mut Host, project: bool, modules: &[usize]) {
+    if project {
+        if let Some(session) = host.hot_patch.as_mut() {
+            session.refresh_snapshots();
+        }
+    }
+    for index in modules {
+        if let Some(Some(session)) = host.module_hot_patch.get_mut(*index) {
+            session.refresh_snapshots();
+        }
+    }
+}
+
+/// See the `hot_patch` version above; without the feature there is no baseline.
+#[cfg(not(feature = "hot_patch"))]
+fn resync_patch_baselines(_host: &mut Host, _project: bool, _modules: &[usize]) {}
+
 pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     #[cfg(feature = "metrics")]
     let frame_start = Instant::now();
 
-    // Step 0: Reload any optional module whose sources changed. Each module
+    // Step 1: Reload any optional module whose sources changed. Each module
     // owns an independent generation counter and clears only its own systems,
     // so editing one module never rebuilds another and never disturbs the
     // project's systems, entities, or resources.
@@ -562,56 +727,17 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     let reload_started = Instant::now();
 
     // This is the thread that owns the frame boundary, and therefore the only
-    // one allowed to rewrite live code. Declared here rather than at setup
-    // because setup may run elsewhere; idempotent and a single relaxed load
-    // once declared.
-    #[cfg(feature = "hot_patch")]
-    pill_engine::hot_patch::declare_patching_thread();
+    // one allowed to rewrite live code.
+    arm_patching_thread();
 
-    // Step 0a2: Honour a rollback request, at the same frame boundary the
+    // Step 2: Honour a rollback request, at the same frame boundary the
     // patch installs use - the prologue route rewrites live code, so this is a
     // requirement rather than a convenience.
-    #[cfg(feature = "hot_patch")]
     process_rollback_request(host);
 
-    // Step 0b: Try the per-function fast path for the optional modules, before
-    // the loop below turns a pending change into a full module rebuild.
-    //
-    // A module's plain functions are compiled into every artifact that links
-    // the crate, so one patch is offered to all of them at once. That is what
-    // makes the cascading project reload a module swap normally queues
-    // unnecessary: the project's embedded copy is redirected too.
-    #[cfg(feature = "hot_patch")]
-    {
-        let Host {
-            optional_modules,
-            module_hot_patch,
-            loaded_patches,
-            loaded_project,
-            engine,
-            ..
-        } = &mut *host;
-
-        for index in 0..module_hot_patch.len() {
-            // Captured before the patch runs: a save that lands while it
-            // compiles advances the counter past this value and must stay
-            // pending, because nothing has delivered it.
-            let Some(pending) = optional_modules[index].pending_reload_generation() else {
-                continue;
-            };
-            let Some(session) = module_hot_patch[index].as_mut() else {
-                continue;
-            };
-            let targets = patch_targets(loaded_project, optional_modules);
-            let outcome = session.try_patch(engine, &targets, loaded_patches);
-            // The borrow of the module list ends here, so the slot below can be
-            // updated.
-            drop(targets);
-            if report_patch_outcome(outcome) {
-                optional_modules[index].consume_pending_reload(pending);
-            }
-        }
-    }
+    // Step 3: Try the per-function fast path for the optional modules, before
+    // the reload below turns a pending change into a full module rebuild.
+    try_module_fast_path(host);
 
     // Destructure so the module list, the engine and the API table are borrowed
     // as disjoint fields rather than through the whole host.
@@ -622,25 +748,20 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
         workspace_root,
         reload_generation,
         module_config,
-        #[cfg(feature = "hot_patch")]
-        hot_patch,
-        #[cfg(feature = "hot_patch")]
-        module_hot_patch,
         ..
     } = &mut *host;
-    for slot in optional_modules.iter_mut() {
+    let mut any_module_reloaded = false;
+    // Which ones, not just whether any: each carries its own patch session, and
+    // only the sessions whose sources were rebuilt need a new baseline.
+    let mut reloaded_modules: Vec<usize> = Vec::new();
+    for (index, slot) in optional_modules.iter_mut().enumerate() {
         if slot.reload_if_changed(engine, engine_api, workspace_root) {
-            // The reloaded image is unpatched and the recorded addresses point
-            // into the previous one, so every prologue record is now stale.
-            #[cfg(feature = "hot_patch")]
-            {
-                if let Some(session) = hot_patch.as_mut() {
-                    session.forget_prologue_patches();
-                }
-                for session in module_hot_patch.iter_mut().flatten() {
-                    session.forget_prologue_patches();
-                }
-            }
+            reloaded_modules.push(index);
+            // The reloaded image is unpatched and every recorded prologue
+            // address points into the previous one. Noted here and acted on
+            // once the borrow below ends; forgetting is idempotent, so doing it
+            // once after the loop is the same as doing it per reload.
+            any_module_reloaded = true;
             info!(
                 target: telemetry_target::HOT_RELOAD,
                 module = slot.name(),
@@ -663,44 +784,18 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
         }
     }
 
-    // Step 0c: Try the per-function fast path before the reload transaction.
-    //
-    // This is a frame boundary: reloads are already processed here, before
-    // `process_frame`, so no system is executing while a dispatch slot is
-    // written. A successful patch consumes the pending generation, which is what
-    // skips the full rebuild below; anything it refuses falls straight through
-    // to that rebuild, so the worst case is the behavior that existed before.
-    #[cfg(feature = "hot_patch")]
-    {
-        let pending = host.reload_generation.load(Ordering::Acquire);
-        if pending != host.last_processed_generation {
-            // Disjoint field borrows, as Step 0 above does.
-            let Host {
-                hot_patch,
-                optional_modules,
-                loaded_patches,
-                loaded_project,
-                engine,
-                ..
-            } = &mut *host;
-            let mut patched = false;
-            if let Some(session) = hot_patch {
-                let targets = patch_targets(loaded_project, optional_modules);
-                let outcome = session.try_patch(engine, &targets, loaded_patches);
-                drop(targets);
-                patched = report_patch_outcome(outcome);
-            }
-            if patched {
-                // The edit is fully accounted for; skip the rebuild. Recorded as
-                // the generation observed above rather than a fresh read: a save
-                // that arrived while the patch compiled is a different edit that
-                // nothing has delivered, and must stay pending.
-                host.last_processed_generation = pending;
-            }
-        }
+    // The borrow above has ended, so the records a module reload invalidated
+    // can be dropped now, and the rebuilt sources become the new patch baseline.
+    if any_module_reloaded {
+        forget_prologue_records(host);
+        resync_patch_baselines(host, false, &reloaded_modules);
     }
 
-    // Step 1: Process a pending hot reload before running systems.
+    // Step 4: Try the per-function fast path for the project, before the
+    // reload below turns a pending change into a full rebuild.
+    try_project_fast_path(host);
+
+    // Step 5: Process a pending project reload before running systems.
     // The watcher bumps a generation counter; reloading while it differs from
     // the last processed value means events that arrive during a reload are
     // never lost.
@@ -712,20 +807,10 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
             "hot reload triggered"
         );
 
-        // The project image is about to be replaced, and the graveyard unmaps it
-        // two generations later. Every recorded prologue address points into the
-        // image being retired, so the records are dropped here for the same
-        // reason the module path drops them: writing saved bytes back to a
-        // retired - or worse, re-used - address is not a rollback.
-        #[cfg(feature = "hot_patch")]
-        {
-            if let Some(session) = host.hot_patch.as_mut() {
-                session.forget_prologue_patches();
-            }
-            for session in host.module_hot_patch.iter_mut().flatten() {
-                session.forget_prologue_patches();
-            }
-        }
+        // The project image is about to be replaced, and the graveyard unmaps
+        // it two generations later, so every recorded prologue address is now
+        // stale for the same reason a module reload makes them stale.
+        forget_prologue_records(host);
 
         host.loaded_project.reload(
             &mut host.engine,
@@ -744,6 +829,11 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
         // Recording the baseline is what lets the next frame observe it and
         // rebuild - which is what the cancellation is for.
         host.last_processed_generation = generation;
+
+        // The project now runs the sources on disk, so the patch classifier's
+        // baseline has to say so too. Skipping this is what makes one refused
+        // patch disable the fast path for the rest of the session.
+        resync_patch_baselines(host, true, &[]);
     }
 
     // Print the analytics line for every reload completed this frame (optional
@@ -752,11 +842,11 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     // breakdowns already populated, so this is a pure drain-and-print.
     analytics::print_reload_events(reload_started);
 
-    // Step 2: Poll the managed loader for an assembly swap.
+    // Step 6: Poll the managed loader for an assembly swap.
     // The managed loader watches the built assembly instead of source files.
     host.loaded_project.poll_managed_reload();
 
-    // Step 3: Execute one scheduler frame and report its failures.
+    // Step 7: Execute one scheduler frame and report its failures.
     if let Err(errors) = host.engine.process_frame() {
         // Deferred command failures arrive as a batch; flatten them into one
         // rate-limited report using each error's plain semantic message.
@@ -775,7 +865,7 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
         host.report_frame_error(failure.to_plain_message());
     }
 
-    // Step 4: Invoke the native compatibility update after scheduler systems.
+    // Step 8: Invoke the native compatibility update after scheduler systems.
     // Managed games run entirely as scheduler systems. Native games retain
     // this compatibility update hook after their scheduled work.
     host.loaded_project.update(&host.engine_api);
@@ -786,7 +876,7 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
         slot.update(&host.engine_api);
     }
 
-    // Step 5: Track and report FPS over the three-second window.
+    // Step 9: Track and report FPS over the three-second window.
     host.frame_count += 1;
     let elapsed = host.last_report.elapsed().as_secs_f64();
     if elapsed < 3.0 {
@@ -922,6 +1012,11 @@ fn process_rollback_request(host: &mut Host) {
         print_patch_generations(host);
     }
 }
+
+/// See the `hot_patch` version above; without the feature there is nothing to
+/// roll back to.
+#[cfg(not(feature = "hot_patch"))]
+fn process_rollback_request(_host: &mut Host) {}
 
 /// Print every generation this session has installed.
 ///

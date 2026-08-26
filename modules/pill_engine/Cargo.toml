@@ -7,6 +7,9 @@ edition = "2021"
 pill_core = { path = "../pill_core" }
 pill_core_macros = { path = "../pill_core_macros" }
 pill_engine_macros = { path = "../pill_engine_macros" }
+# Re-exported as `pill_engine::hot_patch`; see that module for why the path
+# has to stay stable.
+pill_hot_runtime = { path = "../pill_hot_runtime" }
 inventory = "0.3"
 rayon = "1.10"
 parking_lot = "0.12"
@@ -66,7 +69,7 @@ profiling-verify = [
 # into a host built WITH it - `HotPatchRegistry` is an unconditional field, so
 # `Engine`s layout does not change. Such a module simply registers systems that
 # are not hot-patchable.
-hot_patch = []
+hot_patch = ["pill_hot_runtime/hot_patch"]
 
 # Emit repeated numerical measurements through the shared `metrics` recorder.
 metrics = ["dep:metrics", "pill_core/metrics"]

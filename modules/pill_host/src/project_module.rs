@@ -17,14 +17,13 @@
 //! reports success or rejection through `poll_reload`.
 
 // Standard library
-use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
 // External crates
 use pill_core::error::{HostError, LibraryError};
-use pill_core::{debug, error, info, warn};
+use pill_core::{error, info};
 use pill_engine::{Engine, EngineApi, SystemOwner};
 
 // Current crate
@@ -37,13 +36,6 @@ use crate::{ProjectModuleBackend, ProjectModuleConfig};
 // =============================================================================
 // Constants
 // =============================================================================
-
-/// Maximum number of retired native generations kept mapped.
-///
-/// The immediately previous generation must stay mapped because its persist
-/// metadata drives the next migration; anything older can be evicted and its
-/// temporary file deleted.
-const MAX_GRAVEYARD_GENERATIONS: usize = 2;
 
 // =============================================================================
 // LoadedProject
@@ -276,192 +268,19 @@ fn reload_native(
         }
     };
 
-    // Step 3: Capture old schemas, clear old systems, and initialize the new
-    // generation while both DLLs remain mapped. Migration may need the old
-    // persistence functions after project_init registers the replacement
-    // generation's component definitions.
-    let previous_metadata_by_name = engine.world().capture_persist_type_metadata();
-    let previous_manifest = engine.world().persist_type_manifest();
-
-    // Registered native system closures can point into the old DLL. Remove
-    // them before project_init installs closures from the replacement module.
-    // Only the project's own systems are cleared: optional modules are still
-    // running their previous generation, and their systems must survive a
-    // project reload untouched.
-    debug!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-        "reload step 1/4: clearing old systems"
-    );
-    engine.clear_systems_owned_by(SystemOwner::PROJECT);
-    debug!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-        "reload step 2/4: calling project_init on the new module"
-    );
-    let init_started = Instant::now();
-    // Capture the registration sequence before init so the types this new
-    // generation registered can be compared against the previous ones.
-    let registration_sequence = engine.world().persist_registration_sequence();
-    let component_registration_sequence = engine.world().component_registration_sequence();
-    if new_library.call_init(engine_api) != 0 {
-        // The new generation failed to register itself. Roll the engine back
-        // to the previous module: project_init must be idempotent, re-registering
-        // the same components and systems and only filling entities up to a
-        // target count.
-        error!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-            "new project module failed to initialize; rolling back to the previous generation"
-        );
-        engine.clear_systems_owned_by(SystemOwner::PROJECT);
-        let rollback_status = current.call_init(engine_api);
-        if rollback_status != 0 {
-            error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                status = rollback_status,
-                "rollback of the previous generation also failed; the host continues without gameplay systems"
-            );
-        }
-        return;
-    }
-    analytics::record_init(&config.name, init_started.elapsed().as_secs_f64() * 1000.0);
-
-    // Detect persistable component types the new generation stopped
-    // registering. Such data is NOT wiped by migration — the type is absent
-    // from the changed-name set, so its column and metadata linger while the
-    // new generation cannot read them. Surface it instead of letting the type
-    // silently orphan.
-    let newly_registered = engine
-        .world()
-        .persist_type_names_registered_since(registration_sequence);
-    let all_registered = engine
-        .world()
-        .registered_component_names_since(component_registration_sequence);
-    let forgotten_type_names: Vec<String> = registered_type_names
-        .iter()
-        .filter(|name| !newly_registered.iter().any(|current| current == *name))
-        .cloned()
-        .collect();
-    if !forgotten_type_names.is_empty() {
-        warn!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-            module = config.name.as_str(),
-            forgotten_types = ?forgotten_type_names,
-            "component type(s) no longer registered by the project; their data stays in the world \
-             but is orphaned (the new generation cannot read it)"
-        );
-
-        // Drop the orphaned columns only for types the new generation does
-        // not register at all (not even as a plain component). A type merely
-        // downgraded from persistable to plain keeps live data, so its columns
-        // must survive. This runs while the generation that last registered
-        // the type is still mapped, so the drop is safe.
-        let truly_forgotten: Vec<String> = forgotten_type_names
-            .iter()
-            .filter(|name| !all_registered.iter().any(|current| current == *name))
-            .cloned()
-            .collect();
-        if !truly_forgotten.is_empty() {
-            let dropped_entities = engine
-                .world_mut()
-                .drop_forgotten_components(&truly_forgotten);
-            debug!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                module = config.name.as_str(),
-                dropped_entities,
-                "dropped orphaned columns for component types no longer registered"
-            );
-        }
-    }
-    *registered_type_names = newly_registered;
-
-    // Step 3b: Re-home every native storage column to the freshly loaded
-    // generation's function table. Columns created by older generations hold
-    // function pointers into their own DLL; refreshing them here (the old
-    // DLLs are still mapped) keeps drops and upcasts valid when those DLLs
-    // are later evicted from the reload graveyard.
-    engine.world_mut().rehome_native_columns();
-
-    // Match schemas by stable type name rather than runtime ComponentId: IDs
-    // can differ across dynamically loaded generations, while names persist.
-    let migrate_started = Instant::now();
-    let current_schema_by_name: HashMap<String, u64> = engine
-        .world()
-        .persist_type_manifest()
-        .into_iter()
-        .map(|entry| (entry.type_name, entry.schema_hash))
-        .collect();
-    let changed_type_names: HashSet<String> = previous_manifest
-        .iter()
-        .filter_map(|entry| {
-            current_schema_by_name
-                .get(&entry.type_name)
-                .filter(|&&current_hash| current_hash != entry.schema_hash)
-                .map(|_| entry.type_name.clone())
-        })
-        .collect();
-
-    // Step 4: Migrate changed schemas and archive the old DLL.
-    if changed_type_names.is_empty() {
-        // Avoid touching archetype storage when every persisted layout is
-        // byte-for-byte compatible with the previous generation.
-        info!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-            "schema unchanged for all persistable component types - fast path"
-        );
-    } else {
-        // Migrate only changed component types. Unchanged columns keep their
-        // allocations and component ticks, which makes the common reload path
-        // both faster and less disruptive to change detection.
-        debug!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-            changed_types = changed_type_names.len(),
-            "reload step 3/4: selectively migrating changed component types"
-        );
-        let report = engine.world_mut().migrate_changed_persistable_components(
-            &previous_metadata_by_name,
-            &changed_type_names,
-        );
-
-        debug!(
-            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-            migrated_types = report.migrated_type_count,
-            migrated_entities = report.migrated_entity_count,
-            "selective migration complete"
-        );
-        if !report.skipped_type_names.is_empty() {
-            warn!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                skipped_types = ?report.skipped_type_names,
-                "selective migration skipped some component types"
-            );
-        }
-    }
-    analytics::record_migrate(
-        &config.name,
-        migrate_started.elapsed().as_secs_f64() * 1000.0,
-    );
-
-    // Do not unload the previous DLL. Persist metadata, component operations,
-    // or other engine-owned pointers may still reference its executable code.
-    // Moving it into the graveyard keeps those addresses valid permanently.
-    debug!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-        "reload step 4/4: archiving old DLL, swapping generation"
-    );
-    old_libraries.push(std::mem::replace(current, new_library));
-
-    // Keep the graveyard bounded. Engine-owned pointers only reference the
-    // immediately previous generation (its persist metadata drives the next
-    // migration), so anything older than the cap can be evicted safely.
-    if old_libraries.len() > MAX_GRAVEYARD_GENERATIONS {
-        // Dropping the evicted generation unmaps its module and deletes its
-        // temporary copy on disk; cleanup errors are reported by the Drop.
-        drop(old_libraries.remove(0));
-    }
-    analytics::record_reload(&config.name);
-    info!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-        entities = engine.world().entity_count(),
-        graveyard = old_libraries.len(),
-        "hot reload complete"
-    );
+    // Steps 3 to 6 are identical for every subject and live in one place:
+    // capture metadata, swap systems, drop forgotten types, re-home columns,
+    // migrate schemas, retire the old image. Their ORDER is load-bearing -
+    // see `crate::reload`.
+    let transaction = crate::reload::ReloadTransaction {
+        kind: crate::reload::ReloadSubjectKind::Project,
+        subject: &config.name,
+        owner: SystemOwner::PROJECT,
+        current,
+        old_libraries,
+        registered_type_names,
+    };
+    // The project reports no component names onward; only a module's reach
+    // the C# backend.
+    let _ = transaction.commit(engine, engine_api, new_library);
 }
