@@ -61,7 +61,12 @@ const BUILD_INFO_MARKER: &str = "pill_standalone_temp/build_info.txt";
 /// can overwrite it with the module's export-stripped dependency variant (the
 /// "one crate name, two feature sets" collision). The standalone artifact is
 /// staged into the module's private hot-load directory instead.
-const CARGO_MODULE_OUTPUT_SUBDIRECTORY: &str = "target/debug";
+///
+/// Follows the host's own profile rather than being fixed at `target/debug`,
+/// because that is where the module build this host just ran actually wrote.
+fn cargo_module_output_subdirectory() -> String {
+    crate::config::host_target_directory()
+}
 
 /// Private directory the host stages the project's loadable artifacts into,
 /// and the default an optional module's configuration also names.
@@ -95,6 +100,22 @@ const HOST_MODULE_FEATURE_SET: &str =
         (false, false) => "no-rendering",
     };
 
+/// Host build identity: toolchain, feature set **and** cargo profile.
+///
+/// The profile belongs here for the same reason the feature set does. Both
+/// change the crate-metadata hash on both sides of the DLL boundary, so an
+/// artifact built under one and loaded under the other fails to resolve its
+/// exports. Without the profile in this identity, switching between a debug
+/// and a release host would silently reuse the other profile's staged copies -
+/// which present as `LoadLibrary` error 127 rather than as anything that names
+/// a profile.
+fn host_build_identity() -> String {
+    format!(
+        "{HOST_MODULE_FEATURE_SET}\nprofile={}",
+        crate::config::host_profile_name()
+    )
+}
+
 // =============================================================================
 // Up-to-Date Build Detection
 // =============================================================================
@@ -120,7 +141,7 @@ fn current_build_info() -> String {
                 .and_then(|output| String::from_utf8(output.stdout).ok())
                 .and_then(|stdout| stdout.lines().next().map(str::to_string))
                 .unwrap_or_default();
-            format!("{rustc_version}\n{HOST_MODULE_FEATURE_SET}")
+            format!("{rustc_version}\n{}", host_build_identity())
         })
         .clone()
 }
@@ -815,7 +836,7 @@ pub(crate) const STAGED_DEPENDENCY_SUBDIRECTORY: &str = "target/hot/deps";
 #[cfg(feature = "hot_patch")]
 pub(crate) fn stage_shared_dependency_rlibs(workspace_root: &Path) -> usize {
     let source_directory = workspace_root
-        .join(CARGO_MODULE_OUTPUT_SUBDIRECTORY)
+        .join(cargo_module_output_subdirectory())
         .join("deps");
     let staged_directory = workspace_root.join(STAGED_DEPENDENCY_SUBDIRECTORY);
     let Ok(entries) = std::fs::read_dir(&source_directory) else {
@@ -920,7 +941,7 @@ pub(crate) fn build_optional_module(
     // slot with the module's export-stripped dependency variant, but the
     // loaded generation always comes from the untouched hot copy.
     let build_output = workspace_root
-        .join(CARGO_MODULE_OUTPUT_SUBDIRECTORY)
+        .join(cargo_module_output_subdirectory())
         .join(native_library_filename(&config.library_name));
     let hot_output = workspace_root
         .join(&config.output_subdirectory)
@@ -934,7 +955,7 @@ pub(crate) fn build_optional_module(
     // fast path idle for that module.
     let (rlib_build_output, rlib_output) = (
         workspace_root
-            .join(CARGO_MODULE_OUTPUT_SUBDIRECTORY)
+            .join(cargo_module_output_subdirectory())
             .join(format!("lib{}.rlib", config.name)),
         workspace_root
             .join(&config.output_subdirectory)
@@ -988,11 +1009,14 @@ pub(crate) fn build_optional_module(
         }
     }
 
+    // Optional modules carry no per-module environment of their own, but they
+    // need the same profile-driven `RUSTFLAGS` handling the project gets: an
+    // optimized build must not inherit `-C prefer-dynamic`.
     run_build_command(
         workspace_root,
         &config.name,
         &config.build_command,
-        &[],
+        &crate::config::spawned_build_environment(),
         cancel_flag,
     )?;
 

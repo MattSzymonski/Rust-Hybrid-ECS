@@ -40,7 +40,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 // Current crate
-use crate::{FrameReport, HostConfig};
+use crate::FrameReport;
 
 // =============================================================================
 // WindowedApplication
@@ -53,7 +53,7 @@ use crate::{FrameReport, HostConfig};
 /// they can be surfaced through [`run`]'s error path.
 #[cfg(feature = "rendering")]
 struct WindowedApplication {
-    module_config: HostConfig,
+    project: crate::ProjectSource,
     window: Option<Arc<Window>>,
     host: Option<crate::RenderingHost>,
     /// Whether the hidden startup window has been revealed after its first frame.
@@ -77,7 +77,7 @@ impl ApplicationHandler for WindowedApplication {
         // surface for the entire build, so project setup runs ahead of window
         // creation. `winit` only permits creating a window while the event loop
         // is active, which is why setup cannot happen before `resumed`.
-        let host = match crate::setup(self.module_config.clone()) {
+        let host = match crate::setup(self.project.clone()) {
             Ok(host) => host,
             Err(error) => {
                 self.setup_error = Some(error.into());
@@ -234,8 +234,8 @@ impl WindowedApplication {
 /// cannot be built or loaded, or when the source watcher cannot start. Frame
 /// execution never returns an error; the loop runs until the process exits.
 #[cfg(not(feature = "rendering"))]
-pub fn run(module_config: HostConfig) -> Result<(), HostError> {
-    let mut host = crate::setup(module_config)?;
+pub fn run(project: impl Into<crate::ProjectSource>) -> Result<(), HostError> {
+    let mut host = crate::setup(project.into())?;
 
     loop {
         if let Some(report) = crate::run_one_frame(&mut host) {
@@ -251,7 +251,8 @@ pub fn run(module_config: HostConfig) -> Result<(), HostError> {
 /// Returns [`EngineError`] if the event loop cannot be created or run, or if
 /// window creation or host/renderer setup fails inside the event loop.
 #[cfg(feature = "rendering")]
-pub fn run(module_config: HostConfig) -> Result<(), EngineError> {
+pub fn run(project: impl Into<crate::ProjectSource>) -> Result<(), EngineError> {
+    let project = project.into();
     // Step 1: Create a new event loop for the windowed application.
     let event_loop =
         EventLoop::new().map_err(|source| FrontendError::EventLoopCreation { source })?;
@@ -262,7 +263,7 @@ pub fn run(module_config: HostConfig) -> Result<(), EngineError> {
 
     // Step 3: Create the application state and run the event loop.
     let mut application = WindowedApplication {
-        module_config,
+        project,
         window: None,
         host: None,
         window_shown: false,

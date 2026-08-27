@@ -19,7 +19,6 @@
 //! the host matches schemas by type name and migrates only changed layouts.
 
 // External crates
-#[cfg(feature = "module-abi")]
 use pill_core::info;
 use pill_engine::*;
 use serde::{Deserialize, Serialize};
@@ -32,7 +31,6 @@ use serde::{Deserialize, Serialize};
 ///
 /// Hot reload preserves entities, so initialization fills the world up to this
 /// count instead of spawning a fresh batch on every rebuild.
-#[cfg(feature = "module-abi")]
 const MODULE_TEST_ENTITY_COUNT: usize = 4;
 
 /// Frame interval at which the module reports progress to the host log.
@@ -45,7 +43,6 @@ const REPORT_INTERVAL_FRAMES: u64 = 300;
 /// Fixed time step folded into the accumulated time of every entity.
 ///
 /// Used only by [`module_test_processor`], which the module-abi build registers.
-#[cfg(feature = "module-abi")]
 const FIXED_DELTA_TIME: f32 = 1.0 / 60.0;
 
 // =============================================================================
@@ -78,9 +75,8 @@ pub struct ModuleTest {
 /// system's access pattern from the query signature, so it is scheduled against
 /// the project's systems automatically. Progress is reported on one entity only,
 /// at a fixed frame interval, to keep the host console readable.
-#[cfg(feature = "module-abi")]
 fn module_test_processor(mut query: Query<&mut ModuleTest>) -> Result<(), SystemError> {
-    for (_, mut state) in query.iter_mut().enumerate() {
+    for mut state in query.iter_mut() {
         state.processed_frame_count += 1;
         state.accumulated_time += FIXED_DELTA_TIME;
 
@@ -106,8 +102,12 @@ fn module_test_processor(mut query: Query<&mut ModuleTest>) -> Result<(), System
 /// Returns zero on success. Must be idempotent: the host calls it once per
 /// loaded generation and rolls back to the previous library when it reports a
 /// non-zero status, which re-runs this function on the older generation.
+/// Public so a statically linked build can call it directly. With
+/// `module-abi` on, `#[pill_module]` also exports it as
+/// `pill_module_init` for the host to find in a loaded DLL; a shipping
+/// build has no DLL and calls this function itself.
 #[pill_module]
-fn register(engine: &mut Engine) -> u32 {
+pub fn register(engine: &mut Engine) -> u32 {
     engine.register_system("module_test_processor", module_test_processor);
 
     // Fill up to the target count rather than spawning a new batch, because

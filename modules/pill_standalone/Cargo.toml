@@ -5,14 +5,53 @@ edition = "2021"
 
 [dependencies]
 pill_core = { path = "../pill_core" }
-pill_host = { package = "pill_host", path = "../pill_host" }
+pill_host = { package = "pill_host", path = "../pill_host", default-features = false }
 miette = "7"
 tracing = "0.1"
+
+# Linked into the binary only by the `static_project` feature, which a shipping
+# build turns on in place of `hot_reload`. `default-features = false` keeps each
+# module's `#[no_mangle]` `pill_module_*` exports off: statically there is no
+# host looking those up, and two definitions of one symbol is a linker error.
+project = { path = "../../examples/project_rs", optional = true }
+pill_spline = { path = "../optional/pill_spline", default-features = false, optional = true }
+pill_dummy_math = { path = "../optional/pill_dummy_math", default-features = false, optional = true }
+pill_dummy_text = { path = "../optional/pill_dummy_text", default-features = false, optional = true }
+pill_dummy_color = { path = "../optional/pill_dummy_color", default-features = false, optional = true }
+pill_dummy_timer = { path = "../optional/pill_dummy_timer", default-features = false, optional = true }
+pill_dummy_random = { path = "../optional/pill_dummy_random", default-features = false, optional = true }
 
 [build-dependencies]
 pill_hot_scan = { path = "../pill_hot_scan" }
 
 [features]
+# On by default: the development posture. Building with
+# `--no-default-features --features static_project` selects the shipping
+# posture instead - nothing watched, built or loaded at runtime.
+default = ["hot_reload"]
+hot_reload = ["pill_host/hot_reload"]
+# Link the example project and its optional modules into this binary. Only
+# meaningful with `hot_reload` off; `main.rs` refuses the other combinations.
+#
+# Build the shipping binary with `--package pill_standalone`, not
+# `--workspace`: cargo unions the features requested for a package across one
+# invocation, and `pill_editor` asks for `pill_host`'s defaults, which would
+# switch `hot_reload` back on.
+static_project = [
+    "dep:project",
+    "dep:pill_spline",
+    "dep:pill_dummy_math",
+    "dep:pill_dummy_text",
+    "dep:pill_dummy_color",
+    "dep:pill_dummy_timer",
+    "dep:pill_dummy_random",
+]
+# Select the managed project instead of the native one, in a shipping build.
+# The assembly is loaded from where it was already built; nothing is compiled,
+# no C# mirrors are generated, and the assembly is not watched.
+static_csharp = []
+# Per-function hot patching, forwarded to the host. Implies `hot_reload`.
+hot_patch = ["pill_host/hot_patch"]
 # Windowed mode: `host::run` owns the winit event loop and wgpu renderer
 # behind this feature; the binary itself contains no GPU or window code.
 rendering = ["pill_host/rendering"]

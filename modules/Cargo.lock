@@ -2406,6 +2406,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
+name = "host_project_project"
+version = "0.1.0"
+dependencies = [
+ "pill_core",
+ "pill_dummy_color",
+ "pill_dummy_math",
+ "pill_dummy_random",
+ "pill_dummy_text",
+ "pill_dummy_timer",
+ "pill_engine",
+ "pill_spline",
+ "serde",
+ "tracing",
+ "trait_type_map",
+]
+
+[[package]]
 name = "html5ever"
 version = "0.29.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4323,8 +4340,15 @@ version = "0.1.0"
 dependencies = [
  "miette",
  "pill_core",
+ "pill_dummy_color",
+ "pill_dummy_math",
+ "pill_dummy_random",
+ "pill_dummy_text",
+ "pill_dummy_timer",
  "pill_host",
  "pill_hot_scan",
+ "pill_spline",
+ "project",
  "tracing",
 ]
 

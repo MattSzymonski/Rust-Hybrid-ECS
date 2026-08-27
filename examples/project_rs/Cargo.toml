@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-crate-type = ["cdylib"]
+# `cdylib` for a hot-reloading build, where the host loads this as a DLL.
+# `rlib` so a shipping build can link the project straight into the binary -
+# a cdylib cannot be a Rust library dependency. Every optional module already
+# carries both for the same reason.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 pill_engine = { path = "../../modules/pill_engine" }

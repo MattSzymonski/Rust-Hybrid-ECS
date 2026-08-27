@@ -14,29 +14,46 @@
 //! and backend-specific loading stays behind [`LoadedProject`].
 
 // Standard library
+#[cfg(feature = "hot_reload")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "hot_reload")]
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(feature = "hot_reload")]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // External crates
-use pill_core::error::{CSharpError, EngineMessage, HostError};
+#[cfg(feature = "hot_reload")]
+use pill_core::error::CSharpError;
+use pill_core::error::{EngineMessage, HostError};
 use pill_core::telemetry::telemetry_target;
 use pill_core::{error, info};
+use pill_engine::Engine;
+#[cfg(feature = "hot_reload")]
+use pill_engine::EngineApi;
 #[cfg(feature = "rendering")]
 use pill_engine::EngineError;
-use pill_engine::{Engine, EngineApi};
 #[cfg(feature = "rendering")]
 use pill_engine::{RenderViewport, Renderer, RendererError, RendererWindow, VirtualResolution};
 
 // Current crate
+#[cfg(feature = "hot_reload")]
 use crate::analytics;
+#[cfg(feature = "hot_reload")]
 use crate::config::project_depends_on_crate;
+#[cfg(feature = "hot_reload")]
 use crate::csharp::ModuleExposedComponent;
+#[cfg(feature = "hot_reload")]
 use crate::native_library::cleanup_temporary_files;
+#[cfg(feature = "hot_reload")]
 use crate::optional_module::OptionalModuleSlot;
+#[cfg(feature = "hot_reload")]
 use crate::project_module::LoadedProject;
+#[cfg(feature = "hot_reload")]
 use crate::watcher::spawn_source_watcher;
+#[cfg(not(feature = "hot_reload"))]
+use crate::StaticProject;
+#[cfg(feature = "hot_reload")]
 use crate::{HostConfig, ProjectModuleBackend, ProjectModuleConfig};
 
 // =============================================================================
@@ -55,16 +72,41 @@ const FRAME_ERROR_REPORT_INTERVAL: Duration = Duration::from_secs(1);
 /// Bundling this state lets headless, windowed, and editor frontends share the
 /// same engine lifetime and hot-reload behavior through [`run_one_frame`].
 pub struct Host {
+    /// Only a reloading build needs this: it is the directory every spawned
+    /// cargo build runs in and every artifact path is resolved against.
+    #[cfg(feature = "hot_reload")]
     workspace_root: PathBuf,
+    #[cfg(feature = "hot_reload")]
     module_config: ProjectModuleConfig,
     // Boxed before EngineApi is created so its raw engine pointer remains
     // stable even if Host is moved by a caller.
     engine: Box<Engine>,
+    /// The C-callable table a loaded artifact is handed at every entry point.
+    ///
+    /// A pure function-pointer table with no side effects, so a statically
+    /// linked build - which calls Rust functions directly and never crosses an
+    /// FFI boundary - has no use for it and does not build one.
+    #[cfg(feature = "hot_reload")]
     engine_api: EngineApi,
+    /// The managed runtime, when a shipping build runs a C# project.
+    ///
+    /// Held only to keep .NET alive: dropping it unloads the runtime out from
+    /// under the systems its assembly registered. Nothing calls into it per
+    /// frame, because managed gameplay is entirely scheduler systems.
+    #[cfg(not(feature = "hot_reload"))]
+    _managed_runtime: Option<crate::csharp::CSharpRuntime>,
+    /// The loaded project image, and the generations retired behind it.
+    ///
+    /// Absent without `hot_reload`: a statically linked project has no image to
+    /// hold, its entry point having been called once during setup.
+    #[cfg(feature = "hot_reload")]
     loaded_project: LoadedProject,
     /// Optional modules, each with its own watcher and reload transaction.
+    #[cfg(feature = "hot_reload")]
     optional_modules: Vec<OptionalModuleSlot>,
+    #[cfg(feature = "hot_reload")]
     reload_generation: Arc<AtomicU64>,
+    #[cfg(feature = "hot_reload")]
     last_processed_generation: u64,
     /// Per-function fast path, when the project opted in with `#[pill_hot]`.
     ///
@@ -296,10 +338,31 @@ pub struct FrameReport {
     pub entity_count: usize,
 }
 
+/// What a frontend passes to say which project to run.
+///
+/// The two postures answer that question with different things, and neither
+/// makes sense in the other: a reloading build resolves a project path, build
+/// command and watch directory from a [`HostConfig`], while a shipping build
+/// has the entry points linked in and describes them with a
+/// [`StaticProject`](crate::StaticProject).
+///
+/// Aliasing them lets every frontend-facing entry point - headless `run`,
+/// windowed `run`, [`setup_rendering`] - keep one signature instead of a
+/// `#[cfg]` pair, because `impl Into<ProjectSource>` is satisfied by
+/// `HostConfig`, by `ProjectModuleConfig` through its `From`, and by
+/// `StaticProject` through the blanket `From<T> for T`.
+#[cfg(feature = "hot_reload")]
+pub type ProjectSource = HostConfig;
+
+/// See the `hot_reload` version above.
+#[cfg(not(feature = "hot_reload"))]
+pub type ProjectSource = StaticProject;
+
 // =============================================================================
 // Free Functions
 // =============================================================================
 
+#[cfg(feature = "hot_reload")]
 /// Build/load the project module, create the engine, and start its source watcher.
 ///
 /// # Errors
@@ -494,6 +557,46 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
     Ok(host)
 }
 
+/// Create the engine and initialize a statically linked project.
+///
+/// The shipping counterpart of the `hot_reload` [`setup`] above. Nothing is
+/// built, watched or loaded: the project and its optional modules were linked
+/// into this binary, and the frontend passes their entry points in.
+///
+/// # Errors
+///
+/// Returns a typed [`HostError`] when an optional module's or the project's
+/// entry point reports a non-zero initialization status. There is no previous
+/// generation to fall back to on this path, so the first failure is fatal.
+#[cfg(not(feature = "hot_reload"))]
+pub fn setup(project: StaticProject) -> Result<Host, HostError> {
+    // Step 1: Construct the engine and its stable API table. Boxed first so the
+    // raw pointer inside `EngineApi` stays valid if the caller moves the host.
+    let mut engine = Box::new(Engine::new());
+
+    info!(
+        target: telemetry_target::ENGINE,
+        module = project.name,
+        modules = project.modules.len(),
+        "ECS host starting (statically linked)"
+    );
+
+    // Step 2: Register every module, then the project, in the order and under
+    // the owners the reloading path would have used.
+    let managed_runtime = project.initialize(&mut engine)?;
+
+    Ok(Host {
+        engine,
+        _managed_runtime: managed_runtime,
+        last_frame_error: None,
+        last_error_report: Instant::now(),
+        suppressed_error_count: 0,
+        frame_count: 0,
+        last_report: Instant::now(),
+        last_measured_fps: 0.0,
+    })
+}
+
 /// Set up the engine, project module, hot reload, and renderer together.
 ///
 /// A frontend owns its platform event loop and supplies its cloneable window
@@ -506,7 +609,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
 /// a [`HostError`] from setup or a [`RendererError`] from surface creation.
 #[cfg(feature = "rendering")]
 pub fn setup_rendering<W>(
-    host_config: impl Into<HostConfig>,
+    project: impl Into<ProjectSource>,
     window: W,
     width: u32,
     height: u32,
@@ -514,7 +617,7 @@ pub fn setup_rendering<W>(
 where
     W: RendererWindow + 'static,
 {
-    let host = setup(host_config)?;
+    let host = setup(project.into())?;
     let renderer = Renderer::new(window, width, height)?;
     Ok(RenderingHost { host, renderer })
 }
@@ -573,7 +676,7 @@ fn forget_prologue_records(host: &mut Host) {
 }
 
 /// See the `hot_patch` version above; without the feature nothing is recorded.
-#[cfg(not(feature = "hot_patch"))]
+#[cfg(all(not(feature = "hot_patch"), feature = "hot_reload"))]
 fn forget_prologue_records(_host: &mut Host) {}
 
 /// Arm the thread that owns the frame boundary as the only one allowed to
@@ -587,7 +690,7 @@ fn arm_patching_thread() {
 }
 
 /// See the `hot_patch` version above; without the feature nothing patches.
-#[cfg(not(feature = "hot_patch"))]
+#[cfg(all(not(feature = "hot_patch"), feature = "hot_reload"))]
 fn arm_patching_thread() {}
 
 /// Try to deliver every pending optional-module edit by patching, not rebuilding.
@@ -636,7 +739,7 @@ fn try_module_fast_path(host: &mut Host) {
 }
 
 /// See the `hot_patch` version above; without the feature there is no fast path.
-#[cfg(not(feature = "hot_patch"))]
+#[cfg(all(not(feature = "hot_patch"), feature = "hot_reload"))]
 fn try_module_fast_path(_host: &mut Host) {}
 
 /// Try to deliver a pending project edit by patching, not rebuilding.
@@ -678,7 +781,7 @@ fn try_project_fast_path(host: &mut Host) {
 }
 
 /// See the `hot_patch` version above; without the feature there is no fast path.
-#[cfg(not(feature = "hot_patch"))]
+#[cfg(all(not(feature = "hot_patch"), feature = "hot_reload"))]
 fn try_project_fast_path(_host: &mut Host) {}
 
 /// Re-sync the patch baselines of every subject a reload has just rebuilt.
@@ -710,13 +813,17 @@ fn resync_patch_baselines(host: &mut Host, project: bool, modules: &[usize]) {
 }
 
 /// See the `hot_patch` version above; without the feature there is no baseline.
-#[cfg(not(feature = "hot_patch"))]
+#[cfg(all(not(feature = "hot_patch"), feature = "hot_reload"))]
 fn resync_patch_baselines(_host: &mut Host, _project: bool, _modules: &[usize]) {}
 
-pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
-    #[cfg(feature = "metrics")]
-    let frame_start = Instant::now();
-
+/// Run every reload step of one frame: module reloads, the per-function fast
+/// paths, a pending project reload, and the analytics drain that reports them.
+///
+/// Separated from [`run_one_frame`] so the frame loop reads the same in both
+/// build configurations. Without `hot_reload` there is nothing to reload, and
+/// the no-op twin below compiles the whole sequence out.
+#[cfg(feature = "hot_reload")]
+fn run_reload_steps(host: &mut Host) {
     // Step 1: Reload any optional module whose sources changed. Each module
     // owns an independent generation counter and clears only its own systems,
     // so editing one module never rebuilds another and never disturbs the
@@ -841,9 +948,25 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     // The events were recorded with their build/stage/load/init/migrate
     // breakdowns already populated, so this is a pure drain-and-print.
     analytics::print_reload_events(reload_started);
+}
+
+/// See the `hot_reload` version above; a statically linked build reloads
+/// nothing, so there is no work and no analytics to drain.
+#[cfg(not(feature = "hot_reload"))]
+fn run_reload_steps(_host: &mut Host) {}
+
+pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
+    #[cfg(feature = "metrics")]
+    let frame_start = Instant::now();
+
+    // Steps 1 to 5: everything reloading does, in one call so this loop is
+    // identical whether or not the machinery is compiled in.
+    run_reload_steps(host);
 
     // Step 6: Poll the managed loader for an assembly swap.
     // The managed loader watches the built assembly instead of source files.
+    // Only a reloading build has a managed loader to poll.
+    #[cfg(feature = "hot_reload")]
     host.loaded_project.poll_managed_reload();
 
     // Step 7: Execute one scheduler frame and report its failures.
@@ -868,12 +991,20 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     // Step 8: Invoke the native compatibility update after scheduler systems.
     // Managed games run entirely as scheduler systems. Native games retain
     // this compatibility update hook after their scheduled work.
-    host.loaded_project.update(&host.engine_api);
+    //
+    // Both hooks are optional DLL exports (`project_update`,
+    // `pill_module_update`) that the attribute macros do not generate, so a
+    // statically linked build has nothing to call: its gameplay runs entirely
+    // through scheduler systems, which Step 7 already ran.
+    #[cfg(feature = "hot_reload")]
+    {
+        host.loaded_project.update(&host.engine_api);
 
-    // Optional modules may also export a per-frame hook. Run them after the
-    // project so a module observes the world the project's systems produced.
-    for slot in &host.optional_modules {
-        slot.update(&host.engine_api);
+        // Optional modules may also export a per-frame hook. Run them after the
+        // project so a module observes the world the project's systems produced.
+        for slot in &host.optional_modules {
+            slot.update(&host.engine_api);
+        }
     }
 
     // Step 9: Track and report FPS over the three-second window.
@@ -1015,7 +1146,7 @@ fn process_rollback_request(host: &mut Host) {
 
 /// See the `hot_patch` version above; without the feature there is nothing to
 /// roll back to.
-#[cfg(not(feature = "hot_patch"))]
+#[cfg(all(not(feature = "hot_patch"), feature = "hot_reload"))]
 fn process_rollback_request(_host: &mut Host) {}
 
 /// Print every generation this session has installed.
@@ -1200,6 +1331,7 @@ fn record_frame_metrics(entity_count: usize, frame_time_ms: f64, fps: f64) {
     metrics::gauge!("engine.fps").set(fps);
 }
 
+#[cfg(feature = "hot_reload")]
 /// Print the selected backend before any build output starts streaming.
 fn print_startup_configuration(workspace_root: &Path, module_config: &ProjectModuleConfig) {
     info!(

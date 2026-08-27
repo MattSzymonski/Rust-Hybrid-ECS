@@ -18,6 +18,12 @@ metrics = { version = "0.24", optional = true }
 winit = { version = "0.30", optional = true }
 
 [features]
+# On by default: the development posture, where the host watches sources,
+# shells out to cargo, and loads the project and every optional module as a
+# DLL. Turning it OFF selects the shipping posture - nothing is watched, built
+# or loaded at runtime, and the project is linked into the binary instead.
+default = ["hot_reload"]
+hot_reload = []
 rendering = ["pill_engine/rendering", "pill_core/rendering", "dep:winit"]
 # Enable Tracy profiling: engine profiling zones plus the Tracy tracing layer.
 profiling = ["pill_engine/profiling", "pill_core/tracy"]
@@ -30,6 +36,8 @@ metrics = ["dep:metrics", "pill_engine/metrics"]
 # Per-function hot patching: a body-only edit to a `#[pill_hot]` system is
 # compiled on its own and swapped into the running engine, instead of rebuilding
 # and re-registering the whole module. Development only.
-hot_patch = ["pill_engine/hot_patch"]
+# Implies `hot_reload`: a refused patch falls back to a full module reload, so
+# the fallback has to exist for the fast path to be safe to attempt at all.
+hot_patch = ["hot_reload", "pill_engine/hot_patch"]
 # Compile the simple developer log macros (`log!`, `warn!`, `error!`).
 dev-logs = ["pill_core/dev-logs"]

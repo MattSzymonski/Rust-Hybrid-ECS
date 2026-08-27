@@ -23,6 +23,7 @@ use std::sync::Arc;
 
 // External crates
 use pill_core::error::CSharpError;
+#[cfg(feature = "hot_reload")]
 use pill_core::{error, info};
 use pill_engine::commands::CommandQueue;
 use pill_engine::{Engine, SystemAccess, SystemError, World};
@@ -47,10 +48,13 @@ use crate::CSharpModuleConfig;
 /// managed assembly from driving a multi-gigabyte host allocation.
 pub(super) const MAX_COMPONENT_MANIFEST_BYTES: u32 = 16 * 1024 * 1024;
 
+#[cfg(feature = "hot_reload")]
 /// Poll returned without a reload: nothing was due or the file is unchanged.
 pub(crate) const POLL_NO_CHANGE: u8 = 0;
+#[cfg(feature = "hot_reload")]
 /// Poll swapped in a behavior-compatible assembly.
 pub(crate) const POLL_RELOADED: u8 = 1;
+#[cfg(feature = "hot_reload")]
 /// Poll rejected the new assembly; the old version stays loaded.
 pub(crate) const POLL_REJECTED: u8 = 2;
 
@@ -111,6 +115,12 @@ type PollReloadFn = extern "system" fn() -> u8;
 ///
 /// The snapshot is compared against a re-reflection after every successful
 /// reload, so a managed-side bug that silently changes system metadata can
+// Every field below is resolved from the loaded assembly in both postures,
+// but only `verify_systems_unchanged` reads them, and that runs solely on the
+// reload path. The allowance is scoped to the configuration where the reader
+// is compiled out rather than applied unconditionally, so a field that becomes
+// genuinely unused still warns in a reloading build.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 /// never run stale index bindings unnoticed.
 struct ManagedSystemSnapshot {
     /// Reflected native access list resolved at startup.
@@ -123,6 +133,10 @@ struct ManagedSystemSnapshot {
 ///
 /// Keeping `_runtime` and `_api` alive guarantees that both the managed
 /// runtime and every native function pointer remain valid for registered
+// Same reasoning as `ManagedSystemSnapshot` above: these are the assembly's
+// polling and reflection exports, resolved at startup either way, and read
+// only by `poll_reload` and `verify_systems_unchanged`.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 /// scheduler closures.
 pub(crate) struct CSharpRuntime {
     /// Unmanaged export polling the collectible loader for a rebuilt assembly.
@@ -135,6 +149,7 @@ pub(crate) struct CSharpRuntime {
     get_access: GetSystemAccessFn,
     /// Unmanaged export reporting whether one system declares a Commands parameter.
     system_uses_commands: SystemUsesCommandsFn,
+    #[cfg(feature = "hot_reload")]
     /// Outcome of the most recent reload poll, for one-shot rejection logging.
     last_poll_status: u8,
     /// Metadata snapshot the active assembly is verified against after reload.
@@ -405,6 +420,7 @@ impl CSharpRuntime {
             access_count,
             get_access,
             system_uses_commands,
+            #[cfg(feature = "hot_reload")]
             last_poll_status: POLL_NO_CHANGE,
             system_snapshot,
             _runtime: runtime,
@@ -417,6 +433,7 @@ impl CSharpRuntime {
     ///
     /// The managed loader validates the rebuilt assembly's component manifest
     /// and system signatures before swapping. A rejection is logged once per
+    #[cfg(feature = "hot_reload")]
     /// attempt so the per-frame poll cannot drown the terminal in messages.
     pub(crate) fn poll_reload(&mut self) -> u8 {
         let status = (self.poll_reload)();
@@ -449,6 +466,7 @@ impl CSharpRuntime {
     /// The managed loader already rejects swaps whose system signatures
     /// changed, so this is defense in depth: a mismatch means the loader
     /// validation and the host snapshot disagree, and continuing would run
+    #[cfg(feature = "hot_reload")]
     /// stale index bindings.
     fn verify_systems_unchanged(&self) -> bool {
         let count = (self.system_count)();

@@ -860,7 +860,13 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     );
 
     let expanded = quote! {
-        #[cfg(feature = "module-abi")]
+        // Emitted unconditionally. What `module-abi` gates is the `#[no_mangle]`
+        // exports below: those must stay off when this crate is linked as an
+        // ordinary dependency, or one symbol ends up with two definitions. The
+        // user's own function has no such problem, and a statically linked
+        // build calls it directly - without this it would not be compiled at
+        // all, and a shipping binary would have no way to initialize the module
+        // it just linked in.
         #item_fn
 
         #hot_patch_resolver

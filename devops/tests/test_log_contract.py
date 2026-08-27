@@ -67,6 +67,8 @@ EXTERNALLY_PRODUCED: Dict[str, str] = {
     "STATUS_ACCESS_VIOLATION": "Windows prints this exit status, not the host.",
     "panicked at": "Emitted by the Rust panic runtime, not by our code.",
     "counter tick": "Printed by the example project in examples/project_rs.",
+    "[project]": "Printed by the example project in examples/project_rs, which "
+    "is outside the `modules/` tree this test scans.",
     "warning CS": "Emitted by the C# compiler.",
     "[csharp_runtime] reloaded project_cs.dll":
         "Emitted by the .NET bridge, whose source is C# rather than Rust.",

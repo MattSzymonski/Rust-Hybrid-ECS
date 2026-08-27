@@ -57,6 +57,73 @@ const OPTIONAL_MODULE_DIRECTORY: &str = "optional";
 /// manifest; only the package name differs per project.
 const HOST_PROJECT_MEMBER_PREFIX: &str = "host_project_";
 
+/// Cargo profile directory this host was compiled into, recorded by `build.rs`.
+///
+/// `debug` for an ordinary `cargo build`, `release` for `--release`, and the
+/// profile's own name for any custom profile (`release-fast`,
+/// `release-with-debug`).
+const HOST_PROFILE_DIRECTORY: &str = env!("PILL_HOST_PROFILE_DIRECTORY");
+
+/// Cargo profile *name* matching [`HOST_PROFILE_DIRECTORY`].
+///
+/// Cargo names the default profile `dev` but writes it into `target/debug`;
+/// every other profile's directory is its own name. This is the only place the
+/// two vocabularies are reconciled.
+///
+/// Module builds must use the host's profile. A host and a module compiled
+/// into different profiles resolve different crate-metadata hashes, so the
+/// module's exports do not match what the host looks up and `LoadLibrary`
+/// fails with "The specified procedure could not be found" - an error that
+/// names nothing useful and cost a full afternoon the first time it appeared.
+pub(crate) fn host_profile_name() -> &'static str {
+    profile_name_for_directory(HOST_PROFILE_DIRECTORY)
+}
+
+/// Map a cargo profile *directory* to the profile *name* that produces it.
+///
+/// Split out from [`host_profile_name`] so the mapping is testable without
+/// rebuilding the host under every profile.
+fn profile_name_for_directory(directory: &str) -> &str {
+    // The one profile whose directory and name differ. `test` and `bench` also
+    // build into `debug`, but the host is never compiled under those - they
+    // apply to test and benchmark targets, not to a dependency being built.
+    if directory == "debug" {
+        "dev"
+    } else {
+        directory
+    }
+}
+
+/// Environment every host-spawned cargo build needs, on top of the host's own.
+///
+/// Empty for the default profile. For any optimized profile it clears
+/// `RUSTFLAGS`, which is the only thing that can drop the workspace's
+/// `-C prefer-dynamic`: cargo MERGES `build.rustflags` arrays, so
+/// `--config build.rustflags=[]` joins the existing list and changes nothing,
+/// and a `target.<triple>` list does not replace it either. An empty
+/// `RUSTFLAGS` in the environment takes precedence over the config file and is
+/// the mechanism `devops/ci_cd/build_release.sh` already uses for the host's
+/// own build.
+///
+/// Without this, every module and project build the host spawns fails with
+/// "cannot prefer dynamic linking when performing LTO", because the release
+/// profile sets `lto = "fat"` and rustc refuses that pairing outright.
+pub(crate) fn spawned_build_environment() -> Vec<(String, String)> {
+    if host_profile_name() == "dev" {
+        Vec::new()
+    } else {
+        vec![("RUSTFLAGS".to_string(), String::new())]
+    }
+}
+
+/// Workspace-relative directory cargo writes this host's profile into.
+///
+/// Used as the project's build-output location, so the host looks for the
+/// artifact where its own profile put it rather than always in `target/debug`.
+pub(crate) fn host_target_directory() -> String {
+    format!("target/{HOST_PROFILE_DIRECTORY}")
+}
+
 /// Optional host configuration file name, resolved in the engine workspace
 /// root. Declares the project and the optional modules; environment variables
 /// override it for a single run.
@@ -100,6 +167,33 @@ pub struct CSharpModuleConfig {
     pub project_assembly_name: String,
     /// Output subdirectory for the project assembly, relative to the workspace root.
     pub project_output_subdirectory: String,
+}
+
+impl CSharpModuleConfig {
+    /// Describe a managed project by its assembly names and output directories.
+    ///
+    /// A reloading build gets this from
+    /// [`ProjectModuleConfig::from_environment`], which reads the project's
+    /// `.csproj`. A shipping build has no project path to read, so its frontend
+    /// states the same four values directly - which is also why this type needs
+    /// a constructor at all: it is `#[non_exhaustive]`, so it cannot be built
+    /// with a struct expression from another crate.
+    ///
+    /// The two subdirectories are relative to the root the caller supplies with
+    /// them, not to any fixed location.
+    pub fn new(
+        runtime_assembly_name: impl Into<String>,
+        runtime_output_subdirectory: impl Into<String>,
+        project_assembly_name: impl Into<String>,
+        project_output_subdirectory: impl Into<String>,
+    ) -> Self {
+        Self {
+            runtime_assembly_name: runtime_assembly_name.into(),
+            runtime_output_subdirectory: runtime_output_subdirectory.into(),
+            project_assembly_name: project_assembly_name.into(),
+            project_output_subdirectory: project_output_subdirectory.into(),
+        }
+    }
 }
 
 /// Configuration for a hot-reloadable project module.
@@ -198,6 +292,12 @@ impl OptionalModuleConfig {
             // cache lock (which rust-analyzer's cargo check can hold for long
             // stretches) and halves the fixed per-build cargo overhead.
             "--offline".to_string(),
+            // Build into the host's own profile. Stated explicitly rather than
+            // left to cargo's default, because the default is only correct for
+            // a debug host; a release host that loads a debug module fails
+            // inside `LoadLibrary` on mismatched crate-metadata hashes.
+            "--profile".to_string(),
+            host_profile_name().to_string(),
         ];
         // Enable the module's C-ABI exports explicitly. The feature is opt-in
         // (not a default) so that building every member in one cargo
@@ -445,7 +545,10 @@ impl ProjectModuleConfig {
         // Sources are watched in place at the real project path, while the
         // built artifact lands in the workspace target directory.
         let watch_directory = format!("{project_path}/src");
-        let output_subdirectory = "target/debug".to_string();
+        // Where cargo will put it, which is the host's profile directory - not
+        // `target/debug`, which is only right when the host itself is a debug
+        // build.
+        let output_subdirectory = host_target_directory();
 
         // Step 4: Build the Cargo command. The project is a workspace member,
         // so the build selects it by package name from the workspace root. It
@@ -458,7 +561,10 @@ impl ProjectModuleConfig {
             "cargo".to_string(),
             "build".to_string(),
             "--package".to_string(),
-            package_name.clone(),
+            // The generated member, not the project package it was copied
+            // from: the two are distinct packages so a shipping binary can link
+            // the project directly without colliding with this one.
+            format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}"),
             // Emit a cargo timing report so the analytics collector can show
             // per-crate compile+link wall time for every host-driven build.
             "--timings".to_string(),
@@ -467,6 +573,11 @@ impl ProjectModuleConfig {
             // cache lock (which rust-analyzer's cargo check can hold for long
             // stretches) and halves the fixed per-build cargo overhead.
             "--offline".to_string(),
+            // Build into the host's own profile, for the same reason the
+            // optional modules do: a profile mismatch across the DLL boundary
+            // is a load failure, not a performance difference.
+            "--profile".to_string(),
+            host_profile_name().to_string(),
         ];
         // Mirror the host's engine feature set into the project build, for the
         // same reason optional modules do: `pill_engine` is an rlib, so the
@@ -491,7 +602,7 @@ impl ProjectModuleConfig {
             manifest_path: Some(format!("{project_path}/Cargo.toml")),
             watch_directory,
             build_command,
-            build_environment: Vec::new(),
+            build_environment: spawned_build_environment(),
             backend: ProjectModuleBackend::NativeLibrary {
                 library_name,
                 output_subdirectory,
@@ -617,6 +728,7 @@ fn manifest_string_value(manifest: &str, section: &str, key: &str) -> Option<Str
 /// Reads the project's manifest again at runtime because the decision depends
 /// on the module that just changed, which is only known during the frame loop.
 /// A missing or unreadable manifest counts as "no dependency", so a transient
+#[cfg(feature = "hot_reload")]
 /// filesystem state can never force the project through an extra reload.
 pub(crate) fn project_depends_on_crate(
     workspace_root: &Path,
@@ -642,6 +754,7 @@ pub(crate) fn project_depends_on_crate(
 /// Accepts both a direct entry (`pill_spline = { ... }`) and a renamed one
 /// (`my_spline = { package = "pill_spline", ... }`). Only dependency sections
 /// contribute code to the built library: `[dependencies]`, the dev and build
+#[cfg(feature = "hot_reload")]
 /// variants, and target-specific tables that end in `.dependencies`.
 fn manifest_depends_on_crate(manifest: &str, crate_name: &str) -> bool {
     let mut in_dependency_section = false;
@@ -685,6 +798,7 @@ fn manifest_depends_on_crate(manifest: &str, crate_name: &str) -> bool {
 /// code: the plain `[dependencies]` family or a target-specific table ending
 /// in `.dependencies`. The workspace-wide `[workspace.dependencies]` table is
 /// shared infrastructure rather than a dependency of this project, so it is
+#[cfg(feature = "hot_reload")]
 /// excluded.
 fn is_dependency_section(section: &str) -> bool {
     matches!(
@@ -696,6 +810,7 @@ fn is_dependency_section(section: &str) -> bool {
 /// The crate name a dependency sub-table declares, for sections shaped like
 /// `[dependencies.<name>]`, `[dev-dependencies.<name>]`, or
 /// `[build-dependencies.<name>]`. Returns `None` for any other section or for
+#[cfg(feature = "hot_reload")]
 /// a sub-table nested deeper than one level.
 fn dependency_sub_table_key(section: &str) -> Option<&str> {
     for prefix in ["dependencies.", "dev-dependencies.", "build-dependencies."] {
@@ -886,8 +1001,24 @@ fn materialize_host_project_member(
     #[allow(unused_mut)]
     let mut generated_manifest = strip_workspace_tables(&generated_manifest);
 
+    // Step 2b: Give the generated member its own package name.
+    //
+    // It used to keep the project's, which made two packages in one workspace
+    // claim the same name: this member, and the project crate itself for any
+    // build that links the project directly. Cargo rejects that outright
+    // ("package collision in the lockfile"), and a statically linked shipping
+    // binary has to link the project directly - that is the whole point of it.
+    //
+    // The `[lib] name` set below keeps the built artifact called `project.dll`,
+    // so nothing downstream of the build changes; only the package cargo
+    // selects does. The build command is generated from the same prefix, so
+    // the two cannot drift.
+    let member_package_name = format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}");
+    generated_manifest = rewrite_package_name(&generated_manifest, &member_package_name);
+
     // Step 3: Point the generated member's library at the real source file so
-    // the project compiles from its actual location.
+    // the project compiles from its actual location, and pin the library name
+    // so the artifact keeps the name the host looks for.
     let lib_source = project_root.join("src").join("lib.rs");
     if lib_source.is_file() {
         let absolute_lib_path = lib_source.to_string_lossy().replace('\\', "/");
@@ -907,6 +1038,24 @@ fn materialize_host_project_member(
                     &format!("\npath = \"{absolute_lib_path}\""),
                 );
             }
+        }
+    }
+
+    // Step 3a: Name the library after the project, not after this member.
+    //
+    // Without this the artifact would follow the renamed package and land as
+    // `host_project_project.dll`, which is not what the host looks for.
+    if let Some(lib_header) = generated_manifest.find("[lib]") {
+        let section_end = generated_manifest[lib_header..]
+            .find("\n[")
+            .map(|offset| lib_header + offset)
+            .unwrap_or(generated_manifest.len());
+        if !generated_manifest[lib_header..section_end].contains("name =") {
+            let header_line_end = generated_manifest[lib_header..]
+                .find('\n')
+                .map(|offset| lib_header + offset)
+                .unwrap_or(section_end);
+            generated_manifest.insert_str(header_line_end, &format!("\nname = \"{package_name}\""));
         }
     }
 
@@ -954,6 +1103,42 @@ fn materialize_host_project_member(
     }
 
     Ok(())
+}
+
+/// Replace the `name` of a manifest's `[package]` section.
+///
+/// Only the `[package]` table is touched: a `name` under `[lib]` or inside a
+/// dependency entry means something else entirely, and rewriting one of those
+/// would silently retarget the build.
+///
+/// Returns the manifest unchanged when it declares no `[package]` name, which
+/// cannot happen for a project the host accepted - [`ProjectModuleConfig`]
+/// rejects that earlier with `ProjectPackageNameMissing` - but is handled here
+/// rather than assumed.
+fn rewrite_package_name(manifest: &str, package_name: &str) -> String {
+    let Some(section) = manifest.find("[package]") else {
+        return manifest.to_string();
+    };
+    let section_end = manifest[section..]
+        .find("\n[")
+        .map(|offset| section + offset)
+        .unwrap_or(manifest.len());
+    let Some(name_offset) = manifest[section..section_end]
+        .find("name")
+        .map(|offset| section + offset)
+    else {
+        return manifest.to_string();
+    };
+    let line_end = manifest[name_offset..]
+        .find('\n')
+        .map(|offset| name_offset + offset)
+        .unwrap_or(manifest.len());
+
+    let mut rewritten = String::with_capacity(manifest.len() + package_name.len());
+    rewritten.push_str(&manifest[..name_offset]);
+    rewritten.push_str(&format!("name = \"{package_name}\""));
+    rewritten.push_str(&manifest[line_end..]);
+    rewritten
 }
 
 /// Names the manifest entry that owns the `path = "..."` at `key_offset`.
@@ -1108,12 +1293,14 @@ serde = { version = "1", features = ["derive"] }
     // =========================================================================
 
     /// A direct dependency declared as an inline table is detected.
+    #[cfg(feature = "hot_reload")]
     #[test]
     fn direct_dependency_is_detected() {
         assert!(manifest_depends_on_crate(DEPENDENT_MANIFEST, "pill_spline"));
     }
 
     /// A dependency renamed through `package = "..."` is detected.
+    #[cfg(feature = "hot_reload")]
     #[test]
     fn renamed_dependency_is_detected() {
         let manifest = r#"
@@ -1125,6 +1312,7 @@ spline_path = { package = "pill_spline", path = "../../modules/optional/pill_spl
 
     /// A dependency with a quoted key (renamed to a non-identifier) is detected
     /// through its `package` value.
+    #[cfg(feature = "hot_reload")]
     #[test]
     fn quoted_key_rename_is_detected() {
         let manifest = r#"
@@ -1135,6 +1323,7 @@ spline_path = { package = "pill_spline", path = "../../modules/optional/pill_spl
     }
 
     /// Dev and build dependencies also link the crate into the build.
+    #[cfg(feature = "hot_reload")]
     #[test]
     fn dev_and_build_dependencies_are_detected() {
         let manifest = r#"
@@ -1148,6 +1337,7 @@ pill_spline = { path = "../../modules/optional/pill_spline" }
     }
 
     /// A target-specific dependency table is detected.
+    #[cfg(feature = "hot_reload")]
     #[test]
     fn target_specific_dependency_is_detected() {
         let manifest = r#"
@@ -1158,6 +1348,7 @@ pill_spline = { path = "../../modules/optional/pill_spline" }
     }
 
     /// A dependency written as its own sub-table is detected.
+    #[cfg(feature = "hot_reload")]
     #[test]
     fn sub_table_dependency_is_detected() {
         let manifest = r#"
@@ -1168,6 +1359,7 @@ path = "../../modules/optional/pill_spline"
     }
 
     /// A manifest that never mentions the crate reports no dependency.
+    #[cfg(feature = "hot_reload")]
     #[test]
     fn missing_dependency_is_not_detected() {
         assert!(!manifest_depends_on_crate(
@@ -1178,6 +1370,7 @@ path = "../../modules/optional/pill_spline"
 
     /// A crate listed only under `[workspace.dependencies]` is shared
     /// infrastructure, not something this project links directly.
+    #[cfg(feature = "hot_reload")]
     #[test]
     fn workspace_shared_dependency_is_not_a_project_dependency() {
         let manifest = r#"
@@ -1191,6 +1384,7 @@ pill_engine = { path = "../../modules/pill_engine" }
     }
 
     /// A crate name appearing outside any dependency section is not a link.
+    #[cfg(feature = "hot_reload")]
     #[test]
     fn same_name_outside_dependency_sections_is_ignored() {
         let manifest = r#"
@@ -1207,6 +1401,7 @@ pill_engine = { path = "../../modules/pill_engine" }
     }
 
     /// A longer crate name sharing the prefix must not match.
+    #[cfg(feature = "hot_reload")]
     #[test]
     fn shared_prefix_does_not_match() {
         let manifest = r#"
@@ -1250,6 +1445,7 @@ shared = { version = "1" }
     }
 
     /// The project manifest is read from disk and a direct dependency found.
+    #[cfg(feature = "hot_reload")]
     #[test]
     fn reads_the_project_manifest() {
         let manifest = write_manifest("dependent", DEPENDENT_MANIFEST);
@@ -1263,6 +1459,7 @@ shared = { version = "1" }
     }
 
     /// A project that does not depend on the module is not triggered.
+    #[cfg(feature = "hot_reload")]
     #[test]
     fn independent_manifest_is_not_triggered() {
         let manifest = write_manifest("independent", INDEPENDENT_MANIFEST);
@@ -1277,6 +1474,7 @@ shared = { version = "1" }
 
     /// A managed project is never triggered, even with a manifest path set,
     /// because it cannot link a Rust optional-module crate.
+    #[cfg(feature = "hot_reload")]
     #[test]
     fn managed_project_is_never_triggered() {
         let manifest = write_manifest("managed", "# csproj contents\n");
@@ -1291,6 +1489,7 @@ shared = { version = "1" }
     }
 
     /// A missing manifest counts as "no dependency" rather than an error.
+    #[cfg(feature = "hot_reload")]
     #[test]
     fn missing_manifest_file_is_not_an_error() {
         let project = native_config(Some("does/not/exist/Cargo.toml"));
@@ -1302,6 +1501,7 @@ shared = { version = "1" }
     }
 
     /// A config without a manifest path counts as "no dependency".
+    #[cfg(feature = "hot_reload")]
     #[test]
     fn missing_manifest_path_is_not_an_error() {
         let project = native_config(None);
@@ -1354,6 +1554,73 @@ fn add_rlib_crate_type(manifest: &str) -> String {
     rewritten.push_str(", \"rlib\"");
     rewritten.push_str(&manifest[lib_header + close..]);
     rewritten
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::{host_profile_name, host_target_directory, profile_name_for_directory};
+
+    /// The one profile whose cargo name and target directory differ.
+    #[test]
+    fn the_default_profile_is_named_dev_but_builds_into_debug() {
+        assert_eq!(profile_name_for_directory("debug"), "dev");
+    }
+
+    /// Every other profile's directory is its own name, including custom ones.
+    #[test]
+    fn every_other_profile_directory_is_its_own_name() {
+        for directory in ["release", "release-fast", "release-with-debug", "shipping"] {
+            assert_eq!(
+                profile_name_for_directory(directory),
+                directory,
+                "{directory} should map to itself"
+            );
+        }
+    }
+
+    /// Whatever the build script recorded has to be usable as a cargo
+    /// `--profile` value, or every module build this host runs fails.
+    #[test]
+    fn the_recorded_profile_is_a_usable_cargo_argument() {
+        let name = host_profile_name();
+        assert!(!name.is_empty(), "the profile name must not be empty");
+        assert!(
+            !name.starts_with('-'),
+            "{name:?} would be parsed as a flag, not a profile"
+        );
+        assert!(
+            !name.contains(char::is_whitespace),
+            "{name:?} would split into two arguments"
+        );
+    }
+
+    /// The output directory must be the workspace-relative `target/<profile>`
+    /// cargo actually writes into, not an absolute or parent-relative path.
+    #[test]
+    fn the_target_directory_is_workspace_relative() {
+        let directory = host_target_directory();
+        assert!(
+            directory.starts_with("target/"),
+            "{directory:?} must live under the workspace target directory"
+        );
+        assert!(
+            !directory.contains(".."),
+            "{directory:?} must not escape it"
+        );
+    }
+
+    /// Under `cargo test` the host is a debug build, which is the one case
+    /// where the two vocabularies differ - so this pins the pairing end to end.
+    #[test]
+    fn the_name_and_the_directory_describe_the_same_profile() {
+        let expected_name = profile_name_for_directory(
+            host_target_directory()
+                .strip_prefix("target/")
+                .expect("the directory is workspace-relative"),
+        )
+        .to_string();
+        assert_eq!(host_profile_name(), expected_name);
+    }
 }
 
 #[cfg(test)]

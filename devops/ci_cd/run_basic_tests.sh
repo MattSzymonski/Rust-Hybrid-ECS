@@ -13,9 +13,11 @@
 #
 #     python devops/tests/test_basic.py code_linting
 #
-#   Checks: code formatting (cargo fmt), code linting (cargo clippy), native
-#   example build with an artifact size report, WASM build with a size budget
-#   and a dev-server smoke test, and the native performance benchmark.
+#   Checks: code formatting (cargo fmt), code linting (cargo clippy), the Rust
+#   test suite in both feature configurations, the static shipping build with
+#   proof that the hot-reload machinery is compiled out, native example build
+#   with an artifact size report, WASM build with a size budget and a
+#   dev-server smoke test, and the native performance benchmark.
 #
 #   Designed for both local development and GitHub Actions CI
 #   (ci-basic-tests.yml).
@@ -25,6 +27,9 @@
 #   all                            run every check (default)
 #   code_formatting                cargo fmt --check over the workspace
 #   code_linting                   cargo clippy -D warnings over the workspace
+#   rust_tests                     cargo test --workspace, with and without hot_patch
+#   shipping_build                 static release build + proof the reload
+#                                  machinery is gone
 #   native_example_build           launcher release build + artifact sizes
 #   wasm_example_build             launcher WASM build + size budget + smoke test
 #   native_performance_benchmark   build + run the benchmark project (release)

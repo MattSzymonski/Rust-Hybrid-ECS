@@ -172,12 +172,16 @@ def run_command(
     timeout: int = COMMAND_TIMEOUT_SECONDS,
     capture: bool = True,
     cwd: Optional[Path] = None,
+    environment: Optional[dict] = None,
 ) -> subprocess.CompletedProcess:
     """Runs a command from the repository root, merging stderr into stdout.
 
     Returns a CompletedProcess with returncode 127 when the executable is
     missing and 124 on timeout, so callers can report a reason without having
     to catch exceptions themselves.
+
+    `environment` replaces the child's environment entirely when given, which
+    the shipping build needs in order to clear RUSTFLAGS.
     """
     # stdout/stderr are set explicitly rather than via `capture_output`, which
     # cannot be combined with redirecting stderr into stdout.
@@ -193,6 +197,7 @@ def run_command(
             text=True,
             encoding="utf-8",
             errors="replace",
+            env=environment,
         )
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(command, 124, f"timed out after {timeout}s", "")
@@ -206,6 +211,30 @@ def failure_excerpt(completed: subprocess.CompletedProcess) -> str:
     return output[-FAILURE_EXCERPT_CHARACTERS:] if output else f"exit {completed.returncode}"
 
 
+# Name of the binary a shipping build produces.
+SHIPPING_BINARY_NAME = "pill_standalone.exe" if os.name == "nt" else "pill_standalone"
+
+# Strings only the hot-reloading path can produce, asserted absent from a
+# shipping binary.
+#
+# Deliberately NOT the bare word "cargo". Every Rust binary embeds its
+# dependencies' panic locations, which are paths inside the cargo registry, so
+# that string is present in any build and proves nothing - measured at 99
+# occurrences in a shipping binary that invokes cargo nowhere. What matters is
+# the cargo *command* the host would spawn, so the arguments it always passes
+# are checked instead.
+RELOAD_ONLY_TOKENS = (
+    "watching for source changes",
+    "module DLL loaded successfully",
+    "building project module",
+    "pill_config.yaml",
+    "pill_standalone_temp",
+    "cargo build",
+    "--offline",
+    "--timings",
+)
+
+
 # =============================================================================
 # 1. Code formatting
 # =============================================================================
@@ -213,7 +242,7 @@ def failure_excerpt(completed: subprocess.CompletedProcess) -> str:
 
 def code_formatting(tally: ResultTally) -> None:
     """Checks the workspace is rustfmt-clean."""
-    section("(1/6) Code formatting check")
+    section("(1/7) Code formatting check")
     print(f"Running cargo fmt --check on {WORKSPACE_MANIFEST.relative_to(REPOSITORY_ROOT).as_posix()}")
     if not WORKSPACE_MANIFEST.is_file():
         tally.report_skip("code formatting", f"{WORKSPACE_MANIFEST} not found")
@@ -242,7 +271,7 @@ def code_formatting(tally: ResultTally) -> None:
 
 def code_linting(tally: ResultTally) -> None:
     """Checks the workspace is clippy-clean with warnings denied."""
-    section("(2/6) Code linting check")
+    section("(2/7) Code linting check")
     print(f"Running clippy on {WORKSPACE_MANIFEST.relative_to(REPOSITORY_ROOT).as_posix()}")
     if not WORKSPACE_MANIFEST.is_file():
         tally.report_skip("code linting", f"{WORKSPACE_MANIFEST} not found")
@@ -284,7 +313,7 @@ def rust_tests(tally: ResultTally) -> None:
     behaviour on paths the default build also takes, so a suite that passes with
     the feature can still fail without it. Both configurations are checked.
     """
-    section("(3/6) Rust tests")
+    section("(3/7) Rust tests")
     if not WORKSPACE_MANIFEST.is_file():
         tally.report_skip("rust tests", f"{WORKSPACE_MANIFEST} not found")
         return
@@ -330,13 +359,86 @@ def summarize_test_results(output: str) -> str:
 
 
 # =============================================================================
-# 4. Native example build
+# 4. Shipping build
+# =============================================================================
+
+
+def shipping_build(tally: ResultTally) -> None:
+    """Builds the static shipping binary and proves the dev machinery is gone.
+
+    The hot-reload net cannot cover this: by construction none of its eight
+    suites apply to a build with reloading compiled out. So this check does two
+    things the net cannot.
+
+    First it builds `pill_standalone` with `--no-default-features --features
+    static_project`, which turns `hot_reload` off and links the project and its
+    optional modules into the binary. That alone catches the usual breakage - a
+    `#[cfg]` that only compiles in one configuration.
+
+    Then it searches the binary for strings only the reloading path produces,
+    which asserts the machinery is *absent* rather than merely unused. It is the
+    same technique `test_log_contract.py` uses in the other direction.
+
+    RUSTFLAGS is cleared for the reason `devops/ci_cd/build_release.sh`
+    documents: the workspace sets `-C prefer-dynamic`, and rustc refuses that
+    together with the release profile's `lto = "fat"`.
+    """
+    section("(4/7) Shipping build")
+    if not WORKSPACE_MANIFEST.is_file():
+        tally.report_skip("shipping build", f"{WORKSPACE_MANIFEST} not found")
+        return
+
+    print("Building pill_standalone --no-default-features --features static_project")
+    completed = run_command(
+        [
+            find_executable("cargo"),
+            "build",
+            "--release",
+            "--package",
+            "pill_standalone",
+            "--no-default-features",
+            "--features",
+            "static_project",
+            "--manifest-path",
+            str(WORKSPACE_MANIFEST),
+        ],
+        timeout=BUILD_TIMEOUT_SECONDS,
+        environment=dict(os.environ, RUSTFLAGS=""),
+    )
+    if completed.returncode != 0:
+        tally.report_fail("shipping build", failure_excerpt(completed))
+        return
+
+    binary = WORKSPACE_MANIFEST.parent / "target" / "release" / SHIPPING_BINARY_NAME
+    if not binary.is_file():
+        tally.report_fail("shipping build", f"{binary} was not produced")
+        return
+
+    image = binary.read_bytes()
+    present = [token for token in RELOAD_ONLY_TOKENS if token.encode() in image]
+    if present:
+        tally.report_fail(
+            "shipping build",
+            "the shipping binary still contains reload-only strings, so that "
+            "machinery was compiled in rather than gated out: " + ", ".join(present),
+        )
+        return
+
+    print(
+        f"  {len(image):,} bytes, none of "
+        f"{len(RELOAD_ONLY_TOKENS)} reload-only strings present"
+    )
+    tally.report_pass("shipping build")
+
+
+# =============================================================================
+# 5. Native example build
 # =============================================================================
 
 
 def native_example_build(tally: ResultTally) -> None:
     """Builds the native example in release and reports its artifact sizes."""
-    section("(4/6) Native build")
+    section("(5/7) Native build")
     launcher = launcher_prerequisites("native example build", NATIVE_EXAMPLE, tally)
     if launcher is None:
         return
@@ -376,7 +478,7 @@ def native_example_build(tally: ResultTally) -> None:
 
 def wasm_example_build(tally: ResultTally) -> None:
     """Builds the WASM target, enforces its size budget, and serves it once."""
-    section("(5/6) WASM build")
+    section("(6/7) WASM build")
     launcher = launcher_prerequisites("WASM example build", WASM_EXAMPLE, tally)
     if launcher is None:
         return
@@ -516,7 +618,7 @@ def native_performance_benchmark(tally: ResultTally) -> None:
     directly; with a display, windowed is tried first and headless is the
     fallback when it fails (typically no usable GPU).
     """
-    section("(6/6) Performance benchmark")
+    section("(7/7) Performance benchmark")
     launcher = launcher_prerequisites(
         "native performance benchmark", BENCHMARK_EXAMPLE, tally
     )
@@ -694,6 +796,7 @@ CHECKS: Dict[str, Callable[[ResultTally], None]] = {
     "code_formatting": code_formatting,
     "code_linting": code_linting,
     "rust_tests": rust_tests,
+    "shipping_build": shipping_build,
     "native_example_build": native_example_build,
     "wasm_example_build": wasm_example_build,
     "native_performance_benchmark": native_performance_benchmark,
@@ -703,6 +806,7 @@ CHECK_DESCRIPTIONS = {
     "code_formatting": "cargo fmt --check over the workspace",
     "code_linting": "cargo clippy -D warnings over the workspace",
     "rust_tests": "cargo test --workspace, with and without hot_patch",
+    "shipping_build": "static release build + proof the reload machinery is gone",
     "native_example_build": "launcher release build + artifact size report",
     "wasm_example_build": "launcher WASM build + size budget + dev server smoke test",
     "native_performance_benchmark": "build + run the benchmark project (release)",

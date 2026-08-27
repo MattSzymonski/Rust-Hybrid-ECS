@@ -321,8 +321,11 @@ fn run_dummy_module_demo() {
 /// the previously loaded module. Initialization must therefore be idempotent:
 /// re-registering the same components and systems is safe, and entities are
 /// only filled up to a target count.
+/// Public so a statically linked build can call it directly. With a
+/// reloading build, `#[pill_project]` also exports it as `project_init`
+/// for the host to resolve in the loaded DLL.
 #[pill_project]
-fn init(engine: &mut Engine) -> u32 {
+pub fn init(engine: &mut Engine) -> u32 {
     #[cfg(feature = "rendering")]
     {
         // Engine-owned render components are not declared by this crate, so

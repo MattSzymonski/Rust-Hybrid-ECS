@@ -17,6 +17,7 @@
 mod abi;
 /// High-level C# project startup, discovery, and scheduler registration.
 mod backend;
+#[cfg(feature = "hot_reload")]
 /// Host-side generation of the C# mirror structs for exposed module components.
 mod codegen;
 /// Native callbacks that translate C# lifecycle requests into deferred ECS commands.
@@ -42,6 +43,7 @@ pub(crate) use backend::CSharpRuntime;
 /// Aggregate of the native components optional modules exposed to managed code.
 pub(crate) use components::ModuleExposedComponent;
 
+#[cfg(feature = "hot_reload")]
 /// Generate the C# mirror file for optional-module components.
 pub(crate) use codegen::generate_module_components_csharp;
 
