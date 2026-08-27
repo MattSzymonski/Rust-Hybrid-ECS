@@ -221,6 +221,10 @@ impl NativeLibrary {
         // disk. `Self::load` validates the required exports before returning,
         // and the returned `ProjectLibrary` owns the mapping for its lifetime.
         let load_started = Instant::now();
+        // SAFETY: `temporary_path` is a complete native module on disk - it was
+        // written by `std::fs::copy` immediately above - and `Self::load`
+        // validates the required exports before returning; see the fuller
+        // justification above the copy.
         let native_library =
             unsafe { Self::load(&temporary_path, temporary_path.clone(), entry_points) }?;
         analytics::record_load(module_name, load_started.elapsed().as_secs_f64() * 1000.0);

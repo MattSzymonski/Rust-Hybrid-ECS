@@ -3,6 +3,9 @@ name = "pill_spline"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [lib]
 # `cdylib` is the artifact the host loads and hot swaps at runtime. `rlib` is
 # kept both for monolithic release builds and so another module or the project

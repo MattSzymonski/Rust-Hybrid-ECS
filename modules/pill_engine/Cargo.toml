@@ -3,6 +3,9 @@ name = "pill_engine"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
 pill_core = { path = "../pill_core" }
 pill_core_macros = { path = "../pill_core_macros" }

@@ -22,7 +22,7 @@ use std::any::Any;
 use std::collections::HashMap;
 
 // External crates
-use pill_core::warn;
+use pill_core::{error, warn};
 use trait_type_map::{ErasedVecStorageInfo, TraitAccessible, TraitTypeMap, VecFamily};
 
 // Current crate
@@ -41,6 +41,17 @@ use crate::scripting::{ScriptComponent, ScriptContext};
 // =============================================================================
 
 pub use crate::error::{AddComponentError, BuildError, RemoveComponentError, WorldError};
+
+// =============================================================================
+// Registration headroom
+// =============================================================================
+
+/// Component-type headroom below which registration warns.
+///
+/// The 128-type ceiling is shared across a project and every optional module,
+/// so it can be exhausted even with few of "your own" types. Warn while there
+/// is still room to act, so exhaustion is visible before it is fatal.
+const REGISTRATION_HEADROOM_WARNING_THRESHOLD: usize = 16;
 
 // =============================================================================
 // Per-Thread Last-Run Tick (thread-local statics)
@@ -248,6 +259,13 @@ pub struct World {
     /// Chronological `(type_name, sequence)` log of every component
     /// registration, plain and persistable alike.
     pub(crate) component_registration_log: Vec<(String, u64)>,
+    /// First component-registration failure of the current init pass, if any.
+    ///
+    /// Set when the 128-type ceiling is hit (or any other registry error
+    /// surfaces during `register_component`). The artifact-wide registration
+    /// loop drains it so the generated `init` can fail the reload
+    /// transactionally instead of running with a half-registered component set.
+    registration_error: Option<WorldError>,
 }
 
 impl World {
@@ -280,6 +298,7 @@ impl World {
             persist_registration_log: Vec::new(),
             component_registration_sequence: 0,
             component_registration_log: Vec::new(),
+            registration_error: None,
         }
     }
 
@@ -429,7 +448,38 @@ impl World {
         // `register_bit` rather than `register`: the world does not act on
         // whether the type was already present, and re-registration is normal
         // here because a hot reload re-runs every `init`.
-        let _bit = self.component_registry.register_bit::<T>();
+        let bit = match self.component_registry.register_bit::<T>() {
+            Ok(bit) => bit,
+            Err(error) => {
+                // The 128-type ceiling is a configuration outcome, not a
+                // programming error, so it is reported as a first-class
+                // diagnostic and recorded for the init entry point instead of
+                // panicking. The caller (project/module init) fails the reload
+                // transactionally when the error is drained by
+                // `component_registry::register_all_components`.
+                error!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    type_name = %type_name,
+                    error = %error,
+                    remaining = self.component_registry.available_slots(),
+                    "component registration failed"
+                );
+                self.registration_error = Some(error);
+                return;
+            }
+        };
+        // Warn while headroom is still available but getting thin, so
+        // exhaustion is visible before it is fatal.
+        let remaining = self.component_registry.available_slots();
+        if remaining <= REGISTRATION_HEADROOM_WARNING_THRESHOLD {
+            warn!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                remaining,
+                type_name = %type_name,
+                "component-type headroom is low; the 128-type ceiling is approaching"
+            );
+        }
+        let _ = bit;
 
         // Record the registration chronologically so the host can enumerate
         // which types one module's init registered at all (plain or
@@ -455,6 +505,17 @@ impl World {
         // requires no heap allocation or vtable dispatch.
         self.component_copiers
             .insert(component_id, copy_component::<T>);
+    }
+
+    /// Drain the first registration failure recorded by
+    /// [`Self::register_component`], if any.
+    ///
+    /// The artifact-wide registration loop calls this after running every
+    /// descriptor so the generated `init` can fail the reload with a non-zero
+    /// status when the component-type ceiling was hit — a diagnosable startup
+    /// failure rather than a silent half-registration.
+    pub fn take_registration_error(&mut self) -> Option<WorldError> {
+        self.registration_error.take()
     }
 
     /// Re-home every native column's per-type function table.
@@ -547,11 +608,10 @@ impl World {
                 _ => Err(WorldError::DynamicAlreadyRegistered),
             };
         }
-        if self.component_registry.len() >= 128 {
-            return Err(WorldError::ComponentTypeLimitExceeded);
-        }
+        // The registry reports the 128-type ceiling as a typed error (with the
+        // offending name and current count) rather than panicking; propagate it.
         self.component_registry
-            .register_dynamic(stable_id, name, size);
+            .register_dynamic(stable_id, name, size)?;
         self.storage_factories.insert(
             component_id,
             StorageFactory::Dynamic(DynamicComponentLayout {
@@ -1732,8 +1792,16 @@ impl World {
 
         // Step 4: Recycle the entity ID with an incremented generation so
         // the ID can be reused while stale handles are invalidated.
-        self.free_entity_ids
-            .push((entity.id, entity.generation.wrapping_add(1)));
+        //
+        // A slot whose generation has reached `u32::MAX` is retired instead of
+        // wrapping back to zero: wrapping would resurrect every stale handle
+        // from 2^32 recycles ago - the classic ABA failure. Retirement is
+        // effectively unreachable in practice (2^32 recycles of one slot), but
+        // it is cheap to make the wrap impossible rather than silent.
+        if entity.generation != u32::MAX {
+            self.free_entity_ids
+                .push((entity.id, entity.generation + 1));
+        }
 
         true
     }
@@ -3442,6 +3510,61 @@ mod tests {
         assert_eq!(new_entity4.generation, 0);
 
         println!("✓ Free list LIFO order works correctly!");
+    }
+
+    /// A slot whose generation reaches `u32::MAX` is retired instead of
+    /// wrapping back to zero (audit 5.14 / 4.1).
+    ///
+    /// Wrapping would resurrect every stale handle from 2^32 recycles ago -
+    /// the ABA failure where a handle silently addresses an unrelated entity.
+    /// The free list must drop the slot instead, so a stale handle can never
+    /// validate against a recycled entity.
+    #[test]
+    fn slot_at_generation_max_is_retired_not_wrapped() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+
+        // Seed the free list so the next create reuses id 7 at the
+        // second-highest representable generation.
+        world.free_entity_ids.push((7, u32::MAX - 1));
+
+        // First life of the slot: a real entity near the ceiling.
+        let stale = world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build()
+            .unwrap();
+        assert_eq!(stale.id, 7);
+        assert_eq!(stale.generation, u32::MAX - 1);
+
+        // Destroying it recycles the slot one step closer to the ceiling.
+        assert!(world.destroy_entity(stale));
+        assert_eq!(world.free_entity_ids.as_slice(), &[(7, u32::MAX)]);
+
+        // Second life at the ceiling itself.
+        let ceiling = world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build()
+            .unwrap();
+        assert_eq!(ceiling.generation, u32::MAX);
+
+        // Destroying at the ceiling retires the slot instead of wrapping to 0.
+        assert!(world.destroy_entity(ceiling));
+        assert!(
+            world.free_entity_ids.is_empty(),
+            "the slot must be retired, not wrapped back to generation 0"
+        );
+
+        // The id is never handed out again, so the stale handle can never
+        // validate against a recycled entity.
+        let replacement = world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build()
+            .unwrap();
+        assert_ne!(replacement.id, 7, "a retired slot must not be recycled");
+        assert!(!world.is_entity_valid(stale), "the stale handle stays dead");
     }
 
     /// Tests entity generations with multiple archetypes and component removal.

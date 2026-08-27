@@ -88,6 +88,16 @@ pub struct SystemAccess {
     /// after registration; empty until then.
     writes_mask: ComponentMask,
 
+    /// Sorted copy of `resource_reads`, built by
+    /// [`build_component_masks`](SystemAccess::build_component_masks) so the
+    /// resource-conflict check in [`conflicts_with`](SystemAccess::conflicts_with)
+    /// can use an allocation-free merge intersection instead of hashing every
+    /// pair. Kept in lockstep with the set it mirrors; a length mismatch means
+    /// the set changed after the sort and the check falls back to the sets.
+    resource_reads_sorted: Vec<ResourceId>,
+    /// Sorted copy of `resource_writes`, as above.
+    resource_writes_sorted: Vec<ResourceId>,
+
     /// Whether the bitmasks describe **every** access in the sets above.
     ///
     /// False until [`build_component_masks`](SystemAccess::build_component_masks)
@@ -178,6 +188,15 @@ impl SystemAccess {
             }
         }
         self.masks_complete = complete;
+
+        // Snapshot the resource sets in sorted order so the resource-conflict
+        // check can merge-intersect instead of hashing each pair. The sorted
+        // caches are only valid while the sets they mirror keep the same
+        // length; `conflicts_with` checks that before trusting them.
+        self.resource_reads_sorted = self.resource_reads.iter().copied().collect();
+        self.resource_reads_sorted.sort_unstable();
+        self.resource_writes_sorted = self.resource_writes.iter().copied().collect();
+        self.resource_writes_sorted.sort_unstable();
     }
 
     /// Whether the bitmasks currently describe every access this system makes.
@@ -245,19 +264,61 @@ impl SystemAccess {
             }
         }
 
-        // Step 3: Resource conflicts - still HashSet-based
-        if !self.resource_writes.is_disjoint(&other.resource_writes) {
-            return true;
-        }
-        if !self.resource_writes.is_disjoint(&other.resource_reads) {
-            return true;
-        }
-        if !self.resource_reads.is_disjoint(&other.resource_writes) {
-            return true;
+        // Step 3: Resource conflicts.
+        //
+        // Resources get the same treatment the component masks do - a
+        // precomputed sorted snapshot, checked with an allocation-free merge
+        // intersection instead of `HashSet::is_disjoint` on every pair. The
+        // snapshot is trusted only while the live set keeps the same length;
+        // if a caller mutated `resource_reads`/`resource_writes` after
+        // `build_component_masks`, the length check falls back to the sets,
+        // which are always the source of truth.
+        let reads_in_sync = self.resource_reads.len() == self.resource_reads_sorted.len()
+            && other.resource_reads.len() == other.resource_reads_sorted.len();
+        let writes_in_sync = self.resource_writes.len() == self.resource_writes_sorted.len()
+            && other.resource_writes.len() == other.resource_writes_sorted.len();
+        if reads_in_sync && writes_in_sync {
+            if !sorted_disjoint(&self.resource_writes_sorted, &other.resource_writes_sorted) {
+                return true;
+            }
+            if !sorted_disjoint(&self.resource_writes_sorted, &other.resource_reads_sorted) {
+                return true;
+            }
+            if !sorted_disjoint(&self.resource_reads_sorted, &other.resource_writes_sorted) {
+                return true;
+            }
+        } else {
+            if !self.resource_writes.is_disjoint(&other.resource_writes) {
+                return true;
+            }
+            if !self.resource_writes.is_disjoint(&other.resource_reads) {
+                return true;
+            }
+            if !self.resource_reads.is_disjoint(&other.resource_writes) {
+                return true;
+            }
         }
 
         false
     }
+}
+
+/// Whether two sorted, deduplicated slices share no element.
+///
+/// Walks both slices with a single index each (merge intersection), O(n + m)
+/// and allocation-free. Both inputs must be sorted ascending; duplicates
+/// within one slice are harmless (the walk still finds any shared value).
+#[inline]
+fn sorted_disjoint(left: &[ResourceId], right: &[ResourceId]) -> bool {
+    let (mut left_index, mut right_index) = (0, 0);
+    while left_index < left.len() && right_index < right.len() {
+        match left[left_index].cmp(&right[right_index]) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Greater => right_index += 1,
+            std::cmp::Ordering::Equal => return false,
+        }
+    }
+    true
 }
 
 // =============================================================================
@@ -1129,8 +1190,8 @@ mod tests {
         impl Component for A {}
         impl Component for B {}
 
-        registry.register_bit::<A>();
-        registry.register_bit::<B>();
+        registry.register_bit::<A>().unwrap();
+        registry.register_bit::<B>().unwrap();
 
         let id_a = ComponentId::of::<A>();
         let id_b = ComponentId::of::<B>();
@@ -1408,7 +1469,7 @@ mod mask_completeness_tests {
         a.build_component_masks(&ComponentRegistry::new());
 
         let mut registry = ComponentRegistry::new();
-        registry.register_bit::<Foo>();
+        registry.register_bit::<Foo>().unwrap();
         let mut b = SystemAccess::new();
         b.add_write(id);
         b.build_component_masks(&registry);
@@ -1430,7 +1491,7 @@ mod mask_completeness_tests {
         reader.build_component_masks(&ComponentRegistry::new());
 
         let mut registry = ComponentRegistry::new();
-        registry.register_bit::<Foo>();
+        registry.register_bit::<Foo>().unwrap();
         let mut writer = SystemAccess::new();
         writer.add_write(id);
         writer.build_component_masks(&registry);
@@ -1448,7 +1509,7 @@ mod mask_completeness_tests {
         a.build_component_masks(&ComponentRegistry::new());
 
         let mut registry = ComponentRegistry::new();
-        registry.register_bit::<Bar>();
+        registry.register_bit::<Bar>().unwrap();
         let mut b = SystemAccess::new();
         b.add_write(ComponentId::of::<Bar>());
         b.build_component_masks(&registry);
@@ -1464,8 +1525,8 @@ mod mask_completeness_tests {
     #[test]
     fn complete_masks_take_the_fast_path_and_agree() {
         let mut registry = ComponentRegistry::new();
-        registry.register_bit::<Foo>();
-        registry.register_bit::<Bar>();
+        registry.register_bit::<Foo>().unwrap();
+        registry.register_bit::<Bar>().unwrap();
 
         let mut a = SystemAccess::new();
         a.add_write(ComponentId::of::<Foo>());

@@ -174,6 +174,9 @@ pub struct MutFetchState<T: Component> {
 // Within one batch, `ParQueryIter` assigns each thread a disjoint entity range,
 // so no two threads fetch the same row.
 unsafe impl<T: Component> Send for MutFetchState<T> {}
+// SAFETY: Shared access to the fetch state only permits reading the row
+// pointers and metadata; per-row mutation stays exclusive through the same
+// disjoint-access guarantee the `Send` impl above cites.
 unsafe impl<T: Component> Sync for MutFetchState<T> {}
 
 /// Allows queries to include mutable component references, e.g.

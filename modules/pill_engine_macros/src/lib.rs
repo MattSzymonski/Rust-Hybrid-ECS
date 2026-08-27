@@ -921,7 +921,14 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
                 // `&mut Engine` is unique.
                 let api = unsafe { &*api };
                 let engine = unsafe { &mut *(api.engine_handle as *mut ::pill_engine::Engine) };
-                ::pill_engine::component_registry::register_all_components(engine.world_mut());
+                if let Err(_error) =
+                    ::pill_engine::component_registry::register_all_components(engine.world_mut())
+                {
+                    // The engine logged the first-class diagnostic; fail the
+                    // init so the host rolls the reload back instead of running
+                    // with a half-registered component set.
+                    return u32::MAX;
+                }
                 #fn_ident(engine)
             }));
             result.unwrap_or(u32::MAX)
@@ -982,7 +989,14 @@ pub fn pill_project(_attribute: TokenStream, item: TokenStream) -> TokenStream {
                 // `&mut Engine` is unique.
                 let api = unsafe { &*api };
                 let engine = unsafe { &mut *(api.engine_handle as *mut ::pill_engine::Engine) };
-                ::pill_engine::component_registry::register_all_components(engine.world_mut());
+                if let Err(_error) =
+                    ::pill_engine::component_registry::register_all_components(engine.world_mut())
+                {
+                    // The engine logged the first-class diagnostic; fail the
+                    // init so the host rolls the reload back instead of running
+                    // with a half-registered component set.
+                    return u32::MAX;
+                }
                 #fn_ident(engine)
             }));
             result.unwrap_or(u32::MAX)

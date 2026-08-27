@@ -308,6 +308,38 @@ fn bench_archetype_explosion(criterion: &mut Criterion) {
 // Criterion Entry Point
 // =============================================================================
 
+/// Measures LIFO despawn: destroying entities in the reverse of creation order.
+///
+/// This is the pattern projectile/particle systems produce - the most recently
+/// spawned entity dies first - so every `swap_remove` removes the last row and
+/// the `index != last` guard in `DynamicColumn::swap_remove` (and the native
+/// column path) skips the redundant self-copy. The guard was added to fix the
+/// wasted `memmove` reported by audit 5.9; this benchmark pins the despawn
+/// path so a regression in it stays visible.
+fn bench_lifo_despawn(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("entity_lifo_despawn");
+    for &count in &[1_000, 10_000] {
+        group.bench_with_input(
+            BenchmarkId::from_parameter(count),
+            &count,
+            |benchmark, &count| {
+                benchmark.iter_batched(
+                    || setup_world(count),
+                    |(mut world, handles)| {
+                        // LIFO: destroy the most recently created entity first,
+                        // which removes the last row of every column.
+                        for entity in handles.into_iter().rev() {
+                            black_box(world.destroy_entity(entity));
+                        }
+                    },
+                    criterion::BatchSize::LargeInput,
+                );
+            },
+        );
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_add_component,
@@ -315,5 +347,6 @@ criterion_group!(
     bench_add_multi_component,
     bench_remove_multi_component,
     bench_archetype_explosion,
+    bench_lifo_despawn,
 );
 criterion_main!(benches);

@@ -3,6 +3,9 @@ name = "pill_host"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
 pill_hot_scan = { path = "../pill_hot_scan" }
 pill_engine = { path = "../pill_engine" }

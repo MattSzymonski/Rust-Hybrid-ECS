@@ -607,8 +607,13 @@ fn collect_sprite_instances_named(
             .min(position_storage.len())
             .min(sprite_storage.len());
         for row in 0..row_count {
+            // SAFETY: `read_shared_component` dereferences the type-erased
+            // storage pointer; `row_count` is capped at every storage length
+            // and the layout checks above guarantee the value is a valid
+            // `Position` for every row in this loop.
             let position =
                 unsafe { read_shared_component::<Position>(position_storage.get_dyn(row)) };
+            // SAFETY: as for the `Position` read directly above, for `Sprite`.
             let sprite = unsafe { read_shared_component::<Sprite>(sprite_storage.get_dyn(row)) };
             instances.push(SpriteInstance {
                 position: [position.x, position.y],

@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Procedural macro implementing the Pill semantic error DSL (#[engine_error])."
 
+[lints]
+workspace = true
+
 [lib]
 proc-macro = true
 

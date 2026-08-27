@@ -357,6 +357,9 @@ impl DynamicColumn {
 //    `SystemAccess::conflicts_with`, which only takes its bitmask fast path when
 //    both systems' access masks are complete.
 unsafe impl Send for DynamicColumn {}
+// SAFETY: Shared access to a column only permits reading rows, which is sound
+// under the same two premises as `Send` above: rows are blittable value types
+// and access is serialised by the scheduler, so no write can race a read.
 unsafe impl Sync for DynamicColumn {}
 
 impl Drop for DynamicColumn {

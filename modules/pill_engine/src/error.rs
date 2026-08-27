@@ -37,6 +37,7 @@ use crate::{archetype::ArchetypeId, ComponentId, Entity};
 /// invariants, such as unregistered IDs, malformed byte layouts, or
 /// exceeding the component-type limit.
 #[engine_error(namespace = engine::world, runtime = ::pill_core::error)]
+#[derive(PartialEq)]
 pub enum WorldError {
     /// The stable ID of a dynamic component cannot be zero.
     #[message("dynamic component stable ID cannot be zero")]
@@ -59,8 +60,25 @@ pub enum WorldError {
     DynamicAlreadyRegistered,
 
     /// The world's component type limit has been reached.
-    #[message("component type limit exceeded (max 128)")]
-    ComponentTypeLimitExceeded,
+    ///
+    /// Registration is driven by user data — a project's compile-time registry
+    /// and dynamic manifests from the managed runtime — so exceeding 128 types
+    /// is a configuration outcome, not a programming error. The diagnostic
+    /// carries the offending type name and the current count so the host can
+    /// report it as a normal engine error instead of a bare panic.
+    #[message(
+        "component type limit exceeded: cannot register ",
+        name_style(type_name),
+        " (max 128 component types, ",
+        debug_value(count),
+        " already registered)"
+    )]
+    ComponentTypeLimitExceeded {
+        /// The type that could not be registered.
+        type_name: String,
+        /// How many component types were already registered.
+        count: u8,
+    },
 
     /// A dynamic entity must carry at least one component.
     #[message("a dynamic entity must contain at least one component")]

@@ -3,6 +3,9 @@ name = "editor"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
 pill_host = { package = "pill_host", path = "../pill_host", features = [
     "rendering",

@@ -21,6 +21,9 @@
 use std::any::TypeId;
 use std::collections::HashMap;
 
+// Current crate
+use crate::error::WorldError;
+
 // =============================================================================
 // Component
 // =============================================================================
@@ -295,6 +298,11 @@ pub struct ComponentRegistry {
     sizes: HashMap<ComponentId, usize>,
     /// Next bit index to assign to a newly registered component.
     next_bit: u8,
+    /// Bit indices reclaimed by [`Self::remove`], reused before `next_bit`
+    /// advances. Without this, a dynamic manifest that retires and introduces
+    /// types across reloads walks `next_bit` upward until the 128-type limit
+    /// aborts the process, even though live components never exceed a handful.
+    free_bits: Vec<u8>,
 }
 
 /// Outcome of registering a component type.
@@ -336,6 +344,7 @@ impl ComponentRegistry {
             names: HashMap::new(),
             sizes: HashMap::new(),
             next_bit: 0,
+            free_bits: Vec::new(),
         }
     }
 }
@@ -356,17 +365,22 @@ impl ComponentRegistry {
     /// them apart. [`Self::register_bit`] discards the distinction for callers
     /// that do not.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the 128-component type limit has already been reached.
+    /// Returns [`WorldError::ComponentTypeLimitExceeded`] when the 128-type
+    /// limit is reached and no bit has been reclaimed by
+    /// [`Self::remove`](ComponentRegistry::remove). Registration is driven by
+    /// user data, so exceeding the limit is a configuration outcome, not a
+    /// programming error - it is reported rather than panicked on.
     ///
-    /// In debug builds, also panics when a type is re-registered with a
-    /// different size than was recorded the first time. That means a hot reload
-    /// replaced the definition without the registry noticing: the stored layout
-    /// is now stale, and everything reading size from here - the byte-level
-    /// bindings handed to C#, the persistence migration - would work from the
-    /// old one.
-    pub fn register<T: Component>(&mut self) -> Registration {
+    /// # Panics (debug only)
+    ///
+    /// Panics when a type is re-registered with a different size than was
+    /// recorded the first time. That means a hot reload replaced the
+    /// definition without the registry noticing: the stored layout is now
+    /// stale, and everything reading size from here - the byte-level bindings
+    /// handed to C#, the persistence migration - would work from the old one.
+    pub fn register<T: Component>(&mut self) -> Result<Registration, WorldError> {
         // Step 1: Return the existing bit index when the type is already registered.
         let component_id = ComponentId::of::<T>();
         if let Some(&bit) = self.id_to_bit.get(&component_id) {
@@ -376,63 +390,88 @@ impl ComponentRegistry {
                 "component {} was re-registered with a different size; the                  recorded layout is stale",
                 std::any::type_name::<T>()
             );
-            return Registration::AlreadyPresent(bit);
+            return Ok(Registration::AlreadyPresent(bit));
         }
-        // Step 2: Enforce the 128-component capacity before assigning a new bit.
-        assert!(
-            self.next_bit < 128,
-            "Component type limit exceeded: cannot register {} (max 128 component types). \
-             Consider combining related components or using a component with interior data variants.",
-            std::any::type_name::<T>()
-        );
-        // Step 3: Assign the next free bit and record the type's metadata.
-        let bit = self.next_bit;
+        // Step 2: Assign the next bit - either one reclaimed by `remove`, or a
+        // fresh one. When neither is available the 128-type ceiling is hit,
+        // which is reported as a typed error rather than an assert.
+        let Some(bit) = self.allocate_bit(std::any::type_name::<T>()) else {
+            return Err(WorldError::ComponentTypeLimitExceeded {
+                type_name: std::any::type_name::<T>().to_string(),
+                count: self.id_to_bit.len() as u8,
+            });
+        };
+        // Step 3: Record the type's metadata under the assigned bit.
         self.id_to_bit.insert(component_id, bit);
         self.names
             .insert(component_id, std::any::type_name::<T>().to_string());
         self.sizes.insert(component_id, std::mem::size_of::<T>());
-        self.next_bit += 1;
-        Registration::Created(bit)
+        Ok(Registration::Created(bit))
     }
 
     /// Register a component type and return its bit, ignoring whether it was
     /// already present.
     ///
     /// The common case: callers that only need the bit index.
-    pub fn register_bit<T: Component>(&mut self) -> u8 {
-        self.register::<T>().bit()
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::ComponentTypeLimitExceeded`] when the 128-type
+    /// limit is reached, as [`Self::register`] does.
+    pub fn register_bit<T: Component>(&mut self) -> Result<u8, WorldError> {
+        self.register::<T>().map(Registration::bit)
     }
 
     /// Register a component whose concrete type is defined outside Rust.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if the 128-component type limit has already been reached.
+    /// Returns [`WorldError::ComponentTypeLimitExceeded`] when the 128-type
+    /// limit is reached and no bit has been reclaimed by [`Self::remove`].
     pub fn register_dynamic(
         &mut self,
         stable_id: u128,
         name: impl Into<String>,
         size: usize,
-    ) -> u8 {
+    ) -> Result<u8, WorldError> {
         // Step 1: Return the existing bit index when the stable ID is already registered.
         let component_id = ComponentId::dynamic(stable_id);
         if let Some(&bit) = self.id_to_bit.get(&component_id) {
-            return bit;
+            return Ok(bit);
         }
 
-        // Step 2: Enforce the 128-component capacity before assigning a new bit.
-        assert!(
-            self.next_bit < 128,
-            "Component type limit exceeded (max 128)"
-        );
+        // Step 2: Assign the next bit - reclaimed or fresh - reporting the
+        // ceiling as a typed error instead of panicking.
+        let name = name.into();
+        let Some(bit) = self.allocate_bit(&name) else {
+            return Err(WorldError::ComponentTypeLimitExceeded {
+                type_name: name,
+                count: self.id_to_bit.len() as u8,
+            });
+        };
 
-        // Step 3: Assign the next free bit and record the dynamic component's metadata.
-        let bit = self.next_bit;
-        self.next_bit += 1;
+        // Step 3: Record the dynamic component's metadata.
         self.id_to_bit.insert(component_id, bit);
-        self.names.insert(component_id, name.into());
+        self.names.insert(component_id, name);
         self.sizes.insert(component_id, size);
-        bit
+        Ok(bit)
+    }
+
+    /// Reserve one bit index for a newly registered type, preferring a bit
+    /// reclaimed by [`Self::remove`] over a fresh one.
+    ///
+    /// Returns `None` once both the reclaimed pool and the fresh range are
+    /// exhausted - that is, at the 128-type ceiling.
+    fn allocate_bit(&mut self, _for_type: &str) -> Option<u8> {
+        if let Some(bit) = self.free_bits.pop() {
+            return Some(bit);
+        }
+        if self.next_bit < 128 {
+            let bit = self.next_bit;
+            self.next_bit += 1;
+            return Some(bit);
+        }
+        None
     }
 
     /// Get the bit index for a component ID, if registered.
@@ -441,10 +480,25 @@ impl ComponentRegistry {
     /// Called when a reloaded module or project stops registering a type
     /// entirely and the host drops its orphaned data. Re-registering the same
     /// `TypeId` later simply allocates a fresh bit index again.
+    ///
+    /// The freed bit is returned to the reclaim pool, so a dynamic manifest
+    /// that retires and introduces types across reloads reuses bits instead of
+    /// walking `next_bit` toward the 128-type ceiling.
     pub fn remove(&mut self, component_id: &ComponentId) {
-        self.id_to_bit.remove(component_id);
+        if let Some(bit) = self.id_to_bit.remove(component_id) {
+            self.free_bits.push(bit);
+        }
         self.names.remove(component_id);
         self.sizes.remove(component_id);
+    }
+
+    /// Number of component types that can still be registered before the
+    /// 128-type ceiling is reached, counting both reclaimed bits and the
+    /// unused fresh range.
+    ///
+    /// The host reports this so exhaustion is visible before it becomes fatal.
+    pub fn available_slots(&self) -> usize {
+        self.free_bits.len() + (128 - usize::from(self.next_bit))
     }
 
     pub fn get_bit(&self, component_id: &ComponentId) -> Option<u8> {
@@ -530,7 +584,7 @@ mod tests {
         let mut registry = ComponentRegistry::new();
         let component_id = ComponentId::of::<ReRegisterTestComponent>();
 
-        let first = registry.register::<ReRegisterTestComponent>();
+        let first = registry.register::<ReRegisterTestComponent>().unwrap();
         assert!(first.is_new(), "the first registration creates the bit");
         let first_bit = first.bit();
         assert!(registry.is_registered::<ReRegisterTestComponent>());
@@ -538,7 +592,7 @@ mod tests {
 
         // Registering the same type again reports that, rather than looking
         // identical to a fresh registration.
-        let repeat = registry.register::<ReRegisterTestComponent>();
+        let repeat = registry.register::<ReRegisterTestComponent>().unwrap();
         assert_eq!(repeat, Registration::AlreadyPresent(first_bit));
         assert!(!repeat.is_new());
 
@@ -548,13 +602,77 @@ mod tests {
         assert_eq!(registry.get_name(&component_id), None);
         assert_eq!(registry.get_size(&component_id), None);
 
-        // Re-registering works and, per the documented contract, allocates a
-        // fresh bit (bits are never reused).
-        let second = registry.register::<ReRegisterTestComponent>();
+        // Re-registering works and reuses the freed bit: `remove` returns the
+        // bit to the reclaim pool, so a dynamic manifest that retires and
+        // introduces types across reloads does not walk `next_bit` toward the
+        // 128-type ceiling.
+        let second = registry.register::<ReRegisterTestComponent>().unwrap();
         assert!(second.is_new(), "after removal it is a fresh registration");
         let second_bit = second.bit();
         assert!(registry.is_registered::<ReRegisterTestComponent>());
         assert_eq!(registry.get_bit(&component_id), Some(second_bit));
-        assert_ne!(first_bit, second_bit);
+        assert_eq!(first_bit, second_bit, "the freed bit is reused");
+    }
+
+    /// Registering the 129th component type reports a typed error instead of
+    /// panicking - the ceiling is a configuration outcome, not a programming
+    /// error (audit 4.2).
+    #[test]
+    fn the_129th_component_type_errors_instead_of_panicking() {
+        // Each tuple is a distinct fake type (distinct names), registered
+        // dynamically so the test does not need 129 real Rust types.
+        let mut registry = ComponentRegistry::new();
+        for index in 0..128 {
+            let result =
+                registry.register_dynamic(index as u128 + 1, format!("Project.FakeType{index}"), 4);
+            assert!(result.is_ok(), "slot {index} must register");
+        }
+
+        // One more than the ceiling: the registry reports the limit, naming
+        // the offending type and the current count.
+        let error = registry
+            .register_dynamic(u128::MAX, "Project.OneTooMany", 4)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            WorldError::ComponentTypeLimitExceeded {
+                type_name: "Project.OneTooMany".to_string(),
+                count: 128,
+            }
+        );
+
+        // A freed bit reopens a slot, so the same registry accepts a new type
+        // after `remove` - the ceiling is not a permanent dead end. The first
+        // registered type (stable id 1) holds bit 0, so freeing it reopens bit 0.
+        registry.remove(&ComponentId::dynamic(1));
+        let reused = registry
+            .register_dynamic(u128::MAX - 1, "Project.AfterFree", 4)
+            .unwrap();
+        assert_eq!(reused, 0, "the reclaimed bit is handed out again");
+    }
+
+    /// Reclaimed bits keep the registry from walking toward the 128-type
+    /// ceiling during a churn-heavy editing session (audit 4.10).
+    #[test]
+    fn removed_bits_are_reclaimed_and_reported_as_headroom() {
+        let mut registry = ComponentRegistry::new();
+        for index in 0..8 {
+            registry
+                .register_dynamic(index as u128 + 10, format!("Project.C{index}"), 4)
+                .unwrap();
+        }
+        assert_eq!(registry.available_slots(), 120);
+
+        // Remove half the types: their bits rejoin the pool.
+        for index in 0..4 {
+            registry.remove(&ComponentId::dynamic(index as u128 + 10));
+        }
+        assert_eq!(registry.available_slots(), 124);
+
+        // New registrations reuse the reclaimed bits (LIFO: the most recently
+        // freed first) rather than consuming fresh ones.
+        let new_bit = registry.register_dynamic(999, "Project.New", 4).unwrap();
+        assert_eq!(new_bit, 3, "the most recently freed bit is reused first");
+        assert_eq!(registry.available_slots(), 123);
     }
 }

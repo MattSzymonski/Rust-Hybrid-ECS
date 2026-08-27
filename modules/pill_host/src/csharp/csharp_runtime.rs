@@ -150,6 +150,7 @@ impl DotnetRuntimeContext {
                     source,
                 })?
         };
+        // SAFETY: These names and signatures are fixed by the hostfxr ABI.
         let get_delegate: GetDelegateFn = unsafe {
             *library
                 .get(b"hostfxr_get_runtime_delegate")
@@ -158,6 +159,7 @@ impl DotnetRuntimeContext {
                     source,
                 })?
         };
+        // SAFETY: These names and signatures are fixed by the hostfxr ABI.
         let close: CloseFn = unsafe {
             *library
                 .get(b"hostfxr_close")

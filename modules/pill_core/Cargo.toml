@@ -3,6 +3,9 @@ name = "pill_core"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [lib]
 # `dylib` makes this one shared library that the host executable and every
 # dynamically loaded module link against instead of each embedding a private

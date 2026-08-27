@@ -198,6 +198,8 @@ impl<T: Resource> Copy for ResHandle<T> {}
 // therefore sound for any `T`: handles are inert, zero-sized type-level
 // markers with no data to race on, alias, or invalidate.
 unsafe impl<T: Resource> Send for ResHandle<T> {}
+// SAFETY: As for `Send` above - a handle carries no `T` data to share, so
+// shared access across threads cannot race or alias anything.
 unsafe impl<T: Resource> Sync for ResHandle<T> {}
 
 impl<T: Resource> std::fmt::Debug for ResHandle<T> {

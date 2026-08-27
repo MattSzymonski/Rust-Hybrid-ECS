@@ -17,6 +17,20 @@ members = [
 ]
 resolver = "2"
 
+# Workspace-wide lint policy, inherited by every member via `lints.workspace = true`.
+#
+# These are the lints that pin conventions this codebase already follows -
+# unsafe operations inside `unsafe fn` bodies must be inside explicit `unsafe`
+# blocks, and every `unsafe` block must carry a `// SAFETY:` justification -
+# so enabling them costs nothing today and ratchets against regressions. Start
+# at `warn`; the project's 0-warning discipline means a lint can be promoted
+# to `deny` once it is known to be clean across every feature configuration.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
 # Release profiles are defined here, at the workspace root, so every member
 # builds with the same optimization settings. They used to live in
 # `pill_engine/Cargo.toml`, where Cargo ignored them because profiles must be

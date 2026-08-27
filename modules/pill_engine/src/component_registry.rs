@@ -23,6 +23,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
+use crate::error::WorldError;
 use crate::World;
 
 /// One component type declared with `#[derive(PillComponent)]`.
@@ -45,10 +46,17 @@ inventory::collect!(PillComponentDescriptor);
 /// Called by the macro-generated `init` entry point before the user's own
 /// registration code runs, so entity seeding and system registration can rely
 /// on every component type already being known to the world.
-pub fn register_all_components(world: &mut World) {
+///
+/// # Errors
+///
+/// Returns the first registration failure recorded during the loop (currently
+/// only the 128-type ceiling) so the generated `init` can fail the reload
+/// transactionally instead of running with a half-registered component set.
+pub fn register_all_components(world: &mut World) -> Result<(), WorldError> {
     for descriptor in inventory::iter::<PillComponentDescriptor> {
         (descriptor.register)(world);
     }
+    world.take_registration_error().map_or(Ok(()), Err)
 }
 
 /// Aggregate schema fingerprint of every persistable component.
@@ -122,7 +130,7 @@ mod tests {
     #[test]
     fn registry_registers_every_submitted_component() {
         let mut world = World::new();
-        register_all_components(&mut world);
+        register_all_components(&mut world).expect("registration must succeed");
 
         assert!(world
             .component_registry
@@ -138,8 +146,8 @@ mod tests {
     #[test]
     fn registry_registration_is_idempotent() {
         let mut world = World::new();
-        register_all_components(&mut world);
-        register_all_components(&mut world);
+        register_all_components(&mut world).expect("registration must succeed");
+        register_all_components(&mut world).expect("re-registration must succeed");
 
         assert!(world
             .component_registry

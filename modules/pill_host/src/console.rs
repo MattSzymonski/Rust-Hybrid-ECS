@@ -51,6 +51,10 @@ fn enable_windows_vt() {
     const ENABLE_VIRTUAL_TERMINAL_PROCESSING: u32 = 0x0004;
 
     static ENABLED: Once = Once::new();
+    // SAFETY: The `kernel32` functions declared above are part of the stable
+    // Win32 ABI and are called with matching argument types; the mode buffer
+    // is a stack value that outlives the call. The call is best-effort - a
+    // failure leaves the console in its previous mode.
     ENABLED.call_once(|| unsafe {
         let handle = GetStdHandle(STD_OUTPUT_HANDLE);
         let mut mode: u32 = 0;

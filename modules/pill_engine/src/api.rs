@@ -78,7 +78,20 @@ pub type SetParallelExecutionFn = unsafe extern "C" fn(engine: *mut c_void, enab
 pub type EntityCountFn = unsafe extern "C" fn(engine: *mut c_void) -> u64;
 
 /// Pre-allocates internal storage for at least `capacity` entities.
-pub type ReserveEntitiesFn = unsafe extern "C" fn(engine: *mut c_void, capacity: u64);
+///
+/// Returns 0 on success, non-zero when the request is rejected: a null handle,
+/// a capacity that cannot be represented on this target, or one exceeding
+/// [`MAX_ENTITIES_PER_RESERVE`].
+pub type ReserveEntitiesFn = unsafe extern "C" fn(engine: *mut c_void, capacity: u64) -> i32;
+
+/// Largest `reserve_entities` request the ABI accepts.
+///
+/// The request flows straight into a `Vec::reserve` on the free list, so an
+/// unvalidated value could ask for an allocation that aborts the process.
+/// The bound is generous (a game would need hundreds of gigabytes of entity
+/// bookkeeping to need more) but keeps the failure reportable instead of
+/// fatal.
+pub const MAX_ENTITIES_PER_RESERVE: u64 = 1 << 24;
 
 // =============================================================================
 // EngineApi
@@ -421,10 +434,14 @@ unsafe extern "C" fn api_entity_count(engine: *mut c_void) -> u64 {
 
 /// C-callable wrapper around `Engine::world_mut().reserve_entities`.
 ///
+/// Returns 0 on success and -1 when the request is rejected: a null handle, a
+/// capacity that cannot be represented as a `usize` on this target, or one
+/// exceeding [`MAX_ENTITIES_PER_RESERVE`].
+///
 /// # Safety
 ///
 /// `engine` must be a valid `*mut Engine` that outlives this call.
-unsafe extern "C" fn api_reserve_entities(engine: *mut c_void, capacity: u64) {
+unsafe extern "C" fn api_reserve_entities(engine: *mut c_void, capacity: u64) -> i32 {
     // SAFETY: The handle was created by `EngineApi::new` via
     // `engine as *mut Engine as *mut c_void`, so it points to a valid,
     // correctly aligned `Engine`. The host keeps the engine alive for the
@@ -434,14 +451,20 @@ unsafe extern "C" fn api_reserve_entities(engine: *mut c_void, capacity: u64) {
     // (no overlapping `&mut` aliasing).
     // A `u64` request cannot always be represented as a `usize`, and truncating
     // it silently would reserve a wildly different amount than was asked for.
+    // The request is also bounded so a hostile or buggy value cannot drive the
+    // free-list allocation to an abort.
     let Ok(capacity) = usize::try_from(capacity) else {
-        return;
+        return -1;
     };
+    if capacity as u64 > MAX_ENTITIES_PER_RESERVE {
+        return -1;
+    }
     // SAFETY: see `with_engine`.
     unsafe {
-        with_engine(engine, (), |engine| {
-            engine.world_mut().reserve_entities(capacity)
-        });
+        with_engine(engine, -1, |engine| {
+            engine.world_mut().reserve_entities(capacity);
+            0
+        })
     }
 }
 
@@ -476,7 +499,11 @@ mod abi_guard_tests {
             // The void-returning wrappers must simply not fault.
             api_set_fps_limit(null, 60.0);
             api_set_parallel_execution(null, true);
-            api_reserve_entities(null, 128);
+            assert_eq!(
+                api_reserve_entities(null, 128),
+                -1,
+                "reserve_entities must report failure on a null handle"
+            );
         }
     }
 
@@ -489,14 +516,28 @@ mod abi_guard_tests {
         let handle = &mut engine as *mut Engine as *mut c_void;
 
         // SAFETY: `handle` addresses a live engine for the duration of the call.
-        unsafe {
-            api_reserve_entities(handle, u64::MAX);
-        }
+        let status = unsafe { api_reserve_entities(handle, u64::MAX) };
+        assert_eq!(status, -1, "an unrepresentable request must be refused");
 
         assert_eq!(
             engine.world().entity_count(),
             before,
             "an unrepresentable request must change nothing"
+        );
+    }
+
+    /// A request beyond the documented bound is refused rather than allowed
+    /// to drive the free-list allocation into an abort.
+    #[test]
+    fn an_over_budget_capacity_is_refused() {
+        let mut engine = Engine::new();
+        let handle = &mut engine as *mut Engine as *mut c_void;
+
+        // SAFETY: `handle` addresses a live engine for the duration of the call.
+        let status = unsafe { api_reserve_entities(handle, MAX_ENTITIES_PER_RESERVE + 1) };
+        assert_eq!(
+            status, -1,
+            "a request beyond MAX_ENTITIES_PER_RESERVE must be refused"
         );
     }
 
@@ -513,7 +554,11 @@ mod abi_guard_tests {
         // SAFETY: as above.
         unsafe {
             api_set_parallel_execution(handle, false);
-            api_reserve_entities(handle, 16);
+            assert_eq!(
+                api_reserve_entities(handle, 16),
+                0,
+                "a bounded reserve must succeed"
+            );
         }
     }
 

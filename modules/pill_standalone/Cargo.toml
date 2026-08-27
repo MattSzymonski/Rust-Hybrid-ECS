@@ -3,6 +3,9 @@ name = "pill_standalone"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [dependencies]
 pill_core = { path = "../pill_core" }
 pill_host = { package = "pill_host", path = "../pill_host", default-features = false }

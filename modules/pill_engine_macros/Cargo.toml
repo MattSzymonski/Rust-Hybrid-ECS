@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 description = "Procedural macros for Pill registration: #[derive(PillComponent)], #[pill_module], #[pill_project]."
 
+[lints]
+workspace = true
+
 [lib]
 proc-macro = true
 

@@ -3,6 +3,9 @@ name = "pill_dummy_color"
 version = "0.1.0"
 edition = "2021"
 
+[lints]
+workspace = true
+
 [lib]
 # `cdylib` is the artifact the host loads and hot swaps at runtime. `rlib` is
 # kept so a monolithic release build can link the same module statically

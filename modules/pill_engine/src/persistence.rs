@@ -669,9 +669,18 @@ impl World {
     ) -> SelectiveMigrationReport {
         let mut report = SelectiveMigrationReport::default();
 
-        let mut sorted_changed_type_names: Vec<String> =
-            changed_type_names.iter().cloned().collect();
-        sorted_changed_type_names.sort();
+        // Sort references into the names rather than cloning every string into
+        // a heap `Vec<String>`: the ordering exists only for a deterministic
+        // report, and the names are unique, so `sort_unstable` is fine. The
+        // sort is skipped entirely when nothing will render the report.
+        let mut sorted_changed_type_names: Vec<&str> =
+            changed_type_names.iter().map(String::as_str).collect();
+        if tracing::enabled!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            tracing::Level::INFO
+        ) {
+            sorted_changed_type_names.sort_unstable();
+        }
 
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -680,19 +689,19 @@ impl World {
         );
 
         for type_name in &sorted_changed_type_names {
-            let Some(previous_metadata) = previous_metadata_by_name.get(type_name) else {
+            let Some(previous_metadata) = previous_metadata_by_name.get(*type_name) else {
                 debug!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     "[persistence]   '{}' -> SKIP (missing previous metadata)",
                     type_name,
                 );
-                report.skipped_type_names.push(type_name.clone());
+                report.skipped_type_names.push((*type_name).to_string());
                 continue;
             };
 
             let current_schema_hash = self
                 .persist_schema_hashes
-                .get(type_name)
+                .get(*type_name)
                 .copied()
                 .unwrap_or(0);
             debug!(
@@ -715,7 +724,7 @@ impl World {
                     debug!(
                         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                         "[persistence]   '{type_name}' -> SKIP ({error})",);
-                    report.skipped_type_names.push(type_name.clone());
+                    report.skipped_type_names.push((*type_name).to_string());
                 }
             }
         }
@@ -1226,6 +1235,10 @@ fn insert_boxed_component<T>(
     // and pushed into storage, ending the box's ownership without a
     // double-free.
     let raw = Box::into_raw(component);
+    // SAFETY: `raw` was produced by `Box::into_raw(component)` immediately
+    // above, so it is valid, aligned, and uniquely owned; the detailed
+    // justification (matching concrete type, single ownership handover) is
+    // above this function's first use.
     let typed: Box<T> = unsafe { Box::from_raw(raw as *mut T) };
     storage.get_storage_mut::<T>().push::<T>(*typed);
 }

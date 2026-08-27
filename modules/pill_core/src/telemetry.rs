@@ -479,26 +479,20 @@ impl TelemetryBuilder {
     ///     .expect("default configuration installs cleanly");
     /// ```
     pub fn init(self) -> Result<TelemetryHandles, TelemetryError> {
-        static INSTALLED: OnceLock<TelemetryHandles> = OnceLock::new();
-        static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        // Step 1: Fast-path return when the subscriber is already installed.
-        if let Some(handles) = INSTALLED.get() {
-            return Ok(handles.clone());
+        // Exactly-once install. `OnceLock::get_or_init` runs the installer at
+        // most once process-wide and blocks concurrent callers until it
+        // completes, so the double guard of a second `Mutex` adds nothing: the
+        // lock existed to serialize check-and-install, which the OnceLock does
+        // itself. The stored value is the install's `Result`, flattened to a
+        // message so it can be shared with every caller - the error itself is
+        // not `Clone` (it boxes the underlying parse/appender source).
+        static INSTALLED: OnceLock<Result<TelemetryHandles, String>> = OnceLock::new();
+        match INSTALLED.get_or_init(|| Self::install(self).map_err(|error| error.to_string())) {
+            Ok(handles) => Ok(handles.clone()),
+            Err(message) => Err(TelemetryError::InstallFailed {
+                message: message.clone(),
+            }),
         }
-        // Step 2: Serialize the check-and-install so two threads cannot both
-        // set the process-wide default subscriber.
-        let _guard = INSTALL_LOCK
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // Step 3: Re-check under the lock; install only when this thread is
-        // the first to reach the installer.
-        if let Some(handles) = INSTALLED.get() {
-            return Ok(handles.clone());
-        }
-        let handles = Self::install(self)?;
-        // A concurrent caller may win the race; either handle set is valid.
-        let _ = INSTALLED.set(handles.clone());
-        Ok(handles)
     }
 
     /// Build the full subscriber stack (terminal, optional file, optional
@@ -697,6 +691,17 @@ pub enum TelemetryError {
     Reload {
         /// Human-readable reload failure.
         error: String,
+    },
+
+    /// The one-time subscriber install failed.
+    ///
+    /// The install is attempted at most once per process; the failure is
+    /// rendered into a message and cached so every concurrent or later caller
+    /// sees the same error instead of silently re-attempting the install.
+    #[error("failed to install the telemetry subscriber: {message}")]
+    InstallFailed {
+        /// Rendered description of the underlying install failure.
+        message: String,
     },
 }
 
@@ -902,6 +907,60 @@ mod tests {
 
         assert!(handles.reload_file("engine=debug").is_ok());
         assert!(handles.reload_file("engine=debug, ====").is_err());
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// Concurrent `init` calls install the subscriber exactly once, and every
+    /// caller receives the same installed handle set.
+    ///
+    /// This is the property the old `OnceLock` + `Mutex` double guard existed
+    /// to provide; the single `OnceLock` must preserve it. Uses a file lane
+    /// like `reload_handles_work_for_terminal_and_file_lanes` so the two tests
+    /// agree on what "installed" means whichever one wins the process-wide race.
+    #[test]
+    fn concurrent_init_installs_exactly_once() {
+        let directory = std::env::temp_dir().join(format!(
+            "ecs-telemetry-concurrent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let handles: Vec<TelemetryHandles> = std::thread::scope(|scope| {
+            let mut joiners = Vec::new();
+            for _ in 0..8 {
+                joiners.push(scope.spawn(|| {
+                    TelemetryBuilder::new()
+                        .with_logging_config(LoggingConfig::new())
+                        .with_file_output(LoggingConfig::new(), &directory)
+                        .init()
+                        .expect("concurrent install must succeed")
+                }));
+            }
+            joiners
+                .into_iter()
+                .map(|joiner| joiner.join().expect("install thread must not panic"))
+                .collect()
+        });
+
+        // Every caller holds the same install: the worker guards are literally
+        // the same `Arc`, which is only possible if the OnceLock ran the
+        // installer exactly once and every other caller read the result.
+        let first_guard = handles[0]
+            ._file_guard
+            .as_ref()
+            .expect("the shared install must carry a file lane");
+        for handle in &handles[1..] {
+            let guard = handle
+                ._file_guard
+                .as_ref()
+                .expect("every caller must see the same install");
+            assert!(
+                std::sync::Arc::ptr_eq(first_guard, guard),
+                "concurrent callers must share one install, not each get their own"
+            );
+        }
         let _ = std::fs::remove_dir_all(directory);
     }
 
