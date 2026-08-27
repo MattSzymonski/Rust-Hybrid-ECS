@@ -42,6 +42,39 @@ use super::abi::ComponentChunk;
 /// opaque parser error, rejects pathological manifests.
 const MAX_FIELD_NESTING_DEPTH: usize = 32;
 
+/// Field types a dynamic component is allowed to contain.
+///
+/// This is the enforcement behind `DynamicColumn`'s `unsafe impl Send`/`Sync`
+/// and its lack of drop glue. That storage is a raw byte buffer: rows are moved
+/// with `ptr::copy` and the buffer is freed without running any destructor, so
+/// every field must be a blittable value with no ownership, no interior
+/// pointer, and nothing to release.
+///
+/// Before this list existed the only check on a field's type was that its name
+/// was non-empty, so a manifest declaring a managed reference passed validation
+/// and the resulting column was shared across threads on a promise nothing
+/// verified.
+///
+/// `"struct"` denotes a nested value type; its own fields are validated
+/// recursively against this same list, so allowing it does not open a hole.
+const BLITTABLE_FIELD_TYPES: &[&str] = &[
+    "System.Byte",
+    "System.SByte",
+    "System.Int16",
+    "System.UInt16",
+    "System.Int32",
+    "System.UInt32",
+    "System.Int64",
+    "System.UInt64",
+    "System.IntPtr",
+    "System.UIntPtr",
+    "System.Single",
+    "System.Double",
+    "System.Boolean",
+    "System.Char",
+    "struct",
+];
+
 // =============================================================================
 // Types + Impls
 // =============================================================================
@@ -461,7 +494,8 @@ fn validate_sibling_non_overlap(
 /// # Errors
 ///
 /// Returns an error when a field overflows its containing struct, names an
-/// empty field or type, or exceeds the maximum nesting depth.
+/// empty field or type, declares a type outside [`BLITTABLE_FIELD_TYPES`], or
+/// exceeds the maximum nesting depth.
 fn validate_field_manifest(field: &ManagedFieldManifest, parent_size: usize) -> Result<(), String> {
     // Each entry carries the field to inspect, the size of the struct that
     // directly contains it, and that branch's current nesting depth.
@@ -473,6 +507,17 @@ fn validate_field_manifest(field: &ManagedFieldManifest, parent_size: usize) -> 
             .ok_or("managed field range overflow")?;
         if field.name.is_empty() || field.primitive_type.is_empty() || end > parent_size {
             return Err("managed field lies outside its component layout".into());
+        }
+        // Reject anything that is not a blittable value type. `DynamicColumn`
+        // copies rows as raw bytes and frees its buffer without running drop
+        // glue, so a field owning a resource would be duplicated on move and
+        // leaked on free - and sharing such a column across threads, which the
+        // engine does, would be unsound.
+        if !BLITTABLE_FIELD_TYPES.contains(&field.primitive_type.as_str()) {
+            return Err(format!(
+                "managed field {} has non-blittable type {}; dynamic components                  must contain only unmanaged value types",
+                field.name, field.primitive_type
+            ));
         }
         // The depth check runs after the field validates so the error always
         // names a well-formed field.

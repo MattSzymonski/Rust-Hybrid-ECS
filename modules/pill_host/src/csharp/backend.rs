@@ -319,13 +319,19 @@ impl CSharpRuntime {
         engine.queue_deferred_commands(|world, queue| {
             let no_accesses = [];
             for startup_index in 0..startup_count() {
-                let _guard = ActiveSystemGuard::set_with_commands(
+                // A rejected scope means a managed startup method re-entered
+                // the host. Running it without a scope would only produce
+                // failing FFI calls, so treat it as this startup's failure.
+                let Some(_guard) = ActiveSystemGuard::set_with_commands(
                     world,
                     queue,
                     &no_accesses,
                     &startup_bindings,
                     true,
-                );
+                ) else {
+                    startup_failed = Some(startup_index);
+                    break;
+                };
                 if run_startup(startup_index) == 0 {
                     startup_failed = Some(startup_index);
                     break;
@@ -392,13 +398,20 @@ impl CSharpRuntime {
                     name,
                     access,
                     move |world: &mut World, queue: &mut CommandQueue| -> Result<(), SystemError> {
-                        let _guard = ActiveSystemGuard::set_with_commands(
+                        // As above: without a scope every managed callback
+                        // this system makes would fail, so report it as a
+                        // system error rather than running it blind.
+                        let Some(_guard) = ActiveSystemGuard::set_with_commands(
                             world,
                             queue,
                             &managed_access,
                             &system_bindings,
                             uses_commands,
-                        );
+                        ) else {
+                            return Err(SystemError::Managed {
+                                message: "nested managed system invocation".to_string(),
+                            });
+                        };
                         if run_system(system_index) == 0 {
                             return Err(SystemError::Managed {
                                 message: managed_system_error_message(

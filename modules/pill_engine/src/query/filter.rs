@@ -231,7 +231,22 @@ impl TickFilterState {
         // deallocated - so dereferencing it yields a valid `Vec`. `index` is
         // a row index into that archetype, and the tick vector is kept in
         // lockstep with the archetype's row count, so `index` is in bounds.
-        unsafe { (&*self.ticks.as_ref().unwrap_unchecked().as_ptr()).get_unchecked(index) }
+        // SAFETY: as documented above.
+        let ticks = unsafe { &*self.ticks.as_ref().unwrap_unchecked().as_ptr() };
+        // The lockstep claim above is the whole justification for eliding the
+        // bounds check, and `World` treats the same invariant as worth checking
+        // at migration time (`old ticks vec out of sync with components`). If it
+        // can fail there it can fail here, so assert it in debug builds - the
+        // release path is unchanged.
+        debug_assert!(
+            index < ticks.len(),
+            "row {index} is out of bounds for {} component ticks; the tick              vector has fallen out of lockstep with the archetype's rows",
+            ticks.len()
+        );
+        // SAFETY: `index` is a row index into the archetype this state was
+        // built from, and the tick vector is kept in lockstep with that
+        // archetype's row count.
+        unsafe { ticks.get_unchecked(index) }
     }
 }
 

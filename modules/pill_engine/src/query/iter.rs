@@ -268,6 +268,10 @@ pub struct ParQueryIter<'w, Q: QueryTarget, F: QueryFilter = ()> {
 // Parallel execution assigns each thread disjoint entity ranges, and the
 // `Send` bounds below guarantee the pointed-to data can be transferred between
 // threads, so no data race is possible.
+//
+// That the *systems* sharing a batch are themselves disjoint is established by
+// `SystemAccess::conflicts_with`, not here; see its contract for the
+// mask-completeness rule that makes it trustworthy.
 unsafe impl<'w, Q: QueryTarget, F: QueryFilter> Send for ParQueryIter<'w, Q, F>
 where
     Q::State: Send,

@@ -87,6 +87,20 @@ pub struct SystemAccess {
     /// Populated by [`build_component_masks`](SystemAccess::build_component_masks)
     /// after registration; empty until then.
     writes_mask: ComponentMask,
+
+    /// Whether the bitmasks describe **every** access in the sets above.
+    ///
+    /// False until [`build_component_masks`](SystemAccess::build_component_masks)
+    /// runs, and false again afterwards if any accessed component had no bit in
+    /// the registry at that moment - which happens whenever a system is
+    /// registered before the component it touches.
+    ///
+    /// This flag is the difference between a fast answer and a wrong one. A
+    /// mask that silently omits a component makes two systems writing it look
+    /// disjoint, so they are dispatched to different threads and race. Access
+    /// sets are always complete, so the fallback below is the source of truth
+    /// and the masks are only ever an optimization over it.
+    masks_complete: bool,
 }
 
 impl SystemAccess {
@@ -144,27 +158,49 @@ impl SystemAccess {
         // Reset both masks to empty before rebuilding.
         self.reads_mask = ComponentMask::empty();
         self.writes_mask = ComponentMask::empty();
+        // Track whether every access resolved. A component with no registry bit
+        // cannot be represented in a mask, and dropping it silently is what
+        // makes two conflicting systems look disjoint - so the omission is
+        // recorded and `conflicts_with` falls back to the complete sets.
+        let mut complete = true;
         // Fold every read component's registry bit into the read mask.
         for id in &self.reads {
-            if let Some(bit) = registry.get_bit(id) {
-                self.reads_mask.set(bit);
+            match registry.get_bit(id) {
+                Some(bit) => self.reads_mask.set(bit),
+                None => complete = false,
             }
         }
         // Fold every write component's registry bit into the write mask.
         for id in &self.writes {
-            if let Some(bit) = registry.get_bit(id) {
-                self.writes_mask.set(bit);
+            match registry.get_bit(id) {
+                Some(bit) => self.writes_mask.set(bit),
+                None => complete = false,
             }
         }
+        self.masks_complete = complete;
+    }
+
+    /// Whether the bitmasks currently describe every access this system makes.
+    ///
+    /// [`conflicts_with`](SystemAccess::conflicts_with) may only take its fast
+    /// path when this holds for **both** systems being compared.
+    #[inline]
+    pub fn masks_are_complete(&self) -> bool {
+        self.masks_complete
     }
 
     /// Checks whether this system conflicts with another.
     ///
     /// Component conflicts are detected with a single bitwise AND
-    /// (O(1) via [`ComponentMask`]) when masks have been built via
-    /// [`build_component_masks`](SystemAccess::build_component_masks).  Falls
-    /// back to [`HashSet::is_disjoint`] when masks are empty (e.g. in tests
-    /// that don't have a registry).
+    /// (O(1) via [`ComponentMask`]) when both systems' masks are **complete** -
+    /// that is, when [`build_component_masks`](SystemAccess::build_component_masks)
+    /// resolved every accessed component to a registry bit. Otherwise the
+    /// comparison falls back to [`HashSet::is_disjoint`] over the access sets,
+    /// which are always complete.
+    ///
+    /// The distinction is load-bearing rather than an optimization detail: a
+    /// mask that omits a component would make two systems that both write it
+    /// compare as disjoint, and the scheduler would run them in parallel.
     ///
     /// Resource conflicts always use [`HashSet::is_disjoint`].
     #[inline]
@@ -175,25 +211,18 @@ impl SystemAccess {
             return true;
         }
 
-        // Step 2: Component conflicts - prefer O(1) bitmasks when available,
-        // fall back to HashSet for tests / ad-hoc usage.
-        if self.reads_mask.is_empty()
-            && self.writes_mask.is_empty()
-            && other.reads_mask.is_empty()
-            && other.writes_mask.is_empty()
-        {
-            // Fallback: use HashSet operations
-            if !self.writes.is_disjoint(&other.writes) {
-                return true;
-            }
-            if !self.writes.is_disjoint(&other.reads) {
-                return true;
-            }
-            if !self.reads.is_disjoint(&other.writes) {
-                return true;
-            }
-        } else {
-            // Fast path: O(1) bitwise AND
+        // Step 2: Component conflicts. The bitmasks are an optimization over
+        // the access sets, so they may only be trusted when they describe every
+        // access on BOTH sides.
+        //
+        // The previous rule keyed off emptiness - masks were used unless all
+        // four were empty - which made "no mask" indistinguishable from "no
+        // access". A system whose components were unregistered when its masks
+        // were built compared as if it touched nothing, so a genuine
+        // write/write conflict was reported as disjoint and the two systems ran
+        // concurrently on the same data.
+        if self.masks_complete && other.masks_complete {
+            // Fast path: O(1) bitwise AND.
             if self.writes_mask.intersects(&other.writes_mask) {
                 return true;
             }
@@ -201,6 +230,17 @@ impl SystemAccess {
                 return true;
             }
             if self.reads_mask.intersects(&other.writes_mask) {
+                return true;
+            }
+        } else {
+            // Complete-but-slower path over the access sets themselves.
+            if !self.writes.is_disjoint(&other.writes) {
+                return true;
+            }
+            if !self.writes.is_disjoint(&other.reads) {
+                return true;
+            }
+            if !self.reads.is_disjoint(&other.writes) {
                 return true;
             }
         }
@@ -1089,8 +1129,8 @@ mod tests {
         impl Component for A {}
         impl Component for B {}
 
-        registry.register::<A>();
-        registry.register::<B>();
+        registry.register_bit::<A>();
+        registry.register_bit::<B>();
 
         let id_a = ComponentId::of::<A>();
         let id_b = ComponentId::of::<B>();
@@ -1322,3 +1362,121 @@ mod tests {
         }
     }
 } // mod tests
+
+// =============================================================================
+// Mask-completeness regression tests
+// =============================================================================
+
+/// Conflict detection must never depend on registration *order*.
+///
+/// These pin the two defects that let the scheduler dispatch conflicting
+/// systems in parallel: a mask silently dropping an unregistered component, and
+/// a fallback rule that treated an empty mask as "accesses nothing".
+#[cfg(test)]
+mod mask_completeness_tests {
+    use super::SystemAccess;
+    use crate::component::{Component, ComponentRegistry};
+    use crate::ComponentId;
+
+    struct Foo;
+    impl Component for Foo {}
+    struct Bar;
+    impl Component for Bar {}
+
+    /// A system registered before its component has incomplete masks, and must
+    /// say so rather than reporting an empty access set.
+    #[test]
+    fn masks_are_incomplete_when_a_component_is_unregistered() {
+        let mut access = SystemAccess::new();
+        access.add_write(ComponentId::of::<Foo>());
+        access.build_component_masks(&ComponentRegistry::new());
+
+        assert!(
+            !access.masks_are_complete(),
+            "an unresolved component must mark the masks incomplete"
+        );
+    }
+
+    /// The original defect: system A registered before `Foo`, system B after.
+    /// Both write `Foo`, so they must conflict regardless of that ordering.
+    #[test]
+    fn unregistered_component_still_conflicts() {
+        let id = ComponentId::of::<Foo>();
+
+        let mut a = SystemAccess::new();
+        a.add_write(id);
+        a.build_component_masks(&ComponentRegistry::new());
+
+        let mut registry = ComponentRegistry::new();
+        registry.register_bit::<Foo>();
+        let mut b = SystemAccess::new();
+        b.add_write(id);
+        b.build_component_masks(&registry);
+
+        assert!(
+            a.conflicts_with(&b),
+            "two systems writing the same component must conflict"
+        );
+        assert!(b.conflicts_with(&a), "conflict detection must be symmetric");
+    }
+
+    /// A read paired with a write is equally a conflict across the same gap.
+    #[test]
+    fn unregistered_component_conflicts_on_read_write() {
+        let id = ComponentId::of::<Foo>();
+
+        let mut reader = SystemAccess::new();
+        reader.add_read(id);
+        reader.build_component_masks(&ComponentRegistry::new());
+
+        let mut registry = ComponentRegistry::new();
+        registry.register_bit::<Foo>();
+        let mut writer = SystemAccess::new();
+        writer.add_write(id);
+        writer.build_component_masks(&registry);
+
+        assert!(reader.conflicts_with(&writer));
+        assert!(writer.conflicts_with(&reader));
+    }
+
+    /// The fallback must not over-report either: genuinely disjoint systems
+    /// stay parallel even when one side's masks are incomplete.
+    #[test]
+    fn incomplete_masks_do_not_invent_conflicts() {
+        let mut a = SystemAccess::new();
+        a.add_write(ComponentId::of::<Foo>());
+        a.build_component_masks(&ComponentRegistry::new());
+
+        let mut registry = ComponentRegistry::new();
+        registry.register_bit::<Bar>();
+        let mut b = SystemAccess::new();
+        b.add_write(ComponentId::of::<Bar>());
+        b.build_component_masks(&registry);
+
+        assert!(
+            !a.conflicts_with(&b),
+            "disjoint systems must still be allowed to run in parallel"
+        );
+    }
+
+    /// With everything registered, both sides are complete and the fast path
+    /// is used - and must agree with the fallback.
+    #[test]
+    fn complete_masks_take_the_fast_path_and_agree() {
+        let mut registry = ComponentRegistry::new();
+        registry.register_bit::<Foo>();
+        registry.register_bit::<Bar>();
+
+        let mut a = SystemAccess::new();
+        a.add_write(ComponentId::of::<Foo>());
+        a.build_component_masks(&registry);
+
+        let mut b = SystemAccess::new();
+        b.add_read(ComponentId::of::<Foo>());
+        b.add_write(ComponentId::of::<Bar>());
+        b.build_component_masks(&registry);
+
+        assert!(a.masks_are_complete() && b.masks_are_complete());
+        assert!(a.conflicts_with(&b), "write/read on Foo is a conflict");
+    }
+}

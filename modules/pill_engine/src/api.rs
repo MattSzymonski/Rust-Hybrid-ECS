@@ -200,6 +200,51 @@ impl EngineApi {
 // that was created by the host and has not been dropped. The host guarantees
 // this invariant.
 
+// =============================================================================
+// Guarded Entry
+// =============================================================================
+
+/// Run one C ABI body with the two protections every foreign entry point needs.
+///
+/// Both are required for soundness rather than politeness:
+///
+/// - **Null rejection.** Forming `&mut *ptr` from a null pointer is undefined
+///   behaviour in Rust even when the reference is never read, so the check has
+///   to happen before the reference exists, not before it is used.
+/// - **Unwind containment.** Letting a panic cross an `extern "C"` boundary is
+///   undefined behaviour. The engine cannot use `panic = "abort"` (`pill_core`
+///   is a `dylib`, and rustc rejects that pairing), so catching here is the
+///   only mechanism available. The generated `#[pill_project]` and
+///   `#[pill_module]` wrappers already do exactly this; this brings the
+///   engine's own ABI to the same standard.
+///
+/// `on_failure` is returned for a null handle and for a caught panic, so each
+/// wrapper reports failure in whatever vocabulary its signature uses.
+///
+/// # Safety
+///
+/// `engine` must be null or a valid `*mut Engine` that outlives this call, and
+/// must not be aliased for the duration of `body`.
+unsafe fn with_engine<R>(
+    engine: *mut c_void,
+    on_failure: R,
+    body: impl FnOnce(&mut Engine) -> R,
+) -> R {
+    // `as_mut` performs the null check and only then forms the reference, which
+    // is the ordering the UB rule requires.
+    //
+    // SAFETY: the caller guarantees a valid, unaliased `Engine` pointer when it
+    // is non-null; `as_mut` rejects the null case before any reference exists.
+    let Some(engine_ref) = (unsafe { (engine as *mut Engine).as_mut() }) else {
+        return on_failure;
+    };
+    // `AssertUnwindSafe` is justified because a caught panic here is terminal
+    // for the call: the failure value is returned and the engine is not used
+    // again by this wrapper, so no observer sees a torn intermediate state.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(engine_ref)))
+        .unwrap_or(on_failure)
+}
+
 /// C-callable wrapper for raw component registration.
 ///
 /// Reports an error for now: the engine does not yet implement
@@ -207,24 +252,15 @@ impl EngineApi {
 ///
 /// # Safety
 ///
-/// `engine` must be a valid `*mut Engine` that outlives this call.
+/// The engine handle is unused: this entry point is unimplemented and never
+/// forms a reference from it, so any value including null is safe to pass.
+/// `type_name` must be null or a NUL-terminated string readable for this call.
 unsafe extern "C" fn api_register_component(
-    engine: *mut c_void,
+    _engine: *mut c_void,
     type_name: *const c_char,
     _size_in_bytes: u32,
     _alignment_in_bytes: u32,
 ) -> i32 {
-    // Step 1: Recover the engine reference from the opaque handle.
-    //
-    // SAFETY: The handle was created by `EngineApi::new` via
-    // `engine as *mut Engine as *mut c_void`, so it points to a valid,
-    // correctly aligned `Engine`. The host keeps the engine alive for the
-    // entire time the project module is loaded, so the engine outlives this
-    // call. No other reference to the engine exists during this call, so
-    // the reconstructed `&mut Engine` is the only outstanding reference
-    // (no overlapping `&mut` aliasing).
-    let _engine_ref: &mut Engine = unsafe { &mut *(engine as *mut Engine) };
-
     // Step 2: Decode the component name for the diagnostic message.
     //
     // Raw component registration by name/size/alignment is not yet
@@ -251,7 +287,6 @@ unsafe extern "C" fn api_register_component(
         name_str, _size_in_bytes, _alignment_in_bytes,
     );
 
-    let _ = _engine_ref;
     // Return error for now — raw registration needs engine-side support.
     -1
 }
@@ -263,23 +298,14 @@ unsafe extern "C" fn api_register_component(
 ///
 /// # Safety
 ///
-/// `engine` must be a valid `*mut Engine` that outlives this call.
+/// The engine handle is unused: this entry point is unimplemented and never
+/// forms a reference from it, so any value including null is safe to pass.
+/// `system_name` must be null or a NUL-terminated string readable for this call.
 unsafe extern "C" fn api_register_system_raw(
-    engine: *mut c_void,
+    _engine: *mut c_void,
     system_name: *const c_char,
     _system_function: unsafe extern "C" fn(*mut c_void),
 ) -> i32 {
-    // Step 1: Recover the engine reference from the opaque handle.
-    //
-    // SAFETY: The handle was created by `EngineApi::new` via
-    // `engine as *mut Engine as *mut c_void`, so it points to a valid,
-    // correctly aligned `Engine`. The host keeps the engine alive for the
-    // entire time the project module is loaded, so the engine outlives this
-    // call. No other reference to the engine exists during this call, so
-    // the reconstructed `&mut Engine` is the only outstanding reference
-    // (no overlapping `&mut` aliasing).
-    let _engine_ref: &mut Engine = unsafe { &mut *(engine as *mut Engine) };
-
     // Step 2: Decode the system name for the diagnostic message.
     let name_str = if system_name.is_null() {
         "(null)"
@@ -301,7 +327,6 @@ unsafe extern "C" fn api_register_system_raw(
         name_str,
     );
 
-    let _ = _engine_ref;
     let _ = _system_function;
     // Return error for now — raw system registration needs engine-side support.
     -1
@@ -323,15 +348,18 @@ unsafe extern "C" fn api_process_frame(engine: *mut c_void) -> i32 {
     // call. No other reference to the engine exists during this call, so
     // the reconstructed `&mut Engine` is the only outstanding reference
     // (no overlapping `&mut` aliasing).
-    let engine_ref: &mut Engine = unsafe { &mut *(engine as *mut Engine) };
-    match engine_ref.process_frame() {
-        Ok(()) => 0,
-        Err(_errors) => {
-            // Errors are logged internally by the engine when
-            // `should_exit_on_error` is false. When true, they are
-            // returned here.
-            1
-        }
+    // SAFETY: see `with_engine` - it rejects null before forming a reference
+    // and contains any unwind, which is what this ABI boundary requires.
+    unsafe {
+        with_engine(engine, -1, |engine| match engine.process_frame() {
+            Ok(()) => 0,
+            Err(_errors) => {
+                // Errors are logged internally by the engine when
+                // `should_exit_on_error` is false. When true, they are
+                // returned here.
+                1
+            }
+        })
     }
 }
 
@@ -348,8 +376,10 @@ unsafe extern "C" fn api_set_fps_limit(engine: *mut c_void, frames_per_second: f
     // call. No other reference to the engine exists during this call, so
     // the reconstructed `&mut Engine` is the only outstanding reference
     // (no overlapping `&mut` aliasing).
-    let engine_ref: &mut Engine = unsafe { &mut *(engine as *mut Engine) };
-    engine_ref.set_fps_limit(frames_per_second);
+    // SAFETY: see `with_engine`.
+    unsafe {
+        with_engine(engine, (), |engine| engine.set_fps_limit(frames_per_second));
+    }
 }
 
 /// C-callable wrapper around `Engine::set_parallel_execution`.
@@ -365,8 +395,10 @@ unsafe extern "C" fn api_set_parallel_execution(engine: *mut c_void, enabled: bo
     // call. No other reference to the engine exists during this call, so
     // the reconstructed `&mut Engine` is the only outstanding reference
     // (no overlapping `&mut` aliasing).
-    let engine_ref: &mut Engine = unsafe { &mut *(engine as *mut Engine) };
-    engine_ref.set_parallel_execution(enabled);
+    // SAFETY: see `with_engine`.
+    unsafe {
+        with_engine(engine, (), |engine| engine.set_parallel_execution(enabled));
+    }
 }
 
 /// C-callable wrapper around `Engine::world().entity_count()`.
@@ -382,8 +414,9 @@ unsafe extern "C" fn api_entity_count(engine: *mut c_void) -> u64 {
     // call. Only a shared `&Engine` is reconstructed here, so no mutable
     // aliasing is introduced; the caller must not mutate the engine
     // concurrently with this call.
-    let engine_ref: &Engine = unsafe { &*(engine as *const Engine) };
-    engine_ref.world().entity_count() as u64
+    // SAFETY: see `with_engine`. Zero is the failure value: a caller that
+    // passed a null handle has no entities to count.
+    unsafe { with_engine(engine, 0, |engine| engine.world().entity_count() as u64) }
 }
 
 /// C-callable wrapper around `Engine::world_mut().reserve_entities`.
@@ -399,6 +432,114 @@ unsafe extern "C" fn api_reserve_entities(engine: *mut c_void, capacity: u64) {
     // call. No other reference to the engine exists during this call, so
     // the reconstructed `&mut Engine` is the only outstanding reference
     // (no overlapping `&mut` aliasing).
-    let engine_ref: &mut Engine = unsafe { &mut *(engine as *mut Engine) };
-    engine_ref.world_mut().reserve_entities(capacity as usize);
+    // A `u64` request cannot always be represented as a `usize`, and truncating
+    // it silently would reserve a wildly different amount than was asked for.
+    let Ok(capacity) = usize::try_from(capacity) else {
+        return;
+    };
+    // SAFETY: see `with_engine`.
+    unsafe {
+        with_engine(engine, (), |engine| {
+            engine.world_mut().reserve_entities(capacity)
+        });
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+/// The C ABI is called by bindings outside Rust's guarantees, so it has to
+/// survive the inputs those bindings actually produce.
+#[cfg(test)]
+mod abi_guard_tests {
+    use super::*;
+
+    /// A null handle must be rejected, never dereferenced.
+    ///
+    /// Forming `&mut *ptr` from null is undefined behaviour even when the
+    /// reference is unused, so this asserts on the documented failure value
+    /// rather than on "it did not crash".
+    #[test]
+    fn every_entry_point_rejects_a_null_handle() {
+        let null = std::ptr::null_mut();
+
+        // SAFETY: passing null is exactly the contract under test; the wrappers
+        // are required to reject it before forming a reference.
+        unsafe {
+            assert_eq!(
+                api_process_frame(null),
+                -1,
+                "process_frame must report failure"
+            );
+            assert_eq!(api_entity_count(null), 0, "entity_count must report zero");
+            // The void-returning wrappers must simply not fault.
+            api_set_fps_limit(null, 60.0);
+            api_set_parallel_execution(null, true);
+            api_reserve_entities(null, 128);
+        }
+    }
+
+    /// A capacity that cannot be represented as a `usize` must be refused
+    /// rather than truncated into a much smaller reservation.
+    #[test]
+    fn an_unrepresentable_capacity_is_refused() {
+        let mut engine = Engine::new();
+        let before = engine.world().entity_count();
+        let handle = &mut engine as *mut Engine as *mut c_void;
+
+        // SAFETY: `handle` addresses a live engine for the duration of the call.
+        unsafe {
+            api_reserve_entities(handle, u64::MAX);
+        }
+
+        assert_eq!(
+            engine.world().entity_count(),
+            before,
+            "an unrepresentable request must change nothing"
+        );
+    }
+
+    /// A valid handle still works - the guard must not break the happy path.
+    #[test]
+    fn a_valid_handle_is_still_serviced() {
+        let mut engine = Engine::new();
+        let handle = &mut engine as *mut Engine as *mut c_void;
+
+        // SAFETY: `handle` addresses a live engine for the duration of the call.
+        let count = unsafe { api_entity_count(handle) };
+        assert_eq!(count, 0, "a fresh world has no entities");
+
+        // SAFETY: as above.
+        unsafe {
+            api_set_parallel_execution(handle, false);
+            api_reserve_entities(handle, 16);
+        }
+    }
+
+    /// A panic inside a system must not unwind across the ABI boundary.
+    ///
+    /// `catch_unwind` converts it to the wrapper's failure value; without that
+    /// the unwind would be undefined behaviour at the `extern "C"` frame.
+    #[test]
+    fn a_panicking_system_is_contained() {
+        let mut engine = Engine::new();
+        engine.register_system("panics", || -> Result<(), crate::error::SystemError> {
+            panic!("deliberate panic from a system under test");
+        });
+        let handle = &mut engine as *mut Engine as *mut c_void;
+
+        // The default panic hook would print the payload and clutter the test
+        // output; the panic itself is the point, not its report.
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        // SAFETY: `handle` addresses a live engine for the duration of the call.
+        let status = unsafe { api_process_frame(handle) };
+        std::panic::set_hook(previous_hook);
+
+        assert_eq!(
+            status, -1,
+            "a caught panic must surface as the failure value"
+        );
+    }
 }

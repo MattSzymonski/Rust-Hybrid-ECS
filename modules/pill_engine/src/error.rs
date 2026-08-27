@@ -25,7 +25,7 @@ use pill_core::error::{EngineMessage, MessageRenderer, SemanticRole};
 use pill_core_macros::engine_error;
 
 // Current crate
-use crate::{ComponentId, Entity};
+use crate::{archetype::ArchetypeId, ComponentId, Entity};
 
 // =============================================================================
 // World Errors
@@ -101,6 +101,43 @@ pub enum WorldError {
     /// A byte copy length does not match the registered element size.
     #[message("dynamic component byte length does not match its registered size")]
     DynamicSizeMismatch,
+
+    /// A registered dynamic component has no storage column in the archetype
+    /// the entity was placed in.
+    ///
+    /// Signals that the manifest and the archetype's columns disagree, which
+    /// the manifest-driven registration path can produce if a component is
+    /// registered without its storage being created.
+    #[message(
+        "dynamic component ",
+        debug_value(component_id),
+        " has no storage column in archetype ",
+        debug_value(archetype_id)
+    )]
+    DynamicStorageMissing {
+        /// The dynamic component whose column is absent.
+        component_id: ComponentId,
+        /// The archetype that was expected to own the column.
+        archetype_id: ArchetypeId,
+    },
+
+    /// The archetype recorded for an entity is absent from the world.
+    ///
+    /// Signals that an entity location outlived the archetype it points at,
+    /// which a partially applied hot-reload rehome can produce.
+    #[message(
+        "entity ",
+        debug_value(entity),
+        " references archetype ",
+        debug_value(archetype_id),
+        " which is missing from the world"
+    )]
+    ArchetypeMissing {
+        /// The entity whose recorded location is stale.
+        entity: Entity,
+        /// The archetype ID that could not be resolved.
+        archetype_id: ArchetypeId,
+    },
 }
 
 // =============================================================================
@@ -119,6 +156,26 @@ pub enum CommandError {
     EntityNotFound {
         entity: Entity,
         operation: &'static str,
+    },
+
+    /// A queued entity creation could not write one of its components.
+    ///
+    /// The component was validated when the command was queued, but the world
+    /// can change before the queue is flushed - a hot reload that retires a
+    /// component type between a managed `CreateEntity` call and the end of the
+    /// frame leaves the queued command naming storage that no longer exists.
+    /// Reported rather than raised, because a panic here would unwind through
+    /// the C ABI for a managed project.
+    #[message(
+        "entity ",
+        debug_value(entity),
+        " was created but component ",
+        debug_value(component_id),
+        " could not be written"
+    )]
+    ComponentWriteFailed {
+        entity: Entity,
+        component_id: ComponentId,
     },
 
     /// The entity already possesses the component being added.
@@ -144,6 +201,17 @@ pub enum CommandError {
         entity: Entity,
         component_id: ComponentId,
     },
+
+    /// A queued command's archetype migration failed partway through.
+    ///
+    /// The entity's recorded location referenced an archetype that no longer
+    /// exists, or a dynamic component named by an archetype had no storage
+    /// column. Those inconsistencies are exactly what a partially applied hot
+    /// reload can leave behind, so they are collected like any other command
+    /// failure rather than panicking inside the flush - which for a managed
+    /// project would unwind across the C ABI.
+    #[message("entity ", debug_value(entity), " migration failed: ", value(reason))]
+    MigrationFailed { entity: Entity, reason: String },
 }
 
 // =============================================================================

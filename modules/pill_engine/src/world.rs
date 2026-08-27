@@ -22,6 +22,7 @@ use std::any::Any;
 use std::collections::HashMap;
 
 // External crates
+use pill_core::warn;
 use trait_type_map::{ErasedVecStorageInfo, TraitAccessible, TraitTypeMap, VecFamily};
 
 // Current crate
@@ -372,11 +373,20 @@ impl World {
             .component_storages
             .get_storage_mut::<T>()
             .as_mut_slice::<T>();
-        let ticks = archetype
-            .component_ticks
-            .get_mut(&component_id)
-            .expect("component tick column missing")
-            .as_mut_slice();
+        let Some(ticks_vec) = archetype.component_ticks.get_mut(&component_id) else {
+            // `Archetype::new` creates a tick column for every entry in
+            // `component_types`, so a component with storage but no ticks is
+            // an internal-invariant break rather than a user error. Reporting
+            // "no chunk" keeps the language-binding path from panicking
+            // mid-call; the debug assertion names the offending pair.
+            debug_assert!(
+                false,
+                "component {component_id:?} has storage but no tick column in \
+                 archetype {archetype_id:?}"
+            );
+            return None;
+        };
+        let ticks = ticks_vec.as_mut_slice();
         debug_assert_eq!(components.len(), ticks.len());
         Some((archetype_id, components, ticks))
     }
@@ -416,7 +426,10 @@ impl World {
         let type_name = std::any::type_name::<T>().to_string();
 
         // Register component (bit index + name)
-        self.component_registry.register::<T>();
+        // `register_bit` rather than `register`: the world does not act on
+        // whether the type was already present, and re-registration is normal
+        // here because a hot reload re-runs every `init`.
+        let _bit = self.component_registry.register_bit::<T>();
 
         // Record the registration chronologically so the host can enumerate
         // which types one module's init registered at all (plain or
@@ -675,26 +688,58 @@ impl World {
         // for this component set.
         let entity = self.allocate_entity();
         let archetype_id = self.get_or_create_archetype(component_ids);
-        let archetype = self.archetypes.get_mut(&archetype_id).unwrap();
+        let current_tick = Tick::new(self.change_tick);
+        let Some(archetype) = self.archetypes.get_mut(&archetype_id) else {
+            return Err(WorldError::ArchetypeMissing {
+                entity,
+                archetype_id,
+            });
+        };
+
+        // Step 3: Confirm every requested column exists before touching any of
+        // them. A manifest that registers a component without creating its
+        // storage would otherwise leave a half-populated row behind, so this
+        // pre-flight pass keeps the failure atomic.
+        for (id, _) in components {
+            if !archetype.dynamic_component_storages.contains_key(id)
+                || !archetype.component_ticks.contains_key(id)
+            {
+                return Err(WorldError::DynamicStorageMissing {
+                    component_id: *id,
+                    archetype_id,
+                });
+            }
+        }
+
         let index = archetype.entities.len();
         archetype.entities.push(entity);
 
-        // Step 3: Push each raw byte payload and a fresh change tick into
-        // the entity's new row.
+        // Step 4: Push each raw byte payload and a fresh change tick into
+        // the entity's new row. The lookups cannot fail after the pass above,
+        // but they report rather than panic so a future refactor that drops
+        // the pre-flight check degrades into an error instead of unwinding.
         for (id, bytes) in components {
-            archetype
-                .dynamic_component_storages
-                .get_mut(id)
-                .unwrap()
-                .push_bytes(bytes)?;
-            archetype
-                .component_ticks
-                .get_mut(id)
-                .unwrap()
-                .push(ComponentTicks::new(Tick::new(self.change_tick)));
+            match archetype.dynamic_component_storages.get_mut(id) {
+                Some(storage) => storage.push_bytes(bytes)?,
+                None => {
+                    return Err(WorldError::DynamicStorageMissing {
+                        component_id: *id,
+                        archetype_id,
+                    })
+                }
+            }
+            match archetype.component_ticks.get_mut(id) {
+                Some(ticks) => ticks.push(ComponentTicks::new(current_tick)),
+                None => {
+                    return Err(WorldError::DynamicStorageMissing {
+                        component_id: *id,
+                        archetype_id,
+                    })
+                }
+            }
         }
 
-        // Step 4: Record where the entity lives so random access stays O(1).
+        // Step 5: Record where the entity lives so random access stays O(1).
         self.entity_locations.insert(
             entity,
             EntityLocation {
@@ -991,10 +1036,16 @@ impl World {
             .resources
             .get_mut(&id)
             .and_then(|boxed| boxed.downcast_mut::<T>())?;
-        let ticks: &mut ComponentTicks = self
-            .resource_ticks
-            .get_mut(&id)
-            .expect("resource_ticks must be in sync with resources");
+        let ticks: &mut ComponentTicks = self.resource_ticks.get_mut(&id).unwrap_or_else(|| {
+            // `insert_resource` writes `resources` and `resource_ticks`
+            // together, so a resource present in one and absent from the
+            // other is an internal-invariant break. Naming the resource
+            // keeps the diagnosis startable.
+            panic!(
+                "resource {id:?} exists in resources but has no change-tick \
+                     column; resource_ticks has fallen out of sync with resources"
+            )
+        });
         let this_run = Tick::new(self.change_tick);
         Some(Mut::new(value, ticks, this_run))
     }
@@ -1288,10 +1339,16 @@ impl World {
         let archetype_id = self.get_or_create_archetype(component_ids);
         let current_tick = Tick::new(self.change_tick);
 
-        let archetype = self
-            .archetypes
-            .get_mut(&archetype_id)
-            .expect("archetype must exist after get_or_create_archetype");
+        let archetype = self.archetypes.get_mut(&archetype_id).unwrap_or_else(|| {
+            // `get_or_create_archetype` either returns an existing entry
+            // or inserts a fresh one, so a miss here is an
+            // internal-invariant break. Naming the archetype and entity
+            // makes the report useful.
+            panic!(
+                "archetype {archetype_id:?} vanished after get_or_create_archetype \
+                     while inserting entity {entity:?}"
+            )
+        });
         let index: usize = archetype.entities.len();
 
         // Step 2: Append the entity row, then let the closure push each
@@ -1337,12 +1394,22 @@ impl World {
     /// 1. Old archetype storage (to read existing components)
     /// 2. New archetype storage (to write all components)
     /// 3. Index of the entity in old archetype
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::EntityNotFound`] when the entity has no location
+    /// record, [`WorldError::ArchetypeMissing`] when either the source or the
+    /// destination archetype is absent from the world, and
+    /// [`WorldError::DynamicStorageMissing`] when a dynamic component named
+    /// by an archetype has no storage column — the desync a partially applied
+    /// hot reload can leave behind.
     pub(crate) fn move_entity_to_archetype<F>(
         &mut self,
         entity: Entity,
         new_component_ids: Vec<ComponentId>,
         move_fn: F,
-    ) where
+    ) -> Result<(), WorldError>
+    where
         F: FnOnce(
             &TraitTypeMap<dyn Component, VecFamily>,
             &mut TraitTypeMap<dyn Component, VecFamily>,
@@ -1360,10 +1427,7 @@ impl World {
         // Step 1: Resolve where the entity currently lives.
         let old_location = match self.entity_locations.get(&entity) {
             Some(loc) => *loc,
-            None => {
-                println!("  [Warning] Entity {:?} not found in world", entity.id);
-                return;
-            }
+            None => return Err(WorldError::EntityNotFound),
         };
 
         let old_archetype_id = old_location.archetype_id;
@@ -1375,11 +1439,13 @@ impl World {
 
         // If same archetype, nothing to do (shouldn't happen for add_component)
         if old_archetype_id == new_archetype_id {
-            println!(
-                "  [Warning] Entity {:?} already has this component",
-                entity.id
+            warn!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                entity = ?entity,
+                archetype_id = ?new_archetype_id,
+                "entity already lives in the destination archetype; nothing to migrate"
             );
-            return;
+            return Ok(());
         }
 
         // Step 3: Migrate the entity. We need simultaneous access to two
@@ -1389,16 +1455,20 @@ impl World {
         // disjoint allocations; the debug_assert_ne! below re-checks this
         // inside the unsafe block as a second line of defense against a
         // future refactor removing the early-return.
-        let old_archetype_ptr = self
-            .archetypes
-            .get(&old_archetype_id)
-            .expect("source archetype must exist during entity migration")
-            as *const Archetype;
-        let new_archetype_ptr = self
-            .archetypes
-            .get_mut(&new_archetype_id)
-            .expect("destination archetype must exist after get_or_create_archetype")
-            as *mut Archetype;
+        let old_archetype_ptr =
+            self.archetypes
+                .get(&old_archetype_id)
+                .ok_or(WorldError::ArchetypeMissing {
+                    entity,
+                    archetype_id: old_archetype_id,
+                })? as *const Archetype;
+        let new_archetype_ptr =
+            self.archetypes
+                .get_mut(&new_archetype_id)
+                .ok_or(WorldError::ArchetypeMissing {
+                    entity,
+                    archetype_id: new_archetype_id,
+                })? as *mut Archetype;
 
         // SAFETY: old_archetype_id != new_archetype_id is proven by the
         // early-return above and re-checked below. Different ArchetypeId
@@ -1437,6 +1507,18 @@ impl World {
                     .dynamic_component_storages
                     .get_mut(&component_id)
                 else {
+                    // Native components have no dynamic column and are skipped
+                    // by design. A dynamic component (whose native_type_id is
+                    // None) missing its column is a manifest/storage desync -
+                    // the condition `WorldError::DynamicStorageMissing`
+                    // reports - so fail the migration rather than leave the
+                    // destination archetype short a column.
+                    if component_id.native_type_id().is_none() {
+                        return Err(WorldError::DynamicStorageMissing {
+                            component_id,
+                            archetype_id: new_archetype_id,
+                        });
+                    }
                     continue;
                 };
                 if let Some(source) = old_archetype.dynamic_component_storages.get(&component_id) {
@@ -1454,10 +1536,19 @@ impl World {
             for &component_id in new_component_ids {
                 let new_tick =
                     if let Some(old_ticks_vec) = old_archetype.component_ticks.get(&component_id) {
-                        // Component carried over from old archetype.
-                        *old_ticks_vec
-                            .get(old_index)
-                            .expect("old ticks vec out of sync with components")
+                        // Component carried over from old archetype. `Archetype`
+                        // creates tick columns for every component type in
+                        // lockstep, so a row missing here is an internal
+                        // invariant break; name the entity and archetype so the
+                        // report is startable.
+                        *old_ticks_vec.get(old_index).unwrap_or_else(|| {
+                            panic!(
+                                "old ticks vec out of sync with components while migrating \
+                                 entity {entity:?} to archetype {new_archetype_id:?}: row \
+                                 {old_index} is missing from {} ticks for {component_id:?}",
+                                old_ticks_vec.len()
+                            )
+                        })
                     } else {
                         // Newly added component on this entity.
                         ComponentTicks::new(current_tick)
@@ -1481,7 +1572,15 @@ impl World {
 
         // Step 4: Remove the entity from the old archetype with swap_remove
         // for O(1) removal, keeping every column in lockstep.
-        let old_archetype = self.archetypes.get_mut(&old_archetype_id).unwrap();
+        let Some(old_archetype) = self.archetypes.get_mut(&old_archetype_id) else {
+            // The source archetype was resolved at the top of this function
+            // and nothing here removes archetypes, so a miss is an internal
+            // break. Report it with the same vocabulary as the migration.
+            return Err(WorldError::ArchetypeMissing {
+                entity,
+                archetype_id: old_archetype_id,
+            });
+        };
 
         if old_index < old_archetype.entities.len() {
             old_archetype.entities.swap_remove(old_index);
@@ -1505,11 +1604,22 @@ impl World {
                             storage.swap_remove_discard(old_index);
                         }
                     }
-                    None => old_archetype
-                        .dynamic_component_storages
-                        .get_mut(&component_id)
-                        .expect("dynamic storage missing")
-                        .swap_remove(old_index),
+                    None => {
+                        let Some(column) = old_archetype
+                            .dynamic_component_storages
+                            .get_mut(&component_id)
+                        else {
+                            // A dynamic component without a column is the
+                            // manifest/storage desync this function already
+                            // reports during migration; surface it here too
+                            // instead of panicking mid-frame.
+                            return Err(WorldError::DynamicStorageMissing {
+                                component_id,
+                                archetype_id: old_archetype_id,
+                            });
+                        };
+                        column.swap_remove(old_index);
+                    }
                 }
                 // Keep change-detection ticks in lockstep with storage.
                 if let Some(ticks) = old_archetype.component_ticks.get_mut(&component_id) {
@@ -1526,6 +1636,8 @@ impl World {
             self.archetypes.remove(&old_archetype_id);
             self.archetype_generation = self.archetype_generation.wrapping_add(1);
         }
+
+        Ok(())
     }
 
     /// Remove an entity from the world completely
@@ -1586,11 +1698,26 @@ impl World {
                             storage.swap_remove_discard(old_index);
                         }
                     }
-                    None => archetype
-                        .dynamic_component_storages
-                        .get_mut(component_id)
-                        .expect("dynamic storage missing")
-                        .swap_remove(old_index),
+                    None => {
+                        if let Some(column) =
+                            archetype.dynamic_component_storages.get_mut(component_id)
+                        {
+                            column.swap_remove(old_index);
+                        } else {
+                            // A dynamic component with no column has no data to
+                            // remove, so skipping is safe. The missing column is
+                            // the manifest/storage desync reported by
+                            // `WorldError::DynamicStorageMissing`; report rather
+                            // than panic, because this runs inside
+                            // `process_frame` for managed projects.
+                            warn!(
+                                target: pill_core::telemetry::telemetry_target::ECS,
+                                component_id = ?component_id,
+                                archetype_id = ?archetype.id,
+                                "destroy_entity: dynamic component has no storage column; skipping"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1693,7 +1820,16 @@ impl World {
                     copier(old_storage, new_storage, old_index);
                 }
             },
-        );
+        )
+        .unwrap_or_else(|error| {
+            // The entity and its archetype were validated above, so a
+            // migration failure here is an internal-invariant break, not a
+            // user error. Name the entity and the failure so the report is
+            // startable; the dynamic paths propagate the same failure as a
+            // typed error instead, because their inputs come from outside
+            // the engine.
+            panic!("internal invariant broken while migrating entity {entity:?}: {error}")
+        });
 
         Ok(())
     }
@@ -1768,7 +1904,13 @@ impl World {
                 // Add the new component
                 new_storage.get_storage_mut::<T>().push::<T>(component);
             },
-        );
+        )
+        .unwrap_or_else(|error| {
+            // As in `remove_component_by_id`: the entity and its archetype
+            // were validated above, so this failure is an internal-invariant
+            // break, not a user error.
+            panic!("internal invariant broken while migrating entity {entity:?}: {error}")
+        });
 
         Ok(())
     }
@@ -1793,7 +1935,12 @@ impl World {
             .entity_locations
             .get(&entity)
             .ok_or(WorldError::EntityNotFound)?;
-        let old_archetype = self.archetypes.get(&location.archetype_id).unwrap();
+        let Some(old_archetype) = self.archetypes.get(&location.archetype_id) else {
+            return Err(WorldError::ArchetypeMissing {
+                entity,
+                archetype_id: location.archetype_id,
+            });
+        };
         if old_archetype.component_types.contains(&component_id) {
             return Err(WorldError::DynamicComponentAlreadyPresent);
         }
@@ -1816,15 +1963,25 @@ impl World {
             for copier in &copiers {
                 copier(old, new, index);
             }
-        });
-        let location = self.entity_locations[&entity];
-        self.archetypes
-            .get_mut(&location.archetype_id)
-            .unwrap()
-            .dynamic_component_storages
-            .get_mut(&component_id)
-            .unwrap()
-            .set_bytes(location.index_in_archetype, bytes)?;
+        })?;
+        // Re-resolve the location: the migration above moved the entity into
+        // the destination archetype, so the pre-move location is stale.
+        let Some(&location) = self.entity_locations.get(&entity) else {
+            return Err(WorldError::EntityNotFound);
+        };
+        let Some(archetype) = self.archetypes.get_mut(&location.archetype_id) else {
+            return Err(WorldError::ArchetypeMissing {
+                entity,
+                archetype_id: location.archetype_id,
+            });
+        };
+        let Some(storage) = archetype.dynamic_component_storages.get_mut(&component_id) else {
+            return Err(WorldError::DynamicStorageMissing {
+                component_id,
+                archetype_id: location.archetype_id,
+            });
+        };
+        storage.set_bytes(location.index_in_archetype, bytes)?;
         Ok(())
     }
 
@@ -1884,7 +2041,12 @@ impl World {
             .entity_locations
             .get(&entity)
             .ok_or(WorldError::EntityNotFound)?;
-        let old_archetype = self.archetypes.get(&location.archetype_id).unwrap();
+        let Some(old_archetype) = self.archetypes.get(&location.archetype_id) else {
+            return Err(WorldError::ArchetypeMissing {
+                entity,
+                archetype_id: location.archetype_id,
+            });
+        };
         if !old_archetype
             .dynamic_component_storages
             .contains_key(&component_id)
@@ -1909,7 +2071,7 @@ impl World {
             for copier in &copiers {
                 copier(old, new, index);
             }
-        });
+        })?;
         Ok(())
     }
 

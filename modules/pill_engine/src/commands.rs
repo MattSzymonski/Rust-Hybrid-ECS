@@ -359,19 +359,30 @@ impl CommandQueue {
         let mut succeeded = 0usize;
 
         for command in self.commands.drain(..) {
+            // Every executor reports failure by appending to `errors`; a
+            // command that appended nothing succeeded. Counting from the
+            // vector length keeps one source of truth and avoids the
+            // double-counting an unconditional `succeeded += 1` used to
+            // introduce for the non-create arms.
+            let errors_before = errors.len();
             match command {
                 DeferredCommand::CreateEntity {
                     entity,
                     component_adders,
                     dynamic_components,
                 } => {
-                    Self::execute_create_entity(
+                    // Entity creation can fail to write one or more components
+                    // after the row exists; every failure is collected rather
+                    // than panicking inside the flush, and a creation that did
+                    // not fully materialise is no longer counted as succeeded.
+                    if let Err(mut failures) = Self::execute_create_entity(
                         world,
                         entity,
                         component_adders,
                         dynamic_components,
-                    );
-                    succeeded += 1;
+                    ) {
+                        errors.append(&mut failures);
+                    }
                 }
 
                 DeferredCommand::AddComponentToEntity {
@@ -379,7 +390,6 @@ impl CommandQueue {
                     component_adder,
                 } => {
                     Self::execute_add_component(world, entity, component_adder, &mut errors);
-                    succeeded += 1;
                 }
 
                 DeferredCommand::AddDynamicComponentToEntity {
@@ -394,7 +404,6 @@ impl CommandQueue {
                         bytes,
                         &mut errors,
                     );
-                    succeeded += 1;
                 }
 
                 DeferredCommand::RemoveComponentFromEntity {
@@ -402,20 +411,21 @@ impl CommandQueue {
                     component_id,
                 } => {
                     Self::execute_remove_component(world, entity, component_id, &mut errors);
-                    succeeded += 1;
                 }
 
                 DeferredCommand::DestroyEntity { entity } => {
                     Self::execute_destroy_entity(world, entity, &mut errors);
-                    succeeded += 1;
                 }
+            }
+            if errors.len() == errors_before {
+                succeeded += 1;
             }
         }
 
         // Step 3: Report success/failure totals to the profiler.
         zone.text(format_args!(
             "{} succeeded, {} errors",
-            succeeded - errors.len(),
+            succeeded,
             errors.len(),
         ));
 
@@ -447,7 +457,7 @@ impl CommandQueue {
         entity: Entity,
         component_adders: Vec<Box<dyn ComponentAdder>>,
         dynamic_components: Vec<(ComponentId, Vec<u8>)>,
-    ) {
+    ) -> Result<(), Vec<CommandError>> {
         // Step 1: Collect the full component-ID set that defines the new archetype.
         let mut component_ids: Vec<ComponentId> = component_adders
             .iter()
@@ -463,10 +473,29 @@ impl CommandQueue {
         });
 
         // Step 3: Write type-erased components once the entity row exists.
+        //
+        // These were validated when the command was queued, not now. A reload
+        // that retires a component type between the queue and the flush leaves
+        // this naming storage that no longer exists, so the failure is
+        // collected and reported with the rest of the batch. It used to be an
+        // `expect`, which panicked inside `process_frame` - and for a managed
+        // project that unwinds across the C ABI.
+        let mut errors = Vec::new();
         for (component_id, bytes) in dynamic_components {
-            world
+            if world
                 .set_dynamic_component_bytes(entity, component_id, &bytes)
-                .expect("validated dynamic create component must have a storage row");
+                .is_err()
+            {
+                errors.push(CommandError::ComponentWriteFailed {
+                    entity,
+                    component_id,
+                });
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors)
         }
     }
 
@@ -503,9 +532,19 @@ impl CommandQueue {
             return;
         }
         // Step 3: Write the serialized blob into the component storage.
-        world
-            .add_dynamic_component(entity, component_id, &bytes)
-            .expect("managed command blobs are validated before being queued");
+        //
+        // The blob was validated when the command was queued, not now. A
+        // reload that retires a component type between the queue and the
+        // flush leaves this naming storage that no longer exists, so the
+        // failure is collected with the rest of the batch. It used to be an
+        // `expect`, which panicked inside the flush - and for a managed
+        // project that unwinds across the C ABI.
+        if let Err(_error) = world.add_dynamic_component(entity, component_id, &bytes) {
+            errors.push(CommandError::ComponentWriteFailed {
+                entity,
+                component_id,
+            });
+        }
     }
 
     /// Executes a queued native component addition.
@@ -532,10 +571,17 @@ impl CommandQueue {
 
         // Step 2: Compute the target archetype's component-ID set, rejecting
         // components the entity already has.
-        let old_archetype = world
-            .archetypes
-            .get(&entity_location.archetype_id)
-            .expect("archetype must exist for entity at its recorded location");
+        let Some(old_archetype) = world.archetypes.get(&entity_location.archetype_id) else {
+            // The entity's location references an archetype that no longer
+            // exists - the desync a partially applied hot reload can leave
+            // behind. The entity is effectively unreachable, so report it as
+            // not found rather than panicking inside the flush.
+            errors.push(CommandError::EntityNotFound {
+                entity,
+                operation: "add_component",
+            });
+            return;
+        };
         let mut new_component_ids = Vec::with_capacity(old_archetype.component_types.len() + 1);
         new_component_ids.extend_from_slice(&old_archetype.component_types);
         let new_component_id = component_adder.component_id();
@@ -559,8 +605,10 @@ impl CommandQueue {
             .collect();
 
         // Step 4: Migrate the entity row, copying surviving components and
-        // writing the new component into the destination storage.
-        world.move_entity_to_archetype(
+        // writing the new component into the destination storage. A migration
+        // failure (archetype missing, dynamic column missing) is collected
+        // rather than panicking inside the flush.
+        if let Err(error) = world.move_entity_to_archetype(
             entity,
             new_component_ids,
             |old_storage, new_storage, old_index| {
@@ -569,7 +617,12 @@ impl CommandQueue {
                 }
                 component_adder.add_component_to_storage(new_storage);
             },
-        );
+        ) {
+            errors.push(CommandError::MigrationFailed {
+                entity,
+                reason: error.to_string(),
+            });
+        }
     }
 
     /// Executes a queued component removal.
@@ -596,7 +649,16 @@ impl CommandQueue {
 
         // Step 2: Reject removal of a component the entity does not have, and
         // compute the surviving component-ID set.
-        let old_archetype = world.archetypes.get(&entity_location.archetype_id).unwrap();
+        let Some(old_archetype) = world.archetypes.get(&entity_location.archetype_id) else {
+            // As in `execute_add_component`: the entity's recorded archetype
+            // is gone, so the entity is effectively unreachable. Report it as
+            // not found rather than panicking inside the flush.
+            errors.push(CommandError::EntityNotFound {
+                entity,
+                operation: "remove_component",
+            });
+            return;
+        };
 
         if !old_archetype.component_types.contains(&component_id) {
             errors.push(CommandError::ComponentNotFound {
@@ -621,13 +683,15 @@ impl CommandQueue {
             return;
         }
 
-        // Step 4: Migrate surviving components to the new archetype.
+        // Step 4: Migrate surviving components to the new archetype. A
+        // migration failure is collected rather than panicking inside the
+        // flush, matching `execute_add_component`.
         let component_copiers: Vec<_> = new_component_ids
             .iter()
             .filter_map(|component_id| world.component_copiers.get(component_id).copied())
             .collect();
 
-        world.move_entity_to_archetype(
+        if let Err(error) = world.move_entity_to_archetype(
             entity,
             new_component_ids,
             |old_storage, new_storage, old_index| {
@@ -635,7 +699,12 @@ impl CommandQueue {
                     component_copier(old_storage, new_storage, old_index);
                 }
             },
-        );
+        ) {
+            errors.push(CommandError::MigrationFailed {
+                entity,
+                reason: error.to_string(),
+            });
+        }
     }
 
     /// Executes a queued entity destruction.
@@ -1132,5 +1201,113 @@ mod tests {
             3,
             "Should have 3 different archetypes"
         );
+    }
+
+    /// A queued create that cannot write one of its components is reported,
+    /// not counted as a success and not panicked on.
+    ///
+    /// The component blob was validated when the command was queued, but the
+    /// world can change before the flush - here the storage column vanishes
+    /// (a partially applied reload rehome). `execute_create_entity` must
+    /// surface `ComponentWriteFailed` through the error list, because a panic
+    /// here would unwind through `process_frame` and, for a managed project,
+    /// across the C ABI.
+    #[test]
+    fn a_queued_create_that_cannot_write_a_component_is_reported() {
+        let mut world = World::new();
+        let dynamic_a = world
+            .register_dynamic_component(0xA1, "Project.DynamicA", 4, 4, 1)
+            .unwrap();
+
+        // First flush materialises entity A, which creates the archetype with
+        // the dynamic storage column.
+        let entity_a = world.reserve_entity();
+        let mut queue = CommandQueue::new();
+        queue.create_mixed_entity(
+            entity_a,
+            vec![],
+            vec![(dynamic_a, 11_u32.to_ne_bytes().to_vec())],
+        );
+        queue.execute_queued_commands(&mut world, false).unwrap();
+        assert!(world.is_entity_valid(entity_a));
+
+        // Simulate a partially applied reload rehome: the archetype keeps the
+        // component in `component_types` but loses its storage column.
+        world
+            .archetypes
+            .values_mut()
+            .next()
+            .unwrap()
+            .dynamic_component_storages
+            .remove(&dynamic_a);
+
+        // A second queued create reuses the existing archetype, so the row is
+        // materialised but the component write fails.
+        let entity_b = world.reserve_entity();
+        queue.create_mixed_entity(
+            entity_b,
+            vec![],
+            vec![(dynamic_a, 22_u32.to_ne_bytes().to_vec())],
+        );
+        let errors = queue
+            .execute_queued_commands(&mut world, true)
+            .expect_err("a component that cannot be written must fail the flush");
+
+        assert!(matches!(
+            errors.as_slice(),
+            [CommandError::ComponentWriteFailed {
+                entity,
+                component_id,
+            }] if *entity == entity_b && *component_id == dynamic_a
+        ));
+    }
+
+    /// A queued removal whose archetype migration hits missing dynamic
+    /// storage is reported as `MigrationFailed`, never panicked on.
+    ///
+    /// The migration path used to `expect("dynamic storage missing")`, which
+    /// aborted the frame inside the flush. After the fix the desync is
+    /// collected as a typed `WorldError` and surfaced through the command
+    /// error list.
+    #[test]
+    fn a_queued_remove_whose_migration_hits_missing_storage_is_reported() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let dynamic_a = world
+            .register_dynamic_component(0xA1, "Project.DynamicA", 4, 4, 1)
+            .unwrap();
+
+        // Create an entity carrying both a native and a dynamic component, so
+        // removing the dynamic one migrates instead of destroying.
+        let entity = world.reserve_entity();
+        let mut queue = CommandQueue::new();
+        queue.create_mixed_entity(
+            entity,
+            vec![boxed_component_adder(Position { x: 1.0, y: 2.0 })],
+            vec![(dynamic_a, 11_u32.to_ne_bytes().to_vec())],
+        );
+        queue.execute_queued_commands(&mut world, false).unwrap();
+        assert!(world.is_entity_valid(entity));
+
+        // Simulate the desync: the dynamic column vanishes from the archetype
+        // while its `component_types` entry survives.
+        world
+            .archetypes
+            .values_mut()
+            .next()
+            .unwrap()
+            .dynamic_component_storages
+            .remove(&dynamic_a);
+
+        queue.remove_component_by_id(entity, dynamic_a);
+        let errors = queue
+            .execute_queued_commands(&mut world, true)
+            .expect_err("a migration that cannot complete must fail the flush");
+
+        assert!(matches!(
+            errors.as_slice(),
+            [CommandError::MigrationFailed { entity: failed_entity, .. }]
+                if *failed_entity == entity
+        ));
     }
 }

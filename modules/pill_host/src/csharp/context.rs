@@ -18,6 +18,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 
 // External crates
+use pill_core::error;
 use pill_engine::commands::CommandQueue;
 use pill_engine::{Entity, World};
 
@@ -74,7 +75,7 @@ impl ActiveSystemGuard {
         world: &mut World,
         access: &[NativeSystemAccess],
         bindings: &ComponentBindings,
-    ) -> Self {
+    ) -> Option<Self> {
         Self::set_inner(world, std::ptr::null_mut(), access, bindings, false)
     }
 
@@ -86,26 +87,37 @@ impl ActiveSystemGuard {
         access: &[NativeSystemAccess],
         bindings: &ComponentBindings,
         uses_commands: bool,
-    ) -> Self {
+    ) -> Option<Self> {
         Self::set_inner(world, queue, access, bindings, uses_commands)
     }
 
     /// Installs the complete scope in one assignment after rejecting nested
     /// invocation, which would overwrite active raw pointers.
     ///
-    /// The nested-invocation check is the only fallible step and it runs
-    /// before any mutation, so a panic there leaves no stale state behind.
+    /// Returns `None` when a scope is already installed on this thread. That is
+    /// a managed-side programming error - a C# system re-entering the host -
+    /// and it used to be an `assert!`. Panicking here unwinds through the .NET
+    /// frames that called in, which is undefined behaviour at the FFI boundary,
+    /// so the condition is reported instead of raised.
+    ///
+    /// The nested-invocation check is the only fallible step and it runs before
+    /// any mutation, so a rejection leaves no stale state behind.
     fn set_inner(
         world: &mut World,
         queue: *mut CommandQueue,
         access: &[NativeSystemAccess],
         bindings: &ComponentBindings,
         uses_commands: bool,
-    ) -> Self {
+    ) -> Option<Self> {
         // Step 1: Reject nested invocation before touching any thread-local.
-        ACTIVE_SCOPE.with(|slot| {
-            assert!(slot.get().is_none(), "nested managed ECS system invocation");
-        });
+        let already_active = ACTIVE_SCOPE.with(|slot| slot.get().is_some());
+        if already_active {
+            error!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                "nested managed ECS system invocation rejected; a managed system                  re-entered the host while one was already running"
+            );
+            return None;
+        }
 
         // Step 2: Clear reservations from the previous invocation without
         // panicking. A reservation borrow can only exist while a scope is
@@ -127,7 +139,7 @@ impl ActiveSystemGuard {
                 uses_commands,
             }));
         });
-        Self
+        Some(Self)
     }
 }
 

@@ -62,6 +62,8 @@ pub mod telemetry_target {
     pub const INPUT: &str = "engine::input";
     /// ECS world and scheduler activity.
     pub const ECS: &str = "engine::ecs";
+    /// Hardware detection and startup configuration reporting.
+    pub const SYSTEM: &str = "engine::system";
     /// Renderer activity.
     pub const RENDERING: &str = "engine::rendering";
     /// Resource loading and storage.

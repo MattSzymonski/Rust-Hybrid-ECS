@@ -117,7 +117,24 @@ impl DynamicColumn {
     /// Creates an empty column for the given runtime layout.
     ///
     /// No heap allocation is made until the first row is pushed.
+    ///
+    /// This is a POD-only container: rows are copied as raw bytes and the
+    /// buffer is freed without running element destructors, so the layout
+    /// must describe a blittable value type. `pill_host::csharp::components`
+    /// enforces that through `BLITTABLE_FIELD_TYPES` before any layout is
+    /// registered; the debug assertion below is a second line of defense for
+    /// any caller that constructs a layout directly.
     pub fn new(layout: DynamicComponentLayout) -> Self {
+        debug_assert!(
+            layout.size > 0
+                && layout.align > 0
+                && layout.align.is_power_of_two()
+                && std::alloc::Layout::from_size_align(layout.size, layout.align).is_ok(),
+            "invalid DynamicComponentLayout: size {} align {} (must be a valid, \
+             non-zero POD layout)",
+            layout.size,
+            layout.align
+        );
         Self {
             layout,
             data: NonNull::dangling(),
@@ -287,7 +304,11 @@ impl DynamicColumn {
         }
 
         // Step 2: Compute the doubled capacity and the layout it requires.
-        let new_capacity = self.capacity.max(4).saturating_mul(2);
+        //
+        // The floor is applied *after* doubling. Applying it before made the
+        // first allocation eight rows rather than four, over-allocating every
+        // manifest-driven column on first use.
+        let new_capacity = self.capacity.checked_mul(2).unwrap_or(4).max(4);
         let new_layout = Layout::from_size_align(
             self.layout
                 .size
@@ -325,12 +346,31 @@ impl DynamicColumn {
     }
 }
 
-// SAFETY: Dynamic manifests admit only unmanaged value types. Access remains
-// protected by the same scheduler rules as native component columns.
+// SAFETY: Two premises, each enforced by named code rather than asserted here.
+//
+// 1. Every field of a dynamic component is a blittable value type, enforced by
+//    `BLITTABLE_FIELD_TYPES` in `pill_host::csharp::components`, which rejects
+//    any manifest declaring a managed reference. This is what makes the raw
+//    `ptr::copy` in `swap_remove` and the destructor-free `Drop` below correct:
+//    there is no ownership to duplicate or release.
+// 2. Access is serialised by the same scheduler rules as native columns - see
+//    `SystemAccess::conflicts_with`, which only takes its bitmask fast path when
+//    both systems' access masks are complete.
 unsafe impl Send for DynamicColumn {}
 unsafe impl Sync for DynamicColumn {}
 
 impl Drop for DynamicColumn {
+    /// Frees the buffer. **No element destructor runs, by design.**
+    ///
+    /// Every field of a dynamic component is a blittable value type - enforced
+    /// by `BLITTABLE_FIELD_TYPES` in `pill_host::csharp::components`, which
+    /// rejects any manifest declaring otherwise - so a row owns nothing that
+    /// needs releasing. That is also what makes the raw `ptr::copy` in
+    /// `swap_remove` correct: moving a row cannot duplicate ownership.
+    ///
+    /// If dynamic components ever need to own a resource, this is the first
+    /// place that has to change: `DynamicComponentLayout` would need an
+    /// optional `drop_fn`, called here and from `swap_remove`.
     fn drop(&mut self) {
         if self.capacity != 0 {
             // SAFETY: this is the live allocation created by reserve_one.

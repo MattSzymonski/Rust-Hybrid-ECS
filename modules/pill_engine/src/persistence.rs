@@ -43,6 +43,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 // External crates
+use pill_core::{debug, info, warn};
 use serde::{de::DeserializeOwned, Serialize};
 use trait_type_map::{ErasedVecStorage, TraitAccessible, TraitTypeMap, VecFamily};
 
@@ -255,7 +256,8 @@ impl World {
         let total_archetypes = self.archetypes.len();
         let persistable_type_count = self.persist_serializers.len();
 
-        println!(
+        info!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             "[persistence] Snapshotting {} entities across {} archetypes ({} persistable component types)...",
             total_entities, total_archetypes, persistable_type_count,
         );
@@ -289,7 +291,8 @@ impl World {
                         total_components_serialized += 1;
 
                         if total_components_serialized <= 5 {
-                            println!(
+                            debug!(
+                                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                                 "[persistence]   snapshot '{}' → {} bytes",
                                 name_for_log, byte_len,
                             );
@@ -305,7 +308,8 @@ impl World {
             }
         }
 
-        println!(
+        info!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             "[persistence] Snapshot complete: {} entities, {} components serialized ({} non-persistable skipped)",
             entries.len(),
             total_components_serialized,
@@ -330,7 +334,8 @@ impl World {
     /// skipped with a warning.
     pub fn restore_from_snapshot(&mut self, snapshot: &ComponentSnapshot) {
         let snapshot_entity_count = snapshot.entries.len();
-        println!(
+        info!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             "[persistence] Restoring {} entities from snapshot...",
             snapshot_entity_count,
         );
@@ -342,7 +347,8 @@ impl World {
         for entity in all_entity_ids {
             let _ = self.destroy_entity(entity);
         }
-        println!(
+        debug!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             "[persistence]   Destroyed {} old entities (stale TypeIds)",
             destroyed_count,
         );
@@ -363,7 +369,8 @@ impl World {
                     if let Some(component) = deserialize_fn(bytes) {
                         if let Some(component_id) = self.resolve_component_id_by_name(type_name) {
                             if entry_idx < 3 {
-                                println!(
+                                debug!(
+                                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                                     "[persistence]   restore '{}' → ok ({} bytes)",
                                     type_name,
                                     bytes.len(),
@@ -374,7 +381,8 @@ impl World {
                         } else {
                             skipped_no_inserter += 1;
                             if entry_idx < 3 {
-                                println!(
+                                debug!(
+                                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                                     "[persistence]   restore '{}' → SKIP (no inserter)",
                                     type_name,
                                 );
@@ -382,7 +390,8 @@ impl World {
                         }
                     } else {
                         skipped_deser_fail += 1;
-                        println!(
+                        debug!(
+                            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                             "[persistence]   restore '{}' → SKIP (deserialize failed)",
                             type_name,
                         );
@@ -390,7 +399,8 @@ impl World {
                 } else {
                     skipped_type_removed += 1;
                     if entry_idx < 3 {
-                        println!(
+                        debug!(
+                            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                             "[persistence]   restore '{}' → SKIP (type removed)",
                             type_name,
                         );
@@ -446,29 +456,34 @@ impl World {
             restored_entity_count += 1;
         }
 
-        println!(
+        info!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             "[persistence] Restore complete: {} entities, {} components inserted",
             restored_entity_count, restored_component_total,
         );
         if skipped_type_removed > 0 {
-            println!(
+            debug!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 "[persistence]   {} components skipped (type removed from project)",
                 skipped_type_removed,
             );
         }
         if skipped_deser_fail > 0 {
-            println!(
+            debug!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 "[persistence]   {} components skipped (deserialization failed)",
                 skipped_deser_fail,
             );
         }
         if skipped_no_inserter > 0 {
-            println!(
+            debug!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 "[persistence]   {} components skipped (no inserter for TypeId)",
                 skipped_no_inserter,
             );
         }
-        println!(
+        debug!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             "[persistence]   World now has {} entities in {} archetypes",
             self.entity_locations.len(),
             self.archetypes.len(),
@@ -658,14 +673,16 @@ impl World {
             changed_type_names.iter().cloned().collect();
         sorted_changed_type_names.sort();
 
-        println!(
+        info!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             "[persistence] Selective migration starting for {} component type(s)...",
             sorted_changed_type_names.len(),
         );
 
         for type_name in &sorted_changed_type_names {
             let Some(previous_metadata) = previous_metadata_by_name.get(type_name) else {
-                println!(
+                debug!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     "[persistence]   '{}' -> SKIP (missing previous metadata)",
                     type_name,
                 );
@@ -678,14 +695,16 @@ impl World {
                 .get(type_name)
                 .copied()
                 .unwrap_or(0);
-            println!(
+            debug!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 "[persistence]   '{}' -> migrating (schema {} -> {})",
                 type_name, previous_metadata.schema_hash, current_schema_hash,
             );
 
             match self.migrate_single_component_type(type_name, previous_metadata) {
                 Ok(migrated_entity_count_for_type) => {
-                    println!(
+                    debug!(
+                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                         "[persistence]   '{}' -> OK ({} entities)",
                         type_name, migrated_entity_count_for_type,
                     );
@@ -693,13 +712,16 @@ impl World {
                     report.migrated_entity_count += migrated_entity_count_for_type;
                 }
                 Err(error) => {
-                    println!("[persistence]   '{type_name}' -> SKIP ({error})",);
+                    debug!(
+                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        "[persistence]   '{type_name}' -> SKIP ({error})",);
                     report.skipped_type_names.push(type_name.clone());
                 }
             }
         }
 
-        println!(
+        info!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             "[persistence] Selective migration finished: {} type(s) migrated, {} entities touched, {} type(s) skipped.",
             report.migrated_type_count,
             report.migrated_entity_count,
@@ -748,7 +770,8 @@ impl World {
         };
 
         if previous_metadata.component_id == new_component_id {
-            println!(
+            debug!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 "[persistence]     strategy: in-place column swap for '{}'",
                 type_name,
             );
@@ -759,7 +782,8 @@ impl World {
                 insert_component,
             )
         } else {
-            println!(
+            debug!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 "[persistence]     strategy: archetype remap for '{}' (component id changed)",
                 type_name,
             );
@@ -1066,7 +1090,8 @@ where
     // Step 1: Deserialize the snapshot bytes into a generic JSON Value.
     let snapshot_json: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| {
-            eprintln!(
+            warn!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 "[persistence] Failed to parse JSON for '{}': {}",
                 std::any::type_name::<T>(),
                 error
@@ -1079,7 +1104,8 @@ where
     let default_instance = T::default();
     let default_json: serde_json::Value = serde_json::to_value(&default_instance)
         .map_err(|error| {
-            eprintln!(
+            warn!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 "[persistence] Failed to serialize default for '{}': {}",
                 std::any::type_name::<T>(),
                 error
@@ -1094,7 +1120,8 @@ where
     match serde_json::from_value::<T>(merged) {
         Ok(value) => Some(Box::new(value)),
         Err(error) => {
-            eprintln!(
+            warn!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 "[persistence] Failed to deserialize '{}': {}. Component data skipped.",
                 std::any::type_name::<T>(),
                 error

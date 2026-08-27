@@ -31,11 +31,19 @@ pub struct SendPtr<T>(*const T);
 // SAFETY: `SendPtr<T>` owns a raw `*const T` with no ownership semantics, so
 // transferring it across threads moves only an address; no data race or
 // aliasing violation can arise from the move itself.
-unsafe impl<T> Send for SendPtr<T> {}
+//
+// Bounded on `T` rather than unconditional. The wrapper alone would be sound
+// for any `T`, because it never dereferences - but its whole purpose is to be
+// dereferenced on a worker thread, and an unbounded impl would silently make
+// `SendPtr<Rc<_>>` cross threads with nothing but an `unsafe` block between
+// that and a data race. The bound puts the requirement where the type system
+// can see it. Every current use is a `T: Component`, which is already `Send`.
+unsafe impl<T: Send> Send for SendPtr<T> {}
 // SAFETY: Shared access `&SendPtr<T>` only permits copying the stored address
 // out; the wrapper never dereferences the pointer, so no `&mut` aliasing or
-// data race is reachable through the wrapper itself.
-unsafe impl<T> Sync for SendPtr<T> {}
+// data race is reachable through the wrapper itself. Bounded for the same
+// reason as `Send` above.
+unsafe impl<T: Sync> Sync for SendPtr<T> {}
 
 impl<T> SendPtr<T> {
     /// Wraps a raw read-only pointer in a [`SendPtr`].
@@ -65,13 +73,17 @@ pub struct SendPtrMut<T>(*mut T);
 
 // SAFETY: `SendPtrMut<T>` owns a raw `*mut T` and moving it between threads
 // transfers only the address; the wrapper itself performs no dereference, so
-// no data race is introduced by the move.
-unsafe impl<T> Send for SendPtrMut<T> {}
+// no data race is introduced by the move. Bounded on `T: Send` for the reason
+// given on `SendPtr` above: the address exists to be dereferenced elsewhere.
+unsafe impl<T: Send> Send for SendPtrMut<T> {}
 // SAFETY: Sharing `&SendPtrMut<T>` only allows copying the stored `*mut T`
-// address; dereference is deferred to `unsafe` blocks that the query
-// scheduler's disjoint-access guarantee protects, so no data race is reachable
-// through the wrapper itself.
-unsafe impl<T> Sync for SendPtrMut<T> {}
+// address; dereference is deferred to `unsafe` blocks protected by the
+// disjoint-access guarantee that `SystemAccess::conflicts_with` establishes,
+// so no data race is reachable through the wrapper itself.
+//
+// `T: Send` rather than `T: Sync`: a `*mut T` is handed out for **exclusive**
+// access to a disjoint row, which is a transfer to another thread, not sharing.
+unsafe impl<T: Send> Sync for SendPtrMut<T> {}
 
 impl<T> SendPtrMut<T> {
     /// Wraps a raw mutable pointer in a [`SendPtrMut`].

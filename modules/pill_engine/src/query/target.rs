@@ -161,7 +161,18 @@ pub struct MutFetchState<T: Component> {
 }
 
 // SAFETY: Both inner pointers wrap raw addresses backed by storage that
-// outlives the query. Disjoint per-row access is guaranteed by the scheduler.
+// outlives the query.
+//
+// Disjoint access is established by `SystemAccess::conflicts_with`, which the
+// scheduler consults before placing two systems in the same parallel batch; it
+// only takes its bitmask fast path when both systems' masks are complete, and
+// otherwise compares the full access sets. That completeness rule is what makes
+// this impl sound - an earlier version inferred "no access" from an empty mask,
+// so two systems writing the same component could be batched together and this
+// state shared across threads for genuinely overlapping rows.
+//
+// Within one batch, `ParQueryIter` assigns each thread a disjoint entity range,
+// so no two threads fetch the same row.
 unsafe impl<T: Component> Send for MutFetchState<T> {}
 unsafe impl<T: Component> Sync for MutFetchState<T> {}
 

@@ -797,6 +797,88 @@ fn deeply_nested_manifest_is_rejected_without_stack_overflow() {
     );
 }
 
+/// A dynamic component may only contain blittable value types.
+///
+/// `DynamicColumn` moves rows with `ptr::copy` and frees its buffer without
+/// running drop glue, and the engine shares those columns across threads on an
+/// `unsafe impl Send`/`Sync`. A field owning a managed resource would be
+/// duplicated on move, leaked on free, and raced on. Before this check the only
+/// constraint on a field's type was that its name was non-empty.
+#[test]
+fn a_non_blittable_field_type_is_rejected() {
+    let mut engine = Engine::new();
+    let shared = shared_component_bindings(&mut engine);
+    let stable_id = stable_component_id("TracyLive.HasManagedField");
+
+    let manifest = serde_json::json!([{
+        "stable_id_low": stable_id.0 as u64,
+        "stable_id_high": (stable_id.0 >> 64) as u64,
+        "full_name": "TracyLive.HasManagedField",
+        "size": 8,
+        "alignment": 8,
+        "schema_hash": 1,
+        "shared": false,
+        "fields": [{
+            "name": "Label",
+            "offset": 0,
+            "size": 8,
+            "primitive_type": "System.String",
+            "fields": []
+        }]
+    }]);
+
+    let error =
+        register_component_manifest(&mut engine, &serde_json::to_vec(&manifest).unwrap(), shared)
+            .err()
+            .expect("a managed reference field must be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("non-blittable") && message.contains("Label"),
+        "the error should name the field and why it was refused: {message}"
+    );
+}
+
+/// A non-blittable type nested inside a value type is rejected too, so the
+/// recursive walk cannot be used to smuggle one past the check.
+#[test]
+fn a_nested_non_blittable_field_type_is_rejected() {
+    let mut engine = Engine::new();
+    let shared = shared_component_bindings(&mut engine);
+    let stable_id = stable_component_id("TracyLive.NestedManaged");
+
+    let manifest = serde_json::json!([{
+        "stable_id_low": stable_id.0 as u64,
+        "stable_id_high": (stable_id.0 >> 64) as u64,
+        "full_name": "TracyLive.NestedManaged",
+        "size": 8,
+        "alignment": 8,
+        "schema_hash": 1,
+        "shared": false,
+        "fields": [{
+            "name": "Inner",
+            "offset": 0,
+            "size": 8,
+            "primitive_type": "struct",
+            "fields": [{
+                "name": "Handle",
+                "offset": 0,
+                "size": 8,
+                "primitive_type": "System.Object",
+                "fields": []
+            }]
+        }]
+    }]);
+
+    let error =
+        register_component_manifest(&mut engine, &serde_json::to_vec(&manifest).unwrap(), shared)
+            .err()
+            .expect("a nested managed reference must be rejected");
+    assert!(
+        error.to_string().contains("Handle"),
+        "the error should name the nested field: {error}"
+    );
+}
+
 /// Verifies that overlapping component fields are rejected so conflicting
 /// byte interpretations cannot corrupt data silently.
 #[test]

@@ -297,6 +297,37 @@ pub struct ComponentRegistry {
     next_bit: u8,
 }
 
+/// Outcome of registering a component type.
+///
+/// Registration is idempotent, so "registered" and "was already registered"
+/// are both successes - but they are different facts, and collapsing them is
+/// how a stale recorded layout goes unnoticed after a reload replaces a
+/// component's definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "registration reports whether the type was already present; use               `register_bit` if only the bit index is wanted"]
+pub enum Registration {
+    /// The type was not present and has been assigned this bit.
+    Created(u8),
+    /// The type was already registered under this bit; nothing changed.
+    AlreadyPresent(u8),
+}
+
+impl Registration {
+    /// The bit index, whichever case this is.
+    #[must_use]
+    pub fn bit(self) -> u8 {
+        match self {
+            Self::Created(bit) | Self::AlreadyPresent(bit) => bit,
+        }
+    }
+
+    /// Whether this call is what created the registration.
+    #[must_use]
+    pub fn is_new(self) -> bool {
+        matches!(self, Self::Created(_))
+    }
+}
+
 impl ComponentRegistry {
     /// Creates an empty registry with no components registered.
     pub fn new() -> Self {
@@ -317,16 +348,35 @@ impl Default for ComponentRegistry {
 
 impl ComponentRegistry {
     /// Register a component type and assign it a bit index.
-    /// Returns the bit index, or the existing index if already registered.
+    ///
+    /// Returns [`Registration::Created`] with a fresh bit, or
+    /// [`Registration::AlreadyPresent`] with the existing one. Idempotent by
+    /// design - the reload path re-runs `init`, which re-registers every type -
+    /// but the two cases are distinguishable so a caller that cares can tell
+    /// them apart. [`Self::register_bit`] discards the distinction for callers
+    /// that do not.
     ///
     /// # Panics
     ///
     /// Panics if the 128-component type limit has already been reached.
-    pub fn register<T: Component>(&mut self) -> u8 {
+    ///
+    /// In debug builds, also panics when a type is re-registered with a
+    /// different size than was recorded the first time. That means a hot reload
+    /// replaced the definition without the registry noticing: the stored layout
+    /// is now stale, and everything reading size from here - the byte-level
+    /// bindings handed to C#, the persistence migration - would work from the
+    /// old one.
+    pub fn register<T: Component>(&mut self) -> Registration {
         // Step 1: Return the existing bit index when the type is already registered.
         let component_id = ComponentId::of::<T>();
         if let Some(&bit) = self.id_to_bit.get(&component_id) {
-            return bit;
+            debug_assert_eq!(
+                self.sizes.get(&component_id).copied(),
+                Some(std::mem::size_of::<T>()),
+                "component {} was re-registered with a different size; the                  recorded layout is stale",
+                std::any::type_name::<T>()
+            );
+            return Registration::AlreadyPresent(bit);
         }
         // Step 2: Enforce the 128-component capacity before assigning a new bit.
         assert!(
@@ -342,7 +392,15 @@ impl ComponentRegistry {
             .insert(component_id, std::any::type_name::<T>().to_string());
         self.sizes.insert(component_id, std::mem::size_of::<T>());
         self.next_bit += 1;
-        bit
+        Registration::Created(bit)
+    }
+
+    /// Register a component type and return its bit, ignoring whether it was
+    /// already present.
+    ///
+    /// The common case: callers that only need the bit index.
+    pub fn register_bit<T: Component>(&mut self) -> u8 {
+        self.register::<T>().bit()
     }
 
     /// Register a component whose concrete type is defined outside Rust.
@@ -472,9 +530,17 @@ mod tests {
         let mut registry = ComponentRegistry::new();
         let component_id = ComponentId::of::<ReRegisterTestComponent>();
 
-        let first_bit = registry.register::<ReRegisterTestComponent>();
+        let first = registry.register::<ReRegisterTestComponent>();
+        assert!(first.is_new(), "the first registration creates the bit");
+        let first_bit = first.bit();
         assert!(registry.is_registered::<ReRegisterTestComponent>());
         assert_eq!(registry.get_bit(&component_id), Some(first_bit));
+
+        // Registering the same type again reports that, rather than looking
+        // identical to a fresh registration.
+        let repeat = registry.register::<ReRegisterTestComponent>();
+        assert_eq!(repeat, Registration::AlreadyPresent(first_bit));
+        assert!(!repeat.is_new());
 
         registry.remove(&component_id);
         assert!(!registry.is_registered::<ReRegisterTestComponent>());
@@ -484,7 +550,9 @@ mod tests {
 
         // Re-registering works and, per the documented contract, allocates a
         // fresh bit (bits are never reused).
-        let second_bit = registry.register::<ReRegisterTestComponent>();
+        let second = registry.register::<ReRegisterTestComponent>();
+        assert!(second.is_new(), "after removal it is a fresh registration");
+        let second_bit = second.bit();
         assert!(registry.is_registered::<ReRegisterTestComponent>());
         assert_eq!(registry.get_bit(&component_id), Some(second_bit));
         assert_ne!(first_bit, second_bit);

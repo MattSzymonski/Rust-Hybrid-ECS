@@ -12,6 +12,15 @@
 //! source files. The [`ParallelProcessingConfig`] struct groups related knobs;
 //! free functions handle slice-size computation and hardware reporting.
 //! Re-exported at the crate root via `crate::config`.
+//!
+//! The startup reports (`print_system_specs`, `print_parallel_config`) emit
+//! through the tracing stack under `telemetry_target::SYSTEM` so they can be
+//! filtered, redirected to the file lane, or silenced like any other engine
+//! output. The box-drawing layout is preserved line by line because the
+//! terminal formatter renders one message per event.
+
+// External crates
+use pill_core::info;
 
 // =============================================================================
 // ProfilingConfig
@@ -169,10 +178,14 @@ pub fn default_entities_per_slice(bytes_per_entity: usize) -> usize {
     (default * 8 / bytes_per_entity).clamp(min, default)
 }
 
-/// Print a summary of detected system hardware to stdout.
+/// Report a summary of detected system hardware through the telemetry stack.
 ///
 /// Includes CPU, core/thread count, RAM, swap, disks, OS, and uptime.
 /// GPU detection requires a rendering backend.
+///
+/// Emitted under `telemetry_target::SYSTEM` so the report can be filtered or
+/// redirected like any other engine output; the box-drawing layout is kept
+/// intact because the formatter renders one message per line.
 ///
 /// Called during [`Engine::new`](crate::Engine::new).
 pub fn print_system_specs() {
@@ -212,74 +225,86 @@ pub fn print_system_specs() {
     let uptime_str = format_uptime(uptime_secs);
 
     // Step 2: Emit the formatted hardware report.
-    println!();
-    println!("System specs");
-    println!("├─ CPU: {}", cpu_name);
-    println!(
+    info!(target: pill_core::telemetry::telemetry_target::SYSTEM, "");
+    info!(target: pill_core::telemetry::telemetry_target::SYSTEM, "System specs");
+    info!(target: pill_core::telemetry::telemetry_target::SYSTEM, "├─ CPU: {}", cpu_name);
+    info!(
+        target: pill_core::telemetry::telemetry_target::SYSTEM,
         "│  └─ Cores: {} physical, {} logical threads",
         physical_cores, logical_threads
     );
-    println!("├─ Memory");
-    println!(
+    info!(target: pill_core::telemetry::telemetry_target::SYSTEM, "├─ Memory");
+    info!(
+        target: pill_core::telemetry::telemetry_target::SYSTEM,
         "│  ├─ RAM: {:.1} / {:.1} GiB used ({:.0}%)",
         used_ram_gb, total_ram_gb, ram_pct
     );
     if total_swap_gb > 0.0 {
-        println!(
+        info!(
+            target: pill_core::telemetry::telemetry_target::SYSTEM,
             "│  └─ Swap: {:.1} / {:.1} GiB used ({:.0}%)",
             used_swap_gb, total_swap_gb, swap_pct
         );
     } else {
-        println!("│  └─ Swap: none");
+        info!(target: pill_core::telemetry::telemetry_target::SYSTEM, "│  └─ Swap: none");
     }
     print_disk_info(&disks);
-    println!("├─ OS: {}", os_pretty_name());
-    println!("│  └─ Uptime: {}", uptime_str);
-    println!("└─ GPU: use external tools (dxdiag / lspci)");
-    println!();
+    info!(target: pill_core::telemetry::telemetry_target::SYSTEM, "├─ OS: {}", os_pretty_name());
+    info!(target: pill_core::telemetry::telemetry_target::SYSTEM, "│  └─ Uptime: {}", uptime_str);
+    info!(
+        target: pill_core::telemetry::telemetry_target::SYSTEM,
+        "└─ GPU: use external tools (dxdiag / lspci)"
+    );
+    info!(target: pill_core::telemetry::telemetry_target::SYSTEM, "");
 }
 
-/// Print the active parallel-iterator configuration to stdout.
+/// Report the active parallel-iterator configuration through the telemetry stack.
 ///
 /// Shows the Rayon thread-pool size and every tunable in
-/// [`ParallelProcessingConfig`].
+/// [`ParallelProcessingConfig`], under the same `telemetry_target::SYSTEM`
+/// target as [`print_system_specs`].
 ///
 /// Called after [`print_system_specs`] during [`Engine::new`](crate::Engine::new).
 pub fn print_parallel_config() {
     let threads = rayon::current_num_threads();
 
-    println!("Parallel execution config");
-    println!("├─ Rayon threads: {}", threads);
-    println!(
+    info!(target: pill_core::telemetry::telemetry_target::SYSTEM, "Parallel execution config");
+    info!(target: pill_core::telemetry::telemetry_target::SYSTEM, "├─ Rayon threads: {}", threads);
+    info!(
+        target: pill_core::telemetry::telemetry_target::SYSTEM,
         "├─ Target work-group duration: {} µs",
         ParallelProcessingConfig::TARGET_ITERATOR_WORK_GROUP_DURATION / 1000
     );
-    println!(
+    info!(
+        target: pill_core::telemetry::telemetry_target::SYSTEM,
         "├─ Splitting-hint averaging window: {} frames",
         ParallelProcessingConfig::SPLITTING_HINT_WINDOW
     );
-    println!(
+    info!(
+        target: pill_core::telemetry::telemetry_target::SYSTEM,
         "├─ Default entities per slice: {}",
         default_entities_per_slice(8)
     );
-    println!(
+    info!(
+        target: pill_core::telemetry::telemetry_target::SYSTEM,
         "└─ Minimum slice size: {}",
         ParallelProcessingConfig::MINIMUM_SLICE_SIZE
     );
-    println!();
+    info!(target: pill_core::telemetry::telemetry_target::SYSTEM, "");
 }
 
-/// Print one line per detected storage device under the `Storage` heading.
+/// Emit one line per detected storage device under the `Storage` heading.
 ///
 /// Each line shows the mount point, used/total space, usage percentage, and
-/// disk kind (SSD/HDD).  Emits a single "no disks detected" line when the
-/// list is empty.
+/// disk kind (SSD/HDD). Emits a single "no disks detected" line when the
+/// list is empty. All lines go to `telemetry_target::SYSTEM` like the rest
+/// of the startup report.
 fn print_disk_info(disks: &sysinfo::Disks) {
     if disks.is_empty() {
-        println!("├─ Storage: no disks detected");
+        info!(target: pill_core::telemetry::telemetry_target::SYSTEM, "├─ Storage: no disks detected");
         return;
     }
-    println!("├─ Storage");
+    info!(target: pill_core::telemetry::telemetry_target::SYSTEM, "├─ Storage");
     let count = disks.len();
     for (i, disk) in disks.iter().enumerate() {
         let total_gb = disk.total_space() as f64 / (1024.0 * 1024.0 * 1024.0);
@@ -298,7 +323,8 @@ fn print_disk_info(disks: &sysinfo::Disks) {
         let mount = disk.mount_point().to_string_lossy();
         // Disk name can be long; just show mount point.
         let branch = if i == count - 1 { "└─" } else { "├─" };
-        println!(
+        info!(
+            target: pill_core::telemetry::telemetry_target::SYSTEM,
             "│  {} {}  {:.0} / {:.0} GiB used ({:.0}%)  [{}]",
             branch, mount, used_gb, total_gb, pct, kind
         );
