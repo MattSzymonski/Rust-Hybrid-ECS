@@ -126,7 +126,7 @@ public sealed class QueryDescriptor
             component,
             stableId.Low,
             stableId.High,
-            Marshal.SizeOf(component),
+            TracyLive.Loader.NativeLayout.SizeOf(component),
             access,
             optional,
             false);
@@ -710,47 +710,47 @@ public abstract class QueryBase : IQueryDescriptor
 public sealed class Query<T1> : QueryBase
 {
     private static readonly QueryDescriptor Cached = new(typeof(T1));
-    internal Query() : base(Cached) { }
+    public Query() : base(Cached) { }
 }
 
 public sealed class Query<T1, T2> : QueryBase
 {
     private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2));
-    internal Query() : base(Cached) { }
+    public Query() : base(Cached) { }
 }
 
 public sealed class Query<T1, T2, T3> : QueryBase
 {
     private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3));
-    internal Query() : base(Cached) { }
+    public Query() : base(Cached) { }
 }
 
 public sealed class Query<T1, T2, T3, T4> : QueryBase
 {
     private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3), typeof(T4));
-    internal Query() : base(Cached) { }
+    public Query() : base(Cached) { }
 }
 
 public sealed class Query<T1, T2, T3, T4, T5> : QueryBase
 {
     private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3), typeof(T4), typeof(T5));
-    internal Query() : base(Cached) { }
+    public Query() : base(Cached) { }
 }
 
 public sealed class Query<T1, T2, T3, T4, T5, T6> : QueryBase
 {
     private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3), typeof(T4), typeof(T5), typeof(T6));
-    internal Query() : base(Cached) { }
+    public Query() : base(Cached) { }
 }
 
 public sealed class Query<T1, T2, T3, T4, T5, T6, T7> : QueryBase
 {
     private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3), typeof(T4), typeof(T5), typeof(T6), typeof(T7));
-    internal Query() : base(Cached) { }
+    public Query() : base(Cached) { }
 }
 
 public sealed class Query<T1, T2, T3, T4, T5, T6, T7, T8> : QueryBase
 {
     private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3), typeof(T4), typeof(T5), typeof(T6), typeof(T7), typeof(T8));
-    internal Query() : base(Cached) { }
+    public Query() : base(Cached) { }
 }

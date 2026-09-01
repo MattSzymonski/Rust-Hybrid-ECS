@@ -47,7 +47,9 @@ public static unsafe class LoaderInterop
     public const uint InteropContractVersion = 3;
 
     /// <summary>Return the unmanaged ABI contract version for host validation.</summary>
-    [UnmanagedCallersOnly]
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_interop_version")]
+#endif
     public static uint InteropVersion() => InteropContractVersion;
 
     // The stable runtime owns exactly one active collectible project loader.
@@ -55,7 +57,9 @@ public static unsafe class LoaderInterop
 
     /// <summary>Bind the native API and load the initial gameplay assembly.</summary>
     /// <returns>One on success; zero after reporting an initialization error.</returns>
-    [UnmanagedCallersOnly]
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_init")]
+#endif
     public static byte Init(IntPtr api)
     {
         try
@@ -77,15 +81,21 @@ public static unsafe class LoaderInterop
     }
 
     /// <summary>Return the number of systems in the active project version.</summary>
-    [UnmanagedCallersOnly]
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_system_count")]
+#endif
     public static uint SystemCount() => (uint)(_host?.SystemCount ?? 0);
 
     /// <summary>Return the number of one-shot startup methods.</summary>
-    [UnmanagedCallersOnly]
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_startup_count")]
+#endif
     public static uint StartupCount() => (uint)(_host?.StartupCount ?? 0);
 
     /// <summary>Return whether a system declared the Commands parameter.</summary>
-    [UnmanagedCallersOnly]
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_system_uses_commands")]
+#endif
     public static byte SystemUsesCommands(uint systemIndex)
     {
         try
@@ -100,7 +110,9 @@ public static unsafe class LoaderInterop
     }
 
     /// <summary>Run one startup method before the first frame.</summary>
-    [UnmanagedCallersOnly]
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_run_startup")]
+#endif
     public static byte RunStartup(uint startupIndex)
     {
         try
@@ -118,12 +130,16 @@ public static unsafe class LoaderInterop
     }
 
     /// <summary>Return the UTF-8 JSON component manifest byte count.</summary>
-    [UnmanagedCallersOnly]
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_component_manifest_length")]
+#endif
     public static uint ComponentManifestLength() =>
         checked((uint)(_host?.ComponentManifest.Length ?? 0));
 
     /// <summary>Copy the complete UTF-8 JSON component manifest.</summary>
-    [UnmanagedCallersOnly]
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_copy_component_manifest")]
+#endif
     public static byte CopyComponentManifest(byte* output, uint capacity)
     {
         try
@@ -141,7 +157,9 @@ public static unsafe class LoaderInterop
     }
 
     /// <summary>Return the number of scheduler accesses for one system.</summary>
-    [UnmanagedCallersOnly]
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_system_access_count")]
+#endif
     public static uint SystemAccessCount(uint systemIndex)
     {
         try
@@ -157,7 +175,9 @@ public static unsafe class LoaderInterop
 
     /// <summary>Copy one scheduler access into native-owned output storage.</summary>
     /// <returns>One on success or zero for invalid input/failure.</returns>
-    [UnmanagedCallersOnly]
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_get_system_access")]
+#endif
     public static byte GetSystemAccess(uint systemIndex, uint accessIndex, NativeSystemAccess* output)
     {
         try
@@ -178,7 +198,9 @@ public static unsafe class LoaderInterop
     }
 
     /// <summary>Return the UTF-8 byte count of one system's reflected name.</summary>
-    [UnmanagedCallersOnly]
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_system_name_length")]
+#endif
     public static uint SystemNameLength(uint systemIndex)
     {
         try
@@ -194,7 +216,9 @@ public static unsafe class LoaderInterop
 
     /// <summary>Copy one system's reflected UTF-8 name into a caller buffer.</summary>
     /// <returns>One on success or zero for invalid input/failure.</returns>
-    [UnmanagedCallersOnly]
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_copy_system_name")]
+#endif
     public static byte CopySystemName(uint systemIndex, byte* output, uint capacity)
     {
         try
@@ -218,7 +242,9 @@ public static unsafe class LoaderInterop
     /// <summary>Run one managed system selected by its stable discovery index.</summary>
     /// <returns>One on success; zero after recording the failure message for
     /// later retrieval through the error-message exports.</returns>
-    [UnmanagedCallersOnly]
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_run_system")]
+#endif
     public static byte RunSystem(uint systemIndex)
     {
         try
@@ -237,7 +263,9 @@ public static unsafe class LoaderInterop
     }
 
     /// <summary>Return the UTF-8 byte count of one system's last error message.</summary>
-    [UnmanagedCallersOnly]
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_system_error_message_length")]
+#endif
     public static uint SystemErrorMessageLength(uint systemIndex)
     {
         try
@@ -254,7 +282,9 @@ public static unsafe class LoaderInterop
 
     /// <summary>Copy one system's last UTF-8 error message into a caller buffer.</summary>
     /// <returns>One on success or zero for invalid input/failure.</returns>
-    [UnmanagedCallersOnly]
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_copy_system_error_message")]
+#endif
     public static byte CopySystemErrorMessage(uint systemIndex, byte* output, uint capacity)
     {
         try
@@ -282,7 +312,9 @@ public static unsafe class LoaderInterop
     /// Zero when no reload is due, one after a successful swap, and two when
     /// the loader rejected the new assembly so the old version stays loaded.
     /// </returns>
-    [UnmanagedCallersOnly]
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_poll_reload")]
+#endif
     public static byte PollReload()
     {
         try

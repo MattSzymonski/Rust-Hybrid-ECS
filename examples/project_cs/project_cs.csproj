@@ -6,15 +6,27 @@
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
 
-    <!-- Deliberately omitted: AllowUnsafeBlocks. This is the assembly you
-         edit constantly (Systems.cs) and hot-reload while the host runs —
-         it must not be able to construct raw pointers, so the compiler
-         itself refuses to build unsafe code here. See
-         csharp_features.md's "Trust and sandboxing model" section. -->
+    <!-- Deliberately omitted by default: AllowUnsafeBlocks. This is the
+         assembly you edit constantly (Systems.cs) and hot-reload while the
+         host runs — it must not be able to construct raw pointers, so the
+         compiler itself refuses to build unsafe code here. See
+         csharp_features.md's "Trust and sandboxing model" section.
+
+         The NativeAOT shipping posture is the exception: the assembly is
+         compiled into a static image that is never hot-reloaded, and the
+         `AotExports.cs` export forwarders it carries need raw pointers to
+         re-export the loader ABI from the AOT root. `unsafe` is therefore
+         enabled only when that posture is active (EnablePillAot=true); the
+         reloadable JIT build keeps it off. -->
 
     <!-- This is a library, but the Rust host loads it via hostfxr, which
          needs a runtimeconfig.json describing the target framework. -->
     <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+
+    <!-- AOT posture switches unsafe + the PILL_AOT define on. See the trust
+         note above. -->
+    <AllowUnsafeBlocks Condition="'$(EnablePillAot)' == 'true'">true</AllowUnsafeBlocks>
+    <DefineConstants Condition="'$(EnablePillAot)' == 'true'">$(DefineConstants);PILL_AOT</DefineConstants>
   </PropertyGroup>
 
   <ItemGroup>
@@ -22,6 +34,30 @@
          structs live in this reloadable project. -->
     <ProjectReference Include="../../modules/pill_csharp_runtime/csharp_runtime.csproj" />
   </ItemGroup>
+
+  <!-- NativeAOT shipping posture. ProjectHost cannot load or reflect over the
+       gameplay assembly under AOT (no dynamic code, no reflection invokers),
+       so the source generator emits a direct, compile-time system registry and
+       installs it through a module initializer. Full type metadata keeps the
+       GetTypes()-based component-manifest discovery working.
+
+       The AOT posture is switched on by the release build script with
+       `-p:EnablePillAot=true`; `PublishAot` itself is set HERE (not on the
+       command line) so the flag does not propagate as a global property onto
+       the analyzer project, which targets netstandard2.0 and must never be
+       AOT-compiled. Ordinary JIT builds never set EnablePillAot and pay
+       nothing. The RuntimeIdentifier is supplied by the release script. -->
+  <ItemGroup Condition="'$(EnablePillAot)' == 'true'">
+    <ProjectReference Include="../../modules/pill_csharp_runtime/macros/PillCSharpRuntimeMacros.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <PropertyGroup Condition="'$(EnablePillAot)' == 'true'">
+    <PublishAot>true</PublishAot>
+    <IlcGenerateCompleteTypeMetadata>true</IlcGenerateCompleteTypeMetadata>
+    <IlcGenerateStackTraceData>true</IlcGenerateStackTraceData>
+  </PropertyGroup>
 
   <ItemGroup>
     <!-- Auto-generated mirrors of components exposed by optional Rust modules.

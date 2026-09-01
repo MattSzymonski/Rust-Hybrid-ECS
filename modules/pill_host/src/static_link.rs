@@ -98,6 +98,21 @@ pub enum StaticProjectBackend {
         /// workspace it was built in does not travel with it.
         root: PathBuf,
     },
+    /// A managed project published with NativeAOT and loaded as a native
+    /// library.
+    ///
+    /// Unlike [`Self::CSharp`] there is no hostfxr, no .NET install and no
+    /// JIT: the AOT publish embeds a trimmed runtime in one native library,
+    /// which the host loads directly and resolves the `pill_*` exports from.
+    /// The `config` names that library (`project_assembly_name` +
+    /// `project_output_subdirectory`); the runtime-side fields are unused.
+    CSharpAot {
+        /// Assembly names and output directories; only the project side is
+        /// used, and it points at the `dotnet publish` output directory.
+        config: CSharpModuleConfig,
+        /// Directory the subdirectories in `config` are resolved against.
+        root: PathBuf,
+    },
 }
 
 /// A project and its optional modules, compiled into the host binary.
@@ -198,6 +213,14 @@ impl StaticProject {
             StaticProjectBackend::CSharp { config, root } => {
                 let exposed = exposed_components(engine, &exposed_names);
                 Some(CSharpRuntime::start(engine, root, config, &exposed)?)
+            }
+            // The NativeAOT posture: load the published native library, resolve
+            // the `pill_*` exports directly (no hostfxr, no installed .NET),
+            // and register the generated systems exactly as the hostfxr path
+            // does. The runtime is embedded and trimmed, so nothing else ships.
+            StaticProjectBackend::CSharpAot { config, root } => {
+                let exposed = exposed_components(engine, &exposed_names);
+                Some(CSharpRuntime::start_aot(engine, root, config, &exposed)?)
             }
         };
 

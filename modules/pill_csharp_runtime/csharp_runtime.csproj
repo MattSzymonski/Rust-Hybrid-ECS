@@ -15,11 +15,20 @@
     <!-- This is a library, but the Rust host loads it via hostfxr, which needs
          a runtimeconfig.json describing the target framework. -->
     <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+
+    <!-- The AOT shipping posture (EnablePillAot, a global build-script
+         property) drops the [UnmanagedCallersOnly] attributes from
+         LoaderInterop so the root-assembly export forwarders in the gameplay
+         project can call the methods directly. -->
+    <DefineConstants Condition="'$(EnablePillAot)' == 'true'">$(DefineConstants);PILL_AOT</DefineConstants>
   </PropertyGroup>
 
   <!-- Tests live below this project directory but are a separate executable. -->
   <ItemGroup>
     <Compile Remove="tests/**/*.cs" />
+    <!-- The Roslyn source generator lives below this directory too but is its
+         own project (compiled as an analyzer, never into the runtime). -->
+    <Compile Remove="macros/**/*.cs" />
   </ItemGroup>
 
 </Project>

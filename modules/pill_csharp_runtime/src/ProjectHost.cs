@@ -14,6 +14,7 @@
 
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.Loader;
 using System.Threading;
 
@@ -119,8 +120,49 @@ internal sealed class ProjectHost
     public int GetAccessCount(int systemIndex) => _systems[systemIndex].Accesses.Length;
     public bool UsesCommands(int systemIndex) => _systems[systemIndex].UsesCommands;
 
-    /// <summary>Load the initial project assembly and compile its runners.</summary>
-    public void Init() => Load(isReload: false);
+    /// <summary>Load the initial project version (reflection or AOT registry).</summary>
+    public void Init()
+    {
+        // NativeAOT cannot load a project assembly or reflect over it at
+        // runtime, so the generated registry (installed at module init) is the
+        // only source of systems. The JIT path keeps loading + reflecting.
+        if (!RuntimeFeature.IsDynamicCodeSupported)
+        {
+            LoadFromAotRegistry();
+            return;
+        }
+        Load(isReload: false);
+    }
+
+    /// <summary>
+    /// Load systems from the compile-time generated registry (NativeAOT).
+    /// </summary>
+    private void LoadFromAotRegistry()
+    {
+        ManagedSystem[] systems = AotRegistry.Systems
+            .Select(registration => new ManagedSystem(
+                registration.Name,
+                (registration.Query?.Terms ?? [])
+                    .Where(term => !term.IsEntity)
+                    .Select(term => new ManagedAccess(
+                        term.ComponentKey, term.ComponentKeyHigh, (byte)term.Access))
+                    .ToArray(),
+                registration.Query,
+                registration.UsesCommands,
+                registration.Run))
+            .ToArray();
+        ManagedStartup[] startups = AotRegistry.Startups
+            .Select(registration => new ManagedStartup(registration.Name, registration.Run))
+            .ToArray();
+        if (systems.Length == 0)
+            throw new InvalidOperationException(
+                "No [EcsSystem] methods were generated for the AOT build.");
+        _systems = systems;
+        _startups = startups;
+        _componentManifest = ComponentManifestBuilder.Build(
+            systems, AotRegistry.ProjectAssembly);
+        _lastSystemErrors = new string?[systems.Length];
+    }
 
     /// <summary>Invoke a discovered system by its stable index.</summary>
     public void RunSystem(int index) => _systems[index].Run();
@@ -148,6 +190,10 @@ internal sealed class ProjectHost
     /// </summary>
     public byte PollReload()
     {
+        // NativeAOT builds are static shipping artifacts: no project assembly
+        // exists to watch, so a reload poll is always a no-op.
+        if (!RuntimeFeature.IsDynamicCodeSupported)
+            return (byte)PollStatus.NoChange;
         var now = DateTime.UtcNow;
         if (now - _lastPollUtc < PollInterval)
             return (byte)PollStatus.NoChange;

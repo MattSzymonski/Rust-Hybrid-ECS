@@ -15,6 +15,8 @@
 
 /// C-compatible data structures and callback table shared with the managed runtime.
 mod abi;
+/// NativeAOT library loader used by the C# project backend's AOT posture.
+mod aot_runtime;
 /// High-level C# project startup, discovery, and scheduler registration.
 mod backend;
 #[cfg(feature = "hot_reload")]

@@ -10,6 +10,7 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 
 namespace TracyLive.Loader;
 
@@ -22,15 +23,19 @@ internal sealed record ComponentManifest(
     int Size, int Alignment, ulong SchemaHash, bool Shared,
     ComponentFieldManifest[] Fields);
 
+/// <summary>
+/// Source-generated JSON contract for the component manifest. Reflection-based
+/// serialization is disabled under NativeAOT, so the manifest must go through
+/// the generated context.
+/// </summary>
+[JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]
+[JsonSerializable(typeof(ComponentManifest[]))]
+internal partial class ComponentManifestJsonContext : JsonSerializerContext
+{
+}
+
 internal static class ComponentManifestBuilder
 {
-    [StructLayout(LayoutKind.Sequential)]
-    private struct AlignmentProbe<T> where T : unmanaged
-    {
-        public byte Prefix;
-        public T Value;
-    }
-
     internal static byte[] Build(IEnumerable<ManagedSystem> systems, Assembly? projectAssembly = null)
     {
         IEnumerable<Type> queryComponents = systems
@@ -50,6 +55,11 @@ internal static class ComponentManifestBuilder
             .ToArray();
         return JsonSerializer.SerializeToUtf8Bytes(components, new JsonSerializerOptions
         {
+            // NativeAOT disables reflection-based serialization; the generated
+            // context is the metadata source. The naming policy is stated here
+            // as well as in the context attribute: when a JsonSerializerOptions
+            // carries a TypeInfoResolver, its own PropertyNamingPolicy wins.
+            TypeInfoResolver = ComponentManifestJsonContext.Default,
             PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
         });
     }
@@ -85,8 +95,8 @@ internal static class ComponentManifestBuilder
             id.Low,
             id.High,
             type.FullName ?? type.Name,
-            Marshal.SizeOf(type),
-            AlignmentOf(type),
+            NativeLayout.SizeOf(type),
+            NativeLayout.AlignmentOf(type),
             Hash64(schema),
             type.Assembly == typeof(Engine).Assembly,
             fields);
@@ -122,7 +132,7 @@ internal static class ComponentManifestBuilder
         .GetFields(System.Reflection.BindingFlags.Instance |
                    System.Reflection.BindingFlags.Public |
                    System.Reflection.BindingFlags.NonPublic)
-        .OrderBy(field => Marshal.OffsetOf(type, field.Name).ToInt32())
+        .OrderBy(field => NativeLayout.FieldOffset(type, field.Name))
         .Select(field =>
         {
             Type valueType = field.FieldType.IsEnum
@@ -131,23 +141,17 @@ internal static class ComponentManifestBuilder
             bool primitive = valueType.IsPrimitive;
             return new ComponentFieldManifest(
                 field.Name,
-                Marshal.OffsetOf(type, field.Name).ToInt32(),
-                Marshal.SizeOf(valueType),
+                NativeLayout.FieldOffset(type, field.Name),
+                NativeLayout.SizeOf(valueType),
                 primitive ? valueType.FullName! : "struct",
                 primitive ? [] : DescribeFields(valueType));
         })
         .ToArray();
 
-    private static int AlignmentOf(Type type)
-    {
-        Type probe = typeof(AlignmentProbe<>).MakeGenericType(type);
-        return Marshal.OffsetOf(probe, nameof(AlignmentProbe<int>.Value)).ToInt32();
-    }
-
     private static string SchemaText(Type type, ComponentFieldManifest[] fields)
     {
         var text = new StringBuilder(type.FullName).Append('|')
-            .Append(Marshal.SizeOf(type)).Append('|').Append(AlignmentOf(type));
+            .Append(NativeLayout.SizeOf(type)).Append('|').Append(NativeLayout.AlignmentOf(type));
         AppendFields(text, fields);
         return text.ToString();
     }

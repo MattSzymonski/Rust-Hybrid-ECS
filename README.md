@@ -36,9 +36,15 @@ e.g. `../examples/project_cs`.
 `devops/ci_cd/build_release.py` builds the shipping host release. It reads the
 project's scripting language from its manifest and picks the matching posture —
 `static_project` for a native Rust project (`Cargo.toml`), `static_csharp` for
-a managed C# project (`*.csproj`). The project assembly of a C# build is
-produced with `dotnet build -c Release` before the host is linked, and the
-managed sidecars are copied alongside the shipping binary.
+a managed C# project (`*.csproj`). A managed C# build has two shipping modes:
+
+- **Framework-dependent (default):** `dotnet build -c Release` produces the
+  project assembly, and the host boots CoreCLR through hostfxr at runtime. The
+  user's machine must have the .NET 8 runtime installed.
+- **NativeAOT self-contained (`--csharp-aot`):** `dotnet publish
+  -p:PublishAot=true` merges the loader, the gameplay code, and a trimmed
+  runtime into one native library; the host loads it directly with no hostfxr,
+  no .NET install, and no JIT.
 
 ```bat
 cd D:\Programming\Rust-Hybrid-ECS
@@ -47,7 +53,8 @@ set PROJECT_PATH=examples/project_rs
 python devops\ci_cd\build_release.py --features rendering   :: native shipping build
 
 set PROJECT_PATH=examples/project_cs
-python devops\ci_cd\build_release.py --features rendering   :: managed (C#) shipping build
+python devops\ci_cd\build_release.py --features rendering   :: managed (C#), framework-dependent
+python devops\ci_cd\build_release.py --csharp-aot           :: managed (C#), NativeAOT self-contained
 ```
 
 `PROJECT_PATH` is resolved against the working directory first (the dev

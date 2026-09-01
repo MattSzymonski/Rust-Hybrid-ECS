@@ -15,7 +15,10 @@
 #   is a native Rust project, a `*.csproj` is a managed C# project. A managed
 #   project has no cargo dependency to declare; its `project_backend()` instead
 #   returns the `StaticProjectBackend::CSharp` configuration, resolving the
-#   assemblies `dotnet build` produced against the engine workspace root.
+#   assemblies `dotnet build` produced against the engine workspace root. With
+#   `--csharp-aot` the backend becomes `StaticProjectBackend::CSharpAot` and the
+#   project subdirectory points at the `dotnet publish` NativeAOT output, which
+#   the host loads directly (no hostfxr, no installed .NET).
 #
 #   Cargo resolves dependencies before build scripts run, so a `build.rs`
 #   cannot pull modules in from a YAML file; this generator runs before cargo
@@ -36,6 +39,13 @@
 #                            release build forwards its requested features,
 #                            so e.g. `--feature rendering` makes the static
 #                            build link the project's renderer components.
+#          --csharp-aot      emit the NativeAOT backend (`CSharpAot`) instead
+#                            of the hostfxr one, for a managed project whose
+#                            assembly was published with `dotnet publish
+#                            -p:PublishAot=true`.
+#          --rid <rid>       runtime identifier for the NativeAOT publish
+#                            output path (default win-x64; only meaningful
+#                            with --csharp-aot).
 #          [project_path]    workspace-relative path to the project directory
 #                            (e.g. examples/project_rs). When omitted, the
 #                            PROJECT_PATH environment variable is used - the
@@ -291,6 +301,8 @@ def build_library_source(
     project_path: str,
     bundle_directory: Path,
     workspace_root: Path,
+    aot: bool = False,
+    rid: str = "win-x64",
 ) -> str:
     """Builds the generated bundle's src/lib.rs text."""
     lines = [
@@ -316,19 +328,39 @@ def build_library_source(
         # emitted root is that workspace expressed relative to this bundle
         # crate, so no absolute path is ever compiled in.
         workspace_relative_path = manifest_relative_path(bundle_directory, workspace_root)
-        lines += [
-            "pub fn project_backend() -> StaticProjectBackend {",
-            "    StaticProjectBackend::CSharp {",
-            "        config: pill_host::CSharpModuleConfig::new(",
-            f'            "{CSHARP_RUNTIME_ASSEMBLY_NAME}",',
-            f'            "{CSHARP_RUNTIME_OUTPUT_SUBDIRECTORY}",',
-            f'            "{package_name}",',
-            f'            "../{project_path}/bin/Release/{CSHARP_TARGET_FRAMEWORK}",',
-            "        ),",
-            f'        root: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("{workspace_relative_path}"),',
-            "    }",
-            "}",
-        ]
+        if aot:
+            # The NativeAOT posture loads one published native library; the
+            # project subdirectory points at the `dotnet publish` output.
+            project_subdirectory = (
+                f"../{project_path}/bin/Release/{CSHARP_TARGET_FRAMEWORK}/{rid}/publish"
+            )
+            lines += [
+                "pub fn project_backend() -> StaticProjectBackend {",
+                "    StaticProjectBackend::CSharpAot {",
+                "        config: pill_host::CSharpModuleConfig::new(",
+                f'            "{CSHARP_RUNTIME_ASSEMBLY_NAME}",',
+                f'            "{CSHARP_RUNTIME_OUTPUT_SUBDIRECTORY}",',
+                f'            "{package_name}",',
+                f'            "{project_subdirectory}",',
+                "        ),",
+                f'        root: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("{workspace_relative_path}"),',
+                "    }",
+                "}",
+            ]
+        else:
+            lines += [
+                "pub fn project_backend() -> StaticProjectBackend {",
+                "    StaticProjectBackend::CSharp {",
+                "        config: pill_host::CSharpModuleConfig::new(",
+                f'            "{CSHARP_RUNTIME_ASSEMBLY_NAME}",',
+                f'            "{CSHARP_RUNTIME_OUTPUT_SUBDIRECTORY}",',
+                f'            "{package_name}",',
+                f'            "../{project_path}/bin/Release/{CSHARP_TARGET_FRAMEWORK}",',
+                "        ),",
+                f'        root: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("{workspace_relative_path}"),',
+                "    }",
+                "}",
+            ]
     else:
         lines += [
             "pub fn project_backend() -> StaticProjectBackend {",
@@ -367,9 +399,12 @@ def main() -> int:
     PROJECT_PATH environment variable when no argument is given - the same
     resolution the host uses at startup.
     """
-    # Parse `--feature <name>` (repeatable) and the optional project path.
+    # Parse `--feature <name>` (repeatable), `--csharp-aot`, `--rid <rid>`,
+    # and the optional project path.
     arguments = sys.argv[1:]
     requested_features = []
+    aot = False
+    rid = "win-x64"
     positional = []
     index = 0
     while index < len(arguments):
@@ -382,6 +417,16 @@ def main() -> int:
             requested_features.append(arguments[index])
         elif argument.startswith("--feature="):
             requested_features.append(argument[len("--feature=") :])
+        elif argument == "--csharp-aot":
+            aot = True
+        elif argument == "--rid":
+            index += 1
+            if index >= len(arguments):
+                print("error: --rid requires a value", file=sys.stderr)
+                return 2
+            rid = arguments[index]
+        elif argument.startswith("--rid="):
+            rid = argument[len("--rid=") :]
         else:
             positional.append(argument)
         index += 1
@@ -435,6 +480,13 @@ def main() -> int:
     except (FileNotFoundError, ValueError, yaml.YAMLError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    if aot and kind != "managed":
+        print(
+            "error: --csharp-aot requires a managed (`.csproj`) project; "
+            f"{project_path} is a native Rust project",
+            file=sys.stderr,
+        )
+        return 1
 
     # Step 2: validate every selected module exists under modules/optional/.
     missing_modules = [
@@ -487,6 +539,8 @@ def main() -> int:
         project_path,
         bundle_directory,
         root / WORKSPACE_DIRECTORY,
+        aot=aot and kind == "managed",
+        rid=rid,
     )
     wrote_manifest = write_if_changed(
         bundle_directory / PROJECT_MANIFEST_FILE_NAME, cargo_manifest

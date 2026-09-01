@@ -36,7 +36,11 @@
 #   `examples/project_cs`) is built with `static_csharp` instead: the bundle
 #   generator emits the managed backend, `dotnet build -c Release` produces the
 #   project assembly (and the C# runtime it references) before cargo runs, and
-#   the managed sidecars are copied alongside the shipping binary.
+#   the managed sidecars are copied alongside the shipping binary. Pass
+#   `--csharp-aot` to switch that posture to NativeAOT: `dotnet publish
+#   -p:PublishAot=true` merges the loader, gameplay code and a trimmed runtime
+#   into one self-contained native library (no .NET install, no JIT), the
+#   bundle emits `CSharpAot`, and the host loads the library directly.
 #
 #   Build output lands with the project: cargo's target directory is redirected
 #   to `<project_root>/build/build_meta/pill_build_data`, and the finished
@@ -63,6 +67,11 @@
 #                              PE section layout (always), then per-crate and
 #                              top-function attribution via cargo-bloat when
 #                              it is installed (cargo install cargo-bloat).
+#          --csharp-aot        For a managed C# project, ship the NativeAOT
+#                              posture: `dotnet publish -p:PublishAot=true`
+#                              produces one self-contained native library (no
+#                              .NET runtime install required) instead of the
+#                              framework-dependent `dotnet build` output.
 #          -p <package>        Release-build a specific package; targeting
 #                              pill_standalone always forces the shipping posture
 #          Any other argument is passed straight to cargo.
@@ -72,6 +81,7 @@
 #   python devops/ci_cd/build_release.py                        # native shipping host release
 #   set PROJECT_PATH=examples/project_cs
 #   python devops/ci_cd/build_release.py                        # managed (C#) shipping host release
+#   python devops/ci_cd/build_release.py --csharp-aot           # managed (C#) NativeAOT self-contained release
 #   python devops/ci_cd/build_release.py --profile release-fast # shipping host, throughput profile
 #   python devops/ci_cd/build_release.py -p pill_engine         # release-build any package
 
@@ -95,6 +105,24 @@ from pathlib import Path
 # force UTF-8 on any stream that supports reconfiguration (Python 3.7+).
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
+
+
+# REMOVE_MISC_ARTIFACTS: strip the dated output folder down to what the build
+# actually needs to RUN. Debug symbol files (`.pdb`) and linker side products
+# (`.exp`, `.lib`) are never loaded at startup - a PDB is only consulted when
+# a debugger attaches or a crash dump is symbolicated, and import/export
+# libraries only matter when other code links against the DLL by name. They
+# are safe to drop because every release build regenerates them from source;
+# deleting them keeps the bundle to just the shipping binary, the std
+# sidecars, and (for C# projects) the managed assemblies. Keep this True for
+# a lean artifact folder; set it False to preserve full debugging support in
+# the shipped output (e.g. when collecting a symbolicated crash dump from a
+# customer machine).
+REMOVE_MISC_ARTIFACTS = True
+
+# File extensions a shipped bundle never needs at runtime (see the constant
+# above). Matched case-insensitively against the copied artifact names.
+MISC_ARTIFACT_SUFFIXES = (".pdb", ".exp", ".lib")
 
 
 def collect_requested_features(arguments: list) -> set:
@@ -218,6 +246,18 @@ def shipping_posture_feature(project_root) -> str:
     return "static_project"
 
 
+def dotnet_rid() -> str:
+    """Maps the build platform to a .NET runtime identifier for AOT publish."""
+    system = platform.system().lower()
+    machine = platform.machine().lower()
+    arm = machine in ("arm64", "aarch64")
+    if system == "windows":
+        return "win-arm64" if arm else "win-x64"
+    if system == "darwin":
+        return "osx-arm64" if arm else "osx-x64"
+    return "linux-arm64" if arm else "linux-x64"
+
+
 def resolve_project_root(repository_root: Path, project_path: str) -> Path:
     """Resolves the project directory, honouring both path conventions.
 
@@ -296,15 +336,31 @@ def copy_managed_artifacts(
     workspace_root: Path,
     artifacts_directory: Path,
     managed_assembly_name: str,
+    aot: bool = False,
+    rid: str = "win-x64",
 ) -> list:
     """Copies the managed project and runtime assemblies into the artifact dir.
 
     A `static_csharp` host loads these by the workspace paths the bundle baked
     in at compile time, so the copies document what shipped rather than being
     what the binary loads; the artifact folder stays a complete record either
-    way. Returns the names copied (empty when nothing was produced).
+    way. With `aot=True` the managed side is one self-contained native library
+    from the `dotnet publish` output instead. Returns the names copied (empty
+    when nothing was produced).
     """
     copied = []
+    if aot:
+        # NativeAOT posture: a single native library (embedded trimmed runtime)
+        # plus its PDB, straight from the publish output.
+        publish_output = (
+            project_root / "bin" / "Release" / "net8.0" / rid / "publish"
+        )
+        for source_name in (f"{managed_assembly_name}.dll", f"{managed_assembly_name}.pdb"):
+            source = publish_output / source_name
+            if source.is_file():
+                shutil.copy2(source, artifacts_directory / source_name)
+                copied.append(source_name)
+        return copied
     # The project assembly (plus its PDB), from `dotnet build -c Release`.
     project_output = project_root / "bin" / "Release" / "net8.0"
     for source_name in (f"{managed_assembly_name}.dll", f"{managed_assembly_name}.pdb"):
@@ -321,6 +377,30 @@ def copy_managed_artifacts(
             shutil.copy2(source, artifacts_directory / source_name)
             copied.append(source_name)
     return copied
+
+
+def remove_misc_artifacts(
+    artifacts_directory: Path, copied_artifacts: list
+) -> list:
+    """Deletes the files a shipped build never loads at runtime.
+
+    Every entry in `copied_artifacts` whose name ends in one of the
+    `MISC_ARTIFACT_SUFFIXES` suffixes (debug symbols, linker side products) is
+    removed from the dated output folder. Returns the filtered list so the
+    build report reflects exactly what remains.
+    """
+    kept = []
+    for name in copied_artifacts:
+        if name.lower().endswith(MISC_ARTIFACT_SUFFIXES):
+            artifact_path = artifacts_directory / name
+            try:
+                artifact_path.unlink()
+            except OSError:
+                # A file that vanished on its own is fine - nothing to clean.
+                pass
+            continue
+        kept.append(name)
+    return kept
 
 
 def load_project_settings(project_root: Path) -> dict:
@@ -767,11 +847,14 @@ def main() -> int:
 
     # Step 3: resolve the project path from `--project` or `PROJECT_PATH`; it
     # is only required when the shipping bundle must be regenerated.
-    # `--analyze_size` is this script's own flag, not a cargo argument, so it
-    # is pulled out before anything is forwarded to cargo.
+    # `--analyze_size` and `--csharp-aot` are this script's own flags, not
+    # cargo arguments, so they are pulled out before anything is forwarded to
+    # cargo.
     arguments = sys.argv[1:]
     analyze_size = "--analyze_size" in arguments
     arguments = [argument for argument in arguments if argument != "--analyze_size"]
+    aot = "--csharp-aot" in arguments
+    arguments = [argument for argument in arguments if argument != "--csharp-aot"]
     try:
         project_path, arguments = extract_project_argument(arguments)
     except ValueError as error:
@@ -793,6 +876,13 @@ def main() -> int:
     # Step 5: validate the effective feature set before any build work starts.
     requested_features = collect_requested_features(arguments)
     shipping_posture = requested_features & {"static_project", "static_csharp"}
+    if aot and shipping_posture != {"static_csharp"}:
+        print(
+            "error: --csharp-aot requires a managed C# project (static_csharp "
+            "posture); point PROJECT_PATH at a directory with a .csproj",
+            file=sys.stderr,
+        )
+        return 1
     # Where a shipping build's output lands: cargo's target dir under the
     # project's build/build_meta, and dated artifact copies under build/<date>.
     target_directory = None
@@ -843,6 +933,8 @@ def main() -> int:
         # cannot leak `..` into the generated bundle's paths.
         generator_project_path = os.path.relpath(project_root, repository_root)
         generator_command = [sys.executable, str(generator_script), generator_project_path]
+        if aot:
+            generator_command += ["--csharp-aot", "--rid", dotnet_rid()]
         for feature in sorted(requested_features):
             generator_command += ["--feature", feature]
         generated = subprocess.run(generator_command, cwd=str(repository_root))
@@ -882,18 +974,43 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 1
-        print("Building the managed project assembly (dotnet build -c Release).")
-        managed_build = subprocess.run(
-            [
-                "dotnet",
-                "build",
-                str(managed_manifests[0]),
-                "-c",
-                "Release",
-                "--nologo",
-            ],
-            cwd=str(repository_root),
-        )
+        if aot:
+            # NativeAOT posture: publish the project with PublishAot so the
+            # loader, the gameplay code, and the trimmed runtime merge into one
+            # native library. `EnablePillAot` turns on the source generator
+            # (which emits the direct system registry) and the root export
+            # forwarders; the RID selects the platform's publish output dir.
+            print(
+                "Publishing the managed project with NativeAOT "
+                f"(dotnet publish -c Release -r {dotnet_rid()} -p:PublishAot=true)."
+            )
+            managed_build = subprocess.run(
+                [
+                    "dotnet",
+                    "publish",
+                    str(managed_manifests[0]),
+                    "-c",
+                    "Release",
+                    "-r",
+                    dotnet_rid(),
+                    "-p:EnablePillAot=true",
+                    "--nologo",
+                ],
+                cwd=str(repository_root),
+            )
+        else:
+            print("Building the managed project assembly (dotnet build -c Release).")
+            managed_build = subprocess.run(
+                [
+                    "dotnet",
+                    "build",
+                    str(managed_manifests[0]),
+                    "-c",
+                    "Release",
+                    "--nologo",
+                ],
+                cwd=str(repository_root),
+            )
         if managed_build.returncode != 0:
             return managed_build.returncode
 
@@ -950,7 +1067,9 @@ def main() -> int:
             target_directory, artifacts_directory, build_binary_name
         )
         # The managed side of a `static_csharp` build: the project assembly and
-        # the C# runtime it references, recorded alongside the shipping binary.
+        # the C# runtime it references (or, with --csharp-aot, the single
+        # self-contained native library), recorded alongside the shipping
+        # binary.
         if shipping_posture == {"static_csharp"}:
             managed_assembly_name = managed_manifests[0].stem
             copied_artifacts += copy_managed_artifacts(
@@ -958,6 +1077,15 @@ def main() -> int:
                 workspace_directory,
                 artifacts_directory,
                 managed_assembly_name,
+                aot=aot,
+                rid=dotnet_rid(),
+            )
+        # Drop the debug symbols and linker side products now that every
+        # artifact is in place, so the dated folder holds only what runs
+        # (see REMOVE_MISC_ARTIFACTS above).
+        if REMOVE_MISC_ARTIFACTS:
+            copied_artifacts = remove_misc_artifacts(
+                artifacts_directory, copied_artifacts
             )
 
     # Step 10: print the build analysis as a box-drawing tree - the project is

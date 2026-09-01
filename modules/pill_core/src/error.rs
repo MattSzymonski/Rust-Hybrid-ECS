@@ -697,6 +697,26 @@ pub enum CSharpError {
         source: libloading::Error,
     },
 
+    /// The NativeAOT library could not be found on disk.
+    #[message("no NativeAOT library at ", name_style(path))]
+    AotLibraryNotFound { path: String },
+
+    /// The NativeAOT library could not be loaded.
+    #[message("failed to load NativeAOT library from ", name_style(path))]
+    AotLibraryLoadFailed {
+        path: String,
+        #[source]
+        source: libloading::Error,
+    },
+
+    /// A required export is missing from the NativeAOT library.
+    #[message("failed to resolve NativeAOT export ", name_style(symbol))]
+    AotExportMissing {
+        symbol: String,
+        #[source]
+        source: libloading::Error,
+    },
+
     /// A required hostfxr export is missing.
     #[message("failed to resolve hostfxr export ", name_style(symbol))]
     HostfxrExportMissing {

@@ -18,7 +18,7 @@
 //! never run silently.
 
 // Standard library
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 // External crates
@@ -30,6 +30,7 @@ use pill_engine::{Engine, SystemAccess, SystemError, World};
 
 // Current crate
 use super::abi::{CsEngineApi, NativeSystemAccess};
+use super::aot_runtime::AotRuntimeContext;
 use super::components::{
     module_native_bindings, register_component_manifest, shared_component_bindings,
     ComponentBindings, ModuleExposedComponent, StableComponentId,
@@ -129,6 +130,20 @@ struct ManagedSystemSnapshot {
     uses_commands: bool,
 }
 
+/// Owns one hosted managed runtime: CoreCLR through hostfxr, or a loaded
+/// NativeAOT library. Keeping this alive guarantees every resolved function
+/// pointer below stays valid for the host's lifetime.
+///
+/// The AOT variant is only constructed in the shipping posture (no
+/// `hot_reload`), so a dev build may not reference it.
+#[cfg_attr(feature = "hot_reload", allow(dead_code))]
+pub(crate) enum ManagedRuntimeContext {
+    /// CoreCLR booted through hostfxr (framework-dependent posture).
+    Dotnet(DotnetRuntimeContext),
+    /// A NativeAOT library loaded directly (self-contained posture).
+    Aot(AotRuntimeContext),
+}
+
 /// Owns the hosted .NET context, stable API table, and reload callback.
 ///
 /// Keeping `_runtime` and `_api` alive guarantees that both the managed
@@ -155,11 +170,40 @@ pub(crate) struct CSharpRuntime {
     /// Metadata snapshot the active assembly is verified against after reload.
     system_snapshot: Vec<ManagedSystemSnapshot>,
     /// Keeps the hosted .NET runtime alive for the host's lifetime.
-    _runtime: DotnetRuntimeContext,
+    _runtime: ManagedRuntimeContext,
     /// Keeps the native API table alive so registered closures stay valid.
     _api: Box<CsEngineApi>,
     /// Keeps the shared component bindings alive for reload verification.
     _bindings: Arc<ComponentBindings>,
+}
+
+/// Resolves one managed artifact (a runtime assembly, its `runtimeconfig.json`,
+/// or the project assembly / AOT library) shipped next to the host executable,
+/// falling back to the source-tree location the generated bundle baked in.
+///
+/// A shipping bundle is self-contained: every managed file the host needs is
+/// copied into the same dated output folder as the executable, so a shipped
+/// build prefers `current_exe()`'s directory and runs on any machine with no
+/// engine source tree present. The developer layout (running straight from
+/// `cargo run` against the `dotnet build` / `dotnet publish` outputs) has no
+/// sidecars next to the exe, so the `workspace_root`-relative path is the
+/// fallback. Only shipping postures reach this code, so `current_exe()` always
+/// points at the shipping binary rather than a dev target.
+fn shipped_or_baked(
+    workspace_root: &Path,
+    baked_relative_dir: &str,
+    file_name: &str,
+) -> PathBuf {
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    {
+        let shipped = exe_dir.join(file_name);
+        if shipped.is_file() {
+            return shipped;
+        }
+    }
+    workspace_root.join(baked_relative_dir).join(file_name)
 }
 
 impl CSharpRuntime {
@@ -187,18 +231,39 @@ impl CSharpRuntime {
         bindings.extend(module_native_bindings(engine, module_exposed));
 
         // Step 1: Resolve assembly paths, start .NET, and load managed exports.
-        let runtime_dir = workspace_root.join(&config.runtime_output_subdirectory);
-        let project_dir = workspace_root.join(&config.project_output_subdirectory);
-        let assembly = runtime_dir.join(format!("{}.dll", config.runtime_assembly_name));
-        let runtime_config = runtime_dir.join(format!(
+        // A shipped bundle keeps the runtime sidecars and the project assembly
+        // flat next to the executable, so prefer those copies (portable); the
+        // generated bundle's source-tree paths are the developer fallback.
+        let runtime_assembly_name = format!("{}.dll", config.runtime_assembly_name);
+        let runtime_config_name = format!(
             "{}.runtimeconfig.json",
             config.runtime_assembly_name
-        ));
-        std::env::set_var("ECS_CSHARP_PROJECT_DIR", &project_dir);
-        std::env::set_var(
-            "ECS_CSHARP_PROJECT_ASSEMBLY",
-            format!("{}.dll", config.project_assembly_name),
         );
+        let project_assembly_name = format!("{}.dll", config.project_assembly_name);
+        let assembly = shipped_or_baked(
+            workspace_root,
+            &config.runtime_output_subdirectory,
+            &runtime_assembly_name,
+        );
+        let runtime_config = shipped_or_baked(
+            workspace_root,
+            &config.runtime_output_subdirectory,
+            &runtime_config_name,
+        );
+        let project_assembly = shipped_or_baked(
+            workspace_root,
+            &config.project_output_subdirectory,
+            &project_assembly_name,
+        );
+        // The managed side resolves the project assembly against this directory
+        // plus the assembly file name; keep them in the same folder (shipped:
+        // the exe's directory, developer: the baked build output).
+        let project_dir = project_assembly
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| workspace_root.join(&config.project_output_subdirectory));
+        std::env::set_var("ECS_CSHARP_PROJECT_DIR", &project_dir);
+        std::env::set_var("ECS_CSHARP_PROJECT_ASSEMBLY", project_assembly_name);
 
         let runtime = DotnetRuntimeContext::new(&runtime_config)?;
         let type_name = format!(
@@ -436,7 +501,219 @@ impl CSharpRuntime {
             #[cfg(feature = "hot_reload")]
             last_poll_status: POLL_NO_CHANGE,
             system_snapshot,
-            _runtime: runtime,
+            _runtime: ManagedRuntimeContext::Dotnet(runtime),
+            _api: api,
+            _bindings: bindings,
+        })
+    }
+
+    /// Start a NativeAOT-published library, resolve the loader exports by
+    /// symbol, discover managed systems, and register each system with its
+    /// declared read/write access.
+    ///
+    /// Mirrors [`Self::start`] but replaces the hostfxr bootstrap with a direct
+    /// `libloading` load of the AOT native library (which embeds a trimmed
+    /// runtime, so no .NET install and no JIT are involved). Everything from
+    /// the component-manifest exchange onward is identical.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the library cannot be loaded, an export is missing,
+    /// the ABI contract mismatches, initialization fails, the component
+    /// manifest cannot be registered, a startup method fails, or a reflected
+    /// access references an unregistered component.
+    #[cfg_attr(feature = "hot_reload", allow(dead_code))]
+    pub(crate) fn start_aot(
+        engine: &mut Engine,
+        workspace_root: &Path,
+        config: &CSharpModuleConfig,
+        module_exposed: &[ModuleExposedComponent],
+    ) -> Result<Self, CSharpError> {
+        // Step 0: merge the shared renderer bindings with byte-level bindings
+        // for every native component the optional modules exposed, exactly as
+        // the hostfxr path does.
+        let shared_bindings = shared_component_bindings(engine);
+        let mut bindings = shared_bindings;
+        bindings.extend(module_native_bindings(engine, module_exposed));
+
+        // Step 1: load the AOT native library and resolve every export by its
+        // `pill_*` symbol. A shipped bundle carries the library next to the
+        // executable (portable); the `dotnet publish` output the generated
+        // bundle describes is the developer fallback.
+        let library_path = shipped_or_baked(
+            workspace_root,
+            &config.project_output_subdirectory,
+            &format!("{}.dll", config.project_assembly_name),
+        );
+        let runtime = AotRuntimeContext::new(&library_path)?;
+
+        let interop_version =
+            runtime.get_unmanaged_fn::<InteropVersionFn>("pill_interop_version")?;
+        if interop_version() != INTEROP_CONTRACT_VERSION {
+            return Err(CSharpError::InteropVersionMismatch {
+                expected: INTEROP_CONTRACT_VERSION,
+                actual: interop_version(),
+            });
+        }
+        let init = runtime.get_unmanaged_fn::<InitFn>("pill_init")?;
+        let system_count = runtime.get_unmanaged_fn::<SystemCountFn>("pill_system_count")?;
+        let startup_count = runtime.get_unmanaged_fn::<StartupCountFn>("pill_startup_count")?;
+        let system_uses_commands =
+            runtime.get_unmanaged_fn::<SystemUsesCommandsFn>("pill_system_uses_commands")?;
+        let run_startup = runtime.get_unmanaged_fn::<RunStartupFn>("pill_run_startup")?;
+        let manifest_length =
+            runtime.get_unmanaged_fn::<ComponentManifestLengthFn>("pill_component_manifest_length")?;
+        let copy_manifest =
+            runtime.get_unmanaged_fn::<CopyComponentManifestFn>("pill_copy_component_manifest")?;
+        let system_name_length =
+            runtime.get_unmanaged_fn::<SystemNameLengthFn>("pill_system_name_length")?;
+        let copy_system_name =
+            runtime.get_unmanaged_fn::<CopySystemNameFn>("pill_copy_system_name")?;
+        let access_count =
+            runtime.get_unmanaged_fn::<SystemAccessCountFn>("pill_system_access_count")?;
+        let get_access = runtime.get_unmanaged_fn::<GetSystemAccessFn>("pill_get_system_access")?;
+        let run_system = runtime.get_unmanaged_fn::<RunSystemFn>("pill_run_system")?;
+        let system_error_length = runtime.get_unmanaged_fn::<SystemErrorMessageLengthFn>(
+            "pill_system_error_message_length",
+        )?;
+        let copy_system_error = runtime.get_unmanaged_fn::<CopySystemErrorMessageFn>(
+            "pill_copy_system_error_message",
+        )?;
+        let poll_reload = runtime.get_unmanaged_fn::<PollReloadFn>("pill_poll_reload")?;
+
+        // Step 2: initialize the bridge and register the component manifest.
+        let api = Box::new(CsEngineApi::new());
+        if init(api.as_ref() as *const CsEngineApi) == 0 {
+            return Err(CSharpError::RuntimeInitFailed);
+        }
+
+        let manifest_length = manifest_length();
+        if !is_supported_manifest_length(manifest_length) {
+            return Err(CSharpError::ManifestLengthOutOfRange {
+                length: manifest_length,
+                limit: MAX_COMPONENT_MANIFEST_BYTES,
+            });
+        }
+        let mut manifest = Vec::new();
+        manifest
+            .try_reserve_exact(manifest_length as usize)
+            .map_err(|_| CSharpError::ManifestAllocationFailed)?;
+        manifest.resize(manifest_length as usize, 0);
+        if copy_manifest(manifest.as_mut_ptr(), manifest_length) == 0 {
+            return Err(CSharpError::ManifestCopyFailed);
+        }
+        let bindings = Arc::new(register_component_manifest(engine, &manifest, bindings)?);
+
+        // Step 3: run every managed startup method transactionally.
+        let startup_bindings = Arc::clone(&bindings);
+        let mut startup_failed = None;
+        engine.queue_deferred_commands(|world, queue| {
+            let no_accesses = [];
+            for startup_index in 0..startup_count() {
+                let Some(_guard) = ActiveSystemGuard::set_with_commands(
+                    world,
+                    queue,
+                    &no_accesses,
+                    &startup_bindings,
+                    true,
+                ) else {
+                    startup_failed = Some(startup_index);
+                    break;
+                };
+                if run_startup(startup_index) == 0 {
+                    startup_failed = Some(startup_index);
+                    break;
+                }
+            }
+        });
+        if let Some(index) = startup_failed {
+            engine.discard_deferred_commands();
+            return Err(CSharpError::StartupFailed { index });
+        }
+        engine
+            .flush_deferred_commands()
+            .map_err(|errors| CSharpError::StartupCommandsFailed {
+                details: format!("{errors:?}"),
+            })?;
+
+        // Step 4: register each system with the scheduler under its accesses.
+        let count = system_count();
+        if count == 0 {
+            return Err(CSharpError::NoSystems);
+        }
+        let mut system_snapshot = Vec::with_capacity(count as usize);
+        for system_index in 0..count {
+            let system_access_count = access_count(system_index);
+            let mut managed_access = Vec::with_capacity(system_access_count as usize);
+            for access_index in 0..system_access_count {
+                let mut item = NativeSystemAccess {
+                    component_key: 0,
+                    component_key_high: 0,
+                    mode: 0,
+                };
+                if get_access(system_index, access_index, &mut item) == 0 {
+                    return Err(CSharpError::SystemAccessFailed {
+                        system: system_index,
+                        access: access_index,
+                    });
+                }
+                managed_access.push(item);
+            }
+
+            let uses_commands = system_uses_commands(system_index) != 0;
+            let mut access = derive_system_access(&managed_access, &bindings)?;
+            access.set_uses_commands(uses_commands);
+            system_snapshot.push(ManagedSystemSnapshot {
+                accesses: managed_access.clone().into_boxed_slice(),
+                uses_commands,
+            });
+            let managed_access = managed_access.into_boxed_slice();
+            let system_bindings = Arc::clone(&bindings);
+            let name = managed_system_name(system_name_length, copy_system_name, system_index)
+                .unwrap_or_else(|| format!("csharp_system_{system_index}"));
+            // SAFETY: `derive_system_access` has resolved every managed access
+            // and the closure exposes the world only under that exact list.
+            unsafe {
+                engine.register_system_with_access(
+                    name,
+                    access,
+                    move |world: &mut World, queue: &mut CommandQueue| -> Result<(), SystemError> {
+                        let Some(_guard) = ActiveSystemGuard::set_with_commands(
+                            world,
+                            queue,
+                            &managed_access,
+                            &system_bindings,
+                            uses_commands,
+                        ) else {
+                            return Err(SystemError::Managed {
+                                message: "nested managed system invocation".to_string(),
+                            });
+                        };
+                        if run_system(system_index) == 0 {
+                            return Err(SystemError::Managed {
+                                message: managed_system_error_message(
+                                    system_error_length,
+                                    copy_system_error,
+                                    system_index,
+                                ),
+                            });
+                        }
+                        Ok(())
+                    },
+                );
+            }
+        }
+
+        Ok(Self {
+            poll_reload,
+            system_count,
+            access_count,
+            get_access,
+            system_uses_commands,
+            #[cfg(feature = "hot_reload")]
+            last_poll_status: POLL_NO_CHANGE,
+            system_snapshot,
+            _runtime: ManagedRuntimeContext::Aot(runtime),
             _api: api,
             _bindings: bindings,
         })
