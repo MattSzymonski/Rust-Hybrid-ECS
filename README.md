@@ -28,6 +28,14 @@ Rust project (headless):
 Rust project (windowed): run
 `cargo run --package pill_standalone --features rendering`.
 
+Live per-function hot patching is on by default in dev builds: a body-only
+edit to a `#[pill_hot]` system is compiled on its own and swapped into the
+running engine at the next frame, instead of a full module reload. Everything
+a patch cannot express (signature or type changes, new components, constants)
+falls back to the normal reload. To run the pure reload path without the patch
+machinery - e.g. when measuring reload performance - build the host with
+`--no-default-features --features hot_reload` instead.
+
 C# project: point `PROJECT_PATH` at the directory containing the `.csproj`,
 e.g. `../examples/project_cs`.
 

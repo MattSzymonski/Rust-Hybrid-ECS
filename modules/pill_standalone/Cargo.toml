@@ -34,7 +34,15 @@ pill_hot_scan = { path = "../pill_hot_scan" }
 # On by default: the development posture. Building with
 # `--no-default-features --features static_project` selects the shipping
 # posture instead - nothing watched, built or loaded at runtime.
-default = ["hot_reload"]
+#
+# `hot_patch` sits in the defaults so a plain dev `cargo run` gets live
+# per-function patching with no extra flag. It stays a named feature (rather
+# than being folded into `hot_reload`) for two reasons: shipping builds drop
+# it cleanly with `--no-default-features`, and a dev run can opt out with
+# `--no-default-features --features hot_reload` when it wants the pure reload
+# path (a benchmark measuring reload, or a run where the patch machinery must
+# stay out).
+default = ["hot_reload", "hot_patch"]
 hot_reload = ["pill_host/hot_reload"]
 # Link the example project and its optional modules into this binary. Only
 # meaningful with `hot_reload` off; `main.rs` refuses the other combinations.
@@ -42,7 +50,7 @@ hot_reload = ["pill_host/hot_reload"]
 # Build the shipping binary with `--package pill_standalone`, not
 # `--workspace`: cargo unions the features requested for a package across one
 # invocation, and `pill_editor` asks for `pill_host`'s defaults, which would
-# switch `hot_reload` back on.
+# switch `hot_reload`/`hot_patch` back on.
 static_project = ["dep:pill_shipping_bundle"]
 # Select the managed project instead of the native one, in a shipping build.
 # The assembly is loaded from where it was already built; nothing is compiled,
@@ -50,6 +58,8 @@ static_project = ["dep:pill_shipping_bundle"]
 # modules still come from the generated shipping bundle.
 static_csharp = ["dep:pill_shipping_bundle"]
 # Per-function hot patching, forwarded to the host. Implies `hot_reload`.
+# A default feature: every dev host reloads through the patch fast path; see
+# the `default` comment for how a run opts out and how shipping excludes it.
 hot_patch = ["pill_host/hot_patch"]
 # Windowed mode: `host::run` owns the winit event loop and wgpu renderer
 # behind this feature; the binary itself contains no GPU or window code.

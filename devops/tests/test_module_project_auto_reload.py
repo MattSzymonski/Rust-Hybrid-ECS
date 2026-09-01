@@ -190,8 +190,18 @@ def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
     # project explicitly for this test.
     process_environment = os.environ.copy()
     process_environment["PROJECT_PATH"] = "../examples/project_rs"
+    # `hot_patch` is a default feature now; this suite measures the cascade via
+    # the plain reload transaction, so pin the reload-only posture.
     return launch_process(
-        ["cargo", "run", "--package", "pill_standalone"],
+        [
+            "cargo",
+            "run",
+            "--package",
+            "pill_standalone",
+            "--no-default-features",
+            "--features",
+            "hot_reload",
+        ],
         MODULES_ROOT,
         process_environment,
     )
@@ -208,7 +218,17 @@ def build_workspace() -> bool:
     print("\n  [PREP] Building pill_standalone...")
     try:
         result = subprocess.run(
-            ["cargo", "build", "-p", "pill_standalone"],
+            # `hot_patch` is a default feature now; pin the reload-only posture
+            # so this suite measures the cascade, not patching.
+            [
+                "cargo",
+                "build",
+                "-p",
+                "pill_standalone",
+                "--no-default-features",
+                "--features",
+                "hot_reload",
+            ],
             cwd=str(MODULES_ROOT),
             capture_output=True,
             text=True,

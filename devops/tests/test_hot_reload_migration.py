@@ -346,8 +346,18 @@ def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
     """Starts the standalone host via cargo and returns process + monitor."""
     process_environment = os.environ.copy()
     process_environment["PROJECT_PATH"] = "../devops/tests/project"
+    # `hot_patch` is a default feature now; this suite measures migration via
+    # the plain reload transaction, so pin the reload-only posture.
     return launch_process(
-        ["cargo", "run", "--package", "pill_standalone"],
+        [
+            "cargo",
+            "run",
+            "--package",
+            "pill_standalone",
+            "--no-default-features",
+            "--features",
+            "hot_reload",
+        ],
         WORKSPACE_ROOT / "modules",
         process_environment,
     )
@@ -548,7 +558,17 @@ def build_workspace() -> bool:
             # every optional module together re-enables `module-abi` on crates
             # like `pill_dummy_color` that other modules depend on with it
             # disabled, which collides with their `pill_module_*` exports.
-            ["cargo", "build", "--package", "pill_standalone"],
+            # `hot_patch` is a default feature now; pin the reload-only posture
+            # so this suite measures migration, not patching.
+            [
+                "cargo",
+                "build",
+                "--package",
+                "pill_standalone",
+                "--no-default-features",
+                "--features",
+                "hot_reload",
+            ],
             cwd=str(WORKSPACE_ROOT / "modules"),
             capture_output=True,
             text=True,

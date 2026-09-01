@@ -302,11 +302,14 @@ def code_linting(tally: ResultTally) -> None:
 def rust_tests(tally: ResultTally) -> None:
     """Runs the workspace's Rust test suite in both feature configurations.
 
-    Two runs, deliberately. `hot_patch` is an additive cargo feature, so the
-    default run never compiles the live-patching code at all - at the time this
-    check was added that left 47 tests in `pill_host` and 5 in `pill_engine`
-    outside every automated lane, including the ones covering code that rewrites
-    a running process's instructions.
+    Two runs, deliberately. `hot_patch` is now a default feature of
+    `pill_standalone`, so a plain `cargo test --workspace` compiles the
+    live-patching code (feature union pulls it into `pill_host`/`pill_engine`).
+    The first lane excludes `pill_standalone` - its defaults are the only thing
+    that switches the feature on - so the plain-reload code is still built and
+    tested WITHOUT it. At the time this check was added that left 47 tests in
+    `pill_host` and 5 in `pill_engine` outside every automated lane, including
+    the ones covering code that rewrites a running process's instructions.
 
     The second run is not a superset in principle either: a feature can change
     behaviour on paths the default build also takes, so a suite that passes with
@@ -318,7 +321,7 @@ def rust_tests(tally: ResultTally) -> None:
         return
 
     for label, extra_arguments in (
-        ("default features", []),
+        ("default features (no hot_patch)", ["--exclude", "pill_standalone"]),
         ("hot_patch", ["--features", "pill_host/hot_patch,pill_engine/hot_patch"]),
     ):
         print(f"Running cargo test --workspace ({label})")

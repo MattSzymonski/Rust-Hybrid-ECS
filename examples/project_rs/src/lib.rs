@@ -196,11 +196,11 @@ fn physics_system(
 ///
 /// Large because the headless loop runs tens of thousands of frames per second
 /// and this is only a demonstration of reading the component.
-const SPLINE_REPORT_INTERVAL_FRAMES: u64 = 30_000;
+pub const SPLINE_REPORT_INTERVAL_FRAMES: u64 = 30_000;
 
 /// Counts frames so the spline probe reports at a readable interval.
-struct SplineProbeState {
-    frame_count: u64,
+pub struct SplineProbeState {
+    pub frame_count: u64,
 }
 
 impl Resource for SplineProbeState {}
@@ -210,6 +210,7 @@ impl Resource for SplineProbeState {}
 /// Demonstrates the project using a component type defined by the `pill_spline`
 /// crate: the type is named through a direct dependency, so the query matches
 /// only splines registered by this same compiled copy of the crate.
+#[pill_hot]
 fn spline_probe_system(
     mut state: ResMut<SplineProbeState>,
     mut splines: Query<&mut Spline>,
@@ -250,7 +251,7 @@ fn spline_probe_system(
     // spline(s)` and the `midpoint ({:.1}, {:.1})` shape intact, or update the
     // tokens in the two files above to match.
     println!(
-        "[project] dawdxxseaasdadwwdes {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), colawdoxxxxrx {:.2}",
+        "[project] 123 {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}),asdolawdoxxxxrxyyyasd {:.2}",
         midpoint.x, midpoint.y, color
     );
 

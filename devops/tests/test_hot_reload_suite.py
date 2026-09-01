@@ -115,8 +115,20 @@ def build_host() -> bool:
     """Builds the standalone host once before the suite runs."""
     print("\n  [PREP] Building pill_standalone (offline)...")
     try:
+        # `hot_patch` is a default feature now; this suite measures the plain
+        # reload transaction, so pin the reload-only posture to keep the patch
+        # fast path out of the host it drives.
         result = subprocess.run(
-            ["cargo", "build", "--package", "pill_standalone", "--offline"],
+            [
+                "cargo",
+                "build",
+                "--package",
+                "pill_standalone",
+                "--no-default-features",
+                "--features",
+                "hot_reload",
+                "--offline",
+            ],
             cwd=str(MODULES_ROOT),
             capture_output=True,
             text=True,
