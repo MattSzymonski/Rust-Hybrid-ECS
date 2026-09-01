@@ -20,7 +20,12 @@ tracing = "0.1"
 # bundle's manifest keeps each module's `#[no_mangle]` `pill_module_*` exports
 # off via `default-features = false`: statically there is no host looking those
 # up, and two definitions of one symbol is a linker error.
-pill_shipping_bundle = { path = "../../examples/project_rs/build/build_meta/pill_shipping_bundle", optional = true }
+#
+# The path is a stable, project-agnostic scratch location under the repository
+# root (`<repo>/build/pill_shipping_bundle`): cargo needs a static path here,
+# but only the bundle's CONTENTS change per project (one shipping binary is
+# built at a time), so no project-specific path is ever hardcoded.
+pill_shipping_bundle = { path = "../../build/pill_shipping_bundle", optional = true }
 
 [build-dependencies]
 pill_hot_scan = { path = "../pill_hot_scan" }

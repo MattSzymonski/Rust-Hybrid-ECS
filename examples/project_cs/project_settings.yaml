@@ -1,0 +1,24 @@
+# Project settings for the native Rust example project.
+#
+# `name` is the display name (window title); `build_binary_name` is the
+# artifact file base and must contain only letters, digits and underscores.
+# Both are required. The other fields are classic package metadata.
+#
+# `modules` declares which optional engine modules this project uses, in load
+# order (the project itself initializes last). The dev host reads this file at
+# startup and the shipping bundle generator reads it at build time, so adding
+# or removing a module is a single edit here.
+
+name: "Bouncing Balls"
+build_binary_name: "BouncingBalls"
+version: "0.1.0"
+author: "Matt Szymonski"
+description: "Hot-reloadable bouncing-ball ECS example project."
+
+modules:
+  - "pill_spline"
+  - "pill_dummy_math"
+  - "pill_dummy_text"
+  - "pill_dummy_color"
+  - "pill_dummy_timer"
+  - "pill_dummy_random"

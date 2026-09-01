@@ -11,13 +11,22 @@
 #   dependencies, and exposes the `StaticModule` / `StaticProject` registration
 #   the static-link path initializes.
 #
+#   The project's scripting language is read from its manifest: a `Cargo.toml`
+#   is a native Rust project, a `*.csproj` is a managed C# project. A managed
+#   project has no cargo dependency to declare; its `project_backend()` instead
+#   returns the `StaticProjectBackend::CSharp` configuration, resolving the
+#   assemblies `dotnet build` produced against the engine workspace root.
+#
 #   Cargo resolves dependencies before build scripts run, so a `build.rs`
 #   cannot pull modules in from a YAML file; this generator runs before cargo
 #   instead (as a pre-step of the release build) and writes the bundle crate
-#   under `<project_root>/build/build_meta/pill_shipping_bundle/`. The engine
-#   host links it by path (like the project itself), so no workspace edit is
-#   needed; the folder is gitignored, and regeneration is content-based:
-#   unchanged output is not rewritten, so a stable tree shows no diff.
+#   under `<repository_root>/build/pill_shipping_bundle/`. The location is
+#   project-agnostic (cargo needs a static path, and only one shipping binary
+#   is built at a time), so `pill_standalone`'s manifest never names a specific
+#   project. The host links it by path (like the project itself), so no
+#   workspace edit is needed; the folder is gitignored, and regeneration is
+#   content-based: unchanged output is not rewritten, so a stable tree shows
+#   no diff.
 #
 # USAGE: python devops/tools/generate_shipping_bundle.py [--feature <name>...]
 #                                                     [project_path]
@@ -35,6 +44,7 @@
 # EXAMPLE USAGE:
 #   python devops/tools/generate_shipping_bundle.py examples/project_rs
 #   python devops/tools/generate_shipping_bundle.py --feature rendering examples/project_rs
+#   python devops/tools/generate_shipping_bundle.py examples/project_cs
 #   set PROJECT_PATH=examples/project_rs
 #   python devops/tools/generate_shipping_bundle.py
 
@@ -48,15 +58,28 @@ from pathlib import Path
 # Third-party
 import yaml
 
-# The generated crate's name and its location relative to the PROJECT root.
+# The generated crate's name and its location relative to the REPOSITORY root.
+# The location is shared by every project, so `pill_standalone`'s manifest
+# path stays stable; only the contents change per project.
 BUNDLE_CRATE_NAME = "pill_shipping_bundle"
-BUNDLE_DIRECTORY = Path("build") / "build_meta" / BUNDLE_CRATE_NAME
+BUNDLE_DIRECTORY = Path("build") / BUNDLE_CRATE_NAME
 
 # File names the generator reads and writes.
 PROJECT_SETTINGS_FILE_NAME = "project_settings.yaml"
 PROJECT_MANIFEST_FILE_NAME = "Cargo.toml"
 OPTIONAL_MODULE_DIRECTORY = Path("modules") / "optional"
 HOST_CRATE_DIRECTORY = Path("modules") / "pill_host"
+
+# Managed (C#) project constants, mirroring `pill_host::config` so a generated
+# bundle resolves assemblies exactly where `dotnet build` produced them. The
+# host derives the same four values in `csharp_from_manifest`; a shipping build
+# has no project path to read, so the generator states them instead.
+CSHARP_RUNTIME_ASSEMBLY_NAME = "csharp_runtime"
+CSHARP_RUNTIME_OUTPUT_SUBDIRECTORY = "pill_csharp_runtime/bin/Release/net8.0"
+CSHARP_TARGET_FRAMEWORK = "net8.0"
+# The engine workspace root, against which the managed config's output
+# subdirectories are resolved (the workspace manifest globs `modules/*`).
+WORKSPACE_DIRECTORY = Path("modules")
 
 
 def repository_root() -> Path:
@@ -157,7 +180,8 @@ def load_project_features(project_root: Path) -> set:
 
     The bundle can enable a project feature only when the project declares it,
     so the generator filters the requested names against this table. Parsed
-    line-by-line like the package name; no TOML parser is required.
+    line-by-line like the package name; no TOML parser is required. A managed
+    project declares no cargo features, so this is only called for native ones.
     """
     manifest_path = project_root / PROJECT_MANIFEST_FILE_NAME
     if not manifest_path.is_file():
@@ -178,6 +202,34 @@ def load_project_features(project_root: Path) -> set:
     return features
 
 
+def find_csproj_manifest(project_root: Path) -> Path:
+    """Locates the single `.csproj` manifest inside a project directory.
+
+    Raises ValueError when the directory contains no `.csproj` file.
+    """
+    matches = sorted(project_root.glob("*.csproj"))
+    if not matches:
+        raise ValueError(f"no .csproj file found in project root {project_root}")
+    return matches[0]
+
+
+def project_kind(project_root: Path) -> str:
+    """Returns 'native' for a Cargo crate, 'managed' for a dotnet-built project.
+
+    A project declares its scripting language by its manifest: a `Cargo.toml`
+    is native, a `*.csproj` is managed. Anything else is an error, because the
+    generator cannot name a project it cannot build.
+    """
+    if (project_root / PROJECT_MANIFEST_FILE_NAME).is_file():
+        return "native"
+    if find_csproj_manifest(project_root):
+        return "managed"
+    raise ValueError(
+        f"project root {project_root} has neither {PROJECT_MANIFEST_FILE_NAME} "
+        "nor a .csproj file; a shipping project must be one or the other"
+    )
+
+
 def manifest_relative_path(from_directory: Path, target: Path) -> str:
     """Computes a Cargo `path` dependency relative to `from_directory`, using /."""
     return os.path.relpath(target, from_directory).replace(os.sep, "/")
@@ -190,6 +242,7 @@ def build_cargo_manifest(
     modules: list,
     project_features: set,
     root: Path,
+    managed: bool = False,
 ) -> str:
     """Builds the generated bundle's Cargo.toml text."""
     lines = [
@@ -205,17 +258,22 @@ def build_cargo_manifest(
         "pill_host = { path = "
         f'"{manifest_relative_path(bundle_directory, root / HOST_CRATE_DIRECTORY)}", '
         'default-features = false }',
-        # The project itself, so `project::init` is nameable. Requested project
-        # features (e.g. rendering) are enabled so the static binary matches a
-        # windowed dev build; cargo does not propagate the host's features here.
-        f'project = {{ path = "{manifest_relative_path(bundle_directory, project_root)}"'
-        + (
-            f", features = [{', '.join(f'"{name}"' for name in sorted(project_features))}]"
-            if project_features
-            else ""
-        )
-        + " }",
     ]
+    if not managed:
+        # The native project itself, so `project::init` is nameable. Requested
+        # project features (e.g. rendering) are enabled so the static binary
+        # matches a windowed dev build; cargo does not propagate the host's
+        # features here. A managed project is a dotnet assembly, so it has no
+        # cargo dependency to declare.
+        lines.append(
+            f'project = {{ path = "{manifest_relative_path(bundle_directory, project_root)}"'
+            + (
+                f", features = [{', '.join(f'"{name}"' for name in sorted(project_features))}]"
+                if project_features
+                else ""
+            )
+            + " }",
+        )
     for module in modules:
         module_directory = root / OPTIONAL_MODULE_DIRECTORY / module
         relative_path = manifest_relative_path(bundle_directory, module_directory)
@@ -225,7 +283,15 @@ def build_cargo_manifest(
     return "\n".join(lines) + "\n"
 
 
-def build_library_source(package_name: str, project_name: str, modules: list) -> str:
+def build_library_source(
+    package_name: str,
+    project_name: str,
+    modules: list,
+    kind: str,
+    project_path: str,
+    bundle_directory: Path,
+    workspace_root: Path,
+) -> str:
     """Builds the generated bundle's src/lib.rs text."""
     lines = [
         "//! Generated shipping bundle - do not edit. Regenerated from",
@@ -242,10 +308,34 @@ def build_library_source(package_name: str, project_name: str, modules: list) ->
     lines += [
         "];",
         "",
-        "/// The project backend for a native Rust project.",
-        "pub fn project_backend() -> StaticProjectBackend {",
-        f"    StaticProjectBackend::Native {{ init: {package_name}::init }}",
-        "}",
+        "/// The project backend for this shipping project.",
+    ]
+    if kind == "managed":
+        # The managed backend resolves its assemblies against the engine
+        # workspace root, which is where `dotnet build` produced them. The
+        # emitted root is that workspace expressed relative to this bundle
+        # crate, so no absolute path is ever compiled in.
+        workspace_relative_path = manifest_relative_path(bundle_directory, workspace_root)
+        lines += [
+            "pub fn project_backend() -> StaticProjectBackend {",
+            "    StaticProjectBackend::CSharp {",
+            "        config: pill_host::CSharpModuleConfig::new(",
+            f'            "{CSHARP_RUNTIME_ASSEMBLY_NAME}",',
+            f'            "{CSHARP_RUNTIME_OUTPUT_SUBDIRECTORY}",',
+            f'            "{package_name}",',
+            f'            "../{project_path}/bin/Release/{CSHARP_TARGET_FRAMEWORK}",',
+            "        ),",
+            f'        root: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("{workspace_relative_path}"),',
+            "    }",
+            "}",
+        ]
+    else:
+        lines += [
+            "pub fn project_backend() -> StaticProjectBackend {",
+            f"    StaticProjectBackend::Native {{ init: {package_name}::init }}",
+            "}",
+        ]
+    lines += [
         "",
         "/// The complete shipping project: modules first, then the project.",
         "pub fn static_project() -> StaticProject {",
@@ -311,18 +401,37 @@ def main() -> int:
         return 1
 
     root = repository_root()
-    project_root = root / project_path
+    # The host resolves PROJECT_PATH against the working directory, so
+    # `../examples/project_rs` works from the workspace dir; the generator
+    # historically resolved it against the repository root, so
+    # `examples/project_rs` works from anywhere. Try the working directory
+    # first, then the repository root, so both spellings work.
+    cwd_candidate = (Path.cwd() / project_path).resolve()
+    project_root = (
+        cwd_candidate if cwd_candidate.is_dir() else (root / project_path).resolve()
+    )
     if not project_root.is_dir():
         print(f"error: no project directory at {project_root}", file=sys.stderr)
         return 1
+    # Canonicalize to a repository-root-relative path: the bundle locates the
+    # project with it, and the managed backend's output subdirectory is derived
+    # from it against the engine workspace root. Forward slashes keep the path
+    # valid when it is emitted inside generated Rust string literals.
+    project_path = os.path.relpath(project_root, root).replace(os.sep, "/")
 
-    # Step 1: read the project's module selection, package name, and required
-    # display name + artifact binary name.
+    # Step 1: read the project's scripting language, module selection, package
+    # name, and required display name + artifact binary name. A native project
+    # names its crate in Cargo.toml; a managed project names its assembly in
+    # the .csproj file stem.
     try:
+        kind = project_kind(project_root)
         modules = load_module_list(project_root)
-        package_name = load_project_package_name(project_root)
         project_name = load_project_name(project_root)
         build_binary_name = load_build_binary_name(project_root)
+        if kind == "managed":
+            package_name = find_csproj_manifest(project_root).stem
+        else:
+            package_name = load_project_package_name(project_root)
     except (FileNotFoundError, ValueError, yaml.YAMLError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
@@ -342,10 +451,14 @@ def main() -> int:
         return 1
 
     # Step 3: keep only the requested project features the project declares, so
-    # an unknown or host-only feature is ignored rather than erroring.
-    declared_features = load_project_features(project_root)
+    # an unknown or host-only feature is ignored rather than erroring. A managed
+    # project declares no cargo features, so requested names are simply not
+    # applied (the host-side feature, e.g. `rendering`, still reaches cargo).
+    declared_features = (
+        load_project_features(project_root) if kind == "native" else set()
+    )
     project_features = set(requested_features) & declared_features
-    if requested_features and not project_features:
+    if requested_features and not project_features and kind == "native":
         print(
             f"note: none of {sorted(requested_features)} are declared by the "
             "project; linking it without extra features",
@@ -353,8 +466,10 @@ def main() -> int:
         )
 
     # Step 4: render and write the bundle files plus the artifact-name record
-    # (content-based, so a stable tree shows no diff).
-    bundle_directory = project_root / BUNDLE_DIRECTORY
+    # (content-based, so a stable tree shows no diff). The bundle and the
+    # binary-name record land in the shared `<repo>/build/` scratch location,
+    # not under the project, so `pill_standalone`'s manifest path stays static.
+    bundle_directory = root / BUNDLE_DIRECTORY
     cargo_manifest = build_cargo_manifest(
         bundle_directory,
         project_root,
@@ -362,13 +477,22 @@ def main() -> int:
         modules,
         project_features,
         root,
+        managed=(kind == "managed"),
     )
-    library_source = build_library_source(package_name, project_name, modules)
+    library_source = build_library_source(
+        package_name,
+        project_name,
+        modules,
+        kind,
+        project_path,
+        bundle_directory,
+        root / WORKSPACE_DIRECTORY,
+    )
     wrote_manifest = write_if_changed(
         bundle_directory / PROJECT_MANIFEST_FILE_NAME, cargo_manifest
     )
     wrote_source = write_if_changed(bundle_directory / "src" / "lib.rs", library_source)
-    project_name_path = project_root / "build" / "build_meta" / "build_binary_name.txt"
+    project_name_path = root / "build" / "build_meta" / "build_binary_name.txt"
     wrote_name = write_if_changed(project_name_path, build_binary_name + "\n")
 
     print(f"shipping bundle: {os.path.relpath(bundle_directory, root)}")

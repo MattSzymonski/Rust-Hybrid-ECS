@@ -31,6 +31,31 @@ Rust project (windowed): run
 C# project: point `PROJECT_PATH` at the directory containing the `.csproj`,
 e.g. `../examples/project_cs`.
 
+## Shipping builds
+
+`devops/ci_cd/build_release.py` builds the shipping host release. It reads the
+project's scripting language from its manifest and picks the matching posture —
+`static_project` for a native Rust project (`Cargo.toml`), `static_csharp` for
+a managed C# project (`*.csproj`). The project assembly of a C# build is
+produced with `dotnet build -c Release` before the host is linked, and the
+managed sidecars are copied alongside the shipping binary.
+
+```bat
+cd D:\Programming\Rust-Hybrid-ECS
+
+set PROJECT_PATH=examples/project_rs
+python devops\ci_cd\build_release.py --features rendering   :: native shipping build
+
+set PROJECT_PATH=examples/project_cs
+python devops\ci_cd\build_release.py --features rendering   :: managed (C#) shipping build
+```
+
+`PROJECT_PATH` is resolved against the working directory first (the dev
+convention: from `modules`, `../examples/project_cs`), falling back to the
+repository root, so both spellings work from either place.
+
+Build output lands under the project's `build/<timestamp>/` directory.
+
 ## Optional modules
 
 Optional engine modules are crates inside `modules/optional/`, built as `cdylib`

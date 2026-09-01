@@ -24,16 +24,20 @@ use pill_core::error;
 use pill_host::HostConfig;
 #[cfg(not(feature = "hot_reload"))]
 use pill_host::StaticProject;
-#[cfg(all(not(feature = "hot_reload"), feature = "static_csharp"))]
-use pill_host::StaticProjectBackend;
 use pill_host::{engine_report, install_engine_report_handler};
 
 // A build with reloading compiled out has to link a project instead, or it has
 // nothing to run. Caught here rather than at the first frame, because the
-// mistake is in the build command and the message should say so.
-#[cfg(all(not(feature = "hot_reload"), not(feature = "static_project")))]
+// mistake is in the build command and the message should say so. The posture
+// feature is chosen by the project's scripting language: `static_project` for a
+// native Rust project, `static_csharp` for a managed C# project.
+#[cfg(all(
+    not(feature = "hot_reload"),
+    not(feature = "static_project"),
+    not(feature = "static_csharp")
+))]
 compile_error!(
-    "with `hot_reload` off this binary links its project in, so it needs the      `static_project` feature: build it as `--no-default-features --features      static_project`. Leaving both off would produce a host with no project."
+    "with `hot_reload` off this binary links its project in, so it needs the      `static_project` (native) or `static_csharp` (managed) feature: build it as      `--no-default-features --features static_project`. Leaving both off would      produce a host with no project."
 );
 
 // A shipping build links its project and modules in, so hot reloading them is
@@ -54,49 +58,18 @@ compile_error!(
 // Static Project
 // =============================================================================
 
-/// Directory the managed backend resolves its assembly paths against.
-///
-/// The engine workspace root, which is where a development build finds the
-/// assemblies `dotnet build` already produced. **A distributed build should use
-/// the executable's own directory instead**: the workspace it was compiled in
-/// does not travel with the binary. That substitution is the one thing a real
-/// packaging step has to change here.
-#[cfg(all(not(feature = "hot_reload"), feature = "static_csharp"))]
-fn managed_assembly_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("the crate directory always has a parent")
-        .to_path_buf()
-}
-
-/// The native project and its optional modules, taken from the generated
-/// shipping bundle.
+/// The project and its optional modules, taken from the generated shipping
+/// bundle.
 ///
 /// The bundle is regenerated from the project's `project_settings.yaml` by
 /// `devops/tools/generate_shipping_bundle.py` before a shipping build, so this
-/// binary never names a project or module itself.
-#[cfg(all(not(feature = "hot_reload"), not(feature = "static_csharp")))]
+/// binary never names a project or module itself. The bundle also encodes the
+/// backend - native Rust or managed C# - so both shipping features
+/// (`static_project` / `static_csharp`) reach the same entry point here and
+/// differ only in which posture the build tooling selected.
+#[cfg(not(feature = "hot_reload"))]
 fn static_project() -> StaticProject {
     pill_shipping_bundle::static_project()
-}
-
-/// The managed project, loaded from assemblies built ahead of time, with the
-/// optional modules taken from the generated shipping bundle.
-#[cfg(all(not(feature = "hot_reload"), feature = "static_csharp"))]
-fn static_project() -> StaticProject {
-    StaticProject {
-        name: "project",
-        backend: StaticProjectBackend::CSharp {
-            config: pill_host::CSharpModuleConfig::new(
-                "csharp_runtime",
-                "pill_csharp_runtime/bin/Release/net8.0",
-                "project_cs",
-                "../examples/project_cs/bin/Release/net8.0",
-            ),
-            root: managed_assembly_root(),
-        },
-        modules: pill_shipping_bundle::STATIC_MODULES,
-    }
 }
 
 // =============================================================================

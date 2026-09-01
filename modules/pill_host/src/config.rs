@@ -383,31 +383,37 @@ impl HostConfig {
     /// # Errors
     ///
     /// Returns a [`ConfigError`] when `PROJECT_PATH` is not set, the project
-    /// configuration cannot be derived, the project settings file cannot be
-    /// parsed, or a configured module is invalid.
+    /// configuration cannot be derived, the project settings file is missing
+    /// or cannot be read/parsed, or a configured module is invalid.
     pub fn from_environment() -> Result<Self, ConfigError> {
         // Step 1: Resolve the project from the PROJECT_PATH environment
         // variable; there is no other source for it.
         let project_path = required_environment(PROJECT_PATH_ENVIRONMENT_VARIABLE)?;
         let project = ProjectModuleConfig::from_path(&project_path)?;
 
-        // Step 2: Load the project's own settings file, if it has one; it is
-        // the only source of the optional-module list.
+        // Step 2: Load the project's own settings file. It is the only source
+        // of the optional-module list and of the required `name` /
+        // `build_binary_name`, so a missing file is a configuration error
+        // reported as such, not masked as a missing field.
         let current_dir = env::current_dir().map_err(|_| ConfigError::ProjectDirectoryMissing {
             path: project_path.clone(),
         })?;
         let project_root = current_dir.join(&project_path);
-        let project_settings = read_project_settings_file(&project_root)?;
+        let settings_path = project_root.join(PROJECT_SETTINGS_FILE);
+        let project_settings = read_project_settings_file(&project_root)?.ok_or(
+            ConfigError::ProjectSettingsFileMissing {
+                path: settings_path.display().to_string(),
+            },
+        )?;
 
         // Step 3: Resolve the required project name and binary name. The name
         // is the window title; the build binary name is the artifact file base
         // and must be filename-safe (letters, digits, underscores only), so a
         // settings file missing either is a configuration error rather than a
         // silent default.
-        let settings_path = project_root.join(PROJECT_SETTINGS_FILE);
         let project_name = project_settings
-            .as_ref()
-            .and_then(|settings| settings.name.as_deref())
+            .name
+            .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty())
             .ok_or(ConfigError::MissingProjectName {
@@ -415,8 +421,8 @@ impl HostConfig {
             })?
             .to_string();
         let build_binary_name = project_settings
-            .as_ref()
-            .and_then(|settings| settings.build_binary_name.as_deref())
+            .build_binary_name
+            .as_deref()
             .map(str::trim)
             .filter(|value| is_valid_build_binary_name(value))
             .ok_or(ConfigError::InvalidBuildBinaryName {
@@ -427,8 +433,7 @@ impl HostConfig {
         // Step 4: Resolve the optional modules and validate every configured
         // module before any build work starts.
         let optional_modules: Vec<OptionalModuleConfig> = project_settings
-            .map(|settings| settings.modules)
-            .unwrap_or_default()
+            .modules
             .iter()
             .map(|name| OptionalModuleConfig::workspace_member(name))
             .collect();
@@ -878,9 +883,11 @@ fn is_valid_build_binary_name(value: &str) -> bool {
 
 /// Read the project's own settings file from the project root.
 ///
-/// Returns `Ok(None)` when no file exists, so a project that does not ship one
-/// behaves exactly as before. A present but unreadable or malformed file is an
-/// error, so a typo cannot silently fall back to a different module set.
+/// Returns `Ok(None)` when no file exists; the caller decides whether that is
+/// a missing-file error ([`HostConfig::from_environment`] treats it as one,
+/// because `name` and `build_binary_name` are required) or a no-op. A present
+/// but unreadable or malformed file is an error, so a typo cannot silently
+/// fall back to a different module set.
 ///
 /// # Errors
 ///

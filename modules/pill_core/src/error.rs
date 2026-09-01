@@ -436,6 +436,10 @@ pub enum ConfigError {
         resolved_path: String,
     },
 
+    /// The project's settings file does not exist.
+    #[message("project settings file not found at ", name_style(path))]
+    ProjectSettingsFileMissing { path: String },
+
     /// The project's settings file could not be read.
     #[message("failed to read project settings file ", name_style(path))]
     ProjectSettingsFileReadFailed {

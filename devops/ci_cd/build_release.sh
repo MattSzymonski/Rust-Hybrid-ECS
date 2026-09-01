@@ -27,7 +27,9 @@
 
 # USAGE: devops/ci_cd/build_release.sh [cargo arguments...]
 #          (no arguments)      Build the shipping host release (project from
-#                              PROJECT_PATH, bundle regenerated, static_project)
+#                              PROJECT_PATH, bundle regenerated; static_project
+#                              for a native project, static_csharp for a
+#                              managed C# project)
 #          --profile <name>   Build a different release profile
 #                             (release-fast, release-with-debug)
 #          --project <path>   Project directory (workspace-relative) whose
@@ -39,10 +41,15 @@
 #   building `pill_standalone` requires `--no-default-features --features
 #   static_project` (or `static_csharp`), and the script refuses any other
 #   way - as does `pill_standalone`'s build script, for direct cargo builds.
+#   A managed (C#) project is additionally built with `dotnet build -c
+#   Release` before the host, and its assemblies are copied alongside the
+#   shipping binary.
 
 # EXAMPLE USAGE:
 #   set PROJECT_PATH=examples/project_rs
-#   devops/ci_cd/build_release.sh                            # shipping host release
+#   devops/ci_cd/build_release.sh                            # native shipping host release
+#   set PROJECT_PATH=examples/project_cs
+#   devops/ci_cd/build_release.sh                            # managed (C#) shipping host release
 #   devops/ci_cd/build_release.sh -p pill_engine             # release-build any package
 
 # --- SCRIPT ---
@@ -99,11 +106,40 @@ package_scoping_present() {
     return 1
 }
 
+# Resolve the project root up front so the shipping default below can pick the
+# posture matching the project's scripting language: a `*.csproj` in the root
+# means managed (C#), anything else means native Rust.
+project_root=""
+managed_project=0
+if [[ -n "${project_path}" ]]; then
+    case "${project_path}" in
+        /*) project_root="${project_path}" ;;
+        *)
+            # The host resolves PROJECT_PATH against the working directory, so
+            # `../examples/project_rs` works from the workspace dir; try that
+            # first, then the repository root, so both spellings work.
+            if [[ -d "${PWD}/${project_path}" ]]; then
+                project_root="${PWD}/${project_path}"
+            else
+                project_root="${repository_root}/${project_path}"
+            fi
+            ;;
+    esac
+    if compgen -G "${project_root}"/*.csproj >/dev/null 2>&1; then
+        managed_project=1
+    fi
+fi
+
 # A plain invocation defaults to the shipping host: pill_standalone built with
-# `--no-default-features --features static_project`.
+# `--no-default-features --features static_project` for a native project and
+# `static_csharp` for a managed one.
 host_default=()
 if ! package_scoping_present "$@"; then
-    host_default=(--package pill_standalone --no-default-features --features static_project)
+    if [[ ${managed_project} -eq 1 ]]; then
+        host_default=(--package pill_standalone --no-default-features --features static_csharp)
+    else
+        host_default=(--package pill_standalone --no-default-features --features static_project)
+    fi
 fi
 set -- "${host_default[@]}" "$@"
 
@@ -112,20 +148,17 @@ set -- "${host_default[@]}" "$@"
 target_directory=""
 artifacts_directory=""
 if [[ -n "${project_path}" ]]; then
-    case "${project_path}" in
-        /*) project_root="${project_path}" ;;
-        *) project_root="${repository_root}/${project_path}" ;;
-    esac
     target_directory="${project_root}/build/build_meta/pill_build_data"
     artifacts_directory="${project_root}/build/$(date +%d-%m-%Y_%H-%M)"
     # The project's recorded artifact name (validated and written by the
-    # generator); it names the copied binary and PDB.
+    # generator into the shared build scratch dir); it names the copied binary
+    # and PDB.
     build_binary_name=""
-    if [[ -f "${project_root}/build/build_meta/build_binary_name.txt" ]]; then
-        build_binary_name="$(cat "${project_root}/build/build_meta/build_binary_name.txt")"
+    if [[ -f "${repository_root}/build/build_meta/build_binary_name.txt" ]]; then
+        build_binary_name="$(cat "${repository_root}/build/build_meta/build_binary_name.txt")"
     fi
     if [[ -z "${build_binary_name}" ]]; then
-        echo "error: build_meta/build_binary_name.txt missing (the generator did not record a build binary name)" >&2
+        echo "error: build/build_meta/build_binary_name.txt missing (the generator did not record a build binary name)" >&2
         exit 1
     fi
 fi
@@ -235,9 +268,25 @@ if host_will_build "$@"; then
             echo "error: shipping bundle generation failed" >&2
             exit 1
         fi
+        # A managed shipping build loads a prebuilt assembly: produce it with
+        # dotnet before the host is linked. The bundle declared the modules in
+        # Rust, so this dotnet build is the whole managed side of the binary.
+        if [[ ${managed_project} -eq 1 ]]; then
+            managed_manifest="$(find "${project_root}" -maxdepth 1 -name '*.csproj' | head -n 1)"
+            if [[ -z "${managed_manifest}" ]]; then
+                echo "error: no .csproj in managed project root ${project_root}" >&2
+                exit 1
+            fi
+            if ! command -v dotnet >/dev/null 2>&1; then
+                echo "error: a C# shipping build needs the .NET SDK (dotnet) on PATH" >&2
+                exit 1
+            fi
+            echo "Building the managed project assembly (dotnet build -c Release)."
+            ( cd "${repository_root}" && dotnet build "${managed_manifest}" -c Release --nologo )
+        fi
     else
         echo "error: a release build of pill_standalone is always the shipping posture - hot reload is a development tool and must not ship." >&2
-        echo "  build it as: devops/ci_cd/build_release.sh --package pill_standalone --no-default-features --features static_project" >&2
+        echo "  build it as: devops/ci_cd/build_release.sh --package pill_standalone --no-default-features --features static_project (native) or static_csharp (managed)" >&2
         echo "  or scope the build away from the host (e.g. -p pill_engine or --exclude pill_standalone)." >&2
         exit 1
     fi
@@ -298,5 +347,20 @@ if [[ -n "${artifacts_directory}" ]]; then
             echo "  artifact: $(basename "${sidecar}")"
         fi
     done
+    # The managed side of a `static_csharp` build: the project assembly and the
+    # C# runtime it references, recorded alongside the shipping binary.
+    if [[ ${managed_project} -eq 1 && -n "${managed_manifest:-}" ]]; then
+        managed_assembly_name="$(basename "${managed_manifest}" .csproj)"
+        for source in \
+            "${project_root}/bin/Release/net8.0/${managed_assembly_name}.dll" \
+            "${project_root}/bin/Release/net8.0/${managed_assembly_name}.pdb" \
+            "${workspace_directory}/pill_csharp_runtime/bin/Release/net8.0/csharp_runtime.dll" \
+            "${workspace_directory}/pill_csharp_runtime/bin/Release/net8.0/csharp_runtime.runtimeconfig.json"; do
+            if [[ -f "${source}" ]]; then
+                cp -f "${source}" "${artifacts_directory}/"
+                echo "  artifact: $(basename "${source}")"
+            fi
+        done
+    fi
     echo "artifacts: ${artifacts_directory}"
 fi

@@ -94,7 +94,7 @@ impl ApplicationHandler for WindowedApplication {
         // so revealing it only after the first frame renders prevents the OS
         // default white surface from ever being shown.
         let attributes = Window::default_attributes()
-            .with_title(self.project.name.clone())
+            .with_title(self.project.name.to_owned())
             .with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0))
             .with_visible(false);
         let window = match event_loop.create_window(attributes) {
