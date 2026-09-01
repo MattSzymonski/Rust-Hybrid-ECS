@@ -1,0 +1,10 @@
+# Test-fixture settings for devops/tests/project.
+#
+# The fixture project is selected by PROJECT_PATH; this file supplies the
+# required project `name` / `build_binary_name` and its optional-module list.
+
+name: "Fixture Project"
+build_binary_name: "FixtureProject"
+
+modules:
+  - "pill_spline"

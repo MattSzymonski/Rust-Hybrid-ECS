@@ -192,7 +192,7 @@ def main() -> None:
         sys.exit(1)
 
     environment = os.environ.copy()
-    environment.pop("PROJECT_PATH", None)
+    environment["PROJECT_PATH"] = "../examples/project_rs"
     process, monitor = launch_process(HOST_LAUNCH_COMMAND, MODULES_ROOT, environment)
     backups = BackupRegistry()
     passed = False

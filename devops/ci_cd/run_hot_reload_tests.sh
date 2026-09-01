@@ -40,7 +40,8 @@
 #   Each suite launches the standalone host and drives live source edits
 #   against a real project and an optional module, asserting the host's reload
 #   behaviour from its console output. The suites temporarily modify - and
-#   automatically restore - modules/pill_config.yaml, devops/tests/project/src/lib.rs,
+#   automatically restore - the projects' project_settings.yaml files,
+#   devops/tests/project/src/lib.rs,
 #   examples/project_rs/src/lib.rs, examples/project_cs/src/Systems.cs and
 #   modules/optional/pill_spline/src/lib.rs, so a normal developer workspace
 #   is left exactly as it was.

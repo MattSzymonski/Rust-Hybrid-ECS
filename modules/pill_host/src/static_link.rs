@@ -18,9 +18,9 @@
 //! the project crate - it does not depend on it, and must not, or every game
 //! would need its own host. So the binary that *does* link both passes the
 //! functions in, which also makes the set of linked modules explicit at the
-//! call site. That is what a shipping build wants: `pill_config.yaml` is a
-//! development convenience and should not decide what a released binary
-//! contains.
+//! call site. That is what a shipping build wants: a project's
+//! `project_settings.yaml` is a development convenience and should not decide
+//! what a released binary contains.
 //!
 //! ## What this has to reproduce
 //!

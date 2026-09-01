@@ -10,6 +10,9 @@ modules/pill_standalone_temp/
 # Host-generated project workspace member (created at runtime)
 modules/optional/host_project_*/
 
+# Generated shipping bundle (created by devops/tools/generate_shipping_bundle.py)
+**/build/
+
 # Test infrastructure
 devops/tests/__pycache__/
 __pycache__/

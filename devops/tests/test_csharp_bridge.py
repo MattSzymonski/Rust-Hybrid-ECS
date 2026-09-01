@@ -33,7 +33,7 @@ DESCRIPTION
           before the project build (missing-file regeneration), and the
           bridge still works.
 
-    Every file the suite touches (pill_config.yaml, Systems.cs, the generated
+    Every file the suite touches (project_settings.yaml, Systems.cs, the generated
     mirror files) is backed up at startup and restored afterwards, so a
     developer workspace is left exactly as it was.
 
@@ -84,8 +84,9 @@ DUMMY_GENERATED_FILE = (
 # The C# project plus a component-less dummy module: the dummy exercises the
 # empty-exposure codegen path (no mirror file must be written) inside the same
 # session that asserts the real module's mirror.
-CSHARP_YAML = """\
-project: "../examples/project_cs"
+CSHARP_SETTINGS = """\
+name: "C# Bridge Test"
+build_binary_name: "CSharpBridgeTest"
 modules:
   - "pill_spline"
   - "pill_dummy_color"
@@ -569,16 +570,16 @@ def build_host() -> bool:
 
 
 def launch_host():
-    """Launches the standalone host exe with a clean environment."""
+    """Launches the standalone host exe with PROJECT_PATH pinned to the C# project."""
     environment = os.environ.copy()
-    environment.pop("PROJECT_PATH", None)
+    environment["PROJECT_PATH"] = "../examples/project_cs"
     return launch_process([str(HOST_EXE)], MODULES_ROOT, environment)
 
 
 def run_csharp_session() -> bool:
-    """Writes the C# config, launches the host, and runs the scenarios."""
+    """Writes the C# project's settings, launches the host, and runs the scenarios."""
     print("\n  [TEST] Launching standalone host with project_cs...")
-    write_host_config(CSHARP_YAML)
+    write_project_settings(CSHARP_PROJECT_ROOT, CSHARP_SETTINGS)
     process, monitor = launch_host()
     session_passed = True
 
@@ -699,7 +700,7 @@ def main() -> None:
     # Capture originals for every file the suite may touch, including the
     # committed bootstrap mirror that the codegen-rebuild check deletes.
     for path in (
-        HOST_CONFIG_YAML,
+        project_settings_yaml(CSHARP_PROJECT_ROOT),
         PROJECT_CS_SYSTEMS_CS,
         SPLINE_GENERATED_FILE,
         DUMMY_GENERATED_FILE,
@@ -721,9 +722,10 @@ def main() -> None:
     finally:
         # Always restore the developer's files, even on failure.
         BACKUP.restore_all()
-        # Restore the host config to its original content last.
-        if HOST_CONFIG_YAML in BACKUP._originals:
-            BACKUP.restore_one(HOST_CONFIG_YAML)
+        # Restore the C# project's settings file last.
+        csharp_settings_path = project_settings_yaml(CSHARP_PROJECT_ROOT)
+        if csharp_settings_path in BACKUP._originals:
+            BACKUP.restore_one(csharp_settings_path)
 
     print(f"\n{'=' * 64}")
     print("  SUMMARY")

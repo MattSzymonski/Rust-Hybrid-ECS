@@ -345,8 +345,8 @@ pub fn init(engine: &mut Engine) -> u32 {
     // crate. Registration is keyed by the type, so this is the same component
     // the crate itself would register only when both sides were compiled in one
     // workspace; a separately built copy is a distinct type with its own
-    // storage. Keep `pill_spline` out of `pill_config.yaml`'s `modules:` list
-    // while the project links it directly, so there is exactly one
+    // storage. Keep `pill_spline` out of `project_settings.yaml`'s `modules:`
+    // list while the project links it directly, so there is exactly one
     // registration of the type.
     //
     // `Spline` itself is registered automatically: the project links

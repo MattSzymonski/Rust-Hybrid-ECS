@@ -100,14 +100,16 @@ SPLINE_LIB_RS = MODULES_ROOT / "optional" / "pill_spline" / "src" / "lib.rs"
 PROJECT_RS_LIB_RS = WORKSPACE_ROOT / "examples" / "project_rs" / "src" / "lib.rs"
 PROJECT_CS_SYSTEMS_CS = WORKSPACE_ROOT / "examples" / "project_cs" / "src" / "Systems.cs"
 
-NATIVE_YAML = """\
-project: "../examples/project_rs"
+NATIVE_SETTINGS = """\
+name: "Harness Native"
+build_binary_name: "HarnessNative"
 modules:
   - "pill_spline"
 """
 
-CSHARP_YAML = """\
-project: "../examples/project_cs"
+CSHARP_SETTINGS = """\
+name: "Harness C#"
+build_binary_name: "HarnessCSharp"
 modules:
   - "pill_spline"
 """
@@ -207,7 +209,8 @@ PREREQUISITE_FILES = [
     ("pill_spline module source", SPLINE_LIB_RS, "native"),
     ("project_rs source", PROJECT_RS_LIB_RS, "native"),
     ("project_cs source", PROJECT_CS_SYSTEMS_CS, "csharp"),
-    ("host config", HOST_CONFIG_YAML, "both"),
+    ("project_rs settings", project_settings_yaml(NATIVE_PROJECT_ROOT), "native"),
+    ("project_cs settings", project_settings_yaml(CSHARP_PROJECT_ROOT), "csharp"),
 ]
 
 PREREQUISITE_ANCHORS = [
@@ -436,10 +439,10 @@ def build_host() -> bool:
     return True
 
 
-def launch_host():
-    """Launches the standalone host exe with a clean environment."""
+def launch_host(project_path: str):
+    """Launches the standalone host exe with PROJECT_PATH pinned to the session project."""
     environment = os.environ.copy()
-    environment.pop("PROJECT_PATH", None)
+    environment["PROJECT_PATH"] = project_path
     return launch_process([str(HOST_EXE)], MODULES_ROOT, environment)
 
 
@@ -609,7 +612,9 @@ def measure_category(
 
 def run_session(
     name: str,
-    yaml_content: str,
+    project_root: Path,
+    project_path: str,
+    settings_content: str,
     categories: Sequence[EditHook],
     iterations: int,
     warmup: bool,
@@ -621,9 +626,9 @@ def run_session(
     print(f"  SESSION {name}")
     print(f"{'=' * 64}")
 
-    write_host_config(yaml_content)
+    write_project_settings(project_root, settings_content)
     print("\n  [TEST] Launching standalone host...")
-    process, monitor = launch_host()
+    process, monitor = launch_host(project_path)
     session_passed = True
     try:
         startup = measure_startup(monitor)
@@ -881,7 +886,13 @@ def main() -> None:
         sys.exit(1)
 
     # Capture originals for every file the script may touch.
-    for path in (HOST_CONFIG_YAML, SPLINE_LIB_RS, PROJECT_RS_LIB_RS, PROJECT_CS_SYSTEMS_CS):
+    for path in (
+        project_settings_yaml(NATIVE_PROJECT_ROOT),
+        project_settings_yaml(CSHARP_PROJECT_ROOT),
+        SPLINE_LIB_RS,
+        PROJECT_RS_LIB_RS,
+        PROJECT_CS_SYSTEMS_CS,
+    ):
         BACKUP.capture(path)
 
     kill_stale_hosts()
@@ -898,7 +909,9 @@ def main() -> None:
             native_categories = [SPLINE_EDIT, CASCADE_EDIT, PROJECT_EDIT]
             if not run_session(
                 "NATIVE (project_rs + pill_spline)",
-                NATIVE_YAML,
+                NATIVE_PROJECT_ROOT,
+                "../examples/project_rs",
+                NATIVE_SETTINGS,
                 native_categories,
                 args.iterations,
                 not args.no_warmup,
@@ -910,7 +923,9 @@ def main() -> None:
         if run_csharp and passed:
             if not run_session(
                 "CSHARP (project_cs + pill_spline)",
-                CSHARP_YAML,
+                CSHARP_PROJECT_ROOT,
+                "../examples/project_cs",
+                CSHARP_SETTINGS,
                 [CSHARP_EDIT],
                 args.iterations,
                 not args.no_warmup,
@@ -921,8 +936,12 @@ def main() -> None:
     finally:
         # Always restore the developer's files, even on failure.
         BACKUP.restore_all()
-        if HOST_CONFIG_YAML in BACKUP._originals:
-            BACKUP.restore_one(HOST_CONFIG_YAML)
+        for path in (
+            project_settings_yaml(NATIVE_PROJECT_ROOT),
+            project_settings_yaml(CSHARP_PROJECT_ROOT),
+        ):
+            if path in BACKUP._originals:
+                BACKUP.restore_one(path)
 
     if startup_results:
         print(f"\n{'=' * 64}")

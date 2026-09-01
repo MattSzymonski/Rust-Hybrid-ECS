@@ -23,7 +23,8 @@ DESCRIPTION
     checks: that an edit was delivered BY A PATCH, not by a reload.
 
     Crates are discovered rather than listed - the project and the optional
-    modules come from `modules/pill_config.yaml`, so a module added later is
+    modules come from `examples/project_rs/project_settings.yaml`, so a module
+    added later is
     covered without touching this file. The function to edit is discovered too:
     the scanner looks for a numeric literal inside a function body, preferring
     an annotated function when the crate has one.
@@ -137,22 +138,21 @@ class Crate:
 
 
 def discover_crates() -> List[Crate]:
-    """Read the host's own config to find the project and every module.
+    """Reads the example project's settings file to find the project and every
+    module.
 
-    Discovered rather than listed so a module added to `pill_config.yaml` is
-    covered without editing this file - the same convention the host itself
-    follows when deciding what to load.
+    Discovered rather than listed so a module added to `project_settings.yaml`
+    is covered without editing this file - the same convention the host itself
+    follows when deciding what to load. The project is the native example
+    (PROJECT_PATH drives it at runtime; discovery assumes the same default).
     """
-    config_text = read_source(HOST_CONFIG_YAML)
     crates: List[Crate] = []
-
-    project_match = re.search(r'^project:\s*"([^"]+)"', config_text, re.MULTILINE)
-    if project_match:
-        project_root = (MODULES_ROOT / project_match.group(1)).resolve()
-        crates.append(Crate(project_root.name, project_root / "src", "project"))
+    project_root = NATIVE_PROJECT_ROOT
+    crates.append(Crate(project_root.name, project_root / "src", "project"))
 
     # `modules:` is a YAML list of quoted crate directory names under
     # `optional/`, ending at the next top-level key or end of file.
+    config_text = read_source(project_settings_yaml(NATIVE_PROJECT_ROOT))
     modules_block = re.search(
         r"^modules:\s*$(.*?)(?=^\S|\Z)", config_text, re.MULTILINE | re.DOTALL
     )
@@ -573,7 +573,7 @@ def main() -> None:
 
     crates = discover_crates()
     if not crates:
-        print("  [FAIL] No crates discovered from pill_config.yaml.")
+        print("  [FAIL] No crates discovered from project_settings.yaml.")
         sys.exit(1)
     print(f"\n  Discovered {len(crates)} crate(s): "
           f"{', '.join(crate.name for crate in crates)}")
@@ -593,7 +593,7 @@ def main() -> None:
             crate.detail = "no annotation and no build.rs inventory"
 
     environment = os.environ.copy()
-    environment.pop("PROJECT_PATH", None)
+    environment["PROJECT_PATH"] = "../examples/project_rs"
     process, monitor = launch_process(HOST_LAUNCH_COMMAND, MODULES_ROOT, environment)
     backups = BackupRegistry()
     passed = False

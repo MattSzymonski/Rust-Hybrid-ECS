@@ -42,7 +42,8 @@ DESCRIPTION
                                      proving the project's embedded copy and the
                                      module's own copy coexist as distinct types.
 
-    Every file the suite touches (pill_config.yaml, module/project sources) is
+    Every file the suite touches (project_settings.yaml files, module/project
+    sources) is
     backed up at startup and restored afterwards, so a normal developer
     workspace is left exactly as it was.
 
@@ -83,14 +84,18 @@ from core.suite_common import *  # noqa: E402,F401,F403
 PROJECT_SANDBOX_LIB_RS = WORKSPACE_ROOT / "devops" / "tests" / "project" / "src" / "lib.rs"
 SPLINE_LIB_RS = MODULES_ROOT / "optional" / "pill_spline" / "src" / "lib.rs"
 
-SESSION_A_YAML = """\
-project: "../devops/tests/project"
+# Session settings: only the optional-module list lives in a file now; the
+# project itself is selected by PROJECT_PATH per session.
+SESSION_A_SETTINGS = """\
+name: "Suite Session A"
+build_binary_name: "SuiteSessionA"
 modules:
   - "pill_spline"
 """
 
-SESSION_B_YAML = """\
-project: "../examples/project_rs"
+SESSION_B_SETTINGS = """\
+name: "Suite Session B"
+build_binary_name: "SuiteSessionB"
 modules:
   - "pill_spline"
   - "pill_dummy_color"
@@ -128,10 +133,10 @@ def build_host() -> bool:
     return True
 
 
-def launch_host():
-    """Launches the standalone host exe with a clean environment."""
+def launch_host(project_path: str):
+    """Launches the standalone host exe with PROJECT_PATH pinned to the session project."""
     environment = os.environ.copy()
-    environment.pop("PROJECT_PATH", None)
+    environment["PROJECT_PATH"] = project_path
     return launch_process([str(HOST_EXE)], MODULES_ROOT, environment)
 
 # =============================================================================
@@ -644,7 +649,9 @@ SESSION_B_SCENARIOS = [
 # =============================================================================
 
 
-def verify_fast_path_restart(yaml_content: str) -> bool:
+def verify_fast_path_restart(
+    project_root: Path, project_path: str, settings_content: str
+) -> bool:
     """Relaunch the host once and verify the up-to-date build fast path.
 
     After a session's scenarios every artifact is current, so a clean restart
@@ -655,8 +662,8 @@ def verify_fast_path_restart(yaml_content: str) -> bool:
     a hard failure.
     """
     print("\n  [TEST] Fast-path restart (everything up to date)...")
-    write_host_config(yaml_content)
-    process, monitor = launch_host()
+    write_project_settings(project_root, settings_content)
+    process, monitor = launch_host(project_path)
     try:
         if not monitor.wait_for(STARTUP_TOKEN, STARTUP_TIMEOUT):
             print("  [FAIL] Fast-path restart did not reach the project loop.")
@@ -685,16 +692,22 @@ def verify_fast_path_restart(yaml_content: str) -> bool:
         terminate_process(process, monitor)
 
 
-def run_session(name: str, yaml_content: str, scenarios: Sequence[Scenario]) -> bool:
-    """Writes the session config, launches the host, and runs its scenarios."""
+def run_session(
+    name: str,
+    project_root: Path,
+    project_path: str,
+    settings_content: str,
+    scenarios: Sequence[Scenario],
+) -> bool:
+    """Writes the session's project settings, launches the host, and runs its scenarios."""
     print(f"\n{'=' * 64}")
     print(f"  SESSION {name}")
     print(f"{'=' * 64}")
 
-    write_host_config(yaml_content)
+    write_project_settings(project_root, settings_content)
 
     print("\n  [TEST] Launching standalone host...")
-    process, monitor = launch_host()
+    process, monitor = launch_host(project_path)
     session_passed = True
 
     try:
@@ -731,7 +744,7 @@ def run_session(name: str, yaml_content: str, scenarios: Sequence[Scenario]) -> 
             # Stop this host first so the relaunch does not contend for the
             # shared DLLs, then relaunch with the same (fully built) config.
             terminate_process(process, monitor)
-            if not verify_fast_path_restart(yaml_content):
+            if not verify_fast_path_restart(project_root, project_path, settings_content):
                 session_passed = False
             print(f"\n  [PASS] Session {name} completed.")
     finally:
@@ -779,8 +792,14 @@ def main() -> None:
     SETTLE_SLEEP = max(1, int(SETTLE_SLEEP * scale))
     BUILD_TIMEOUT = int(BUILD_TIMEOUT * scale)
 
-    # Capture originals for every file the suite may touch.
-    for path in (HOST_CONFIG_YAML, PROJECT_SANDBOX_LIB_RS, SPLINE_LIB_RS):
+    # Capture originals for every file the suite may touch, including both
+    # sessions' project settings files.
+    for path in (
+        project_settings_yaml(FIXTURE_PROJECT_ROOT),
+        project_settings_yaml(NATIVE_PROJECT_ROOT),
+        PROJECT_SANDBOX_LIB_RS,
+        SPLINE_LIB_RS,
+    ):
         BACKUP.capture(path)
 
     kill_stale_hosts()
@@ -794,22 +813,38 @@ def main() -> None:
         results.append(
             (
                 "A (devops/tests/project + pill_spline)",
-                run_session("A", SESSION_A_YAML, SESSION_A_SCENARIOS),
+                run_session(
+                    "A",
+                    FIXTURE_PROJECT_ROOT,
+                    "../devops/tests/project",
+                    SESSION_A_SETTINGS,
+                    SESSION_A_SCENARIOS,
+                ),
             )
         )
         if results[-1][1]:
             results.append(
                 (
                     "B (examples/project_rs + pill_spline)",
-                    run_session("B", SESSION_B_YAML, SESSION_B_SCENARIOS),
+                    run_session(
+                        "B",
+                        NATIVE_PROJECT_ROOT,
+                        "../examples/project_rs",
+                        SESSION_B_SETTINGS,
+                        SESSION_B_SCENARIOS,
+                    ),
                 )
             )
     finally:
         # Always restore the developer's files, even on failure.
         BACKUP.restore_all()
-        # Restore the host config to its original content last.
-        if HOST_CONFIG_YAML in BACKUP._originals:
-            BACKUP.restore_one(HOST_CONFIG_YAML)
+        # Restore the project settings files last.
+        for path in (
+            project_settings_yaml(FIXTURE_PROJECT_ROOT),
+            project_settings_yaml(NATIVE_PROJECT_ROOT),
+        ):
+            if path in BACKUP._originals:
+                BACKUP.restore_one(path)
 
     print(f"\n{'=' * 64}")
     print("  SUMMARY")

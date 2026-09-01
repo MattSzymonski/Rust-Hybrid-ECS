@@ -94,7 +94,7 @@ impl ApplicationHandler for WindowedApplication {
         // so revealing it only after the first frame renders prevents the OS
         // default white surface from ever being shown.
         let attributes = Window::default_attributes()
-            .with_title("ECS Standalone Host")
+            .with_title(self.project.name.clone())
             .with_inner_size(winit::dpi::LogicalSize::new(800.0, 600.0))
             .with_visible(false);
         let window = match event_loop.create_window(attributes) {
@@ -203,12 +203,11 @@ impl WindowedApplication {
                 }
 
                 // Step 4: Publish frame statistics and schedule the next redraw.
+                // The window title stays exactly the project name from
+                // project_settings.yaml (set once at window creation); only the
+                // console carries the live frame stats.
                 if let Some(report) = report {
                     print_frame_statistics(&report);
-                    window.set_title(&format!(
-                        "ECS Standalone Host — {:.0} FPS | {} entities",
-                        report.fps, report.entity_count
-                    ));
                 }
                 window.request_redraw();
             }

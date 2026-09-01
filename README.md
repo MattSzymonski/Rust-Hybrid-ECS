@@ -13,30 +13,22 @@
 
 
 
-The standalone host is a generic launcher. It reads its configuration from
-`modules/pill_config.yaml` (run from `modules/`), which declares the project
-directory and the optional modules to load; a plain `cargo run --package
-pill_standalone` therefore needs no environment variables. Everything else —
-backend, name, watch directory, build command, and output paths — is inferred
-from the project's manifest, so no project identity is compiled into the host.
-
-The environment can still override the project for a single run:
-
-- `PROJECT_PATH` overrides `project` in `pill_config.yaml`.
-
-There is no environment override for `modules`: it is always read from
-`pill_config.yaml`.
+The standalone host is a generic launcher. It selects the project from the
+`PROJECT_PATH` environment variable and reads that project's
+`project_settings.yaml` for the optional-module list — there is no host-level
+configuration file. Everything else — backend, name, watch directory, build
+command, and output paths — is inferred from the project's manifest, so no
+project identity is compiled into the host.
 
 Rust project (headless):
 
-- `cargo run --package pill_standalone` (uses `pill_config.yaml`)
-- or `$env:PROJECT_PATH = "../examples/project_rs"; cargo run --package pill_standalone`
+- `set PROJECT_PATH=../examples/project_rs` then `cargo run --package pill_standalone`
+- or, in PowerShell: `$env:PROJECT_PATH = "../examples/project_rs"; cargo run --package pill_standalone`
 
 Rust project (windowed): run
 `cargo run --package pill_standalone --features rendering`.
 
-C# project: point `project` in `pill_config.yaml` (or `PROJECT_PATH`) at the
-directory containing the `.csproj`,
+C# project: point `PROJECT_PATH` at the directory containing the `.csproj`,
 e.g. `../examples/project_cs`.
 
 ## Optional modules
@@ -46,10 +38,10 @@ and loaded by the host next to the project. Each is watched, rebuilt and swapped
 on its own, so editing one module reloads only that module and leaves the
 project and every other module running.
 
-The `modules` list in `pill_config.yaml` selects which ones to load, in order.
-An absent or empty list loads none.
+The `modules` list in the project's `project_settings.yaml` selects which ones
+to load, in order. An absent or empty list loads none.
 
-- `modules: ["pill_spline"]` in `pill_config.yaml` — load the spline module.
+- `modules: ["pill_spline"]` in `project_settings.yaml` — load the spline module.
 - `modules: ["pill_spline", "pill_physics"]` — several modules.
 - `modules: []` (or omitting the key) — run with no optional modules.
 
@@ -62,7 +54,7 @@ existing; nothing lists it by name.
    `crate-type = ["cdylib", "rlib"]` and depending on `pill_engine`.
 2. Export `pill_module_abi_version` and `pill_module_init`, optionally
    `pill_module_update`.
-3. Add `<name>` to the `modules` list in `pill_config.yaml`.
+3. Add `<name>` to the `modules` list in the project's `project_settings.yaml`.
 
 Everything else — watch directory, build command, output path — is derived from
 the directory name, so the host needs no changes. See

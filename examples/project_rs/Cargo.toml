@@ -24,7 +24,8 @@ pill_spline = { path = "../../modules/optional/pill_spline", default-features = 
 # change cannot pull the `#[no_mangle]` `pill_module_*` exports into this one
 # `cdylib`, where more than one definition of the same symbol names is a
 # linker error. Each crate is built standalone by the host (which passes
-# `--features module-abi`) for hot-loading via `pill_config.yaml`.
+# `--features module-abi`) for hot-loading via the project's
+# `project_settings.yaml`.
 pill_dummy_math = { path = "../../modules/optional/pill_dummy_math", default-features = false }
 pill_dummy_text = { path = "../../modules/optional/pill_dummy_text", default-features = false }
 pill_dummy_color = { path = "../../modules/optional/pill_dummy_color", default-features = false }

@@ -436,22 +436,39 @@ pub enum ConfigError {
         resolved_path: String,
     },
 
-    /// The optional host configuration file could not be read.
-    #[message("failed to read host configuration file ", name_style(path))]
-    HostConfigFileReadFailed {
+    /// The project's settings file could not be read.
+    #[message("failed to read project settings file ", name_style(path))]
+    ProjectSettingsFileReadFailed {
         path: String,
         #[source]
         source: std::io::Error,
     },
 
-    /// The optional host configuration file could not be parsed.
+    /// The project's settings file could not be parsed.
     #[message(
-        "failed to parse host configuration file ",
+        "failed to parse project settings file ",
         name_style(path),
         ": ",
         value(details)
     )]
-    HostConfigFileParseFailed { path: String, details: String },
+    ProjectSettingsFileParseFailed { path: String, details: String },
+
+    /// The project's settings file does not declare a `name`.
+    #[message(
+        "project settings file ",
+        name_style(path),
+        " must declare a `name` (used for the window title)"
+    )]
+    MissingProjectName { path: String },
+
+    /// The project's settings file's `build_binary_name` is missing or not
+    /// filename-safe.
+    #[message(
+        "project settings file ",
+        name_style(path),
+        " must declare a `build_binary_name` with only letters, digits and underscores (no spaces or special characters)"
+    )]
+    InvalidBuildBinaryName { path: String },
 }
 
 /// Project-module build execution failures.

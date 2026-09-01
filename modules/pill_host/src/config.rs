@@ -124,10 +124,10 @@ pub(crate) fn host_target_directory() -> String {
     format!("target/{HOST_PROFILE_DIRECTORY}")
 }
 
-/// Optional host configuration file name, resolved in the engine workspace
-/// root. Declares the project and the optional modules; environment variables
-/// override it for a single run.
-const HOST_CONFIG_FILE: &str = "pill_config.yaml";
+/// Project configuration file name, resolved in the project root. A project
+/// that ships one declares its own optional-module list; the project itself is
+/// selected by `PROJECT_PATH` alone.
+const PROJECT_SETTINGS_FILE: &str = "project_settings.yaml";
 
 // =============================================================================
 // Types
@@ -355,48 +355,80 @@ impl OptionalModuleConfig {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct HostConfig {
+    /// The project's display name from `project_settings.yaml`; used as the
+    /// window title.
+    pub name: String,
+
+    /// The artifact file base from `project_settings.yaml`; letters, digits
+    /// and underscores only, so it is safe as a file name.
+    pub build_binary_name: String,
+
     /// The project module selected by `PROJECT_PATH`.
     pub project: ProjectModuleConfig,
 
-    /// Optional modules selected by `pill_config.yaml`, loaded before the project.
+    /// Optional modules selected by the project's `project_settings.yaml`,
+    /// loaded before the project.
     pub optional_modules: Vec<OptionalModuleConfig>,
 }
 
 impl HostConfig {
-    /// Assemble the host configuration from the environment and the optional
-    /// `pill_config.yaml` file in the workspace root.
+    /// Assemble the host configuration from the environment and the project's
+    /// own settings file.
     ///
-    /// The file declares the project and the optional modules. `PROJECT_PATH`
-    /// overrides the file's `project` entry for a single run; the optional
-    /// module list comes from the file alone, so which modules load is always
-    /// visible in one place instead of depending on shell state.
+    /// `PROJECT_PATH` selects the project; the project's `project_settings.yaml`
+    /// (in the project root) supplies the optional-module list. There is no
+    /// host-level configuration file anymore, so which project runs and which
+    /// modules load are both visible at the project itself.
     ///
     /// # Errors
     ///
-    /// Returns a [`ConfigError`] when no project is configured, the project
-    /// configuration cannot be derived, the configuration file cannot be
+    /// Returns a [`ConfigError`] when `PROJECT_PATH` is not set, the project
+    /// configuration cannot be derived, the project settings file cannot be
     /// parsed, or a configured module is invalid.
     pub fn from_environment() -> Result<Self, ConfigError> {
-        // Step 1: Load the optional host configuration file.
-        let file_config = read_host_file_config()?;
-
-        // Step 2: Resolve the effective project path: the environment wins,
-        // then the configuration file.
-        let project_path = env::var(PROJECT_PATH_ENVIRONMENT_VARIABLE)
-            .ok()
-            .or_else(|| {
-                file_config
-                    .as_ref()
-                    .and_then(|config| config.project.clone())
-            })
-            .ok_or(ConfigError::MissingEnvironmentVariable {
-                variable: PROJECT_PATH_ENVIRONMENT_VARIABLE,
-            })?;
+        // Step 1: Resolve the project from the PROJECT_PATH environment
+        // variable; there is no other source for it.
+        let project_path = required_environment(PROJECT_PATH_ENVIRONMENT_VARIABLE)?;
         let project = ProjectModuleConfig::from_path(&project_path)?;
 
-        // Step 3: Resolve the optional modules and validate every configured
+        // Step 2: Load the project's own settings file, if it has one; it is
+        // the only source of the optional-module list.
+        let current_dir = env::current_dir().map_err(|_| ConfigError::ProjectDirectoryMissing {
+            path: project_path.clone(),
+        })?;
+        let project_root = current_dir.join(&project_path);
+        let project_settings = read_project_settings_file(&project_root)?;
+
+        // Step 3: Resolve the required project name and binary name. The name
+        // is the window title; the build binary name is the artifact file base
+        // and must be filename-safe (letters, digits, underscores only), so a
+        // settings file missing either is a configuration error rather than a
+        // silent default.
+        let settings_path = project_root.join(PROJECT_SETTINGS_FILE);
+        let project_name = project_settings
+            .as_ref()
+            .and_then(|settings| settings.name.as_deref())
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or(ConfigError::MissingProjectName {
+                path: settings_path.display().to_string(),
+            })?
+            .to_string();
+        let build_binary_name = project_settings
+            .as_ref()
+            .and_then(|settings| settings.build_binary_name.as_deref())
+            .map(str::trim)
+            .filter(|value| is_valid_build_binary_name(value))
+            .ok_or(ConfigError::InvalidBuildBinaryName {
+                path: settings_path.display().to_string(),
+            })?
+            .to_string();
+
+        // Step 4: Resolve the optional modules and validate every configured
         // module before any build work starts.
-        let optional_modules: Vec<OptionalModuleConfig> = optional_module_names(&file_config)
+        let optional_modules: Vec<OptionalModuleConfig> = project_settings
+            .map(|settings| settings.modules)
+            .unwrap_or_default()
             .iter()
             .map(|name| OptionalModuleConfig::workspace_member(name))
             .collect();
@@ -404,6 +436,8 @@ impl HostConfig {
             module.validate()?;
         }
         Ok(Self {
+            name: project_name,
+            build_binary_name,
             project,
             optional_modules,
         })
@@ -416,21 +450,12 @@ impl From<ProjectModuleConfig> for HostConfig {
     /// Keeps embedders that already build a `ProjectModuleConfig` compiling.
     fn from(project: ProjectModuleConfig) -> Self {
         Self {
+            name: project.name.clone(),
+            build_binary_name: project.name.clone(),
             project,
             optional_modules: Vec::new(),
         }
     }
-}
-
-/// Resolve the optional modules to load from the host configuration file.
-///
-/// An absent file or an empty `modules` list both mean no optional modules,
-/// so leaving `pill_config.yaml` unwritten is equivalent to opting out.
-fn optional_module_names(file_config: &Option<HostFileConfig>) -> Vec<String> {
-    file_config
-        .as_ref()
-        .map(|config| config.modules.clone())
-        .unwrap_or_default()
 }
 
 impl ProjectModuleConfig {
@@ -481,8 +506,7 @@ impl ProjectModuleConfig {
     ///
     /// Backend detection and path derivation are shared with
     /// [`Self::from_environment`]; this is the entry point used by
-    /// [`HostConfig::from_environment`] so a `pill_config.yaml` value can be
-    /// honoured without the environment variable.
+    /// [`HostConfig::from_environment`] to honour the `PROJECT_PATH` value.
     ///
     /// # Errors
     ///
@@ -823,48 +847,60 @@ fn dependency_sub_table_key(section: &str) -> Option<&str> {
     None
 }
 
-/// Values declared by the optional `pill_config.yaml` file.
+/// Values declared by the project's own `project_settings.yaml`.
 ///
-/// Every field is optional so a file can override just the entries it cares
-/// about; anything left unset falls back to the environment or a default.
+/// `name` and `build_binary_name` are required (the display/window title and
+/// the artifact file base respectively); the rest is optional classic package
+/// metadata.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
-struct HostFileConfig {
-    /// Project directory, workspace-relative; overridden by `PROJECT_PATH`.
-    project: Option<String>,
+struct ProjectSettingsFile {
+    /// Project display name; required, used as the window title.
+    name: Option<String>,
+    /// Artifact file base; required, letters/digits/underscores only.
+    build_binary_name: Option<String>,
+    /// Optional package version.
+    version: Option<String>,
+    /// Optional package author.
+    author: Option<String>,
+    /// Optional one-line package description.
+    description: Option<String>,
     /// Optional module crate names, in load order. The only source for this
     /// list: there is no environment-variable override, so the file is always
     /// the complete answer to "which modules load".
     modules: Vec<String>,
 }
 
-/// Read the optional host configuration file from the workspace root.
+/// Whether a value is a safe artifact file base: letters, digits, underscores.
+fn is_valid_build_binary_name(value: &str) -> bool {
+    !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Read the project's own settings file from the project root.
 ///
-/// Returns `Ok(None)` when no file exists or the working directory cannot be
-/// determined, so a host that has no config file behaves exactly as before.
-/// A present but unreadable or malformed file is an error, so a typo cannot
-/// silently fall back to a different project.
+/// Returns `Ok(None)` when no file exists, so a project that does not ship one
+/// behaves exactly as before. A present but unreadable or malformed file is an
+/// error, so a typo cannot silently fall back to a different module set.
 ///
 /// # Errors
 ///
 /// Returns a [`ConfigError`] when the file exists but cannot be read or is
 /// not valid YAML.
-fn read_host_file_config() -> Result<Option<HostFileConfig>, ConfigError> {
-    let Ok(workspace_root) = env::current_dir() else {
-        return Ok(None);
-    };
-    let config_path = workspace_root.join(HOST_CONFIG_FILE);
+fn read_project_settings_file(
+    project_root: &Path,
+) -> Result<Option<ProjectSettingsFile>, ConfigError> {
+    let config_path = project_root.join(PROJECT_SETTINGS_FILE);
     if !config_path.is_file() {
         return Ok(None);
     }
     let contents = std::fs::read_to_string(&config_path).map_err(|source| {
-        ConfigError::HostConfigFileReadFailed {
+        ConfigError::ProjectSettingsFileReadFailed {
             path: config_path.display().to_string(),
             source,
         }
     })?;
     serde_yaml::from_str(&contents).map(Some).map_err(|source| {
-        ConfigError::HostConfigFileParseFailed {
+        ConfigError::ProjectSettingsFileParseFailed {
             path: config_path.display().to_string(),
             details: source.to_string(),
         }
@@ -1286,6 +1322,38 @@ serde = { version = "1", features = ["derive"] }
         let path = directory.join("Cargo.toml");
         std::fs::write(&path, contents).unwrap();
         path
+    }
+
+    // =========================================================================
+    // project settings file
+    // =========================================================================
+
+    /// A project settings file yields its module list in order.
+    #[test]
+    fn project_settings_file_lists_modules() {
+        let directory = temp_root().join("project_settings_parse");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("project_settings.yaml"),
+            "name: \"Bouncing Balls\"\nbuild_binary_name: \"BouncingBalls\"\nmodules:\n  - \"pill_spline\"\n  - \"pill_dummy_math\"\n",
+        )
+        .unwrap();
+        let settings = read_project_settings_file(&directory)
+            .unwrap()
+            .expect("the settings file should parse");
+        assert_eq!(settings.name.as_deref(), Some("Bouncing Balls"));
+        assert_eq!(settings.build_binary_name.as_deref(), Some("BouncingBalls"));
+        assert_eq!(settings.modules, vec!["pill_spline", "pill_dummy_math"]);
+    }
+
+    /// A missing project settings file selects no optional modules.
+    #[test]
+    fn missing_project_settings_file_selects_no_modules() {
+        let directory = temp_root().join("project_settings_missing");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        assert!(read_project_settings_file(&directory).unwrap().is_none());
     }
 
     // =========================================================================

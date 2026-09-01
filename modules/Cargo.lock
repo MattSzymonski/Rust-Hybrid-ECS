@@ -4323,6 +4323,20 @@ name = "pill_hot_scan"
 version = "0.1.0"
 
 [[package]]
+name = "pill_shipping_bundle"
+version = "0.0.0"
+dependencies = [
+ "pill_dummy_color",
+ "pill_dummy_math",
+ "pill_dummy_random",
+ "pill_dummy_text",
+ "pill_dummy_timer",
+ "pill_host",
+ "pill_spline",
+ "project",
+]
+
+[[package]]
 name = "pill_spline"
 version = "0.1.0"
 dependencies = [
@@ -4340,15 +4354,9 @@ version = "0.1.0"
 dependencies = [
  "miette",
  "pill_core",
- "pill_dummy_color",
- "pill_dummy_math",
- "pill_dummy_random",
- "pill_dummy_text",
- "pill_dummy_timer",
  "pill_host",
  "pill_hot_scan",
- "pill_spline",
- "project",
+ "pill_shipping_bundle",
  "tracing",
 ]
 

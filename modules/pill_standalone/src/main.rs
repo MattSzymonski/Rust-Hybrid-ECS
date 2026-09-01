@@ -22,9 +22,11 @@ use std::path::PathBuf;
 use pill_core::error;
 #[cfg(feature = "hot_reload")]
 use pill_host::HostConfig;
-use pill_host::{engine_report, install_engine_report_handler};
 #[cfg(not(feature = "hot_reload"))]
-use pill_host::{StaticModule, StaticProject, StaticProjectBackend};
+use pill_host::StaticProject;
+#[cfg(all(not(feature = "hot_reload"), feature = "static_csharp"))]
+use pill_host::StaticProjectBackend;
+use pill_host::{engine_report, install_engine_report_handler};
 
 // A build with reloading compiled out has to link a project instead, or it has
 // nothing to run. Caught here rather than at the first frame, because the
@@ -34,43 +36,23 @@ compile_error!(
     "with `hot_reload` off this binary links its project in, so it needs the      `static_project` feature: build it as `--no-default-features --features      static_project`. Leaving both off would produce a host with no project."
 );
 
+// A shipping build links its project and modules in, so hot reloading them is
+// meaningless, and `main` treats the two postures as mutually exclusive (the
+// reloading path would win and the linked project would sit unused). Feature
+// unification makes this easy to trigger by accident - e.g. a `--workspace`
+// build where another package pulls `hot_reload` back on - so the combination
+// is refused at compile time rather than discovered in a shipped binary.
+#[cfg(all(
+    any(feature = "hot_reload", feature = "hot_patch"),
+    any(feature = "static_project", feature = "static_csharp")
+))]
+compile_error!(
+    "a shipping build cannot combine hot-reload features (`hot_reload`/`hot_patch`) with `static_project`/`static_csharp`: build it as `--no-default-features --features static_project`."
+);
+
 // =============================================================================
 // Static Project
 // =============================================================================
-
-/// The project and optional modules this binary links in.
-///
-/// The shipping counterpart of `pill_config.yaml`, and deliberately not read
-/// from it: a released binary's contents are decided when it is built, not by a
-/// file next to it. The module order matches the config file's, because the
-/// project names types `pill_spline` defines and so must initialize after it.
-#[cfg(not(feature = "hot_reload"))]
-const STATIC_MODULES: &[StaticModule] = &[
-    StaticModule {
-        name: "pill_spline",
-        init: pill_spline::register,
-    },
-    StaticModule {
-        name: "pill_dummy_math",
-        init: pill_dummy_math::register,
-    },
-    StaticModule {
-        name: "pill_dummy_text",
-        init: pill_dummy_text::register,
-    },
-    StaticModule {
-        name: "pill_dummy_color",
-        init: pill_dummy_color::register,
-    },
-    StaticModule {
-        name: "pill_dummy_timer",
-        init: pill_dummy_timer::register,
-    },
-    StaticModule {
-        name: "pill_dummy_random",
-        init: pill_dummy_random::register,
-    },
-];
 
 /// Directory the managed backend resolves its assembly paths against.
 ///
@@ -87,38 +69,33 @@ fn managed_assembly_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// The native Rust project, linked into this binary.
-#[cfg(all(not(feature = "hot_reload"), not(feature = "static_csharp")))]
-fn project_backend() -> StaticProjectBackend {
-    StaticProjectBackend::Native {
-        init: project::init,
-    }
-}
-
-/// The managed project, loaded from assemblies built ahead of time.
-#[cfg(all(not(feature = "hot_reload"), feature = "static_csharp"))]
-fn project_backend() -> StaticProjectBackend {
-    StaticProjectBackend::CSharp {
-        config: pill_host::CSharpModuleConfig::new(
-            "csharp_runtime",
-            "pill_csharp_runtime/bin/Release/net8.0",
-            "project_cs",
-            "../examples/project_cs/bin/Release/net8.0",
-        ),
-        root: managed_assembly_root(),
-    }
-}
-
-/// Assemble the project this binary links in.
+/// The native project and its optional modules, taken from the generated
+/// shipping bundle.
 ///
-/// A function rather than a `const` because the managed backend carries owned
-/// configuration; the native one is const-constructible either way.
-#[cfg(not(feature = "hot_reload"))]
+/// The bundle is regenerated from the project's `project_settings.yaml` by
+/// `devops/tools/generate_shipping_bundle.py` before a shipping build, so this
+/// binary never names a project or module itself.
+#[cfg(all(not(feature = "hot_reload"), not(feature = "static_csharp")))]
+fn static_project() -> StaticProject {
+    pill_shipping_bundle::static_project()
+}
+
+/// The managed project, loaded from assemblies built ahead of time, with the
+/// optional modules taken from the generated shipping bundle.
+#[cfg(all(not(feature = "hot_reload"), feature = "static_csharp"))]
 fn static_project() -> StaticProject {
     StaticProject {
         name: "project",
-        backend: project_backend(),
-        modules: STATIC_MODULES,
+        backend: StaticProjectBackend::CSharp {
+            config: pill_host::CSharpModuleConfig::new(
+                "csharp_runtime",
+                "pill_csharp_runtime/bin/Release/net8.0",
+                "project_cs",
+                "../examples/project_cs/bin/Release/net8.0",
+            ),
+            root: managed_assembly_root(),
+        },
+        modules: pill_shipping_bundle::STATIC_MODULES,
     }
 }
 
@@ -164,7 +141,7 @@ fn main() -> miette::Result<()> {
     init_telemetry();
     // Step 3: delegate to the shared run loop and convert the error once.
     // A reloading build resolves what to run from the environment and
-    // `pill_config.yaml`; a shipping build already has it linked in.
+    // `PROJECT_PATH`; a shipping build already has it linked in.
     #[cfg(feature = "hot_reload")]
     let outcome = pill_host::run(HostConfig::from_environment()?);
     #[cfg(not(feature = "hot_reload"))]

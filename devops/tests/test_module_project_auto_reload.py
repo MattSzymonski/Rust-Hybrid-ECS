@@ -52,11 +52,13 @@ from core.suite_common import *  # noqa: E402,F401,F403
 MODULE_LIB_RS = MODULES_ROOT / "optional" / "pill_spline" / "src" / "lib.rs"
 
 # The host has no environment-variable override for the optional-module list,
-# so this test drives it the same way a person would: by writing the config
-# file the host actually reads. The real file is backed up and restored around
-# the run so this test never leaves a developer's `pill_config.yaml` changed.
-TEST_HOST_CONFIG = """\
-project: "../examples/project_rs"
+# so this test drives it the same way a person would: by writing the project's
+# settings file the host actually reads. The real file is backed up and
+# restored around the run so this test never leaves the project's
+# `project_settings.yaml` changed.
+TEST_PROJECT_SETTINGS = """\
+name: "Auto Reload Test"
+build_binary_name: "AutoReloadTest"
 modules:
   - "pill_spline"
 """
@@ -138,27 +140,30 @@ def plan_value_edit(content: str) -> Tuple[str, str, str]:
 # =============================================================================
 
 
-def install_test_host_config() -> None:
-    """Backs up the real `pill_config.yaml` and installs the test's own.
+def install_test_project_settings() -> None:
+    """Backs up the example project's `project_settings.yaml` and installs the
+    test's own.
 
     The host reads `modules` only from this file, so the test writes a minimal
-    config that loads just `pill_spline`, keeping the scenario independent of
-    whatever optional modules a developer's real config currently lists.
+    list that loads just `pill_spline`, keeping the scenario independent of
+    whatever modules the project currently lists.
     """
     global ORIGINAL_HOST_CONFIG
-    if HOST_CONFIG_YAML.exists():
-        ORIGINAL_HOST_CONFIG = HOST_CONFIG_YAML.read_text(encoding="utf-8")
+    settings_path = project_settings_yaml(NATIVE_PROJECT_ROOT)
+    if settings_path.exists():
+        ORIGINAL_HOST_CONFIG = settings_path.read_text(encoding="utf-8")
     else:
         ORIGINAL_HOST_CONFIG = None
-    HOST_CONFIG_YAML.write_text(TEST_HOST_CONFIG, encoding="utf-8")
+    settings_path.write_text(TEST_PROJECT_SETTINGS, encoding="utf-8")
 
 
-def restore_host_config() -> None:
-    """Restores the real `pill_config.yaml`, or removes the test's own."""
+def restore_project_settings() -> None:
+    """Restores the project's settings file, or removes the test's own."""
+    settings_path = project_settings_yaml(NATIVE_PROJECT_ROOT)
     if ORIGINAL_HOST_CONFIG is None:
-        HOST_CONFIG_YAML.unlink(missing_ok=True)
+        settings_path.unlink(missing_ok=True)
     else:
-        HOST_CONFIG_YAML.write_text(ORIGINAL_HOST_CONFIG, encoding="utf-8")
+        settings_path.write_text(ORIGINAL_HOST_CONFIG, encoding="utf-8")
 
 
 # =============================================================================
@@ -180,9 +185,9 @@ def kill_stray_hosts() -> None:
 
 def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
     """Starts the host with the module-project setup and returns process + monitor."""
-    # The optional-module list comes only from `pill_config.yaml`
-    # (installed by `install_test_host_config`); `PROJECT_PATH` is still a
-    # supported override and pins the project explicitly for this test.
+    # The optional-module list comes only from the project's settings file
+    # (installed by `install_test_project_settings`); `PROJECT_PATH` pins the
+    # project explicitly for this test.
     process_environment = os.environ.copy()
     process_environment["PROJECT_PATH"] = "../examples/project_rs"
     return launch_process(
@@ -333,21 +338,21 @@ def main() -> None:
     print("=" * 60)
 
     kill_stray_hosts()
-    install_test_host_config()
+    install_test_project_settings()
 
     if not build_workspace():
         restore_original()
-        restore_host_config()
+        restore_project_settings()
         sys.exit(1)
 
     passed = False
     try:
         passed = run_suite(expected_midpoint)
     finally:
-        print("\n  [CLEANUP] Restoring original module source and host config...")
+        print("\n  [CLEANUP] Restoring original module source and project settings...")
         restore_original()
-        restore_host_config()
-        print("  [OK] Source and host config restored.")
+        restore_project_settings()
+        print("  [OK] Source and project settings restored.")
     print("\n" + "=" * 60)
     print("  TEST PASSED" if passed else "  TEST FAILED")
     print("=" * 60)

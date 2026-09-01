@@ -319,9 +319,9 @@ def measure_host_startup(
     log(f"  [RUN]  {name}: launching {host_executable.name}")
     suite_common.kill_stale_hosts()
     environment = os.environ.copy()
-    # The host reads `pill_config.yaml`; an inherited override would silently
-    # measure a different project than the developer's configuration.
-    environment.pop("PROJECT_PATH", None)
+    # The project is selected by PROJECT_PATH; pin it to the native example so
+    # the measurement is deterministic regardless of the caller's shell.
+    environment["PROJECT_PATH"] = "../examples/project_rs"
 
     started = time.monotonic()
     process, monitor = suite_common.launch_process(

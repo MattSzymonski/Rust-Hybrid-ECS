@@ -100,6 +100,27 @@ def build_shipping_binary(timeout: int) -> str:
     documents: the workspace sets `-C prefer-dynamic`, which rustc refuses to
     combine with the release profile's `lto = "fat"`.
     """
+    # The shipping binary links the generated bundle, which is gitignored build
+    # output: regenerate it from the project's settings file first.
+    generator = [
+        sys.executable,
+        str(REPOSITORY_ROOT / "devops" / "tools" / "generate_shipping_bundle.py"),
+        "examples/project_rs",
+    ]
+    completed = subprocess.run(
+        generator,
+        cwd=str(REPOSITORY_ROOT),
+        env=dict(os.environ, RUSTFLAGS=""),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=timeout,
+    )
+    if completed.returncode != 0:
+        return (completed.stdout or "")[-1500:]
+
     command = [
         find_executable("cargo"),
         "build",

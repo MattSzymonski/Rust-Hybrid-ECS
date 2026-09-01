@@ -50,7 +50,18 @@ from typing import Dict, List, Optional, Sequence, Tuple
 WORKSPACE_ROOT = Path(__file__).resolve().parents[2]
 MODULES_ROOT = WORKSPACE_ROOT / "modules"
 HOST_EXE = MODULES_ROOT / "target" / "debug" / "pill_standalone.exe"
-HOST_CONFIG_YAML = MODULES_ROOT / "pill_config.yaml"
+
+# Known project roots. Each declares its own `project_settings.yaml`, the only
+# source of the optional-module list; the project itself is selected by
+# `PROJECT_PATH` alone (there is no host-level config file anymore).
+NATIVE_PROJECT_ROOT = WORKSPACE_ROOT / "examples" / "project_rs"
+CSHARP_PROJECT_ROOT = WORKSPACE_ROOT / "examples" / "project_cs"
+FIXTURE_PROJECT_ROOT = WORKSPACE_ROOT / "devops" / "tests" / "project"
+
+
+def project_settings_yaml(project_root: Path) -> Path:
+    """Returns a project's settings file path."""
+    return project_root / "project_settings.yaml"
 
 # =============================================================================
 # Output tokens shared by the suites
@@ -451,9 +462,9 @@ def kill_stale_hosts() -> None:
         subprocess.run(["pkill", "-f", "pill_standalone"], capture_output=True)
 
 
-def write_host_config(content: str) -> None:
-    """Writes the host config the standalone reads at startup."""
-    atomic_write(HOST_CONFIG_YAML, content)
+def write_project_settings(project_root: Path, content: str) -> None:
+    """Writes a project's `project_settings.yaml`, the file the host reads."""
+    atomic_write(project_settings_yaml(project_root), content)
 
 
 # Names importable via `from suite_common import *`.
@@ -461,7 +472,11 @@ __all__ = [
     "WORKSPACE_ROOT",
     "MODULES_ROOT",
     "HOST_EXE",
-    "HOST_CONFIG_YAML",
+    "NATIVE_PROJECT_ROOT",
+    "CSHARP_PROJECT_ROOT",
+    "FIXTURE_PROJECT_ROOT",
+    "project_settings_yaml",
+    "write_project_settings",
     "STARTUP_TOKEN",
     "MODULE_LOADED_TOKEN",
     "ANALYTICS_REPORT_TOKEN",
@@ -502,5 +517,4 @@ __all__ = [
     "launch_process",
     "terminate_process",
     "kill_stale_hosts",
-    "write_host_config",
 ]

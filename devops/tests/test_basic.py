@@ -227,7 +227,6 @@ RELOAD_ONLY_TOKENS = (
     "watching for source changes",
     "module DLL loaded successfully",
     "building project module",
-    "pill_config.yaml",
     "pill_standalone_temp",
     "cargo build",
     "--offline",
@@ -386,6 +385,20 @@ def shipping_build(tally: ResultTally) -> None:
     section("(4/7) Shipping build")
     if not WORKSPACE_MANIFEST.is_file():
         tally.report_skip("shipping build", f"{WORKSPACE_MANIFEST} not found")
+        return
+
+    # The shipping binary links the generated bundle, which is gitignored build
+    # output: regenerate it from the project's settings file first.
+    print("Generating the shipping bundle from project_settings.yaml")
+    generated = run_command(
+        [
+            sys.executable,
+            str(REPOSITORY_ROOT / "devops" / "tools" / "generate_shipping_bundle.py"),
+            "examples/project_rs",
+        ]
+    )
+    if generated.returncode != 0:
+        tally.report_fail("shipping build", failure_excerpt(generated))
         return
 
     print("Building pill_standalone --no-default-features --features static_project")
