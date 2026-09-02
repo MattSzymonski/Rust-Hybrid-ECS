@@ -474,16 +474,83 @@ fn emit_opaque_struct(name: &str, size: usize, align: usize) -> Result<String, S
 /// argument falls back to a positional `argN` name (clearer in generated code
 /// than `@`-escaping, and immune to future keyword additions).
 const CSHARP_RESERVED_KEYWORDS: &[&str] = &[
-    "abstract", "as", "base", "bool", "break", "byte", "case", "catch", "char",
-    "checked", "class", "const", "continue", "decimal", "default", "delegate",
-    "do", "double", "else", "enum", "event", "explicit", "extern", "false",
-    "finally", "fixed", "float", "for", "foreach", "goto", "if", "implicit",
-    "in", "int", "interface", "internal", "is", "lock", "long", "namespace",
-    "new", "null", "object", "operator", "out", "override", "params", "private",
-    "protected", "public", "readonly", "ref", "return", "sbyte", "sealed",
-    "short", "sizeof", "stackalloc", "static", "string", "struct", "switch",
-    "this", "throw", "true", "try", "typeof", "uint", "ulong", "unchecked",
-    "unsafe", "ushort", "using", "virtual", "void", "volatile", "while",
+    "abstract",
+    "as",
+    "base",
+    "bool",
+    "break",
+    "byte",
+    "case",
+    "catch",
+    "char",
+    "checked",
+    "class",
+    "const",
+    "continue",
+    "decimal",
+    "default",
+    "delegate",
+    "do",
+    "double",
+    "else",
+    "enum",
+    "event",
+    "explicit",
+    "extern",
+    "false",
+    "finally",
+    "fixed",
+    "float",
+    "for",
+    "foreach",
+    "goto",
+    "if",
+    "implicit",
+    "in",
+    "int",
+    "interface",
+    "internal",
+    "is",
+    "lock",
+    "long",
+    "namespace",
+    "new",
+    "null",
+    "object",
+    "operator",
+    "out",
+    "override",
+    "params",
+    "private",
+    "protected",
+    "public",
+    "readonly",
+    "ref",
+    "return",
+    "sbyte",
+    "sealed",
+    "short",
+    "sizeof",
+    "stackalloc",
+    "static",
+    "string",
+    "struct",
+    "switch",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typeof",
+    "uint",
+    "ulong",
+    "unchecked",
+    "unsafe",
+    "ushort",
+    "using",
+    "virtual",
+    "void",
+    "volatile",
+    "while",
 ];
 
 /// The parameter name the generated C# uses for one mirrored-method argument.
@@ -1420,9 +1487,13 @@ mod tests {
             align: 8,
             fields: FIELDS,
         }];
-        let methods = [
-            mirrored_method("pill_spline::OmoMO", "reset", "", &["u64"], &["countdown"]),
-        ];
+        let methods = [mirrored_method(
+            "pill_spline::OmoMO",
+            "reset",
+            "",
+            &["u64"],
+            &["countdown"],
+        )];
         generate_module_components_csharp(
             &workspace,
             "pill_spline",
@@ -1434,9 +1505,8 @@ mod tests {
 
         let content = read_generated(&workspace, "pill_spline");
         assert!(content.contains("public void Reset(ulong countdown)"));
-        assert!(content.contains(
-            "public delegate void OmoMOResetDelegate(IntPtr self, ulong countdown);"
-        ));
+        assert!(content
+            .contains("public delegate void OmoMOResetDelegate(IntPtr self, ulong countdown);"));
         assert!(content.contains("mirror(handle.AddrOfPinnedObject(), countdown);"));
     }
 
@@ -1473,7 +1543,13 @@ mod tests {
             align: 8,
             fields: FIELDS,
         }];
-        let methods_without = [mirrored_method("pill_spline::OmoMO", "get_sum", "u64", &[], &[])];
+        let methods_without = [mirrored_method(
+            "pill_spline::OmoMO",
+            "get_sum",
+            "u64",
+            &[],
+            &[],
+        )];
         let methods_with = [
             mirrored_method("pill_spline::OmoMO", "get_sum", "u64", &[], &[]),
             mirrored_method("pill_spline::OmoMO", "get_b", "u64", &[], &[]),
