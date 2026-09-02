@@ -127,7 +127,8 @@ pub use tracing;
 // so module/project crates need no dependency beyond `pill_engine` itself.
 pub use inventory::submit;
 pub use pill_engine_macros::{
-    pill_hot, pill_hot_fn, pill_hot_resolver, pill_module, pill_project, PillComponent,
+    pill_hot, pill_hot_fn, pill_hot_resolver, pill_mirror_impl, pill_mirror_method, pill_module,
+    pill_project, PillComponent, PillMirror,
 };
 
 // World container and its entity-builder and error types.

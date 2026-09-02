@@ -40,7 +40,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 # =============================================================================
 # Paths
@@ -193,6 +193,7 @@ TAG_COLOR_MAP = {
     "[PASS]": ANSI_BOLD + ANSI_GREEN,
     "[PREP]": ANSI_BOLD + ANSI_CYAN,
     "[CLEANUP]": ANSI_BOLD + ANSI_MAGENTA,
+    "[timing]": ANSI_CYAN,
     "[std]": ANSI_DIM + ANSI_CYAN,
 }
 
@@ -218,6 +219,64 @@ def print(*args, **kwargs) -> None:  # type: ignore[override]
     flush = kwargs.get("flush", False)
     message = separator.join(str(argument) for argument in args)
     builtins.print(_colorize_message(message), end=end, flush=flush)
+
+
+# =============================================================================
+# Suite timing
+# =============================================================================
+
+
+def run_suite_with_timing(main_fn: Callable[[], Optional[int]]) -> Optional[int]:
+    """Run one test suite's `main()` wrapped in a start/end/duration log.
+
+    Prints the script's own name with the wall-clock start time before running
+    it, then the finish time and the elapsed duration afterwards, tagging the
+    outcome with `[PASSED]`/`[FAILED]` (tokens the usual suite console filters
+    match). Every suite in `devops/tests/` routes its `__main__` entry through
+    this helper so a plain `python devops/tests/test_*.py` run reports how
+    long the suite took.
+
+    A `SystemExit` raised inside `main()` is logged with its code and then
+    re-raised so the exit status propagates; any other exception is logged and
+    re-raised. Returns `main()`'s value (or `None`) on a normal return so
+    callers can `sys.exit(run_suite_with_timing(main))`.
+    """
+    # The real suite script, not sys.argv[0]: a suite may load other devops
+    # modules by exec (test_harness_parsing) and mutate sys.argv for them, so
+    # argv[0] does not always name the suite being timed.
+    main_module = sys.modules.get("__main__")
+    main_file = getattr(main_module, "__file__", None) if main_module else None
+    script_name = (
+        os.path.basename(main_file)
+        if main_file
+        else (os.path.basename(sys.argv[0]) if sys.argv and sys.argv[0] else "<suite>")
+    )
+    started_wall = time.perf_counter()
+    started_local = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[timing] {script_name}: started at {started_local}")
+
+    def report_finish(verdict: str, note: str = "") -> None:
+        elapsed = time.perf_counter() - started_wall
+        finished_local = time.strftime("%Y-%m-%d %H:%M:%S")
+        suffix = f" ({note})" if note else ""
+        print(
+            f"[timing] {script_name}: finished at {finished_local} "
+            f"after {elapsed:.1f}s [{verdict}]{suffix}"
+        )
+
+    try:
+        result = main_fn()
+    except SystemExit as exit_error:
+        # A suite may signal its result through sys.exit() from inside main;
+        # report the code, then propagate so the process exits with it.
+        code = exit_error.code
+        report_finish("PASSED" if code in (None, 0) else "FAILED")
+        raise
+    except BaseException:
+        report_finish("FAILED", "errored")
+        raise
+    report_finish("PASSED" if result in (None, 0) else "FAILED")
+    return result
 
 # =============================================================================
 # Backup / restore
@@ -507,6 +566,7 @@ __all__ = [
     "USE_COLOR",
     "TAG_COLOR_MAP",
     "print",
+    "run_suite_with_timing",
     "BackupRegistry",
     "BACKUP",
     "read_source",

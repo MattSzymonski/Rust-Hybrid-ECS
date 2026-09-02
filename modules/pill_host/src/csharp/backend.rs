@@ -37,6 +37,7 @@ use super::components::{
 };
 use super::context::ActiveSystemGuard;
 use super::csharp_runtime::DotnetRuntimeContext;
+use super::ResolvedMirrorMethod;
 use crate::CSharpModuleConfig;
 
 // =============================================================================
@@ -189,11 +190,7 @@ pub(crate) struct CSharpRuntime {
 /// sidecars next to the exe, so the `workspace_root`-relative path is the
 /// fallback. Only shipping postures reach this code, so `current_exe()` always
 /// points at the shipping binary rather than a dev target.
-fn shipped_or_baked(
-    workspace_root: &Path,
-    baked_relative_dir: &str,
-    file_name: &str,
-) -> PathBuf {
+fn shipped_or_baked(workspace_root: &Path, baked_relative_dir: &str, file_name: &str) -> PathBuf {
     if let Some(exe_dir) = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf))
@@ -221,6 +218,7 @@ impl CSharpRuntime {
         workspace_root: &Path,
         config: &CSharpModuleConfig,
         module_exposed: &[ModuleExposedComponent],
+        mirror_methods: &[ResolvedMirrorMethod],
     ) -> Result<Self, CSharpError> {
         // Step 0: Merge the hardcoded shared renderer bindings with byte-level
         // bindings for every native component the optional modules exposed, so
@@ -235,10 +233,7 @@ impl CSharpRuntime {
         // flat next to the executable, so prefer those copies (portable); the
         // generated bundle's source-tree paths are the developer fallback.
         let runtime_assembly_name = format!("{}.dll", config.runtime_assembly_name);
-        let runtime_config_name = format!(
-            "{}.runtimeconfig.json",
-            config.runtime_assembly_name
-        );
+        let runtime_config_name = format!("{}.runtimeconfig.json", config.runtime_assembly_name);
         let project_assembly_name = format!("{}.dll", config.project_assembly_name);
         let assembly = shipped_or_baked(
             workspace_root,
@@ -345,7 +340,7 @@ impl CSharpRuntime {
 
         // Step 2: Initialize the runtime bridge and register the component
         // manifest copied from the managed assembly.
-        let api = Box::new(CsEngineApi::new());
+        let api = Box::new(CsEngineApi::new(mirror_methods));
         if init(api.as_ref() as *const CsEngineApi) == 0 {
             return Err(CSharpError::RuntimeInitFailed);
         }
@@ -528,6 +523,7 @@ impl CSharpRuntime {
         workspace_root: &Path,
         config: &CSharpModuleConfig,
         module_exposed: &[ModuleExposedComponent],
+        mirror_methods: &[ResolvedMirrorMethod],
     ) -> Result<Self, CSharpError> {
         // Step 0: merge the shared renderer bindings with byte-level bindings
         // for every native component the optional modules exposed, exactly as
@@ -561,8 +557,8 @@ impl CSharpRuntime {
         let system_uses_commands =
             runtime.get_unmanaged_fn::<SystemUsesCommandsFn>("pill_system_uses_commands")?;
         let run_startup = runtime.get_unmanaged_fn::<RunStartupFn>("pill_run_startup")?;
-        let manifest_length =
-            runtime.get_unmanaged_fn::<ComponentManifestLengthFn>("pill_component_manifest_length")?;
+        let manifest_length = runtime
+            .get_unmanaged_fn::<ComponentManifestLengthFn>("pill_component_manifest_length")?;
         let copy_manifest =
             runtime.get_unmanaged_fn::<CopyComponentManifestFn>("pill_copy_component_manifest")?;
         let system_name_length =
@@ -573,16 +569,14 @@ impl CSharpRuntime {
             runtime.get_unmanaged_fn::<SystemAccessCountFn>("pill_system_access_count")?;
         let get_access = runtime.get_unmanaged_fn::<GetSystemAccessFn>("pill_get_system_access")?;
         let run_system = runtime.get_unmanaged_fn::<RunSystemFn>("pill_run_system")?;
-        let system_error_length = runtime.get_unmanaged_fn::<SystemErrorMessageLengthFn>(
-            "pill_system_error_message_length",
-        )?;
-        let copy_system_error = runtime.get_unmanaged_fn::<CopySystemErrorMessageFn>(
-            "pill_copy_system_error_message",
-        )?;
+        let system_error_length = runtime
+            .get_unmanaged_fn::<SystemErrorMessageLengthFn>("pill_system_error_message_length")?;
+        let copy_system_error = runtime
+            .get_unmanaged_fn::<CopySystemErrorMessageFn>("pill_copy_system_error_message")?;
         let poll_reload = runtime.get_unmanaged_fn::<PollReloadFn>("pill_poll_reload")?;
 
         // Step 2: initialize the bridge and register the component manifest.
-        let api = Box::new(CsEngineApi::new());
+        let api = Box::new(CsEngineApi::new(mirror_methods));
         if init(api.as_ref() as *const CsEngineApi) == 0 {
             return Err(CSharpError::RuntimeInitFailed);
         }

@@ -22,6 +22,7 @@ use std::collections::{HashMap, HashSet};
 // External crates
 use pill_core::error::{CSharpError, EngineMessage};
 use pill_engine::commands::{boxed_component_adder, ComponentAdder};
+use pill_engine::component_registry::ComponentFieldDescriptor;
 use pill_engine::{Component, ComponentId, Engine, World};
 use serde::Deserialize;
 #[cfg(not(feature = "rendering"))]
@@ -421,6 +422,11 @@ pub(crate) struct ModuleExposedComponent {
     pub(crate) size: usize,
     /// Alignment in bytes of the native layout.
     pub(crate) align: usize,
+    /// Compile-time field layout registered with the component, when the
+    /// component was declared with `#[derive(PillComponent)]`. Empty for
+    /// hand-registered or dynamic components, which keep the opaque ABI-blob
+    /// mirror.
+    pub(crate) fields: Vec<ComponentFieldDescriptor>,
 }
 
 /// Build byte-level bindings for every optional-module component exposed to

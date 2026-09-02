@@ -235,6 +235,8 @@ fn spline_probe_system(
         midpoint = spline.get_location_at(0.5);
         color = spline.get_color_a();
     }
+
+    let omomo = pill_spline::OmoMO { x: 123, y: 456 };
     // Printed rather than logged through `tracing`: the project links its own
     // copy of `pill_core`, so its tracing dispatcher has no subscriber and log
     // lines emitted here never reach the host's telemetry.
@@ -251,9 +253,10 @@ fn spline_probe_system(
     // spline(s)` and the `midpoint ({:.1}, {:.1})` shape intact, or update the
     // tokens in the two files above to match.
     println!(
-        "[project] 123 {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}),asdolawdoxxxxrxyyyasd {:.2}",
+        "[project] 123 {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), aawddwadwd {:.2}",
         midpoint.x, midpoint.y, color
     );
+    println!("[project] 123 OmoMO.x = {}, OmoMO.y = {}", omomo.x, omomo.y);
 
     Ok(())
 }

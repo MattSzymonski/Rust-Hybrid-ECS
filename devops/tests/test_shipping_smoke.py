@@ -46,6 +46,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.paths import MODULES_ROOT, REPOSITORY_ROOT, find_executable  # noqa: E402
+from core.suite_common import run_suite_with_timing  # noqa: E402
 
 # =============================================================================
 # Constants
@@ -302,4 +303,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_suite_with_timing(main)

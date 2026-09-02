@@ -49,6 +49,8 @@ from typing import Callable, List, Tuple
 DEVOPS_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(DEVOPS_ROOT))
 
+from core.suite_common import run_suite_with_timing  # noqa: E402
+
 
 def load_module(relative_path: str, name: str):
     """Import a devops module by path.
@@ -310,4 +312,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_suite_with_timing(main)

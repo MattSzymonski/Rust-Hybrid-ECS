@@ -264,6 +264,21 @@ mod slot {
             &self.exposed_component_names
         }
 
+        /// The current generation's `#[derive(PillMirror)]` value-type
+        /// descriptors, used by the C# codegen to resolve nested struct tags.
+        pub(crate) fn value_type_descriptors(
+            &self,
+        ) -> Vec<pill_engine::component_registry::PillValueTypeDescriptor> {
+            self.current.value_type_descriptors()
+        }
+
+        /// The current generation's `#[pill_mirror_method]` entries, each with
+        /// the resolved address of its C-ABI trampoline, used by the C#
+        /// codegen and the managed runtime's method table.
+        pub(crate) fn mirror_methods(&self) -> Vec<crate::csharp::ResolvedMirrorMethod> {
+            self.current.mirror_methods()
+        }
+
         /// Rebuild and swap one generation, keeping the previous one on any failure.
         fn reload(
             &mut self,

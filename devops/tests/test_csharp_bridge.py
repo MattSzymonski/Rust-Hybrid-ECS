@@ -73,6 +73,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 
 PROJECT_CS_SYSTEMS_CS = WORKSPACE_ROOT / "examples" / "project_cs" / "src" / "Systems.cs"
 PROJECT_CS_COMPONENTS_CS = WORKSPACE_ROOT / "examples" / "project_cs" / "src" / "Components.cs"
+SPLINE_LIB_RS = MODULES_ROOT / "optional" / "pill_spline" / "src" / "lib.rs"
 SPLINE_GENERATED_FILE = (
     MODULES_ROOT / "optional" / "pill_spline" / "generated" / "pill_spline_Components.g.cs"
 )
@@ -114,6 +115,18 @@ BRIDGE_PROBE_V2_PREFIX = "cs spline bridge v2: sees"
 # dotnet build's summary line; a clean managed build reports exactly these.
 DOTNET_CLEAN_WARNING_SUMMARY = "0 Warning(s)"
 WARNING_CS_TOKEN = "warning CS"
+
+# Host log line printed when a reloaded module changed the C# mirror surface
+# and the host queued a C# project reload (live mirror regeneration).
+CSHARP_MIRROR_REGEN_TOKEN = "module reload changed the C# mirror surface; queuing a C# project reload"
+
+# Expected probe values for the canonical OmoMO demo (X=12, Y=34):
+#   GetSum()  = x + y      = 46
+#   GetA()    = x + 1200   = 1212
+#   GetB()    = y + 1200   = 1234
+#   GetC()    = y + 9000   = 9034 (added live by the regeneration scenario)
+OMO_PROBE_SUM_A_B = "omo=(12,34) sum=46 a=1212 b=1234"
+OMO_PROBE_WITH_C = "omo=(12,34) sum=46 a=1212 b=1234 c=9034"
 
 # =============================================================================
 # Scenario model (same shape as the native hot-reload suite)
@@ -296,14 +309,25 @@ def verify_startup(
         return False
 
     # The module mirror must be regenerated from the module's real layout:
-    # exact namespace, struct name, size, alignment pad, and the safe accessor.
+    # typed structs with exact sizes and field offsets for PillMirror-able
+    # types, and an opaque ABI-blob fallback for foreign types (Vector3f).
+    # Mirrored `#[pill_mirror_method]` Rust methods appear as typed C# instance
+    # methods that resolve the module's trampoline through MirrorMethods.
     if not verify_generated_mirror(
         SPLINE_GENERATED_FILE,
         [
             "namespace pill_spline {",
             "public struct Spline",
-            "Size = 196",
-            "private readonly uint _alignmentPad;",
+            "Size = 200",
+            "[FieldOffset(192)] public uint ControlPointCount;",
+            "[FieldOffset(196)] public float Elo;",
+            "[StructLayout(LayoutKind.Explicit, Size = 16)]\npublic struct OmoMO",
+            "[FieldOffset(0)] public ulong X;",
+            "[StructLayout(LayoutKind.Sequential, Size = 12)]\npublic struct Vector3f",
+            "public ulong GetSum()",
+            "public delegate ulong OmoMOGetSumDelegate(IntPtr self);",
+            "global::TracyLive.MirrorMethods.Resolve<OmoMOGetSumDelegate>(\"pill_spline::OmoMO\", \"get_sum\")",
+            "public ulong GetA()",
             "MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1))",
         ],
         should_exist=True,
@@ -363,6 +387,14 @@ def verify_startup(
         print(f"  Output tail:\n{monitor.output_since(0)[-1600:]}")
         return False
     print("  [OK] C# -> Rust: C#-created spline is visible in the module's native column.")
+    #   Mirrored Rust method: C# calls the module's OmoMO::get_sum trampoline
+    #   through the typed mirror (X=12, Y=34 -> 46). This only succeeds when the
+    #   host resolved the exported trampoline and handed the address to C#.
+    if not monitor.wait_for(OMO_PROBE_SUM_A_B, PROBE_TIMEOUT, 0):
+        print("  [FAIL] Mirrored OmoMO method probe missing (GetSum did not run).")
+        print(f"  Output tail:\n{monitor.output_since(0)[-1600:]}")
+        return False
+    print("  [OK] Rust method mirroring: C# GetSum/GetA/GetB call the module's OmoMO methods.")
     return True
 
 # =============================================================================
@@ -540,6 +572,75 @@ SESSION_SCENARIOS = [
         CSHARP_REJECT_STARTUP_REASON,
         BRIDGE_PROBE_PREFIX,
     ),
+    # Adding a mirrored method to a module WHILE the host runs must reach C#
+    # without a restart: the module reload regenerates the mirror file, queues
+    # a C# project rebuild, and the swapped assembly resolves the new
+    # trampoline. Phase 1 adds get_c to pill_spline and waits for the cascade;
+    # Phase 2 calls GetC() from Systems.cs and waits for its value to print -
+    # which only compiles because Phase 1's mirror regeneration put GetC() in
+    # the file the C# build compiles.
+    Scenario(
+        name="csharp_mirror_live_regeneration",
+        phases=[
+            ScenarioPhase(
+                edits=[(
+                    SPLINE_LIB_RS,
+                    [
+                        (
+                            """    #[pill_mirror_method]
+    pub fn get_b(&self) -> u64 {
+        self.y + 1200
+    }
+}""",
+                            """    #[pill_mirror_method]
+    pub fn get_b(&self) -> u64 {
+        self.y + 1200
+    }
+
+    /// Live-added while the host ran; the mirror must regenerate without a restart.
+    #[pill_mirror_method]
+    pub fn get_c(&self) -> u64 {
+        self.y + 9000
+    }
+}""",
+                        )
+                    ],
+                )],
+                wait_token=CSHARP_RELOADED_TOKEN,
+                required_tokens=[
+                    CSHARP_RELOADED_TOKEN,
+                    CSHARP_MIRROR_REGEN_TOKEN,
+                ],
+                forbidden_tokens=[CSHARP_RELOAD_REJECTED_TOKEN, PANIC_TOKEN,
+                                  ACCESS_VIOLATION_TOKEN],
+            ),
+            ScenarioPhase(
+                edits=[(
+                    PROJECT_CS_SYSTEMS_CS,
+                    [
+                        (
+                            "ulong omoB = omo.GetB();",
+                            "ulong omoB = omo.GetB();\n        ulong omoC = omo.GetC();",
+                        ),
+                        (
+                            'b={omoB}");',
+                            'b={omoB} c={omoC}");',
+                        ),
+                    ],
+                )],
+                wait_token=OMO_PROBE_WITH_C,
+                required_tokens=[
+                    OMO_PROBE_WITH_C,
+                    CSHARP_RELOADED_TOKEN,
+                ],
+                forbidden_tokens=[CSHARP_RELOAD_REJECTED_TOKEN, PANIC_TOKEN,
+                                  ACCESS_VIOLATION_TOKEN],
+            ),
+        ],
+        # Restore Systems.cs first so no build references GetC after the module
+        # reverts (a transient reference would fail the intermediate build).
+        restore_after=[PROJECT_CS_SYSTEMS_CS, SPLINE_LIB_RS],
+    ),
 ]
 
 # =============================================================================
@@ -649,8 +750,12 @@ def verify_codegen_rebuild() -> bool:
             [
                 "namespace pill_spline {",
                 "public struct Spline",
-                "Size = 196",
-                "private readonly uint _alignmentPad;",
+                "Size = 200",
+                "[FieldOffset(192)] public uint ControlPointCount;",
+                "[FieldOffset(196)] public float Elo;",
+                "[StructLayout(LayoutKind.Explicit, Size = 16)]\npublic struct OmoMO",
+                "public ulong GetSum()",
+                "public delegate ulong OmoMOGetSumDelegate(IntPtr self);",
             ],
             should_exist=True,
             description="regenerated pill_spline mirror",
@@ -662,6 +767,12 @@ def verify_codegen_rebuild() -> bool:
             PROBE_TIMEOUT,
         ):
             print("  [FAIL] Bridge probe missing after codegen rebuild.")
+            print(f"  Output tail:\n{monitor.output_since(0)[-1600:]}")
+            return False
+        # The mirrored Rust method must actually run: GetSum() returns 46 for
+        # the C#-seeded OmoMO (X=12, Y=34), plus GetA/GetB.
+        if not monitor.wait_for(OMO_PROBE_SUM_A_B, PROBE_TIMEOUT):
+            print("  [FAIL] Mirrored OmoMO probe missing after codegen rebuild.")
             print(f"  Output tail:\n{monitor.output_since(0)[-1600:]}")
             return False
         print("  [OK] Codegen rebuild: mirror regenerated and bridge live.")
@@ -750,4 +861,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_suite_with_timing(main)

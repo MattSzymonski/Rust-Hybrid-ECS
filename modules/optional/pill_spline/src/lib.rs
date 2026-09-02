@@ -80,6 +80,8 @@ pub struct Spline {
     pub control_points: [Vector3f; MAX_CONTROL_POINTS],
     /// How many leading entries of `control_points` are in use.
     pub control_point_count: u32,
+
+    pub elo: f32,
 }
 
 impl Default for Spline {
@@ -88,7 +90,35 @@ impl Default for Spline {
         Self {
             control_points: [Vector3f::ZERO; MAX_CONTROL_POINTS],
             control_point_count: 0,
+            elo: 30.0,
         }
+    }
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PillMirror)]
+pub struct OmoMO {
+    pub x: u64,
+    pub y: u64,
+}
+
+#[pill_mirror_impl]
+impl OmoMO {
+    /// Sum of both coordinates; mirrored to C# as `GetSum()`.
+    #[pill_mirror_method]
+    pub fn get_sum(&self) -> u64 {
+        self.x + self.y
+    }
+
+    /// The `x` coordinate; mirrored to C# as `GetA()`.
+    #[pill_mirror_method]
+    pub fn get_a(&self) -> u64 {
+        self.x + 1200
+    }
+
+    #[pill_mirror_method]
+    pub fn get_b(&self) -> u64 {
+        self.y + 1200
     }
 }
 
@@ -179,7 +209,7 @@ impl Spline {
     /// Dummy alpha channel, delegated straight through to `pill_dummy_color`.
     #[pill_hot_fn]
     pub fn get_color_a(&self) -> f32 {
-        pill_dummy_color::get_color_a() + 3450.0
+        pill_dummy_color::get_color_a() + 1450.0
     }
 }
 

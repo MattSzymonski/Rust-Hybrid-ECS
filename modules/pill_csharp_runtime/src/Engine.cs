@@ -154,11 +154,45 @@ public static unsafe class Engine
     private static EngineApi _api;
 
     /// <summary>Bind the native function table for all subsequent queries.</summary>
-    public static void Bind(EngineApi* api) => _api = *api;
+    public static void Bind(EngineApi* api)
+    {
+        _api = *api;
+        ReloadMirrorMethods();
+    }
+
     /// <summary>Bind an unmanaged pointer received by the exported loader API.</summary>
     public static void Bind(IntPtr api) => Bind((EngineApi*)api);
+
     /// <summary>Return the active native world's entity count.</summary>
     public static uint EntityCount() => _api.EntityCount();
+
+    /// <summary>
+    /// Re-copy the host's mirrored-method table into <see cref="MirrorMethods"/>
+    /// and drop the resolved delegate cache.
+    ///
+    /// Called at bind time and again after each managed assembly swap: an
+    /// optional module reload maps the module at a fresh base and may add or
+    /// remove mirrored methods, so the addresses the generated structs call
+    /// must be re-read from the host, and each collectible context defines its
+    /// own delegate types.
+    /// </summary>
+    internal static void ReloadMirrorMethods()
+    {
+        MirrorMethods.Reset();
+        uint count = _api.MirrorMethodCount();
+        if (count == 0)
+            return;
+        MirrorMethodEntry[] buffer = new MirrorMethodEntry[count];
+        uint written;
+        fixed (MirrorMethodEntry* pointer = buffer)
+            written = _api.CopyMirrorMethods(pointer, count);
+        for (int index = 0; index < written; index++)
+        {
+            string typeName = Marshal.PtrToStringAnsi(buffer[index].TypeName) ?? string.Empty;
+            string method = Marshal.PtrToStringAnsi(buffer[index].Method) ?? string.Empty;
+            MirrorMethods.Register(typeName, method, buffer[index].Address);
+        }
+    }
 
     /// <summary>Build the stable component ID shared with the Rust adapter.</summary>
     internal static ulong ComponentKey(Type type) => ComponentStableId(type).Low;
@@ -283,6 +317,62 @@ public static unsafe class Engine
 }
 
 internal readonly record struct StableComponentId(ulong Low, ulong High);
+
+// =============================================================================
+// Mirrored Rust Methods
+// =============================================================================
+
+/// <summary>
+/// Registry of the Rust methods mirrored into generated C# structs.
+///
+/// Populated once at startup from the host's native table (see
+/// <see cref="Engine.Bind"/>). Generated mirror methods resolve a typed
+/// delegate over each method's exported C-ABI trampoline and invoke it with
+/// the struct pinned; the whole path stays safe C# so the reloadable project
+/// assembly needs no <c>AllowUnsafeBlocks</c>.
+/// </summary>
+public static class MirrorMethods
+{
+    private static readonly Dictionary<(string TypeName, string Method), IntPtr> Addresses = new();
+    private static readonly Dictionary<(string TypeName, string Method), Delegate> Cache = new();
+
+    /// <summary>Drop all registered methods; called when the host rebinds.</summary>
+    internal static void Reset()
+    {
+        Addresses.Clear();
+        Cache.Clear();
+    }
+
+    /// <summary>Register one mirrored method's trampoline address.</summary>
+    internal static void Register(string typeName, string method, IntPtr address)
+        => Addresses[(typeName, method)] = address;
+
+    /// <summary>
+    /// Resolve (and cache) the typed delegate that calls a mirrored Rust
+    /// method's C-ABI trampoline.
+    /// </summary>
+    /// <typeparam name="T">The generated delegate type for the method.</typeparam>
+    /// <exception cref="InvalidOperationException">
+    /// No trampoline is registered for the method — most often because the
+    /// module was statically linked rather than loaded as a dynamic library.
+    /// </exception>
+    public static T Resolve<T>(string typeName, string method) where T : Delegate
+    {
+        (string, string) key = (typeName, method);
+        if (Cache.TryGetValue(key, out Delegate? cached))
+            return (T)cached;
+        if (!Addresses.TryGetValue(key, out IntPtr address))
+        {
+            throw new InvalidOperationException(
+                $"No mirrored Rust method {typeName}::{method} is registered. " +
+                "Mirrored methods are only available when the declaring module is " +
+                "loaded as a dynamic library by the developer host.");
+        }
+        T created = (T)Marshal.GetDelegateForFunctionPointer(address, typeof(T));
+        Cache[key] = created;
+        return created;
+    }
+}
 
 /// <summary>
 /// Per-closed-component metadata initialized once outside row iteration.

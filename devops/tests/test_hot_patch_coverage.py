@@ -630,4 +630,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_suite_with_timing(main)

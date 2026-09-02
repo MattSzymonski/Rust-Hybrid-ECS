@@ -62,6 +62,7 @@ from typing import Callable, Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.paths import MODULES_ROOT, REPOSITORY_ROOT, find_executable  # noqa: E402
+from core.suite_common import run_suite_with_timing  # noqa: E402
 from core.test_report import (  # noqa: E402
     ANSI_BOLD,
     ANSI_CYAN,
@@ -883,4 +884,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_suite_with_timing(main))

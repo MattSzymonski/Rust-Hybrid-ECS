@@ -435,30 +435,17 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
     // per optional module that exposes components, derived from each module's
     // real registered layout. Nothing is hand-written in the project.
     let mut module_exposed_components: Vec<ModuleExposedComponent> = Vec::new();
+    let mut all_mirror_methods: Vec<crate::csharp::ResolvedMirrorMethod> = Vec::new();
     if let ProjectModuleBackend::CSharp(_) = &module_config.backend {
         for slot in &optional_modules {
-            let exposed: Vec<ModuleExposedComponent> = slot
-                .exposed_component_names()
-                .iter()
-                .filter_map(|type_name| {
-                    let component_id =
-                        engine.world().resolve_component_id_by_name_any(type_name)?;
-                    let (size, align) = engine.world().component_layout(component_id)?;
-                    Some(ModuleExposedComponent {
-                        csharp_name: type_name.replace("::", "."),
-                        component_id,
-                        size,
-                        align,
-                    })
-                })
-                .collect();
-            crate::csharp::generate_module_components_csharp(
-                &workspace_root,
-                slot.name(),
-                &exposed,
-            )
-            .map_err(|message| CSharpError::CodegenFailed { message })?;
+            // Regenerate the module's C# mirror from its current generation.
+            // The returned change flag is ignored at startup (the mirror is
+            // always written before the project compiles); the reload path
+            // uses it to decide whether to queue a C# project rebuild.
+            let (exposed, methods, _changed) =
+                regenerate_module_csharp_mirror(&workspace_root, &mut engine, slot)?;
             module_exposed_components.extend(exposed);
+            all_mirror_methods.extend(methods);
         }
     }
     let loaded_project = LoadedProject::start(
@@ -467,6 +454,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
         &workspace_root,
         &module_config,
         &module_exposed_components,
+        &all_mirror_methods,
     )?;
 
     let reload_generation = Arc::new(AtomicU64::new(0));
@@ -816,6 +804,64 @@ fn resync_patch_baselines(host: &mut Host, project: bool, modules: &[usize]) {
 #[cfg(all(not(feature = "hot_patch"), feature = "hot_reload"))]
 fn resync_patch_baselines(_host: &mut Host, _project: bool, _modules: &[usize]) {}
 
+/// Compute the C#-exposed bindings for one optional module's current
+/// generation and regenerate its `generated/<module>_Components.g.cs` mirror
+/// file from that generation's real registry, value types, and mirrored
+/// methods.
+///
+/// Returns the exposed component bindings (for the C# backend's native
+/// bindings), the resolved mirror methods (for the managed method table), and
+/// whether the mirror file on disk actually changed. The change flag lets the
+/// reload path queue a C# project rebuild only when the C# surface moved.
+#[cfg(feature = "hot_reload")]
+fn regenerate_module_csharp_mirror(
+    workspace_root: &Path,
+    engine: &mut Engine,
+    slot: &OptionalModuleSlot,
+) -> Result<
+    (
+        Vec<ModuleExposedComponent>,
+        Vec<crate::csharp::ResolvedMirrorMethod>,
+        bool,
+    ),
+    CSharpError,
+> {
+    // Each registered type name resolves to its native component; the
+    // C#-facing name is the Rust path with `::` replaced by `.` so a
+    // `project_cs` mirror struct reproduces the same stable identity.
+    let exposed: Vec<ModuleExposedComponent> = slot
+        .exposed_component_names()
+        .iter()
+        .filter_map(|type_name| {
+            let component_id = engine.world().resolve_component_id_by_name_any(type_name)?;
+            let (size, align) = engine.world().component_layout(component_id)?;
+            // The derive registers the compile-time field layout with the
+            // world; components without one keep the ABI blob.
+            let fields = engine
+                .world()
+                .component_field_layout(component_id)
+                .unwrap_or(&[]);
+            Some(ModuleExposedComponent {
+                csharp_name: type_name.replace("::", "."),
+                component_id,
+                size,
+                align,
+                fields: fields.to_vec(),
+            })
+        })
+        .collect();
+    let methods = slot.mirror_methods();
+    let changed = crate::csharp::generate_module_components_csharp(
+        workspace_root,
+        slot.name(),
+        &exposed,
+        &slot.value_type_descriptors(),
+        &methods,
+    )
+    .map_err(|message| CSharpError::CodegenFailed { message })?;
+    Ok((exposed, methods, changed))
+}
+
 /// Run every reload step of one frame: module reloads, the per-function fast
 /// paths, a pending project reload, and the analytics drain that reports them.
 ///
@@ -888,6 +934,54 @@ fn run_reload_steps(host: &mut Host) {
                 );
                 reload_generation.fetch_add(1, Ordering::Release);
             }
+        }
+    }
+
+    // Step 3b: A reloaded module may have changed the C# mirror surface
+    // (component fields, value types, or mirrored methods), and even a
+    // body-only edit recompiles a module with mirrored methods onto a fresh
+    // base, moving every trampoline address C# calls. When the active project
+    // is managed, regenerate each affected module's mirror file and queue a C#
+    // project reload so `project_cs.dll` rebuilds and the collectible loader
+    // swaps it in — a mirrored method added (or edited) at runtime becomes
+    // callable without a host restart. Modules with no C#-visible content skip
+    // the rebuild entirely.
+    if matches!(&module_config.backend, ProjectModuleBackend::CSharp(_)) && any_module_reloaded {
+        let mut needs_csharp_reload = false;
+        for index in &reloaded_modules {
+            match regenerate_module_csharp_mirror(workspace_root, engine, &optional_modules[*index])
+            {
+                Ok((_exposed, methods, mirror_changed)) => {
+                    // A mirror-content change (fields/value types/method set)
+                    // always rebuilds; a module exposing mirrored methods also
+                    // rebuilds on any reload, because its trampolines live at
+                    // new addresses and body edits should reach C#.
+                    needs_csharp_reload |= mirror_changed || !methods.is_empty();
+                }
+                Err(error) => {
+                    error!(
+                        target: telemetry_target::HOT_RELOAD,
+                        module = optional_modules[*index].name(),
+                        error = %error,
+                        "failed to regenerate the module's C# mirror after reload"
+                    );
+                }
+            }
+        }
+        // Republish the mirror-method table from every module's current
+        // generation: reloaded modules expose fresh addresses, untouched ones
+        // keep the addresses they were loaded with.
+        let methods: Vec<crate::csharp::ResolvedMirrorMethod> = optional_modules
+            .iter()
+            .flat_map(OptionalModuleSlot::mirror_methods)
+            .collect();
+        crate::csharp::publish_mirror_methods(&methods);
+        if needs_csharp_reload {
+            info!(
+                target: telemetry_target::HOT_RELOAD,
+                "module reload changed the C# mirror surface; queuing a C# project reload"
+            );
+            reload_generation.fetch_add(1, Ordering::Release);
         }
     }
 

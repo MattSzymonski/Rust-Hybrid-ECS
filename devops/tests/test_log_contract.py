@@ -44,6 +44,11 @@ import sys
 from pathlib import Path
 from typing import Callable, Dict, List, Tuple
 
+# Standalone-runnable: put `devops/` on `sys.path` before reaching `core`.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from core.suite_common import run_suite_with_timing  # noqa: E402
+
 # =============================================================================
 # Constants
 # =============================================================================
@@ -255,4 +260,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_suite_with_timing(main)

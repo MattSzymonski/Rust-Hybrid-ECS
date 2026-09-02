@@ -208,7 +208,15 @@ internal static unsafe class MockNativeWorld
         QueueDestroy = &QueueDestroy,
         QueueAddComponent = &QueueAddComponent,
         QueueRemoveComponent = &QueueRemoveComponent,
+        MirrorMethodCount = &MirrorMethodCount,
+        CopyMirrorMethods = &CopyMirrorMethods,
     };
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static uint MirrorMethodCount() => 0;
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static uint CopyMirrorMethods(MirrorMethodEntry* entries, uint max) => 0;
 
     internal static void ResetCommands()
     {

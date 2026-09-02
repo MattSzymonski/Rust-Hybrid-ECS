@@ -96,6 +96,7 @@ mod loaded {
             workspace_root: &Path,
             config: &ProjectModuleConfig,
             module_exposed_components: &[crate::csharp::ModuleExposedComponent],
+            mirror_methods: &[crate::csharp::ResolvedMirrorMethod],
         ) -> Result<Self, HostError> {
             // Step 1: Build the module through the shared command runner.
             // Build before branching so both backends use the same command runner,
@@ -145,6 +146,7 @@ mod loaded {
                     workspace_root,
                     config,
                     module_exposed_components,
+                    mirror_methods,
                 )?)),
             }
         }

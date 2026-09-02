@@ -259,6 +259,13 @@ pub struct World {
     /// Chronological `(type_name, sequence)` log of every component
     /// registration, plain and persistable alike.
     pub(crate) component_registration_log: Vec<(String, u64)>,
+    /// Compile-time field layouts submitted by `#[derive(PillComponent)]`,
+    /// consumed by the C# mirror codegen to emit typed structs. The slices
+    /// live in the declaring artifact's static data, exactly like the
+    /// `storage_factories` function pointers, and are re-registered by each
+    /// reloaded generation. Empty for components without field metadata.
+    pub(crate) component_field_layouts:
+        HashMap<ComponentId, &'static [crate::component_registry::ComponentFieldDescriptor]>,
     /// First component-registration failure of the current init pass, if any.
     ///
     /// Set when the 128-type ceiling is hit (or any other registry error
@@ -298,6 +305,7 @@ impl World {
             persist_registration_log: Vec::new(),
             component_registration_sequence: 0,
             component_registration_log: Vec::new(),
+            component_field_layouts: HashMap::new(),
             registration_error: None,
         }
     }
@@ -516,6 +524,32 @@ impl World {
     /// failure rather than a silent half-registration.
     pub fn take_registration_error(&mut self) -> Option<WorldError> {
         self.registration_error.take()
+    }
+
+    /// Register a component together with its compile-time field layout, so
+    /// the C# mirror codegen can emit a typed struct. Components registered
+    /// without field metadata (hand-registered, dynamic, or unit types) keep
+    /// the opaque ABI-blob mirror.
+    pub fn register_component_with_layout<T>(
+        &mut self,
+        fields: &'static [crate::component_registry::ComponentFieldDescriptor],
+    ) where
+        T: Component + TraitAccessible<dyn Component> + Clone,
+    {
+        self.register_component::<T>();
+        self.component_field_layouts
+            .insert(ComponentId::of::<T>(), fields);
+    }
+
+    /// Return the compile-time field layout a component was registered with.
+    ///
+    /// `None` for components registered without field metadata, which is how
+    /// the C# codegen decides between a typed mirror and the ABI blob.
+    pub fn component_field_layout(
+        &self,
+        component_id: ComponentId,
+    ) -> Option<&'static [crate::component_registry::ComponentFieldDescriptor]> {
+        self.component_field_layouts.get(&component_id).copied()
     }
 
     /// Re-home every native column's per-type function table.

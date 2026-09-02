@@ -212,7 +212,12 @@ impl StaticProject {
             // scheduler systems.
             StaticProjectBackend::CSharp { config, root } => {
                 let exposed = exposed_components(engine, &exposed_names);
-                Some(CSharpRuntime::start(engine, root, config, &exposed)?)
+                // Mirrored methods are resolved from a dynamically loaded
+                // module's exports; the static path has no module handle, so
+                // the C# method table stays empty (calling one throws at
+                // runtime). Follow-up: resolve trampolines from the static
+                // image's own exports.
+                Some(CSharpRuntime::start(engine, root, config, &exposed, &[])?)
             }
             // The NativeAOT posture: load the published native library, resolve
             // the `pill_*` exports directly (no hostfxr, no installed .NET),
@@ -220,7 +225,13 @@ impl StaticProject {
             // does. The runtime is embedded and trimmed, so nothing else ships.
             StaticProjectBackend::CSharpAot { config, root } => {
                 let exposed = exposed_components(engine, &exposed_names);
-                Some(CSharpRuntime::start_aot(engine, root, config, &exposed)?)
+                Some(CSharpRuntime::start_aot(
+                    engine,
+                    root,
+                    config,
+                    &exposed,
+                    &[],
+                )?)
             }
         };
 
@@ -246,6 +257,12 @@ fn exposed_components(engine: &Engine, names: &[String]) -> Vec<ModuleExposedCom
         .filter_map(|type_name| {
             let component_id = engine.world().resolve_component_id_by_name_any(type_name)?;
             let (size, align) = engine.world().component_layout(component_id)?;
+            // Field layouts only drive the dev codegen; shipping mirrors are
+            // committed, so this stays informational here.
+            let fields = engine
+                .world()
+                .component_field_layout(component_id)
+                .unwrap_or(&[]);
             Some(ModuleExposedComponent {
                 // The C#-facing name is the Rust path with `::` replaced by
                 // `.`, so a `project_cs` mirror struct reproduces the same
@@ -254,6 +271,7 @@ fn exposed_components(engine: &Engine, names: &[String]) -> Vec<ModuleExposedCom
                 component_id,
                 size,
                 align,
+                fields: fields.to_vec(),
             })
         })
         .collect()

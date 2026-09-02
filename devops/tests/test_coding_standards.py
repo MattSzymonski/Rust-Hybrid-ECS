@@ -57,6 +57,7 @@ from typing import Dict, List, Optional, Tuple
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from core.paths import REPOSITORY_ROOT  # noqa: E402
+from core.suite_common import run_suite_with_timing  # noqa: E402
 from core.test_report import (  # noqa: E402
     ANSI_BOLD,
     ANSI_GREEN,
@@ -76,11 +77,14 @@ SAFETY_WINDOW_LINES = int(os.environ.get("SAFETY_WINDOW_LINES", "30"))
 DOC_WINDOW_LINES = int(os.environ.get("DOC_WINDOW_LINES", "12"))
 
 # Directories whose contents are build output or vendored code, never sources.
+# `build` covers cargo OUT_DIR staging under `examples/*/build/` and the
+# generated shipping bundle under the repo-root `build/`.
 EXCLUDED_DIRECTORY_NAMES = {
     "target",
     "node_modules",
     ".git",
     "pill_standalone_temp",
+    "build",
 }
 
 # =============================================================================
@@ -479,4 +483,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_suite_with_timing(main))

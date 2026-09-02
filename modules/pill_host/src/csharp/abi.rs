@@ -27,10 +27,91 @@ use super::commands::{
     ffi_reserve_entity,
 };
 use super::queries::{ffi_entity_count, ffi_get_component_chunk, ffi_get_entity_chunk};
+use super::ResolvedMirrorMethod;
 
 // =============================================================================
 // Types
 // =============================================================================
+
+/// Host-side table of mirrored Rust methods handed to the managed runtime.
+///
+/// Set once per C# runtime startup by [`CsEngineApi::new`]; the two FFI
+/// callbacks below read it. It is replaced on every (re)start, and the strings
+/// are kept alive alongside the table for its whole lifetime. `Send`-safe by
+/// construction (no raw pointers are stored; rows reference owned strings by
+/// index), so the table can live in a `static`.
+static MIRROR_METHOD_TABLE: std::sync::Mutex<Option<MirrorMethodTable>> =
+    std::sync::Mutex::new(None);
+
+/// One send-safe row of the mirror-method table.
+struct MirrorMethodRow {
+    /// Index into [`MirrorMethodTable::names`] of the fully-qualified Rust
+    /// type name.
+    type_name_index: usize,
+    /// Index into [`MirrorMethodTable::names`] of the Rust method name.
+    method_index: usize,
+    /// Address of the exported `#[no_mangle]` C-ABI trampoline.
+    address: usize,
+}
+
+/// Owned backing store for the mirror-method table exposed to managed code.
+struct MirrorMethodTable {
+    /// NUL-terminated names, kept alive so the exposed pointers stay valid.
+    names: Vec<std::ffi::CString>,
+    /// Send-safe rows; the copy callback materializes the C-ABI entries.
+    rows: Vec<MirrorMethodRow>,
+}
+
+/// One mirrored Rust method the managed runtime can call.
+///
+/// Field order and widths are part of the native/managed ABI and must stay
+/// synchronized with `EngineApi.cs`.
+#[repr(C)]
+pub(super) struct MirrorMethodEntry {
+    /// Fully-qualified Rust type name (`pill_spline::OmoMO`), NUL-terminated.
+    pub(super) type_name: *const std::ffi::c_char,
+    /// Rust method name (`get_sum`), NUL-terminated.
+    pub(super) method: *const std::ffi::c_char,
+    /// Address of the exported `#[no_mangle]` C-ABI trampoline.
+    pub(super) address: usize,
+}
+
+/// Report how many mirrored Rust methods are registered.
+extern "C" fn ffi_mirror_method_count() -> u32 {
+    MIRROR_METHOD_TABLE
+        .lock()
+        .map(|table| table.as_ref().map_or(0, |table| table.rows.len() as u32))
+        .unwrap_or(0)
+}
+
+/// Copy up to `max` mirror-method rows into `out`; returns the count written.
+///
+/// # Safety
+///
+/// `out` must point at `max` writable [`MirrorMethodEntry`] slots owned by the
+/// managed runtime for the duration of the call.
+extern "C" fn ffi_copy_mirror_methods(out: *mut MirrorMethodEntry, max: u32) -> u32 {
+    let Ok(table) = MIRROR_METHOD_TABLE.lock() else {
+        return 0;
+    };
+    let Some(table) = table.as_ref() else {
+        return 0;
+    };
+    let count = (table.rows.len() as u32).min(max);
+    for (index, row) in table.rows.iter().take(count as usize).enumerate() {
+        let entry = MirrorMethodEntry {
+            type_name: table.names[row.type_name_index].as_ptr(),
+            method: table.names[row.method_index].as_ptr(),
+            address: row.address,
+        };
+        // SAFETY: `index < count <= max`, so `out.add(index)` stays inside the
+        // buffer the caller promised, and `MirrorMethodEntry` is `Copy`.
+        unsafe {
+            out.add(index).write(entry);
+        }
+    }
+    count
+}
 
 /// Function table copied by `csharp_runtime` during managed initialization.
 ///
@@ -55,6 +136,10 @@ pub(super) struct CsEngineApi {
     queue_add_component: extern "C" fn(*const Entity, u64, u64, *const u8, u32) -> u8,
     /// Queue removal of one component from an entity.
     queue_remove_component: extern "C" fn(*const Entity, u64, u64) -> u8,
+    /// Report how many mirrored Rust methods are registered.
+    mirror_method_count: extern "C" fn() -> u32,
+    /// Copy the mirrored-method rows into a managed-owned buffer.
+    copy_mirror_methods: extern "C" fn(*mut MirrorMethodEntry, u32) -> u32,
 }
 
 impl CsEngineApi {
@@ -62,8 +147,12 @@ impl CsEngineApi {
     /// adapter callbacks.
     ///
     /// Every slot is wired to the matching `ffi_*` adapter so the managed
-    /// runtime never observes Rust-internal representation details.
-    pub(super) fn new() -> Self {
+    /// runtime never observes Rust-internal representation details. The
+    /// resolved `#[pill_mirror_method]` trampolines are published through the
+    /// two mirror-method slots.
+    pub(super) fn new(mirror_methods: &[ResolvedMirrorMethod]) -> Self {
+        publish_mirror_methods(mirror_methods);
+
         Self {
             entity_count: ffi_entity_count,
             get_component_chunk: ffi_get_component_chunk,
@@ -73,8 +162,41 @@ impl CsEngineApi {
             queue_destroy: ffi_queue_destroy,
             queue_add_component: ffi_queue_add_component,
             queue_remove_component: ffi_queue_remove_component,
+            mirror_method_count: ffi_mirror_method_count,
+            copy_mirror_methods: ffi_copy_mirror_methods,
         }
     }
+}
+
+/// Rebuild the mirror-method table the managed runtime copies at startup.
+///
+/// Called both when the C# backend starts (from [`CsEngineApi::new`]) and when
+/// an optional module reloads, so the C# side always resolves trampoline
+/// addresses from the module generations currently loaded — a hot reload gives
+/// the module a new image (and therefore new addresses), and a reloaded module
+/// may have added or removed mirrored methods.
+pub(crate) fn publish_mirror_methods(mirror_methods: &[ResolvedMirrorMethod]) {
+    // Two NUL-terminated names per method, stored so the exposed pointers stay
+    // valid for as long as the table lives. Rows reference the names by index
+    // so the stored table stays `Send`.
+    let mut names: Vec<std::ffi::CString> = Vec::new();
+    let mut rows: Vec<MirrorMethodRow> = Vec::new();
+    for method in mirror_methods {
+        let Some(type_name) = std::ffi::CString::new(method.type_name.as_str()).ok() else {
+            continue;
+        };
+        let Some(method_name) = std::ffi::CString::new(method.method_name.as_str()).ok() else {
+            continue;
+        };
+        rows.push(MirrorMethodRow {
+            type_name_index: names.len(),
+            method_index: names.len() + 1,
+            address: method.address,
+        });
+        names.push(type_name);
+        names.push(method_name);
+    }
+    *MIRROR_METHOD_TABLE.lock().unwrap() = Some(MirrorMethodTable { names, rows });
 }
 
 /// One pinned managed component value supplied to a deferred command.

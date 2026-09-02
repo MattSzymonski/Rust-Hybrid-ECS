@@ -883,9 +883,9 @@ impl HotPatchSession {
         }
 
         // Load. Never unloaded: a slot will hold an address inside this image.
+        let load_started = Instant::now();
         // SAFETY: the file was just produced by rustc from a generated source
         // and is a complete native module.
-        let load_started = Instant::now();
         let library = unsafe { Library::new(&artifact) }.map_err(|error| {
             PatchRefusal::new(
                 failure_code::LOAD,

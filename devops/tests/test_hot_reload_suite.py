@@ -627,26 +627,24 @@ SESSION_B_SCENARIOS = [
                     )
                 ],
                 wait_token=RELOAD_MODULE_TOKEN,
-                # `xxsees 1 spline(s)` pins module<->project coexistence: the
-                # project probe matches only the project's embedded Spline (its
-                # own TypeId), so after both reloads it still sees exactly one -
-                # the module DLL's copy is a distinct type (audit 3.1/C1).
+                # `1 spline(s)` pins module<->project coexistence: the project
+                # probe matches only the project's embedded Spline (its own
+                # TypeId), so after both reloads it still sees exactly one - the
+                # module DLL's copy is a distinct type (audit 3.1/C1).
                 #
-                # Only `1 spline(s)` carries that meaning. `xxsees` is incidental
-                # text from `examples/project_rs/src/lib.rs`, and this token is
-                # matched as a plain substring of the host's stdout - so editing
-                # that probe string, which the demo exists to encourage, fails
-                # this scenario with "Missing required token" even though the
-                # cascade worked perfectly. If that happens, read the analytics
-                # lines just above the failure: two reloads and a `1 spline(s)`
-                # in the output mean the behaviour is fine and only the wording
-                # moved. Widening this to `1 spline(s)` is the better fix.
+                # The count alone carries that meaning; the surrounding probe
+                # wording in `examples/project_rs/src/lib.rs` is incidental and
+                # edited freely by the demos. Widened from the previous
+                # `xxsees 1 spline(s)` so a probe rewording no longer fails this
+                # scenario. If it regresses, read the analytics lines just above
+                # the failure: two reloads and a `1 spline(s)` in the output
+                # mean the behaviour is fine and only the wording moved.
                 required_tokens=[
                     RELOAD_MODULE_TOKEN,
                     MODULE_RELOAD_COMPLETE_TOKEN,
                     CASCADE_TOKEN,
                     RELOAD_PROJECT_TOKEN,
-                    "xxsees 1 spline(s)",
+                    "1 spline(s)",
                 ],
                 forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
                 wait_after=[("midpoint (400.0, 298.8", PROBE_TIMEOUT)],
@@ -875,4 +873,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    run_suite_with_timing(main)

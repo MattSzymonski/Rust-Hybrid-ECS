@@ -42,6 +42,30 @@ public unsafe struct EngineApi
 
     /// <summary>Queue removing one component selected by stable identity.</summary>
     public delegate* unmanaged[Cdecl]<Entity*, ulong, ulong, byte> QueueRemoveComponent;
+
+    /// <summary>Return how many mirrored Rust methods are registered.</summary>
+    public delegate* unmanaged[Cdecl]<uint> MirrorMethodCount;
+
+    /// <summary>Copy the mirrored-method rows into a caller-owned buffer.</summary>
+    public delegate* unmanaged[Cdecl]<MirrorMethodEntry*, uint, uint> CopyMirrorMethods;
+}
+
+/// <summary>
+/// One mirrored Rust method the managed runtime can call through its exported
+/// C-ABI trampoline. Field order and widths match the Rust host's
+/// <c>MirrorMethodEntry</c>.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct MirrorMethodEntry
+{
+    /// <summary>Fully-qualified Rust type name, e.g. <c>pill_spline::OmoMO</c>.</summary>
+    internal IntPtr TypeName;
+
+    /// <summary>Rust method name, e.g. <c>get_sum</c>.</summary>
+    internal IntPtr Method;
+
+    /// <summary>Address of the exported <c>#[no_mangle]</c> C-ABI trampoline.</summary>
+    internal IntPtr Address;
 }
 
 /// <summary>Pinned component value passed synchronously to native commands.</summary>

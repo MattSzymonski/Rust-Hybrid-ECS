@@ -316,7 +316,12 @@ def build_library_source(
         "pub const STATIC_MODULES: &[StaticModule] = &[",
     ]
     for module in modules:
-        lines.append(f'    StaticModule {{ name: "{module}", init: {module}::register }},')
+        lines += [
+            "    StaticModule {",
+            f'        name: "{module}",',
+            f"        init: {module}::register,",
+            "    },",
+        ]
     lines += [
         "];",
         "",
@@ -364,7 +369,9 @@ def build_library_source(
     else:
         lines += [
             "pub fn project_backend() -> StaticProjectBackend {",
-            f"    StaticProjectBackend::Native {{ init: {package_name}::init }}",
+            "    StaticProjectBackend::Native {",
+            f"        init: {package_name}::init,",
+            "    }",
             "}",
         ]
     lines += [

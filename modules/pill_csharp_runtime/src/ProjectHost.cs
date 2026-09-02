@@ -270,6 +270,13 @@ internal sealed class ProjectHost
                     "C# startup methods changed; restart the host. Startup methods are not rerun during hot reload.");
 
             var oldContext = _context;
+            // The new assembly carries its own mirror delegate types (each
+            // collectible context defines them), and an optional module reload
+            // may have moved every mirrored method to fresh trampoline
+            // addresses, so re-read the host's table and drop the old
+            // context's resolved delegates. Done before the swap so the old
+            // context holds nothing back and can actually unload.
+            Engine.ReloadMirrorMethods();
             _context = context;
             _systems = systems;
             _startups = startups;

@@ -233,6 +233,26 @@ impl World {
             .push((type_name, self.persist_registration_sequence));
         self.persist_registration_sequence += 1;
     }
+
+    /// Register a persistable component together with its compile-time field
+    /// layout, so the C# mirror codegen can emit a typed struct. See
+    /// [`Self::register_component_with_layout`].
+    pub fn register_persistable_component_with_layout<T>(
+        &mut self,
+        fields: &'static [crate::component_registry::ComponentFieldDescriptor],
+    ) where
+        T: Component
+            + TraitAccessible<dyn Component>
+            + Clone
+            + Serialize
+            + DeserializeOwned
+            + Default
+            + 'static,
+    {
+        self.register_persistable_component::<T>();
+        self.component_field_layouts
+            .insert(ComponentId::of::<T>(), fields);
+    }
 }
 
 // =============================================================================
@@ -704,7 +724,7 @@ impl World {
                 .get(*type_name)
                 .copied()
                 .unwrap_or(0);
-            debug!(
+            info!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 "[persistence]   '{}' -> migrating (schema {} -> {})",
                 type_name, previous_metadata.schema_hash, current_schema_hash,
@@ -712,7 +732,7 @@ impl World {
 
             match self.migrate_single_component_type(type_name, previous_metadata) {
                 Ok(migrated_entity_count_for_type) => {
-                    debug!(
+                    info!(
                         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                         "[persistence]   '{}' -> OK ({} entities)",
                         type_name, migrated_entity_count_for_type,

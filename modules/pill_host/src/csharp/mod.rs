@@ -45,9 +45,31 @@ pub(crate) use backend::CSharpRuntime;
 /// Aggregate of the native components optional modules exposed to managed code.
 pub(crate) use components::ModuleExposedComponent;
 
+/// One mirrored Rust method resolved to a callable address, shared by the
+/// host's module loader and the C# backend. Defined here (not in the
+/// `hot_reload`-gated `native_library` module) because the C# backend is
+/// compiled in every host configuration.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedMirrorMethod {
+    /// Fully-qualified Rust type name the method belongs to.
+    pub(crate) type_name: String,
+    /// Rust method name, snake_case.
+    pub(crate) method_name: String,
+    /// Return type tag; empty for a `()` return.
+    pub(crate) return_tag: String,
+    /// Argument type tags, in declaration order.
+    pub(crate) arg_tags: Vec<String>,
+    /// Address of the exported C-ABI trampoline.
+    pub(crate) address: usize,
+}
+
 #[cfg(feature = "hot_reload")]
 /// Generate the C# mirror file for optional-module components.
 pub(crate) use codegen::generate_module_components_csharp;
+
+/// Rebuild the mirror-method table the managed runtime reads, after an
+/// optional module reload changes its trampoline addresses or method set.
+pub(crate) use abi::publish_mirror_methods;
 
 // =============================================================================
 // Tests

@@ -35,10 +35,12 @@ use std::time::Instant;
 use libloading::{Library, Symbol};
 use pill_core::error::LibraryError;
 use pill_core::{debug, info};
+use pill_engine::component_registry::{PillMethodDescriptor, PillValueTypeDescriptor};
 use pill_engine::EngineApi;
 
 // Current crate
 use crate::analytics;
+use crate::csharp::ResolvedMirrorMethod;
 
 // =============================================================================
 // Constants
@@ -115,6 +117,36 @@ const PLAIN_FUNCTION_RESET_SYMBOL: &[u8] = b"pill_hot_resolve_reset";
 /// Signature of the optional ABI revision export.
 type ModuleAbiVersionFn = unsafe extern "C" fn() -> u32;
 
+/// Signature of the optional value-type manifest exports.
+///
+/// The module artifact reports how many `#[derive(PillMirror)]` descriptors it
+/// carries, then copies that many into a host-owned buffer. Both sides share
+/// the `pill_engine` rlib, so `PillValueTypeDescriptor` has one layout.
+type ValueTypeCountFn = unsafe extern "C" fn() -> u32;
+type CopyValueTypesFn = unsafe extern "C" fn(*mut PillValueTypeDescriptor, u32) -> u32;
+
+/// Signature of the optional mirrored-method manifest exports.
+///
+/// Same shape as the value-type manifest: the artifact reports how many
+/// `#[pill_mirror_method]` descriptors it carries, then copies that many into
+/// a host-owned buffer. Each descriptor names a `#[no_mangle]` trampoline the
+/// artifact exports, which the host resolves by symbol for the callable
+/// address.
+type MirrorMethodCountFn = unsafe extern "C" fn() -> u32;
+type CopyMirrorMethodsFn = unsafe extern "C" fn(*mut PillMethodDescriptor, u32) -> u32;
+
+/// Export reporting how many value-type descriptors an artifact declares.
+const VALUE_TYPE_COUNT_SYMBOL: &[u8] = b"pill_value_type_descriptor_count";
+
+/// Export copying an artifact's value-type descriptors into a host buffer.
+const VALUE_TYPE_COPY_SYMBOL: &[u8] = b"pill_copy_value_type_descriptors";
+
+/// Export reporting how many mirrored-method descriptors an artifact declares.
+const MIRROR_METHOD_COUNT_SYMBOL: &[u8] = b"pill_mirror_method_descriptor_count";
+
+/// Export copying an artifact's mirrored-method descriptors into a host buffer.
+const MIRROR_METHOD_COPY_SYMBOL: &[u8] = b"pill_copy_mirror_method_descriptors";
+
 /// Export names one loaded native library is expected to provide.
 ///
 /// The project module and optional engine modules use different export names
@@ -158,10 +190,25 @@ pub(crate) struct NativeLibrary {
     module_update: Option<ModuleUpdateFn>,
     /// ABI revision the module reports, when it exports one.
     abi_version: Option<u32>,
+    /// Optional value-type manifest exports (`#[derive(PillMirror)]`), used by
+    /// the C# mirror codegen to resolve nested struct tags.
+    value_type_count: Option<ValueTypeCountFn>,
+    copy_value_types: Option<CopyValueTypesFn>,
+    /// Optional mirrored-method manifest exports (`#[pill_mirror_impl]`),
+    /// used by the C# mirror codegen and runtime method table.
+    mirror_method_count: Option<MirrorMethodCountFn>,
+    copy_mirror_methods: Option<CopyMirrorMethodsFn>,
     /// Temporary copy backing this library; deleted when the library drops.
     temporary_path: PathBuf,
 }
 
+/// Fetch the artifact's `#[pill_mirror_method]` descriptors, each with the
+/// exported address of its `#[no_mangle]` trampoline.
+///
+/// Empty when the artifact predates the exports or declares no mirrored
+/// methods. A descriptor whose trampoline symbol cannot be resolved is
+/// skipped rather than surfaced, so a stale descriptor can never hand C#
+/// a null callable.
 impl NativeLibrary {
     /// Copy and load the built shared library from a unique temporary path.
     ///
@@ -245,6 +292,97 @@ impl NativeLibrary {
         self.abi_version
     }
 
+    /// Fetch the artifact's `#[derive(PillMirror)]` value-type descriptors.
+    ///
+    /// Empty when the artifact predates the exports or declares no value
+    /// types. The returned descriptors reference static data inside this
+    /// loaded library, which stays mapped for the library's lifetime.
+    pub(crate) fn value_type_descriptors(&self) -> Vec<PillValueTypeDescriptor> {
+        let (Some(count), Some(copy)) = (self.value_type_count, self.copy_value_types) else {
+            return Vec::new();
+        };
+        // SAFETY: the count export takes no arguments and returns a plain
+        // integer while the library is mapped.
+        let total = unsafe { count() } as usize;
+        if total == 0 {
+            return Vec::new();
+        }
+        let mut descriptors = vec![
+            PillValueTypeDescriptor {
+                type_name: "",
+                size: 0,
+                align: 0,
+                fields: &[],
+            };
+            total
+        ];
+        // SAFETY: the copy export was validated to take a host-owned buffer of
+        // `total` slots; the slice's pointer and length satisfy that contract,
+        // and the library stays mapped for the call.
+        let copied = unsafe { copy(descriptors.as_mut_ptr(), total as u32) } as usize;
+        descriptors.truncate(copied.min(total));
+        descriptors
+    }
+
+    /// Fetch the artifact's `#[pill_mirror_method]` descriptors, each with the
+    /// exported address of its `#[no_mangle]` trampoline.
+    ///
+    /// Empty when the artifact predates the exports or declares no mirrored
+    /// methods. A descriptor whose trampoline symbol cannot be resolved is
+    /// skipped rather than surfaced, so a stale descriptor can never hand C#
+    /// a null callable.
+    pub(crate) fn mirror_methods(&self) -> Vec<ResolvedMirrorMethod> {
+        let Some(library) = self.library.as_ref() else {
+            return Vec::new();
+        };
+        let (Some(count), Some(copy)) = (self.mirror_method_count, self.copy_mirror_methods) else {
+            return Vec::new();
+        };
+        // SAFETY: the count export takes no arguments and returns a plain
+        // integer while the library is mapped.
+        let total = unsafe { count() } as usize;
+        if total == 0 {
+            return Vec::new();
+        }
+        let mut descriptors = vec![
+            PillMethodDescriptor {
+                type_name: "",
+                name: "",
+                symbol: "",
+                return_tag: "",
+                arg_tags: &[],
+            };
+            total
+        ];
+        // SAFETY: the copy export was validated to take a host-owned buffer of
+        // `total` slots; the slice's pointer and length satisfy that contract,
+        // and the library stays mapped for the call.
+        let copied = unsafe { copy(descriptors.as_mut_ptr(), total as u32) } as usize;
+        descriptors.truncate(copied.min(total));
+
+        let mut resolved: Vec<ResolvedMirrorMethod> = Vec::new();
+        for descriptor in descriptors {
+            // SAFETY: `library.get` maps the exported trampoline symbol; the
+            // module stays mapped for this `NativeLibrary`'s lifetime.
+            let address = match unsafe { library.get::<usize>(descriptor.symbol.as_bytes()) } {
+                Ok(symbol) => *symbol,
+                Err(_) => continue,
+            };
+            resolved.push(ResolvedMirrorMethod {
+                type_name: descriptor.type_name.to_string(),
+                method_name: descriptor.name.to_string(),
+                return_tag: descriptor.return_tag.to_string(),
+                arg_tags: descriptor
+                    .arg_tags
+                    .iter()
+                    .map(|tag| tag.to_string())
+                    .collect(),
+                address,
+            });
+        }
+        resolved
+    }
+
     /// Load a module and verify its required exports.
     ///
     /// # Safety
@@ -304,6 +442,44 @@ impl NativeLibrary {
                 .ok()
                 .map(|symbol| unsafe { symbol() });
 
+        // Step 4b: Resolve the optional value-type manifest exports. Optional,
+        // because the project contract predates them; a library that does not
+        // export them simply contributes no typed value types.
+        // SAFETY: Both exports, when present, are resolved with their statically
+        // known C ABI signatures and called with a host-owned buffer; the
+        // pointer stays valid because the `library` handle keeps the module
+        // mapped for the lifetime of the returned `NativeLibrary`.
+        // SAFETY: `library.get` maps a function pointer from the loaded module
+        // with the statically known signature; the mapped module stays alive
+        // for as long as the `library` handle held by this `NativeLibrary`.
+        let value_type_count: Option<ValueTypeCountFn> =
+            unsafe { library.get(VALUE_TYPE_COUNT_SYMBOL) }
+                .ok()
+                .map(|symbol| *symbol);
+        // SAFETY: same as above; `library.get` maps the copy export from the
+        // module that is kept mapped by the `library` handle.
+        let copy_value_types: Option<CopyValueTypesFn> =
+            unsafe { library.get(VALUE_TYPE_COPY_SYMBOL) }
+                .ok()
+                .map(|symbol| *symbol);
+        // Step 4c: Resolve the optional mirrored-method manifest exports.
+        // Optional, exactly like the value-type manifest: a library built
+        // before the exports simply contributes no mirrored methods.
+        // SAFETY: `library.get` maps each export with its statically known C
+        // ABI signature; the module stays mapped for the lifetime of the
+        // returned `NativeLibrary`.
+        let mirror_method_count: Option<MirrorMethodCountFn> =
+            unsafe { library.get(MIRROR_METHOD_COUNT_SYMBOL) }
+                .ok()
+                .map(|symbol| *symbol);
+        // SAFETY: `library.get` maps the copy export from the module that is
+        // kept mapped by the `library` handle; the descriptor array stays
+        // inside this artifact's static data for the artifact's lifetime.
+        let copy_mirror_methods: Option<CopyMirrorMethodsFn> =
+            unsafe { library.get(MIRROR_METHOD_COPY_SYMBOL) }
+                .ok()
+                .map(|symbol| *symbol);
+
         // Step 5: Copy the resolved pointers out of the borrowed Symbol
         // wrappers. The `library` field keeps the module mapped, so these raw
         // pointers remain valid for the complete lifetime of the returned
@@ -315,6 +491,10 @@ impl NativeLibrary {
             module_init: module_init_pointer,
             module_update: module_update_pointer,
             abi_version,
+            value_type_count,
+            copy_value_types,
+            mirror_method_count,
+            copy_mirror_methods,
             temporary_path,
         })
     }
