@@ -351,6 +351,7 @@ impl NativeLibrary {
                 symbol: "",
                 return_tag: "",
                 arg_tags: &[],
+                arg_names: &[],
             };
             total
         ];
@@ -376,6 +377,11 @@ impl NativeLibrary {
                     .arg_tags
                     .iter()
                     .map(|tag| tag.to_string())
+                    .collect(),
+                arg_names: descriptor
+                    .arg_names
+                    .iter()
+                    .map(|name| name.to_string())
                     .collect(),
                 address,
             });

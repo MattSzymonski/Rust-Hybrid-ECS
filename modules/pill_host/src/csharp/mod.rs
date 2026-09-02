@@ -59,6 +59,10 @@ pub(crate) struct ResolvedMirrorMethod {
     pub(crate) return_tag: String,
     /// Argument type tags, in declaration order.
     pub(crate) arg_tags: Vec<String>,
+    /// Argument names from the Rust source, in declaration order (`alpha`,
+    /// `beta`), so the generated C# mirror names its parameters identically.
+    /// Parallel to `arg_tags`.
+    pub(crate) arg_names: Vec<String>,
     /// Address of the exported C-ABI trampoline.
     pub(crate) address: usize,
 }

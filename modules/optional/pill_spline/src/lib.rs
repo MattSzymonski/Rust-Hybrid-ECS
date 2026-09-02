@@ -107,7 +107,7 @@ impl OmoMO {
     /// Sum of both coordinates; mirrored to C# as `GetSum()`.
     #[pill_mirror_method]
     pub fn get_sum(&self) -> u64 {
-        self.x + self.y
+        self.x + self.y + 1
     }
 
     /// The `x` coordinate; mirrored to C# as `GetA()`.
@@ -119,6 +119,16 @@ impl OmoMO {
     #[pill_mirror_method]
     pub fn get_b(&self) -> u64 {
         self.y + 1200
+    }
+
+    #[pill_mirror_method]
+    pub fn get_c(&self) -> u64 {
+        666
+    }
+
+    #[pill_mirror_method]
+    pub fn get_d(&self, alpha: i32, beta: i32) -> i32 {
+        alpha + beta
     }
 }
 

@@ -467,6 +467,7 @@ fn emit_mirrored_method_trampoline(
     let mut arg_types: Vec<&syn::Type> = Vec::new();
     let mut arg_idents: Vec<syn::Ident> = Vec::new();
     let mut arg_tag_literals: Vec<syn::LitStr> = Vec::new();
+    let mut arg_name_literals: Vec<syn::LitStr> = Vec::new();
     for (index, argument) in method.sig.inputs.iter().enumerate().skip(1) {
         let syn::FnArg::Typed(pat_type) = argument else {
             unreachable!("receiver handled above; remaining inputs are typed")
@@ -479,6 +480,17 @@ fn emit_mirrored_method_trampoline(
         })?;
         arg_types.push(&pat_type.ty);
         arg_idents.push(format_ident!("arg{index}"));
+
+        // The C# mirror names its parameters after the Rust source, so the
+        // user's `alpha`/`beta` survive into the generated delegate and method.
+        // A pattern that is not a plain identifier (a `_` or a destructure)
+        // falls back to a positional `argN` name, indexed from the first
+        // argument to match the C# codegen's convention.
+        let argument_name = match &*pat_type.pat {
+            syn::Pat::Ident(pat_ident) => pat_ident.ident.to_string(),
+            _ => format!("arg{}", index - 1),
+        };
+        arg_name_literals.push(syn::LitStr::new(&argument_name, pat_type.ty.span()));
         arg_tag_literals.push(syn::LitStr::new(&tag, pat_type.ty.span()));
     }
 
@@ -537,6 +549,7 @@ fn emit_mirrored_method_trampoline(
                 symbol: #symbol_literal,
                 return_tag: #return_tag_literal,
                 arg_tags: &[#(#arg_tag_literals),*],
+                arg_names: &[#(#arg_name_literals),*],
             }
         }
     })

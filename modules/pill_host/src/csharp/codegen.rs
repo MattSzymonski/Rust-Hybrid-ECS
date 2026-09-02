@@ -466,6 +466,38 @@ fn emit_opaque_struct(name: &str, size: usize, align: usize) -> Result<String, S
     ))
 }
 
+/// C# reserved keywords that cannot name a parameter.
+///
+/// A Rust argument may legally be named like any of these (`event`, `string`,
+/// `ref`, ...) because Rust reserves a different set of words. Emitting it
+/// verbatim would make the generated project fail to compile, so such an
+/// argument falls back to a positional `argN` name (clearer in generated code
+/// than `@`-escaping, and immune to future keyword additions).
+const CSHARP_RESERVED_KEYWORDS: &[&str] = &[
+    "abstract", "as", "base", "bool", "break", "byte", "case", "catch", "char",
+    "checked", "class", "const", "continue", "decimal", "default", "delegate",
+    "do", "double", "else", "enum", "event", "explicit", "extern", "false",
+    "finally", "fixed", "float", "for", "foreach", "goto", "if", "implicit",
+    "in", "int", "interface", "internal", "is", "lock", "long", "namespace",
+    "new", "null", "object", "operator", "out", "override", "params", "private",
+    "protected", "public", "readonly", "ref", "return", "sbyte", "sealed",
+    "short", "sizeof", "stackalloc", "static", "string", "struct", "switch",
+    "this", "throw", "true", "try", "typeof", "uint", "ulong", "unchecked",
+    "unsafe", "ushort", "using", "virtual", "void", "volatile", "while",
+];
+
+/// The parameter name the generated C# uses for one mirrored-method argument.
+///
+/// Prefers the Rust parameter name captured by the macro; falls back to a
+/// positional `argN` when the name is blank or is a C# reserved keyword.
+fn csharp_parameter_name(argument_index: usize, rust_name: &str) -> String {
+    if !rust_name.is_empty() && !CSHARP_RESERVED_KEYWORDS.contains(&rust_name) {
+        rust_name.to_string()
+    } else {
+        format!("arg{argument_index}")
+    }
+}
+
 /// Emit the typed C# instance methods that mirror a value type's
 /// `#[pill_mirror_method]` Rust methods.
 ///
@@ -519,30 +551,36 @@ fn emit_value_type_methods(
                     )
                 })?;
             arg_types.push(cs_type);
-            arg_names.push(format!("arg{index}"));
+            // The Rust parameter name is preserved so the mirror reads like the
+            // original; a missing/blank name or a C# keyword (a Rust argument
+            // may legally be named `event`) falls back to a positional `argN`.
+            let rust_name = method.arg_names.get(index).map_or("", String::as_str);
+            arg_names.push(csharp_parameter_name(index, rust_name));
         }
 
         let delegate_name = format!("{cs_name}{pascal}Delegate");
-        let delegate_args = if arg_types.is_empty() {
+        let typed_arguments: Vec<String> = arg_types
+            .iter()
+            .zip(arg_names.iter())
+            .map(|(cs_type, arg_name)| format!("{cs_type} {arg_name}"))
+            .collect();
+        let delegate_args = if typed_arguments.is_empty() {
             "IntPtr self".to_string()
         } else {
-            format!("IntPtr self, {}", arg_types.join(", "))
+            format!("IntPtr self, {}", typed_arguments.join(", "))
         };
         let call_args = if arg_names.is_empty() {
             "handle.AddrOfPinnedObject()".to_string()
         } else {
             format!("handle.AddrOfPinnedObject(), {}", arg_names.join(", "))
         };
-        let method_signature = if arg_types.is_empty() {
+        let method_signature = if typed_arguments.is_empty() {
             format!("public {return_type} {pascal}()")
         } else {
-            let parameters = arg_types
-                .iter()
-                .zip(arg_names.iter())
-                .map(|(cs_type, arg_name)| format!("{cs_type} {arg_name}"))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("public {return_type} {pascal}({parameters})")
+            format!(
+                "public {return_type} {pascal}({})",
+                typed_arguments.join(", ")
+            )
         };
         let invocation = if method.return_tag.is_empty() {
             format!("mirror({call_args});")
@@ -677,12 +715,14 @@ mod tests {
         method_name: &str,
         return_tag: &str,
         arg_tags: &[&str],
+        arg_names: &[&str],
     ) -> ResolvedMirrorMethod {
         ResolvedMirrorMethod {
             type_name: type_name.to_string(),
             method_name: method_name.to_string(),
             return_tag: return_tag.to_string(),
             arg_tags: arg_tags.iter().map(|tag| tag.to_string()).collect(),
+            arg_names: arg_names.iter().map(|name| name.to_string()).collect(),
             address: 0x1234,
         }
     }
@@ -1319,9 +1359,15 @@ mod tests {
             fields: FIELDS,
         }];
         let methods = [
-            mirrored_method("pill_spline::OmoMO", "get_sum", "u64", &[]),
-            mirrored_method("pill_spline::OmoMO", "add", "u32", &["u32", "f32"]),
-            mirrored_method("pill_spline::Other", "unused", "", &[]),
+            mirrored_method("pill_spline::OmoMO", "get_sum", "u64", &[], &[]),
+            mirrored_method(
+                "pill_spline::OmoMO",
+                "add",
+                "u32",
+                &["u32", "f32"],
+                &["amount", "scale"],
+            ),
+            mirrored_method("pill_spline::Other", "unused", "", &[], &[]),
         ];
         generate_module_components_csharp(
             &workspace,
@@ -1339,13 +1385,13 @@ mod tests {
         assert!(content.contains(
             "global::TracyLive.MirrorMethods.Resolve<OmoMOGetSumDelegate>(\"pill_spline::OmoMO\", \"get_sum\")"
         ));
-        // Argument-carrying method: delegate takes the primitive args, and the
-        // instance method forwards them by value.
-        assert!(content.contains("public uint Add(uint arg0, float arg1)"));
-        assert!(
-            content.contains("public delegate uint OmoMOAddDelegate(IntPtr self, uint, float);")
-        );
-        assert!(content.contains("mirror(handle.AddrOfPinnedObject(), arg0, arg1);"));
+        // Argument-carrying method: the Rust parameter names survive into both
+        // the delegate and the instance method, which forwards them by value.
+        assert!(content.contains("public uint Add(uint amount, float scale)"));
+        assert!(content.contains(
+            "public delegate uint OmoMOAddDelegate(IntPtr self, uint amount, float scale);"
+        ));
+        assert!(content.contains("mirror(handle.AddrOfPinnedObject(), amount, scale);"));
         // The pinned-box call keeps the whole body in safe C#.
         assert!(content.contains(
             "global::System.Runtime.InteropServices.GCHandle.Alloc(boxed, global::System.Runtime.InteropServices.GCHandleType.Pinned)"
@@ -1374,7 +1420,9 @@ mod tests {
             align: 8,
             fields: FIELDS,
         }];
-        let methods = [mirrored_method("pill_spline::OmoMO", "reset", "", &["u64"])];
+        let methods = [
+            mirrored_method("pill_spline::OmoMO", "reset", "", &["u64"], &["countdown"]),
+        ];
         generate_module_components_csharp(
             &workspace,
             "pill_spline",
@@ -1385,9 +1433,22 @@ mod tests {
         .unwrap();
 
         let content = read_generated(&workspace, "pill_spline");
-        assert!(content.contains("public void Reset(ulong arg0)"));
-        assert!(content.contains("public delegate void OmoMOResetDelegate(IntPtr self, ulong);"));
-        assert!(content.contains("mirror(handle.AddrOfPinnedObject(), arg0);"));
+        assert!(content.contains("public void Reset(ulong countdown)"));
+        assert!(content.contains(
+            "public delegate void OmoMOResetDelegate(IntPtr self, ulong countdown);"
+        ));
+        assert!(content.contains("mirror(handle.AddrOfPinnedObject(), countdown);"));
+    }
+
+    /// A Rust parameter name that is a C# reserved keyword (or is absent) must
+    /// not be emitted verbatim - the generated project would not compile.
+    #[test]
+    fn csharp_parameter_names_are_keyword_safe() {
+        assert_eq!(csharp_parameter_name(0, "alpha"), "alpha");
+        assert_eq!(csharp_parameter_name(2, "event"), "arg2");
+        assert_eq!(csharp_parameter_name(1, "string"), "arg1");
+        assert_eq!(csharp_parameter_name(0, "ref"), "arg0");
+        assert_eq!(csharp_parameter_name(1, ""), "arg1");
     }
 
     /// The codegen reports whether the mirror file on disk changed, so the
@@ -1412,10 +1473,10 @@ mod tests {
             align: 8,
             fields: FIELDS,
         }];
-        let methods_without = [mirrored_method("pill_spline::OmoMO", "get_sum", "u64", &[])];
+        let methods_without = [mirrored_method("pill_spline::OmoMO", "get_sum", "u64", &[], &[])];
         let methods_with = [
-            mirrored_method("pill_spline::OmoMO", "get_sum", "u64", &[]),
-            mirrored_method("pill_spline::OmoMO", "get_b", "u64", &[]),
+            mirrored_method("pill_spline::OmoMO", "get_sum", "u64", &[], &[]),
+            mirrored_method("pill_spline::OmoMO", "get_b", "u64", &[], &[]),
         ];
 
         // First write on a fresh workspace always reports a change.

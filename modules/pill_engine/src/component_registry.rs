@@ -117,6 +117,12 @@ pub struct PillMethodDescriptor {
     pub return_tag: &'static str,
     /// Type tags of the method's arguments, in declaration order.
     pub arg_tags: &'static [&'static str],
+    /// Argument names from the Rust source, in declaration order (`alpha`,
+    /// `beta`), so the generated C# mirror names its parameters identically
+    /// instead of inventing `arg0`, `arg1`. Parallel to `arg_tags`; the macro
+    /// always emits one name per tag (a positional fallback when the pattern
+    /// is not a plain identifier).
+    pub arg_names: &'static [&'static str],
 }
 
 inventory::collect!(PillComponentDescriptor);
@@ -317,6 +323,7 @@ mod tests {
                 symbol: "pill_mirror_Zulu_alpha",
                 return_tag: "u64",
                 arg_tags: &[],
+                arg_names: &[],
             }
         }
         crate::submit! {
@@ -326,6 +333,7 @@ mod tests {
                 symbol: "pill_mirror_Alpha_beta",
                 return_tag: "u32",
                 arg_tags: &["f32", "u8"],
+                arg_names: &["blend", "count"],
             }
         }
 
@@ -350,6 +358,7 @@ mod tests {
             .expect("the submitted beta descriptor must be present");
         assert_eq!(beta.return_tag, "u32");
         assert_eq!(beta.arg_tags, &["f32", "u8"]);
+        assert_eq!(beta.arg_names, &["blend", "count"]);
         assert_eq!(beta.symbol, "pill_mirror_Alpha_beta");
     }
 

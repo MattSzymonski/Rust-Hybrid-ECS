@@ -62,6 +62,34 @@ public struct OmoMO
         finally { handle.Free(); }
     }
 
+    /// Calls the Rust method `pill_spline::OmoMO::get_c` through its
+    /// generated C-ABI trampoline; this struct is pinned for the call.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate ulong OmoMOGetCDelegate(IntPtr self);
+
+    public ulong GetC()
+    {
+        var mirror = global::TracyLive.MirrorMethods.Resolve<OmoMOGetCDelegate>("pill_spline::OmoMO", "get_c");
+        object boxed = this;
+        var handle = global::System.Runtime.InteropServices.GCHandle.Alloc(boxed, global::System.Runtime.InteropServices.GCHandleType.Pinned);
+        try { return mirror(handle.AddrOfPinnedObject()); }
+        finally { handle.Free(); }
+    }
+
+    /// Calls the Rust method `pill_spline::OmoMO::get_d` through its
+    /// generated C-ABI trampoline; this struct is pinned for the call.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate int OmoMOGetDDelegate(IntPtr self, int alpha, int beta);
+
+    public int GetD(int alpha, int beta)
+    {
+        var mirror = global::TracyLive.MirrorMethods.Resolve<OmoMOGetDDelegate>("pill_spline::OmoMO", "get_d");
+        object boxed = this;
+        var handle = global::System.Runtime.InteropServices.GCHandle.Alloc(boxed, global::System.Runtime.InteropServices.GCHandleType.Pinned);
+        try { return mirror(handle.AddrOfPinnedObject(), alpha, beta); }
+        finally { handle.Free(); }
+    }
+
     /// Calls the Rust method `pill_spline::OmoMO::get_sum` through its
     /// generated C-ABI trampoline; this struct is pinned for the call.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]

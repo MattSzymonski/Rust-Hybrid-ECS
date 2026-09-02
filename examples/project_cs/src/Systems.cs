@@ -205,7 +205,7 @@ public static class ModuleSplineBridgeDemo
         omo.Y = 34;
         ulong omoSum = omo.GetSum();
         ulong omoA = omo.GetA();
-        ulong omoB = omo.GetB();
+        int omoB = omo.GetD(2, 4);
 
         Console.WriteLine(
             $"[project_cs] cs spline bridge: sees {visibleSplines} spline(s), " +
