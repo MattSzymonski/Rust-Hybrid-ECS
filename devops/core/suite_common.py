@@ -124,6 +124,11 @@ RELOAD_TIMEOUT = 60
 PROBE_TIMEOUT = 25
 COUNTER_TICK_TIMEOUT = 15
 SETTLE_TIMEOUT = 30
+# Fixed settling pauses after a reload token lands. These are NOT pure
+# overhead: they give the host's reload transaction time to fully unwind
+# (re-seeding, watcher re-arm) before the next edit lands, so a rapid second
+# edit to the same crate cannot be coalesced or missed. Trimming them made
+# `module_double_reload` flaky, so they stay conservative.
 STABILITY_SLEEP = 2
 SETTLE_SLEEP = 1
 PROCESS_KILL_TIMEOUT = 5
@@ -284,29 +289,54 @@ def run_suite_with_timing(main_fn: Callable[[], Optional[int]]) -> Optional[int]
 
 
 class BackupRegistry:
-    """Captures original file bytes and restores them all at the end."""
+    """Captures original file bytes (and timestamps) and restores them at the end.
+
+    Why the mtime is captured too: every suite edits module/project sources and
+    then restores them, and a plain byte restore leaves each file stamped
+    "now" - newer than the artifacts the host built, so the *next* host start
+    recompiles identical content from scratch (pill_spline alone costs ~8s).
+    Rewinding the modification time in `restore_all` tells the host's up-to-date
+    check that the restored source is older than those artifacts, and the
+    rebuild is skipped.
+
+    `restore_one` deliberately does NOT rewind: it runs mid-suite while the host
+    is watching, and the watcher must see a freshly written file so it reloads
+    the restored (original) content.
+    """
 
     def __init__(self) -> None:
-        self._originals: Dict[Path, bytes] = {}
+        self._originals: Dict[Path, Tuple[bytes, float]] = {}
 
     def capture(self, path: Path) -> None:
-        """Records the original content of a file exactly once."""
+        """Records the original content and mtime of a file exactly once."""
         if path not in self._originals and path.exists():
-            self._originals[path] = path.read_bytes()
+            stat = path.stat()
+            self._originals[path] = (path.read_bytes(), stat.st_mtime)
 
-    def restore_all(self) -> None:
-        """Writes every captured file back to its original bytes."""
-        for path, original_bytes in self._originals.items():
+    def restore_all(self, reset_mtime: bool = True) -> None:
+        """Writes every captured file back to its original bytes.
+
+        With `reset_mtime` (the default) the original modification time is
+        restored too, leaving the workspace exactly as found so the next host
+        start does not rebuild identical content. Pass `reset_mtime=False` when
+        the last host build was of *edited* content and nothing reloaded the
+        restored bytes - rewinding the mtime there would make the next host
+        trust that stale artifact as up to date.
+        """
+        for path, (original_bytes, original_mtime) in self._originals.items():
             try:
                 path.write_bytes(original_bytes)
+                if reset_mtime:
+                    os.utime(path, (original_mtime, original_mtime))
                 print(f"  [CLEANUP] restored {path.relative_to(WORKSPACE_ROOT)}")
             except OSError as error:
                 print(f"  [CLEANUP] failed to restore {path}: {error}")
 
     def restore_one(self, path: Path) -> None:
-        """Restores a single captured file to its original bytes."""
+        """Restores a single captured file to its original bytes (mtime stays fresh)."""
         if path in self._originals:
-            path.write_bytes(self._originals[path])
+            original_bytes, _ = self._originals[path]
+            path.write_bytes(original_bytes)
 
 
 # Suite-wide backup singleton: capture every file a suite may touch at startup

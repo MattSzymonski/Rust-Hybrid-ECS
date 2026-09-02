@@ -204,7 +204,12 @@ def main() -> None:
         passed = run_scenario(monitor, backups, args.second_edit_delay)
     finally:
         print("\n  [CLEANUP] Restoring source and stopping the host...")
-        backups.restore_all()
+        # The restored source is the ONLY restore of this edit, and the host is
+        # killed immediately after - so the artifact on disk is still the second
+        # edit's build, not the original. Rewinding the mtime here would make the
+        # next host start trust that stale artifact as up to date; leave the
+        # file stamped "now" so the next build regenerates the original.
+        backups.restore_all(reset_mtime=False)
         terminate_process(process, monitor)
         print("  [OK] Restored.")
 

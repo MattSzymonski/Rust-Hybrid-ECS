@@ -38,7 +38,7 @@ use std::process::Command;
 /// parser are re-captured instead of replayed. Nothing else in the cache key can
 /// detect that: a parser fix leaves the manifests, the lockfile and the build
 /// command exactly as they were.
-const CACHE_FORMAT_VERSION: &str = "pill-hotpatch-flags-v2";
+const CACHE_FORMAT_VERSION: &str = "pill-hotpatch-flags-v3";
 
 const TWO_TOKEN_FLAGS: &[&str] = &[
     "-C",
@@ -182,9 +182,15 @@ impl CargoRustcLine {
             if !names_this_package {
                 continue;
             }
+
+            // Unwrap a rustc wrapper (e.g. sccache under `RUSTC_WRAPPER`) if
+            // cargo ran rustc through one; the wrapper's own CLI would reject
+            // the replayed rustc arguments. A plain invocation is unaffected:
+            // its first token is the compiler.
+            let compiler_index = compiler_token_index(&tokens);
             return Ok(Some(Self {
-                program: tokens[0].clone(),
-                args: tokens[1..].to_vec(),
+                program: tokens[compiler_index].clone(),
+                args: tokens[compiler_index + 1..].to_vec(),
             }));
         }
         Ok(None)
@@ -556,6 +562,28 @@ fn tokenize(command: &str) -> Vec<String> {
     tokens
 }
 
+/// Index of the actual `rustc` binary inside a captured invocation.
+///
+/// Returns 0 when none of the tokens names a rustc binary, which keeps a plain
+/// invocation - whose first token is the compiler - unchanged.
+///
+/// Cargo can run rustc through a wrapper (a `RUSTC_WRAPPER` such as sccache),
+/// which makes a captured line read `sccache C:\...\rustc.exe --crate-name
+/// ...`. The patch replays the captured program directly with rustc arguments,
+/// and the wrapper's own CLI rejects those, so the wrapper token is dropped and
+/// the first token that names a rustc binary becomes the program.
+fn compiler_token_index(tokens: &[String]) -> usize {
+    tokens
+        .iter()
+        .position(|token| {
+            Path::new(token)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.to_ascii_lowercase().contains("rustc"))
+        })
+        .unwrap_or(0)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -633,6 +661,35 @@ mod tests {
             tokenize(r#"'it\"s one token' after"#),
             vec![r#"it\"s one token"#.to_string(), "after".to_string()]
         );
+    }
+
+    /// A rustc wrapper (sccache under `RUSTC_WRAPPER`) appears ahead of the
+    /// real compiler in cargo's `Running` line. The patch replays the captured
+    /// program with rustc arguments, so capture must drop the wrapper and keep
+    /// the first token that names a rustc binary - which is the first token on
+    /// a plain invocation, leaving that case unchanged.
+    #[test]
+    fn a_rustc_wrapper_is_unwrapped_to_the_real_compiler() {
+        let plain = tokenize(r"C:\rustc.exe --crate-name project --edition=2021");
+        assert_eq!(
+            compiler_token_index(&plain),
+            0,
+            "a plain invocation already names rustc first"
+        );
+
+        let wrapped = tokenize(
+            r"sccache C:\Users\me\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin\rustc.exe --crate-name project --edition=2021",
+        );
+        assert_eq!(
+            compiler_token_index(&wrapped),
+            1,
+            "the wrapper token is dropped in favour of the real rustc"
+        );
+
+        // No token names rustc: fall back to the first token, which preserves
+        // the pre-wrapper behaviour rather than guessing.
+        let unrelated = tokenize(r"--crate-name project --edition=2021");
+        assert_eq!(compiler_token_index(&unrelated), 0);
     }
 
     /// Quote one argument the way cargo does, in either style.

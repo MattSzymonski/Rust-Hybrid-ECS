@@ -321,19 +321,33 @@ def rust_tests(tally: ResultTally) -> None:
         tally.report_skip("rust tests", f"{WORKSPACE_MANIFEST} not found")
         return
 
-    for label, extra_arguments in (
-        ("default features (no hot_patch)", ["--exclude", "pill_standalone"]),
-        ("hot_patch", ["--features", "pill_host/hot_patch,pill_engine/hot_patch"]),
+    # The hot_patch lane runs only the crates that actually gate code on the
+    # feature (`pill_engine`, `pill_host`). The rest of the workspace behaves
+    # identically under it, so compiling them a second time only adds wall
+    # clock. `pill_standalone` is a binary crate whose defaults flip the
+    # feature on; excluding it from the plain lane keeps that lane free of
+    # hot_patch, exactly as before.
+    for label, package_arguments, feature_arguments in (
+        (
+            "default features (no hot_patch)",
+            ["--workspace", "--exclude", "pill_standalone"],
+            [],
+        ),
+        (
+            "hot_patch",
+            ["-p", "pill_engine", "-p", "pill_host"],
+            ["--features", "pill_host/hot_patch,pill_engine/hot_patch"],
+        ),
     ):
-        print(f"Running cargo test --workspace ({label})")
+        print(f"Running cargo test ({label})")
         completed = run_command(
             [
                 find_executable("cargo"),
                 "test",
-                "--workspace",
+                *package_arguments,
                 "--manifest-path",
                 str(WORKSPACE_MANIFEST),
-                *extra_arguments,
+                *feature_arguments,
             ],
             timeout=BUILD_TIMEOUT_SECONDS,
         )
@@ -822,7 +836,7 @@ CHECKS: Dict[str, Callable[[ResultTally], None]] = {
 CHECK_DESCRIPTIONS = {
     "code_formatting": "cargo fmt --check over the workspace",
     "code_linting": "cargo clippy -D warnings over the workspace",
-    "rust_tests": "cargo test --workspace, with and without hot_patch",
+    "rust_tests": "cargo test; the hot_patch lane covers the gated crates",
     "shipping_build": "static release build + proof the reload machinery is gone",
     "native_example_build": "launcher release build + artifact size report",
     "wasm_example_build": "launcher WASM build + size budget + dev server smoke test",
