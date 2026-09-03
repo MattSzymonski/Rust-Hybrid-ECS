@@ -464,6 +464,52 @@ fn collect_manifest_dependencies(
 // Free Functions
 // =============================================================================
 
+/// Apply the environment and argument overrides every host-spawned cargo build
+/// needs, regardless of which path spawns it.
+///
+/// The full module-reload path and the per-function hot-patch path both invoke
+/// the module's configured `cargo build ...` command, and both must agree with
+/// the host binary that is running right now:
+///
+/// - `CARGO_TARGET_DIR` redirects into the private module build tree so cargo
+///   never has to delete a DLL the host has mapped, and both paths share one
+///   artifact set (see [`crate::config::MODULE_BUILD_TARGET_DIRECTORY`]).
+/// - The running host binary is selected as an anchor package. Cargo resolves
+///   features across every selected package, so the module's engine crates
+///   (`pill_core` and its transitive deps) unify to the SAME feature universe
+///   the host itself was built with - a GUI frontend like the editor unions
+///   extra features onto those crates, and a module compiled against a
+///   differently featured engine cannot resolve its `pill_core.dll` imports
+///   against the single instance the host already has loaded (Windows
+///   deduplicates loaded modules by name). The anchor's own artifacts are
+///   already fresh inside the private tree after the first build, so this only
+///   costs feature resolution, not a rebuild of the frontend.
+/// - A launcher-injected profile (the dioxus CLI builds the editor under
+///   `--profile desktop-dev`) is not declared in the module workspaces, so
+///   cargo would reject `--profile <name>` here. It is defined on the spawned
+///   build as an inheritor of `dev` so the module compiles under the same
+///   profile name the host binary itself used - profile name is part of
+///   cargo's crate-metadata hash, so a differently named profile would produce
+///   a module whose DLL imports cannot resolve against the engine dylib the
+///   host already has loaded. Built-in profiles need no definition.
+///
+/// Only cargo builds take these overrides; `dotnet` module builds ignore them.
+pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: &Path) {
+    command.env(
+        "CARGO_TARGET_DIR",
+        workspace_root.join(crate::config::MODULE_BUILD_TARGET_DIRECTORY),
+    );
+    if let Some(anchor) = host_anchor_package() {
+        command.arg("--package").arg(anchor);
+    }
+    let profile = crate::config::host_profile_name();
+    if !matches!(profile, "dev" | "release" | "test" | "bench") {
+        command
+            .arg("--config")
+            .arg(format!("profile.{profile}.inherits=\"dev\""));
+    }
+}
+
 /// Run one module's build command to completion.
 ///
 /// Shared by the project module and by optional modules so both use the same
@@ -504,47 +550,11 @@ pub(crate) fn run_build_command(
         .args(arguments)
         .current_dir(workspace_root)
         .envs(build_environment.iter().map(|(key, value)| (key, value)));
-    // Every cargo build this host spawns writes into the private module build
-    // tree instead of the shared `target/<profile>` the running binary maps
-    // its engine dylibs from (see
-    // [`crate::config::MODULE_BUILD_TARGET_DIRECTORY`]). Redirecting at spawn
-    // keeps the configured `build_command` (and therefore artifact stamps)
-    // unchanged while guaranteeing cargo never has to delete a DLL the host
-    // has loaded. `dotnet` builds ignore the variable.
-    //
-    // The running host binary is also selected as an anchor package. Cargo
-    // resolves features across every selected package, so the module's engine
-    // crates (`pill_core` and its transitive deps) unify to the SAME feature
-    // universe the host itself was built with - a GUI frontend like the editor
-    // unions extra features onto those crates, and a module compiled against a
-    // differently featured engine cannot resolve its `pill_core.dll` imports
-    // against the single instance the host already has loaded (Windows
-    // deduplicates loaded modules by name). The anchor's own artifacts are
-    // already fresh inside the private tree after the first build, so this
-    // only costs feature resolution, not a rebuild of the frontend.
+    // Redirect the artifact tree, unify the feature universe with the running
+    // host, and define the launcher-injected profile. See the helper's docs
+    // for why each override exists; `dotnet` builds ignore them all.
     if program == "cargo" {
-        command.env(
-            "CARGO_TARGET_DIR",
-            workspace_root.join(crate::config::MODULE_BUILD_TARGET_DIRECTORY),
-        );
-        if let Some(anchor) = host_anchor_package() {
-            command.arg("--package").arg(anchor);
-        }
-        // A launcher-injected profile (the dioxus CLI builds the editor under
-        // `--profile desktop-dev`) is not declared in the module workspaces,
-        // so cargo would reject `--profile <name>` here. Define it on the
-        // spawned build as an inheritor of `dev` so the module compiles under
-        // the same profile name the host binary itself used - profile name is
-        // part of cargo's crate-metadata hash, so a differently named profile
-        // would produce a module whose DLL imports cannot resolve against the
-        // engine dylib the host already has loaded. Built-in profiles need no
-        // definition.
-        let profile = crate::config::host_profile_name();
-        if !matches!(profile, "dev" | "release" | "test" | "bench") {
-            command
-                .arg("--config")
-                .arg(format!("profile.{profile}.inherits=\"dev\""));
-        }
+        apply_cargo_host_overrides(&mut command, workspace_root);
     }
     let mut child = command.spawn().map_err(|source| BuildError::SpawnFailed {
         name: name.to_string(),

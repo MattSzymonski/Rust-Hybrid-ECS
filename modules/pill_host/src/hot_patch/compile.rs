@@ -149,10 +149,31 @@ impl CargoRustcLine {
             .split_first()
             .ok_or_else(|| "the build command is empty".to_string())?;
 
-        let output = Command::new(program)
-            .args(arguments)
+        let mut command = Command::new(program);
+        command.args(arguments).current_dir(workspace_dir);
+        // The full reload path and this flag-capture path both invoke the
+        // module's configured cargo command, and both must agree with the host
+        // binary that is running right now. Re-apply everything the reload path
+        // applies: the spawned-build environment (an empty `RUSTFLAGS` for any
+        // non-dev profile, which strips the workspace's `-C prefer-dynamic`),
+        // plus the shared overrides (the private target directory, the host
+        // anchor package and the custom profile definition). Missing the
+        // profile definition makes cargo reject a launcher-injected profile
+        // such as `desktop-dev`; missing the `RUSTFLAGS` override instead
+        // compiles the crate with different codegen flags than the module was
+        // built with, which changes every metadata hash and makes the captured
+        // `--extern` closure disagree with the staged rlib - rustc then
+        // reports `error[E0463]` and every edit falls back to a full reload.
+        if program == "cargo" {
+            command.envs(
+                crate::config::spawned_build_environment()
+                    .into_iter()
+                    .map(|(key, value)| (key, value)),
+            );
+            crate::build_runner::apply_cargo_host_overrides(&mut command, workspace_dir);
+        }
+        let output = command
             .arg("-v")
-            .current_dir(workspace_dir)
             .output()
             .map_err(|error| format!("cannot run cargo in {}: {error}", workspace_dir.display()))?;
 

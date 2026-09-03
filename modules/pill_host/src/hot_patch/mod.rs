@@ -1281,10 +1281,21 @@ impl HotPatchSession {
     /// A patch links a half-frozen closure: the crate's own rlib comes from the
     /// staged copy, which only changes when the host rebuilds that module, while
     /// every `--extern` for its dependencies comes from the replayed cargo line
-    /// and points into `target/debug`, which moves whenever anything rebuilds.
-    /// Let those drift apart and the compile fails with
+    /// and points into the module build tree, which moves whenever anything
+    /// rebuilds. Let those drift apart and the compile fails with
     /// `error[E0463]: can't find crate for <this crate>` - which names the wrong
     /// crate and says nothing about staleness.
+    ///
+    /// The source of truth is the same place the module reload stages from and
+    /// the flag-capture build writes into: the private module build tree under
+    /// the host's profile directory ([`crate::config::module_build_artifact_directory`],
+    /// e.g. `target/hot/build/debug` for a dev host or
+    /// `target/hot/build/desktop-dev` under the dioxus CLI). The previous
+    /// hardcoded `target/debug` only matched a bare default-directory build, which
+    /// the host never runs: when a launcher injects a custom profile that path
+    /// holds a stale dev-profile rlib (or nothing), and refreshing the staged
+    /// copy from it linked the patch against a differently configured engine -
+    /// every type got a different `TypeId` and rustc reported `error[E0463]`.
     ///
     /// Re-copying costs a few milliseconds and keeps the closure consistent.
     /// The staged copy is still what the host *loads*, so the protection it was
@@ -1295,8 +1306,7 @@ impl HotPatchSession {
     fn refresh_staged_rlib(&self) -> Result<(), String> {
         let built = self
             .workspace_root
-            .join("target")
-            .join("debug")
+            .join(crate::config::module_build_artifact_directory())
             .join(format!("lib{}.rlib", self.package));
         let Ok(built_metadata) = std::fs::metadata(&built) else {
             // Cargo has not produced one; the staged copy is all there is.
@@ -1338,10 +1348,28 @@ impl HotPatchSession {
             // invalidated the cache on every single patch and re-ran a full
             // `cargo build -v` to re-derive flags that were already correct.
             // That cost about 1.2 s of a 1.9 s patch.
-            let freshness = vec![
+            //
+            // The crate's own freshly built rlib IS included, though. The flags
+            // describe the dependency closure this crate links, and that
+            // closure only changes when the crate is rebuilt - at startup, on a
+            // module reload, or whenever the feature unification with the host
+            // anchor moves (under the dioxus CLI, engine crates can carry two
+            // different metadata hashes side by side for the module and the
+            // editor anchor; a cache captured against one goes silently stale
+            // against the other and rustc reports `error[E0463]` when the patch
+            // tries to link the freshly staged rlib against the old externs).
+            // The rlib's mtime moves exactly when that happens, so keying on it
+            // re-captures precisely when the world changed and stays hot across
+            // plain source edits and patches.
+            let mut freshness = vec![
                 self.workspace_root.join("Cargo.toml"),
                 self.workspace_root.join("Cargo.lock"),
             ];
+            freshness.push(
+                self.workspace_root
+                    .join(crate::config::module_build_artifact_directory())
+                    .join(format!("lib{}.rlib", self.package)),
+            );
             let line = match CargoRustcLine::load_if_fresh(&cache, &freshness, &self.build_command)
             {
                 Some(cached) => cached,
@@ -1873,10 +1901,10 @@ fn size(&self) -> u32 { 222 }\n}\n";
         let _ = std::fs::remove_dir_all(&directory);
         let session = session_over(&directory, PLAIN_SOURCE);
 
-        // What cargo produced, and the older copy the host staged from it.
+        // What cargo produced (in the private module build tree under the
+        // host profile directory), and the older copy the host staged from it.
         let built = directory
-            .join("target")
-            .join("debug")
+            .join(crate::config::module_build_artifact_directory())
             .join("libproject.rlib");
         fs_write(&built, "rebuilt against the current dependencies");
         fs_write(&session.package_rlib, "stale");
@@ -1902,8 +1930,7 @@ fn size(&self) -> u32 { 222 }\n}\n";
         let session = session_over(&directory, PLAIN_SOURCE);
 
         let built = directory
-            .join("target")
-            .join("debug")
+            .join(crate::config::module_build_artifact_directory())
             .join("libproject.rlib");
         fs_write(&built, "same length!!");
         std::thread::sleep(std::time::Duration::from_millis(20));

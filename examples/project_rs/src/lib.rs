@@ -277,7 +277,7 @@ fn spline_probe_system(
     // spline(s)` and the `midpoint ({:.1}, {:.1})` shape intact, or update the
     // tokens in the two files above to match.
     println!(
-        "[project] 123 {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), aawddwadwd {:.2}",
+        "[project] 123 {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), AWDWAWDRRR123eeee11awdwad11111111111aawddwadwd {:.2}",
         midpoint.x, midpoint.y, color
     );
     println!("[project] 123 OmoMO.x = {}, OmoMO.y = {}", omomo.x, omomo.y);
