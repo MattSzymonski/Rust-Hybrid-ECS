@@ -136,6 +136,12 @@ pub struct Host {
     frame_count: u64,
     last_report: Instant,
     last_measured_fps: f64,
+    /// Monotonic counter of reload/rollback/patch events.
+    ///
+    /// The editor keys its cached engine metadata on this. It is NOT how the
+    /// editor learns that entities changed - gameplay changes those every
+    /// frame without a reload - it only says "the set of loaded code changed".
+    editor_revision: u64,
 }
 
 impl Host {
@@ -213,6 +219,38 @@ impl Host {
     /// Mutable engine access for frontend-owned ad-hoc work.
     pub fn engine_mut(&mut self) -> &mut Engine {
         &mut self.engine
+    }
+
+    /// Monotonic counter of reload/rollback/patch events completed by this
+    /// host. Editor caches of engine metadata key on it.
+    pub fn revision(&self) -> u64 {
+        self.editor_revision
+    }
+
+    /// Advance the editor revision counter after a reload/rollback/patch.
+    ///
+    /// The increment itself is the editor's cache-invalidation signal; the
+    /// log line exists so integration suites can assert a bump happened
+    /// without driving a GUI.
+    fn bump_editor_revision(&mut self) {
+        self.editor_revision = self.editor_revision.wrapping_add(1);
+        info!(
+            target: telemetry_target::HOT_RELOAD,
+            revision = self.editor_revision,
+            "editor revision bumped"
+        );
+    }
+
+    /// Names of the loaded optional modules, in `SystemOwner` order.
+    ///
+    /// `SystemOwner::optional_module(i)` is `i + 1`, so index `i` of this
+    /// vector labels owner `i + 1`; owner `0` is the project.
+    #[cfg(feature = "hot_reload")]
+    pub fn optional_module_names(&self) -> Vec<String> {
+        self.optional_modules
+            .iter()
+            .map(|slot| slot.name().to_string())
+            .collect()
     }
 
     /// Snapshot the current frame rate and entity count without resetting the
@@ -326,6 +364,28 @@ impl RenderingHost {
     /// lower-frequency report returned by [`Self::run_one_frame`].
     pub fn current_frame_report(&self) -> FrameReport {
         self.host.current_frame_report()
+    }
+
+    /// Read-only engine access for frontend diagnostics and editor snapshots.
+    pub fn engine(&self) -> &Engine {
+        self.host.engine()
+    }
+
+    /// Mutable engine access for frontend-owned, frame-boundary work.
+    pub fn engine_mut(&mut self) -> &mut Engine {
+        self.host.engine_mut()
+    }
+
+    /// Monotonic reload/rollback/patch counter; see [`Host::revision`].
+    pub fn revision(&self) -> u64 {
+        self.host.revision()
+    }
+
+    /// Loaded optional-module names in `SystemOwner` order; see
+    /// [`Host::optional_module_names`].
+    #[cfg(feature = "hot_reload")]
+    pub fn optional_module_names(&self) -> Vec<String> {
+        self.host.optional_module_names()
     }
 }
 
@@ -540,6 +600,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
         frame_count: 0,
         last_report: Instant::now(),
         last_measured_fps: 0.0,
+        editor_revision: 0,
     };
 
     Ok(host)
@@ -582,6 +643,7 @@ pub fn setup(project: StaticProject) -> Result<Host, HostError> {
         frame_count: 0,
         last_report: Instant::now(),
         last_measured_fps: 0.0,
+        editor_revision: 0,
     })
 }
 
@@ -696,33 +758,41 @@ fn arm_patching_thread() {}
 /// both configurations rather than carrying a `cfg` of its own.
 #[cfg(feature = "hot_patch")]
 fn try_module_fast_path(host: &mut Host) {
-    let Host {
-        optional_modules,
-        module_hot_patch,
-        loaded_patches,
-        loaded_project,
-        engine,
-        ..
-    } = &mut *host;
+    let mut any_patch_applied = false;
+    {
+        let Host {
+            optional_modules,
+            module_hot_patch,
+            loaded_patches,
+            loaded_project,
+            engine,
+            ..
+        } = &mut *host;
 
-    for index in 0..module_hot_patch.len() {
-        // Captured before the patch runs: a save that lands while it compiles
-        // advances the counter past this value and must stay pending, because
-        // nothing has delivered it.
-        let Some(pending) = optional_modules[index].pending_reload_generation() else {
-            continue;
-        };
-        let Some(session) = module_hot_patch[index].as_mut() else {
-            continue;
-        };
-        let targets = patch_targets(loaded_project, optional_modules);
-        let outcome = session.try_patch(engine, &targets, loaded_patches);
-        // The borrow of the module list ends here, so the slot below can be
-        // updated.
-        drop(targets);
-        if report_patch_outcome(outcome) {
-            optional_modules[index].consume_pending_reload(pending);
+        for index in 0..module_hot_patch.len() {
+            // Captured before the patch runs: a save that lands while it
+            // compiles advances the counter past this value and must stay
+            // pending, because nothing has delivered it.
+            let Some(pending) = optional_modules[index].pending_reload_generation() else {
+                continue;
+            };
+            let Some(session) = module_hot_patch[index].as_mut() else {
+                continue;
+            };
+            let targets = patch_targets(loaded_project, optional_modules);
+            let outcome = session.try_patch(engine, &targets, loaded_patches);
+            // The borrow of the module list ends here, so the slot below can
+            // be updated.
+            drop(targets);
+            if report_patch_outcome(outcome) {
+                optional_modules[index].consume_pending_reload(pending);
+                any_patch_applied = true;
+            }
         }
+    }
+    if any_patch_applied {
+        // A patch replaced live code; the editor must refresh its metadata.
+        host.bump_editor_revision();
     }
 }
 
@@ -765,6 +835,7 @@ fn try_project_fast_path(host: &mut Host) {
         // arrived while the patch compiled is a different edit that nothing has
         // delivered, and must stay pending.
         host.last_processed_generation = pending;
+        host.bump_editor_revision();
     }
 }
 
@@ -990,6 +1061,8 @@ fn run_reload_steps(host: &mut Host) {
     if any_module_reloaded {
         forget_prologue_records(host);
         resync_patch_baselines(host, false, &reloaded_modules);
+        // The set of loaded code changed; editor metadata caches must drop.
+        host.bump_editor_revision();
     }
 
     // Step 4: Try the per-function fast path for the project, before the
@@ -1035,6 +1108,8 @@ fn run_reload_steps(host: &mut Host) {
         // baseline has to say so too. Skipping this is what makes one refused
         // patch disable the fast path for the rest of the session.
         resync_patch_baselines(host, true, &[]);
+        // A project reload replaced the running image; the editor must refresh.
+        host.bump_editor_revision();
     }
 
     // Print the analytics line for every reload completed this frame (optional
@@ -1235,6 +1310,9 @@ fn process_rollback_request(host: &mut Host) {
         // A rollback usually fails because the generation does not exist, so
         // show what does rather than making the developer guess.
         print_patch_generations(host);
+    } else {
+        // A rollback changed which implementation is live; refresh the editor.
+        host.bump_editor_revision();
     }
 }
 

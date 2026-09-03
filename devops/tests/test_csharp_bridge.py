@@ -361,6 +361,25 @@ def verify_startup(
         return False
     print(f"  [OK] Managed build is warning-free ({DOTNET_CLEAN_WARNING_SUMMARY}).")
 
+    # Slice G: each managed component's reflected field layout must reach the
+    # engine's field-layout table (what makes C# components inspectable in the
+    # editor). The host logs every dynamic layout registration deterministically
+    # as `name@offset:size:type_tag` entries, so assert the well-known fields of
+    # `TracyLive.PhysicsState` (six floats, then a byte) and `TracyLive.BallTag`.
+    if "managed component field layout registered" not in startup_output:
+        print("  [FAIL] No dynamic component field layout was registered at startup.")
+        print(f"  Output tail:\n{startup_output[-1600:]}")
+        return False
+    if "Active@24:1:u8" not in startup_output:
+        print("  [FAIL] TracyLive.PhysicsState layout is missing its trailing byte field.")
+        print(f"  Output tail:\n{startup_output[-1600:]}")
+        return False
+    if "Kind@0:4:u32" not in startup_output:
+        print("  [FAIL] TracyLive.BallTag layout is missing its uint field.")
+        print(f"  Output tail:\n{startup_output[-1600:]}")
+        return False
+    print("  [OK] Managed component field layouts match the manifest.")
+
     # Bridge probes (both directions of the Rust <-> C# connection). The
     # probe is throttled to one line every 2s, so both waits are bounded by
     # PROBE_TIMEOUT. start_index 0 covers the whole run because the first

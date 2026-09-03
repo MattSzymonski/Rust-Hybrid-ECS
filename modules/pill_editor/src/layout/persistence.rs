@@ -34,6 +34,18 @@ pub fn load_or_default() -> LayoutModel {
         report_load_failure(&path, LayoutPersistenceError::Validation { source });
         return LayoutModel::default_editor();
     }
+    // A layout saved by an older editor schema may not contain the panels this
+    // build knows about (for example `Systems`); refuse it loudly instead of
+    // silently rendering a workspace without a way to open them.
+    if model.schema_version != super::model::LAYOUT_SCHEMA_VERSION {
+        eprintln!(
+            "[editor] Ignoring saved layout '{}': schema v{} is stale (this build is v{})",
+            path.display(),
+            model.schema_version,
+            super::model::LAYOUT_SCHEMA_VERSION
+        );
+        return LayoutModel::default_editor();
+    }
     model
 }
 

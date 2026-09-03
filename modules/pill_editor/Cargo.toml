@@ -10,6 +10,7 @@ workspace = true
 pill_host = { package = "pill_host", path = "../pill_host", features = [
     "rendering",
 ] }
+pill_engine = { path = "../pill_engine", features = ["rendering"] }
 pill_core = { path = "../pill_core", features = ["rendering"] }
 pill_core_macros = { path = "../pill_core_macros" }
 dioxus = { version = "0.7", features = ["desktop"] }
@@ -24,7 +25,18 @@ tracing = "0.1"
 [build-dependencies]
 pill_hot_scan = { path = "../pill_hot_scan" }
 
+[dev-dependencies]
+# The editor's unit tests hand-write tiny `impl Component` test doubles and
+# need `impl_trait_accessible!` to reach them through the engine's storage;
+# production code never touches this crate.
+trait_type_map = { path = "../../../Trait-Type-Map" }
+
 [features]
+# Match a normal `cargo run` of pill_standalone: per-function hot patching is
+# on so the Systems tab's `hot_patchable` column is meaningful.
+default = ["hot_patch"]
+# Per-function hot patching, forwarded to the host. Implies `hot_reload`.
+hot_patch = ["pill_host/hot_patch"]
 # Enable Tracy profiling through the shared telemetry stack.
 profiling = ["pill_host/profiling"]
 # Investigative fine-grained profiling zones.

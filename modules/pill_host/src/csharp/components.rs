@@ -21,6 +21,8 @@ use std::collections::{HashMap, HashSet};
 
 // External crates
 use pill_core::error::{CSharpError, EngineMessage};
+use pill_core::info;
+use pill_core::telemetry::telemetry_target;
 use pill_engine::commands::{boxed_component_adder, ComponentAdder};
 use pill_engine::component_registry::ComponentFieldDescriptor;
 use pill_engine::{Component, ComponentId, Engine, World};
@@ -541,6 +543,87 @@ fn validate_field_manifest(field: &ManagedFieldManifest, parent_size: usize) -> 
     Ok(())
 }
 
+/// Map a managed primitive type onto the engine's field type-tag vocabulary.
+///
+/// Returns `None` for blittable types the engine cannot decode (the field is
+/// then omitted from the registered layout but keeps its bytes in storage).
+fn managed_primitive_tag(primitive_type: &str) -> Option<&'static str> {
+    match primitive_type {
+        "System.Byte" => Some("u8"),
+        "System.SByte" => Some("i8"),
+        "System.Int16" => Some("i16"),
+        "System.UInt16" => Some("u16"),
+        "System.Int32" => Some("i32"),
+        "System.UInt32" => Some("u32"),
+        "System.Int64" => Some("i64"),
+        "System.UInt64" => Some("u64"),
+        "System.Single" => Some("f32"),
+        "System.Double" => Some("f64"),
+        "System.Boolean" => Some("bool"),
+        // `System.Char` is a blittable UTF-16 code unit with the same size as
+        // the engine's `u16`; exposing it that way keeps the field editable.
+        "System.Char" => Some("u16"),
+        _ => None,
+    }
+}
+
+/// Convert a managed component manifest's field tree into engine descriptors.
+///
+/// Primitive leaves map onto the engine's type-tag vocabulary so the editor
+/// can decode and edit them. Nested `struct:` fields stay opaque: the engine
+/// has no struct walking, so their bytes are visible but not interpretable.
+/// Field names and struct tags are leaked once per registration, bounded by
+/// the number of distinct C# component types in the process.
+fn managed_field_layout(
+    component_name: &str,
+    fields: &[ManagedFieldManifest],
+) -> Vec<ComponentFieldDescriptor> {
+    let mut layout = Vec::new();
+    for field in fields {
+        if field.primitive_type == "struct" {
+            layout.push(ComponentFieldDescriptor {
+                name: Box::leak(field.name.clone().into_boxed_str()),
+                type_tag: Box::leak(
+                    format!("struct:{component_name}::{}", field.name).into_boxed_str(),
+                ),
+                offset: field.offset,
+                size: field.size,
+                align: 1,
+                element_count: 0,
+            });
+            continue;
+        }
+        let Some(type_tag) = managed_primitive_tag(&field.primitive_type) else {
+            continue;
+        };
+        layout.push(ComponentFieldDescriptor {
+            name: Box::leak(field.name.clone().into_boxed_str()),
+            type_tag,
+            offset: field.offset,
+            size: field.size,
+            align: 1,
+            element_count: 0,
+        });
+    }
+    layout
+}
+
+/// Render a registered field layout as one stable, parseable line so
+/// integration suites can assert the managed manifest reached the engine
+/// intact: `name@offset:size:type_tag` entries joined by `|`.
+fn format_field_layout_line(layout: &[ComponentFieldDescriptor]) -> String {
+    layout
+        .iter()
+        .map(|field| {
+            format!(
+                "{}@{}:{}:{}",
+                field.name, field.offset, field.size, field.type_tag
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 /// Validate and register all components discovered in the managed assembly.
 ///
 /// Shared components must already have a native engine binding; every other
@@ -596,6 +679,11 @@ pub(super) fn register_component_manifest(
         for field in &component.fields {
             validate_field_manifest(field, component.size)?;
         }
+
+        // Compute the editor layout up front: the manifest name is moved into
+        // `register_dynamic_component` below, and the borrow must end first.
+        let field_layout = managed_field_layout(&component.full_name, &component.fields);
+        let component_name = component.full_name.clone();
 
         if let Some(binding) = bindings.get(&stable_id).copied() {
             let (size, align, expected_schema) = match binding {
@@ -653,6 +741,19 @@ pub(super) fn register_component_manifest(
                 align: component.alignment,
             },
         );
+
+        // Slice G: give the editor the same field vocabulary `#[derive(PillComponent)]`
+        // produces, so a C# component shows named, editable fields instead of
+        // nothing. Re-registration on assembly swap replaces the layout.
+        info!(
+            target: telemetry_target::HOT_RELOAD,
+            component = %component_name,
+            fields = %format_field_layout_line(&field_layout),
+            "managed component field layout registered"
+        );
+        engine
+            .world_mut()
+            .register_dynamic_component_field_layout(id, field_layout);
     }
     Ok(bindings)
 }

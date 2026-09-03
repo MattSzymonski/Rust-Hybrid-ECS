@@ -43,6 +43,9 @@ pub mod component;
 /// Compile-time component registry driven by `#[derive(PillComponent)]`.
 pub mod component_registry;
 
+/// Generic type-erased component field access for editor-style tools.
+pub mod component_field;
+
 /// Centralised configuration constants and hardware detection.
 pub mod config;
 
@@ -98,7 +101,8 @@ pub mod world;
 pub use api::EngineApi;
 pub use commands::{CommandError, Commands};
 pub use component::{Component, ComponentId, ComponentTicks, Tick};
-pub use engine::{Engine, SystemOwner};
+pub use component_field::{ComponentFieldError, FieldValue};
+pub use engine::{Engine, SystemOwner, SystemSnapshot};
 pub use entity::Entity;
 pub use error::{EngineError, SystemError, SystemFailure};
 pub use hot_patch::{
@@ -132,7 +136,9 @@ pub use pill_engine_macros::{
 };
 
 // World container and its entity-builder and error types.
-pub use world::{AddComponentError, BuildError, EntityBuilder, RemoveComponentError, World};
+pub use world::{
+    AddComponentError, BuildError, EntityBuilder, EntityRow, RemoveComponentError, World,
+};
 
 // ----------------------------------------------------------------------------
 // Profiling macro re-exports

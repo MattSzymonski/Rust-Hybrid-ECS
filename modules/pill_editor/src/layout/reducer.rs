@@ -544,6 +544,7 @@ mod tests {
         for panel in [
             PanelKind::Hierarchy,
             PanelKind::Inspector,
+            PanelKind::Systems,
             PanelKind::Console,
             PanelKind::Statistics,
         ] {

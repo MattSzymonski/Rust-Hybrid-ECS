@@ -250,8 +250,10 @@ impl World {
             + 'static,
     {
         self.register_persistable_component::<T>();
-        self.component_field_layouts
-            .insert(ComponentId::of::<T>(), fields);
+        self.component_field_layouts.insert(
+            ComponentId::of::<T>(),
+            crate::world::ComponentFieldLayout::Static(fields),
+        );
     }
 }
 

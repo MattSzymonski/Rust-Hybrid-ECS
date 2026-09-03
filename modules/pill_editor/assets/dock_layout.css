@@ -265,3 +265,191 @@ body {
     position: absolute;
     inset: 0;
 }
+
+/* ------------------------------------------------------------------ *
+ * Editor data panels (Hierarchy / Inspector / Systems / Console).
+ * Rendered inside .dock-panel-host, which is already a positioned
+ * box; these classes only style the document flow within it.
+ * ------------------------------------------------------------------ */
+
+.editor-panel {
+    position: absolute;
+    inset: 0;
+    overflow: auto;
+    padding: 6px 8px;
+    box-sizing: border-box;
+    color: var(--dock-text);
+    font-size: 12px;
+}
+
+.editor-panel-toolbar {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    margin-bottom: 6px;
+}
+
+.editor-panel-toolbar button,
+.editor-icon-button {
+    border: 1px solid rgb(70, 70, 70);
+    border-radius: 3px;
+    background: rgb(48, 48, 48);
+    color: var(--dock-text);
+    font: inherit;
+    font-size: 11px;
+    padding: 2px 8px;
+    cursor: pointer;
+}
+
+.editor-panel-toolbar button:hover,
+.editor-icon-button:hover {
+    background: var(--dock-accent);
+    color: white;
+}
+
+.editor-icon-button {
+    margin-left: auto;
+}
+
+.editor-panel-title,
+.editor-component-head {
+    font-weight: 600;
+    color: var(--dock-text);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.editor-panel-note {
+    font-size: 11px;
+    opacity: 0.75;
+    margin-bottom: 6px;
+}
+
+.editor-placeholder {
+    opacity: 0.6;
+    font-style: italic;
+    padding: 4px 0;
+}
+
+.editor-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.editor-list-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 3px 4px;
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+.editor-list-row:hover {
+    background: rgba(255, 255, 255, 0.07);
+}
+
+.editor-row-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.editor-row-subtitle {
+    font-size: 11px;
+    opacity: 0.7;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.editor-tag {
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: 8px;
+    background: rgb(40, 62, 40);
+    color: rgb(150, 220, 150);
+}
+
+.editor-tag.editor-warn {
+    background: rgb(64, 54, 30);
+    color: rgb(230, 200, 120);
+}
+
+.editor-component {
+    margin: 6px 0;
+    padding: 4px 0;
+    border-top: 1px solid rgb(58, 58, 58);
+}
+
+.editor-field {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 0;
+}
+
+.editor-field-name {
+    flex: 1 1 auto;
+    min-width: 90px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.editor-number {
+    flex: 0 0 120px;
+    border: 1px solid rgb(70, 70, 70);
+    border-radius: 3px;
+    background: rgb(28, 28, 28);
+    color: var(--dock-text);
+    padding: 2px 6px;
+    font: inherit;
+    font-size: 12px;
+    text-align: right;
+}
+
+.editor-checkbox {
+    width: 14px;
+    height: 14px;
+    accent-color: var(--dock-accent);
+}
+
+.editor-field-value {
+    flex: 0 1 auto;
+    opacity: 0.85;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.editor-select {
+    width: 100%;
+    margin-bottom: 4px;
+    border: 1px solid rgb(70, 70, 70);
+    border-radius: 3px;
+    background: rgb(28, 28, 28);
+    color: var(--dock-text);
+    font: inherit;
+    font-size: 12px;
+    padding: 2px 4px;
+}
+
+.editor-context-menu {
+    position: fixed;
+    z-index: 200;
+    background: rgb(52, 52, 52);
+    border: 1px solid rgb(34, 34, 34);
+    border-radius: 4px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.42);
+    padding: 4px;
+}
+
+.editor-hierarchy .editor-list-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0;
+}

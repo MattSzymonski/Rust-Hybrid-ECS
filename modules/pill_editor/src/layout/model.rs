@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{LayoutAction, LayoutChange, LayoutError, NodeId};
 
-pub const LAYOUT_SCHEMA_VERSION: u32 = 1;
+pub const LAYOUT_SCHEMA_VERSION: u32 = 2;
 
 /// Direction in which a row distributes its children.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +23,7 @@ pub enum PanelKind {
     Inspector,
     Console,
     Statistics,
+    Systems,
 }
 
 impl PanelKind {
@@ -33,6 +34,7 @@ impl PanelKind {
             Self::Inspector => "Inspector",
             Self::Console => "Console",
             Self::Statistics => "Statistics",
+            Self::Systems => "Systems",
         }
     }
 }
@@ -101,12 +103,14 @@ impl LayoutModel {
         let inspector = model.add_tab(PanelKind::Inspector, true);
         let statistics = model.add_tab(PanelKind::Statistics, true);
         let console = model.add_tab(PanelKind::Console, true);
+        let systems = model.add_tab(PanelKind::Systems, true);
 
         let hierarchy_set = model.add_tabset(vec![hierarchy], hierarchy);
         let scene_set = model.add_tabset(vec![scene], scene);
         let inspector_set = model.add_tabset(vec![inspector], inspector);
         let statistics_set = model.add_tabset(vec![statistics], statistics);
         let console_set = model.add_tabset(vec![console], console);
+        let systems_set = model.add_tabset(vec![systems], systems);
 
         let right = model.add_row(
             Axis::Vertical,
@@ -116,7 +120,11 @@ impl LayoutModel {
             Axis::Horizontal,
             vec![(hierarchy_set, 20.0), (scene_set, 55.0), (right, 25.0)],
         );
-        let root = model.add_row(Axis::Vertical, vec![(top, 76.0), (console_set, 24.0)]);
+        let bottom = model.add_row(
+            Axis::Horizontal,
+            vec![(systems_set, 50.0), (console_set, 50.0)],
+        );
+        let root = model.add_row(Axis::Vertical, vec![(top, 70.0), (bottom, 30.0)]);
         model.root = root;
         model.active_tabset = Some(scene_set);
         model

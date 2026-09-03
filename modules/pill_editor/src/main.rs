@@ -9,10 +9,15 @@
 //! The editor forwards resize and redraw events, keeps its center viewport
 //! transparent for the surface, and draws opaque HTML panels around it.
 
+mod console_tab;
 mod dock_view;
+mod editor_state;
+mod entities_tab;
 mod error;
+mod inspector;
 mod layout;
 mod popout;
+mod systems_tab;
 
 use std::cell::{Cell, RefCell};
 use std::io::Write;
@@ -32,14 +37,19 @@ use pill_host::{
 };
 
 use dock_view::DockView;
+use editor_state::{EditorCommand, EditorSnapshot};
 use error::EditorError;
 use layout::{
     compute_layout, load_or_default, LayoutAction, LayoutMetrics, LayoutNode, PanelKind, Rect,
 };
+use pill_engine::Entity;
 use popout::PopoutManager;
 
 /// Maximum frequency at which live host statistics invalidate the Dioxus UI.
 const STATS_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Cap for the console ring buffer of failed editor commands.
+const COMMAND_ERROR_LIMIT: usize = 100;
 
 /// Stable coordinate space used by the bouncing-ball project systems.
 const PROJECT_VIRTUAL_RESOLUTION: VirtualResolution = VirtualResolution::new(800.0, 600.0);
@@ -222,6 +232,7 @@ fn app() -> Element {
             model: layout_model,
             snapshot,
             stats,
+            editor: Arc::clone(&editor),
             on_undock: move |panel| {
                 popout::open_panel_window(
                     panel,
@@ -293,6 +304,25 @@ pub(crate) struct EditorContext {
     last_stats_update: Cell<Instant>,
     main_scene_viewport: Cell<RenderViewport>,
     detached_scene_window: Cell<Option<WindowId>>,
+    /// Latest engine snapshot shared by every dock's VirtualDom.
+    snapshot: RefCell<EditorSnapshot>,
+    /// Structural and field commands queued by panels since the last frame.
+    pending_commands: RefCell<Vec<EditorCommand>>,
+    /// Ring buffer of the most recent command failures, shown in the Console.
+    last_command_errors: RefCell<Vec<String>>,
+    /// Entity the Inspector is showing; cleared when that entity dies.
+    selection: Cell<Option<Entity>>,
+    /// Throttle for snapshot captures (the engine keeps running uncapped).
+    last_snapshot_refresh: Cell<Instant>,
+}
+
+impl PartialEq for EditorContext {
+    /// Dioxus memoization compares component props between renders. The
+    /// context is process-unique and every dock receives a clone of the same
+    /// `Arc`, so equality reduces to a pointer check on the shared allocation.
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
 }
 
 /// Values produced while advancing one editor frame.
@@ -327,6 +357,11 @@ impl EditorContext {
             last_stats_update: Cell::new(Instant::now()),
             main_scene_viewport: Cell::new(RenderViewport::default()),
             detached_scene_window: Cell::new(None),
+            snapshot: RefCell::new(EditorSnapshot::default()),
+            pending_commands: RefCell::new(Vec::new()),
+            last_command_errors: RefCell::new(Vec::new()),
+            selection: Cell::new(None),
+            last_snapshot_refresh: Cell::new(Instant::now()),
         })
     }
 
@@ -404,33 +439,119 @@ impl EditorContext {
         }
     }
 
+    /// Latest captured engine snapshot for the panels of any VirtualDom.
+    pub(crate) fn snapshot(&self) -> EditorSnapshot {
+        self.snapshot.borrow().clone()
+    }
+
+    /// Registered component types for the Inspector's add picker.
+    pub(crate) fn registered_components(&self) -> Vec<editor_state::RegisteredComponent> {
+        let host = self.host.borrow();
+        editor_state::registered_components(host.engine().world())
+    }
+
+    /// Queue one editor command; it is applied at the next frame boundary.
+    pub(crate) fn push_command(&self, command: EditorCommand) {
+        self.pending_commands.borrow_mut().push(command);
+    }
+
+    /// Change Inspector selection; panels also use this to clear it.
+    pub(crate) fn set_selection(&self, selection: Option<Entity>) {
+        self.selection.set(selection);
+    }
+
     /// Advance the ECS and present one frame on Dioxus's redraw event.
+    ///
+    /// Queued editor commands are applied first so this frame's systems see
+    /// the world the user just arranged (structural commands are already
+    /// visible; scalar writes take effect for `Changed<T>` the next frame,
+    /// one accepted frame of latency).
     fn render(&self) -> Option<EditorFrame> {
-        let mut host = self.host.borrow_mut();
-        match host.run_one_frame() {
-            Ok(console_report) => {
-                let now = Instant::now();
-                let ui_report =
-                    if now.duration_since(self.last_stats_update.get()) >= STATS_UPDATE_INTERVAL {
+        self.flush_pending_commands();
+
+        let frame = {
+            let mut host = self.host.borrow_mut();
+            match host.run_one_frame() {
+                Ok(console_report) => {
+                    let now = Instant::now();
+                    let ui_report = if now.duration_since(self.last_stats_update.get())
+                        >= STATS_UPDATE_INTERVAL
+                    {
                         self.last_stats_update.set(now);
                         Some(host.current_frame_report())
                     } else {
                         None
                     };
 
-                Some(EditorFrame {
-                    console_report,
-                    ui_report,
-                })
+                    Some(EditorFrame {
+                        console_report,
+                        ui_report,
+                    })
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[editor] Fatal renderer error: {}",
+                        EditorError::Frame { source: error }.to_plain_message()
+                    );
+                    None
+                }
             }
-            Err(error) => {
-                eprintln!(
-                    "[editor] Fatal renderer error: {}",
-                    EditorError::Frame { source: error }.to_plain_message()
-                );
-                None
+        };
+
+        // The host borrow has ended; capture a fresh snapshot without touching
+        // the renderer.
+        self.refresh_snapshot();
+        frame
+    }
+
+    /// Apply the accumulated command batch right before systems run.
+    fn flush_pending_commands(&self) {
+        let commands = std::mem::take(&mut *self.pending_commands.borrow_mut());
+        if commands.is_empty() {
+            return;
+        }
+        let mut host = self.host.borrow_mut();
+        let failures = EditorCommand::apply(host.engine_mut(), &commands);
+        if !failures.is_empty() {
+            let mut errors = self.last_command_errors.borrow_mut();
+            for (_, message) in failures {
+                if errors.len() >= COMMAND_ERROR_LIMIT {
+                    errors.remove(0);
+                }
+                errors.push(message);
             }
         }
+    }
+
+    /// Re-capture the shared snapshot on the same cadence as the statistics.
+    fn refresh_snapshot(&self) {
+        let now = Instant::now();
+        if now.duration_since(self.last_snapshot_refresh.get()) < STATS_UPDATE_INTERVAL {
+            return;
+        }
+        self.last_snapshot_refresh.set(now);
+
+        // Errors are drained here so they appear in exactly one snapshot and
+        // never resurface on later refreshes.
+        let errors = std::mem::take(&mut *self.last_command_errors.borrow_mut());
+
+        let host = self.host.borrow();
+        let module_names = host.optional_module_names();
+        let revision = host.revision();
+        let engine = host.engine();
+        let mut fresh = EditorSnapshot::capture_list(engine, revision, &module_names, errors);
+        let Some(selected) = self.selection.get() else {
+            *self.snapshot.borrow_mut() = fresh;
+            return;
+        };
+        if engine.world().is_entity_valid(selected) {
+            fresh.detail = EditorSnapshot::capture_detail(engine, selected);
+        } else {
+            // The selected entity died; drop the selection rather than keep a
+            // stale Inspector open.
+            self.selection.set(None);
+        }
+        *self.snapshot.borrow_mut() = fresh;
     }
 }
 

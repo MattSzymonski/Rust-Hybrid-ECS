@@ -1582,6 +1582,7 @@ dependencies = [
  "miette",
  "pill_core",
  "pill_core_macros",
+ "pill_engine",
  "pill_host",
  "pill_hot_scan",
  "serde",
@@ -1589,6 +1590,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "trait_type_map",
 ]
 
 [[package]]

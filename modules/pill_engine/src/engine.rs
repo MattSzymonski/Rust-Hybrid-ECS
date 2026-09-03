@@ -92,6 +92,28 @@ struct RegisteredSystem {
     last_duration: u64,
 }
 
+/// A read-only snapshot of one registered system, in registration order.
+///
+/// `index` is the position in the registration vector and is the stable key
+/// for toggling, because system **names are not unique** —
+/// [`Engine::set_system_enabled`] matches the first system with a given name.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SystemSnapshot {
+    /// Position in the registration vector; the un-ambiguous toggle key.
+    pub index: usize,
+    /// Registration name used for display, profiling, and (ambiguous) lookup.
+    pub name: String,
+    /// Module that registered this system: the project or one optional module.
+    pub owner: SystemOwner,
+    /// Whether the system currently participates in frame execution.
+    pub enabled: bool,
+    /// Whether the system has a hot-patch dispatch slot in the registry.
+    pub hot_patchable: bool,
+    /// True when another registered system shares this name, so the UI can
+    /// warn instead of toggling an ambiguous target.
+    pub name_is_ambiguous: bool,
+}
+
 // =============================================================================
 // Engine
 // =============================================================================
@@ -132,6 +154,17 @@ pub struct Engine {
     parallel_execution: bool,
     /// Whether the execution graph needs rebuilding (dirty after enable/disable)
     graph_dirty: bool,
+    /// When true, `process_frame` skips the system-execution phase (but still
+    /// bumps the world tick, updates scripts, and flushes deferred commands).
+    ///
+    /// Deliberately a field rather than a host-side convention: an editor
+    /// needs the engine itself to keep ticking and flushing while systems are
+    /// frozen so it can mutate a paused world and observe the result.
+    systems_paused: bool,
+    /// When true, the next `process_frame` runs exactly one system phase even
+    /// while paused, then pauses again. Set by
+    /// [`Engine::request_single_step`].
+    single_step_pending: bool,
     /// If true, `process_frame` returns an error immediately when any
     /// deferred command fails.  When false (default), errors are logged
     /// to stderr and execution continues.
@@ -219,6 +252,8 @@ impl Engine {
             system_failures: Vec::new(),
             parallel_execution: true,
             graph_dirty: false,
+            systems_paused: false,
+            single_step_pending: false,
             should_exit_on_error: false,
             frame_budget: None,
             trace_frame_wait: true,
@@ -239,6 +274,34 @@ impl Engine {
     /// When disabled, systems run sequentially in registration order.
     pub fn set_parallel_execution(&mut self, enabled: bool) {
         self.parallel_execution = enabled;
+    }
+
+    /// Stop executing systems without stopping the frame.
+    ///
+    /// A paused engine still bumps the world tick, still updates scripts and
+    /// still flushes deferred commands, so an editor can mutate a frozen world
+    /// and see the result. Only the system-execution phase is skipped.
+    pub fn set_systems_paused(&mut self, paused: bool) {
+        self.systems_paused = paused;
+        if !paused {
+            // Resuming also cancels any pending single step: there is nothing
+            // to step one frame of if systems are running freely.
+            self.single_step_pending = false;
+        }
+    }
+
+    /// Whether the system-execution phase is currently skipped.
+    pub fn systems_paused(&self) -> bool {
+        self.systems_paused
+    }
+
+    /// Run exactly one more system phase on the next `process_frame`, then
+    /// pause again.
+    ///
+    /// Used by the editor's step control: it works whether or not the engine
+    /// is currently paused and leaves the engine paused afterwards.
+    pub fn request_single_step(&mut self) {
+        self.single_step_pending = true;
     }
 
     /// Limits the frame rate to `fps` frames per second.
@@ -305,6 +368,51 @@ impl Engine {
             .iter()
             .find(|s| s.name == name)
             .map(|s| s.enabled)
+    }
+
+    /// Snapshot of every registered system, in registration order.
+    ///
+    /// The editor's Systems tab reads this; it never requires knowing the
+    /// concrete system type. `hot_patchable` reports whether the system has a
+    /// dispatch slot in the hot-patch registry (only present when the host was
+    /// built with the `hot_patch` feature).
+    pub fn system_snapshots(&self) -> Vec<SystemSnapshot> {
+        self.systems
+            .iter()
+            .enumerate()
+            .map(|(index, system)| {
+                let name_is_ambiguous = self
+                    .systems
+                    .iter()
+                    .filter(|other| other.name == system.name)
+                    .count()
+                    > 1;
+                SystemSnapshot {
+                    index,
+                    name: system.name.clone(),
+                    owner: system.owner,
+                    enabled: system.enabled,
+                    hot_patchable: self.hot_patch_registry.get(&system.name).is_some(),
+                    name_is_ambiguous,
+                }
+            })
+            .collect()
+    }
+
+    /// Enable or disable a system by registration index, unambiguously.
+    ///
+    /// Unlike [`Self::set_system_enabled`], which matches by name and therefore
+    /// hits the first of several same-named systems, this targets exactly one
+    /// registration. Returns `false` when the index is out of range.
+    pub fn set_system_enabled_at(&mut self, index: usize, enabled: bool) -> bool {
+        let Some(system) = self.systems.get_mut(index) else {
+            return false;
+        };
+        if system.enabled != enabled {
+            system.enabled = enabled;
+            self.graph_dirty = true;
+        }
+        true
     }
 
     /// Prints the execution graph for debugging.
@@ -709,10 +817,18 @@ impl Engine {
             }
 
             // Step 4: Run all systems (parallel batches or sequential fallback).
-            if self.parallel_execution && self.systems.len() > 1 {
-                self.run_systems_parallel();
-            } else {
-                self.run_systems_sequential();
+            //
+            // A paused engine skips this phase but still bumps the world tick
+            // (Step 1), still updates scripts (Step 5), and still flushes
+            // deferred commands (Step 6). `request_single_step` runs exactly
+            // one phase and re-pauses by clearing the pending flag here.
+            if !self.systems_paused || self.single_step_pending {
+                if self.parallel_execution && self.systems.len() > 1 {
+                    self.run_systems_parallel();
+                } else {
+                    self.run_systems_sequential();
+                }
+                self.single_step_pending = false;
             }
 
             // Compute parallel-utilization metrics and emit Tracy plots.
@@ -1333,5 +1449,72 @@ mod tests {
         assert_eq!(first_runs.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(last_runs.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(engine.is_system_enabled("middle"), None);
+    }
+
+    /// A paused engine skips the system phase but keeps accepting frames, and
+    /// `request_single_step` runs exactly one more phase before pausing again.
+    #[test]
+    fn paused_engine_skips_systems_but_step_runs_exactly_one_phase() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_system = Arc::clone(&counter);
+        let mut engine = Engine::new();
+        engine.register_system("counter", move || {
+            counter_system.fetch_add(1, AtomicOrdering::SeqCst);
+        });
+
+        engine.process_frame().unwrap();
+        assert_eq!(counter.load(AtomicOrdering::SeqCst), 1);
+
+        // Paused: frames still process (tick bump, command flush) but no
+        // system runs.
+        engine.set_systems_paused(true);
+        engine.process_frame().unwrap();
+        engine.process_frame().unwrap();
+        assert_eq!(counter.load(AtomicOrdering::SeqCst), 1);
+
+        // One explicit step advances exactly one phase.
+        engine.request_single_step();
+        engine.process_frame().unwrap();
+        assert_eq!(counter.load(AtomicOrdering::SeqCst), 2);
+        engine.process_frame().unwrap();
+        assert_eq!(counter.load(AtomicOrdering::SeqCst), 2);
+
+        // Resuming runs systems again.
+        engine.set_systems_paused(false);
+        engine.process_frame().unwrap();
+        assert_eq!(counter.load(AtomicOrdering::SeqCst), 3);
+        assert!(!engine.systems_paused());
+    }
+
+    /// `system_snapshots` reports owners, enabled state, and name ambiguity,
+    /// and `set_system_enabled_at` toggles exactly one of two same-named
+    /// systems.
+    #[test]
+    fn system_snapshots_report_owners_and_toggle_by_index() {
+        let mut engine = Engine::new();
+        engine.register_system("duplicate", || {});
+        engine.begin_module_registration(SystemOwner::optional_module(0));
+        engine.register_system("duplicate", || {});
+        engine.end_module_registration();
+        engine.register_system("project_only", || {});
+
+        let snapshots = engine.system_snapshots();
+        assert_eq!(snapshots.len(), 3);
+        assert_eq!(snapshots[0].index, 0);
+        assert_eq!(snapshots[0].owner, SystemOwner::PROJECT);
+        assert_eq!(snapshots[1].owner, SystemOwner::optional_module(0));
+        assert!(snapshots.iter().all(|system| system.enabled));
+        assert!(snapshots[0].name_is_ambiguous);
+        assert!(snapshots[1].name_is_ambiguous);
+        assert!(!snapshots[2].name_is_ambiguous);
+
+        // Toggle by index affects exactly the first same-named system.
+        assert!(engine.set_system_enabled_at(0, false));
+        assert!(!engine.set_system_enabled_at(99, false));
+        let after = engine.system_snapshots();
+        assert!(!after[0].enabled);
+        assert!(after[1].enabled);
+        // The name-keyed query sees the first (now disabled) registration.
+        assert_eq!(engine.is_system_enabled("duplicate"), Some(false));
     }
 }

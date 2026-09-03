@@ -182,7 +182,11 @@ fn DetachedPanelWindow(props: DetachedPanelProps) -> Element {
             },
             div {
                 class: "dock-detached-panel",
-                PanelContent { panel, stats }
+                PanelContent {
+                    panel,
+                    stats,
+                    editor: Arc::clone(&editor),
+                }
             }
             if let Some((x, y)) = *context_menu.read() {
                 div {

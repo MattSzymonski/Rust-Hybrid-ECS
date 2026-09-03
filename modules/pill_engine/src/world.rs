@@ -165,6 +165,35 @@ impl IteratorTimings {
 // World
 // =============================================================================
 
+/// One live entity and the type names of the components attached to it.
+///
+/// Returned by [`World::entity_rows`] for the editor's Hierarchy panel. The
+/// names are stable across hot reloads; the [`Entity`] handle is the stable
+/// selection identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EntityRow {
+    /// The live entity handle, generation-tagged.
+    pub entity: Entity,
+    /// Registered type names of the components attached to the entity.
+    pub components: Vec<String>,
+}
+
+/// Where a component's field layout came from.
+///
+/// Native components submit a `&'static` slice from their declaring
+/// artifact's static data. Components defined by another language describe
+/// themselves in a runtime manifest, so their layout is owned by the `World`
+/// instead. The editor reads either through [`World::component_field_layout`],
+/// which erases the distinction.
+#[derive(Debug, Clone)]
+pub(crate) enum ComponentFieldLayout {
+    /// Compile-time layout living in the declaring artifact's static data.
+    Static(&'static [crate::component_registry::ComponentFieldDescriptor]),
+    /// Runtime-described layout owned by the world (foreign-language
+    /// components).
+    Owned(Vec<crate::component_registry::ComponentFieldDescriptor>),
+}
+
 /// Manages all entities, archetypes, and resources in the ECS.
 ///
 /// The central hub of the engine. It allocates entity IDs with generation
@@ -259,13 +288,12 @@ pub struct World {
     /// Chronological `(type_name, sequence)` log of every component
     /// registration, plain and persistable alike.
     pub(crate) component_registration_log: Vec<(String, u64)>,
-    /// Compile-time field layouts submitted by `#[derive(PillComponent)]`,
-    /// consumed by the C# mirror codegen to emit typed structs. The slices
-    /// live in the declaring artifact's static data, exactly like the
-    /// `storage_factories` function pointers, and are re-registered by each
-    /// reloaded generation. Empty for components without field metadata.
-    pub(crate) component_field_layouts:
-        HashMap<ComponentId, &'static [crate::component_registry::ComponentFieldDescriptor]>,
+    /// Field layouts submitted by `#[derive(PillComponent)]` (static, living
+    /// in the declaring artifact) or described at runtime by a foreign-language
+    /// manifest (owned). Consumed by the C# mirror codegen and the editor's
+    /// generic inspector. Re-registered by each reloaded generation; a dynamic
+    /// manifest replaces rather than accumulates.
+    pub(crate) component_field_layouts: HashMap<ComponentId, ComponentFieldLayout>,
     /// First component-registration failure of the current init pass, if any.
     ///
     /// Set when the 128-type ceiling is hit (or any other registry error
@@ -538,18 +566,37 @@ impl World {
     {
         self.register_component::<T>();
         self.component_field_layouts
-            .insert(ComponentId::of::<T>(), fields);
+            .insert(ComponentId::of::<T>(), ComponentFieldLayout::Static(fields));
     }
 
-    /// Return the compile-time field layout a component was registered with.
+    /// Return the field layout a component was registered with.
     ///
     /// `None` for components registered without field metadata, which is how
-    /// the C# codegen decides between a typed mirror and the ABI blob.
+    /// the C# codegen decides between a typed mirror and the ABI blob, and how
+    /// the editor decides a component is not field-editable.
     pub fn component_field_layout(
         &self,
         component_id: ComponentId,
-    ) -> Option<&'static [crate::component_registry::ComponentFieldDescriptor]> {
-        self.component_field_layouts.get(&component_id).copied()
+    ) -> Option<&[crate::component_registry::ComponentFieldDescriptor]> {
+        match self.component_field_layouts.get(&component_id) {
+            Some(ComponentFieldLayout::Static(fields)) => Some(fields),
+            Some(ComponentFieldLayout::Owned(fields)) => Some(fields),
+            None => None,
+        }
+    }
+
+    /// Record a runtime-described layout for a dynamic component.
+    ///
+    /// Overwrites any previous layout for the same id, so a manifest reload
+    /// replaces rather than accumulates. Used by the C# backend so managed
+    /// components become field-inspectable in the editor.
+    pub fn register_dynamic_component_field_layout(
+        &mut self,
+        component_id: ComponentId,
+        fields: Vec<crate::component_registry::ComponentFieldDescriptor>,
+    ) {
+        self.component_field_layouts
+            .insert(component_id, ComponentFieldLayout::Owned(fields));
     }
 
     /// Re-home every native column's per-type function table.
@@ -742,6 +789,112 @@ impl World {
             Some(StorageFactory::Dynamic(layout)) => Some((layout.size, layout.align)),
             None => None,
         }
+    }
+
+    /// Every live entity with its component type names, sorted by entity id.
+    ///
+    /// Read-only and tick-neutral: nothing is mutated and no change tick is
+    /// touched, so the editor can call this every refresh without disturbing
+    /// the simulation. Component names are resolved per archetype once and
+    /// shared across the entities of that archetype.
+    pub fn entity_rows(&self) -> Vec<EntityRow> {
+        // Step 1: Resolve each archetype's component names once; the string
+        // work is per archetype rather than per entity.
+        let mut archetype_names: HashMap<ArchetypeId, Vec<String>> =
+            HashMap::with_capacity(self.archetypes.len());
+        for (archetype_id, archetype) in &self.archetypes {
+            let names: Vec<String> = archetype
+                .component_types
+                .iter()
+                .filter_map(|component_id| {
+                    self.component_registry
+                        .get_name(component_id)
+                        .map(str::to_string)
+                })
+                .collect();
+            archetype_names.insert(*archetype_id, names);
+        }
+
+        // Step 2: Assemble one row per live entity, cloning the shared names.
+        let mut rows: Vec<EntityRow> = self
+            .entity_locations
+            .iter()
+            .map(|(entity, location)| EntityRow {
+                entity: *entity,
+                components: archetype_names
+                    .get(&location.archetype_id)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect();
+
+        // Step 3: Deterministic ordering for the editor list.
+        rows.sort_by_key(|row| row.entity.id());
+        rows
+    }
+
+    /// Component type names attached to one entity, or `None` when it is dead.
+    ///
+    /// Names come from the entity's own archetype, never from a registry scan,
+    /// so the result is authoritative for the generation that created the data.
+    pub fn entity_component_names(&self, entity: Entity) -> Option<Vec<String>> {
+        let location = self.entity_locations.get(&entity)?;
+        let archetype = self.archetypes.get(&location.archetype_id)?;
+        Some(
+            archetype
+                .component_types
+                .iter()
+                .filter_map(|component_id| {
+                    self.component_registry
+                        .get_name(component_id)
+                        .map(str::to_string)
+                })
+                .collect(),
+        )
+    }
+
+    /// Every registered component type: name plus current [`ComponentId`].
+    ///
+    /// Names are the stable cross-reload key; ids are per-generation and must
+    /// not be cached across a reload. Used by the editor's add-component
+    /// picker, not by the per-frame snapshot.
+    pub fn registered_components(&self) -> Vec<(String, ComponentId)> {
+        let mut components: Vec<(String, ComponentId)> = self
+            .component_registry
+            .registered_components()
+            .map(|(component_id, _, name)| (name.to_string(), component_id))
+            .collect();
+        components.sort();
+        components
+    }
+
+    /// Whether a component type is registered as persistable (schema-migrated
+    /// across reloads). Used by the editor to mark such components.
+    pub fn component_is_persistable(&self, component_id: ComponentId) -> bool {
+        self.persist_inserters.contains_key(&component_id)
+    }
+
+    /// The component id an entity's archetype actually stores for a registered
+    /// type name.
+    ///
+    /// Unlike [`Self::resolve_component_id_by_name_any`], which picks the
+    /// highest bit across every generation the registry still remembers, this
+    /// looks only at the columns the entity really has. That makes it correct
+    /// across reloads even when a bit index was recycled, and it guarantees the
+    /// returned id has a live column, a live tick vector, and a field layout
+    /// belonging to the generation that created the data.
+    pub fn resolve_entity_component_id(
+        &self,
+        entity: Entity,
+        type_name: &str,
+    ) -> Option<ComponentId> {
+        let location = self.entity_locations.get(&entity)?;
+        let archetype = self.archetypes.get(&location.archetype_id)?;
+        archetype
+            .component_types
+            .iter()
+            .copied()
+            .find(|component_id| self.component_registry.get_name(component_id) == Some(type_name))
     }
 
     /// Create an entity consisting entirely of runtime-defined components.
@@ -3996,5 +4149,111 @@ mod tests {
         assert_eq!(t.per_iterator_label_average_duration["physics"], 800_000);
 
         println!("✓ Duplicate label detection works correctly!");
+    }
+
+    /// The editor's Hierarchy source: `entity_rows` lists every live entity
+    /// with its component names, sorted by entity id.
+    #[test]
+    fn entity_rows_list_live_entities_with_components() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Velocity>();
+
+        let a = world
+            .create_entity()
+            .with(Position { x: 1.0, y: 2.0 })
+            .with(Velocity { x: 0.0, y: 0.0 })
+            .build()
+            .unwrap();
+        let _b = world
+            .create_entity()
+            .with(Position { x: 3.0, y: 4.0 })
+            .build()
+            .unwrap();
+
+        let rows = world.entity_rows();
+        assert_eq!(rows.len(), 2);
+        // Deterministic ordering by entity id: `a` was created first (id 0).
+        assert_eq!(rows[0].entity, a);
+        assert_eq!(rows[0].components.len(), 2);
+        assert!(rows[0]
+            .components
+            .iter()
+            .any(|name| name.contains("Position")));
+        assert!(rows[0]
+            .components
+            .iter()
+            .any(|name| name.contains("Velocity")));
+        assert_eq!(rows[1].components.len(), 1);
+
+        // A destroyed entity no longer appears and reports no names.
+        world.destroy_entity(a);
+        assert_eq!(world.entity_rows().len(), 1);
+        assert_eq!(world.entity_component_names(a), None);
+    }
+
+    /// `entity_component_names` includes runtime-defined (dynamic) components,
+    /// and `resolve_entity_component_id` is scoped to the entity's archetype.
+    #[test]
+    fn dynamic_components_appear_and_resolution_is_archetype_scoped() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let dynamic = world
+            .register_dynamic_component(0xABCD, "Demo.Thing", 4, 4, 99)
+            .unwrap();
+
+        let with_dynamic = world
+            .create_dynamic_entity(&[(dynamic, 7_u32.to_ne_bytes().to_vec())])
+            .unwrap();
+        let with_position = world
+            .create_entity()
+            .with(Position { x: 0.0, y: 0.0 })
+            .build()
+            .unwrap();
+
+        let names = world
+            .entity_component_names(with_dynamic)
+            .expect("entity alive");
+        assert_eq!(names, vec!["Demo.Thing"]);
+
+        // Resolution is per-entity: the dynamic component only resolves on the
+        // entity that carries it, and Position only on its own entity.
+        assert_eq!(
+            world.resolve_entity_component_id(with_dynamic, "Demo.Thing"),
+            Some(dynamic)
+        );
+        assert_eq!(
+            world.resolve_entity_component_id(with_position, "Demo.Thing"),
+            None
+        );
+        assert_eq!(
+            world.resolve_entity_component_id(with_position, &type_name_of::<Position>()),
+            Some(ComponentId::of::<Position>())
+        );
+    }
+
+    /// `registered_components` lists every type (native and dynamic), sorted.
+    #[test]
+    fn registered_components_lists_every_type_sorted() {
+        let mut world = World::new();
+        world.register_component::<Velocity>();
+        world.register_component::<Position>();
+        world
+            .register_dynamic_component(0x1111, "Demo.Alpha", 4, 4, 1)
+            .unwrap();
+
+        let registered = world.registered_components();
+        assert_eq!(registered.len(), 3);
+        // Sorted by name (full type paths sort before the demo name here).
+        let names: Vec<String> = registered.iter().map(|(name, _)| name.clone()).collect();
+        assert_eq!(names[0], "Demo.Alpha");
+        assert!(names[1].contains("Position"));
+        assert!(names[2].contains("Velocity"));
+    }
+
+    /// A tiny helper to get a component's registered type name without
+    /// depending on the registry ordering in this test module.
+    fn type_name_of<T: 'static>() -> String {
+        std::any::type_name::<T>().to_string()
     }
 }

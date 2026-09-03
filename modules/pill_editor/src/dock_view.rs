@@ -1,12 +1,18 @@
 //! Dioxus view layer for the geometry-driven dock workspace.
 
+use std::sync::Arc;
+
 use dioxus::prelude::*;
 
+use crate::console_tab::ConsoleTab;
+use crate::entities_tab::EntitiesTab;
+use crate::inspector::InspectorTab;
 use crate::layout::{
     Axis, DockLocation, DropTarget, LayoutAction, LayoutMetrics, LayoutModel, LayoutNode,
     LayoutSnapshot, NodeId, PanelKind, Rect,
 };
-use crate::{Stats, StatsWidget};
+use crate::systems_tab::SystemsTab;
+use crate::{EditorContext, Stats, StatsWidget};
 
 pub(crate) const DOCK_CSS: &str = include_str!("../assets/dock_layout.css");
 
@@ -55,6 +61,7 @@ pub fn DockView(
     mut model: Signal<LayoutModel>,
     snapshot: LayoutSnapshot,
     stats: Signal<Stats>,
+    editor: Arc<EditorContext>,
     on_undock: EventHandler<PanelKind>,
 ) -> Element {
     let mut drag = use_signal(|| None::<PointerDrag>);
@@ -70,6 +77,7 @@ pub fn DockView(
     let closed_panels = [
         PanelKind::Hierarchy,
         PanelKind::Inspector,
+        PanelKind::Systems,
         PanelKind::Console,
         PanelKind::Statistics,
     ]
@@ -240,7 +248,11 @@ pub fn DockView(
                                 role: "tabpanel",
                                 aria_labelledby: tab_id.dom_id("dock-tab"),
                                 style: panel_style(rect, visible),
-                                PanelContent { panel: tab.panel, stats }
+                                PanelContent {
+                                    panel: tab.panel,
+                                    stats,
+                                    editor: Arc::clone(&editor),
+                                }
                             }
                         }
                     }
@@ -523,17 +535,18 @@ pub fn DockView(
 
 /// Instantiate editor content from its durable panel identity.
 #[component]
-pub(crate) fn PanelContent(panel: PanelKind, stats: Signal<Stats>) -> Element {
+pub(crate) fn PanelContent(
+    panel: PanelKind,
+    stats: Signal<Stats>,
+    editor: Arc<EditorContext>,
+) -> Element {
     match panel {
         PanelKind::Scene => rsx! { ViewportFps { stats } },
         PanelKind::Statistics => rsx! { StatsWidget { stats } },
-        PanelKind::Hierarchy | PanelKind::Inspector | PanelKind::Console => rsx! {
-            div {
-                class: "dock-panel-placeholder",
-                div { class: "dock-panel-title", "{panel.title()}" }
-                div { "Panel content will be added here." }
-            }
-        },
+        PanelKind::Hierarchy => rsx! { EntitiesTab { editor } },
+        PanelKind::Inspector => rsx! { InspectorTab { editor } },
+        PanelKind::Systems => rsx! { SystemsTab { editor } },
+        PanelKind::Console => rsx! { ConsoleTab { editor } },
     }
 }
 
