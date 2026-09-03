@@ -41,7 +41,25 @@ use serde_json::Value;
 
 /// Subdirectory, relative to the workspace root, where cargo writes its
 /// `--timings` HTML report for every host-driven build.
-const CARGO_TIMINGS_DIRECTORY: &str = "target/cargo-timings";
+///
+/// Derived from the private module build tree rather than named, because that
+/// is where the reports land: every build the host spawns runs with
+/// `CARGO_TARGET_DIR` pointing at
+/// [`crate::config::MODULE_BUILD_TARGET_DIRECTORY`], and cargo writes the
+/// report under whichever target directory it was given. A hardcoded
+/// `target/cargo-timings` found only reports left by ordinary `cargo build`
+/// runs, so the per-crate rebuild breakdown was stale - or, on a clean
+/// checkout, missing entirely - and the `crates rebuilt by cargo:` line
+/// silently disappeared from every reload's analytics.
+///
+/// Cargo does NOT insert the target triple here, so this stays the same under
+/// the dioxus CLI's `--target` builds; only the artifact directories move.
+fn cargo_timings_directory() -> String {
+    format!(
+        "{}/cargo-timings",
+        crate::config::MODULE_BUILD_TARGET_DIRECTORY
+    )
+}
 
 /// Subdirectory, relative to the workspace root, where cargo writes each
 /// compiled crate's fingerprint JSON.
@@ -395,7 +413,7 @@ pub(crate) struct CargoTiming {
 /// non-zero duration, which is exactly what a rebuild report wants. Returns
 /// `None` when no report exists yet or its embedded JSON cannot be parsed.
 pub(crate) fn parse_latest_cargo_timings(workspace_root: &Path) -> Option<CargoTiming> {
-    let timings_directory = workspace_root.join(CARGO_TIMINGS_DIRECTORY);
+    let timings_directory = workspace_root.join(cargo_timings_directory());
     let mut reports: Vec<PathBuf> = std::fs::read_dir(&timings_directory)
         .ok()?
         .filter_map(Result::ok)
@@ -1421,7 +1439,7 @@ const CONCURRENCY_DATA = [
             "pill_analytics_test_{}_{unique}",
             std::process::id()
         ));
-        let timings = root.join(CARGO_TIMINGS_DIRECTORY);
+        let timings = root.join(cargo_timings_directory());
         std::fs::create_dir_all(&timings).unwrap();
         std::fs::write(
             timings.join("cargo-timing-20260822T000000000Z-deadbeef.html"),

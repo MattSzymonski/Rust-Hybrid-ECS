@@ -101,19 +101,35 @@ const HOST_MODULE_FEATURE_SET: &str =
         (false, false) => "no-rendering",
     };
 
-/// Host build identity: toolchain, feature set **and** cargo profile.
+/// Host build identity: toolchain, feature set, cargo profile, target, and the
+/// environment every spawned build runs with.
 ///
-/// The profile belongs here for the same reason the feature set does. Both
-/// change the crate-metadata hash on both sides of the DLL boundary, so an
-/// artifact built under one and loaded under the other fails to resolve its
-/// exports. Without the profile in this identity, switching between a debug
-/// and a release host would silently reuse the other profile's staged copies -
-/// which present as `LoadLibrary` error 127 rather than as anything that names
-/// a profile.
+/// The profile and target belong here for the same reason the feature set
+/// does: both change the crate-metadata hash on both sides of the DLL
+/// boundary, so an artifact built under one and loaded under the other fails
+/// to resolve its exports. Without the profile in this identity, switching
+/// between a debug and a release host would silently reuse the other profile's
+/// staged copies; without the target, switching between a native host and a
+/// `--target` host (a plain `cargo run` vs the dioxus CLI) reuses artifacts
+/// whose symbols no longer match. The spawned environment belongs here too:
+/// [`crate::config::spawned_build_environment`] decides whether module builds
+/// strip `-C prefer-dynamic` (LTO and the fail-safe dx fallback) and whether
+/// they mirror the dioxus CLI's `RUSTC_WORKSPACE_WRAPPER`, both of which
+/// change every member crate's metadata hash. All of these present as
+/// `LoadLibrary` error 127 rather than as anything that names a cause.
 fn host_build_identity() -> String {
+    let mut spawned_environment = crate::config::spawned_build_environment();
+    // The pairs are compared as a set, so ordering never matters.
+    spawned_environment.sort();
+    let spawned_environment = spawned_environment
+        .iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "{HOST_MODULE_FEATURE_SET}\nprofile={}\nbuild_tree={}",
+        "{HOST_MODULE_FEATURE_SET}\nprofile={}\ntarget={}\nbuild_tree={}\nspawned_env={spawned_environment}",
         crate::config::host_profile_name(),
+        crate::config::host_target_triple().unwrap_or("native"),
         crate::config::MODULE_BUILD_TARGET_DIRECTORY
     )
 }
@@ -502,6 +518,16 @@ pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: 
     if let Some(anchor) = host_anchor_package() {
         command.arg("--package").arg(anchor);
     }
+    // Mirror the host's own `--target` when a launcher (the dioxus CLI) built
+    // it with one. Cargo folds the target into every crate's metadata hash,
+    // so a module built natively against a `--target` host cannot resolve its
+    // dynamic imports against the host's loaded engine dylibs (os error 127
+    // at `LoadLibrary`). Cargo writes the mirrored build under
+    // `<CARGO_TARGET_DIR>/<triple>/<profile>`, which
+    // [`crate::config::module_build_artifact_directory`] already accounts for.
+    if let Some(triple) = crate::config::host_target_triple() {
+        command.arg("--target").arg(triple);
+    }
     let profile = crate::config::host_profile_name();
     if !matches!(profile, "dev" | "release" | "test" | "bench") {
         command
@@ -510,12 +536,188 @@ pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: 
     }
 }
 
+// =============================================================================
+// Piggybacked flag capture
+// =============================================================================
+
+/// Harvests the module crate's `rustc` invocation out of a build already running.
+///
+/// # Why
+///
+/// A fast patch replays the exact compiler line cargo uses for the module, so
+/// the patch links the identical dependency closure. Discovering that line
+/// costs a `cargo build -v`, and cargo only prints the invocation when it
+/// actually compiles - so when the crate is already fresh the discovery path
+/// has to TOUCH the crate root and force a rebuild of the module and of
+/// everything the host anchor drags in. Measured, that is 1.8-3.4 s under the
+/// standalone host and up to ~15 s under the editor, paid on the first patch
+/// after every module reload, because a reload is exactly what makes the
+/// cached line stale.
+///
+/// The build the host just ran compiled that crate for real. Asking it for
+/// `-v` and reading the line out of its output makes the discovery free and
+/// makes the cache fresh at the same instant the artifact it describes appears.
+///
+/// # How
+///
+/// `-v` is appended at spawn time only, never to the configured build command:
+/// that command is part of the cache key and of the artifact stamp, and adding
+/// a flag to it would invalidate both. Cargo's stderr is piped rather than
+/// inherited so it can be scanned, and every line is written straight back out
+/// so the console still streams compiler progress live - minus the two kinds of
+/// line `-v` itself adds (`Running` and `Fresh`), which would otherwise bury
+/// the diagnostics. Colour is requested explicitly when the host's own stderr
+/// is a terminal, because cargo turns it off for a pipe.
+#[cfg(feature = "hot_patch")]
+struct VerboseCapture {
+    /// Crate name to look for, which is the module's name.
+    crate_name: String,
+    /// Reader thread and the line it found, once joined.
+    reader: Option<std::thread::JoinHandle<Option<crate::hot_patch::CargoRustcLine>>>,
+}
+
+#[cfg(feature = "hot_patch")]
+impl VerboseCapture {
+    /// Turn `command` into a verbose, pipe-reading build, for cargo only.
+    ///
+    /// Returns `None` for a non-cargo build (the managed backend's `dotnet`),
+    /// which has no rustc line to harvest and must keep its inherited streams.
+    fn arm(command: &mut Command, program: &str, name: &str) -> Option<Self> {
+        if program != "cargo" {
+            return None;
+        }
+        use std::io::IsTerminal;
+        if std::io::stderr().is_terminal() {
+            command.arg("--color").arg("always");
+        }
+        command.arg("-v").stderr(std::process::Stdio::piped());
+        Some(Self {
+            crate_name: name.to_string(),
+            reader: None,
+        })
+    }
+
+    /// Begin draining the child's stderr.
+    fn start(mut self, child: &mut std::process::Child) -> Self {
+        let Some(stderr) = child.stderr.take() else {
+            return self;
+        };
+        let crate_name = self.crate_name.clone();
+        self.reader = std::thread::Builder::new()
+            .name("pill-build-capture".to_string())
+            .spawn(move || {
+                use std::io::{BufRead, BufReader, Write};
+                let mut found = None;
+                let mut reader = BufReader::new(stderr);
+                let mut line = Vec::new();
+                // Read bytes rather than `lines()`: compiler output is not
+                // guaranteed to be valid UTF-8 on every locale, and a decode
+                // error must not truncate the build log.
+                while reader.read_until(b'\n', &mut line).unwrap_or(0) > 0 {
+                    let text = String::from_utf8_lossy(&line);
+                    if found.is_none() {
+                        found = crate::hot_patch::parse_rustc_line(&text, &crate_name);
+                    }
+                    if !is_verbose_only_line(&text) {
+                        let _ = std::io::stderr().write_all(&line);
+                    }
+                    line.clear();
+                }
+                let _ = std::io::stderr().flush();
+                found
+            })
+            .ok();
+        self
+    }
+
+    /// Join the reader and cache whatever it found.
+    ///
+    /// A build that recompiled nothing prints no invocation, which is not a
+    /// failure: the cached line from when the crate WAS compiled still
+    /// describes it, and the patch pipeline's own freshness check decides that.
+    fn finish(self, name: &str, build_command: &[String]) {
+        let Some(reader) = self.reader else {
+            return;
+        };
+        let Ok(Some(line)) = reader.join() else {
+            return;
+        };
+        let cache = crate::hot_patch::flags_cache_path(name);
+        match line.save(&cache, build_command) {
+            Ok(()) => debug!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = name,
+                cache = %cache.display(),
+                "captured the patch compiler flags from this build"
+            ),
+            Err(error) => debug!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = name,
+                error = %error,
+                "could not cache the patch compiler flags; the next patch will re-capture"
+            ),
+        }
+    }
+}
+
+/// Whether a line exists only because the build was asked for `-v`.
+///
+/// Filtered out on the way to the console so the reload output reads exactly as
+/// it did before the capture was added; nothing else is touched.
+///
+/// Cargo colours its status words, so the label is preceded by ANSI escape
+/// sequences whenever the host's stderr is a terminal - matching on the raw
+/// prefix would silently stop filtering in exactly the case a human is
+/// watching, and dump every multi-kilobyte `rustc` command line into the
+/// console.
+#[cfg(feature = "hot_patch")]
+fn is_verbose_only_line(line: &str) -> bool {
+    let plain = without_ansi(line);
+    let label = plain.trim_start();
+    // The three status words `-v` adds: the invocation itself, the crates it
+    // skipped, and the reason it did not skip the others.
+    label.starts_with("Running `") || label.starts_with("Fresh ") || label.starts_with("Dirty ")
+}
+
+/// The line with every ANSI escape sequence removed.
+///
+/// Cargo colours the status word alone, so the escapes sit both before and
+/// immediately after the word being matched; dropping only the leading ones
+/// still leaves `Running<ESC>[0m ` and matches nothing.
+#[cfg(feature = "hot_patch")]
+fn without_ansi(line: &str) -> String {
+    let mut plain = String::with_capacity(line.len());
+    let mut rest = line;
+    while let Some(escape) = rest.find('\u{1b}') {
+        plain.push_str(&rest[..escape]);
+        let after = &rest[escape..];
+        // A CSI sequence: ESC '[' <parameters> <final byte in @..~>. Anything
+        // that does not look like one is kept verbatim, so unusual compiler
+        // output is passed through rather than swallowed.
+        let Some(parameters) = after.strip_prefix("\u{1b}[") else {
+            plain.push('\u{1b}');
+            rest = &after[1..];
+            continue;
+        };
+        match parameters.find(|character: char| ('@'..='~').contains(&character)) {
+            Some(end) => rest = &parameters[end + 1..],
+            None => return plain,
+        }
+    }
+    plain.push_str(rest);
+    plain
+}
+
 /// Run one module's build command to completion.
 ///
 /// Shared by the project module and by optional modules so both use the same
 /// process handling, watchdog, cancellation, and failure reporting. Resolving
 /// and validating the produced artifact is left to the caller, because each
 /// module kind names and locates its output differently.
+///
+/// With the `hot_patch` feature this also harvests the compiler flags the fast
+/// patch pipeline needs, out of the build it was going to run anyway - see
+/// [`VerboseCapture`].
 ///
 /// # Errors
 ///
@@ -556,10 +758,18 @@ pub(crate) fn run_build_command(
     if program == "cargo" {
         apply_cargo_host_overrides(&mut command, workspace_root);
     }
+    // Ask this build to say which rustc invocation it used, so the fast patch
+    // pipeline never has to run a build of its own to find out.
+    #[cfg(feature = "hot_patch")]
+    let capture = VerboseCapture::arm(&mut command, program, name);
     let mut child = command.spawn().map_err(|source| BuildError::SpawnFailed {
         name: name.to_string(),
         source,
     })?;
+    // Started before the watchdog loop: cargo's stderr must be drained while
+    // the build runs, or the pipe fills and the compiler blocks forever.
+    #[cfg(feature = "hot_patch")]
+    let capture = capture.map(|capture| capture.start(&mut child));
 
     // Step 3: Poll for completion, cancellation, or timeout under a watchdog.
     //
@@ -613,6 +823,12 @@ pub(crate) fn run_build_command(
             name: name.to_string(),
             status,
         });
+    }
+    // Only after a successful build: a failed one may have recompiled the crate
+    // with flags that never produced the artifact now on disk.
+    #[cfg(feature = "hot_patch")]
+    if let Some(capture) = capture {
+        capture.finish(name, build_command);
     }
     analytics::record_build_command(
         name,
@@ -1590,5 +1806,60 @@ dependency = { path = "../dependency" }
         ));
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    // -------------------------------------------------------------------------
+    // Piggybacked flag capture
+    // -------------------------------------------------------------------------
+
+    /// The two line kinds `-v` adds are recognised with and without colour.
+    ///
+    /// Cargo colours its status words whenever stderr is a terminal, which is
+    /// exactly when a human is reading the console - so a filter that only
+    /// matched the uncoloured spelling would dump every multi-kilobyte `rustc`
+    /// command line in front of the person it was meant to spare.
+    #[cfg(feature = "hot_patch")]
+    #[test]
+    fn verbose_only_lines_are_recognised_with_and_without_colour() {
+        for line in [
+            "     Running `rustc --crate-name project`\n",
+            "\u{1b}[0m\u{1b}[1m\u{1b}[32m     Running\u{1b}[0m `rustc --crate-name project`\n",
+            "       Fresh pill_core v0.1.0\n",
+            "\u{1b}[1m\u{1b}[32m       Fresh\u{1b}[0m pill_core v0.1.0\n",
+            "       Dirty pill_spline v0.1.0: the list of features changed\n",
+            "\u{1b}[1m\u{1b}[32m       Dirty\u{1b}[0m pill_spline v0.1.0: the file changed\n",
+        ] {
+            assert!(is_verbose_only_line(line), "must be filtered: {line:?}");
+        }
+        for line in [
+            "   Compiling pill_core v0.1.0\n",
+            "\u{1b}[1m\u{1b}[32m   Compiling\u{1b}[0m pill_core v0.1.0\n",
+            "error[E0433]: failed to resolve\n",
+            "warning: unused variable `x`\n",
+            "\n",
+        ] {
+            assert!(
+                !is_verbose_only_line(line),
+                "must reach the console: {line:?}"
+            );
+        }
+    }
+
+    /// The module crate's invocation is picked out of cargo's verbose stream,
+    /// and every other crate's is ignored - the patch must replay the flags of
+    /// the crate it is patching, not of whatever else the build recompiled.
+    #[cfg(feature = "hot_patch")]
+    #[test]
+    fn the_harvest_picks_only_the_module_crate() {
+        let other = r"     Running `C:\rustc.exe --crate-name pill_core --edition=2021 x.rs`";
+        let wanted = r"     Running `C:\rustc.exe --crate-name project --edition=2021 y.rs`";
+        assert!(crate::hot_patch::parse_rustc_line(other, "project").is_none());
+        assert!(
+            crate::hot_patch::parse_rustc_line("   Compiling project v0.1.0", "project").is_none()
+        );
+        let line = crate::hot_patch::parse_rustc_line(wanted, "project")
+            .expect("the module crate's invocation");
+        assert_eq!(line.program, r"C:\rustc.exe");
+        assert!(line.args.contains(&"--edition=2021".to_string()));
     }
 }

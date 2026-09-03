@@ -59,6 +59,11 @@ pub(crate) mod routes;
 pub(crate) use generations::Generation;
 pub use generations::PatchGeneration;
 
+// The captured compiler line and its cache, re-exported for the build runner:
+// a module build harvests the same line this pipeline would otherwise pay a
+// second `cargo build -v` to discover.
+pub(crate) use compile::{flags_cache_path, parse_rustc_line};
+
 // The three install routes and the patch-image plumbing they share. Re-exported
 // rather than referenced through `routes::` at every call site, so the session
 // below reads the same as it did when these lived in this file.
@@ -83,7 +88,7 @@ pub(crate) mod source {
 
 use crate::native_library::NativeLibrary;
 
-use compile::CargoRustcLine;
+pub(crate) use compile::CargoRustcLine;
 
 // =============================================================================
 // Constants
@@ -672,12 +677,16 @@ impl HotPatchSession {
             }
 
             // Exactly one changed body keeps the first version simple and the
-            // diagnostics precise.
+            // diagnostics precise. Both revisions are scanned once for every
+            // body at a time rather than once per function: asking about each
+            // function separately rebuilt the file's code mask on every
+            // question, which made classification of a 500-line file cost tens
+            // of milliseconds on every save.
+            let old_bodies = source::function_bodies(old_contents, &hot_names);
+            let new_bodies = source::function_bodies(&new_contents, &hot_names);
             let mut changed: Vec<String> = Vec::new();
             for name in &hot_names {
-                let old_body = source::find_function(old_contents, name).map(|found| found.body);
-                let new_body = source::find_function(&new_contents, name).map(|found| found.body);
-                if old_body != new_body {
+                if old_bodies.get(name) != new_bodies.get(name) {
                     changed.push(name.clone());
                 }
             }
@@ -1341,7 +1350,7 @@ impl HotPatchSession {
     /// The captured compiler flags, asking cargo on first use.
     fn rustc_line(&mut self) -> Result<&CargoRustcLine, String> {
         if self.rustc_line.is_none() {
-            let cache = std::env::temp_dir().join(format!("pill_hotpatch_{}.flags", self.package));
+            let cache = compile::flags_cache_path(&self.package);
             // Deliberately NOT the crate root. The flags describe the dependency
             // graph and feature set, which a source edit cannot change - and the
             // crate root is precisely the file being edited, so including it

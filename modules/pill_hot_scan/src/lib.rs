@@ -246,8 +246,25 @@ pub fn find_method(
 /// when its braces are unbalanced - both of which make the caller fall back to
 /// a full reload rather than guess.
 pub fn find_function(source: &str, name: &str) -> Option<FunctionText> {
-    let bytes = source.as_bytes();
     let mask = code_mask(source);
+    find_function_in(source, &mask, name)
+}
+
+/// [`find_function`] against a code mask the caller already computed.
+///
+/// Building the mask allocates and scans the whole file, so a caller that asks
+/// about several functions - or about the same file twice - must not pay for it
+/// once per question. Classification asks about every function in a file twice
+/// (old contents and new), and body stripping asks once per function it strips;
+/// computing the mask per call made classification of a 500-line file cost tens
+/// of milliseconds of pure re-scanning.
+///
+/// `mask` MUST be `code_mask(source)` for this exact `source`: it is indexed by
+/// the same byte offsets, so a mask built from different text silently reports
+/// the wrong function bounds.
+pub fn find_function_in(source: &str, mask: &[bool], name: &str) -> Option<FunctionText> {
+    let bytes = source.as_bytes();
+    debug_assert_eq!(mask.len(), bytes.len(), "the mask must describe this source");
     let needle = format!("fn {name}");
     let needle_bytes = needle.as_bytes();
 
@@ -271,8 +288,8 @@ pub fn find_function(source: &str, name: &str) -> Option<FunctionText> {
                 || matches!(bytes[after], b'(' | b' ' | b'<' | b'\n' | b'\r' | b'\t');
 
             if preceded_ok && followed_ok {
-                let open = next_open_brace(bytes, &mask, after)?;
-                let close = matching_brace(bytes, &mask, open)?;
+                let open = next_open_brace(bytes, mask, after)?;
+                let close = matching_brace(bytes, mask, open)?;
                 return Some(FunctionText {
                     start: search,
                     end: close + 1,
@@ -811,31 +828,143 @@ fn is_identifier_byte(byte: u8) -> bool {
 /// constants, imports, attributes and every other function all survive the
 /// strip, so any edit to them shows up as a difference.
 pub fn strip_function_bodies(source: &str, names: &HashSet<String>) -> String {
+    let mask = code_mask(source);
     let mut stripped = String::with_capacity(source.len());
     let mut cursor = 0usize;
 
-    // Repeatedly find the earliest remaining named function and blank its body.
-    loop {
-        let next = names
-            .iter()
-            .filter_map(|name| find_function(&source[cursor..], name))
-            .min_by_key(|found| found.start);
-
-        let Some(found) = next else {
-            break;
-        };
-
+    // One forward pass over the file, blanking each named body as it is
+    // reached. Asking `find_function` per name per round instead made the walk
+    // O(functions x names) full-file scans - 17 ms on a 500-line file, paid
+    // twice on every save, which was the largest single cost in classification.
+    for (_, found) in scan_named_functions(source, &mask, names, SkipStrategy::PastBody) {
         // Keep everything up to and including the opening brace, drop the body.
-        let absolute_start = cursor + found.start;
-        let body_open = absolute_start + (found.text.len() - found.body.len() - 2);
+        let body_open = found.start + (found.text.len() - found.body.len() - 2);
         stripped.push_str(&source[cursor..=body_open]);
         stripped.push_str("/*body*/");
         stripped.push('}');
-        cursor += found.end;
+        cursor = found.end;
     }
 
     stripped.push_str(&source[cursor..]);
     stripped
+}
+
+/// The body text of each named function that this source declares.
+///
+/// Classification compares one revision's bodies against another's to decide
+/// which function actually changed. Asking [`find_function`] that question once
+/// per name re-scanned the whole file per name, twice per save; this answers
+/// every name in one pass.
+///
+/// A name the source does not declare is simply absent from the map, which is
+/// the same answer [`find_function`] gives by returning `None`. Like
+/// [`find_function`], the FIRST declaration of a name wins, so a nested
+/// function shadows a later top-level one exactly as it did before.
+pub fn function_bodies(source: &str, names: &HashSet<String>) -> HashMap<String, String> {
+    let mask = code_mask(source);
+    let mut bodies = HashMap::new();
+    for (name, found) in scan_named_functions(source, &mask, names, SkipStrategy::IntoBody) {
+        bodies.entry(name).or_insert(found.body);
+    }
+    bodies
+}
+
+/// Whether a scan continues inside a function it just matched.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SkipStrategy {
+    /// Resume after the function's closing brace, so nested declarations are
+    /// part of the body rather than matches of their own. Body stripping needs
+    /// this: a nested function's body is already inside the body it blanked.
+    PastBody,
+    /// Resume just after the matched declaration, so nested functions are
+    /// matched too - which is what [`find_function`] does, since it searches
+    /// the whole file for a name.
+    IntoBody,
+}
+
+/// Every declaration of a named function, in source order, in one pass.
+///
+/// Shared by [`strip_function_bodies`] and [`function_bodies`] so both answer
+/// with exactly the bounds [`find_function`] would report for the same name:
+/// the same `fn <name>` spelling, the same boundary characters either side, and
+/// the same brace matching over `mask`.
+///
+/// `mask` MUST be `code_mask(source)`, so a `fn` inside a string or a comment
+/// is never matched.
+fn scan_named_functions(
+    source: &str,
+    mask: &[bool],
+    names: &HashSet<String>,
+    skip: SkipStrategy,
+) -> Vec<(String, FunctionText)> {
+    const KEYWORD: &[u8] = b"fn ";
+    let bytes = source.as_bytes();
+    let mut found = Vec::new();
+    let mut index = 0usize;
+
+    while index + KEYWORD.len() < bytes.len() {
+        // `fn ` in real code, preceded by a boundary - the same test
+        // `find_function` applies, so `r#fn ` or `xfn ` never matches.
+        let is_keyword = &bytes[index..index + KEYWORD.len()] == KEYWORD
+            && mask[index..index + KEYWORD.len()]
+                .iter()
+                .all(|byte_is_code| *byte_is_code);
+        let preceded_ok = index == 0
+            || matches!(
+                bytes[index - 1],
+                b'\n' | b'\r' | b'\t' | b' ' | b'}' | b';'
+            );
+        if !is_keyword || !preceded_ok {
+            index += 1;
+            continue;
+        }
+
+        // The identifier that follows, which is what decides whether this
+        // declaration is one of the ones being asked about.
+        let name_start = index + KEYWORD.len();
+        let mut name_end = name_start;
+        while name_end < bytes.len() && is_identifier_byte(bytes[name_end]) && mask[name_end] {
+            name_end += 1;
+        }
+        let followed_ok = name_end >= bytes.len()
+            || matches!(bytes[name_end], b'(' | b' ' | b'<' | b'\n' | b'\r' | b'\t');
+        if name_end == name_start || !followed_ok {
+            index += 1;
+            continue;
+        }
+        let name = &source[name_start..name_end];
+        if !names.contains(name) {
+            index = name_end;
+            continue;
+        }
+
+        // A declaration whose braces do not resolve is skipped, not fatal:
+        // `find_function` answers `None` for that one name and its caller goes
+        // on asking about the others, so abandoning the whole scan here would
+        // silently stop stripping every function further down the file.
+        let Some(open) = next_open_brace(bytes, mask, name_end) else {
+            index = name_end;
+            continue;
+        };
+        let Some(close) = matching_brace(bytes, mask, open) else {
+            index = name_end;
+            continue;
+        };
+        found.push((
+            name.to_string(),
+            FunctionText {
+                start: index,
+                end: close + 1,
+                text: source[index..=close].to_string(),
+                body: source[open + 1..close].to_string(),
+            },
+        ));
+        index = match skip {
+            SkipStrategy::PastBody => close + 1,
+            SkipStrategy::IntoBody => name_end,
+        };
+    }
+    found
 }
 
 // =============================================================================
@@ -1677,5 +1806,139 @@ fn also_not_annotated() {}
         let comment_brace = source.rfind('}').unwrap();
         assert!(!mask[comment_brace], "brace in a comment must be masked");
         assert!(mask[0] && bytes[0] == b'l', "plain code stays unmasked");
+    }
+
+    // -------------------------------------------------------------------------
+    // Single-pass scanning
+    // -------------------------------------------------------------------------
+
+    /// The per-name algorithm the single-pass scanner replaced.
+    ///
+    /// Kept as the oracle rather than as production code: it is obviously
+    /// correct (one independent `find_function` per name) and obviously slow
+    /// (a full-file scan per name per function, 17 ms on a 500-line file,
+    /// paid twice on every save). The tests below assert the fast scanner
+    /// agrees with it.
+    fn reference_strip(source: &str, names: &HashSet<String>) -> String {
+        let mut stripped = String::with_capacity(source.len());
+        let mut cursor = 0usize;
+        loop {
+            let next = names
+                .iter()
+                .filter_map(|name| find_function(&source[cursor..], name))
+                .min_by_key(|found| found.start);
+            let Some(found) = next else {
+                break;
+            };
+            let absolute_start = cursor + found.start;
+            let body_open = absolute_start + (found.text.len() - found.body.len() - 2);
+            stripped.push_str(&source[cursor..=body_open]);
+            stripped.push_str("/*body*/");
+            stripped.push('}');
+            cursor += found.end;
+        }
+        stripped.push_str(&source[cursor..]);
+        stripped
+    }
+
+    /// A file that exercises every shape the scanner has to survive.
+    ///
+    /// The body-less trait declaration is the one that mattered: an early
+    /// version abandoned the whole scan when a declaration's braces did not
+    /// resolve, so every function BELOW such a declaration silently stopped
+    /// being stripped - and an edit to any of them was then reported as a
+    /// change outside a hot body and fell back to a full module reload.
+    fn awkward_source() -> &'static str {
+        r#"
+//! A doc comment mentioning fn disguised in prose.
+
+pub trait Shape {
+    /// No body at all, so its braces never resolve.
+    fn area(&self) -> f32;
+    fn name(&self) -> &str;
+}
+
+pub struct Probe;
+
+impl Probe {
+    pub const fn new() -> Self {
+        Self
+    }
+
+    pub fn install(&self, value: usize) {
+        let _ = value;
+    }
+}
+
+impl Default for Probe {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn outer() -> u32 {
+    fn inner() -> u32 {
+        7
+    }
+    inner()
+}
+
+fn quoted() -> &'static str {
+    // fn commented_out() { }
+    "fn in_a_string() {"
+}
+"#
+    }
+
+    /// The fast scanner and the per-name oracle strip the same bytes.
+    #[test]
+    fn stripping_matches_the_per_name_algorithm() {
+        let source = awkward_source();
+        let names: HashSet<String> = all_functions(source)
+            .into_iter()
+            .map(|function| function.name)
+            .collect();
+        assert!(
+            names.contains("install") && names.contains("default"),
+            "the sample must contain functions below the body-less declaration"
+        );
+        assert_eq!(strip_function_bodies(source, &names), reference_strip(source, &names));
+    }
+
+    /// A declaration whose braces do not resolve must not stop the scan.
+    #[test]
+    fn a_body_less_declaration_does_not_end_the_scan() {
+        let source = awkward_source();
+        let names: HashSet<String> = all_functions(source)
+            .into_iter()
+            .map(|function| function.name)
+            .collect();
+        let stripped = strip_function_bodies(source, &names);
+        for below in ["install", "default", "outer"] {
+            assert!(
+                !stripped.contains(&format!("fn {below}(")) || stripped.contains("/*body*/"),
+                "{below} must still be reachable"
+            );
+        }
+        assert_eq!(
+            stripped.matches("/*body*/").count(),
+            reference_strip(source, &names).matches("/*body*/").count(),
+            "the same number of bodies must be blanked"
+        );
+    }
+
+    /// `function_bodies` answers exactly what `find_function` would, per name.
+    #[test]
+    fn function_bodies_match_find_function() {
+        let source = awkward_source();
+        let names: HashSet<String> = all_functions(source)
+            .into_iter()
+            .map(|function| function.name)
+            .collect();
+        let expected: HashMap<String, String> = names
+            .iter()
+            .filter_map(|name| find_function(source, name).map(|found| (name.clone(), found.body)))
+            .collect();
+        assert_eq!(function_bodies(source, &names), expected);
     }
 }

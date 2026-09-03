@@ -23,6 +23,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 // Current crate
 use pill_core::error::ConfigError;
@@ -79,6 +80,28 @@ pub(crate) fn host_profile_name() -> &'static str {
     profile_name_for_directory(HOST_PROFILE_DIRECTORY)
 }
 
+/// Target triple the host was compiled for, recorded by `build.rs`.
+///
+/// Empty when the host was built natively (an ordinary `cargo build`/`cargo
+/// run` without `--target`), which is every host except one launched by the
+/// dioxus CLI (`dx serve`). dx always passes `--target <host-triple>` to
+/// cargo, and cargo folds the target into each crate's metadata hash - so a
+/// module built natively against a `--target` host gets different symbol
+/// names than the host's loaded engine dylibs export, and every module load
+/// dies with "The specified procedure could not be found" (os error 127).
+/// Host-spawned module builds mirror this triple so both sides agree.
+const HOST_TARGET_TRIPLE: &str = env!("PILL_HOST_TARGET_TRIPLE");
+
+/// The `--target` triple host-spawned builds must pass, when the host itself
+/// was built with one.
+pub(crate) fn host_target_triple() -> Option<&'static str> {
+    if HOST_TARGET_TRIPLE.is_empty() {
+        None
+    } else {
+        Some(HOST_TARGET_TRIPLE)
+    }
+}
+
 /// Map a cargo profile *directory* to the profile *name* that produces it.
 ///
 /// Split out from [`host_profile_name`] so the mapping is testable without
@@ -94,35 +117,178 @@ fn profile_name_for_directory(directory: &str) -> &str {
     }
 }
 
-/// Environment every host-spawned cargo build needs, on top of the host's own.
+/// Whether a cargo profile enables link-time optimization, the one case where
+/// a host-spawned build must drop the workspace's `-C prefer-dynamic` rustflag.
 ///
-/// Empty for the default profile. For any optimized profile it clears
-/// `RUSTFLAGS`, which is the only thing that can drop the workspace's
-/// `-C prefer-dynamic`: cargo MERGES `build.rustflags` arrays, so
-/// `--config build.rustflags=[]` joins the existing list and changes nothing,
-/// and a `target.<triple>` list does not replace it either. An empty
-/// `RUSTFLAGS` in the environment takes precedence over the config file and is
-/// the mechanism `devops/ci_cd/build_release.sh` already uses for the host's
-/// own build.
-///
-/// Without this, every module and project build the host spawns fails with
-/// "cannot prefer dynamic linking when performing LTO", because the release
-/// profile sets `lto = "fat"` and rustc refuses that pairing outright.
-pub(crate) fn spawned_build_environment() -> Vec<(String, String)> {
-    if host_profile_name() == "dev" {
-        Vec::new()
-    } else {
-        vec![("RUSTFLAGS".to_string(), String::new())]
-    }
+/// rustc refuses `prefer-dynamic` combined with `lto = "fat"` outright
+/// ("cannot prefer dynamic linking when performing LTO"), so a host running
+/// under an LTO profile has to clear the flag for every build it spawns.
+/// Every other profile - `dev`, and launcher-injected dev-like profiles such
+/// as the dioxus CLI's `desktop-dev` - keeps `prefer-dynamic`, which is what
+/// makes modules dynamic (importing the one shared `pill_core.dll` instead of
+/// embedding a private engine copy).
+fn profile_uses_lto(profile: &str) -> bool {
+    // The workspace manifest sets `lto = "fat"` on `release` and everything
+    // that inherits from it. Custom profiles that inherit `dev` (for example
+    // the dioxus CLI's `desktop-dev`) deliberately stay out of this list.
+    matches!(profile, "release" | "release-fast" | "release-with-debug")
 }
 
-/// Workspace-relative directory cargo writes this host's profile into.
+/// Environment variable the dioxus CLI sets on every app it launches.
+///
+/// Its presence tells the host it is running as an app built and served by
+/// `dx`, which matters because dx builds by wrapping every workspace-member
+/// rustc invocation through its own binary (see [`dioxus_executable_path`]).
+const DIOXUS_CLI_ENABLED_ENVIRONMENT: &str = "DIOXUS_CLI_ENABLED";
+
+/// Cargo's workspace-wrapper environment variable.
+///
+/// Cargo wraps only workspace member crates through this executable and folds
+/// the executable's path into their `-C metadata` hash, which is how dx's
+/// build diverges from a plain cargo build. The value is deliberately kept as
+/// a constant here (not hard-coded) so the env name and the dx-specific
+/// `DX_RUSTC` sibling stay in one place.
+const RUSTC_WORKSPACE_WRAPPER_ENVIRONMENT: &str = "RUSTC_WORKSPACE_WRAPPER";
+
+/// Environment variable that makes dx's own binary act as a rustc wrapper.
+///
+/// Without it dx treats a `dx <rustc> <args>` invocation as a normal CLI call
+/// and fails; with it, dx records the invocation into the directory named by
+/// this variable and then proxies the real `rustc`. Host-spawned builds that
+/// mirror dx's workspace wrapper must set both variables together.
+const DX_RUSTC_WRAPPER_ENVIRONMENT: &str = "DX_RUSTC";
+
+/// Whether this host binary is running as an app launched by the dioxus CLI.
+///
+/// `dx serve`/`dx run` set `DIOXUS_CLI_ENABLED` (plus `DIOXUS_BUILD_ID`, the
+/// devserver address, and friends) on the environment of every app it builds
+/// and launches (dioxus-cli `build/builder.rs` `child_environment_variables`).
+/// A plain `cargo run`/`cargo build` never sets it, which is what separates
+/// the dx-built editor - whose engine dylibs carry dx's workspace-wrapper
+/// hash - from every other host.
+fn running_under_dioxus_cli() -> bool {
+    env::var_os(DIOXUS_CLI_ENABLED_ENVIRONMENT).is_some()
+}
+
+/// Canonicalize a path without the Windows `\\?\` verbatim prefix.
+///
+/// `std::fs::canonicalize` returns `\\?\C:\...` on Windows; dx canonicalizes
+/// its own executable with `dunce` (which strips the prefix), and the two
+/// strings must be byte-identical or cargo's metadata hash will not agree.
+fn canonicalize_plain(path: &Path) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(path).ok()?;
+    let text = canonical.to_string_lossy();
+    let plain = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    Some(PathBuf::from(plain))
+}
+
+/// Canonical path of the `dx` executable that launched this host, if any.
+///
+/// dx builds by setting `RUSTC_WORKSPACE_WRAPPER` to its own canonical
+/// executable path (dioxus-cli `build/request.rs` `cargo_build_command`), and
+/// cargo folds that exact path into the `-C metadata` hash of workspace
+/// member crates (cargo `compiler/build_runner/compilation_files.rs`
+/// `compute_metadata`). Host-spawned builds must mirror the SAME path string
+/// for their member crates to hash identically to the editor's, so this
+/// resolves dx the same way dx resolves itself: prefer an already-recorded
+/// wrapper value from the environment, otherwise look `dx` up on `PATH` and
+/// canonicalize. Cached because it is read for every spawned build.
+fn dioxus_executable_path() -> Option<&'static Path> {
+    static DIOXUS_EXECUTABLE_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIOXUS_EXECUTABLE_PATH
+        .get_or_init(|| {
+            // A launcher may already have set the wrapper (or dx may have left
+            // it in the environment); reuse it rather than guessing on PATH.
+            if let Some(recorded) = env::var_os(RUSTC_WORKSPACE_WRAPPER_ENVIRONMENT) {
+                let recorded_path = PathBuf::from(recorded);
+                return canonicalize_plain(&recorded_path).or(Some(recorded_path));
+            }
+            let executable_name = if cfg!(windows) { "dx.exe" } else { "dx" };
+            for directory in env::split_paths(&env::var_os("PATH")?) {
+                let candidate = directory.join(executable_name);
+                if candidate.is_file() {
+                    return canonicalize_plain(&candidate);
+                }
+            }
+            None
+        })
+        .as_deref()
+}
+
+/// Directory dx's wrapper writes captured member rustc invocations into.
+///
+/// dx only acts as a rustc wrapper when `DX_RUSTC` names a directory; it
+/// records one JSON file per member crate there (never read back by this
+/// host) and then proxies the real `rustc`. A private temp directory keeps
+/// these host-driven captures out of dx's own `target/dx/.captured-args`
+/// scope, which dx serve reads for its own thin-rebuild replay.
+fn dioxus_wrapper_args_directory() -> PathBuf {
+    std::env::temp_dir().join("pill-host-dx-rustc-args")
+}
+
+/// Environment every host-spawned cargo build needs, on top of the host's own.
+///
+/// Two independent decisions are made here, both about keeping the spawned
+/// build's crate-metadata universe byte-identical to the host binary that is
+/// running right now:
+///
+/// 1. `RUSTFLAGS` is cleared only for LTO profiles, the one case where the
+///    workspace's `-C prefer-dynamic` cannot survive (rustc rejects the
+///    pairing). `RUSTFLAGS` is the only lever that can drop it: cargo MERGES
+///    `build.rustflags` arrays, so `--config build.rustflags=[]` joins the
+///    existing list and changes nothing. An empty `RUSTFLAGS` in the
+///    environment takes precedence over the config file, which is also the
+///    mechanism `devops/ci_cd/build_release.sh` uses for the host's own build.
+///    Dev-like launcher profiles such as the dioxus CLI's `desktop-dev`
+///    (inherits `dev`, no LTO) keep `prefer-dynamic`, so modules stay
+///    dynamic - importing the one shared engine instance.
+/// 2. Under the dioxus CLI, spawned builds mirror dx's `RUSTC_WORKSPACE_WRAPPER`
+///    so workspace member crates hash identically to the editor's. dx wraps
+///    every member rustc invocation through its own binary and cargo folds
+///    that wrapper path into the member crates' `-C metadata` (registry
+///    crates are unaffected, which is why only members ever diverged).
+///    Mirroring it through dx's own executable is safe: dx's wrapper only
+///    intercepts LINKER-driver invocations (rustc args carrying `.o` files or
+///    `-flavor`), and host builds link through `link.exe`, so every member
+///    compile is simply proxied to the real `rustc`.
+///
+/// The dynamic choice is fail-safe: when running under dx but the wrapper path
+/// cannot be resolved, `prefer-dynamic` is dropped too, leaving the previous
+/// static-module behaviour (static modules embed their own engine and load
+/// regardless of the wrapper hash; dynamic ones would fail with os error 127).
+pub(crate) fn spawned_build_environment() -> Vec<(String, String)> {
+    let mut environment = Vec::new();
+    let under_dioxus = running_under_dioxus_cli();
+    let wrapper_mirrored = under_dioxus && dioxus_executable_path().is_some();
+    if profile_uses_lto(host_profile_name()) || (under_dioxus && !wrapper_mirrored) {
+        environment.push(("RUSTFLAGS".to_string(), String::new()));
+    }
+    if wrapper_mirrored {
+        if let Some(executable) = dioxus_executable_path() {
+            environment.push((
+                RUSTC_WORKSPACE_WRAPPER_ENVIRONMENT.to_string(),
+                executable.display().to_string(),
+            ));
+            environment.push((
+                DX_RUSTC_WRAPPER_ENVIRONMENT.to_string(),
+                dioxus_wrapper_args_directory().display().to_string(),
+            ));
+        }
+    }
+    environment
+}
+
+/// Workspace-relative directory cargo wrote this host's profile into.
 ///
 /// Used as the host's own artifact location, so the host looks for the engine
 /// dylibs it maps where its own profile put them rather than always in
-/// `target/debug`.
+/// `target/debug`. A host built with `--target` (the dioxus CLI) lives under
+/// `target/<triple>/<profile>`; a native one under `target/<profile>`.
 pub(crate) fn host_target_directory() -> String {
-    format!("target/{HOST_PROFILE_DIRECTORY}")
+    match host_target_triple() {
+        Some(triple) => format!("target/{triple}/{HOST_PROFILE_DIRECTORY}"),
+        None => format!("target/{HOST_PROFILE_DIRECTORY}"),
+    }
 }
 
 /// Private build tree for every cargo build the host spawns.
@@ -136,13 +302,24 @@ pub(crate) fn host_target_directory() -> String {
 /// refuses to replace a loaded image). All host-spawned native builds write
 /// here instead; their engine artifacts are staged into the hot-load directory
 /// and loaded co-located when the two worlds differ.
+///
+/// When the host was itself built with `--target` ([`HOST_TARGET_TRIPLE`]),
+/// host-spawned builds pass the same `--target`, so cargo inserts the triple
+/// between this directory and the profile and the whole subtree lands under
+/// `target/hot/build/<triple>/<profile>`.
 pub(crate) const MODULE_BUILD_TARGET_DIRECTORY: &str = "target/hot/build";
 
 /// Profile subdirectory inside [`MODULE_BUILD_TARGET_DIRECTORY`] where cargo
-/// writes a host-spawned build's artifacts (`target/hot/build/debug` for a dev
-/// host).
+/// writes a host-spawned build's artifacts (`target/hot/build/debug` for a
+/// native dev host, `target/hot/build/x86_64-pc-windows-msvc/desktop-dev`
+/// under the dioxus CLI, which builds with an explicit `--target`).
 pub(crate) fn module_build_artifact_directory() -> String {
-    format!("{MODULE_BUILD_TARGET_DIRECTORY}/{HOST_PROFILE_DIRECTORY}")
+    match host_target_triple() {
+        Some(triple) => {
+            format!("{MODULE_BUILD_TARGET_DIRECTORY}/{triple}/{HOST_PROFILE_DIRECTORY}")
+        }
+        None => format!("{MODULE_BUILD_TARGET_DIRECTORY}/{HOST_PROFILE_DIRECTORY}"),
+    }
 }
 
 /// Project configuration file name, resolved in the project root. A project
@@ -1669,12 +1846,33 @@ fn add_rlib_crate_type(manifest: &str) -> String {
 
 #[cfg(test)]
 mod profile_tests {
-    use super::{host_profile_name, host_target_directory, profile_name_for_directory};
+    use super::{
+        host_profile_name, host_target_directory, profile_name_for_directory, profile_uses_lto,
+    };
 
     /// The one profile whose cargo name and target directory differ.
     #[test]
     fn the_default_profile_is_named_dev_but_builds_into_debug() {
         assert_eq!(profile_name_for_directory("debug"), "dev");
+    }
+
+    /// Only the release family enables LTO, which is what forces spawned builds
+    /// to drop `-C prefer-dynamic`. Dev-like launcher profiles (for example
+    /// the dioxus CLI's `desktop-dev`) must keep it so modules stay dynamic.
+    #[test]
+    fn only_the_release_family_uses_lto() {
+        for lto_profile in ["release", "release-fast", "release-with-debug"] {
+            assert!(
+                profile_uses_lto(lto_profile),
+                "{lto_profile} must be treated as an LTO profile"
+            );
+        }
+        for dynamic_profile in ["dev", "desktop-dev", "shipping", "test", "bench"] {
+            assert!(
+                !profile_uses_lto(dynamic_profile),
+                "{dynamic_profile} must keep `-C prefer-dynamic`"
+            );
+        }
     }
 
     /// Every other profile's directory is its own name, including custom ones.

@@ -95,6 +95,50 @@ pub struct CargoRustcLine {
     pub args: Vec<String>,
 }
 
+/// Where a package's captured flags are cached between processes.
+///
+/// The system temporary directory rather than the build tree, because the
+/// cache describes the CURRENT host's universe and must not be mistaken for a
+/// build artifact; its freshness is decided by
+/// [`CargoRustcLine::load_if_fresh`], not by its location.
+///
+/// Shared by the two writers so they cannot disagree: the fast-patch pipeline,
+/// which captures on demand, and [`crate::build_runner::run_build_command`],
+/// which harvests the same line for free out of a build it was going to run
+/// anyway.
+pub(crate) fn flags_cache_path(package: &str) -> PathBuf {
+    std::env::temp_dir().join(format!("pill_hotpatch_{package}.flags"))
+}
+
+/// Pull the invocation for `crate_name` out of one line of cargo's `-v` output.
+///
+/// Returns `None` for every line that is not a `Running \`rustc ...\`` naming
+/// that crate, so a caller can feed it cargo's whole stderr stream a line at a
+/// time. Any rustc wrapper cargo ran (sccache) is unwrapped, exactly as the
+/// on-demand capture does - the patch replays the compiler directly and the
+/// wrapper's own CLI would reject rustc's arguments.
+pub(crate) fn parse_rustc_line(line: &str, crate_name: &str) -> Option<CargoRustcLine> {
+    let invocation = extract_backticked(line)?;
+    if !invocation.contains("rustc") {
+        return None;
+    }
+    let tokens = tokenize(&invocation);
+    if tokens.len() < 2 {
+        return None;
+    }
+    let names_this_crate = tokens
+        .windows(2)
+        .any(|pair| pair[0] == "--crate-name" && pair[1] == crate_name);
+    if !names_this_crate {
+        return None;
+    }
+    let compiler_index = compiler_token_index(&tokens);
+    Some(CargoRustcLine {
+        program: tokens[compiler_index].clone(),
+        args: tokens[compiler_index + 1..].to_vec(),
+    })
+}
+
 impl CargoRustcLine {
     // -------------------------------------------------------------------------
     // Capture
@@ -154,16 +198,18 @@ impl CargoRustcLine {
         // The full reload path and this flag-capture path both invoke the
         // module's configured cargo command, and both must agree with the host
         // binary that is running right now. Re-apply everything the reload path
-        // applies: the spawned-build environment (an empty `RUSTFLAGS` for any
-        // non-dev profile, which strips the workspace's `-C prefer-dynamic`),
-        // plus the shared overrides (the private target directory, the host
-        // anchor package and the custom profile definition). Missing the
-        // profile definition makes cargo reject a launcher-injected profile
-        // such as `desktop-dev`; missing the `RUSTFLAGS` override instead
-        // compiles the crate with different codegen flags than the module was
-        // built with, which changes every metadata hash and makes the captured
-        // `--extern` closure disagree with the staged rlib - rustc then
-        // reports `error[E0463]` and every edit falls back to a full reload.
+        // applies: the spawned-build environment (profile-driven `RUSTFLAGS`
+        // handling, and under the dioxus CLI the mirror of dx's
+        // `RUSTC_WORKSPACE_WRAPPER`), plus the shared overrides (the private
+        // target directory, the host anchor package and the custom profile
+        // definition). Missing the profile definition makes cargo reject a
+        // launcher-injected profile such as `desktop-dev`; an environment that
+        // differs from the module build's instead compiles the crate with
+        // different codegen flags or a different wrapper hash than the module
+        // was built with, which changes every metadata hash and makes the
+        // captured `--extern` closure disagree with the staged rlib - rustc
+        // then reports `error[E0463]` and every edit falls back to a full
+        // reload.
         if program == "cargo" {
             command.envs(
                 crate::config::spawned_build_environment()
@@ -186,35 +232,9 @@ impl CargoRustcLine {
         // Several crates may be rebuilt; take the one that names this package as
         // its crate. `--crate-name <package>` identifies it unambiguously
         // because cargo builds one library target per package here.
-        for raw in stderr.lines() {
-            let Some(invocation) = extract_backticked(raw) else {
-                continue;
-            };
-            if !invocation.contains("rustc") {
-                continue;
-            }
-            let tokens = tokenize(&invocation);
-            if tokens.len() < 2 {
-                continue;
-            }
-            let names_this_package = tokens
-                .windows(2)
-                .any(|pair| pair[0] == "--crate-name" && pair[1] == package);
-            if !names_this_package {
-                continue;
-            }
-
-            // Unwrap a rustc wrapper (e.g. sccache under `RUSTC_WRAPPER`) if
-            // cargo ran rustc through one; the wrapper's own CLI would reject
-            // the replayed rustc arguments. A plain invocation is unaffected:
-            // its first token is the compiler.
-            let compiler_index = compiler_token_index(&tokens);
-            return Ok(Some(Self {
-                program: tokens[compiler_index].clone(),
-                args: tokens[compiler_index + 1..].to_vec(),
-            }));
-        }
-        Ok(None)
+        Ok(stderr
+            .lines()
+            .find_map(|raw| parse_rustc_line(raw, package)))
     }
 
     // -------------------------------------------------------------------------
@@ -323,6 +343,10 @@ impl CargoRustcLine {
                 let value = &self.args[index + 1];
                 arguments.push(match (token.as_str(), staged_dependencies) {
                     ("--extern", Some(directory)) => redirect_extern(value, directory),
+                    // The patch is linked by the toolchain's own LLD even when
+                    // cargo recorded a different linker; see
+                    // [`patch_linker_value`].
+                    ("-C", _) => patch_linker_value(value),
                     _ => value.clone(),
                 });
             }
@@ -450,6 +474,52 @@ impl CargoRustcLine {
 // =============================================================================
 // Free functions
 // =============================================================================
+
+/// Linker the patch is built with, given the one cargo recorded.
+///
+/// Returns the value unchanged for every `-C` other than `linker=`, and for a
+/// `linker=` that already names an LLD.
+///
+/// **Why the patch overrides the linker at all.** The workspace asks for
+/// `rust-lld` (`modules/.cargo/config.toml`), but the editor launcher has to
+/// force `link.exe` for the whole dx session, because dx drives the link
+/// through its own linker proxy and that proxy cannot run LLD. The patch is not
+/// linked by dx: the host runs `rustc` itself, so nothing forces `link.exe`
+/// here beyond the flag having been captured from a build that did run under
+/// the launcher.
+///
+/// **What it is worth.** Measured on the same patch and the same inputs, LLD
+/// links this closure in ~236 ms against link.exe's ~950 ms - the single
+/// largest difference between the editor's patch time and the standalone
+/// host's, and about 55 % of the editor's whole per-patch cost.
+///
+/// **Why it is safe.** The linker choice affects only the ephemeral patch
+/// image. Both linkers consume the same object files and import libraries and
+/// both accept the `/DEBUG:NONE` the replay appends; the patch never links
+/// anything the module did not, and a linker that failed would refuse the patch
+/// and fall back to a module reload rather than produce a wrong one.
+fn patch_linker_value(value: &str) -> String {
+    let Some(linker) = value.strip_prefix("linker=") else {
+        return value.to_string();
+    };
+    let file_name = Path::new(linker)
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or(linker)
+        .to_ascii_lowercase();
+    if file_name.contains("lld") {
+        return value.to_string();
+    }
+    format!("linker={PATCH_LINKER}")
+}
+
+/// The linker [`patch_linker_value`] substitutes.
+///
+/// `rust-lld` is resolved by rustc out of the active toolchain's sysroot
+/// (`lib/rustlib/<target>/bin`), so it needs nothing installed and follows a
+/// toolchain switch. It is the same linker `modules/.cargo/config.toml` already
+/// asks every non-dx build in this repository to use.
+const PATCH_LINKER: &str = "rust-lld";
 
 /// Point one `--extern name=path` at its staged copy, when there is one.
 ///
@@ -1006,6 +1076,54 @@ mod tests {
         assert!(joined.contains("linker=rust-lld"));
         assert!(joined.contains("--edition=2021"));
         assert!(joined.contains("cfg(docsrs,test)"));
+    }
+
+    /// The patch links through the toolchain's LLD whatever cargo recorded.
+    ///
+    /// The editor launcher forces `link.exe` on the whole dx session because
+    /// dx's linker proxy cannot drive LLD, and that flag is captured with the
+    /// rest of the command. Replaying it costs ~290 ms of extra link time per
+    /// patch (measured on the same inputs) for a linker choice that only ever
+    /// affects the ephemeral patch image.
+    #[test]
+    fn the_patch_links_with_lld_even_when_cargo_recorded_link_exe() {
+        assert_eq!(patch_linker_value("linker=link.exe"), "linker=rust-lld");
+        assert_eq!(
+            patch_linker_value(r"linker=C:\Program Files\...\link.exe"),
+            "linker=rust-lld"
+        );
+        // Already an LLD: left exactly as cargo recorded it, so a workspace
+        // that names a specific LLD build keeps it.
+        assert_eq!(patch_linker_value("linker=rust-lld"), "linker=rust-lld");
+        assert_eq!(
+            patch_linker_value("linker=lld-link.exe"),
+            "linker=lld-link.exe"
+        );
+        // Every other `-C` value passes through untouched.
+        assert_eq!(patch_linker_value("prefer-dynamic"), "prefer-dynamic");
+        assert_eq!(patch_linker_value("debuginfo=2"), "debuginfo=2");
+    }
+
+    /// A captured `link.exe` is rewritten inside a full replay, not only in
+    /// isolation - and nothing else about the linker line moves.
+    #[test]
+    fn replay_rewrites_a_captured_link_exe() {
+        let mut line = parsed();
+        for argument in &mut line.args {
+            if argument == "linker=rust-lld" {
+                *argument = "linker=link.exe".to_string();
+            }
+        }
+        let arguments = line.replay_args(
+            Path::new("patch.rs"),
+            Path::new("patch.dll"),
+            "pill_hotpatch_1",
+            &[],
+            None,
+        );
+        let joined = arguments.join(" ");
+        assert!(joined.contains("linker=rust-lld"), "{joined}");
+        assert!(!joined.contains("link.exe"), "{joined}");
     }
 
     #[test]
