@@ -84,14 +84,6 @@ pub(crate) fn SystemsTab(editor: Arc<EditorContext>) -> Element {
                     "Step"
                 }
             }
-            div {
-                class: "editor-panel-note",
-                if paused {
-                    "Paused — systems are not running; edits are observable."
-                } else {
-                    "Running — edits to animated components may be overwritten next frame."
-                }
-            }
             ul {
                 class: "editor-list",
                 for row in rows {

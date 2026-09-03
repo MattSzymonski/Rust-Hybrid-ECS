@@ -1089,7 +1089,7 @@ mod tests {
             .expect("entity builds");
         let name = "pill_engine::component_field::tests::SampleComponent";
 
-        world.destroy_entity(entity);
+        let _ = world.destroy_entity(entity);
         assert_eq!(
             world.read_component_field(entity, name, "a_float"),
             Err(ComponentFieldError::EntityNotFound)

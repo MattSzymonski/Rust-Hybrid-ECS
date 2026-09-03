@@ -10,7 +10,7 @@ use dioxus::desktop::tao::window::WindowBuilder;
 use dioxus::desktop::{use_wry_event_handler, window, Config};
 use dioxus::prelude::*;
 
-use crate::dock_view::{PanelContent, DOCK_CSS};
+use crate::dock_view::{live_dock_css, PanelContent};
 use crate::layout::PanelKind;
 use crate::{EditorContext, Stats};
 
@@ -163,9 +163,10 @@ fn DetachedPanelWindow(props: DetachedPanelProps) -> Element {
     } else {
         "dock-detached-root dock-checker"
     };
+    let dock_css = live_dock_css();
 
     rsx! {
-        style { dangerous_inner_html: DOCK_CSS }
+        style { dangerous_inner_html: dock_css }
         div {
             class: root_class,
             tabindex: "0",

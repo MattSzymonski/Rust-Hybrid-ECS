@@ -32,6 +32,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 // External crates
+#[cfg(windows)]
+use libloading::os::windows as windows_loader;
 use libloading::{Library, Symbol};
 use pill_core::error::LibraryError;
 use pill_core::{debug, info};
@@ -52,6 +54,67 @@ const TEMPORARY_DIRECTORY: &str = "pill_standalone_temp";
 /// Monotonic suffix ensuring temporary copies never collide, even when the
 /// system clock repeats or moves backwards.
 static TEMPORARY_COPY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// `LOAD_WITH_ALTERED_SEARCH_PATH`: make a module's dependency resolution start
+/// from the directory that contains the module, so it loads the engine dylib
+/// staged beside it rather than the host's copy from the executable directory.
+#[cfg(windows)]
+const LOAD_WITH_ALTERED_SEARCH_PATH: u32 = 0x0000_0008;
+
+/// Whether a module build produced an engine dylib different from the one the
+/// host has mapped, which means the module must load against its own copy.
+///
+/// When the two are byte-identical (a plain CLI host whose feature closure
+/// matches the module build) the module keeps loading the host's single
+/// instance; only a host whose graph unions different features onto the shared
+/// engine crates (a GUI frontend) needs the isolated copy.
+fn engine_dylib_needs_isolation(workspace_root: &Path) -> bool {
+    let Some(module_engine) = module_world_engine_dylib(workspace_root) else {
+        return false;
+    };
+    let host_engine = workspace_root
+        .join(crate::config::host_target_directory())
+        .join("pill_core.dll");
+    if !host_engine.is_file() {
+        return true;
+    }
+    !files_equal(&module_engine, &host_engine)
+}
+
+/// Copy the module-world engine dylib into `directory` so a module loaded from
+/// there resolves it co-located instead of the host's copy.
+fn stage_module_engine_dylib(workspace_root: &Path, directory: &Path) {
+    let Some(source) = module_world_engine_dylib(workspace_root) else {
+        return;
+    };
+    if std::fs::create_dir_all(directory).is_err() {
+        return;
+    }
+    let _ = std::fs::copy(source, directory.join("pill_core.dll"));
+}
+
+/// Locate the engine dylib the module build produced: the staged hot-load copy
+/// when a build has run, otherwise the one still in the private build tree.
+fn module_world_engine_dylib(workspace_root: &Path) -> Option<PathBuf> {
+    let staged = workspace_root
+        .join(crate::build_runner::PROJECT_HOT_OUTPUT_SUBDIRECTORY)
+        .join("pill_core.dll");
+    if staged.is_file() {
+        return Some(staged);
+    }
+    let built = workspace_root
+        .join(crate::config::module_build_artifact_directory())
+        .join("pill_core.dll");
+    built.is_file().then_some(built)
+}
+
+/// Byte equality for two DLL files.
+fn files_equal(left: &Path, right: &Path) -> bool {
+    match (std::fs::read(left), std::fs::read(right)) {
+        (Ok(left_bytes), Ok(right_bytes)) => left_bytes == right_bytes,
+        _ => false,
+    }
+}
 
 // =============================================================================
 // Types + Impls
@@ -262,6 +325,22 @@ impl NativeLibrary {
             "copied project DLL"
         );
 
+        // Step 2b: Decide whether this module must load against its own engine
+        // dylib rather than the host's.
+        //
+        // The host binary maps `pill_core.dll` from the regular target
+        // directory. When the module build produced a different engine dylib
+        // than the host runs (a GUI frontend unions extra features onto shared
+        // crates), the module must resolve ITS copy or symbol lookup fails at
+        // load time. The matching copy is staged into the hot-load directory
+        // by the build; when the two copies are byte-identical (a plain CLI
+        // host) the module keeps loading the host's single instance exactly as
+        // before.
+        let isolated_engine = engine_dylib_needs_isolation(workspace_root);
+        if isolated_engine {
+            stage_module_engine_dylib(workspace_root, &temporary_directory);
+        }
+
         // Step 3: Load the copy and validate its required exports.
         // SAFETY: `temporary_path` was just written by `std::fs::copy` from
         // the freshly built output, so it is a complete native module on
@@ -272,8 +351,14 @@ impl NativeLibrary {
         // written by `std::fs::copy` immediately above - and `Self::load`
         // validates the required exports before returning; see the fuller
         // justification above the copy.
-        let native_library =
-            unsafe { Self::load(&temporary_path, temporary_path.clone(), entry_points) }?;
+        let native_library = unsafe {
+            Self::load(
+                &temporary_path,
+                temporary_path.clone(),
+                entry_points,
+                isolated_engine,
+            )
+        }?;
         analytics::record_load(module_name, load_started.elapsed().as_secs_f64() * 1000.0);
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -399,17 +484,64 @@ impl NativeLibrary {
         path: &Path,
         temporary_path: PathBuf,
         entry_points: &NativeEntryPoints,
+        isolated_engine: bool,
     ) -> Result<Self, LibraryError> {
         // Step 1: Open the native library and map it into this process.
         // SAFETY: The `# Safety` contract of `load` guarantees `path` names a
-        // valid native library. `Library::new` maps the module and runs its
-        // constructors; the returned handle keeps it mapped and is stored in
-        // the `ProjectLibrary` for the module's whole lifetime.
-        let library = unsafe {
-            Library::new(path).map_err(|source| LibraryError::LoadFailed {
-                path: path.display().to_string(),
-                source,
-            })?
+        // valid native library. Mapping runs the module's constructors; the
+        // returned handle keeps it mapped and is stored in the
+        // `ProjectLibrary` for the module's whole lifetime.
+        let library = if isolated_engine {
+            // The module was compiled against an engine dylib that differs from
+            // the host's; load with the module's own directory first in the
+            // dependency search order so it resolves the copy staged beside it.
+            #[cfg(windows)]
+            {
+                unsafe {
+                    // SAFETY: `path` is the complete native module on disk
+                    // (copied by the caller immediately before this load), and
+                    // the matching engine dylib was copied into the same
+                    // directory just above; the altered search path therefore
+                    // only resolves known, self-owned DLLs.
+
+                    // `load_with_flags` returns the platform-level handle; the
+                    // crate-root `Library` used by `NativeLibrary` is the safe
+                    // wrapper over it, which `From` provides.
+                    Library::from(
+                        windows_loader::Library::load_with_flags(
+                            path,
+                            LOAD_WITH_ALTERED_SEARCH_PATH,
+                        )
+                        .map_err(|source| LibraryError::LoadFailed {
+                            path: path.display().to_string(),
+                            source,
+                        })?,
+                    )
+                }
+            }
+            // Non-Windows loaders do not pin dependency resolution the way
+            // Windows does; fall back to the default load, which resolves the
+            // module's dependencies the same way it always has.
+            #[cfg(not(windows))]
+            {
+                unsafe {
+                    Library::new(path).map_err(|source| LibraryError::LoadFailed {
+                        path: path.display().to_string(),
+                        source,
+                    })?
+                }
+            }
+        } else {
+            // SAFETY: `path` names a complete native module on disk (validated
+            // by the caller), and the module was built against the engine dylib
+            // the host already has mapped, so the default search resolves that
+            // shared single instance.
+            unsafe {
+                Library::new(path).map_err(|source| LibraryError::LoadFailed {
+                    path: path.display().to_string(),
+                    source,
+                })?
+            }
         };
 
         // Step 2: Resolve the required `project_init` export.

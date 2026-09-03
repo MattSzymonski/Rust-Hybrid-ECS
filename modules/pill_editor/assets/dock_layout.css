@@ -426,6 +426,33 @@ body {
     white-space: nowrap;
 }
 
+/* Colour picker row: swatch block, native colour input, and alpha box. */
+.editor-color {
+    gap: 8px;
+}
+
+.editor-color-swatch {
+    flex: 0 0 22px;
+    width: 22px;
+    height: 22px;
+    border: 1px solid rgb(70, 70, 70);
+    border-radius: 3px;
+}
+
+.editor-color-input {
+    flex: 0 0 120px;
+    width: 46px;
+    height: 22px;
+    border: 1px solid rgb(70, 70, 70);
+    border-radius: 3px;
+    background: rgb(28, 28, 28);
+    padding: 0;
+}
+
+.editor-color-alpha {
+    flex: 0 0 56px;
+}
+
 .editor-select {
     width: 100%;
     margin-bottom: 4px;

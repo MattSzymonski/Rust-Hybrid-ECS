@@ -480,6 +480,19 @@ impl World {
         let component_id = ComponentId::of::<T>();
         let type_name = std::any::type_name::<T>().to_string();
 
+        // Shared renderer components (Position/Sprite/Color) are `repr(C)` ABI
+        // types registered through this plain path, so a hand-written catalog
+        // supplies their field layouts here - the editor then shows and edits
+        // them like any `#[derive(PillComponent)]` type. Resolved up front
+        // because `type_name` is moved into the registration log below; the
+        // non-rendering build of the engine has no renderer catalog at all.
+        #[cfg(feature = "rendering")]
+        let shared_field_layout = crate::render::shared_component_field_layout(&type_name);
+        #[cfg(not(feature = "rendering"))]
+        let shared_field_layout: Option<
+            &'static [crate::component_registry::ComponentFieldDescriptor],
+        > = None;
+
         // Register component (bit index + name)
         // `register_bit` rather than `register`: the world does not act on
         // whether the type was already present, and re-registration is normal
@@ -541,6 +554,13 @@ impl World {
         // requires no heap allocation or vtable dispatch.
         self.component_copiers
             .insert(component_id, copy_component::<T>);
+
+        // Attach the shared renderer layout (if the catalog names this type),
+        // giving hand-registered ABI components editable editor fields.
+        if let Some(layout) = shared_field_layout {
+            self.component_field_layouts
+                .insert(component_id, ComponentFieldLayout::Static(layout));
+        }
     }
 
     /// Drain the first registration failure recorded by
@@ -4187,7 +4207,7 @@ mod tests {
         assert_eq!(rows[1].components.len(), 1);
 
         // A destroyed entity no longer appears and reports no names.
-        world.destroy_entity(a);
+        let _ = world.destroy_entity(a);
         assert_eq!(world.entity_rows().len(), 1);
         assert_eq!(world.entity_component_names(a), None);
     }

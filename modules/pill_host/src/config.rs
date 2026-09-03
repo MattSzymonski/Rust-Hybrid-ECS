@@ -118,10 +118,31 @@ pub(crate) fn spawned_build_environment() -> Vec<(String, String)> {
 
 /// Workspace-relative directory cargo writes this host's profile into.
 ///
-/// Used as the project's build-output location, so the host looks for the
-/// artifact where its own profile put it rather than always in `target/debug`.
+/// Used as the host's own artifact location, so the host looks for the engine
+/// dylibs it maps where its own profile put them rather than always in
+/// `target/debug`.
 pub(crate) fn host_target_directory() -> String {
     format!("target/{HOST_PROFILE_DIRECTORY}")
+}
+
+/// Private build tree for every cargo build the host spawns.
+///
+/// The running host binary maps the engine dylibs (`pill_core.dll`) out of the
+/// regular target directory ([`host_target_directory`]). A GUI frontend like
+/// the editor unions extra features onto crates those dylibs depend on, so the
+/// engine the host itself runs can legitimately need different artifacts than
+/// a module build does - and a module build that rewrote the shared target
+/// directory would make cargo delete a DLL the host has mapped (Windows
+/// refuses to replace a loaded image). All host-spawned native builds write
+/// here instead; their engine artifacts are staged into the hot-load directory
+/// and loaded co-located when the two worlds differ.
+pub(crate) const MODULE_BUILD_TARGET_DIRECTORY: &str = "target/hot/build";
+
+/// Profile subdirectory inside [`MODULE_BUILD_TARGET_DIRECTORY`] where cargo
+/// writes a host-spawned build's artifacts (`target/hot/build/debug` for a dev
+/// host).
+pub(crate) fn module_build_artifact_directory() -> String {
+    format!("{MODULE_BUILD_TARGET_DIRECTORY}/{HOST_PROFILE_DIRECTORY}")
 }
 
 /// Project configuration file name, resolved in the project root. A project
@@ -303,11 +324,21 @@ impl OptionalModuleConfig {
         // (not a default) so that building every member in one cargo
         // invocation never leaks the `#[no_mangle]` `pill_module_*` exports
         // onto a module's dependency copies via feature unification.
-        let mut module_features = vec!["module-abi".to_string()];
+        //
+        // The features are package-qualified because the host frontend is
+        // selected as an anchor package in the same invocation (see
+        // `run_build_command`): a plain `module-abi` would have to exist on
+        // every selected package. Qualifying keeps the module's own features
+        // on the module while the anchor's presence unifies the shared engine
+        // crates with whatever host binary is running - a GUI frontend unions
+        // extra features onto those crates, and a module compiled against a
+        // differently featured engine cannot resolve its `pill_core.dll`
+        // imports against the single instance the host has loaded.
+        let mut module_features = vec![format!("{name}/module-abi")];
         // Mirror the host's engine feature set. A module compiled against a
         // differently configured engine can disagree about type layout.
         if cfg!(feature = "rendering") {
-            module_features.push("rendering".to_string());
+            module_features.push(format!("{name}/rendering"));
         }
         // Hot patching must be mirrored for a different reason: `pill_engine` is
         // an rlib, so the module links its own copy of `register_system`. Built
@@ -574,10 +605,11 @@ impl ProjectModuleConfig {
         // Sources are watched in place at the real project path, while the
         // built artifact lands in the workspace target directory.
         let watch_directory = format!("{project_path}/src");
-        // Where cargo will put it, which is the host's profile directory - not
-        // `target/debug`, which is only right when the host itself is a debug
-        // build.
-        let output_subdirectory = host_target_directory();
+        // Where cargo will put it: the private build tree host-spawned builds
+        // write into (see [`module_build_artifact_directory`]), never the
+        // shared `target/<profile>` the host binary maps its engine dylibs
+        // from.
+        let output_subdirectory = module_build_artifact_directory();
 
         // Step 4: Build the Cargo command. The project is a workspace member,
         // so the build selects it by package name from the workspace root. It
@@ -610,10 +642,14 @@ impl ProjectModuleConfig {
         ];
         // Mirror the host's engine feature set into the project build, for the
         // same reason optional modules do: `pill_engine` is an rlib, so the
-        // project links its own copy and must be configured identically.
+        // project links its own copy and must be configured identically. The
+        // project's own feature (`rendering`) is package-qualified for the
+        // same reason module features are: the host frontend is selected as an
+        // anchor package in the same invocation.
+        let project_package = format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}");
         let mut project_features: Vec<String> = Vec::new();
         if cfg!(feature = "rendering") {
-            project_features.push("rendering".to_string());
+            project_features.push(format!("{project_package}/rendering"));
         }
         // Without this the project's copy of `register_system` compiles the
         // no-slot path, and every patch is refused with "no hot-patchable

@@ -59,7 +59,7 @@ const FLOOR_Y: f32 = 580.0;
 const CEILING_Y: f32 = 20.0;
 const LEFT_WALL: f32 = 20.0;
 const RIGHT_WALL: f32 = 780.0;
-const BALL_COUNT: usize = 100;
+const BALL_COUNT: usize = 3;
 
 /// Public so a hot patch can name it: a patched system's signature must be
 /// expressible from outside the crate.
@@ -102,6 +102,30 @@ impl Default for PhysicsState {
         initial_physics_state()
     }
 }
+
+// =============================================================================
+// Static landmark sprites (inspector-editable while the sim runs)
+// =============================================================================
+
+/// Marks the static landmark sprites so `project_init` fills the world up to
+/// the target count after a hot reload instead of adding fresh squares every
+/// rebuild.
+///
+/// Landmarks carry only `Position` + `Sprite` and are deliberately never
+/// touched by a system, so the editor can repaint their colour and size live
+/// while the balls keep bouncing. The ball sprites, by contrast, are owned by
+/// `ball_physics` and overwritten every frame.
+#[cfg(feature = "rendering")]
+#[derive(Debug, Clone, Copy, PillComponent)]
+pub struct SceneLandmark;
+
+/// Landmark layout: `(x, y, width, height, (r, g, b))` for each square.
+#[cfg(feature = "rendering")]
+const LANDMARKS: [(f32, f32, f32, f32, (f32, f32, f32)); 3] = [
+    (24.0, 24.0, 56.0, 56.0, (1.0, 0.35, 0.35)),
+    (96.0, 24.0, 56.0, 56.0, (0.35, 1.0, 0.45)),
+    (168.0, 24.0, 56.0, 56.0, (0.40, 0.55, 1.0)),
+];
 
 /// Public so a hot patch of `physics_system` can call it without the patch
 /// having to duplicate the physics constants.
@@ -432,6 +456,32 @@ pub fn init(engine: &mut Engine) -> u32 {
                     target: pill_core::telemetry::telemetry_target::ECS,
                     error = %error,
                     "failed to build a ball entity; aborting this project generation"
+                );
+                return 1;
+            }
+        }
+    }
+
+    // Static landmark squares: no system writes them, so their Position/Sprite
+    // stay editable in the inspector while the sim runs.
+    #[cfg(feature = "rendering")]
+    {
+        let existing_landmarks = {
+            let mut query = Query::<&SceneLandmark>::new(engine.world_mut());
+            query.iter_mut().count()
+        };
+        for index in existing_landmarks..LANDMARKS.len() {
+            let (x, y, width, height, (r, g, b)) = LANDMARKS[index];
+            let entity = engine.world_mut().create_entity().with(SceneLandmark);
+            let entity = entity.with(Position { x, y }).with(Sprite {
+                width,
+                height,
+                color: Color::new(r, g, b, 1.0),
+            });
+            if entity.build().is_err() {
+                error!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    "failed to build a landmark sprite; aborting this project generation"
                 );
                 return 1;
             }

@@ -1,6 +1,7 @@
 //! Dioxus view layer for the geometry-driven dock workspace.
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use dioxus::prelude::*;
 
@@ -14,7 +15,54 @@ use crate::layout::{
 use crate::systems_tab::SystemsTab;
 use crate::{EditorContext, Stats, StatsWidget};
 
+/// Compiled-in fallback stylesheet, injected into every dock root.
 pub(crate) const DOCK_CSS: &str = include_str!("../assets/dock_layout.css");
+
+/// Absolute path of the stylesheet asset in the dev tree. When the file is
+/// present, edits to it hot-apply while the editor runs instead of requiring
+/// a rebuild.
+const CSS_ASSET_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/dock_layout.css");
+
+/// How often the stylesheet file is checked for changes while the editor runs.
+const CSS_RELOAD_INTERVAL: Duration = Duration::from_millis(150);
+
+/// Read the stylesheet from disk, or fall back to the compiled copy when the
+/// file is not part of this build (packaged binaries).
+fn read_stylesheet_from_disk() -> Option<String> {
+    std::fs::read_to_string(CSS_ASSET_PATH).ok()
+}
+
+/// Modification stamp of the stylesheet asset, used to detect file changes.
+fn stylesheet_modified_time() -> Option<SystemTime> {
+    std::fs::metadata(CSS_ASSET_PATH)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+}
+
+/// The stylesheet text to inject into a dock root's `<style>` node.
+///
+/// Starts from disk (compiled CSS as the fallback) and re-reads the asset
+/// whenever it changes on disk, so editing `dock_layout.css` restyles the
+/// open editor live instead of requiring a rebuild.
+pub(crate) fn live_dock_css() -> String {
+    let mut css =
+        use_signal(|| read_stylesheet_from_disk().unwrap_or_else(|| DOCK_CSS.to_string()));
+    let mut last_modified = use_signal(stylesheet_modified_time);
+    use_future(move || async move {
+        loop {
+            tokio::time::sleep(CSS_RELOAD_INTERVAL).await;
+            let modified = stylesheet_modified_time();
+            if modified != *last_modified.read() {
+                last_modified.set(modified);
+                if let Some(text) = read_stylesheet_from_disk() {
+                    css.set(text);
+                }
+            }
+        }
+    });
+    let stylesheet = css.read().clone();
+    stylesheet
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum PointerDrag {
@@ -66,6 +114,7 @@ pub fn DockView(
 ) -> Element {
     let mut drag = use_signal(|| None::<PointerDrag>);
     let mut context_menu = use_signal(|| None::<(f64, f64)>);
+    let dock_css = live_dock_css();
     let model_value = model.read();
     let move_snapshot = snapshot.clone();
     let active_tabset = model_value.active_tabset.or_else(|| {
@@ -99,7 +148,7 @@ pub fn DockView(
     };
 
     rsx! {
-        style { dangerous_inner_html: DOCK_CSS }
+        style { dangerous_inner_html: dock_css }
         div {
             class: "dock-root",
             onclick: move |_| context_menu.set(None),

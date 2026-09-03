@@ -1,0 +1,41 @@
+[package]
+name = "host_project_project"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "project"
+path = "D:/Programming/Rust-Hybrid-ECS/examples/project_rs/src/lib.rs"
+# `cdylib` for a hot-reloading build, where the host loads this as a DLL.
+# `rlib` so a shipping build can link the project straight into the binary -
+# a cdylib cannot be a Rust library dependency. Every optional module already
+# carries both for the same reason.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pill_engine = { path = "D:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/pill_engine" }
+pill_core = { path = "D:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/pill_core" }
+# Linked directly so the project can name the `Spline` type. See the note in
+# `project_init` about why this crate must not also be loaded as a module.
+# `default-features = false` is a defensive no-op: `module-abi` is opt-in now,
+# so the `pill_module_*` exports stay off in this build either way.
+pill_spline = { path = "D:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/optional/pill_spline", default-features = false }
+# Dummy optional modules, linked directly purely to exercise their structs and
+# free functions from the project. `default-features = false` is a defensive
+# no-op (each crate's `module-abi` feature is opt-in), kept so that a future
+# change cannot pull the `#[no_mangle]` `pill_module_*` exports into this one
+# `cdylib`, where more than one definition of the same symbol names is a
+# linker error. Each crate is built standalone by the host (which passes
+# `--features module-abi`) for hot-loading via the project's
+# `project_settings.yaml`.
+pill_dummy_math = { path = "D:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/optional/pill_dummy_math", default-features = false }
+pill_dummy_text = { path = "D:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/optional/pill_dummy_text", default-features = false }
+pill_dummy_color = { path = "D:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/optional/pill_dummy_color", default-features = false }
+pill_dummy_timer = { path = "D:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/optional/pill_dummy_timer", default-features = false }
+pill_dummy_random = { path = "D:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/optional/pill_dummy_random", default-features = false }
+trait_type_map = { path = "D:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../../Trait-Type-Map" }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+
+[features]
+rendering = ["pill_engine/rendering"]

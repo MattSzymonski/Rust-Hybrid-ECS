@@ -21,6 +21,7 @@ use wgpu::util::DeviceExt;
 
 // Current crate
 use crate::component::Component;
+use crate::component_registry::ComponentFieldDescriptor;
 use crate::world::World;
 
 // =============================================================================
@@ -163,6 +164,147 @@ impl Default for Sprite {
             height: 16.0,
             color: Color::WHITE,
         }
+    }
+}
+
+// =============================================================================
+// Shared component field layouts (editor inspectability)
+// =============================================================================
+
+/// Hand-written `repr(C)` offsets mirroring the shared renderer structs, for
+/// the editor's generic field API.
+///
+/// These types are part of the shared renderer ABI and are registered with
+/// plain [`World::register_component`] - they cannot carry
+/// `#[derive(PillComponent)]` - so without a catalog entry the editor would
+/// show them with no fields at all.
+///
+/// `Sprite::color` is flattened into per-channel scalars at absolute offsets
+/// (`color.r` … `color.a`) so the editor can render it as a colour picker over
+/// the generic scalar read/write path instead of an opaque byte blob.
+const POSITION_FIELD_LAYOUT: &[ComponentFieldDescriptor] = &[
+    ComponentFieldDescriptor {
+        name: "x",
+        type_tag: "f32",
+        offset: 0,
+        size: 4,
+        align: 4,
+        element_count: 0,
+    },
+    ComponentFieldDescriptor {
+        name: "y",
+        type_tag: "f32",
+        offset: 4,
+        size: 4,
+        align: 4,
+        element_count: 0,
+    },
+];
+
+/// `Color` is itself a component; register its channels like the derive would.
+const COLOR_FIELD_LAYOUT: &[ComponentFieldDescriptor] = &[
+    ComponentFieldDescriptor {
+        name: "r",
+        type_tag: "f32",
+        offset: 0,
+        size: 4,
+        align: 4,
+        element_count: 0,
+    },
+    ComponentFieldDescriptor {
+        name: "g",
+        type_tag: "f32",
+        offset: 4,
+        size: 4,
+        align: 4,
+        element_count: 0,
+    },
+    ComponentFieldDescriptor {
+        name: "b",
+        type_tag: "f32",
+        offset: 8,
+        size: 4,
+        align: 4,
+        element_count: 0,
+    },
+    ComponentFieldDescriptor {
+        name: "a",
+        type_tag: "f32",
+        offset: 12,
+        size: 4,
+        align: 4,
+        element_count: 0,
+    },
+];
+
+/// `Sprite { width, height, color }` with `color` flattened into channels.
+const SPRITE_FIELD_LAYOUT: &[ComponentFieldDescriptor] = &[
+    ComponentFieldDescriptor {
+        name: "width",
+        type_tag: "f32",
+        offset: 0,
+        size: 4,
+        align: 4,
+        element_count: 0,
+    },
+    ComponentFieldDescriptor {
+        name: "height",
+        type_tag: "f32",
+        offset: 4,
+        size: 4,
+        align: 4,
+        element_count: 0,
+    },
+    ComponentFieldDescriptor {
+        name: "color.r",
+        type_tag: "f32",
+        offset: 8,
+        size: 4,
+        align: 4,
+        element_count: 0,
+    },
+    ComponentFieldDescriptor {
+        name: "color.g",
+        type_tag: "f32",
+        offset: 12,
+        size: 4,
+        align: 4,
+        element_count: 0,
+    },
+    ComponentFieldDescriptor {
+        name: "color.b",
+        type_tag: "f32",
+        offset: 16,
+        size: 4,
+        align: 4,
+        element_count: 0,
+    },
+    ComponentFieldDescriptor {
+        name: "color.a",
+        type_tag: "f32",
+        offset: 20,
+        size: 4,
+        align: 4,
+        element_count: 0,
+    },
+];
+
+/// Return the editor field layout for a shared renderer component type name.
+///
+/// `World::register_component` consults this catalog so any world that uses
+/// the renderer components (native or C# project) exposes their fields to the
+/// editor without the types carrying the derive macro.
+pub(crate) fn shared_component_field_layout(
+    type_name: &str,
+) -> Option<&'static [ComponentFieldDescriptor]> {
+    if type_name == std::any::type_name::<Position>() {
+        Some(POSITION_FIELD_LAYOUT)
+    } else if type_name == std::any::type_name::<Color>() {
+        Some(COLOR_FIELD_LAYOUT)
+    } else if type_name == std::any::type_name::<Sprite>() {
+        Some(SPRITE_FIELD_LAYOUT)
+    } else {
+        None
     }
 }
 
@@ -651,6 +793,7 @@ unsafe fn read_shared_component<T: Copy>(component: &dyn Component) -> T {
 #[cfg(test)]
 mod shared_component_tests {
     use super::*;
+    use crate::component::ComponentId;
     use trait_type_map::impl_trait_accessible;
 
     /// Layout-compatible stand-in with a different TypeId than Position.
@@ -713,5 +856,88 @@ mod shared_component_tests {
         assert!(!VirtualResolution::new(0.0, 600.0).is_valid());
         assert!(!VirtualResolution::new(800.0, f32::NAN).is_valid());
         assert!(!VirtualResolution::new(f32::INFINITY, 600.0).is_valid());
+    }
+
+    /// The editor field-layout catalog mirrors the `repr(C)` structs and is
+    /// attached by plain `register_component`, so the hand-registered renderer
+    /// components become field-editable in the inspector without carrying the
+    /// derive macro.
+    #[test]
+    fn shared_layouts_match_struct_layout_and_attach_on_registration() {
+        // Channel order and byte sizes come straight from the compiler.
+        assert_eq!(std::mem::size_of::<Position>(), 8);
+        assert_eq!(std::mem::size_of::<Color>(), 16);
+        assert_eq!(std::mem::size_of::<Sprite>(), 24);
+
+        let assert_matches = |fields: &[ComponentFieldDescriptor],
+                              expected: &[(&str, usize, usize)]| {
+            assert_eq!(fields.len(), expected.len());
+            for (field, (name, offset, size)) in fields.iter().zip(expected) {
+                assert_eq!(field.name, *name, "descriptor name for {name}");
+                assert_eq!(field.type_tag, "f32", "descriptor tag for {name}");
+                assert_eq!(field.offset, *offset, "descriptor offset for {name}");
+                assert_eq!(field.size, *size, "descriptor size for {name}");
+                assert_eq!(field.align, 4, "descriptor align for {name}");
+                assert_eq!(field.element_count, 0);
+            }
+        };
+
+        let position_layout =
+            shared_component_field_layout(std::any::type_name::<Position>()).expect("position");
+        assert_matches(
+            position_layout,
+            &[
+                ("x", std::mem::offset_of!(Position, x), 4),
+                ("y", std::mem::offset_of!(Position, y), 4),
+            ],
+        );
+
+        let color_layout =
+            shared_component_field_layout(std::any::type_name::<Color>()).expect("color");
+        assert_matches(
+            color_layout,
+            &[
+                ("r", std::mem::offset_of!(Color, r), 4),
+                ("g", std::mem::offset_of!(Color, g), 4),
+                ("b", std::mem::offset_of!(Color, b), 4),
+                ("a", std::mem::offset_of!(Color, a), 4),
+            ],
+        );
+
+        // `Sprite.color` is flattened into per-channel scalars at absolute
+        // offsets so the inspector renders it as one colour group.
+        let color_offset = std::mem::offset_of!(Sprite, color);
+        let sprite_layout =
+            shared_component_field_layout(std::any::type_name::<Sprite>()).expect("sprite");
+        assert_matches(
+            sprite_layout,
+            &[
+                ("width", std::mem::offset_of!(Sprite, width), 4),
+                ("height", std::mem::offset_of!(Sprite, height), 4),
+                ("color.r", color_offset + std::mem::offset_of!(Color, r), 4),
+                ("color.g", color_offset + std::mem::offset_of!(Color, g), 4),
+                ("color.b", color_offset + std::mem::offset_of!(Color, b), 4),
+                ("color.a", color_offset + std::mem::offset_of!(Color, a), 4),
+            ],
+        );
+
+        // Registering the real components attaches the catalog layouts through
+        // `World::register_component`, which is what makes them editable.
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Color>();
+        world.register_component::<Sprite>();
+        let position = world
+            .component_field_layout(ComponentId::of::<Position>())
+            .expect("Position registered with a layout");
+        assert_eq!(position.len(), 2);
+        let color = world
+            .component_field_layout(ComponentId::of::<Color>())
+            .expect("Color registered with a layout");
+        assert_eq!(color.len(), 4);
+        let sprite = world
+            .component_field_layout(ComponentId::of::<Sprite>())
+            .expect("Sprite registered with a layout");
+        assert_eq!(sprite.len(), 6);
     }
 }

@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use pill_core::debug;
 use pill_core::error::BuildError;
 use pill_core::info;
+use pill_core::warn;
 
 // Current crate
 use crate::analytics::{self, BuildStatus, ModuleKind};
@@ -54,18 +55,18 @@ const WATCHDOG_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// every host run against this workspace shares the same record.
 const BUILD_INFO_MARKER: &str = "pill_standalone_temp/build_info.txt";
 
-/// Subdirectory, relative to the workspace root, where cargo writes a freshly
-/// compiled module `cdylib`.
+/// Subdirectory, relative to the workspace root, where a host-spawned build
+/// writes its freshly compiled artifacts.
 ///
-/// The host never loads from this shared per-crate slot: the project's build
-/// can overwrite it with the module's export-stripped dependency variant (the
-/// "one crate name, two feature sets" collision). The standalone artifact is
-/// staged into the module's private hot-load directory instead.
-///
-/// Follows the host's own profile rather than being fixed at `target/debug`,
-/// because that is where the module build this host just ran actually wrote.
+/// Every cargo build the host spawns runs with `CARGO_TARGET_DIR` pointing at
+/// the private module build tree ([`crate::config::MODULE_BUILD_TARGET_DIRECTORY`]),
+/// never the shared `target/<profile>` the running binary maps its engine
+/// dylibs from - a GUI frontend's module build needs a different engine
+/// variant than the host runs, and rewriting the shared slot would make cargo
+/// delete a DLL the host has loaded. The produced artifacts are staged into
+/// the module's private hot-load directory, exactly as before.
 fn cargo_module_output_subdirectory() -> String {
-    crate::config::host_target_directory()
+    crate::config::module_build_artifact_directory()
 }
 
 /// Private directory the host stages the project's loadable artifacts into,
@@ -111,9 +112,38 @@ const HOST_MODULE_FEATURE_SET: &str =
 /// a profile.
 fn host_build_identity() -> String {
     format!(
-        "{HOST_MODULE_FEATURE_SET}\nprofile={}",
-        crate::config::host_profile_name()
+        "{HOST_MODULE_FEATURE_SET}\nprofile={}\nbuild_tree={}",
+        crate::config::host_profile_name(),
+        crate::config::MODULE_BUILD_TARGET_DIRECTORY
     )
+}
+
+/// The workspace package name to anchor module builds to.
+///
+/// Cargo unifies features across every selected package, so module builds
+/// select the running host binary's own package (`-p <name>`) to force the
+/// shared engine crates onto the host's feature universe. The package name is
+/// normally the executable's file stem (`editor` -> package `editor`), but the
+/// Dioxus CLI (`dx`) stages the built binary under a cargo-metadata-hash
+/// suffixed name such as `editor-d6d95e94.exe`; trim that trailing `-<hex>`
+/// suffix so the anchor still resolves to the real package.
+fn host_anchor_package() -> Option<String> {
+    let stem = std::env::current_exe()
+        .ok()?
+        .file_stem()?
+        .to_str()?
+        .to_owned();
+    if let Some((base, suffix)) = stem.rsplit_once('-') {
+        let is_metadata_hash = !suffix.is_empty()
+            && suffix.len() <= 16
+            && suffix
+                .chars()
+                .all(|character| character.is_ascii_hexdigit());
+        if is_metadata_hash {
+            return Some(base.to_owned());
+        }
+    }
+    Some(stem)
 }
 
 // =============================================================================
@@ -469,15 +499,57 @@ pub(crate) fn run_build_command(
     // warnings, and errors visible during startup and hot reload. Configured
     // environment overrides are applied last so they win over anything the
     // host itself inherited.
-    let mut child = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .args(arguments)
         .current_dir(workspace_root)
-        .envs(build_environment.iter().map(|(key, value)| (key, value)))
-        .spawn()
-        .map_err(|source| BuildError::SpawnFailed {
-            name: name.to_string(),
-            source,
-        })?;
+        .envs(build_environment.iter().map(|(key, value)| (key, value)));
+    // Every cargo build this host spawns writes into the private module build
+    // tree instead of the shared `target/<profile>` the running binary maps
+    // its engine dylibs from (see
+    // [`crate::config::MODULE_BUILD_TARGET_DIRECTORY`]). Redirecting at spawn
+    // keeps the configured `build_command` (and therefore artifact stamps)
+    // unchanged while guaranteeing cargo never has to delete a DLL the host
+    // has loaded. `dotnet` builds ignore the variable.
+    //
+    // The running host binary is also selected as an anchor package. Cargo
+    // resolves features across every selected package, so the module's engine
+    // crates (`pill_core` and its transitive deps) unify to the SAME feature
+    // universe the host itself was built with - a GUI frontend like the editor
+    // unions extra features onto those crates, and a module compiled against a
+    // differently featured engine cannot resolve its `pill_core.dll` imports
+    // against the single instance the host already has loaded (Windows
+    // deduplicates loaded modules by name). The anchor's own artifacts are
+    // already fresh inside the private tree after the first build, so this
+    // only costs feature resolution, not a rebuild of the frontend.
+    if program == "cargo" {
+        command.env(
+            "CARGO_TARGET_DIR",
+            workspace_root.join(crate::config::MODULE_BUILD_TARGET_DIRECTORY),
+        );
+        if let Some(anchor) = host_anchor_package() {
+            command.arg("--package").arg(anchor);
+        }
+        // A launcher-injected profile (the dioxus CLI builds the editor under
+        // `--profile desktop-dev`) is not declared in the module workspaces,
+        // so cargo would reject `--profile <name>` here. Define it on the
+        // spawned build as an inheritor of `dev` so the module compiles under
+        // the same profile name the host binary itself used - profile name is
+        // part of cargo's crate-metadata hash, so a differently named profile
+        // would produce a module whose DLL imports cannot resolve against the
+        // engine dylib the host already has loaded. Built-in profiles need no
+        // definition.
+        let profile = crate::config::host_profile_name();
+        if !matches!(profile, "dev" | "release" | "test" | "bench") {
+            command
+                .arg("--config")
+                .arg(format!("profile.{profile}.inherits=\"dev\""));
+        }
+    }
+    let mut child = command.spawn().map_err(|source| BuildError::SpawnFailed {
+        name: name.to_string(),
+        source,
+    })?;
 
     // Step 3: Poll for completion, cancellation, or timeout under a watchdog.
     //
@@ -601,8 +673,7 @@ pub(crate) fn build_project_module(
     // configured engine and give every type a different `TypeId`.
     let (rlib_build_output, rlib_output) = (
         workspace_root
-            .join("target")
-            .join("debug")
+            .join(crate::config::module_build_artifact_directory())
             .join(format!("lib{}.rlib", config.name)),
         workspace_root
             .join(PROJECT_HOT_OUTPUT_SUBDIRECTORY)
@@ -756,6 +827,34 @@ fn stage_artifact(build_output: &Path, hot_output: &Path) -> Result<(), BuildErr
     Ok(())
 }
 
+/// Stage the module-world engine dylib beside the hot-load copies.
+///
+/// Every native module and project imports `pill_core.dll`. The engine dylib a
+/// host-spawned build produces (in the private module build tree) can differ
+/// from the one the host binary itself maps from the regular target
+/// directory, since a GUI frontend unions extra features onto shared crates;
+/// the loader then gives modules their matching copy. When they are
+/// byte-identical (a plain CLI host) this staged copy simply stays unused and
+/// the loader keeps the host's single instance.
+fn stage_engine_dylib(workspace_root: &Path) {
+    let source = workspace_root
+        .join(crate::config::module_build_artifact_directory())
+        .join("pill_core.dll");
+    if !source.is_file() {
+        return;
+    }
+    let destination = workspace_root
+        .join(PROJECT_HOT_OUTPUT_SUBDIRECTORY)
+        .join("pill_core.dll");
+    if let Err(error) = std::fs::copy(source, destination) {
+        warn!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            error = %error,
+            "could not stage the module-world engine dylib into the hot-load directory"
+        );
+    }
+}
+
 /// Copy everything one build produced into the host's private hot-load paths.
 ///
 /// Both build paths end the same way, and that ending is where two real bugs
@@ -798,6 +897,13 @@ fn stage_build_outputs(
     // Record the toolchain and host feature set that produced these artifacts,
     // so a later run can recognize them as up to date.
     record_build_info(workspace_root);
+
+    // Stage the module-world engine dylib beside the hot copies: modules
+    // import `pill_core.dll`, and when the host runs a different engine
+    // variant than this build produced the loader hands the module this
+    // matching copy instead of the host's.
+    stage_engine_dylib(workspace_root);
+
     Ok(produced)
 }
 

@@ -209,6 +209,6 @@ public static class ModuleSplineBridgeDemo
 
         Console.WriteLine(
             $"[project_cs] cs spline bridge: sees {visibleSplines} spline(s), " +
-            $"first P0.X={firstPointX}, count={firstPointCount}, omo=({omo.X},{omo.Y}) sum={omoSum} a={omoA} b={omoB}");
+            $"first P0.X={firstPointX}, count={firstPointCount}, xxxomo=({omo.X},{omo.Y}) sum={omoSum} a={omoA} b={omoB}");
     }
 }
