@@ -38,4 +38,3 @@ serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 
 [features]
-rendering = ["pill_engine/rendering"]

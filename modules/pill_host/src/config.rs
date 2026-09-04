@@ -512,11 +512,10 @@ impl OptionalModuleConfig {
         // differently featured engine cannot resolve its `pill_core.dll`
         // imports against the single instance the host has loaded.
         let mut module_features = vec![format!("{name}/module-abi")];
-        // Mirror the host's engine feature set. A module compiled against a
-        // differently configured engine can disagree about type layout.
-        if cfg!(feature = "rendering") {
-            module_features.push(format!("{name}/rendering"));
-        }
+        // `rendering` used to be mirrored here too, because the engine's
+        // renderer feature changed its public type layout. The renderer now
+        // lives in `pill_wgpu_renderer`, which only the host links, so the
+        // engine a module compiles against is the same either way.
         // Hot patching must be mirrored for a different reason: `pill_engine` is
         // an rlib, so the module links its own copy of `register_system`. Built
         // without the feature, that copy creates no dispatch slot and every
@@ -819,15 +818,13 @@ impl ProjectModuleConfig {
         ];
         // Mirror the host's engine feature set into the project build, for the
         // same reason optional modules do: `pill_engine` is an rlib, so the
-        // project links its own copy and must be configured identically. The
-        // project's own feature (`rendering`) is package-qualified for the
-        // same reason module features are: the host frontend is selected as an
-        // anchor package in the same invocation.
-        let project_package = format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}");
+        // project links its own copy and must be configured identically.
+        //
+        // `rendering` used to be mirrored here as well, package-qualified onto
+        // the generated project member. It is gone because the renderer left
+        // `pill_engine`, so the engine a project compiles against no longer
+        // depends on it.
         let mut project_features: Vec<String> = Vec::new();
-        if cfg!(feature = "rendering") {
-            project_features.push(format!("{project_package}/rendering"));
-        }
         // Without this the project's copy of `register_system` compiles the
         // no-slot path, and every patch is refused with "no hot-patchable
         // system registered" - which is exactly how this was found.

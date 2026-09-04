@@ -10,6 +10,15 @@ workspace = true
 pill_hot_scan = { path = "../pill_hot_scan" }
 pill_engine = { path = "../pill_engine" }
 pill_core = { path = "../pill_core" }
+# The `#[engine_error]` attribute behind the host's own error types, plus
+# the two crates it expands into.
+pill_core_macros = { path = "../pill_core_macros" }
+thiserror = "2"
+miette = { version = "7", features = ["derive"] }
+# The wgpu renderer, and the only crate in the workspace that owns wgpu. The
+# host is the only thing that links it: keeping it out of `pill_engine` keeps
+# the graphics stack out of every loaded module and every hot patch.
+pill_wgpu_renderer = { path = "../optional/pill_wgpu_renderer", optional = true }
 libloading = "0.8"
 notify = "6"
 serde = { version = "1", features = ["derive"] }
@@ -27,7 +36,11 @@ winit = { version = "0.30", optional = true }
 # or loaded at runtime, and the project is linked into the binary instead.
 default = ["hot_reload"]
 hot_reload = []
-rendering = ["pill_engine/rendering", "pill_core/rendering", "dep:winit"]
+# A windowed host: the winit event loop plus the wgpu renderer. Nothing is
+# forwarded to `pill_engine` or `pill_core` any more - neither has a
+# `rendering` feature, which is what lets a module and a hot patch link the
+# same engine the host does without any of the graphics stack.
+rendering = ["dep:winit", "dep:pill_wgpu_renderer"]
 # Enable Tracy profiling: engine profiling zones plus the Tracy tracing layer.
 profiling = ["pill_engine/profiling", "pill_core/tracy"]
 # Investigative fine-grained profiling zones.

@@ -270,11 +270,14 @@ def build_cargo_manifest(
         'default-features = false }',
     ]
     if not managed:
-        # The native project itself, so `project::init` is nameable. Requested
-        # project features (e.g. rendering) are enabled so the static binary
-        # matches a windowed dev build; cargo does not propagate the host's
-        # features here. A managed project is a dotnet assembly, so it has no
-        # cargo dependency to declare.
+        # The native project itself, so `project::init` is nameable. Any
+        # requested feature the project actually declares is enabled so the
+        # static binary matches a dev build; cargo does not propagate the
+        # host's features here. `rendering` used to be such a feature and no
+        # longer is: the renderer left `pill_engine`, so a windowed ship is
+        # requested on the HOST (`pill_standalone/rendering`) and the filter
+        # below simply drops the name here. A managed project is a dotnet
+        # assembly, so it has no cargo dependency to declare.
         lines.append(
             f'project = {{ path = "{manifest_relative_path(bundle_directory, project_root)}"'
             + (
@@ -510,9 +513,10 @@ def main() -> int:
         return 1
 
     # Step 3: keep only the requested project features the project declares, so
-    # an unknown or host-only feature is ignored rather than erroring. A managed
-    # project declares no cargo features, so requested names are simply not
-    # applied (the host-side feature, e.g. `rendering`, still reaches cargo).
+    # an unknown or host-only feature is ignored rather than erroring. This is
+    # what makes `--feature rendering` still work: it is a host feature now, so
+    # it is dropped here and reaches cargo through the host instead. A managed
+    # project declares no cargo features, so requested names are never applied.
     declared_features = (
         load_project_features(project_root) if kind == "native" else set()
     )

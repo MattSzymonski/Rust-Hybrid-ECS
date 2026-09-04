@@ -47,14 +47,14 @@ pub struct PhysicsState {
 
 const FIXED_DELTA_TIME: f32 = 1.0 / 60.0;
 const GRAVITY: f32 = 800.0;
-const BOUNCE_VELOCITY_Y: f32 = -500.0;
-const BOUNCE_VELOCITY_X: f32 = 150.0;
+const BOUNCE_VELOCITY_Y: f32 = -800.0;
+const BOUNCE_VELOCITY_X: f32 = 350.0;
 const RESTITUTION: f32 = 0.7;
 /// Upward speed restored when a floor bounce would otherwise decay to rest.
 ///
 /// Keeps every ball visibly bouncing for the whole lifetime of the scene
 /// instead of settling on the floor after a few seconds.
-const MINIMUM_BOUNCE_VELOCITY_Y: f32 = 300.0;
+const MINIMUM_BOUNCE_VELOCITY_Y: f32 = 500.0;
 const FLOOR_Y: f32 = 580.0;
 const CEILING_Y: f32 = 20.0;
 const LEFT_WALL: f32 = 20.0;
@@ -115,12 +115,10 @@ impl Default for PhysicsState {
 /// touched by a system, so the editor can repaint their colour and size live
 /// while the balls keep bouncing. The ball sprites, by contrast, are owned by
 /// `ball_physics` and overwritten every frame.
-#[cfg(feature = "rendering")]
 #[derive(Debug, Clone, Copy, PillComponent)]
 pub struct SceneLandmark;
 
 /// Landmark layout: `(x, y, width, height, (r, g, b))` for each square.
-#[cfg(feature = "rendering")]
 const LANDMARKS: [(f32, f32, f32, f32, (f32, f32, f32)); 3] = [
     (24.0, 24.0, 56.0, 56.0, (1.0, 0.35, 0.35)),
     (96.0, 24.0, 56.0, 56.0, (0.35, 1.0, 0.45)),
@@ -162,26 +160,6 @@ pub fn simulate_ball(state: &mut PhysicsState) {
     }
 }
 
-#[cfg(not(feature = "rendering"))]
-#[pill_hot]
-fn physics_system(
-    time: Res<SimulationTime>,
-    mut query: Query<&mut PhysicsState>,
-) -> Result<(), SystemError> {
-    let Some(time) = time.get() else {
-        return Err(SystemError::MissingResource {
-            name: String::from("SimulasdasdatsdionTxxxime"),
-        });
-    };
-    let delta_seconds = time.delta_seconds;
-    for mut physics in query.iter_mut() {
-        physics.delta_time = delta_seconds + 2.0;
-        simulate_ball(&mut physics);
-    }
-    Ok(())
-}
-
-#[cfg(feature = "rendering")]
 #[pill_hot]
 fn physics_system(
     time: Res<SimulationTime>,
@@ -201,13 +179,13 @@ fn physics_system(
         // renderer expects the top-left corner.
         position.x = physics.position_x - physics.radius;
         position.y = physics.position_y - physics.radius;
-        sprite.width = physics.radius * 2.0;
-        sprite.height = physics.radius * 2.0;
-        sprite.color = if physics.active {
-            Color::new(1.0, 0.3, 0.3, 1.0)
-        } else {
-            Color::new(0.5, 0.5, 0.5, 1.0)
-        };
+        sprite.width = physics.radius * 3.0;
+        sprite.height = physics.radius * 3.0;
+        // sprite.color = if physics.active {
+        //     Color::new(1.0, 0.3, 0.3, 1.0)
+        // } else {
+        //     Color::new(0.5, 0.5, 0.5, 1.0)
+        // };
     }
     Ok(())
 }
@@ -277,7 +255,7 @@ fn spline_probe_system(
     // spline(s)` and the `midpoint ({:.1}, {:.1})` shape intact, or update the
     // tokens in the two files above to match.
     println!(
-        "[project] 123 {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), 33dawdawasdas323asAWDWAWDRRR123eeee11awdwad11111111111aawddwadwd {:.2}",
+        "[project] 123 {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), awdwawddwadwd {:.2}",
         midpoint.x, midpoint.y, color
     );
     println!("[project] 123 OmoMO.x = {}, OmoMO.y = {}", omomo.x, omomo.y);
@@ -354,13 +332,10 @@ fn run_dummy_module_demo() {
 /// for the host to resolve in the loaded DLL.
 #[pill_project]
 pub fn init(engine: &mut Engine) -> u32 {
-    #[cfg(feature = "rendering")]
-    {
-        // Engine-owned render components are not declared by this crate, so
-        // they cannot carry the derive and stay registered manually.
-        engine.world_mut().register_component::<Position>();
-        engine.world_mut().register_component::<Sprite>();
-    }
+    // Engine-owned render components are not declared by this crate, so they
+    // cannot carry the derive and stay registered manually.
+    engine.world_mut().register_component::<Position>();
+    engine.world_mut().register_component::<Sprite>();
 
     engine.world_mut().insert_resource(SimulationTime {
         last_frame: Instant::now(),
@@ -435,7 +410,6 @@ pub fn init(engine: &mut Engine) -> u32 {
 
         let entity = engine.world_mut().create_entity().with(physics);
 
-        #[cfg(feature = "rendering")]
         let entity = entity
             .with(Position {
                 x: physics.position_x - physics.radius,
@@ -464,7 +438,6 @@ pub fn init(engine: &mut Engine) -> u32 {
 
     // Static landmark squares: no system writes them, so their Position/Sprite
     // stay editable in the inspector while the sim runs.
-    #[cfg(feature = "rendering")]
     {
         let existing_landmarks = {
             let mut query = Query::<&SceneLandmark>::new(engine.world_mut());

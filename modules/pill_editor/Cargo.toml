@@ -10,8 +10,8 @@ workspace = true
 pill_host = { package = "pill_host", path = "../pill_host", features = [
     "rendering",
 ] }
-pill_engine = { path = "../pill_engine", features = ["rendering"] }
-pill_core = { path = "../pill_core", features = ["rendering"] }
+pill_engine = { path = "../pill_engine" }
+pill_core = { path = "../pill_core" }
 pill_core_macros = { path = "../pill_core_macros" }
 dioxus = { version = "0.7", features = ["desktop"] }
 futures-util = "0.3"
@@ -37,6 +37,12 @@ trait_type_map = { path = "../../../Trait-Type-Map" }
 default = ["hot_patch"]
 # Per-function hot patching, forwarded to the host. Implies `hot_reload`.
 hot_patch = ["pill_host/hot_patch"]
+# The editor is always windowed - its `pill_host` dependency above already
+# forces `rendering`. The feature exists so every host frontend can be selected
+# the same way: `build_runner::apply_cargo_host_overrides` anchors module builds
+# to the running frontend's package AND its features, and a frontend that had no
+# `rendering` feature to name would break that rule.
+rendering = ["pill_host/rendering"]
 # Enable Tracy profiling through the shared telemetry stack.
 profiling = ["pill_host/profiling"]
 # Investigative fine-grained profiling zones.

@@ -484,14 +484,14 @@ impl World {
         // types registered through this plain path, so a hand-written catalog
         // supplies their field layouts here - the editor then shows and edits
         // them like any `#[derive(PillComponent)]` type. Resolved up front
-        // because `type_name` is moved into the registration log below; the
-        // non-rendering build of the engine has no renderer catalog at all.
-        #[cfg(feature = "rendering")]
+        // because `type_name` is moved into the registration log below.
+        //
+        // Unconditional: the catalog is pure data and now lives in the half of
+        // `render` that carries no GPU dependency, so a headless world resolves
+        // the same layouts a windowed one does. It used to be gated on the
+        // `rendering` feature, which silently made the same component
+        // inspectable in one build and not in the other.
         let shared_field_layout = crate::render::shared_component_field_layout(&type_name);
-        #[cfg(not(feature = "rendering"))]
-        let shared_field_layout: Option<
-            &'static [crate::component_registry::ComponentFieldDescriptor],
-        > = None;
 
         // Register component (bit index + name)
         // `register_bit` rather than `register`: the world does not act on

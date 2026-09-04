@@ -1,4 +1,4 @@
-//! Window-surface renderer owned by the engine's optional rendering feature.
+//! Window-surface renderer owned by the host's optional rendering feature.
 //!
 //! # Responsibilities
 //!
@@ -14,9 +14,12 @@
 //! [`Renderer::resize`] and [`Renderer::render`]. No frontend needs a direct
 //! dependency on wgpu or an async executor.
 
+// External crates
+use pill_engine::engine::Engine;
+use pill_engine::render::{RenderViewport, VirtualResolution};
+
 // Current crate
-use crate::engine::Engine;
-use crate::render::{RenderViewport, SpriteRenderer, VirtualResolution};
+use crate::sprite::SpriteRenderer;
 
 // =============================================================================
 // Re-exports

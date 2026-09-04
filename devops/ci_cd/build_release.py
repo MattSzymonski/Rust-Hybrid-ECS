@@ -584,6 +584,11 @@ ENGINE_LIBRARIES = {
     "pill_core_macros",
     "pill_hot_scan",
     "pill_editor",
+    # Under `modules/optional/`, but engine code rather than an optional
+    # module: it is the renderer the host links when built windowed, never
+    # something a project loads. Bucketing it with the engine keeps a
+    # windowed build's size attributed where the code actually comes from.
+    "pill_wgpu_renderer",
 }
 PROJECT_CRATES = {"project", "pill_shipping_bundle"}
 STANDARD_LIBRARY_CRATES = {

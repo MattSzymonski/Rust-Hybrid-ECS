@@ -85,14 +85,21 @@ const ARTIFACT_STAMP_DIRECTORY: &str = "pill_standalone_temp/artifact_stamps";
 
 /// Host feature set that module builds must mirror.
 ///
-/// Modules are compiled with the same engine features as the host so type
-/// layouts stay identical across the DLL boundary; a host rebuilt with a
-/// different feature set therefore invalidates every cached module artifact.
+/// A host rebuilt with a different feature set invalidates every cached
+/// module artifact, because both features below change the crate metadata on
+/// one side of the DLL boundary or the other.
 ///
-/// `hot_patch` belongs here for exactly the same reason `rendering` does: the
-/// host mirrors it into every module and project build, so it changes the
-/// engine's crate metadata on both sides of the boundary. Leaving it out let a
-/// host rebuilt with the feature go on trusting artifacts built without it.
+/// `hot_patch` is mirrored into every module and project build directly, so
+/// it changes the engine each module links.
+///
+/// `rendering` no longer touches the module's own engine - the renderer left
+/// `pill_engine` - but it still belongs here. A windowed host links
+/// `pill_wgpu_renderer` and the whole wgpu graph, and
+/// [`apply_cargo_host_overrides`] selects the anchor package WITH that
+/// feature so module builds resolve the same graph. The resolution reaches
+/// `pill_core.dll`, so artifacts built under one setting still cannot be
+/// loaded by a host running the other - it presents as os error 127, with
+/// nothing naming a feature.
 const HOST_MODULE_FEATURE_SET: &str =
     match (cfg!(feature = "rendering"), cfg!(feature = "hot_patch")) {
         (true, true) => "rendering+hot_patch",
@@ -516,7 +523,29 @@ pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: 
         workspace_root.join(crate::config::MODULE_BUILD_TARGET_DIRECTORY),
     );
     if let Some(anchor) = host_anchor_package() {
-        command.arg("--package").arg(anchor);
+        command.arg("--package").arg(&anchor);
+        // Select the anchor with the SAME features the running host was built
+        // with, not merely the same package.
+        //
+        // Selecting the package is what makes cargo unify features across the
+        // whole graph; selecting it with the wrong features unifies it to a
+        // different answer. A windowed host links `pill_wgpu_renderer` and the
+        // whole wgpu graph, which turns on extra features in crates `pill_core`
+        // also depends on - and cargo folds a dependency's resolved features
+        // into the dependent's `-C metadata`. So a module built against a
+        // feature-poorer anchor links a `pill_core.dll` whose symbol names do
+        // not match the one the host has already loaded, and every module load
+        // dies with "The specified procedure could not be found" (os error 127).
+        //
+        // This used to be masked: the host mirrored `rendering` onto the module
+        // itself, which dragged wgpu into the module's graph too and made the
+        // two unify alike by accident. That mirror is gone now that the renderer
+        // has left `pill_engine`, so the anchor has to carry the feature
+        // explicitly. Any future host-level feature that changes the dependency
+        // graph belongs here for the same reason.
+        if cfg!(feature = "rendering") {
+            command.arg("--features").arg(format!("{anchor}/rendering"));
+        }
     }
     // Mirror the host's own `--target` when a launcher (the dioxus CLI) built
     // it with one. Cargo folds the target into every crate's metadata hash,

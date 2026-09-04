@@ -32,8 +32,8 @@ use dioxus::prelude::*;
 use futures_util::StreamExt;
 use pill_core::error::EngineMessage;
 use pill_host::{
-    engine_report, install_engine_report_handler, setup_rendering, EngineError, FrameReport,
-    HostConfig, HostError, RenderViewport, RenderingHost, VirtualResolution,
+    engine_report, install_engine_report_handler, setup_rendering, FrameReport,
+    HostConfig, HostError, RenderViewport, RenderingError, RenderingHost, VirtualResolution,
 };
 
 use dock_view::DockView;
@@ -337,13 +337,13 @@ impl EditorContext {
     /// # Errors
     ///
     /// Returns the composed [`EditorError`] wrapping the host
-    /// [`pill_host::EngineError`] when setup or GPU surface creation fails; the
-    /// caller reports it once and exits.
+    /// [`pill_host::RenderingError`] when setup or GPU surface creation fails;
+    /// the caller reports it once and exits.
     fn new(window: Arc<Window>) -> Result<Self, EditorError> {
         let size = window.inner_size();
         let mut host = setup_rendering(
             HostConfig::from_environment()
-                .map_err(|source| EngineError::from(HostError::from(source)))?,
+                .map_err(|source| RenderingError::from(HostError::from(source)))?,
             Arc::clone(&window),
             size.width,
             size.height,

@@ -22,9 +22,6 @@ serde_json = "1"
 thiserror = "2"
 miette = { version = "7", features = ["derive"] }
 tracing = "0.1"
-wgpu = { version = "26.0.1", optional = true }
-bytemuck = { version = "1", features = ["derive"], optional = true }
-pollster = { version = "0.4", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
@@ -73,10 +70,6 @@ hot_patch = []
 
 # Emit repeated numerical measurements through the shared `metrics` recorder.
 metrics = ["dep:metrics", "pill_core/metrics"]
-# Minimal 2D renderer (wgpu-backed): Position/Sprite components, the sprite
-# pipeline, and window-surface/device/queue lifecycle. Frontends supply only a
-# compatible window handle and drive the engine Renderer API.
-rendering = ["dep:wgpu", "dep:bytemuck", "dep:pollster", "pill_core/rendering"]
 
 [[bench]]
 name = "entity_lifecycle"
@@ -109,13 +102,21 @@ harness = false
 [lib]
 name = "pill_engine"
 path = "src/lib.rs"
-# Deliberately not a `dylib`. Sharing one engine library across the host and
-# every loaded module would remove the duplicated statics described in
-# `local/documents/modularity_implementation_plan.md`, but a Rust dylib must
-# export every symbol, and with the `rendering` feature the wgpu, naga and winit
-# instantiations push the export table past the Windows limit of 65535
-# (`LINK : fatal error LNK1189`). The shared boundary is `pill_core` instead,
-# which carries the telemetry and logging globals without the graphics stack.
+# Still an `rlib`, but no longer because it has to be.
+#
+# A Rust `dylib` must export every symbol, and while wgpu, naga and winit lived
+# in this crate their instantiations pushed the export table past the Windows
+# limit of 65535 (`LINK : fatal error LNK1189`) - measured at 74,979 exports.
+# With the renderer moved to `pill_wgpu_renderer` that count is 22,623, well
+# inside the limit, so the blocker is gone.
+#
+# Converting is deliberately NOT part of that move: sharing one engine library
+# across the host and every loaded module also removes the duplicated statics
+# described in `local/documents/modularity_implementation_plan.md`, which is a
+# separate architectural decision with its own analysis. It would additionally
+# let a hot patch resolve engine symbols through an import library instead of
+# reading this crate's 26 MB archive, which is the largest remaining cost in a
+# patch - see `local/documents/engine_hot_reload_and_patching_speed_improvements.md`.
 crate-type = ["rlib"]
 
 [[bin]]

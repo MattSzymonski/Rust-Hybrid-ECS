@@ -60,6 +60,11 @@ mod project_module;
 #[cfg(feature = "hot_reload")]
 mod reload;
 /// Complete standalone application runner owned by the host crate.
+/// Windowed-frontend and rendering errors, owned by the host because the
+/// host owns the event loop and the renderer.
+#[cfg(feature = "rendering")]
+mod frontend;
+
 mod runner;
 /// Engine ownership and frontend-facing frame orchestration.
 mod runtime;
@@ -80,8 +85,6 @@ pub use config::{
     CSharpModuleConfig, HostConfig, OptionalModuleConfig, ProjectModuleBackend, ProjectModuleConfig,
 };
 pub use optional_module::OPTIONAL_MODULE_ABI_VERSION;
-#[cfg(feature = "rendering")]
-pub use pill_core::error::FrontendError;
 pub use pill_core::error::{
     engine_report, install_engine_report_handler, BuildError, CSharpError, ConfigError,
     EngineMessage, EngineReportHandler, HostError, LibraryError, MessageRenderer, ModuleError,
@@ -97,9 +100,18 @@ pub use runner::run;
 pub use runtime::{run_one_frame, setup, FrameReport, Host, ProjectSource};
 pub use telemetry::init_telemetry;
 
-// Rendering-only engine surface: error and viewport types.
+// Engine surface that used to be rendering-only. The viewport types are
+// plain data and `EngineError` no longer has rendering variants, so both are
+// available to headless frontends too.
+pub use pill_engine::{EngineError, RenderViewport, VirtualResolution};
+
+// Rendering-only: the renderer itself, and the errors the windowed path
+// composes. Re-exported so frontends never name `pill_wgpu_renderer`
+// directly and stay free of a wgpu dependency of their own.
 #[cfg(feature = "rendering")]
-pub use pill_engine::{EngineError, RenderViewport, RendererError, VirtualResolution};
+pub use crate::frontend::{FrontendError, RenderingError};
+#[cfg(feature = "rendering")]
+pub use pill_wgpu_renderer::{Renderer, RendererError, RendererWindow};
 
 // Rendering-only frontend entry points: window and event-loop setup.
 #[cfg(feature = "rendering")]

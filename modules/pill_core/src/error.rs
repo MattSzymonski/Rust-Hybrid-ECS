@@ -8,8 +8,8 @@
 //! - Provide the plain and terminal renderers plus the miette presentation
 //!   adapter and report handler.
 //! - Declare every subsystem error ([`ConfigError`], [`BuildError`],
-//!   [`LibraryError`], [`WatcherError`], [`CSharpError`],
-//!   [`FrontendError`]) and their transparent composition [`HostError`].
+//!   [`LibraryError`], [`WatcherError`], [`CSharpError`]) and their
+//!   transparent composition [`HostError`].
 //!
 //! # Design
 //!
@@ -842,27 +842,6 @@ impl From<serde_json::Error> for CSharpError {
     }
 }
 
-/// Windowed-frontend failures produced by `winit`, compiled only with the
-/// `rendering` feature.
-///
-/// Raised while creating the event loop or the native standalone window.
-#[cfg(feature = "rendering")]
-#[engine_error(namespace = host::frontend)]
-pub enum FrontendError {
-    /// The `winit` event loop could not be created.
-    #[message("failed to create the event loop")]
-    EventLoopCreation {
-        #[source]
-        source: winit::error::EventLoopError,
-    },
-
-    /// The native window could not be created.
-    #[message("failed to create the standalone host window")]
-    WindowCreation {
-        #[source]
-        source: winit::error::OsError,
-    },
-}
 
 // =============================================================================
 // Host Error Composition
@@ -897,11 +876,6 @@ pub enum HostError {
     /// The managed backend failed to start.
     #[transparent]
     CSharp(#[from] CSharpError),
-
-    /// The windowed frontend failed to create its event loop or window.
-    #[cfg(feature = "rendering")]
-    #[transparent]
-    Frontend(#[from] FrontendError),
 
     /// The workspace root cannot be derived from the manifest directory.
     #[message("cannot determine the workspace root")]

@@ -27,8 +27,6 @@ use pill_engine::commands::{boxed_component_adder, ComponentAdder};
 use pill_engine::component_registry::ComponentFieldDescriptor;
 use pill_engine::{Component, ComponentId, Engine, World};
 use serde::Deserialize;
-#[cfg(not(feature = "rendering"))]
-use trait_type_map::impl_trait_accessible;
 use trait_type_map::TraitAccessible;
 
 // Current crate
@@ -82,70 +80,13 @@ const BLITTABLE_FIELD_TYPES: &[&str] = &[
 // Types + Impls
 // =============================================================================
 
-// In rendering builds these names resolve to the renderer's components so
-// managed physics writes directly into the columns consumed by the renderer.
-// Headless builds provide layout-identical local definitions instead.
-#[cfg(feature = "rendering")]
+// The renderer's components, which managed physics writes into directly.
+//
+// There used to be a second, layout-identical set of local definitions for
+// headless builds, because these types only existed behind the engine's
+// `rendering` feature. They are unconditional now, so there is one
+// definition and no way for the two to drift.
 pub(super) use pill_engine::{Color, Position, Sprite};
-
-/// Headless ABI mirror of `TracyLive.Position`.
-///
-/// Layout-identical to the renderer's component so managed physics writes
-/// land in the same columns consumed by rendering builds.
-#[cfg(not(feature = "rendering"))]
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(super) struct Position {
-    /// Horizontal position in world units.
-    pub(super) x: f32,
-    /// Vertical position in world units.
-    pub(super) y: f32,
-}
-#[cfg(not(feature = "rendering"))]
-impl Component for Position {}
-
-/// Headless ABI mirror of the renderer's RGBA color.
-///
-/// Stores the four channels as single-precision floats in the same order the
-/// renderer's component uses, keeping the native and managed layouts in sync.
-#[cfg(not(feature = "rendering"))]
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(super) struct Color {
-    /// Red channel in the 0.0–1.0 range.
-    pub(super) r: f32,
-    /// Green channel in the 0.0–1.0 range.
-    pub(super) g: f32,
-    /// Blue channel in the 0.0–1.0 range.
-    pub(super) b: f32,
-    /// Alpha channel in the 0.0–1.0 range.
-    pub(super) a: f32,
-}
-#[cfg(not(feature = "rendering"))]
-impl Component for Color {}
-
-/// Headless ABI mirror of `TracyLive.Sprite`.
-///
-/// Carries the sprite's dimensions and tint color; the layout matches the
-/// renderer's component so managed code can populate sprite columns directly.
-#[cfg(not(feature = "rendering"))]
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(super) struct Sprite {
-    /// Sprite width in world units.
-    pub(super) width: f32,
-    /// Sprite height in world units.
-    pub(super) height: f32,
-    /// Tint applied when the sprite is rendered.
-    pub(super) color: Color,
-}
-#[cfg(not(feature = "rendering"))]
-impl Component for Sprite {}
-
-// Registers the headless mirrors as trait-accessible so the native binding
-// machinery can look them up through `dyn Component` in headless builds.
-#[cfg(not(feature = "rendering"))]
-impl_trait_accessible!(dyn Component; Position, Sprite, Color);
 
 /// Stable 128-bit identity derived from a managed component's canonical name.
 ///

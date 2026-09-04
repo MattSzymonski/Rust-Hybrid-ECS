@@ -34,7 +34,3 @@ default = []
 # build the host hot-loads passes `--features module-abi` so it stays
 # discoverable.
 module-abi = []
-# Must mirror the host's engine feature set: a module built against a
-# differently configured engine can disagree about type layout. The host passes
-# this flag automatically when it was itself built with rendering.
-rendering = ["pill_engine/rendering"]

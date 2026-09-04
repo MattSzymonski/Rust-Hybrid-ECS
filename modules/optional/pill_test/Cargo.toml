@@ -25,7 +25,3 @@ serde = { version = "1", features = ["derive"] }
 # this crate statically.
 default = []
 module-abi = []
-# Must mirror the host's engine feature set: a module built against a
-# differently configured engine can disagree about type layout. The host passes
-# this flag automatically when it was itself built with rendering.
-rendering = ["pill_engine/rendering"]

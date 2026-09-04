@@ -4215,7 +4215,6 @@ dependencies = [
  "tracing-subscriber",
  "tracing-tracy",
  "tracy-client",
- "winit",
 ]
 
 [[package]]
@@ -4272,7 +4271,6 @@ dependencies = [
 name = "pill_engine"
 version = "0.1.0"
 dependencies = [
- "bytemuck",
  "criterion",
  "inventory",
  "metrics",
@@ -4281,7 +4279,6 @@ dependencies = [
  "pill_core",
  "pill_core_macros",
  "pill_engine_macros",
- "pollster",
  "rayon",
  "serde",
  "serde_json",
@@ -4290,7 +4287,6 @@ dependencies = [
  "tracing",
  "tracy-client",
  "trait_type_map",
- "wgpu",
 ]
 
 [[package]]
@@ -4308,13 +4304,17 @@ version = "0.1.0"
 dependencies = [
  "libloading 0.8.9",
  "metrics",
+ "miette",
  "notify",
  "pill_core",
+ "pill_core_macros",
  "pill_engine",
  "pill_hot_scan",
+ "pill_wgpu_renderer",
  "serde",
  "serde_json",
  "serde_yaml",
+ "thiserror 2.0.19",
  "tracing",
  "trait_type_map",
  "winit",
@@ -4370,6 +4370,20 @@ dependencies = [
  "pill_engine",
  "serde",
  "trait_type_map",
+]
+
+[[package]]
+name = "pill_wgpu_renderer"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "miette",
+ "pill_core",
+ "pill_core_macros",
+ "pill_engine",
+ "pollster",
+ "thiserror 2.0.19",
+ "wgpu",
 ]
 
 [[package]]

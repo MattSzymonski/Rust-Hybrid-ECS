@@ -26,7 +26,6 @@ serde_json = "1"
 thiserror = "2"
 miette = { version = "7", features = ["derive", "fancy"] }
 colored = "2"
-winit = { version = "0.30", optional = true }
 tracing = "0.1"
 tracing-log = "0.2"
 # The default `tracing-log` feature would auto-bridge `log` inside
@@ -51,7 +50,6 @@ metrics = { version = "0.24", optional = true }
 log = "0.4"
 
 [features]
-rendering = ["dep:winit"]
 dev-logs = []
 tracy = ["dep:tracing-tracy", "dep:tracy-client"]
 metrics = ["dep:metrics"]

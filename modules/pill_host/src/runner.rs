@@ -24,12 +24,8 @@
 use std::sync::Arc;
 
 // External crates
-#[cfg(feature = "rendering")]
-use pill_core::error::FrontendError;
 #[cfg(not(feature = "rendering"))]
 use pill_core::error::HostError;
-#[cfg(feature = "rendering")]
-use pill_engine::EngineError;
 #[cfg(feature = "rendering")]
 use winit::application::ApplicationHandler;
 #[cfg(feature = "rendering")]
@@ -40,6 +36,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
 // Current crate
+#[cfg(feature = "rendering")]
+use crate::frontend::{FrontendError, RenderingError};
 use crate::FrameReport;
 
 // =============================================================================
@@ -59,7 +57,7 @@ struct WindowedApplication {
     /// Whether the hidden startup window has been revealed after its first frame.
     window_shown: bool,
     /// Failure recorded during `resumed`; surfaced after the loop exits.
-    setup_error: Option<EngineError>,
+    setup_error: Option<RenderingError>,
 }
 
 #[cfg(feature = "rendering")]
@@ -247,10 +245,10 @@ pub fn run(project: impl Into<crate::ProjectSource>) -> Result<(), HostError> {
 ///
 /// # Errors
 ///
-/// Returns [`EngineError`] if the event loop cannot be created or run, or if
+/// Returns [`RenderingError`] if the event loop cannot be created or run, or if
 /// window creation or host/renderer setup fails inside the event loop.
 #[cfg(feature = "rendering")]
-pub fn run(project: impl Into<crate::ProjectSource>) -> Result<(), EngineError> {
+pub fn run(project: impl Into<crate::ProjectSource>) -> Result<(), RenderingError> {
     let project = project.into();
     // Step 1: Create a new event loop for the windowed application.
     let event_loop =

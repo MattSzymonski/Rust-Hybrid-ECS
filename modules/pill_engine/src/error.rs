@@ -5,7 +5,7 @@
 //!
 //! - Declare the engine's subsystem errors ([`WorldError`],
 //!   [`CommandError`], [`AddComponentError`], [`RemoveComponentError`],
-//!   [`BuildError`], [`RendererError`]).
+//!   [`BuildError`]).
 //! - Compose them transparently into the top-level [`EngineError`] together
 //!   with the shared host errors from `pill_core`.
 //!
@@ -356,54 +356,6 @@ pub enum PersistenceError {
 }
 
 // =============================================================================
-// Renderer Errors
-// =============================================================================
-
-/// Rendering initialization or presentation failures of the wgpu backend.
-///
-/// Compiled only when the `rendering` feature is enabled; covers surface,
-/// adapter, device, and frame-acquisition failures.
-#[cfg(feature = "rendering")]
-#[engine_error(namespace = engine::renderer, runtime = ::pill_core::error)]
-pub enum RendererError {
-    /// The GPU surface could not be created for the supplied window.
-    #[message("failed to create the GPU surface")]
-    SurfaceCreation {
-        #[source]
-        source: wgpu::CreateSurfaceError,
-    },
-
-    /// No compatible GPU adapter could be found.
-    #[message("failed to find a compatible GPU adapter")]
-    AdapterRequest {
-        #[source]
-        source: wgpu::RequestAdapterError,
-    },
-
-    /// The GPU device could not be created from the adapter.
-    #[message("failed to create the GPU device")]
-    DeviceCreation {
-        #[source]
-        source: wgpu::RequestDeviceError,
-    },
-
-    /// The surface exposes no texture formats.
-    #[message("GPU surface exposes no texture formats")]
-    NoTextureFormats,
-
-    /// The surface exposes no alpha modes.
-    #[message("GPU surface exposes no alpha modes")]
-    NoAlphaModes,
-
-    /// The frame texture could not be acquired for a fatal reason.
-    #[message("failed to acquire the GPU surface texture")]
-    SurfaceTextureFailed {
-        #[source]
-        source: wgpu::SurfaceError,
-    },
-}
-
-// =============================================================================
 // System Errors
 // =============================================================================
 
@@ -505,16 +457,6 @@ pub enum EngineError {
     #[transparent]
     Persistence(#[from] PersistenceError),
 
-    /// The renderer failed to initialize or draw a frame.
-    #[cfg(feature = "rendering")]
-    #[transparent]
-    Renderer(#[from] RendererError),
-
-    /// The windowed frontend failed to create its event loop or window.
-    #[cfg(feature = "rendering")]
-    #[transparent]
-    Frontend(#[from] ::pill_core::error::FrontendError),
-
     /// A subsystem of the shared host crate failed.
     #[transparent]
     Host(#[from] ::pill_core::error::HostError),
@@ -569,19 +511,6 @@ mod tests {
         };
         let copied = error;
         assert_eq!(error, copied);
-    }
-
-    /// Renderer unit variants produce their diagnostic code.
-    #[cfg(feature = "rendering")]
-    #[test]
-    fn renderer_error_code_derives_from_namespace_and_variant() {
-        assert_eq!(
-            RendererError::NoTextureFormats
-                .code()
-                .map(|code| code.to_string())
-                .as_deref(),
-            Some("engine::renderer::no_texture_formats")
-        );
     }
 
     /// System failures render the failing system's name with its error.

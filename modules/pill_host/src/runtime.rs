@@ -32,9 +32,9 @@ use pill_engine::Engine;
 #[cfg(feature = "hot_reload")]
 use pill_engine::EngineApi;
 #[cfg(feature = "rendering")]
-use pill_engine::EngineError;
+use pill_engine::{RenderViewport, VirtualResolution};
 #[cfg(feature = "rendering")]
-use pill_engine::{RenderViewport, Renderer, RendererError, RendererWindow, VirtualResolution};
+use pill_wgpu_renderer::{Renderer, RendererError, RendererWindow};
 
 // Current crate
 #[cfg(feature = "hot_reload")]
@@ -655,15 +655,16 @@ pub fn setup(project: StaticProject) -> Result<Host, HostError> {
 ///
 /// # Errors
 ///
-/// Returns the composed [`EngineError`], which transparently carries either
-/// a [`HostError`] from setup or a [`RendererError`] from surface creation.
+/// Returns the composed [`RenderingError`](crate::frontend::RenderingError),
+/// which transparently carries either a [`HostError`] from setup or a
+/// [`RendererError`] from surface creation.
 #[cfg(feature = "rendering")]
 pub fn setup_rendering<W>(
     project: impl Into<ProjectSource>,
     window: W,
     width: u32,
     height: u32,
-) -> Result<RenderingHost, EngineError>
+) -> Result<RenderingHost, crate::frontend::RenderingError>
 where
     W: RendererWindow + 'static,
 {

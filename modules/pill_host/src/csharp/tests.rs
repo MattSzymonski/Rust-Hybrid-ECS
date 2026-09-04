@@ -478,7 +478,9 @@ fn managed_shared_component_schema_mismatch_is_rejected() {
 }
 
 /// Verify managed shared bindings use the renderer's concrete component types.
-#[cfg(feature = "rendering")]
+///
+/// Runs in every build: the components are unconditional now, so the managed
+/// bridge has one binding path rather than one per feature set.
 #[test]
 fn csharp_world_supports_the_sprite_renderer_query() {
     let mut engine = Engine::new();
