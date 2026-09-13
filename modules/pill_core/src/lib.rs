@@ -48,6 +48,8 @@ pub mod math;
 /// Metrics recording foundation, gated on the `metrics` feature.
 #[cfg(feature = "metrics")]
 pub mod metrics;
+/// Engine-owned native buffer allocation, shared by every loaded artifact.
+pub mod native_buffer;
 /// Tracy profiling API with feature gating and no-op fallbacks.
 pub mod profiling;
 /// `PillStyle` string-styling vocabulary for terminal output.

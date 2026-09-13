@@ -502,10 +502,14 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
             // The returned change flag is ignored at startup (the mirror is
             // always written before the project compiles); the reload path
             // uses it to decide whether to queue a C# project rebuild.
-            let (exposed, methods, _changed) =
+            let (exposed, methods, accessors, _changed) =
                 regenerate_module_csharp_mirror(&workspace_root, &mut engine, slot)?;
             module_exposed_components.extend(exposed);
             all_mirror_methods.extend(methods);
+            // Container accessors ride the mirror-method table, so the managed
+            // runtime resolves them through the same lookup and the same
+            // per-reload refresh as value-type methods.
+            all_mirror_methods.extend(crate::csharp::accessor_rows(&accessors));
         }
     }
     let loaded_project = LoadedProject::start(
@@ -876,28 +880,33 @@ fn resync_patch_baselines(host: &mut Host, project: bool, modules: &[usize]) {
 #[cfg(all(not(feature = "hot_patch"), feature = "hot_reload"))]
 fn resync_patch_baselines(_host: &mut Host, _project: bool, _modules: &[usize]) {}
 
+/// What `regenerate_module_csharp_mirror` hands back: the exposed component
+/// bindings, the resolved mirror methods and heap-field accessors for the
+/// managed method table, and whether the mirror file on disk changed.
+#[cfg(feature = "hot_reload")]
+type RegeneratedMirror = (
+    Vec<ModuleExposedComponent>,
+    Vec<crate::csharp::ResolvedMirrorMethod>,
+    Vec<crate::csharp::ResolvedFieldAccessor>,
+    bool,
+);
+
 /// Compute the C#-exposed bindings for one optional module's current
 /// generation and regenerate its `generated/<module>_Components.g.cs` mirror
 /// file from that generation's real registry, value types, and mirrored
 /// methods.
 ///
 /// Returns the exposed component bindings (for the C# backend's native
-/// bindings), the resolved mirror methods (for the managed method table), and
-/// whether the mirror file on disk actually changed. The change flag lets the
-/// reload path queue a C# project rebuild only when the C# surface moved.
+/// bindings), the resolved mirror methods and container accessors (for the
+/// managed method table), and whether the mirror file on disk actually
+/// changed. The change flag lets the reload path queue a C# project rebuild
+/// only when the C# surface moved.
 #[cfg(feature = "hot_reload")]
 fn regenerate_module_csharp_mirror(
     workspace_root: &Path,
     engine: &mut Engine,
     slot: &OptionalModuleSlot,
-) -> Result<
-    (
-        Vec<ModuleExposedComponent>,
-        Vec<crate::csharp::ResolvedMirrorMethod>,
-        bool,
-    ),
-    CSharpError,
-> {
+) -> Result<RegeneratedMirror, CSharpError> {
     // Each registered type name resolves to its native component; the
     // C#-facing name is the Rust path with `::` replaced by `.` so a
     // `project_cs` mirror struct reproduces the same stable identity.
@@ -923,15 +932,17 @@ fn regenerate_module_csharp_mirror(
         })
         .collect();
     let methods = slot.mirror_methods();
+    let accessors = slot.field_accessors();
     let changed = crate::csharp::generate_module_components_csharp(
         workspace_root,
         slot.name(),
         &exposed,
         &slot.value_type_descriptors(),
         &methods,
+        &accessors,
     )
     .map_err(|message| CSharpError::CodegenFailed { message })?;
-    Ok((exposed, methods, changed))
+    Ok((exposed, methods, accessors, changed))
 }
 
 /// Run every reload step of one frame: module reloads, the per-function fast
@@ -1023,12 +1034,14 @@ fn run_reload_steps(host: &mut Host) {
         for index in &reloaded_modules {
             match regenerate_module_csharp_mirror(workspace_root, engine, &optional_modules[*index])
             {
-                Ok((_exposed, methods, mirror_changed)) => {
+                Ok((_exposed, methods, accessors, mirror_changed)) => {
                     // A mirror-content change (fields/value types/method set)
-                    // always rebuilds; a module exposing mirrored methods also
-                    // rebuilds on any reload, because its trampolines live at
-                    // new addresses and body edits should reach C#.
-                    needs_csharp_reload |= mirror_changed || !methods.is_empty();
+                    // always rebuilds; a module exposing mirrored methods or
+                    // heap-field accessors also rebuilds on any reload, because
+                    // its trampolines live at new addresses and body edits
+                    // should reach C#.
+                    needs_csharp_reload |=
+                        mirror_changed || !methods.is_empty() || !accessors.is_empty();
                 }
                 Err(error) => {
                     error!(
@@ -1042,12 +1055,17 @@ fn run_reload_steps(host: &mut Host) {
         }
         // Republish the mirror-method table from every module's current
         // generation: reloaded modules expose fresh addresses, untouched ones
-        // keep the addresses they were loaded with.
-        let methods: Vec<crate::csharp::ResolvedMirrorMethod> = optional_modules
+        // keep the addresses they were loaded with. Container accessors are
+        // appended as rows so the managed side resolves them through the same
+        // lookup.
+        let mut rows: Vec<crate::csharp::ResolvedMirrorMethod> = optional_modules
             .iter()
             .flat_map(OptionalModuleSlot::mirror_methods)
             .collect();
-        crate::csharp::publish_mirror_methods(&methods);
+        for slot in optional_modules.iter() {
+            rows.extend(crate::csharp::accessor_rows(&slot.field_accessors()));
+        }
+        crate::csharp::publish_mirror_methods(&rows);
         if needs_csharp_reload {
             info!(
                 target: telemetry_target::HOT_RELOAD,

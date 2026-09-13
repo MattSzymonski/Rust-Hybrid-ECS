@@ -33,7 +33,7 @@ use pill_engine::component_registry::{ComponentFieldDescriptor, PillValueTypeDes
 
 // Current crate
 use super::components::ModuleExposedComponent;
-use super::ResolvedMirrorMethod;
+use super::{ResolvedFieldAccessor, ResolvedMirrorMethod};
 
 // =============================================================================
 // Free Functions
@@ -80,6 +80,7 @@ pub(crate) fn generate_module_components_csharp(
     exposed: &[ModuleExposedComponent],
     value_types: &[PillValueTypeDescriptor],
     methods: &[ResolvedMirrorMethod],
+    accessors: &[ResolvedFieldAccessor],
 ) -> Result<bool, String> {
     let module_root = workspace_root.join("optional").join(module_name);
     let generated_dir = module_root.join("generated");
@@ -109,6 +110,9 @@ pub(crate) fn generate_module_components_csharp(
          // Regenerated on every host startup into generated/<module>_Components.g.cs.\n\
          // Components registered with compile-time field layouts are emitted as\n\
          // typed structs; everything else is an opaque ABI blob with a `Raw` span.\n\
+         // Heap-owning fields become accessor members: `Vec`/`String` reach the\n\
+         // Rust heap through exported trampolines, and `DynamicBuffer` mirrors\n\
+         // its `(ptr, len, cap)` handle so iterating costs no calls at all.\n\
          using System;\n\
          using System.Runtime.CompilerServices;\n\
          using System.Runtime.InteropServices;\n\n",
@@ -132,6 +136,9 @@ pub(crate) fn generate_module_components_csharp(
         let body = if component.fields.is_empty() {
             emit_blob_component(name, component.size, component.align)?
         } else {
+            // The C# name is the Rust path with `::` replaced by `.`, so
+            // mapping the dots back recovers the name the accessor rows carry.
+            let rust_type_name = component.csharp_name.replace('.', "::");
             emit_typed_struct(
                 name,
                 &component.fields,
@@ -141,6 +148,8 @@ pub(crate) fn generate_module_components_csharp(
                 &mut nested_definitions,
                 methods,
                 "",
+                accessors,
+                &rust_type_name,
             )?
         };
         component_blocks.push((namespace.to_string(), body));
@@ -176,6 +185,8 @@ pub(crate) fn generate_module_components_csharp(
             &mut nested_definitions,
             methods,
             value_type.type_name,
+            &[],
+            "",
         )?;
         nested_definitions.push(EmittedStruct {
             qualified: value_type.type_name.to_string(),
@@ -248,17 +259,19 @@ fn emit_blob_component(name: &str, size: usize, align: usize) -> Result<String, 
     ))
 }
 
-/// Emit one typed C# struct from a compile-time field layout.
+/// Emit a typed C# struct from a compile-time field layout.
 ///
 /// `size`/`align` come from the Rust type; alignment above 8 is rejected
 /// because no C# primitive can drive it. `struct:` fields are resolved against
 /// the module's `PillMirror` inventory (recursively), falling back to an
 /// opaque blob of the field's size when a type is not declared. Nested
 /// definitions are appended to `emitted` in dependency order.
-/// Emit a typed C# struct from a compile-time field layout.
 ///
-/// The many parameters mirror the descriptor fields plus the recursion
-/// context; clippy's threshold is below the (internal) signature's size.
+/// `owner_type_name` is the component's Rust type name when this struct
+/// mirrors a component row — which is what enables the heap-field accessor
+/// members — and empty for a `PillMirror` value type. The many parameters
+/// mirror the descriptor fields plus the recursion context; clippy's
+/// threshold is below the (internal) signature's size.
 #[allow(clippy::too_many_arguments)]
 fn emit_typed_struct(
     name: &str,
@@ -269,6 +282,8 @@ fn emit_typed_struct(
     emitted: &mut Vec<EmittedStruct>,
     methods: &[ResolvedMirrorMethod],
     qualified: &str,
+    accessors: &[ResolvedFieldAccessor],
+    owner_type_name: &str,
 ) -> Result<String, String> {
     if align > 8 {
         return Err(format!(
@@ -278,10 +293,19 @@ fn emit_typed_struct(
 
     // Step 1: validate the descriptor and resolve every field to concrete C#
     // declarations with byte offsets and element sizes.
-    let mut resolved: Vec<(String, String, usize, usize)> = Vec::new();
+    let mut resolved: Vec<(String, usize, usize)> = Vec::new();
+    // The strongest alignment the emitted C# fields force; a container field
+    // contributes nothing, which is what the pad below compensates for.
+    let mut emitted_alignment: usize = 1;
     let mut sorted: Vec<&ComponentFieldDescriptor> = fields.iter().collect();
     sorted.sort_by_key(|field| field.offset);
     for field in &sorted {
+        // Heap-owning containers carry no C# field: the header is an
+        // implementation detail of the Rust container, and its elements are
+        // reached through the accessor members emitted below.
+        if is_opaque_container_tag(field.type_tag) {
+            continue;
+        }
         if field.size == 0 || field.offset + field.size > size {
             return Err(format!(
                 "field `{}` of `{name}` spans bytes {}..{} outside the {size}-byte type",
@@ -289,6 +313,37 @@ fn emit_typed_struct(
                 field.offset,
                 field.offset + field.size
             ));
+        }
+        // An engine-owned native buffer is mirrored as its three raw words
+        // rather than skipped: `#[repr(C)]` pins the handle to `(ptr, len,
+        // cap)`, so managed code reads the live buffer straight out of the row
+        // and iterates it without a single boundary call.
+        if field.type_tag.starts_with("dynbuf:") {
+            let word = std::mem::size_of::<usize>();
+            if field.size != 3 * word || field.align != word {
+                return Err(format!(
+                    "`DynamicBuffer` field `{}` of `{name}` is {}-byte/{}-aligned; the mirror \
+                     needs the {}-byte `(ptr, len, cap)` handle of a 64-bit target",
+                    field.name,
+                    field.size,
+                    field.align,
+                    3 * word
+                ));
+            }
+            let pascal = snake_to_pascal(field.name);
+            resolved.push((format!("private UIntPtr {pascal}Ptr"), field.offset, word));
+            resolved.push((
+                format!("private UIntPtr {pascal}Len"),
+                field.offset + word,
+                word,
+            ));
+            resolved.push((
+                format!("private UIntPtr {pascal}Cap"),
+                field.offset + 2 * word,
+                word,
+            ));
+            emitted_alignment = emitted_alignment.max(field.align);
+            continue;
         }
         let (base_tag, is_array) = split_array_tag(field.type_tag)?;
         let (element_size, element_align) = if is_array {
@@ -314,6 +369,7 @@ fn emit_typed_struct(
                 field.name
             ));
         }
+        emitted_alignment = emitted_alignment.max(element_align);
         let cs_type = if let Some((cs, _, _)) = cs_primitive(base_tag) {
             cs.to_string()
         } else if let Some(qualified) = base_tag.strip_prefix("struct:") {
@@ -336,23 +392,26 @@ fn emit_typed_struct(
             for index in 0..field.element_count {
                 let offset = field.offset + index * element_size;
                 resolved.push((
-                    format!("{pascal}{index}"),
-                    cs_type.clone(),
+                    format!("public {cs_type} {pascal}{index}"),
                     offset,
                     element_size,
                 ));
             }
         } else {
-            resolved.push((pascal, cs_type, field.offset, element_size));
+            resolved.push((
+                format!("public {cs_type} {pascal}"),
+                field.offset,
+                element_size,
+            ));
         }
     }
 
     // Step 2: siblings must not overlap - two C# fields over one byte range
     // would be a silent data race on the same storage.
-    resolved.sort_by_key(|(_, _, offset, _)| *offset);
+    resolved.sort_by_key(|(_, offset, _)| *offset);
     for pair in resolved.windows(2) {
-        let (_, _, left_offset, left_size) = &pair[0];
-        let (_, _, right_offset, _) = &pair[1];
+        let (_, left_offset, left_size) = &pair[0];
+        let (_, right_offset, _) = &pair[1];
         if *left_offset + *left_size > *right_offset {
             return Err(format!(
                 "fields of `{name}` overlap at byte {}; the derive produced an invalid layout",
@@ -361,15 +420,49 @@ fn emit_typed_struct(
         }
     }
 
-    // Step 3: emit the struct. `Size` forces the exact Rust byte size even
+    // Step 3: raise the struct's alignment when the emitted fields cannot.
+    // C# struct alignment is driven by its fields, and a container field emits
+    // no C# field at all, so a mirror can fall short of the alignment the
+    // module registered - which the manifest registration compares. A pad with
+    // the alignment's primitive is placed over bytes no emitted field claims (a
+    // container's header region, or trailing padding), exactly as the opaque
+    // blob mirror does with its sequential pad.
+    let mut alignment_pad: Option<(usize, &'static str)> = None;
+    if emitted_alignment < align {
+        let pad_primitive = alignment_primitive(align).ok_or_else(|| {
+            format!("type `{name}` has alignment {align} that no C# primitive can drive")
+        })?;
+        let mut pad_offset = 0;
+        'search: loop {
+            let pad_end = pad_offset + align;
+            if pad_end > size {
+                return Err(format!(
+                    "type `{name}` needs an {align}-byte alignment pad but has no free range inside its {size} bytes"
+                ));
+            }
+            for (_, offset, field_size) in &resolved {
+                if pad_offset < offset + field_size && *offset < pad_end {
+                    pad_offset = offset + field_size;
+                    continue 'search;
+                }
+            }
+            break;
+        }
+        alignment_pad = Some((pad_offset, pad_primitive));
+    }
+
+    // Step 4: emit the struct. `Size` forces the exact Rust byte size even
     // when trailing padding exists; `Raw` keeps the live-bytes escape hatch.
     let mut body = String::new();
     body.push_str(&format!(
         "[StructLayout(LayoutKind.Explicit, Size = {size})]\npublic struct {name}\n{{\n"
     ));
-    for (cs_field, cs_type, offset, _) in &resolved {
+    for (declaration, offset, _) in &resolved {
+        body.push_str(&format!("    [FieldOffset({offset})] {declaration};\n"));
+    }
+    if let Some((pad_offset, pad_primitive)) = alignment_pad {
         body.push_str(&format!(
-            "    [FieldOffset({offset})] public {cs_type} {cs_field};\n"
+            "    [FieldOffset({pad_offset})] private readonly {pad_primitive} _alignmentPad;\n"
         ));
     }
     body.push_str(
@@ -381,6 +474,19 @@ fn emit_typed_struct(
     // methods that call the Rust implementation through its C-ABI trampoline.
     if !qualified.is_empty() {
         body.push_str(&emit_value_type_methods(name, qualified, methods)?);
+    }
+    // Heap-field accessors (components only): a value type never carries a
+    // container field, so an empty owner type means nothing to emit.
+    if !owner_type_name.is_empty() {
+        body.push_str(&emit_heap_field_accessors(
+            name,
+            owner_type_name,
+            fields,
+            value_types,
+            emitted,
+            methods,
+            accessors,
+        )?);
     }
     body.push_str("}\n");
     Ok(body)
@@ -435,6 +541,8 @@ fn emit_nested_struct(
                 emitted,
                 methods,
                 descriptor.type_name,
+                &[],
+                "",
             )?
         }
         None => emit_opaque_struct(&cs_name, size, align)?,
@@ -682,6 +790,469 @@ fn emit_value_type_methods(
     Ok(output)
 }
 
+/// Emit the C# members that reach a component's heap-owning fields.
+///
+/// A `Vec<E>` field becomes a count, a read-only span, a writable span, and a
+/// resize method; a `DynamicBuffer<E>` field becomes a count and two spans
+/// whose reads come straight out of the row, plus a resize method; a
+/// `Vec<String>` field becomes a count, element get/set, an append, and a
+/// resize (one boundary call per element, never a span); a `String` field
+/// becomes a getter and a setter. Every member that calls native code takes
+/// the row's address with
+/// `MirrorMethods.AddressOf(ref Unsafe.AsRef(in this))` and hands it to the
+/// module's trampoline, so the buffer is read and written where it lives: one
+/// boundary call per member use, none per element. All of it stays safe C#, so
+/// the reloadable project assembly needs no `AllowUnsafeBlocks`.
+///
+/// Every span is a lease, not ownership: resizing or replacing the container
+/// invalidates it, exactly as a `&mut Vec` would in Rust.
+fn emit_heap_field_accessors(
+    cs_name: &str,
+    type_name: &str,
+    fields: &[ComponentFieldDescriptor],
+    value_types: &[PillValueTypeDescriptor],
+    emitted: &mut Vec<EmittedStruct>,
+    methods: &[ResolvedMirrorMethod],
+    accessors: &[ResolvedFieldAccessor],
+) -> Result<String, String> {
+    let mut containers: Vec<&ComponentFieldDescriptor> = fields
+        .iter()
+        .filter(|field| is_heap_field_tag(field.type_tag))
+        .collect();
+    if containers.is_empty() {
+        return Ok(String::new());
+    }
+    // Layout order, like the typed fields, so a regenerated mirror keeps its
+    // member order stable.
+    containers.sort_by_key(|field| field.offset);
+
+    let mut output = String::new();
+    for field in containers {
+        let Some(accessor) = accessors
+            .iter()
+            .find(|accessor| accessor.type_name == type_name && accessor.field_name == field.name)
+        else {
+            return Err(format!(
+                "component `{cs_name}` declares container field `{}` but its module published \
+                 no accessor for it; rebuild the module so the derive's trampolines are exported",
+                field.name
+            ));
+        };
+        let pascal = snake_to_pascal(field.name);
+        let view_operation = crate::csharp::accessor_operation_name(&accessor.field_name, "view");
+        // The generated members call these trampolines; a missing one would
+        // fail at C# call time instead of build time, so refuse here.
+        let require = |operation: &str, present: bool| -> Result<(), String> {
+            if present {
+                Ok(())
+            } else {
+                Err(format!(
+                    "field `{}` of `{cs_name}` needs a `{operation}` trampoline but its module \
+                     published none; rebuild the module so the derive's accessors are exported",
+                    field.name
+                ))
+            }
+        };
+
+        if field.type_tag == "vec:string" {
+            if accessor.kind != "vecstring" {
+                return Err(format!(
+                    "field `{}` of `{cs_name}` is a `Vec<String>` but its module published a `{}` accessor",
+                    field.name, accessor.kind
+                ));
+            }
+            require("view", accessor.view_address.is_some())?;
+            require("item", accessor.item_address.is_some())?;
+            require("set_item", accessor.set_item_address.is_some())?;
+            require("push", accessor.push_address.is_some())?;
+            require("resize", accessor.resize_address.is_some())?;
+            let item_operation =
+                crate::csharp::accessor_operation_name(&accessor.field_name, "item");
+            let set_item_operation =
+                crate::csharp::accessor_operation_name(&accessor.field_name, "set_item");
+            let push_operation =
+                crate::csharp::accessor_operation_name(&accessor.field_name, "push");
+            let resize_operation =
+                crate::csharp::accessor_operation_name(&accessor.field_name, "resize");
+            let view_delegate = format!("{cs_name}{pascal}ViewDelegate");
+            let item_delegate = format!("{cs_name}{pascal}ItemDelegate");
+            let set_item_delegate = format!("{cs_name}{pascal}SetItemDelegate");
+            let push_delegate = format!("{cs_name}{pascal}PushDelegate");
+            let resize_delegate = format!("{cs_name}{pascal}ResizeDelegate");
+            output.push_str(&format!(
+                r#"
+    /// Number of strings in `{field}` (Rust `Vec<String>`).
+    public readonly int {pascal}Count
+    {{
+        get
+        {{
+            {view_delegate} view = global::TracyLive.MirrorMethods.Resolve<{view_delegate}>("{type_name}", "{view_operation}");
+            view(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out _, out IntPtr length);
+            return checked((int)length);
+        }}
+    }}
+
+    /// Element `index` of `{field}`, decoded as UTF-8. Each element is its own
+    /// boundary call; an unreachable index throws rather than returning an empty string.
+    public readonly string Get{pascal}(int index)
+    {{
+        {item_delegate} item = global::TracyLive.MirrorMethods.Resolve<{item_delegate}>("{type_name}", "{item_operation}");
+        byte status = item(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), (IntPtr)index, out IntPtr data, out IntPtr length);
+        if (status != 0)
+            throw new global::System.ArgumentOutOfRangeException(nameof(index), "the element is not reachable (the row is dead or the index is out of range)");
+        return global::System.Runtime.InteropServices.Marshal.PtrToStringUTF8(data, checked((int)length)) ?? string.Empty;
+    }}
+
+    /// Replace element `index` of `{field}` with `value`, encoded as UTF-8.
+    public void Set{pascal}(int index, string value)
+    {{
+        {set_item_delegate} setItem = global::TracyLive.MirrorMethods.Resolve<{set_item_delegate}>("{type_name}", "{set_item_operation}");
+        byte[] utf8 = global::System.Text.Encoding.UTF8.GetBytes(value);
+        global::System.Runtime.InteropServices.GCHandle handle = global::System.Runtime.InteropServices.GCHandle.Alloc(utf8, global::System.Runtime.InteropServices.GCHandleType.Pinned);
+        try
+        {{
+            byte status = setItem(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), (IntPtr)index, handle.AddrOfPinnedObject(), (IntPtr)utf8.Length);
+            if (status != 0)
+                throw new global::System.ArgumentOutOfRangeException(nameof(index), "the element is not reachable (the row is dead or the index is out of range)");
+        }}
+        finally
+        {{
+            handle.Free();
+        }}
+    }}
+
+    /// Append `value` to `{field}` as a new last element.
+    public void Push{pascal}(string value)
+    {{
+        {push_delegate} push = global::TracyLive.MirrorMethods.Resolve<{push_delegate}>("{type_name}", "{push_operation}");
+        byte[] utf8 = global::System.Text.Encoding.UTF8.GetBytes(value);
+        global::System.Runtime.InteropServices.GCHandle handle = global::System.Runtime.InteropServices.GCHandle.Alloc(utf8, global::System.Runtime.InteropServices.GCHandleType.Pinned);
+        try
+        {{
+            push(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), handle.AddrOfPinnedObject(), (IntPtr)utf8.Length);
+        }}
+        finally
+        {{
+            handle.Free();
+        }}
+    }}
+
+    /// Resize `{field}` to `count` elements; new elements are empty strings.
+    public void Resize{pascal}(int count)
+    {{
+        {resize_delegate} resize = global::TracyLive.MirrorMethods.Resolve<{resize_delegate}>("{type_name}", "{resize_operation}");
+        resize(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), (IntPtr)count);
+    }}
+
+    /// C-ABI count view over `{field}`; `data` is always null (elements are separate allocations).
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate byte {view_delegate}(IntPtr row, out IntPtr data, out IntPtr length);
+
+    /// C-ABI element view over `{field}` (status: 0 ok, 1 dead row, 2 out of range).
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate byte {item_delegate}(IntPtr row, IntPtr index, out IntPtr data, out IntPtr length);
+
+    /// C-ABI element replace in `{field}` (status: 0 ok, 1 dead row, 2 out of range, 3 invalid UTF-8).
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate byte {set_item_delegate}(IntPtr row, IntPtr index, IntPtr utf8, IntPtr length);
+
+    /// C-ABI append to `{field}` (status: 0 ok, 1 dead row, 2 invalid UTF-8).
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate byte {push_delegate}(IntPtr row, IntPtr utf8, IntPtr length);
+
+    /// C-ABI resize of `{field}`.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate byte {resize_delegate}(IntPtr row, IntPtr count);
+"#,
+                field = field.name,
+                pascal = pascal,
+                type_name = type_name,
+                view_operation = view_operation,
+                item_operation = item_operation,
+                set_item_operation = set_item_operation,
+                push_operation = push_operation,
+                resize_operation = resize_operation,
+                view_delegate = view_delegate,
+                item_delegate = item_delegate,
+                set_item_delegate = set_item_delegate,
+                push_delegate = push_delegate,
+                resize_delegate = resize_delegate,
+            ));
+            continue;
+        }
+
+        if let Some(element_tag) = field.type_tag.strip_prefix("dynbuf:") {
+            if accessor.kind != "dynbuf" {
+                return Err(format!(
+                    "field `{}` of `{cs_name}` is a `DynamicBuffer` but its module published a `{}` accessor",
+                    field.name, accessor.kind
+                ));
+            }
+            if accessor.element_tag != element_tag {
+                return Err(format!(
+                    "field `{}` of `{cs_name}` is tagged `{element_tag}` but its module published \
+                     element `{}`; rebuild the module so the mirror matches",
+                    field.name, accessor.element_tag
+                ));
+            }
+            require("resize", accessor.resize_address.is_some())?;
+            let element_type = resolve_span_element_type(
+                element_tag,
+                cs_name,
+                field.name,
+                value_types,
+                emitted,
+                methods,
+            )?;
+            let resize_operation =
+                crate::csharp::accessor_operation_name(&accessor.field_name, "resize");
+            let resize_delegate = format!("{cs_name}{pascal}ResizeDelegate");
+            output.push_str(&format!(
+                r#"
+    /// Number of live elements in `{field}` (engine-owned `DynamicBuffer<{element_tag}>`);
+    /// read straight out of the row, with no boundary call.
+    public readonly int {pascal}Count => checked((int){pascal}Len);
+
+    /// Read-only lease over the engine-owned `{field}` buffer; a resize retires the block.
+    public readonly ReadOnlySpan<{element_type}> {pascal} =>
+        global::TracyLive.ComponentViews.AsReadOnlySpan<{element_type}>((IntPtr){pascal}Ptr, {pascal}Count);
+
+    /// Writable lease over `{field}`: write elements in place, then resize to grow or shrink.
+    public Span<{element_type}> {pascal}Mut =>
+        global::TracyLive.ComponentViews.AsSpan<{element_type}>((IntPtr){pascal}Ptr, {pascal}Count);
+
+    /// Resize `{field}` to `count` elements; new elements take the element type's `default`.
+    /// Native code reallocates - the elements live in engine-owned memory.
+    public void Resize{pascal}(int count)
+    {{
+        {resize_delegate} resize = global::TracyLive.MirrorMethods.Resolve<{resize_delegate}>("{type_name}", "{resize_operation}");
+        resize(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), (IntPtr)count);
+    }}
+
+    /// C-ABI resize of the `{field}` buffer.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate byte {resize_delegate}(IntPtr row, IntPtr count);
+"#,
+                field = field.name,
+                pascal = pascal,
+                element_tag = element_tag,
+                element_type = element_type,
+                type_name = type_name,
+                resize_operation = resize_operation,
+                resize_delegate = resize_delegate,
+            ));
+            continue;
+        }
+
+        if let Some(element_tag) = field.type_tag.strip_prefix("vec:") {
+            if accessor.kind != "vec" {
+                return Err(format!(
+                    "field `{}` of `{cs_name}` is a `Vec` but its module published a `{}` accessor",
+                    field.name, accessor.kind
+                ));
+            }
+            // The layout tag and the accessor's element tag come from the same
+            // derive, so a disagreement means the module and its registered
+            // layout drifted apart; refuse rather than emit a sized-by-guess
+            // span.
+            if accessor.element_tag != element_tag {
+                return Err(format!(
+                    "field `{}` of `{cs_name}` is tagged `{element_tag}` but its module published \
+                     element `{}`; rebuild the module so the mirror matches",
+                    field.name, accessor.element_tag
+                ));
+            }
+            // The span's element type: a primitive, or a `#[derive(PillMirror)]`
+            // struct whose descriptor supplies both the Rust size and the C#
+            // struct a `Span<T>` of it needs.
+            require("view", accessor.view_address.is_some())?;
+            require("resize", accessor.resize_address.is_some())?;
+            let element_type = resolve_span_element_type(
+                element_tag,
+                cs_name,
+                field.name,
+                value_types,
+                emitted,
+                methods,
+            )?;
+            let resize_operation =
+                crate::csharp::accessor_operation_name(&accessor.field_name, "resize");
+            let view_delegate = format!("{cs_name}{pascal}ViewDelegate");
+            let resize_delegate = format!("{cs_name}{pascal}ResizeDelegate");
+            output.push_str(&format!(
+                r#"
+    /// Number of live elements in `{field}` (Rust `Vec<{element_tag}>`).
+    public readonly int {pascal}Count
+    {{
+        get
+        {{
+            {view_delegate} view = global::TracyLive.MirrorMethods.Resolve<{view_delegate}>("{type_name}", "{view_operation}");
+            view(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out _, out IntPtr length);
+            return checked((int)length);
+        }}
+    }}
+
+    /// Read-only lease over `{field}`; a resize or any structural change invalidates it.
+    public readonly ReadOnlySpan<{element_type}> {pascal}
+    {{
+        get
+        {{
+            {view_delegate} view = global::TracyLive.MirrorMethods.Resolve<{view_delegate}>("{type_name}", "{view_operation}");
+            view(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out IntPtr data, out IntPtr length);
+            return global::TracyLive.ComponentViews.AsReadOnlySpan<{element_type}>(data, checked((int)length));
+        }}
+    }}
+
+    /// Writable lease over `{field}`: write elements in place, then resize to grow or shrink.
+    public Span<{element_type}> {pascal}Mut
+    {{
+        get
+        {{
+            {view_delegate} view = global::TracyLive.MirrorMethods.Resolve<{view_delegate}>("{type_name}", "{view_operation}");
+            view(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out IntPtr data, out IntPtr length);
+            return global::TracyLive.ComponentViews.AsSpan<{element_type}>(data, checked((int)length));
+        }}
+    }}
+
+    /// Resize `{field}` to `count` elements; new elements take the element type's `default`.
+    public void Resize{pascal}(int count)
+    {{
+        {resize_delegate} resize = global::TracyLive.MirrorMethods.Resolve<{resize_delegate}>("{type_name}", "{resize_operation}");
+        resize(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), (IntPtr)count);
+    }}
+
+    /// C-ABI view over the `{field}` field: writes `(data, length)` through the out parameters.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate byte {view_delegate}(IntPtr row, out IntPtr data, out IntPtr length);
+
+    /// C-ABI resize of the `{field}` field.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate byte {resize_delegate}(IntPtr row, IntPtr count);
+"#,
+                field = field.name,
+                pascal = pascal,
+                element_tag = element_tag,
+                element_type = element_type,
+                type_name = type_name,
+                view_operation = view_operation,
+                resize_operation = resize_operation,
+                view_delegate = view_delegate,
+                resize_delegate = resize_delegate,
+            ));
+            continue;
+        }
+
+        if accessor.kind != "string" {
+            return Err(format!(
+                "field `{}` of `{cs_name}` is a `String` but its module published a `{}` accessor",
+                field.name, accessor.kind
+            ));
+        }
+        require("view", accessor.view_address.is_some())?;
+        require("set", accessor.set_address.is_some())?;
+        let set_operation = crate::csharp::accessor_operation_name(&accessor.field_name, "set");
+        let view_delegate = format!("{cs_name}{pascal}ViewDelegate");
+        let set_delegate = format!("{cs_name}{pascal}SetDelegate");
+        output.push_str(&format!(
+            r#"
+    /// Decoded UTF-8 text of `{field}` (Rust `String`).
+    public readonly string Get{pascal}()
+    {{
+        {view_delegate} view = global::TracyLive.MirrorMethods.Resolve<{view_delegate}>("{type_name}", "{view_operation}");
+        view(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out IntPtr data, out IntPtr length);
+        return global::System.Runtime.InteropServices.Marshal.PtrToStringUTF8(data, checked((int)length)) ?? string.Empty;
+    }}
+
+    /// Replace `{field}` with `value`, encoded as UTF-8.
+    public void Set{pascal}(string value)
+    {{
+        {set_delegate} set = global::TracyLive.MirrorMethods.Resolve<{set_delegate}>("{type_name}", "{set_operation}");
+        byte[] utf8 = global::System.Text.Encoding.UTF8.GetBytes(value);
+        global::System.Runtime.InteropServices.GCHandle handle = global::System.Runtime.InteropServices.GCHandle.Alloc(utf8, global::System.Runtime.InteropServices.GCHandleType.Pinned);
+        try
+        {{
+            set(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), handle.AddrOfPinnedObject(), (IntPtr)utf8.Length);
+        }}
+        finally
+        {{
+            handle.Free();
+        }}
+    }}
+
+    /// C-ABI view over the `{field}` field: writes the UTF-8 `(data, length)` through the out parameters.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate byte {view_delegate}(IntPtr row, out IntPtr data, out IntPtr length);
+
+    /// C-ABI replace-in-place of the `{field}` field from UTF-8 bytes.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate byte {set_delegate}(IntPtr row, IntPtr utf8, IntPtr length);
+"#,
+            field = field.name,
+            pascal = pascal,
+            type_name = type_name,
+            view_operation = view_operation,
+            set_operation = set_operation,
+            view_delegate = view_delegate,
+            set_delegate = set_delegate,
+        ));
+    }
+    Ok(output)
+}
+
+/// Resolve the C# element type a generated span iterates.
+///
+/// A primitive maps straight across; a `struct:<path>` element must be
+/// declared with `#[derive(PillMirror)]`, because that descriptor is where the
+/// span's C# struct and its size both come from.
+fn resolve_span_element_type(
+    element_tag: &str,
+    cs_name: &str,
+    field_name: &str,
+    value_types: &[PillValueTypeDescriptor],
+    emitted: &mut Vec<EmittedStruct>,
+    methods: &[ResolvedMirrorMethod],
+) -> Result<String, String> {
+    if let Some((cs_type, _, _)) = cs_primitive(element_tag) {
+        return Ok(cs_type.to_string());
+    }
+    if let Some(qualified) = element_tag.strip_prefix("struct:") {
+        let descriptor = value_types
+            .iter()
+            .find(|descriptor| descriptor.type_name == qualified)
+            .ok_or_else(|| {
+                format!(
+                    "container field `{field_name}` of `{cs_name}` has element type `{qualified}`, \
+                     which must derive `PillMirror` so the generated span has a sized C# struct"
+                )
+            })?;
+        return emit_nested_struct(
+            qualified,
+            descriptor.size,
+            descriptor.align,
+            value_types,
+            emitted,
+            methods,
+        );
+    }
+    Err(format!(
+        "container field `{field_name}` of `{cs_name}` has unsupported element tag `{element_tag}`"
+    ))
+}
+
+/// Whether a tag names a Rust-owned container field, which carries no C# field
+/// of its own: its pointer must never be exposed to managed code, so elements
+/// are reached through the generated accessor members instead.
+fn is_opaque_container_tag(tag: &str) -> bool {
+    tag.starts_with("vec:") || tag == "string"
+}
+
+/// Whether a tag names any heap-owning field, which the accessor member
+/// emitter handles - Rust-owned containers and engine-owned native buffers
+/// alike.
+fn is_heap_field_tag(tag: &str) -> bool {
+    is_opaque_container_tag(tag) || tag.starts_with("dynbuf:")
+}
+
 /// Split an `array:<inner>` tag into its base tag and whether it is an array.
 fn split_array_tag(tag: &str) -> Result<(&str, bool), String> {
     match tag.strip_prefix("array:") {
@@ -772,8 +1343,15 @@ mod tests {
         components: &[ModuleExposedComponent],
         value_types: &[PillValueTypeDescriptor],
     ) -> Result<(), String> {
-        generate_module_components_csharp(workspace, module_name, components, value_types, &[])
-            .map(|_changed| ())
+        generate_module_components_csharp(
+            workspace,
+            module_name,
+            components,
+            value_types,
+            &[],
+            &[],
+        )
+        .map(|_changed| ())
     }
 
     /// One resolved mirrored method for codegen tests.
@@ -1442,6 +2020,7 @@ mod tests {
             &[exposed("pill_spline.Spline", 200, 4)],
             &value_types,
             &methods,
+            &[],
         )
         .unwrap();
 
@@ -1500,6 +2079,7 @@ mod tests {
             &[exposed("pill_spline.Spline", 200, 4)],
             &value_types,
             &methods,
+            &[],
         )
         .unwrap();
 
@@ -1559,18 +2139,20 @@ mod tests {
         assert!(generate_module_components_csharp(
             &workspace,
             "pill_spline",
-            &[component.clone()],
+            std::slice::from_ref(&component),
             &value_types,
             &methods_without,
+            &[],
         )
         .unwrap());
         // Identical regeneration reports no change.
         assert!(!generate_module_components_csharp(
             &workspace,
             "pill_spline",
-            &[component.clone()],
+            std::slice::from_ref(&component),
             &value_types,
             &methods_without,
+            &[],
         )
         .unwrap());
         // Adding a mirrored method changes the content, so it reports a change.
@@ -1580,8 +2162,334 @@ mod tests {
             &[component],
             &value_types,
             &methods_with,
+            &[],
         )
         .unwrap());
         assert!(read_generated(&workspace, "pill_spline").contains("public ulong GetB()"));
+    }
+
+    /// One resolved heap-field accessor for codegen tests; every kind
+    /// publishes a view, and the remaining trampolines are present exactly
+    /// where the kind has them.
+    fn resolved_accessor(
+        type_name: &str,
+        field_name: &str,
+        kind: &str,
+        element_tag: &str,
+    ) -> ResolvedFieldAccessor {
+        ResolvedFieldAccessor {
+            type_name: type_name.to_string(),
+            field_name: field_name.to_string(),
+            kind: kind.to_string(),
+            element_tag: element_tag.to_string(),
+            view_address: Some(0x2000),
+            resize_address: (kind == "vec" || kind == "dynbuf" || kind == "vecstring")
+                .then_some(0x2001),
+            set_address: (kind == "string").then_some(0x2002),
+            item_address: (kind == "vecstring").then_some(0x2003),
+            set_item_address: (kind == "vecstring").then_some(0x2004),
+            push_address: (kind == "vecstring").then_some(0x2005),
+        }
+    }
+
+    /// A `vec:f32` field emits count/span/span/resize members that resolve the
+    /// module's accessor trampolines and hand them the live row address; the
+    /// container header itself is never a C# field.
+    #[test]
+    fn heap_vec_field_emits_span_accessors() {
+        let workspace = temp_workspace("heap_vec", "pill_spline");
+        let component = exposed_typed(
+            "pill_spline.Trail",
+            32,
+            8,
+            vec![
+                field("points", "vec:f32", 0, 24, 8),
+                field("kind", "u32", 24, 4, 4),
+            ],
+        );
+        let accessors = [resolved_accessor("pill_spline::Trail", "points", "vec", "f32")];
+        generate_module_components_csharp(
+            &workspace,
+            "pill_spline",
+            &[component],
+            &[],
+            &[],
+            &accessors,
+        )
+        .unwrap();
+
+        let content = read_generated(&workspace, "pill_spline");
+        // The heap field occupies no C# field; the blittable ones still do.
+        assert!(!content.contains("public float Points"));
+        assert!(content.contains("[FieldOffset(24)] public uint Kind;"));
+        // A container contributes no C# field, so the pad keeps the struct's
+        // reflected alignment at the module's declared 8 bytes.
+        assert!(content.contains("[FieldOffset(0)] private readonly ulong _alignmentPad;"));
+        assert!(content.contains("public readonly int PointsCount"));
+        assert!(content.contains("public readonly ReadOnlySpan<float> Points"));
+        assert!(content.contains("public Span<float> PointsMut"));
+        assert!(content.contains("public void ResizePoints(int count)"));
+        // Resolution goes through the shared table under the operation names
+        // the host registers, and the row address comes from the live struct.
+        assert!(content.contains(
+            "global::TracyLive.MirrorMethods.Resolve<TrailPointsViewDelegate>(\"pill_spline::Trail\", \"points_view\")"
+        ));
+        assert!(content.contains(
+            "global::TracyLive.MirrorMethods.Resolve<TrailPointsResizeDelegate>(\"pill_spline::Trail\", \"points_resize\")"
+        ));
+        assert!(content.contains(
+            "global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this))"
+        ));
+        assert!(content.contains(
+            "global::TracyLive.ComponentViews.AsSpan<float>(data, checked((int)length))"
+        ));
+    }
+
+    /// A `string` field emits a UTF-8 getter and setter, with the setter
+    /// pinning its encoded bytes for the trampoline call.
+    #[test]
+    fn heap_string_field_emits_text_accessors() {
+        let workspace = temp_workspace("heap_string", "pill_spline");
+        let component = exposed_typed(
+            "pill_spline.Label",
+            32,
+            8,
+            vec![
+                field("name", "string", 0, 24, 8),
+                field("weight", "f32", 24, 4, 4),
+            ],
+        );
+        let accessors = [resolved_accessor("pill_spline::Label", "name", "string", "")];
+        generate_module_components_csharp(
+            &workspace,
+            "pill_spline",
+            &[component],
+            &[],
+            &[],
+            &accessors,
+        )
+        .unwrap();
+
+        let content = read_generated(&workspace, "pill_spline");
+        assert!(content.contains("[FieldOffset(0)] private readonly ulong _alignmentPad;"));
+        assert!(content.contains("public readonly string GetName()"));
+        assert!(content.contains("public void SetName(string value)"));
+        assert!(content.contains("Marshal.PtrToStringUTF8(data, checked((int)length))"));
+        assert!(content.contains(
+            "GCHandle.Alloc(utf8, global::System.Runtime.InteropServices.GCHandleType.Pinned)"
+        ));
+        assert!(content.contains(
+            "global::TracyLive.MirrorMethods.Resolve<LabelNameSetDelegate>(\"pill_spline::Label\", \"name_set\")"
+        ));
+    }
+
+    /// A `vec:string` field emits per-element accessors: count, get, set,
+    /// push, resize - one boundary call per element, never a span, because the
+    /// elements are separately allocated strings on the Rust side.
+    #[test]
+    fn heap_vec_string_field_emits_element_accessors() {
+        let workspace = temp_workspace("heap_vec_string", "pill_spline");
+        let component = exposed_typed(
+            "pill_spline.NameList",
+            32,
+            8,
+            vec![
+                field("names", "vec:string", 0, 24, 8),
+                field("kind", "u32", 24, 4, 4),
+            ],
+        );
+        let accessors = [resolved_accessor("pill_spline::NameList", "names", "vecstring", "string")];
+        generate_module_components_csharp(
+            &workspace,
+            "pill_spline",
+            &[component],
+            &[],
+            &[],
+            &accessors,
+        )
+        .unwrap();
+
+        let content = read_generated(&workspace, "pill_spline");
+        // No span can exist over separately allocated elements, and no
+        // container header becomes a C# field.
+        assert!(!content.contains("ReadOnlySpan<string>"));
+        assert!(!content.contains("NamesMut"));
+        assert!(!content.contains("UIntPtr NamesPtr"));
+        assert!(content.contains("[FieldOffset(0)] private readonly ulong _alignmentPad;"));
+        // The per-element surface.
+        assert!(content.contains("public readonly int NamesCount"));
+        assert!(content.contains("public readonly string GetNames(int index)"));
+        assert!(content.contains("public void SetNames(int index, string value)"));
+        assert!(content.contains("public void PushNames(string value)"));
+        assert!(content.contains("public void ResizeNames(int count)"));
+        assert!(content.contains(
+            "global::TracyLive.MirrorMethods.Resolve<NameListNamesItemDelegate>(\"pill_spline::NameList\", \"names_item\")"
+        ));
+        assert!(content.contains(
+            "global::TracyLive.MirrorMethods.Resolve<NameListNamesSetItemDelegate>(\"pill_spline::NameList\", \"names_set_item\")"
+        ));
+        assert!(content.contains(
+            "global::TracyLive.MirrorMethods.Resolve<NameListNamesPushDelegate>(\"pill_spline::NameList\", \"names_push\")"
+        ));
+        // Element reads decode UTF-8, and an unreachable element throws
+        // instead of silently reading as an empty string.
+        assert!(content.contains("Marshal.PtrToStringUTF8(data, checked((int)length))"));
+        assert!(content.contains("throw new global::System.ArgumentOutOfRangeException(nameof(index)"));
+    }
+
+    /// A `vec:string` field whose module published only some of the element
+    /// trampolines is refused: the generated members would otherwise fail at
+    /// C# call time instead of at build time.
+    #[test]
+    fn heap_vec_string_without_element_trampolines_is_refused() {
+        let workspace = temp_workspace("heap_vec_string_missing", "pill_spline");
+        let component = exposed_typed(
+            "pill_spline.NameList",
+            32,
+            8,
+            vec![
+                field("names", "vec:string", 0, 24, 8),
+                field("kind", "u32", 24, 4, 4),
+            ],
+        );
+        let mut accessor = resolved_accessor("pill_spline::NameList", "names", "vecstring", "string");
+        accessor.item_address = None;
+        let result = generate_module_components_csharp(
+            &workspace,
+            "pill_spline",
+            &[component],
+            &[],
+            &[],
+            &[accessor],
+        );
+        let error = result.expect_err("a missing element trampoline must be refused");
+        assert!(error.contains("`item` trampoline"));
+    }
+
+    /// A `Vec` of a struct needs `#[derive(PillMirror)]` on the element type:
+    /// that descriptor is where the span's C# struct and size come from. With
+    /// one declared, the nested struct is emitted before the component.
+    #[test]
+    fn heap_vec_of_struct_requires_a_declared_value_type() {
+        let workspace = temp_workspace("heap_vec_struct", "pill_spline");
+        let component = exposed_typed(
+            "pill_spline.Path",
+            32,
+            8,
+            vec![
+                field("nodes", "vec:struct:pill_core::math::Vector2f", 0, 24, 8),
+                field("kind", "u32", 24, 4, 4),
+            ],
+        );
+        let accessors = [resolved_accessor(
+            "pill_spline::Path",
+            "nodes",
+            "vec",
+            "struct:pill_core::math::Vector2f",
+        )];
+        let result = generate_module_components_csharp(
+            &workspace,
+            "pill_spline",
+            std::slice::from_ref(&component),
+            &[],
+            &[],
+            &accessors,
+        );
+        let error = result.expect_err("an undeclared element type must be refused");
+        assert!(error.contains("PillMirror"));
+
+        let value_types = [PillValueTypeDescriptor {
+            type_name: "pill_core::math::Vector2f",
+            size: 8,
+            align: 4,
+            fields: VECTOR2F_FIELDS,
+        }];
+        generate_module_components_csharp(
+            &workspace,
+            "pill_spline",
+            &[component],
+            &value_types,
+            &[],
+            &accessors,
+        )
+        .unwrap();
+
+        let content = read_generated(&workspace, "pill_spline");
+        assert!(content.contains("public Span<Vector2f> NodesMut"));
+        assert!(content.contains("[FieldOffset(0)] private readonly ulong _alignmentPad;"));
+        let nested_index = content.find("public struct Vector2f").expect("nested struct");
+        let component_index = content.find("public struct Path").expect("component struct");
+        assert!(nested_index < component_index);
+    }
+
+    /// A container field whose module published no accessor is a drift bug -
+    /// the module and the mirror would disagree about what exists - so codegen
+    /// refuses rather than emitting a mirror that cannot compile.
+    #[test]
+    fn heap_field_without_a_published_accessor_is_refused() {
+        let workspace = temp_workspace("heap_missing_accessor", "pill_spline");
+        let component = exposed_typed(
+            "pill_spline.Trail",
+            32,
+            8,
+            vec![field("points", "vec:f32", 0, 24, 8)],
+        );
+        let result = generate_module_components_csharp(
+            &workspace,
+            "pill_spline",
+            &[component],
+            &[],
+            &[],
+            &[],
+        );
+        let error = result.expect_err("a container field without an accessor must be refused");
+        assert!(error.contains("no accessor"));
+    }
+
+    /// An engine-owned `DynamicBuffer` field is mirrored as its three raw
+    /// words plus zero-call accessor members: count and spans read the row
+    /// directly, and only resizing resolves a trampoline.
+    #[test]
+    fn dynamic_buffer_field_emits_zero_call_members() {
+        let workspace = temp_workspace("dynbuf", "pill_spline");
+        let component = exposed_typed(
+            "pill_spline.Trail",
+            32,
+            8,
+            vec![
+                field("points", "dynbuf:f32", 0, 24, 8),
+                field("kind", "u32", 24, 4, 4),
+            ],
+        );
+        let accessors = [resolved_accessor("pill_spline::Trail", "points", "dynbuf", "f32")];
+        generate_module_components_csharp(
+            &workspace,
+            "pill_spline",
+            &[component],
+            &[],
+            &[],
+            &accessors,
+        )
+        .unwrap();
+
+        let content = read_generated(&workspace, "pill_spline");
+        // The handle's words are real fields, so the struct stays blittable
+        // and no alignment pad is needed.
+        assert!(content.contains("[FieldOffset(0)] private UIntPtr PointsPtr;"));
+        assert!(content.contains("[FieldOffset(8)] private UIntPtr PointsLen;"));
+        assert!(content.contains("[FieldOffset(16)] private UIntPtr PointsCap;"));
+        assert!(!content.contains("_alignmentPad"));
+        // Count and spans read straight from the row: no trampoline, no call.
+        assert!(content.contains("public readonly int PointsCount => checked((int)PointsLen);"));
+        assert!(content.contains("public readonly ReadOnlySpan<float> Points =>"));
+        assert!(content.contains("public Span<float> PointsMut =>"));
+        assert!(!content.contains("PointsViewDelegate"));
+        // Only the resize goes through the module's trampoline.
+        assert!(content.contains(
+            "global::TracyLive.MirrorMethods.Resolve<TrailPointsResizeDelegate>(\"pill_spline::Trail\", \"points_resize\")"
+        ));
+        assert!(content.contains("public void ResizePoints(int count)"));
+        // The blittable field after the handle is still emitted at its offset.
+        assert!(content.contains("[FieldOffset(24)] public uint Kind;"));
     }
 }

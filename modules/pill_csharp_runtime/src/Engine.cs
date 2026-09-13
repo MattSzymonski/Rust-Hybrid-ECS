@@ -372,6 +372,39 @@ public static class MirrorMethods
         Cache[key] = created;
         return created;
     }
+
+    /// <summary>
+    /// Address of a live value passed by reference, for generated heap-field
+    /// accessors.
+    ///
+    /// The address points at the storage the reference names - for a component
+    /// row, the native column slot - so a trampoline reached through it reads
+    /// and writes the real container rather than a copy of its header.
+    /// </summary>
+    public static unsafe IntPtr AddressOf<T>(ref T value) where T : unmanaged
+        => (IntPtr)global::System.Runtime.CompilerServices.Unsafe.AsPointer(ref value);
+}
+
+/// <summary>
+/// Span helpers for generated heap-field accessors.
+///
+/// A generated accessor hands these methods the address and element count a
+/// Rust trampoline (or a mirrored `DynamicBuffer` handle) reported, so managed
+/// code iterates a component's live buffer with no per-element boundary call.
+/// An empty buffer carries a null element pointer, which a zero count turns
+/// into the empty span rather than an invalid one. A span is a lease, not
+/// ownership: resizing or replacing the container on the Rust side invalidates
+/// it.
+/// </summary>
+public static class ComponentViews
+{
+    /// <summary>Writable span over <paramref name="count"/> elements at <paramref name="data"/>.</summary>
+    public static unsafe Span<T> AsSpan<T>(IntPtr data, int count) where T : unmanaged
+        => count == 0 ? Span<T>.Empty : new Span<T>((void*)data, count);
+
+    /// <summary>Read-only span over <paramref name="count"/> elements at <paramref name="data"/>.</summary>
+    public static unsafe ReadOnlySpan<T> AsReadOnlySpan<T>(IntPtr data, int count) where T : unmanaged
+        => count == 0 ? ReadOnlySpan<T>.Empty : new ReadOnlySpan<T>((void*)data, count);
 }
 
 /// <summary>

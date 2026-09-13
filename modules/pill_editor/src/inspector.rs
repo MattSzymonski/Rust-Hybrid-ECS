@@ -50,6 +50,11 @@ fn field_value_text(value: &FieldValue) -> String {
                     .join(", ")
             )
         }
+        FieldValue::List {
+            element_tag,
+            element_count,
+        } => format!("Vec<{element_tag}> ({element_count} elements, read-only)"),
+        FieldValue::Text(text) => format!("\"{}\" (read-only)", text.replace('"', "\\\"")),
         FieldValue::Opaque { type_tag, bytes } => {
             format!("{type_tag} ({} bytes)", bytes.len())
         }

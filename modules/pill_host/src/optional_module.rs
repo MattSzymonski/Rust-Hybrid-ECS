@@ -279,6 +279,13 @@ mod slot {
             self.current.mirror_methods()
         }
 
+        /// The current generation's heap-field accessors, each with the
+        /// resolved addresses of its operation trampolines, used by the C#
+        /// mirror codegen and the managed runtime's method table.
+        pub(crate) fn field_accessors(&self) -> Vec<crate::csharp::ResolvedFieldAccessor> {
+            self.current.field_accessors()
+        }
+
         /// Rebuild and swap one generation, keeping the previous one on any failure.
         fn reload(
             &mut self,

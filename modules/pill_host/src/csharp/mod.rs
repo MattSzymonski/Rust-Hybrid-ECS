@@ -67,6 +67,77 @@ pub(crate) struct ResolvedMirrorMethod {
     pub(crate) address: usize,
 }
 
+/// One heap-field accessor resolved to callable addresses, shared by the
+/// host's module loader, the C# mirror codegen, and the managed runtime's
+/// method table.
+#[derive(Clone, Debug)]
+#[cfg(feature = "hot_reload")]
+pub(crate) struct ResolvedFieldAccessor {
+    /// Fully-qualified component type name the field belongs to.
+    pub(crate) type_name: String,
+    /// Rust field name, snake_case.
+    pub(crate) field_name: String,
+    /// Container kind: `"vec"`, `"dynbuf"`, `"string"`, or `"vecstring"`.
+    pub(crate) kind: String,
+    /// Element type tag of a `vec` field; `string` for a `vecstring` field;
+    /// empty for a `string` field.
+    pub(crate) element_tag: String,
+    /// Address of the view trampoline; `None` for a `vecstring` field, whose
+    /// elements are individually allocated and cannot be viewed as one run.
+    pub(crate) view_address: Option<usize>,
+    /// Address of the resize trampoline for a `vec`, `dynbuf` or `vecstring`
+    /// field.
+    pub(crate) resize_address: Option<usize>,
+    /// Address of the replace-in-place trampoline for a `string` field.
+    pub(crate) set_address: Option<usize>,
+    /// Address of the per-element view trampoline for a `vecstring` field.
+    pub(crate) item_address: Option<usize>,
+    /// Address of the per-element replace trampoline for a `vecstring` field.
+    pub(crate) set_item_address: Option<usize>,
+    /// Address of the append trampoline for a `vecstring` field.
+    pub(crate) push_address: Option<usize>,
+}
+
+/// The operation name a generated `MirrorMethods.Resolve` call and the host's
+/// accessor rows agree on for one operation of a heap field.
+///
+/// Defined once so the codegen (which writes the name into C#) and the table
+/// builder (which registers it) can never drift; `operation` is `view`,
+/// `resize`, `set`, `item`, `set_item`, or `push`.
+#[cfg(feature = "hot_reload")]
+pub(crate) fn accessor_operation_name(field_name: &str, operation: &str) -> String {
+    format!("{field_name}_{operation}")
+}
+
+/// Convert heap-field accessors into mirror-method rows, so the managed
+/// runtime resolves them through the same table — and the same per-reload
+/// refresh — as mirrored value-type methods.
+#[cfg(feature = "hot_reload")]
+pub(crate) fn accessor_rows(accessors: &[ResolvedFieldAccessor]) -> Vec<ResolvedMirrorMethod> {
+    let mut rows = Vec::with_capacity(accessors.len() * 6);
+    for accessor in accessors {
+        let mut push = |operation: &str, address: Option<usize>| {
+            if let Some(address) = address {
+                rows.push(ResolvedMirrorMethod {
+                    type_name: accessor.type_name.clone(),
+                    method_name: accessor_operation_name(&accessor.field_name, operation),
+                    return_tag: String::new(),
+                    arg_tags: Vec::new(),
+                    arg_names: Vec::new(),
+                    address,
+                });
+            }
+        };
+        push("view", accessor.view_address);
+        push("resize", accessor.resize_address);
+        push("set", accessor.set_address);
+        push("item", accessor.item_address);
+        push("set_item", accessor.set_item_address);
+        push("push", accessor.push_address);
+    }
+    rows
+}
+
 #[cfg(feature = "hot_reload")]
 /// Generate the C# mirror file for optional-module components.
 pub(crate) use codegen::generate_module_components_csharp;

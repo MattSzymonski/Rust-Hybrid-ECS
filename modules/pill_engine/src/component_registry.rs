@@ -53,8 +53,17 @@ pub struct ComponentFieldDescriptor {
     /// Rust field name (snake_case); the C# codegen maps it to PascalCase.
     pub name: &'static str,
     /// Type tag from a closed vocabulary — `f32`, `u32`, `bool`, ...
-    /// `array:<inner>`, `struct:<path>` — that the C# codegen maps to
-    /// a concrete C# type. See `pill_host/src/csharp/codegen.rs`.
+    /// `array:<inner>`, `struct:<path>`, `vec:<element>`, `dynbuf:<element>`,
+    /// `string` — that the C# codegen maps to a concrete C# type. See
+    /// `pill_host/src/csharp/codegen.rs`.
+    ///
+    /// `vec:<element>` and `string` describe Rust-owned heap fields, which
+    /// carry no C# field of their own: managed code reaches them through the
+    /// accessor members the codegen emits, whose trampolines are declared with
+    /// [`PillFieldAccessorDescriptor`]. `dynbuf:<element>` describes an
+    /// engine-owned native buffer, whose `(ptr, len, cap)` handle is mirrorable
+    /// as plain words — managed code reads it in place, and only resizing goes
+    /// through an accessor.
     pub type_tag: &'static str,
     /// Byte offset of the field within the type (`core::mem::offset_of!`).
     pub offset: usize,
@@ -85,6 +94,59 @@ pub struct PillValueTypeDescriptor {
     pub align: usize,
     /// Field layout of the value type.
     pub fields: &'static [ComponentFieldDescriptor],
+}
+
+/// One heap-owning field accessor declared by `#[derive(PillComponent)]`,
+/// submitted into the same per-artifact inventory as the other descriptors.
+///
+/// Unlike [`ComponentFieldDescriptor`], which says where a field sits in the
+/// row, an accessor says how the field's *buffer* is reached: the derive emits
+/// one `#[no_mangle]` trampoline per supported operation and records its
+/// symbol here. The host resolves those symbols at load time and hands their
+/// addresses to the C# runtime under the operation names `<field>_view`,
+/// `<field>_resize`, `<field>_set`, `<field>_item`, `<field>_set_item` and
+/// `<field>_push`, so a generated mirror reaches the live buffer instead of
+/// copying its header out of the row.
+///
+/// Every trampoline receives the address of the live component value (the row
+/// a managed query is iterating) and works in place: no serialization, no
+/// buffer copy, and no allocation on the read path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PillFieldAccessorDescriptor {
+    /// Fully-qualified component type name the field belongs to.
+    pub type_name: &'static str,
+    /// Rust field name (snake_case); the C# codegen derives member names from
+    /// it.
+    pub field_name: &'static str,
+    /// Container kind: `"vec"`, `"dynbuf"`, `"string"`, or `"vecstring"`.
+    ///
+    /// `"vecstring"` describes a `Vec<String>`: its elements are separately
+    /// allocated strings, so no span exists over them and managed code reaches
+    /// each element through its own accessor instead.
+    pub kind: &'static str,
+    /// Element type tag of a `vec` field (`f32`, `struct:<path>`, ...);
+    /// `string` for a `vecstring` field; empty for a `string` field.
+    pub element_tag: &'static str,
+    /// Exported symbol of the view trampoline
+    /// (`pill_accessor_{Type}_{field}_view`); empty for a `vecstring` field,
+    /// whose elements cannot be viewed as one run.
+    pub view_symbol: &'static str,
+    /// Exported symbol of the resize trampoline for a `vec`, `dynbuf` or
+    /// `vecstring` field; empty for a `string` field.
+    pub resize_symbol: &'static str,
+    /// Exported symbol of the mutate-in-place trampoline for a `string` field;
+    /// empty for every other kind.
+    pub set_symbol: &'static str,
+    /// Exported symbol of the per-element view trampoline for a `vecstring`
+    /// field (`pill_accessor_{Type}_{field}_item`); empty for every other
+    /// kind.
+    pub item_symbol: &'static str,
+    /// Exported symbol of the per-element replace trampoline for a `vecstring`
+    /// field; empty for every other kind.
+    pub set_item_symbol: &'static str,
+    /// Exported symbol of the append trampoline for a `vecstring` field; empty
+    /// for every other kind.
+    pub push_symbol: &'static str,
 }
 
 /// One mirrored method of a `#[derive(PillMirror)]` value type, submitted by
@@ -128,6 +190,7 @@ pub struct PillMethodDescriptor {
 inventory::collect!(PillComponentDescriptor);
 inventory::collect!(PillValueTypeDescriptor);
 inventory::collect!(PillMethodDescriptor);
+inventory::collect!(PillFieldAccessorDescriptor);
 
 /// Every value type this artifact declares with `#[derive(PillMirror)]`,
 /// sorted by type name so the host consumes them deterministically.
@@ -145,6 +208,19 @@ pub fn mirror_method_descriptors() -> Vec<&'static PillMethodDescriptor> {
     let mut descriptors: Vec<&'static PillMethodDescriptor> =
         inventory::iter::<PillMethodDescriptor>().collect();
     descriptors.sort_by_key(|descriptor| (descriptor.type_name, descriptor.name));
+    descriptors
+}
+
+/// Every heap-field accessor this artifact declares with
+/// `#[derive(PillComponent)]`, sorted by component type name then field name
+/// so the host consumes them deterministically.
+///
+/// The returned descriptors live in this artifact's static data, so their
+/// symbol strings stay valid for as long as the artifact is mapped.
+pub fn field_accessor_descriptors() -> Vec<&'static PillFieldAccessorDescriptor> {
+    let mut descriptors: Vec<&'static PillFieldAccessorDescriptor> =
+        inventory::iter::<PillFieldAccessorDescriptor>().collect();
+    descriptors.sort_by_key(|descriptor| (descriptor.type_name, descriptor.field_name));
     descriptors
 }
 

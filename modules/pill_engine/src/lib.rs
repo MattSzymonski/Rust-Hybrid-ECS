@@ -49,6 +49,10 @@ pub mod component_field;
 /// Centralised configuration constants and hardware detection.
 pub mod config;
 
+/// Engine-owned native dynamic buffer: variable-length component data whose
+/// `(ptr, len, cap)` handle managed code reads straight out of the row.
+pub mod dynamic_buffer;
+
 /// System registration, frame execution, and parallel dispatch orchestration.
 pub mod engine;
 
@@ -102,6 +106,7 @@ pub use api::EngineApi;
 pub use commands::{CommandError, Commands};
 pub use component::{Component, ComponentId, ComponentTicks, Tick};
 pub use component_field::{ComponentFieldError, FieldValue};
+pub use dynamic_buffer::DynamicBuffer;
 pub use engine::{Engine, SystemOwner, SystemSnapshot};
 pub use entity::Entity;
 pub use error::{EngineError, SystemError, SystemFailure};

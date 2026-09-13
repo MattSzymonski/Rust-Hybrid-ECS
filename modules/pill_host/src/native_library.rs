@@ -37,12 +37,14 @@ use libloading::os::windows as windows_loader;
 use libloading::{Library, Symbol};
 use pill_core::error::LibraryError;
 use pill_core::{debug, info};
-use pill_engine::component_registry::{PillMethodDescriptor, PillValueTypeDescriptor};
+use pill_engine::component_registry::{
+    PillFieldAccessorDescriptor, PillMethodDescriptor, PillValueTypeDescriptor,
+};
 use pill_engine::EngineApi;
 
 // Current crate
 use crate::analytics;
-use crate::csharp::ResolvedMirrorMethod;
+use crate::csharp::{ResolvedFieldAccessor, ResolvedMirrorMethod};
 
 // =============================================================================
 // Constants
@@ -198,6 +200,16 @@ type CopyValueTypesFn = unsafe extern "C" fn(*mut PillValueTypeDescriptor, u32) 
 type MirrorMethodCountFn = unsafe extern "C" fn() -> u32;
 type CopyMirrorMethodsFn = unsafe extern "C" fn(*mut PillMethodDescriptor, u32) -> u32;
 
+/// Signature of the optional heap-field accessor manifest exports.
+///
+/// Same shape again: the artifact reports how many accessor descriptors it
+/// carries, then copies that many into a host-owned buffer. Each descriptor
+/// names the `#[no_mangle]` trampolines the artifact exports for one `Vec` or
+/// `String` component field, which the host resolves by symbol for the
+/// callable addresses.
+type FieldAccessorCountFn = unsafe extern "C" fn() -> u32;
+type CopyFieldAccessorsFn = unsafe extern "C" fn(*mut PillFieldAccessorDescriptor, u32) -> u32;
+
 /// Export reporting how many value-type descriptors an artifact declares.
 const VALUE_TYPE_COUNT_SYMBOL: &[u8] = b"pill_value_type_descriptor_count";
 
@@ -209,6 +221,14 @@ const MIRROR_METHOD_COUNT_SYMBOL: &[u8] = b"pill_mirror_method_descriptor_count"
 
 /// Export copying an artifact's mirrored-method descriptors into a host buffer.
 const MIRROR_METHOD_COPY_SYMBOL: &[u8] = b"pill_copy_mirror_method_descriptors";
+
+/// Export reporting how many heap-field accessor descriptors an artifact
+/// declares.
+const FIELD_ACCESSOR_COUNT_SYMBOL: &[u8] = b"pill_field_accessor_descriptor_count";
+
+/// Export copying an artifact's heap-field accessor descriptors into a host
+/// buffer.
+const FIELD_ACCESSOR_COPY_SYMBOL: &[u8] = b"pill_copy_field_accessor_descriptors";
 
 /// Export names one loaded native library is expected to provide.
 ///
@@ -261,6 +281,11 @@ pub(crate) struct NativeLibrary {
     /// used by the C# mirror codegen and runtime method table.
     mirror_method_count: Option<MirrorMethodCountFn>,
     copy_mirror_methods: Option<CopyMirrorMethodsFn>,
+    /// Optional heap-field accessor manifest exports (`#[derive(PillComponent)]`
+    /// components with `Vec`/`String` fields), used by the C# mirror codegen
+    /// and the managed runtime's method table.
+    field_accessor_count: Option<FieldAccessorCountFn>,
+    copy_field_accessors: Option<CopyFieldAccessorsFn>,
     /// Temporary copy backing this library; deleted when the library drops.
     temporary_path: PathBuf,
 }
@@ -474,6 +499,98 @@ impl NativeLibrary {
         resolved
     }
 
+    /// Fetch the artifact's heap-field accessor descriptors, each with the
+    /// exported addresses of its `#[no_mangle]` trampolines.
+    ///
+    /// Empty when the artifact predates the exports or declares no heap
+    /// fields. Each operation's trampoline resolves to `None` when the
+    /// artifact does not export it, and a descriptor whose every operation
+    /// failed to resolve is skipped entirely rather than surfaced as a row
+    /// nothing could call; which operations a mirror actually needs is
+    /// checked by the codegen, which knows the field's kind.
+    pub(crate) fn field_accessors(&self) -> Vec<ResolvedFieldAccessor> {
+        let Some(library) = self.library.as_ref() else {
+            return Vec::new();
+        };
+        let (Some(count), Some(copy)) = (self.field_accessor_count, self.copy_field_accessors)
+        else {
+            return Vec::new();
+        };
+        // SAFETY: the count export takes no arguments and returns a plain
+        // integer while the library is mapped.
+        let total = unsafe { count() } as usize;
+        if total == 0 {
+            return Vec::new();
+        }
+        let mut descriptors = vec![
+            PillFieldAccessorDescriptor {
+                type_name: "",
+                field_name: "",
+                kind: "",
+                element_tag: "",
+                view_symbol: "",
+                resize_symbol: "",
+                set_symbol: "",
+                item_symbol: "",
+                set_item_symbol: "",
+                push_symbol: "",
+            };
+            total
+        ];
+        // SAFETY: the copy export was validated to take a host-owned buffer of
+        // `total` slots; the slice's pointer and length satisfy that contract,
+        // and the library stays mapped for the call.
+        let copied = unsafe { copy(descriptors.as_mut_ptr(), total as u32) } as usize;
+        descriptors.truncate(copied.min(total));
+
+        let resolve_optional = |symbol: &str| -> Option<usize> {
+            if symbol.is_empty() {
+                return None;
+            }
+            // SAFETY: `library.get` maps the exported trampoline symbol; the
+            // module stays mapped for this `NativeLibrary`'s lifetime.
+            unsafe { library.get::<usize>(symbol.as_bytes()) }
+                .ok()
+                .map(|symbol| *symbol)
+        };
+
+        let mut resolved: Vec<ResolvedFieldAccessor> = Vec::new();
+        for descriptor in descriptors {
+            let view_address = resolve_optional(descriptor.view_symbol);
+            let resize_address = resolve_optional(descriptor.resize_symbol);
+            let set_address = resolve_optional(descriptor.set_symbol);
+            let item_address = resolve_optional(descriptor.item_symbol);
+            let set_item_address = resolve_optional(descriptor.set_item_symbol);
+            let push_address = resolve_optional(descriptor.push_symbol);
+            // A descriptor whose every operation failed to resolve is not a
+            // usable accessor; publish nothing rather than a row nothing could
+            // call. Which operations a generated mirror needs is checked by
+            // the codegen, which knows the field's kind.
+            let callable = view_address.is_some()
+                || resize_address.is_some()
+                || set_address.is_some()
+                || item_address.is_some()
+                || set_item_address.is_some()
+                || push_address.is_some();
+            if !callable {
+                continue;
+            }
+            resolved.push(ResolvedFieldAccessor {
+                type_name: descriptor.type_name.to_string(),
+                field_name: descriptor.field_name.to_string(),
+                kind: descriptor.kind.to_string(),
+                element_tag: descriptor.element_tag.to_string(),
+                view_address,
+                resize_address,
+                set_address,
+                item_address,
+                set_item_address,
+                push_address,
+            });
+        }
+        resolved
+    }
+
     /// Load a module and verify its required exports.
     ///
     /// # Safety
@@ -618,6 +735,23 @@ impl NativeLibrary {
                 .ok()
                 .map(|symbol| *symbol);
 
+        // Step 4d: Resolve the optional heap-field accessor exports. Optional
+        // like the manifests above: a library built before the exports simply
+        // contributes no container accessors.
+        // SAFETY: `library.get` maps each export with its statically known C
+        // ABI signature; the module stays mapped for the lifetime of the
+        // returned `NativeLibrary`.
+        let field_accessor_count: Option<FieldAccessorCountFn> =
+            unsafe { library.get(FIELD_ACCESSOR_COUNT_SYMBOL) }
+                .ok()
+                .map(|symbol| *symbol);
+        // SAFETY: same as above; the descriptor array stays inside this
+        // artifact's static data for the artifact's lifetime.
+        let copy_field_accessors: Option<CopyFieldAccessorsFn> =
+            unsafe { library.get(FIELD_ACCESSOR_COPY_SYMBOL) }
+                .ok()
+                .map(|symbol| *symbol);
+
         // Step 5: Copy the resolved pointers out of the borrowed Symbol
         // wrappers. The `library` field keeps the module mapped, so these raw
         // pointers remain valid for the complete lifetime of the returned
@@ -633,6 +767,8 @@ impl NativeLibrary {
             copy_value_types,
             mirror_method_count,
             copy_mirror_methods,
+            field_accessor_count,
+            copy_field_accessors,
             temporary_path,
         })
     }

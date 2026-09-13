@@ -43,10 +43,14 @@ use crate::world::World;
 /// One read or edited value in the engine's reflected vocabulary.
 ///
 /// Mirrors the derive's `type_tag` vocabulary 1:1: the scalar primitives the
-/// engine can describe, whole fixed-size arrays, and an `Opaque` escape hatch
-/// for fields the engine can locate but not interpret (`struct:` tags whose
-/// value type is not resolvable, and any tag outside the vocabulary). `Opaque`
-/// carries the raw bytes so the UI can show them; it is never writable.
+/// engine can describe, whole fixed-size arrays, heap-backed containers
+/// (`List` and `Text`, summarized rather than materialized), and an `Opaque`
+/// escape hatch for fields the engine can locate but not interpret (`struct:`
+/// tags whose value type is not resolvable, and any tag outside the
+/// vocabulary). `Opaque` carries the raw bytes so the UI can show them; it is
+/// never writable. `List` and `Text` are read-only through this path — writes
+/// go through the container field's generated accessors, which reach the live
+/// buffer instead of rebuilding the row.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FieldValue {
     /// A 32-bit IEEE-754 floating point value.
@@ -77,6 +81,19 @@ pub enum FieldValue {
     Isize(isize),
     /// A whole fixed-size array field, one entry per element in layout order.
     Array(Vec<FieldValue>),
+    /// A heap-backed sequence field (`vec:<element_tag>`), summarized by its
+    /// element count rather than materialized: a component `Vec` may hold
+    /// millions of elements, and an inspector showing the length is what makes
+    /// it useful. Read-only here; use the field's accessors to edit elements.
+    List {
+        /// Element type tag from the closed vocabulary (`f32`, `struct:path`).
+        element_tag: &'static str,
+        /// Number of live elements in the buffer right now.
+        element_count: usize,
+    },
+    /// A heap-backed UTF-8 string field (`string`), decoded for display.
+    /// Read-only here; use the field's accessors to replace its contents.
+    Text(String),
     /// A field the engine can locate but not interpret. Never writable.
     Opaque {
         /// The registered `type_tag` of the field (for example `struct:path`).
@@ -108,6 +125,8 @@ impl FieldValue {
             Self::Usize(_) => "usize",
             Self::Isize(_) => "isize",
             Self::Array(_) => "array",
+            Self::List { .. } => "list",
+            Self::Text(_) => "text",
             Self::Opaque { .. } => "opaque",
         }
     }
@@ -307,8 +326,63 @@ fn array_element_size(descriptor: &ComponentFieldDescriptor) -> Option<usize> {
     Some(descriptor.size / descriptor.element_count)
 }
 
-/// Decode one field (scalar, whole array, or opaque) from a row image.
+/// Read the `(pointer, length)` header of a heap container field.
+///
+/// `std::vec::Vec` stores its three words in `(pointer, length, capacity)`
+/// order, and `String` — a `Vec<u8>` newtype — inherits that layout. The
+/// generic path has no concrete type to call `as_ptr()` on, so it reads the
+/// two words it needs directly: the length the inspector reports, and the
+/// pointer it dereferences only to decode a `String`. Fixed-array fields keep
+/// going through `element_count`/`element_size`; only `vec:` and `string` tags
+/// reach here, and only from a row copied out of a live column.
+fn container_header(bytes: &[u8], offset: usize) -> Option<(*const u8, usize)> {
+    let read_word = |at: usize| -> Option<usize> {
+        Some(usize::from_ne_bytes(
+            bytes.get(at..at + size_of::<usize>())?.try_into().ok()?,
+        ))
+    };
+    let pointer = read_word(offset)? as *const u8;
+    let length = read_word(offset + size_of::<usize>())?;
+    Some((pointer, length))
+}
+
+/// Decode one field (scalar, whole array, heap container, or opaque) from a
+/// row image.
 fn decode_field(bytes: &[u8], descriptor: &ComponentFieldDescriptor) -> FieldValue {
+    // Heap-owning containers are summarized rather than materialized. Both are
+    // read-only through this path; writes go through the field's generated
+    // accessors, which reach the live buffer in place.
+    if let Some(element_tag) = descriptor
+        .type_tag
+        .strip_prefix("vec:")
+        .or_else(|| descriptor.type_tag.strip_prefix("dynbuf:"))
+    {
+        // Both containers lead with their element pointer and follow it with
+        // the count: `DynamicBuffer` pins that order with `repr(C)`, and `Vec`
+        // has kept it across every released toolchain.
+        let element_count = container_header(bytes, descriptor.offset)
+            .map(|(_, length)| length)
+            .unwrap_or(0);
+        return FieldValue::List {
+            element_tag,
+            element_count,
+        };
+    }
+    if descriptor.type_tag == "string" {
+        let text = match container_header(bytes, descriptor.offset) {
+            // A zero-length string may carry the dangling-but-aligned pointer
+            // `String` uses for its empty state; reading nothing from it is
+            // fine, and the null check keeps that explicit.
+            Some((pointer, length)) if !pointer.is_null() => {
+                // SAFETY: the header was copied out of a live component row,
+                // so the buffer it describes is live for this call too.
+                let slice = unsafe { std::slice::from_raw_parts(pointer, length) };
+                String::from_utf8_lossy(slice).into_owned()
+            }
+            _ => String::new(),
+        };
+        return FieldValue::Text(text);
+    }
     // The layout's tag is `&'static` (compile-time or leaked runtime string),
     // so the stripped inner tag is `&'static` too.
     let Some(inner_tag) = descriptor.type_tag.strip_prefix("array:") else {
@@ -521,6 +595,16 @@ fn encode_field_write(
     value: &FieldValue,
 ) -> Result<FieldWrite, ComponentFieldError> {
     let tag = descriptor.type_tag;
+    // A heap-backed container is never writable through the generic path: its
+    // buffer is reached through the field's accessors, which edit the live
+    // container in place rather than replacing it, so an editor that showed a
+    // stale image cannot overwrite the real one here.
+    if tag.starts_with("vec:") || tag == "string" {
+        return Err(ComponentFieldError::UnsupportedField {
+            field: field.to_string(),
+            reason: "heap-backed fields are read-only here; edit them through the field accessors",
+        });
+    }
     // A `struct:` field, or any other tag the engine cannot interpret, is
     // never writable through the generic path.
     if !is_scalar_tag(tag) && !tag.starts_with("array:") {

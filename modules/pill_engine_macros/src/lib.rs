@@ -54,6 +54,26 @@ use syn::{parse_macro_input, spanned::Spanned, DeriveInput, ItemFn};
 ///   (requires `Clone + Serialize + DeserializeOwned + Default`, matching
 ///   [`World::register_persistable_component`]).
 ///
+/// Supported field types:
+/// - blittable values — primitives, fixed-size arrays, `#[derive(PillMirror)]`
+///   structs — become typed C# fields on the generated mirror;
+/// - `String` and `Vec<E>` (with `E` a primitive or a `#[derive(PillMirror)]`
+///   struct) are Rust-owned container fields. They mirror as accessor members
+///   (a span over the live buffer, a count, a resize; get/set for text) that
+///   call derive-generated C-ABI trampolines, so managed code reads and writes
+///   the real container in place. Resizing a `Vec` field needs `E: Default +
+///   Clone`, which the component's own `Clone` already half implies;
+/// - `Vec<String>` is supported too, through per-element accessors: its
+///   elements are separately allocated, so managed code gets `Count`, `GetX`,
+///   `SetX`, `PushX` and `ResizeX` (one boundary call per element) instead of
+///   a span;
+/// - `DynamicBuffer<E>` is the engine-owned container: its elements live in
+///   native memory with a stable address, the mirror reads the `(ptr, len,
+///   cap)` handle straight out of the row (iterating costs zero calls), and
+///   only resizing - which retires the block - calls native code. `E` must be
+///   a primitive or a `#[derive(PillMirror)]` struct, and `Copy`, because the
+///   buffer never runs element drop glue.
+///
 /// [`World::register_persistable_component`]: ::pill_engine::World::register_persistable_component
 #[proc_macro_derive(PillComponent, attributes(pill))]
 pub fn derive_pill_component(input: TokenStream) -> TokenStream {
@@ -88,13 +108,15 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
         .into();
     }
 
-    // Capture the compile-time field layout for the C# mirror codegen. An
-    // unsupported field type is a compile error here, before the host would
-    // have to guess at a mirror.
-    let (declared_layout, layout_reference) = match component_field_descriptors(&input) {
-        Ok(pair) => pair,
-        Err(error) => return error.to_compile_error().into(),
-    };
+    // Capture the compile-time field layout for the C# mirror codegen, plus
+    // the accessor trampolines that let managed code reach a `Vec` or `String`
+    // field's live buffer. An unsupported field type is a compile error here,
+    // before the host would have to guess at a mirror.
+    let (declared_layout, layout_reference, field_accessors) =
+        match component_field_descriptors(&input, true) {
+            Ok(triple) => triple,
+            Err(error) => return error.to_compile_error().into(),
+        };
 
     let register_fn_name = format_ident!("__pill_register_{}", ident);
     let registration_call = if persistable {
@@ -116,6 +138,8 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
 
         #declared_layout
 
+        #field_accessors
+
         /// Registers this component into the world; used by the artifact-wide
         /// registration loop generated for the module/project entry point.
         #[allow(non_snake_case)]
@@ -136,32 +160,48 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
-/// Emit a `static` carrying one [`ComponentFieldDescriptor`] per named field
-/// and return it together with the expression that names it.
+/// Emit a `static` carrying one [`ComponentFieldDescriptor`] per named field,
+/// the expression that names it, and the heap-field accessor machinery when
+/// the struct declares container fields.
+///
+/// `allow_containers` is `true` for `#[derive(PillComponent)]`, whose values
+/// live in native columns that managed code may reach through generated
+/// accessors, and `false` for `#[derive(PillMirror)]` value types, which cross
+/// the boundary as plain data and therefore cannot own a heap buffer.
 ///
 /// Enums, unions, unit structs and tuple structs have no named fields to
 /// mirror and yield an empty layout.
 fn component_field_descriptors(
     input: &DeriveInput,
-) -> syn::Result<(proc_macro2::TokenStream, proc_macro2::TokenStream)> {
+    allow_containers: bool,
+) -> syn::Result<(
+    proc_macro2::TokenStream,
+    proc_macro2::TokenStream,
+    proc_macro2::TokenStream,
+)> {
     let ident = &input.ident;
     let named = match &input.data {
         syn::Data::Struct(data) => match &data.fields {
             syn::Fields::Named(named) => &named.named,
-            _ => return Ok((quote! {}, quote! { &[] })),
+            _ => return Ok((quote! {}, quote! { &[] }, quote! {})),
         },
-        _ => return Ok((quote! {}, quote! { &[] })),
+        _ => return Ok((quote! {}, quote! { &[] }, quote! {})),
     };
     if named.is_empty() {
-        return Ok((quote! {}, quote! { &[] }));
+        return Ok((quote! {}, quote! { &[] }, quote! {}));
     }
 
+    let type_name = quote! {
+        ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#ident))
+    };
+
     let mut entries = Vec::with_capacity(named.len());
+    let mut accessors: Vec<proc_macro2::TokenStream> = Vec::new();
     for field in named {
         let field_ident = field.ident.as_ref().expect("named field has an identifier");
         let field_ty = &field.ty;
         let field_name = field_ident.to_string();
-        let type_tag = field_type_tag(field_ty)?;
+        let type_tag = field_type_tag(field_ty, allow_containers)?;
         // Array lengths may be a literal or a `const` path; both resolve in a
         // const context, so the count is computed here rather than parsed.
         let element_count = match field_ty {
@@ -181,6 +221,18 @@ fn component_field_descriptors(
                 element_count: #element_count,
             }
         });
+        // A container field additionally gets one accessor per supported
+        // operation, so a managed mirror iterates the live buffer instead of
+        // copying the row's 24-byte header somewhere else.
+        if let Some(kind) = heap_field_accessor(&type_tag) {
+            accessors.push(emit_heap_field_accessor(
+                ident,
+                field_ident,
+                &field_name,
+                &type_name,
+                kind,
+            ));
+        }
     }
 
     let static_name = format_ident!("__PILL_FIELD_LAYOUT_{}", ident);
@@ -191,7 +243,457 @@ fn component_field_descriptors(
         #[allow(non_upper_case_globals)]
         static #static_name: &[::pill_engine::component_registry::ComponentFieldDescriptor] = &[ #(#entries),* ];
     };
-    Ok((declared, quote! { #static_name }))
+    Ok((declared, quote! { #static_name }, quote! { #(#accessors)* }))
+}
+
+/// What the managed side needs to know about one heap-owning field.
+enum HeapFieldKind {
+    /// A `Vec<E>` field; the element tag drives the generated span type.
+    Vec {
+        /// Element type tag (`f32`, `struct:<path>`, ...).
+        element_tag: String,
+    },
+    /// A `DynamicBuffer<E>` field: elements in engine-owned native memory,
+    /// whose `(ptr, len, cap)` handle the mirror reads straight out of the
+    /// row.
+    DynamicBuffer {
+        /// Element type tag (`f32`, `struct:<path>`, ...).
+        element_tag: String,
+    },
+    /// A `Vec<String>` field: elements are individually allocated, so managed
+    /// code reaches each one through its own accessor instead of a span.
+    VecString,
+    /// A `String` field, exposed to C# as UTF-8 text.
+    String,
+}
+
+/// Recognise a container tag the derive emitted, or `None` for every other
+/// tag in the vocabulary.
+fn heap_field_accessor(type_tag: &str) -> Option<HeapFieldKind> {
+    // `vec:string` is checked before the `vec:` prefix below, because its
+    // accessor set is per element rather than a span over the run.
+    if type_tag == "vec:string" {
+        return Some(HeapFieldKind::VecString);
+    }
+    if let Some(element_tag) = type_tag.strip_prefix("vec:") {
+        return Some(HeapFieldKind::Vec {
+            element_tag: element_tag.to_string(),
+        });
+    }
+    if let Some(element_tag) = type_tag.strip_prefix("dynbuf:") {
+        return Some(HeapFieldKind::DynamicBuffer {
+            element_tag: element_tag.to_string(),
+        });
+    }
+    (type_tag == "string").then_some(HeapFieldKind::String)
+}
+
+/// Emit the accessor trampolines and the descriptor submission for one
+/// heap-owning field.
+///
+/// Each trampoline receives the address of the live component value (the row a
+/// managed query is iterating): the view answers `(data, length)` for every
+/// container, resize grows or shrinks a `Vec` or a `DynamicBuffer`, and set
+/// replaces a `String`'s contents from UTF-8 bytes. Nothing here serializes or
+/// copies a buffer; the managed side reads and writes elements through the
+/// pointer it is handed.
+fn emit_heap_field_accessor(
+    type_ident: &syn::Ident,
+    field_ident: &syn::Ident,
+    field_name: &str,
+    type_name: &proc_macro2::TokenStream,
+    kind: HeapFieldKind,
+) -> proc_macro2::TokenStream {
+    let view_symbol = format!("pill_accessor_{type_ident}_{field_ident}_view");
+    let view_fn = syn::Ident::new(&view_symbol, field_ident.span());
+
+    // A `Vec<String>` has no contiguous element run to point at: each element
+    // is its own allocation, so its view reports the count and a null data
+    // pointer, and the elements travel through their own trampolines below.
+    let view_data = match &kind {
+        HeapFieldKind::VecString => quote! {
+            *out_data = ::core::ptr::null();
+        },
+        _ => quote! {
+            *out_data = values.as_ptr().cast::<u8>();
+        },
+    };
+
+    let view = quote! {
+        /// View trampoline for the `#field_ident` field, generated by
+        /// `#[derive(PillComponent)]`.
+        ///
+        /// Writes what one borrowed view of the field can offer: the element
+        /// address and count for a contiguous run, or a null address and the
+        /// count for a `Vec<String>`, whose elements are separately allocated
+        /// and have no span. Returns 0, or returns 1 when a pointer is null.
+        /// The buffer stays owned by the component: the caller may read (and,
+        /// for a `Vec`, write) elements until the container is structurally
+        /// modified.
+        ///
+        /// # Safety
+        ///
+        /// `row` must point at a live `#type_ident` value, and both out
+        /// pointers must be writable.
+        #[doc(hidden)]
+        #[no_mangle]
+        pub unsafe extern "C" fn #view_fn(
+            row: *const u8,
+            out_data: *mut *const u8,
+            out_length: *mut usize,
+        ) -> u8 {
+            if row.is_null() || out_data.is_null() || out_length.is_null() {
+                return 1;
+            }
+            // SAFETY: the caller guarantees `row` addresses a live component
+            // value, so the shared reference is valid for the whole call.
+            let component = unsafe { &*(row as *const #type_ident) };
+            let values = &component.#field_ident;
+            // SAFETY: both out pointers were checked non-null above.
+            unsafe {
+                #view_data
+                *out_length = values.len();
+            }
+            0
+        }
+    };
+
+    let mut resize = quote! {};
+    let mut set = quote! {};
+    let mut item = quote! {};
+    let mut set_item = quote! {};
+    let mut push = quote! {};
+    let mut resize_symbol = String::new();
+    let mut set_symbol = String::new();
+    let mut item_symbol = String::new();
+    let mut set_item_symbol = String::new();
+    let mut push_symbol = String::new();
+    let (kind_tag, element_tag) = match &kind {
+        HeapFieldKind::Vec { element_tag } => {
+            resize_symbol = format!("pill_accessor_{type_ident}_{field_ident}_resize");
+            let resize_fn = syn::Ident::new(&resize_symbol, field_ident.span());
+            resize = quote! {
+                /// Resize trampoline for the `#field_ident` field, generated by
+                /// `#[derive(PillComponent)]`.
+                ///
+                /// Rewrites the vector to `new_length` elements and returns 0,
+                /// or returns 1 when `row` is null. Growing fills the new
+                /// elements with the element type's `Default`. Existing
+                /// elements keep their values; the buffer may move, so a view
+                /// taken before the call must not be used afterwards.
+                ///
+                /// # Safety
+                ///
+                /// `row` must point at a live `#type_ident` value the caller
+                /// holds write access to.
+                #[doc(hidden)]
+                #[no_mangle]
+                pub unsafe extern "C" fn #resize_fn(row: *mut u8, new_length: usize) -> u8 {
+                    if row.is_null() {
+                        return 1;
+                    }
+                    // SAFETY: the caller guarantees `row` addresses a live
+                    // component value and holds the write declaration the
+                    // mutation needs, so the exclusive reference is valid for
+                    // the whole call.
+                    let component = unsafe { &mut *(row as *mut #type_ident) };
+                    // `resize` needs `E: Clone`, which every registered
+                    // component already satisfies: `Vec<E>: Clone` is part of
+                    // the component's own `Clone`.
+                    component.#field_ident.resize(
+                        new_length,
+                        ::core::default::Default::default(),
+                    );
+                    0
+                }
+            };
+            ("vec", element_tag.as_str())
+        }
+        HeapFieldKind::DynamicBuffer { element_tag } => {
+            resize_symbol = format!("pill_accessor_{type_ident}_{field_ident}_resize");
+            let resize_fn = syn::Ident::new(&resize_symbol, field_ident.span());
+            resize = quote! {
+                /// Resize trampoline for the `#field_ident` buffer, generated
+                /// by `#[derive(PillComponent)]`.
+                ///
+                /// Rewrites the buffer to `new_length` elements and returns 0,
+                /// or returns 1 when `row` is null. Growing fills the new
+                /// elements with the element type's `Default`. This is the one
+                /// operation that can retire the block, so it ends every
+                /// outstanding view of it; the handle is re-read from the row
+                /// afterwards.
+                ///
+                /// # Safety
+                ///
+                /// `row` must point at a live `#type_ident` value the caller
+                /// holds write access to.
+                #[doc(hidden)]
+                #[no_mangle]
+                pub unsafe extern "C" fn #resize_fn(row: *mut u8, new_length: usize) -> u8 {
+                    if row.is_null() {
+                        return 1;
+                    }
+                    // SAFETY: the caller guarantees `row` addresses a live
+                    // component value and holds the write declaration the
+                    // mutation needs, so the exclusive reference is valid for
+                    // the whole call.
+                    let component = unsafe { &mut *(row as *mut #type_ident) };
+                    // The block is engine-owned, so this reallocate-and-release
+                    // pair runs the shared native-buffer service rather than
+                    // whatever code currently owns the element heap.
+                    component.#field_ident.resize(
+                        new_length,
+                        ::core::default::Default::default(),
+                    );
+                    0
+                }
+            };
+            ("dynbuf", element_tag.as_str())
+        }
+        HeapFieldKind::VecString => {
+            resize_symbol = format!("pill_accessor_{type_ident}_{field_ident}_resize");
+            item_symbol = format!("pill_accessor_{type_ident}_{field_ident}_item");
+            set_item_symbol = format!("pill_accessor_{type_ident}_{field_ident}_set_item");
+            push_symbol = format!("pill_accessor_{type_ident}_{field_ident}_push");
+            let resize_fn = syn::Ident::new(&resize_symbol, field_ident.span());
+            let item_fn = syn::Ident::new(&item_symbol, field_ident.span());
+            let set_item_fn = syn::Ident::new(&set_item_symbol, field_ident.span());
+            let push_fn = syn::Ident::new(&push_symbol, field_ident.span());
+            resize = quote! {
+                /// Resize trampoline for the `#field_ident` list, generated by
+                /// `#[derive(PillComponent)]`.
+                ///
+                /// Rewrites the list to `new_length` elements and returns 0,
+                /// or returns 1 when `row` is null. Growing fills the new
+                /// elements with empty strings. This is the one operation that
+                /// can move the outer allocation, so it ends every outstanding
+                /// element pointer.
+                ///
+                /// # Safety
+                ///
+                /// `row` must point at a live `#type_ident` value the caller
+                /// holds write access to.
+                #[doc(hidden)]
+                #[no_mangle]
+                pub unsafe extern "C" fn #resize_fn(row: *mut u8, new_length: usize) -> u8 {
+                    if row.is_null() {
+                        return 1;
+                    }
+                    // SAFETY: the caller guarantees `row` addresses a live
+                    // component value and holds the write declaration the
+                    // mutation needs, so the exclusive reference is valid for
+                    // the whole call.
+                    let component = unsafe { &mut *(row as *mut #type_ident) };
+                    component.#field_ident.resize(
+                        new_length,
+                        ::core::default::Default::default(),
+                    );
+                    0
+                }
+            };
+            item = quote! {
+                /// Element-view trampoline for the `#field_ident` list,
+                /// generated by `#[derive(PillComponent)]`.
+                ///
+                /// Writes element `index`'s UTF-8 bytes through
+                /// `out_data`/`out_length` and returns 0, returns 1 when a
+                /// pointer is null, or returns 2 when `index` is out of
+                /// range. The bytes borrow the element only for the call.
+                ///
+                /// # Safety
+                ///
+                /// `row` must point at a live `#type_ident` value, and both
+                /// out pointers must be writable.
+                #[doc(hidden)]
+                #[no_mangle]
+                pub unsafe extern "C" fn #item_fn(
+                    row: *const u8,
+                    index: usize,
+                    out_data: *mut *const u8,
+                    out_length: *mut usize,
+                ) -> u8 {
+                    if row.is_null() || out_data.is_null() || out_length.is_null() {
+                        return 1;
+                    }
+                    // SAFETY: the caller guarantees `row` addresses a live
+                    // component value, so the shared reference is valid for
+                    // the whole call.
+                    let component = unsafe { &*(row as *const #type_ident) };
+                    let Some(text) = component.#field_ident.get(index) else {
+                        return 2;
+                    };
+                    // SAFETY: both out pointers were checked non-null above,
+                    // and `text` borrows the live element for this call.
+                    unsafe {
+                        *out_data = text.as_ptr();
+                        *out_length = text.len();
+                    }
+                    0
+                }
+            };
+            set_item = quote! {
+                /// Element-replace trampoline for the `#field_ident` list,
+                /// generated by `#[derive(PillComponent)]`.
+                ///
+                /// Replaces element `index` with the UTF-8 bytes
+                /// `utf8..utf8+length` and returns 0, returns 1 for a null
+                /// pointer, returns 2 when `index` is out of range, or returns
+                /// 3 when the bytes are not valid UTF-8.
+                ///
+                /// # Safety
+                ///
+                /// `row` must point at a live `#type_ident` value the caller
+                /// holds write access to, and `utf8` must be readable for
+                /// `length` bytes (it may be null only when `length` is zero).
+                #[doc(hidden)]
+                #[no_mangle]
+                pub unsafe extern "C" fn #set_item_fn(
+                    row: *mut u8,
+                    index: usize,
+                    utf8: *const u8,
+                    length: usize,
+                ) -> u8 {
+                    if row.is_null() || (utf8.is_null() && length != 0) {
+                        return 1;
+                    }
+                    // SAFETY: the caller promises `utf8` is readable for
+                    // `length` bytes; the slice borrows only for this call.
+                    let bytes: &[u8] = if length == 0 {
+                        &[]
+                    } else {
+                        unsafe { ::core::slice::from_raw_parts(utf8, length) }
+                    };
+                    let Ok(text) = ::core::str::from_utf8(bytes) else {
+                        return 3;
+                    };
+                    // SAFETY: the caller guarantees `row` addresses a live
+                    // component value the caller holds write access to, so the
+                    // exclusive reference is valid for the whole call.
+                    let component = unsafe { &mut *(row as *mut #type_ident) };
+                    let Some(slot) = component.#field_ident.get_mut(index) else {
+                        return 2;
+                    };
+                    // Reuse the element's allocation rather than replacing it.
+                    slot.clear();
+                    slot.push_str(text);
+                    0
+                }
+            };
+            push = quote! {
+                /// Append trampoline for the `#field_ident` list, generated by
+                /// `#[derive(PillComponent)]`.
+                ///
+                /// Appends the UTF-8 bytes `utf8..utf8+length` as a new last
+                /// element and returns 0, returns 1 for a null pointer, or
+                /// returns 2 when the bytes are not valid UTF-8.
+                ///
+                /// # Safety
+                ///
+                /// `row` must point at a live `#type_ident` value the caller
+                /// holds write access to, and `utf8` must be readable for
+                /// `length` bytes (it may be null only when `length` is zero).
+                #[doc(hidden)]
+                #[no_mangle]
+                pub unsafe extern "C" fn #push_fn(
+                    row: *mut u8,
+                    utf8: *const u8,
+                    length: usize,
+                ) -> u8 {
+                    if row.is_null() || (utf8.is_null() && length != 0) {
+                        return 1;
+                    }
+                    // SAFETY: the caller promises `utf8` is readable for
+                    // `length` bytes; the slice borrows only for this call.
+                    let bytes: &[u8] = if length == 0 {
+                        &[]
+                    } else {
+                        unsafe { ::core::slice::from_raw_parts(utf8, length) }
+                    };
+                    let Ok(text) = ::core::str::from_utf8(bytes) else {
+                        return 2;
+                    };
+                    // SAFETY: as above: `row` addresses a live component value
+                    // the caller holds write access to.
+                    let component = unsafe { &mut *(row as *mut #type_ident) };
+                    component.#field_ident.push(text.to_string());
+                    0
+                }
+            };
+            ("vecstring", "string")
+        }
+        HeapFieldKind::String => {
+            set_symbol = format!("pill_accessor_{type_ident}_{field_ident}_set");
+            let set_fn = syn::Ident::new(&set_symbol, field_ident.span());
+            set = quote! {
+                /// Replace-in-place trampoline for the `#field_ident` field,
+                /// generated by `#[derive(PillComponent)]`.
+                ///
+                /// Replaces the string with the UTF-8 bytes `utf8..utf8+length`
+                /// and returns 0, returns 1 for a null pointer, or returns 2
+                /// when the bytes are not valid UTF-8. Invalid input is
+                /// refused rather than lossily replaced, so an edit can never
+                /// silently corrupt the stored text.
+                ///
+                /// # Safety
+                ///
+                /// `row` must point at a live `#type_ident` value the caller
+                /// holds write access to, and `utf8` must be readable for
+                /// `length` bytes (it may be null only when `length` is zero).
+                #[doc(hidden)]
+                #[no_mangle]
+                pub unsafe extern "C" fn #set_fn(
+                    row: *mut u8,
+                    utf8: *const u8,
+                    length: usize,
+                ) -> u8 {
+                    if row.is_null() || (utf8.is_null() && length != 0) {
+                        return 1;
+                    }
+                    // SAFETY: the caller promises `utf8` is readable for
+                    // `length` bytes; the slice borrows only for this call.
+                    let bytes: &[u8] = if length == 0 {
+                        &[]
+                    } else {
+                        unsafe { ::core::slice::from_raw_parts(utf8, length) }
+                    };
+                    let Ok(text) = ::core::str::from_utf8(bytes) else {
+                        return 2;
+                    };
+                    // SAFETY: as in the view trampoline: `row` addresses a live
+                    // component value the caller holds write access to.
+                    let component = unsafe { &mut *(row as *mut #type_ident) };
+                    component.#field_ident.clear();
+                    component.#field_ident.push_str(text);
+                    0
+                }
+            };
+            ("string", "")
+        }
+    };
+
+    quote! {
+        #view
+        #resize
+        #set
+        #item
+        #set_item
+        #push
+
+        ::pill_engine::submit! {
+            ::pill_engine::component_registry::PillFieldAccessorDescriptor {
+                type_name: #type_name,
+                field_name: #field_name,
+                kind: #kind_tag,
+                element_tag: #element_tag,
+                view_symbol: #view_symbol,
+                resize_symbol: #resize_symbol,
+                set_symbol: #set_symbol,
+                item_symbol: #item_symbol,
+                set_item_symbol: #set_item_symbol,
+                push_symbol: #push_symbol,
+            }
+        }
+    }
 }
 
 /// Map a Rust field type to the closed C#-mirror type-tag vocabulary.
@@ -199,15 +701,18 @@ fn component_field_descriptors(
 /// Primitives and fixed-size arrays are expressible; any other path type is
 /// tagged as a nested struct by its fully-qualified name (the codegen resolves
 /// it against the artifact's `PillMirror` inventory, falling back to an opaque
-/// blob of the field's size when it is not declared). Heap-owning types and
-/// `char` are rejected outright because no mirror can represent them.
-fn field_type_tag(ty: &syn::Type) -> syn::Result<String> {
+/// blob of the field's size when it is not declared). `String`, `Vec<E>` and
+/// `DynamicBuffer<E>` become the heap-owning container tags `string`,
+/// `vec:<element>` and `dynbuf:<element>` when the caller allows them
+/// (component rows, which managed code reaches through generated accessor
+/// members) and are rejected otherwise (mirrored value types, which cross the
+/// boundary as plain data). `char` is rejected outright because Rust's and
+/// C#'s widths disagree.
+fn field_type_tag(ty: &syn::Type, allow_containers: bool) -> syn::Result<String> {
     match ty {
         syn::Type::Path(path) if path.qself.is_none() => {
-            let last = path
-                .path
-                .segments
-                .last()
+            let segment = path.path.segments.last();
+            let last = segment
                 .map(|segment| segment.ident.to_string())
                 .unwrap_or_default();
             match last.as_str() {
@@ -217,15 +722,69 @@ fn field_type_tag(ty: &syn::Type) -> syn::Result<String> {
                     ty,
                     "`char` fields cannot be mirrored: Rust `char` is 4 bytes while C# `char` is 2",
                 )),
-                // Heap-owning or otherwise un-mirrorable standard types.
-                "String" | "Vec" | "Box" | "Arc" | "Rc" | "Option" | "Result" | "Cow"
-                | "HashMap" | "HashSet" | "BTreeMap" | "BTreeSet" | "VecDeque"
-                | "LinkedList" => Err(syn::Error::new_spanned(
-                    ty,
-                    format!(
-                        "field type `{last}` owns heap memory and cannot be mirrored to C#; use a blittable value type"
-                    ),
-                )),
+                "String" => {
+                    if allow_containers {
+                        Ok("string".to_string())
+                    } else {
+                        Err(heap_owned_rejection(ty, "String"))
+                    }
+                }
+                "Vec" | "DynamicBuffer" => {
+                    if !allow_containers {
+                        return Err(heap_owned_rejection(ty, &last));
+                    }
+                    // The element type decides the span C# iterates, so it
+                    // must be inside the closed vocabulary too.
+                    let element = container_element_type(segment, &last)
+                        .map_err(|message| syn::Error::new_spanned(ty, message))?;
+                    let element_tag = field_type_tag(element, allow_containers)?;
+                    if is_primitive_tag(&element_tag) || element_tag.starts_with("struct:") {
+                        let prefix = if last == "Vec" { "vec" } else { "dynbuf" };
+                        Ok(format!("{prefix}:{element_tag}"))
+                    } else if element_tag == "string" {
+                        if last == "Vec" {
+                            // Elements are individually allocated strings, so
+                            // there is no span over them; C# reaches each one
+                            // through its own accessor instead.
+                            Ok("vec:string".to_string())
+                        } else {
+                            Err(syn::Error::new_spanned(
+                                ty,
+                                "`DynamicBuffer<String>` fields are not supported; a \
+                                 `DynamicBuffer` holds plain `Copy` elements - use a `Vec<String>` \
+                                 for a text list",
+                            ))
+                        }
+                    } else if element_tag.starts_with("vec:")
+                        || element_tag.starts_with("dynbuf:")
+                    {
+                        Err(syn::Error::new_spanned(
+                            ty,
+                            format!(
+                                "nested containers are not supported; a `{last}` field's element \
+                                 must be a primitive or a `#[derive(PillMirror)]` struct"
+                            ),
+                        ))
+                    } else if element_tag.starts_with("array:") {
+                        Err(syn::Error::new_spanned(
+                            ty,
+                            format!(
+                                "a `{last}` of fixed-size arrays is not supported; use a `{last}` \
+                                 of primitives"
+                            ),
+                        ))
+                    } else {
+                        Err(syn::Error::new_spanned(
+                            ty,
+                            format!("`{last}<{element_tag}>` is not a supported container field"),
+                        ))
+                    }
+                }
+                // Heap-owning standard types that have no accessor machinery.
+                "Box" | "Arc" | "Rc" | "Option" | "Result" | "Cow" | "HashMap" | "HashSet"
+                | "BTreeMap" | "BTreeSet" | "VecDeque" | "LinkedList" => {
+                    Err(heap_owned_rejection(ty, &last))
+                }
                 _ => {
                     // A nested struct (or an enum, which the codegen treats as
                     // an un-resolvable struct and renders opaque). Tagged by
@@ -246,7 +805,14 @@ fn field_type_tag(ty: &syn::Type) -> syn::Result<String> {
             // The element count lives in `element_count` (computed from the
             // length expression at compile time), so the tag only carries the
             // element type.
-            let inner = field_type_tag(&array.elem)?;
+            let inner = field_type_tag(&array.elem, allow_containers)?;
+            if inner.starts_with("vec:") || inner.starts_with("dynbuf:") || inner == "string" {
+                return Err(syn::Error::new_spanned(
+                    ty,
+                    "arrays of heap-owning fields are not supported; use a `Vec` or \
+                     `DynamicBuffer` field instead",
+                ));
+            }
             Ok(format!("array:{inner}"))
         }
         other => Err(syn::Error::new_spanned(
@@ -254,6 +820,68 @@ fn field_type_tag(ty: &syn::Type) -> syn::Result<String> {
             "unsupported field type for the C# mirror; use a primitive, a fixed-size array, or a `#[derive(PillMirror)]` struct",
         )),
     }
+}
+
+/// The rejection for a heap-owning type outside the container vocabulary.
+///
+/// `String`, `Vec` and `DynamicBuffer` reach this only from
+/// `#[derive(PillMirror)]`, whose values are copied across the boundary and
+/// have no live row to reach a buffer through.
+fn heap_owned_rejection(ty: &syn::Type, name: &str) -> syn::Error {
+    syn::Error::new_spanned(
+        ty,
+        format!(
+            "field type `{name}` owns heap memory and cannot be mirrored to C#; use a blittable \
+             value type, a `String`, a `Vec`, or a `DynamicBuffer`"
+        ),
+    )
+}
+
+/// Extract the element type of a `Vec<E>` or `DynamicBuffer<E>` field.
+fn container_element_type<'a>(
+    segment: Option<&'a syn::PathSegment>,
+    container: &str,
+) -> Result<&'a syn::Type, String> {
+    let missing = || {
+        format!(
+            "a `{container}` field must name its element type (`{container}<f32>`, not bare \
+             `{container}`)"
+        )
+    };
+    let Some(segment) = segment else {
+        return Err(missing());
+    };
+    let syn::PathArguments::AngleBracketed(arguments) = &segment.arguments else {
+        return Err(missing());
+    };
+    arguments
+        .args
+        .iter()
+        .find_map(|argument| match argument {
+            syn::GenericArgument::Type(element) => Some(element),
+            _ => None,
+        })
+        .ok_or_else(missing)
+}
+
+/// Whether a tag names one of the scalar primitives.
+fn is_primitive_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "f32"
+            | "f64"
+            | "i8"
+            | "u8"
+            | "i16"
+            | "u16"
+            | "i32"
+            | "u32"
+            | "i64"
+            | "u64"
+            | "bool"
+            | "usize"
+            | "isize"
+    )
 }
 
 // =============================================================================
@@ -282,10 +910,14 @@ pub fn derive_pill_mirror(input: TokenStream) -> TokenStream {
         .into();
     }
 
-    let (declared_layout, layout_reference) = match component_field_descriptors(&input) {
-        Ok(pair) => pair,
-        Err(error) => return error.to_compile_error().into(),
-    };
+    // Value types cross the boundary as plain data, so a heap-owning field has
+    // no meaning here: there is no live row for managed code to reach a buffer
+    // through, and the mirror is copied by value.
+    let (declared_layout, layout_reference, _accessors) =
+        match component_field_descriptors(&input, false) {
+            Ok(triple) => triple,
+            Err(error) => return error.to_compile_error().into(),
+        };
 
     let type_name = quote! {
         ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#ident))
@@ -1415,6 +2047,42 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
                 // SAFETY: `index < count <= max`, so `out.add(index)` stays
                 // inside the buffer the host promised, and
                 // `PillMethodDescriptor` is `Copy`.
+                unsafe { out.add(index).write(**descriptor); }
+            }
+            count
+        }
+
+        /// Number of heap-field accessor descriptors this artifact declares,
+        /// letting the host size its copy buffer.
+        #[cfg(feature = "module-abi")]
+        #[no_mangle]
+        pub extern "C" fn pill_field_accessor_descriptor_count() -> u32 {
+            ::pill_engine::component_registry::field_accessor_descriptors().len() as u32
+        }
+
+        /// Copy up to `max` heap-field accessor descriptors into `out`;
+        /// returns the count actually copied. Each descriptor names the
+        /// `#[no_mangle]` trampolines this artifact exports for one `Vec` or
+        /// `String` component field, which the host resolves by symbol to
+        /// obtain the callable addresses.
+        ///
+        /// # Safety
+        ///
+        /// `out` must point at `max` writable
+        /// [`PillFieldAccessorDescriptor`](::pill_engine::component_registry::PillFieldAccessorDescriptor)
+        /// slots owned by the host for the duration of this call.
+        #[cfg(feature = "module-abi")]
+        #[no_mangle]
+        pub unsafe extern "C" fn pill_copy_field_accessor_descriptors(
+            out: *mut ::pill_engine::component_registry::PillFieldAccessorDescriptor,
+            max: u32,
+        ) -> u32 {
+            let descriptors = ::pill_engine::component_registry::field_accessor_descriptors();
+            let count = (descriptors.len() as u32).min(max);
+            for (index, descriptor) in descriptors.iter().take(count as usize).enumerate() {
+                // SAFETY: `index < count <= max`, so `out.add(index)` stays
+                // inside the buffer the host promised, and
+                // `PillFieldAccessorDescriptor` is `Copy`.
                 unsafe { out.add(index).write(**descriptor); }
             }
             count

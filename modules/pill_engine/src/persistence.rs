@@ -168,8 +168,36 @@ impl World {
     /// so that JSON can round-trip its data.  When the struct shape changes
     /// between reloads, serde matches fields by **name** — new fields get
     /// `Default::default()`, removed fields are silently ignored.
+    ///
+    /// The schema hash of this path covers the type name, its size, and the
+    /// kind of every field in a default instance. A type registered through
+    /// the derive uses [`Self::register_persistable_component_with_layout`]
+    /// instead, whose hash additionally covers the declared field layout, so
+    /// two shapes with identical defaults but different containers (`Vec<f32>`
+    /// against `Vec<String>`) can never compare equal.
     pub fn register_persistable_component<T>(&mut self)
     where
+        T: Component
+            + TraitAccessible<dyn Component>
+            + Clone
+            + Serialize
+            + DeserializeOwned
+            + Default
+            + 'static,
+    {
+        self.register_persistable_component_inner::<T>(&[]);
+    }
+
+    /// Shared registration body for the layout-less and layout-carrying entry
+    /// points.
+    ///
+    /// `fields` is the compile-time field layout when the caller has one; the
+    /// schema hash incorporates it so a container kind or element type change
+    /// forces a migration instead of taking the unchanged-schema fast path.
+    fn register_persistable_component_inner<T>(
+        &mut self,
+        fields: &'static [crate::component_registry::ComponentFieldDescriptor],
+    ) where
         T: Component
             + TraitAccessible<dyn Component>
             + Clone
@@ -222,7 +250,7 @@ impl World {
             insert_boxed_component::<T> as InsertComponentFn,
         );
 
-        let schema_hash = calculate_schema_hash::<T>();
+        let schema_hash = calculate_schema_hash::<T>(fields);
         self.persist_schema_hashes
             .insert(type_name.clone(), schema_hash);
 
@@ -235,8 +263,15 @@ impl World {
     }
 
     /// Register a persistable component together with its compile-time field
-    /// layout, so the C# mirror codegen can emit a typed struct. See
+    /// layout, so the C# mirror codegen can emit a typed struct and the schema
+    /// hash can account for container fields. See
     /// [`Self::register_component_with_layout`].
+    ///
+    /// The layout is what distinguishes two component shapes whose defaults
+    /// look identical to serde: `Vec<f32>` and `Vec<String>` both serialize a
+    /// default instance as `[]`, but their tags differ, so a change of element
+    /// type changes the hash and the reload migrates the stored values rather
+    /// than reinterpreting the old buffer under the new layout.
     pub fn register_persistable_component_with_layout<T>(
         &mut self,
         fields: &'static [crate::component_registry::ComponentFieldDescriptor],
@@ -249,7 +284,7 @@ impl World {
             + Default
             + 'static,
     {
-        self.register_persistable_component::<T>();
+        self.register_persistable_component_inner::<T>(fields);
         self.component_field_layouts.insert(
             ComponentId::of::<T>(),
             crate::world::ComponentFieldLayout::Static(fields),
@@ -1219,7 +1254,13 @@ fn normalize_schema_shape(value: &serde_json::Value) -> serde_json::Value {
 }
 
 /// Compute schema hash for one persistable component type.
-fn calculate_schema_hash<T>() -> u64
+///
+/// `fields` is the declared field layout when the type was registered through
+/// the derive, and empty for hand-registered types. Including it matters:
+/// normalized default values describe a `Vec<f32>` and a `Vec<String>` alike
+/// as an empty array, so without the tags a reload could take the
+/// unchanged-schema fast path and then interpret one as the other.
+fn calculate_schema_hash<T>(fields: &[crate::component_registry::ComponentFieldDescriptor]) -> u64
 where
     T: Component + Serialize + Default + 'static,
 {
@@ -1237,6 +1278,20 @@ where
     std::any::type_name::<T>().hash(&mut hasher);
     std::mem::size_of::<T>().hash(&mut hasher);
     normalized_schema_string.hash(&mut hasher);
+
+    // Step 3: Fold in the declared field layout. Tags carry the container
+    // kinds (`vec:f32`, `string`), offsets distinguish a reordered or padded
+    // shape, and the element count separates a fixed array from a resized one.
+    // A layout-less registration contributes nothing here, keeping its hash
+    // exactly what earlier builds produced.
+    for field in fields {
+        field.name.hash(&mut hasher);
+        field.type_tag.hash(&mut hasher);
+        field.offset.hash(&mut hasher);
+        field.size.hash(&mut hasher);
+        field.align.hash(&mut hasher);
+        field.element_count.hash(&mut hasher);
+    }
     hasher.finish()
 }
 
