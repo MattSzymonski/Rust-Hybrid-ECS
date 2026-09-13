@@ -1,7 +1,17 @@
+// Components owned by this project.
+//
+// Mirrors the component declarations in examples/project_rs/src/lib.rs: same
+// names, same field order, same field types. The native host discovers these
+// layouts from the managed component manifest and registers them itself - no
+// Rust mirror and no match arm is involved on either side.
+
 using System.Runtime.InteropServices;
 
 namespace TracyLive;
 
+/// <summary>
+/// A rigid ball that bounces inside a fixed box, simulated each frame.
+/// </summary>
 [StructLayout(LayoutKind.Sequential)]
 public struct PhysicsState
 {
@@ -11,13 +21,22 @@ public struct PhysicsState
     public float VelocityX;
     public float VelocityY;
     public float Radius;
+
+    /// <summary>Rust's `active: bool`; only zero means inactive.</summary>
     public byte Active;
 }
 
-// Project-owned component: the native host discovers and registers this layout
-// from the managed component manifest without a Rust mirror or match arm.
+/// <summary>
+/// One dot on the project's spline, drawn at the curve parameter `t`.
+/// </summary>
+/// <remarks>
+/// The dot carries the usual <see cref="Position"/> and <see cref="Sprite"/>, so
+/// it renders like any other sprite, and the sample system moves it along the
+/// curve as the balls move.
+/// </remarks>
 [StructLayout(LayoutKind.Sequential)]
-public struct BallTag
+public struct SplineSample
 {
-    public uint Kind;
+    /// <summary>Curve parameter this dot samples, running from 0.0 to 1.0.</summary>
+    public float T;
 }

@@ -223,6 +223,26 @@ impl Spline {
     }
 }
 
+/// Sampling entry points for the managed mirror.
+///
+/// The mirror contract carries primitives only, so the `Vector3f` return of
+/// [`Spline::get_location_at`] crosses one axis at a time; managed code
+/// samples through these getters instead of its own copy of the curve.
+#[pill_mirror_impl]
+impl Spline {
+    /// `x` of [`Spline::get_location_at`], mirrored to C# as `GetLocationX`.
+    #[pill_mirror_method]
+    pub fn get_location_x(&self, t: f32) -> f32 {
+        self.get_location_at(t).x
+    }
+
+    /// `y` of [`Spline::get_location_at`], mirrored to C# as `GetLocationY`.
+    #[pill_mirror_method]
+    pub fn get_location_y(&self, t: f32) -> f32 {
+        self.get_location_at(t).y
+    }
+}
+
 // =============================================================================
 // Free Functions
 // =============================================================================

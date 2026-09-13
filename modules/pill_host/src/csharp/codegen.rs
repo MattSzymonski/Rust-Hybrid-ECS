@@ -137,7 +137,8 @@ pub(crate) fn generate_module_components_csharp(
             emit_blob_component(name, component.size, component.align)?
         } else {
             // The C# name is the Rust path with `::` replaced by `.`, so
-            // mapping the dots back recovers the name the accessor rows carry.
+            // mapping the dots back recovers the name the accessor rows carry
+            // and the path mirrored methods resolve against.
             let rust_type_name = component.csharp_name.replace('.', "::");
             emit_typed_struct(
                 name,
@@ -147,7 +148,7 @@ pub(crate) fn generate_module_components_csharp(
                 value_types,
                 &mut nested_definitions,
                 methods,
-                "",
+                &rust_type_name,
                 accessors,
                 &rust_type_name,
             )?
@@ -272,6 +273,10 @@ fn emit_blob_component(name: &str, size: usize, align: usize) -> Result<String, 
 /// members — and empty for a `PillMirror` value type. The many parameters
 /// mirror the descriptor fields plus the recursion context; clippy's
 /// threshold is below the (internal) signature's size.
+///
+/// `qualified` is the Rust path mirrored methods resolve against: a component
+/// row passes its own name, so `#[pill_mirror_impl]` methods attach to it the
+/// same way they attach to a `PillMirror` value type.
 #[allow(clippy::too_many_arguments)]
 fn emit_typed_struct(
     name: &str,
@@ -678,12 +683,12 @@ fn csharp_parameter_name(argument_index: usize, rust_name: &str) -> String {
 ///
 /// Each mirrored method becomes a `[UnmanagedFunctionPointer(Cdecl)]` delegate
 /// (nested inside the struct) and an instance method that resolves the
-/// module's exported trampoline through [`TracyLive.MirrorMethods`] and calls
-/// it with the struct pinned. Everything stays safe C#: the reloadable
-/// project assembly compiles without `AllowUnsafeBlocks`, so the receiver is
-/// pinned through a `GCHandle` over a boxed copy rather than a raw pointer.
-/// That is why only `&self` (read-only) methods are supported: writes through
-/// `&mut self` could never propagate back to the caller's copy.
+/// module's exported trampoline through [`TracyLive.MirrorMethods`] and hands
+/// it the receiver's live address via `MirrorMethods.AddressOf`, so a call
+/// neither boxes nor pins the struct. The generated body still compiles
+/// without `AllowUnsafeBlocks`: the runtime helper owns the pointer work. The
+/// mirror contract stays `&self` (read-only), matching the trampoline's
+/// `*const` receiver pointer.
 ///
 /// Returns an empty string when the value type has no mirrored methods.
 fn emit_value_type_methods(
@@ -744,10 +749,14 @@ fn emit_value_type_methods(
         } else {
             format!("IntPtr self, {}", typed_arguments.join(", "))
         };
+        // The receiver crosses as its live address: `AddressOf` turns the
+        // `ref` into a pointer inside the runtime, so the call needs neither
+        // `unsafe` nor a boxed copy of the struct.
+        let receiver = "global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this))";
         let call_args = if arg_names.is_empty() {
-            "handle.AddrOfPinnedObject()".to_string()
+            receiver.to_string()
         } else {
-            format!("handle.AddrOfPinnedObject(), {}", arg_names.join(", "))
+            format!("{receiver}, {}", arg_names.join(", "))
         };
         let method_signature = if typed_arguments.is_empty() {
             format!("public {return_type} {pascal}()")
@@ -766,17 +775,15 @@ fn emit_value_type_methods(
         output.push_str(&format!(
             "\n\
              \x20\x20\x20\x20/// Calls the Rust method `{qualified}::{method_name}` through its\n\
-             \x20\x20\x20\x20/// generated C-ABI trampoline; this struct is pinned for the call.\n\
+             \x20\x20\x20\x20/// generated C-ABI trampoline, handing it the receiver's live\n\
+             \x20\x20\x20\x20/// address without boxing or pinning it.\n\
              \x20\x20\x20\x20[UnmanagedFunctionPointer(CallingConvention.Cdecl)]\n\
              \x20\x20\x20\x20public delegate {return_type} {delegate_name}({delegate_args});\n\
              \n\
              \x20\x20\x20\x20{method_signature}\n\
              \x20\x20\x20\x20{{\n\
              \x20\x20\x20\x20\x20\x20\x20\x20var mirror = global::TracyLive.MirrorMethods.Resolve<{delegate_name}>(\"{qualified}\", \"{method_name}\");\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20object boxed = this;\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20var handle = global::System.Runtime.InteropServices.GCHandle.Alloc(boxed, global::System.Runtime.InteropServices.GCHandleType.Pinned);\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20try {{ {invocation} }}\n\
-             \x20\x20\x20\x20\x20\x20\x20\x20finally {{ handle.Free(); }}\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20{invocation}\n\
              \x20\x20\x20\x20}}\n",
             qualified = qualified,
             method_name = method.method_name,
@@ -1999,8 +2006,8 @@ mod tests {
     }
 
     /// Mirrored methods become typed C# instance methods that resolve the
-    /// module's trampoline through `MirrorMethods` and pin the struct for the
-    /// call. A value type without methods emits no method block.
+    /// module's trampoline through `MirrorMethods` and hand it the receiver's
+    /// live address. A value type without methods emits no method block.
     #[test]
     fn mirrored_methods_are_emitted_on_value_types() {
         static FIELDS: &[ComponentFieldDescriptor] = &[
@@ -2062,14 +2069,50 @@ mod tests {
         assert!(content.contains(
             "public delegate uint OmoMOAddDelegate(IntPtr self, uint amount, float scale);"
         ));
-        assert!(content.contains("mirror(handle.AddrOfPinnedObject(), amount, scale);"));
-        // The pinned-box call keeps the whole body in safe C#.
         assert!(content.contains(
-            "global::System.Runtime.InteropServices.GCHandle.Alloc(boxed, global::System.Runtime.InteropServices.GCHandleType.Pinned)"
+            "return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), amount, scale);"
         ));
-        assert!(content.contains("handle.AddrOfPinnedObject()"));
+        // The receiver is addressed through the runtime helper and nothing is
+        // boxed or pinned, so a mirrored call allocates nothing.
+        assert!(!content.contains("boxed"));
+        assert!(!content.contains("GCHandle"));
         // Methods of a type that is never emitted must not appear.
         assert!(!content.contains("Unused"));
+    }
+
+    /// Mirrored methods on a component row reach the same emission path as
+    /// value-type methods, which is how a C# project samples a module's math
+    /// off the component instead of reimplementing it.
+    #[test]
+    fn mirrored_methods_are_emitted_on_component_rows() {
+        let workspace = temp_workspace("mirror_component", "pill_spline");
+        let methods = [mirrored_method(
+            "pill_spline::Spline",
+            "get_location_x",
+            "f32",
+            &["f32"],
+            &["t"],
+        )];
+        generate_module_components_csharp(
+            &workspace,
+            "pill_spline",
+            &[exposed_typed(
+                "pill_spline.Spline",
+                4,
+                4,
+                vec![field("elo", "f32", 0, 4, 4)],
+            )],
+            &[],
+            &methods,
+            &[],
+        )
+        .unwrap();
+
+        let content = read_generated(&workspace, "pill_spline");
+        assert!(content.contains("public float GetLocationX(float t)"));
+        assert!(content.contains(
+            "return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), t);"
+        ));
     }
 
     /// A void-returning mirrored method emits a `void` delegate and a call
@@ -2112,7 +2155,9 @@ mod tests {
         assert!(content.contains("public void Reset(ulong countdown)"));
         assert!(content
             .contains("public delegate void OmoMOResetDelegate(IntPtr self, ulong countdown);"));
-        assert!(content.contains("mirror(handle.AddrOfPinnedObject(), countdown);"));
+        assert!(content.contains(
+            "mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), countdown);"
+        ));
     }
 
     /// A Rust parameter name that is a C# reserved keyword (or is absent) must

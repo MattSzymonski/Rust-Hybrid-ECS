@@ -943,7 +943,10 @@ pub fn derive_pill_mirror(input: TokenStream) -> TokenStream {
 // #[pill_mirror_impl] / #[pill_mirror_method]
 // =============================================================================
 
-/// Mirrors selected `&self` methods of a `#[derive(PillMirror)]` type to C#.
+/// Mirrors selected `&self` methods of a mirrored type to C#.
+///
+/// The type may be a `#[derive(PillMirror)]` value type or an exposed
+/// component row; both reach the generated C# struct the same way.
 ///
 /// Applied to an inherent `impl` block; methods inside it marked with
 /// `#[pill_mirror_method]` become typed C# instance methods on the generated
@@ -971,9 +974,9 @@ pub fn derive_pill_mirror(input: TokenStream) -> TokenStream {
 ///   the host can resolve the trampoline's symbol and hand the address to the
 ///   C# runtime.
 ///
-/// v1 supports a deliberately narrow contract, matching what a pinned C# box
-/// can express in safe code: a `&self` receiver (read-only — writes cannot
-/// propagate back through the box), primitive arguments and return values
+/// v1 supports a deliberately narrow contract: a `&self` receiver (the
+/// generated call hands the trampoline the receiver's live address, so a
+/// mirrored call allocates nothing), primitive arguments and return values
 /// (`u8..u64`, `i8..i64`, `f32`, `f64`, `bool`, `usize`, `isize`), and a `()`
 /// return. Anything else is rejected here at compile time with a clear error.
 ///
@@ -1073,9 +1076,10 @@ fn emit_mirrored_method_trampoline(
         ));
     }
 
-    // Receiver must be `&self` (read-only). `&mut self` cannot propagate writes
-    // through the C# pinned-box call, and `self` by value would copy the type
-    // across an ABI the mirror does not define.
+    // Receiver must be `&self` (read-only), matching the trampoline's `*const`
+    // receiver pointer: `&mut self` would widen the mirror contract to writes,
+    // and `self` by value would copy the type across an ABI the mirror does
+    // not define.
     match &method.sig.inputs.first() {
         Some(syn::FnArg::Receiver(receiver))
             if receiver.reference.is_some() && receiver.mutability.is_none() => {}
@@ -1161,8 +1165,8 @@ fn emit_mirrored_method_trampoline(
         /// # Safety
         ///
         /// `#self_pointer` must point at a live `#type_ident` value for the
-        /// duration of the call; the C# runtime passes the pinned box of the
-        /// struct it was invoked on.
+        /// duration of the call; the C# runtime passes the address of the
+        /// value the mirror method was invoked on.
         #[doc(hidden)]
         #[no_mangle]
         pub unsafe extern "C" fn #symbol_ident(

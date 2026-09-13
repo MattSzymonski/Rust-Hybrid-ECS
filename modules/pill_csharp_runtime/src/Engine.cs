@@ -435,7 +435,8 @@ internal readonly record struct StableComponentId(ulong Low, ulong High);
 /// Populated once at startup from the host's native table (see
 /// <see cref="Engine.Bind"/>). Generated mirror methods resolve a typed
 /// delegate over each method's exported C-ABI trampoline and invoke it with
-/// the struct pinned. Generated heap-field accessors skip the delegate layer
+/// the receiver's live address, so a call boxes and pins nothing. Generated
+/// heap-field accessors skip the delegate layer
 /// entirely: they resolve the trampoline's raw address once per host bind
 /// (guarded by <see cref="Generation"/>) and call it through the
 /// <c>Invoke*</c> helpers below, which use C-ABI function pointers with no
@@ -552,7 +553,7 @@ public static class MirrorMethods
 
     /// <summary>
     /// Address of a live value passed by reference, for generated heap-field
-    /// accessors.
+    /// accessors and mirrored method receivers.
     ///
     /// The address points at the storage the reference names - for a component
     /// row, the native column slot - so a trampoline reached through it reads

@@ -38,73 +38,63 @@ public struct OmoMO
         MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
 
     /// Calls the Rust method `pill_spline::OmoMO::get_a` through its
-    /// generated C-ABI trampoline; this struct is pinned for the call.
+    /// generated C-ABI trampoline, handing it the receiver's live
+    /// address without boxing or pinning it.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate ulong OmoMOGetADelegate(IntPtr self);
 
     public ulong GetA()
     {
         var mirror = global::TracyLive.MirrorMethods.Resolve<OmoMOGetADelegate>("pill_spline::OmoMO", "get_a");
-        object boxed = this;
-        var handle = global::System.Runtime.InteropServices.GCHandle.Alloc(boxed, global::System.Runtime.InteropServices.GCHandleType.Pinned);
-        try { return mirror(handle.AddrOfPinnedObject()); }
-        finally { handle.Free(); }
+        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)));
     }
 
     /// Calls the Rust method `pill_spline::OmoMO::get_b` through its
-    /// generated C-ABI trampoline; this struct is pinned for the call.
+    /// generated C-ABI trampoline, handing it the receiver's live
+    /// address without boxing or pinning it.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate ulong OmoMOGetBDelegate(IntPtr self);
 
     public ulong GetB()
     {
         var mirror = global::TracyLive.MirrorMethods.Resolve<OmoMOGetBDelegate>("pill_spline::OmoMO", "get_b");
-        object boxed = this;
-        var handle = global::System.Runtime.InteropServices.GCHandle.Alloc(boxed, global::System.Runtime.InteropServices.GCHandleType.Pinned);
-        try { return mirror(handle.AddrOfPinnedObject()); }
-        finally { handle.Free(); }
+        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)));
     }
 
     /// Calls the Rust method `pill_spline::OmoMO::get_c` through its
-    /// generated C-ABI trampoline; this struct is pinned for the call.
+    /// generated C-ABI trampoline, handing it the receiver's live
+    /// address without boxing or pinning it.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate ulong OmoMOGetCDelegate(IntPtr self);
 
     public ulong GetC()
     {
         var mirror = global::TracyLive.MirrorMethods.Resolve<OmoMOGetCDelegate>("pill_spline::OmoMO", "get_c");
-        object boxed = this;
-        var handle = global::System.Runtime.InteropServices.GCHandle.Alloc(boxed, global::System.Runtime.InteropServices.GCHandleType.Pinned);
-        try { return mirror(handle.AddrOfPinnedObject()); }
-        finally { handle.Free(); }
+        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)));
     }
 
     /// Calls the Rust method `pill_spline::OmoMO::get_d` through its
-    /// generated C-ABI trampoline; this struct is pinned for the call.
+    /// generated C-ABI trampoline, handing it the receiver's live
+    /// address without boxing or pinning it.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate int OmoMOGetDDelegate(IntPtr self, int alpha, int beta);
 
     public int GetD(int alpha, int beta)
     {
         var mirror = global::TracyLive.MirrorMethods.Resolve<OmoMOGetDDelegate>("pill_spline::OmoMO", "get_d");
-        object boxed = this;
-        var handle = global::System.Runtime.InteropServices.GCHandle.Alloc(boxed, global::System.Runtime.InteropServices.GCHandleType.Pinned);
-        try { return mirror(handle.AddrOfPinnedObject(), alpha, beta); }
-        finally { handle.Free(); }
+        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), alpha, beta);
     }
 
     /// Calls the Rust method `pill_spline::OmoMO::get_sum` through its
-    /// generated C-ABI trampoline; this struct is pinned for the call.
+    /// generated C-ABI trampoline, handing it the receiver's live
+    /// address without boxing or pinning it.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     public delegate ulong OmoMOGetSumDelegate(IntPtr self);
 
     public ulong GetSum()
     {
         var mirror = global::TracyLive.MirrorMethods.Resolve<OmoMOGetSumDelegate>("pill_spline::OmoMO", "get_sum");
-        object boxed = this;
-        var handle = global::System.Runtime.InteropServices.GCHandle.Alloc(boxed, global::System.Runtime.InteropServices.GCHandleType.Pinned);
-        try { return mirror(handle.AddrOfPinnedObject()); }
-        finally { handle.Free(); }
+        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)));
     }
 }
 
@@ -137,104 +127,29 @@ public struct Spline
     /// Live ABI bytes of this component row (safe code).
     public readonly Span<byte> Raw =>
         MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
-}
 
+    /// Calls the Rust method `pill_spline::Spline::get_location_x` through its
+    /// generated C-ABI trampoline, handing it the receiver's live
+    /// address without boxing or pinning it.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate float SplineGetLocationXDelegate(IntPtr self, float t);
 
-}
-
-namespace pill_spline {
-
-[StructLayout(LayoutKind.Explicit, Size = 48)]
-public struct Trail
-{
-    [FieldOffset(0)] private readonly ulong _alignmentPad;
-    /// Live ABI bytes of this component row (safe code).
-    public readonly Span<byte> Raw =>
-        MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
-
-    /// Number of live elements in `points` (Rust `Vec<f32>`).
-    public readonly int PointsCount
+    public float GetLocationX(float t)
     {
-        get
-        {
-            EnsureAccessorsBound();
-            global::TracyLive.MirrorMethods.InvokeView(_pointsViewAddress, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out _, out IntPtr length);
-            return checked((int)length);
-        }
+        var mirror = global::TracyLive.MirrorMethods.Resolve<SplineGetLocationXDelegate>("pill_spline::Spline", "get_location_x");
+        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), t);
     }
 
-    /// Read-only lease over `points`; a resize or any structural change invalidates it.
-    public readonly ReadOnlySpan<float> Points
-    {
-        get
-        {
-            EnsureAccessorsBound();
-            global::TracyLive.MirrorMethods.InvokeView(_pointsViewAddress, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out IntPtr data, out IntPtr length);
-            return global::TracyLive.ComponentViews.AsReadOnlySpan<float>(data, checked((int)length));
-        }
-    }
+    /// Calls the Rust method `pill_spline::Spline::get_location_y` through its
+    /// generated C-ABI trampoline, handing it the receiver's live
+    /// address without boxing or pinning it.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate float SplineGetLocationYDelegate(IntPtr self, float t);
 
-    /// Writable lease over `points`: write elements in place, then resize to grow or shrink.
-    public Span<float> PointsMut
+    public float GetLocationY(float t)
     {
-        get
-        {
-            EnsureAccessorsBound();
-            global::TracyLive.MirrorMethods.InvokeView(_pointsViewAddress, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out IntPtr data, out IntPtr length);
-            return global::TracyLive.ComponentViews.AsSpan<float>(data, checked((int)length));
-        }
-    }
-
-    /// Resize `points` to `count` elements; new elements take the element type's `default`.
-    public void ResizePoints(int count)
-    {
-        EnsureAccessorsBound();
-        global::TracyLive.MirrorMethods.InvokeResize(_pointsResizeAddress, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), (IntPtr)count);
-    }
-
-    /// Decoded UTF-8 text of `label` (Rust `String`).
-    public readonly string GetLabel()
-    {
-        EnsureAccessorsBound();
-        global::TracyLive.MirrorMethods.InvokeView(_labelViewAddress, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out IntPtr data, out IntPtr length);
-        return global::System.Runtime.InteropServices.Marshal.PtrToStringUTF8(data, checked((int)length)) ?? string.Empty;
-    }
-
-    /// Replace `label` with `value`, encoded as UTF-8.
-    public void SetLabel(string value)
-    {
-        EnsureAccessorsBound();
-        byte[] utf8 = global::System.Text.Encoding.UTF8.GetBytes(value);
-        global::System.Runtime.InteropServices.GCHandle handle = global::System.Runtime.InteropServices.GCHandle.Alloc(utf8, global::System.Runtime.InteropServices.GCHandleType.Pinned);
-        try
-        {
-            global::TracyLive.MirrorMethods.InvokeUtf8Write(_labelSetAddress, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), handle.AddrOfPinnedObject(), (IntPtr)utf8.Length);
-        }
-        finally
-        {
-            handle.Free();
-        }
-    }
-
-    private static int _accessorsBoundGeneration = -1;
-    private static IntPtr _pointsViewAddress;
-    private static IntPtr _pointsResizeAddress;
-    private static IntPtr _labelViewAddress;
-    private static IntPtr _labelSetAddress;
-
-    /// Re-resolve this struct's heap-field trampoline addresses after a host
-    /// (re)bind and remember which bind they came from: one int compare per
-    /// member use, and no lookup at all while the host stays bound.
-    private static void EnsureAccessorsBound()
-    {
-        int generation = global::TracyLive.MirrorMethods.Generation;
-        if (_accessorsBoundGeneration == generation)
-            return;
-        _pointsViewAddress = global::TracyLive.MirrorMethods.Address("pill_spline::Trail", "points_view");
-        _pointsResizeAddress = global::TracyLive.MirrorMethods.Address("pill_spline::Trail", "points_resize");
-        _labelViewAddress = global::TracyLive.MirrorMethods.Address("pill_spline::Trail", "label_view");
-        _labelSetAddress = global::TracyLive.MirrorMethods.Address("pill_spline::Trail", "label_set");
-        _accessorsBoundGeneration = generation;
+        var mirror = global::TracyLive.MirrorMethods.Resolve<SplineGetLocationYDelegate>("pill_spline::Spline", "get_location_y");
+        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), t);
     }
 }
 

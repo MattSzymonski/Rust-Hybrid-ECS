@@ -387,14 +387,25 @@ internal static class Program
             Test("current project discovers native and dynamic component systems", () =>
             {
                 var systems = ProjectHost.DiscoverSystems(typeof(BallPhysicsSystem).Assembly);
-                // BallPhysicsSystem + BallTagSystem + the module-spline bridge demo.
-                Equal(systems.Length, 3, "unexpected project system count");
+                // The physics step, plus the systems a managed project needs to
+                // express what the Rust project does in one pass: snapshot the
+                // ball centres, publish the spline, place the dots, and fill the
+                // world up to the target counts.
+                Equal(systems.Length, 7, "unexpected project system count");
                 Assert(systems.Any(system => system.Name == "TracyLive.BallPhysicsSystem.Run"),
                     "ball physics system was not discovered");
-                Assert(systems.Any(system => system.Name == "TracyLive.BallTagSystem.Observe"),
-                    "dynamic component system was not discovered");
-                Assert(systems.Any(system => system.Name == "TracyLive.ModuleSplineBridgeDemo.Run"),
-                    "module-spline bridge demo system was not discovered");
+                Assert(systems.Any(system => system.Name == "TracyLive.BallSnapshotSystem.Run"),
+                    "ball snapshot system was not discovered");
+                Assert(systems.Any(system => system.Name == "TracyLive.BallSpawnSystem.Run"),
+                    "ball spawn system was not discovered");
+                Assert(systems.Any(system => system.Name == "TracyLive.SplinePathSystem.Run"),
+                    "spline path system was not discovered");
+                Assert(systems.Any(system => system.Name == "TracyLive.SplineSampleSystem.Run"),
+                    "spline sample system was not discovered");
+                Assert(systems.Any(system => system.Name == "TracyLive.SplineSampleSpawnSystem.Run"),
+                    "spline sample spawn system was not discovered");
+                Assert(systems.Any(system => system.Name == "TracyLive.SplineSpawnSystem.Run"),
+                    "spline spawn system was not discovered");
             });
 
             Test("component manifest separates runtime mirrors from project components", () =>
@@ -403,7 +414,7 @@ internal static class Program
                 using var json = System.Text.Json.JsonDocument.Parse(
                     ComponentManifestBuilder.Build(systems));
                 var components = json.RootElement.EnumerateArray().ToArray();
-                // Position, Sprite, PhysicsState, BallTag + the module Spline mirror.
+                // Position, Sprite, PhysicsState, SplineSample + the module Spline mirror.
                 Equal(components.Length, 5, "unexpected manifest component count");
                 var position = components.Single(component =>
                     component.GetProperty("full_name").GetString() == "TracyLive.Position");
@@ -411,8 +422,8 @@ internal static class Program
                     component.GetProperty("full_name").GetString() == "TracyLive.Sprite");
                 var physics = components.Single(component =>
                     component.GetProperty("full_name").GetString() == "TracyLive.PhysicsState");
-                var tag = components.Single(component =>
-                    component.GetProperty("full_name").GetString() == "TracyLive.BallTag");
+                var sample = components.Single(component =>
+                    component.GetProperty("full_name").GetString() == "TracyLive.SplineSample");
                 var spline = components.Single(component =>
                     component.GetProperty("full_name").GetString() == "pill_spline.Spline");
                 Assert(position.GetProperty("shared").GetBoolean(),
@@ -421,13 +432,13 @@ internal static class Program
                     "runtime Sprite mirror must be shared");
                 Assert(!physics.GetProperty("shared").GetBoolean(),
                     "project-owned PhysicsState must be dynamic");
-                Assert(!tag.GetProperty("shared").GetBoolean(),
-                    "project-owned BallTag must be dynamic");
-                Equal(tag.GetProperty("size").GetInt32(), 4, "BallTag size mismatch");
-                Equal(tag.GetProperty("alignment").GetInt32(), 4,
-                    "BallTag alignment mismatch");
-                Equal(tag.GetProperty("fields").GetArrayLength(), 1,
-                    "BallTag field schema mismatch");
+                Assert(!sample.GetProperty("shared").GetBoolean(),
+                    "project-owned SplineSample must be dynamic");
+                Equal(sample.GetProperty("size").GetInt32(), 4, "SplineSample size mismatch");
+                Equal(sample.GetProperty("alignment").GetInt32(), 4,
+                    "SplineSample alignment mismatch");
+                Equal(sample.GetProperty("fields").GetArrayLength(), 1,
+                    "SplineSample field schema mismatch");
                 // The module mirror is declared in the project (not shared on
                 // the managed side); the Rust host resolves it to the module's
                 // native binding by stable identity instead.
@@ -480,18 +491,21 @@ internal static class Program
                 Equal(mixed.Accesses.Length, 1, "query plus Commands lost query access");
             });
 
-            Test("project startup queues exactly 100 fully described balls", () =>
+            Test("ball spawn system queues the missing balls and nothing else", () =>
             {
                 MockNativeWorld.ResetCommands();
                 EngineApi api = MockNativeWorld.Api();
                 Engine.Bind(&api);
-                var startups = ProjectHost.DiscoverStartups(typeof(ProjectStartup).Assembly);
-                Equal(startups.Length, 1, "unexpected startup count");
-                startups[0].Run();
-                Equal(MockNativeWorld.QueuedCreates, 100, "startup create count mismatch");
-                Equal(MockNativeWorld.LastCreateComponentCount, 4,
-                    "each ball must contain PhysicsState, Position, Sprite, and BallTag");
-                Equal(MockNativeWorld.NextEntityId, 100UL, "startup did not reserve unique entities");
+                var method = typeof(BallSpawnSystem).GetMethod(nameof(BallSpawnSystem.Run))
+                    ?? throw new InvalidOperationException("BallSpawnSystem.Run is missing");
+                // The mock world has no PhysicsState column, so the spawn system
+                // sees an empty world and queues the full scene, which is also
+                // what a fresh project build does.
+                ProjectHost.CreateSystem(method).Run();
+                Equal(MockNativeWorld.QueuedCreates, 5, "spawn create count mismatch");
+                Equal(MockNativeWorld.LastCreateComponentCount, 3,
+                    "each ball must contain PhysicsState, Position, and Sprite");
+                Equal(MockNativeWorld.NextEntityId, 5UL, "spawn did not reserve unique entities");
             });
 
             Test("managed Commands reports stale entity generations", () =>
@@ -1006,8 +1020,8 @@ internal static class Program
                     (delegate* unmanaged<uint, uint>)&LoaderInterop.SystemErrorMessageLength;
 
                 Equal(init((IntPtr)(&api)), 1, "loader init failed");
-                // BallPhysicsSystem + BallTagSystem + the module-spline bridge demo.
-                Equal(systemCount(), 3u, "unexpected managed system count");
+                // BallPhysicsSystem + the snapshot, spawn, spline and sample systems.
+                Equal(systemCount(), 7u, "unexpected managed system count");
                 Equal(runSystem(1), 1, "healthy system reported failure");
                 Equal(errorLength(1), 0u,
                     "healthy system carries a stale error message");
