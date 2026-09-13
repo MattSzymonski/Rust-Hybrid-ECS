@@ -49,6 +49,11 @@ mod hot_patch;
 #[cfg(feature = "hot_patch")]
 pub use hot_patch::PatchGeneration;
 
+/// Complete standalone application runner owned by the host crate.
+/// Windowed-frontend and rendering errors, owned by the host because the
+/// host owns the event loop and the renderer.
+#[cfg(feature = "rendering")]
+mod frontend;
 /// Native project-library loading and Windows-safe temporary-copy handling.
 #[cfg(feature = "hot_reload")]
 mod native_library;
@@ -59,11 +64,6 @@ mod project_module;
 /// The sequence every reload runs once its replacement image is loaded.
 #[cfg(feature = "hot_reload")]
 mod reload;
-/// Complete standalone application runner owned by the host crate.
-/// Windowed-frontend and rendering errors, owned by the host because the
-/// host owns the event loop and the renderer.
-#[cfg(feature = "rendering")]
-mod frontend;
 
 mod runner;
 /// Engine ownership and frontend-facing frame orchestration.

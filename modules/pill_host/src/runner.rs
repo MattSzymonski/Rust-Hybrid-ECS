@@ -24,8 +24,14 @@
 use std::sync::Arc;
 
 // External crates
+#[cfg(feature = "rendering")]
+use pill_core::error;
 #[cfg(not(feature = "rendering"))]
 use pill_core::error::HostError;
+#[cfg(feature = "rendering")]
+use pill_core::telemetry::telemetry_target;
+#[cfg(feature = "rendering")]
+use pill_core::utils::format_error_chain;
 #[cfg(feature = "rendering")]
 use winit::application::ApplicationHandler;
 #[cfg(feature = "rendering")]
@@ -78,6 +84,7 @@ impl ApplicationHandler for WindowedApplication {
         let host = match crate::setup(self.project.clone()) {
             Ok(host) => host,
             Err(error) => {
+                report_failure("host setup", &error);
                 self.setup_error = Some(error.into());
                 event_loop.exit();
                 return;
@@ -98,6 +105,7 @@ impl ApplicationHandler for WindowedApplication {
         let window = match event_loop.create_window(attributes) {
             Ok(window) => Arc::new(window),
             Err(source) => {
+                report_failure("window creation", &source);
                 self.setup_error = Some(FrontendError::WindowCreation { source }.into());
                 event_loop.exit();
                 return;
@@ -118,6 +126,7 @@ impl ApplicationHandler for WindowedApplication {
                 self.present_first_frame_and_reveal(event_loop);
             }
             Err(error) => {
+                report_failure("renderer attachment", &error);
                 self.setup_error = Some(error.into());
                 event_loop.exit();
             }
@@ -132,7 +141,14 @@ impl ApplicationHandler for WindowedApplication {
         event: WindowEvent,
     ) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // The loop ends here as well as in the error arms, so it gets a
+                // line of its own: without it, a shutdown that follows a window
+                // close looks exactly like one that follows a failure in the
+                // frame path - both are an event loop that simply stopped.
+                println!("[host] Close requested; leaving the event loop.");
+                event_loop.exit();
+            }
             WindowEvent::Resized(size) => {
                 if let Some(host) = &mut self.host {
                     host.resize(size.width, size.height);
@@ -170,10 +186,12 @@ impl WindowedApplication {
                 window.set_visible(true);
                 self.window_shown = true;
                 window.request_redraw();
+                println!("[host] First frame presented; window shown.");
             }
             Err(source) => {
                 // Step 4: Rendering failed before the window was shown; report
                 // through the regular error boundary without revealing it.
+                report_failure("first frame render", &source);
                 self.setup_error = Some(source.into());
                 event_loop.exit();
             }
@@ -212,6 +230,7 @@ impl WindowedApplication {
             Err(source) => {
                 // Step 5: The frame renderer failed; stop the loop and report
                 // the typed failure through the regular error boundary.
+                report_failure("frame render", &source);
                 self.setup_error = Some(source.into());
                 event_loop.exit();
             }
@@ -222,6 +241,43 @@ impl WindowedApplication {
 // =============================================================================
 // Free Functions
 // =============================================================================
+
+/// Report a failure where it happens, before anything starts tearing down.
+///
+/// The error is also stored so the run function can return it, but that return
+/// happens after the host has been dropped - and dropping it unmaps the module
+/// images, where a stale call can kill the process first. Reporting at the
+/// point of failure is what keeps the original cause in the log, and the whole
+/// source chain is reported with it, because the outer message of these errors
+/// names the operation and only the causes name the reason.
+#[cfg(feature = "rendering")]
+fn report_failure(context: &str, error: &(dyn std::error::Error + 'static)) {
+    let cause_chain = format_error_chain(error);
+    eprintln!("[host] {context} failed: {cause_chain}");
+    error!(
+        target: telemetry_target::ENGINE,
+        error = %cause_chain,
+        "{} failed",
+        context
+    );
+}
+
+/// Drop a frontend's state, announcing the teardown around it.
+///
+/// The drop unmaps every module copy and drops the engine, and it is the one
+/// phase where the process can die with nothing of its own to say: a call into
+/// an already-unmapped image faults natively. The two lines bracket that region
+/// in the log, so a crash inside the drop shows the first line and no second
+/// one.
+///
+/// Only the windowed run reaches it: the headless loop runs until the process
+/// is killed, so it never tears the host down.
+#[cfg(feature = "rendering")]
+fn teardown<T>(state: T) {
+    println!("[host] Shutting down.");
+    drop(state);
+    println!("[host] Shutdown complete.");
+}
 
 /// Run the configured project continuously without creating a native window.
 ///
@@ -268,15 +324,22 @@ pub fn run(project: impl Into<crate::ProjectSource>) -> Result<(), RenderingErro
     };
 
     // Step 4: Run the event loop until the window is closed.
-    event_loop
-        .run_app(&mut application)
-        .map_err(|source| FrontendError::EventLoopCreation { source })?;
+    let event_loop_result = event_loop.run_app(&mut application);
 
-    // Window-creation and host setup happen inside the event loop; surface
-    // any deferred failure after the loop exits.
-    if let Some(error) = application.setup_error {
+    // Step 5: Take the failure recorded inside the loop and tear the
+    // application down. The error is deliberately not reported here: every
+    // path that records one reports it where it happens, before this teardown,
+    // because the drop below unmaps the module images and a fault inside it
+    // would end the process before a report made here could reach the console.
+    let deferred_error = application.setup_error.take();
+    teardown(application);
+
+    // Step 6: Surface the first failure, so the event loop's own error cannot
+    // mask the deferred one that explains it.
+    if let Some(error) = deferred_error {
         return Err(error);
     }
+    event_loop_result.map_err(|source| FrontendError::EventLoopCreation { source })?;
     Ok(())
 }
 

@@ -212,3 +212,57 @@ public static class ModuleSplineBridgeDemo
             $"first P0.X={firstPointX}, count={firstPointCount}, xxxomo=({omo.X},{omo.Y}) sum={omoSum} a={omoA} b={omoB}");
     }
 }
+
+// =============================================================================
+// Heap-data demo: the `Trail` component (defined in pill_spline) owns a
+// growable `Vec<f32>` and a `String`, which the host mirrors as accessor
+// members instead of plain fields. C# cannot construct such a component (a
+// zero-filled `Vec` header is not a valid Rust value), so the module seeds one
+// at registration and this system reads it:
+//
+//   * `ref row.Trail`    - no header copy; the row value stays in place;
+//   * `trail.Points`     - ONE boundary call acquires a span over the whole
+//                          Vec; iterating that span is free;
+//   * `trail.GetLabel()` - one call, decoded from UTF-8.
+//
+// The write-side members (`PointsMut`, `ResizePoints`, `SetLabel`) have the
+// same shape; declaring `Query<Write<Trail>>` is what makes them legal. See
+// local/documents/pill_heap_types_101.md section 6 for the member table.
+// =============================================================================
+
+public static class TrailReadSystem
+{
+    private static long _lastReport;
+
+    [EcsSystem]
+    public static void Run(Query<Read<global::pill_spline.Trail>> query)
+    {
+        long now = Stopwatch.GetTimestamp();
+        if (Stopwatch.GetElapsedTime(_lastReport, now).TotalMilliseconds < 2000)
+            return;
+        _lastReport = now;
+
+        int trailCount = 0;
+        int sampleCount = 0;
+        float sampleSum = 0.0f;
+        string firstLabel = string.Empty;
+
+        foreach (var row in query.Rows())
+        {
+            ref readonly global::pill_spline.Trail trail = ref row.Trail;
+
+            ReadOnlySpan<float> samples = trail.Points;
+            for (int index = 0; index < samples.Length; index++)
+                sampleSum += samples[index];
+
+            sampleCount += samples.Length;
+            if (trailCount == 0)
+                firstLabel = trail.GetLabel();
+            trailCount++;
+        }
+
+        Console.WriteLine(
+            $"[project_cs] cs heap demo: {trailCount} trail(s), " +
+            $"{sampleCount} sample(s), sum={sampleSum:F2}, first=\"{firstLabel}\"");
+    }
+}

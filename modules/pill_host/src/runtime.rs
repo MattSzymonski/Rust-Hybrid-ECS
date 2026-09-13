@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 use pill_core::error::CSharpError;
 use pill_core::error::{EngineMessage, HostError};
 use pill_core::telemetry::telemetry_target;
+use pill_core::utils::format_error_chain;
 use pill_core::{error, info};
 use pill_engine::Engine;
 #[cfg(feature = "hot_reload")]
@@ -422,6 +423,26 @@ pub type ProjectSource = StaticProject;
 // Free Functions
 // =============================================================================
 
+/// Report a setup failure and hand the error back to the caller.
+///
+/// The host state built so far unwinds as soon as the error is returned, and
+/// what it owns is loaded module images: dropping one unmaps code the engine
+/// may still be running, and a fault in that unmap would destroy the only copy
+/// of this error. Reporting first is what keeps the failure legible when the
+/// unload then crashes, which is how the first windowed-startup failure went
+/// missing.
+#[cfg(feature = "hot_reload")]
+fn report_setup_failure(error: HostError) -> HostError {
+    let cause_chain = format_error_chain(&error);
+    eprintln!("[host] Host setup failed: {cause_chain}");
+    error!(
+        target: telemetry_target::ENGINE,
+        error = %cause_chain,
+        "host setup failed"
+    );
+    error
+}
+
 #[cfg(feature = "hot_reload")]
 /// Build/load the project module, create the engine, and start its source watcher.
 ///
@@ -467,20 +488,25 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
     let mut optional_modules = Vec::with_capacity(host_config.optional_modules.len());
     for (index, module_config) in host_config.optional_modules.iter().enumerate() {
         let module_generation = Arc::new(AtomicU64::new(0));
-        let slot = OptionalModuleSlot::start(
+        let slot = match OptionalModuleSlot::start(
             &mut engine,
             &engine_api,
             &workspace_root,
             module_config,
             pill_engine::SystemOwner::optional_module(index),
             Arc::clone(&module_generation),
-        )?;
-        spawn_source_watcher(
+        ) {
+            Ok(slot) => slot,
+            Err(error) => return Err(report_setup_failure(error.into())),
+        };
+        if let Err(error) = spawn_source_watcher(
             workspace_root.clone(),
             &module_config.name,
             &module_config.watch_directory,
             module_generation,
-        )?;
+        ) {
+            return Err(report_setup_failure(error.into()));
+        }
         optional_modules.push(slot);
     }
 
@@ -512,22 +538,27 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
             all_mirror_methods.extend(crate::csharp::accessor_rows(&accessors));
         }
     }
-    let loaded_project = LoadedProject::start(
+    let loaded_project = match LoadedProject::start(
         &mut engine,
         &engine_api,
         &workspace_root,
         &module_config,
         &module_exposed_components,
         &all_mirror_methods,
-    )?;
+    ) {
+        Ok(project) => project,
+        Err(error) => return Err(report_setup_failure(error)),
+    };
 
     let reload_generation = Arc::new(AtomicU64::new(0));
-    spawn_source_watcher(
+    if let Err(error) = spawn_source_watcher(
         workspace_root.clone(),
         &module_config.name,
         &module_config.watch_directory,
         Arc::clone(&reload_generation),
-    )?;
+    ) {
+        return Err(report_setup_failure(error.into()));
+    }
 
     // Step 6: Snapshot host memory and print the startup analytics report.
     // Every module has been built, staged, loaded and initialized by now, so
@@ -673,6 +704,12 @@ where
     W: RendererWindow + 'static,
 {
     let host = setup(project.into())?;
+    info!(
+        target: telemetry_target::RENDERING,
+        width,
+        height,
+        "attaching the engine renderer to the window surface"
+    );
     let renderer = Renderer::new(window, width, height)?;
     Ok(RenderingHost { host, renderer })
 }
@@ -698,6 +735,12 @@ pub fn attach_renderer<W>(
 where
     W: RendererWindow + 'static,
 {
+    info!(
+        target: telemetry_target::RENDERING,
+        width,
+        height,
+        "attaching the engine renderer to the window surface"
+    );
     let renderer = Renderer::new(window, width, height)?;
     Ok(RenderingHost { host, renderer })
 }

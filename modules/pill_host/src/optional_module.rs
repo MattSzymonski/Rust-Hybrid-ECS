@@ -366,6 +366,23 @@ mod slot {
         }
     }
 
+    impl Drop for OptionalModuleSlot {
+        /// Announce the unload of this module's images, current and retired.
+        ///
+        /// The fields drop straight after this body, and each one unmaps a
+        /// native library whose exported code engine-owned pointers may still
+        /// refer to. That makes this the riskiest moment in a host's life, so
+        /// every module names itself in the log before its images go.
+        fn drop(&mut self) {
+            info!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = %self.config.name,
+                generations = self.old_libraries.len() + 1,
+                "unloading optional module"
+            );
+        }
+    }
+
     // =============================================================================
     // Free Functions
     // =============================================================================

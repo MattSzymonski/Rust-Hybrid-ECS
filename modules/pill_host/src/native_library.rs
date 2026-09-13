@@ -953,6 +953,14 @@ impl Drop for NativeLibrary {
     /// because Windows refuses to delete a file that is still mapped into the
     /// process. Cleanup failures are reported rather than swallowed.
     fn drop(&mut self) {
+        // This is the drop in which a stale call into already-freed code shows
+        // up, so the image is named before it goes: the last line printed is
+        // what identifies the image when the process dies inside this drop.
+        info!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            path = %self.temporary_path.display(),
+            "unmapping module copy"
+        );
         drop(self.library.take());
         if let Err(error) = std::fs::remove_file(&self.temporary_path) {
             eprintln!(

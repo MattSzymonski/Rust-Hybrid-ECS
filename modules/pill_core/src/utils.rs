@@ -227,6 +227,47 @@ pub fn get_project_error_message<E: std::error::Error>(result: Result<(), E>) ->
     })
 }
 
+/// Format an error and its full source chain on a single line.
+///
+/// Console reports render errors with `Display`, which shows only the outermost
+/// message. The cause that names the actual problem - which import could not be
+/// resolved, which file was not found - sits under it in the chain, so a report
+/// built from `Display` alone says an operation failed without saying why.
+/// Causes are appended in order, separated by `: `.
+///
+/// Use [`get_project_error_message`] where a multi-line report is wanted: this
+/// one is shaped for one log line.
+///
+/// # Examples
+///
+/// ```
+/// use pill_core::utils::format_error_chain;
+///
+/// #[derive(Debug)]
+/// struct ProjectError;
+///
+/// impl std::fmt::Display for ProjectError {
+///     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+///         formatter.write_str("project exploded")
+///     }
+/// }
+///
+/// impl std::error::Error for ProjectError {}
+///
+/// assert_eq!(format_error_chain(&ProjectError), "project exploded");
+/// ```
+pub fn format_error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut message = error.to_string();
+    // Walk the causes inwards, so the line reads in the order they happened.
+    let mut source = error.source();
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    message
+}
+
 // =============================================================================
 // Project entry-point generation
 // =============================================================================

@@ -404,7 +404,15 @@ impl ReloadTransaction<'_> {
             .push(std::mem::replace(&mut *self.current, new_library));
         if self.old_libraries.len() > MAX_GRAVEYARD_GENERATIONS {
             // Dropping the evicted generation unmaps its image and deletes its
-            // temporary file on disk.
+            // temporary file on disk. Logged before the drop: anything still
+            // holding a pointer into that image faults inside it, and this line
+            // is what tells that apart from a crash somewhere else.
+            info!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                subject = self.subject,
+                generations = self.old_libraries.len(),
+                "evicting the oldest retired generation"
+            );
             drop(self.old_libraries.remove(0));
         }
 
