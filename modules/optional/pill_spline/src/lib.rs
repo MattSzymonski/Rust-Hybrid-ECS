@@ -3,8 +3,6 @@
 //! # Responsibilities
 //!
 //! - Defines the [`Spline`] component: an ordered set of control points.
-//! - Defines the [`Trail`] component: the crate's heap-bearing demo, a
-//!   `Vec<f32>` plus a `String` that C# reads through generated accessors.
 //! - Samples a position anywhere along that path with [`Spline::get_location_at`].
 //! - Registers the component through the optional-module ABI when loaded.
 //!
@@ -22,11 +20,6 @@
 //! keeping the component plain data means no heap allocation is created by one
 //! library and released by another, and it keeps the `#[repr(C)]` layout
 //! meaningful across a hot reload.
-//!
-//! [`Trail`] is the deliberate opposite: it exists to exercise the heap-field
-//! mirror and trampoline pipeline (`pill_heap_types_101.md`, §6), so managed
-//! code can iterate a module component's container payload without copying a
-//! row header.
 //!
 //! Registration work lives in [`register`], a plain Rust function, so the same
 //! crate can be linked statically into a monolithic build. Another module or
@@ -57,12 +50,6 @@ pub const MAX_CONTROL_POINTS: usize = 16;
 /// Used only by the module-abi registration path; the project build compiles
 /// that path out, so the constant is gated with it to stay warning-free.
 const DEMO_SPLINE_COUNT: usize = 1;
-
-/// Number of demo trails the module keeps in the world.
-///
-/// Like [`DEMO_SPLINE_COUNT`], this exists for the module-abi registration
-/// path and is compiled out of the project build with it.
-const DEMO_TRAIL_COUNT: usize = 1;
 
 /// Extra vertical offset applied to every sampled position.
 ///
@@ -106,28 +93,6 @@ impl Default for Spline {
             elo: 30.0,
         }
     }
-}
-
-/// A named polyline: the heap-bearing counterpart of [`Spline`].
-///
-/// Where `Spline` keeps its samples inline, `Trail` owns real allocations - a
-/// growable `Vec<f32>` and a UTF-8 `String` - so the host mirrors container
-/// members to C# (`points` becomes `PointsCount`/`Points`/`PointsMut`/
-/// `ResizePoints`, `label` becomes `GetLabel`/`SetLabel`) instead of plain
-/// fields. `project_cs`'s heap demo queries this type and walks the `Points`
-/// span; see `pill_heap_types_101.md` §6 for the member list.
-///
-/// C# cannot construct it (a zero-filled `Vec` header is not a valid Rust
-/// value), so the module seeds one at registration and managed code reads and
-/// mutates the resulting rows.
-#[repr(C)]
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PillComponent)]
-#[pill(persistable)]
-pub struct Trail {
-    /// Sample points along the path, in order.
-    pub points: Vec<f32>,
-    /// Human-readable name of the path.
-    pub label: String,
 }
 
 #[repr(C)]
@@ -299,14 +264,6 @@ fn demo_spline() -> Spline {
     ])
 }
 
-/// One demo trail: five samples along a straight run.
-fn demo_trail() -> Trail {
-    Trail {
-        points: vec![0.0, 40.0, 80.0, 120.0, 160.0],
-        label: String::from("demo trail"),
-    }
-}
-
 // =============================================================================
 // Registration
 // =============================================================================
@@ -341,24 +298,6 @@ pub fn register(engine: &mut Engine) -> u32 {
         {
             // Report the failure so the host keeps the previous generation
             // instead of running with a half-populated world.
-            return 1;
-        }
-    }
-
-    // The heap-bearing demo component fills up the same way: one trail, with
-    // its `Vec<f32>` and `String` owned by this module's allocator.
-    let existing_trail_count = {
-        let mut query = Query::<&Trail>::new(engine.world_mut());
-        query.iter_mut().count()
-    };
-    for _ in existing_trail_count..DEMO_TRAIL_COUNT {
-        if engine
-            .world_mut()
-            .create_entity()
-            .with(demo_trail())
-            .build()
-            .is_err()
-        {
             return 1;
         }
     }
