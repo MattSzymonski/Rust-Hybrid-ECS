@@ -224,7 +224,7 @@ fn buffer_contents_survive_migration_and_the_fast_path() {
     let previous = world.capture_persist_type_metadata();
     world.register_persistable_component_with_layout::<Trail>(ALTERED_LAYOUT);
     let changed: HashSet<String> = HashSet::from([type_name]);
-    let report = world.migrate_changed_persistable_components(&previous, &changed);
+    let report = world.migrate_changed_persistable_components(&previous, &changed, None);
     assert_eq!(report.migrated_type_count, 1);
     assert_eq!(report.migrated_entity_count, 1);
 
@@ -238,7 +238,11 @@ fn buffer_contents_survive_migration_and_the_fast_path() {
     // The unchanged-schema fast path visits no value at all: the same block
     // stays in place, which is what keeps outstanding views valid.
     let previous = world.capture_persist_type_metadata();
-    let report = world.migrate_changed_persistable_components(&previous, &HashSet::new());
+    let report = world.migrate_changed_persistable_components(
+        &previous,
+        &HashSet::new(),
+        None,
+    );
     assert_eq!(report.migrated_type_count, 0);
     let trail = world
         .get_component::<Trail>(entity)

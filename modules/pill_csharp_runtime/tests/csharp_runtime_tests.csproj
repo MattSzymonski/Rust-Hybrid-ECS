@@ -17,6 +17,11 @@
     <!-- The gameplay assembly moved from modules/project_cs to examples/project_cs;
          keep the nested test -> project -> C# runtime chain pointing at it. -->
     <ProjectReference Include="../../../examples/project_cs/project_cs.csproj" />
+    <!-- Named query-row iteration for the test systems, mirroring how a
+         gameplay project references the generator. -->
+    <ProjectReference Include="../generators/PillIterationGenerators.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

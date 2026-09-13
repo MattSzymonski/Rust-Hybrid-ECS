@@ -8,9 +8,13 @@ REQUIREMENTS
 
 DESCRIPTION
     This script launches the standalone host and executes a table-driven migration
-    suite by editing devops/tests/project/src/lib.rs. Every scenario waits for hot-reload,
-    checks crash signals, verifies expected migration logs, and optionally
-    validates that the counter system still ticks.
+    suite by editing devops/tests/project/src/lib.rs. Every scenario waits for
+    hot-reload, checks crash signals, verifies expected migration logs, optionally
+    validates migration entity counts and the fixture's value witnesses (component
+    values printed once per generation), and that the counter system still ticks.
+    One scenario expects the reload to be REJECTED - a size-changing schema edit
+    trips an engine guard - and asserts the rollback and continued ticking instead
+    of a completed reload.
 
 USAGE
   python tests/test_hot_reload_migration.py [--cycles N] [--timeout-scale S]
@@ -56,6 +60,23 @@ SELECTIVE_FINISHED_TOKEN = MIGRATION_FINISHED_TOKEN
 FRAMECOUNTER_MIGRATE_LOG_TOKEN = "'project::FrameCounter' -> migrating"
 SPATIAL_POSITION_MIGRATE_LOG_TOKEN = "'project::SpatialPosition' -> migrating"
 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN = "'project::LinearVelocity' -> migrating"
+MARKER_TRAIL_MIGRATE_LOG_TOKEN = "'project::MarkerTrail' -> migrating"
+DESERIALIZE_FAILED_TOKEN = "[persistence] Failed to deserialize"
+
+# Value witnesses: the fixture prints its components once per module generation
+# (see the witness systems in project/src/lib.rs), so a scenario can assert that
+# migration carried VALUES across, not just entity counts. Without these, a
+# migration that silently reset every field to its default would still pass.
+WITNESS_POSITION_2 = "[project] witness SpatialPosition(10.00,20.00)"
+WITNESS_POSITION_3_A = "[project] witness SpatialPosition(10.00,20.00,0.00)"
+WITNESS_POSITION_3_B = "[project] witness SpatialPosition(1.00,2.00,1.00)"
+WITNESS_POSITION_3_C = "[project] witness SpatialPosition(-5.00,8.00,2.00)"
+WITNESS_TRAIL_ALPHA = (
+    '[project] witness MarkerTrail(points=3,sum=6.00,label="alpha",samples=2,last=1.50)'
+)
+WITNESS_TRAIL_BETA = (
+    '[project] witness MarkerTrail(points=2,sum=9.00,label="beta",samples=1,last=2.50)'
+)
 
 STARTUP_TIMEOUT = 60
 RELOAD_TIMEOUT = 45
@@ -161,6 +182,183 @@ LINEAR_VELOCITY_ENTITY_TWO_RENAMED = """.with(LinearVelocity {
             upward_speed: 0.75,
         })"""
 
+# SpatialPosition after the depth field was added: reordering the fields must
+# not reorder the DATA (JSON migrates by field name).
+SPATIAL_POSITION_REORDERED = """struct SpatialPosition {
+    depth: f32,
+    vertical: f32,
+    horizontal: f32,
+}"""
+
+# Widening a field changes the component's in-memory size, which the registry
+# guard refuses outright: the reload is rejected and the host rolls back. This
+# edit therefore runs last, once no later scenario needs a working source tree.
+SPATIAL_POSITION_WIDENED = """struct SpatialPosition {
+    depth: f32,
+    vertical: f32,
+    horizontal: f64,
+}"""
+
+WITNESS_POSITION_PRINT_BASE = """        println!(
+            "[project] witness SpatialPosition({:.2},{:.2})",
+            position.horizontal, position.vertical
+        );"""
+
+WITNESS_POSITION_PRINT_WITH_DEPTH = """        println!(
+            "[project] witness SpatialPosition({:.2},{:.2},{:.2})",
+            position.horizontal, position.vertical, position.depth
+        );"""
+
+MARKER_TRAIL_BASE = """struct MarkerTrail {
+    points: Vec<f32>,
+    label: String,
+    samples: DynamicBuffer<f32>,
+}"""
+
+MARKER_TRAIL_WITH_STAMPS = """struct MarkerTrail {
+    points: Vec<f32>,
+    label: String,
+    samples: DynamicBuffer<f32>,
+    stamps: Vec<u32>,
+}"""
+
+MARKER_TRAIL_POINTS_F64 = """struct MarkerTrail {
+    points: Vec<f64>,
+    label: String,
+    samples: DynamicBuffer<f32>,
+    stamps: Vec<u32>,
+}"""
+
+MARKER_TRAIL_RENAMED_LABEL = """struct MarkerTrail {
+    points: Vec<f64>,
+    name: String,
+    samples: DynamicBuffer<f32>,
+    stamps: Vec<u32>,
+}"""
+
+# A `Vec` is 24 bytes whatever it holds, so changing the ELEMENT type keeps the
+# component's size stable - the registry guard lets it through and the failure
+# only shows up when the stored numbers meet `Vec<u32>` in the JSON layer.
+MARKER_TRAIL_INCOMPATIBLE = """struct MarkerTrail {
+    points: Vec<u32>,
+    name: String,
+    samples: DynamicBuffer<f32>,
+    stamps: Vec<u32>,
+}"""
+
+MARKER_TRAIL_SEED_ALPHA = """.with(MarkerTrail {
+            points: vec![1.0, 2.0, 3.0],
+            label: String::from("alpha"),
+            samples: DynamicBuffer::from_slice(&[0.5, 1.5]),
+        })"""
+
+MARKER_TRAIL_SEED_ALPHA_WITH_STAMPS = """.with(MarkerTrail {
+            points: vec![1.0, 2.0, 3.0],
+            label: String::from("alpha"),
+            samples: DynamicBuffer::from_slice(&[0.5, 1.5]),
+            stamps: vec![10, 11],
+        })"""
+
+MARKER_TRAIL_SEED_ALPHA_NAMED = """.with(MarkerTrail {
+            points: vec![1.0, 2.0, 3.0],
+            name: String::from("alpha"),
+            samples: DynamicBuffer::from_slice(&[0.5, 1.5]),
+            stamps: vec![10, 11],
+        })"""
+
+MARKER_TRAIL_SEED_ALPHA_U32 = """.with(MarkerTrail {
+            points: vec![1, 2, 3],
+            name: String::from("alpha"),
+            samples: DynamicBuffer::from_slice(&[0.5, 1.5]),
+            stamps: vec![10, 11],
+        })"""
+
+MARKER_TRAIL_SEED_BETA = """.with(MarkerTrail {
+            points: vec![4.0, 5.0],
+            label: String::from("beta"),
+            samples: DynamicBuffer::from_slice(&[2.5]),
+        })"""
+
+MARKER_TRAIL_SEED_BETA_WITH_STAMPS = """.with(MarkerTrail {
+            points: vec![4.0, 5.0],
+            label: String::from("beta"),
+            samples: DynamicBuffer::from_slice(&[2.5]),
+            stamps: vec![20],
+        })"""
+
+MARKER_TRAIL_SEED_BETA_NAMED = """.with(MarkerTrail {
+            points: vec![4.0, 5.0],
+            name: String::from("beta"),
+            samples: DynamicBuffer::from_slice(&[2.5]),
+            stamps: vec![20],
+        })"""
+
+MARKER_TRAIL_SEED_BETA_U32 = """.with(MarkerTrail {
+            points: vec![4, 5],
+            name: String::from("beta"),
+            samples: DynamicBuffer::from_slice(&[2.5]),
+            stamps: vec![20],
+        })"""
+
+WITNESS_TRAIL_PRINT_BASE = r"""        let sum: f32 = trail.points.iter().sum();
+        let last = trail.samples.last().copied().unwrap_or(0.0);
+        println!(
+            "[project] witness MarkerTrail(points={},sum={:.2},label=\"{}\",samples={},last={:.2})",
+            trail.points.len(),
+            sum,
+            trail.label,
+            trail.samples.len(),
+            last,
+        );"""
+
+WITNESS_TRAIL_PRINT_WITH_STAMPS = r"""        let sum: f32 = trail.points.iter().sum();
+        let last = trail.samples.last().copied().unwrap_or(0.0);
+        println!(
+            "[project] witness MarkerTrail(points={},sum={:.2},label=\"{}\",samples={},last={:.2},stamps={})",
+            trail.points.len(),
+            sum,
+            trail.label,
+            trail.samples.len(),
+            last,
+            trail.stamps.len(),
+        );"""
+
+WITNESS_TRAIL_PRINT_WITH_STAMPS_F64 = r"""        let sum: f64 = trail.points.iter().sum();
+        let last = trail.samples.last().copied().unwrap_or(0.0);
+        println!(
+            "[project] witness MarkerTrail(points={},sum={:.2},label=\"{}\",samples={},last={:.2},stamps={})",
+            trail.points.len(),
+            sum,
+            trail.label,
+            trail.samples.len(),
+            last,
+            trail.stamps.len(),
+        );"""
+
+WITNESS_TRAIL_PRINT_NAMED = r"""        let sum: f64 = trail.points.iter().sum();
+        let last = trail.samples.last().copied().unwrap_or(0.0);
+        println!(
+            "[project] witness MarkerTrail(points={},sum={:.2},name=\"{}\",samples={},last={:.2},stamps={})",
+            trail.points.len(),
+            sum,
+            trail.name,
+            trail.samples.len(),
+            last,
+            trail.stamps.len(),
+        );"""
+
+WITNESS_TRAIL_PRINT_U32 = r"""        let sum: f64 = trail.points.iter().map(|&value| value as f64).sum();
+        let last = trail.samples.last().copied().unwrap_or(0.0);
+        println!(
+            "[project] witness MarkerTrail(points={},sum={:.2},name=\"{}\",samples={},last={:.2},stamps={})",
+            trail.points.len(),
+            sum,
+            trail.name,
+            trail.samples.len(),
+            last,
+            trail.stamps.len(),
+        );"""
+
 
 THRESHOLD_200 = "const THRESHOLD: u64 = 200;"
 THRESHOLD_150 = "const THRESHOLD: u64 = 150;"
@@ -181,6 +379,13 @@ class Scenario:
     required_tokens: Sequence[str]
     forbidden_tokens: Sequence[str]
     expected_migration_entity_counts: Sequence[Tuple[str, int]] = ()
+    expected_witness_tokens: Sequence[str] = ()
+
+    # A rejected reload never reaches "hot reload complete": the engine refuses
+    # the generation (its debug guard catches the mismatch) and the host rolls
+    # back to the running one. The scenario waits for the rollback marker instead
+    # and treats the assertion panic as the expected outcome rather than a crash.
+    expect_rejected_reload: bool = False
 
 
 # =============================================================================
@@ -288,6 +493,21 @@ def validate_migration_entity_counts(
     return True
 
 
+def validate_witness_tokens(
+    label: str,
+    output: str,
+    expected_tokens: Sequence[str],
+) -> bool:
+    """Validates that migrated VALUES survived: the fixture's per-generation
+    witness lines must contain every expected value string."""
+    for token in expected_tokens:
+        if token not in output:
+            print(f"  [FAIL] Missing witness value for {label}: {token!r}")
+            print(f"  Output tail:\n{output[-1600:]}")
+            return False
+    return True
+
+
 def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
     """Runs one scenario edit and asserts reload/log behavior."""
     print(f"\n  [TEST] {scenario.name}...")
@@ -296,7 +516,10 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
     if not apply_replacements(scenario.replacements):
         return False
 
-    if not monitor.wait_for(RELOAD_COMPLETE_TOKEN, RELOAD_TIMEOUT, start_index):
+    settle_token = (
+        ROLLBACK_TOKEN if scenario.expect_rejected_reload else RELOAD_COMPLETE_TOKEN
+    )
+    if not monitor.wait_for(settle_token, RELOAD_TIMEOUT, start_index):
         output = monitor.output_since(start_index)
         if has_crash_signals(output):
             print(f"  [FAIL] Crash detected in scenario: {scenario.name}")
@@ -318,7 +541,16 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
 
     output = monitor.output_since(start_index)
 
-    if has_crash_signals(output):
+    crash_signals = has_crash_signals(output)
+    if scenario.expect_rejected_reload:
+        # The rejection is an assertion inside the engine. Seeing its panic here
+        # proves the guard fired; the counter-tick check above already proved the
+        # host survived it and kept serving the previous generation.
+        if not crash_signals:
+            print(f"  [FAIL] Expected a rejection panic, saw none: {scenario.name}")
+            print(f"  Output tail:\n{output[-1600:]}")
+            return False
+    elif crash_signals:
         print(f"  [FAIL] Crash token observed in scenario output: {scenario.name}")
         print(f"  Output tail:\n{output[-1600:]}")
         return False
@@ -335,6 +567,13 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
         scenario.name,
         output,
         scenario.expected_migration_entity_counts,
+    ):
+        return False
+
+    if not validate_witness_tokens(
+        scenario.name,
+        output,
+        scenario.expected_witness_tokens,
     ):
         return False
 
@@ -377,6 +616,7 @@ def build_scenarios() -> List[Scenario]:
             expect_counter_tick=True,
             required_tokens=[FAST_PATH_TOKEN],
             forbidden_tokens=[SELECTIVE_START_TOKEN],
+            expected_witness_tokens=[WITNESS_POSITION_2, WITNESS_TRAIL_ALPHA],
         ),
         Scenario(
             name="Modify FrameCounter: add migrated bool",
@@ -397,6 +637,7 @@ def build_scenarios() -> List[Scenario]:
                 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN,
             ],
             expected_migration_entity_counts=[("project::FrameCounter", 6)],
+            expected_witness_tokens=[WITNESS_POSITION_2, WITNESS_TRAIL_ALPHA],
         ),
         Scenario(
             name="Revert FrameCounter: remove migrated bool",
@@ -417,6 +658,7 @@ def build_scenarios() -> List[Scenario]:
                 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN,
             ],
             expected_migration_entity_counts=[("project::FrameCounter", 9)],
+            expected_witness_tokens=[WITNESS_POSITION_2, WITNESS_TRAIL_ALPHA],
         ),
         Scenario(
             name="Modify SpatialPosition: add depth coordinate",
@@ -425,6 +667,7 @@ def build_scenarios() -> List[Scenario]:
                 (SPATIAL_POSITION_ENTITY_ONE_BASE, SPATIAL_POSITION_ENTITY_ONE_WITH_DEPTH),
                 (SPATIAL_POSITION_ENTITY_TWO_BASE, SPATIAL_POSITION_ENTITY_TWO_WITH_DEPTH),
                 (SPATIAL_POSITION_ENTITY_THREE_BASE, SPATIAL_POSITION_ENTITY_THREE_WITH_DEPTH),
+                (WITNESS_POSITION_PRINT_BASE, WITNESS_POSITION_PRINT_WITH_DEPTH),
             ],
             expect_counter_tick=True,
             required_tokens=[
@@ -437,6 +680,13 @@ def build_scenarios() -> List[Scenario]:
                 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN,
             ],
             expected_migration_entity_counts=[("project::SpatialPosition", 12)],
+            # The added field defaults to zero on migrated entities while every
+            # pre-existing value survives: the witness pins exactly that.
+            expected_witness_tokens=[
+                WITNESS_POSITION_3_A,
+                WITNESS_POSITION_3_B,
+                WITNESS_POSITION_3_C,
+            ],
         ),
         Scenario(
             name="Modify LinearVelocity: rename vertical_speed field",
@@ -456,6 +706,11 @@ def build_scenarios() -> List[Scenario]:
                 SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
             ],
             expected_migration_entity_counts=[("project::LinearVelocity", 10)],
+            expected_witness_tokens=[
+                WITNESS_POSITION_3_A,
+                WITNESS_POSITION_3_B,
+                WITNESS_TRAIL_BETA,
+            ],
         ),
         Scenario(
             name="Remove LinearVelocity from registered/seeded components",
@@ -474,6 +729,143 @@ def build_scenarios() -> List[Scenario]:
                 SELECTIVE_START_TOKEN,
                 LINEAR_VELOCITY_MIGRATE_LOG_TOKEN,
             ],
+            expected_witness_tokens=[WITNESS_POSITION_3_C, WITNESS_TRAIL_ALPHA],
+        ),
+        Scenario(
+            name="Reorder SpatialPosition fields: data follows names, not positions",
+            replacements=[(SPATIAL_POSITION_WITH_DEPTH, SPATIAL_POSITION_REORDERED)],
+            expect_counter_tick=True,
+            required_tokens=[
+                SELECTIVE_START_TOKEN,
+                SELECTIVE_FINISHED_TOKEN,
+                SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
+            ],
+            forbidden_tokens=[
+                FRAMECOUNTER_MIGRATE_LOG_TOKEN,
+                LINEAR_VELOCITY_MIGRATE_LOG_TOKEN,
+            ],
+            expected_migration_entity_counts=[("project::SpatialPosition", 21)],
+            expected_witness_tokens=[
+                WITNESS_POSITION_3_A,
+                WITNESS_POSITION_3_B,
+                WITNESS_POSITION_3_C,
+            ],
+        ),
+        Scenario(
+            name="MarkerTrail: add a Vec<u32> field (old entities get an empty one)",
+            replacements=[
+                (MARKER_TRAIL_BASE, MARKER_TRAIL_WITH_STAMPS),
+                (MARKER_TRAIL_SEED_ALPHA, MARKER_TRAIL_SEED_ALPHA_WITH_STAMPS),
+                (MARKER_TRAIL_SEED_BETA, MARKER_TRAIL_SEED_BETA_WITH_STAMPS),
+                (WITNESS_TRAIL_PRINT_BASE, WITNESS_TRAIL_PRINT_WITH_STAMPS),
+            ],
+            expect_counter_tick=True,
+            required_tokens=[
+                SELECTIVE_START_TOKEN,
+                SELECTIVE_FINISHED_TOKEN,
+                MARKER_TRAIL_MIGRATE_LOG_TOKEN,
+            ],
+            forbidden_tokens=[
+                FRAMECOUNTER_MIGRATE_LOG_TOKEN,
+                SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
+            ],
+            expected_migration_entity_counts=[("project::MarkerTrail", 16)],
+            # Heap payloads must survive the schema change; the new vector must
+            # arrive empty on migrated rows (stamps=0) and seeded on new ones.
+            expected_witness_tokens=[
+                '[project] witness MarkerTrail(points=3,sum=6.00,label="alpha",samples=2,last=1.50,stamps=0)',
+                '[project] witness MarkerTrail(points=2,sum=9.00,label="beta",samples=1,last=2.50,stamps=0)',
+                '[project] witness MarkerTrail(points=3,sum=6.00,label="alpha",samples=2,last=1.50,stamps=2)',
+            ],
+        ),
+        Scenario(
+            name="MarkerTrail: widen the Vec element type f32 -> f64",
+            replacements=[
+                (MARKER_TRAIL_WITH_STAMPS, MARKER_TRAIL_POINTS_F64),
+                (WITNESS_TRAIL_PRINT_WITH_STAMPS, WITNESS_TRAIL_PRINT_WITH_STAMPS_F64),
+            ],
+            expect_counter_tick=True,
+            required_tokens=[
+                SELECTIVE_START_TOKEN,
+                SELECTIVE_FINISHED_TOKEN,
+                MARKER_TRAIL_MIGRATE_LOG_TOKEN,
+            ],
+            # Widening a Vec ELEMENT type keeps the component's size, so the
+            # entities this generation seeds land in the same archetype as the
+            # ones being converted. Feeding them to the retiring generation's
+            # f32 serializer reinterprets their f64 heap and prints sums like
+            # 1.88 for [1.0, 2.0, 3.0]; correct migration never produces those.
+            forbidden_tokens=[
+                FRAMECOUNTER_MIGRATE_LOG_TOKEN,
+                SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
+                "MarkerTrail(points=3,sum=1.88",
+                "MarkerTrail(points=2,sum=2.25",
+            ],
+            expected_migration_entity_counts=[("project::MarkerTrail", 20)],
+            expected_witness_tokens=[
+                '[project] witness MarkerTrail(points=3,sum=6.00,label="alpha",samples=2,last=1.50,stamps=0)',
+                '[project] witness MarkerTrail(points=2,sum=9.00,label="beta",samples=1,last=2.50,stamps=1)',
+                # This generation's own spawn, carried across the rebuilt
+                # column without reinterpretation.
+                '[project] witness MarkerTrail(points=3,sum=6.00,label="alpha",samples=2,last=1.50,stamps=2)',
+            ],
+        ),
+        Scenario(
+            name="MarkerTrail: rename label -> name (renamed text resets, rest survives)",
+            replacements=[
+                (MARKER_TRAIL_POINTS_F64, MARKER_TRAIL_RENAMED_LABEL),
+                (MARKER_TRAIL_SEED_ALPHA_WITH_STAMPS, MARKER_TRAIL_SEED_ALPHA_NAMED),
+                (MARKER_TRAIL_SEED_BETA_WITH_STAMPS, MARKER_TRAIL_SEED_BETA_NAMED),
+                (WITNESS_TRAIL_PRINT_WITH_STAMPS_F64, WITNESS_TRAIL_PRINT_NAMED),
+            ],
+            expect_counter_tick=True,
+            required_tokens=[
+                SELECTIVE_START_TOKEN,
+                SELECTIVE_FINISHED_TOKEN,
+                MARKER_TRAIL_MIGRATE_LOG_TOKEN,
+            ],
+            forbidden_tokens=[
+                FRAMECOUNTER_MIGRATE_LOG_TOKEN,
+                SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
+            ],
+            expected_migration_entity_counts=[("project::MarkerTrail", 20)],
+            expected_witness_tokens=[
+                # A renamed field has no source value: it resets to Default
+                # while its neighbours keep their data.
+                '[project] witness MarkerTrail(points=3,sum=6.00,name="",samples=2,last=1.50,stamps=2)',
+                '[project] witness MarkerTrail(points=3,sum=6.00,name="alpha",samples=2,last=1.50,stamps=2)',
+            ],
+        ),
+        Scenario(
+            name="MarkerTrail: change the Vec element type f32 -> u32 (snapshot no longer parses)",
+            replacements=[
+                (MARKER_TRAIL_RENAMED_LABEL, MARKER_TRAIL_INCOMPATIBLE),
+                (MARKER_TRAIL_SEED_ALPHA_NAMED, MARKER_TRAIL_SEED_ALPHA_U32),
+                (MARKER_TRAIL_SEED_BETA_NAMED, MARKER_TRAIL_SEED_BETA_U32),
+                (WITNESS_TRAIL_PRINT_NAMED, WITNESS_TRAIL_PRINT_U32),
+            ],
+            expect_counter_tick=True,
+            required_tokens=[
+                SELECTIVE_START_TOKEN,
+                SELECTIVE_FINISHED_TOKEN,
+                MARKER_TRAIL_MIGRATE_LOG_TOKEN,
+                DESERIALIZE_FAILED_TOKEN,
+            ],
+            forbidden_tokens=[
+                FRAMECOUNTER_MIGRATE_LOG_TOKEN,
+                SPATIAL_POSITION_MIGRATE_LOG_TOKEN,
+            ],
+            expected_migration_entity_counts=[("project::MarkerTrail", 24)],
+            # The stored floats cannot become u32, so the snapshot fails to
+            # parse and the fallback resets the WHOLE component on migrated
+            # rows (name reverts too, visible as the empty string) while the
+            # reload itself completes and new rows carry the new shape.
+            # A reset row sums an empty Vec<u32>: f64's Sum identity is a
+            # negative zero, hence the `-0.00`.
+            expected_witness_tokens=[
+                '[project] witness MarkerTrail(points=0,sum=-0.00,name="",samples=0,last=0.00,stamps=0)',
+                '[project] witness MarkerTrail(points=3,sum=6.00,name="alpha",samples=2,last=1.50,stamps=2)',
+            ],
         ),
         Scenario(
             name="Revert threshold 150 -> 200 (fast path)",
@@ -481,6 +873,20 @@ def build_scenarios() -> List[Scenario]:
             expect_counter_tick=True,
             required_tokens=[FAST_PATH_TOKEN],
             forbidden_tokens=[SELECTIVE_START_TOKEN],
+        ),
+        Scenario(
+            name="Widen SpatialPosition.horizontal f32 -> f64 (rejected: component size must stay stable)",
+            replacements=[(SPATIAL_POSITION_REORDERED, SPATIAL_POSITION_WIDENED)],
+            expect_counter_tick=True,
+            expect_rejected_reload=True,
+            required_tokens=[
+                "was re-registered with a different size",
+                ROLLBACK_TOKEN,
+            ],
+            forbidden_tokens=[
+                SELECTIVE_START_TOKEN,
+                FAST_PATH_TOKEN,
+            ],
         ),
     ]
 

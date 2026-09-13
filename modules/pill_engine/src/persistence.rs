@@ -714,15 +714,39 @@ impl World {
         metadata_by_name
     }
 
+    /// Snapshot every live entity id.
+    ///
+    /// Migration runs after the incoming generation's `init`, so archetypes
+    /// may already hold entities whose components were written with the
+    /// current schema. This set lets the migration tell those apart from the
+    /// entities that need converting - see
+    /// [`Self::migrate_changed_persistable_components`].
+    pub fn capture_live_entities(&self) -> HashSet<Entity> {
+        let mut entities: HashSet<Entity> = HashSet::new();
+        for archetype in self.archetypes.values() {
+            entities.extend(archetype.entities.iter().copied());
+        }
+        entities
+    }
+
     /// Migrate only changed persistable components.
     ///
     /// For each changed type name, this uses the old serializer (captured before
     /// reload) and the new deserializer/inserter (registered by new project_init)
     /// to rewrite only the affected component columns.
+    ///
+    /// `pre_swap_entities` is the set of entities that existed before the
+    /// incoming generation's `init` ran (see [`Self::capture_live_entities`]).
+    /// Entities outside the set were spawned by the new generation: they
+    /// already carry the current schema, so where a column rebuild touches
+    /// them they are round-tripped through the current serializer rather than
+    /// the retiring generation's. Pass `None` when every entity predates the
+    /// migration (for example when restoring a snapshot).
     pub fn migrate_changed_persistable_components(
         &mut self,
         previous_metadata_by_name: &HashMap<String, PersistTypeMetadata>,
         changed_type_names: &HashSet<String>,
+        pre_swap_entities: Option<&HashSet<Entity>>,
     ) -> SelectiveMigrationReport {
         let mut report = SelectiveMigrationReport::default();
 
@@ -767,7 +791,11 @@ impl World {
                 type_name, previous_metadata.schema_hash, current_schema_hash,
             );
 
-            match self.migrate_single_component_type(type_name, previous_metadata) {
+            match self.migrate_single_component_type(
+                type_name,
+                previous_metadata,
+                pre_swap_entities,
+            ) {
                 Ok(migrated_entity_count_for_type) => {
                     info!(
                         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -816,6 +844,7 @@ impl World {
         &mut self,
         type_name: &str,
         previous_metadata: &PersistTypeMetadata,
+        pre_swap_entities: Option<&HashSet<Entity>>,
     ) -> Result<usize, PersistenceError> {
         let Some(new_component_id) = self.resolve_component_id_by_name(type_name) else {
             return Err(PersistenceError::ComponentTypeUnregistered {
@@ -841,11 +870,23 @@ impl World {
                 "[persistence]     strategy: in-place column swap for '{}'",
                 type_name,
             );
+            // The current serializer reads spawns' values with the layout the
+            // new generation wrote them in; without it the rebuild would have
+            // to misread them through the retiring generation's layout.
+            let Some(&serialize_current_component) =
+                self.persist_serializers.get(&new_component_id)
+            else {
+                return Err(PersistenceError::SerializerMissing {
+                    type_name: type_name.to_string(),
+                });
+            };
             self.migrate_component_column_in_place(
                 previous_metadata.component_id,
                 previous_metadata.serializer,
+                serialize_current_component,
                 deserialize_component,
                 insert_component,
+                pre_swap_entities,
             )
         } else {
             debug!(
@@ -871,6 +912,13 @@ impl World {
     /// removes the old storage column, recreates it through the registered
     /// storage factory, and inserts the migrated values.
     ///
+    /// Entities the incoming generation spawned during `init` are part of the
+    /// same archetype when the schema change kept the component's layout
+    /// identical (a widened `Vec<f32>` element type, for example). Those
+    /// already hold current-layout values, so they are serialized with
+    /// `serialize_current_component` instead of the retiring generation's
+    /// serializer, which would reinterpret their bytes under the old shape.
+    ///
     /// # Errors
     ///
     /// Returns [`PersistenceError::DeserializationFailed`] when a value cannot
@@ -884,8 +932,10 @@ impl World {
         &mut self,
         component_id: ComponentId,
         serialize_old_component: SerializeComponentFn,
+        serialize_current_component: SerializeComponentFn,
         deserialize_new_component: DeserializeComponentFn,
         insert_new_component: InsertComponentFn,
+        pre_swap_entities: Option<&HashSet<Entity>>,
     ) -> Result<usize, PersistenceError> {
         // Step 1: Collect the archetypes whose columns contain the old
         // component id.
@@ -899,8 +949,10 @@ impl World {
         let mut migrated_entity_count: usize = 0;
 
         for archetype_id in archetype_ids {
-            // Step 2: Serialize every old value before the storage column is
-            // removed.
+            // Step 2: Serialize every value before the storage column is
+            // removed. Entities spawn-swapped in by the new generation (they
+            // are not in the pre-swap set) already hold current-layout values
+            // and go through the current serializer.
             let serialized_components: Vec<Vec<u8>> = {
                 let Some(archetype) = self.archetypes.get(&archetype_id) else {
                     continue;
@@ -908,7 +960,14 @@ impl World {
 
                 (0..archetype.entities.len())
                     .map(|entity_index| {
-                        serialize_old_component(&archetype.component_storages, entity_index)
+                        let spawned_this_generation = pre_swap_entities.is_some_and(|entities| {
+                            !entities.contains(&archetype.entities[entity_index])
+                        });
+                        if spawned_this_generation {
+                            serialize_current_component(&archetype.component_storages, entity_index)
+                        } else {
+                            serialize_old_component(&archetype.component_storages, entity_index)
+                        }
                     })
                     .collect()
             };

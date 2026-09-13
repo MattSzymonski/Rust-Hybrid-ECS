@@ -30,6 +30,19 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- Named query-row iteration: `foreach (var row in query.Rows())` with
+         one named accessor per term (`row.Position`, `row.Sprite`, ...). The
+         wrappers must be generated into THIS compilation, so the generator is
+         referenced here rather than flowing in with the runtime reference
+         (project-referenced analyzers are not transitive). It is a separate
+         project from the AOT registry generator, which stays opt-in with the
+         AOT posture so an ordinary build does not install that registry. -->
+    <ProjectReference Include="../../modules/pill_csharp_runtime/generators/PillIterationGenerators.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- For Engine.cs's safe generic query facade. Project-specific component
          structs live in this reloadable project. -->
     <ProjectReference Include="../../modules/pill_csharp_runtime/csharp_runtime.csproj" />

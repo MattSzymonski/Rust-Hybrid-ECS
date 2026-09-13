@@ -18,6 +18,7 @@
 //! invocation.
 
 // External crates
+use pill_engine::archetype::ArchetypeId;
 use pill_engine::Entity;
 
 // Current crate
@@ -104,6 +105,133 @@ pub(super) extern "C" fn ffi_get_component_chunk(
             let bits = archetype.0;
             // SAFETY: identical to the dynamic arm above - pointers stay owned
             // by the active world's archetype for the managed invocation.
+            unsafe {
+                output.write(ComponentChunk {
+                    archetype_low: bits as u64,
+                    archetype_high: (bits >> 64) as u64,
+                    data: data.cast(),
+                    len: len as u32,
+                    element_size: element_size as u32,
+                    ticks: ticks.as_mut_ptr(),
+                    change_tick,
+                });
+            }
+            1
+        }
+        None => 2,
+    })
+    .unwrap_or(3)
+}
+
+/// Return one component chunk of an archetype the managed enumerator already
+/// identified through its driver chunk.
+///
+/// Managed query iterators resolve every non-driver term with this call once
+/// per archetype, instead of scanning chunk indices until the archetypes
+/// match. Status codes match [`ffi_get_component_chunk`]: `0` means the
+/// archetype does not carry the component (an optional term is absent), `1`
+/// returns a chunk, `2` is unknown component, `3` is out-of-scope access, and
+/// `4` is an undeclared access mode. A `mode` of `2` requests the archetype's
+/// entity column instead, which carries no component access to validate.
+pub(super) extern "C" fn ffi_get_archetype_chunk(
+    archetype_low: u64,
+    archetype_high: u64,
+    key_low: u64,
+    key_high: u64,
+    mode: u8,
+    output: *mut ComponentChunk,
+) -> u8 {
+    // Step 1: Reject null output buffers before reconstructing the identity.
+    if output.is_null() {
+        return 0;
+    }
+    let archetype_id = ArchetypeId(((archetype_high as u128) << 64) | archetype_low as u128);
+
+    // Step 2: Entity terms resolve against the archetype's entity column and
+    // carry no component access, matching the dedicated entity callback.
+    if mode == 2 {
+        return with_active_world(|world| {
+            let Some((archetype, entities)) = world.entity_chunk_in_archetype(archetype_id) else {
+                return 0;
+            };
+            let bits = archetype.0;
+            // SAFETY: `output` was checked above and the entity slice remains
+            // owned by the active world's archetype for the managed
+            // invocation. The managed side must treat the pointers as
+            // read-only and must not retain them beyond the invocation.
+            unsafe {
+                output.write(ComponentChunk {
+                    archetype_low: bits as u64,
+                    archetype_high: (bits >> 64) as u64,
+                    data: entities.as_ptr().cast_mut().cast(),
+                    len: entities.len() as u32,
+                    element_size: std::mem::size_of::<Entity>() as u32,
+                    ticks: std::ptr::null_mut(),
+                    change_tick: world.change_tick().get(),
+                });
+            }
+            1
+        })
+        .unwrap_or(3);
+    }
+
+    // Step 3: Component terms validate the declared access exactly like the
+    // index-based lookup, so both entry points fail the same way.
+    let stable_id = StableComponentId::from_halves(key_low, key_high);
+    match access_is_authorized(stable_id, mode) {
+        None => return 3,
+        Some(false) => return 4,
+        Some(true) => {}
+    }
+
+    // Step 4: Resolve the binding and write the column from that one
+    // archetype; the remaining chunks of the world are never touched.
+    with_active_context(|world, bindings| match bindings.get(&stable_id).copied() {
+        Some(ComponentBinding::Native {
+            get_chunk_in_archetype,
+            ..
+        }) => get_chunk_in_archetype(world, archetype_id, output),
+        Some(ComponentBinding::Dynamic {
+            component_id, size, ..
+        }) => {
+            let change_tick = world.change_tick().get();
+            let Some((archetype, data, len, ticks)) =
+                world.dynamic_component_chunk_in_archetype(component_id, archetype_id)
+            else {
+                return 0;
+            };
+            let bits = archetype.0;
+            // SAFETY: `output` is non-null and the pointers stay owned by the
+            // active world's archetype for the managed invocation, exactly as
+            // in the index-based callback above.
+            unsafe {
+                output.write(ComponentChunk {
+                    archetype_low: bits as u64,
+                    archetype_high: (bits >> 64) as u64,
+                    data: data.cast(),
+                    len: len as u32,
+                    element_size: size as u32,
+                    ticks: ticks.as_mut_ptr(),
+                    change_tick,
+                });
+            }
+            1
+        }
+        Some(ComponentBinding::ModuleNative {
+            component_id, size, ..
+        }) => {
+            let change_tick = world.change_tick().get();
+            let Some((archetype, data, len, element_size, ticks)) =
+                world.native_component_chunk_in_archetype(component_id, archetype_id)
+            else {
+                return 0;
+            };
+            debug_assert_eq!(
+                element_size, size,
+                "module native binding size must match the column"
+            );
+            let bits = archetype.0;
+            // SAFETY: identical to the dynamic arm above.
             unsafe {
                 output.write(ComponentChunk {
                     archetype_low: bits as u64,

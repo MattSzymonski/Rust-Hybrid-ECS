@@ -23,6 +23,7 @@ use std::collections::{HashMap, HashSet};
 use pill_core::error::{CSharpError, EngineMessage};
 use pill_core::info;
 use pill_core::telemetry::telemetry_target;
+use pill_engine::archetype::ArchetypeId;
 use pill_engine::commands::{boxed_component_adder, ComponentAdder};
 use pill_engine::component_registry::ComponentFieldDescriptor;
 use pill_engine::{Component, ComponentId, Engine, World};
@@ -112,6 +113,9 @@ pub(super) type ComponentBindings = HashMap<StableComponentId, ComponentBinding>
 /// Copies one archetype column into an ABI `ComponentChunk` for managed code.
 type NativeChunkGetter = fn(&mut World, u32, *mut ComponentChunk) -> u8;
 
+/// Copies one component column of an already-known archetype into an ABI chunk.
+type NativeArchetypeChunkGetter = fn(&mut World, ArchetypeId, *mut ComponentChunk) -> u8;
+
 /// Decodes one managed component blob into a deferred command adder.
 type NativeBlobDecoder = fn(*const u8, usize) -> Result<Box<dyn ComponentAdder>, String>;
 
@@ -127,6 +131,8 @@ pub(super) enum ComponentBinding {
         component_id: ComponentId,
         /// Copies the matching archetype column into an ABI chunk.
         get_chunk: NativeChunkGetter,
+        /// Copies one column of an already-known archetype into an ABI chunk.
+        get_chunk_in_archetype: NativeArchetypeChunkGetter,
         /// Size of the Rust type in bytes.
         size: usize,
         /// Alignment of the Rust type in bytes.
@@ -233,6 +239,42 @@ fn get_component_chunk<T: Component + TraitAccessible<dyn Component>>(
     1
 }
 
+/// Return one archetype column containing native component T.
+///
+/// The archetype-scoped twin of [`get_component_chunk`]: managed enumerators
+/// that already hold a driver chunk's archetype identity use this to resolve
+/// the remaining query terms directly, with no chunk-index scan.
+fn get_component_chunk_in_archetype<T: Component + TraitAccessible<dyn Component>>(
+    world: &mut World,
+    archetype_id: ArchetypeId,
+    output: *mut ComponentChunk,
+) -> u8 {
+    let change_tick = world.change_tick().get();
+    let Some((archetype, slice, ticks)) =
+        world.component_chunk_with_ticks_mut_in_archetype::<T>(archetype_id)
+    else {
+        return 0;
+    };
+    let bits = archetype.0;
+    // SAFETY: `output` was checked by the FFI entry point and the slice stays
+    // alive for the duration of the active scheduled system invocation. The
+    // managed side must stay within `len * element_size` and must not retain
+    // the returned pointers beyond that invocation. The u32 length ceiling
+    // is documented on `ComponentChunk`.
+    unsafe {
+        output.write(ComponentChunk {
+            archetype_low: bits as u64,
+            archetype_high: (bits >> 64) as u64,
+            data: slice.as_mut_ptr().cast(),
+            len: slice.len() as u32,
+            element_size: std::mem::size_of::<T>() as u32,
+            ticks: ticks.as_mut_ptr(),
+            change_tick,
+        });
+    }
+    1
+}
+
 /// Copy one managed component blob into a concrete Rust component adder.
 ///
 /// The decoder is stored in a native binding so deferred commands can recover
@@ -311,6 +353,7 @@ fn register_native_binding<T>(
         ComponentBinding::Native {
             component_id: ComponentId::of::<T>(),
             get_chunk: get_component_chunk::<T>,
+            get_chunk_in_archetype: get_component_chunk_in_archetype::<T>,
             size: std::mem::size_of::<T>(),
             align: std::mem::align_of::<T>(),
             schema_hash: component_hash(managed_schema, 0xcbf29ce484222325),

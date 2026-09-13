@@ -7,11 +7,16 @@
 // - Keeps every native pointer inside stack-only enumerator and row values.
 //
 // Design:
-// - Closed Query<T...> types build and validate their descriptor once.
+// - Closed Query<T...> types build and validate their descriptor once and
+//   return a typed enumerator through a hidden `new` GetEnumerator; the base
+//   type keeps the shape-erased enumerator for consumers that need it.
 // - ProjectHost consumes IQueryDescriptor without knowing query arity or shape.
-// - QueryRow is a ref struct. Typed accessors validate the declared term before
-//   returning a writable or read-only reference into the active native chunk.
+// - QueryRow<T...> is a ref struct holding references into the enumerator's
+//   joined columns. Typed accessors resolve against the query's own term list
+//   at JIT time and return writable or read-only references into the active
+//   native chunk, with no per-row column lookup and no per-row column copy.
 
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -33,20 +38,82 @@ public sealed class EcsStartupAttribute : Attribute;
 // Query Terms and Descriptors
 // =============================================================================
 
+/// <summary>Compile-time metadata every query term carries.</summary>
+/// <remarks>
+/// The static abstract members let a typed row resolve an accessor against the
+/// query's own ordered term list instead of searching the joined columns: for
+/// a closed value-type query both sides of every comparison are compile-time
+/// constants, so the JIT folds every non-matching branch.
+/// </remarks>
+public interface IQueryTerm
+{
+    /// <summary>Declared component type; null for padding slots.</summary>
+    static abstract Type? DataType { get; }
+
+    /// <summary>Scheduler access the term declares.</summary>
+    static abstract QueryAccess Access { get; }
+
+    /// <summary>Whether the term tolerates archetypes without the component.</summary>
+    static abstract bool Optional { get; }
+
+    /// <summary>Whether the term exposes the entity column.</summary>
+    static abstract bool IsEntity { get; }
+}
+
 /// <summary>Required read-only component term.</summary>
-public readonly struct Read<T> where T : unmanaged;
+public readonly struct Read<T> : IQueryTerm where T : unmanaged
+{
+    static Type? IQueryTerm.DataType => typeof(T);
+    static QueryAccess IQueryTerm.Access => QueryAccess.Read;
+    static bool IQueryTerm.Optional => false;
+    static bool IQueryTerm.IsEntity => false;
+}
 
 /// <summary>Required writable component term.</summary>
-public readonly struct Write<T> where T : unmanaged;
+public readonly struct Write<T> : IQueryTerm where T : unmanaged
+{
+    static Type? IQueryTerm.DataType => typeof(T);
+    static QueryAccess IQueryTerm.Access => QueryAccess.Write;
+    static bool IQueryTerm.Optional => false;
+    static bool IQueryTerm.IsEntity => false;
+}
 
 /// <summary>Optional read-only component term.</summary>
-public readonly struct OptionalRead<T> where T : unmanaged;
+public readonly struct OptionalRead<T> : IQueryTerm where T : unmanaged
+{
+    static Type? IQueryTerm.DataType => typeof(T);
+    static QueryAccess IQueryTerm.Access => QueryAccess.Read;
+    static bool IQueryTerm.Optional => true;
+    static bool IQueryTerm.IsEntity => false;
+}
 
 /// <summary>Optional writable component term.</summary>
-public readonly struct OptionalWrite<T> where T : unmanaged;
+public readonly struct OptionalWrite<T> : IQueryTerm where T : unmanaged
+{
+    static Type? IQueryTerm.DataType => typeof(T);
+    static QueryAccess IQueryTerm.Access => QueryAccess.Write;
+    static bool IQueryTerm.Optional => true;
+    static bool IQueryTerm.IsEntity => false;
+}
 
 /// <summary>Term exposing the current entity without scheduler component access.</summary>
-public readonly struct EntityTerm;
+public readonly struct EntityTerm : IQueryTerm
+{
+    static Type? IQueryTerm.DataType => typeof(Entity);
+    static QueryAccess IQueryTerm.Access => QueryAccess.Read;
+    static bool IQueryTerm.Optional => false;
+    static bool IQueryTerm.IsEntity => true;
+}
+
+/// <summary>Padding term filling the unused slots of a closed query's row.</summary>
+/// <remarks>Never matches an accessor: it declares no component type.</remarks>
+public readonly struct None : IQueryTerm
+{
+    static Type? IQueryTerm.DataType => null;
+    static QueryAccess IQueryTerm.Access => QueryAccess.Read;
+    static bool IQueryTerm.Optional => false;
+    static bool IQueryTerm.IsEntity => false;
+}
 
 /// <summary>Native access mode declared to the Rust scheduler.</summary>
 public enum QueryAccess : byte
@@ -226,6 +293,46 @@ public static unsafe class Engine
         return true;
     }
 
+    /// <summary>
+    /// Resolve one term's column inside an archetype a driver chunk already
+    /// identified.
+    /// </summary>
+    /// <remarks>
+    /// The enumerator calls this once per term per archetype instead of
+    /// scanning chunk indices until the archetypes match, so the number of
+    /// native calls no longer grows with the archetype count. Entity terms
+    /// request the archetype's entity column through the same slot.
+    /// </remarks>
+    internal static bool TryGetArchetypeChunk(
+        QueryTermDescriptor term,
+        ulong archetypeLow,
+        ulong archetypeHigh,
+        out NativeComponentChunk chunk)
+    {
+        string name = term.ComponentType?.FullName ?? "entity";
+        NativeComponentChunk result;
+        byte mode = term.IsEntity ? (byte)2 : (byte)term.Access;
+        byte status = _api.GetArchetypeChunk(
+            archetypeLow,
+            archetypeHigh,
+            term.ComponentKey,
+            term.ComponentKeyHigh,
+            mode,
+            &result);
+        chunk = result;
+        if (status == 0)
+            return false;
+        ValidateStatus(status, name, term.Access);
+        if (chunk.ElementSize != term.ComponentSize)
+            throw new InvalidOperationException(
+                $"Component {name} has size {term.ComponentSize} in C# but " +
+                $"{chunk.ElementSize} in Rust. The component layouts must match exactly.");
+        if (term.Access == QueryAccess.Write && chunk.Ticks == IntPtr.Zero)
+            throw new InvalidOperationException(
+                $"Writable component {name} has no native change-tick column.");
+        return true;
+    }
+
     internal static bool TryGetEntityChunk(uint index, out NativeComponentChunk chunk)
     {
         NativeComponentChunk result;
@@ -328,19 +435,34 @@ internal readonly record struct StableComponentId(ulong Low, ulong High);
 /// Populated once at startup from the host's native table (see
 /// <see cref="Engine.Bind"/>). Generated mirror methods resolve a typed
 /// delegate over each method's exported C-ABI trampoline and invoke it with
-/// the struct pinned; the whole path stays safe C# so the reloadable project
-/// assembly needs no <c>AllowUnsafeBlocks</c>.
+/// the struct pinned. Generated heap-field accessors skip the delegate layer
+/// entirely: they resolve the trampoline's raw address once per host bind
+/// (guarded by <see cref="Generation"/>) and call it through the
+/// <c>Invoke*</c> helpers below, which use C-ABI function pointers with no
+/// marshalling between managed and native code. Both paths stay callable from
+/// safe C#, so the reloadable project assembly needs no
+/// <c>AllowUnsafeBlocks</c>.
 /// </summary>
 public static class MirrorMethods
 {
     private static readonly Dictionary<(string TypeName, string Method), IntPtr> Addresses = new();
     private static readonly Dictionary<(string TypeName, string Method), Delegate> Cache = new();
+    private static int _generation;
+
+    /// <summary>
+    /// Counts host binds. Generated accessors cache trampoline addresses and
+    /// re-resolve whenever this value changes: reloading an optional module
+    /// maps it at a fresh base address, so the addresses from the previous
+    /// bind dangle from then on.
+    /// </summary>
+    public static int Generation => global::System.Threading.Volatile.Read(ref _generation);
 
     /// <summary>Drop all registered methods; called when the host rebinds.</summary>
     internal static void Reset()
     {
         Addresses.Clear();
         Cache.Clear();
+        global::System.Threading.Volatile.Write(ref _generation, _generation + 1);
     }
 
     /// <summary>Register one mirrored method's trampoline address.</summary>
@@ -348,30 +470,85 @@ public static class MirrorMethods
         => Addresses[(typeName, method)] = address;
 
     /// <summary>
-    /// Resolve (and cache) the typed delegate that calls a mirrored Rust
-    /// method's C-ABI trampoline.
+    /// Address of a mirrored Rust method's C-ABI trampoline, for generated
+    /// accessors that call it through the <c>Invoke*</c> helpers.
     /// </summary>
-    /// <typeparam name="T">The generated delegate type for the method.</typeparam>
     /// <exception cref="InvalidOperationException">
     /// No trampoline is registered for the method — most often because the
     /// module was statically linked rather than loaded as a dynamic library.
     /// </exception>
-    public static T Resolve<T>(string typeName, string method) where T : Delegate
+    public static IntPtr Address(string typeName, string method)
     {
-        (string, string) key = (typeName, method);
-        if (Cache.TryGetValue(key, out Delegate? cached))
-            return (T)cached;
-        if (!Addresses.TryGetValue(key, out IntPtr address))
+        if (!Addresses.TryGetValue((typeName, method), out IntPtr address))
         {
             throw new InvalidOperationException(
                 $"No mirrored Rust method {typeName}::{method} is registered. " +
                 "Mirrored methods are only available when the declaring module is " +
                 "loaded as a dynamic library by the developer host.");
         }
-        T created = (T)Marshal.GetDelegateForFunctionPointer(address, typeof(T));
+        return address;
+    }
+
+    /// <summary>
+    /// Resolve (and cache) the typed delegate that calls a mirrored Rust
+    /// method's C-ABI trampoline.
+    /// </summary>
+    /// <typeparam name="T">The generated delegate type for the method.</typeparam>
+    public static T Resolve<T>(string typeName, string method) where T : Delegate
+    {
+        (string, string) key = (typeName, method);
+        if (Cache.TryGetValue(key, out Delegate? cached))
+            return (T)cached;
+        T created = (T)Marshal.GetDelegateForFunctionPointer(Address(typeName, method), typeof(T));
         Cache[key] = created;
         return created;
     }
+
+    // One helper per heap-field trampoline shape. The address comes from the
+    // host's registration table and the caller passes the component row's
+    // live address, so the call reads and writes the real container: one
+    // boundary call per member use, no delegate stub, no marshalling.
+
+    /// <summary>
+    /// Call a `(row, out data, out length)` trampoline — a `Vec`/`String` view
+    /// or the count view of a `Vec<String>`.
+    /// </summary>
+    public static unsafe byte InvokeView(
+        IntPtr address, IntPtr row, out IntPtr data, out IntPtr length)
+        => ((delegate* unmanaged[Cdecl]<IntPtr, out IntPtr, out IntPtr, byte>)address)(
+            row, out data, out length);
+
+    /// <summary>Call a `(row, count)` trampoline that resizes a container field.</summary>
+    public static unsafe byte InvokeResize(IntPtr address, IntPtr row, IntPtr count)
+        => ((delegate* unmanaged[Cdecl]<IntPtr, IntPtr, byte>)address)(row, count);
+
+    /// <summary>
+    /// Call a `(row, index, out data, out length)` trampoline — one element of
+    /// a `Vec<String>` (status: 0 reachable, 1 dead row, 2 out of range).
+    /// </summary>
+    public static unsafe byte InvokeItem(
+        IntPtr address, IntPtr row, IntPtr index, out IntPtr data, out IntPtr length)
+        => ((delegate* unmanaged[Cdecl]<IntPtr, IntPtr, out IntPtr, out IntPtr, byte>)address)(
+            row, index, out data, out length);
+
+    /// <summary>
+    /// Call a `(row, index, utf8, length)` trampoline that replaces one
+    /// element of a `Vec<String>` (status: 0 ok, 1 dead row, 2 out of range,
+    /// 3 invalid UTF-8).
+    /// </summary>
+    public static unsafe byte InvokeSetItem(
+        IntPtr address, IntPtr row, IntPtr index, IntPtr utf8, IntPtr length)
+        => ((delegate* unmanaged[Cdecl]<IntPtr, IntPtr, IntPtr, IntPtr, byte>)address)(
+            row, index, utf8, length);
+
+    /// <summary>
+    /// Call a `(row, utf8, length)` trampoline — writing a `String` field or
+    /// appending to a `Vec<String>`.
+    /// </summary>
+    public static unsafe byte InvokeUtf8Write(
+        IntPtr address, IntPtr row, IntPtr utf8, IntPtr length)
+        => ((delegate* unmanaged[Cdecl]<IntPtr, IntPtr, IntPtr, byte>)address)(
+            row, utf8, length);
 
     /// <summary>
     /// Address of a live value passed by reference, for generated heap-field
@@ -689,7 +866,9 @@ public readonly unsafe ref struct QueryRow
 public ref struct QueryEnumerator
 {
     private readonly QueryTermDescriptor[] _terms;
-    private QueryColumn _c0, _c1, _c2, _c3, _c4, _c5, _c6, _c7;
+    // The joined columns live in one array so a typed row can address every
+    // slot through a single reference to element zero.
+    private readonly QueryColumn[] _columns;
     private readonly int _driver;
     private uint _nextDriverChunk;
     private int _row;
@@ -698,7 +877,7 @@ public ref struct QueryEnumerator
     internal QueryEnumerator(QueryDescriptor descriptor)
     {
         _terms = descriptor.TermArray;
-        _c0 = _c1 = _c2 = _c3 = _c4 = _c5 = _c6 = _c7 = default;
+        _columns = new QueryColumn[8];
         _driver = FindDriver(_terms);
         _nextDriverChunk = 0;
         _row = -1;
@@ -707,14 +886,30 @@ public ref struct QueryEnumerator
 
     /// <summary>Return the current stack-only joined row.</summary>
     public QueryRow Current => new(
-        _c0, _c1, _c2, _c3, _c4, _c5, _c6, _c7, _terms.Length, _row);
+        _columns[0],
+        _columns[1],
+        _columns[2],
+        _columns[3],
+        _columns[4],
+        _columns[5],
+        _columns[6],
+        _columns[7],
+        _terms.Length,
+        _row);
 
-    /// <summary>Advance within the current archetype or join the next one.</summary>
-    public bool MoveNext()
+    /// <summary>Advance one row inside the joined chunk.</summary>
+    /// <remarks>
+    /// This is the per-row hot path, so it is deliberately one branch: the
+    /// typed enumerator's MoveNext inlines it, and everything that happens
+    /// once per chunk lives in <see cref="MoveToNextChunk"/>. Merging the two
+    /// makes MoveNext big enough that the JIT stops inlining it, which
+    /// measurably moves the per-row cost from ~0.4 ns to ~3 ns.
+    /// </remarks>
+    internal bool TryAdvanceRow() => ++_row < _length;
+
+    /// <summary>Join the next archetype chunk; runs once per chunk, not per row.</summary>
+    internal bool MoveToNextChunk()
     {
-        if (++_row < _length)
-            return true;
-
         while (TryLoadDriver(_nextDriverChunk++, out var archetype, out var driverChunk))
         {
             _length = checked((int)driverChunk.Length);
@@ -734,7 +929,8 @@ public ref struct QueryEnumerator
                 }
                 else
                 {
-                    present = TryFindChunk(term, archetype, out chunk);
+                    present = Engine.TryGetArchetypeChunk(
+                        term, archetype.Low, archetype.High, out chunk);
                     if (!present && !term.Optional)
                     {
                         matched = false;
@@ -763,6 +959,14 @@ public ref struct QueryEnumerator
         return false;
     }
 
+    /// <summary>Advance within the current archetype or join the next one.</summary>
+    public bool MoveNext()
+    {
+        if (TryAdvanceRow())
+            return true;
+        return MoveToNextChunk();
+    }
+
     private static int FindDriver(QueryTermDescriptor[] terms)
     {
         for (var i = 0; i < terms.Length; i++)
@@ -786,36 +990,19 @@ public ref struct QueryEnumerator
         return found;
     }
 
-    private static bool TryFindChunk(
-        QueryTermDescriptor term, ArchetypeKey wanted, out NativeComponentChunk chunk)
-    {
-        for (uint index = 0; ; index++)
-        {
-            bool found = term.IsEntity
-                ? Engine.TryGetEntityChunk(index, out chunk)
-                : Engine.TryGetChunk(term, index, out chunk);
-            if (!found)
-                return false;
-            if (new ArchetypeKey(chunk.ArchetypeLow, chunk.ArchetypeHigh) == wanted)
-                return true;
-        }
-    }
+    private void SetColumn(int index, QueryColumn value) => _columns[index] = value;
 
-    private void SetColumn(int index, QueryColumn value)
-    {
-        switch (index)
-        {
-            case 0: _c0 = value; break;
-            case 1: _c1 = value; break;
-            case 2: _c2 = value; break;
-            case 3: _c3 = value; break;
-            case 4: _c4 = value; break;
-            case 5: _c5 = value; break;
-            case 6: _c6 = value; break;
-            case 7: _c7 = value; break;
-            default: throw new ArgumentOutOfRangeException(nameof(index));
-        }
-    }
+    /// <summary>Reference to one joined column, for the typed row wrappers.</summary>
+    /// <remarks>
+    /// Ref-returning an array element needs the explicit [UnscopedRef] opt-in.
+    /// The contract is narrow: only the typed enumerator calls this, and the
+    /// row it feeds never outlives the enumerator that owns the columns.
+    /// </remarks>
+    [UnscopedRef]
+    internal ref QueryColumn ColumnRef(int index) => ref _columns[index];
+
+    /// <summary>Index of the current row inside the joined chunk.</summary>
+    internal int RowIndex => _row;
 }
 
 // =============================================================================
@@ -830,50 +1017,58 @@ public abstract class QueryBase : IQueryDescriptor
     public QueryEnumerator GetEnumerator() => new(Descriptor);
 }
 
-public sealed class Query<T1> : QueryBase
+public sealed class Query<T1> : QueryBase where T1 : IQueryTerm
 {
     private static readonly QueryDescriptor Cached = new(typeof(T1));
     public Query() : base(Cached) { }
+    public new QueryEnumerator<T1, None, None, None, None, None, None, None> GetEnumerator() => new(Descriptor);
 }
 
-public sealed class Query<T1, T2> : QueryBase
+public sealed class Query<T1, T2> : QueryBase where T1 : IQueryTerm where T2 : IQueryTerm
 {
     private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2));
     public Query() : base(Cached) { }
+    public new QueryEnumerator<T1, T2, None, None, None, None, None, None> GetEnumerator() => new(Descriptor);
 }
 
-public sealed class Query<T1, T2, T3> : QueryBase
+public sealed class Query<T1, T2, T3> : QueryBase where T1 : IQueryTerm where T2 : IQueryTerm where T3 : IQueryTerm
 {
     private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3));
     public Query() : base(Cached) { }
+    public new QueryEnumerator<T1, T2, T3, None, None, None, None, None> GetEnumerator() => new(Descriptor);
 }
 
-public sealed class Query<T1, T2, T3, T4> : QueryBase
+public sealed class Query<T1, T2, T3, T4> : QueryBase where T1 : IQueryTerm where T2 : IQueryTerm where T3 : IQueryTerm where T4 : IQueryTerm
 {
     private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3), typeof(T4));
     public Query() : base(Cached) { }
+    public new QueryEnumerator<T1, T2, T3, T4, None, None, None, None> GetEnumerator() => new(Descriptor);
 }
 
-public sealed class Query<T1, T2, T3, T4, T5> : QueryBase
+public sealed class Query<T1, T2, T3, T4, T5> : QueryBase where T1 : IQueryTerm where T2 : IQueryTerm where T3 : IQueryTerm where T4 : IQueryTerm where T5 : IQueryTerm
 {
     private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3), typeof(T4), typeof(T5));
     public Query() : base(Cached) { }
+    public new QueryEnumerator<T1, T2, T3, T4, T5, None, None, None> GetEnumerator() => new(Descriptor);
 }
 
-public sealed class Query<T1, T2, T3, T4, T5, T6> : QueryBase
+public sealed class Query<T1, T2, T3, T4, T5, T6> : QueryBase where T1 : IQueryTerm where T2 : IQueryTerm where T3 : IQueryTerm where T4 : IQueryTerm where T5 : IQueryTerm where T6 : IQueryTerm
 {
     private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3), typeof(T4), typeof(T5), typeof(T6));
     public Query() : base(Cached) { }
+    public new QueryEnumerator<T1, T2, T3, T4, T5, T6, None, None> GetEnumerator() => new(Descriptor);
 }
 
-public sealed class Query<T1, T2, T3, T4, T5, T6, T7> : QueryBase
+public sealed class Query<T1, T2, T3, T4, T5, T6, T7> : QueryBase where T1 : IQueryTerm where T2 : IQueryTerm where T3 : IQueryTerm where T4 : IQueryTerm where T5 : IQueryTerm where T6 : IQueryTerm where T7 : IQueryTerm
 {
     private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3), typeof(T4), typeof(T5), typeof(T6), typeof(T7));
     public Query() : base(Cached) { }
+    public new QueryEnumerator<T1, T2, T3, T4, T5, T6, T7, None> GetEnumerator() => new(Descriptor);
 }
 
-public sealed class Query<T1, T2, T3, T4, T5, T6, T7, T8> : QueryBase
+public sealed class Query<T1, T2, T3, T4, T5, T6, T7, T8> : QueryBase where T1 : IQueryTerm where T2 : IQueryTerm where T3 : IQueryTerm where T4 : IQueryTerm where T5 : IQueryTerm where T6 : IQueryTerm where T7 : IQueryTerm where T8 : IQueryTerm
 {
     private static readonly QueryDescriptor Cached = new(typeof(T1), typeof(T2), typeof(T3), typeof(T4), typeof(T5), typeof(T6), typeof(T7), typeof(T8));
     public Query() : base(Cached) { }
+    public new QueryEnumerator<T1, T2, T3, T4, T5, T6, T7, T8> GetEnumerator() => new(Descriptor);
 }

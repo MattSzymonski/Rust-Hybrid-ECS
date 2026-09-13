@@ -446,12 +446,63 @@ impl World {
         Some((archetype_id, components, ticks))
     }
 
+    /// Return one component chunk from one already-known archetype, with its
+    /// parallel change-tick column.
+    ///
+    /// The archetype-scoped twin of [`Self::component_chunk_with_ticks_mut`]:
+    /// language bindings that hold an archetype identity (from a driver chunk)
+    /// resolve the remaining query terms directly instead of scanning chunk
+    /// indices until the archetypes match.
+    pub fn component_chunk_with_ticks_mut_in_archetype<T>(
+        &mut self,
+        archetype_id: ArchetypeId,
+    ) -> Option<(ArchetypeId, &mut [T], &mut [ComponentTicks])>
+    where
+        T: Component + TraitAccessible<dyn Component>,
+    {
+        let component_id = ComponentId::of::<T>();
+        let archetype = self.archetypes.get_mut(&archetype_id)?;
+        if !archetype.component_types.contains(&component_id) {
+            return None;
+        }
+        let components = archetype
+            .component_storages
+            .get_storage_mut::<T>()
+            .as_mut_slice::<T>();
+        let Some(ticks_vec) = archetype.component_ticks.get_mut(&component_id) else {
+            // Same invariant break the index-based twin documents: storage
+            // without a tick column. Report "no chunk" instead of panicking
+            // mid-boundary-call, and name the pair in debug builds.
+            debug_assert!(
+                false,
+                "component {component_id:?} has storage but no tick column in \
+                 archetype {archetype_id:?}"
+            );
+            return None;
+        };
+        let ticks = ticks_vec.as_mut_slice();
+        debug_assert_eq!(components.len(), ticks.len());
+        Some((archetype_id, components, ticks))
+    }
+
     /// Return one archetype-sized entity chunk for language bindings.
     ///
     /// Entity chunks enumerate every archetype and provide the driver for
     /// `EntityTerm` and queries containing only optional component terms.
     pub fn entity_chunk(&self, chunk_index: usize) -> Option<(ArchetypeId, &[Entity])> {
         let archetype = self.archetypes.values().nth(chunk_index)?;
+        Some((archetype.id, archetype.entities.as_slice()))
+    }
+
+    /// Return one already-known archetype's entity column.
+    ///
+    /// The archetype-scoped twin of [`Self::entity_chunk`], used by language
+    /// bindings that identified the archetype through a driver chunk.
+    pub fn entity_chunk_in_archetype(
+        &self,
+        archetype_id: ArchetypeId,
+    ) -> Option<(ArchetypeId, &[Entity])> {
+        let archetype = self.archetypes.get(&archetype_id)?;
         Some((archetype.id, archetype.entities.as_slice()))
     }
 }
@@ -773,6 +824,53 @@ impl World {
         let column = archetype
             .component_storages
             .get_trait_storage_mut(type_id)?;
+        let len = column.len();
+        let data = column.as_mut_ptr();
+        let element_size = column.elem_size();
+        let ticks = archetype
+            .component_ticks
+            .get_mut(&component_id)?
+            .as_mut_slice();
+        debug_assert_eq!(len, ticks.len());
+        Some((archetype_id, data, len, element_size, ticks))
+    }
+
+    /// Return a raw dynamic component column from one already-known archetype.
+    ///
+    /// The archetype-scoped twin of [`Self::dynamic_component_chunk_mut`].
+    pub fn dynamic_component_chunk_in_archetype(
+        &mut self,
+        component_id: ComponentId,
+        archetype_id: ArchetypeId,
+    ) -> Option<(ArchetypeId, *mut u8, usize, &mut [ComponentTicks])> {
+        let archetype = self.archetypes.get_mut(&archetype_id)?;
+        let column = archetype
+            .dynamic_component_storages
+            .get_mut(&component_id)?;
+        let len = column.len();
+        let data = column.as_mut_ptr();
+        let ticks = archetype
+            .component_ticks
+            .get_mut(&component_id)?
+            .as_mut_slice();
+        debug_assert_eq!(len, ticks.len());
+        Some((archetype_id, data, len, ticks))
+    }
+
+    /// Return a raw native component column from one already-known archetype.
+    ///
+    /// The archetype-scoped twin of [`Self::native_component_chunk_mut`].
+    pub fn native_component_chunk_in_archetype(
+        &mut self,
+        component_id: ComponentId,
+        archetype_id: ArchetypeId,
+    ) -> Option<(ArchetypeId, *mut u8, usize, usize, &mut [ComponentTicks])> {
+        let type_id = component_id.native_type_id()?;
+        let archetype = self.archetypes.get_mut(&archetype_id)?;
+        if !archetype.component_types.contains(&component_id) {
+            return None;
+        }
+        let column = archetype.component_storages.get_trait_storage_mut(type_id)?;
         let len = column.len();
         let data = column.as_mut_ptr();
         let element_size = column.elem_size();

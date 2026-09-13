@@ -26,7 +26,9 @@ use super::commands::{
     ffi_queue_add_component, ffi_queue_create, ffi_queue_destroy, ffi_queue_remove_component,
     ffi_reserve_entity,
 };
-use super::queries::{ffi_entity_count, ffi_get_component_chunk, ffi_get_entity_chunk};
+use super::queries::{
+    ffi_entity_count, ffi_get_archetype_chunk, ffi_get_component_chunk, ffi_get_entity_chunk,
+};
 use super::ResolvedMirrorMethod;
 
 // =============================================================================
@@ -124,6 +126,11 @@ pub(super) struct CsEngineApi {
     entity_count: extern "C" fn() -> u32,
     /// Fill a [`ComponentChunk`] for one archetype/component pair.
     get_component_chunk: extern "C" fn(u64, u64, u8, u32, *mut ComponentChunk) -> u8,
+    /// Fill a [`ComponentChunk`] for one component of an already-known archetype.
+    ///
+    /// `mode` `0`/`1` request component storage; `mode` `2` requests the
+    /// archetype's entity column, which ignores the component key.
+    get_archetype_chunk: extern "C" fn(u64, u64, u64, u64, u8, *mut ComponentChunk) -> u8,
     /// Fill a [`ComponentChunk`] describing the entity column.
     get_entity_chunk: extern "C" fn(u32, *mut ComponentChunk) -> u8,
     /// Reserve a generation-checked entity handle without inserting it.
@@ -156,6 +163,7 @@ impl CsEngineApi {
         Self {
             entity_count: ffi_entity_count,
             get_component_chunk: ffi_get_component_chunk,
+            get_archetype_chunk: ffi_get_archetype_chunk,
             get_entity_chunk: ffi_get_entity_chunk,
             reserve_entity: ffi_reserve_entity,
             queue_create: ffi_queue_create,

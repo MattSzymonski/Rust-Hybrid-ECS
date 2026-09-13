@@ -658,6 +658,60 @@ fn bench_multi_component(criterion: &mut Criterion) {
     group.finish();
 }
 
+/// Bare-loop ceiling: the same element work the query benchmarks do, walked
+/// over two plain slices with no query machinery, no archetype join and no
+/// iterator adapter. This is the shape a span/index loop compiles to in any
+/// language, so it is the fair per-row floor for cross-language iteration
+/// comparisons (the managed side benchmarks the identical shape).
+///
+/// The write half includes a per-row tick store, mirroring what change
+/// tracking adds to a mutable pass.
+fn bench_slice_ceiling(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("slice_ceiling");
+    for &count in &[10_000, 100_000] {
+        // Step 1: two contiguous element columns, mirroring component storage.
+        let positions: Vec<Position> = (0..count)
+            .map(|i| Position {
+                x: i as f32,
+                y: (i * 2) as f32,
+            })
+            .collect();
+        let velocities: Vec<Velocity> = (0..count)
+            .map(|_| Velocity { x: 0.1, y: 0.2 })
+            .collect();
+
+        // Step 2: read-only pass - two loads and an add per row.
+        group.bench_with_input(BenchmarkId::new("read", count), &count, |benchmark, _| {
+            benchmark.iter(|| {
+                let mut sum: f32 = 0.0;
+                for (position, velocity) in positions.iter().zip(velocities.iter()) {
+                    sum += position.x + velocity.x;
+                }
+                black_box(sum);
+            });
+        });
+
+        // Step 3: writable pass - the same work plus a per-row tick store.
+        let mut mutable_positions = positions.clone();
+        let mut ticks = vec![2u32; count];
+        group.bench_with_input(BenchmarkId::new("write", count), &count, |benchmark, _| {
+            benchmark.iter(|| {
+                for ((position, velocity), tick) in mutable_positions
+                    .iter_mut()
+                    .zip(velocities.iter())
+                    .zip(ticks.iter_mut())
+                {
+                    position.x += velocity.x;
+                    position.y += velocity.y;
+                    *tick = 9;
+                }
+                black_box(&mutable_positions[0].x);
+            });
+        });
+    }
+    group.finish();
+}
+
 // =============================================================================
 // Criterion Entry Point
 // =============================================================================
@@ -680,5 +734,6 @@ criterion_group!(
     bench_get_component,
     bench_par_with_filter,
     bench_multi_component,
+    bench_slice_ceiling,
 );
 criterion_main!(benches);

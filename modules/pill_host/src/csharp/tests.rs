@@ -16,7 +16,7 @@
 
 // External crates
 use pill_core::error::EngineMessage;
-use pill_engine::{ComponentTicks, Engine, SystemAccess, SystemError, SystemScheduler};
+use pill_engine::{ComponentTicks, Engine, Entity, SystemAccess, SystemError, SystemScheduler};
 
 // Current crate
 use super::abi::{ComponentChunk, NativeComponentBlob, NativeSystemAccess};
@@ -32,7 +32,7 @@ use super::components::{
     ComponentBinding, ComponentBindings, Position, Sprite, StableComponentId,
 };
 use super::context::ActiveSystemGuard;
-use super::queries::{ffi_get_component_chunk, ffi_get_entity_chunk};
+use super::queries::{ffi_get_archetype_chunk, ffi_get_component_chunk, ffi_get_entity_chunk};
 
 // =============================================================================
 // Constants
@@ -390,6 +390,92 @@ fn component_chunk_change_tracking_abi_layout_is_stable() {
     assert_eq!(std::mem::size_of::<ComponentChunk>(), 48);
     assert_eq!(std::mem::offset_of!(ComponentChunk, ticks), 32);
     assert_eq!(std::mem::offset_of!(ComponentChunk, change_tick), 40);
+}
+
+/// Verify the archetype-scoped chunk lookup resolves the remaining terms of
+/// an archetype without scanning chunk indices.
+#[test]
+fn archetype_chunk_lookup_resolves_components_and_entities() {
+    let mut engine = Engine::new();
+    let shared = shared_component_bindings(&mut engine);
+    engine
+        .world_mut()
+        .create_entity()
+        .with(Position { x: 1.0, y: 2.0 })
+        .build()
+        .unwrap();
+
+    let position_id = test_stable_id("Position");
+    let sprite_id = test_stable_id("Sprite");
+    let accesses = [
+        native_access("Position", 1),
+        native_access("Sprite", 0),
+    ];
+    let mut chunk = empty_chunk();
+    let mut sprite_chunk = empty_chunk();
+    let mut entity_chunk = empty_chunk();
+    {
+        let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &shared);
+
+        // Step 1: one index-based lookup yields the archetype identity the
+        // managed enumerator would carry in its driver chunk.
+        assert_eq!(
+            get_test_chunk("Position", 1, 0, &mut chunk),
+            ABI_SUCCESS
+        );
+
+        // Step 2: the archetype-scoped twin resolves the same column directly.
+        assert_eq!(
+            ffi_get_archetype_chunk(
+                chunk.archetype_low,
+                chunk.archetype_high,
+                position_id.0 as u64,
+                (position_id.0 >> 64) as u64,
+                1,
+                &mut chunk,
+            ),
+            ABI_SUCCESS
+        );
+        assert_eq!(chunk.len, 1);
+        assert_eq!(chunk.element_size, std::mem::size_of::<Position>() as u32);
+        // SAFETY: the lookup succeeded and the asserted geometry guarantees
+        // the data pointer addresses one valid `Position` row.
+        assert_eq!(unsafe { *(chunk.data as *const Position) }.x, 1.0);
+
+        // Step 3: an authorized component the archetype does not carry
+        // reports absence (`0`), which the enumerator turns into
+        // "optional term not present".
+        assert_eq!(
+            ffi_get_archetype_chunk(
+                chunk.archetype_low,
+                chunk.archetype_high,
+                sprite_id.0 as u64,
+                (sprite_id.0 >> 64) as u64,
+                0,
+                &mut sprite_chunk,
+            ),
+            0
+        );
+
+        // Step 4: mode `2` returns the archetype's entity column without
+        // consulting any component binding or access declaration.
+        assert_eq!(
+            ffi_get_archetype_chunk(
+                chunk.archetype_low,
+                chunk.archetype_high,
+                0,
+                0,
+                2,
+                &mut entity_chunk,
+            ),
+            ABI_SUCCESS
+        );
+        assert_eq!(entity_chunk.len, 1);
+        assert_eq!(
+            entity_chunk.element_size,
+            std::mem::size_of::<Entity>() as u32
+        );
+    }
 }
 
 /// Verify a C#-only manifest component can be registered and queried natively.

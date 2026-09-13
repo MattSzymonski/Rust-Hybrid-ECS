@@ -312,6 +312,17 @@ pub enum PersistenceError {
     )]
     DeserializerMissing { type_name: String },
 
+    /// No current serializer is registered for the component type.
+    ///
+    /// Migration needs it to carry entities the incoming generation spawned
+    /// during `init` across a rebuilt column without reinterpreting their
+    /// bytes through the retiring generation's layout.
+    #[message(
+        "no serializer is registered for component type ",
+        name_style(type_name)
+    )]
+    SerializerMissing { type_name: String },
+
     /// No inserter is registered for the component type.
     #[message("no inserter is registered for component type ", name_style(type_name))]
     InserterMissing { type_name: String },

@@ -295,7 +295,7 @@ fn heap_fields_migrate_with_serde_and_survive_the_fast_path() {
     world.register_persistable_component_with_layout::<HeapProbe>(ALTERED_LAYOUT);
 
     let changed: HashSet<String> = HashSet::from([type_name.clone()]);
-    let report = world.migrate_changed_persistable_components(&previous, &changed);
+    let report = world.migrate_changed_persistable_components(&previous, &changed, None);
     assert_eq!(report.migrated_type_count, 1);
     assert_eq!(report.migrated_entity_count, 1);
 
@@ -311,7 +311,11 @@ fn heap_fields_migrate_with_serde_and_survive_the_fast_path() {
     // remains in place, which is what makes the common reload cheap and keeps
     // outstanding heap pointers valid.
     let previous = world.capture_persist_type_metadata();
-    let report = world.migrate_changed_persistable_components(&previous, &HashSet::new());
+    let report = world.migrate_changed_persistable_components(
+        &previous,
+        &HashSet::new(),
+        None,
+    );
     assert_eq!(report.migrated_type_count, 0);
     let probe = world
         .get_component::<HeapProbe>(entity)
@@ -434,7 +438,7 @@ fn vec_string_contents_migrate_with_serde_and_survive_the_fast_path() {
     let previous = world.capture_persist_type_metadata();
     world.register_persistable_component_with_layout::<NameList>(NAME_ALTERED_LAYOUT);
     let changed: HashSet<String> = HashSet::from([type_name.clone()]);
-    let report = world.migrate_changed_persistable_components(&previous, &changed);
+    let report = world.migrate_changed_persistable_components(&previous, &changed, None);
     assert_eq!(report.migrated_type_count, 1);
     assert_eq!(report.migrated_entity_count, 1);
 
@@ -446,7 +450,11 @@ fn vec_string_contents_migrate_with_serde_and_survive_the_fast_path() {
     let buffer = list.names.as_ptr();
 
     let previous = world.capture_persist_type_metadata();
-    let report = world.migrate_changed_persistable_components(&previous, &HashSet::new());
+    let report = world.migrate_changed_persistable_components(
+        &previous,
+        &HashSet::new(),
+        None,
+    );
     assert_eq!(report.migrated_type_count, 0);
     let list = world
         .get_component::<NameList>(entity)

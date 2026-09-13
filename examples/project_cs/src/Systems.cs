@@ -68,11 +68,11 @@ public static class BallPhysicsSystem
             0.1f);
         _lastFrame = now;
 
-        foreach (var components in query)
+        foreach (var row in query.Rows())
         {
-            ref var physics = ref components.Write<PhysicsState>();
-            ref var position = ref components.Write<Position>();
-            ref var sprite = ref components.Write<Sprite>();
+            ref var physics = ref row.PhysicsState;
+            ref var position = ref row.Position;
+            ref var sprite = ref row.Sprite;
 
             physics.DeltaTime = deltaTime;
             if (physics.Active != 0)
@@ -123,8 +123,8 @@ public static class BallTagSystem
     {
         // Declaring and iterating this type exercises automatic registration
         // of a component owned entirely by project_cs.
-        foreach (var row in query)
-            _ = row.Read<BallTag>().Kind;
+        foreach (var row in query.Rows())
+            _ = row.BallTag.Kind;
     }
 }
 
@@ -188,9 +188,9 @@ public static class ModuleSplineBridgeDemo
         int visibleSplines = 0;
         float firstPointX = float.NaN;
         uint firstPointCount = 0;
-        foreach (var row in query)
+        foreach (var row in query.Rows())
         {
-            var mirror = row.Read<global::pill_spline.Spline>();
+            var mirror = row.Spline;
             Span<byte> bytes = mirror.Raw;
             if (visibleSplines == 0)
             {

@@ -2,8 +2,10 @@
 //!
 //! # Responsibilities
 //!
-//! - Defines three persistable components used by migration tests.
+//! - Defines four persistable components used by migration tests.
 //! - Implements a single `counter_system` that prints a timestamp at threshold.
+//! - Prints per-generation value witnesses for the components migration must
+//!   preserve, so tests can assert values, not just entity counts.
 //! - Exports `project_init` and `project_update` for the standalone host.
 //!
 //! # Design
@@ -17,6 +19,13 @@
 //! Components are declared with `#[derive(PillComponent)]`, which registers
 //! them at init automatically; `#[pill_project]` generates the `project_*`
 //! entry points from the `init` function below.
+//!
+//! The witness systems print once per module generation (their guard statics
+//! are fresh in every reloaded module) and run after migration has settled,
+//! which is exactly when a migration test needs to read the preserved values.
+
+// Standard library
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // External crates
 use serde::{Deserialize, Serialize};
@@ -46,6 +55,17 @@ struct SpatialPosition {
 struct LinearVelocity {
     horizontal_speed: f32,
     vertical_speed: f32,
+}
+
+/// A persistable component whose fields own heap data, so migration has to
+/// round-trip a `Vec`, a `String`, and an engine-owned `DynamicBuffer` through
+/// JSON in both directions.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PillComponent)]
+#[pill(persistable)]
+struct MarkerTrail {
+    points: Vec<f32>,
+    label: String,
+    samples: DynamicBuffer<f32>,
 }
 
 // =============================================================================
@@ -81,6 +101,50 @@ fn counter_system(mut query: Query<&mut FrameCounter>) {
 }
 
 // =============================================================================
+// Value witnesses
+// =============================================================================
+
+/// Guards the once-per-generation `SpatialPosition` witness print.
+static POSITION_WITNESS_PRINTED: AtomicBool = AtomicBool::new(false);
+
+/// Prints every `SpatialPosition` value once per module generation.
+fn position_witness_system(mut query: Query<&SpatialPosition>) {
+    if POSITION_WITNESS_PRINTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    for position in query.iter_mut() {
+        println!(
+            "[project] witness SpatialPosition({:.2},{:.2})",
+            position.horizontal, position.vertical
+        );
+    }
+}
+
+/// Guards the once-per-generation `MarkerTrail` witness print.
+static TRAIL_WITNESS_PRINTED: AtomicBool = AtomicBool::new(false);
+
+/// Prints every `MarkerTrail` value once per module generation, including the
+/// heap contents migration must carry across (element count, sum, text, and
+/// the engine-owned buffer's length and last element).
+fn trail_witness_system(mut query: Query<&MarkerTrail>) {
+    if TRAIL_WITNESS_PRINTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    for trail in query.iter_mut() {
+        let sum: f32 = trail.points.iter().sum();
+        let last = trail.samples.last().copied().unwrap_or(0.0);
+        println!(
+            "[project] witness MarkerTrail(points={},sum={:.2},label=\"{}\",samples={},last={:.2})",
+            trail.points.len(),
+            sum,
+            trail.label,
+            trail.samples.len(),
+            last,
+        );
+    }
+}
+
+// =============================================================================
 // FFI Entry Points
 // =============================================================================
 
@@ -89,12 +153,19 @@ fn counter_system(mut query: Query<&mut FrameCounter>) {
 #[pill_project]
 fn init(engine: &mut Engine) -> u32 {
     engine.register_system("counter", counter_system);
+    engine.register_system("position_witness", position_witness_system);
+    engine.register_system("trail_witness", trail_witness_system);
 
     // Seed multiple archetypes so migration tests can validate per-component behavior.
     let _ = engine
         .world_mut()
         .create_entity()
         .with(FrameCounter { count: 0 })
+        .with(MarkerTrail {
+            points: vec![1.0, 2.0, 3.0],
+            label: String::from("alpha"),
+            samples: DynamicBuffer::from_slice(&[0.5, 1.5]),
+        })
         .build();
 
     let _ = engine
@@ -117,6 +188,11 @@ fn init(engine: &mut Engine) -> u32 {
         .with(LinearVelocity {
             horizontal_speed: 1.5,
             vertical_speed: 0.25,
+        })
+        .with(MarkerTrail {
+            points: vec![4.0, 5.0],
+            label: String::from("beta"),
+            samples: DynamicBuffer::from_slice(&[2.5]),
         })
         .build();
 

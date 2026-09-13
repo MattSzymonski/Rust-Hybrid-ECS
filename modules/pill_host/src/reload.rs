@@ -204,6 +204,11 @@ impl ReloadTransaction<'_> {
         // generation registered can be compared against the previous ones.
         let registration_sequence = engine.world().persist_registration_sequence();
         let component_registration_sequence = engine.world().component_registration_sequence();
+        // Entities alive before the incoming generation's init. Migration
+        // converts only these: anything init spawns already carries the new
+        // schema, and the retiring serializer would misread it while a
+        // same-layout column is rebuilt.
+        let pre_swap_entities = engine.world().capture_live_entities();
         self.begin_registration(engine);
         let status = new_library.call_init(engine_api);
         self.end_registration(engine);
@@ -369,6 +374,7 @@ impl ReloadTransaction<'_> {
             let report = engine.world_mut().migrate_changed_persistable_components(
                 &previous_metadata_by_name,
                 &changed_type_names,
+                Some(&pre_swap_entities),
             );
             debug!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
