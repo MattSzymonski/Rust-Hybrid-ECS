@@ -21,7 +21,7 @@
 //! the split too.
 
 // External crates
-use pill_engine::render::{RenderViewport, SpriteInstance, VirtualResolution};
+use crate::component::{self, RenderViewport, SpriteInstance, VirtualResolution};
 use pill_engine::world::World;
 use wgpu::util::DeviceExt;
 
@@ -386,8 +386,7 @@ impl SpriteRenderer {
         debug_assert!(virtual_resolution.is_valid());
 
         // Step 1: Collect the instanced quad data for every sprite in the world.
-        let instances: Vec<GpuSpriteInstance> = world
-            .sprite_instances()
+        let instances: Vec<GpuSpriteInstance> = component::sprite_instances(world)
             .into_iter()
             .map(GpuSpriteInstance::from)
             .collect();

@@ -10,8 +10,32 @@ modules/pill_standalone_temp/
 # Host-generated project workspace member (created at runtime)
 modules/optional/host_project_*/
 
-# Generated shipping bundle (created by devops/tools/generate_shipping_bundle.py)
-**/build/
+# Generated build scratch (shipping bundle contents, build metadata).
+#
+# Ignore the CONTENTS rather than the directory itself: git never descends
+# into an excluded directory, so a `build/` exclusion would make the
+# negations below unreachable.
+**/build/*
+
+# ...except the shipping bundle crate skeleton, which is COMMITTED as a stub.
+#
+# `pill_standalone` declares `pill_shipping_bundle` as an optional path
+# dependency. Cargo resolves every manifest in the workspace BEFORE it
+# evaluates features, so a missing directory here breaks resolution for the
+# whole workspace - including plain debug builds that never enable
+# `static_project`, and including `cargo run -p editor`. `optional = true`
+# means "do not compile it", not "do not look for it".
+#
+# The committed stub is deliberately project-agnostic. A shipping build
+# overwrites both files through the generator's content-based writes, so a
+# stable tree shows no diff; run `git checkout -- build/pill_shipping_bundle`
+# to return to the neutral stub afterwards.
+!build/pill_shipping_bundle/
+build/pill_shipping_bundle/*
+!build/pill_shipping_bundle/Cargo.toml
+!build/pill_shipping_bundle/src/
+build/pill_shipping_bundle/src/*
+!build/pill_shipping_bundle/src/lib.rs
 
 # Test infrastructure
 devops/tests/__pycache__/

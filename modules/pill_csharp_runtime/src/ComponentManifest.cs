@@ -86,6 +86,20 @@ internal static class ComponentManifestBuilder
         }
     }
 
+    /// <summary>
+    /// Whether the native host binds this component itself rather than
+    /// registering it as a dynamic byte-level layout.
+    /// </summary>
+    /// <remarks>
+    /// Two sources, both meaning "the host holds a canonical schema for this
+    /// type": the <see cref="EcsSharedComponentAttribute"/> a shared component
+    /// declares, and membership of the csharp_runtime assembly, which stays
+    /// recognised so runtime-owned mirrors need no attribute of their own.
+    /// </remarks>
+    private static bool IsShared(Type type) =>
+        type.IsDefined(typeof(EcsSharedComponentAttribute), inherit: false) ||
+        type.Assembly == typeof(Engine).Assembly;
+
     private static ComponentManifest Describe(Type type)
     {
         ValidateValueType(type, new HashSet<Type>());
@@ -99,7 +113,7 @@ internal static class ComponentManifestBuilder
             NativeLayout.SizeOf(type),
             NativeLayout.AlignmentOf(type),
             Hash64(schema),
-            type.Assembly == typeof(Engine).Assembly,
+            IsShared(type),
             fields);
     }
 

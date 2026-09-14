@@ -933,7 +933,7 @@ pub(crate) fn InspectorTab(editor: Arc<EditorContext>) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pill_engine::render::{Color, Sprite};
+    use pill_wgpu_renderer::{register_components, Color, Sprite};
     use pill_engine::Engine;
 
     /// A `Sprite`-carrying entity surfaces width/height as ordinary scalar
@@ -942,7 +942,7 @@ mod tests {
     #[test]
     fn sprite_fields_produce_one_color_group() {
         let mut engine = Engine::new();
-        engine.world_mut().register_component::<Sprite>();
+        register_components(engine.world_mut());
         let entity = engine
             .world_mut()
             .create_entity()

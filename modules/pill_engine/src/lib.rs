@@ -34,6 +34,14 @@ pub mod api;
 /// Archetype-based component storage with structure-of-arrays layout.
 pub mod archetype;
 
+/// Many-per-type asset storage addressed by generational handle.
+///
+/// The counterpart to [`resource`] for data a world holds several of - meshes,
+/// textures, materials - where the type alone does not name one value. The
+/// store is itself a resource, so it reaches systems through the existing
+/// `Res` / `ResMut` parameters.
+pub mod asset;
+
 /// Deferred command queue for structural ECS mutations.
 pub mod commands;
 
@@ -74,13 +82,6 @@ pub mod profiling;
 /// Query system for efficient iteration over entities with specific components.
 pub mod query;
 
-/// Renderer data contract: sprite components, viewport types, instance data.
-///
-/// Deliberately free of any GPU dependency: this crate is compiled into every
-/// loaded module and every hot patch, so a module that merely declares sprites
-/// must not drag wgpu in with it. The pipeline that consumes this data lives
-/// in the `pill_wgpu_renderer` crate, which the host links.
-pub mod render;
 
 /// Singleton resources stored in the [`World`], not attached to entities.
 pub mod resource;
@@ -96,6 +97,9 @@ pub mod hot_patch;
 
 /// Advanced system parameter infrastructure with automatic parameter resolution.
 pub mod system;
+
+/// Frame timing maintained by the engine and read through `Res<Time>`.
+pub mod time;
 
 /// Central ECS state container - entities, archetypes, components, and resources.
 pub mod world;
@@ -118,8 +122,9 @@ pub use persistence::ComponentSnapshot;
 pub use query::{
     Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,
 };
-pub use render::{Color, Position, RenderViewport, Sprite, SpriteInstance, VirtualResolution};
+pub use asset::{Asset, AssetManager, Handle};
 pub use resource::{ResHandle, Resource};
+pub use time::Time;
 pub use scheduler::{SystemAccess, SystemScheduler, TypeKey};
 pub use scripting::{ScriptComponent, ScriptContext};
 

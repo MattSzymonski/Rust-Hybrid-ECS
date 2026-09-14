@@ -83,11 +83,13 @@ const BLITTABLE_FIELD_TYPES: &[&str] = &[
 
 // The renderer's components, which managed physics writes into directly.
 //
-// There used to be a second, layout-identical set of local definitions for
-// headless builds, because these types only existed behind the engine's
-// `rendering` feature. They are unconditional now, so there is one
-// definition and no way for the two to drift.
-pub(super) use pill_engine::{Color, Position, Sprite};
+// They live in `pill_wgpu_renderer` with the pipeline that draws them, so they
+// are reachable only in a windowed build. A headless host registers no native
+// binding for them: a managed project that declares a `Sprite` mirror still
+// works, falling through to the dynamic byte-level binding like any other
+// component the host does not know natively.
+#[cfg(feature = "rendering")]
+pub(super) use pill_wgpu_renderer::{Color, Position, Sprite};
 
 /// Stable 128-bit identity derived from a managed component's canonical name.
 ///
@@ -368,25 +370,39 @@ fn register_native_binding<T>(
 /// the runtime's own reflection is rejected during manifest registration.
 pub(super) fn shared_component_bindings(engine: &mut Engine) -> ComponentBindings {
     let mut bindings = HashMap::new();
+    #[cfg(feature = "rendering")]
+    shared_renderer_bindings(engine, &mut bindings);
+    // Headless: nothing to register, but the parameter is still part of the
+    // shared signature both backends call.
+    #[cfg(not(feature = "rendering"))]
+    let _ = engine;
+    bindings
+}
+
+/// Bind the renderer's components to their canonical managed mirrors.
+///
+/// Windowed builds only - the types live in `pill_wgpu_renderer`, which only a
+/// windowed host links.
+#[cfg(feature = "rendering")]
+fn shared_renderer_bindings(engine: &mut Engine, bindings: &mut ComponentBindings) {
     register_native_binding::<Position>(
         engine,
-        &mut bindings,
+        bindings,
         "TracyLive.Position",
         "TracyLive.Position|8|4|X@0:4:System.Single|Y@4:4:System.Single",
     );
     register_native_binding::<Sprite>(
         engine,
-        &mut bindings,
+        bindings,
         "TracyLive.Sprite",
         "TracyLive.Sprite|24|4|Width@0:4:System.Single|Height@4:4:System.Single|Color@8:16:struct|R@0:4:System.Single|G@4:4:System.Single|B@8:4:System.Single|A@12:4:System.Single",
     );
     register_native_binding::<Color>(
         engine,
-        &mut bindings,
+        bindings,
         "TracyLive.Color",
         "TracyLive.Color|16|4|R@0:4:System.Single|G@4:4:System.Single|B@8:4:System.Single|A@12:4:System.Single",
     );
-    bindings
 }
 
 /// One native component an optional Rust module registered, exposed to managed

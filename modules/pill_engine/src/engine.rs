@@ -244,10 +244,18 @@ impl Engine {
         // Print the active parallel-iteration knobs.
         crate::config::print_parallel_config();
 
+        // Engine-owned resources, present before any project or module runs so
+        // nothing has to check whether they exist. Both are advanced or owned
+        // by the engine itself rather than by a registered system, so a hot
+        // reload - which retires systems by owner - cannot take them away.
+        let mut world = World::new();
+        world.insert_resource(crate::time::Time::new());
+        world.insert_resource(crate::asset::AssetManager::new());
+
         Self {
             systems: Vec::new(),
             queue: CommandQueue::new(),
-            world: World::new(),
+            world,
             scheduler: SystemScheduler::new(),
             system_failures: Vec::new(),
             parallel_execution: true,
@@ -782,6 +790,20 @@ impl Engine {
             // Bump the world tick so that any change-detection comparisons
             // performed by mutable queries during this frame use a fresh value.
             self.world.increment_change_tick();
+
+            // Advance the clock before anything reads it, so every system in
+            // this frame sees the same values and none sees last frame's.
+            //
+            // Done here rather than in a registered system because
+            // `build_execution_graph` orders systems independently of
+            // registration order: a time system could be batched after its
+            // readers, which would hand them stale values with nothing in the
+            // API to reveal it. `get_resource_mut` rather than the tracked
+            // variant, since bumping a change tick for a resource that changes
+            // every single frame tells a reader nothing.
+            if let Some(time) = self.world.get_resource_mut::<crate::time::Time>() {
+                time.advance();
+            }
 
             // Debug-only: clear the resource write-lock tracker so that the
             // isolation check only guards within a single frame.

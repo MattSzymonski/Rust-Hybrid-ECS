@@ -30,6 +30,7 @@ use pill_core::error;
 use pill_core::math::Vector3f;
 use pill_engine::*;
 use pill_spline::Spline;
+use pill_wgpu_renderer::{register_components, Color, Position, Sprite};
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -311,10 +312,11 @@ fn ball_spawn_state(index: usize) -> PhysicsState {
 /// resolve in the loaded DLL.
 #[pill_project]
 pub fn init(engine: &mut Engine) -> u32 {
-    // Engine-owned render components are not declared by this crate, so they
-    // cannot carry the derive and stay registered manually.
-    engine.world_mut().register_component::<Position>();
-    engine.world_mut().register_component::<Sprite>();
+    // The renderer's components are declared by `pill_wgpu_renderer`, not by
+    // this crate, so they cannot carry the derive. Registering them through
+    // the renderer's own entry point also attaches their editor field layouts,
+    // which is what makes a sprite's size and colour editable in the inspector.
+    register_components(engine.world_mut());
 
     engine.world_mut().insert_resource(SimulationTime {
         last_frame: Instant::now(),
