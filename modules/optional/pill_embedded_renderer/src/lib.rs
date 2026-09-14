@@ -1,66 +1,91 @@
-//! The engine's renderer: the sprite components and the wgpu pipeline drawing them.
+//! Software sprite renderer for display-controller targets, with no GPU.
 //!
 //! # Responsibilities
 //!
 //! - Defines the renderer's data contract ([`Position`], [`Color`], [`Sprite`],
 //!   [`RenderViewport`], [`VirtualResolution`], [`SpriteInstance`]).
-//! - Creates and drives the window surface, adapter, device and queue
-//!   ([`Renderer`]).
-//! - Owns the sprite render pipeline and its GPU buffers ([`SpriteRenderer`]).
-//! - Declares the rendering failure type ([`RendererError`]).
+//! - Rasterizes sprites into an RGB565 framebuffer on the CPU
+//!   ([`SpriteRasterizer`], [`Framebuffer`]).
+//! - Draws one frame from an [`Engine`](pill_engine::engine::Engine) and hands
+//!   it over as bytes ([`Renderer`]).
 //!
 //! # Design
 //!
-//! A sprite is a renderer concept, so the components that describe one live
-//! here, with the code that draws them, rather than in `pill_engine`. The ECS
-//! core defines storage and scheduling; it does not define what a quad is. A
-//! project that wants sprites depends on this crate and calls
-//! [`component::register_components`].
+//! The same renderer contract as `pill_wgpu_renderer`, implemented in software
+//! for machines that have a display but no usable GPU - a Raspberry Pi driving
+//! an SPI panel being the case this was written for. A project depends on this
+//! crate, calls [`register_components`], and the sprites it spawns are drawn by
+//! a rasterizer instead of a shader.
 //!
-//! The crate is split in two halves. [`component`] is pure data: it names no
-//! `wgpu` type and reads the world through the two read-only seams `pill_engine`
-//! exposes, [`World::archetypes_iter`](pill_engine::world::World::archetypes_iter)
-//! and [`World::component_registry`](pill_engine::world::World::component_registry).
-//! [`sprite`] and [`renderer`] are the GPU half. The split is what lets
-//! `sprite.rs` keep its `bytemuck` upload record separate from the component
-//! definitions while asserting at compile time that the two layouts agree.
+//! The crate ends at the framebuffer. It owns no display, no SPI bus and no
+//! GPIO pin, and depends on no hardware crate: [`Renderer::render`] fills a
+//! buffer and [`Renderer::frame_rgb565`] hands it over, and the caller writes
+//! those bytes wherever they belong.
 //!
-//! It is a plain `rlib` linked by `pill_host` under its `rendering` feature,
-//! not a hot-loadable module: a renderer needs a live window handle, per-frame
-//! `World` access and the frontend's event loop, none of which the one-shot
-//! module ABI provides.
+//! ```ignore
+//! let mut renderer = Renderer::new(240, 280);
+//! renderer.set_virtual_resolution(Some(VirtualResolution::new(800.0, 600.0)));
 //!
-//! # Cost note
+//! loop {
+//!     run_one_frame(&mut host);
+//!     renderer.render(host.engine_mut());
+//!     display.draw(renderer.frame_rgb565())?;
+//! }
+//! ```
 //!
-//! This crate carries `wgpu`, and a project links it to name `Sprite`. That
-//! puts wgpu, naga and the `windows` bindings into every project `cdylib` and
-//! every hot patch: measured on a patch of one function, the linker pulls 278
-//! archive members it then discards, about 215 ms of the compile. That is the
-//! accepted price of keeping renderer components out of the ECS core. If patch
-//! latency ever matters more than this layering, the fix is to split
-//! [`component`] into its own dependency-free crate that projects depend on
-//! instead, leaving `wgpu` reachable only from the host.
+//! Keeping the driver out is what makes the rasterizer testable: every module
+//! here builds and runs its unit tests on an ordinary desktop, with no panel
+//! attached. It also means one renderer serves any controller taking RGB565,
+//! not just the ST7789 this was validated against.
+//!
+//! # Relationship to the other renderers
+//!
+//! [`component`] is a deliberate duplicate of the wgpu backend's module rather
+//! than a shared dependency, so a project targeting a display never links wgpu
+//! to name `Sprite`. The two copies are a shared ABI: both are `#[repr(C)]`,
+//! both are resolved by stable type name and verified size, and the layouts
+//! must not drift.
+//!
+//! The renderer surface matches the wgpu backend where it can - `resize`,
+//! `set_viewport`, `set_virtual_resolution`, `render` - so a frontend can drive
+//! either. Two differences are inherent: construction takes pixel dimensions
+//! instead of a window handle, and `render` is infallible, because there is no
+//! device to lose and no swapchain image to acquire.
 
 // Current crate
 
 /// The renderer's data contract: sprite components, viewports, instance data.
 pub mod component;
 
-/// Rendering initialization and presentation failures.
-pub mod error;
+/// The RGB565 pixel buffer and its colour packing.
+pub mod framebuffer;
 
-/// Window surface, adapter, device and queue lifecycle.
+/// The software rasterizer that turns sprite instances into pixels.
+pub mod rasterizer;
+
+/// Framebuffer ownership and the per-frame draw entry point.
 pub mod renderer;
 
-/// The sprite render pipeline and its GPU buffers.
-pub mod sprite;
-
-// The renderer's public surface, so callers name `pill_master_renderer::Sprite`
+// The renderer's public surface, so callers name `pill_embedded_renderer::Sprite`
 // rather than reaching through the module that happens to declare it.
 pub use component::{
     register_components, sprite_instances, Color, Position, RenderViewport, Sprite, SpriteInstance,
     VirtualResolution,
 };
-pub use error::RendererError;
-pub use renderer::{Renderer, RendererWindow};
-pub use sprite::SpriteRenderer;
+pub use framebuffer::{pack_rgb565, unpack_rgb565, Framebuffer, BYTES_PER_PIXEL};
+pub use rasterizer::SpriteRasterizer;
+pub use renderer::Renderer;
+
+// NOTE: there is no `RendererError` and no `RendererWindow` here, unlike in
+// `pill_wgpu_renderer`.
+//
+// `RendererError` existed to wrap surface, adapter, device and frame
+// acquisition failures - every variant held a `wgpu` type. Rasterizing into an
+// owned buffer has no such step, so the enum would be empty and every
+// signature would carry a `Result` that is always `Ok`. Presentation is the
+// one part that can fail, and it belongs to the caller's display driver, which
+// reports failures in its own terms.
+//
+// `RendererWindow` abstracted a window handle for wgpu to bind a surface to.
+// This backend has no surface and no window: it targets a panel described by
+// its pixel dimensions.
