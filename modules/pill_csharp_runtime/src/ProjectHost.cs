@@ -3,7 +3,7 @@
 // Responsibilities:
 // - Loads project assemblies without locking their build output.
 // - Discovers and deterministically orders methods marked with EcsSystem.
-// - Derives scheduler access from each method's single query parameter.
+// - Derives scheduler access from every query parameter a method declares.
 // - Reloads behavior while rejecting scheduler-signature changes.
 //
 // Design:
@@ -28,12 +28,50 @@ namespace TracyLive.Loader;
 internal readonly record struct ManagedAccess(ulong ComponentKey, ulong ComponentKeyHigh, byte Mode);
 
 /// <summary>Compiled managed system plus its scheduler declaration.</summary>
+/// <remarks>
+/// `Accesses` is the union of every query's component terms: one entry per
+/// component, positioned by first occurrence, with a write in any query
+/// upgrading a shared declaration. The host consumes exactly this list for
+/// scheduling, access checks, and reload verification, so query grouping
+/// never crosses the native ABI. `Queries` preserves the grouping for
+/// iteration and for the reload signature.
+/// </remarks>
 internal sealed record ManagedSystem(
-    string Name, ManagedAccess[] Accesses, QueryDescriptor? QueryDescriptor,
+    string Name, ManagedAccess[] Accesses, QueryDescriptor?[] Queries,
     bool UsesCommands, Action Run)
 {
-    internal string Signature =>
-        $"{Name}:commands={UsesCommands}:{string.Join(',', Accesses.Select(a => $"{a.Mode}:{a.ComponentKeyHigh:X16}{a.ComponentKey:X16}"))}";
+    internal string Signature
+    {
+        get
+        {
+            var builder = new System.Text.StringBuilder(Name);
+            builder.Append(":commands=").Append(UsesCommands);
+            // One separator per query keeps a grouping change visible even
+            // when the merged access list happens to be identical.
+            foreach (QueryDescriptor? query in Queries)
+            {
+                builder.Append('|');
+                if (query is null)
+                    continue;
+                for (int index = 0; index < query.Terms.Count; index++)
+                {
+                    if (index > 0)
+                        builder.Append(',');
+                    QueryTermDescriptor term = query.Terms[index];
+                    if (term.IsEntity)
+                    {
+                        builder.Append("entity");
+                        continue;
+                    }
+                    builder.Append((byte)term.Access)
+                        .Append(':')
+                        .Append(term.ComponentKeyHigh.ToString("X16"))
+                        .Append(term.ComponentKey.ToString("X16"));
+                }
+            }
+            return builder.ToString();
+        }
+    }
 }
 
 /// <summary>Compiled one-shot startup method.</summary>
@@ -60,8 +98,9 @@ internal enum PollStatus : byte
 
 /// <summary>
 /// Loads the collectible gameplay assembly and discovers methods marked with
-/// <see cref="EcsSystemAttribute"/>. Each method's single query parameter is
-/// both its executable iterator and the authoritative scheduler access list.
+/// <see cref="EcsSystemAttribute"/>. Every query parameter is both an
+/// executable iterator and part of the authoritative scheduler access list;
+/// the merged list is what the host registers.
 /// </summary>
 internal sealed class ProjectHost
 {
@@ -140,16 +179,17 @@ internal sealed class ProjectHost
     private void LoadFromAotRegistry()
     {
         ManagedSystem[] systems = AotRegistry.Systems
-            .Select(registration => new ManagedSystem(
-                registration.Name,
-                (registration.Query?.Terms ?? [])
-                    .Where(term => !term.IsEntity)
-                    .Select(term => new ManagedAccess(
-                        term.ComponentKey, term.ComponentKeyHigh, (byte)term.Access))
-                    .ToArray(),
-                registration.Query,
-                registration.UsesCommands,
-                registration.Run))
+            .Select(registration =>
+            {
+                QueryDescriptor?[] queries = registration.Queries ?? [];
+                ValidateQueries(registration.Name, queries, registration.QueryNames);
+                return new ManagedSystem(
+                    registration.Name,
+                    MergeAccesses(queries),
+                    queries,
+                    registration.UsesCommands,
+                    registration.Run);
+            })
             .ToArray();
         ManagedStartup[] startups = AotRegistry.Startups
             .Select(registration => new ManagedStartup(registration.Name, registration.Run))
@@ -309,21 +349,40 @@ internal sealed class ProjectHost
             .ToArray();
     }
 
+    /// <summary>Upper bound on the total parameters one managed system may declare.</summary>
+    /// <remarks>
+    /// Matches the native `SystemParam` tuple arity, so a system ported
+    /// between the two languages can keep the same signature.
+    /// </remarks>
+    internal const int MaxSystemParameters = 6;
+
     /// <summary>
-    /// Validate one managed method, derive component access from its query
-    /// type, and compile a parameterless runner for the Rust scheduler.
+    /// Validate one managed method, derive component access from every query
+    /// parameter it declares, and compile a parameterless runner for the Rust
+    /// scheduler.
     /// </summary>
+    /// <remarks>
+    /// A system may declare any number of query parameters plus at most one
+    /// `Commands`, within the parameter budget. Each query keeps its own
+    /// iteration, exactly like a native system that takes several query
+    /// parameters.
+    /// </remarks>
     internal static ManagedSystem CreateSystem(MethodInfo method)
     {
         if (method.ReturnType != typeof(void))
             throw new InvalidOperationException($"{method} must return void.");
 
         var parameters = method.GetParameters();
-        if (parameters.Length == 0 || parameters.Length > 2)
+        if (parameters.Length == 0)
             throw new InvalidOperationException(
-                $"{method} must have a query, Commands, or one of each.");
+                $"{method} must declare at least one parameter: queries, Commands, or both.");
+        if (parameters.Length > MaxSystemParameters)
+            throw new InvalidOperationException(
+                $"{method} declares {parameters.Length} parameters; managed systems support at " +
+                $"most {MaxSystemParameters}, matching the native system parameter arity.");
 
-        QueryDescriptor? descriptor = null;
+        var queries = new List<QueryDescriptor?>(parameters.Length);
+        var queryNames = new List<string?>(parameters.Length);
         bool usesCommands = false;
         var arguments = new List<Expression>(parameters.Length);
         foreach (ParameterInfo parameter in parameters)
@@ -337,7 +396,7 @@ internal sealed class ProjectHost
                 arguments.Add(Expression.Default(typeof(Commands)));
                 continue;
             }
-            if (!typeof(IQueryDescriptor).IsAssignableFrom(parameterType) || descriptor is not null)
+            if (!typeof(IQueryDescriptor).IsAssignableFrom(parameterType))
                 throw UnsupportedQuery(method);
             object query;
             try
@@ -351,19 +410,96 @@ internal sealed class ProjectHost
                     $"Invalid query parameter on {method}: {exception.InnerException.Message}",
                     exception.InnerException);
             }
-            descriptor = ((IQueryDescriptor)query).Descriptor;
+            queries.Add(((IQueryDescriptor)query).Descriptor);
+            queryNames.Add(parameter.Name);
             arguments.Add(Expression.Constant(query, parameterType));
         }
 
-        ManagedAccess[] accesses = (descriptor?.Terms ?? [])
-            .Where(term => !term.IsEntity)
-            .Select(term => new ManagedAccess(
-                term.ComponentKey, term.ComponentKeyHigh, (byte)term.Access))
-            .ToArray();
+        QueryDescriptor?[] queryArray = queries.ToArray();
+        ValidateQueries(method.ToString() ?? method.Name, queryArray, queryNames);
         var call = Expression.Call(method, arguments);
         Action runner = Expression.Lambda<Action>(call).Compile();
         string name = $"{method.DeclaringType?.FullName}.{method.Name}";
-        return new ManagedSystem(name, accesses, descriptor, usesCommands, runner);
+        return new ManagedSystem(name, MergeAccesses(queryArray), queryArray, usesCommands, runner);
+    }
+
+    /// <summary>
+    /// Reject a component that two query parameters both touch when either
+    /// access is a write.
+    /// </summary>
+    /// <remarks>
+    /// The native access check treats a write declaration as permitting
+    /// reads, so without this validation both queries would be authorized to
+    /// reach the same component - one through writable pointers, the other
+    /// through read-only ones - which aliases storage the native scheduler
+    /// cannot see. Sharing a component is allowed when every access is a
+    /// read.
+    /// </remarks>
+    private static void ValidateQueries(
+        string systemName, QueryDescriptor?[] queries, IReadOnlyList<string?>? queryNames)
+    {
+        var firstUse = new Dictionary<(ulong High, ulong Low), (QueryAccess Access, int Query)>();
+        for (int queryIndex = 0; queryIndex < queries.Length; queryIndex++)
+        {
+            QueryDescriptor? query = queries[queryIndex];
+            if (query is null)
+                continue;
+            foreach (QueryTermDescriptor term in query.Terms)
+            {
+                if (term.IsEntity)
+                    continue;
+                var key = (term.ComponentKeyHigh, term.ComponentKey);
+                if (firstUse.TryGetValue(key, out var existing))
+                {
+                    if (existing.Access == QueryAccess.Write || term.Access == QueryAccess.Write)
+                        throw new InvalidOperationException(
+                            $"{systemName}: component {term.ComponentType!.FullName} is accessed by " +
+                            $"{DescribeQuery(queryNames, existing.Query)} and " +
+                            $"{DescribeQuery(queryNames, queryIndex)}; declare it in one query " +
+                            "parameter or use read access only.");
+                    continue;
+                }
+                firstUse[key] = (term.Access, queryIndex);
+            }
+        }
+    }
+
+    /// <summary>Name one query parameter for a validation message.</summary>
+    private static string DescribeQuery(IReadOnlyList<string?>? names, int queryIndex) =>
+        names is not null && queryIndex < names.Count && !string.IsNullOrWhiteSpace(names[queryIndex])
+            ? $"query parameter '{names[queryIndex]}'"
+            : $"query parameter #{queryIndex}";
+
+    /// <summary>
+    /// Merge every query's component terms into the flat scheduler access
+    /// list: one entry per component, first-seen order, and a write in any
+    /// query upgrades a shared declaration.
+    /// </summary>
+    internal static ManagedAccess[] MergeAccesses(QueryDescriptor?[] queries)
+    {
+        var merged = new List<ManagedAccess>();
+        var indexByKey = new Dictionary<(ulong High, ulong Low), int>();
+        foreach (QueryDescriptor? query in queries)
+        {
+            if (query is null)
+                continue;
+            foreach (QueryTermDescriptor term in query.Terms)
+            {
+                if (term.IsEntity)
+                    continue;
+                var key = (term.ComponentKeyHigh, term.ComponentKey);
+                if (indexByKey.TryGetValue(key, out int existing))
+                {
+                    if (term.Access == QueryAccess.Write)
+                        merged[existing] = merged[existing] with { Mode = 1 };
+                    continue;
+                }
+                indexByKey[key] = merged.Count;
+                merged.Add(new ManagedAccess(
+                    term.ComponentKey, term.ComponentKeyHigh, (byte)term.Access));
+            }
+        }
+        return merged.ToArray();
     }
 
     /// <summary>Discover and compile deterministic one-shot startup methods.</summary>

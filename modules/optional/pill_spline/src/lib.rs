@@ -95,6 +95,57 @@ impl Default for Spline {
     }
 }
 
+/// Compile-time layout of the vector type the control points are stored in.
+///
+/// `Vector3f` is `glam::Vec3`, a foreign type that cannot carry
+/// `#[derive(PillMirror)]`; without this declaration the managed mirror falls
+/// back to an opaque byte blob and C# has to write points by offset. The name
+/// is the path the field is written with (`array:struct:Vector3f`), so
+/// managed code gets typed `X`/`Y`/`Z` members instead. glam guarantees
+/// `#[repr(C)]` with `x`, `y`, `z` in order, and the asserts below turn that
+/// guarantee into a build failure if it ever changes.
+static VECTOR3F_MIRROR_FIELDS: &[pill_engine::component_registry::ComponentFieldDescriptor] = &[
+    pill_engine::component_registry::ComponentFieldDescriptor {
+        name: "x",
+        type_tag: "f32",
+        offset: 0,
+        size: 4,
+        align: 4,
+        element_count: 0,
+    },
+    pill_engine::component_registry::ComponentFieldDescriptor {
+        name: "y",
+        type_tag: "f32",
+        offset: 4,
+        size: 4,
+        align: 4,
+        element_count: 0,
+    },
+    pill_engine::component_registry::ComponentFieldDescriptor {
+        name: "z",
+        type_tag: "f32",
+        offset: 8,
+        size: 4,
+        align: 4,
+        element_count: 0,
+    },
+];
+
+pill_engine::submit! {
+    pill_engine::component_registry::PillValueTypeDescriptor {
+        type_name: "Vector3f",
+        size: 12,
+        align: 4,
+        fields: VECTOR3F_MIRROR_FIELDS,
+    }
+}
+
+const _: () = assert!(core::mem::size_of::<Vector3f>() == 12);
+const _: () = assert!(core::mem::align_of::<Vector3f>() == 4);
+const _: () = assert!(core::mem::offset_of!(Vector3f, x) == 0);
+const _: () = assert!(core::mem::offset_of!(Vector3f, y) == 4);
+const _: () = assert!(core::mem::offset_of!(Vector3f, z) == 8);
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PillMirror)]
 pub struct OmoMO {
@@ -223,11 +274,13 @@ impl Spline {
     }
 }
 
-/// Sampling entry points for the managed mirror.
+/// Mirrored entry points for managed code.
 ///
-/// The mirror contract carries primitives only, so the `Vector3f` return of
-/// [`Spline::get_location_at`] crosses one axis at a time; managed code
-/// samples through these getters instead of its own copy of the curve.
+/// The contract carries primitives only, so the `Vector3f` return of
+/// [`Spline::get_location_at`] crosses one axis at a time and points are
+/// written one `x`/`y` pair at a time. Managed code therefore samples and
+/// edits the curve through the module instead of copying its math or its
+/// byte layout.
 #[pill_mirror_impl]
 impl Spline {
     /// `x` of [`Spline::get_location_at`], mirrored to C# as `GetLocationX`.
@@ -240,6 +293,22 @@ impl Spline {
     #[pill_mirror_method]
     pub fn get_location_y(&self, t: f32) -> f32 {
         self.get_location_at(t).y
+    }
+
+    /// Writes the `x`/`y` of one control point and zeroes its `z`, the plane
+    /// the demo scene lives in; mirrored to C# as `SetControlPointLocation`.
+    ///
+    /// The write goes through the value the managed call was made on, so a
+    /// component row is edited in place. Returns `false` when `index` is at
+    /// or beyond [`MAX_CONTROL_POINTS`], so a caller sees the capacity limit
+    /// instead of a silent no-op.
+    #[pill_mirror_method]
+    pub fn set_control_point_location(&mut self, index: u32, x: f32, y: f32) -> bool {
+        let Some(slot) = self.control_points.get_mut(index as usize) else {
+            return false;
+        };
+        *slot = Vector3f::new(x, y, 0.0);
+        true
     }
 }
 
@@ -474,6 +543,33 @@ mod tests {
         assert!(!spline.push_control_point(Vector3f::ZERO));
         assert_eq!(spline.control_points().len(), MAX_CONTROL_POINTS);
     }
+
+    /// The mirrored setter edits one point in place and pins the plane the
+    /// scene works in.
+    #[test]
+    fn set_control_point_location_writes_x_y_and_zeroes_z() {
+        let mut spline =
+            Spline::from_points(&[Vector3f::new(1.0, 2.0, 3.0), Vector3f::new(4.0, 5.0, 6.0)]);
+
+        assert!(spline.set_control_point_location(1, 10.0, 20.0));
+
+        let point = spline.control_points[1];
+        assert_eq!(point.x, 10.0);
+        assert_eq!(point.y, 20.0);
+        assert_eq!(point.z, 0.0);
+        // Neighbouring storage stays untouched.
+        assert_eq!(spline.control_points[0], Vector3f::new(1.0, 2.0, 3.0));
+    }
+
+    /// Out-of-range indices report the capacity limit instead of writing.
+    #[test]
+    fn set_control_point_location_rejects_out_of_range_index() {
+        let mut spline = Spline::default();
+
+        assert!(!spline.set_control_point_location(MAX_CONTROL_POINTS as u32, 1.0, 2.0));
+        assert!(spline.set_control_point_location(MAX_CONTROL_POINTS as u32 - 1, 1.0, 2.0));
+    }
+
     /// An inherent method carries a redirect slot exactly as a free function
     /// does, and callers of the public name follow an installed replacement.
     ///

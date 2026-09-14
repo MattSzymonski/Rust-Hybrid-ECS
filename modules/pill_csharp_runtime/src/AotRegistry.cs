@@ -21,8 +21,11 @@ public readonly struct AotSystemRegistration
     /// <summary>Stable display name, matching the reflection path's format.</summary>
     public string Name { get; }
 
-    /// <summary>Validated query metadata; null for Commands-only systems.</summary>
-    public QueryDescriptor? Query { get; }
+    /// <summary>Validated query metadata in parameter order; empty for Commands-only systems.</summary>
+    public QueryDescriptor?[] Queries { get; }
+
+    /// <summary>Declared query parameter names, aligned with <see cref="Queries"/>.</summary>
+    public string[] QueryNames { get; }
 
     /// <summary>Whether the system declared a Commands parameter.</summary>
     public bool UsesCommands { get; }
@@ -31,10 +34,12 @@ public readonly struct AotSystemRegistration
     public Action Run { get; }
 
     /// <summary>Describe one generated system registration.</summary>
-    public AotSystemRegistration(string name, QueryDescriptor? query, bool usesCommands, Action run)
+    public AotSystemRegistration(
+        string name, QueryDescriptor?[] queries, string[] queryNames, bool usesCommands, Action run)
     {
         Name = name;
-        Query = query;
+        Queries = queries;
+        QueryNames = queryNames;
         UsesCommands = usesCommands;
         Run = run;
     }

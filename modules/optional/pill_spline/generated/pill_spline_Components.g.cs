@@ -12,13 +12,13 @@ using System.Runtime.InteropServices;
 
 namespace pill_spline {
 
-[StructLayout(LayoutKind.Sequential, Size = 12)]
+[StructLayout(LayoutKind.Explicit, Size = 12)]
 public struct Vector3f
 {
-    private readonly uint _alignmentPad;
-
-    /// Live ABI bytes of this value type; it was not declared with
-    /// `#[derive(PillMirror)]`, so its fields stay opaque.
+    [FieldOffset(0)] public float X;
+    [FieldOffset(4)] public float Y;
+    [FieldOffset(8)] public float Z;
+    /// Live ABI bytes of this component row (safe code).
     public readonly Span<byte> Raw =>
         MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
 }
@@ -150,6 +150,18 @@ public struct Spline
     {
         var mirror = global::TracyLive.MirrorMethods.Resolve<SplineGetLocationYDelegate>("pill_spline::Spline", "get_location_y");
         return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), t);
+    }
+
+    /// Calls the Rust method `pill_spline::Spline::set_control_point_location` through its
+    /// generated C-ABI trampoline, handing it the receiver's live
+    /// address without boxing or pinning it.
+    [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+    public delegate byte SplineSetControlPointLocationDelegate(IntPtr self, uint index, float x, float y);
+
+    public byte SetControlPointLocation(uint index, float x, float y)
+    {
+        var mirror = global::TracyLive.MirrorMethods.Resolve<SplineSetControlPointLocationDelegate>("pill_spline::Spline", "set_control_point_location");
+        return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), index, x, y);
     }
 }
 

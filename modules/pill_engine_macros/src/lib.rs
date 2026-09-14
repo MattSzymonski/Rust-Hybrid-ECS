@@ -943,7 +943,7 @@ pub fn derive_pill_mirror(input: TokenStream) -> TokenStream {
 // #[pill_mirror_impl] / #[pill_mirror_method]
 // =============================================================================
 
-/// Mirrors selected `&self` methods of a mirrored type to C#.
+/// Mirrors selected `&self` or `&mut self` methods of a mirrored type to C#.
 ///
 /// The type may be a `#[derive(PillMirror)]` value type or an exposed
 /// component row; both reach the generated C# struct the same way.
@@ -974,9 +974,10 @@ pub fn derive_pill_mirror(input: TokenStream) -> TokenStream {
 ///   the host can resolve the trampoline's symbol and hand the address to the
 ///   C# runtime.
 ///
-/// v1 supports a deliberately narrow contract: a `&self` receiver (the
-/// generated call hands the trampoline the receiver's live address, so a
-/// mirrored call allocates nothing), primitive arguments and return values
+/// v1 supports a deliberately narrow contract: a `&self` or `&mut self`
+/// receiver (the generated call hands the trampoline the receiver's live
+/// address, so a mirrored call allocates nothing and a `&mut self` method
+/// writes through to that address), primitive arguments and return values
 /// (`u8..u64`, `i8..i64`, `f32`, `f64`, `bool`, `usize`, `isize`), and a `()`
 /// return. Anything else is rejected here at compile time with a clear error.
 ///
@@ -1076,28 +1077,30 @@ fn emit_mirrored_method_trampoline(
         ));
     }
 
-    // Receiver must be `&self` (read-only), matching the trampoline's `*const`
-    // receiver pointer: `&mut self` would widen the mirror contract to writes,
-    // and `self` by value would copy the type across an ABI the mirror does
-    // not define.
-    match &method.sig.inputs.first() {
-        Some(syn::FnArg::Receiver(receiver))
-            if receiver.reference.is_some() && receiver.mutability.is_none() => {}
+    // Receiver must be `&self` or `&mut self`: the trampoline receives the
+    // address of the value the method was invoked on, so a `&mut self` method
+    // writes through to the caller's storage - a component row, or the local
+    // copy the call was made on. `self` by value would copy the type across
+    // an ABI the mirror does not define.
+    let receiver_is_mutable = match &method.sig.inputs.first() {
+        Some(syn::FnArg::Receiver(receiver)) if receiver.reference.is_some() => {
+            receiver.mutability.is_some()
+        }
         Some(other) => {
             return Err(syn::Error::new_spanned(
                 other,
                 format!(
-                    "`{method_ident}` must take `&self` to be mirrored; `&mut self` and `self` are not supported"
+                    "`{method_ident}` must take `&self` or `&mut self` to be mirrored; `self` by value is not supported"
                 ),
             ));
         }
         None => {
             return Err(syn::Error::new_spanned(
                 &method.sig,
-                format!("`{method_ident}` must take `&self` to be mirrored"),
+                format!("`{method_ident}` must take `&self` or `&mut self` to be mirrored"),
             ));
         }
-    }
+    };
 
     // Every argument must be a supported primitive, tagged for the C# codegen.
     let mut arg_types: Vec<&syn::Type> = Vec::new();
@@ -1157,6 +1160,14 @@ fn emit_mirrored_method_trampoline(
     let symbol_ident = syn::Ident::new(&symbol_name, method_ident.span());
     let symbol_literal = syn::LitStr::new(&symbol_name, method_ident.span());
     let self_pointer = format_ident!("self_pointer");
+    // A `&mut self` method receives a writable pointer so it can edit the
+    // value the managed call was made on; `&self` methods keep the read-only
+    // `*const` contract.
+    let self_pointer_type = if receiver_is_mutable {
+        quote! { *mut #type_ident }
+    } else {
+        quote! { *const #type_ident }
+    };
 
     Ok(quote! {
         /// C-ABI trampoline for the mirrored method
@@ -1166,11 +1177,12 @@ fn emit_mirrored_method_trampoline(
         ///
         /// `#self_pointer` must point at a live `#type_ident` value for the
         /// duration of the call; the C# runtime passes the address of the
-        /// value the mirror method was invoked on.
+        /// value the mirror method was invoked on, and a `&mut self` method
+        /// writes through it.
         #[doc(hidden)]
         #[no_mangle]
         pub unsafe extern "C" fn #symbol_ident(
-            #self_pointer: *const #type_ident
+            #self_pointer: #self_pointer_type
             #(, #arg_idents: #arg_types)*
         ) -> #return_type {
             // SAFETY: the host-side runtime guarantees the pointer points at a

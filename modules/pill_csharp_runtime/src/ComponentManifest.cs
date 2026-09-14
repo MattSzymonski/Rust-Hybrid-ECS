@@ -39,8 +39,9 @@ internal static class ComponentManifestBuilder
     internal static byte[] Build(IEnumerable<ManagedSystem> systems, Assembly? projectAssembly = null)
     {
         IEnumerable<Type> queryComponents = systems
-            .Where(system => system.QueryDescriptor is not null)
-            .SelectMany(system => system.QueryDescriptor!.Terms)
+            .SelectMany(system => system.Queries)
+            .Where(query => query is not null)
+            .SelectMany(query => query!.Terms)
             .Where(term => !term.IsEntity)
             .Select(term => term.ComponentType!);
         IEnumerable<Type> declaredProjectComponents = projectAssembly is null

@@ -5,9 +5,9 @@
 // `MethodInfo.Invoke` all require dynamic code or reflection invokers that
 // AOT does not provide. This generator instead emits, at compile time, a
 // direct registration table for every `[EcsSystem]` / `[EcsStartup]` method:
-// a static runner per system that constructs the query with `new` and calls
-// the method directly (no reflection), plus the query descriptor needed for
-// scheduler access derivation and the component manifest.
+// method: a static runner per system that constructs each query with `new`
+// and calls the method directly (no reflection), plus the query descriptors
+// needed for scheduler access derivation and the component manifest.
 //
 // The generated code is compiled into the *project* assembly (the only one
 // that can see the gameplay types) and installed into `AotRegistry`
@@ -35,6 +35,8 @@ namespace PillCSharpRuntimeMacros
     {
         private const string AotRegistryNamespace = "TracyLive.Loader";
         private const string AotRegistryTypeName = "AotRegistry";
+        /// <summary>Parameter budget matching the runtime's managed system contract.</summary>
+        private const int MaxSystemParameters = 6;
         // FullyQualifiedFormat renders with the `global::` prefix, so the
         // comparison strings must carry it too.
         private const string CommandsTypeName = "global::TracyLive.Commands";
@@ -128,7 +130,8 @@ namespace PillCSharpRuntimeMacros
                         new DiagnosticDescriptor(
                             "PCS0001",
                             "Unsupported EcsSystem signature",
-                            "System {0} has an unsupported query parameter for the AOT registry",
+                            "System {0} has an unsupported signature for the AOT registry " +
+                            "(expected up to six parameters: query parameters plus at most one Commands)",
                             "PillCSharpRuntimeMacros",
                             DiagnosticSeverity.Error,
                             isEnabledByDefault: true),
@@ -201,7 +204,7 @@ namespace PillCSharpRuntimeMacros
             return false;
         }
 
-        /// <summary>Emit one system's query holder, runner, and registry entry.</summary>
+        /// <summary>Emit one system's query holders, runner, and registry entry.</summary>
         private static string? EmitSystem(
             StringBuilder source,
             IMethodSymbol method,
@@ -209,56 +212,66 @@ namespace PillCSharpRuntimeMacros
             int index,
             List<string> entries)
         {
-            // Classify parameters: at most two, each Commands or a query.
-            IParameterSymbol? queryParameter = null;
+            // Classify parameters: queries and at most one Commands, within
+            // the same parameter budget the runtime enforces.
+            if (method.Parameters.Length == 0 || method.Parameters.Length > MaxSystemParameters)
+                return null;
             bool usesCommands = false;
             foreach (IParameterSymbol parameter in method.Parameters)
             {
                 if (IsCommands(parameter.Type))
                 {
+                    if (usesCommands)
+                        return null; // second Commands parameter: unsupported
                     usesCommands = true;
                     continue;
                 }
-                if (queryParameter is not null)
-                    return null; // more than one query parameter: unsupported
                 if (!IsQueryType(parameter.Type))
                     return null; // non-query, non-Commands parameter: unsupported
-                queryParameter = parameter;
-            }
-            if (queryParameter is null && !usesCommands)
-                return null; // no usable parameters at all
-
-            string queryType = queryParameter is null
-                ? "global::System.Object"
-                : queryParameter.Type.ToDisplayString(FullyQualified);
-            string queryField = $"s_query_{index}";
-            string runMethod = $"RunSystem_{index}";
-
-            if (queryParameter is not null)
-            {
-                source.AppendLine($"        private static readonly {queryType} {queryField} = new {queryType}();");
             }
 
-            // Build the invocation argument list in declared parameter order.
-            List<string> arguments = new();
-            foreach (IParameterSymbol parameter in method.Parameters)
+            // One static query holder per query parameter, so the runner can
+            // hand each of them to the method in declared order.
+            string[] queryFields = new string[method.Parameters.Length];
+            for (int parameterIndex = 0; parameterIndex < method.Parameters.Length; parameterIndex++)
             {
+                IParameterSymbol parameter = method.Parameters[parameterIndex];
                 if (IsCommands(parameter.Type))
+                    continue;
+                string field = $"s_query_{index}_{parameterIndex}";
+                string queryType = parameter.Type.ToDisplayString(FullyQualified);
+                source.AppendLine($"        private static readonly {queryType} {field} = new {queryType}();");
+                queryFields[parameterIndex] = field;
+            }
+
+            string runMethod = $"RunSystem_{index}";
+            // Build the invocation argument list in declared parameter order,
+            // alongside the descriptor and name arrays the runtime consumes.
+            List<string> arguments = new();
+            List<string> descriptors = new();
+            List<string> queryNames = new();
+            for (int parameterIndex = 0; parameterIndex < method.Parameters.Length; parameterIndex++)
+            {
+                IParameterSymbol parameter = method.Parameters[parameterIndex];
+                if (IsCommands(parameter.Type))
+                {
                     arguments.Add("default");
-                else
-                    arguments.Add(queryField);
+                    continue;
+                }
+                arguments.Add(queryFields[parameterIndex]);
+                descriptors.Add($"{queryFields[parameterIndex]}.Descriptor");
+                queryNames.Add($"\"{parameter.Name}\"");
             }
             string args = string.Join(", ", arguments);
             source.AppendLine(
                 $"        private static void {runMethod}() => {receiver}.{method.Name}({args});");
 
-            string descriptor = queryParameter is null
-                ? "null"
-                : $"{queryField}.Descriptor";
             string name = $"{method.ContainingType.ToDisplayString(FullyQualified)}.{method.Name}";
             entries.Add(
                 $"            new global::TracyLive.Loader.AotSystemRegistration(" +
-                $"\"{name}\", {descriptor}, {(usesCommands ? "true" : "false")}, {runMethod})");
+                $"\"{name}\", new global::TracyLive.QueryDescriptor?[] {{ {string.Join(", ", descriptors)} }}, " +
+                $"new string[] {{ {string.Join(", ", queryNames)} }}, " +
+                $"{(usesCommands ? "true" : "false")}, {runMethod})");
             return name;
         }
 

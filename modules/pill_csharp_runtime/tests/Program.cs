@@ -52,6 +52,8 @@ internal static class TestSystems
 {
     internal static bool WasRun;
 
+    internal static int QueriesVisited;
+
     public static void Runner(Query<Write<TestPosition>, Read<TestVelocity>> query) =>
         WasRun = query is not null;
 
@@ -96,6 +98,45 @@ internal static class TestSystems
 
     public static void QueryAndCommands(
         Query<Read<TestPosition>> query, Commands commands)
+    { }
+
+    public static void TwoQueries(
+        Query<Read<TestPosition>> positions, Query<Read<TestVelocity>> velocities)
+    {
+        foreach (var row in positions)
+        {
+            _ = row.Read<TestPosition>().X;
+            QueriesVisited++;
+        }
+        foreach (var row in velocities)
+        {
+            _ = row.Read<TestVelocity>().X;
+            QueriesVisited++;
+        }
+    }
+
+    public static void ThreeQueriesAndCommands(
+        Query<Read<TestPosition>> positions, Query<Write<TestVelocity>> velocities,
+        Query<Read<TestHealth>> healths, Commands commands)
+    { }
+
+    public static void SharedReadQueries(
+        Query<Read<TestPosition>> first, Query<Read<TestPosition>> second)
+    { }
+
+    public static void ConflictingQueries(
+        Query<Write<TestPosition>> first, Query<Read<TestPosition>> second)
+    { }
+
+    public static void TwoCommands(
+        Query<Read<TestPosition>> query, Commands first, Commands second)
+    { }
+
+    public static void SevenParameters(
+        Query<Read<TestPosition>> first, Query<Read<TestVelocity>> second,
+        Query<Read<TestHealth>> third, Query<Read<TestComponent4>> fourth,
+        Query<Read<TestComponent5>> fifth, Query<Read<TestComponent6>> sixth,
+        Commands seventh)
     { }
 
     public static void DespawnSystem(
@@ -387,21 +428,16 @@ internal static class Program
             Test("current project discovers native and dynamic component systems", () =>
             {
                 var systems = ProjectHost.DiscoverSystems(typeof(BallPhysicsSystem).Assembly);
-                // The physics step, plus the systems a managed project needs to
-                // express what the Rust project does in one pass: snapshot the
-                // ball centres, publish the spline, place the dots, and fill the
-                // world up to the target counts.
-                Equal(systems.Length, 7, "unexpected project system count");
+                // The physics step, the three-query spline pass - the same
+                // system shape the Rust project uses - and the systems that
+                // fill the world up to the target counts.
+                Equal(systems.Length, 5, "unexpected project system count");
                 Assert(systems.Any(system => system.Name == "TracyLive.BallPhysicsSystem.Run"),
                     "ball physics system was not discovered");
-                Assert(systems.Any(system => system.Name == "TracyLive.BallSnapshotSystem.Run"),
-                    "ball snapshot system was not discovered");
                 Assert(systems.Any(system => system.Name == "TracyLive.BallSpawnSystem.Run"),
                     "ball spawn system was not discovered");
                 Assert(systems.Any(system => system.Name == "TracyLive.SplinePathSystem.Run"),
                     "spline path system was not discovered");
-                Assert(systems.Any(system => system.Name == "TracyLive.SplineSampleSystem.Run"),
-                    "spline sample system was not discovered");
                 Assert(systems.Any(system => system.Name == "TracyLive.SplineSampleSpawnSystem.Run"),
                     "spline sample spawn system was not discovered");
                 Assert(systems.Any(system => system.Name == "TracyLive.SplineSpawnSystem.Run"),
@@ -490,6 +526,50 @@ internal static class Program
                 Assert(mixed.UsesCommands, "query plus Commands did not declare commands");
                 Equal(mixed.Accesses.Length, 1, "query plus Commands lost query access");
             });
+
+            Test("multiple query parameters merge into one scheduler access list", () =>
+            {
+                var system = ProjectHost.CreateSystem(
+                    Method(nameof(TestSystems.ThreeQueriesAndCommands)));
+                Assert(system.UsesCommands, "multi-query system lost its Commands flag");
+                Equal(system.Queries.Length, 3, "query descriptors were not preserved");
+                Equal(system.Accesses.Length, 3, "unexpected merged access count");
+                Equal(system.Accesses[0],
+                    new ManagedAccess(Engine.ComponentKey(typeof(TestPosition)),
+                        Engine.ComponentKeyHigh(typeof(TestPosition)), 0),
+                    "wrong first-query read access");
+                Equal(system.Accesses[1],
+                    new ManagedAccess(Engine.ComponentKey(typeof(TestVelocity)),
+                        Engine.ComponentKeyHigh(typeof(TestVelocity)), 1),
+                    "wrong second-query write access");
+                Equal(system.Accesses[2],
+                    new ManagedAccess(Engine.ComponentKey(typeof(TestHealth)),
+                        Engine.ComponentKeyHigh(typeof(TestHealth)), 0),
+                    "wrong third-query read access");
+            });
+
+            Test("a component read by two queries merges into a single access entry", () =>
+            {
+                var system = ProjectHost.CreateSystem(
+                    Method(nameof(TestSystems.SharedReadQueries)));
+                Equal(system.Accesses.Length, 1, "shared reads must merge into one entry");
+                Equal(system.Accesses[0].Mode, 0, "shared reads must stay read-only");
+            });
+
+            Test("a write shared across query parameters is rejected", () =>
+                Throws<InvalidOperationException>(
+                    () => ProjectHost.CreateSystem(Method(nameof(TestSystems.ConflictingQueries))),
+                    "cross-query write must be rejected"));
+
+            Test("a second Commands parameter is rejected", () =>
+                Throws<InvalidOperationException>(
+                    () => ProjectHost.CreateSystem(Method(nameof(TestSystems.TwoCommands))),
+                    "a second Commands parameter must be rejected"));
+
+            Test("a system beyond the parameter budget is rejected", () =>
+                Throws<InvalidOperationException>(
+                    () => ProjectHost.CreateSystem(Method(nameof(TestSystems.SevenParameters))),
+                    "systems beyond the parameter budget must be rejected"));
 
             Test("ball spawn system queues the missing balls and nothing else", () =>
             {
@@ -951,6 +1031,21 @@ internal static class Program
                 Assert(TestSystems.WasRun, "compiled runner did not invoke the method");
             });
 
+            Test("compiled runner supplies every query parameter", () =>
+            {
+                TestPosition* positions = stackalloc TestPosition[1];
+                TestVelocity* velocities = stackalloc TestVelocity[1];
+                MockNativeWorld.Positions = positions;
+                MockNativeWorld.Velocities = velocities;
+                MockNativeWorld.Length = 1;
+                TestSystems.QueriesVisited = 0;
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+                ProjectHost.CreateSystem(Method(nameof(TestSystems.TwoQueries))).Run();
+                Equal(TestSystems.QueriesVisited, 2,
+                    "the runner did not iterate both query parameters");
+            });
+
             Test("component keys are stable and type-specific", () =>
             {
                 Equal(Engine.ComponentKey(typeof(Position)),
@@ -1020,8 +1115,8 @@ internal static class Program
                     (delegate* unmanaged<uint, uint>)&LoaderInterop.SystemErrorMessageLength;
 
                 Equal(init((IntPtr)(&api)), 1, "loader init failed");
-                // BallPhysicsSystem + the snapshot, spawn, spline and sample systems.
-                Equal(systemCount(), 7u, "unexpected managed system count");
+                // BallPhysicsSystem, the three-query spline pass, and the spawn systems.
+                Equal(systemCount(), 5u, "unexpected managed system count");
                 Equal(runSystem(1), 1, "healthy system reported failure");
                 Equal(errorLength(1), 0u,
                     "healthy system carries a stale error message");

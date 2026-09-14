@@ -8,24 +8,19 @@
 //   Rust init does.
 //
 // Design
-// The scene, the constants and the per-frame math are the Rust project's, so
-// both projects run the same demo against the same world. Four things cannot be
-// expressed the same way on the managed side, and each is named where it
+// The scene, the constants, the per-frame math and the shapes of the systems
+// are the Rust project's - including the three-query `spline_path` pass - so
+// both projects run the same demo against the same world. Three things cannot
+// be expressed the same way on the managed side, and each is named where it
 // matters:
 // 1. Managed systems have no resources. `SimulationTime` is a static, and the
 //    ball system stamps it before reading it - the counterpart of the Rust
 //    `update_time_system` writing the resource every other system reads.
-// 2. A managed system declares ONE query, and no entity handle travels between
-//    queries. The Rust `spline_path_system` reads the ball centres and writes
-//    the spline and its dots in a single pass; here that pass is the snapshot,
-//    the control-point writer and the sampler, sharing `SplinePath`. The curve
-//    math itself is not duplicated: the sampler calls the module's mirrored
-//    `get_location_at` getters on the spline row.
-// 3. A startup cannot query, so filling the world up to a target count - which
+// 2. A startup cannot query, so filling the world up to a target count - which
 //    the Rust init checks by counting entities - is done by the spawn systems:
 //    they run every frame and create only what is missing, which is also what
 //    keeps a hot reload from duplicating the scene.
-// 4. Registration needs no code here: the loader discovers the attributed
+// 3. Registration needs no code here: the loader discovers the attributed
 //    systems and registers the project's components from the managed manifest,
 //    where the Rust init calls `register_system` and `register_component`
 //    itself.
@@ -35,6 +30,7 @@ using System.Runtime.InteropServices;
 
 using static TracyLive.ProjectConstants;
 using Spline = pill_spline.Spline;
+using Vector3f = pill_spline.Vector3f;
 
 namespace TracyLive;
 
@@ -185,46 +181,20 @@ public static class BallPhysicsSystem
 // Spline path
 // =============================================================================
 
-/// <summary>
-/// The curve the sample dots are placed on, shared by the systems that build it.
-/// </summary>
+/// <summary>Shared helpers for the spline pass: the point value and the seed curve.</summary>
 /// <remarks>
-/// The Rust project samples the spline component itself, through the module's
-/// `Spline::get_location_at`; the mirror exposes that same math as the
-/// primitive getters `GetLocationX`/`GetLocationY`, so the curve is never
-/// reimplemented on this side. The arrays exist because a managed system
-/// declares a single query: the ball centres travel through
-/// <see cref="ControlPoints"/> from the ball system to the writer, and the
-/// sampled grid through <see cref="SamplePositions"/> from the writer to the
-/// dots. The seed spline is built from the balls' spawn positions for the
-/// dots' first frame.
+/// The module's mirror declares `Vector3f` with typed `X`/`Y`/`Z` members, so
+/// the seed spline is written with ordinary assignments over a cast of its
+/// control point storage; live rows are edited through the module's
+/// `SetControlPointLocation` instead. The curve math itself is the module's,
+/// reached through the mirrored `GetLocationX`/`GetLocationY` getters. The
+/// seed spline is built from the balls' spawn positions for the dots' first
+/// frame.
 /// </remarks>
 internal static class SplinePath
 {
-    /// <summary>Bytes one control point occupies in the module's ABI blob.</summary>
-    internal const int ControlPointStride = 12;
-
-    /// <summary>The module's `MAX_CONTROL_POINTS`, the length of its array.</summary>
-    private const int MaxControlPoints = 16;
-
-    /// <summary>Ball centres for this frame, three floats per point.</summary>
-    internal static readonly float[] ControlPoints = new float[MaxControlPoints * 3];
-
-    /// <summary>How many leading <see cref="ControlPoints"/> the balls filled in.</summary>
-    internal static int ControlPointCount;
-
-    /// <summary>Sampled curve positions, an x/y pair per dot index.</summary>
-    internal static readonly float[] SamplePositions = new float[SplineSampleCount * 2];
-
-    /// <summary>Writes one control point into a spline row's ABI bytes.</summary>
-    internal static void WriteControlPoint(Span<byte> bytes, int index, float x, float y)
-    {
-        int offset = index * ControlPointStride;
-        MemoryMarshal.Write(bytes.Slice(offset), in x);
-        MemoryMarshal.Write(bytes.Slice(offset + 4), in y);
-        // The z axis stays zero: the whole scene lives in the z = 0 plane.
-        MemoryMarshal.Write(bytes.Slice(offset + 8), 0.0f);
-    }
+    /// <summary>One control point, the shape glam's `Vector3f::new` takes.</summary>
+    internal static Vector3f Vec3(float x, float y, float z) => new() { X = x, Y = y, Z = z };
 
     /// <summary>
     /// A spline through the balls' spawn positions, for seeding the dots
@@ -233,11 +203,13 @@ internal static class SplinePath
     internal static Spline CreateSeedSpline()
     {
         var spline = new Spline();
-        Span<byte> bytes = spline.Raw;
+        // The raw span is 200 bytes wide: the cast keeps the 16 control
+        // points at the front and drops the count/elo tail.
+        Span<Vector3f> points = MemoryMarshal.Cast<byte, Vector3f>(spline.Raw);
         for (int index = 0; index < BallCount; index++)
         {
             PhysicsState ball = WorldSetup.BallSpawnState(index);
-            WriteControlPoint(bytes, index, ball.PositionX, ball.PositionY);
+            points[index] = Vec3(ball.PositionX, ball.PositionY, 0.0f);
         }
         spline.ControlPointCount = BallCount;
         // The module's `from_points` builds on `Spline::default()`, so a
@@ -245,105 +217,74 @@ internal static class SplinePath
         spline.Elo = 30.0f;
         return spline;
     }
-
 }
 
-/// <summary>Copies the ball centres into <see cref="SplinePath"/> for this frame.</summary>
+/// <summary>Rebuilds the spline from the ball centres and walks the sample dots along the result.</summary>
 /// <remarks>
-/// Query iteration walks the ball archetype row by row, and the balls are
-/// created in index order, so the i-th centre seen belongs to the i-th ball -
-/// the ordering assumption the Rust system makes as well.
+/// The managed counterpart of the Rust `spline_path_system`: three query
+/// parameters in one system, each iterating independently. The physics system
+/// touches the same components in the same frame, and the scheduler is free to
+/// batch it either side of this system; a centre can therefore be one frame
+/// old by the time it becomes a control point, which is invisible at 60 Hz and
+/// keeps the spline out of the physics step.
 /// </remarks>
-public static class BallSnapshotSystem
+public static class SplinePathSystem
 {
     [EcsSystem]
-    public static void Run(Query<Read<PhysicsState>> query)
+    public static void Run(
+        Query<Read<PhysicsState>> balls,
+        Query<Write<Spline>> splines,
+        Query<Write<SplineSample>, Write<Position>> samples)
     {
+        // Step 1: collect the ball centres in the order the control points
+        // take. Iteration walks the ball archetype row by row and the balls
+        // are created in index order, so the i-th centre seen belongs to the
+        // i-th ball. The points are staged because the two query iterations
+        // cannot interleave: the centres are gathered first, then handed to
+        // the spline in Step 2.
+        Span<Vector3f> controlPoints = stackalloc Vector3f[BallCount];
         int count = 0;
-        foreach (var row in query.Rows())
+        foreach (var row in balls.Rows())
         {
             if (count == BallCount)
                 break;
 
             ref readonly var ball = ref row.PhysicsState;
-            SplinePath.ControlPoints[count * 3] = ball.PositionX;
-            SplinePath.ControlPoints[count * 3 + 1] = ball.PositionY;
-            SplinePath.ControlPoints[count * 3 + 2] = 0.0f;
+            controlPoints[count] = SplinePath.Vec3(ball.PositionX, ball.PositionY, 0.0f);
             count++;
         }
 
-        SplinePath.ControlPointCount = count;
-    }
-}
-
-/// <summary>Publishes the snapshot as the spline's control points.</summary>
-/// <remarks>
-/// The control point array lives behind the generated mirror's ABI blob:
-/// `glam::Vec3` is not a mirrorable type, so the floats go through its `Raw`
-/// span at the offsets the module registered. The spline keeps its own copy of
-/// the centres, so the balls need no relationship to it and stay free to move.
-/// The same pass samples the updated curve through the module's mirrored
-/// getters, filling the grid the dots read.
-/// </remarks>
-public static class SplinePathSystem
-{
-    [EcsSystem]
-    public static void Run(Query<Write<Spline>> query)
-    {
-        int count = SplinePath.ControlPointCount;
-        if (count == 0)
-            return;
-
-        foreach (var row in query.Rows())
+        // Step 2: publish the points, then place the dots on the curve they
+        // describe. The spline keeps its own copy of the centres, so the balls
+        // need no relationship to it and stay free to keep moving.
+        foreach (var row in splines.Rows())
         {
             ref var spline = ref row.Spline;
-            Span<byte> bytes = spline.Raw;
             for (int index = 0; index < count; index++)
             {
-                SplinePath.WriteControlPoint(
-                    bytes,
-                    index,
-                    SplinePath.ControlPoints[index * 3],
-                    SplinePath.ControlPoints[index * 3 + 1]);
+                // The module writes the point in place: the mirrored call
+                // receives the row reference's live storage. The demo never
+                // exceeds MAX_CONTROL_POINTS, so the capacity result is
+                // deliberately discarded.
+                spline.SetControlPointLocation(
+                    (uint)index,
+                    controlPoints[index].X,
+                    controlPoints[index].Y);
             }
             spline.ControlPointCount = (uint)count;
 
-            // The curve is current: ask the module for the sample grid the
-            // dots read, one dot index at a time.
-            for (int index = 0; index < SplineSampleCount; index++)
+            foreach (var sampleRow in samples.Rows())
             {
-                float t = index * SplineSampleStep;
-                SplinePath.SamplePositions[index * 2] = spline.GetLocationX(t);
-                SplinePath.SamplePositions[index * 2 + 1] = spline.GetLocationY(t);
+                ref var sample = ref sampleRow.SplineSample;
+                ref var position = ref sampleRow.Position;
+                float x = spline.GetLocationX(sample.T);
+                float y = spline.GetLocationY(sample.T);
+
+                // Samples are curve points and the dot is centred on them;
+                // sprites draw from the top-left corner of their quad.
+                position.X = x - SplineSampleDotSize * 0.5f;
+                position.Y = y - SplineSampleDotSize * 0.5f;
             }
-        }
-    }
-}
-
-/// <summary>Walks the sample dots along the curve the ball centres describe.</summary>
-public static class SplineSampleSystem
-{
-    [EcsSystem]
-    public static void Run(Query<Write<SplineSample>, Write<Position>> query)
-    {
-        // Before the first snapshot there is no curve to sample; the dots keep
-        // the positions the spawn system seeded them with.
-        if (SplinePath.ControlPointCount == 0)
-            return;
-
-        foreach (var row in query.Rows())
-        {
-            ref var sample = ref row.SplineSample;
-            ref var position = ref row.Position;
-            // The dots sit on the fixed sample grid, so `t` identifies which
-            // grid entry holds their position.
-            int index = Math.Clamp(
-                (int)MathF.Round(sample.T / SplineSampleStep), 0, SplineSampleCount - 1);
-
-            // Samples are curve points and the dot is centred on them; sprites
-            // draw from the top-left corner of their quad.
-            position.X = SplinePath.SamplePositions[index * 2] - SplineSampleDotSize * 0.5f;
-            position.Y = SplinePath.SamplePositions[index * 2 + 1] - SplineSampleDotSize * 0.5f;
         }
     }
 }
