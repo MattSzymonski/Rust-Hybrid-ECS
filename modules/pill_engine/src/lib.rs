@@ -34,6 +34,14 @@ pub mod api;
 /// Archetype-based component storage with structure-of-arrays layout.
 pub mod archetype;
 
+/// Many-per-type asset storage addressed by generational handle.
+///
+/// The counterpart to [`resource`] for data a world holds several of - meshes,
+/// textures, materials - where the type alone does not name one value. The
+/// store is itself a resource, so it reaches systems through the existing
+/// `Res` / `ResMut` parameters.
+pub mod asset;
+
 /// Deferred command queue for structural ECS mutations.
 pub mod commands;
 
@@ -90,6 +98,9 @@ pub mod hot_patch;
 /// Advanced system parameter infrastructure with automatic parameter resolution.
 pub mod system;
 
+/// Frame timing maintained by the engine and read through `Res<Time>`.
+pub mod time;
+
 /// Central ECS state container - entities, archetypes, components, and resources.
 pub mod world;
 // ===== Public Re-exports =====
@@ -111,7 +122,9 @@ pub use persistence::ComponentSnapshot;
 pub use query::{
     Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,
 };
+pub use asset::{Asset, AssetManager, Handle};
 pub use resource::{ResHandle, Resource};
+pub use time::Time;
 pub use scheduler::{SystemAccess, SystemScheduler, TypeKey};
 pub use scripting::{ScriptComponent, ScriptContext};
 
