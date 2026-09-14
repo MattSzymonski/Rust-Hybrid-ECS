@@ -84,7 +84,7 @@ const SAMPLE_VERTICAL_OFFSET: f32 = 0.0;
 /// the C# bindings, the editor, `project_settings.yaml` - is unaffected.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PillComponent)]
-#[pill(persistable)]
+#[pill(persistable, shared)]
 pub struct Spline {
     /// Control points the curve passes through, in order.
     pub control_points: [Vector3f; MAX_CONTROL_POINTS],
