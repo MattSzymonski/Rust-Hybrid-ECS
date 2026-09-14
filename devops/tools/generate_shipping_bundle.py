@@ -278,13 +278,14 @@ def build_cargo_manifest(
         # requested on the HOST (`pill_standalone/rendering`) and the filter
         # below simply drops the name here. A managed project is a dotnet
         # assembly, so it has no cargo dependency to declare.
+        # The feature list is built outside the f-string: nesting the same
+        # quote character inside an f-string expression is only valid on
+        # Python 3.12+, and this script supports 3.8+.
+        feature_names = ", ".join(f'"{name}"' for name in sorted(project_features))
+        feature_clause = f", features = [{feature_names}]" if project_features else ""
         lines.append(
             f'project = {{ path = "{manifest_relative_path(bundle_directory, project_root)}"'
-            + (
-                f", features = [{', '.join(f'"{name}"' for name in sorted(project_features))}]"
-                if project_features
-                else ""
-            )
+            + feature_clause
             + " }",
         )
     for module in modules:

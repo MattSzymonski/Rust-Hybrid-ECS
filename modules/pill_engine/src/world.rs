@@ -531,19 +531,6 @@ impl World {
         let component_id = ComponentId::of::<T>();
         let type_name = std::any::type_name::<T>().to_string();
 
-        // Shared renderer components (Position/Sprite/Color) are `repr(C)` ABI
-        // types registered through this plain path, so a hand-written catalog
-        // supplies their field layouts here - the editor then shows and edits
-        // them like any `#[derive(PillComponent)]` type. Resolved up front
-        // because `type_name` is moved into the registration log below.
-        //
-        // Unconditional: the catalog is pure data and now lives in the half of
-        // `render` that carries no GPU dependency, so a headless world resolves
-        // the same layouts a windowed one does. It used to be gated on the
-        // `rendering` feature, which silently made the same component
-        // inspectable in one build and not in the other.
-        let shared_field_layout = crate::render::shared_component_field_layout(&type_name);
-
         // Register component (bit index + name)
         // `register_bit` rather than `register`: the world does not act on
         // whether the type was already present, and re-registration is normal
@@ -606,12 +593,6 @@ impl World {
         self.component_copiers
             .insert(component_id, copy_component::<T>);
 
-        // Attach the shared renderer layout (if the catalog names this type),
-        // giving hand-registered ABI components editable editor fields.
-        if let Some(layout) = shared_field_layout {
-            self.component_field_layouts
-                .insert(component_id, ComponentFieldLayout::Static(layout));
-        }
     }
 
     /// Drain the first registration failure recorded by
@@ -2491,6 +2472,31 @@ impl World {
     #[inline]
     pub fn entity_count(&self) -> usize {
         self.entity_locations.len()
+    }
+
+    /// Iterate every archetype in the world, for read-only column access.
+    ///
+    /// The narrow seam an out-of-crate renderer needs. Collecting drawable
+    /// entities means walking each archetype's columns, and `archetypes` is
+    /// crate-private so the ECS internals cannot be mutated from outside. This
+    /// hands out `&Archetype` only: the map itself, and every mutation path on
+    /// it, stays sealed in this crate.
+    ///
+    /// Pairs with [`World::component_registry`], which resolves the columns
+    /// found here by stable type name and size.
+    #[inline]
+    pub fn archetypes_iter(&self) -> impl Iterator<Item = &Archetype> {
+        self.archetypes.values()
+    }
+
+    /// Read-only view of the component registry.
+    ///
+    /// Exposed for the same reason as [`World::archetypes_iter`]: resolving a
+    /// component column by stable type name and size rather than by a `TypeId`,
+    /// which differs between the host and a hot-loaded DLL.
+    #[inline]
+    pub fn component_registry(&self) -> &ComponentRegistry {
+        &self.component_registry
     }
 
     /// Estimate the total memory footprint of the world in bytes.

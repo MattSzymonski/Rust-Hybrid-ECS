@@ -100,18 +100,24 @@ pub use runner::run;
 pub use runtime::{run_one_frame, setup, FrameReport, Host, ProjectSource};
 pub use telemetry::init_telemetry;
 
-// Engine surface that used to be rendering-only. The viewport types are
-// plain data and `EngineError` no longer has rendering variants, so both are
-// available to headless frontends too.
-pub use pill_engine::{EngineError, RenderViewport, VirtualResolution};
+// `EngineError` has no rendering variants, so it is available to headless
+// frontends too.
+pub use pill_engine::EngineError;
 
-// Rendering-only: the renderer itself, and the errors the windowed path
-// composes. Re-exported so frontends never name `pill_wgpu_renderer`
-// directly and stay free of a wgpu dependency of their own.
+// Rendering-only: the renderer itself, its data contract, and the errors the
+// windowed path composes. Re-exported so frontends never name
+// `pill_wgpu_renderer` directly and stay free of a wgpu dependency of their
+// own.
+//
+// The viewport types moved here with the rest of the renderer. They are plain
+// data, but they describe where a renderer draws, so a headless build has
+// nothing to point them at - and only the windowed path ever named them.
 #[cfg(feature = "rendering")]
 pub use crate::frontend::{FrontendError, RenderingError};
 #[cfg(feature = "rendering")]
-pub use pill_wgpu_renderer::{Renderer, RendererError, RendererWindow};
+pub use pill_wgpu_renderer::{
+    RenderViewport, Renderer, RendererError, RendererWindow, VirtualResolution,
+};
 
 // Rendering-only frontend entry points: window and event-loop setup.
 #[cfg(feature = "rendering")]

@@ -25,6 +25,16 @@ tracing = "0.1"
 # root (`<repo>/build/pill_shipping_bundle`): cargo needs a static path here,
 # but only the bundle's CONTENTS change per project (one shipping binary is
 # built at a time), so no project-specific path is ever hardcoded.
+#
+# The directory must EXIST even for a debug build that never enables
+# `static_project`. Cargo resolves every manifest in the workspace before it
+# evaluates features, so `optional = true` means "do not compile it", not "do
+# not look for it" - a missing directory fails resolution for the whole
+# workspace, `cargo run -p editor` included. A neutral stub crate is therefore
+# committed there (the one exception to `build/` being gitignored) so a fresh
+# clone builds with no generator step. A shipping build overwrites it, which
+# makes it show up as modified in `git status`; restore it afterwards with
+# `git checkout -- build/pill_shipping_bundle`.
 pill_shipping_bundle = { path = "../../build/pill_shipping_bundle", optional = true }
 
 [build-dependencies]

@@ -34,6 +34,23 @@ public sealed class EcsSystemAttribute : Attribute;
 [AttributeUsage(AttributeTargets.Method)]
 public sealed class EcsStartupAttribute : Attribute;
 
+/// <summary>
+/// Marks a component whose layout the native host already knows and binds
+/// natively, rather than registering as a dynamic byte-level component.
+/// </summary>
+/// <remarks>
+/// This is the managed half of a shared ABI: the host holds a canonical schema
+/// for the type and validates this declaration against it, so the two cannot
+/// drift. The renderer's components carry it.
+///
+/// It used to be inferred from assembly identity - "declared in csharp_runtime"
+/// stood in for "the host binds it natively". That proxy broke once shared
+/// components moved out to the crate that owns them, so the property is now
+/// declared rather than guessed.
+/// </remarks>
+[AttributeUsage(AttributeTargets.Struct)]
+public sealed class EcsSharedComponentAttribute : Attribute;
+
 // =============================================================================
 // Query Terms and Descriptors
 // =============================================================================

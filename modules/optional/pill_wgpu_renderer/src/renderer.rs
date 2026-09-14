@@ -16,7 +16,7 @@
 
 // External crates
 use pill_engine::engine::Engine;
-use pill_engine::render::{RenderViewport, VirtualResolution};
+use crate::component::{RenderViewport, VirtualResolution};
 
 // Current crate
 use crate::sprite::SpriteRenderer;

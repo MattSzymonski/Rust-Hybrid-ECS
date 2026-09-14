@@ -4,21 +4,26 @@
 //!
 //! - Defines [`Position`], [`Color`] and [`Sprite`], the components describing
 //!   where and how to draw an entity as a colored rectangle.
-//! - Publishes their editor field layouts, so a world that registers them by
-//!   hand still exposes their fields to the inspector.
+//! - Publishes their editor field layouts through [`register_components`], so a
+//!   world that registers them exposes their fields to the inspector.
 //! - Defines [`RenderViewport`] and [`VirtualResolution`], the pure-data
 //!   description of where sprites are drawn and in what coordinate space.
 //! - Collects a world's drawable entities into [`SpriteInstance`] records
-//!   through [`World::sprite_instances`].
+//!   through [`sprite_instances`].
 //!
 //! # Design
 //!
-//! This module contains no GPU code and no `wgpu` dependency, and that is
-//! load-bearing rather than incidental. `pill_engine` is an rlib compiled into
-//! the host, into every loaded module, and into every hot patch, so anything
-//! reachable from here is linked into all of them. The wgpu pipeline that
-//! consumes this data lives in [`crate::sprite_pipeline`], behind the
-//! `rendering` feature.
+//! This module contains no GPU code and names no `wgpu` type: it is the data
+//! half of the renderer, and [`crate::sprite`] is the pipeline that consumes
+//! it. Keeping the two halves apart means the `bytemuck` upload record and the
+//! component definitions never have to agree by hand-maintained coincidence -
+//! `sprite.rs` asserts their layouts match at compile time.
+//!
+//! These components live here, with the renderer that draws them, rather than
+//! in `pill_engine`: a sprite is a renderer concept, and the ECS core has no
+//! business defining one. Collection reaches into the world through the two
+//! read-only seams `pill_engine` exposes,
+//! [`World::archetypes_iter`] and [`World::component_registry`].
 //!
 //! The components are a deliberately shared ABI: a hot-loaded project and the
 //! host assign different `TypeId`s to the same type, so collection resolves
@@ -26,13 +31,10 @@
 //! a host-typed query.
 
 // External crates
+use pill_engine::component::Component;
+use pill_engine::component_registry::ComponentFieldDescriptor;
+use pill_engine::world::World;
 use trait_type_map::impl_trait_accessible;
-
-// Current crate
-use crate::component::Component;
-use crate::component_registry::ComponentFieldDescriptor;
-use crate::world::World;
-
 
 // =============================================================================
 // Components
@@ -127,10 +129,10 @@ impl Default for Sprite {
 /// Hand-written `repr(C)` offsets mirroring the shared renderer structs, for
 /// the editor's generic field API.
 ///
-/// These types are part of the shared renderer ABI and are registered with
-/// plain [`World::register_component`] - they cannot carry
-/// `#[derive(PillComponent)]` - so without a catalog entry the editor would
-/// show them with no fields at all.
+/// These types are part of the shared renderer ABI and cannot carry
+/// `#[derive(PillComponent)]` - the derive lives in `pill_engine_macros` and
+/// expects to own the type - so without these layouts the editor would show
+/// them with no fields at all. [`register_components`] attaches them.
 ///
 /// `Sprite::color` is flattened into per-channel scalars at absolute offsets
 /// (`color.r` … `color.a`) so the editor can render it as a colour picker over
@@ -242,24 +244,26 @@ const SPRITE_FIELD_LAYOUT: &[ComponentFieldDescriptor] = &[
     },
 ];
 
-/// Return the editor field layout for a shared renderer component type name.
+/// Register [`Position`], [`Color`] and [`Sprite`] with their editor layouts.
 ///
-/// `World::register_component` consults this catalog so any world that uses
-/// the renderer components (native or C# project) exposes their fields to the
-/// editor without the types carrying the derive macro.
-pub(crate) fn shared_component_field_layout(
-    type_name: &str,
-) -> Option<&'static [ComponentFieldDescriptor]> {
-    if type_name == std::any::type_name::<Position>() {
-        Some(POSITION_FIELD_LAYOUT)
-    } else if type_name == std::any::type_name::<Color>() {
-        Some(COLOR_FIELD_LAYOUT)
-    } else if type_name == std::any::type_name::<Sprite>() {
-        Some(SPRITE_FIELD_LAYOUT)
-    } else {
-        None
-    }
+/// The one call a project makes to opt into sprite rendering. Registration is
+/// idempotent, so a hot reload re-running `init` is safe, and it goes through
+/// `register_component_with_layout` so the components arrive field-editable in
+/// the inspector rather than as opaque blobs.
+///
+/// This replaces a catalog that used to live inside `pill_engine` and was
+/// consulted by every `register_component` call: the layouts belong with the
+/// types, and a world that never draws no longer pays a name comparison per
+/// registered component.
+pub fn register_components(world: &mut World) {
+    world.register_component_with_layout::<Position>(POSITION_FIELD_LAYOUT);
+    world.register_component_with_layout::<Color>(COLOR_FIELD_LAYOUT);
+    world.register_component_with_layout::<Sprite>(SPRITE_FIELD_LAYOUT);
 }
+
+// =============================================================================
+// Viewport
+// =============================================================================
 
 /// Physical-pixel rectangle within a render target.
 ///
@@ -336,9 +340,9 @@ impl VirtualResolution {
 
 /// One drawable entity, flattened for the renderer.
 ///
-/// Plain `repr(C)` data with no GPU dependency: [`crate::sprite_pipeline`]
-/// keeps its own layout-identical `bytemuck` mirror for the actual upload, so
-/// this side of the split needs neither `wgpu` nor `bytemuck`.
+/// Plain `repr(C)` data with no GPU dependency: [`crate::sprite`] keeps its own
+/// layout-identical `bytemuck` mirror for the actual upload, so this side of
+/// the split needs no `bytemuck` derive of its own.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SpriteInstance {
@@ -351,34 +355,17 @@ pub struct SpriteInstance {
 }
 
 // =============================================================================
-// World collection
-// =============================================================================
-
-impl World {
-    /// Every drawable entity in this world, flattened for a renderer.
-    ///
-    /// The one public seam the GPU half needs. Collection has to live here
-    /// because it reads `archetypes` and `component_registry`, which are
-    /// crate-private; exposing those instead would leak the ECS internals to
-    /// anything that wanted to draw.
-    pub fn sprite_instances(&self) -> Vec<SpriteInstance> {
-        collect_sprite_instances(self)
-    }
-}
-
-
-// =============================================================================
 // Shared-ABI collection
 // =============================================================================
 
-/// Collect renderer components across the native project-module ABI boundary.
+/// Every drawable entity in `world`, flattened for a renderer.
 ///
 /// A hot-loaded Rust project and the host executable can assign different
-/// `TypeId` values to the same `pill_engine` type. Renderer components are a
-/// deliberately shared ABI, so resolve their columns by stable type name and
-/// verify their C layouts instead of issuing a host-typed ECS query.
-fn collect_sprite_instances(world: &World) -> Vec<SpriteInstance> {
-    collect_sprite_instances_named(
+/// `TypeId` values to the same renderer type. These components are a
+/// deliberately shared ABI, so columns are resolved by stable type name and
+/// verified C layout instead of by a host-typed ECS query.
+pub fn sprite_instances(world: &World) -> Vec<SpriteInstance> {
+    sprite_instances_named(
         world,
         std::any::type_name::<Position>(),
         std::any::type_name::<Sprite>(),
@@ -387,15 +374,15 @@ fn collect_sprite_instances(world: &World) -> Vec<SpriteInstance> {
 
 /// Type-erased implementation separated from the public renderer names so its
 /// cross-`TypeId` behavior can be covered by an ordinary unit test.
-fn collect_sprite_instances_named(
+fn sprite_instances_named(
     world: &World,
     position_name: &str,
     sprite_name: &str,
 ) -> Vec<SpriteInstance> {
-    let registry = &world.component_registry;
+    let registry = world.component_registry();
     let mut instances = Vec::new();
 
-    for archetype in world.archetypes.values() {
+    for archetype in world.archetypes_iter() {
         // Step 1: Resolve each column among the components actually present in
         // this archetype by shared type name and size. This also supports
         // entities retained from older DLL generations whose component IDs
@@ -440,7 +427,7 @@ fn collect_sprite_instances_named(
         // so each read from the type-erased trait storage yields a valid value
         // of the target type even when its native TypeId originated in another
         // DLL. `row_count` caps the loop at every storage length, keeping the
-        // `get(row)` accesses in bounds.
+        // `get_dyn(row)` accesses in bounds.
         let row_count = archetype
             .entity_count()
             .min(position_storage.len())
@@ -490,7 +477,7 @@ unsafe fn read_shared_component<T: Copy>(component: &dyn Component) -> T {
 #[cfg(test)]
 mod shared_component_tests {
     use super::*;
-    use crate::component::ComponentId;
+    use pill_engine::component::ComponentId;
     use trait_type_map::impl_trait_accessible;
 
     /// Layout-compatible stand-in with a different TypeId than Position.
@@ -534,7 +521,7 @@ mod shared_component_tests {
             .build()
             .unwrap();
 
-        let instances = collect_sprite_instances_named(
+        let instances = sprite_instances_named(
             &world,
             std::any::type_name::<ForeignPosition>(),
             std::any::type_name::<ForeignSprite>(),
@@ -555,10 +542,9 @@ mod shared_component_tests {
         assert!(!VirtualResolution::new(f32::INFINITY, 600.0).is_valid());
     }
 
-    /// The editor field-layout catalog mirrors the `repr(C)` structs and is
-    /// attached by plain `register_component`, so the hand-registered renderer
-    /// components become field-editable in the inspector without carrying the
-    /// derive macro.
+    /// The hand-written layouts mirror the `repr(C)` structs, and
+    /// `register_components` attaches them, so the renderer components are
+    /// field-editable in the inspector without carrying the derive macro.
     #[test]
     fn shared_layouts_match_struct_layout_and_attach_on_registration() {
         // Channel order and byte sizes come straight from the compiler.
@@ -579,20 +565,16 @@ mod shared_component_tests {
             }
         };
 
-        let position_layout =
-            shared_component_field_layout(std::any::type_name::<Position>()).expect("position");
         assert_matches(
-            position_layout,
+            POSITION_FIELD_LAYOUT,
             &[
                 ("x", std::mem::offset_of!(Position, x), 4),
                 ("y", std::mem::offset_of!(Position, y), 4),
             ],
         );
 
-        let color_layout =
-            shared_component_field_layout(std::any::type_name::<Color>()).expect("color");
         assert_matches(
-            color_layout,
+            COLOR_FIELD_LAYOUT,
             &[
                 ("r", std::mem::offset_of!(Color, r), 4),
                 ("g", std::mem::offset_of!(Color, g), 4),
@@ -604,10 +586,8 @@ mod shared_component_tests {
         // `Sprite.color` is flattened into per-channel scalars at absolute
         // offsets so the inspector renders it as one colour group.
         let color_offset = std::mem::offset_of!(Sprite, color);
-        let sprite_layout =
-            shared_component_field_layout(std::any::type_name::<Sprite>()).expect("sprite");
         assert_matches(
-            sprite_layout,
+            SPRITE_FIELD_LAYOUT,
             &[
                 ("width", std::mem::offset_of!(Sprite, width), 4),
                 ("height", std::mem::offset_of!(Sprite, height), 4),
@@ -618,12 +598,10 @@ mod shared_component_tests {
             ],
         );
 
-        // Registering the real components attaches the catalog layouts through
-        // `World::register_component`, which is what makes them editable.
+        // `register_components` is what makes them editable: it routes through
+        // `register_component_with_layout` rather than the plain path.
         let mut world = World::new();
-        world.register_component::<Position>();
-        world.register_component::<Color>();
-        world.register_component::<Sprite>();
+        register_components(&mut world);
         let position = world
             .component_field_layout(ComponentId::of::<Position>())
             .expect("Position registered with a layout");
@@ -636,5 +614,20 @@ mod shared_component_tests {
             .component_field_layout(ComponentId::of::<Sprite>())
             .expect("Sprite registered with a layout");
         assert_eq!(sprite.len(), 6);
+    }
+
+    /// Registration is idempotent, because a hot reload re-runs every `init`.
+    #[test]
+    fn register_components_is_idempotent() {
+        let mut world = World::new();
+        register_components(&mut world);
+        register_components(&mut world);
+
+        assert_eq!(
+            world
+                .component_field_layout(ComponentId::of::<Sprite>())
+                .map(<[ComponentFieldDescriptor]>::len),
+            Some(6)
+        );
     }
 }

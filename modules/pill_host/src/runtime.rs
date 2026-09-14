@@ -33,9 +33,9 @@ use pill_engine::Engine;
 #[cfg(feature = "hot_reload")]
 use pill_engine::EngineApi;
 #[cfg(feature = "rendering")]
-use pill_engine::{RenderViewport, VirtualResolution};
-#[cfg(feature = "rendering")]
-use pill_wgpu_renderer::{Renderer, RendererError, RendererWindow};
+use pill_wgpu_renderer::{
+    RenderViewport, Renderer, RendererError, RendererWindow, VirtualResolution,
+};
 
 // Current crate
 #[cfg(feature = "hot_reload")]

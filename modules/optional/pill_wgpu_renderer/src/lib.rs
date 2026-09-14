@@ -1,7 +1,9 @@
-//! The engine's wgpu renderer, and the only crate in the workspace that owns wgpu.
+//! The engine's renderer: the sprite components and the wgpu pipeline drawing them.
 //!
 //! # Responsibilities
 //!
+//! - Defines the renderer's data contract ([`Position`], [`Color`], [`Sprite`],
+//!   [`RenderViewport`], [`VirtualResolution`], [`SpriteInstance`]).
 //! - Creates and drives the window surface, adapter, device and queue
 //!   ([`Renderer`]).
 //! - Owns the sprite render pipeline and its GPU buffers ([`SpriteRenderer`]).
@@ -9,26 +11,40 @@
 //!
 //! # Design
 //!
-//! This crate exists so that `wgpu` is reachable from the **host** and from
-//! nowhere else. `pill_engine` is an rlib compiled into the host, into every
-//! hot-loaded module and into every hot patch, so a single wgpu type reachable
-//! from the engine puts the entire graphics stack - wgpu, naga, the `windows`
-//! bindings - into all of them. Measured on a patch of one function, that
-//! closure is ~215 ms of the compile: the linker pulls 278 archive members it
-//! then discards, purely because generic instantiations resolve into them.
+//! A sprite is a renderer concept, so the components that describe one live
+//! here, with the code that draws them, rather than in `pill_engine`. The ECS
+//! core defines storage and scheduling; it does not define what a quad is. A
+//! project that wants sprites depends on this crate and calls
+//! [`component::register_components`].
 //!
-//! The invariant to preserve: **`wgpu` appears in exactly one `Cargo.toml`
-//! under `modules/`, this one**, and no source file outside this crate names a
-//! `wgpu::` type.
+//! The crate is split in two halves. [`component`] is pure data: it names no
+//! `wgpu` type and reads the world through the two read-only seams `pill_engine`
+//! exposes, [`World::archetypes_iter`](pill_engine::world::World::archetypes_iter)
+//! and [`World::component_registry`](pill_engine::world::World::component_registry).
+//! [`sprite`] and [`renderer`] are the GPU half. The split is what lets
+//! `sprite.rs` keep its `bytemuck` upload record separate from the component
+//! definitions while asserting at compile time that the two layouts agree.
 //!
 //! It is a plain `rlib` linked by `pill_host` under its `rendering` feature,
 //! not a hot-loadable module: a renderer needs a live window handle, per-frame
 //! `World` access and the frontend's event loop, none of which the one-shot
-//! module ABI provides. It reads the world through the one public seam
-//! `pill_engine` exposes for it,
-//! [`World::sprite_instances`](pill_engine::world::World::sprite_instances).
+//! module ABI provides.
+//!
+//! # Cost note
+//!
+//! This crate carries `wgpu`, and a project links it to name `Sprite`. That
+//! puts wgpu, naga and the `windows` bindings into every project `cdylib` and
+//! every hot patch: measured on a patch of one function, the linker pulls 278
+//! archive members it then discards, about 215 ms of the compile. That is the
+//! accepted price of keeping renderer components out of the ECS core. If patch
+//! latency ever matters more than this layering, the fix is to split
+//! [`component`] into its own dependency-free crate that projects depend on
+//! instead, leaving `wgpu` reachable only from the host.
 
 // Current crate
+
+/// The renderer's data contract: sprite components, viewports, instance data.
+pub mod component;
 
 /// Rendering initialization and presentation failures.
 pub mod error;
@@ -39,8 +55,12 @@ pub mod renderer;
 /// The sprite render pipeline and its GPU buffers.
 pub mod sprite;
 
-// The renderer's public surface, so callers name `pill_wgpu_renderer::Renderer`
+// The renderer's public surface, so callers name `pill_wgpu_renderer::Sprite`
 // rather than reaching through the module that happens to declare it.
+pub use component::{
+    register_components, sprite_instances, Color, Position, RenderViewport, Sprite, SpriteInstance,
+    VirtualResolution,
+};
 pub use error::RendererError;
 pub use renderer::{Renderer, RendererWindow};
 pub use sprite::SpriteRenderer;

@@ -74,13 +74,6 @@ pub mod profiling;
 /// Query system for efficient iteration over entities with specific components.
 pub mod query;
 
-/// Renderer data contract: sprite components, viewport types, instance data.
-///
-/// Deliberately free of any GPU dependency: this crate is compiled into every
-/// loaded module and every hot patch, so a module that merely declares sprites
-/// must not drag wgpu in with it. The pipeline that consumes this data lives
-/// in the `pill_wgpu_renderer` crate, which the host links.
-pub mod render;
 
 /// Singleton resources stored in the [`World`], not attached to entities.
 pub mod resource;
@@ -118,7 +111,6 @@ pub use persistence::ComponentSnapshot;
 pub use query::{
     Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,
 };
-pub use render::{Color, Position, RenderViewport, Sprite, SpriteInstance, VirtualResolution};
 pub use resource::{ResHandle, Resource};
 pub use scheduler::{SystemAccess, SystemScheduler, TypeKey};
 pub use scripting::{ScriptComponent, ScriptContext};
