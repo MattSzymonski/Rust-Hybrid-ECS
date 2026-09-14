@@ -55,7 +55,7 @@ pub mod renderer;
 /// The sprite render pipeline and its GPU buffers.
 pub mod sprite;
 
-// The renderer's public surface, so callers name `pill_wgpu_renderer::Sprite`
+// The renderer's public surface, so callers name `pill_master_renderer::Sprite`
 // rather than reaching through the module that happens to declare it.
 pub use component::{
     register_components, sprite_instances, Color, Position, RenderViewport, Sprite, SpriteInstance,

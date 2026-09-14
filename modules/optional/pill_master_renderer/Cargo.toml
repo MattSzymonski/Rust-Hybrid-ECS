@@ -1,5 +1,5 @@
 [package]
-name = "pill_wgpu_renderer"
+name = "pill_master_renderer"
 version = "0.1.0"
 edition = "2021"
 
