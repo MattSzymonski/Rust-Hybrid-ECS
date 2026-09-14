@@ -514,7 +514,7 @@ impl OptionalModuleConfig {
         let mut module_features = vec![format!("{name}/module-abi")];
         // `rendering` used to be mirrored here too, because the engine's
         // renderer feature changed its public type layout. The renderer now
-        // lives in `pill_wgpu_renderer`, which only the host links, so the
+        // lives in `pill_master_renderer`, which only the host links, so the
         // engine a module compiles against is the same either way.
         // Hot patching must be mirrored for a different reason: `pill_engine` is
         // an rlib, so the module links its own copy of `register_system`. Built

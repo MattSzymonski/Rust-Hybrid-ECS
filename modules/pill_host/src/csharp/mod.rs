@@ -43,7 +43,7 @@ mod queries;
 pub(crate) use backend::CSharpRuntime;
 
 /// Aggregate of the native components optional modules exposed to managed code.
-pub(crate) use components::ModuleExposedComponent;
+pub(crate) use components::{resolve_exposed_component_id, ModuleExposedComponent};
 
 /// One mirrored Rust method resolved to a callable address, shared by the
 /// host's module loader and the C# backend. Defined here (not in the
@@ -155,7 +155,7 @@ pub(crate) use abi::publish_mirror_methods;
 /// Gated on `rendering` because the fixtures are the renderer's own components
 /// (`Position`, `Sprite`, `Color`): they are the shared-ABI types the managed
 /// side mirrors, so they are what these tests must exercise, and they live in
-/// `pill_wgpu_renderer`, which only a windowed host links. `cargo test` on the
+/// `pill_master_renderer`, which only a windowed host links. `cargo test` on the
 /// editor or any windowed frontend runs them; `--no-default-features` does not.
 #[cfg(all(test, feature = "rendering"))]
 mod tests;

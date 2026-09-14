@@ -16,10 +16,10 @@ workspace = true
 crate-type = ["rlib"]
 
 [dependencies]
-pill_engine = { path = "../../pill_engine" }
+pill_engine = { path = "../../../pill_engine" }
 # `impl_trait_accessible!` for the renderer components, so the ECS can reach
 # them through its type-erased `dyn Component` storage.
-trait_type_map = { path = "../../../../Trait-Type-Map" }
+trait_type_map = { path = "../../../../../Trait-Type-Map" }
 
 # NOTE: deliberately nothing else.
 #

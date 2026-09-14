@@ -49,10 +49,18 @@ use syn::{parse_macro_input, spanned::Spanned, DeriveInput, ItemFn};
 /// - the `TraitAccessible<dyn Component>` impl
 /// - a descriptor submitted into this artifact's compile-time registry
 ///
-/// Supported helper attribute:
-/// - `#[pill(persistable)]` — the component is schema-migrated across reloads
+/// Supported helper attributes:
+/// - `#[pill(persistable)]` - the component is schema-migrated across reloads
 ///   (requires `Clone + Serialize + DeserializeOwned + Default`, matching
 ///   [`World::register_persistable_component`]).
+/// - `#[pill(shared)]` - the component keeps one identity across every binary
+///   that links it, instead of a separate one per binary. Use it for a type
+///   more than one artifact names directly: without it each binary gets its
+///   own `TypeId`, hence its own column, and neither can see the other's
+///   entities. The identity is derived from `module_path!()::TypeName`;
+///   `#[pill(shared = "some::other::Name")]` overrides that when a type has
+///   moved between modules and the old identity must be kept. The name must be
+///   unique process-wide, so it should stay namespaced.
 ///
 /// Supported field types:
 /// - blittable values — primitives, fixed-size arrays, `#[derive(PillMirror)]`
@@ -82,14 +90,53 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
 
     // Parse the `#[pill(...)]` helper attribute.
     let mut persistable = false;
+    let mut shared = false;
+    let mut shared_name_override: Option<String> = None;
     for attribute in &input.attrs {
         if attribute.path().is_ident("pill") {
             if let Err(error) = attribute.parse_nested_meta(|meta| {
                 if meta.path.is_ident("persistable") {
                     persistable = true;
                     Ok(())
+                } else if meta.path.is_ident("shared") {
+                    shared = true;
+                    // `shared` on its own derives the name from the module
+                    // path; `shared = "..."` pins it explicitly.
+                    if meta.input.peek(syn::Token![=]) {
+                        let literal: syn::LitStr = meta.value()?.parse()?;
+                        let name = literal.value();
+                        if name.is_empty() {
+                            return Err(syn::Error::new_spanned(
+                                &literal,
+                                "a shared component name cannot be empty",
+                            ));
+                        }
+                        // A shared name is a process-wide identity: two types
+                        // holding it become one component, one column, and one
+                        // set of rows. When their layouts also happen to agree
+                        // nothing downstream can notice, so the guard has to be
+                        // here, before the collision is expressible. Requiring
+                        // a path separator makes an accidental `"Transform"`
+                        // a compile error while leaving a deliberate, qualified
+                        // name - the only way two artifacts legitimately share
+                        // one - untouched.
+                        if !name.contains("::") {
+                            return Err(syn::Error::new_spanned(
+                                &literal,
+                                format!(
+                                    "shared component name `{name}` is not namespaced. A shared \
+                                     name is a process-wide identity, so an unrelated crate \
+                                     declaring `{name}` too would bind to this component's \
+                                     column and read its rows. Qualify it (`my_crate::{name}`), \
+                                     or drop the argument to derive it from `module_path!()`."
+                                ),
+                            ));
+                        }
+                        shared_name_override = Some(name);
+                    }
+                    Ok(())
                 } else {
-                    Err(meta.error("unknown `pill` attribute; expected `persistable`"))
+                    Err(meta.error("unknown `pill` attribute; expected `persistable` or `shared`"))
                 }
             }) {
                 return error.to_compile_error().into();
@@ -132,8 +179,37 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
         ::core::concat!(::core::module_path!(), "::", ::core::stringify!(#ident))
     };
 
+    // A shared component reports a stable name that every binary linking it
+    // computes identically; an ordinary one reports nothing and keeps the
+    // default per-binary `TypeId` identity.
+    let shared_name_impl = if shared {
+        let shared_name = match &shared_name_override {
+            Some(name) => quote! { #name },
+            None => type_name.clone(),
+        };
+        quote! {
+            fn shared_name() -> ::core::option::Option<&'static str> {
+                ::core::option::Option::Some(#shared_name)
+            }
+
+            fn shared_identity() -> ::core::option::Option<u128> {
+                // A `const` item, not the trait's default: that would hash the
+                // name on every `ComponentId::of` call, which is measurable on
+                // the per-call random-access path. Bound here, it is folded at
+                // compile time.
+                const IDENTITY: u128 =
+                    ::pill_engine::component::shared_component_identity(#shared_name);
+                ::core::option::Option::Some(IDENTITY)
+            }
+        }
+    } else {
+        quote! {}
+    };
+
     let expanded = quote! {
-        impl ::pill_engine::Component for #ident {}
+        impl ::pill_engine::Component for #ident {
+            #shared_name_impl
+        }
         ::trait_type_map::impl_trait_accessible!(dyn ::pill_engine::Component; #ident);
 
         #declared_layout

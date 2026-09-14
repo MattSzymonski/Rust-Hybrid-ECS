@@ -20,8 +20,8 @@ pill_core = { path = "../../modules/pill_core" }
 #
 # NOTE: this crate carries `wgpu`, so linking it puts the graphics stack into
 # this `cdylib` and into every hot patch of it. See the cost note in
-# `pill_wgpu_renderer`'s crate docs for what that buys and what it costs.
-pill_wgpu_renderer = { path = "../../modules/optional/pill_wgpu_renderer" }
+# `pill_master_renderer`'s crate docs for what that buys and what it costs.
+pill_master_renderer = { path = "../../modules/optional/rendering/pill_master_renderer" }
 # Linked directly so the project can name the `Spline` type. See the note in
 # `project_init` about why this crate must not also be loaded as a module.
 # `default-features = false` is a defensive no-op: `module-abi` is opt-in now,

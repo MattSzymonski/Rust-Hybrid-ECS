@@ -16,14 +16,14 @@ workspace = true
 crate-type = ["rlib"]
 
 [dependencies]
-pill_core = { path = "../../pill_core" }
+pill_core = { path = "../../../pill_core" }
 # The `#[engine_error]` attribute that declares `RendererError`; it renders
 # through `pill_core::error`, which is why both are needed.
-pill_core_macros = { path = "../../pill_core_macros" }
-pill_engine = { path = "../../pill_engine" }
+pill_core_macros = { path = "../../../pill_core_macros" }
+pill_engine = { path = "../../../pill_engine" }
 # `impl_trait_accessible!` for the renderer components, so the ECS can reach
 # them through its type-erased `dyn Component` storage.
-trait_type_map = { path = "../../../../Trait-Type-Map" }
+trait_type_map = { path = "../../../../../Trait-Type-Map" }
 wgpu = "26.0.1"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"

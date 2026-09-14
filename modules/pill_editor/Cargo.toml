@@ -35,7 +35,7 @@ trait_type_map = { path = "../../../Trait-Type-Map" }
 # actual component rather than a stand-in. Production code reaches the
 # viewport types through `pill_host`'s re-export instead, so this stays a
 # dev-dependency.
-pill_wgpu_renderer = { path = "../optional/pill_wgpu_renderer" }
+pill_master_renderer = { path = "../optional/rendering/pill_master_renderer" }
 
 [features]
 # Match a normal `cargo run` of pill_standalone: per-function hot patching is

@@ -84,6 +84,10 @@ name = "query_iteration"
 harness = false
 
 [[bench]]
+name = "shared_component_identity"
+harness = false
+
+[[bench]]
 name = "archetype_migration"
 harness = false
 

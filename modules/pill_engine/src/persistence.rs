@@ -20,9 +20,9 @@
 //!
 //! | Function        | Signature | Purpose |
 //! |-----------------|-----------|---------|
-//! | `serialize`     | `fn(&TraitTypeMap, index) → Vec<u8>` | Read concrete component from archetype column, JSON-encode it |
+//! | `serialize`     | `fn(&ComponentColumns, index) → Vec<u8>` | Read concrete component from archetype column, JSON-encode it |
 //! | `deserialize`   | `fn(&[u8]) → Option<Box<dyn Component>>` | Decode JSON bytes back into a component; returns None on schema mismatch |
-//! | `insert_boxed`  | `fn(&mut TraitTypeMap, Box<dyn Component>)` | Downcast and push into the concrete VecStorage |
+//! | `insert_boxed`  | `fn(&mut ComponentColumns, Box<dyn Component>)` | Downcast and push into the archetype's column |
 //!
 //! These functions are monomorphized in the project DLL (where the concrete
 //! types are defined).  They are stored as plain function pointers in the
@@ -43,14 +43,15 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
 // External crates
-use pill_core::{debug, info, warn};
+use pill_core::{debug, error, info, warn};
 use serde::{de::DeserializeOwned, Serialize};
-use trait_type_map::{ErasedVecStorage, TraitAccessible, TraitTypeMap, VecFamily};
+use trait_type_map::{ErasedVecStorage, TraitAccessible};
 
 // Current crate
+use crate::archetype::ComponentColumns;
 use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
-use crate::error::PersistenceError;
+use crate::error::{PersistenceError, WorldError};
 use crate::world::World;
 
 // =============================================================================
@@ -60,7 +61,7 @@ use crate::world::World;
 /// Serializes the component at `index` in the given storage map into a
 /// JSON-encoded byte vector.
 pub(crate) type SerializeComponentFn =
-    fn(storage: &TraitTypeMap<dyn Component, VecFamily>, index: usize) -> Vec<u8>;
+    fn(storage: &ComponentColumns, index: usize) -> Vec<u8>;
 
 /// Deserializes JSON bytes back into a heap-allocated component.
 ///
@@ -72,7 +73,7 @@ pub(crate) type DeserializeComponentFn = fn(bytes: &[u8]) -> Option<Box<dyn Comp
 /// Downcasts a `Box<dyn Component>` to its concrete type and pushes it
 /// into the appropriate `VecStorage<T>` inside the storage map.
 pub(crate) type InsertComponentFn =
-    fn(storage: &mut TraitTypeMap<dyn Component, VecFamily>, component: Box<dyn Component>);
+    fn(storage: &mut ComponentColumns, component: Box<dyn Component>);
 
 // =============================================================================
 // ComponentSnapshot
@@ -207,17 +208,29 @@ impl World {
             + 'static,
     {
         // Step 1: Perform the standard component registration (bit index,
-        // storage factory, copier).
-        self.register_component::<T>();
+        // storage factory, copier), carrying the field layout so the registry
+        // can check a repeat registration against the first one.
+        self.register_component_inner::<T>(fields);
 
         let component_id = ComponentId::of::<T>();
-        let type_name = std::any::type_name::<T>().to_string();
+        // The persist maps are keyed by name and resolved against the name the
+        // registry recorded, so both must use the same one: a shared
+        // component's declared name, an ordinary component's Rust path.
+        let type_name = crate::component::ComponentRegistry::registered_name::<T>();
 
         // Step 2: Purge stale persist entries left over from previous
         // registrations of the same type name.  This handles the case where
         // a component struct is changed and then changed back — the compiler
         // may assign the same TypeId, but old entries from intermediate
         // shapes still pollute the persist maps.
+        //
+        // Eviction is what makes name resolution unambiguous later, so it must
+        // only ever remove a *superseded* generation. A same-name entry whose
+        // column still holds rows is not superseded - it is a concurrent peer,
+        // registered by another binary that linked the same component type and
+        // therefore got its own `TypeId` for it. Evicting that entry would drop
+        // its inserter, and every row it owns would be silently discarded at
+        // the next reload, so the collision is reported instead.
         let stale_ids: Vec<ComponentId> = self
             .component_registry
             .registered_components()
@@ -225,6 +238,23 @@ impl World {
             .map(|(id, _, _)| id)
             .filter(|id| *id != component_id)
             .collect();
+        if let Some((existing_id, live_rows)) =
+            self.live_component_with_name(&type_name, component_id)
+        {
+            self.record_registration_error(WorldError::ComponentNameCollision {
+                type_name: type_name.clone(),
+                existing_id,
+                incoming_id: component_id,
+                live_rows,
+            });
+            error!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                type_name = %type_name,
+                live_rows,
+                "two live registrations claim one component type name;                  refusing to evict the peer's persist entries"
+            );
+            return;
+        }
         for stale_id in &stale_ids {
             self.persist_serializers.remove(stale_id);
             self.persist_inserters.remove(stale_id);
@@ -424,7 +454,9 @@ impl World {
             for (type_name, bytes) in component_set {
                 if let Some(&deserialize_fn) = self.persist_deserializers.get(type_name) {
                     if let Some(component) = deserialize_fn(bytes) {
-                        if let Some(component_id) = self.resolve_component_id_by_name(type_name) {
+                        if let Some(component_id) =
+                            self.resolve_component_id_by_name_logged(type_name)
+                        {
                             if entry_idx < 3 {
                                 debug!(
                                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -547,20 +579,74 @@ impl World {
         );
     }
 
-    /// Look up a [`ComponentId`] by the component's type name string,
-    /// returning the most recently registered match (highest bit index).
+    /// Look up the single [`ComponentId`] a component type name resolves to.
     ///
-    /// After multiple hot-reloads the component registry accumulates one
-    /// entry per reload (each with a different `TypeId` but the same type
-    /// name).  The entry with the highest bit is the one registered most
-    /// recently and is the only one present in `persist_inserters`.
-    fn resolve_component_id_by_name(&self, type_name: &str) -> Option<ComponentId> {
-        self.component_registry
+    /// After multiple hot-reloads the component registry can hold one entry
+    /// per reload, each with a different `TypeId` but the same type name.
+    /// What reduces those to one candidate is **eviction**: registering a new
+    /// generation purges every same-name entry from `persist_inserters`
+    /// (see [`Self::register_persistable_component`]), so the
+    /// `persist_inserters` filter below leaves exactly one.
+    ///
+    /// The bit index is deliberately *not* used as a tiebreak. It is not a
+    /// recency ordering: `ComponentRegistry::allocate_bit` hands out bits
+    /// reclaimed by `remove` before advancing `next_bit`, so a later
+    /// registration can receive a lower bit than an earlier one. Since
+    /// eviction already guarantees uniqueness, more than one surviving
+    /// candidate is a bug rather than something to break a tie on, and it is
+    /// reported as [`WorldError::ComponentNameAmbiguous`].
+    ///
+    /// [`persist_registration_sequence`](Self::persist_registration_sequence)
+    /// is the true chronological ordering, if a recency tiebreak is ever
+    /// genuinely wanted.
+    fn resolve_component_id_by_name(
+        &self,
+        type_name: &str,
+    ) -> Result<Option<ComponentId>, WorldError> {
+        let mut candidates = self
+            .component_registry
             .registered_components()
             .filter(|(_, _, name)| *name == type_name)
             .filter(|(id, _, _)| self.persist_inserters.contains_key(id))
-            .max_by_key(|(_, bit, _)| *bit)
-            .map(|(id, _, _)| id)
+            .map(|(id, _, _)| id);
+
+        let Some(first) = candidates.next() else {
+            return Ok(None);
+        };
+        // Any second candidate means eviction did not collapse the set, so
+        // picking either one would silently bind half the rows to the wrong
+        // column.
+        let extra = candidates.count();
+        if extra > 0 {
+            return Err(WorldError::ComponentNameAmbiguous {
+                type_name: type_name.to_string(),
+                count: extra + 1,
+            });
+        }
+        Ok(Some(first))
+    }
+
+    /// [`Self::resolve_component_id_by_name`] for callers that cannot return
+    /// an error, degrading an ambiguous name to "unresolved".
+    ///
+    /// Every such caller already has a safe answer for an unresolved name -
+    /// skip the row, omit the manifest entry, drop nothing - so reporting the
+    /// ambiguity and taking that path is strictly better than the previous
+    /// `max_by_key(bit)` tiebreak, which silently picked one of the candidates
+    /// and could bind rows to the wrong column.
+    fn resolve_component_id_by_name_logged(&self, type_name: &str) -> Option<ComponentId> {
+        match self.resolve_component_id_by_name(type_name) {
+            Ok(component_id) => component_id,
+            Err(error) => {
+                error!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    type_name = %type_name,
+                    error = %error,
+                    "component type name is ambiguous; treating it as unresolved"
+                );
+                None
+            }
+        }
     }
 
     /// Return current persistable component manifest.
@@ -569,7 +655,7 @@ impl World {
             .persist_schema_hashes
             .iter()
             .filter_map(|(type_name, schema_hash)| {
-                self.resolve_component_id_by_name(type_name)
+                self.resolve_component_id_by_name_logged(type_name)
                     .map(|component_id| PersistTypeManifestEntry {
                         type_name: type_name.clone(),
                         component_id,
@@ -639,12 +725,13 @@ impl World {
     pub fn drop_forgotten_components(&mut self, type_names: &[String]) -> usize {
         let mut dropped_entities = 0;
         for type_name in type_names {
-            let Some(component_id) = self.resolve_component_id_by_name(type_name) else {
+            let Some(component_id) = self.resolve_component_id_by_name_logged(type_name) else {
                 continue;
             };
             // Native columns only; type-erased foreign-language columns are
-            // not part of the native forgotten-type path.
-            if component_id.native_type_id().is_none() {
+            // not part of the native forgotten-type path. Shared components
+            // are native, so they are covered here.
+            if !component_id.is_native_storage() {
                 continue;
             }
 
@@ -846,10 +933,24 @@ impl World {
         previous_metadata: &PersistTypeMetadata,
         pre_swap_entities: Option<&HashSet<Entity>>,
     ) -> Result<usize, PersistenceError> {
-        let Some(new_component_id) = self.resolve_component_id_by_name(type_name) else {
-            return Err(PersistenceError::ComponentTypeUnregistered {
-                type_name: type_name.to_string(),
-            });
+        let new_component_id = match self.resolve_component_id_by_name(type_name) {
+            Ok(Some(component_id)) => component_id,
+            Ok(None) => {
+                return Err(PersistenceError::ComponentTypeUnregistered {
+                    type_name: type_name.to_string(),
+                })
+            }
+            Err(WorldError::ComponentNameAmbiguous { count, .. }) => {
+                return Err(PersistenceError::ComponentTypeAmbiguous {
+                    type_name: type_name.to_string(),
+                    count,
+                })
+            }
+            Err(_) => {
+                return Err(PersistenceError::ComponentTypeUnregistered {
+                    type_name: type_name.to_string(),
+                })
+            }
         };
 
         let Some(&deserialize_component) = self.persist_deserializers.get(type_name) else {
@@ -991,13 +1092,12 @@ impl World {
                 continue;
             };
 
+            if !component_id.is_native_storage() {
+                return Err(PersistenceError::NativeStorageExpected { component_id });
+            }
             if archetype
                 .component_storages
-                .remove_trait_storage(
-                    component_id
-                        .native_type_id()
-                        .expect("persisted components must have native Rust storage"),
-                )
+                .remove(component_id)
                 .is_none()
             {
                 return Err(PersistenceError::StorageRemovalFailed { component_id });
@@ -1013,7 +1113,7 @@ impl World {
             // trait-object vtable) so it stays valid across module unloads.
             archetype
                 .component_storages
-                .insert_erased(ErasedVecStorage::<dyn Component>::new(*info));
+                .insert(component_id, ErasedVecStorage::<dyn Component>::new(*info));
 
             for component in migrated_components {
                 insert_new_component(&mut archetype.component_storages, component);
@@ -1191,11 +1291,11 @@ impl World {
 // no destructors, no vtable calls, no DLL-unload issues.
 
 /// Serialize a single component at `index` from storage into JSON bytes.
-fn serialize_component<T>(storage: &TraitTypeMap<dyn Component, VecFamily>, index: usize) -> Vec<u8>
+fn serialize_component<T>(storage: &ComponentColumns, index: usize) -> Vec<u8>
 where
     T: Component + TraitAccessible<dyn Component> + Serialize,
 {
-    let typed_storage = storage.get_storage::<T>();
+    let typed_storage = storage.column_of::<T>();
     let value: &T = typed_storage.get::<T>(index);
     serde_json::to_vec(value).expect("JSON serialization failed")
 }
@@ -1356,7 +1456,7 @@ where
 
 /// Downcast and push a boxed component into the concrete VecStorage.
 fn insert_boxed_component<T>(
-    storage: &mut TraitTypeMap<dyn Component, VecFamily>,
+    storage: &mut ComponentColumns,
     component: Box<dyn Component>,
 ) where
     T: Component + TraitAccessible<dyn Component> + 'static,
@@ -1376,7 +1476,7 @@ fn insert_boxed_component<T>(
     // justification (matching concrete type, single ownership handover) is
     // above this function's first use.
     let typed: Box<T> = unsafe { Box::from_raw(raw as *mut T) };
-    storage.get_storage_mut::<T>().push::<T>(*typed);
+    storage.column_of_mut::<T>().push::<T>(*typed);
 }
 
 // =============================================================================
@@ -1535,5 +1635,174 @@ mod tests {
         assert!(world.persist_deserializers.contains_key(&type_name));
         assert_eq!(world.persist_schema_hashes.len(), 1);
         assert!(world.persist_schema_hashes.contains_key(&type_name));
+    }
+
+    // =========================================================================
+    // Concurrent-peer guard
+    // =========================================================================
+
+    /// A second registration of a type name whose existing column still holds
+    /// rows is a concurrent peer, not a superseded generation, so it is
+    /// reported instead of evicting the peer's persist entries and silently
+    /// dropping its rows at the next reload.
+    #[test]
+    fn a_same_name_registration_over_live_rows_is_reported_not_evicted() {
+        let mut world = World::new();
+        world.register_persistable_component::<DropTestForgottenComponent>();
+        let native_id = ComponentId::of::<DropTestForgottenComponent>();
+        let type_name = std::any::type_name::<DropTestForgottenComponent>().to_string();
+
+        // Give the native column a live row, which is what makes the second
+        // registration a peer rather than a dead generation.
+        world
+            .create_entity()
+            .with(DropTestForgottenComponent { value: 7 })
+            .build()
+            .unwrap();
+        assert_eq!(world.live_row_count(native_id), 1);
+
+        // A second component claiming the same name arrives - the in-process
+        // stand-in for a second binary that linked the same type.
+        let error = world
+            .register_dynamic_component(0x5EED, type_name.clone(), 4, 4, 0)
+            .unwrap_err();
+
+        match error {
+            WorldError::ComponentNameCollision {
+                type_name: reported_name,
+                existing_id,
+                live_rows,
+                ..
+            } => {
+                assert_eq!(reported_name, type_name);
+                assert_eq!(existing_id, native_id);
+                assert_eq!(live_rows, 1);
+            }
+            other => panic!("expected a name collision, got {other:?}"),
+        }
+
+        // The peer's persist entries are untouched, so its rows still restore.
+        assert!(world.persist_inserters.contains_key(&native_id));
+        assert!(world.persist_serializers.contains_key(&native_id));
+    }
+
+    /// The same collision is allowed through once the existing column has no
+    /// rows left: that is a superseded generation, and replacing it is the
+    /// behaviour hot reload depends on.
+    #[test]
+    fn a_same_name_registration_over_an_empty_column_still_succeeds() {
+        let mut world = World::new();
+        world.register_persistable_component::<DropTestForgottenComponent>();
+        let type_name = std::any::type_name::<DropTestForgottenComponent>().to_string();
+
+        // No entity is created, so the native column holds nothing.
+        assert_eq!(
+            world.live_row_count(ComponentId::of::<DropTestForgottenComponent>()),
+            0
+        );
+
+        let result = world.register_dynamic_component(0x5EED, type_name, 4, 4, 0);
+        assert!(
+            result.is_ok(),
+            "an empty same-name column is a dead generation, not a peer: {result:?}"
+        );
+    }
+
+    /// Re-registering a persistable type while its own column holds rows is
+    /// the ordinary hot-reload path and must not trip the peer guard: the
+    /// guard only looks at *other* component ids.
+    #[test]
+    fn re_registering_the_same_type_over_live_rows_is_not_a_collision() {
+        let mut world = World::new();
+        world.register_persistable_component::<DropTestForgottenComponent>();
+        world
+            .create_entity()
+            .with(DropTestForgottenComponent { value: 1 })
+            .build()
+            .unwrap();
+
+        world.register_persistable_component::<DropTestForgottenComponent>();
+        assert!(
+            world.take_registration_error().is_none(),
+            "a reload re-registering its own type is not a peer collision"
+        );
+    }
+
+    // =========================================================================
+    // Name resolution
+    // =========================================================================
+
+    /// A name claimed by exactly one registration resolves to it, through both
+    /// the persistable-filtered resolver and the unfiltered one.
+    #[test]
+    fn an_unambiguous_name_resolves_through_both_resolvers() {
+        let mut world = World::new();
+        world.register_persistable_component::<DropTestForgottenComponent>();
+        let component_id = ComponentId::of::<DropTestForgottenComponent>();
+        let type_name = std::any::type_name::<DropTestForgottenComponent>();
+
+        assert_eq!(
+            world.resolve_component_id_by_name(type_name).unwrap(),
+            Some(component_id)
+        );
+        assert_eq!(
+            world.resolve_component_id_by_name_any(type_name).unwrap(),
+            Some(component_id)
+        );
+    }
+
+    /// A name claimed by two registrations is reported as ambiguous rather
+    /// than resolved by the old `max_by_key(bit)` tiebreak, which is not a
+    /// recency ordering and could bind callers to the wrong column.
+    #[test]
+    fn a_name_claimed_twice_resolves_to_an_ambiguity_error() {
+        let mut world = World::new();
+        world.register_persistable_component::<DropTestForgottenComponent>();
+        let type_name = std::any::type_name::<DropTestForgottenComponent>().to_string();
+
+        // The native column is empty, so a second claim on the name registers
+        // (see the empty-column test above) and both are now visible to the
+        // unfiltered resolver.
+        world
+            .register_dynamic_component(0x5EED, type_name.clone(), 4, 4, 0)
+            .unwrap();
+
+        let error = world
+            .resolve_component_id_by_name_any(&type_name)
+            .unwrap_err();
+        match error {
+            WorldError::ComponentNameAmbiguous {
+                type_name: reported_name,
+                count,
+            } => {
+                assert_eq!(reported_name, type_name);
+                assert_eq!(count, 2);
+            }
+            other => panic!("expected an ambiguity error, got {other:?}"),
+        }
+
+        // The persistable-filtered resolver still collapses to one, because
+        // only the native registration has an inserter.
+        assert_eq!(
+            world.resolve_component_id_by_name(&type_name).unwrap(),
+            Some(ComponentId::of::<DropTestForgottenComponent>())
+        );
+    }
+
+    /// A name nothing claims resolves to `None` rather than an error - an
+    /// unregistered type is an ordinary outcome, not an ambiguity.
+    #[test]
+    fn an_unclaimed_name_resolves_to_none() {
+        let world = World::new();
+        assert_eq!(
+            world.resolve_component_id_by_name("nothing::Registered").unwrap(),
+            None
+        );
+        assert_eq!(
+            world
+                .resolve_component_id_by_name_any("nothing::Registered")
+                .unwrap(),
+            None
+        );
     }
 }

@@ -106,7 +106,7 @@ pub use pill_engine::EngineError;
 
 // Rendering-only: the renderer itself, its data contract, and the errors the
 // windowed path composes. Re-exported so frontends never name
-// `pill_wgpu_renderer` directly and stay free of a wgpu dependency of their
+// `pill_master_renderer` directly and stay free of a wgpu dependency of their
 // own.
 //
 // The viewport types moved here with the rest of the renderer. They are plain
@@ -115,7 +115,7 @@ pub use pill_engine::EngineError;
 #[cfg(feature = "rendering")]
 pub use crate::frontend::{FrontendError, RenderingError};
 #[cfg(feature = "rendering")]
-pub use pill_wgpu_renderer::{
+pub use pill_master_renderer::{
     RenderViewport, Renderer, RendererError, RendererWindow, VirtualResolution,
 };
 

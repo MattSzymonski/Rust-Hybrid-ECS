@@ -22,6 +22,7 @@ use std::any::TypeId;
 use std::collections::HashMap;
 
 // Current crate
+use crate::component_registry::ComponentFieldDescriptor;
 use crate::error::WorldError;
 
 // =============================================================================
@@ -52,7 +53,61 @@ use crate::error::WorldError;
 ///
 /// impl Component for Position {}
 /// ```
-pub trait Component: Send + 'static {}
+pub trait Component: Send + 'static {
+    /// Stable, cross-binary name for this component, or `None` for the
+    /// ordinary per-binary identity.
+    ///
+    /// A component type linked into more than one binary in the same process -
+    /// the host, the project, a module DLL - gets a different [`TypeId`] in
+    /// each, because `TypeId` is a hash over the crate name, its `-C metadata`
+    /// disambiguator and the type path, computed per compilation unit.
+    /// Identified by `TypeId`, one type therefore becomes several components
+    /// with several columns, and neither binary can see the other's entities.
+    ///
+    /// Declaring a name here replaces that identity with one derived from the
+    /// name itself, which every binary computes identically and without any
+    /// coordination. All of them then resolve to one [`ComponentId`], one mask
+    /// bit, and one column.
+    ///
+    /// The name must be unique across the whole process, so it should be
+    /// namespaced - `"pill_spline::Spline"`, not `"Spline"`. It must also be
+    /// stable: it is written down rather than derived from
+    /// [`std::any::type_name`], whose output is explicitly not guaranteed
+    /// stable across compiler versions.
+    ///
+    /// Set it through `#[pill(shared)]` on `#[derive(PillComponent)]` rather
+    /// than by hand; see [`ComponentId::of`] for what changes once it is set.
+    ///
+    /// This is a `where Self: Sized` method rather than an associated
+    /// constant because an associated constant would make `Component` no
+    /// longer dyn-compatible, and the engine's whole storage layer moves
+    /// components as `dyn Component`.
+    fn shared_name() -> Option<&'static str>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    /// The stable identity [`Self::shared_name`] hashes to, or `None`.
+    ///
+    /// Defaulted in terms of `shared_name`, so an implementor only writes the
+    /// name and the two cannot disagree. `#[derive(PillComponent)]` overrides
+    /// it with a compile-time constant: `ComponentId::of` is called once per
+    /// `get_component`, and hashing the name on every one of those is
+    /// measurable - around 20% of that call - where folding it to a constant
+    /// makes it exactly the load `TypeId::of` compiles to.
+    ///
+    /// Override it only with `shared_component_identity(Self::shared_name())`;
+    /// any other value silently splits the component's identity from the name
+    /// every other binary derives it from.
+    fn shared_identity() -> Option<u128>
+    where
+        Self: Sized,
+    {
+        Self::shared_name().map(shared_component_identity)
+    }
+}
 
 // =============================================================================
 // Tick
@@ -158,19 +213,105 @@ impl ComponentTicks {
 /// Type-erased identifier for a registered component type.
 ///
 /// Native components retain their Rust [`TypeId`]. Runtime-defined components
-/// use the stable 128-bit identity supplied by their external manifest.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// use the stable 128-bit identity supplied by their external manifest. A
+/// native component that declares [`Component::shared_name`] uses a stable
+/// identity derived from that name instead of its `TypeId`, so every binary
+/// that links the type arrives at the same id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ComponentId {
-    /// Component backed by a concrete Rust type.
+    /// Component backed by a concrete Rust type, identified per binary.
     Native(TypeId),
     /// Component described at runtime by an external language manifest.
     Dynamic(u128),
+    /// Component backed by a concrete Rust type that may be linked into more
+    /// than one binary, identified by the stable name it declares.
+    ///
+    /// Storage is native, exactly as for [`Self::Native`] - only the identity
+    /// differs - so [`Self::is_native_storage`] holds for both.
+    Shared(u128),
 }
+
+/// Mix one 64-bit half of a stable component identity out of a name.
+///
+/// FNV-1a, a fixed function of the bytes alone: no seed, no runtime state, no
+/// dependence on compiler version or process. That is what lets two separately
+/// compiled binaries - and the managed runtime, which derives the same value
+/// from the same canonical name - agree on an identity without exchanging
+/// anything.
+pub const fn component_name_hash(name: &str, offset: u64) -> u64 {
+    let bytes = name.as_bytes();
+    let mut hash = offset;
+    let mut index = 0;
+    while index < bytes.len() {
+        hash ^= bytes[index] as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+        index += 1;
+    }
+    hash
+}
+
+/// Derive the stable 128-bit identity of a component from its declared name.
+///
+/// Two FNV-1a passes with different offsets, concatenated, so the 128-bit
+/// space is actually used rather than a 64-bit hash being zero-padded into it.
+pub const fn shared_component_identity(name: &str) -> u128 {
+    let low = component_name_hash(name, 0xcbf29ce484222325);
+    let high = component_name_hash(name, 0x84222325cbf29ce4);
+    ((high as u128) << 64) | low as u128
+}
+
+/// `Hash` is written by hand rather than derived so a 128-bit identity feeds
+/// the hasher as 64 bits.
+///
+/// This is the reasoning [`TypeId`] applies to itself: it too holds 128 bits
+/// and hashes only half of them, because a hash map resolves collisions with
+/// `Eq` - which still compares every bit - so the second 8-byte block buys no
+/// correctness and costs a compression round. Deriving `Hash` here made a
+/// shared component's lookups measurably slower than a native component's,
+/// around 18% of `World::get_component`, which performs two of them per call.
+///
+/// The variant is mixed in as a salt rather than hashed as a separate value,
+/// so distinguishing the variants stays free.
+impl std::hash::Hash for ComponentId {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            // `TypeId`'s own impl already does the 128-to-64 narrowing.
+            Self::Native(type_id) => type_id.hash(state),
+            Self::Dynamic(identity) => (*identity as u64 ^ DYNAMIC_HASH_SALT).hash(state),
+            Self::Shared(identity) => (*identity as u64 ^ SHARED_HASH_SALT).hash(state),
+        }
+    }
+}
+
+/// Salts keeping the two 128-bit-identity variants from colliding with each
+/// other on identical values. Arbitrary odd constants; only their difference
+/// matters.
+const DYNAMIC_HASH_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
+const SHARED_HASH_SALT: u64 = 0xbf58_476d_1ce4_e5b9;
 
 impl ComponentId {
     /// Returns the [`ComponentId`] for the concrete Rust type `T`.
-    pub fn of<T: 'static>() -> Self {
-        Self::Native(TypeId::of::<T>())
+    ///
+    /// For an ordinary component this is its [`TypeId`], which differs between
+    /// binaries. For one that declares [`Component::shared_name`] it is the
+    /// stable identity derived from that name, which does not - so every
+    /// binary that links the type produces the same id here, and the engine
+    /// gives them one bit and one column between them.
+    ///
+    /// The bound is [`Component`] rather than `'static` precisely so that
+    /// distinction cannot be bypassed: there is no second entry point that
+    /// could forget to consult the declaration.
+    ///
+    /// Costs the same as `TypeId::of` either way: a derived component's
+    /// `shared_identity` is a compile-time constant, so this is a load in both
+    /// arms rather than a hash in one of them.
+    #[inline]
+    pub fn of<T: Component>() -> Self {
+        match T::shared_identity() {
+            Some(identity) => Self::Shared(identity),
+            None => Self::Native(TypeId::of::<T>()),
+        }
     }
 
     /// Builds a dynamic component ID from the stable 128-bit identity
@@ -184,14 +325,127 @@ impl ComponentId {
         Self::Native(type_id)
     }
 
-    /// Returns the wrapped [`TypeId`] if this is a native component ID, or
-    /// `None` for dynamically registered components.
+    /// Returns the wrapped [`TypeId`] if this component is identified by one.
+    ///
+    /// `None` for a dynamic component, which has no Rust type at all, and also
+    /// for a shared one, which has a Rust type in every binary that links it
+    /// but no single `TypeId` that names it. Callers asking "are these rows
+    /// native storage?" want [`Self::is_native_storage`] instead; the callers
+    /// that genuinely need a `TypeId` are the ones that should still get
+    /// `None` here.
     pub const fn native_type_id(self) -> Option<TypeId> {
         match self {
             Self::Native(type_id) => Some(type_id),
-            Self::Dynamic(_) => None,
+            Self::Dynamic(_) | Self::Shared(_) => None,
         }
     }
+
+    /// Whether this component's rows live in a native column rather than in a
+    /// byte-oriented dynamic one.
+    ///
+    /// True for [`Self::Native`] and [`Self::Shared`] alike: shared identity
+    /// changes how a component is *named*, never how it is stored.
+    pub const fn is_native_storage(self) -> bool {
+        matches!(self, Self::Native(_) | Self::Shared(_))
+    }
+
+    /// The stable identity behind a shared component id, if this is one.
+    pub const fn shared_identity(self) -> Option<u128> {
+        match self {
+            Self::Shared(identity) => Some(identity),
+            Self::Native(_) | Self::Dynamic(_) => None,
+        }
+    }
+}
+
+// =============================================================================
+// ComponentLayout
+// =============================================================================
+
+/// The memory shape of one registered component type.
+///
+/// Recorded per [`ComponentId`] so a second registration of the same component
+/// can be checked against the first. For an ordinary component that check is a
+/// diagnostic; for a shared one it is a soundness requirement, because two
+/// binaries reach one column through it and nothing else proves they agree
+/// about what a row contains.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ComponentLayout {
+    /// Byte size of one component value.
+    pub size: usize,
+    /// Byte alignment of one component value.
+    pub align: usize,
+    /// Structural hash over the declared field layout, or `None` when the
+    /// component was registered without one (hand-registered or unit types).
+    pub schema_hash: Option<u64>,
+}
+
+impl ComponentLayout {
+    /// Build the layout record for `T` from its declared field descriptors.
+    ///
+    /// An empty `fields` slice records no schema hash rather than the hash of
+    /// nothing, so a registration that simply carries no field metadata is not
+    /// mistaken for one describing an empty struct.
+    pub fn of<T: Component>(fields: &[ComponentFieldDescriptor]) -> Self {
+        Self {
+            size: std::mem::size_of::<T>(),
+            align: std::mem::align_of::<T>(),
+            schema_hash: (!fields.is_empty()).then(|| component_schema_hash(fields)),
+        }
+    }
+
+    /// Whether `other` describes the same memory shape as this layout.
+    ///
+    /// Size and alignment must always agree. The structural hash is compared
+    /// only when both records have one: a layout-less registration carries no
+    /// evidence either way, and treating its absence as a mismatch would
+    /// reject a hand-registered component that is in fact identical.
+    ///
+    /// Size and alignment alone are *not* layout - `{f32, f32}` and
+    /// `{u32, u32}` agree on both and would misread each other's rows
+    /// silently - which is exactly why the schema hash exists and why a shared
+    /// component should always be registered with its field descriptors.
+    pub fn is_compatible_with(&self, other: &Self) -> bool {
+        if self.size != other.size || self.align != other.align {
+            return false;
+        }
+        match (self.schema_hash, other.schema_hash) {
+            (Some(left), Some(right)) => left == right,
+            _ => true,
+        }
+    }
+}
+
+/// Structural hash over a component's declared field layout.
+///
+/// FNV-1a over the field descriptors rather than a `DefaultHasher`, because
+/// this value is compared *between separately compiled binaries*: the standard
+/// hasher's algorithm is explicitly unspecified and may change between Rust
+/// releases, while this is a fixed function of the bytes.
+///
+/// Every field's name, type tag, offset, size, alignment and element count is
+/// folded in, so a reordered, retyped, repadded or resized field all change the
+/// result even when the struct's total size does not.
+pub fn component_schema_hash(fields: &[ComponentFieldDescriptor]) -> u64 {
+    // FNV-1a offset basis; `component_name_hash` continues the same chain, so
+    // strings and integers mix into one running value.
+    let mut hash = 0xcbf29ce484222325u64;
+    for field in fields {
+        hash = component_name_hash(field.name, hash);
+        hash = component_name_hash(field.type_tag, hash);
+        for value in [
+            field.offset,
+            field.size,
+            field.align,
+            field.element_count,
+        ] {
+            for byte in (value as u64).to_le_bytes() {
+                hash ^= byte as u64;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+    }
+    hash
 }
 
 // =============================================================================
@@ -295,7 +549,14 @@ pub struct ComponentRegistry {
     /// Type name of each registered component, used for diagnostics and tooling.
     names: HashMap<ComponentId, String>,
     /// Size in bytes of each registered component type.
-    sizes: HashMap<ComponentId, usize>,
+    layouts: HashMap<ComponentId, ComponentLayout>,
+    /// Rust type name that claimed each shared identity, so a second claim by a
+    /// *different* type can be told apart from the same type compiled twice.
+    ///
+    /// Owned rather than the `&'static str` `type_name` returns: that pointer
+    /// lives in the declaring artifact's read-only data and dangles once a
+    /// module DLL is unloaded, while the registry outlives every module.
+    shared_declaring_types: HashMap<ComponentId, String>,
     /// Next bit index to assign to a newly registered component.
     next_bit: u8,
     /// Bit indices reclaimed by [`Self::remove`], reused before `next_bit`
@@ -342,7 +603,8 @@ impl ComponentRegistry {
         Self {
             id_to_bit: HashMap::new(),
             names: HashMap::new(),
-            sizes: HashMap::new(),
+            layouts: HashMap::new(),
+            shared_declaring_types: HashMap::new(),
             next_bit: 0,
             free_bits: Vec::new(),
         }
@@ -381,15 +643,82 @@ impl ComponentRegistry {
     /// stale, and everything reading size from here - the byte-level bindings
     /// handed to C#, the persistence migration - would work from the old one.
     pub fn register<T: Component>(&mut self) -> Result<Registration, WorldError> {
-        // Step 1: Return the existing bit index when the type is already registered.
+        self.register_with_layout::<T>(&[])
+    }
+
+    /// Register a component type together with its declared field layout.
+    ///
+    /// The layout is recorded so a later registration of the same component -
+    /// a hot-reload generation, or a second binary that linked the same shared
+    /// type - can be checked against it.
+    ///
+    /// # Errors
+    ///
+    /// In addition to [`Self::register`]'s error, returns
+    /// [`WorldError::SharedComponentLayoutMismatch`] when a component with a
+    /// declared shared identity is registered a second time with a different
+    /// memory shape. That check is what makes reaching one column from two
+    /// binaries sound, so it is an error rather than a debug assertion.
+    pub fn register_with_layout<T: Component>(
+        &mut self,
+        fields: &[ComponentFieldDescriptor],
+    ) -> Result<Registration, WorldError> {
+        // Step 1: Return the existing bit index when the type is already
+        // registered, after checking that both registrations describe the
+        // same memory shape.
         let component_id = ComponentId::of::<T>();
+        let layout = ComponentLayout::of::<T>(fields);
         if let Some(&bit) = self.id_to_bit.get(&component_id) {
-            debug_assert_eq!(
-                self.sizes.get(&component_id).copied(),
-                Some(std::mem::size_of::<T>()),
-                "component {} was re-registered with a different size; the                  recorded layout is stale",
-                std::any::type_name::<T>()
-            );
+            // A shared name is a process-wide identity, so two types holding
+            // it are one component: one bit, one column, and every write
+            // through either landing on the other's rows. When their layouts
+            // also agree, nothing downstream can notice - the reads succeed and
+            // return another component's data.
+            //
+            // The legitimate case this must not reject is one type compiled
+            // into two binaries, which is the entire point of shared identity.
+            // Those agree on the type's own name - `Spline` is `Spline` in
+            // whichever artifact compiled it - while two different components
+            // do not. Only the final path segment is compared, because the
+            // module path differs between an in-process stand-in and the real
+            // cross-binary case while the type's name does not.
+            if let Some(shared_name) = T::shared_name() {
+                let incoming = Self::declaring_type_name::<T>();
+                if let Some(existing) = self.shared_declaring_types.get(&component_id) {
+                    if existing != incoming {
+                        return Err(WorldError::SharedComponentNameConflict {
+                            shared_name: shared_name.to_string(),
+                            existing_type: existing.clone(),
+                            incoming_type: incoming.to_string(),
+                        });
+                    }
+                }
+            }
+            let recorded = self.layouts.get(&component_id).copied();
+            match (recorded, T::shared_name()) {
+                // A shared component reaching this branch is the whole point
+                // of the feature: a second binary registering the type the
+                // first one already owns. Both will read and write the same
+                // rows through their own `T`, so a layout disagreement is a
+                // misread waiting to happen and must stop the registration.
+                (Some(recorded), Some(shared_name)) if !recorded.is_compatible_with(&layout) => {
+                    return Err(WorldError::SharedComponentLayoutMismatch {
+                        shared_name: shared_name.to_string(),
+                        type_name: std::any::type_name::<T>().to_string(),
+                        existing_size: recorded.size,
+                        existing_align: recorded.align,
+                        incoming_size: layout.size,
+                        incoming_align: layout.align,
+                    });
+                }
+                // An ordinary component keeps the identity of its `TypeId`, so
+                // a layout change here means a reload replaced the definition
+                // while the compiler happened to reuse the id. The persistence
+                // migration is what handles that; the record is refreshed so
+                // it describes the definition now in force.
+                _ => {}
+            }
+            self.layouts.insert(component_id, layout);
             return Ok(Registration::AlreadyPresent(bit));
         }
         // Step 2: Assign the next bit - either one reclaimed by `remove`, or a
@@ -403,9 +732,17 @@ impl ComponentRegistry {
         };
         // Step 3: Record the type's metadata under the assigned bit.
         self.id_to_bit.insert(component_id, bit);
+        // A shared component is recorded under its declared name, not
+        // `std::any::type_name`: the declared name is what both binaries agree
+        // on, and it is what every name-keyed lookup - persistence, the C#
+        // bindings, the editor - must find it by.
         self.names
-            .insert(component_id, std::any::type_name::<T>().to_string());
-        self.sizes.insert(component_id, std::mem::size_of::<T>());
+            .insert(component_id, Self::registered_name::<T>());
+        self.layouts.insert(component_id, layout);
+        if T::shared_name().is_some() {
+            self.shared_declaring_types
+                .insert(component_id, Self::declaring_type_name::<T>().to_string());
+        }
         Ok(Registration::Created(bit))
     }
 
@@ -420,6 +757,38 @@ impl ComponentRegistry {
     /// limit is reached, as [`Self::register`] does.
     pub fn register_bit<T: Component>(&mut self) -> Result<u8, WorldError> {
         self.register::<T>().map(Registration::bit)
+    }
+
+    /// [`Self::register_with_layout`] for callers that only need the bit.
+    pub fn register_bit_with_layout<T: Component>(
+        &mut self,
+        fields: &[ComponentFieldDescriptor],
+    ) -> Result<u8, WorldError> {
+        self.register_with_layout::<T>(fields).map(Registration::bit)
+    }
+
+    /// The Rust type's own name, without its module path.
+    ///
+    /// `pill_spline::Spline` and `tests::module_copy::Spline` both yield
+    /// `Spline`. The module path is deliberately dropped: it is what differs
+    /// between an in-process stand-in for the cross-binary case and the real
+    /// thing, while the type's name is what two copies of one type always
+    /// share.
+    pub fn declaring_type_name<T: ?Sized>() -> &'static str {
+        let path = std::any::type_name::<T>();
+        path.rsplit("::").next().unwrap_or(path)
+    }
+
+    /// The name a component type is registered under.
+    ///
+    /// Its declared shared name when it has one, otherwise
+    /// [`std::any::type_name`]. A shared component must be findable by the
+    /// name both binaries wrote down rather than by one binary's rendering of
+    /// its Rust path.
+    pub fn registered_name<T: Component>() -> String {
+        T::shared_name()
+            .map(str::to_string)
+            .unwrap_or_else(|| std::any::type_name::<T>().to_string())
     }
 
     /// Register a component whose concrete type is defined outside Rust.
@@ -453,7 +822,17 @@ impl ComponentRegistry {
         // Step 3: Record the dynamic component's metadata.
         self.id_to_bit.insert(component_id, bit);
         self.names.insert(component_id, name);
-        self.sizes.insert(component_id, size);
+        // A dynamic component's alignment lives with its storage factory, and
+        // its schema hash is carried by the manifest, so the registry records
+        // only what it is asked for here.
+        self.layouts.insert(
+            component_id,
+            ComponentLayout {
+                size,
+                align: 1,
+                schema_hash: None,
+            },
+        );
         Ok(bit)
     }
 
@@ -489,7 +868,8 @@ impl ComponentRegistry {
             self.free_bits.push(bit);
         }
         self.names.remove(component_id);
-        self.sizes.remove(component_id);
+        self.layouts.remove(component_id);
+        self.shared_declaring_types.remove(component_id);
     }
 
     /// Number of component types that can still be registered before the
@@ -512,7 +892,12 @@ impl ComponentRegistry {
 
     /// Get the size in bytes of a registered component type.
     pub fn get_size(&self, component_id: &ComponentId) -> Option<usize> {
-        self.sizes.get(component_id).copied()
+        self.layouts.get(component_id).map(|layout| layout.size)
+    }
+
+    /// Get the recorded memory layout of a registered component type.
+    pub fn get_layout(&self, component_id: &ComponentId) -> Option<ComponentLayout> {
+        self.layouts.get(component_id).copied()
     }
 
     /// Check whether a component type has been registered.

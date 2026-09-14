@@ -129,7 +129,7 @@ impl<T: Component> QueryTarget for &T {
                 ("Component type: {}", std::any::type_name::<T>())
             ]
         );
-        SendPtr::new(archetype.component_storages.get_storage::<T>()
+        SendPtr::new(archetype.component_storages.column_of::<T>()
             as *const ErasedVecStorage<dyn Component>)
     }
 
@@ -203,7 +203,7 @@ impl<T: Component> QueryTarget for &mut T {
                 ("Component type (mutable): {}", std::any::type_name::<T>())
             ]
         );
-        let values = SendPtrMut::new(archetype.component_storages.get_storage_mut::<T>()
+        let values = SendPtrMut::new(archetype.component_storages.column_of_mut::<T>()
             as *mut ErasedVecStorage<dyn Component>);
         let ticks_vec = archetype
             .component_ticks

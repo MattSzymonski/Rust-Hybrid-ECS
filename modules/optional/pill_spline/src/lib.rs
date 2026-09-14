@@ -72,6 +72,16 @@ const SAMPLE_VERTICAL_OFFSET: f32 = 0.0;
 ///
 /// The host serializes this component across hot-reload generations, so the
 /// layout is pinned with `#[repr(C)]` and every field stays serde compatible.
+///
+/// `#[pill(shared)]` because this type is linked by two artifacts at once: the
+/// project depends on this crate directly so it can write `Query<&Spline>`,
+/// *and* the host loads this crate as a hot-swappable module DLL. Each binary
+/// gets its own `TypeId` for the type, so without a declared identity the
+/// engine would see two components, allocate two columns, and let neither side
+/// see the other's entities - and the reload path would silently drop whichever
+/// one registered first. The declared name is `pill_spline::Spline`, which is
+/// what `std::any::type_name` already produced, so every name-keyed consumer -
+/// the C# bindings, the editor, `project_settings.yaml` - is unaffected.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PillComponent)]
 #[pill(persistable)]

@@ -70,7 +70,7 @@ pub enum RenderingError {
 
     /// The GPU surface, device, or a frame could not be obtained.
     #[transparent]
-    Renderer(#[from] pill_wgpu_renderer::RendererError),
+    Renderer(#[from] pill_master_renderer::RendererError),
 }
 
 // =============================================================================
@@ -94,7 +94,7 @@ mod tests {
     /// from when the enum lived in `pill_core`.
     #[test]
     fn every_composed_arm_reports_the_leaf_code() {
-        let renderer = RenderingError::Renderer(pill_wgpu_renderer::RendererError::NoAlphaModes);
+        let renderer = RenderingError::Renderer(pill_master_renderer::RendererError::NoAlphaModes);
         assert_eq!(
             renderer.code().map(|code| code.to_string()).as_deref(),
             Some("engine::renderer::no_alpha_modes")

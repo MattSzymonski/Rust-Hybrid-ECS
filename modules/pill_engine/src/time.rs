@@ -72,6 +72,12 @@ pub struct Time {
     last_frame: Duration,
     /// Clamped `last_frame`, the value gameplay should integrate with.
     delta: Duration,
+    /// Frames completed since startup, counting the current one.
+    ///
+    /// Distinct from the world's change tick, which is an ordering device for
+    /// change detection and may be bumped outside a frame; this counts frames
+    /// and nothing else, so a periodic task can key on it.
+    frame: u64,
 }
 
 impl Resource for Time {}
@@ -90,6 +96,9 @@ impl Time {
             elapsed: Duration::ZERO,
             last_frame: Duration::ZERO,
             delta: Duration::ZERO,
+            // The first `advance` makes this 1, so the first frame a system
+            // observes is frame 1 rather than frame 0.
+            frame: 0,
         }
     }
 
@@ -104,6 +113,22 @@ impl Time {
         );
         self.frame_start = now;
         self.elapsed = now.duration_since(self.startup);
+        // Saturating rather than wrapping: at 1000 fps this takes ~584 million
+        // years to reach, and a wrap would silently restart every frame-keyed
+        // periodic task at once.
+        self.frame = self.frame.saturating_add(1);
+    }
+
+    // -------------------------------------------------------------------------
+    // Frames
+    // -------------------------------------------------------------------------
+
+    /// Frames completed since startup, counting the one now running.
+    ///
+    /// `1` during the first frame. Use it to run something periodically:
+    /// `time.frame_count() % 100 == 0`.
+    pub fn frame_count(&self) -> u64 {
+        self.frame
     }
 
     // -------------------------------------------------------------------------

@@ -82,12 +82,12 @@
 
     <!-- The renderer's components (Position, Sprite, Color). This project
          draws, so it imports them from the renderer that owns them - the
-         managed counterpart of the Rust project's `pill_wgpu_renderer`
+         managed counterpart of the Rust project's `pill_master_renderer`
          dependency. They are hand-written rather than generated because the
          host binds them as typed native components that managed physics writes
          into directly, not as the opaque ABI blobs the module generator emits.
          A project that draws nothing simply omits this line. -->
-    <Compile Include="../../modules/optional/pill_wgpu_renderer/managed/RendererComponents.cs" />
+    <Compile Include="../../modules/optional/rendering/pill_master_renderer/managed/RendererComponents.cs" />
   </ItemGroup>
 
 </Project>

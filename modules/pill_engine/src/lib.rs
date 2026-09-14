@@ -57,6 +57,10 @@ pub mod component_field;
 /// Centralised configuration constants and hardware detection.
 pub mod config;
 
+/// Periodic ECS state report, registered by the engine and printed every N
+/// frames.
+pub mod diagnostics;
+
 /// Engine-owned native dynamic buffer: variable-length component data whose
 /// `(ptr, len, cap)` handle managed code reads straight out of the row.
 pub mod dynamic_buffer;

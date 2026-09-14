@@ -255,7 +255,8 @@ fn exposed_components(engine: &Engine, names: &[String]) -> Vec<ModuleExposedCom
     names
         .iter()
         .filter_map(|type_name| {
-            let component_id = engine.world().resolve_component_id_by_name_any(type_name)?;
+            let component_id =
+                crate::csharp::resolve_exposed_component_id(engine.world(), type_name)?;
             let (size, align) = engine.world().component_layout(component_id)?;
             // Field layouts only drive the dev codegen; shipping mirrors are
             // committed, so this stays informational here.

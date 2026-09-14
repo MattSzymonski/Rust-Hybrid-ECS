@@ -83,13 +83,13 @@ const BLITTABLE_FIELD_TYPES: &[&str] = &[
 
 // The renderer's components, which managed physics writes into directly.
 //
-// They live in `pill_wgpu_renderer` with the pipeline that draws them, so they
+// They live in `pill_master_renderer` with the pipeline that draws them, so they
 // are reachable only in a windowed build. A headless host registers no native
 // binding for them: a managed project that declares a `Sprite` mirror still
 // works, falling through to the dynamic byte-level binding like any other
 // component the host does not know natively.
 #[cfg(feature = "rendering")]
-pub(super) use pill_wgpu_renderer::{Color, Position, Sprite};
+pub(super) use pill_master_renderer::{Color, Position, Sprite};
 
 /// Stable 128-bit identity derived from a managed component's canonical name.
 ///
@@ -187,21 +187,20 @@ impl ComponentBinding {
 // =============================================================================
 
 /// Produce one half of the stable component identity or a native schema hash.
-pub(super) const fn component_hash(name: &str, offset: u64) -> u64 {
-    let bytes = name.as_bytes();
-    let mut hash = offset;
-    let mut index = 0;
-    // FNV-1a mixing keeps the hash stable across runs and runtimes, so the
-    // managed side can reproduce the same value from the canonical name.
-    while index < bytes.len() {
-        hash ^= bytes[index] as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-        index += 1;
-    }
-    hash
-}
+///
+/// Re-exported from the engine rather than reimplemented: the engine derives a
+/// shared component's [`ComponentId`] from its declared name with exactly this
+/// function, so two copies of the algorithm could drift apart and silently
+/// stop agreeing on an identity.
+pub(super) use pill_engine::component::component_name_hash as component_hash;
 
 /// Hash a canonical managed full name into its stable 128-bit identity.
+///
+/// Managed code names a component with dots (`pill_spline.Spline`) where Rust
+/// names it with colons, so this identity is not interchangeable with the one
+/// the engine derives for a shared component - the two are related by
+/// `ModuleExposedComponent`, which carries both. Only the mixing function is
+/// shared.
 pub(super) const fn stable_component_id(name: &str) -> StableComponentId {
     StableComponentId::from_halves(
         component_hash(name, 0xcbf29ce484222325),
@@ -381,7 +380,7 @@ pub(super) fn shared_component_bindings(engine: &mut Engine) -> ComponentBinding
 
 /// Bind the renderer's components to their canonical managed mirrors.
 ///
-/// Windowed builds only - the types live in `pill_wgpu_renderer`, which only a
+/// Windowed builds only - the types live in `pill_master_renderer`, which only a
 /// windowed host links.
 #[cfg(feature = "rendering")]
 fn shared_renderer_bindings(engine: &mut Engine, bindings: &mut ComponentBindings) {
@@ -429,6 +428,29 @@ pub(crate) struct ModuleExposedComponent {
     /// hand-registered or dynamic components, which keep the opaque ABI-blob
     /// mirror.
     pub(crate) fields: Vec<ComponentFieldDescriptor>,
+}
+
+/// Resolve one exposed component name to its engine [`ComponentId`], reporting
+/// an ambiguous name instead of binding managed code to a guessed column.
+///
+/// A name that resolves to nothing is an ordinary outcome - the module that
+/// registered it may be unloaded - and yields `None` quietly. A name claimed by
+/// two registrations is not: managed code would be bound to whichever column
+/// won an arbitrary tiebreak, and every read and write through that binding
+/// would silently address the wrong rows. That case is logged and left unbound.
+pub(crate) fn resolve_exposed_component_id(world: &World, type_name: &str) -> Option<ComponentId> {
+    match world.resolve_component_id_by_name_any(type_name) {
+        Ok(component_id) => component_id,
+        Err(error) => {
+            pill_core::error!(
+                target: telemetry_target::ECS,
+                type_name = %type_name,
+                error = %error,
+                "exposed component name is ambiguous; leaving it unbound for managed code"
+            );
+            None
+        }
+    }
 }
 
 /// Build byte-level bindings for every optional-module component exposed to

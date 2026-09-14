@@ -452,8 +452,8 @@ impl World {
     ) -> Option<Vec<u8>> {
         let archetype = self.archetypes.get(&archetype_id)?;
         match component_id {
-            ComponentId::Native(type_id) => {
-                let column = archetype.component_storages.get_trait_storage(type_id)?;
+            _ if component_id.is_native_storage() => {
+                let column = archetype.component_storages.get(component_id)?;
                 if row >= column.len() {
                     return None;
                 }
@@ -471,7 +471,7 @@ impl World {
                 }
                 Some(buffer)
             }
-            ComponentId::Dynamic(_) => archetype
+            _ => archetype
                 .dynamic_component_storages
                 .get(&component_id)?
                 .bytes(row)
@@ -744,8 +744,12 @@ impl World {
         component_name: &str,
         fields: &[(String, FieldValue)],
     ) -> Result<Vec<u8>, ComponentFieldError> {
+        // An ambiguous name means two registrations claim it, so there is no
+        // one component to build an image for; it reads the same as "not
+        // found" to the editor, which is the safe outcome either way.
         let component_id = self
             .resolve_component_id_by_name_any(component_name)
+            .unwrap_or(None)
             .ok_or(ComponentFieldError::ComponentNotFound {
                 component: component_name.to_string(),
             })?;
@@ -856,7 +860,7 @@ impl World {
         bytes: &[u8],
     ) -> Result<(), ComponentFieldError> {
         match component_id {
-            ComponentId::Native(type_id) => {
+            _ if component_id.is_native_storage() => {
                 let archetype = self
                     .archetypes
                     .get_mut(&archetype_id)
@@ -866,7 +870,7 @@ impl World {
                 {
                     let column = archetype
                         .component_storages
-                        .get_trait_storage_mut(type_id)
+                        .get_mut(component_id)
                         .ok_or(ComponentFieldError::ComponentNotFound {
                             component: String::new(),
                         })?;
@@ -898,7 +902,7 @@ impl World {
                 }
                 Ok(())
             }
-            ComponentId::Dynamic(_) => {
+            _ => {
                 let archetype = self
                     .archetypes
                     .get_mut(&archetype_id)

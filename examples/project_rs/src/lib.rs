@@ -29,8 +29,8 @@ use std::time::Instant;
 use pill_core::error;
 use pill_core::math::Vector3f;
 use pill_engine::*;
+use pill_master_renderer::{register_components, Color, Position, Sprite};
 use pill_spline::Spline;
-use pill_wgpu_renderer::{register_components, Color, Position, Sprite};
 use serde::{Deserialize, Serialize};
 
 // =============================================================================
@@ -41,7 +41,7 @@ const FIXED_DELTA_TIME: f32 = 1.0 / 60.0;
 const GRAVITY: f32 = 800.0;
 const BOUNCE_VELOCITY_Y: f32 = -800.0;
 const BOUNCE_VELOCITY_X: f32 = 350.0;
-const RESTITUTION: f32 = 0.7;
+const RESTITUTION: f32 = 0.6;
 
 /// Upward speed restored when a floor bounce would otherwise decay to rest.
 ///
@@ -88,6 +88,8 @@ const SAMPLE_DOT_COLOR: Color = Color::new(0.25, 0.85, 1.0, 1.0);
 pub struct SimulationTime {
     pub last_frame: Instant,
     pub delta_seconds: f32,
+
+    pub test: i32,
 }
 
 impl Resource for SimulationTime {}
@@ -186,14 +188,16 @@ pub fn simulate_ball(state: &mut PhysicsState) {
 /// Returns [`SystemError::MissingResource`] when `SimulationTime` is absent.
 #[pill_hot]
 fn physics_system(
-    time: Res<SimulationTime>,
+    mut commands: Commands,
+    mut time: ResMut<SimulationTime>,
     mut query: Query<(&mut PhysicsState, &mut Position, &mut Sprite)>,
 ) -> Result<(), SystemError> {
-    let Some(time) = time.get() else {
+    let Some(mut time) = time.get_mut() else {
         return Err(SystemError::MissingResource {
             name: String::from("SimulationTime"),
         });
     };
+
     let delta_seconds = time.delta_seconds;
     for (mut physics, mut position, mut sprite) in query.iter_mut() {
         physics.delta_time = delta_seconds;
@@ -312,7 +316,7 @@ fn ball_spawn_state(index: usize) -> PhysicsState {
 /// resolve in the loaded DLL.
 #[pill_project]
 pub fn init(engine: &mut Engine) -> u32 {
-    // The renderer's components are declared by `pill_wgpu_renderer`, not by
+    // The renderer's components are declared by `pill_master_renderer`, not by
     // this crate, so they cannot carry the derive. Registering them through
     // the renderer's own entry point also attaches their editor field layouts,
     // which is what makes a sprite's size and colour editable in the inspector.
@@ -321,15 +325,18 @@ pub fn init(engine: &mut Engine) -> u32 {
     engine.world_mut().insert_resource(SimulationTime {
         last_frame: Instant::now(),
         delta_seconds: FIXED_DELTA_TIME,
+        test: 0,
     });
     engine.register_system("simulation_time", update_time_system);
     engine.register_system("ball_physics", physics_system);
     engine.register_system("spline_path", spline_path_system);
 
     // The spline entity. `Spline` is registered by the linked `pill_spline`
-    // crate, and a separately built copy of that crate - the module DLL the
-    // host may be loading alongside this project - is a distinct type with its
-    // own storage, so this query only ever sees the project's own spline.
+    // crate, and the host may also be loading a separately built copy of that
+    // crate as a module DLL. `Spline` declares `#[pill(shared)]`, so both
+    // copies are one component with one column: this query sees the module's
+    // spline as readily as the project's own, and whichever artifact
+    // initialises first creates the entity while the other adopts it.
     //
     // `spline_path_system` rewrites the control points from the ball centres
     // every frame, so the only decision left here is whether the world already

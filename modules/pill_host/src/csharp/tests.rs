@@ -32,7 +32,7 @@ use super::components::{
     ComponentBinding, ComponentBindings, Position, Sprite, StableComponentId,
 };
 // `Color`, `Position` and `Sprite` above are the renderer's components,
-// re-exported by `components` from `pill_wgpu_renderer`.
+// re-exported by `components` from `pill_master_renderer`.
 use super::context::ActiveSystemGuard;
 use super::queries::{ffi_get_archetype_chunk, ffi_get_component_chunk, ffi_get_entity_chunk};
 

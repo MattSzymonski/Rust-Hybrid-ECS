@@ -139,6 +139,140 @@ pub enum WorldError {
         archetype_id: ArchetypeId,
     },
 
+    /// Two live registrations claim the same component type name under
+    /// different [`ComponentId`]s.
+    ///
+    /// The persistable-registration path evicts a same-name entry from the
+    /// persist maps on the assumption that it is a superseded hot-reload
+    /// generation. A generation that has been superseded has no live rows
+    /// left, so when the older column still holds entities the two
+    /// registrations are concurrent peers - two binaries that each linked the
+    /// same component type and therefore each got their own `TypeId` for it -
+    /// and evicting one would silently drop its rows at the next reload.
+    ///
+    /// The fix is to give the type a shared identity with
+    /// `#[pill(shared)]`, which makes both binaries resolve to one column
+    /// instead of two.
+    #[message(
+        "component ",
+        name_style(type_name),
+        " is registered twice with different type identities (",
+        debug_value(existing_id),
+        " still holds ",
+        value(live_rows),
+        " live rows, and ",
+        debug_value(incoming_id),
+        " is registering now); declare it `#[pill(shared)]` so both          registrations bind to one column"
+    )]
+    ComponentNameCollision {
+        /// The type name both registrations claim.
+        type_name: String,
+        /// The already-registered id whose column still holds rows.
+        existing_id: ComponentId,
+        /// The id being registered now.
+        incoming_id: ComponentId,
+        /// How many rows the existing column still holds.
+        live_rows: usize,
+    },
+
+    /// Two different Rust types claim the same shared component name.
+    ///
+    /// A shared name is a process-wide identity, so two types holding it are
+    /// one component as far as the engine is concerned: one bit, one column,
+    /// and every write through either type landing on the other's rows. When
+    /// their layouts also agree, nothing downstream can notice - the reads
+    /// succeed and silently return another component's data.
+    ///
+    /// The legitimate case this must not reject is one type compiled into two
+    /// binaries, which is the entire point of shared identity. Those are told
+    /// apart by their Rust path: the same type compiled twice reports the same
+    /// [`std::any::type_name`], while two different types never do.
+    ///
+    /// Give the two components distinct names. The default derived from
+    /// `module_path!()` is already distinct; this is reachable only by
+    /// overriding it with `#[pill(shared = "...")]`.
+    #[message(
+        "shared component name ",
+        name_style(shared_name),
+        " is claimed by two different types (",
+        name_style(existing_type),
+        " and ",
+        name_style(incoming_type),
+        "); a shared name is a process-wide identity, so give them distinct names"
+    )]
+    SharedComponentNameConflict {
+        /// The shared name both types declared.
+        shared_name: String,
+        /// Rust path of the type that registered the name first.
+        existing_type: String,
+        /// Rust path of the type claiming it now.
+        incoming_type: String,
+    },
+
+    /// Two binaries registered the same shared component with different
+    /// memory layouts.
+    ///
+    /// A shared component is reached from every binary that links it through
+    /// one column, and the only thing establishing that they agree about what
+    /// a row contains is this check. Binding the second registration anyway
+    /// would let one binary read another's rows through the wrong field
+    /// offsets, so the registration is refused instead.
+    ///
+    /// Because identity is resolved at load time rather than by the compiler,
+    /// a field reorder or type change compiles cleanly in both binaries and
+    /// surfaces here. Rebuild both against the same definition.
+    #[message(
+        "shared component ",
+        name_style(shared_name),
+        " is registered with two different layouts (existing: ",
+        value(existing_size),
+        " bytes / ",
+        value(existing_align),
+        " align; incoming ",
+        name_style(type_name),
+        ": ",
+        value(incoming_size),
+        " bytes / ",
+        value(incoming_align),
+        " align); rebuild every binary that links it against one definition"
+    )]
+    SharedComponentLayoutMismatch {
+        /// The shared name both registrations declared.
+        shared_name: String,
+        /// The Rust path of the type being registered now.
+        type_name: String,
+        /// Size recorded by the registration that got there first.
+        existing_size: usize,
+        /// Alignment recorded by that first registration.
+        existing_align: usize,
+        /// Size of the type being registered now.
+        incoming_size: usize,
+        /// Alignment of the type being registered now.
+        incoming_align: usize,
+    },
+
+    /// A component type name resolved to more than one registered
+    /// [`ComponentId`].
+    ///
+    /// Name resolution is only meaningful when a name identifies one column.
+    /// More than one surviving candidate means
+    /// [`WorldError::ComponentNameCollision`] was not enforced somewhere
+    /// upstream, so it is reported rather than resolved by an arbitrary
+    /// tiebreak that would quietly pick the wrong column.
+    #[message(
+        "component name ",
+        name_style(type_name),
+        " resolves to ",
+        value(count),
+        " different registered components; it must resolve to exactly one"
+    )]
+    ComponentNameAmbiguous {
+        /// The ambiguous type name.
+        type_name: String,
+        /// How many registered components claim it.
+        count: usize,
+    },
+
     /// The archetype recorded for an entity is absent from the world.
     ///
     /// Signals that an entity location outlived the archetype it points at,
@@ -304,6 +438,26 @@ pub enum PersistenceError {
         " is not registered in the current world"
     )]
     ComponentTypeUnregistered { type_name: String },
+
+    /// The component type name resolves to more than one registered
+    /// component, so migration cannot tell which column owns the rows.
+    ///
+    /// The persistable-registration path evicts superseded same-name entries
+    /// precisely so this cannot happen; reaching it means two concurrent peers
+    /// registered the name and the collision guard was bypassed.
+    #[message(
+        "component type ",
+        name_style(type_name),
+        " resolves to ",
+        value(count),
+        " registered components, so the rows to migrate are ambiguous"
+    )]
+    ComponentTypeAmbiguous {
+        /// The ambiguous type name.
+        type_name: String,
+        /// How many registered components claim it.
+        count: usize,
+    },
 
     /// No deserializer is registered for the component type.
     #[message(

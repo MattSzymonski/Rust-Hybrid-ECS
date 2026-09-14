@@ -933,7 +933,7 @@ pub(crate) fn InspectorTab(editor: Arc<EditorContext>) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pill_wgpu_renderer::{register_components, Color, Sprite};
+    use pill_master_renderer::{register_components, Color, Sprite};
     use pill_engine::Engine;
 
     /// A `Sprite`-carrying entity surfaces width/height as ordinary scalar

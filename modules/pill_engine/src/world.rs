@@ -23,10 +23,12 @@ use std::collections::HashMap;
 
 // External crates
 use pill_core::{error, warn};
-use trait_type_map::{ErasedVecStorageInfo, TraitAccessible, TraitTypeMap, VecFamily};
+use trait_type_map::{ErasedVecStorageInfo, TraitAccessible};
 
 // Current crate
-use crate::archetype::{Archetype, ArchetypeId, DynamicComponentLayout, StorageFactory};
+use crate::archetype::{
+    Archetype, ArchetypeId, ComponentColumns, DynamicComponentLayout, StorageFactory,
+};
 use crate::commands::CommandQueue;
 use crate::component::{
     Component, ComponentId, ComponentMask, ComponentRegistry, ComponentTicks, Tick,
@@ -97,8 +99,8 @@ pub(crate) fn set_per_thread_last_run_tick(value: Option<Tick>) -> Option<Tick> 
 
 /// Function that copies a component from one storage to another at given indices.
 type ComponentCopier = fn(
-    source: &TraitTypeMap<dyn Component, VecFamily>,
-    destination: &mut TraitTypeMap<dyn Component, VecFamily>,
+    source: &ComponentColumns,
+    destination: &mut ComponentColumns,
     index: usize,
 );
 
@@ -116,7 +118,7 @@ type ComponentCopier = fn(
 /// (not a closure) guarantees that no state is captured and the callee
 /// cannot stash the pointers for later use.
 type ScriptUpdater =
-    fn(&mut TraitTypeMap<dyn Component, VecFamily>, usize, Entity, *mut World, *mut CommandQueue);
+    fn(&mut ComponentColumns, usize, Entity, *mut World, *mut CommandQueue);
 
 // =============================================================================
 // EntityLocation
@@ -253,8 +255,16 @@ pub struct World {
     /// obtain `&mut` to the same resource simultaneously.
     ///
     /// Cleared at the start of every frame by the Engine.
+    ///
+    /// Behind a mutex because the systems of one parallel batch each rebuild
+    /// `&mut World` from the same pointer and run concurrently, so two of them
+    /// taking `ResMut` of *different* resources would otherwise mutate this set
+    /// from two threads at once. Their resource ids are disjoint - the
+    /// scheduler guarantees that - but a `HashSet` is not safe to mutate
+    /// concurrently whatever the keys are.
     #[cfg(debug_assertions)]
-    pub(crate) debug_resource_write_locks: std::collections::HashSet<ResourceId>,
+    pub(crate) debug_resource_write_locks:
+        parking_lot::Mutex<std::collections::HashSet<ResourceId>>,
 
     /// Number of deferred commands executed in the current frame.
     /// Set by `CommandQueue::execute_queued_commands`, read by the Engine for Tracy plots.
@@ -322,7 +332,9 @@ impl World {
             system_last_run: 0,
             archetype_generation: 0,
             #[cfg(debug_assertions)]
-            debug_resource_write_locks: std::collections::HashSet::new(),
+            debug_resource_write_locks: parking_lot::Mutex::new(
+                std::collections::HashSet::new(),
+            ),
             commands_executed_this_frame: 0,
             iterator_timings: std::sync::Arc::new(std::sync::Mutex::new(IteratorTimings::new())),
             persist_serializers: HashMap::new(),
@@ -376,7 +388,7 @@ impl World {
         let component_id = ComponentId::of::<T>();
         for archetype in self.archetypes.values_mut() {
             if archetype.component_types.contains(&component_id) {
-                let storage = archetype.component_storages.get_storage_mut::<T>();
+                let storage = archetype.component_storages.column_of_mut::<T>();
                 storage.reserve::<T>(additional);
                 if let Some(ticks) = archetype.component_ticks.get_mut(&component_id) {
                     ticks.reserve(additional);
@@ -401,7 +413,7 @@ impl World {
             .filter(|archetype| archetype.component_types.contains(&component_id))
             .nth(chunk_index)?;
         let archetype_id = archetype.id;
-        let storage = archetype.component_storages.get_storage_mut::<T>();
+        let storage = archetype.component_storages.column_of_mut::<T>();
         Some((archetype_id, storage.as_mut_slice::<T>()))
     }
 
@@ -426,7 +438,7 @@ impl World {
         let archetype_id = archetype.id;
         let components = archetype
             .component_storages
-            .get_storage_mut::<T>()
+            .column_of_mut::<T>()
             .as_mut_slice::<T>();
         let Some(ticks_vec) = archetype.component_ticks.get_mut(&component_id) else {
             // `Archetype::new` creates a tick column for every entry in
@@ -467,7 +479,7 @@ impl World {
         }
         let components = archetype
             .component_storages
-            .get_storage_mut::<T>()
+            .column_of_mut::<T>()
             .as_mut_slice::<T>();
         let Some(ticks_vec) = archetype.component_ticks.get_mut(&component_id) else {
             // Same invariant break the index-based twin documents: storage
@@ -521,6 +533,33 @@ impl World {
     where
         T: Component + TraitAccessible<dyn Component> + Clone,
     {
+        self.register_component_inner::<T>(&[]);
+    }
+
+    /// Shared registration body for the layout-less and layout-carrying entry
+    /// points.
+    ///
+    /// `fields` is the compile-time field layout when the caller has one. It
+    /// is forwarded to the registry, which records it so a second registration
+    /// of the same component can be checked against the first - a diagnostic
+    /// for an ordinary component, and the soundness check for a shared one.
+    ///
+    /// # Shared components
+    ///
+    /// A component that declares [`Component::shared_name`] resolves to the
+    /// same [`ComponentId`] in every binary that links it, so the second
+    /// binary's registration finds the bit already taken and **binds to the
+    /// existing column** rather than allocating a second one: the registry
+    /// reports `AlreadyPresent`, no new bit is consumed, and entities spawned
+    /// from either binary land in the same archetype. Nothing here special-
+    /// cases that - it falls out of the id being equal - which is why there is
+    /// no window in which two binaries share a column but not a mask bit.
+    pub(crate) fn register_component_inner<T>(
+        &mut self,
+        fields: &'static [crate::component_registry::ComponentFieldDescriptor],
+    ) where
+        T: Component + TraitAccessible<dyn Component> + Clone,
+    {
         let _zone = crate::profile_scope!(
             "register component",
             [(
@@ -529,21 +568,25 @@ impl World {
             )]
         );
         let component_id = ComponentId::of::<T>();
-        let type_name = std::any::type_name::<T>().to_string();
+        let type_name = crate::component::ComponentRegistry::registered_name::<T>();
 
-        // Register component (bit index + name)
-        // `register_bit` rather than `register`: the world does not act on
-        // whether the type was already present, and re-registration is normal
-        // here because a hot reload re-runs every `init`.
-        let bit = match self.component_registry.register_bit::<T>() {
+        // Register component (bit index + name + layout)
+        // `register_bit_with_layout` rather than `register`: the world does not
+        // act on whether the type was already present, and re-registration is
+        // normal here because a hot reload re-runs every `init`.
+        let bit = match self
+            .component_registry
+            .register_bit_with_layout::<T>(fields)
+        {
             Ok(bit) => bit,
             Err(error) => {
-                // The 128-type ceiling is a configuration outcome, not a
-                // programming error, so it is reported as a first-class
-                // diagnostic and recorded for the init entry point instead of
-                // panicking. The caller (project/module init) fails the reload
-                // transactionally when the error is drained by
-                // `component_registry::register_all_components`.
+                // Neither the 128-type ceiling nor a shared-layout
+                // disagreement is a programming error - both are outcomes of
+                // what the user's binaries declare - so they are reported as
+                // first-class diagnostics and recorded for the init entry
+                // point instead of panicking. The caller (project/module init)
+                // fails the reload transactionally when the error is drained
+                // by `component_registry::register_all_components`.
                 error!(
                     target: pill_core::telemetry::telemetry_target::ECS,
                     type_name = %type_name,
@@ -551,7 +594,7 @@ impl World {
                     remaining = self.component_registry.available_slots(),
                     "component registration failed"
                 );
-                self.registration_error = Some(error);
+                self.record_registration_error(error);
                 return;
             }
         };
@@ -582,10 +625,25 @@ impl World {
         // actual column in `Archetype::new` as a concrete `Box<ErasedVecStorage>`
         // with no trait-object vtable, and re-homes its function table on
         // every reload, so columns survive DLL unloads.
-        self.storage_factories.insert(
-            component_id,
-            StorageFactory::Native(ErasedVecStorageInfo::<dyn Component>::of::<T>()),
-        );
+        //
+        // A shared component's column is built with `of_shared`, so its
+        // element-type check compares layout instead of `TypeId`. That is the
+        // point where the compiler stops vouching for the type and the
+        // registry's layout check above takes over: the second binary's `T` is
+        // a different `TypeId` for the same type, and only the recorded size,
+        // alignment and schema hash establish that it really is.
+        //
+        // Re-registering replaces the factory, so the function table points at
+        // the most recently loaded generation - the same last-writer-wins rule
+        // the reload path already relies on, with `rehome_native_columns`
+        // re-pointing live columns at it afterwards.
+        let storage_info = if T::shared_name().is_some() {
+            ErasedVecStorageInfo::<dyn Component>::of_shared::<T>()
+        } else {
+            ErasedVecStorageInfo::<dyn Component>::of::<T>()
+        };
+        self.storage_factories
+            .insert(component_id, StorageFactory::Native(storage_info));
 
         // Register copier function for this component type.
         // Uses a named generic function (not a closure) so the fn pointer
@@ -606,6 +664,18 @@ impl World {
         self.registration_error.take()
     }
 
+    /// Record a registration failure raised outside `register_component`, so
+    /// the artifact-wide registration loop fails the reload the same way it
+    /// does for the component-type ceiling.
+    ///
+    /// The first failure wins: later registrations in the same pass are often
+    /// knock-on effects of the first, and the original is the diagnosable one.
+    pub(crate) fn record_registration_error(&mut self, error: WorldError) {
+        if self.registration_error.is_none() {
+            self.registration_error = Some(error);
+        }
+    }
+
     /// Register a component together with its compile-time field layout, so
     /// the C# mirror codegen can emit a typed struct. Components registered
     /// without field metadata (hand-registered, dynamic, or unit types) keep
@@ -616,7 +686,7 @@ impl World {
     ) where
         T: Component + TraitAccessible<dyn Component> + Clone,
     {
-        self.register_component::<T>();
+        self.register_component_inner::<T>(fields);
         self.component_field_layouts
             .insert(ComponentId::of::<T>(), ComponentFieldLayout::Static(fields));
     }
@@ -682,10 +752,7 @@ impl World {
                 let Some(&ops) = factory_ops.get(&component_id) else {
                     continue;
                 };
-                let Some(type_id) = component_id.native_type_id() else {
-                    continue;
-                };
-                if let Some(column) = archetype.component_storages.get_trait_storage_mut(type_id) {
+                if let Some(column) = archetype.component_storages.get_mut(component_id) {
                     column.refresh_ops(ops);
                 }
             }
@@ -741,6 +808,22 @@ impl World {
                 _ => Err(WorldError::DynamicAlreadyRegistered),
             };
         }
+        // A name already claimed by a live column belongs to a different
+        // component, not to an earlier generation of this one: a manifest
+        // reload derives `stable_id` from the same full name, so it lands on
+        // the idempotent path above rather than here. Registering a second
+        // component under that name would make every later lookup by name
+        // ambiguous, and managed code binds by name, so the collision is
+        // reported now instead of producing a binding to the wrong column.
+        if let Some((existing_id, live_rows)) = self.live_component_with_name(&name, component_id) {
+            return Err(WorldError::ComponentNameCollision {
+                type_name: name,
+                existing_id,
+                incoming_id: component_id,
+                live_rows,
+            });
+        }
+
         // The registry reports the 128-type ceiling as a typed error (with the
         // offending name and current count) rather than panicking; propagate it.
         self.component_registry
@@ -795,16 +878,16 @@ impl World {
         component_id: ComponentId,
         chunk_index: usize,
     ) -> Option<(ArchetypeId, *mut u8, usize, usize, &mut [ComponentTicks])> {
-        let type_id = component_id.native_type_id()?;
+        if !component_id.is_native_storage() {
+            return None;
+        }
         let archetype = self
             .archetypes
             .values_mut()
             .filter(|archetype| archetype.component_types.contains(&component_id))
             .nth(chunk_index)?;
         let archetype_id = archetype.id;
-        let column = archetype
-            .component_storages
-            .get_trait_storage_mut(type_id)?;
+        let column = archetype.component_storages.get_mut(component_id)?;
         let len = column.len();
         let data = column.as_mut_ptr();
         let element_size = column.elem_size();
@@ -846,12 +929,14 @@ impl World {
         component_id: ComponentId,
         archetype_id: ArchetypeId,
     ) -> Option<(ArchetypeId, *mut u8, usize, usize, &mut [ComponentTicks])> {
-        let type_id = component_id.native_type_id()?;
+        if !component_id.is_native_storage() {
+            return None;
+        }
         let archetype = self.archetypes.get_mut(&archetype_id)?;
         if !archetype.component_types.contains(&component_id) {
             return None;
         }
-        let column = archetype.component_storages.get_trait_storage_mut(type_id)?;
+        let column = archetype.component_storages.get_mut(component_id)?;
         let len = column.len();
         let data = column.as_mut_ptr();
         let element_size = column.elem_size();
@@ -863,18 +948,93 @@ impl World {
         Some((archetype_id, data, len, element_size, ticks))
     }
 
+    /// Entity IDs that were destroyed and are waiting to be handed out again.
+    ///
+    /// The engine's own retirement pool: an ID here belongs to no live entity,
+    /// but the slot is kept so a later spawn reuses it with a bumped
+    /// generation rather than growing the ID space.
+    pub fn recycled_entity_id_count(&self) -> usize {
+        self.free_entity_ids.len()
+    }
+
+    /// Number of resources the world holds.
+    pub fn resource_count(&self) -> usize {
+        self.resources.len()
+    }
+
+    /// Total number of rows every archetype currently stores for one
+    /// component id.
+    ///
+    /// Zero means the component is registered but nothing is using it, which
+    /// is what a superseded hot-reload generation looks like once its entities
+    /// have migrated away. A non-zero count means the column is still live, so
+    /// its registration cannot be treated as stale and discarded.
+    pub fn live_row_count(&self, component_id: ComponentId) -> usize {
+        self.archetypes
+            .values()
+            .filter(|archetype| archetype.component_types.contains(&component_id))
+            .map(|archetype| archetype.entities.len())
+            .sum()
+    }
+
+    /// The first registered component other than `excluding` that claims
+    /// `type_name` and still holds rows, with that row count.
+    ///
+    /// Both collision guards ask the same question: is a same-name
+    /// registration a superseded generation, which is safe to replace, or a
+    /// live peer, which is not? Live rows are what separates the two.
+    pub(crate) fn live_component_with_name(
+        &self,
+        type_name: &str,
+        excluding: ComponentId,
+    ) -> Option<(ComponentId, usize)> {
+        self.component_registry
+            .registered_components()
+            .filter(|(id, _, name)| *name == type_name && *id != excluding)
+            .map(|(id, _, _)| (id, self.live_row_count(id)))
+            .find(|(_, live_rows)| *live_rows > 0)
+    }
+
     /// Resolve a component ID from its registered type name, without the
     /// persistable-only filter.
     ///
     /// Used by the C# backend to map an optional module's exposed component
     /// name (e.g. `pill_spline::Spline`) to its native [`ComponentId`] so a
     /// byte-level binding can be created without naming the concrete type.
-    pub fn resolve_component_id_by_name_any(&self, type_name: &str) -> Option<ComponentId> {
-        self.component_registry
+    ///
+    /// Unlike the persistable resolver, this has no `persist_inserters` filter
+    /// to collapse the candidate set, so a name claimed by two registrations
+    /// arrives here with both still visible. It used to break that tie with
+    /// `max_by_key(bit)`, which is not a recency ordering - `allocate_bit`
+    /// reissues bits reclaimed by `remove` before advancing `next_bit`, so the
+    /// highest bit can belong to the older registration. Binding managed code
+    /// to the wrong column that way is silent, so an ambiguous name is now
+    /// reported as [`WorldError::ComponentNameAmbiguous`] instead.
+    ///
+    /// A component declared with a shared identity cannot reach this state:
+    /// every binary that links it computes the same [`ComponentId`], so there
+    /// is only ever one registration to find.
+    pub fn resolve_component_id_by_name_any(
+        &self,
+        type_name: &str,
+    ) -> Result<Option<ComponentId>, WorldError> {
+        let mut candidates = self
+            .component_registry
             .registered_components()
             .filter(|(_, _, name)| *name == type_name)
-            .max_by_key(|(_, bit, _)| *bit)
-            .map(|(id, _, _)| id)
+            .map(|(id, _, _)| id);
+
+        let Some(first) = candidates.next() else {
+            return Ok(None);
+        };
+        let extra = candidates.count();
+        if extra > 0 {
+            return Err(WorldError::ComponentNameAmbiguous {
+                type_name: type_name.to_string(),
+                count: extra + 1,
+            });
+        }
+        Ok(Some(first))
     }
 
     /// Return the byte size and alignment of a registered component's layout.
@@ -976,12 +1136,12 @@ impl World {
     /// The component id an entity's archetype actually stores for a registered
     /// type name.
     ///
-    /// Unlike [`Self::resolve_component_id_by_name_any`], which picks the
-    /// highest bit across every generation the registry still remembers, this
-    /// looks only at the columns the entity really has. That makes it correct
-    /// across reloads even when a bit index was recycled, and it guarantees the
-    /// returned id has a live column, a live tick vector, and a field layout
-    /// belonging to the generation that created the data.
+    /// Unlike [`Self::resolve_component_id_by_name_any`], which searches every
+    /// generation the registry still remembers, this looks only at the columns
+    /// the entity really has. That makes it correct across reloads even when a
+    /// bit index was recycled, and it guarantees the returned id has a live
+    /// column, a live tick vector, and a field layout belonging to the
+    /// generation that created the data.
     pub fn resolve_entity_component_id(
         &self,
         entity: Entity,
@@ -1140,13 +1300,13 @@ impl World {
             // every invocation.
             self.script_updaters.insert(
                 component_id,
-                (|storage: &mut TraitTypeMap<dyn Component, VecFamily>,
+                (|storage: &mut ComponentColumns,
                   index: usize,
                   entity: Entity,
                   world_ptr: *mut World,
                   commands_ptr: *mut CommandQueue| {
                     // Get mutable reference to the component
-                    let component = storage.get_storage_mut::<T>().get_mut::<T>(index);
+                    let component = storage.column_of_mut::<T>().get_mut::<T>(index);
                     // SAFETY: `world_ptr` and `commands_ptr` are derived from
                     // `&mut World` / `&mut CommandQueue` that are valid for the
                     // entire duration of `update_scripts`, which is the sole
@@ -1366,17 +1526,6 @@ impl World {
                 std::any::type_name::<T>()
             )]
         );
-        #[cfg(debug_assertions)]
-        {
-            let id = ResourceId::of::<T>();
-            debug_assert!(
-                !self.debug_resource_write_locks.contains(&id),
-                "Resource {:?} is already mutably borrowed - possible scheduler bug or concurrent system access",
-                id
-            );
-            self.debug_resource_write_locks.insert(id);
-        }
-
         let id = ResourceId::of::<T>();
         let value: &mut T = self
             .resources
@@ -1417,9 +1566,37 @@ impl World {
     /// Called by [`Engine::process_frame`] at the start of every frame so
     /// that the isolation check only guards against concurrent access
     /// within a single frame.
+    /// Take one resource's debug write lock, reporting an overlapping holder.
+    ///
+    /// Acquired when a [`ResMut`](crate::query::ResMut) is built and released
+    /// when it drops, so the lock spans exactly one system's access. Doing it
+    /// per `get_mut()` call instead meant a system that took the resource
+    /// twice in sequence tripped the assertion, and holding it to the end of
+    /// the frame meant the second of two systems writing one resource did -
+    /// both while the message blamed concurrency that was not happening.
+    ///
+    /// `&self`, not `&mut self`: the systems of a parallel batch hold aliasing
+    /// `&mut World`, so this must be callable through a shared reference.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_acquire_resource_lock(&self, id: ResourceId) {
+        let newly_inserted = self.debug_resource_write_locks.lock().insert(id);
+        debug_assert!(
+            newly_inserted,
+            "Resource {id:?} is already mutably borrowed by another live \
+             `ResMut` - possible scheduler bug or concurrent system access"
+        );
+    }
+
+    /// Release one resource's debug write lock; see
+    /// [`Self::debug_acquire_resource_lock`].
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_release_resource_lock(&self, id: ResourceId) {
+        self.debug_resource_write_locks.lock().remove(&id);
+    }
+
     #[cfg(debug_assertions)]
     pub(crate) fn debug_clear_resource_locks(&mut self) {
-        self.debug_resource_write_locks.clear();
+        self.debug_resource_write_locks.lock().clear();
     }
 
     /// Check if an entity exists and is valid (not destroyed/recycled)
@@ -1465,7 +1642,7 @@ impl World {
         Some(
             archetype
                 .component_storages
-                .get_storage::<T>()
+                .column_of::<T>()
                 .get::<T>(location.index_in_archetype),
         )
     }
@@ -1506,7 +1683,7 @@ impl World {
         Some(
             archetype
                 .component_storages
-                .get_storage_mut::<T>()
+                .column_of_mut::<T>()
                 .get_mut::<T>(index),
         )
     }
@@ -1540,7 +1717,7 @@ impl World {
         }
 
         // Get raw pointer to component - avoids creating intermediate &mut
-        let storage = archetype.component_storages.get_storage_mut::<T>();
+        let storage = archetype.component_storages.column_of_mut::<T>();
         Some(storage.get_mut::<T>(index) as *mut T)
     }
 
@@ -1667,15 +1844,16 @@ impl World {
 
     /// Insert an entity with its components into the appropriate archetype
     ///
-    /// Note: With TraitTypeMap, we need concrete types to push components.
-    /// Components are added via EntityBuilder which has access to concrete types.
+    /// Note: the archetype's columns are type-erased, so pushing a component
+    /// still needs its concrete type. Components are added via EntityBuilder,
+    /// which has access to those types.
     pub(crate) fn insert_entity_with_components<F>(
         &mut self,
         entity: Entity,
         component_ids: Vec<ComponentId>,
         insert_fn: F,
     ) where
-        F: FnOnce(&mut TraitTypeMap<dyn Component, VecFamily>),
+        F: FnOnce(&mut ComponentColumns),
     {
         let _zone = crate::profile_scope!(
             "insert entity",
@@ -1757,8 +1935,8 @@ impl World {
     ) -> Result<(), WorldError>
     where
         F: FnOnce(
-            &TraitTypeMap<dyn Component, VecFamily>,
-            &mut TraitTypeMap<dyn Component, VecFamily>,
+            &ComponentColumns,
+            &mut ComponentColumns,
             usize,
         ),
     {
@@ -1854,12 +2032,15 @@ impl World {
                     .get_mut(&component_id)
                 else {
                     // Native components have no dynamic column and are skipped
-                    // by design. A dynamic component (whose native_type_id is
-                    // None) missing its column is a manifest/storage desync -
-                    // the condition `WorldError::DynamicStorageMissing`
-                    // reports - so fail the migration rather than leave the
-                    // destination archetype short a column.
-                    if component_id.native_type_id().is_none() {
+                    // by design - shared ones included, which is why the test
+                    // is `is_native_storage` and not "has a TypeId": a shared
+                    // component has native storage but no single TypeId. A
+                    // genuinely dynamic component missing its column is a
+                    // manifest/storage desync - the condition
+                    // `WorldError::DynamicStorageMissing` reports - so fail the
+                    // migration rather than leave the destination archetype
+                    // short a column.
+                    if !component_id.is_native_storage() {
                         return Err(WorldError::DynamicStorageMissing {
                             component_id,
                             archetype_id: new_archetype_id,
@@ -1941,16 +2122,15 @@ impl World {
 
             // Also swap_remove from all component storages to keep them in sync
             for &component_id in &old_archetype.component_types {
-                match component_id.native_type_id() {
-                    Some(type_id) => {
-                        if let Some(storage) = old_archetype
-                            .component_storages
-                            .get_trait_storage_mut(type_id)
+                match component_id.is_native_storage() {
+                    true => {
+                        if let Some(storage) =
+                            old_archetype.component_storages.get_mut(component_id)
                         {
                             storage.swap_remove_discard(old_index);
                         }
                     }
-                    None => {
+                    false => {
                         let Some(column) = old_archetype
                             .dynamic_component_storages
                             .get_mut(&component_id)
@@ -2036,15 +2216,15 @@ impl World {
                 }
             }
             for component_id in component_type_ids {
-                match component_id.native_type_id() {
-                    Some(type_id) => {
+                match component_id.is_native_storage() {
+                    true => {
                         if let Some(storage) =
-                            archetype.component_storages.get_trait_storage_mut(type_id)
+                            archetype.component_storages.get_mut(*component_id)
                         {
                             storage.swap_remove_discard(old_index);
                         }
                     }
-                    None => {
+                    false => {
                         if let Some(column) =
                             archetype.dynamic_component_storages.get_mut(component_id)
                         {
@@ -2256,7 +2436,7 @@ impl World {
                     copier(old_storage, new_storage, old_index);
                 }
                 // Add the new component
-                new_storage.get_storage_mut::<T>().push::<T>(component);
+                new_storage.column_of_mut::<T>().push::<T>(component);
             },
         )
         .unwrap_or_else(|error| {
@@ -2593,7 +2773,7 @@ impl World {
 /// being generic over every possible component.
 trait ComponentInserter {
     /// Push the captured component value into the given storage.
-    fn insert(self: Box<Self>, storage: &mut TraitTypeMap<dyn Component, VecFamily>);
+    fn insert(self: Box<Self>, storage: &mut ComponentColumns);
     /// Return the [`ComponentId`] of the captured component type.
     fn component_id(&self) -> ComponentId;
 }
@@ -2607,8 +2787,8 @@ struct TypedComponentInserter<T: Component + TraitAccessible<dyn Component>> {
 impl<T: Component + TraitAccessible<dyn Component>> ComponentInserter
     for TypedComponentInserter<T>
 {
-    fn insert(self: Box<Self>, storage: &mut TraitTypeMap<dyn Component, VecFamily>) {
-        storage.get_storage_mut::<T>().push::<T>(self.component);
+    fn insert(self: Box<Self>, storage: &mut ComponentColumns) {
+        storage.column_of_mut::<T>().push::<T>(self.component);
     }
 
     fn component_id(&self) -> ComponentId {
@@ -2703,13 +2883,13 @@ impl<'w> EntityBuilder<'w> {
 
 /// Copies a single component instance from source to destination storage.
 fn copy_component<T: Component + TraitAccessible<dyn Component> + Clone>(
-    source: &TraitTypeMap<dyn Component, VecFamily>,
-    destination: &mut TraitTypeMap<dyn Component, VecFamily>,
+    source: &ComponentColumns,
+    destination: &mut ComponentColumns,
     index: usize,
 ) {
-    let component = source.get_storage::<T>().get::<T>(index);
+    let component = source.column_of::<T>().get::<T>(index);
     destination
-        .get_storage_mut::<T>()
+        .column_of_mut::<T>()
         .push::<T>(component.clone());
 }
 

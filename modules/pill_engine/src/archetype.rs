@@ -8,7 +8,8 @@
 //!
 //! - Group entities by their exact component set into [`Archetype`] instances.
 //! - Own the contiguous, type-erased component storage for each archetype,
-//!   both native (`TraitTypeMap`) and dynamically laid out ([`DynamicColumn`]).
+//!   both native (`ComponentColumns`) and dynamically laid out
+//!   (`DynamicColumn`).
 //! - Track change-detection [`ComponentTicks`] for every component instance.
 //!
 //! # Design
@@ -46,7 +47,7 @@ use std::collections::HashMap;
 use std::ptr::NonNull;
 
 // External crates
-use trait_type_map::{ErasedVecStorage, ErasedVecStorageInfo, TraitTypeMap, VecFamily};
+use trait_type_map::{ErasedVecStorage, ErasedVecStorageInfo};
 
 // Current crate
 use crate::component::{Component, ComponentId, ComponentMask, ComponentTicks};
@@ -64,7 +65,7 @@ use crate::error::WorldError;
 /// concrete component types.
 pub enum StorageFactory {
     /// Creates a type-erased native storage column inside the archetype's
-    /// [`TraitTypeMap`].
+    /// [`ComponentColumns`].
     ///
     /// Carries only data (type id, layout, per-type function table), never a
     /// closure: the column is stored as a concrete `Box<ErasedVecStorage>`
@@ -91,6 +92,133 @@ pub struct DynamicComponentLayout {
     pub align: usize,
     /// Hash identifying the component's schema across language boundaries.
     pub schema_hash: u64,
+}
+
+// =============================================================================
+// ComponentColumns
+// =============================================================================
+
+/// The native component columns of one archetype, keyed by [`ComponentId`].
+///
+/// This replaced a `TraitTypeMap` keyed by [`TypeId`](std::any::TypeId). That
+/// map was already storing a concrete `ErasedVecStorage` per entry rather than
+/// a trait object, so the only thing it contributed was the key - and `TypeId`
+/// is the wrong key here. A component type linked into two binaries has two
+/// `TypeId`s, so the binary that did not create the column could not find it,
+/// while the engine identifies the same component by one [`ComponentId`] every
+/// other structure is already keyed on: the registry's bit, the archetype's
+/// `component_types`, the tick vectors, the storage factories. Keying the
+/// columns the same way makes a shared component reachable from either binary
+/// and removes a translation step from every lookup.
+#[derive(Default)]
+pub struct ComponentColumns {
+    /// One contiguous column per native component in the archetype.
+    columns: HashMap<ComponentId, ErasedVecStorage<dyn Component>>,
+}
+
+impl ComponentColumns {
+    /// Creates an empty set of columns.
+    pub fn new() -> Self {
+        Self {
+            columns: HashMap::new(),
+        }
+    }
+
+    /// Creates an empty set of columns sized for `capacity` component types.
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            columns: HashMap::with_capacity(capacity),
+        }
+    }
+
+    /// Returns the column for `component_id`, or `None` when the archetype
+    /// does not store that component.
+    #[inline]
+    pub fn get(&self, component_id: ComponentId) -> Option<&ErasedVecStorage<dyn Component>> {
+        self.columns.get(&component_id)
+    }
+
+    /// Returns the column for `component_id` mutably.
+    #[inline]
+    pub fn get_mut(
+        &mut self,
+        component_id: ComponentId,
+    ) -> Option<&mut ErasedVecStorage<dyn Component>> {
+        self.columns.get_mut(&component_id)
+    }
+
+    /// Returns the column storing `T`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the archetype does not store `T`, which means the caller
+    /// reached a column the archetype's mask says is not there.
+    #[inline]
+    pub fn column_of<T: Component>(&self) -> &ErasedVecStorage<dyn Component> {
+        self.get(ComponentId::of::<T>())
+            .unwrap_or_else(|| missing_column::<T>())
+    }
+
+    /// Returns the column storing `T`, mutably.
+    ///
+    /// # Panics
+    ///
+    /// Panics under the same condition as [`Self::column_of`].
+    #[inline]
+    pub fn column_of_mut<T: Component>(&mut self) -> &mut ErasedVecStorage<dyn Component> {
+        self.get_mut(ComponentId::of::<T>())
+            .unwrap_or_else(|| missing_column::<T>())
+    }
+
+    /// Inserts a column for `component_id`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when a column for that component already exists; an archetype
+    /// builds each of its columns exactly once.
+    pub fn insert(&mut self, component_id: ComponentId, column: ErasedVecStorage<dyn Component>) {
+        let replaced = self.columns.insert(component_id, column);
+        assert!(
+            replaced.is_none(),
+            "component {component_id:?} already has a column in this archetype"
+        );
+    }
+
+    /// Removes and returns the column for `component_id`.
+    pub fn remove(&mut self, component_id: ComponentId) -> Option<ErasedVecStorage<dyn Component>> {
+        self.columns.remove(&component_id)
+    }
+
+    /// Whether a column exists for `component_id`.
+    #[inline]
+    pub fn contains(&self, component_id: ComponentId) -> bool {
+        self.columns.contains_key(&component_id)
+    }
+
+    /// Number of columns stored.
+    pub fn len(&self) -> usize {
+        self.columns.len()
+    }
+
+    /// Whether no columns are stored.
+    pub fn is_empty(&self) -> bool {
+        self.columns.is_empty()
+    }
+}
+
+/// Report a lookup for a column the archetype does not have.
+///
+/// Split out of the accessors so the panic path stays off their inlined fast
+/// path, and `#[cold]` so the branch predictor is told which way this goes.
+#[cold]
+#[inline(never)]
+fn missing_column<T: Component>() -> ! {
+    panic!(
+        "archetype has no column for component {} ({:?}); the archetype's mask \
+         and its columns disagree, or the component was never registered",
+        std::any::type_name::<T>(),
+        ComponentId::of::<T>(),
+    )
 }
 
 // =============================================================================
@@ -420,8 +548,8 @@ pub struct Archetype {
     pub component_types: Vec<ComponentId>,
     /// Bitmask of the stored component types for fast query matching.
     pub component_mask: ComponentMask,
-    /// Type-erased native component storage, keyed by component type.
-    pub component_storages: TraitTypeMap<dyn Component, VecFamily>,
+    /// Type-erased native component storage, keyed by component id.
+    pub component_storages: ComponentColumns,
     /// Byte-oriented storage for components owned by other languages.
     pub dynamic_component_storages: HashMap<ComponentId, DynamicColumn>,
     /// Entities currently stored in this archetype.
@@ -460,7 +588,7 @@ impl Archetype {
             "archetype new",
             [("Component types in this archetype: {}", component_count)]
         );
-        let mut component_storages = TraitTypeMap::with_capacity(component_count);
+        let mut component_storages = ComponentColumns::with_capacity(component_count);
         let mut dynamic_component_storages = HashMap::new();
         let mut component_ticks: HashMap<ComponentId, Vec<ComponentTicks>> =
             HashMap::with_capacity(component_count);
@@ -475,10 +603,13 @@ impl Archetype {
             match factory {
                 StorageFactory::Native(info) => {
                     // Build the erased column from the registered type
-                    // description and store it as a concrete
-                    // `Box<ErasedVecStorage>` (no trait-object vtable), so
-                    // the column stays valid across module unloads.
-                    component_storages.insert_erased(ErasedVecStorage::<dyn Component>::new(*info));
+                    // description. It is stored as a concrete
+                    // `ErasedVecStorage` (no trait-object vtable), so the
+                    // column stays valid across module unloads, and under the
+                    // component's id rather than its `TypeId`, so a component
+                    // shared between binaries resolves to it from either one.
+                    component_storages
+                        .insert(component_id, ErasedVecStorage::<dyn Component>::new(*info));
                 }
                 StorageFactory::Dynamic(layout) => {
                     dynamic_component_storages

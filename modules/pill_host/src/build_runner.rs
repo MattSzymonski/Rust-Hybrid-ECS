@@ -94,7 +94,7 @@ const ARTIFACT_STAMP_DIRECTORY: &str = "pill_standalone_temp/artifact_stamps";
 ///
 /// `rendering` no longer touches the module's own engine - the renderer left
 /// `pill_engine` - but it still belongs here. A windowed host links
-/// `pill_wgpu_renderer` and the whole wgpu graph, and
+/// `pill_master_renderer` and the whole wgpu graph, and
 /// [`apply_cargo_host_overrides`] selects the anchor package WITH that
 /// feature so module builds resolve the same graph. The resolution reaches
 /// `pill_core.dll`, so artifacts built under one setting still cannot be
@@ -529,7 +529,7 @@ pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: 
         //
         // Selecting the package is what makes cargo unify features across the
         // whole graph; selecting it with the wrong features unifies it to a
-        // different answer. A windowed host links `pill_wgpu_renderer` and the
+        // different answer. A windowed host links `pill_master_renderer` and the
         // whole wgpu graph, which turns on extra features in crates `pill_core`
         // also depends on - and cargo folds a dependency's resolved features
         // into the dependent's `-C metadata`. So a module built against a

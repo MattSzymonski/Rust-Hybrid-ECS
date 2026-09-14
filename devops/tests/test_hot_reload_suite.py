@@ -627,10 +627,13 @@ SESSION_B_SCENARIOS = [
                     )
                 ],
                 wait_token=RELOAD_MODULE_TOKEN,
-                # `1 spline(s)` pins module<->project coexistence: the project
-                # probe matches only the project's embedded Spline (its own
-                # TypeId), so after both reloads it still sees exactly one - the
-                # module DLL's copy is a distinct type (audit 3.1/C1).
+                # `1 spline(s)` pins module<->project coexistence: `Spline` is
+                # `#[pill(shared)]`, so the module DLL's copy and the project's
+                # are one component with one column, and both artifacts top up
+                # to a single spline rather than each seeding its own. After
+                # both reloads the probe therefore still sees exactly one -
+                # previously for the opposite reason, that the two copies were
+                # distinct types the project could not see across.
                 #
                 # The count alone carries that meaning; the surrounding probe
                 # wording in `examples/project_rs/src/lib.rs` is incidental and

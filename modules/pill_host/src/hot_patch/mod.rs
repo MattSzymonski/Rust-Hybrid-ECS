@@ -2170,6 +2170,11 @@ fn helper(value: f32) -> f32 {
         // it. Without this call the assertion below fails with OUTSIDE_HOT_BODY,
         // because the constant change is still in the diff.
         session.refresh_snapshots();
+        // Re-stamping the snapshots restarts the same coarse-timestamp race
+        // `session_over` documents, so the edit below needs the same guard: a
+        // write landing in the recorded modification time's tick looks
+        // unchanged and `classify` skips the file.
+        std::thread::sleep(std::time::Duration::from_millis(20));
 
         // Step 3: a clean body-only edit on top must now be patchable.
         let body_edited = after_reload.replace("value * SPEED", "value * SPEED + 1.0");
@@ -2234,6 +2239,11 @@ fn helper(value: f32) -> f32 {
         // an edit rather than a new file.
         std::fs::write(directory.join("other.rs"), HOT_SOURCE).expect("write second file");
         session.refresh_snapshots();
+        // Re-stamping the snapshots restarts the same coarse-timestamp race
+        // `session_over` documents, so the edit below needs the same guard: a
+        // write landing in the recorded modification time's tick looks
+        // unchanged and `classify` skips the file.
+        std::thread::sleep(std::time::Duration::from_millis(20));
 
         let edited = HOT_SOURCE.replace("value * SPEED", "value * SPEED * 2.0");
         std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");

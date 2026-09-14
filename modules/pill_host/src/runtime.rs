@@ -33,7 +33,7 @@ use pill_engine::Engine;
 #[cfg(feature = "hot_reload")]
 use pill_engine::EngineApi;
 #[cfg(feature = "rendering")]
-use pill_wgpu_renderer::{
+use pill_master_renderer::{
     RenderViewport, Renderer, RendererError, RendererWindow, VirtualResolution,
 };
 
@@ -957,7 +957,8 @@ fn regenerate_module_csharp_mirror(
         .exposed_component_names()
         .iter()
         .filter_map(|type_name| {
-            let component_id = engine.world().resolve_component_id_by_name_any(type_name)?;
+            let component_id =
+                crate::csharp::resolve_exposed_component_id(engine.world(), type_name)?;
             let (size, align) = engine.world().component_layout(component_id)?;
             // The derive registers the compile-time field layout with the
             // world; components without one keep the ABI blob.

@@ -391,13 +391,17 @@ impl EditorCommand {
                         .world()
                         .build_component_image(&seed.type_name, &seed.fields)
                         .map_err(|error| format!("{command:?}: {error}"))?;
+                    // An ambiguous name reports itself rather than resolving
+                    // to a guessed column, so the editor never writes bytes
+                    // into the wrong component's storage.
                     let component_id = engine
                         .world()
                         .resolve_component_id_by_name_any(&seed.type_name)
+                        .map_err(|error| format!("{command:?}: {error}"))?
                         .ok_or_else(|| {
                             format!("{command:?}: `{}` is not registered", seed.type_name)
                         })?;
-                    if component_id.native_type_id().is_some() {
+                    if component_id.is_native_storage() {
                         native.push(Box::new(pill_engine::commands::ByteComponentAdder::new(
                             component_id,
                             bytes,
@@ -440,9 +444,10 @@ impl EditorCommand {
                 let component_id = engine
                     .world()
                     .resolve_component_id_by_name_any(component)
+                    .map_err(|error| format!("{command:?}: {error}"))?
                     .ok_or_else(|| format!("{command:?}: `{component}` is not registered"))?;
                 engine.queue_deferred_commands(move |_world, queue| {
-                    if component_id.native_type_id().is_some() {
+                    if component_id.is_native_storage() {
                         queue.add_component_adder_to_entity(
                             *entity,
                             Box::new(pill_engine::commands::ByteComponentAdder::new(
@@ -679,7 +684,7 @@ mod tests {
     /// which is the path the Inspector uses to repaint sprites live.
     #[test]
     fn set_field_on_renderer_sprite_repaints_color_channels() {
-        use pill_wgpu_renderer::{register_components, Color, Sprite};
+        use pill_master_renderer::{register_components, Color, Sprite};
 
         let mut engine = Engine::new();
         register_components(engine.world_mut());

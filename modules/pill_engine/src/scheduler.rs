@@ -552,8 +552,30 @@ impl SystemScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::component::ComponentId;
+    use crate::component::{Component, ComponentId};
     use std::{any::TypeId, hash::BuildHasher};
+
+    // The scheduler only ever compares component ids for equality, so these
+    // tests need nothing of a component but a distinct identity. They used to
+    // borrow primitives (`ComponentId::of::<TestComponentA>()`) for that; `ComponentId::of`
+    // now takes `T: Component`, so that a shared component's declared identity
+    // can never be bypassed, and the stand-ins are declared here instead.
+    macro_rules! test_components {
+        ($($name:ident),* $(,)?) => {$(
+            #[derive(Debug)]
+            struct $name;
+            impl Component for $name {}
+        )*};
+    }
+    test_components!(
+        TestComponentA,
+        TestComponentB,
+        TestComponentC,
+        TestComponentD,
+        TestComponentE,
+        TestComponentF,
+        TestComponentG,
+    );
 
     // Helper: Verify that no batch contains conflicting systems
     fn assert_no_batch_conflicts(scheduler: &SystemScheduler) {
@@ -616,12 +638,12 @@ mod tests {
 
         // System 1: reads A
         let mut access1 = SystemAccess::new();
-        access1.add_read(ComponentId::of::<i32>());
+        access1.add_read(ComponentId::of::<TestComponentA>());
         scheduler.register_system(access1);
 
         // System 2: reads B
         let mut access2 = SystemAccess::new();
-        access2.add_read(ComponentId::of::<f32>());
+        access2.add_read(ComponentId::of::<TestComponentB>());
         scheduler.register_system(access2);
 
         scheduler.build_execution_graph();
@@ -648,12 +670,12 @@ mod tests {
 
         // System 1: writes A
         let mut access1 = SystemAccess::new();
-        access1.add_write(ComponentId::of::<i32>());
+        access1.add_write(ComponentId::of::<TestComponentA>());
         scheduler.register_system(access1);
 
         // System 2: writes A
         let mut access2 = SystemAccess::new();
-        access2.add_write(ComponentId::of::<i32>());
+        access2.add_write(ComponentId::of::<TestComponentA>());
         scheduler.register_system(access2);
 
         scheduler.build_execution_graph();
@@ -679,12 +701,12 @@ mod tests {
 
         // System 1: reads A
         let mut access1 = SystemAccess::new();
-        access1.add_read(ComponentId::of::<i32>());
+        access1.add_read(ComponentId::of::<TestComponentA>());
         scheduler.register_system(access1);
 
         // System 2: writes A
         let mut access2 = SystemAccess::new();
-        access2.add_write(ComponentId::of::<i32>());
+        access2.add_write(ComponentId::of::<TestComponentA>());
         scheduler.register_system(access2);
 
         scheduler.build_execution_graph();
@@ -715,7 +737,7 @@ mod tests {
 
         // System 2: reads A
         let mut access2 = SystemAccess::new();
-        access2.add_read(ComponentId::of::<i32>());
+        access2.add_read(ComponentId::of::<TestComponentA>());
         scheduler.register_system(access2);
 
         scheduler.build_execution_graph();
@@ -741,7 +763,7 @@ mod tests {
         // 5 systems all reading the same component
         for _ in 0..5 {
             let mut access = SystemAccess::new();
-            access.add_read(ComponentId::of::<i32>());
+            access.add_read(ComponentId::of::<TestComponentA>());
             scheduler.register_system(access);
         }
 
@@ -769,13 +791,13 @@ mod tests {
         // 4 readers
         for _ in 0..4 {
             let mut access = SystemAccess::new();
-            access.add_read(ComponentId::of::<i32>());
+            access.add_read(ComponentId::of::<TestComponentA>());
             scheduler.register_system(access);
         }
 
         // 1 writer of the same component
         let mut access = SystemAccess::new();
-        access.add_write(ComponentId::of::<i32>());
+        access.add_write(ComponentId::of::<TestComponentA>());
         scheduler.register_system(access);
 
         scheduler.build_execution_graph();
@@ -800,24 +822,24 @@ mod tests {
 
         // System 0: reads A, writes B
         let mut access0 = SystemAccess::new();
-        access0.add_read(ComponentId::of::<i32>());
-        access0.add_write(ComponentId::of::<f32>());
+        access0.add_read(ComponentId::of::<TestComponentA>());
+        access0.add_write(ComponentId::of::<TestComponentB>());
         scheduler.register_system(access0);
 
         // System 1: reads B, writes C
         let mut access1 = SystemAccess::new();
-        access1.add_read(ComponentId::of::<f32>());
-        access1.add_write(ComponentId::of::<u32>());
+        access1.add_read(ComponentId::of::<TestComponentB>());
+        access1.add_write(ComponentId::of::<TestComponentC>());
         scheduler.register_system(access1);
 
         // System 2: reads A (can run with system 1)
         let mut access2 = SystemAccess::new();
-        access2.add_read(ComponentId::of::<i32>());
+        access2.add_read(ComponentId::of::<TestComponentA>());
         scheduler.register_system(access2);
 
         // System 3: reads C (can run with systems 0 and 2)
         let mut access3 = SystemAccess::new();
-        access3.add_read(ComponentId::of::<u32>());
+        access3.add_read(ComponentId::of::<TestComponentC>());
         scheduler.register_system(access3);
 
         scheduler.build_execution_graph();
@@ -839,17 +861,17 @@ mod tests {
 
         // System 0: writes A
         let mut access0 = SystemAccess::new();
-        access0.add_write(ComponentId::of::<i32>());
+        access0.add_write(ComponentId::of::<TestComponentA>());
         scheduler.register_system(access0);
 
         // System 1: writes B
         let mut access1 = SystemAccess::new();
-        access1.add_write(ComponentId::of::<f32>());
+        access1.add_write(ComponentId::of::<TestComponentB>());
         scheduler.register_system(access1);
 
         // System 2: writes C
         let mut access2 = SystemAccess::new();
-        access2.add_write(ComponentId::of::<u32>());
+        access2.add_write(ComponentId::of::<TestComponentC>());
         scheduler.register_system(access2);
 
         scheduler.build_execution_graph();
@@ -902,7 +924,7 @@ mod tests {
 
         // System 0: reads A
         let mut access0 = SystemAccess::new();
-        access0.add_read(ComponentId::of::<i32>());
+        access0.add_read(ComponentId::of::<TestComponentA>());
         scheduler.register_system(access0);
 
         // System 1: uses commands
@@ -912,7 +934,7 @@ mod tests {
 
         // System 2: reads B
         let mut access2 = SystemAccess::new();
-        access2.add_read(ComponentId::of::<f32>());
+        access2.add_read(ComponentId::of::<TestComponentB>());
         scheduler.register_system(access2);
 
         // System 3: uses commands
@@ -941,7 +963,7 @@ mod tests {
         let mut scheduler = SystemScheduler::new();
 
         let mut access = SystemAccess::new();
-        access.add_write(ComponentId::of::<i32>());
+        access.add_write(ComponentId::of::<TestComponentA>());
         scheduler.register_system(access);
 
         scheduler.build_execution_graph();
@@ -966,17 +988,17 @@ mod tests {
 
         // Chain: System0 writes A -> System1 reads A, writes B -> System2 reads B, writes C
         let mut access0 = SystemAccess::new();
-        access0.add_write(ComponentId::of::<i32>());
+        access0.add_write(ComponentId::of::<TestComponentA>());
         scheduler.register_system(access0);
 
         let mut access1 = SystemAccess::new();
-        access1.add_read(ComponentId::of::<i32>());
-        access1.add_write(ComponentId::of::<f32>());
+        access1.add_read(ComponentId::of::<TestComponentA>());
+        access1.add_write(ComponentId::of::<TestComponentB>());
         scheduler.register_system(access1);
 
         let mut access2 = SystemAccess::new();
-        access2.add_read(ComponentId::of::<f32>());
-        access2.add_write(ComponentId::of::<u32>());
+        access2.add_read(ComponentId::of::<TestComponentB>());
+        access2.add_write(ComponentId::of::<TestComponentC>());
         scheduler.register_system(access2);
 
         scheduler.build_execution_graph();
@@ -1003,27 +1025,27 @@ mod tests {
 
         // System 0: writes type A
         let mut access = SystemAccess::new();
-        access.add_write(ComponentId::of::<u8>());
+        access.add_write(ComponentId::of::<TestComponentD>());
         scheduler.register_system(access);
 
         // System 1: writes type B
         let mut access = SystemAccess::new();
-        access.add_write(ComponentId::of::<u16>());
+        access.add_write(ComponentId::of::<TestComponentE>());
         scheduler.register_system(access);
 
         // System 2: writes type C
         let mut access = SystemAccess::new();
-        access.add_write(ComponentId::of::<u32>());
+        access.add_write(ComponentId::of::<TestComponentC>());
         scheduler.register_system(access);
 
         // System 3: writes type D
         let mut access = SystemAccess::new();
-        access.add_write(ComponentId::of::<u64>());
+        access.add_write(ComponentId::of::<TestComponentF>());
         scheduler.register_system(access);
 
         // System 4: writes type E
         let mut access = SystemAccess::new();
-        access.add_write(ComponentId::of::<i8>());
+        access.add_write(ComponentId::of::<TestComponentG>());
         scheduler.register_system(access);
 
         scheduler.build_execution_graph();
@@ -1140,19 +1162,19 @@ mod tests {
 
         // System 1: reads component A, writes resource X
         let mut access1 = SystemAccess::new();
-        access1.add_read(ComponentId::of::<i32>());
+        access1.add_read(ComponentId::of::<TestComponentA>());
         access1.add_resource_write(ResourceId(TypeId::of::<u64>()));
         scheduler.register_system(access1);
 
         // System 2: reads component A, reads resource X
         let mut access2 = SystemAccess::new();
-        access2.add_read(ComponentId::of::<i32>());
+        access2.add_read(ComponentId::of::<TestComponentA>());
         access2.add_resource_read(ResourceId(TypeId::of::<u64>()));
         scheduler.register_system(access2);
 
         // System 3: writes component B, reads resource Y (no conflicts with either)
         let mut access3 = SystemAccess::new();
-        access3.add_write(ComponentId::of::<f32>());
+        access3.add_write(ComponentId::of::<TestComponentB>());
         access3.add_resource_read(ResourceId(TypeId::of::<u32>()));
         scheduler.register_system(access3);
 
@@ -1291,10 +1313,10 @@ mod tests {
         let mut a = SystemAccess::new();
         match k {
             AccessKind::None => {}
-            AccessKind::ReadA => a.add_read(ComponentId::of::<u8>()),
-            AccessKind::WriteA => a.add_write(ComponentId::of::<u8>()),
-            AccessKind::ReadB => a.add_read(ComponentId::of::<u16>()),
-            AccessKind::WriteB => a.add_write(ComponentId::of::<u16>()),
+            AccessKind::ReadA => a.add_read(ComponentId::of::<TestComponentD>()),
+            AccessKind::WriteA => a.add_write(ComponentId::of::<TestComponentD>()),
+            AccessKind::ReadB => a.add_read(ComponentId::of::<TestComponentE>()),
+            AccessKind::WriteB => a.add_write(ComponentId::of::<TestComponentE>()),
             AccessKind::Commands => a.set_uses_commands(true),
             AccessKind::ResReadX => a.add_resource_read(ResourceId(TypeId::of::<u32>())),
             AccessKind::ResWriteX => a.add_resource_write(ResourceId(TypeId::of::<u32>())),

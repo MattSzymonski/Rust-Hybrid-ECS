@@ -60,9 +60,10 @@
 
 // External crates
 use pill_core::warn;
-use trait_type_map::{TraitAccessible, TraitTypeMap, VecFamily};
+use trait_type_map::TraitAccessible;
 
 // Current crate
+use crate::archetype::ComponentColumns;
 use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
 use crate::world::World;
@@ -87,7 +88,7 @@ pub trait ComponentAdder: Send {
     /// adder's component type before invoking this method.
     fn add_component_to_storage(
         self: Box<Self>,
-        new_storage: &mut TraitTypeMap<dyn Component, VecFamily>,
+        new_storage: &mut ComponentColumns,
     );
 }
 
@@ -109,11 +110,11 @@ impl<T: Component + TraitAccessible<dyn Component> + Send> ComponentAdder
 
     fn add_component_to_storage(
         self: Box<Self>,
-        new_storage: &mut TraitTypeMap<dyn Component, VecFamily>,
+        new_storage: &mut ComponentColumns,
     ) {
         // The storage row for `T` was allocated by the caller; append the
         // component value to it to finish the insertion.
-        new_storage.get_storage_mut::<T>().push::<T>(self.component);
+        new_storage.column_of_mut::<T>().push::<T>(self.component);
     }
 }
 
@@ -137,16 +138,16 @@ impl ComponentAdder for ByteComponentAdder {
 
     fn add_component_to_storage(
         self: Box<Self>,
-        new_storage: &mut TraitTypeMap<dyn Component, VecFamily>,
+        new_storage: &mut ComponentColumns,
     ) {
         // The storage row for the native component was allocated by the
         // caller; copy the raw ABI bytes into it.
-        let type_id = self
-            .component_id
-            .native_type_id()
-            .expect("byte component adder requires a native component id");
+        assert!(
+            self.component_id.is_native_storage(),
+            "byte component adder requires a native component id"
+        );
         let column = new_storage
-            .get_trait_storage_mut(type_id)
+            .get_mut(self.component_id)
             .expect("native column must exist for a registered component");
         column.push_bytes(self.bytes.as_ptr(), self.bytes.len());
     }

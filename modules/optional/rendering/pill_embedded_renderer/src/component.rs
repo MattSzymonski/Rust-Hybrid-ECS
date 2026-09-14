@@ -399,23 +399,17 @@ fn sprite_instances_named(
             continue;
         };
 
-        // Step 2: Fetch the type-erased trait storage backing each resolved
-        // component column so rows can be read without a host-typed query.
-        let (Some(position_type_id), Some(sprite_type_id)) =
-            (position_id.native_type_id(), sprite_id.native_type_id())
-        else {
+        // Step 2: Fetch the type-erased column backing each resolved component
+        // so rows can be read without a host-typed query. The columns are keyed
+        // by component id, so a component whose rows were created by another
+        // binary is reached the same way as one of this crate's own.
+        if !position_id.is_native_storage() || !sprite_id.is_native_storage() {
+            continue;
+        }
+        let Some(position_storage) = archetype.component_storages.get(position_id) else {
             continue;
         };
-        let Some(position_storage) = archetype
-            .component_storages
-            .get_trait_storage(position_type_id)
-        else {
-            continue;
-        };
-        let Some(sprite_storage) = archetype
-            .component_storages
-            .get_trait_storage(sprite_type_id)
-        else {
+        let Some(sprite_storage) = archetype.component_storages.get(sprite_id) else {
             continue;
         };
 

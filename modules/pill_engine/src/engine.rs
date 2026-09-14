@@ -57,6 +57,18 @@ impl SystemOwner {
     /// Owner of systems registered by the host or by the project module.
     pub const PROJECT: Self = Self(0);
 
+    /// Owner of systems the engine registers for itself.
+    ///
+    /// No reload path clears these: the host retires systems with
+    /// [`Engine::clear_systems_owned_by`], naming the project or one module,
+    /// and an engine-owned system is neither. That is what it is for - the
+    /// function pointer lives in the host's own copy of `pill_engine`, which is
+    /// never unloaded, so there is nothing to retire.
+    ///
+    /// `u64::MAX` so it cannot collide with [`Self::PROJECT`] or any
+    /// [`Self::optional_module`]; reaching it that way would need 2^64 modules.
+    pub const ENGINE: Self = Self(u64::MAX);
+
     /// Owner of the optional module loaded at `index`.
     ///
     /// Offset by one so that no optional module can collide with
@@ -252,7 +264,7 @@ impl Engine {
         world.insert_resource(crate::time::Time::new());
         world.insert_resource(crate::asset::AssetManager::new());
 
-        Self {
+        let mut engine = Self {
             systems: Vec::new(),
             queue: CommandQueue::new(),
             world,
@@ -268,7 +280,14 @@ impl Engine {
             last_archetype_generation: 0,
             active_owner: SystemOwner::PROJECT,
             hot_patch_registry: crate::hot_patch::HotPatchRegistry::new(),
-        }
+        };
+
+        // Engine-owned systems, registered before any project or module runs.
+        // Attributed to `SystemOwner::ENGINE`, which no reload retires.
+        engine.register_ecs_diagnostics_system(Some(
+            crate::diagnostics::DEFAULT_REPORT_INTERVAL,
+        ));
+        engine
     }
 }
 
@@ -282,6 +301,87 @@ impl Engine {
     /// When disabled, systems run sequentially in registration order.
     pub fn set_parallel_execution(&mut self, enabled: bool) {
         self.parallel_execution = enabled;
+    }
+
+    /// How often the built-in ECS state report prints.
+    ///
+    /// `None` turns it off. The engine registers it at
+    /// [`DEFAULT_REPORT_INTERVAL`](crate::diagnostics::DEFAULT_REPORT_INTERVAL)
+    /// during [`Engine::new`], so this is for changing or silencing it:
+    ///
+    /// ```no_run
+    /// # use std::time::Duration;
+    /// # let mut engine = pill_engine::Engine::new();
+    /// engine.set_ecs_diagnostics_interval(None);                          // silence it
+    /// engine.set_ecs_diagnostics_interval(Some(Duration::from_secs(10))); // every 10s
+    /// ```
+    ///
+    /// The system stays registered either way and costs one `Duration`
+    /// comparison on the frames it does not print. Disabling it removes the
+    /// system entirely, which also removes the scheduler barrier it otherwise
+    /// costs every frame for being exclusive.
+    pub fn set_ecs_diagnostics_interval(&mut self, interval: Option<Duration>) {
+        // Re-register rather than mutate: the interval is captured by the
+        // closure, and replacing it keeps exactly one such system registered.
+        self.clear_systems_owned_by(SystemOwner::ENGINE);
+        self.register_ecs_diagnostics_system(interval);
+    }
+
+    /// Register the periodic ECS state report under
+    /// [`SystemOwner::ENGINE`].
+    ///
+    /// `None`, or a zero interval, registers nothing - which is how the report
+    /// is disabled.
+    fn register_ecs_diagnostics_system(&mut self, interval: Option<Duration>) {
+        let Some(interval) = interval.filter(|interval| !interval.is_zero()) else {
+            return;
+        };
+
+        let mut access = SystemAccess::new();
+        // The report reads the entire world - every archetype, the registry,
+        // the resources - which no per-component declaration can describe.
+        // Declaring exclusive world access is what makes that sound: the
+        // scheduler never places a system that conflicts with everything into a
+        // parallel batch, so nothing else is touching the world while it runs.
+        access.set_uses_commands(true);
+
+        // Schedule state lives in the closure, which the registration takes as
+        // an `FnMut`.
+        let mut next_report: Option<Duration> = None;
+        let previous_owner = self.active_owner;
+        self.active_owner = SystemOwner::ENGINE;
+        // SAFETY: `access` declares exclusive world access, which is a superset
+        // of everything the system touches; it only reads, and never retains a
+        // borrow past the call.
+        unsafe {
+            self.register_system_with_access(
+                crate::diagnostics::SYSTEM_NAME,
+                access,
+                // The closure owns the schedule. `None` until the first
+                // frame, so the first report lands one interval in rather than
+                // immediately at startup, when the world has just been built.
+                move |world: &mut World, _queue: &mut CommandQueue| {
+                    let elapsed = world
+                        .get_resource::<crate::time::Time>()
+                        .map_or(Duration::ZERO, crate::time::Time::elapsed);
+                    match next_report {
+                        Some(due) if elapsed >= due => {}
+                        Some(_) => return Ok(()),
+                        None => {
+                            next_report = Some(elapsed + interval);
+                            return Ok(());
+                        }
+                    }
+                    // Measured from now rather than from the time that was
+                    // due, so a stalled frame does not leave a backlog that
+                    // prints several reports in a row to catch up.
+                    next_report = Some(elapsed + interval);
+                    println!("{}", crate::diagnostics::EcsSnapshot::gather(world).render());
+                    Ok(())
+                },
+            );
+        }
+        self.active_owner = previous_owner;
     }
 
     /// Stop executing systems without stopping the frame.
@@ -1514,6 +1614,10 @@ mod tests {
     #[test]
     fn system_snapshots_report_owners_and_toggle_by_index() {
         let mut engine = Engine::new();
+        // This test is about project and module ownership and indexes the
+        // snapshot list directly, so the engine's own system is silenced to
+        // keep those indices meaning what they did.
+        engine.set_ecs_diagnostics_interval(None);
         engine.register_system("duplicate", || {});
         engine.begin_module_registration(SystemOwner::optional_module(0));
         engine.register_system("duplicate", || {});
