@@ -28,8 +28,9 @@ use super::commands::{
     ffi_reserve_entity,
 };
 use super::components::{
-    register_component_manifest, shared_component_bindings, stable_component_id, Color,
-    ComponentBinding, ComponentBindings, Position, Sprite, StableComponentId,
+    apply_component_manifest_on_reload, register_component_manifest, shared_component_bindings,
+    stable_component_id, BindingStore, Color, ComponentBinding, ComponentBindings, Position, Sprite,
+    StableComponentId,
 };
 // `Color`, `Position` and `Sprite` above are the renderer's components,
 // re-exported by `components` from `pill_master_renderer`.
@@ -104,6 +105,7 @@ fn managed_access(entries: &[(&str, u8)]) -> SystemAccess {
                 component_id,
                 size: 4,
                 align: 4,
+                schema_hash: 1,
             },
         );
     }
@@ -192,6 +194,7 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
             component_id: dynamic_a,
             size: 4,
             align: 4,
+            schema_hash: 1,
         },
     );
     bindings.insert(
@@ -200,6 +203,7 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
             component_id: dynamic_b,
             size: 4,
             align: 4,
+            schema_hash: 2,
         },
     );
     let position_key = stable_component_id("TracyLive.Position");
@@ -1010,4 +1014,228 @@ fn manifest_length_bounds_reject_empty_and_oversized_values() {
         MAX_COMPONENT_MANIFEST_BYTES + 1
     ));
     assert!(!is_supported_manifest_length(u32::MAX));
+}
+
+// =============================================================================
+// Manifest apply on reload
+// =============================================================================
+
+/// Build one top-level field entry for a managed manifest.
+fn manifest_field(name: &str, offset: usize, size: usize) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "offset": offset,
+        "size": size,
+        "primitive_type": "System.Single",
+        "fields": [],
+    })
+}
+
+/// Build the serialized manifest for one four-byte-fielded test component.
+fn manifest_bytes(
+    name: &str,
+    size: usize,
+    alignment: usize,
+    schema_hash: u64,
+    fields: Vec<serde_json::Value>,
+) -> Vec<u8> {
+    let stable_id = stable_component_id(&format!("TracyLive.{name}"));
+    serde_json::to_vec(&serde_json::json!([{
+        "stable_id_low": stable_id.0 as u64,
+        "stable_id_high": (stable_id.0 >> 64) as u64,
+        "full_name": format!("TracyLive.{name}"),
+        "size": size,
+        "alignment": alignment,
+        "schema_hash": schema_hash,
+        "shared": false,
+        "fields": fields,
+    }]))
+    .expect("the test manifest serializes")
+}
+
+/// Register one dynamic test component from a manifest and hand back its
+/// binding store, the way a managed project start leaves them.
+fn store_with_component(
+    engine: &mut Engine,
+    name: &str,
+    size: usize,
+    alignment: usize,
+    schema_hash: u64,
+    fields: Vec<serde_json::Value>,
+) -> (BindingStore, Vec<u8>) {
+    let manifest = manifest_bytes(name, size, alignment, schema_hash, fields);
+    let shared = shared_component_bindings(engine);
+    let store = BindingStore::new(
+        register_component_manifest(engine, &manifest, shared).expect("the test manifest registers"),
+    );
+    (store, manifest)
+}
+
+/// A manifest that says what the bindings already hold applies nothing.
+#[test]
+fn an_unchanged_manifest_applies_nothing() {
+    let mut engine = Engine::new();
+    let (store, manifest) = store_with_component(
+        &mut engine,
+        "Unchanged",
+        8,
+        4,
+        7,
+        vec![manifest_field("a", 0, 4), manifest_field("b", 4, 4)],
+    );
+
+    let report = apply_component_manifest_on_reload(&mut engine, &manifest, &store)
+        .expect("the same manifest applies cleanly");
+
+    assert!(report.added.is_empty(), "nothing was added");
+    assert!(report.migrated.is_empty(), "nothing was migrated");
+    let component_id = store.read()[&test_stable_id("Unchanged")].component_id();
+    assert_eq!(engine.world().component_layout(component_id), Some((8, 4)));
+}
+
+/// A reshaped dynamic component keeps its entities and moves their bytes.
+#[test]
+fn a_reshaped_dynamic_component_is_migrated_on_apply() {
+    let mut engine = Engine::new();
+    let (store, _before) = store_with_component(
+        &mut engine,
+        "Relayout",
+        8,
+        4,
+        1,
+        vec![manifest_field("a", 0, 4), manifest_field("b", 4, 4)],
+    );
+    let stable_id = test_stable_id("Relayout");
+    let component_id = store.read()[&stable_id].component_id();
+    let entity = engine
+        .world_mut()
+        .create_dynamic_entity(&[(
+            component_id,
+            [1.0_f32, 2.0].map(f32::to_ne_bytes).concat(),
+        )])
+        .expect("the entity carries the registered layout");
+
+    // `b` first, then `a`, then two fields that did not exist.
+    let after = manifest_bytes(
+        "Relayout",
+        16,
+        8,
+        2,
+        vec![
+            manifest_field("b", 0, 4),
+            manifest_field("a", 4, 4),
+            manifest_field("c", 8, 4),
+            manifest_field("d", 12, 4),
+        ],
+    );
+    let report = apply_component_manifest_on_reload(&mut engine, &after, &store)
+        .expect("a reshaped layout migrates");
+
+    assert_eq!(report.migrated, vec!["TracyLive.Relayout".to_string()]);
+    let mut expected = [2.0_f32, 1.0].map(f32::to_ne_bytes).concat();
+    expected.extend_from_slice(&[0_u8; 8]);
+    assert_eq!(
+        engine
+            .world()
+            .dynamic_component_bytes(entity, component_id)
+            .expect("the entity still carries the component"),
+        expected.as_slice(),
+        "values follow their field names and the new fields start zeroed"
+    );
+    assert_eq!(engine.world().component_layout(component_id), Some((16, 8)));
+    // The table a system scope reads is the one that moved, not a copy of it.
+    let ComponentBinding::Dynamic {
+        size,
+        align,
+        schema_hash,
+        ..
+    } = store.read()[&stable_id]
+    else {
+        panic!("the binding is still dynamic");
+    };
+    assert_eq!((size, align, schema_hash), (16, 8, 2));
+}
+
+/// The three refusals: a module mirror that changed, a vanished component, and
+/// a manifest that cannot be trusted.
+#[test]
+fn the_apply_refuses_what_it_cannot_migrate() {
+    // A `ModuleNative` binding the manifest disagrees with: the Rust side owns
+    // that layout, so the mirror is simply wrong.
+    let mut engine = Engine::new();
+    let stable_id = test_stable_id("ModuleThing");
+    let module_id = engine
+        .world_mut()
+        .register_dynamic_component(stable_id.0, "TracyLive.ModuleThing", 8, 4, 1)
+        .expect("the module component registers");
+    let mut bindings = shared_component_bindings(&mut engine);
+    bindings.insert(
+        stable_id,
+        ComponentBinding::ModuleNative {
+            component_id: module_id,
+            size: 8,
+            align: 4,
+        },
+    );
+    let store = BindingStore::new(bindings);
+    let changed = manifest_bytes(
+        "ModuleThing",
+        16,
+        8,
+        2,
+        vec![manifest_field("a", 0, 4)],
+    );
+    let error = apply_component_manifest_on_reload(&mut engine, &changed, &store)
+        .expect_err("a module mirror cannot change");
+    assert!(
+        error
+            .to_string()
+            .contains("native component uses 8/4"),
+        "the refusal names both layouts: {error}"
+    );
+
+    // A component the manifest stopped naming: its storage would have to be
+    // retired, which this path does not do yet.
+    let mut engine = Engine::new();
+    let (store, _manifest) = store_with_component(
+        &mut engine,
+        "Vanished",
+        4,
+        4,
+        1,
+        vec![manifest_field("a", 0, 4)],
+    );
+    let empty = serde_json::to_vec(&serde_json::json!([])).expect("an empty manifest serializes");
+    let error = apply_component_manifest_on_reload(&mut engine, &empty, &store)
+        .expect_err("a vanished component is refused");
+    assert!(
+        error.to_string().contains("disappeared from the manifest"),
+        "the refusal names the reason: {error}"
+    );
+
+    // A duplicated identity never reaches the world.
+    let mut engine = Engine::new();
+    let (store, manifest) = store_with_component(
+        &mut engine,
+        "Twice",
+        4,
+        4,
+        1,
+        vec![manifest_field("a", 0, 4)],
+    );
+    let entry: serde_json::Value = serde_json::from_slice::<serde_json::Value>(&manifest)
+        .expect("the manifest parses")
+        .as_array()
+        .expect("one entry")
+        .first()
+        .expect("one entry")
+        .clone();
+    let duplicated = serde_json::to_vec(&serde_json::json!([entry.clone(), entry]))
+        .expect("the duplicated manifest serializes");
+    let error = apply_component_manifest_on_reload(&mut engine, &duplicated, &store)
+        .expect_err("a duplicate is refused");
+    assert!(
+        error.to_string().contains("duplicate component"),
+        "the refusal names the cause: {error}"
+    );
 }

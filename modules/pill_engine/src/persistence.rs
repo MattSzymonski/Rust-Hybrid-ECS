@@ -60,8 +60,7 @@ use crate::world::World;
 
 /// Serializes the component at `index` in the given storage map into a
 /// JSON-encoded byte vector.
-pub(crate) type SerializeComponentFn =
-    fn(storage: &ComponentColumns, index: usize) -> Vec<u8>;
+pub(crate) type SerializeComponentFn = fn(storage: &ComponentColumns, index: usize) -> Vec<u8>;
 
 /// Deserializes JSON bytes back into a heap-allocated component.
 ///
@@ -241,19 +240,26 @@ impl World {
         if let Some((existing_id, live_rows)) =
             self.live_component_with_name(&type_name, component_id)
         {
-            self.record_registration_error(WorldError::ComponentNameCollision {
-                type_name: type_name.clone(),
-                existing_id,
-                incoming_id: component_id,
-                live_rows,
-            });
-            error!(
-                target: pill_core::telemetry::telemetry_target::ECS,
-                type_name = %type_name,
-                live_rows,
-                "two live registrations claim one component type name;                  refusing to evict the peer's persist entries"
-            );
-            return;
+            // One of the names the host announced is the predecessor, not a
+            // peer: the reload is replacing this generation, and it rehomes the
+            // rows afterwards. Live rows alone could not tell the two apart - a
+            // generation being retired still holds them - which is why the
+            // announcement exists and why it is consumed here.
+            if !self.superseded_persist_names.remove(&type_name) {
+                self.record_registration_error(WorldError::ComponentNameCollision {
+                    type_name: type_name.clone(),
+                    existing_id,
+                    incoming_id: component_id,
+                    live_rows,
+                });
+                error!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    type_name = %type_name,
+                    live_rows,
+                    "two live registrations claim one component type name;                  refusing to evict the peer's persist entries"
+                );
+                return;
+            }
         }
         for stale_id in &stale_ids {
             self.persist_serializers.remove(stale_id);
@@ -290,6 +296,32 @@ impl World {
         self.persist_registration_log
             .push((type_name, self.persist_registration_sequence));
         self.persist_registration_sequence += 1;
+    }
+
+    /// Announce the persistable type names a retiring generation registered, so
+    /// the init pass that follows may replace their persist entries instead of
+    /// being refused as a concurrent peer.
+    ///
+    /// A reloaded project re-registers every type its previous `init`
+    /// registered, and the rebuilt image gives each of them a fresh `TypeId`
+    /// for the same name - indistinguishable, at the registration site, from
+    /// another binary that linked the same type. The host is the only side that
+    /// knows which it is, because it captured these names from the generation
+    /// it is retiring, so it says so here just before init.
+    ///
+    /// The announcement covers one init pass: a mark is consumed by the
+    /// registration it applies to, and
+    /// [`Self::clear_superseded_persist_registrations`] drops what the pass did
+    /// not re-register - a name the new generation no longer declares was
+    /// forgotten, not superseded, and must not license a later peer.
+    pub fn supersede_persist_registrations(&mut self, type_names: &[String]) {
+        self.superseded_persist_names
+            .extend(type_names.iter().cloned());
+    }
+
+    /// Drop the marks left by [`Self::supersede_persist_registrations`].
+    pub fn clear_superseded_persist_registrations(&mut self) {
+        self.superseded_persist_names.clear();
     }
 
     /// Register a persistable component together with its compile-time field
@@ -1095,11 +1127,7 @@ impl World {
             if !component_id.is_native_storage() {
                 return Err(PersistenceError::NativeStorageExpected { component_id });
             }
-            if archetype
-                .component_storages
-                .remove(component_id)
-                .is_none()
-            {
+            if archetype.component_storages.remove(component_id).is_none() {
                 return Err(PersistenceError::StorageRemovalFailed { component_id });
             }
 
@@ -1455,10 +1483,8 @@ where
 }
 
 /// Downcast and push a boxed component into the concrete VecStorage.
-fn insert_boxed_component<T>(
-    storage: &mut ComponentColumns,
-    component: Box<dyn Component>,
-) where
+fn insert_boxed_component<T>(storage: &mut ComponentColumns, component: Box<dyn Component>)
+where
     T: Component + TraitAccessible<dyn Component> + 'static,
 {
     // SAFETY: `raw` is produced by `Box::into_raw` above, so it is valid,
@@ -1515,6 +1541,19 @@ mod tests {
     }
     impl Component for DropTestKeptComponent {}
     trait_type_map::impl_trait_accessible!(dyn Component; DropTestKeptComponent);
+
+    /// A distinct type that *declares* another type's name, standing in for the
+    /// registration a rebuilt image makes: same name, fresh `TypeId`.
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    struct DropTestSupersedingComponent {
+        value: u32,
+    }
+    impl Component for DropTestSupersedingComponent {
+        fn shared_name() -> Option<&'static str> {
+            Some(std::any::type_name::<DropTestForgottenComponent>())
+        }
+    }
+    trait_type_map::impl_trait_accessible!(dyn Component; DropTestSupersedingComponent);
 
     /// Dropping a forgotten type removes its columns from every entity while
     /// entities that carry other components survive with those intact.
@@ -1708,6 +1747,51 @@ mod tests {
         );
     }
 
+    /// The same collision shape as the peer test above - same name, different
+    /// id, live rows - but announced by the host as the retiring generation.
+    /// That registration is the predecessor and must replace the entries, which
+    /// is the case every project reload runs through.
+    #[test]
+    fn an_announced_name_replaces_its_live_predecessor() {
+        let mut world = World::new();
+        world.register_persistable_component::<DropTestForgottenComponent>();
+        let predecessor_id = ComponentId::of::<DropTestForgottenComponent>();
+        let type_name = std::any::type_name::<DropTestForgottenComponent>().to_string();
+        world
+            .create_entity()
+            .with(DropTestForgottenComponent { value: 7 })
+            .build()
+            .unwrap();
+        assert_eq!(world.live_row_count(predecessor_id), 1);
+
+        let successor_id = ComponentId::of::<DropTestSupersedingComponent>();
+        world.supersede_persist_registrations(&[type_name]);
+        world.register_persistable_component::<DropTestSupersedingComponent>();
+
+        // Replaced, not refused: the successor's entries are the live ones now.
+        assert!(world.take_registration_error().is_none());
+        assert!(!world.persist_serializers.contains_key(&predecessor_id));
+        assert!(world.persist_serializers.contains_key(&successor_id));
+        assert!(world.persist_inserters.contains_key(&successor_id));
+        // The predecessor's rows are untouched: rehoming them is the reload's
+        // step, not the registry's.
+        assert_eq!(world.live_row_count(predecessor_id), 1);
+
+        // The announcement was consumed with that one registration. With the
+        // successor now holding a row of its own, the same arrival the mark
+        // permitted a moment ago is refused again.
+        world
+            .create_entity()
+            .with(DropTestSupersedingComponent { value: 1 })
+            .build()
+            .unwrap();
+        world.register_persistable_component::<DropTestForgottenComponent>();
+        assert!(matches!(
+            world.take_registration_error(),
+            Some(WorldError::ComponentNameCollision { .. })
+        ));
+    }
+
     /// Re-registering a persistable type while its own column holds rows is
     /// the ordinary hot-reload path and must not trip the peer guard: the
     /// guard only looks at *other* component ids.
@@ -1795,7 +1879,9 @@ mod tests {
     fn an_unclaimed_name_resolves_to_none() {
         let world = World::new();
         assert_eq!(
-            world.resolve_component_id_by_name("nothing::Registered").unwrap(),
+            world
+                .resolve_component_id_by_name("nothing::Registered")
+                .unwrap(),
             None
         );
         assert_eq!(

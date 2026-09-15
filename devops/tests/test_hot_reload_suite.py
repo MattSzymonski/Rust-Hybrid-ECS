@@ -117,7 +117,11 @@ def build_host() -> bool:
     try:
         # `hot_patch` is a default feature now; this suite measures the plain
         # reload transaction, so pin the reload-only posture to keep the patch
-        # fast path out of the host it drives.
+        # fast path out of the host it drives. `rendering` stays ON because
+        # session B drives `examples/project_rs`, which links
+        # `pill_master_renderer`: a host without it resolves `pill_core`
+        # differently from that project and the project DLL fails to load with
+        # "The specified procedure could not be found" (os error 127).
         result = subprocess.run(
             [
                 "cargo",
@@ -126,7 +130,7 @@ def build_host() -> bool:
                 "pill_standalone",
                 "--no-default-features",
                 "--features",
-                "hot_reload",
+                "hot_reload,rendering",
                 "--offline",
             ],
             cwd=str(MODULES_ROOT),
@@ -650,7 +654,14 @@ SESSION_B_SCENARIOS = [
                     "1 spline(s)",
                 ],
                 forbidden_tokens=[PANIC_TOKEN, ACCESS_VIOLATION_TOKEN],
-                wait_after=[("midpoint (400.0, 298.8", PROBE_TIMEOUT)],
+                # The probe samples a reference spline over the project's spawn
+                # geometry - five collinear points 150 apart from x=90, all at
+                # y=120 - so its Catmull-Rom midpoint is the middle point,
+                # (390, 120), plus the module's vertical offset, which this
+                # phase moves from 0.0 to 10.0. The value is stable because the
+                # reference curve does not move with the balls; the sameness is
+                # the point, since the token below has to name it in advance.
+                wait_after=[("midpoint (390.0, 130.0", PROBE_TIMEOUT)],
             )
         ],
         restore_after=[SPLINE_LIB_RS],

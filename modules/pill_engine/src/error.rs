@@ -25,7 +25,7 @@ use pill_core::error::{EngineMessage, MessageRenderer, SemanticRole};
 use pill_core_macros::engine_error;
 
 // Current crate
-use crate::{archetype::ArchetypeId, ComponentId, Entity};
+use crate::{archetype::ArchetypeId, ComponentId, Entity, ResourceId};
 
 // =============================================================================
 // World Errors
@@ -137,6 +137,79 @@ pub enum WorldError {
         component_id: ComponentId,
         /// The archetype that was expected to own the column.
         archetype_id: ArchetypeId,
+    },
+
+    /// A foreign resource declaration carries no name to be identified by.
+    #[message("a foreign resource must declare a name")]
+    ForeignResourceNameEmpty,
+
+    /// The declared layout of a foreign resource cannot describe an allocation.
+    #[message(
+        "foreign resource layout of ",
+        debug_value(size),
+        " bytes at alignment ",
+        debug_value(align),
+        " is not a valid allocation"
+    )]
+    ForeignResourceLayoutInvalid {
+        /// Declared size in bytes.
+        size: usize,
+        /// Declared alignment in bytes.
+        align: usize,
+    },
+
+    /// The id does not name a registered foreign resource.
+    #[message("resource ", debug_value(id), " is not a registered foreign resource")]
+    ForeignResourceNotRegistered {
+        /// The resource that was asked for.
+        id: ResourceId,
+    },
+
+    /// The id does not name a registered shared resource.
+    #[message("resource ", debug_value(id), " is not a registered shared resource")]
+    SharedResourceNotRegistered {
+        /// The resource that was asked for.
+        id: ResourceId,
+    },
+
+    /// A Rust value is stored under the id, and its type fixes its shape.
+    #[message(
+        "resource ",
+        debug_value(id),
+        " holds a Rust value; a foreign declaration cannot reshape it"
+    )]
+    ForeignResourceHoldsRustValue {
+        /// The resource whose value refused the migration.
+        id: ResourceId,
+    },
+
+    /// The payload length does not match the foreign resource's declared size.
+    #[message(
+        "foreign resource ",
+        debug_value(id),
+        " takes ",
+        debug_value(expected),
+        " bytes; the payload has ",
+        debug_value(actual)
+    )]
+    ForeignResourceBytesMismatch {
+        /// The resource the payload was offered to.
+        id: ResourceId,
+        /// Declared size in bytes.
+        expected: usize,
+        /// Payload length in bytes.
+        actual: usize,
+    },
+
+    /// A migration plan for a foreign resource falls outside its rows.
+    #[message(
+        "the migration plan for foreign resource ",
+        debug_value(id),
+        " reads or writes past the edge of a row"
+    )]
+    ForeignResourcePlanOutOfBounds {
+        /// The resource the plan was built for.
+        id: ResourceId,
     },
 
     /// Two live registrations claim the same component type name under

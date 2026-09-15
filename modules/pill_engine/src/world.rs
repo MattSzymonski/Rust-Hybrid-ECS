@@ -26,7 +26,8 @@ use trait_type_map::{ErasedVecStorageInfo, TraitAccessible};
 
 // Current crate
 use crate::archetype::{
-    Archetype, ArchetypeId, ComponentColumns, DynamicComponentLayout, StorageFactory,
+    validate_dynamic_layout, Archetype, ArchetypeId, ComponentColumns, DynamicComponentLayout,
+    DynamicFieldPlan, StorageFactory,
 };
 use crate::commands::CommandQueue;
 use crate::component::{
@@ -83,6 +84,19 @@ thread_local! {
 #[inline]
 fn per_thread_last_run_tick() -> Option<Tick> {
     PER_THREAD_LAST_RUN_TICK.with(|cell| cell.get())
+}
+
+/// Whether a size and alignment can describe a foreign resource's allocation.
+///
+/// The predicate both [`World::register_foreign_resource`] and
+/// [`World::relayout_foreign_resource`] need, kept in one place so the two
+/// cannot drift apart: a declaration that passed while its next relayout did
+/// not would leave the world holding a shape it can no longer store.
+fn is_valid_foreign_layout(size: usize, align: usize) -> bool {
+    size != 0
+        && align != 0
+        && align.is_power_of_two()
+        && std::alloc::Layout::from_size_align(size, align).is_ok()
 }
 
 /// Store a per-thread baseline tick, returning the old value so the
@@ -167,8 +181,15 @@ impl IteratorTimings {
 pub struct SharedResourceClaim {
     /// The shared name the claiming type declared.
     pub shared_name: String,
-    /// Rust type name (final path segment) that claimed the shared name.
+    /// Name of the first declarer: a Rust type's final path segment, or a
+    /// managed full name for a declaration from another language.
     pub declaring_type: String,
+    /// Whether the first declarer was another language's declaration.
+    ///
+    /// Such a claim carries no Rust type name to compare against, so the name
+    /// check applies only between two Rust declarations - see
+    /// [`World::claim_shared_resource`].
+    pub foreign: bool,
     /// Size in bytes the claiming type declared.
     pub size: usize,
     /// Alignment in bytes the claiming type declared.
@@ -334,6 +355,10 @@ pub struct World {
     pub(crate) persist_registration_sequence: u64,
     /// Chronological `(type_name, sequence)` log of persistable registrations.
     pub(crate) persist_registration_log: Vec<(String, u64)>,
+    /// Type names the host announced as superseded for the init pass that is
+    /// about to run, so a reloaded generation may replace its predecessor's
+    /// persist entries instead of being refused as a concurrent peer.
+    pub(crate) superseded_persist_names: std::collections::HashSet<String>,
     /// Monotonic counter bumped on every component registration (plain or
     /// persistable), letting the host enumerate which types one module's
     /// `init` registered at all — the distinction between a type that was
@@ -389,6 +414,7 @@ impl World {
             persist_schema_hashes: HashMap::new(),
             persist_registration_sequence: 0,
             persist_registration_log: Vec::new(),
+            superseded_persist_names: std::collections::HashSet::new(),
             component_registration_sequence: 0,
             component_registration_log: Vec::new(),
             component_field_layouts: HashMap::new(),
@@ -829,15 +855,9 @@ impl World {
         if stable_id == 0 {
             return Err(WorldError::DynamicStableIdZero);
         }
-        if size == 0 {
-            return Err(WorldError::DynamicSizeZero);
-        }
-        if align == 0 || !align.is_power_of_two() {
-            return Err(WorldError::DynamicAlignmentInvalid);
-        }
-        if std::alloc::Layout::from_size_align(size, align).is_err() {
-            return Err(WorldError::DynamicLayoutInvalid);
-        }
+        // The same three checks a relayout runs, so a layout this refuses can
+        // never be one the storage would accept later.
+        validate_dynamic_layout(size, align)?;
         let name = name.into();
         let component_id = ComponentId::dynamic(stable_id);
         if let Some(existing) = self.storage_factories.get(&component_id) {
@@ -882,6 +902,86 @@ impl World {
             }),
         );
         Ok(component_id)
+    }
+
+    /// Replace a dynamic component's layout, migrating every stored row.
+    ///
+    /// The one way a dynamic component's storage shape may change after
+    /// registration. The component keeps its id, its registry bit and its
+    /// archetype membership - a fresh registration would allocate a new bit
+    /// index, and that index is baked into archetype masks and scheduled access
+    /// masks - so only the columns' element layout and the recorded size move.
+    ///
+    /// `plan` says where each byte of a new row comes from
+    /// ([`DynamicFieldPlan::between`] builds one from two field lists). Anything
+    /// it does not cover is left zero. Row order and change ticks are
+    /// preserved, so entity locations stay valid and no system observes a
+    /// spurious `Added`.
+    ///
+    /// The new layout and the plan are checked before the first column is
+    /// touched, so a rejected call leaves the world exactly as it was.
+    ///
+    /// Returns the number of rows migrated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::DynamicSizeZero`],
+    /// [`WorldError::DynamicAlignmentInvalid`] or
+    /// [`WorldError::DynamicLayoutInvalid`] when the new layout cannot describe
+    /// storage, [`WorldError::DynamicComponentNotRegistered`] when the id is not
+    /// a registered dynamic component, [`WorldError::DynamicStorageMissing`]
+    /// when an archetype lists the component without a column, and
+    /// [`WorldError::DynamicRowInvalid`] when a planned field falls outside a
+    /// row of either layout.
+    pub fn relayout_dynamic_component(
+        &mut self,
+        component_id: ComponentId,
+        size: usize,
+        align: usize,
+        schema_hash: u64,
+        plan: &DynamicFieldPlan,
+    ) -> Result<usize, WorldError> {
+        validate_dynamic_layout(size, align)?;
+
+        // The previous layout is what the plan's source offsets are measured
+        // against, so it has to be the one the columns are actually using.
+        let Some(StorageFactory::Dynamic(previous)) = self.storage_factories.get(&component_id)
+        else {
+            return Err(WorldError::DynamicComponentNotRegistered { id: component_id });
+        };
+        let previous_size = previous.size;
+        plan.validate(previous_size, size)?;
+
+        // Every archetype holding the component, including the ones with no
+        // rows: their columns must carry the new element layout so the next
+        // entity added to them is stored at the new shape.
+        let layout = DynamicComponentLayout {
+            size,
+            align,
+            schema_hash,
+        };
+        let mut migrated = 0;
+        for archetype in self.archetypes.values_mut() {
+            if !archetype.component_types.contains(&component_id) {
+                continue;
+            }
+            let Some(column) = archetype.dynamic_component_storages.get_mut(&component_id) else {
+                return Err(WorldError::DynamicStorageMissing {
+                    component_id,
+                    archetype_id: archetype.id,
+                });
+            };
+            migrated += column.relayout_validated(layout.clone(), plan);
+        }
+
+        // Publish the new layout to everyone who reads it back: the storage
+        // factory the chunk accessors consult, and the registry copy the
+        // diagnostics and later registrations compare against.
+        self.storage_factories
+            .insert(component_id, StorageFactory::Dynamic(layout));
+        self.component_registry
+            .update_dynamic_size(&component_id, size);
+        Ok(migrated)
     }
 
     /// Return a raw dynamic component column for language bindings.
@@ -1026,8 +1126,13 @@ impl World {
     /// `type_name` and still holds rows, with that row count.
     ///
     /// Both collision guards ask the same question: is a same-name
-    /// registration a superseded generation, which is safe to replace, or a
-    /// live peer, which is not? Live rows are what separates the two.
+    /// registration a superseded generation or a live peer? Live rows answer
+    /// part of it - a peer's rows are the ones that would be lost - but they do
+    /// not separate the two cases on their own, because a generation being
+    /// retired still holds its rows while its replacement registers. The host
+    /// therefore announces the retiring generation's names before init (see
+    /// [`Self::supersede_persist_registrations`]); this lookup supplies the
+    /// candidate the announcement is judged against.
     pub(crate) fn live_component_with_name(
         &self,
         type_name: &str,
@@ -1630,6 +1735,216 @@ impl World {
         self.note_resource_registration(id);
     }
 
+    /// Declare a resource defined by another language, without storing a value.
+    ///
+    /// The foreign-language counterpart of [`Self::register_resource`], for a
+    /// resource type this process has no Rust definition of. Identity is the
+    /// declared name, hashed exactly as [`Resource::shared_name`] hashes a Rust
+    /// type's, so a managed declaration and a Rust type that write down the same
+    /// string are one resource - the scheduler included, because resource access
+    /// sets are id sets.
+    ///
+    /// The payload is blittable bytes: `size` and `align` describe it, and
+    /// [`Self::insert_foreign_resource_bytes`] stores it. Nothing here runs a
+    /// destructor, so a foreign value outlives whatever assembly produced it.
+    ///
+    /// `declaring_type` is the declaring language's own name for the type (the
+    /// managed full name, for the C# path). It is recorded, and compared only
+    /// against another Rust declaration - see [`Self::claim_shared_resource`].
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError::ForeignResourceNameEmpty`] for an empty name,
+    /// [`WorldError::ForeignResourceLayoutInvalid`] for a layout that cannot
+    /// describe an allocation, [`WorldError::SharedResourceNameConflict`] when
+    /// two Rust types disagree about the name, and
+    /// [`WorldError::SharedResourceLayoutMismatch`] when the declared layout
+    /// disagrees with the one already claimed.
+    pub fn register_foreign_resource(
+        &mut self,
+        name: &str,
+        declaring_type: &str,
+        size: usize,
+        align: usize,
+        schema_hash: u64,
+    ) -> Result<ResourceId, WorldError> {
+        if name.is_empty() {
+            return Err(WorldError::ForeignResourceNameEmpty);
+        }
+        if !is_valid_foreign_layout(size, align) {
+            return Err(WorldError::ForeignResourceLayoutInvalid { size, align });
+        }
+        let id = ResourceId::Shared(crate::component::shared_component_identity(name));
+        if let Some(error) = self.claim_shared_resource(id, name, declaring_type, size, align, true)
+        {
+            return Err(error);
+        }
+        self.resource_factories
+            .insert(id, ErasedResourceOps::foreign(size, align, schema_hash));
+        self.note_resource_registration(id);
+        Ok(id)
+    }
+
+    /// Store a value for a shared resource, from another language's bytes.
+    ///
+    /// Replaces whatever is stored under the id: a Rust value's destructor runs
+    /// first and its bytes are never reinterpreted as the new payload. The
+    /// change tick is stamped, because a value appearing is a change.
+    ///
+    /// The id has to name a registered *shared* resource, one whose identity is
+    /// a declared name. A Rust type's private resource is identified by its
+    /// `TypeId`, which no other language can name, so there is nothing here to
+    /// address.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError::SharedResourceNotRegistered`] when the id is not a
+    /// registered shared resource, and
+    /// [`WorldError::ForeignResourceBytesMismatch`] when the payload is not
+    /// exactly the registered size.
+    pub fn insert_foreign_resource_bytes(
+        &mut self,
+        id: ResourceId,
+        bytes: &[u8],
+    ) -> Result<(), WorldError> {
+        let Some(ops) = self.shared_resource_ops(id) else {
+            return Err(WorldError::SharedResourceNotRegistered { id });
+        };
+        if bytes.len() != ops.size {
+            return Err(WorldError::ForeignResourceBytesMismatch {
+                id,
+                expected: ops.size,
+                actual: bytes.len(),
+            });
+        }
+        let tick = Tick::new(self.change_tick);
+        self.resources.insert(
+            id,
+            ErasedResource::new_foreign(bytes, ops.align, ops.schema_hash.unwrap_or(0)),
+        );
+        self.resource_ticks.insert(id, ComponentTicks::new(tick));
+        self.note_resource_registration(id);
+        Ok(())
+    }
+
+    /// The stored bytes of a shared resource, for another language to read.
+    ///
+    /// `None` when the id is not a registered shared resource, or when nothing
+    /// is stored under it yet.
+    pub fn foreign_resource_bytes(&self, id: ResourceId) -> Option<&[u8]> {
+        self.shared_resource_ops(id)?;
+        self.resources.get(&id).map(ErasedResource::bytes)
+    }
+
+    /// The stored bytes of a shared resource, mutably, with its ticks.
+    ///
+    /// The `changed` tick moves as the view is handed out rather than on the
+    /// first write: a caller holding the bytes has no wrapper that could notice
+    /// a mutation, so the conservative reading is that the value changed when
+    /// the borrow was taken.
+    ///
+    /// A caller writing here is responsible for writing a value the stored type
+    /// accepts, exactly as a generated mirror is for the component rows it
+    /// writes in place.
+    pub fn foreign_resource_bytes_mut(
+        &mut self,
+        id: ResourceId,
+    ) -> Option<(&mut [u8], &mut ComponentTicks)> {
+        self.shared_resource_ops(id)?;
+        let changed = Tick::new(self.change_tick);
+        let ticks = self.resource_ticks.get_mut(&id)?;
+        ticks.set_changed(changed);
+        let bytes = self.resources.get_mut(&id)?.bytes_mut();
+        Some((bytes, ticks))
+    }
+
+    /// The declared layout of a foreign resource: size, alignment, schema hash.
+    ///
+    /// What a host compares against the next generation's manifest before it
+    /// decides whether a reload needs a migration at all.
+    pub fn foreign_resource_layout(&self, id: ResourceId) -> Option<(usize, usize, u64)> {
+        let ops = self.resource_factories.get(&id).copied()?;
+        if !ops.foreign {
+            return None;
+        }
+        Some((ops.size, ops.align, ops.schema_hash?))
+    }
+
+    /// Replace a foreign resource's declared layout, migrating its value.
+    ///
+    /// The resource twin of [`Self::relayout_dynamic_component`], and much
+    /// smaller for the same reason a resource is smaller than a column: one
+    /// value, no archetypes, no rows to keep in step. `plan` comes from the same
+    /// two field lists the component path uses
+    /// ([`DynamicFieldPlan::between`]), and anything it does not cover is left
+    /// zero.
+    ///
+    /// Only a foreign payload is rewritten. A Rust value stored under the
+    /// declaration refuses: its shape *is* its type, so a declaration that
+    /// disagrees with it is a conflict to report rather than a migration to
+    /// perform.
+    ///
+    /// Returns 1 when a value was rewritten and 0 when only the declaration
+    /// moved, which is the case for a resource nobody has stored yet.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError::ForeignResourceNotRegistered`] when the id is not a
+    /// registered foreign declaration,
+    /// [`WorldError::ForeignResourceLayoutInvalid`] for a layout that cannot
+    /// describe an allocation,
+    /// [`WorldError::ForeignResourcePlanOutOfBounds`] when the plan does not fit
+    /// the old or the new payload, and
+    /// [`WorldError::ForeignResourceHoldsRustValue`] when a Rust value is stored
+    /// under the id.
+    pub fn relayout_foreign_resource(
+        &mut self,
+        id: ResourceId,
+        size: usize,
+        align: usize,
+        schema_hash: u64,
+        plan: &DynamicFieldPlan,
+    ) -> Result<usize, WorldError> {
+        if !self
+            .resource_factories
+            .get(&id)
+            .is_some_and(|ops| ops.foreign)
+        {
+            return Err(WorldError::ForeignResourceNotRegistered { id });
+        }
+        if !is_valid_foreign_layout(size, align) {
+            return Err(WorldError::ForeignResourceLayoutInvalid { size, align });
+        }
+        if self
+            .resources
+            .get(&id)
+            .is_some_and(|value| !value.is_foreign())
+        {
+            return Err(WorldError::ForeignResourceHoldsRustValue { id });
+        }
+
+        let next = ErasedResourceOps::foreign(size, align, schema_hash);
+        let Some(value) = self.resources.get_mut(&id) else {
+            self.resource_factories.insert(id, next);
+            return Ok(0);
+        };
+        value
+            .migrate_bytes(size, align, plan)
+            .map_err(|_error| WorldError::ForeignResourcePlanOutOfBounds { id })?;
+        self.resource_factories.insert(id, next);
+        Ok(1)
+    }
+
+    /// The per-type table of a registered shared resource, if the id names one.
+    ///
+    /// Shared identity is the gate: a private resource's id is a `TypeId`, so
+    /// no other language can name it and no byte view of it exists to hand out.
+    /// The `?` consumes the identity itself - absent means private.
+    fn shared_resource_ops(&self, id: ResourceId) -> Option<ErasedResourceOps> {
+        id.shared_identity()?;
+        self.resource_factories.get(&id).copied()
+    }
+
     /// Stamp one resource registration into the chronological log.
     fn note_resource_registration(&mut self, id: ResourceId) {
         self.resource_registration_log
@@ -1704,20 +2019,70 @@ impl World {
         let Some(shared_name) = T::shared_name() else {
             return true;
         };
-        let id = ResourceId::of::<T>();
+        match self.claim_shared_resource(
+            ResourceId::of::<T>(),
+            shared_name,
+            crate::component::ComponentRegistry::declaring_type_name::<T>(),
+            std::mem::size_of::<T>(),
+            std::mem::align_of::<T>(),
+            false,
+        ) {
+            None => true,
+            Some(error) => {
+                // Recorded here rather than in the core: the Rust path is the
+                // one whose refusal has to fail the init that raised it. A
+                // foreign declaration's caller gets the error back and acts on
+                // it itself.
+                self.record_registration_error(error);
+                false
+            }
+        }
+    }
+
+    /// The type-independent half of [`Self::claim_shared_resource_name`].
+    ///
+    /// A declaration from another language has no Rust type to ask, so it hands
+    /// over the same four facts its manifest carries. `foreign` decides one
+    /// thing: whether the declaring names are compared. Two Rust types reaching
+    /// one shared name are a collision, and their own names are what tells two
+    /// copies of one type from two different types. A foreign declaration has
+    /// no Rust name to compare against a final path segment, and writing the
+    /// shared name down *is* its statement of which resource it means - so
+    /// there the layout is the check.
+    ///
+    /// The recorded claim deliberately keeps its Rust declarer when a foreign
+    /// declaration joins: that record is what a later Rust arrival is compared
+    /// against, and a managed name would make every later arrival look
+    /// different. A Rust arrival to a foreign claim does take the record, for
+    /// the same reason in reverse.
+    ///
+    /// Returns the error, and does not record it: the Rust wrapper above
+    /// records what its drain has to see, while a foreign declaration's caller
+    /// is the one that must act on the refusal.
+    fn claim_shared_resource(
+        &mut self,
+        id: ResourceId,
+        shared_name: &str,
+        declaring_type: &str,
+        size: usize,
+        align: usize,
+        foreign: bool,
+    ) -> Option<WorldError> {
         let incoming = SharedResourceClaim {
             shared_name: shared_name.to_string(),
-            declaring_type: crate::component::ComponentRegistry::declaring_type_name::<T>()
-                .to_string(),
-            size: std::mem::size_of::<T>(),
-            align: std::mem::align_of::<T>(),
+            declaring_type: declaring_type.to_string(),
+            foreign,
+            size,
+            align,
         };
         if let Some(existing) = self.shared_resource_claims.get(&id) {
-            if existing.declaring_type != incoming.declaring_type {
-                // Logged as well as recorded, exactly as `register_component`
-                // logs its own failures: the recorded copy is what fails the
-                // init, and the log line is what names the cause to whoever
-                // reads the host output.
+            if !existing.foreign
+                && !incoming.foreign
+                && existing.declaring_type != incoming.declaring_type
+            {
+                // Logged as well as returned, exactly as `register_component`
+                // logs its own failures: the log line is what names the cause
+                // to whoever reads the host output.
                 let error = WorldError::SharedResourceNameConflict {
                     shared_name: shared_name.to_string(),
                     existing_type: existing.declaring_type.clone(),
@@ -1731,8 +2096,7 @@ impl World {
                     error = %error,
                     "shared resource name claimed by two different types"
                 );
-                self.record_registration_error(error);
-                return false;
+                return Some(error);
             }
             if existing.size != incoming.size || existing.align != incoming.align {
                 let error = WorldError::SharedResourceLayoutMismatch {
@@ -1752,12 +2116,23 @@ impl World {
                     error = %error,
                     "shared resource registered with two different layouts"
                 );
-                self.record_registration_error(error);
-                return false;
+                return Some(error);
             }
         }
-        self.shared_resource_claims.insert(id, incoming);
-        true
+        match self.shared_resource_claims.get(&id) {
+            None => {
+                self.shared_resource_claims.insert(id, incoming);
+            }
+            // A foreign declaration does not overwrite the record: keeping a
+            // Rust declarer's name is what lets a later Rust arrival still be
+            // compared against one. A Rust arrival to a foreign claim does take
+            // it, because from then on there is a Rust name worth comparing.
+            Some(existing) if existing.foreign && !incoming.foreign => {
+                self.shared_resource_claims.insert(id, incoming);
+            }
+            Some(_) => {}
+        }
+        None
     }
 
     /// Re-home every stored resource's per-type function table.
@@ -1773,8 +2148,16 @@ impl World {
     /// left alone - there is nothing newer to point it at. That case is a
     /// retired owner's resource, and [`Self::drop_resources`] is what releases
     /// it, while the retiring image is still mapped.
+    ///
+    /// A foreign box is left alone as well, for a different reason: its table
+    /// drops nothing and points at this crate's code, which outlives every
+    /// artifact. Refreshing it from the factories would let a Rust type that
+    /// shares the name hand its own destructor to bytes it does not own.
     pub fn rehome_resources(&mut self) {
         for (id, resource) in &mut self.resources {
+            if resource.is_foreign() {
+                continue;
+            }
             if let Some(&ops) = self.resource_factories.get(id) {
                 resource.refresh_ops(ops);
             }
@@ -3175,7 +3558,22 @@ mod layout_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archetype::{FieldSource, LayoutField};
     use trait_type_map::impl_trait_accessible;
+
+    /// The change-detection ticks of one entity's row for one component.
+    fn ticks_of_row(world: &World, entity: Entity, component: ComponentId) -> ComponentTicks {
+        let location = world.entity_locations[&entity];
+        world.archetypes[&location.archetype_id].component_ticks[&component]
+            [location.index_in_archetype]
+    }
+
+    /// Two u32 fields: the two-field shape the relayout tests start from.
+    fn two_u32_row(first: u32, second: u32) -> Vec<u8> {
+        let mut bytes = first.to_ne_bytes().to_vec();
+        bytes.extend_from_slice(&second.to_ne_bytes());
+        bytes
+    }
 
     #[derive(Debug, Clone, Copy, PartialEq)]
     struct Position {
@@ -3246,6 +3644,224 @@ mod tests {
         );
         assert!(world.dynamic_component_bytes(entity, b).is_none());
         assert_eq!(world.dynamic_component_bytes(entity, c).unwrap(), [0; 8]);
+    }
+
+    /// A relayout rewrites rows where they are: entities keep their rows, values
+    /// follow their field names, and a field the old layout did not have starts
+    /// zeroed instead of holding a byte from the previous shape.
+    #[test]
+    fn relayout_migrates_rows_and_keeps_entities_in_their_rows() {
+        let mut world = World::new();
+        let component = world
+            .register_dynamic_component(0xD4, "Project.Relayout", 8, 4, 100)
+            .unwrap();
+        let first = world
+            .create_dynamic_entity(&[(component, two_u32_row(1, 2))])
+            .unwrap();
+        let second = world
+            .create_dynamic_entity(&[(component, two_u32_row(3, 4))])
+            .unwrap();
+
+        let archetype = world.entity_locations[&first].archetype_id;
+        let first_row = world.entity_locations[&first].index_in_archetype;
+        let second_row = world.entity_locations[&second].index_in_archetype;
+        assert_eq!(
+            world.entity_locations[&second].archetype_id, archetype,
+            "identical component sets share one archetype"
+        );
+
+        // `b` first, then `a`, then an eight-byte field that did not exist.
+        let plan = DynamicFieldPlan::between(
+            &[
+                LayoutField {
+                    name: "a",
+                    offset: 0,
+                    size: 4,
+                },
+                LayoutField {
+                    name: "b",
+                    offset: 4,
+                    size: 4,
+                },
+            ],
+            &[
+                LayoutField {
+                    name: "b",
+                    offset: 0,
+                    size: 4,
+                },
+                LayoutField {
+                    name: "a",
+                    offset: 4,
+                    size: 4,
+                },
+                LayoutField {
+                    name: "added",
+                    offset: 8,
+                    size: 8,
+                },
+            ],
+        );
+
+        let migrated = world
+            .relayout_dynamic_component(component, 16, 8, 200, &plan)
+            .unwrap();
+
+        assert_eq!(migrated, 2);
+        let mut expected_first = two_u32_row(2, 1);
+        expected_first.extend_from_slice(&[0_u8; 8]);
+        assert_eq!(
+            world.dynamic_component_bytes(first, component).unwrap(),
+            expected_first.as_slice()
+        );
+        let mut expected_second = two_u32_row(4, 3);
+        expected_second.extend_from_slice(&[0_u8; 8]);
+        assert_eq!(
+            world.dynamic_component_bytes(second, component).unwrap(),
+            expected_second.as_slice()
+        );
+        assert_eq!(
+            world.entity_locations[&first].archetype_id, archetype,
+            "a relayout moves no entity between archetypes"
+        );
+        assert_eq!(world.entity_locations[&first].index_in_archetype, first_row);
+        assert_eq!(
+            world.entity_locations[&second].index_in_archetype,
+            second_row
+        );
+        assert_eq!(world.component_layout(component), Some((16, 8)));
+    }
+
+    /// A relayout is a structural edit, not an add: rows keep their ticks, so no
+    /// `Added` filter fires and a row that was already changed stays changed.
+    #[test]
+    fn relayout_leaves_change_ticks_alone() {
+        let mut world = World::new();
+        let component = world
+            .register_dynamic_component(0xD5, "Project.Ticks", 8, 4, 100)
+            .unwrap();
+        let entity = world
+            .create_dynamic_entity(&[(component, two_u32_row(1, 2))])
+            .unwrap();
+
+        let changed_tick = world.increment_change_tick();
+        let location = world.entity_locations[&entity];
+        world
+            .archetypes
+            .get_mut(&location.archetype_id)
+            .unwrap()
+            .component_ticks
+            .get_mut(&component)
+            .unwrap()[location.index_in_archetype]
+            .set_changed(changed_tick);
+        let before = ticks_of_row(&world, entity, component);
+
+        world
+            .relayout_dynamic_component(component, 16, 8, 200, &DynamicFieldPlan::new())
+            .unwrap();
+
+        let after = ticks_of_row(&world, entity, component);
+        assert_eq!(after.added, before.added);
+        assert_eq!(after.changed, changed_tick);
+    }
+
+    /// The id and the registry bit survive, because they are baked into
+    /// archetype masks and scheduled access masks: a relayout must update the
+    /// layout in place, never re-register the component.
+    #[test]
+    fn relayout_keeps_the_component_id_and_its_bit() {
+        let mut world = World::new();
+        let component = world
+            .register_dynamic_component(0xD6, "Project.Bit", 8, 4, 100)
+            .unwrap();
+        let bit = world.component_registry().get_bit(&component).unwrap();
+
+        world
+            .relayout_dynamic_component(component, 16, 8, 200, &DynamicFieldPlan::new())
+            .unwrap();
+
+        // The same id still names the same component; only its size moved.
+        assert_eq!(world.component_registry().get_bit(&component), Some(bit));
+        assert_eq!(world.component_registry().get_size(&component), Some(16));
+        assert_eq!(
+            world.component_registry().get_name(&component),
+            Some("Project.Bit")
+        );
+    }
+
+    /// A relayout has to reach archetypes whose last row is gone: the next
+    /// entity added there must be stored at the new size. The push only
+    /// succeeds when the column there really was rewritten.
+    #[test]
+    fn relayout_reaches_an_archetype_that_lost_its_last_row() {
+        let mut world = World::new();
+        let component = world
+            .register_dynamic_component(0xD7, "Project.Empty", 8, 4, 100)
+            .unwrap();
+        let disposable = world
+            .create_dynamic_entity(&[(component, two_u32_row(1, 2))])
+            .unwrap();
+        let archetype = world.entity_locations[&disposable].archetype_id;
+        assert!(world.destroy_entity(disposable));
+
+        world
+            .relayout_dynamic_component(component, 16, 8, 200, &DynamicFieldPlan::new())
+            .unwrap();
+
+        let entity = world
+            .create_dynamic_entity(&[(component, vec![7_u8; 16])])
+            .unwrap();
+        assert_eq!(
+            world.entity_locations[&entity].archetype_id, archetype,
+            "the empty archetype is reused, so its column is the one being tested"
+        );
+        assert_eq!(
+            world.dynamic_component_bytes(entity, component).unwrap(),
+            [7_u8; 16].as_slice()
+        );
+    }
+
+    /// Only a registered dynamic component has a layout to replace, and a plan
+    /// that does not fit both layouts is refused before anything is touched.
+    #[test]
+    fn relayout_refuses_what_it_cannot_migrate() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        assert!(matches!(
+            world.relayout_dynamic_component(
+                ComponentId::of::<Position>(),
+                16,
+                8,
+                1,
+                &DynamicFieldPlan::new()
+            ),
+            Err(WorldError::DynamicComponentNotRegistered { .. })
+        ));
+        assert!(matches!(
+            world.relayout_dynamic_component(
+                ComponentId::dynamic(0xEE),
+                16,
+                8,
+                1,
+                &DynamicFieldPlan::new()
+            ),
+            Err(WorldError::DynamicComponentNotRegistered { .. })
+        ));
+
+        let component = world
+            .register_dynamic_component(0xD8, "Project.Refused", 8, 4, 100)
+            .unwrap();
+        let mut too_wide = DynamicFieldPlan::new();
+        too_wide.push(4, 8, FieldSource::OldOffset(0));
+        assert!(matches!(
+            world.relayout_dynamic_component(component, 8, 4, 100, &too_wide),
+            Err(WorldError::DynamicRowInvalid)
+        ));
+        assert_eq!(
+            world.component_layout(component),
+            Some((8, 4)),
+            "a refused plan leaves the registered layout as it was"
+        );
     }
 
     #[test]
@@ -5000,5 +5616,279 @@ mod tests {
             .unwrap()
             .has_shared_identity());
         assert!(world.take_registration_error().is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // Foreign resources
+    // -------------------------------------------------------------------------
+
+    /// A declared name hashes the engine's way, so a declaration from another
+    /// language and a Rust type that writes down the same string are one
+    /// resource - which is the whole point of the name being declared rather
+    /// than derived.
+    #[test]
+    fn a_foreign_declaration_hashes_to_the_rust_types_id() {
+        let mut world = World::new();
+        let id = world
+            .register_foreign_resource("demo::Settings", "Project.Settings", 4, 4, 7)
+            .expect("a fresh name is claimed");
+
+        assert_eq!(
+            id,
+            crate::resource::ResourceId::of::<artifact_a::Settings>()
+        );
+        assert_eq!(
+            id,
+            crate::resource::ResourceId::Shared(crate::component::shared_component_identity(
+                "demo::Settings"
+            ))
+        );
+        assert_eq!(world.foreign_resource_layout(id), Some((4, 4, 7)));
+        assert_eq!(
+            world.shared_resource_names(),
+            vec!["demo::Settings".to_string()]
+        );
+    }
+
+    /// The claim guard keeps its Rust-versus-Rust name check and takes the
+    /// layout as the cross-language one: a matching declaration joins, a
+    /// mismatched one is refused.
+    #[test]
+    fn a_foreign_declaration_joins_by_layout_and_is_refused_by_a_mismatch() {
+        let mut world = World::new();
+        world.register_resource::<artifact_a::Settings>();
+        assert!(world.take_registration_error().is_none());
+
+        let id = world
+            .register_foreign_resource("demo::Settings", "Project.Settings", 4, 4, 7)
+            .expect("the same layout joins");
+        assert_eq!(
+            id,
+            crate::resource::ResourceId::of::<artifact_a::Settings>()
+        );
+        assert!(
+            world.take_registration_error().is_none(),
+            "a matching declaration is not a conflict"
+        );
+
+        let error = world
+            .register_foreign_resource("demo::Settings", "Project.Settings", 16, 8, 7)
+            .expect_err("a different layout cannot be joined");
+        assert!(matches!(
+            error,
+            WorldError::SharedResourceLayoutMismatch { .. }
+        ));
+        assert!(
+            world.take_registration_error().is_none(),
+            "the refusal goes back to the caller that made it, not to the next init drain"
+        );
+    }
+
+    /// Bytes round-trip through a declaration, the size is checked, and a
+    /// mutable view stamps the change tick as it is handed out.
+    #[test]
+    fn foreign_bytes_round_trip_and_stamp_the_change_tick() {
+        let mut world = World::new();
+        let id = world
+            .register_foreign_resource("demo::Bytes", "Project.Bytes", 8, 4, 7)
+            .expect("a fresh name is claimed");
+        assert!(world.foreign_resource_bytes(id).is_none(), "no value yet");
+
+        world
+            .insert_foreign_resource_bytes(id, &[1, 2, 3, 4, 5, 6, 7, 8])
+            .expect("the payload matches the size");
+        assert_eq!(
+            world.foreign_resource_bytes(id),
+            Some([1_u8, 2, 3, 4, 5, 6, 7, 8].as_slice())
+        );
+
+        assert!(matches!(
+            world.insert_foreign_resource_bytes(id, &[0; 4]),
+            Err(WorldError::ForeignResourceBytesMismatch { .. })
+        ));
+        assert_eq!(
+            world.foreign_resource_bytes(id).unwrap().len(),
+            8,
+            "a refused payload leaves the stored value alone"
+        );
+
+        world.increment_change_tick();
+        let expected_tick = world.change_tick();
+        let (bytes, ticks) = world
+            .foreign_resource_bytes_mut(id)
+            .expect("the value is there");
+        bytes[0] = 9;
+        assert_eq!(ticks.changed, expected_tick);
+        assert_eq!(world.foreign_resource_bytes(id).unwrap()[0], 9);
+    }
+
+    /// A private resource has no byte view: its id is a `TypeId`, which no
+    /// other language can name, so there is nothing for one to address.
+    #[test]
+    fn a_private_resource_has_no_foreign_view() {
+        let mut world = World::new();
+        world.insert_resource(rehome_probe().0);
+        let id = crate::resource::ResourceId::of::<RehomeProbe>();
+
+        assert!(world.foreign_resource_bytes(id).is_none());
+        assert!(world.foreign_resource_bytes_mut(id).is_none());
+        assert!(matches!(
+            world.insert_foreign_resource_bytes(id, &[0; 8]),
+            Err(WorldError::SharedResourceNotRegistered { .. })
+        ));
+        assert!(matches!(
+            world.relayout_foreign_resource(id, 8, 4, 1, &DynamicFieldPlan::new()),
+            Err(WorldError::ForeignResourceNotRegistered { .. })
+        ));
+    }
+
+    /// A relayout moves the stored bytes through the plan, updates the declared
+    /// layout, and reports how many values it migrated.
+    #[test]
+    fn relayout_migrates_a_foreign_value_through_the_plan() {
+        let mut world = World::new();
+        let id = world
+            .register_foreign_resource("demo::Relayout", "Project.Relayout", 8, 4, 1)
+            .expect("a fresh name is claimed");
+
+        // `b`, then `a`, then an eight-byte field that did not exist.
+        let plan = DynamicFieldPlan::between(
+            &[
+                LayoutField {
+                    name: "a",
+                    offset: 0,
+                    size: 4,
+                },
+                LayoutField {
+                    name: "b",
+                    offset: 4,
+                    size: 4,
+                },
+            ],
+            &[
+                LayoutField {
+                    name: "b",
+                    offset: 0,
+                    size: 4,
+                },
+                LayoutField {
+                    name: "a",
+                    offset: 4,
+                    size: 4,
+                },
+                LayoutField {
+                    name: "added",
+                    offset: 8,
+                    size: 8,
+                },
+            ],
+        );
+
+        // With no value stored, the declaration moves and nothing is migrated.
+        assert_eq!(
+            world
+                .relayout_foreign_resource(id, 16, 8, 2, &plan)
+                .expect("the declaration moves"),
+            0
+        );
+        assert_eq!(world.foreign_resource_layout(id), Some((16, 8, 2)));
+
+        world
+            .insert_foreign_resource_bytes(id, &[1, 0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])
+            .expect("the payload matches the new size");
+        assert_eq!(
+            world
+                .relayout_foreign_resource(id, 16, 8, 2, &DynamicFieldPlan::new())
+                .expect("a value is there to migrate"),
+            1
+        );
+        assert_eq!(
+            world.foreign_resource_bytes(id),
+            Some([0_u8; 16].as_slice()),
+            "an empty plan zeroes the value it migrates"
+        );
+    }
+
+    /// A Rust value's shape is its type, so a foreign declaration cannot
+    /// reshape it, and a plan that does not fit the payload is refused before
+    /// anything moves.
+    #[test]
+    fn relayout_refuses_a_rust_value_and_a_plan_that_leaves_the_payload() {
+        let mut world = World::new();
+        world.register_resource::<artifact_a::Settings>();
+        let id = world
+            .register_foreign_resource("demo::Settings", "Project.Settings", 4, 4, 1)
+            .expect("the same layout joins");
+
+        // A Rust value stored under the id brings its own table with it, so the
+        // declaration is the Rust type's from then on and a foreign relayout is
+        // no longer even addressed to one.
+        world.insert_resource(artifact_a::Settings { value: 3 });
+        assert!(matches!(
+            world.relayout_foreign_resource(id, 8, 4, 2, &DynamicFieldPlan::new()),
+            Err(WorldError::ForeignResourceNotRegistered { .. })
+        ));
+
+        // Declaring it foreign again - what the managed side does on every
+        // reload - reaches the stored value, and that is what refuses.
+        world
+            .register_foreign_resource("demo::Settings", "Project.Settings", 4, 4, 1)
+            .expect("the layout still matches");
+        assert!(matches!(
+            world.relayout_foreign_resource(id, 8, 4, 2, &DynamicFieldPlan::new()),
+            Err(WorldError::ForeignResourceHoldsRustValue { .. })
+        ));
+
+        // Foreign bytes replace it, and then only the plan is in the way.
+        world
+            .insert_foreign_resource_bytes(id, &3_u32.to_ne_bytes())
+            .expect("the payload matches the size");
+        let mut too_wide = DynamicFieldPlan::new();
+        too_wide.push(2, 4, FieldSource::OldOffset(0));
+        assert!(matches!(
+            world.relayout_foreign_resource(id, 4, 4, 2, &too_wide),
+            Err(WorldError::ForeignResourcePlanOutOfBounds { .. })
+        ));
+        assert_eq!(
+            world.foreign_resource_layout(id),
+            Some((4, 4, 1)),
+            "a refused relayout leaves the declaration as it was"
+        );
+    }
+
+    /// Re-homing leaves a foreign box's table alone: those bytes are not the
+    /// Rust type's to drop, even when it shares their name.
+    #[test]
+    fn rehoming_leaves_a_foreign_box_alone() {
+        let mut world = World::new();
+        let id = world
+            .register_foreign_resource("demo::Settings", "Project.Settings", 4, 4, 1)
+            .expect("a fresh name is claimed");
+        world
+            .insert_foreign_resource_bytes(id, &9_u32.to_ne_bytes())
+            .expect("the payload matches the size");
+
+        // The Rust owner registers and stores a value of its own...
+        world.register_resource::<artifact_a::Settings>();
+        world.insert_resource(artifact_a::Settings { value: 4 });
+        assert!(!world.resources[&id].is_foreign());
+
+        // ...and a later foreign insert makes the box foreign again. From here
+        // a re-home would hand it the Rust destructor without the skip.
+        world
+            .insert_foreign_resource_bytes(id, &5_u32.to_ne_bytes())
+            .expect("the payload matches the size");
+        assert!(world.resources[&id].is_foreign());
+
+        world.rehome_resources();
+
+        assert!(
+            world.resources[&id].is_foreign(),
+            "a foreign box keeps its own drop, whatever the factories say"
+        );
+        assert_eq!(
+            world.foreign_resource_bytes(id),
+            Some(5_u32.to_ne_bytes().as_slice())
+        );
     }
 }

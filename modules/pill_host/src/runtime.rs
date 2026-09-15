@@ -516,7 +516,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
             Arc::clone(&module_generation),
         ) {
             Ok(slot) => slot,
-            Err(error) => return Err(fail_setup(engine, error.into())),
+            Err(error) => return Err(fail_setup(engine, error)),
         };
         if let Err(error) = spawn_source_watcher(
             workspace_root.clone(),
@@ -1218,7 +1218,7 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     // The managed loader watches the built assembly instead of source files.
     // Only a reloading build has a managed loader to poll.
     #[cfg(feature = "hot_reload")]
-    host.loaded_project.poll_managed_reload();
+    host.loaded_project.poll_managed_reload(&mut host.engine);
 
     // Step 7: Execute one scheduler frame and report its failures.
     if let Err(errors) = host.engine.process_frame() {

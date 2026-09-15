@@ -32,8 +32,9 @@ use pill_engine::{Engine, SystemAccess, SystemError, World};
 use super::abi::{CsEngineApi, NativeSystemAccess};
 use super::aot_runtime::AotRuntimeContext;
 use super::components::{
-    module_native_bindings, register_component_manifest, shared_component_bindings,
-    ComponentBindings, ModuleExposedComponent, StableComponentId,
+    apply_component_manifest_on_reload, module_native_bindings, register_component_manifest,
+    shared_component_bindings, BindingStore, ComponentBindings, ModuleExposedComponent,
+    StableComponentId,
 };
 use super::context::ActiveSystemGuard;
 use super::csharp_runtime::DotnetRuntimeContext;
@@ -170,12 +171,26 @@ pub(crate) struct CSharpRuntime {
     last_poll_status: u8,
     /// Metadata snapshot the active assembly is verified against after reload.
     system_snapshot: Vec<ManagedSystemSnapshot>,
+    /// Unmanaged export reporting the current component manifest's length.
+    manifest_length: ComponentManifestLengthFn,
+    /// Unmanaged export copying that manifest into a host buffer.
+    copy_manifest: CopyComponentManifestFn,
+    /// Serialized manifest the bindings below were built from.
+    ///
+    /// A reload compares the swapped assembly's manifest against this one before
+    /// it considers applying anything, so an ordinary behaviour-only swap costs
+    /// one copy and one comparison.
+    applied_manifest: Vec<u8>,
+    /// The live component-binding table, shared with every registered system.
+    ///
+    /// Shared rather than cloned per system so a reload can rewrite it in
+    /// place: each run locks it, which is what makes a reshaped component's new
+    /// layout visible without re-registering the systems that read it.
+    bindings: Arc<BindingStore>,
     /// Keeps the hosted .NET runtime alive for the host's lifetime.
     _runtime: ManagedRuntimeContext,
     /// Keeps the native API table alive so registered closures stay valid.
     _api: Box<CsEngineApi>,
-    /// Keeps the shared component bindings alive for reload verification.
-    _bindings: Arc<ComponentBindings>,
 }
 
 /// Resolves one managed artifact (a runtime assembly, its `runtimeconfig.json`,
@@ -303,6 +318,9 @@ impl CSharpRuntime {
             &type_name,
             "CopyComponentManifest",
         )?;
+        // Kept under its own name: the value below shadows it, and reading the
+        // manifest again after a swap needs the export, not the first length.
+        let manifest_length_export = manifest_length;
         let system_name_length = runtime.get_unmanaged_fn::<SystemNameLengthFn>(
             &assembly,
             &type_name,
@@ -368,7 +386,9 @@ impl CSharpRuntime {
         if copy_manifest(manifest.as_mut_ptr(), manifest_length) == 0 {
             return Err(CSharpError::ManifestCopyFailed);
         }
-        let bindings = Arc::new(register_component_manifest(engine, &manifest, bindings)?);
+        let bindings = Arc::new(BindingStore::new(register_component_manifest(
+            engine, &manifest, bindings,
+        )?));
 
         // Step 3: Run every reflected managed startup method transactionally.
         // Commands are queued first and applied only when every startup
@@ -378,6 +398,10 @@ impl CSharpRuntime {
         let mut startup_failed = None;
         engine.queue_deferred_commands(|world, queue| {
             let no_accesses = [];
+            // One read of the live table for the whole startup batch: every
+            // method in it resolves components through the entries the manifest
+            // has just registered.
+            let startup_bindings = startup_bindings.read();
             for startup_index in 0..startup_count() {
                 // A rejected scope means a managed startup method re-entered
                 // the host. Running it without a scope would only produce
@@ -435,7 +459,7 @@ impl CSharpRuntime {
             }
 
             let uses_commands = system_uses_commands(system_index) != 0;
-            let mut access = derive_system_access(&managed_access, &bindings)?;
+            let mut access = derive_system_access(&managed_access, &bindings.read())?;
             access.set_uses_commands(uses_commands);
             // Snapshot the reflected metadata before moving the access list
             // into the scheduler closure, so reloads can verify that the
@@ -460,7 +484,11 @@ impl CSharpRuntime {
                     move |world: &mut World, queue: &mut CommandQueue| -> Result<(), SystemError> {
                         // As above: without a scope every managed callback
                         // this system makes would fail, so report it as a
-                        // system error rather than running it blind.
+                        // system error rather than running it blind. The live
+                        // table is locked for the whole run, so a component a
+                        // reload reshaped between frames is not read here
+                        // through the layout it had at registration.
+                        let system_bindings = system_bindings.read();
                         let Some(_guard) = ActiveSystemGuard::set_with_commands(
                             world,
                             queue,
@@ -496,9 +524,12 @@ impl CSharpRuntime {
             #[cfg(feature = "hot_reload")]
             last_poll_status: POLL_NO_CHANGE,
             system_snapshot,
+            manifest_length: manifest_length_export,
+            copy_manifest,
+            applied_manifest: manifest,
+            bindings,
             _runtime: ManagedRuntimeContext::Dotnet(runtime),
             _api: api,
-            _bindings: bindings,
         })
     }
 
@@ -559,6 +590,9 @@ impl CSharpRuntime {
         let run_startup = runtime.get_unmanaged_fn::<RunStartupFn>("pill_run_startup")?;
         let manifest_length = runtime
             .get_unmanaged_fn::<ComponentManifestLengthFn>("pill_component_manifest_length")?;
+        // Kept under its own name: the value below shadows it, and the runtime
+        // handle needs the export to read the manifest again after a swap.
+        let manifest_length_export = manifest_length;
         let copy_manifest =
             runtime.get_unmanaged_fn::<CopyComponentManifestFn>("pill_copy_component_manifest")?;
         let system_name_length =
@@ -596,13 +630,16 @@ impl CSharpRuntime {
         if copy_manifest(manifest.as_mut_ptr(), manifest_length) == 0 {
             return Err(CSharpError::ManifestCopyFailed);
         }
-        let bindings = Arc::new(register_component_manifest(engine, &manifest, bindings)?);
+        let bindings = Arc::new(BindingStore::new(register_component_manifest(
+            engine, &manifest, bindings,
+        )?));
 
         // Step 3: run every managed startup method transactionally.
         let startup_bindings = Arc::clone(&bindings);
         let mut startup_failed = None;
         engine.queue_deferred_commands(|world, queue| {
             let no_accesses = [];
+            let startup_bindings = startup_bindings.read();
             for startup_index in 0..startup_count() {
                 let Some(_guard) = ActiveSystemGuard::set_with_commands(
                     world,
@@ -655,7 +692,7 @@ impl CSharpRuntime {
             }
 
             let uses_commands = system_uses_commands(system_index) != 0;
-            let mut access = derive_system_access(&managed_access, &bindings)?;
+            let mut access = derive_system_access(&managed_access, &bindings.read())?;
             access.set_uses_commands(uses_commands);
             system_snapshot.push(ManagedSystemSnapshot {
                 accesses: managed_access.clone().into_boxed_slice(),
@@ -672,6 +709,10 @@ impl CSharpRuntime {
                     name,
                     access,
                     move |world: &mut World, queue: &mut CommandQueue| -> Result<(), SystemError> {
+                        // One read of the live table for this run: a reload can
+                        // add a component or reshape one between frames, and the
+                        // scope has to describe the storage this run touches.
+                        let system_bindings = system_bindings.read();
                         let Some(_guard) = ActiveSystemGuard::set_with_commands(
                             world,
                             queue,
@@ -707,9 +748,12 @@ impl CSharpRuntime {
             #[cfg(feature = "hot_reload")]
             last_poll_status: POLL_NO_CHANGE,
             system_snapshot,
+            manifest_length: manifest_length_export,
+            copy_manifest,
+            applied_manifest: manifest,
+            bindings,
             _runtime: ManagedRuntimeContext::Aot(runtime),
             _api: api,
-            _bindings: bindings,
         })
     }
 
@@ -719,7 +763,7 @@ impl CSharpRuntime {
     /// and system signatures before swapping. A rejection is logged once per
     #[cfg(feature = "hot_reload")]
     /// attempt so the per-frame poll cannot drown the terminal in messages.
-    pub(crate) fn poll_reload(&mut self) -> u8 {
+    pub(crate) fn poll_reload(&mut self, engine: &mut Engine) -> u8 {
         let status = (self.poll_reload)();
         if status == POLL_REJECTED && self.last_poll_status != POLL_REJECTED {
             error!(
@@ -733,6 +777,11 @@ impl CSharpRuntime {
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     "C# hot reload complete"
                 );
+                // The swap is done and the manifest it carried may differ.
+                // Applying it here, before the frame's systems run, is what
+                // puts a migrated row in place before the new generation reads
+                // one.
+                self.apply_manifest_if_changed(engine);
             } else {
                 error!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -742,6 +791,65 @@ impl CSharpRuntime {
         }
         self.last_poll_status = status;
         status
+    }
+
+    /// Apply the swapped assembly's component manifest when it differs from the
+    /// one the bindings were built from.
+    ///
+    /// The managed loader still refuses a manifest change at the swap itself
+    /// (plan §4.4), so today this compares two identical payloads and returns.
+    /// It is here so that relaxing that refusal becomes a managed-side change:
+    /// the host already knows how to migrate what a new manifest asks for - a
+    /// reshaped dynamic component is relaid out, a new one is registered, and a
+    /// native mirror or a vanished component is refused with a typed error.
+    #[cfg(feature = "hot_reload")]
+    fn apply_manifest_if_changed(&mut self, engine: &mut Engine) {
+        let length = (self.manifest_length)();
+        if !is_supported_manifest_length(length) {
+            error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                length,
+                "the reloaded assembly reported a component manifest length outside the accepted range; keeping the applied manifest"
+            );
+            return;
+        }
+        let mut manifest = Vec::new();
+        if manifest.try_reserve_exact(length as usize).is_err() {
+            error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                length,
+                "could not reserve a buffer for the reloaded component manifest; keeping the applied manifest"
+            );
+            return;
+        }
+        manifest.resize(length as usize, 0);
+        if (self.copy_manifest)(manifest.as_mut_ptr(), length) == 0 {
+            error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                "could not copy the reloaded component manifest; keeping the applied manifest"
+            );
+            return;
+        }
+        if manifest == self.applied_manifest {
+            return;
+        }
+
+        match apply_component_manifest_on_reload(engine, &manifest, &self.bindings) {
+            Ok(report) => {
+                info!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    added = report.added.len(),
+                    migrated = report.migrated.len(),
+                    "applied the reloaded assembly's component manifest"
+                );
+                self.applied_manifest = manifest;
+            }
+            Err(error) => error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                error = %error,
+                "component manifest refused; the reloaded assembly's component definitions are not in force"
+            ),
+        }
     }
 
     /// Re-reflect the active project assembly and verify that its system metadata

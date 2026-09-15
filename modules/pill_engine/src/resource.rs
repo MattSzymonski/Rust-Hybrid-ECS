@@ -48,6 +48,8 @@ use std::marker::PhantomData;
 use std::ptr::NonNull;
 
 // Current crate
+use crate::archetype::{DynamicFieldPlan, FieldSource};
+use crate::error::WorldError;
 use crate::world::World;
 
 // =============================================================================
@@ -290,7 +292,8 @@ impl<T: Resource> std::fmt::Debug for ResHandle<T> {
 // ErasedResource
 // =============================================================================
 
-/// Per-type behaviour an [`ErasedResource`] needs, as plain data.
+/// Per-type behaviour an [`ErasedResource`] needs, plus the layout facts that
+/// go with it, as plain data.
 ///
 /// Function pointers rather than a vtable, for the same reason
 /// `ErasedVecStorageOps` exists on the component side: a `Box<dyn Any>` carries
@@ -302,6 +305,11 @@ impl<T: Resource> std::fmt::Debug for ResHandle<T> {
 /// Only a drop is needed. Unlike a component column, a resource is never
 /// upcast to a trait object, so there are no `up_ref`/`up_mut`/`take_boxed`
 /// counterparts.
+///
+/// The layout fields moved here so one table answers every question about a
+/// registration: a value's size and alignment (which a box needs for its own
+/// allocation) and, for a declaration from another language, the schema hash
+/// its manifest carried.
 #[derive(Clone, Copy)]
 pub struct ErasedResourceOps {
     /// Drop the initialized value at `ptr`.
@@ -311,6 +319,21 @@ pub struct ErasedResourceOps {
     /// `ptr` must point at a live, correctly aligned value of the type this
     /// table was built for.
     pub drop_in_place: unsafe fn(*mut u8),
+    /// Size in bytes of the values this table describes.
+    pub size: usize,
+    /// Alignment in bytes of the values this table describes.
+    pub align: usize,
+    /// Schema hash the declaring manifest carried, for a foreign declaration.
+    /// `None` for a Rust type, whose layout *is* its type.
+    pub schema_hash: Option<u64>,
+    /// Whether this table drops nothing because its values are blittable bytes
+    /// owned by another language.
+    ///
+    /// Read in two places: [`World::rehome_resources`] leaves such a box's
+    /// table alone - there is no newer code to point it at, and no destructor
+    /// to keep valid - and the raw byte accessors refuse to hand out anything
+    /// else.
+    pub foreign: bool,
 }
 
 impl ErasedResourceOps {
@@ -318,6 +341,26 @@ impl ErasedResourceOps {
     pub fn of<T: Resource>() -> Self {
         Self {
             drop_in_place: drop_in_place_of::<T>,
+            size: std::mem::size_of::<T>(),
+            align: std::mem::align_of::<T>(),
+            schema_hash: None,
+            foreign: false,
+        }
+    }
+
+    /// Assemble the table for a foreign declaration.
+    ///
+    /// The drop is deliberately a no-op: a foreign resource is a run of
+    /// blittable bytes, enforced by the caller (the C# manifest path allows
+    /// only unmanaged value types), so there is nothing to release and no
+    /// artifact whose code could go away.
+    pub fn foreign(size: usize, align: usize, schema_hash: u64) -> Self {
+        Self {
+            drop_in_place: drop_nothing,
+            size,
+            align,
+            schema_hash: Some(schema_hash),
+            foreign: true,
         }
     }
 }
@@ -331,6 +374,14 @@ unsafe fn drop_in_place_of<T>(ptr: *mut u8) {
     // SAFETY: guaranteed by the caller; the box upholds it.
     unsafe { std::ptr::drop_in_place(ptr.cast::<T>()) };
 }
+
+/// Drop nothing.
+///
+/// # Safety
+///
+/// Always sound: a foreign resource owns no allocation and holds no value that
+/// needs releasing, which is the whole point of the blittable-only rule.
+unsafe fn drop_nothing(_ptr: *mut u8) {}
 
 /// One resource value, stored without a trait object.
 ///
@@ -350,8 +401,8 @@ pub struct ErasedResource {
     /// Heap allocation holding the value, or dangling for a zero-sized type.
     data: NonNull<u8>,
     /// Runtime type identity of the stored value, as the creating artifact
-    /// sees it.
-    type_id: TypeId,
+    /// sees it, or `None` when the value has no Rust type at all.
+    type_id: Option<TypeId>,
     /// Size in bytes of the stored value.
     size: usize,
     /// Alignment in bytes of the stored value.
@@ -374,25 +425,14 @@ impl ErasedResource {
     pub fn new<T: Resource>(value: T) -> Self {
         let size = std::mem::size_of::<T>();
         let align = std::mem::align_of::<T>();
-        let data = if size == 0 {
-            // A zero-sized type needs no allocation, and `drop_in_place` on a
-            // dangling-but-aligned pointer is well defined for one.
-            NonNull::dangling()
-        } else {
-            let layout = Layout::from_size_align(size, align).expect("valid resource layout");
-            // SAFETY: `layout` has non-zero size, checked above.
-            let pointer = unsafe { std::alloc::alloc(layout) };
-            let Some(pointer) = NonNull::new(pointer) else {
-                std::alloc::handle_alloc_error(layout);
-            };
-            // SAFETY: the allocation is exactly `size_of::<T>()` bytes at
-            // `align_of::<T>()`, and is uninitialized until this write.
-            unsafe { std::ptr::write(pointer.as_ptr().cast::<T>(), value) };
-            pointer
-        };
+        // SAFETY: the allocation is `size` bytes at `align`, and the write
+        // below fills it completely before it is read.
+        let data = Self::allocate(size, align, |pointer| unsafe {
+            std::ptr::write(pointer.cast::<T>(), value);
+        });
         Self {
             data,
-            type_id: TypeId::of::<T>(),
+            type_id: Some(TypeId::of::<T>()),
             size,
             align,
             // A shared resource is reached from an artifact whose `TypeId` for
@@ -403,8 +443,56 @@ impl ErasedResource {
         }
     }
 
-    /// Runtime type identity of the stored value.
-    pub fn type_id(&self) -> TypeId {
+    /// Move another language's blittable bytes into a fresh erased box.
+    ///
+    /// The value has no Rust type: its identity is the shared name its
+    /// declaration carried, so `shared_identity` is set and `holds` compares
+    /// layout - which is all a foreign declaration can offer. The box owns a
+    /// copy of `bytes` and releases nothing on drop, because blittable bytes
+    /// own nothing and there is no artifact whose code could go away.
+    pub fn new_foreign(bytes: &[u8], align: usize, schema_hash: u64) -> Self {
+        let size = bytes.len();
+        // SAFETY: the allocation is `bytes.len()` bytes, and the copy fills it
+        // completely before it is read.
+        let data = Self::allocate(size, align, |pointer| unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), pointer, size);
+        });
+        Self {
+            data,
+            // No Rust type names this value, which is exactly what the
+            // layout-based `holds` branch above is for.
+            type_id: None,
+            size,
+            align,
+            shared_identity: true,
+            ops: ErasedResourceOps::foreign(size, align, schema_hash),
+        }
+    }
+
+    /// Allocate a value slot of `size` bytes at `align` and fill it.
+    ///
+    /// A zero-sized value needs no allocation: `drop_in_place` on a
+    /// dangling-but-aligned pointer is well defined for one.
+    fn allocate(size: usize, align: usize, fill: impl FnOnce(*mut u8)) -> NonNull<u8> {
+        if size == 0 {
+            return NonNull::dangling();
+        }
+        let layout = Layout::from_size_align(size, align).expect("valid resource layout");
+        // SAFETY: `layout` has non-zero size, checked above.
+        let pointer = unsafe { std::alloc::alloc(layout) };
+        let Some(pointer) = NonNull::new(pointer) else {
+            std::alloc::handle_alloc_error(layout);
+        };
+        fill(pointer.as_ptr());
+        pointer
+    }
+
+    /// Runtime type identity of the stored value, or `None` for a foreign one.
+    ///
+    /// A foreign resource is a run of bytes with no Rust type anywhere in the
+    /// process; its identity is the shared name it declared, reached through
+    /// [`ResourceId`] instead.
+    pub fn type_id(&self) -> Option<TypeId> {
         self.type_id
     }
 
@@ -418,10 +506,106 @@ impl ErasedResource {
         self.align
     }
 
+    /// Whether this box holds another language's blittable bytes.
+    pub fn is_foreign(&self) -> bool {
+        self.ops.foreign
+    }
+
+    /// The stored value as raw bytes.
+    ///
+    /// The bytes are what another language reads and writes, and what a
+    /// migration plan moves. They only mean anything to a caller that knows the
+    /// registered layout: a Rust value's bytes are its fields at their offsets,
+    /// and handing them out does not make the value any less the type it is.
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: the box owns a live byte run of this size, and the borrow is
+        // tied to `&self`.
+        unsafe { std::slice::from_raw_parts(self.data.as_ptr(), self.size) }
+    }
+
+    /// The stored value as raw bytes, mutably.
+    ///
+    /// A caller writing here is responsible for writing a value the stored type
+    /// accepts - the same trust the managed mirror path places in its generated
+    /// writers, which write component rows in place.
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above, and `&mut self` makes the borrow exclusive.
+        unsafe { std::slice::from_raw_parts_mut(self.data.as_ptr(), self.size) }
+    }
+
+    /// Rewrite the stored payload into a new shape, following a plan.
+    ///
+    /// Only a foreign payload may change size: a Rust value's size is its type,
+    /// and `World::relayout_foreign_resource` refuses that before it gets here.
+    /// The scratch copy is the discipline a dynamic column uses as well - every
+    /// source byte is read before the destination is zeroed - so a plan that
+    /// moves fields inside the value cannot read what it overwrote.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::DynamicRowInvalid`] when an instruction falls
+    /// outside the old or the new payload. Nothing is modified in that case.
+    pub(crate) fn migrate_bytes(
+        &mut self,
+        size: usize,
+        align: usize,
+        plan: &DynamicFieldPlan,
+    ) -> Result<(), WorldError> {
+        plan.validate(self.size, size)?;
+
+        // Read the old payload out first: a plan is free to move a field onto
+        // bytes the field it came from still occupies.
+        let mut scratch = vec![0_u8; self.size.max(size)];
+        // SAFETY: the box holds `self.size` initialized bytes, and the scratch
+        // buffer is at least that long.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.data.as_ptr(), scratch.as_mut_ptr(), self.size);
+        }
+
+        if size != self.size || align != self.align {
+            if self.size != 0 {
+                let old_layout =
+                    Layout::from_size_align(self.size, self.align).expect("valid resource layout");
+                // SAFETY: this is the live allocation, created with this layout.
+                unsafe { std::alloc::dealloc(self.data.as_ptr(), old_layout) };
+            }
+            // SAFETY: the allocation is `size` bytes at `align`, and the writes
+            // below fill it before anything reads it.
+            self.data = Self::allocate(size, align, |_pointer| {});
+            self.size = size;
+            self.align = align;
+        }
+
+        // SAFETY: the destination holds `size` bytes, the plan was checked
+        // against both sizes, and the scratch buffer holds the old payload.
+        unsafe {
+            std::ptr::write_bytes(self.data.as_ptr(), 0, size);
+            for field in plan.fields() {
+                let FieldSource::OldOffset(offset) = field.source else {
+                    continue;
+                };
+                std::ptr::copy_nonoverlapping(
+                    scratch.as_ptr().add(offset),
+                    self.data.as_ptr().add(field.offset),
+                    field.bytes,
+                );
+            }
+        }
+
+        // The box's own table describes the value it now holds. A foreign box's
+        // table is never refreshed from the factories - that is what keeps a
+        // Rust type sharing the name from handing its drop to these bytes - so
+        // this is the one place it moves.
+        self.ops = ErasedResourceOps::foreign(size, align, self.ops.schema_hash.unwrap_or(0));
+        Ok(())
+    }
+
     /// Replace the per-type function table.
     ///
     /// Lets the owner re-point the stored drop at code that is still mapped,
-    /// after the artifact that supplied it has been reloaded or retired.
+    /// after the artifact that supplied it has been reloaded or retired. A
+    /// foreign box is not refreshed: see [`Self::is_foreign`] and
+    /// `World::rehome_resources`.
     pub fn refresh_ops(&mut self, ops: ErasedResourceOps) {
         self.ops = ops;
     }
@@ -447,7 +631,7 @@ impl ErasedResource {
         if self.shared_identity {
             self.size == std::mem::size_of::<T>() && self.align == std::mem::align_of::<T>()
         } else {
-            self.type_id == TypeId::of::<T>()
+            self.type_id == Some(TypeId::of::<T>())
         }
     }
 
@@ -792,7 +976,7 @@ mod tests {
         let erased = ErasedResource::new(tracked(0).0);
         assert_eq!(erased.size(), std::mem::size_of::<Tracked>());
         assert_eq!(erased.align(), std::mem::align_of::<Tracked>());
-        assert_eq!(erased.type_id(), TypeId::of::<Tracked>());
+        assert_eq!(erased.type_id(), Some(TypeId::of::<Tracked>()));
     }
 
     /// Replacing the function table leaves the stored value alone, which is the

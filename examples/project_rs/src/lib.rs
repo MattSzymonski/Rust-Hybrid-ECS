@@ -279,6 +279,79 @@ fn spline_path_system(
 }
 
 // =============================================================================
+// Spline probe
+// =============================================================================
+
+/// Counts frames so the spline probe reports at a readable interval.
+struct SplineProbeState {
+    frame_count: u64,
+}
+
+impl Resource for SplineProbeState {}
+
+/// How often the probe reports, in frames.
+///
+/// The demo runs uncapped, so a per-frame report would drown the log and a
+/// once-a-second one would make the integration suites' waits depend on the
+/// frame rate of the machine. Sub-second keeps those waits proportional.
+const SPLINE_REPORT_INTERVAL_FRAMES: u64 = 600;
+
+/// Reports how many splines the project can see, and samples the curve.
+///
+/// The count is what reveals whether a separately loaded copy of `pill_spline`
+/// shares the component type: `Spline` is `#[pill(shared)]`, so the module
+/// DLL's copy and the project's are one column, and this line keeps saying
+/// `1 spline(s)` instead of each artifact seeding a curve of its own.
+///
+/// # Errors
+///
+/// Returns [`SystemError::MissingResource`] when the resource is absent, which
+/// means the project module and host disagree about initialization.
+fn spline_probe_system(
+    mut state: ResMut<SplineProbeState>,
+    mut splines: Query<&mut Spline>,
+) -> Result<(), SystemError> {
+    let Some(mut state) = state.get_mut() else {
+        return Err(SystemError::MissingResource {
+            name: String::from("SplineProbeState"),
+        });
+    };
+    state.frame_count += 1;
+    if state.frame_count % SPLINE_REPORT_INTERVAL_FRAMES != 0 {
+        return Ok(());
+    }
+
+    let mut visible_spline_count = 0;
+    for spline in splines.iter_mut() {
+        visible_spline_count += 1;
+        let _ = spline;
+    }
+
+    // The sampled point comes from a reference spline over the spawn geometry,
+    // not from the live curve: the live control points are the ball centres,
+    // which move every frame, and an integration suite cannot wait for a moving
+    // number. The spawn geometry is fixed, so this value depends only on the
+    // linked module's math - which is what the cascade suites watch change.
+    let mut spawn_points = [Vector3f::ZERO; BALL_COUNT];
+    for (index, point) in spawn_points.iter_mut().enumerate() {
+        let ball = ball_spawn_state(index);
+        *point = Vector3f::new(ball.position_x, ball.position_y, 0.0);
+    }
+    let reference = Spline::from_points(&spawn_points);
+    let midpoint = reference.get_location_at(0.5);
+    let color = reference.get_color_a();
+    // Printed rather than logged through `tracing`: the project links its own
+    // copy of `pill_core`, so its tracing dispatcher has no subscriber and log
+    // lines emitted here never reach the host's telemetry.
+    println!(
+        "[project] xxsees {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), colorx {:.2}",
+        midpoint.x, midpoint.y, color
+    );
+
+    Ok(())
+}
+
+// =============================================================================
 // Project module entry points
 // =============================================================================
 
@@ -330,6 +403,10 @@ pub fn init(engine: &mut Engine) -> u32 {
     engine.register_system("simulation_time", update_time_system);
     engine.register_system("ball_physics", physics_system);
     engine.register_system("spline_path", spline_path_system);
+    engine
+        .world_mut()
+        .insert_resource(SplineProbeState { frame_count: 0 });
+    engine.register_system("spline_probe", spline_probe_system);
 
     // The spline entity. `Spline` is registered by the linked `pill_spline`
     // crate, and the host may also be loading a separately built copy of that

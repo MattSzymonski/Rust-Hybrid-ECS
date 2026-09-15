@@ -84,10 +84,11 @@ SAMPLE_OFFSET_PATTERN = re.compile(
     r"^(\s*)const SAMPLE_VERTICAL_OFFSET:\s*f32\s*=\s*([0-9.]+)\s*;?\s*$", re.MULTILINE
 )
 
-# Vertical position the probe reports before any offset is applied: the
-# project-owned spline's Catmull-Rom midpoint at t = 0.5 (the probe formats it
-# to one decimal). The offset adds directly to this value.
-BASE_PROBE_MIDPOINT_Y = 288.75
+# The probe's report line, e.g. "midpoint (390.0, 288.8)". The expectation is
+# derived from the baseline report rather than written down here: the value is
+# the module's math applied to the project's spawn geometry, and pinning it as
+# a literal means re-calibrating this suite every time either side is edited.
+PROBE_MIDPOINT_PATTERN = re.compile(r"midpoint \((-?[0-9.]+), (-?[0-9.]+)\)")
 
 ORIGINAL_CONTENT: str = ""
 
@@ -119,8 +120,8 @@ def restore_original() -> None:
     atomic_write(ORIGINAL_CONTENT)
 
 
-def plan_value_edit(content: str) -> Tuple[str, str, str]:
-    """Returns (old line, replacement line, expected new probe midpoint)."""
+def plan_value_edit(content: str) -> Tuple[str, str, float]:
+    """Returns (old line, replacement line, how much the offset moves)."""
     matches = list(SAMPLE_OFFSET_PATTERN.finditer(content))
     if len(matches) != 1:
         raise RuntimeError(
@@ -131,8 +132,16 @@ def plan_value_edit(content: str) -> Tuple[str, str, str]:
     new_offset = (current_offset + 1.0) % 10.0
     new_offset_text = f"{new_offset:.1f}"
     new_line = f"{match.group(1)}const SAMPLE_VERTICAL_OFFSET: f32 = {new_offset_text};"
-    new_y = BASE_PROBE_MIDPOINT_Y + new_offset
-    return match.group(0), new_line, f"midpoint (400.0, {new_y:.1f})"
+    return match.group(0), new_line, new_offset - current_offset
+
+
+def last_probe_midpoint(output: str) -> Tuple[float, float]:
+    """Returns the (x, y) of the newest probe report in the given output."""
+    matches = PROBE_MIDPOINT_PATTERN.findall(output)
+    if not matches:
+        raise RuntimeError("No spline probe midpoint found in the host output")
+    x_text, y_text = matches[-1]
+    return float(x_text), float(y_text)
 
 
 # =============================================================================
@@ -191,7 +200,11 @@ def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
     process_environment = os.environ.copy()
     process_environment["PROJECT_PATH"] = "../examples/project_rs"
     # `hot_patch` is a default feature now; this suite measures the cascade via
-    # the plain reload transaction, so pin the reload-only posture.
+    # the plain reload transaction, so pin the reload-only posture. `rendering`
+    # is required rather than optional: examples/project_rs links
+    # `pill_master_renderer`, so a host without it resolves `pill_core`
+    # differently from the project and the project DLL fails to load with
+    # "The specified procedure could not be found" (os error 127).
     return launch_process(
         [
             "cargo",
@@ -200,7 +213,7 @@ def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
             "pill_standalone",
             "--no-default-features",
             "--features",
-            "hot_reload",
+            "hot_reload,rendering",
         ],
         MODULES_ROOT,
         process_environment,
@@ -219,7 +232,8 @@ def build_workspace() -> bool:
     try:
         result = subprocess.run(
             # `hot_patch` is a default feature now; pin the reload-only posture
-            # so this suite measures the cascade, not patching.
+            # so this suite measures the cascade, not patching. `rendering`
+            # matches the launch below and what examples/project_rs needs.
             [
                 "cargo",
                 "build",
@@ -227,7 +241,7 @@ def build_workspace() -> bool:
                 "pill_standalone",
                 "--no-default-features",
                 "--features",
-                "hot_reload",
+                "hot_reload,rendering",
             ],
             cwd=str(MODULES_ROOT),
             capture_output=True,
@@ -278,10 +292,17 @@ def run_suite(expected_midpoint: str) -> bool:
             return False
         print("  [OK] Baseline spline probe observed.")
 
+        baseline_x, baseline_y = last_probe_midpoint(monitor.output_since(0))
+
         print("  [TEST] Editing pill_spline/src/lib.rs...")
-        old_line, new_line, _ = plan_value_edit(ORIGINAL_CONTENT)
+        old_line, new_line, offset_delta = plan_value_edit(ORIGINAL_CONTENT)
         atomic_write(ORIGINAL_CONTENT.replace(old_line, new_line, 1))
         print("  [OK] Module source edited.")
+        # The offset moves the sampled point vertically by exactly this much,
+        # so the expected report is the baseline shifted by it. Anything else -
+        # a project running its own stale copy of the module, or a reload that
+        # never reached the project's view - leaves the value where it was.
+        expected_midpoint = f"midpoint ({baseline_x:.1f}, {baseline_y + offset_delta:.1f})"
 
         if not monitor.wait_for(MODULE_RELOAD_TOKEN, MODULE_RELOAD_TIMEOUT):
             print("  [FAIL] Module hot reload was not processed.")

@@ -94,6 +94,167 @@ pub struct DynamicComponentLayout {
     pub schema_hash: u64,
 }
 
+/// Check that a size and alignment can describe dynamic storage.
+///
+/// Shared by registration and relayout so the two can never disagree about what
+/// a usable layout is. The errors name the offending layout rather than the
+/// caller, because both callers hand the same three facts to the same engine.
+pub(crate) fn validate_dynamic_layout(size: usize, align: usize) -> Result<(), WorldError> {
+    if size == 0 {
+        return Err(WorldError::DynamicSizeZero);
+    }
+    if align == 0 || !align.is_power_of_two() {
+        return Err(WorldError::DynamicAlignmentInvalid);
+    }
+    if Layout::from_size_align(size, align).is_err() {
+        return Err(WorldError::DynamicLayoutInvalid);
+    }
+    Ok(())
+}
+
+// =============================================================================
+// DynamicFieldPlan
+// =============================================================================
+
+/// One top-level field of a layout, as a migration plan sees it.
+///
+/// Only the top level, by design: a nested struct field moves as a single
+/// block, so a change inside it cannot silently reinterpret its members. The
+/// fields a plan maps are exactly the names the two layouts agree on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayoutField<'a> {
+    /// Field name. Matching is by name, never by position.
+    pub name: &'a str,
+    /// Byte offset of the field inside a row.
+    pub offset: usize,
+    /// Byte size of the field.
+    pub size: usize,
+}
+
+/// Where one field of a new layout takes its bytes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldSource {
+    /// Copy from this byte offset in the old row.
+    OldOffset(usize),
+    /// Leave the field zeroed. The relayout zeroes every row before it applies
+    /// the plan, so a field with no source is defined rather than stale.
+    ZeroFill,
+}
+
+/// One instruction in a migration plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlannedField {
+    /// Byte offset of the field in the new row.
+    pub offset: usize,
+    /// Number of bytes written at `offset`.
+    pub bytes: usize,
+    /// Where those bytes come from.
+    pub source: FieldSource,
+}
+
+/// A byte-level plan for moving rows from one layout of a component to another.
+///
+/// Data, not code. The caller computes it from the two field lists it already
+/// has - the managed manifest carries field names, offsets and sizes, so the
+/// C# path builds one per changed component - and the engine applies it to every
+/// stored row. Anything the plan does not cover is left zero.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DynamicFieldPlan {
+    /// The instructions, in the order they are applied.
+    fields: Vec<PlannedField>,
+}
+
+impl DynamicFieldPlan {
+    /// An empty plan: every byte of every new row is zero.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { fields: Vec::new() }
+    }
+
+    /// Append one instruction.
+    pub fn push(&mut self, offset: usize, bytes: usize, source: FieldSource) {
+        self.fields.push(PlannedField {
+            offset,
+            bytes,
+            source,
+        });
+    }
+
+    /// Build a plan from the top-level fields of the old and new layout.
+    ///
+    /// Fields are matched **by name**, so a reorder keeps every value with its
+    /// own name. A field only the new layout has becomes a zero fill; a field
+    /// only the old layout had is left out, which is how a removed field's
+    /// bytes leave the rows. A name repeated in one list matches its first
+    /// occurrence and the rest are ignored, which keeps the plan deterministic
+    /// for a malformed input rather than depending on iteration order.
+    ///
+    /// A matched pair whose sizes disagree copies the smaller size and leaves
+    /// the remainder zeroed, so a field that grew keeps its bytes and gains a
+    /// defined tail instead of reading past the old row.
+    #[must_use]
+    pub fn between(old: &[LayoutField<'_>], new: &[LayoutField<'_>]) -> Self {
+        let mut plan = Self::new();
+        for new_field in new {
+            match old
+                .iter()
+                .find(|old_field| old_field.name == new_field.name)
+            {
+                Some(old_field) => plan.push(
+                    new_field.offset,
+                    old_field.size.min(new_field.size),
+                    FieldSource::OldOffset(old_field.offset),
+                ),
+                None => plan.push(new_field.offset, new_field.size, FieldSource::ZeroFill),
+            }
+        }
+        plan
+    }
+
+    /// The instructions, in application order.
+    #[must_use]
+    pub fn fields(&self) -> &[PlannedField] {
+        &self.fields
+    }
+
+    /// Whether the plan carries no instructions.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.fields.is_empty()
+    }
+
+    /// Check every instruction against the two row sizes.
+    ///
+    /// Callers run this before touching a row, so a plan that does not fit is
+    /// refused while the storage is still untouched. The error is
+    /// [`WorldError::DynamicRowInvalid`]: the plan is layout-level data and
+    /// carries no component id for a richer message.
+    pub fn validate(&self, old_size: usize, new_size: usize) -> Result<(), WorldError> {
+        for field in &self.fields {
+            if out_of_bounds(field.offset, field.bytes, new_size) {
+                return Err(WorldError::DynamicRowInvalid);
+            }
+            if let FieldSource::OldOffset(offset) = field.source {
+                if out_of_bounds(offset, field.bytes, old_size) {
+                    return Err(WorldError::DynamicRowInvalid);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Whether `bytes` written at `offset` leaves a row of `size` bytes.
+///
+/// A helper rather than two `checked_add` expressions inline: the same question
+/// is asked of the source and the destination of every instruction.
+fn out_of_bounds(offset: usize, bytes: usize, size: usize) -> bool {
+    match offset.checked_add(bytes) {
+        Some(end) => end > size,
+        None => true,
+    }
+}
+
 // =============================================================================
 // ComponentColumns
 // =============================================================================
@@ -398,6 +559,121 @@ impl DynamicColumn {
                 self.layout.size,
             )
         })
+    }
+
+    /// Rewrite every row into a new layout, following `plan`.
+    ///
+    /// The column keeps its row count and its row order, so indices callers
+    /// hold - every `EntityLocation` that names a row among them - stay valid.
+    /// Anything the plan does not cover is zeroed, which is how a field added to
+    /// a foreign-language component starts at a defined value instead of a byte
+    /// left over from the previous shape.
+    ///
+    /// Rows are transformed through a scratch copy, so a plan that moves fields
+    /// inside a row cannot read a byte it has already overwritten. The buffer is
+    /// rewritten in place when the element size and alignment are unchanged and
+    /// reallocated at the same capacity otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::DynamicSizeZero`],
+    /// [`WorldError::DynamicAlignmentInvalid`] or
+    /// [`WorldError::DynamicLayoutInvalid`] when the new layout cannot describe
+    /// storage, and [`WorldError::DynamicRowInvalid`] when a planned field reads
+    /// or writes past the edge of a row. Nothing is modified in either case.
+    pub fn relayout(
+        &mut self,
+        layout: DynamicComponentLayout,
+        plan: &DynamicFieldPlan,
+    ) -> Result<usize, WorldError> {
+        validate_dynamic_layout(layout.size, layout.align)?;
+        plan.validate(self.layout.size, layout.size)?;
+        Ok(self.relayout_validated(layout, plan))
+    }
+
+    /// [`Self::relayout`] for a caller that has already validated.
+    ///
+    /// Infallible by construction: the only failure modes are the layout and
+    /// plan checks above, and both are deterministic functions of data the
+    /// caller can check once for every column it is about to rewrite. That is
+    /// what lets a world-level relayout refuse a bad plan before it touches the
+    /// first column, instead of leaving some columns migrated and some not.
+    pub(crate) fn relayout_validated(
+        &mut self,
+        layout: DynamicComponentLayout,
+        plan: &DynamicFieldPlan,
+    ) -> usize {
+        let rows = self.len;
+        let old_size = self.layout.size;
+        let old_align = self.layout.align;
+        let old_data = self.data;
+        let in_place = layout.size == old_size && layout.align == old_align;
+
+        // Step 1: Prepare the destination buffer. An unchanged shape keeps the
+        // buffer it has; anything else gets a fresh one at the same capacity,
+        // because a relayout is not a reason to re-grow on the next push.
+        let mut new_data = old_data;
+        if !in_place {
+            new_data = if self.capacity == 0 {
+                NonNull::dangling()
+            } else {
+                let bytes = layout
+                    .size
+                    .checked_mul(self.capacity)
+                    .expect("dynamic column too large");
+                let allocation = Layout::from_size_align(bytes, layout.align)
+                    .expect("dynamic layout validated by the caller");
+                // SAFETY: the allocation has non-zero size, checked above.
+                let pointer = unsafe { alloc(allocation) };
+                NonNull::new(pointer).unwrap_or_else(|| handle_alloc_error(allocation))
+            };
+        }
+
+        // Step 2: Transform one row at a time. The scratch copy is what makes
+        // this correct in place as well as across buffers: every source byte is
+        // read before the destination row is zeroed.
+        if rows != 0 {
+            let mut scratch = vec![0_u8; old_size.max(layout.size)];
+            for row in 0..rows {
+                // SAFETY: `row < rows` counts only initialized rows, and both
+                // buffers are allocated for at least `rows` rows.
+                unsafe {
+                    let source = old_data.as_ptr().add(row * old_size);
+                    std::ptr::copy_nonoverlapping(source, scratch.as_mut_ptr(), old_size);
+                    let destination = new_data.as_ptr().add(row * layout.size);
+                    std::ptr::write_bytes(destination, 0, layout.size);
+                    for field in plan.fields() {
+                        let FieldSource::OldOffset(offset) = field.source else {
+                            continue;
+                        };
+                        std::ptr::copy_nonoverlapping(
+                            scratch.as_ptr().add(offset),
+                            destination.add(field.offset),
+                            field.bytes,
+                        );
+                    }
+                }
+            }
+        }
+
+        // Step 3: Release the buffer that is no longer the column's, and adopt
+        // the new shape. `capacity != 0` is the same "is there an allocation"
+        // test `Drop` uses, so a column that never allocated never reaches
+        // `dealloc`.
+        if !in_place {
+            if self.capacity != 0 {
+                // SAFETY: this is the live allocation, created with this layout.
+                unsafe {
+                    dealloc(
+                        old_data.as_ptr(),
+                        Layout::from_size_align_unchecked(old_size * self.capacity, old_align),
+                    );
+                }
+            }
+            self.data = new_data;
+        }
+        self.layout = layout;
+        rows
     }
 
     /// Removes the row at `index` by swapping in the last row.
@@ -738,5 +1014,348 @@ impl Archetype {
         total += self.component_types.len() * 64;
 
         total
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One row of a two-field layout: `a` at 0, `b` at 4.
+    fn two_fields() -> DynamicComponentLayout {
+        DynamicComponentLayout {
+            size: 8,
+            align: 4,
+            schema_hash: 1,
+        }
+    }
+
+    fn column_with_rows(rows: &[[u8; 8]]) -> DynamicColumn {
+        let mut column = DynamicColumn::new(two_fields());
+        for row in rows {
+            column.push_bytes(row).expect("row matches the layout");
+        }
+        column
+    }
+
+    #[test]
+    fn plan_between_matches_fields_by_name_not_by_position() {
+        let old = [
+            LayoutField {
+                name: "a",
+                offset: 0,
+                size: 4,
+            },
+            LayoutField {
+                name: "b",
+                offset: 4,
+                size: 4,
+            },
+        ];
+        // The same two fields, swapped in the new layout.
+        let new = [
+            LayoutField {
+                name: "b",
+                offset: 0,
+                size: 4,
+            },
+            LayoutField {
+                name: "a",
+                offset: 4,
+                size: 4,
+            },
+        ];
+
+        let plan = DynamicFieldPlan::between(&old, &new);
+
+        assert_eq!(
+            plan.fields(),
+            &[
+                PlannedField {
+                    offset: 0,
+                    bytes: 4,
+                    source: FieldSource::OldOffset(4),
+                },
+                PlannedField {
+                    offset: 4,
+                    bytes: 4,
+                    source: FieldSource::OldOffset(0),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_between_zeroes_the_new_fields_and_omits_the_removed_ones() {
+        let old = [
+            LayoutField {
+                name: "kept",
+                offset: 0,
+                size: 4,
+            },
+            LayoutField {
+                name: "removed",
+                offset: 4,
+                size: 4,
+            },
+        ];
+        let new = [
+            LayoutField {
+                name: "kept",
+                offset: 0,
+                size: 4,
+            },
+            LayoutField {
+                name: "added",
+                offset: 4,
+                size: 8,
+            },
+        ];
+
+        let plan = DynamicFieldPlan::between(&old, &new);
+
+        // The removed field leaves no instruction at all, and the added one is
+        // an explicit zero fill rather than a missing entry.
+        assert_eq!(
+            plan.fields(),
+            &[
+                PlannedField {
+                    offset: 0,
+                    bytes: 4,
+                    source: FieldSource::OldOffset(0),
+                },
+                PlannedField {
+                    offset: 4,
+                    bytes: 8,
+                    source: FieldSource::ZeroFill,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_between_copies_the_smaller_of_two_sizes() {
+        let old = [LayoutField {
+            name: "grew",
+            offset: 0,
+            size: 4,
+        }];
+        let new = [LayoutField {
+            name: "grew",
+            offset: 0,
+            size: 8,
+        }];
+        assert_eq!(
+            DynamicFieldPlan::between(&old, &new).fields()[0].bytes,
+            4,
+            "the tail of a grown field has to come from the zero fill, not the old row"
+        );
+
+        let old = [LayoutField {
+            name: "shrank",
+            offset: 0,
+            size: 8,
+        }];
+        let new = [LayoutField {
+            name: "shrank",
+            offset: 0,
+            size: 4,
+        }];
+        assert_eq!(DynamicFieldPlan::between(&old, &new).fields()[0].bytes, 4);
+    }
+
+    #[test]
+    fn relayout_moves_rows_through_the_plan() {
+        // Two rows, `a` and `b` each holding a distinct u32.
+        let mut column = column_with_rows(&[[1, 0, 0, 0, 2, 0, 0, 0], [3, 0, 0, 0, 4, 0, 0, 0]]);
+        let old = [
+            LayoutField {
+                name: "a",
+                offset: 0,
+                size: 4,
+            },
+            LayoutField {
+                name: "b",
+                offset: 4,
+                size: 4,
+            },
+        ];
+        // `b` first, then `a`, then a new eight-byte field.
+        let new = [
+            LayoutField {
+                name: "b",
+                offset: 0,
+                size: 4,
+            },
+            LayoutField {
+                name: "a",
+                offset: 4,
+                size: 4,
+            },
+            LayoutField {
+                name: "added",
+                offset: 8,
+                size: 8,
+            },
+        ];
+        let plan = DynamicFieldPlan::between(&old, &new);
+
+        let rows = column
+            .relayout(
+                DynamicComponentLayout {
+                    size: 16,
+                    align: 8,
+                    schema_hash: 2,
+                },
+                &plan,
+            )
+            .expect("the plan fits both layouts");
+
+        assert_eq!(rows, 2);
+        assert_eq!(
+            column.bytes(0).unwrap(),
+            [2, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0].as_slice()
+        );
+        assert_eq!(
+            column.bytes(1).unwrap(),
+            [4, 0, 0, 0, 3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0].as_slice()
+        );
+        assert_eq!(column.element_size(), 16);
+        assert_eq!(column.schema_hash(), 2);
+    }
+
+    #[test]
+    fn relayout_of_an_equal_shape_rewrites_rows_in_place() {
+        let mut column = column_with_rows(&[[1, 0, 0, 0, 2, 0, 0, 0]]);
+        let before = column.as_mut_ptr();
+        let plan = DynamicFieldPlan::between(
+            &[
+                LayoutField {
+                    name: "a",
+                    offset: 0,
+                    size: 4,
+                },
+                LayoutField {
+                    name: "b",
+                    offset: 4,
+                    size: 4,
+                },
+            ],
+            &[
+                LayoutField {
+                    name: "b",
+                    offset: 0,
+                    size: 4,
+                },
+                LayoutField {
+                    name: "a",
+                    offset: 4,
+                    size: 4,
+                },
+            ],
+        );
+
+        column
+            .relayout(
+                DynamicComponentLayout {
+                    size: 8,
+                    align: 4,
+                    schema_hash: 3,
+                },
+                &plan,
+            )
+            .expect("an equal-shape relayout of a fitting plan");
+
+        assert_eq!(
+            column.as_mut_ptr(),
+            before,
+            "an unchanged shape must not reallocate: pointers into it may be live"
+        );
+        // The scratch copy is what makes this correct: `b` overwrites `a`'s
+        // bytes before `a` has been read out of the same buffer.
+        assert_eq!(
+            column.bytes(0).unwrap(),
+            [2, 0, 0, 0, 1, 0, 0, 0].as_slice()
+        );
+    }
+
+    #[test]
+    fn relayout_keeps_the_row_count_and_capacity() {
+        let mut column = column_with_rows(&[[1, 0, 0, 0, 2, 0, 0, 0], [3, 0, 0, 0, 4, 0, 0, 0]]);
+        let plan = DynamicFieldPlan::new();
+
+        column
+            .relayout(
+                DynamicComponentLayout {
+                    size: 4,
+                    align: 4,
+                    schema_hash: 4,
+                },
+                &plan,
+            )
+            .expect("an empty plan always fits");
+
+        assert_eq!(column.len(), 2);
+        assert_eq!(column.bytes(0).unwrap(), [0, 0, 0, 0].as_slice());
+        assert_eq!(column.bytes(1).unwrap(), [0, 0, 0, 0].as_slice());
+        // Capacity was kept, so the next push still has its spare slot.
+        column
+            .push_bytes(&[9, 0, 0, 0])
+            .expect("fits the kept capacity");
+        assert_eq!(column.len(), 3);
+    }
+
+    #[test]
+    fn relayout_refuses_a_plan_that_leaves_a_row() {
+        let mut column = column_with_rows(&[[1, 0, 0, 0, 2, 0, 0, 0]]);
+        let mut plan = DynamicFieldPlan::new();
+        plan.push(4, 8, FieldSource::OldOffset(0));
+
+        let result = column.relayout(
+            DynamicComponentLayout {
+                size: 8,
+                align: 4,
+                schema_hash: 1,
+            },
+            &plan,
+        );
+
+        assert!(matches!(result, Err(WorldError::DynamicRowInvalid)));
+        assert_eq!(
+            column.bytes(0).unwrap(),
+            [1, 0, 0, 0, 2, 0, 0, 0].as_slice(),
+            "a refused plan must not touch the rows"
+        );
+    }
+
+    #[test]
+    fn relayout_refuses_a_layout_that_cannot_be_allocated() {
+        let mut column = column_with_rows(&[]);
+        assert!(matches!(
+            column.relayout(
+                DynamicComponentLayout {
+                    size: 0,
+                    align: 4,
+                    schema_hash: 1
+                },
+                &DynamicFieldPlan::new()
+            ),
+            Err(WorldError::DynamicSizeZero)
+        ));
+        assert!(matches!(
+            column.relayout(
+                DynamicComponentLayout {
+                    size: 4,
+                    align: 3,
+                    schema_hash: 1
+                },
+                &DynamicFieldPlan::new()
+            ),
+            Err(WorldError::DynamicAlignmentInvalid)
+        ));
     }
 }

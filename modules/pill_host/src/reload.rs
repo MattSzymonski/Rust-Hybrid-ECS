@@ -216,9 +216,21 @@ impl ReloadTransaction<'_> {
         // schema, and the retiring serializer would misread it while a
         // same-layout column is rebuilt.
         let pre_swap_entities = engine.world().capture_live_entities();
+        // Step 5: announce the retiring generation's persistable names. A
+        // rebuilt image has a fresh `TypeId` for every type name it declares,
+        // which at the registration site looks exactly like another binary
+        // claiming the same name - and the world's collision guard refuses that
+        // shape. Only the host knows these names belonged to the generation it
+        // is replacing, so a reload that does not say so fails its own init and
+        // rolls back.
+        let retiring_type_names = self.registered_type_names.clone();
+        engine
+            .world_mut()
+            .supersede_persist_registrations(&retiring_type_names);
         self.begin_registration(engine);
         let status = new_library.call_init(engine_api);
         self.end_registration(engine);
+        engine.world_mut().clear_superseded_persist_registrations();
         analytics::record_init(self.subject, init_started.elapsed().as_secs_f64() * 1000.0);
         if status != 0 {
             // The replacement failed to register. Roll back to the previous
@@ -250,9 +262,16 @@ impl ReloadTransaction<'_> {
 
             let rollback_sequence = engine.world().component_registration_sequence();
             let rollback_resource_sequence = engine.world().resource_registration_sequence();
+            // Announced again: the failed generation consumed the marks for the
+            // names it got as far as re-registering, and the rollback init
+            // re-registers all of them.
+            engine
+                .world_mut()
+                .supersede_persist_registrations(&retiring_type_names);
             self.begin_registration(engine);
             let rollback_status = self.current.call_init(engine_api);
             self.end_registration(engine);
+            engine.world_mut().clear_superseded_persist_registrations();
             if rollback_status != 0 {
                 error!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,

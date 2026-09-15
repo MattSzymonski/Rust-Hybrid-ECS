@@ -22,7 +22,7 @@ DESCRIPTION
               (sees 1 spline, first P0.X=0, count=4);
             * C# -> Rust: C# creates its own spline through Commands and
               sees it in the SAME native column (sees 2 splines).
-      2. csharp_hot_reload      - editing Systems.cs (a behavior-only change)
+      2. csharp_hot_reload      - editing the probe file (a behavior-only change)
           is picked up by the watcher: dotnet rebuilds, the collectible
           assembly is reloaded (`[csharp_runtime] reloaded project_cs.dll`,
           `C# hot reload complete`), and the new assembly's probe runs with
@@ -33,8 +33,9 @@ DESCRIPTION
           before the project build (missing-file regeneration), and the
           bridge still works.
 
-    Every file the suite touches (project_settings.yaml, Systems.cs, the generated
-    mirror files) is backed up at startup and restored afterwards, so a
+    Every file the suite touches (project_settings.yaml, Components.cs, the
+    generated mirror files) is backed up at startup and restored afterwards, and
+    the probe file it writes (src/BridgeProbe.cs) is removed at the end, so a
     developer workspace is left exactly as it was.
 
 USAGE
@@ -81,6 +82,10 @@ DUMMY_GENERATED_FILE = (
     MODULES_ROOT / "optional" / "pill_dummy_color" / "generated"
     / "pill_dummy_color_Components.g.cs"
 )
+# The suite's own probe file. Written before the host starts and removed in the
+# suite's cleanup, so the example project carries no test-only code and this
+# suite does not depend on demo text a project edit can silently change.
+PROJECT_CS_PROBE_CS = WORKSPACE_ROOT / "examples" / "project_cs" / "src" / "BridgeProbe.cs"
 
 # The C# project plus a component-less dummy module: the dummy exercises the
 # empty-exposure codegen path (no mirror file must be written) inside the same
@@ -92,6 +97,99 @@ modules:
   - "pill_spline"
   - "pill_dummy_color"
 """
+
+# The C# half of the bridge assertions.
+#
+# `Run` is the classic two-direction probe: it counts the splines C# can see in
+# the module's native column (the module seeds one on load) and creates one of
+# its own through Commands on the first frame of every assembly load. Seeding
+# per assembly load is deliberate - statics start empty again after a swap, so
+# each accepted reload adds exactly one spline on top of the survivors, which is
+# what makes the probe counts move across reloads instead of standing still.
+# The first report of a load therefore shows the module's spline alone
+# (`P0.X=0, count=4`), because the entity this system creates is deferred to the
+# end of the frame.
+#
+# `omo` drives the mirrored Rust method path: the OmoMO value is built in C#,
+# the calls below resolve the module's exported trampolines, and the printed
+# values (46 / 1212 / 1234) only exist if they really ran in Rust.
+#
+# `BridgeProbeStartup` exists so the startup-contract refusal has something real
+# to change: startup method sets are fixed for the life of a host.
+BRIDGE_PROBE_SOURCE = '''\
+// Written by devops/tests/test_csharp_bridge.py while the suite runs; deleted
+// afterwards. Not part of the project.
+using System;
+using System.Diagnostics;
+
+namespace TracyLive;
+
+/// <summary>Startup renamed by the suite to prove startup changes are refused.</summary>
+public static class BridgeProbeStartup
+{
+    [EcsStartup]
+    public static void Start(Commands commands)
+    {
+        _ = commands;
+    }
+}
+
+/// <summary>Reads the module's spline column and writes one of its own.</summary>
+public static class ModuleSplineBridgeDemo
+{
+    private static bool _seeded;
+    private static long _lastReport;
+
+    [EcsSystem]
+    public static void Run(Query<Read<global::pill_spline.Spline>> query, Commands commands)
+    {
+        if (!_seeded)
+        {
+            _seeded = true;
+            var spline = new global::pill_spline.Spline();
+            spline.ControlPoints0 = new global::pill_spline.Vector3f { X = 10.0f, Y = 20.0f };
+            spline.ControlPoints1 = new global::pill_spline.Vector3f { X = 50.0f, Y = 80.0f };
+            spline.ControlPoints2 = new global::pill_spline.Vector3f { X = 90.0f, Y = 30.0f };
+            spline.ControlPoints3 = new global::pill_spline.Vector3f { X = 130.0f, Y = 60.0f };
+            spline.ControlPointCount = 4;
+            spline.Elo = 30.0f;
+            commands.CreateEntity().With(spline).Build();
+            Console.WriteLine("[project_cs] cs spline bridge: seeded one spline via Commands");
+        }
+
+        long now = Stopwatch.GetTimestamp();
+        if (Stopwatch.GetElapsedTime(_lastReport, now).TotalMilliseconds < 2000)
+            return;
+        _lastReport = now;
+
+        int visibleSplines = 0;
+        float firstPointX = float.NaN;
+        uint firstPointCount = 0;
+        foreach (var row in query.Rows())
+        {
+            var mirror = row.Spline;
+            if (visibleSplines == 0)
+            {
+                firstPointX = mirror.ControlPoints0.X;
+                firstPointCount = mirror.ControlPointCount;
+            }
+            visibleSplines++;
+        }
+
+        var omo = new global::pill_spline.OmoMO();
+        omo.X = 12;
+        omo.Y = 34;
+        ulong omoSum = omo.GetSum();
+        ulong omoA = omo.GetA();
+        ulong omoB = omo.GetB();
+
+        Console.WriteLine(
+            $"[project_cs] cs spline bridge: sees {visibleSplines} spline(s), " +
+            $"first P0.X={firstPointX}, count={firstPointCount}, " +
+            $"omo=({omo.X},{omo.Y}) sum={omoSum} a={omoA} b={omoB}");
+    }
+}
+'''
 
 # --- C# / bridge specific output tokens ---------------------------------------
 
@@ -109,7 +207,8 @@ CSHARP_LOAD_FAILED_TOKEN = "[csharp_runtime] reload failed:"
 CSHARP_REJECT_SIGNATURE_REASON = "C# system names or query signatures changed"
 CSHARP_REJECT_COMPONENT_REASON = "C# component identities or layouts changed"
 CSHARP_REJECT_STARTUP_REASON = "C# startup methods changed"
-# The bridge probe emitted by ModuleSplineBridgeDemo in project_cs.
+# The bridge probe emitted by the suite's BridgeProbe.cs fixture (its
+# `ModuleSplineBridgeDemo`).
 BRIDGE_PROBE_PREFIX = "cs spline bridge: sees"
 BRIDGE_PROBE_V2_PREFIX = "cs spline bridge v2: sees"
 # dotnet build's summary line; a clean managed build reports exactly these.
@@ -120,13 +219,14 @@ WARNING_CS_TOKEN = "warning CS"
 # and the host queued a C# project reload (live mirror regeneration).
 CSHARP_MIRROR_REGEN_TOKEN = "module reload changed the C# mirror surface; queuing a C# project reload"
 
-# Expected probe values for the canonical OmoMO demo (X=12, Y=34):
-#   GetSum()  = x + y      = 46
+# Expected probe values for the canonical OmoMO demo (X=12, Y=34). The module's
+# own arithmetic, not the suite's:
+#   GetSum()  = x + y + 1  = 47
 #   GetA()    = x + 1200   = 1212
 #   GetB()    = y + 1200   = 1234
-#   GetC()    = y + 9000   = 9034 (added live by the regeneration scenario)
-OMO_PROBE_SUM_A_B = "omo=(12,34) sum=46 a=1212 b=1234"
-OMO_PROBE_WITH_C = "omo=(12,34) sum=46 a=1212 b=1234 c=9034"
+#   GetE()    = x + 9000   = 9012 (added live by the regeneration scenario)
+OMO_PROBE_SUM_A_B = "omo=(12,34) sum=47 a=1212 b=1234"
+OMO_PROBE_WITH_E = "omo=(12,34) sum=47 a=1212 b=1234 e=9012"
 
 # =============================================================================
 # Scenario model (same shape as the native hot-reload suite)
@@ -310,7 +410,8 @@ def verify_startup(
 
     # The module mirror must be regenerated from the module's real layout:
     # typed structs with exact sizes and field offsets for PillMirror-able
-    # types, and an opaque ABI-blob fallback for foreign types (Vector3f).
+    # types (`Vector3f` declares its fields, so it lands as X/Y/Z at fixed
+    # offsets rather than as an opaque blob).
     # Mirrored `#[pill_mirror_method]` Rust methods appear as typed C# instance
     # methods that resolve the module's trampoline through MirrorMethods.
     if not verify_generated_mirror(
@@ -323,7 +424,10 @@ def verify_startup(
             "[FieldOffset(196)] public float Elo;",
             "[StructLayout(LayoutKind.Explicit, Size = 16)]\npublic struct OmoMO",
             "[FieldOffset(0)] public ulong X;",
-            "[StructLayout(LayoutKind.Sequential, Size = 12)]\npublic struct Vector3f",
+            "[StructLayout(LayoutKind.Explicit, Size = 12)]\npublic struct Vector3f",
+            "[FieldOffset(0)] public float X;",
+            "[FieldOffset(4)] public float Y;",
+            "[FieldOffset(8)] public float Z;",
             "public ulong GetSum()",
             "public delegate ulong OmoMOGetSumDelegate(IntPtr self);",
             "global::TracyLive.MirrorMethods.Resolve<OmoMOGetSumDelegate>(\"pill_spline::OmoMO\", \"get_sum\")",
@@ -365,7 +469,7 @@ def verify_startup(
     # engine's field-layout table (what makes C# components inspectable in the
     # editor). The host logs every dynamic layout registration deterministically
     # as `name@offset:size:type_tag` entries, so assert the well-known fields of
-    # `TracyLive.PhysicsState` (six floats, then a byte) and `TracyLive.BallTag`.
+    # `TracyLive.PhysicsState` (six floats, then a byte) and `TracyLive.SplineSample`.
     if "managed component field layout registered" not in startup_output:
         print("  [FAIL] No dynamic component field layout was registered at startup.")
         print(f"  Output tail:\n{startup_output[-1600:]}")
@@ -374,8 +478,8 @@ def verify_startup(
         print("  [FAIL] TracyLive.PhysicsState layout is missing its trailing byte field.")
         print(f"  Output tail:\n{startup_output[-1600:]}")
         return False
-    if "Kind@0:4:u32" not in startup_output:
-        print("  [FAIL] TracyLive.BallTag layout is missing its uint field.")
+    if "T@0:4:f32" not in startup_output:
+        print("  [FAIL] TracyLive.SplineSample layout is missing its float field.")
         print(f"  Output tail:\n{startup_output[-1600:]}")
         return False
     print("  [OK] Managed component field layouts match the manifest.")
@@ -396,9 +500,11 @@ def verify_startup(
         return False
     print("  [OK] Rust -> C#: C# reads the module-seeded spline with the right layout.")
     #   C# -> Rust: C# created its own spline via Commands and sees it in the
-    #   same native column (2 total).
+    #   same native column (2 total). Only the count is asserted here: the
+    #   project's own path system rewrites the live curve every frame, so the
+    #   first control point and the point count move from the second report on.
     if not monitor.wait_for(
-        f"{BRIDGE_PROBE_PREFIX} 2 spline(s), first P0.X=0, count=4",
+        f"{BRIDGE_PROBE_PREFIX} 2 spline(s)",
         PROBE_TIMEOUT,
         0,
     ):
@@ -436,17 +542,19 @@ BRIDGE_PROBE_PREFIX_EDIT = (
 # nothing about the loader.
 
 # Adds a field to a project-owned component, changing its layout and therefore
-# the manifest the native component registry was built from.
+# the manifest the native component registry was built from. `SplineSample` is
+# the smallest component the project itself declares.
 COMPONENT_LAYOUT_EDIT = (
-    "public struct BallTag\n{\n    public uint Kind;\n}",
-    "public struct BallTag\n{\n    public uint Kind;\n    public uint Extra;\n}",
+    "    /// <summary>Curve parameter this dot samples, running from 0.0 to 1.0.</summary>\n    public float T;\n}",
+    "    /// <summary>Curve parameter this dot samples, running from 0.0 to 1.0.</summary>\n    public float T;\n\n    /// <summary>Added by the suite; changes the component's layout.</summary>\n    public float Extra;\n}",
 )
 
-# Renames an [EcsSystem] method. Rust builds its execution graph once at startup
-# from these names, so the set has to stay stable until a restart.
+# Renames an [EcsSystem] method of the probe file. Rust builds its execution
+# graph once at startup from these names, so the set has to stay stable until a
+# restart.
 SYSTEM_NAME_EDIT = (
-    "public static void Observe(Query<Read<BallTag>> query)",
-    "public static void ObserveRenamed(Query<Read<BallTag>> query)",
+    "public static void Run(Query<Read<global::pill_spline.Spline>> query, Commands commands)",
+    "public static void Renamed(Query<Read<global::pill_spline.Spline>> query, Commands commands)",
 )
 
 # Renames an [EcsStartup] method. Startups are not re-run on reload, so a change
@@ -509,7 +617,7 @@ SESSION_SCENARIOS = [
         name="csharp_hot_reload",
         phases=[
             ScenarioPhase(
-                edits=[(PROJECT_CS_SYSTEMS_CS, [BRIDGE_PROBE_PREFIX_EDIT])],
+                edits=[(PROJECT_CS_PROBE_CS, [BRIDGE_PROBE_PREFIX_EDIT])],
                 wait_token=CSHARP_RELOADED_TOKEN,
                 required_tokens=[
                     CSHARP_RELOADED_TOKEN,
@@ -528,7 +636,7 @@ SESSION_SCENARIOS = [
                 ],
             )
         ],
-        restore_after=[PROJECT_CS_SYSTEMS_CS],
+        restore_after=[PROJECT_CS_PROBE_CS],
     ),
     # Reloading repeatedly in one session. Each phase is a distinct edit to the
     # same line, so every swap is real work rather than a no-op rebuild.
@@ -543,28 +651,28 @@ SESSION_SCENARIOS = [
         name="csharp_repeated_reload_stability",
         phases=[
             ScenarioPhase(
-                edits=[(PROJECT_CS_SYSTEMS_CS, [BRIDGE_PROBE_PREFIX_EDIT])],
+                edits=[(PROJECT_CS_PROBE_CS, [BRIDGE_PROBE_PREFIX_EDIT])],
                 wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
                 forbidden_tokens=[CSHARP_RELOAD_REJECTED_TOKEN, PANIC_TOKEN,
                                   ACCESS_VIOLATION_TOKEN],
                 alive_tokens=[(BRIDGE_PROBE_V2_PREFIX, PROBE_TIMEOUT)],
             ),
             ScenarioPhase(
-                edits=[(PROJECT_CS_SYSTEMS_CS, [BRIDGE_PROBE_V2_TO_V3_EDIT])],
+                edits=[(PROJECT_CS_PROBE_CS, [BRIDGE_PROBE_V2_TO_V3_EDIT])],
                 wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
                 forbidden_tokens=[CSHARP_RELOAD_REJECTED_TOKEN, PANIC_TOKEN,
                                   ACCESS_VIOLATION_TOKEN],
                 alive_tokens=[(BRIDGE_PROBE_V3_PREFIX, PROBE_TIMEOUT)],
             ),
             ScenarioPhase(
-                edits=[(PROJECT_CS_SYSTEMS_CS, [BRIDGE_PROBE_V3_TO_V4_EDIT])],
+                edits=[(PROJECT_CS_PROBE_CS, [BRIDGE_PROBE_V3_TO_V4_EDIT])],
                 wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
                 forbidden_tokens=[CSHARP_RELOAD_REJECTED_TOKEN, PANIC_TOKEN,
                                   ACCESS_VIOLATION_TOKEN],
                 alive_tokens=[(BRIDGE_PROBE_V4_PREFIX, PROBE_TIMEOUT)],
             ),
         ],
-        restore_after=[PROJECT_CS_SYSTEMS_CS],
+        restore_after=[PROJECT_CS_PROBE_CS],
     ),
     # The three refusals. C# hot reload is behavior-only by design, and these
     # pin what "behavior-only" actually means at the boundary - previously the
@@ -579,14 +687,14 @@ SESSION_SCENARIOS = [
     ),
     rejection_scenario(
         "csharp_rejects_system_signature_change",
-        PROJECT_CS_SYSTEMS_CS,
+        PROJECT_CS_PROBE_CS,
         SYSTEM_NAME_EDIT,
         CSHARP_REJECT_SIGNATURE_REASON,
         BRIDGE_PROBE_PREFIX,
     ),
     rejection_scenario(
         "csharp_rejects_startup_change",
-        PROJECT_CS_SYSTEMS_CS,
+        PROJECT_CS_PROBE_CS,
         STARTUP_NAME_EDIT,
         CSHARP_REJECT_STARTUP_REASON,
         BRIDGE_PROBE_PREFIX,
@@ -594,9 +702,9 @@ SESSION_SCENARIOS = [
     # Adding a mirrored method to a module WHILE the host runs must reach C#
     # without a restart: the module reload regenerates the mirror file, queues
     # a C# project rebuild, and the swapped assembly resolves the new
-    # trampoline. Phase 1 adds get_c to pill_spline and waits for the cascade;
-    # Phase 2 calls GetC() from Systems.cs and waits for its value to print -
-    # which only compiles because Phase 1's mirror regeneration put GetC() in
+    # trampoline. Phase 1 adds get_e to pill_spline and waits for the cascade;
+    # Phase 2 calls GetE() from the probe file and waits for its value to print -
+    # which only compiles because Phase 1's mirror regeneration put GetE() in
     # the file the C# build compiles.
     Scenario(
         name="csharp_mirror_live_regeneration",
@@ -607,19 +715,19 @@ SESSION_SCENARIOS = [
                     [
                         (
                             """    #[pill_mirror_method]
-    pub fn get_b(&self) -> u64 {
-        self.y + 1200
+    pub fn get_d(&self, alpha: i32, beta: i32) -> i32 {
+        alpha + beta
     }
 }""",
                             """    #[pill_mirror_method]
-    pub fn get_b(&self) -> u64 {
-        self.y + 1200
+    pub fn get_d(&self, alpha: i32, beta: i32) -> i32 {
+        alpha + beta
     }
 
     /// Live-added while the host ran; the mirror must regenerate without a restart.
     #[pill_mirror_method]
-    pub fn get_c(&self) -> u64 {
-        self.y + 9000
+    pub fn get_e(&self) -> u64 {
+        self.x + 9000
     }
 }""",
                         )
@@ -635,30 +743,30 @@ SESSION_SCENARIOS = [
             ),
             ScenarioPhase(
                 edits=[(
-                    PROJECT_CS_SYSTEMS_CS,
+                    PROJECT_CS_PROBE_CS,
                     [
                         (
                             "ulong omoB = omo.GetB();",
-                            "ulong omoB = omo.GetB();\n        ulong omoC = omo.GetC();",
+                            "ulong omoB = omo.GetB();\n        ulong omoE = omo.GetE();",
                         ),
                         (
                             'b={omoB}");',
-                            'b={omoB} c={omoC}");',
+                            'b={omoB} e={omoE}");',
                         ),
                     ],
                 )],
-                wait_token=OMO_PROBE_WITH_C,
+                wait_token=OMO_PROBE_WITH_E,
                 required_tokens=[
-                    OMO_PROBE_WITH_C,
+                    OMO_PROBE_WITH_E,
                     CSHARP_RELOADED_TOKEN,
                 ],
                 forbidden_tokens=[CSHARP_RELOAD_REJECTED_TOKEN, PANIC_TOKEN,
                                   ACCESS_VIOLATION_TOKEN],
             ),
         ],
-        # Restore Systems.cs first so no build references GetC after the module
+        # Restore the probe first so no build references GetE after the module
         # reverts (a transient reference would fail the intermediate build).
-        restore_after=[PROJECT_CS_SYSTEMS_CS, SPLINE_LIB_RS],
+        restore_after=[PROJECT_CS_PROBE_CS, SPLINE_LIB_RS],
     ),
 ]
 
@@ -674,6 +782,13 @@ def build_host() -> bool:
         # `hot_patch` is a default feature now; this suite exercises the C#
         # assembly-swap reload, so pin the reload-only posture to keep the
         # Rust patch fast path out of the host it drives.
+        #
+        # `rendering` is on because `project_cs` queries the renderer's own
+        # components: the managed manifest marks every type the runtime
+        # assembly declares as shared, and a shared component with no native
+        # binding is refused at startup. A headless host has no binding for
+        # `TracyLive.Sprite` and dies there, which is what this suite used to
+        # do before the feature was pinned.
         result = subprocess.run(
             [
                 "cargo",
@@ -682,7 +797,7 @@ def build_host() -> bool:
                 "pill_standalone",
                 "--no-default-features",
                 "--features",
-                "hot_reload",
+                "hot_reload,rendering",
                 "--offline",
             ],
             cwd=str(MODULES_ROOT),
@@ -701,6 +816,12 @@ def build_host() -> bool:
     return True
 
 
+def write_bridge_probe() -> None:
+    """Writes the suite's probe file into the managed project."""
+    atomic_write(PROJECT_CS_PROBE_CS, BRIDGE_PROBE_SOURCE)
+    print(f"  [PREP] Wrote {PROJECT_CS_PROBE_CS.relative_to(WORKSPACE_ROOT)}.")
+
+
 def launch_host():
     """Launches the standalone host exe with PROJECT_PATH pinned to the C# project."""
     environment = os.environ.copy()
@@ -712,6 +833,7 @@ def run_csharp_session() -> bool:
     """Writes the C# project's settings, launches the host, and runs the scenarios."""
     print("\n  [TEST] Launching standalone host with project_cs...")
     write_project_settings(CSHARP_PROJECT_ROOT, CSHARP_SETTINGS)
+    write_bridge_probe()
     process, monitor = launch_host()
     session_passed = True
 
@@ -840,10 +962,12 @@ def main() -> None:
     BUILD_TIMEOUT = int(BUILD_TIMEOUT * scale)
 
     # Capture originals for every file the suite may touch, including the
-    # committed bootstrap mirror that the codegen-rebuild check deletes.
+    # committed bootstrap mirror that the codegen-rebuild check deletes. The
+    # probe file is not captured here: it does not exist yet, and the scenarios
+    # that edit it capture it themselves.
     for path in (
         project_settings_yaml(CSHARP_PROJECT_ROOT),
-        PROJECT_CS_SYSTEMS_CS,
+        PROJECT_CS_COMPONENTS_CS,
         SPLINE_GENERATED_FILE,
         DUMMY_GENERATED_FILE,
     ):
@@ -868,6 +992,14 @@ def main() -> None:
         csharp_settings_path = project_settings_yaml(CSHARP_PROJECT_ROOT)
         if csharp_settings_path in BACKUP._originals:
             BACKUP.restore_one(csharp_settings_path)
+        # The probe file belongs to the suite, so it is removed rather than
+        # restored: `restore_all` put its captured content back a moment ago.
+        if PROJECT_CS_PROBE_CS.exists():
+            PROJECT_CS_PROBE_CS.unlink()
+            print(
+                "  [CLEANUP] removed "
+                f"{PROJECT_CS_PROBE_CS.relative_to(WORKSPACE_ROOT)}"
+            )
 
     print(f"\n{'=' * 64}")
     print("  SUMMARY")

@@ -227,7 +227,7 @@ mod loaded {
                                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                                 "C# build complete; polling managed loader"
                             );
-                            runtime.poll_reload();
+                            runtime.poll_reload(engine);
                         }
                         Err(error) => {
                             error!(
@@ -242,12 +242,12 @@ mod loaded {
         }
 
         /// Poll the collectible managed loader after its assembly debounce.
-        pub(crate) fn poll_managed_reload(&mut self) {
+        pub(crate) fn poll_managed_reload(&mut self, engine: &mut Engine) {
             // Source and assembly watchers have independent debounce windows. Poll
             // every frame so a successful build is eventually observed even when
             // the assembly was not ready during the source-triggered reload call.
             if let Self::CSharp(runtime) = self {
-                runtime.poll_reload();
+                runtime.poll_reload(engine);
             }
         }
 

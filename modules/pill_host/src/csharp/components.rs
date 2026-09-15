@@ -18,16 +18,24 @@
 
 // Standard library
 use std::collections::{HashMap, HashSet};
+use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 // External crates
 use pill_core::error::{CSharpError, EngineMessage};
 use pill_core::info;
 use pill_core::telemetry::telemetry_target;
-use pill_engine::archetype::ArchetypeId;
-use pill_engine::commands::{boxed_component_adder, ComponentAdder};
+use pill_engine::archetype::{ArchetypeId, DynamicFieldPlan, LayoutField};
+// The native binding path is windowed-only (its components come from the
+// renderer), so these three are unused in a headless build.
+#[cfg(feature = "rendering")]
+use pill_engine::commands::boxed_component_adder;
+use pill_engine::commands::ComponentAdder;
 use pill_engine::component_registry::ComponentFieldDescriptor;
-use pill_engine::{Component, ComponentId, Engine, World};
+use pill_engine::{ComponentId, Engine, World};
+#[cfg(feature = "rendering")]
+use pill_engine::Component;
 use serde::Deserialize;
+#[cfg(feature = "rendering")]
 use trait_type_map::TraitAccessible;
 
 // Current crate
@@ -112,6 +120,47 @@ impl StableComponentId {
 /// Maps every stable managed identity to its native or dynamic binding.
 pub(super) type ComponentBindings = HashMap<StableComponentId, ComponentBinding>;
 
+/// The live binding table, replaceable under a running managed project.
+///
+/// Every managed system closure holds this handle rather than a snapshot of the
+/// map. A reload can change a component's layout - or add a component - and the
+/// invocation scope a system installs when it runs has to see the layout its
+/// columns actually use, not the one that was current when the system was
+/// registered. The lock is held for the duration of one system run and taken
+/// for writing only between frames, so the two never contend.
+pub(super) struct BindingStore {
+    /// The table itself.
+    bindings: RwLock<ComponentBindings>,
+}
+
+impl BindingStore {
+    /// Wrap one binding table.
+    pub(super) fn new(bindings: ComponentBindings) -> Self {
+        Self {
+            bindings: RwLock::new(bindings),
+        }
+    }
+
+    /// Borrow the table for reading.
+    ///
+    /// A panic while the table is locked cannot leave it wrong - it is a map of
+    /// plain data, and a writer completes or abandons one whole entry - so a
+    /// poisoned lock is reported as the value it guarded rather than becoming a
+    /// new failure mode for every later system run.
+    pub(super) fn read(&self) -> RwLockReadGuard<'_, ComponentBindings> {
+        self.bindings
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Borrow the table for writing, with the same rule as [`Self::read`].
+    pub(super) fn write(&self) -> RwLockWriteGuard<'_, ComponentBindings> {
+        self.bindings
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// Copies one archetype column into an ABI `ComponentChunk` for managed code.
 type NativeChunkGetter = fn(&mut World, u32, *mut ComponentChunk) -> u8;
 
@@ -128,6 +177,12 @@ type NativeBlobDecoder = fn(*const u8, usize) -> Result<Box<dyn ComponentAdder>,
 #[derive(Clone, Copy)]
 pub(super) enum ComponentBinding {
     /// A concrete Rust component with chunk access and a typed decoder.
+    ///
+    /// Constructed only by [`register_native_binding`], which is itself
+    /// windowed-only: the sole native components this host binds are the
+    /// renderer's. A headless build still *matches* on the variant, so it stays
+    /// in the enum rather than being compiled out with the constructor.
+    #[cfg_attr(not(feature = "rendering"), allow(dead_code))]
     Native {
         /// Engine ID of the registered Rust component type.
         component_id: ComponentId,
@@ -152,6 +207,13 @@ pub(super) enum ComponentBinding {
         size: usize,
         /// Alignment of the managed layout in bytes.
         align: usize,
+        /// Hash of the managed field schema the storage was registered with.
+        ///
+        /// Carried here rather than read back from the engine because a reload
+        /// has to tell a component whose layout changed from one whose bytes
+        /// merely moved, and the two can agree on size and alignment while the
+        /// fields underneath them do not.
+        schema_hash: u64,
     },
     /// A native component registered by an optional Rust module, exposed to
     /// managed code through the raw byte view of its column.
@@ -209,6 +271,10 @@ pub(super) const fn stable_component_id(name: &str) -> StableComponentId {
 }
 
 /// Return the `chunk_index`th archetype column containing native component T.
+///
+/// Windowed builds only, with the rest of the native binding path: no other
+/// build has a native component to bind.
+#[cfg(feature = "rendering")]
 fn get_component_chunk<T: Component + TraitAccessible<dyn Component>>(
     world: &mut World,
     chunk_index: u32,
@@ -245,6 +311,7 @@ fn get_component_chunk<T: Component + TraitAccessible<dyn Component>>(
 /// The archetype-scoped twin of [`get_component_chunk`]: managed enumerators
 /// that already hold a driver chunk's archetype identity use this to resolve
 /// the remaining query terms directly, with no chunk-index scan.
+#[cfg(feature = "rendering")]
 fn get_component_chunk_in_archetype<T: Component + TraitAccessible<dyn Component>>(
     world: &mut World,
     archetype_id: ArchetypeId,
@@ -285,6 +352,7 @@ fn get_component_chunk_in_archetype<T: Component + TraitAccessible<dyn Component
 ///
 /// Returns an error when `data` is null or `size` does not match the exact
 /// ABI layout of `T`.
+#[cfg(feature = "rendering")]
 fn decode_native_component<T>(
     data: *const u8,
     size: usize,
@@ -340,6 +408,7 @@ struct ManagedFieldManifest {
 
 /// Register one engine-owned component and bind its managed name and schema to
 /// the callbacks required by queries and deferred commands.
+#[cfg(feature = "rendering")]
 fn register_native_binding<T>(
     engine: &mut Engine,
     bindings: &mut ComponentBindings,
@@ -368,14 +437,21 @@ fn register_native_binding<T>(
 /// The schema strings encode the canonical managed layouts; a mismatch with
 /// the runtime's own reflection is rejected during manifest registration.
 pub(super) fn shared_component_bindings(engine: &mut Engine) -> ComponentBindings {
-    let mut bindings = HashMap::new();
+    // Only a windowed host links `pill_master_renderer`, so a headless build has
+    // nothing to bind and the table comes back empty. Spelled as two blocks
+    // rather than one guarded call so neither configuration carries an unused
+    // `mut` or an unused parameter.
     #[cfg(feature = "rendering")]
-    shared_renderer_bindings(engine, &mut bindings);
-    // Headless: nothing to register, but the parameter is still part of the
-    // shared signature both backends call.
+    {
+        let mut bindings = HashMap::new();
+        shared_renderer_bindings(engine, &mut bindings);
+        bindings
+    }
     #[cfg(not(feature = "rendering"))]
-    let _ = engine;
-    bindings
+    {
+        let _ = engine;
+        HashMap::new()
+    }
 }
 
 /// Bind the renderer's components to their canonical managed mirrors.
@@ -663,10 +739,78 @@ pub(super) fn register_component_manifest(
     bytes: &[u8],
     mut bindings: ComponentBindings,
 ) -> Result<ComponentBindings, CSharpError> {
+    for component in parse_and_validate_manifest(bytes)? {
+        let stable_id =
+            StableComponentId::from_halves(component.stable_id_low, component.stable_id_high);
+        // Compute the editor layout up front: the manifest name is moved into
+        // `register_dynamic_component` below, and the borrow must end first.
+        let field_layout = managed_field_layout(&component.full_name, &component.fields);
+        let component_name = component.full_name.clone();
+
+        if let Some(binding) = bindings.get(&stable_id).copied() {
+            check_binding_against_manifest(binding, &component)?;
+            continue;
+        }
+
+        // Step 2: Register each remaining component as dynamic storage.
+        if component.shared {
+            return Err(format!(
+                "managed shared component {} has no native engine binding",
+                component.full_name
+            )
+            .into());
+        }
+        let id = engine
+            .world_mut()
+            .register_dynamic_component(
+                stable_id.0,
+                component.full_name,
+                component.size,
+                component.alignment,
+                component.schema_hash,
+            )
+            .map_err(|error| CSharpError::ManifestInvalid {
+                message: error.to_plain_message(),
+            })?;
+        bindings.insert(
+            stable_id,
+            ComponentBinding::Dynamic {
+                component_id: id,
+                size: component.size,
+                align: component.alignment,
+                schema_hash: component.schema_hash,
+            },
+        );
+
+        // Slice G: give the editor the same field vocabulary `#[derive(PillComponent)]`
+        // produces, so a C# component shows named, editable fields instead of
+        // nothing. Re-registration on assembly swap replaces the layout.
+        info!(
+            target: telemetry_target::HOT_RELOAD,
+            component = %component_name,
+            fields = %format_field_layout_line(&field_layout),
+            "managed component field layout registered"
+        );
+        engine
+            .world_mut()
+            .register_dynamic_component_field_layout(id, field_layout);
+    }
+    Ok(bindings)
+}
+
+/// Parse a managed manifest and check every entry against its own identity.
+///
+/// Split out of [`register_component_manifest`] so the reload path validates
+/// exactly what the startup path validates. Every check here is a property of
+/// the manifest alone - identity, uniqueness, and the shape of each layout - so
+/// both callers can run it before either touches the world.
+fn parse_and_validate_manifest(
+    bytes: &[u8],
+) -> Result<Vec<ManagedComponentManifest>, CSharpError> {
     // Step 1: Parse and validate every entry against canonical identities.
     let manifest: Vec<ManagedComponentManifest> = serde_json::from_slice(bytes)?;
     let mut seen = HashSet::new();
-    for component in manifest {
+    for component in &manifest {
         let stable_id =
             StableComponentId::from_halves(component.stable_id_low, component.stable_id_high);
         if stable_component_id(&component.full_name) != stable_id {
@@ -701,81 +845,265 @@ pub(super) fn register_component_manifest(
         for field in &component.fields {
             validate_field_manifest(field, component.size)?;
         }
+    }
+    Ok(manifest)
+}
 
-        // Compute the editor layout up front: the manifest name is moved into
-        // `register_dynamic_component` below, and the borrow must end first.
-        let field_layout = managed_field_layout(&component.full_name, &component.fields);
-        let component_name = component.full_name.clone();
+/// Check one manifest entry against the binding the host already holds.
+///
+/// The startup and reload paths share this so they cannot disagree about what
+/// "the same component" means: a reload that accepted a disagreement startup
+/// would have refused is a reload that changed the meaning of a registered id.
+fn check_binding_against_manifest(
+    binding: ComponentBinding,
+    component: &ManagedComponentManifest,
+) -> Result<(), CSharpError> {
+    let (size, align, expected_schema) = match binding {
+        ComponentBinding::Native {
+            size,
+            align,
+            schema_hash,
+            ..
+        } => (size, align, Some(schema_hash)),
+        ComponentBinding::Dynamic {
+            size,
+            align,
+            schema_hash,
+            ..
+        } => (size, align, Some(schema_hash)),
+        ComponentBinding::ModuleNative { size, align, .. } => (size, align, None),
+    };
+    if size != component.size || align != component.alignment {
+        return Err(format!(
+            "managed mirror {} has layout size/alignment {}/{} but native component uses {}/{}",
+            component.full_name, component.size, component.alignment, size, align
+        )
+        .into());
+    }
+    if expected_schema.is_some_and(|hash| hash != component.schema_hash) {
+        return Err(format!(
+            "managed mirror {} does not match the native component field schema",
+            component.full_name
+        )
+        .into());
+    }
+    Ok(())
+}
 
-        if let Some(binding) = bindings.get(&stable_id).copied() {
-            let (size, align, expected_schema) = match binding {
-                ComponentBinding::Native {
-                    size,
-                    align,
-                    schema_hash,
-                    ..
-                } => (size, align, Some(schema_hash)),
-                ComponentBinding::Dynamic { size, align, .. }
-                | ComponentBinding::ModuleNative { size, align, .. } => (size, align, None),
-            };
-            if size != component.size || align != component.alignment {
-                return Err(format!(
-                    "managed mirror {} has layout size/alignment {}/{} but native component uses {}/{}",
-                    component.full_name, component.size, component.alignment, size, align
-                )
-                .into());
-            }
-            if expected_schema.is_some_and(|hash| hash != component.schema_hash) {
-                return Err(format!(
-                    "managed mirror {} does not match the native component field schema",
-                    component.full_name
-                )
-                .into());
-            }
+/// What one applied manifest changed, for the caller's log line.
+#[derive(Debug, Default)]
+pub(super) struct ManifestApplyReport {
+    /// Managed components whose layout changed and whose rows were migrated.
+    pub(super) migrated: Vec<String>,
+    /// Managed components the manifest added.
+    pub(super) added: Vec<String>,
+}
+
+/// Apply a swapped assembly's component manifest to the live world.
+///
+/// The reload counterpart of [`register_component_manifest`]. Where startup may
+/// register what it likes, this one has to *migrate*: a dynamic component whose
+/// layout changed keeps its entities and its rows, and only the bytes move.
+///
+/// Three cases are refused rather than migrated, each for a reason the caller
+/// cannot talk its way out of:
+///
+/// - a `Native` or `ModuleNative` binding whose layout or schema changed - the
+///   Rust side did not change, so the mirror is simply wrong;
+/// - a shared component with no native binding, exactly as at startup;
+/// - a dynamic component the manifest has stopped naming, which would need its
+///   storage retired (a byte-storage analogue of `drop_forgotten_components`,
+///   planned as slice 3b).
+///
+/// The whole manifest is validated before any of it is applied, so a refusal
+/// leaves the world and the bindings as they were.
+///
+/// # Errors
+///
+/// Returns a [`CSharpError`] for any of the refusals above, for a malformed
+/// manifest, or when the engine refuses a registration or a relayout.
+pub(super) fn apply_component_manifest_on_reload(
+    engine: &mut Engine,
+    bytes: &[u8],
+    store: &BindingStore,
+) -> Result<ManifestApplyReport, CSharpError> {
+    let manifest = parse_and_validate_manifest(bytes)?;
+    let live: HashSet<StableComponentId> = manifest
+        .iter()
+        .map(|component| {
+            StableComponentId::from_halves(component.stable_id_low, component.stable_id_high)
+        })
+        .collect();
+
+    // Step 1: Refuse anything this path cannot do, before it does anything.
+    // A dynamic component the manifest stopped naming would keep its columns
+    // and its registry entry, and a later registration could recycle its bit.
+    let retired: Vec<StableComponentId> = store
+        .read()
+        .iter()
+        .filter(|(id, binding)| {
+            !live.contains(id) && matches!(binding, ComponentBinding::Dynamic { .. })
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    if !retired.is_empty() {
+        return Err(CSharpError::ManifestInvalid {
+            message: format!(
+                "{} managed component(s) disappeared from the manifest; restart the host to retire their storage",
+                retired.len()
+            ),
+        });
+    }
+
+    // Step 2: Apply each entry.
+    let mut report = ManifestApplyReport::default();
+    for component in manifest {
+        let stable_id =
+            StableComponentId::from_halves(component.stable_id_low, component.stable_id_high);
+        let Some(binding) = store.read().get(&stable_id).copied() else {
+            let added_name = component.full_name.clone();
+            register_manifest_entry(engine, store, stable_id, component)?;
+            info!(
+                target: telemetry_target::HOT_RELOAD,
+                component = %added_name,
+                "managed component registered on reload"
+            );
+            report.added.push(added_name);
+            continue;
+        };
+
+        let ComponentBinding::Dynamic {
+            component_id,
+            size,
+            align,
+            schema_hash,
+        } = binding
+        else {
+            check_binding_against_manifest(binding, &component)?;
+            continue;
+        };
+
+        // The same layout means nothing to do; anything else is a migration.
+        if size == component.size
+            && align == component.alignment
+            && schema_hash == component.schema_hash
+        {
             continue;
         }
 
-        // Step 2: Register each remaining component as dynamic storage.
-        if component.shared {
-            return Err(format!(
-                "managed shared component {} has no native engine binding",
-                component.full_name
-            )
-            .into());
-        }
-        let id = engine
+        let plan = build_field_plan(engine, component_id, &component.fields);
+        let migrated_rows = engine
             .world_mut()
-            .register_dynamic_component(
-                stable_id.0,
-                component.full_name,
+            .relayout_dynamic_component(
+                component_id,
                 component.size,
                 component.alignment,
                 component.schema_hash,
+                &plan,
             )
             .map_err(|error| CSharpError::ManifestInvalid {
                 message: error.to_plain_message(),
             })?;
-        bindings.insert(
+        store.write().insert(
             stable_id,
             ComponentBinding::Dynamic {
-                component_id: id,
+                component_id,
                 size: component.size,
                 align: component.alignment,
+                schema_hash: component.schema_hash,
             },
         );
-
-        // Slice G: give the editor the same field vocabulary `#[derive(PillComponent)]`
-        // produces, so a C# component shows named, editable fields instead of
-        // nothing. Re-registration on assembly swap replaces the layout.
+        engine.world_mut().register_dynamic_component_field_layout(
+            component_id,
+            managed_field_layout(&component.full_name, &component.fields),
+        );
         info!(
             target: telemetry_target::HOT_RELOAD,
-            component = %component_name,
-            fields = %format_field_layout_line(&field_layout),
-            "managed component field layout registered"
+            component = %component.full_name,
+            rows = migrated_rows,
+            "managed component layout migrated"
         );
-        engine
-            .world_mut()
-            .register_dynamic_component_field_layout(id, field_layout);
+        report.migrated.push(component.full_name);
     }
-    Ok(bindings)
+    Ok(report)
+}
+
+/// Register one manifest entry that the bindings table has no entry for.
+///
+/// The startup path in one function: a shared component needs a native binding
+/// the manifest cannot conjure, and anything else becomes dynamic storage with
+/// its editor-facing field layout.
+fn register_manifest_entry(
+    engine: &mut Engine,
+    store: &BindingStore,
+    stable_id: StableComponentId,
+    component: ManagedComponentManifest,
+) -> Result<(), CSharpError> {
+    if component.shared {
+        return Err(format!(
+            "managed shared component {} has no native engine binding",
+            component.full_name
+        )
+        .into());
+    }
+    let field_layout = managed_field_layout(&component.full_name, &component.fields);
+    let id = engine
+        .world_mut()
+        .register_dynamic_component(
+            stable_id.0,
+            component.full_name.clone(),
+            component.size,
+            component.alignment,
+            component.schema_hash,
+        )
+        .map_err(|error| CSharpError::ManifestInvalid {
+            message: error.to_plain_message(),
+        })?;
+    store.write().insert(
+        stable_id,
+        ComponentBinding::Dynamic {
+            component_id: id,
+            size: component.size,
+            align: component.alignment,
+            schema_hash: component.schema_hash,
+        },
+    );
+    engine
+        .world_mut()
+        .register_dynamic_component_field_layout(id, field_layout);
+    Ok(())
+}
+
+/// Build the byte plan from the layout a component has now to the one a
+/// manifest asks for.
+///
+/// The old side comes from the world rather than from the previous manifest:
+/// the field layout registered with a dynamic component is the layout its
+/// columns actually use, which is the only thing a byte copy can be measured
+/// against.
+fn build_field_plan(
+    engine: &Engine,
+    component_id: ComponentId,
+    fields: &[ManagedFieldManifest],
+) -> DynamicFieldPlan {
+    let previous: Vec<LayoutField<'_>> = engine
+        .world()
+        .component_field_layout(component_id)
+        .unwrap_or(&[])
+        .iter()
+        .map(|field| LayoutField {
+            name: field.name,
+            offset: field.offset,
+            size: field.size,
+        })
+        .collect();
+    let next: Vec<LayoutField<'_>> = fields
+        .iter()
+        .map(|field| LayoutField {
+            name: field.name.as_str(),
+            offset: field.offset,
+            size: field.size,
+        })
+        .collect();
+    DynamicFieldPlan::between(&previous, &next)
 }

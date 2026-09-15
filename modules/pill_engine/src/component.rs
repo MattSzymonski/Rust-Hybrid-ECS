@@ -433,12 +433,7 @@ pub fn component_schema_hash(fields: &[ComponentFieldDescriptor]) -> u64 {
     for field in fields {
         hash = component_name_hash(field.name, hash);
         hash = component_name_hash(field.type_tag, hash);
-        for value in [
-            field.offset,
-            field.size,
-            field.align,
-            field.element_count,
-        ] {
+        for value in [field.offset, field.size, field.align, field.element_count] {
             for byte in (value as u64).to_le_bytes() {
                 hash ^= byte as u64;
                 hash = hash.wrapping_mul(0x100000001b3);
@@ -764,7 +759,8 @@ impl ComponentRegistry {
         &mut self,
         fields: &[ComponentFieldDescriptor],
     ) -> Result<u8, WorldError> {
-        self.register_with_layout::<T>(fields).map(Registration::bit)
+        self.register_with_layout::<T>(fields)
+            .map(Registration::bit)
     }
 
     /// The Rust type's own name, without its module path.
@@ -898,6 +894,18 @@ impl ComponentRegistry {
     /// Get the recorded memory layout of a registered component type.
     pub fn get_layout(&self, component_id: &ComponentId) -> Option<ComponentLayout> {
         self.layouts.get(component_id).copied()
+    }
+
+    /// Update the recorded size of a dynamic component whose storage was relaid out.
+    ///
+    /// Only the size moves. The bit index, the name and the layout's
+    /// deliberately absent schema hash stay as registered: replacing the
+    /// registration instead would allocate a fresh bit index, and that index is
+    /// baked into archetype masks and scheduled access masks.
+    pub(crate) fn update_dynamic_size(&mut self, component_id: &ComponentId, size: usize) {
+        if let Some(layout) = self.layouts.get_mut(component_id) {
+            layout.size = size;
+        }
     }
 
     /// Check whether a component type has been registered.

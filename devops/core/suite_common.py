@@ -42,6 +42,18 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
+# The host's output is UTF-8 (its renderer prints a box-drawing frame
+# dashboard), while CPython encodes redirected output with the locale code
+# page. Echoing one of those lines then raises UnicodeEncodeError inside the
+# monitor thread, which stops draining the pipe - the host blocks on its next
+# write and every later assertion times out for a reason nothing explains.
+# Replacement keeps the log readable instead of dying on a frame border.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, OSError, ValueError):
+        pass
+
 # =============================================================================
 # Paths
 # =============================================================================
@@ -436,8 +448,13 @@ class OutputMonitor:
                 # log without adding information.
                 if COUNTER_TICK_TOKEN not in line:
                     print(f"  [std] {line.rstrip()}")
-        except (ValueError, OSError):
-            pass
+        except (ValueError, OSError) as error:
+            # Reached on a genuine read failure, not on the normal end of
+            # stream (a closed pipe ends the iteration without raising). This
+            # used to pass silently: the reader stopped draining, the host
+            # blocked on its next write, and every later assertion timed out
+            # for a reason nothing in the log explained.
+            print(f"  [FAIL] Output monitor stopped reading: {error!r}")
 
     def _iter_since(self, start_index: int):
         """Yields buffered lines with sequence number >= start_index."""
@@ -510,7 +527,15 @@ def launch_process(
     cwd: Path,
     environment: Optional[Dict[str, str]] = None,
 ) -> Tuple[subprocess.Popen, OutputMonitor]:
-    """Launches a process with merged output capture and returns (process, monitor)."""
+    """Launches a process with merged output capture and returns (process, monitor).
+
+    The stream is decoded as UTF-8 with replacement, not with the locale
+    encoding: the host's renderer prints a box-drawing frame dashboard, and
+    decoding those bytes as the console code page raises in the reader thread.
+    A dead reader stops draining the pipe, the host then blocks on its next
+    write, and every later assertion times out for a reason that has nothing to
+    do with what it tests - so this is correctness, not tolerance.
+    """
     process = subprocess.Popen(
         list(command),
         cwd=str(cwd),
@@ -518,6 +543,8 @@ def launch_process(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        encoding="utf-8",
+        errors="replace",
         bufsize=1,
     )
     monitor = OutputMonitor(process)
