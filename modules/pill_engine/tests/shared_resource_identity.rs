@@ -18,10 +18,12 @@
 //! inserts from a module DLL and reads from the project, and whose writers make
 //! the scheduler keep them apart.
 //!
-//! The scheduler side is covered at three levels here: the pairwise answer
-//! (`conflicts_with`), the batching decision built on top of it
-//! (`SystemScheduler::build_execution_graph`), and the running engine, where two
-//! systems that were batched together would trip the debug write lock.
+//! The scheduler side is covered at five levels here: the pairwise answer
+//! (`conflicts_with`), the fallback when a caller mutates the sets after
+//! `build_component_masks`, the batching decision built on top of both
+//! (`SystemScheduler::build_execution_graph`), the rebuild a reload's `retain`
+//! does, and the running engine, where two systems that were batched together
+//! would trip the debug write lock.
 
 use pill_engine::query::{Res, ResMut};
 use pill_engine::scheduler::{SystemAccess, SystemScheduler};
@@ -374,11 +376,7 @@ fn two_systems_writing_one_shared_resource_are_never_batched_together() {
     scheduler.build_execution_graph();
     let batches = scheduler.execution_graph();
 
-    let batch_of = |system: usize| {
-        batches
-            .iter()
-            .position(|batch| batch.contains(&system))
-    };
+    let batch_of = |system: usize| batches.iter().position(|batch| batch.contains(&system));
     let project_batch = batch_of(project_system).expect("project writer scheduled");
     let module_batch = batch_of(module_system).expect("module writer scheduled");
     let unrelated_batch = batch_of(unrelated_system).expect("unrelated writer scheduled");
@@ -607,6 +605,73 @@ fn inserting_also_runs_the_name_guard() {
     assert!(
         world.take_registration_error().is_some(),
         "a conflicting claim must be reported even without register_resource"
+    );
+}
+
+/// A refused claim must not touch what is stored.
+///
+/// The generation that made the claim is already failing - the drain turns the
+/// recorded error into a failed init - so the only open question is whether the
+/// live value survives it. `UnrelatedSettings` agrees with
+/// `artifact_a::Settings` on size and alignment, so a reader would take the
+/// wrong bytes without noticing: the size check that `holds` runs cannot
+/// separate these two, and the guard that can has just been refused.
+#[test]
+fn a_refused_claim_leaves_the_stored_value_alone() {
+    let mut world = World::new();
+    world.insert_resource(artifact_a::Settings { value: 1 });
+    assert!(world.take_registration_error().is_none());
+
+    world.insert_resource(UnrelatedSettings { _value: 99 });
+    assert!(
+        world.take_registration_error().is_some(),
+        "the name guard has to fire"
+    );
+
+    assert_eq!(
+        world
+            .get_resource::<artifact_a::Settings>()
+            .map(|it| it.value),
+        Some(1),
+        "the refused generation's bytes must not reach the stored value"
+    );
+}
+
+/// The same store, walked through the sequence a reload rolls back through.
+///
+/// The failed generation inserts under a shared name whose layout it disagrees
+/// with, the rollback generation re-registers the resource, and the transaction
+/// re-homes what survived. Nothing puts the old value back on that path - the
+/// rollback only declares the resource - so a stored refused insert would leave
+/// the box holding the failed shape under the rollback type's table: claimed,
+/// registered, and unreadable, with a drop glue that no longer matches the
+/// allocation it is about to run over.
+#[test]
+fn a_shape_change_cannot_strand_a_resource_across_a_rolled_back_reload() {
+    let mut world = World::new();
+    // The generation that owns the resource declares it, and a value is live.
+    world.register_resource::<artifact_a::Settings>();
+    world.insert_resource(artifact_a::Settings { value: 7 });
+    assert!(world.take_registration_error().is_none());
+
+    // A rebuild against a changed definition inserts under the same name.
+    world.insert_resource(stale_artifact::Settings { value: 7, extra: 1 });
+    assert!(
+        world.take_registration_error().is_some(),
+        "the layout guard has to fire"
+    );
+
+    // What the transaction does next: the failed generation is discarded, the
+    // previous one initialises again, every surviving value is re-homed.
+    world.register_resource::<artifact_a::Settings>();
+    world.rehome_resources();
+
+    assert_eq!(
+        world
+            .get_resource::<artifact_a::Settings>()
+            .map(|it| it.value),
+        Some(7),
+        "the value has to survive a rolled-back reload"
     );
 }
 

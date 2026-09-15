@@ -97,11 +97,8 @@ pub(crate) fn set_per_thread_last_run_tick(value: Option<Tick>) -> Option<Tick> 
 // =============================================================================
 
 /// Function that copies a component from one storage to another at given indices.
-type ComponentCopier = fn(
-    source: &ComponentColumns,
-    destination: &mut ComponentColumns,
-    index: usize,
-);
+type ComponentCopier =
+    fn(source: &ComponentColumns, destination: &mut ComponentColumns, index: usize);
 
 // =============================================================================
 // Script Updater Type
@@ -116,8 +113,7 @@ type ComponentCopier = fn(
 /// valid during the `update_scripts` call. Using a plain function pointer
 /// (not a closure) guarantees that no state is captured and the callee
 /// cannot stash the pointers for later use.
-type ScriptUpdater =
-    fn(&mut ComponentColumns, usize, Entity, *mut World, *mut CommandQueue);
+type ScriptUpdater = fn(&mut ComponentColumns, usize, Entity, *mut World, *mut CommandQueue);
 
 // =============================================================================
 // EntityLocation
@@ -384,9 +380,7 @@ impl World {
             system_last_run: 0,
             archetype_generation: 0,
             #[cfg(debug_assertions)]
-            debug_resource_write_locks: parking_lot::Mutex::new(
-                std::collections::HashSet::new(),
-            ),
+            debug_resource_write_locks: parking_lot::Mutex::new(std::collections::HashSet::new()),
             commands_executed_this_frame: 0,
             iterator_timings: std::sync::Arc::new(std::sync::Mutex::new(IteratorTimings::new())),
             persist_serializers: HashMap::new(),
@@ -702,7 +696,6 @@ impl World {
         // requires no heap allocation or vtable dispatch.
         self.component_copiers
             .insert(component_id, copy_component::<T>);
-
     }
 
     /// Drain the first registration failure recorded by
@@ -1517,6 +1510,13 @@ impl World {
     ///
     /// Resources are global state such as time, input, configuration, etc.
     /// If a resource of this type already exists, it is replaced.
+    ///
+    /// A shared name claimed by another type is the exception: the claim is
+    /// refused, its error recorded for the caller's drain, and **nothing is
+    /// stored**. The generation that asked for it is one init away from being
+    /// discarded, and storing its value would replace a live resource with a
+    /// shape no reader can accept - or, when the layouts happen to agree,
+    /// quietly hand one type's bytes to the other.
     pub fn insert_resource<T: Resource>(&mut self, resource: T) {
         let _zone = crate::profile_scope!(
             "insert resource",
@@ -1526,8 +1526,10 @@ impl World {
             )]
         );
         let id = ResourceId::of::<T>();
+        if !self.claim_shared_resource_name::<T>() {
+            return;
+        }
         let tick = Tick::new(self.change_tick);
-        self.claim_shared_resource_name::<T>();
         self.note_resource_registration(id);
         self.resources.insert(id, ErasedResource::new(resource));
         self.resource_ticks.insert(id, ComponentTicks::new(tick));
@@ -1614,9 +1616,15 @@ impl World {
     ///
     /// Call it from a module's `init` for every resource type the module owns.
     /// Idempotent - a reload re-runs `init`, which is the point.
+    ///
+    /// A refused claim records its error and leaves the stored table alone, so
+    /// a generation that disagrees about a name's owner or shape cannot
+    /// re-point the live resource at its own code before its init fails.
     pub fn register_resource<T: Resource>(&mut self) {
         let id = ResourceId::of::<T>();
-        self.claim_shared_resource_name::<T>();
+        if !self.claim_shared_resource_name::<T>() {
+            return;
+        }
         self.resource_factories
             .insert(id, ErasedResourceOps::of::<T>());
         self.note_resource_registration(id);
@@ -1675,8 +1683,16 @@ impl World {
 
     /// Check and record which type owns a shared resource name.
     ///
-    /// No-op for an ordinary resource: its id *is* its `TypeId`, so a second
-    /// claim on one id is necessarily the same type.
+    /// Returns whether the caller may go on to register: `true` for an ordinary
+    /// resource, whose id *is* its `TypeId`, so a second claim on one id is
+    /// necessarily the same type, and for a shared claim that is accepted;
+    /// `false` when the claim was refused and its error recorded.
+    ///
+    /// A refusal has to stop the caller from touching what is stored, not just
+    /// fail the init later: the reload transaction rolls the generation back by
+    /// re-running the previous `init`, which re-registers what it owned rather
+    /// than restoring values, so a value written under a refused claim would
+    /// outlive the generation that wrote it - in a shape nothing can read.
     ///
     /// For a shared resource the id is derived from a written-down name, so
     /// two unrelated types can reach it. The discriminator is the type's own
@@ -1684,9 +1700,9 @@ impl World {
     /// and only the final path segment is compared, because the module path
     /// differs between artifacts while the type's name does not. This is the
     /// same rule `ComponentRegistry` applies to shared components.
-    fn claim_shared_resource_name<T: Resource>(&mut self) {
+    fn claim_shared_resource_name<T: Resource>(&mut self) -> bool {
         let Some(shared_name) = T::shared_name() else {
-            return;
+            return true;
         };
         let id = ResourceId::of::<T>();
         let incoming = SharedResourceClaim {
@@ -1716,7 +1732,7 @@ impl World {
                     "shared resource name claimed by two different types"
                 );
                 self.record_registration_error(error);
-                return;
+                return false;
             }
             if existing.size != incoming.size || existing.align != incoming.align {
                 let error = WorldError::SharedResourceLayoutMismatch {
@@ -1737,10 +1753,11 @@ impl World {
                     "shared resource registered with two different layouts"
                 );
                 self.record_registration_error(error);
-                return;
+                return false;
             }
         }
         self.shared_resource_claims.insert(id, incoming);
+        true
     }
 
     /// Re-home every stored resource's per-type function table.
@@ -2186,11 +2203,7 @@ impl World {
         move_fn: F,
     ) -> Result<(), WorldError>
     where
-        F: FnOnce(
-            &ComponentColumns,
-            &mut ComponentColumns,
-            usize,
-        ),
+        F: FnOnce(&ComponentColumns, &mut ComponentColumns, usize),
     {
         let _zone = crate::profile_scope!(
             "move entity to archetype",
@@ -2470,9 +2483,7 @@ impl World {
             for component_id in component_type_ids {
                 match component_id.is_native_storage() {
                     true => {
-                        if let Some(storage) =
-                            archetype.component_storages.get_mut(*component_id)
-                        {
+                        if let Some(storage) = archetype.component_storages.get_mut(*component_id) {
                             storage.swap_remove_discard(old_index);
                         }
                     }
@@ -4866,7 +4877,10 @@ mod tests {
         world.register_resource::<RehomeProbe>();
 
         assert!(world.resource_factories.contains_key(&id));
-        assert!(!world.has_resource::<RehomeProbe>(), "no value was inserted");
+        assert!(
+            !world.has_resource::<RehomeProbe>(),
+            "no value was inserted"
+        );
     }
 
     /// Re-homing leaves the value intact and still droppable exactly once.
@@ -4944,7 +4958,9 @@ mod tests {
         let id = crate::resource::ResourceId::of::<RehomeProbe>();
         world.insert_resource(rehome_probe().0);
 
-        world.remove_resource::<RehomeProbe>().expect("it was there");
+        world
+            .remove_resource::<RehomeProbe>()
+            .expect("it was there");
 
         assert!(!world.resource_factories.contains_key(&id));
     }
