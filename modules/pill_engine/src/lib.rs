@@ -127,7 +127,7 @@ pub use query::{
     Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,
 };
 pub use asset::{Asset, AssetManager, Handle};
-pub use resource::{ResHandle, Resource};
+pub use resource::{ResHandle, Resource, ResourceId};
 pub use time::Time;
 pub use scheduler::{SystemAccess, SystemScheduler, TypeKey};
 pub use scripting::{ScriptComponent, ScriptContext};

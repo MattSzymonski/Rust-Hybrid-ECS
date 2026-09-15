@@ -143,6 +143,12 @@ pub(crate) struct ReloadTransaction<'a> {
     pub(crate) old_libraries: &'a mut Vec<NativeLibrary>,
     /// Persistable type names the previous `init` registered.
     pub(crate) registered_type_names: &'a mut Vec<String>,
+    /// Resource ids the previous generation of this subject registered.
+    ///
+    /// Compared against what the new generation registers, so a resource type
+    /// the subject has stopped owning can be dropped while the image holding
+    /// its drop function is still mapped.
+    pub(crate) registered_resource_ids: &'a mut Vec<pill_engine::ResourceId>,
 }
 
 /// What a committed reload registered, for the caller to record.
@@ -204,6 +210,7 @@ impl ReloadTransaction<'_> {
         // generation registered can be compared against the previous ones.
         let registration_sequence = engine.world().persist_registration_sequence();
         let component_registration_sequence = engine.world().component_registration_sequence();
+        let resource_registration_sequence = engine.world().resource_registration_sequence();
         // Entities alive before the incoming generation's init. Migration
         // converts only these: anything init spawns already carries the new
         // schema, and the retiring serializer would misread it while a
@@ -234,8 +241,15 @@ impl ReloadTransaction<'_> {
             let failed_registrations = engine
                 .world()
                 .registered_component_names_since(component_registration_sequence);
+            // The resource half of the same capture: the ids the failed
+            // generation claimed, to be compared against what the rollback
+            // generation re-claims below.
+            let failed_resource_ids = engine
+                .world()
+                .resource_ids_registered_since(resource_registration_sequence);
 
             let rollback_sequence = engine.world().component_registration_sequence();
+            let rollback_resource_sequence = engine.world().resource_registration_sequence();
             self.begin_registration(engine);
             let rollback_status = self.current.call_init(engine_api);
             self.end_registration(engine);
@@ -271,6 +285,36 @@ impl ReloadTransaction<'_> {
                 );
                 engine.world_mut().drop_forgotten_components(&stranded);
             }
+
+            // Resources need the stronger version of the same treatment. A
+            // component column's factory is re-pointed by re-registration, but a
+            // stored resource *value* carries its own drop function, so one the
+            // failed generation inserted under an id the rollback generation
+            // does not claim has to be dropped now - while the failing image is
+            // still mapped - rather than left for the graveyard to invalidate.
+            let rollback_resource_ids = engine
+                .world()
+                .resource_ids_registered_since(rollback_resource_sequence);
+            let stranded_resources: Vec<pill_engine::ResourceId> = failed_resource_ids
+                .into_iter()
+                .filter(|id| !rollback_resource_ids.contains(id))
+                .collect();
+            if !stranded_resources.is_empty() {
+                let dropped = engine.world_mut().drop_resources(&stranded_resources);
+                warn!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    module = self.subject,
+                    dropped,
+                    "dropped resources claimed only by the failed generation"
+                );
+            }
+            // Whatever survives still points its drop at whichever generation
+            // supplied the current table, so re-home onto the rollback image the
+            // same way the success path does. Every id the failed generation
+            // touched has either been re-claimed (table refreshed by the rollback
+            // init) or dropped just above, so no table still points into the
+            // image about to be unmapped.
+            engine.world_mut().rehome_resources();
             return None;
         }
 
@@ -322,6 +366,31 @@ impl ReloadTransaction<'_> {
             }
         }
         *self.registered_type_names = newly_registered;
+
+        // The resource twin of the block above. A resource holds a drop
+        // function belonging to the artifact that inserted it, and nothing
+        // clears resources on reload, so a type this subject has stopped
+        // registering must be dropped here - while the retiring image is still
+        // mapped - rather than left for the graveyard to invalidate.
+        let claimed_now = engine
+            .world()
+            .resource_ids_registered_since(resource_registration_sequence);
+        let retired: Vec<pill_engine::ResourceId> = self
+            .registered_resource_ids
+            .iter()
+            .filter(|id| !claimed_now.contains(id))
+            .copied()
+            .collect();
+        if !retired.is_empty() {
+            let dropped = engine.world_mut().drop_resources(&retired);
+            debug!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = self.subject,
+                dropped,
+                "dropped resources for types this generation no longer registers"
+            );
+        }
+        *self.registered_resource_ids = claimed_now;
         // Refresh the C#-exposed component set to the new generation's
         // registrations (plain and persistable alike).
         // Returned to the caller rather than stored: only a module
@@ -333,6 +402,13 @@ impl ReloadTransaction<'_> {
         // old DLLs are still mapped) keeps drops and upcasts valid when those
         // DLLs are later evicted from the reload graveyard.
         engine.world_mut().rehome_native_columns();
+
+        // Step 4c: The same treatment for resources. A resource holds a drop
+        // function belonging to the artifact that inserted it, and nothing
+        // clears resources on reload, so without this a retiring generation's
+        // image would be evicted while a live resource still pointed its
+        // destructor into it.
+        engine.world_mut().rehome_resources();
 
         // Step 5: Migrate persistable schemas that changed across the swap.
         // Types are matched by stable name rather than runtime ComponentId,

@@ -2212,7 +2212,17 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
                     // with a half-registered component set.
                     return u32::MAX;
                 }
-                #fn_ident(engine)
+                let status = #fn_ident(engine);
+                // That drain runs before the user's own registration code, so a
+                // guard raised from there - a shared resource name claimed by
+                // two types, or one registered with two layouts - is recorded
+                // after it has been read. Read the slot once more, so such a
+                // conflict fails the init instead of being recorded and
+                // forgotten.
+                if engine.world_mut().take_registration_error().is_some() {
+                    return u32::MAX;
+                }
+                status
             }));
             result.unwrap_or(u32::MAX)
         }
@@ -2280,7 +2290,17 @@ pub fn pill_project(_attribute: TokenStream, item: TokenStream) -> TokenStream {
                     // with a half-registered component set.
                     return u32::MAX;
                 }
-                #fn_ident(engine)
+                let status = #fn_ident(engine);
+                // That drain runs before the user's own registration code, so a
+                // guard raised from there - a shared resource name claimed by
+                // two types, or one registered with two layouts - is recorded
+                // after it has been read. Read the slot once more, so such a
+                // conflict fails the init instead of being recorded and
+                // forgotten.
+                if engine.world_mut().take_registration_error().is_some() {
+                    return u32::MAX;
+                }
+                status
             }));
             result.unwrap_or(u32::MAX)
         }

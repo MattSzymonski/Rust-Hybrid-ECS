@@ -303,10 +303,17 @@ fn initialize_one(
         engine.end_module_registration();
     }
 
-    if status == 0 {
-        Ok(())
-    } else {
+    // The generated wrappers read the world's registration-error slot once more
+    // after the user's function, because resource guards are raised from that
+    // code rather than from `register_all_components` above. Same here, so a
+    // shared-name conflict fails this entry point instead of being recorded and
+    // forgotten.
+    if status != 0 {
         Err(status)
+    } else if engine.world_mut().take_registration_error().is_some() {
+        Err(u32::MAX)
+    } else {
+        Ok(())
     }
 }
 

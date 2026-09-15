@@ -18,7 +18,6 @@
 //! to prevent dangling-handle bugs.
 
 // Standard library
-use std::any::Any;
 use std::collections::HashMap;
 
 // External crates
@@ -35,7 +34,7 @@ use crate::component::{
 };
 use crate::entity::Entity;
 use crate::query::change_detection::Mut;
-use crate::resource::{Resource, ResourceId};
+use crate::resource::{ErasedResource, ErasedResourceOps, Resource, ResourceId};
 use crate::scripting::{ScriptComponent, ScriptContext};
 
 // =============================================================================
@@ -163,6 +162,23 @@ impl IteratorTimings {
     }
 }
 
+/// What a shared resource name was claimed with.
+///
+/// Recorded per shared [`ResourceId`] so a second claim can be checked against
+/// the first: the same type arriving from another artifact is the case the
+/// feature exists for, while a different type claiming one name is a collision.
+#[derive(Debug, Clone)]
+pub struct SharedResourceClaim {
+    /// The shared name the claiming type declared.
+    pub shared_name: String,
+    /// Rust type name (final path segment) that claimed the shared name.
+    pub declaring_type: String,
+    /// Size in bytes the claiming type declared.
+    pub size: usize,
+    /// Alignment in bytes the claiming type declared.
+    pub align: usize,
+}
+
 // =============================================================================
 // World
 // =============================================================================
@@ -221,10 +237,42 @@ pub struct World {
     script_updaters: HashMap<ComponentId, ScriptUpdater>,
     /// Component registry for bit indices and names
     pub(crate) component_registry: ComponentRegistry,
-    /// Resources (singleton data) stored by type
-    pub(crate) resources: HashMap<ResourceId, Box<dyn Any + Send + Sync>>,
+    /// Resources (singleton data) stored by type.
+    ///
+    /// [`ErasedResource`] rather than `Box<dyn Any>`: a trait object carries
+    /// its destructor in a vtable belonging to the artifact that created the
+    /// value, and resources are never cleared on reload, so retiring a module
+    /// that owned one would leave that destructor pointing into an unmapped
+    /// image. The erased box holds a replaceable function table instead - the
+    /// same discipline component columns already use.
+    pub(crate) resources: HashMap<ResourceId, ErasedResource>,
     /// Per-resource change-detection ticks (parallel to `resources`).
     pub(crate) resource_ticks: HashMap<ResourceId, ComponentTicks>,
+    /// Latest per-type function table registered for each resource id.
+    ///
+    /// The counterpart of `storage_factories` for components, and what
+    /// [`Self::rehome_resources`] refreshes live resources from. Written by
+    /// [`Self::insert_resource`] and [`Self::register_resource`], so a
+    /// generation that re-registers a type without re-inserting its value
+    /// still contributes a table pointing at code that is mapped.
+    pub(crate) resource_factories: HashMap<ResourceId, ErasedResourceOps>,
+    /// For each shared resource id, the Rust type that claimed it and the
+    /// layout it declared.
+    ///
+    /// Only shared ids appear here: an ordinary resource is identified by its
+    /// `TypeId`, so a second claim on the same id is by definition the same
+    /// type. Mirrors what `ComponentRegistry` records for shared components.
+    pub(crate) shared_resource_claims: HashMap<ResourceId, SharedResourceClaim>,
+    /// Monotonic counter stamped onto each resource registration.
+    pub(crate) resource_registration_sequence: u64,
+    /// Every resource registration in order, so the host can enumerate exactly
+    /// which resource types one artifact's `init` claimed.
+    ///
+    /// The resource twin of `component_registration_log`, and needed for the
+    /// same reason: `resource_factories` accumulates and never forgets, so it
+    /// cannot distinguish "registered by the generation now running" from
+    /// "registered by a generation that has since been retired".
+    pub(crate) resource_registration_log: Vec<(ResourceId, u64)>,
     /// Monotonically increasing world tick used for change detection.
     ///
     /// Bumped once per frame by the [`Engine`](crate::engine::Engine) and
@@ -328,6 +376,10 @@ impl World {
             component_registry: ComponentRegistry::new(),
             resources: HashMap::new(),
             resource_ticks: HashMap::new(),
+            resource_factories: HashMap::new(),
+            shared_resource_claims: HashMap::new(),
+            resource_registration_sequence: 0,
+            resource_registration_log: Vec::new(),
             change_tick: 0,
             system_last_run: 0,
             archetype_generation: 0,
@@ -1475,8 +1527,14 @@ impl World {
         );
         let id = ResourceId::of::<T>();
         let tick = Tick::new(self.change_tick);
-        self.resources.insert(id, Box::new(resource));
+        self.claim_shared_resource_name::<T>();
+        self.note_resource_registration(id);
+        self.resources.insert(id, ErasedResource::new(resource));
         self.resource_ticks.insert(id, ComponentTicks::new(tick));
+        // Record the table too, so a later reload can re-home this value even
+        // if the next generation never inserts it again.
+        self.resource_factories
+            .insert(id, ErasedResourceOps::of::<T>());
     }
 
     /// Get immutable reference to a resource
@@ -1490,7 +1548,7 @@ impl World {
         );
         self.resources
             .get(&ResourceId::of::<T>())
-            .and_then(|boxed| boxed.downcast_ref::<T>())
+            .and_then(ErasedResource::get::<T>)
     }
 
     /// Get mutable reference to a resource.
@@ -1500,7 +1558,7 @@ impl World {
     pub fn get_resource_mut<T: Resource>(&mut self) -> Option<&mut T> {
         self.resources
             .get_mut(&ResourceId::of::<T>())
-            .and_then(|boxed| boxed.downcast_mut::<T>())
+            .and_then(ErasedResource::get_mut::<T>)
     }
 
     /// Get mutable, change-tracking access to a resource.
@@ -1530,7 +1588,7 @@ impl World {
         let value: &mut T = self
             .resources
             .get_mut(&id)
-            .and_then(|boxed| boxed.downcast_mut::<T>())?;
+            .and_then(ErasedResource::get_mut::<T>)?;
         let ticks: &mut ComponentTicks = self.resource_ticks.get_mut(&id).unwrap_or_else(|| {
             // `insert_resource` writes `resources` and `resource_ticks`
             // together, so a resource present in one and absent from the
@@ -1545,14 +1603,208 @@ impl World {
         Some(Mut::new(value, ticks, this_run))
     }
 
+    /// Declare that this artifact owns the resource type `T`, without
+    /// inserting a value.
+    ///
+    /// The resource equivalent of `register_component`, and needed for the
+    /// same reason: a resource's stored drop function points into the artifact
+    /// that inserted the value, and a reloaded generation that wants to keep
+    /// the existing value never calls `insert_resource`, so nothing else would
+    /// contribute a table pointing at code that is still mapped.
+    ///
+    /// Call it from a module's `init` for every resource type the module owns.
+    /// Idempotent - a reload re-runs `init`, which is the point.
+    pub fn register_resource<T: Resource>(&mut self) {
+        let id = ResourceId::of::<T>();
+        self.claim_shared_resource_name::<T>();
+        self.resource_factories
+            .insert(id, ErasedResourceOps::of::<T>());
+        self.note_resource_registration(id);
+    }
+
+    /// Stamp one resource registration into the chronological log.
+    fn note_resource_registration(&mut self, id: ResourceId) {
+        self.resource_registration_log
+            .push((id, self.resource_registration_sequence));
+        self.resource_registration_sequence = self.resource_registration_sequence.wrapping_add(1);
+    }
+
+    /// Sequence marker to capture before an artifact's `init`, so the resource
+    /// types that `init` registers can be enumerated afterwards.
+    ///
+    /// Mirrors [`Self::component_registration_sequence`].
+    pub fn resource_registration_sequence(&self) -> u64 {
+        self.resource_registration_sequence
+    }
+
+    /// Resource ids registered at or after `sequence`.
+    ///
+    /// The comparison is `>=`: a registration reads the current value and then
+    /// increments it, so one happening immediately after the capture carries
+    /// exactly the captured value.
+    pub fn resource_ids_registered_since(&self, sequence: u64) -> Vec<ResourceId> {
+        let mut ids: Vec<ResourceId> = self
+            .resource_registration_log
+            .iter()
+            .filter(|(_, stamped)| *stamped >= sequence)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+
+    /// Names declared by the shared resources this world holds a claim for,
+    /// sorted and deduplicated.
+    ///
+    /// The resource counterpart of the component registry's shared-identity
+    /// list, and what the ECS report prints. A shared resource's whole point is
+    /// that no `TypeId` names it, so the declared name is all there is to
+    /// report.
+    #[must_use]
+    pub fn shared_resource_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .shared_resource_claims
+            .values()
+            .map(|claim| claim.shared_name.clone())
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        names
+    }
+
+    /// Check and record which type owns a shared resource name.
+    ///
+    /// No-op for an ordinary resource: its id *is* its `TypeId`, so a second
+    /// claim on one id is necessarily the same type.
+    ///
+    /// For a shared resource the id is derived from a written-down name, so
+    /// two unrelated types can reach it. The discriminator is the type's own
+    /// name - two copies of one type agree on it, two different types do not -
+    /// and only the final path segment is compared, because the module path
+    /// differs between artifacts while the type's name does not. This is the
+    /// same rule `ComponentRegistry` applies to shared components.
+    fn claim_shared_resource_name<T: Resource>(&mut self) {
+        let Some(shared_name) = T::shared_name() else {
+            return;
+        };
+        let id = ResourceId::of::<T>();
+        let incoming = SharedResourceClaim {
+            shared_name: shared_name.to_string(),
+            declaring_type: crate::component::ComponentRegistry::declaring_type_name::<T>()
+                .to_string(),
+            size: std::mem::size_of::<T>(),
+            align: std::mem::align_of::<T>(),
+        };
+        if let Some(existing) = self.shared_resource_claims.get(&id) {
+            if existing.declaring_type != incoming.declaring_type {
+                // Logged as well as recorded, exactly as `register_component`
+                // logs its own failures: the recorded copy is what fails the
+                // init, and the log line is what names the cause to whoever
+                // reads the host output.
+                let error = WorldError::SharedResourceNameConflict {
+                    shared_name: shared_name.to_string(),
+                    existing_type: existing.declaring_type.clone(),
+                    incoming_type: incoming.declaring_type.clone(),
+                };
+                error!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    shared_name = %shared_name,
+                    existing_type = %existing.declaring_type,
+                    incoming_type = %incoming.declaring_type,
+                    error = %error,
+                    "shared resource name claimed by two different types"
+                );
+                self.record_registration_error(error);
+                return;
+            }
+            if existing.size != incoming.size || existing.align != incoming.align {
+                let error = WorldError::SharedResourceLayoutMismatch {
+                    shared_name: shared_name.to_string(),
+                    existing_size: existing.size,
+                    existing_align: existing.align,
+                    incoming_size: incoming.size,
+                    incoming_align: incoming.align,
+                };
+                error!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    shared_name = %shared_name,
+                    existing_size = existing.size,
+                    existing_align = existing.align,
+                    incoming_size = incoming.size,
+                    incoming_align = incoming.align,
+                    error = %error,
+                    "shared resource registered with two different layouts"
+                );
+                self.record_registration_error(error);
+                return;
+            }
+        }
+        self.shared_resource_claims.insert(id, incoming);
+    }
+
+    /// Re-home every stored resource's per-type function table.
+    ///
+    /// The twin of [`Self::rehome_native_columns`], called at the same point
+    /// in the reload transaction and for the same reason: a resource holds a
+    /// drop function belonging to whichever artifact inserted it, and that
+    /// artifact's image is about to be evicted from the reload graveyard.
+    /// Refreshing from the latest registered table, while every image is still
+    /// mapped, keeps the drop valid afterwards.
+    ///
+    /// A resource whose type no artifact has registered in this generation is
+    /// left alone - there is nothing newer to point it at. That case is a
+    /// retired owner's resource, and [`Self::drop_resources`] is what releases
+    /// it, while the retiring image is still mapped.
+    pub fn rehome_resources(&mut self) {
+        for (id, resource) in &mut self.resources {
+            if let Some(&ops) = self.resource_factories.get(id) {
+                resource.refresh_ops(ops);
+            }
+        }
+    }
+
+    /// Drop the named resources, releasing their values.
+    ///
+    /// The resource twin of
+    /// [`drop_forgotten_components`](Self::drop_forgotten_components), and it
+    /// carries the same timing requirement: **call it while the artifact that
+    /// inserted the value is still mapped.** A resource holds a drop function
+    /// belonging to that artifact, so dropping it after the image is evicted
+    /// calls through a dangling pointer.
+    ///
+    /// The host uses it when a reloaded module stops registering a resource
+    /// type it previously owned - compare
+    /// [`resource_ids_registered_since`](Self::resource_ids_registered_since)
+    /// across the two generations to find those ids.
+    ///
+    /// Returns how many were actually present and dropped.
+    pub fn drop_resources(&mut self, ids: &[ResourceId]) -> usize {
+        let mut dropped = 0;
+        for id in ids {
+            if self.resources.remove(id).is_some() {
+                dropped += 1;
+            }
+            self.resource_ticks.remove(id);
+            self.resource_factories.remove(id);
+            self.shared_resource_claims.remove(id);
+        }
+        dropped
+    }
+
     /// Remove a resource and return it if it existed
     pub fn remove_resource<T: Resource>(&mut self) -> Option<T> {
         let id = ResourceId::of::<T>();
         self.resource_ticks.remove(&id);
+        self.resource_factories.remove(&id);
+        self.shared_resource_claims.remove(&id);
+        // A refused take hands the box back rather than destroying it, so
+        // a wrong-type removal leaves the resource in place - but the id is
+        // derived from `T`, so a mismatch here would be an internal-invariant
+        // break rather than a caller error.
         self.resources
             .remove(&id)
-            .and_then(|boxed| boxed.downcast::<T>().ok())
-            .map(|boxed| *boxed)
+            .and_then(|erased| erased.take::<T>().ok())
     }
 
     /// Check if a resource exists
@@ -4559,5 +4811,178 @@ mod tests {
     /// depending on the registry ordering in this test module.
     fn type_name_of<T: 'static>() -> String {
         std::any::type_name::<T>().to_string()
+    }
+
+    // -------------------------------------------------------------------------
+    // Resource re-homing
+    // -------------------------------------------------------------------------
+
+    /// Counts its own drops, so a re-home that corrupted the stored function
+    /// table shows up as a missing or doubled drop rather than as silence.
+    ///
+    /// The counter is owned per instance rather than being a `static`: the
+    /// harness runs these tests in parallel, and a shared counter makes every
+    /// `before + 1` assertion race with the others.
+    #[derive(Debug)]
+    struct RehomeProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+    impl crate::resource::Resource for RehomeProbe {}
+
+    impl Drop for RehomeProbe {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// A fresh probe and the counter watching it.
+    fn rehome_probe() -> (RehomeProbe, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (RehomeProbe(std::sync::Arc::clone(&drops)), drops)
+    }
+
+    /// Reads one probe's counter.
+    fn drops_of(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Inserting a resource records its function table, so a later reload has
+    /// something to re-home from even if it never inserts the value again.
+    #[test]
+    fn inserting_a_resource_records_its_function_table() {
+        let mut world = World::new();
+        let id = crate::resource::ResourceId::of::<RehomeProbe>();
+
+        assert!(!world.resource_factories.contains_key(&id));
+        world.insert_resource(rehome_probe().0);
+        assert!(world.resource_factories.contains_key(&id));
+    }
+
+    /// `register_resource` records the table without inserting a value, which
+    /// is how a reloaded generation keeps an existing resource re-homeable.
+    #[test]
+    fn registering_a_resource_records_the_table_without_a_value() {
+        let mut world = World::new();
+        let id = crate::resource::ResourceId::of::<RehomeProbe>();
+
+        world.register_resource::<RehomeProbe>();
+
+        assert!(world.resource_factories.contains_key(&id));
+        assert!(!world.has_resource::<RehomeProbe>(), "no value was inserted");
+    }
+
+    /// Re-homing leaves the value intact and still droppable exactly once.
+    #[test]
+    fn rehoming_resources_preserves_the_value_and_its_drop() {
+        let (probe, drops) = rehome_probe();
+        let mut world = World::new();
+        world.insert_resource(probe);
+
+        // Stands in for a reloaded generation re-registering the type.
+        world.register_resource::<RehomeProbe>();
+        world.rehome_resources();
+
+        assert!(world.has_resource::<RehomeProbe>(), "the value survives");
+        assert_eq!(drops_of(&drops), 0, "nothing was dropped");
+
+        drop(world);
+        assert_eq!(
+            drops_of(&drops),
+            1,
+            "the value is dropped exactly once after a re-home"
+        );
+    }
+
+    /// The registration log reports what one `init` claimed, which is what
+    /// distinguishes a retired owner from a live one.
+    ///
+    /// `resource_factories` cannot answer that: it accumulates and is never
+    /// pruned, so a retired module's entry looks identical to a live one.
+    #[test]
+    fn the_registration_log_reports_what_one_generation_claimed() {
+        let mut world = World::new();
+        world.insert_resource(rehome_probe().0);
+
+        // Stands in for the moment just before a module's `init` runs.
+        let before_init = world.resource_registration_sequence();
+        world.register_resource::<artifact_a::Settings>();
+
+        assert_eq!(
+            world.resource_ids_registered_since(before_init),
+            vec![crate::resource::ResourceId::of::<artifact_a::Settings>()],
+            "only what this generation registered, not everything ever registered"
+        );
+    }
+
+    /// Dropping a retired owner's resource releases its value, which is what
+    /// the host must do while the owning image is still mapped.
+    #[test]
+    fn dropping_a_retired_owners_resource_releases_its_value() {
+        let (probe, drops) = rehome_probe();
+        let mut world = World::new();
+        world.insert_resource(probe);
+        let id = crate::resource::ResourceId::of::<RehomeProbe>();
+
+        assert_eq!(world.drop_resources(&[id]), 1);
+        assert_eq!(drops_of(&drops), 1, "the value was dropped, not leaked");
+        assert!(!world.has_resource::<RehomeProbe>());
+        // Its bookkeeping goes too, so a later insert starts clean.
+        assert!(!world.resource_factories.contains_key(&id));
+    }
+
+    /// Dropping an id the world does not hold is harmless and reports zero.
+    #[test]
+    fn dropping_an_absent_resource_is_a_no_op() {
+        let mut world = World::new();
+        let id = crate::resource::ResourceId::of::<RehomeProbe>();
+        assert_eq!(world.drop_resources(&[id]), 0);
+    }
+
+    /// Removing a resource forgets its table, so a later resource registered
+    /// under the same id cannot inherit a stale one.
+    #[test]
+    fn removing_a_resource_forgets_its_function_table() {
+        let mut world = World::new();
+        let id = crate::resource::ResourceId::of::<RehomeProbe>();
+        world.insert_resource(rehome_probe().0);
+
+        world.remove_resource::<RehomeProbe>().expect("it was there");
+
+        assert!(!world.resource_factories.contains_key(&id));
+    }
+
+    // -------------------------------------------------------------------------
+    // Shared resource identity
+    // -------------------------------------------------------------------------
+
+    // A shared resource type, standing for one artifact's copy. The
+    // cross-artifact behaviour itself lives in
+    // `tests/shared_resource_identity.rs`; what stays here needs access to the
+    // world's private bookkeeping, which an integration test cannot reach.
+    mod artifact_a {
+        /// `demo::Settings` as one artifact compiled it.
+        #[derive(Debug)]
+        pub struct Settings {
+            #[allow(dead_code)]
+            pub value: u32,
+        }
+        impl crate::resource::Resource for Settings {
+            fn shared_name() -> Option<&'static str> {
+                Some("demo::Settings")
+            }
+        }
+    }
+
+    /// An ordinary resource is untouched: its id is its `TypeId`, and the box
+    /// still checks that exactly.
+    #[test]
+    fn an_ordinary_resource_keeps_the_strict_identity_check() {
+        let mut world = World::new();
+        world.insert_resource(rehome_probe().0);
+
+        assert!(!world
+            .resources
+            .get(&crate::resource::ResourceId::of::<RehomeProbe>())
+            .unwrap()
+            .has_shared_identity());
+        assert!(world.take_registration_error().is_none());
     }
 }

@@ -65,6 +65,9 @@ mod loaded {
             /// Persistable component type names the last `project_init` registered,
             /// used to detect types the next generation forgets to re-register.
             registered_type_names: Vec<String>,
+            /// Resource ids the last `project_init` registered, so a type the
+            /// project stops owning can be dropped while its image is mapped.
+            registered_resource_ids: Vec<pill_engine::ResourceId>,
         },
         /// A collectible managed runtime hosting the C# project assembly.
         CSharp(CSharpRuntime),
@@ -122,21 +125,51 @@ mod loaded {
                     // Capture the registration sequence before init so the exact set
                     // of persistable types this generation registered is recorded.
                     let registration_sequence = engine.world().persist_registration_sequence();
+                    // Taken before init for the same reason, and not read as zero:
+                    // the log accumulates across generations, so `since(0)` would
+                    // record the modules' and the engine's resources as this
+                    // project generation's own claims.
+                    let resource_registration_sequence =
+                        engine.world().resource_registration_sequence();
                     let status = library.call_init(engine_api);
                     analytics::record_init(
                         &config.name,
                         init_started.elapsed().as_secs_f64() * 1000.0,
                     );
                     if status != 0 {
+                        // Everything the failed generation owns has to be
+                        // released before its image is unmapped: its systems are
+                        // `Box<dyn System>` trait objects, and its data -
+                        // resources it inserted, columns its entities live in -
+                        // carries drop glue from the same image. Systems first,
+                        // then the world by replacement, both while the image is
+                        // still mapped.
+                        engine.clear_systems_owned_by(pill_engine::SystemOwner::PROJECT);
+                        let abandoned =
+                            std::mem::replace(engine.world_mut(), pill_engine::World::new());
+                        let resources = abandoned.resource_count();
+                        drop(abandoned);
+                        info!(
+                            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                            module = config.name.as_str(),
+                            resources,
+                            "cleared the world before unmapping the generation that failed to initialize"
+                        );
                         return Err(LibraryError::InitializationFailed { status }.into());
                     }
                     let registered_type_names = engine
                         .world()
                         .persist_type_names_registered_since(registration_sequence);
+                    // What this generation registered, for the same reason the
+                    // type names are kept.
+                    let registered_resource_ids = engine
+                        .world()
+                        .resource_ids_registered_since(resource_registration_sequence);
                     Ok(Self::Native {
                         current: library,
                         old_libraries: Vec::new(),
                         registered_type_names,
+                        registered_resource_ids,
                     })
                 }
                 // The managed runtime performs assembly discovery, component
@@ -171,10 +204,12 @@ mod loaded {
                     current,
                     old_libraries,
                     registered_type_names,
+                    registered_resource_ids,
                 } => reload_native(
                     current,
                     old_libraries,
                     registered_type_names,
+                    registered_resource_ids,
                     engine,
                     engine_api,
                     workspace_root,
@@ -242,6 +277,7 @@ mod loaded {
         current: &mut NativeLibrary,
         old_libraries: &mut Vec<NativeLibrary>,
         registered_type_names: &mut Vec<String>,
+        registered_resource_ids: &mut Vec<pill_engine::ResourceId>,
         engine: &mut Engine,
         engine_api: &EngineApi,
         workspace_root: &Path,
@@ -293,6 +329,7 @@ mod loaded {
             current,
             old_libraries,
             registered_type_names,
+            registered_resource_ids,
         };
         // The project reports no component names onward; only a module's reach
         // the C# backend.

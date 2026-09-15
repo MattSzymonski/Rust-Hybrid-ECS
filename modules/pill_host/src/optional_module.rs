@@ -95,6 +95,9 @@ mod slot {
         /// Persistable component type names the last `init` registered, used to
         /// detect types the next generation forgets to re-register.
         registered_type_names: Vec<String>,
+        /// Resource ids the last `init` registered, so a type this module stops
+        /// owning can be dropped while its image is still mapped.
+        registered_resource_ids: Vec<pill_engine::ResourceId>,
         /// Every component type name (plain or persistable) the last `init`
         /// registered, exposed to the C# backend so `project_cs` can use the
         /// module's native components through byte-level bindings.
@@ -138,17 +141,44 @@ mod slot {
             // persistable types this generation registered can be recorded.
             let registration_sequence = engine.world().persist_registration_sequence();
             let component_registration_sequence = engine.world().component_registration_sequence();
+            // And again for resources. It has to be the sequence taken here, not
+            // zero: the registration log accumulates across every generation and
+            // every other artifact, so `since(0)` would record the engine's own
+            // `Time` and `AssetManager` as this module's claims, and the reload
+            // comparison below would then hand them to `drop_resources`.
+            let resource_registration_sequence = engine.world().resource_registration_sequence();
             engine.begin_module_registration(owner);
             let status = library.call_init(engine_api);
             engine.end_module_registration();
             analytics::record_init(&config.name, init_started.elapsed().as_secs_f64() * 1000.0);
             if status != 0 {
+                // Everything the failed generation owns has to be released
+                // before its image is unmapped: its systems are `Box<dyn
+                // System>` trait objects, and its data - the resources it
+                // inserted, the columns its entities live in - carries drop glue
+                // from the same image. Systems first, then the world by
+                // replacement, both while the image is still mapped.
+                engine.clear_systems_owned_by(owner);
+                let abandoned = std::mem::replace(engine.world_mut(), pill_engine::World::new());
+                let resources = abandoned.resource_count();
+                drop(abandoned);
+                info!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    module = config.name.as_str(),
+                    resources,
+                    "cleared the world before unmapping the generation that failed to initialize"
+                );
                 return Err(ModuleError::InitializationFailed {
                     module: config.name.clone(),
                     status,
                 }
                 .into());
             }
+            // What this generation's `init` registered; kept so the next
+            // reload can tell which types the new one stopped owning.
+            let registered_resource_ids = engine
+                .world()
+                .resource_ids_registered_since(resource_registration_sequence);
             let registered_type_names = engine
                 .world()
                 .persist_type_names_registered_since(registration_sequence);
@@ -173,6 +203,7 @@ mod slot {
                 reload_generation,
                 last_processed_generation: 0,
                 registered_type_names,
+                registered_resource_ids,
                 exposed_component_names,
             })
         }
@@ -354,6 +385,7 @@ mod slot {
                 current: &mut self.current,
                 old_libraries: &mut self.old_libraries,
                 registered_type_names: &mut self.registered_type_names,
+                registered_resource_ids: &mut self.registered_resource_ids,
             };
             let Some(commit) = transaction.commit(engine, engine_api, new_library) else {
                 // The new generation failed to initialize and the previous one

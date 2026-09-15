@@ -175,6 +175,66 @@ pub enum WorldError {
         live_rows: usize,
     },
 
+    /// Two different Rust types claim the same shared resource name.
+    ///
+    /// A shared name is a process-wide identity, so two types holding it are
+    /// one resource: one slot, and whichever artifact inserts last replaces
+    /// the other's value. When their layouts also agree, reads through either
+    /// type succeed and quietly return the other resource's data.
+    ///
+    /// The legitimate case this must not reject is one type compiled into two
+    /// artifacts, which is the entire point of a shared name. Those agree on
+    /// the type's own name, while two different types do not.
+    #[message(
+        "shared resource name ",
+        name_style(shared_name),
+        " is claimed by two different types (",
+        name_style(existing_type),
+        " and ",
+        name_style(incoming_type),
+        "); a shared name is a process-wide identity, so give them distinct names"
+    )]
+    SharedResourceNameConflict {
+        /// The shared name both types declared.
+        shared_name: String,
+        /// Rust type name that claimed the name first.
+        existing_type: String,
+        /// Rust type name claiming it now.
+        incoming_type: String,
+    },
+
+    /// One shared resource name, two different memory layouts.
+    ///
+    /// A shared resource is reached from every artifact through one slot, and
+    /// the only thing establishing that they agree about its contents is this
+    /// check - the box's own identity check compares layout, so a mismatch
+    /// would misread the value rather than refuse it.
+    #[message(
+        "shared resource ",
+        name_style(shared_name),
+        " is registered with two different layouts (existing: ",
+        value(existing_size),
+        " bytes / ",
+        value(existing_align),
+        " align; incoming: ",
+        value(incoming_size),
+        " bytes / ",
+        value(incoming_align),
+        " align); rebuild every artifact that links it against one definition"
+    )]
+    SharedResourceLayoutMismatch {
+        /// The shared name both registrations declared.
+        shared_name: String,
+        /// Size recorded by the registration that got there first.
+        existing_size: usize,
+        /// Alignment recorded by that first registration.
+        existing_align: usize,
+        /// Size of the type being registered now.
+        incoming_size: usize,
+        /// Alignment of the type being registered now.
+        incoming_align: usize,
+    },
+
     /// Two different Rust types claim the same shared component name.
     ///
     /// A shared name is a process-wide identity, so two types holding it are

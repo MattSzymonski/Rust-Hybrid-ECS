@@ -443,6 +443,25 @@ fn report_setup_failure(error: HostError) -> HostError {
     error
 }
 
+/// Report a setup failure and tear the half-built host down world-first.
+///
+/// Locals unwind in reverse declaration order, which here means the loaded
+/// module images unmap while the world is still alive - and a resource a module
+/// inserted stores its drop function in that module's image, so the world's own
+/// teardown is what calls it. An unmapped call is an access violation, which is
+/// why a failed startup could end in a crash after printing the reason.
+///
+/// Dropping the world first makes every one of those drops happen while the
+/// images are still mapped; the slots then unmap with nothing pointing into
+/// them. The error is reported before either drop, so it survives whatever the
+/// teardown does.
+#[cfg(feature = "hot_reload")]
+fn fail_setup(engine: Box<Engine>, error: HostError) -> HostError {
+    let reported = report_setup_failure(error);
+    drop(engine);
+    reported
+}
+
 #[cfg(feature = "hot_reload")]
 /// Build/load the project module, create the engine, and start its source watcher.
 ///
@@ -497,7 +516,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
             Arc::clone(&module_generation),
         ) {
             Ok(slot) => slot,
-            Err(error) => return Err(report_setup_failure(error.into())),
+            Err(error) => return Err(fail_setup(engine, error.into())),
         };
         if let Err(error) = spawn_source_watcher(
             workspace_root.clone(),
@@ -505,7 +524,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
             &module_config.watch_directory,
             module_generation,
         ) {
-            return Err(report_setup_failure(error.into()));
+            return Err(fail_setup(engine, error.into()));
         }
         optional_modules.push(slot);
     }
@@ -547,7 +566,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
         &all_mirror_methods,
     ) {
         Ok(project) => project,
-        Err(error) => return Err(report_setup_failure(error)),
+        Err(error) => return Err(fail_setup(engine, error)),
     };
 
     let reload_generation = Arc::new(AtomicU64::new(0));
@@ -557,7 +576,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
         &module_config.watch_directory,
         Arc::clone(&reload_generation),
     ) {
-        return Err(report_setup_failure(error.into()));
+        return Err(fail_setup(engine, error.into()));
     }
 
     // Step 6: Snapshot host memory and print the startup analytics report.

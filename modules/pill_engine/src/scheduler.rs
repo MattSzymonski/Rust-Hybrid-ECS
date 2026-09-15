@@ -553,7 +553,7 @@ impl SystemScheduler {
 mod tests {
     use super::*;
     use crate::component::{Component, ComponentId};
-    use std::{any::TypeId, hash::BuildHasher};
+    use std::hash::BuildHasher;
 
     // The scheduler only ever compares component ids for equality, so these
     // tests need nothing of a component but a distinct identity. They used to
@@ -576,6 +576,20 @@ mod tests {
         TestComponentF,
         TestComponentG,
     );
+
+    // The same for resources. These tests only ever compare resource ids for
+    // equality, so they need nothing of a resource but a distinct identity.
+    // They used to borrow primitives (`ResourceId::of::<TestResourceA>()`);
+    // `ResourceId` is an enum now, so that construction is gone and the
+    // stand-ins are declared here instead.
+    macro_rules! test_resources {
+        ($($name:ident),* $(,)?) => {$(
+            #[derive(Debug)]
+            struct $name;
+            impl crate::resource::Resource for $name {}
+        )*};
+    }
+    test_resources!(TestResourceA, TestResourceB, TestResourceC, TestResourceD);
 
     // Helper: Verify that no batch contains conflicting systems
     fn assert_no_batch_conflicts(scheduler: &SystemScheduler) {
@@ -1068,11 +1082,11 @@ mod tests {
 
         // Two systems both reading the same resource
         let mut access1 = SystemAccess::new();
-        access1.add_resource_read(ResourceId(TypeId::of::<i32>()));
+        access1.add_resource_read(ResourceId::of::<TestResourceA>());
         scheduler.register_system(access1);
 
         let mut access2 = SystemAccess::new();
-        access2.add_resource_read(ResourceId(TypeId::of::<i32>()));
+        access2.add_resource_read(ResourceId::of::<TestResourceA>());
         scheduler.register_system(access2);
 
         scheduler.build_execution_graph();
@@ -1092,11 +1106,11 @@ mod tests {
 
         // Two systems both writing the same resource
         let mut access1 = SystemAccess::new();
-        access1.add_resource_write(ResourceId(TypeId::of::<i32>()));
+        access1.add_resource_write(ResourceId::of::<TestResourceA>());
         scheduler.register_system(access1);
 
         let mut access2 = SystemAccess::new();
-        access2.add_resource_write(ResourceId(TypeId::of::<i32>()));
+        access2.add_resource_write(ResourceId::of::<TestResourceA>());
         scheduler.register_system(access2);
 
         scheduler.build_execution_graph();
@@ -1115,11 +1129,11 @@ mod tests {
 
         // System 1 reads a resource, System 2 writes same resource
         let mut access1 = SystemAccess::new();
-        access1.add_resource_read(ResourceId(TypeId::of::<i32>()));
+        access1.add_resource_read(ResourceId::of::<TestResourceA>());
         scheduler.register_system(access1);
 
         let mut access2 = SystemAccess::new();
-        access2.add_resource_write(ResourceId(TypeId::of::<i32>()));
+        access2.add_resource_write(ResourceId::of::<TestResourceA>());
         scheduler.register_system(access2);
 
         scheduler.build_execution_graph();
@@ -1138,11 +1152,11 @@ mod tests {
 
         // Two systems writing different resources
         let mut access1 = SystemAccess::new();
-        access1.add_resource_write(ResourceId(TypeId::of::<i32>()));
+        access1.add_resource_write(ResourceId::of::<TestResourceA>());
         scheduler.register_system(access1);
 
         let mut access2 = SystemAccess::new();
-        access2.add_resource_write(ResourceId(TypeId::of::<f32>()));
+        access2.add_resource_write(ResourceId::of::<TestResourceD>());
         scheduler.register_system(access2);
 
         scheduler.build_execution_graph();
@@ -1163,19 +1177,19 @@ mod tests {
         // System 1: reads component A, writes resource X
         let mut access1 = SystemAccess::new();
         access1.add_read(ComponentId::of::<TestComponentA>());
-        access1.add_resource_write(ResourceId(TypeId::of::<u64>()));
+        access1.add_resource_write(ResourceId::of::<TestResourceC>());
         scheduler.register_system(access1);
 
         // System 2: reads component A, reads resource X
         let mut access2 = SystemAccess::new();
         access2.add_read(ComponentId::of::<TestComponentA>());
-        access2.add_resource_read(ResourceId(TypeId::of::<u64>()));
+        access2.add_resource_read(ResourceId::of::<TestResourceC>());
         scheduler.register_system(access2);
 
         // System 3: writes component B, reads resource Y (no conflicts with either)
         let mut access3 = SystemAccess::new();
         access3.add_write(ComponentId::of::<TestComponentB>());
-        access3.add_resource_read(ResourceId(TypeId::of::<u32>()));
+        access3.add_resource_read(ResourceId::of::<TestResourceB>());
         scheduler.register_system(access3);
 
         scheduler.build_execution_graph();
@@ -1318,10 +1332,10 @@ mod tests {
             AccessKind::ReadB => a.add_read(ComponentId::of::<TestComponentE>()),
             AccessKind::WriteB => a.add_write(ComponentId::of::<TestComponentE>()),
             AccessKind::Commands => a.set_uses_commands(true),
-            AccessKind::ResReadX => a.add_resource_read(ResourceId(TypeId::of::<u32>())),
-            AccessKind::ResWriteX => a.add_resource_write(ResourceId(TypeId::of::<u32>())),
-            AccessKind::ResReadY => a.add_resource_read(ResourceId(TypeId::of::<u64>())),
-            AccessKind::ResWriteY => a.add_resource_write(ResourceId(TypeId::of::<u64>())),
+            AccessKind::ResReadX => a.add_resource_read(ResourceId::of::<TestResourceB>()),
+            AccessKind::ResWriteX => a.add_resource_write(ResourceId::of::<TestResourceB>()),
+            AccessKind::ResReadY => a.add_resource_read(ResourceId::of::<TestResourceC>()),
+            AccessKind::ResWriteY => a.add_resource_write(ResourceId::of::<TestResourceC>()),
         }
         a
     }

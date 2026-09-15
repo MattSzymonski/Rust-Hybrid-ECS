@@ -74,6 +74,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # =============================================================================
 
 SPLINE_LIB_RS = MODULES_ROOT / "optional" / "pill_spline" / "src" / "lib.rs"
+PROJECT_LIB_RS = WORKSPACE_ROOT / "examples" / "project_rs" / "src" / "lib.rs"
 
 # The component whose identity this suite is about, spelled as the engine
 # registers it. With `#[pill(shared)]` and no explicit name, the derive uses
@@ -104,6 +105,184 @@ SHARED_IDENTITY_HEADING = "shared identity"
 COLLISION_TOKEN = "two live registrations claim one component type name"
 # The host turns a non-zero project init into a setup failure.
 SETUP_FAILED_TOKEN = "Host setup failed"
+
+# The resource scenario declares a resource in the module, inserts it there, and
+# reads it from the project. Both edits are removed again by the backup
+# registry, and the probe's value is arbitrary but distinctive.
+RESOURCE_PROBE_TOKEN = "SHARED RESOURCE PROBE"
+RESOURCE_PROBE_VALUE = "4242"
+
+RESOURCE_DECLARATION = """\
+/// Injected by `test_shared_component_identity.py` - a resource declared in the
+/// module crate, which the project also links, so it is compiled twice with
+/// different features exactly as `Spline` is.
+#[derive(Debug, Default)]
+pub struct SharedProbeSettings {
+    pub value: u32,
+}
+impl pill_engine::Resource for SharedProbeSettings {
+    fn shared_name() -> Option<&'static str> {
+        Some("pill_spline::SharedProbeSettings")
+    }
+}
+
+"""
+
+RESOURCE_INSERT = """\
+    // Injected by the shared-identity suite: the module inserts a resource of
+    // its own type, which the project then reads through its own copy.
+    engine
+        .world_mut()
+        .insert_resource(SharedProbeSettings { value: 4242 });
+
+    // Injected: a system of the module's own that writes that resource. The
+    // project registers one for the same resource, so the scheduler has to keep
+    // the two apart - one id, one slot, one writer at a time. The line reports
+    // that this side's system ran once the resource was actually reachable,
+    // which is a different failure from the scheduler's.
+    let writer_probe_frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    engine.register_system(
+        "shared_probe_writer",
+        move |mut settings: ResMut<SharedProbeSettings>| {
+            if let Some(mut settings) = settings.get_mut() {
+                settings.value += 1;
+            }
+            if writer_probe_frames
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                == 64
+            {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    "SHARED RESOURCE WRITER MODULE"
+                );
+            }
+        },
+    );
+"""
+
+RESOURCE_PROBE = """\
+    // Injected by the shared-identity suite.
+    {
+        let seen = engine
+            .world()
+            .get_resource::<pill_spline::SharedProbeSettings>()
+            .map(|settings| settings.value);
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            value = ?seen,
+            "SHARED RESOURCE PROBE"
+        );
+    }
+
+    // Injected: the project's own writer for the module's shared resource. Both
+    // writers resolve to one id, so the scheduler must never batch them; if it
+    // did, the debug write lock inside `ResMut::new` would report the overlap
+    // while this line proves the project's side had a slot to write to.
+    let writer_probe_frames = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    engine.register_system(
+        "project_shared_probe_writer",
+        move |mut settings: ResMut<pill_spline::SharedProbeSettings>| {
+            if let Some(mut settings) = settings.get_mut() {
+                settings.value += 1;
+            }
+            if writer_probe_frames
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                == 64
+            {
+                pill_core::info!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    "SHARED RESOURCE WRITER PROJECT"
+                );
+            }
+        },
+    );
+"""
+
+# Each side's writer reports with its own token, so a missing line identifies the
+# side that never ran rather than only that something did not happen.
+RESOURCE_WRITER_MODULE_TOKEN = "SHARED RESOURCE WRITER MODULE"
+RESOURCE_WRITER_PROJECT_TOKEN = "SHARED RESOURCE WRITER PROJECT"
+
+# Emitted by `World::debug_acquire_resource_lock` when two live `ResMut`s hold one
+# resource - which is what a scheduler that batched the two writers would produce.
+SCHEDULER_OVERLAP_TOKEN = "already mutably borrowed"
+
+# The control scenario for the resource guards: a *different* type in the
+# project claims the shared name the module already declared. The claim is made
+# from the artifact's own registration code, so what this pins is that the
+# conflict reaches the init that raised it - being recorded is not enough.
+RESOURCE_CONFLICT_TOKEN = "shared resource name claimed by two different types"
+
+RESOURCE_CONFLICT_DECLARATION = """\
+/// Injected by `test_shared_component_identity.py` - a second type claiming the
+/// shared name the module declared, which registration must refuse.
+#[derive(Debug, Default)]
+pub struct ConflictingProbeSettings {
+    pub value: u32,
+}
+impl pill_engine::Resource for ConflictingProbeSettings {
+    fn shared_name() -> Option<&'static str> {
+        Some("pill_spline::SharedProbeSettings")
+    }
+}
+
+"""
+
+RESOURCE_CONFLICT_INSERT = """\
+    // Injected by the shared-identity suite: a rival claim on a shared name the
+    // module already owns.
+    engine
+        .world_mut()
+        .insert_resource(ConflictingProbeSettings { value: 7 });
+"""
+
+# The engine's own resources are inserted before any artifact runs, so nothing
+# re-inserts them: if one is retired by a reload it stays gone. The probe logs
+# once per generation, from the module's own `register`.
+TIME_PROBE_TOKEN = "TIME SURVIVAL PROBE"
+
+TIME_PROBE = """\
+    // Injected by the shared-identity suite: an engine-owned resource has to
+    // outlive every reload, including one that retires a generation.
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        time_present = engine.world().has_resource::<pill_engine::Time>(),
+        "TIME SURVIVAL PROBE"
+    );
+"""
+
+# The rollback scenario claims a resource only the *incoming* generation knows
+# about, then fails its init. The previous image has neither the type nor the
+# insert, so nothing can re-claim the value during the rollback - which is what
+# makes the host release it, while the failing image is still mapped.
+ROLLBACK_TOKEN = "new generation failed to initialize; rolling back"
+RETIRED_RESOURCE_TOKEN = "dropped resources claimed only by the failed generation"
+
+ROLLBACK_RESOURCE_DECLARATION = """\
+/// Injected by `test_shared_component_identity.py` - a type only the generation
+/// that fails to initialize knows about.
+#[derive(Debug, Default)]
+pub struct RollbackProbeSettings {
+    pub value: u32,
+}
+impl pill_engine::Resource for RollbackProbeSettings {}
+
+"""
+
+ROLLBACK_RESOURCE_INSERT_AND_FAIL = """\
+    // Injected by the shared-identity suite: claim a resource of this
+    // generation's own, register a system of its own, then fail. Both the value
+    // and the system's box carry code from the failing image, which is what the
+    // release has to drop before that image goes.
+    engine
+        .world_mut()
+        .insert_resource(RollbackProbeSettings { value: 9 });
+    engine.register_system(
+        "failed_generation_probe",
+        |_: pill_engine::Res<RollbackProbeSettings>| {},
+    );
+    return 1;
+"""
 
 # The module's sample-offset constant, edited to trigger a body-only reload.
 # A plain `f32` literal, so exactly one line matches.
@@ -205,6 +384,128 @@ def edit_sample_offset() -> None:
     new_offset = (float(match.group(2)) + 1.0) % 10.0
     new_line = f"{match.group(1)}const SAMPLE_VERTICAL_OFFSET: f32 = {new_offset:.1f};"
     atomic_write(SPLINE_LIB_RS, content.replace(match.group(0), new_line, 1))
+
+
+def restore_then_install(*paths: Path) -> None:
+    """Rewinds captured sources before a scenario installs its own edits.
+
+    The suite restores once at the end of a run rather than between scenarios, so
+    a scenario injecting into a file an earlier one already injected into would
+    compile two copies of the same declaration. Rewinding first makes each
+    scenario independent of the order it runs in, and the fresh mtime a restore
+    leaves behind is what makes the host rebuild from it.
+    """
+    for path in paths:
+        BACKUP.restore_one(path)
+
+
+def install_shared_resource_in_module() -> None:
+    """Declares the shared resource in the module and inserts it there.
+
+    Split out because two scenarios need this half: one reads the value from the
+    project, the other claims its name from the project and expects to be
+    refused.
+    """
+    restore_then_install(SPLINE_LIB_RS)
+    module = read_source(SPLINE_LIB_RS)
+    anchor = "// =============================================================================\n// Component\n"
+    if anchor not in module:
+        raise RuntimeError(f"Component section anchor missing from {SPLINE_LIB_RS.name}")
+    module = module.replace(anchor, RESOURCE_DECLARATION + anchor, 1)
+
+    register_anchor = "pub fn register(engine: &mut Engine) -> u32 {\n"
+    if module.count(register_anchor) != 1:
+        raise RuntimeError(f"`register` anchor missing from {SPLINE_LIB_RS.name}")
+    module = module.replace(register_anchor, register_anchor + RESOURCE_INSERT, 1)
+    atomic_write(SPLINE_LIB_RS, module)
+
+
+def install_resource_probe() -> None:
+    """Declares a shared resource in the module and reads it from the project.
+
+    The module inserts it during `register`; the project reads it during `init`,
+    which runs afterwards. Both files are captured by the backup registry, so
+    the edits come out again whatever the scenario does.
+    """
+    install_shared_resource_in_module()
+
+    restore_then_install(PROJECT_LIB_RS)
+    project = read_source(PROJECT_LIB_RS)
+    init_anchor = "pub fn init(engine: &mut Engine) -> u32 {\n"
+    if project.count(init_anchor) != 1:
+        raise RuntimeError(f"`init` anchor missing from {PROJECT_LIB_RS.name}")
+    atomic_write(PROJECT_LIB_RS, project.replace(init_anchor, init_anchor + RESOURCE_PROBE, 1))
+
+
+def install_resource_conflict() -> None:
+    """Installs the module's shared resource, then a rival claim in the project.
+
+    Modules load before the project, so the module's claim is the first one and
+    the project is the artifact whose registration has to be refused.
+
+    The declaration goes *above* the `#[pill_project]` attribute: an item
+    inserted between an attribute and the function it annotates is a parse
+    error, since the attribute expects a function next.
+    """
+    install_shared_resource_in_module()
+
+    restore_then_install(PROJECT_LIB_RS)
+    project = read_source(PROJECT_LIB_RS)
+    attribute_anchor = "#[pill_project]\npub fn init(engine: &mut Engine) -> u32 {\n"
+    init_anchor = "pub fn init(engine: &mut Engine) -> u32 {\n"
+    if project.count(attribute_anchor) != 1:
+        raise RuntimeError(f"`#[pill_project]` anchor missing from {PROJECT_LIB_RS.name}")
+    if project.count(init_anchor) != 1:
+        raise RuntimeError(f"`init` anchor missing from {PROJECT_LIB_RS.name}")
+    project = project.replace(
+        attribute_anchor, RESOURCE_CONFLICT_DECLARATION + attribute_anchor, 1
+    )
+    project = project.replace(init_anchor, init_anchor + RESOURCE_CONFLICT_INSERT, 1)
+    atomic_write(PROJECT_LIB_RS, project)
+
+
+def install_time_probe() -> None:
+    """Logs whether the engine's own `Time` resource exists, once per generation.
+
+    `register` runs on every load and every reload, so it is the *second*
+    reload's line that shows whether the first retired a resource the module
+    never owned: a retired resource is dropped at the end of that transaction,
+    after that generation's `register` has already logged.
+    """
+    restore_then_install(SPLINE_LIB_RS)
+    module = read_source(SPLINE_LIB_RS)
+    register_anchor = "pub fn register(engine: &mut Engine) -> u32 {\n"
+    if module.count(register_anchor) != 1:
+        raise RuntimeError(f"`register` anchor missing from {SPLINE_LIB_RS.name}")
+    atomic_write(SPLINE_LIB_RS, module.replace(register_anchor, register_anchor + TIME_PROBE, 1))
+
+
+def install_failing_reload_with_resource() -> None:
+    """Edits the module so its next generation claims a resource, then fails.
+
+    The declaration and the insert arrive in one edit, so the previous
+    generation - still mapped, and the one the rollback restores - has neither
+    and cannot re-claim the id. That is what leaves the value's drop function as
+    the only thing pointing into the image about to be unmapped.
+
+    The project is rewound too, though this scenario does not edit it: a rival
+    shared-name claim left behind by an earlier scenario would fail the project's
+    init at startup, and this scenario needs a host that starts.
+    """
+    restore_then_install(SPLINE_LIB_RS, PROJECT_LIB_RS)
+    module = read_source(SPLINE_LIB_RS)
+    anchor = "// =============================================================================\n// Component\n"
+    if anchor not in module:
+        raise RuntimeError(f"Component section anchor missing from {SPLINE_LIB_RS.name}")
+    module = module.replace(anchor, ROLLBACK_RESOURCE_DECLARATION + anchor, 1)
+
+    register_anchor = "pub fn register(engine: &mut Engine) -> u32 {\n"
+    if module.count(register_anchor) != 1:
+        raise RuntimeError(f"`register` anchor missing from {SPLINE_LIB_RS.name}")
+    module = module.replace(
+        register_anchor, register_anchor + ROLLBACK_RESOURCE_INSERT_AND_FAIL, 1
+    )
+    atomic_write(SPLINE_LIB_RS, module)
 
 
 # =============================================================================
@@ -497,6 +798,7 @@ def scenario_a_shared_component_survives_a_module_reload() -> bool:
     """
     print("\n  [TEST] Hot reload: a shared component's rows survive a DLL swap.")
     set_shared_identity(True)
+    install_time_probe()
 
     process, monitor = launch_host()
     try:
@@ -540,6 +842,43 @@ def scenario_a_shared_component_survives_a_module_reload() -> bool:
             return False
         print("  [OK] Both binaries re-registered without a collision.")
 
+        # A second swap, because the first is the one that could have retired a
+        # resource this module never owned - and the drop happens at the end of
+        # that transaction, after its `register` had already logged. The next
+        # generation's line is therefore the first that can show the loss.
+        second_start = monitor.line_count
+        print("  [TEST] Editing again to drive a second reload...")
+        edit_sample_offset()
+
+        if not monitor.wait_for(
+            MODULE_RELOAD_COMPLETE_TOKEN, RELOAD_TIMEOUT_SECONDS, second_start
+        ):
+            print("  [FAIL] The second module reload never completed.")
+            print(f"  Output tail:\n{monitor.output_since(second_start)[-2000:]}")
+            return False
+        print("  [OK] Second reload complete.")
+
+        probes = [
+            line
+            for line in monitor.output_since(second_start).splitlines()
+            if TIME_PROBE_TOKEN in line
+        ]
+        if not probes:
+            print("  [FAIL] The module's probe did not run on the second reload.")
+            return False
+        if "time_present=false" in probes[-1]:
+            print(
+                "  [FAIL] `Time` is gone after a reload: an engine-owned resource "
+                "was retired by a generation that never owned it. Nothing "
+                "re-inserts it, so it stays gone for the rest of the session."
+            )
+            print(f"  Probe: {probes[-1].strip()}")
+            return False
+        if "time_present=true" not in probes[-1]:
+            print(f"  [FAIL] Unreadable probe line.\n  Probe: {probes[-1].strip()}")
+            return False
+        print("  [OK] `Time` survived both reloads.")
+
         # A column whose function table was left pointing into the unmapped
         # image would fault here rather than report anything.
         if has_crash_signals(monitor.output_since(0)):
@@ -557,6 +896,274 @@ def scenario_a_shared_component_survives_a_module_reload() -> bool:
         common.terminate_process(process, monitor)
 
 
+def scenario_a_shared_resource_crosses_the_boundary() -> bool:
+    """A resource declared in a module is readable from the project.
+
+    Resources have the identity problem components had, and one the components
+    never did: `ResourceId` was a bare `TypeId`, and the value lived in a
+    `Box<dyn Any>` whose `downcast_ref` compares `TypeId` too. A resource
+    defined in `pill_spline` - compiled twice with different features - was
+    therefore invisible across the boundary, silently, as `None`.
+
+    This is the only scenario that exercises two genuinely different `TypeId`s
+    for one resource type; nothing in-process can, because two distinct Rust
+    types in one binary are exactly what the guard is designed to reject.
+
+    It also covers the scheduler's side of that identity, which is the half no
+    in-process test reaches across two DLLs: each binary registers a system that
+    writes the same shared resource, and the pair has to be serialized.
+    """
+    print("\n  [TEST] A shared resource declared in a module reaches the project.")
+    set_shared_identity(True)
+    install_resource_probe()
+
+    process, monitor = launch_host()
+    try:
+        if not monitor.wait_for(STARTUP_TOKEN, STARTUP_TIMEOUT):
+            print("  [FAIL] Host did not reach the project loop.")
+            print(f"  Output tail:\n{monitor.output_since(0)[-2000:]}")
+            return False
+        print("  [OK] Host started with the module's resource inserted.")
+
+        output = monitor.output_since(0)
+        probe = next(
+            (line for line in output.splitlines() if RESOURCE_PROBE_TOKEN in line), None
+        )
+        if probe is None:
+            print("  [FAIL] The project never reported reading the resource.")
+            print(f"  Output tail:\n{output[-2000:]}")
+            return False
+
+        if "None" in probe:
+            print(
+                "  [FAIL] The project could not see the module's resource: "
+                "the two artifacts resolved it to different ids, or the stored "
+                "value refused the project's copy of the type."
+            )
+            print(f"  Probe: {probe.strip()}")
+            return False
+        if RESOURCE_PROBE_VALUE not in probe:
+            print(f"  [FAIL] The project read an unexpected value.\n  Probe: {probe.strip()}")
+            return False
+        print(f"  [OK] The project read the module's value ({RESOURCE_PROBE_VALUE}).")
+
+        if COLLISION_TOKEN in output:
+            print("  [FAIL] A collision was reported while registering the resource.")
+            return False
+        print("  [OK] No collision: both copies resolved to one resource.")
+
+        # Both binaries registered a writer for that one resource, so both have to
+        # be able to run it: the scheduler must keep them out of one batch, and
+        # each side's own line is what shows its writes reached the shared slot.
+        # A batched pair fails differently - the debug write lock reports the
+        # overlap and takes the host down - so the absence of that report is part
+        # of the claim rather than a detail.
+        for token, side in (
+            (RESOURCE_WRITER_MODULE_TOKEN, "module"),
+            (RESOURCE_WRITER_PROJECT_TOKEN, "project"),
+        ):
+            if not monitor.wait_for(token, REPORT_SAMPLE_TIMEOUT, 0):
+                print(
+                    f"  [FAIL] The {side}'s writer system never reported running, so "
+                    "its writes never reached the shared slot."
+                )
+                print(f"  Output tail:\n{monitor.output_since(0)[-2000:]}")
+                return False
+        print("  [OK] Both binaries' writers ran against the one resource.")
+
+        if SCHEDULER_OVERLAP_TOKEN in monitor.output_since(0) or has_crash_signals(
+            monitor.output_since(0)
+        ):
+            print(
+                "  [FAIL] The host reported two live mutable borrows of the shared "
+                "resource: its two writers were batched in parallel."
+            )
+            return False
+        if not monitor.process_alive():
+            print("  [FAIL] The host exited while the writers were running.")
+            return False
+        print("  [OK] The scheduler kept the two writers apart, with no fault.")
+
+        print("  [PASS] A module's resource is readable and writable from both binaries.")
+        return True
+    finally:
+        common.terminate_process(process, monitor)
+
+
+def scenario_a_conflicting_resource_claim_fails_setup() -> bool:
+    """A rival claim on a shared resource name fails the init that made it.
+
+    The guard fires from the artifact's own registration code, which runs after
+    the engine's component-registration drain, so recording the conflict is not
+    enough: the generated init has to read it back and fail, or the host runs on
+    with two types sharing one resource slot - and the second insert silently
+    replacing the first type's value.
+
+    Nothing in-process covers this half. The integration tests call
+    `World::take_registration_error` directly, which says nothing about whether
+    an `init` wrapper ever does.
+    """
+    print("\n  [TEST] A rival claim on the module's shared resource name fails setup.")
+    install_resource_conflict()
+
+    process, monitor = launch_host()
+    try:
+        # The host is expected to fail setup and exit, so this waits for the
+        # exit rather than for a token, exactly as the component control does.
+        deadline = time.monotonic() + COLLISION_TIMEOUT
+        reached_loop = False
+        while time.monotonic() < deadline:
+            if STARTUP_TOKEN in monitor.output_since(0):
+                reached_loop = True
+                break
+            if not monitor.process_alive():
+                break
+            time.sleep(0.2)
+
+        output = monitor.output_since(0)
+
+        if reached_loop:
+            print(
+                "  [FAIL] The host started with two types claiming one shared "
+                "resource name: the conflict was recorded and never read."
+            )
+            return False
+
+        if RESOURCE_CONFLICT_TOKEN not in output:
+            print("  [FAIL] No shared-resource name conflict was reported.")
+            print(f"  Output tail:\n{output[-2000:]}")
+            return False
+        print("  [OK] The conflict was reported, naming the claim and the claimant.")
+
+        if SETUP_FAILED_TOKEN not in output:
+            print(
+                "  [FAIL] The conflict was reported but setup continued; the "
+                "generated init never read the recorded error."
+            )
+            print(f"  Output tail:\n{output[-2000:]}")
+            return False
+        print("  [OK] Setup failed instead of running with the second claim in place.")
+
+        print("  [PASS] A resource conflict raised from user code fails the init.")
+        return True
+    finally:
+        common.terminate_process(process, monitor)
+
+
+def scenario_a_failed_reload_drops_its_own_resource() -> bool:
+    """A generation that fails to initialize leaves no resource behind.
+
+    The failing image is unmapped the moment the rollback returns, so a resource
+    value that generation inserted points its drop at code that is about to go.
+    The rollback therefore has to release it - and can only do so while the
+    image is still mapped, which is why this is asserted against a live host
+    rather than in-process.
+
+    The type is declared by the failing generation alone, so nothing re-claims
+    it during the rollback and the release has to happen.
+    """
+    print("\n  [TEST] Rollback: a failed generation's own resource is released.")
+    set_shared_identity(True)
+    # Rewind before the host starts rather than after: a rival shared-name claim
+    # left by an earlier scenario would fail this startup, and the first
+    # generation has to succeed for there to be a rollback to observe.
+    restore_then_install(SPLINE_LIB_RS, PROJECT_LIB_RS)
+
+    process, monitor = launch_host()
+    try:
+        if not monitor.wait_for(STARTUP_TOKEN, STARTUP_TIMEOUT):
+            print("  [FAIL] Host did not reach the project loop.")
+            print(f"  Output tail:\n{monitor.output_since(0)[-2000:]}")
+            return False
+        print("  [OK] Host started on a generation that owns no such resource.")
+
+        start_index = monitor.line_count
+        print("  [TEST] Editing the module so its next init claims a resource and fails...")
+        install_failing_reload_with_resource()
+
+        if not monitor.wait_for(ROLLBACK_TOKEN, RELOAD_TIMEOUT_SECONDS, start_index):
+            print("  [FAIL] The failing generation was never rolled back.")
+            print(f"  Output tail:\n{monitor.output_since(start_index)[-2000:]}")
+            return False
+        print("  [OK] The host detected the failure and rolled back.")
+
+        output = monitor.output_since(start_index)
+        if MODULE_RELOAD_COMPLETE_TOKEN in output:
+            print("  [FAIL] The failed generation was reported as a completed reload.")
+            return False
+
+        if RETIRED_RESOURCE_TOKEN not in output:
+            print(
+                "  [FAIL] The value the failed generation inserted was not "
+                "released; its drop still points into the image being unmapped."
+            )
+            print(f"  Output tail:\n{output[-2000:]}")
+            return False
+        print("  [OK] The failed generation's resource was released while mapped.")
+
+        if has_crash_signals(monitor.output_since(0)) or not monitor.process_alive():
+            print("  [FAIL] The host did not survive the rollback.")
+            return False
+        print("  [OK] The host is alive on the previous generation.")
+
+        print("  [PASS] A failed generation leaves nothing pointing into its image.")
+        return True
+    finally:
+        common.terminate_process(process, monitor)
+
+
+def scenario_a_failing_module_start_releases_its_resource() -> bool:
+    """A module whose very first generation fails leaves nothing behind.
+
+    The same release as the reload rollback, one step earlier: there is no
+    previous generation to keep, so the failed generation's systems and the
+    world go with it - and both have to go while its image is still mapped.
+    Get that wrong and the host prints why it is stopping and *then* faults,
+    which is how a diagnosable startup failure turned into a missing one.
+    """
+    print("\n  [TEST] Startup: a module that fails its first generation is released.")
+    set_shared_identity(True)
+    install_failing_reload_with_resource()
+
+    process, monitor = launch_host()
+    try:
+        deadline = time.monotonic() + COLLISION_TIMEOUT
+        reached_loop = False
+        while time.monotonic() < deadline:
+            if STARTUP_TOKEN in monitor.output_since(0):
+                reached_loop = True
+                break
+            if not monitor.process_alive():
+                break
+            time.sleep(0.2)
+
+        output = monitor.output_since(0)
+
+        if reached_loop:
+            print("  [FAIL] The host started with a module whose init reported failure.")
+            return False
+
+        if SETUP_FAILED_TOKEN not in output:
+            print("  [FAIL] Setup neither failed nor reached the loop.")
+            print(f"  Output tail:\n{output[-2000:]}")
+            return False
+        print("  [OK] Setup failed on the module's non-zero status.")
+
+        if has_crash_signals(output):
+            print(
+                "  [FAIL] The host faulted while tearing the failed generation "
+                "down: its image was unmapped with something still pointing into it."
+            )
+            print(f"  Output tail:\n{output[-2000:]}")
+            return False
+        print("  [OK] The teardown completed without a fault.")
+
+        print("  [PASS] A failed module generation leaves nothing pointing into its image.")
+        return True
+    finally:
+        common.terminate_process(process, monitor)
+
+
 SCENARIOS = {
     "shared_identity_binds_both_binaries": scenario_shared_identity_binds_both_binaries,
     "distinct_type_ids_are_proven_by_removing_it": (
@@ -564,6 +1171,18 @@ SCENARIOS = {
     ),
     "a_shared_component_survives_a_module_reload": (
         scenario_a_shared_component_survives_a_module_reload
+    ),
+    "a_shared_resource_crosses_the_boundary": (
+        scenario_a_shared_resource_crosses_the_boundary
+    ),
+    "a_conflicting_resource_claim_fails_setup": (
+        scenario_a_conflicting_resource_claim_fails_setup
+    ),
+    "a_failed_reload_drops_its_own_resource": (
+        scenario_a_failed_reload_drops_its_own_resource
+    ),
+    "a_failing_module_start_releases_its_resource": (
+        scenario_a_failing_module_start_releases_its_resource
     ),
 }
 
@@ -625,6 +1244,7 @@ def main() -> None:
     # The suite edits the module source and the project's settings; both are
     # captured now and restored whatever happens below.
     BACKUP.capture(SPLINE_LIB_RS)
+    BACKUP.capture(PROJECT_LIB_RS)
     kill_stale_hosts()
     install_test_project_settings()
 

@@ -106,6 +106,12 @@ pub struct EcsSnapshot {
     pub available_component_slots: usize,
     /// Registered components that declare a cross-binary shared identity.
     pub shared_components: Vec<String>,
+    /// Resources whose type declares a cross-binary shared identity, by
+    /// declared name.
+    ///
+    /// A shared resource has no `TypeId` naming it in every artifact, so the
+    /// name it declared is the only thing there is to report.
+    pub shared_resources: Vec<String>,
     /// Registered components defined by another language at runtime.
     pub dynamic_components: Vec<String>,
     /// Registered component types no archetype currently stores.
@@ -220,6 +226,10 @@ impl EcsSnapshot {
                 None => (0, 0.0, 0.0),
             };
 
+        // Step 4: Resources carry no registry entry, so their shared identities
+        // come from the names their types declared.
+        let shared_resources = world.shared_resource_names();
+
         Self {
             frame,
             elapsed_seconds,
@@ -231,6 +241,7 @@ impl EcsSnapshot {
             registered_components: registry.len(),
             available_component_slots: registry.available_slots(),
             shared_components,
+            shared_resources,
             dynamic_components,
             unused_components,
             change_tick: world.change_tick().get(),
@@ -363,6 +374,9 @@ impl EcsSnapshot {
         let mut sections: Vec<(&str, &Vec<String>)> = Vec::new();
         if !self.shared_components.is_empty() {
             sections.push(("shared identity", &self.shared_components));
+        }
+        if !self.shared_resources.is_empty() {
+            sections.push(("shared resources", &self.shared_resources));
         }
         if !self.dynamic_components.is_empty() {
             sections.push(("runtime-defined", &self.dynamic_components));
@@ -534,5 +548,44 @@ mod tests {
         let before = world.change_tick();
         let _ = EcsSnapshot::gather(&world);
         assert_eq!(world.change_tick(), before);
+    }
+
+    /// A resource declaring a cross-binary shared identity, and an ordinary one
+    /// to show the listing distinguishes them.
+    #[derive(Debug, Default)]
+    struct SharedSettings {
+        _value: u32,
+    }
+    impl crate::resource::Resource for SharedSettings {
+        fn shared_name() -> Option<&'static str> {
+            Some("diagnostics_test::SharedSettings")
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct PlainSettings {
+        _value: u32,
+    }
+    impl crate::resource::Resource for PlainSettings {}
+
+    /// Only a shared resource is listed by name, because it is the only kind
+    /// whose identity is not already the count line's `TypeId`.
+    #[test]
+    fn only_shared_resources_are_listed_by_name() {
+        let mut world = World::new();
+        world.insert_resource(SharedSettings::default());
+        world.insert_resource(PlainSettings::default());
+
+        let snapshot = EcsSnapshot::gather(&world);
+        assert_eq!(
+            snapshot.shared_resources,
+            vec!["diagnostics_test::SharedSettings".to_string()]
+        );
+        assert!(snapshot.render().contains("shared resources"));
+
+        // Dropping the shared resource takes its claim with it, so the section
+        // disappears rather than naming a name the world no longer holds.
+        world.remove_resource::<SharedSettings>();
+        assert!(EcsSnapshot::gather(&world).shared_resources.is_empty());
     }
 }
