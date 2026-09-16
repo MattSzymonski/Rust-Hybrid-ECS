@@ -35,11 +35,15 @@ use pill_engine::component_registry::ComponentFieldDescriptor;
 use pill_engine::Component;
 use pill_engine::{ComponentId, Engine, World};
 use serde::Deserialize;
-#[cfg(feature = "rendering")]
-use trait_type_map::TraitAccessible;
+
+// Current crate
+use super::resources::{ManagedResourceDeclaration, ResourceFieldLayout};
 
 // Current crate
 use super::abi::ComponentChunk;
+// Only the native chunk binders stamp a scope token, and those are
+// windowed-only, so a headless build never reaches this.
+#[cfg(feature = "rendering")]
 use super::context::active_scope_token;
 
 // =============================================================================
@@ -276,7 +280,7 @@ pub(super) const fn stable_component_id(name: &str) -> StableComponentId {
 /// Windowed builds only, with the rest of the native binding path: no other
 /// build has a native component to bind.
 #[cfg(feature = "rendering")]
-fn get_component_chunk<T: Component + TraitAccessible<dyn Component>>(
+fn get_component_chunk<T: Component>(
     world: &mut World,
     chunk_index: u32,
     output: *mut ComponentChunk,
@@ -316,7 +320,7 @@ fn get_component_chunk<T: Component + TraitAccessible<dyn Component>>(
 /// that already hold a driver chunk's archetype identity use this to resolve
 /// the remaining query terms directly, with no chunk-index scan.
 #[cfg(feature = "rendering")]
-fn get_component_chunk_in_archetype<T: Component + TraitAccessible<dyn Component>>(
+fn get_component_chunk_in_archetype<T: Component>(
     world: &mut World,
     archetype_id: ArchetypeId,
     output: *mut ComponentChunk,
@@ -365,7 +369,7 @@ fn decode_native_component<T>(
     size: usize,
 ) -> Result<Box<dyn ComponentAdder>, String>
 where
-    T: Component + TraitAccessible<dyn Component> + Copy + Send,
+    T: Component + Copy + Send,
 {
     if data.is_null() || size != std::mem::size_of::<T>() {
         return Err("native component blob does not match its ABI layout".into());
@@ -394,8 +398,32 @@ struct ManagedComponentManifest {
     schema_hash: u64,
     /// Whether the managed side expects a native engine binding.
     shared: bool,
+    /// What the entry declares: a component, or a resource.
+    ///
+    /// Defaulted so a manifest written before resources existed still parses as
+    /// a list of components; the managed side always writes the tag now, and
+    /// the default is what keeps an older generation's payload readable during
+    /// a reload that straddles the change.
+    #[serde(default)]
+    kind: ManifestEntryKind,
     /// Top-level field descriptions of the component layout.
     fields: Vec<ManagedFieldManifest>,
+}
+
+/// What one managed manifest entry declares.
+///
+/// Resources ride in the same array as components rather than a second
+/// document, so one transfer and one registration transaction cover a whole
+/// generation's declaration - a resource that registered while its project's
+/// components were refused would be a half-applied manifest.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ManifestEntryKind {
+    /// Per-entity storage, registered as a column.
+    #[default]
+    Component,
+    /// One value for the whole world, registered as a foreign resource.
+    Resource,
 }
 
 /// Deserialized field entry within a managed component manifest.
@@ -422,7 +450,7 @@ fn register_native_binding<T>(
     managed_name: &str,
     managed_schema: &str,
 ) where
-    T: Component + TraitAccessible<dyn Component> + Copy + Send,
+    T: Component + Copy + Send,
 {
     engine.world_mut().register_component::<T>();
     bindings.insert(
@@ -693,13 +721,69 @@ fn managed_primitive_tag(primitive_type: &str) -> Option<&'static str> {
     }
 }
 
+/// The engine-vocabulary tag one manifest field carries.
+///
+/// Mirrors what [`managed_field_layout`] records for the same field, so a plan
+/// built from a manifest compares like with like.
+fn manifest_field_tag(field: &ManagedFieldManifest) -> &'static str {
+    if field.primitive_type == "struct" {
+        return "struct";
+    }
+    managed_primitive_tag(&field.primitive_type).unwrap_or("unsupported")
+}
+
+/// Reduce a field's type tag to what the migration plan should compare.
+///
+/// The registry records a nested struct as `struct:<owner>::<field>` for the
+/// editor's benefit, while a manifest only knows that the field is a struct.
+/// Comparing those verbatim would mark every nested field retyped - and would
+/// do it again whenever a component is renamed, because the owner is part of
+/// the tag. Both sides are folded to `struct`, so the plan asks the question it
+/// actually means: is this field still a struct?
+fn plan_tag(type_tag: &str) -> &str {
+    if type_tag.starts_with("struct:") {
+        "struct"
+    } else {
+        type_tag
+    }
+}
+
 /// Convert a managed component manifest's field tree into engine descriptors.
 ///
 /// Primitive leaves map onto the engine's type-tag vocabulary so the editor
 /// can decode and edit them. Nested `struct:` fields stay opaque: the engine
 /// has no struct walking, so their bytes are visible but not interpretable.
-/// Field names and struct tags are leaked once per registration, bounded by
-/// the number of distinct C# component types in the process.
+/// Field names and struct tags are interned, so a component re-registered on
+/// every reload costs its strings once rather than once per reload.
+/// Strings handed to the engine as `&'static str`, deduplicated by content.
+///
+/// `ComponentFieldDescriptor` holds `&'static str` because the derive builds it
+/// in an artifact's static data. A manifest-declared component has no statics
+/// to borrow from, so its strings have to be given the same lifetime by hand.
+///
+/// Doing that with a bare `Box::leak` per registration is what this replaces:
+/// the C# project re-registers its components on every reload, so the leak grew
+/// with reload count rather than with the number of distinct names. Interning
+/// bounds it by the project's type set, which is the intended cost - a name a
+/// component keeps across a hundred reloads is stored once.
+static INTERNED_FIELD_STRINGS: std::sync::Mutex<Option<HashSet<&'static str>>> =
+    std::sync::Mutex::new(None);
+
+/// Return a `&'static str` equal to `value`, allocating only on first sight.
+fn intern(value: &str) -> &'static str {
+    let mut guard = INTERNED_FIELD_STRINGS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let table = guard.get_or_insert_with(HashSet::new);
+    if let Some(existing) = table.get(value) {
+        return existing;
+    }
+    // First sight: this is the one allocation the string ever costs.
+    let leaked: &'static str = Box::leak(value.to_owned().into_boxed_str());
+    table.insert(leaked);
+    leaked
+}
+
 fn managed_field_layout(
     component_name: &str,
     fields: &[ManagedFieldManifest],
@@ -708,10 +792,8 @@ fn managed_field_layout(
     for field in fields {
         if field.primitive_type == "struct" {
             layout.push(ComponentFieldDescriptor {
-                name: Box::leak(field.name.clone().into_boxed_str()),
-                type_tag: Box::leak(
-                    format!("struct:{component_name}::{}", field.name).into_boxed_str(),
-                ),
+                name: intern(&field.name),
+                type_tag: intern(&format!("struct:{component_name}::{}", field.name)),
                 offset: field.offset,
                 size: field.size,
                 align: 1,
@@ -723,7 +805,7 @@ fn managed_field_layout(
             continue;
         };
         layout.push(ComponentFieldDescriptor {
-            name: Box::leak(field.name.clone().into_boxed_str()),
+            name: intern(&field.name),
             type_tag,
             offset: field.offset,
             size: field.size,
@@ -767,7 +849,12 @@ pub(super) fn register_component_manifest(
     bytes: &[u8],
     mut bindings: ComponentBindings,
 ) -> Result<ComponentBindings, CSharpError> {
-    for component in parse_and_validate_manifest(bytes)? {
+    let (components, resources) = split_manifest_kinds(parse_and_validate_manifest(bytes)?);
+    // Resources first: a startup method may already want to read one, and a
+    // resource registration touches no column, so nothing here can be undone by
+    // a component entry refused afterwards.
+    super::resources::register_resource_manifest(engine, &resources)?;
+    for component in components {
         let stable_id =
             StableComponentId::from_halves(component.stable_id_low, component.stable_id_high);
 
@@ -867,8 +954,11 @@ fn parse_and_validate_manifest(bytes: &[u8]) -> Result<Vec<ManagedComponentManif
             .into());
         }
         if !seen.insert(stable_id) {
+            // Components and resources share one identity space, so this also
+            // catches a resource whose declared name collides with a component's
+            // type name - two entries that would answer to one slot.
             return Err(format!(
-                "duplicate component {} in managed manifest",
+                "duplicate declaration {} in managed manifest",
                 component.full_name
             )
             .into());
@@ -891,8 +981,63 @@ fn parse_and_validate_manifest(bytes: &[u8]) -> Result<Vec<ManagedComponentManif
         for field in &component.fields {
             validate_field_manifest(field, component.size)?;
         }
+
+        // A resource is a singleton, so "the host already binds this natively"
+        // has nothing to mean for one: there is no column to bind and no native
+        // mirror to validate against. Refused where it is declared rather than
+        // silently ignored, so a mis-marked struct is a named error.
+        if component.kind == ManifestEntryKind::Resource && component.shared {
+            return Err(format!(
+                "managed resource {} is marked shared; resources have no native binding",
+                component.full_name
+            )
+            .into());
+        }
     }
     Ok(manifest)
+}
+
+/// Split one parsed manifest into its component and resource halves.
+///
+/// Both halves went through the same identity, layout and field validation
+/// above; only what they are registered as differs.
+fn split_manifest_kinds(
+    manifest: Vec<ManagedComponentManifest>,
+) -> (
+    Vec<ManagedComponentManifest>,
+    Vec<ManagedResourceDeclaration>,
+) {
+    let mut components = Vec::new();
+    let mut resources = Vec::new();
+    for entry in manifest {
+        match entry.kind {
+            ManifestEntryKind::Component => components.push(entry),
+            ManifestEntryKind::Resource => {
+                // The tags are folded through the same function the component
+                // plan uses, so a resource migration compares the two sides of
+                // its diff in one vocabulary rather than marking every nested
+                // field retyped.
+                let fields = entry
+                    .fields
+                    .iter()
+                    .map(|field| ResourceFieldLayout {
+                        name: field.name.clone(),
+                        type_tag: manifest_field_tag(field).to_owned(),
+                        offset: field.offset,
+                        size: field.size,
+                    })
+                    .collect();
+                resources.push(ManagedResourceDeclaration {
+                    full_name: entry.full_name,
+                    size: entry.size,
+                    align: entry.alignment,
+                    schema_hash: entry.schema_hash,
+                    fields,
+                });
+            }
+        }
+    }
+    (components, resources)
 }
 
 /// Check one manifest entry against the binding the host already holds.
@@ -952,6 +1097,10 @@ pub(super) struct ManifestApplyReport {
     pub(super) migrated: Vec<String>,
     /// Managed components the manifest added.
     pub(super) added: Vec<String>,
+    /// Managed resources the manifest added.
+    pub(super) resources_added: Vec<String>,
+    /// Managed resources whose layout changed and whose bytes were migrated.
+    pub(super) resources_migrated: Vec<String>,
 }
 
 /// Apply a swapped assembly's component manifest to the live world.
@@ -986,7 +1135,12 @@ pub(super) fn apply_component_manifest_on_reload(
     bytes: &[u8],
     store: &BindingStore,
 ) -> Result<ManifestApplyReport, CSharpError> {
-    let manifest = parse_and_validate_manifest(bytes)?;
+    let (manifest, resources) = split_manifest_kinds(parse_and_validate_manifest(bytes)?);
+    // Resources settle first and on their own terms: they own no column, so a
+    // component refused afterwards leaves nothing of theirs half-applied, and a
+    // resource entry that reached the component planner would be planned as a
+    // column to add.
+    let resource_report = super::resources::apply_resource_manifest_on_reload(engine, &resources)?;
     let live: HashSet<StableComponentId> = manifest
         .iter()
         .map(|component| {
@@ -1024,7 +1178,11 @@ pub(super) fn apply_component_manifest_on_reload(
     // relayout meeting a column that drifted beneath it - unwinds the journal
     // in reverse before the error is returned.
     let mut undos: Vec<ManifestUndo> = Vec::with_capacity(planned.len());
-    let mut report = ManifestApplyReport::default();
+    let mut report = ManifestApplyReport {
+        resources_added: resource_report.added,
+        resources_migrated: resource_report.migrated,
+        ..ManifestApplyReport::default()
+    };
     for entry in planned {
         match apply_planned_entry(engine, store, entry, &mut report) {
             Ok(Some(undo)) => undos.push(undo),
@@ -1235,6 +1393,18 @@ fn apply_planned_entry(
                 rows = migrated_rows,
                 "managed component layout migrated"
             );
+            // A field that changed type keeps its name but loses its value, so
+            // saying nothing would leave a reset looking like a migration that
+            // worked. Reported per component rather than per field so the line
+            // stays readable when a rewrite touches several at once.
+            if !plan.retyped_fields().is_empty() {
+                info!(
+                    target: telemetry_target::HOT_RELOAD,
+                    component = %component.full_name,
+                    fields = %plan.retyped_fields().join(", "),
+                    "managed component fields changed type and were reset to their default bytes"
+                );
+            }
             report.migrated.push(component.full_name);
             Ok(Some(ManifestUndo::Migrated {
                 stable_id,
@@ -1349,6 +1519,7 @@ fn rollback_field_plan(
         .iter()
         .map(|field| LayoutField {
             name: field.name,
+            type_tag: plan_tag(field.type_tag),
             offset: field.offset,
             size: field.size,
         })
@@ -1357,6 +1528,7 @@ fn rollback_field_plan(
         .iter()
         .map(|field| LayoutField {
             name: field.name,
+            type_tag: plan_tag(field.type_tag),
             offset: field.offset,
             size: field.size,
         })
@@ -1435,14 +1607,19 @@ fn build_field_plan(
         .iter()
         .map(|field| LayoutField {
             name: field.name,
+            type_tag: plan_tag(field.type_tag),
             offset: field.offset,
             size: field.size,
         })
         .collect();
+    // The manifest names a managed type; mapping it through the same function
+    // `managed_field_layout` uses is what makes the two sides of the diff
+    // comparable at all - otherwise every field would look retyped.
     let next: Vec<LayoutField<'_>> = fields
         .iter()
         .map(|field| LayoutField {
             name: field.name.as_str(),
+            type_tag: manifest_field_tag(field),
             offset: field.offset,
             size: field.size,
         })

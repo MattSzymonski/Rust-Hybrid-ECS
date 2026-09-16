@@ -223,6 +223,10 @@ CSHARP_RELOAD_REJECTED_TOKEN = "C# reload rejected"
 CSHARP_LOAD_FAILED_TOKEN = "[csharp_runtime] reload failed:"
 CSHARP_REJECT_SIGNATURE_REASON = "C# system names or query signatures changed"
 CSHARP_REJECT_COMPONENT_REASON = "C# component identities or layouts changed"
+# The loader parks a version whose manifest changed and waits for the host's
+# verdict; seeing this proves the handshake ran rather than the swap simply
+# happening without one.
+CSHARP_MANIFEST_PENDING_TOKEN = "awaiting the host's verdict"
 CSHARP_REJECT_STARTUP_REASON = "C# startup methods changed"
 # The bridge probe emitted by the suite's BridgeProbe.cs fixture (its
 # `ModuleSplineBridgeDemo`).
@@ -698,12 +702,35 @@ SESSION_SCENARIOS = [
     # pin what "behavior-only" actually means at the boundary - previously the
     # rejection token appeared in this suite only as something that must NEVER
     # happen, so nothing checked that it happens when it should.
-    rejection_scenario(
-        "csharp_rejects_component_layout_change",
-        PROJECT_CS_COMPONENTS_CS,
-        COMPONENT_LAYOUT_EDIT,
-        CSHARP_REJECT_COMPONENT_REASON,
-        BRIDGE_PROBE_PREFIX,
+    # Adding a field to a C# component used to demand a host restart: the
+    # managed loader refused any manifest change because nothing could migrate a
+    # descriptor column's rows. It can now. The version parks, the host applies
+    # the manifest to the running world, and only then does the swap happen - so
+    # the assertion is a completed reload rather than a refusal.
+    Scenario(
+        name="csharp_migrates_component_layout_change",
+        phases=[
+            ScenarioPhase(
+                edits=[(PROJECT_CS_COMPONENTS_CS, [COMPONENT_LAYOUT_EDIT])],
+                wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
+                required_tokens=[
+                    CSHARP_MANIFEST_PENDING_TOKEN,
+                    CSHARP_RELOAD_COMPLETE_TOKEN,
+                ],
+                forbidden_tokens=[
+                    # The old refusal must be gone, and nothing may fault while
+                    # the world takes the new layout.
+                    CSHARP_RELOAD_REJECTED_TOKEN,
+                    CSHARP_REJECT_COMPONENT_REASON,
+                    PANIC_TOKEN,
+                    ACCESS_VIOLATION_TOKEN,
+                ],
+                # The probe keeps streaming afterwards, which is what proves the
+                # migrated world is still the one the systems are running on.
+                alive_tokens=[(BRIDGE_PROBE_PREFIX, PROBE_TIMEOUT)],
+            )
+        ],
+        restore_after=[PROJECT_CS_COMPONENTS_CS],
     ),
     rejection_scenario(
         "csharp_rejects_system_signature_change",

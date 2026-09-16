@@ -431,10 +431,17 @@ fn sprite_instances_named(
             // storage pointer; `row_count` is capped at every storage length
             // and the layout checks above guarantee the value is a valid
             // `Position` for every row in this loop.
-            let position =
-                unsafe { read_shared_component::<Position>(position_storage.get_dyn(row)) };
+            let (Some(position_row), Some(sprite_row)) =
+                (position_storage.row_ptr(row), sprite_storage.row_ptr(row))
+            else {
+                continue;
+            };
+            // SAFETY: `row_ptr` returned an in-range row of the validated
+            // shared column, so the bytes are a `Position` by the name and
+            // layout checks above.
+            let position = unsafe { read_shared_component::<Position>(position_row) };
             // SAFETY: as for the `Position` read directly above, for `Sprite`.
-            let sprite = unsafe { read_shared_component::<Sprite>(sprite_storage.get_dyn(row)) };
+            let sprite = unsafe { read_shared_component::<Sprite>(sprite_row) };
             instances.push(SpriteInstance {
                 position: [position.x, position.y],
                 size: [sprite.width, sprite.height],
@@ -455,10 +462,12 @@ fn sprite_instances_named(
 ///
 /// # Safety
 ///
-/// `component` must point to a value with the same `repr(C)` layout and size
-/// as `T`. Callers establish this through the shared component name and size.
-unsafe fn read_shared_component<T: Copy>(component: &dyn Component) -> T {
-    let data = component as *const dyn Component as *const T;
+/// `row` must point to a value with the same `repr(C)` layout and size as `T`.
+/// Callers establish this through the shared component name and size, which is
+/// also why the row arrives as bytes: a shared component is identified by its
+/// layout, so there is no `TypeId` for a typed accessor to check against.
+unsafe fn read_shared_component<T: Copy>(row: *const u8) -> T {
+    let data = row.cast::<T>();
     // SAFETY: Guaranteed by the caller. `read_unaligned` also avoids relying
     // on alignment information that is not present in ComponentRegistry.
     unsafe { data.read_unaligned() }

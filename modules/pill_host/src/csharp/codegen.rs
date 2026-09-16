@@ -747,7 +747,10 @@ fn emit_value_type_methods(
         let delegate_args = if typed_arguments.is_empty() {
             "global::TracyLive.RowPointer self".to_string()
         } else {
-            format!("global::TracyLive.RowPointer self, {}", typed_arguments.join(", "))
+            format!(
+                "global::TracyLive.RowPointer self, {}",
+                typed_arguments.join(", ")
+            )
         };
         // The receiver crosses as its live address: `AddressOf` turns the
         // `ref` into a pointer inside the runtime, so the call needs neither
@@ -918,11 +921,21 @@ fn emit_heap_field_accessors(
             let set_item_address = format!("_{camel}SetItemAddress");
             let push_address = format!("_{camel}PushAddress");
             let resize_address = format!("_{camel}ResizeAddress");
-            bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {view_address};"));
-            bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {item_address};"));
-            bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {set_item_address};"));
-            bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {push_address};"));
-            bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {resize_address};"));
+            bound_declarations.push(format!(
+                "    private static global::TracyLive.MirrorTrampoline {view_address};"
+            ));
+            bound_declarations.push(format!(
+                "    private static global::TracyLive.MirrorTrampoline {item_address};"
+            ));
+            bound_declarations.push(format!(
+                "    private static global::TracyLive.MirrorTrampoline {set_item_address};"
+            ));
+            bound_declarations.push(format!(
+                "    private static global::TracyLive.MirrorTrampoline {push_address};"
+            ));
+            bound_declarations.push(format!(
+                "    private static global::TracyLive.MirrorTrampoline {resize_address};"
+            ));
             bound_assignments.push(format!(
                 "        {view_address} = global::TracyLive.MirrorMethods.Address(\"{type_name}\", \"{view_operation}\");"
             ));
@@ -1030,7 +1043,9 @@ fn emit_heap_field_accessors(
             let resize_operation =
                 crate::csharp::accessor_operation_name(&accessor.field_name, "resize");
             let resize_address = format!("_{camel}ResizeAddress");
-            bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {resize_address};"));
+            bound_declarations.push(format!(
+                "    private static global::TracyLive.MirrorTrampoline {resize_address};"
+            ));
             bound_assignments.push(format!(
                 "        {resize_address} = global::TracyLive.MirrorMethods.Address(\"{type_name}\", \"{resize_operation}\");"
             ));
@@ -1106,8 +1121,12 @@ fn emit_heap_field_accessors(
                 crate::csharp::accessor_operation_name(&accessor.field_name, "resize");
             let view_address = format!("_{camel}ViewAddress");
             let resize_address = format!("_{camel}ResizeAddress");
-            bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {view_address};"));
-            bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {resize_address};"));
+            bound_declarations.push(format!(
+                "    private static global::TracyLive.MirrorTrampoline {view_address};"
+            ));
+            bound_declarations.push(format!(
+                "    private static global::TracyLive.MirrorTrampoline {resize_address};"
+            ));
             bound_assignments.push(format!(
                 "        {view_address} = global::TracyLive.MirrorMethods.Address(\"{type_name}\", \"{view_operation}\");"
             ));
@@ -1183,8 +1202,12 @@ fn emit_heap_field_accessors(
         let set_operation = crate::csharp::accessor_operation_name(&accessor.field_name, "set");
         let view_address = format!("_{camel}ViewAddress");
         let set_address = format!("_{camel}SetAddress");
-        bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {view_address};"));
-        bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {set_address};"));
+        bound_declarations.push(format!(
+            "    private static global::TracyLive.MirrorTrampoline {view_address};"
+        ));
+        bound_declarations.push(format!(
+            "    private static global::TracyLive.MirrorTrampoline {set_address};"
+        ));
         bound_assignments.push(format!(
             "        {view_address} = global::TracyLive.MirrorMethods.Address(\"{type_name}\", \"{view_operation}\");"
         ));
@@ -2120,7 +2143,9 @@ mod tests {
         let content = read_generated(&workspace, "pill_spline");
         // Instance method + delegate, PascalCased, resolving by Rust names.
         assert!(content.contains("public ulong GetSum()"));
-        assert!(content.contains("public delegate ulong OmoMOGetSumDelegate(global::TracyLive.RowPointer self);"));
+        assert!(content.contains(
+            "public delegate ulong OmoMOGetSumDelegate(global::TracyLive.RowPointer self);"
+        ));
         assert!(content.contains(
             "global::TracyLive.MirrorMethods.Resolve<OmoMOGetSumDelegate>(\"pill_spline::OmoMO\", \"get_sum\")"
         ));
@@ -2385,9 +2410,7 @@ mod tests {
         assert!(content.contains("if (_accessorsBoundGeneration == generation)"));
         assert!(content
             .contains("global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this))"));
-        assert!(content.contains(
-            "global::TracyLive.ComponentViews.AsSpan<float>(view)"
-        ));
+        assert!(content.contains("global::TracyLive.ComponentViews.AsSpan<float>(view)"));
         // The header-mutating member lives on the row-ref handle and addresses
         // the bound row, never the struct the caller is holding.
         assert!(content.contains("public ref struct TrailRowRef"));
@@ -2450,10 +2473,16 @@ mod tests {
         );
         // Each field keeps its own address slots, so the shared resolver
         // cannot mix up two containers of the same kind.
-        assert!(content.contains("private static global::TracyLive.MirrorTrampoline _pointsViewAddress;"));
-        assert!(content.contains("private static global::TracyLive.MirrorTrampoline _nameViewAddress;"));
-        assert!(content.contains("private static global::TracyLive.MirrorTrampoline _nameSetAddress;"));
-        assert!(content.contains("private static global::TracyLive.MirrorTrampoline _pointsResizeAddress;"));
+        assert!(content
+            .contains("private static global::TracyLive.MirrorTrampoline _pointsViewAddress;"));
+        assert!(
+            content.contains("private static global::TracyLive.MirrorTrampoline _nameViewAddress;")
+        );
+        assert!(
+            content.contains("private static global::TracyLive.MirrorTrampoline _nameSetAddress;")
+        );
+        assert!(content
+            .contains("private static global::TracyLive.MirrorTrampoline _pointsResizeAddress;"));
     }
 
     /// A `string` field emits a UTF-8 getter and setter; the setter hands

@@ -60,7 +60,6 @@
 
 // External crates
 use pill_core::warn;
-use trait_type_map::TraitAccessible;
 
 // Current crate
 use crate::archetype::ComponentColumns;
@@ -93,14 +92,12 @@ pub trait ComponentAdder: Send {
 ///
 /// Wraps the concrete component value so it can be transported through the
 /// type-erased [`DeferredCommand`] queue without losing its native type.
-struct TypedComponentAdder<T: Component + TraitAccessible<dyn Component>> {
+struct TypedComponentAdder<T: Component> {
     /// The concrete component value to insert when the command executes.
     component: T,
 }
 
-impl<T: Component + TraitAccessible<dyn Component> + Send> ComponentAdder
-    for TypedComponentAdder<T>
-{
+impl<T: Component + Send> ComponentAdder for TypedComponentAdder<T> {
     fn component_id(&self) -> ComponentId {
         ComponentId::of::<T>()
     }
@@ -140,7 +137,7 @@ impl ComponentAdder for ByteComponentAdder {
         let column = new_storage
             .get_mut(self.component_id)
             .expect("native column must exist for a registered component");
-        column.push_bytes(self.bytes.as_ptr(), self.bytes.len());
+        column.push_bytes(&self.bytes).ok();
     }
 }
 
@@ -267,7 +264,7 @@ impl CommandQueue {
     /// Queue adding a component to an entity.
     pub fn add_component_to_entity<T>(&mut self, entity: Entity, component: T)
     where
-        T: Component + TraitAccessible<dyn Component> + Send,
+        T: Component + Send,
     {
         self.commands.push(DeferredCommand::AddComponentToEntity {
             entity,
@@ -827,7 +824,7 @@ impl<'a> Commands<'a> {
     /// Queue adding a component to an entity (executed later)
     pub fn add_component_to_entity<T>(&mut self, entity: Entity, component: T)
     where
-        T: Component + TraitAccessible<dyn Component> + Send,
+        T: Component + Send,
     {
         self.command_queue
             .add_component_to_entity(entity, component);
@@ -881,7 +878,7 @@ impl<'a> DeferredEntityBuilder<'a> {
     /// Add a component to the entity being created
     pub fn with<T>(mut self, component: T) -> Self
     where
-        T: Component + TraitAccessible<dyn Component> + Send,
+        T: Component + Send,
     {
         self.components
             .push(Box::new(TypedComponentAdder { component }));
@@ -911,7 +908,7 @@ impl<'a> DeferredEntityBuilder<'a> {
 /// component blob against an explicitly shared native component binding.
 pub fn boxed_component_adder<T>(component: T) -> Box<dyn ComponentAdder>
 where
-    T: Component + TraitAccessible<dyn Component> + Send,
+    T: Component + Send,
 {
     Box::new(TypedComponentAdder { component })
 }
@@ -1384,8 +1381,8 @@ mod tests {
             .values_mut()
             .next()
             .unwrap()
-            .dynamic_component_storages
-            .remove(&dynamic_a);
+            .component_storages
+            .remove(dynamic_a);
 
         // A second queued create reuses the existing archetype, so the row is
         // materialised but the component write fails.
@@ -1449,8 +1446,8 @@ mod tests {
             .values_mut()
             .next()
             .unwrap()
-            .dynamic_component_storages
-            .remove(&dynamic_a);
+            .component_storages
+            .remove(dynamic_a);
 
         queue.remove_component_by_id(entity, dynamic_a);
         let errors = queue

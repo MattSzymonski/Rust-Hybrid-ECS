@@ -32,6 +32,8 @@ mod context;
 mod csharp_runtime;
 /// Native callbacks used by C# query enumerators.
 mod queries;
+/// Managed resource registration and the callback that serves resource bytes.
+mod resources;
 
 // =============================================================================
 // Types + Impls

@@ -297,7 +297,10 @@ fn first_agrees_with_iteration_order() {
     let mut query = Query::<(&Position,)>::new(&mut world);
     let first_x = query.first().map(|(position,)| position.x);
     let iter_x = query.iter_mut().next().map(|(position,)| position.x);
-    assert!(first_x.is_some(), "the world holds four matching archetypes");
+    assert!(
+        first_x.is_some(),
+        "the world holds four matching archetypes"
+    );
     assert_eq!(
         first_x, iter_x,
         "`first` must return the row `iter_mut().next()` returns"

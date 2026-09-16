@@ -86,7 +86,6 @@ pub mod profiling;
 /// Query system for efficient iteration over entities with specific components.
 pub mod query;
 
-
 /// Singleton resources stored in the [`World`], not attached to entities.
 pub mod resource;
 
@@ -111,6 +110,7 @@ pub mod world;
 
 // Core engine types re-exported for single-import usage.
 pub use api::EngineApi;
+pub use asset::{Asset, AssetManager, Handle};
 pub use commands::{CommandError, Commands};
 pub use component::{Component, ComponentId, ComponentTicks, Tick};
 pub use component_field::{ComponentFieldError, FieldValue};
@@ -122,15 +122,14 @@ pub use hot_patch::{
     HotPatchError, HotPatchRegistry, HotSlot, PillHotFunctionDescriptor, PillHotSlotDescriptor,
     PlainSlot,
 };
-pub use persistence::ComponentSnapshot;
+pub use persistence::{ComponentSnapshot, PersistResourceManifestEntry, ResourceSnapshot};
 pub use query::{
     Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,
 };
-pub use asset::{Asset, AssetManager, Handle};
 pub use resource::{ResHandle, Resource, ResourceId};
-pub use time::Time;
 pub use scheduler::{SystemAccess, SystemScheduler, TypeKey};
 pub use scripting::{ScriptComponent, ScriptContext};
+pub use time::Time;
 
 // Serde derives re-exported so downstream components can derive serialization without a direct dependency.
 pub use serde::{Deserialize, Serialize};

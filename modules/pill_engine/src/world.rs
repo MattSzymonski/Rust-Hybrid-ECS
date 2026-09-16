@@ -22,7 +22,6 @@ use std::collections::HashMap;
 
 // External crates
 use pill_core::{error, warn};
-use trait_type_map::{ErasedVecStorageInfo, TraitAccessible};
 
 // Current crate
 use crate::archetype::{
@@ -286,8 +285,7 @@ pub struct World {
     /// the arriving generation's table onto every column.
     /// `register_component_inner` records the outgoing table here so the
     /// migration can put it back for the removal that drops those rows.
-    pub(crate) retired_native_storage_ops:
-        HashMap<ComponentId, trait_type_map::ErasedVecStorageOps<dyn Component>>,
+    pub(crate) retired_native_storage_ops: HashMap<ComponentId, crate::archetype::ColumnOps>,
     /// Component copiers for moving entities between archetypes
     pub(crate) component_copiers: HashMap<ComponentId, ComponentCopier>,
     /// Script component types (ComponentId, component mask bit)
@@ -412,6 +410,22 @@ pub struct World {
     /// about to run, so a reloaded generation may replace its predecessor's
     /// persist entries instead of being refused as a concurrent peer.
     pub(crate) superseded_persist_names: std::collections::HashSet<String>,
+
+    /// Per-resource serialize fn for snapshotting, keyed by the live id.
+    ///
+    /// Keyed by id rather than name because the serializer has to find the
+    /// value, and a value is stored under its id. Its twin below is keyed by
+    /// name because a restore starts from a snapshot entry, which carries a
+    /// name and never an id.
+    pub(crate) persist_resource_serializers:
+        HashMap<ResourceId, crate::persistence::SerializeResourceFn>,
+    /// Per-name restore fn for rebuilding a resource out of snapshot bytes.
+    pub(crate) persist_resource_restorers: HashMap<String, crate::persistence::RestoreResourceFn>,
+    /// The persistence name each registered resource id was recorded under.
+    pub(crate) persist_resource_names: HashMap<ResourceId, String>,
+    /// Per-name schema hash for persistable resources, so a reload can tell a
+    /// reshaped resource from an unchanged one.
+    pub(crate) persist_resource_schema_hashes: HashMap<String, u64>,
     /// Monotonic counter bumped on every component registration (plain or
     /// persistable), letting the host enumerate which types one module's
     /// `init` registered at all — the distinction between a type that was
@@ -470,6 +484,10 @@ impl World {
             persist_registration_sequence: 0,
             persist_registration_log: Vec::new(),
             superseded_persist_names: std::collections::HashSet::new(),
+            persist_resource_serializers: HashMap::new(),
+            persist_resource_restorers: HashMap::new(),
+            persist_resource_names: HashMap::new(),
+            persist_resource_schema_hashes: HashMap::new(),
             component_registration_sequence: 0,
             component_registration_log: Vec::new(),
             component_field_layouts: HashMap::new(),
@@ -510,7 +528,7 @@ impl World {
     /// and after creating archetypes you intend to populate.
     pub fn reserve_components<T>(&mut self, additional: usize)
     where
-        T: Component + TraitAccessible<dyn Component>,
+        T: Component,
     {
         let component_id = ComponentId::of::<T>();
         for archetype in self.archetypes.values_mut() {
@@ -531,7 +549,7 @@ impl World {
     /// component types.
     pub fn component_chunk_mut<T>(&mut self, chunk_index: usize) -> Option<(ArchetypeId, &mut [T])>
     where
-        T: Component + TraitAccessible<dyn Component>,
+        T: Component,
     {
         let component_id = ComponentId::of::<T>();
         let archetype = self
@@ -554,7 +572,7 @@ impl World {
         chunk_index: usize,
     ) -> Option<(ArchetypeId, &mut [T], &mut [ComponentTicks])>
     where
-        T: Component + TraitAccessible<dyn Component>,
+        T: Component,
     {
         let component_id = ComponentId::of::<T>();
         let archetype = self
@@ -597,7 +615,7 @@ impl World {
         archetype_id: ArchetypeId,
     ) -> Option<(ArchetypeId, &mut [T], &mut [ComponentTicks])>
     where
-        T: Component + TraitAccessible<dyn Component>,
+        T: Component,
     {
         let component_id = ComponentId::of::<T>();
         let archetype = self.archetypes.get_mut(&archetype_id)?;
@@ -658,7 +676,7 @@ impl World {
     /// This must be called for each component type before it can be used.
     pub fn register_component<T>(&mut self)
     where
-        T: Component + TraitAccessible<dyn Component> + Clone,
+        T: Component + Clone,
     {
         self.register_component_inner::<T>(&[]);
     }
@@ -685,7 +703,7 @@ impl World {
         &mut self,
         fields: &'static [crate::component_registry::ComponentFieldDescriptor],
     ) where
-        T: Component + TraitAccessible<dyn Component> + Clone,
+        T: Component + Clone,
     {
         let _zone = crate::profile_scope!(
             "register component",
@@ -771,9 +789,9 @@ impl World {
         // the reload path already relies on, with `rehome_native_columns`
         // re-pointing live columns at it afterwards.
         let storage_info = if T::shared_name().is_some() {
-            ErasedVecStorageInfo::<dyn Component>::of_shared::<T>()
+            crate::archetype::NativeColumnInfo::of::<T>(true)
         } else {
-            ErasedVecStorageInfo::<dyn Component>::of::<T>()
+            crate::archetype::NativeColumnInfo::of::<T>(false)
         };
         // Keep the table that is about to be replaced: the migration that
         // consumes old-layout columns must drop them through the glue that
@@ -824,7 +842,7 @@ impl World {
         &mut self,
         fields: &'static [crate::component_registry::ComponentFieldDescriptor],
     ) where
-        T: Component + TraitAccessible<dyn Component> + Clone,
+        T: Component + Clone,
     {
         self.register_component_inner::<T>(fields);
         self.component_field_layouts
@@ -914,14 +932,14 @@ impl World {
         // Step 1: Snapshot the current per-type function tables first so the
         // immutable borrow of `storage_factories` cannot conflict with the
         // mutable borrow of `archetypes` below.
-        let factory_ops: HashMap<ComponentId, trait_type_map::ErasedVecStorageOps<dyn Component>> =
-            self.storage_factories
-                .iter()
-                .filter_map(|(component_id, factory)| match factory {
-                    StorageFactory::Native(info) => Some((*component_id, info.ops)),
-                    StorageFactory::Dynamic(_) => None,
-                })
-                .collect();
+        let factory_ops: HashMap<ComponentId, crate::archetype::ColumnOps> = self
+            .storage_factories
+            .iter()
+            .filter_map(|(component_id, factory)| match factory {
+                StorageFactory::Native(info) => Some((*component_id, info.ops)),
+                StorageFactory::Dynamic(_) => None,
+            })
+            .collect();
 
         // Step 2: Refresh every column whose component id has a native factory.
         for archetype in self.archetypes.values_mut() {
@@ -1147,7 +1165,6 @@ impl World {
             align,
             schema_hash,
             blittability: previous.blittability,
-            drop_fn: previous.drop_fn,
         };
 
         // Step 1: Verify every column before touching one. The plan and the
@@ -1160,7 +1177,7 @@ impl World {
             if !archetype.component_types.contains(&component_id) {
                 continue;
             }
-            let Some(column) = archetype.dynamic_component_storages.get(&component_id) else {
+            let Some(column) = archetype.component_storages.get(component_id) else {
                 return Err(WorldError::DynamicStorageMissing {
                     component_id,
                     archetype_id: *archetype_id,
@@ -1186,8 +1203,8 @@ impl World {
                 .get_mut(&archetype_id)
                 .expect("the verification pass listed only present archetypes");
             let column = archetype
-                .dynamic_component_storages
-                .get_mut(&component_id)
+                .component_storages
+                .get_mut(component_id)
                 .expect("the verification pass checked the column is present");
             migrated += column.relayout_validated(layout.clone(), plan, previous_size);
         }
@@ -1216,9 +1233,7 @@ impl World {
             .filter(|archetype| archetype.component_types.contains(&component_id))
             .nth(chunk_index)?;
         let archetype_id = archetype.id;
-        let column = archetype
-            .dynamic_component_storages
-            .get_mut(&component_id)?;
+        let column = archetype.component_storages.get_mut(component_id)?;
         let len = column.len();
         let data = column.as_mut_ptr();
         let ticks = archetype
@@ -1273,9 +1288,7 @@ impl World {
         archetype_id: ArchetypeId,
     ) -> Option<(ArchetypeId, *mut u8, usize, &mut [ComponentTicks])> {
         let archetype = self.archetypes.get_mut(&archetype_id)?;
-        let column = archetype
-            .dynamic_component_storages
-            .get_mut(&component_id)?;
+        let column = archetype.component_storages.get_mut(component_id)?;
         let len = column.len();
         let data = column.as_mut_ptr();
         let ticks = archetype
@@ -1605,7 +1618,7 @@ impl World {
         // storage would otherwise leave a half-populated row behind, so this
         // pre-flight pass keeps the failure atomic.
         for (id, _) in components {
-            if !archetype.dynamic_component_storages.contains_key(id)
+            if !archetype.component_storages.contains(*id)
                 || !archetype.component_ticks.contains_key(id)
             {
                 return Err(WorldError::DynamicStorageMissing {
@@ -1623,7 +1636,7 @@ impl World {
         // but they report rather than panic so a future refactor that drops
         // the pre-flight check degrades into an error instead of unwinding.
         for (id, bytes) in components {
-            match archetype.dynamic_component_storages.get_mut(id) {
+            match archetype.component_storages.get_mut(*id) {
                 Some(storage) => storage.push_bytes(bytes)?,
                 None => {
                     return Err(WorldError::DynamicStorageMissing {
@@ -1663,8 +1676,8 @@ impl World {
         let location = self.entity_locations.get(&entity)?;
         self.archetypes
             .get(&location.archetype_id)?
-            .dynamic_component_storages
-            .get(&component_id)?
+            .component_storages
+            .get(component_id)?
             .bytes(location.index_in_archetype)
     }
 
@@ -1674,7 +1687,7 @@ impl World {
     /// This must be called for each script component type before it can be used.
     pub fn register_script_component<T>(&mut self)
     where
-        T: ScriptComponent + TraitAccessible<dyn Component> + Clone,
+        T: ScriptComponent + Clone,
     {
         let _zone = crate::profile_scope!(
             "register script component",
@@ -1984,13 +1997,25 @@ impl World {
     /// a generation that disagrees about a name's owner or shape cannot
     /// re-point the live resource at its own code before its init fails.
     pub fn register_resource<T: Resource>(&mut self) {
+        self.register_resource_claiming::<T>();
+    }
+
+    /// [`Self::register_resource`], reporting whether the claim was accepted.
+    ///
+    /// The public call swallows a refusal because its callers have nothing to
+    /// do with one - the error is recorded and the init that raised it fails.
+    /// The persistable registration does have something to do with it: a
+    /// refused generation must not go on to install a serializer that reads the
+    /// live value through code that is one init away from being discarded.
+    pub(crate) fn register_resource_claiming<T: Resource>(&mut self) -> bool {
         let id = ResourceId::of::<T>();
         if !self.claim_shared_resource_name::<T>() {
-            return;
+            return false;
         }
         self.resource_factories
             .insert(id, ErasedResourceOps::of::<T>());
         self.note_resource_registration(id);
+        true
     }
 
     /// Declare a resource defined by another language, without storing a value.
@@ -2728,7 +2753,7 @@ impl World {
     /// Returns None if the entity doesn't exist or doesn't have the component.
     pub fn get_component<T>(&self, entity: Entity) -> Option<&T>
     where
-        T: Component + TraitAccessible<dyn Component>,
+        T: Component,
     {
         let _zone = crate::profile_scope!(
             "get component",
@@ -2767,7 +2792,7 @@ impl World {
     /// Returns None if the entity doesn't exist or doesn't have the component.
     pub fn get_component_mut<T>(&mut self, entity: Entity) -> Option<&mut T>
     where
-        T: Component + TraitAccessible<dyn Component>,
+        T: Component,
     {
         let _zone = crate::profile_scope!(
             "get component mut",
@@ -2812,7 +2837,7 @@ impl World {
     /// Returns None if the entity doesn't exist or doesn't have the component.
     pub(crate) fn get_component_ptr_mut<T>(&mut self, entity: Entity) -> Option<*mut T>
     where
-        T: Component + TraitAccessible<dyn Component>,
+        T: Component,
     {
         // Get component bit for O(1) archetype check
         let component_id = ComponentId::of::<T>();
@@ -3015,7 +3040,12 @@ impl World {
         // `insert_fn` to push. Allocate their rows here; the command executor
         // overwrites the zero bytes before the new entity becomes observable.
         for &component_id in &archetype.component_types {
-            if let Some(column) = archetype.dynamic_component_storages.get_mut(&component_id) {
+            // `insert_fn` above pushed a row for every component that has a
+            // Rust type. Only descriptor columns are still empty.
+            if component_id.is_native_storage() {
+                continue;
+            }
+            if let Some(column) = archetype.component_storages.get_mut(component_id) {
                 // The layout reached storage only after validation, so this
                 // can fail only after pushing roughly 2^60 rows of one
                 // component: out of address space rather than out of layout.
@@ -3125,10 +3155,7 @@ impl World {
                 if component_id.is_native_storage() {
                     continue;
                 }
-                if !new_archetype
-                    .dynamic_component_storages
-                    .contains_key(&component_id)
-                {
+                if !new_archetype.component_storages.contains(component_id) {
                     return Err(WorldError::DynamicStorageMissing {
                         component_id,
                         archetype_id: new_archetype_id,
@@ -3192,28 +3219,24 @@ impl World {
             // Runtime-defined columns participate in every archetype move
             // without requiring a concrete Rust copier function.
             for &component_id in new_component_ids {
-                let Some(destination) = new_archetype
-                    .dynamic_component_storages
-                    .get_mut(&component_id)
-                else {
-                    // Native components have no dynamic column and are skipped
-                    // by design - shared ones included, which is why the test
-                    // is `is_native_storage` and not "has a TypeId": a shared
-                    // component has native storage but no single TypeId. A
-                    // genuinely dynamic component missing its column is a
-                    // manifest/storage desync - the condition
-                    // `WorldError::DynamicStorageMissing` reports - so fail the
-                    // migration rather than leave the destination archetype
-                    // short a column.
-                    if !component_id.is_native_storage() {
-                        return Err(WorldError::DynamicStorageMissing {
-                            component_id,
-                            archetype_id: new_archetype_id,
-                        });
-                    }
+                // `move_fn` above copied every column that has a Rust type.
+                // Only descriptor columns are left, and before the two maps
+                // merged this loop could not reach a native one to begin with.
+                if component_id.is_native_storage() {
                     continue;
+                }
+                let Some(destination) = new_archetype.component_storages.get_mut(component_id)
+                else {
+                    // Native ids were skipped above, so reaching here means a
+                    // descriptor component has no column: a manifest/storage
+                    // desync. Fail the migration rather than leave the
+                    // destination archetype short a column.
+                    return Err(WorldError::DynamicStorageMissing {
+                        component_id,
+                        archetype_id: new_archetype_id,
+                    });
                 };
-                if let Some(source) = old_archetype.dynamic_component_storages.get(&component_id) {
+                if let Some(source) = old_archetype.component_storages.get(component_id) {
                     destination.push_from(source, old_index)?;
                 } else {
                     destination.push_zeroed()?;
@@ -3263,9 +3286,7 @@ impl World {
             );
             for &component_id in new_component_ids {
                 if !component_id.is_native_storage() {
-                    if let Some(column) =
-                        new_archetype.dynamic_component_storages.get(&component_id)
-                    {
+                    if let Some(column) = new_archetype.component_storages.get(component_id) {
                         debug_assert_eq!(
                             column.len(),
                             new_index + 1,
@@ -3326,9 +3347,7 @@ impl World {
                         }
                     }
                     false => {
-                        let Some(column) = old_archetype
-                            .dynamic_component_storages
-                            .get_mut(&component_id)
+                        let Some(column) = old_archetype.component_storages.get_mut(component_id)
                         else {
                             // A dynamic component without a column is the
                             // manifest/storage desync this function already
@@ -3339,7 +3358,7 @@ impl World {
                                 archetype_id: old_archetype_id,
                             });
                         };
-                        column.swap_remove(old_index);
+                        column.swap_remove_discard(old_index);
                     }
                 }
                 // Keep change-detection ticks in lockstep with storage.
@@ -3418,10 +3437,8 @@ impl World {
                         }
                     }
                     false => {
-                        if let Some(column) =
-                            archetype.dynamic_component_storages.get_mut(component_id)
-                        {
-                            column.swap_remove(old_index);
+                        if let Some(column) = archetype.component_storages.get_mut(*component_id) {
+                            column.swap_remove_discard(old_index);
                         } else {
                             // A dynamic component with no column has no data to
                             // remove, so skipping is safe. The missing column is
@@ -3576,7 +3593,7 @@ impl World {
         component: T,
     ) -> Result<(), AddComponentError>
     where
-        T: Component + TraitAccessible<dyn Component> + Clone,
+        T: Component + Clone,
     {
         let _zone = crate::profile_scope!(
             "add component",
@@ -3702,7 +3719,7 @@ impl World {
                 archetype_id: location.archetype_id,
             });
         };
-        let Some(storage) = archetype.dynamic_component_storages.get_mut(&component_id) else {
+        let Some(storage) = archetype.component_storages.get_mut(component_id) else {
             return Err(WorldError::DynamicStorageMissing {
                 component_id,
                 archetype_id: location.archetype_id,
@@ -3725,7 +3742,7 @@ impl World {
             .ok_or(WorldError::EntityNotFound)?;
         self.archetypes
             .get_mut(&location.archetype_id)
-            .and_then(|archetype| archetype.dynamic_component_storages.get_mut(&component_id))
+            .and_then(|archetype| archetype.component_storages.get_mut(component_id))
             .ok_or(WorldError::DynamicComponentMissing)?
             .set_bytes(location.index_in_archetype, bytes)
     }
@@ -3774,10 +3791,7 @@ impl World {
                 archetype_id: location.archetype_id,
             });
         };
-        if !old_archetype
-            .dynamic_component_storages
-            .contains_key(&component_id)
-        {
+        if !old_archetype.component_storages.contains(component_id) {
             return Err(WorldError::DynamicComponentMissing);
         }
         let new_ids: Vec<_> = old_archetype
@@ -3972,14 +3986,12 @@ trait ComponentInserter {
 }
 
 /// Implementation of [`ComponentInserter`] that captures a concrete component type.
-struct TypedComponentInserter<T: Component + TraitAccessible<dyn Component>> {
+struct TypedComponentInserter<T: Component> {
     /// The component value to insert when the entity is built.
     component: T,
 }
 
-impl<T: Component + TraitAccessible<dyn Component>> ComponentInserter
-    for TypedComponentInserter<T>
-{
+impl<T: Component> ComponentInserter for TypedComponentInserter<T> {
     fn insert(self: Box<Self>, storage: &mut ComponentColumns) {
         storage.column_of_mut::<T>().push::<T>(self.component);
     }
@@ -4028,7 +4040,7 @@ impl<'w> EntityBuilder<'w> {
     /// Add a component to the entity being built
     pub fn with<T>(mut self, component: T) -> Self
     where
-        T: Component + TraitAccessible<dyn Component>,
+        T: Component,
     {
         self.components
             .push(Box::new(TypedComponentInserter { component }));
@@ -4075,7 +4087,7 @@ impl<'w> EntityBuilder<'w> {
 // =============================================================================
 
 /// Copies a single component instance from source to destination storage.
-fn copy_component<T: Component + TraitAccessible<dyn Component> + Clone>(
+fn copy_component<T: Component + Clone>(
     source: &ComponentColumns,
     destination: &mut ComponentColumns,
     index: usize,
@@ -4264,11 +4276,13 @@ mod tests {
             &[
                 LayoutField {
                     name: "a",
+                    type_tag: "u32",
                     offset: 0,
                     size: 4,
                 },
                 LayoutField {
                     name: "b",
+                    type_tag: "u32",
                     offset: 4,
                     size: 4,
                 },
@@ -4276,16 +4290,19 @@ mod tests {
             &[
                 LayoutField {
                     name: "b",
+                    type_tag: "u32",
                     offset: 0,
                     size: 4,
                 },
                 LayoutField {
                     name: "a",
+                    type_tag: "u32",
                     offset: 4,
                     size: 4,
                 },
                 LayoutField {
                     name: "added",
+                    type_tag: "u32",
                     offset: 8,
                     size: 8,
                 },
@@ -4492,8 +4509,8 @@ mod tests {
             .archetypes
             .get_mut(&stripped)
             .unwrap()
-            .dynamic_component_storages
-            .remove(&component)
+            .component_storages
+            .remove(component)
             .is_some());
         let row_before = world
             .dynamic_component_bytes(holder, component)
@@ -4516,7 +4533,7 @@ mod tests {
             .archetypes
             .get_mut(&stripped)
             .unwrap()
-            .dynamic_component_storages
+            .component_storages
             .insert(
                 component,
                 crate::archetype::DynamicColumn::new(DynamicComponentLayout {
@@ -4524,7 +4541,6 @@ mod tests {
                     align: 4,
                     schema_hash: 100,
                     blittability: Blittability::engine_verified(),
-                    drop_fn: None,
                 })
                 .expect("the drifted layout is still a valid allocation layout"),
             );
@@ -4534,8 +4550,8 @@ mod tests {
                 .archetypes
                 .get_mut(&location.archetype_id)
                 .unwrap()
-                .dynamic_component_storages
-                .get_mut(&component)
+                .component_storages
+                .get_mut(component)
                 .unwrap();
             column.relayout_validated(
                 DynamicComponentLayout {
@@ -4543,7 +4559,6 @@ mod tests {
                     align: 4,
                     schema_hash: 100,
                     blittability: Blittability::engine_verified(),
-                    drop_fn: None,
                 },
                 &DynamicFieldPlan::new(),
                 8,
@@ -4555,7 +4570,9 @@ mod tests {
         ));
         assert_eq!(
             world.archetypes[&world.entity_locations[&holder].archetype_id]
-                .dynamic_component_storages[&component]
+                .component_storages
+                .get(component)
+                .expect("column")
                 .element_size(),
             16,
             "the mismatched column was reported, not rewritten"
@@ -4601,8 +4618,8 @@ mod tests {
             .archetypes
             .get_mut(&destination)
             .unwrap()
-            .dynamic_component_storages
-            .remove(&second)
+            .component_storages
+            .remove(second)
             .is_some());
 
         let entity = world
@@ -4610,7 +4627,11 @@ mod tests {
             .unwrap();
         let source = world.entity_locations[&entity].archetype_id;
         let source_rows = world.archetypes[&source].entities.len();
-        let source_column = world.archetypes[&source].dynamic_component_storages[&first].len();
+        let source_column = world.archetypes[&source]
+            .component_storages
+            .get(first)
+            .expect("column")
+            .len();
         let destination_rows = world.archetypes[&destination].entities.len();
 
         assert!(matches!(
@@ -4625,7 +4646,11 @@ mod tests {
             "the source kept its row while the destination refused the migration"
         );
         assert_eq!(
-            world.archetypes[&source].dynamic_component_storages[&first].len(),
+            world.archetypes[&source]
+                .component_storages
+                .get(first)
+                .expect("column")
+                .len(),
             source_column
         );
         assert_eq!(
@@ -6819,11 +6844,13 @@ mod tests {
             &[
                 LayoutField {
                     name: "a",
+                    type_tag: "u32",
                     offset: 0,
                     size: 4,
                 },
                 LayoutField {
                     name: "b",
+                    type_tag: "u32",
                     offset: 4,
                     size: 4,
                 },
@@ -6831,16 +6858,19 @@ mod tests {
             &[
                 LayoutField {
                     name: "b",
+                    type_tag: "u32",
                     offset: 0,
                     size: 4,
                 },
                 LayoutField {
                     name: "a",
+                    type_tag: "u32",
                     offset: 4,
                     size: 4,
                 },
                 LayoutField {
                     name: "added",
+                    type_tag: "u32",
                     offset: 8,
                     size: 8,
                 },

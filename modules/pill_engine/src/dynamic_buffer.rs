@@ -217,11 +217,7 @@ impl<T: Copy> DynamicBuffer<T> {
         // range is inside the block; `values` borrows a different allocation,
         // so the ranges cannot overlap.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                values.as_ptr(),
-                self.ptr.add(self.len),
-                values.len(),
-            );
+            std::ptr::copy_nonoverlapping(values.as_ptr(), self.ptr.add(self.len), values.len());
         }
         self.len += values.len();
     }
@@ -323,15 +319,15 @@ impl<T: Copy> DynamicBuffer<T> {
         }
         // SAFETY: the pointer addresses a live block this handle holds a
         // reference to, allocated with this element alignment.
-        if unsafe { native_buffer::reference_count(self.ptr.cast::<u8>(), Self::ELEMENT_ALIGN) } <= 1
+        if unsafe { native_buffer::reference_count(self.ptr.cast::<u8>(), Self::ELEMENT_ALIGN) }
+            <= 1
         {
             return;
         }
         let bytes = Self::element_bytes(self.cap);
         // SAFETY: the capacity is non-zero (a block exists) and the element
         // size is non-zero, so the allocation request is valid.
-        let new_ptr =
-            unsafe { native_buffer::allocate(bytes, Self::ELEMENT_ALIGN) }.cast::<T>();
+        let new_ptr = unsafe { native_buffer::allocate(bytes, Self::ELEMENT_ALIGN) }.cast::<T>();
         if self.len > 0 {
             // SAFETY: as in `grow_to`: same element type, `len <= cap`
             // initialised elements on both sides, distinct allocations.
@@ -421,7 +417,10 @@ impl<T: Copy> DerefMut for DynamicBuffer<T> {
 
 impl<T: Copy + std::fmt::Debug> std::fmt::Debug for DynamicBuffer<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.debug_list().entries(self.as_slice().iter()).finish()
+        formatter
+            .debug_list()
+            .entries(self.as_slice().iter())
+            .finish()
     }
 }
 
@@ -505,7 +504,10 @@ mod tests {
         }
         assert_eq!(buffer.len(), 10);
         assert!(buffer.capacity() >= 10);
-        assert_eq!(buffer.as_slice(), (0..10).map(|v| v as f32).collect::<Vec<_>>().as_slice());
+        assert_eq!(
+            buffer.as_slice(),
+            (0..10).map(|v| v as f32).collect::<Vec<_>>().as_slice()
+        );
 
         buffer.resize(12, -1.0);
         assert_eq!(buffer.len(), 12);

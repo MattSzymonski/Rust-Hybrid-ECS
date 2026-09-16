@@ -61,13 +61,12 @@ pub(crate) const POLL_RELOADED: u8 = 1;
 /// Poll rejected the new assembly; the old version stays loaded.
 pub(crate) const POLL_REJECTED: u8 = 2;
 #[cfg(feature = "hot_reload")]
-/// A behaviour-compatible assembly is loaded and waiting, but its component
-/// manifest differs from the one in force.
+/// A behaviour-compatible assembly is loaded and waiting on the host's verdict
+/// about its component manifest.
 ///
-/// The managed loader cannot decide this: whether a manifest change can be
+/// The managed loader cannot decide it: whether a manifest change can be
 /// applied depends on what each component is bound to natively, and only the
-/// host holds those bindings. The swap therefore stops, the host applies the
-/// manifest, and answers with commit or abort.
+/// host holds those bindings. It answers within the same poll.
 pub(crate) const POLL_MANIFEST_PENDING: u8 = 3;
 
 /// Maximum UTF-8 byte length accepted for a managed system name.
@@ -97,7 +96,7 @@ pub(super) const MAX_ACCESSES_PER_SYSTEM: u32 = 1024;
 /// `entities` pointer, which a stale runtime would otherwise read as a
 /// 48-byte struct. The host refuses to start against a runtime built for a
 /// different version.
-const INTEROP_CONTRACT_VERSION: u32 = 8;
+const INTEROP_CONTRACT_VERSION: u32 = 9;
 
 // =============================================================================
 // Types + Impls
@@ -139,13 +138,13 @@ type CopySystemErrorMessageFn = extern "system" fn(u32, *mut u8, u32) -> u8;
 /// Signature polling the collectible loader for a new project assembly and
 /// reporting the swap outcome through the status codes below.
 type PollReloadFn = extern "system" fn() -> u8;
-/// Signature returning the pending manifest's byte length.
+/// Signature returning the parked manifest's byte length.
 type PendingManifestLengthFn = extern "system" fn() -> u32;
-/// Signature copying the pending manifest into a caller buffer.
+/// Signature copying the parked manifest into a caller buffer.
 type CopyPendingManifestFn = extern "system" fn(*mut u8, u32) -> u8;
-/// Signature installing the pending version after the host accepted it.
+/// Signature installing the parked version once its manifest is in force.
 type CommitReloadFn = extern "system" fn() -> u8;
-/// Signature discarding the pending version after the host refused it.
+/// Signature discarding the parked version when its manifest is refused.
 type AbortReloadFn = extern "system" fn() -> u8;
 
 /// Reflected metadata of one managed system, captured at startup.
@@ -517,6 +516,7 @@ impl CSharpRuntime {
                     component_key: 0,
                     component_key_high: 0,
                     mode: 0,
+                    kind: 0,
                 };
                 if get_access(system_index, access_index, &mut item) == 0 {
                     return Err(CSharpError::SystemAccessFailed {
@@ -775,6 +775,7 @@ impl CSharpRuntime {
                     component_key: 0,
                     component_key_high: 0,
                     mode: 0,
+                    kind: 0,
                 };
                 if get_access(system_index, access_index, &mut item) == 0 {
                     return Err(CSharpError::SystemAccessFailed {
@@ -897,6 +898,10 @@ impl CSharpRuntime {
                 "C# reload rejected: component or system signatures changed; restart the host to rebuild the native component registry and scheduler"
             );
         }
+        #[cfg(feature = "hot_reload")]
+        if status == POLL_MANIFEST_PENDING {
+            return Ok(self.decide_parked_manifest(engine));
+        }
         if status == POLL_RELOADED {
             if self.verify_systems_unchanged() {
                 info!(
@@ -917,6 +922,113 @@ impl CSharpRuntime {
         }
         self.last_poll_status = status;
         Ok(status)
+    }
+
+    /// Decide the parked version's fate: apply its manifest, then commit or
+    /// abort.
+    ///
+    /// The whole point of the handshake is this ordering. The manifest is
+    /// applied while the *old* assembly is still the running one, so a refusal
+    /// costs an unload and nothing else; committing afterwards means the world
+    /// and the incoming assembly agree the moment the swap lands. Applying
+    /// after a swap would leave a running assembly against a world that never
+    /// took its layout.
+    ///
+    /// Returns the status the caller should report: `POLL_RELOADED` when the
+    /// swap happened, `POLL_REJECTED` when it did not.
+    #[cfg(feature = "hot_reload")]
+    fn decide_parked_manifest(&mut self, engine: &mut Engine) -> u8 {
+        let Some(manifest) = self.read_pending_manifest() else {
+            self.abort_parked("its component manifest could not be read");
+            return POLL_REJECTED;
+        };
+
+        match apply_component_manifest_on_reload(engine, &manifest, &self.bindings) {
+            Ok(report) => {
+                // The same defence the ordinary reload path runs: a managed
+                // assembly whose system metadata drifted from the registered
+                // snapshot would run against stale index bindings. Checked
+                // before the swap here, so a mismatch costs an abort rather
+                // than a running generation.
+                if !self.verify_systems_unchanged() {
+                    self.abort_parked("its system metadata differs from the registered snapshot");
+                    return POLL_REJECTED;
+                }
+                if (self.commit_reload)() == 0 {
+                    // The manifest is in force but the swap did not happen, so
+                    // the running assembly now disagrees with the world. Say so
+                    // loudly: this is the one outcome the handshake cannot make
+                    // safe by ordering alone.
+                    error!(
+                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        "the managed loader failed to install a version whose manifest was already applied; restart the host"
+                    );
+                    return POLL_REJECTED;
+                }
+                self.applied_manifest = manifest;
+                info!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    added = report.added.len(),
+                    migrated = report.migrated.len(),
+                    resources_added = report.resources_added.len(),
+                    resources_migrated = report.resources_migrated.len(),
+                    "C# hot reload complete"
+                );
+                POLL_RELOADED
+            }
+            Err(error) => {
+                self.abort_parked(&error.to_string());
+                POLL_REJECTED
+            }
+        }
+    }
+
+    /// Copy the parked version's manifest, or `None` when it cannot be read.
+    #[cfg(feature = "hot_reload")]
+    fn read_pending_manifest(&self) -> Option<Vec<u8>> {
+        let length = (self.pending_manifest_length)();
+        if !is_supported_manifest_length(length) {
+            error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                length,
+                "the parked assembly reported a component manifest length outside the accepted range"
+            );
+            return None;
+        }
+        let mut manifest = Vec::new();
+        if manifest.try_reserve_exact(length as usize).is_err() {
+            error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                length,
+                "could not reserve a buffer for the parked component manifest"
+            );
+            return None;
+        }
+        manifest.resize(length as usize, 0);
+        if (self.copy_pending_manifest)(manifest.as_mut_ptr(), length) == 0 {
+            error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                "could not copy the parked component manifest"
+            );
+            return None;
+        }
+        Some(manifest)
+    }
+
+    /// Tell the managed loader to discard the parked version, and say why.
+    #[cfg(feature = "hot_reload")]
+    fn abort_parked(&mut self, reason: &str) {
+        error!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            reason,
+            "C# reload rejected: the component manifest could not be applied; the running assembly keeps its rows"
+        );
+        if (self.abort_reload)() == 0 {
+            error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                "the managed loader failed to discard the parked version; restart the host"
+            );
+        }
     }
 
     /// Apply the swapped assembly's component manifest when it differs from the
@@ -966,7 +1078,9 @@ impl CSharpRuntime {
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     added = report.added.len(),
                     migrated = report.migrated.len(),
-                    "applied the reloaded assembly's component manifest"
+                    resources_added = report.resources_added.len(),
+                    resources_migrated = report.resources_migrated.len(),
+                    "applied the reloaded assembly's component and resource manifest"
                 );
                 self.applied_manifest = manifest;
             }
@@ -1002,6 +1116,7 @@ impl CSharpRuntime {
                     component_key: 0,
                     component_key_high: 0,
                     mode: 0,
+                    kind: 0,
                 };
                 if (self.get_access)(system_index, access_index, &mut item) == 0 {
                     return false;
@@ -1028,7 +1143,17 @@ impl CSharpRuntime {
 /// test can pin it without a live runtime.
 #[cfg(feature = "hot_reload")]
 pub(super) fn poll_status_is_known(status: u8) -> bool {
-    matches!(status, POLL_NO_CHANGE | POLL_RELOADED | POLL_REJECTED)
+    #[cfg(feature = "hot_reload")]
+    {
+        matches!(
+            status,
+            POLL_NO_CHANGE | POLL_RELOADED | POLL_REJECTED | POLL_MANIFEST_PENDING
+        )
+    }
+    #[cfg(not(feature = "hot_reload"))]
+    {
+        matches!(status, POLL_NO_CHANGE | POLL_RELOADED | POLL_REJECTED)
+    }
 }
 
 /// Whether a managed-reported manifest length lies within the supported range.
@@ -1118,6 +1243,22 @@ pub(super) fn derive_system_access(
 ) -> Result<SystemAccess, CSharpError> {
     let mut result = SystemAccess::new();
     for access in accesses {
+        // A resource access resolves through its own table: the two key spaces
+        // are both name hashes, so only the declared kind tells them apart, and
+        // recording a resource as a component would let two writers of one
+        // resource run in the same batch.
+        if access.kind == super::resources::RESOURCE_ACCESS_KIND {
+            let resource = super::resources::resolve_resource_access(
+                access.component_key,
+                access.component_key_high,
+            )?;
+            match access.mode {
+                0 => result.add_resource_read(resource),
+                1 => result.add_resource_write(resource),
+                mode => return Err(CSharpError::UnknownAccessMode { mode }),
+            }
+            continue;
+        }
         let stable_id =
             StableComponentId::from_halves(access.component_key, access.component_key_high);
         let component = bindings

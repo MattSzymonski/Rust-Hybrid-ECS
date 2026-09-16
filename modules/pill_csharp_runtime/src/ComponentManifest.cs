@@ -21,7 +21,21 @@ internal sealed record ComponentFieldManifest(
 internal sealed record ComponentManifest(
     ulong StableIdLow, ulong StableIdHigh, string FullName,
     int Size, int Alignment, ulong SchemaHash, bool Shared,
-    ComponentFieldManifest[] Fields);
+    ComponentFieldManifest[] Fields, string Kind = ManifestKinds.Component);
+
+/// <summary>
+/// What one manifest entry declares. Resources ride in the same array as
+/// components so a generation's whole declaration reaches the host in one
+/// transfer and is registered in one transaction.
+/// </summary>
+internal static class ManifestKinds
+{
+    /// <summary>Per-entity storage, registered by the host as a column.</summary>
+    internal const string Component = "component";
+
+    /// <summary>One value for the whole world, registered as a resource.</summary>
+    internal const string Resource = "resource";
+}
 
 /// <summary>
 /// Source-generated JSON contract for the component manifest. Reflection-based
@@ -44,13 +58,25 @@ internal static class ComponentManifestBuilder
             .SelectMany(query => query!.Terms)
             .Where(term => !term.IsEntity)
             .Select(term => term.ComponentType!);
+        // Resources are discovered by their attribute alone, never by use: a
+        // resource nothing reads yet still has to be registered, or the first
+        // system that adds a Res<T> would fail against a host that never heard
+        // of it. The attribute is also what keeps an ordinary project struct
+        // from being mistaken for one.
+        Type[] declaredResources = projectAssembly is null
+            ? []
+            : projectAssembly.GetTypes().Where(IsResourceCandidate).ToArray();
         IEnumerable<Type> declaredProjectComponents = projectAssembly is null
             ? []
-            : projectAssembly.GetTypes().Where(IsProjectComponentCandidate);
+            : projectAssembly.GetTypes()
+                .Where(type => !declaredResources.Contains(type))
+                .Where(IsProjectComponentCandidate);
         ComponentManifest[] components = queryComponents
             .Concat(declaredProjectComponents)
             .Distinct()
-            .Select(Describe)
+            .Where(type => !declaredResources.Contains(type))
+            .Select(type => Describe(type, ManifestKinds.Component))
+            .Concat(declaredResources.Select(type => Describe(type, ManifestKinds.Resource)))
             .OrderBy(component => component.StableIdHigh)
             .ThenBy(component => component.StableIdLow)
             .ToArray();
@@ -87,6 +113,28 @@ internal static class ComponentManifestBuilder
     }
 
     /// <summary>
+    /// Whether this type is a project-declared resource: a blittable struct
+    /// carrying <see cref="EcsResourceAttribute"/>.
+    /// </summary>
+    /// <remarks>
+    /// A struct that carries the attribute and cannot be described is a
+    /// declaration error rather than something to skip quietly, so the layout
+    /// failure is allowed to escape here where
+    /// <see cref="IsProjectComponentCandidate"/> swallows it - that one is
+    /// guessing which structs are components, this one is being told.
+    /// </remarks>
+    private static bool IsResourceCandidate(Type type)
+    {
+        if (!type.IsDefined(typeof(EcsResourceAttribute), inherit: false))
+            return false;
+        if (!type.IsValueType || type.IsEnum || type.IsPrimitive || type.IsGenericType)
+            throw new InvalidOperationException(
+                $"Resource {type.FullName} must be a plain, non-generic struct.");
+        ValidateValueType(type, new HashSet<Type>());
+        return true;
+    }
+
+    /// <summary>
     /// Whether the native host binds this component itself rather than
     /// registering it as a dynamic byte-level layout.
     /// </summary>
@@ -100,21 +148,32 @@ internal static class ComponentManifestBuilder
         type.IsDefined(typeof(EcsSharedComponentAttribute), inherit: false) ||
         type.Assembly == typeof(Engine).Assembly;
 
-    private static ComponentManifest Describe(Type type)
+    private static ComponentManifest Describe(Type type, string kind)
     {
         ValidateValueType(type, new HashSet<Type>());
-        StableComponentId id = Engine.ComponentStableId(type);
+        // A resource may declare its own identity so it can meet a Rust module
+        // that names the same resource; a component's identity is always its
+        // full type name. Both the id and the manifest's `full_name` come from
+        // the same string, because the host recomputes one from the other and
+        // refuses the entry if they disagree.
+        string identity = kind == ManifestKinds.Resource
+            ? ResourceNames.Of(type)
+            : type.FullName ?? type.Name;
+        StableComponentId id = Engine.StableIdOf(identity);
         ComponentFieldManifest[] fields = DescribeFields(type);
         string schema = SchemaText(type, fields);
         return new ComponentManifest(
             id.Low,
             id.High,
-            type.FullName ?? type.Name,
+            identity,
             NativeLayout.SizeOf(type),
             NativeLayout.AlignmentOf(type),
             Hash64(schema),
-            IsShared(type),
-            fields);
+            // A resource has no native binding to be shared with: the host
+            // registers it from this declaration and holds no rival schema.
+            kind == ManifestKinds.Component && IsShared(type),
+            fields,
+            kind);
     }
 
     private static void ValidateValueType(Type type, HashSet<Type> visiting)

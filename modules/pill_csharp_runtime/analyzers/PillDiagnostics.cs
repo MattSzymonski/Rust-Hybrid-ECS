@@ -10,9 +10,11 @@
 //   04xx component struct layout.
 // - Correctness hazards are Error rather than Warning. A warning in a gameplay
 //   project is a warning nobody reads, and every rule here describes something
-//   that either cannot work or corrupts memory. The one exception is PILL0301,
-//   which stays a warning until managed systems can reach engine resources and
-//   therefore have somewhere legal to keep per-frame state.
+//   that either cannot work or corrupts memory. PILL0301 was the one exception
+//   while managed systems had nowhere legal to keep per-frame state; [EcsResource]
+//   and Res<T>/ResMut<T> gave them one, so it is an error like the rest.
+//   PILL0305 stays a warning: a finalizer delays an unload rather than
+//   preventing it, and some types legitimately have one.
 
 using Microsoft.CodeAnalysis;
 
@@ -92,13 +94,14 @@ namespace PillScriptAnalyzers
             "Mutable static state in a type that declares ECS systems",
             "'{0}' is mutable static state in a type that declares ECS systems",
             StateCategory,
-            DiagnosticSeverity.Warning,
+            DiagnosticSeverity.Error,
             "Systems with disjoint component access run on different threads in the same frame. " +
             "The scheduler derives that from component access and cannot see a static, so two " +
             "systems sharing one race. Statics also reset on every hot reload, because each " +
-            "reload loads the assembly into a fresh collectible context. This is a warning " +
-            "rather than an error until managed systems can reach engine resources, which is " +
-            "where per-frame state belongs.");
+            "reload loads the assembly into a fresh collectible context. Declare the state as " +
+            "an [EcsResource] struct and take it as a Res<T> or ResMut<T> parameter: the " +
+            "scheduler then orders the systems that share it, and the value outlives the " +
+            "assembly.");
 
         internal static readonly DiagnosticDescriptor StaticEventBlocksUnload = Rule(
             "PILL0302",

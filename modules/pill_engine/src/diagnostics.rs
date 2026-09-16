@@ -170,16 +170,14 @@ impl EcsSnapshot {
                 }
                 // Row bytes, not capacity: what the stored rows actually
                 // occupy, so the total tracks entities rather than allocation.
-                let (stride, rows, dynamic) = if let Some(column) =
-                    archetype.component_storages.get(component_id)
-                {
-                    (column.elem_size(), column.len(), false)
-                } else if let Some(column) = archetype.dynamic_component_storages.get(&component_id)
-                {
-                    (column.element_size(), column.len(), true)
-                } else {
-                    (0, 0, false)
-                };
+                let (stride, rows, dynamic) =
+                    if let Some(column) = archetype.component_storages.get(component_id) {
+                        (column.elem_size(), column.len(), false)
+                    } else if let Some(column) = archetype.component_storages.get(component_id) {
+                        (column.element_size(), column.len(), true)
+                    } else {
+                        (0, 0, false)
+                    };
                 total_bytes += stride * rows;
                 columns.push(ColumnReport {
                     bit: registry.get_bit(&component_id),

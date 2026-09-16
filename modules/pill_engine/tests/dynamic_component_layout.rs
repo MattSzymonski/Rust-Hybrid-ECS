@@ -40,7 +40,6 @@ fn degenerate_layouts_are_typed_errors() {
         align: 4,
         schema_hash: 1,
         blittability: Blittability::from_manifest_fields(),
-        drop_fn: None,
     };
     assert!(matches!(
         DynamicColumn::new(zero_sized),
@@ -52,7 +51,6 @@ fn degenerate_layouts_are_typed_errors() {
         align: 3,
         schema_hash: 1,
         blittability: Blittability::from_manifest_fields(),
-        drop_fn: None,
     };
     assert!(matches!(
         DynamicColumn::new(misaligned),
@@ -71,7 +69,6 @@ fn an_unrepresentable_growth_is_a_layout_error() {
         align: 8,
         schema_hash: 1,
         blittability: Blittability::from_manifest_fields(),
-        drop_fn: None,
     };
     let mut column = DynamicColumn::new(unallocatable_growth).expect("one element still fits");
     assert!(matches!(

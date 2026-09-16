@@ -168,11 +168,14 @@ pub(super) struct CsEngineApi {
     /// Token of the managed invocation active on the calling thread, or zero.
     current_scope_token: extern "C" fn() -> u32,
     /// Report the epoch of the mirror-method table.
-    ///
-    /// Appended last on purpose: the managed mirror struct reproduces this
-    /// field order, so a new slot goes at the end rather than between existing
-    /// ones.
     mirror_epoch: extern "C" fn() -> u32,
+    /// Fill a [`ResourceView`] for one resource the active system declared.
+    ///
+    /// Arguments are the stable identity's low and high halves, the requested
+    /// mode (`0` read, `1` write) and the output view. Appended last on
+    /// purpose: the managed mirror struct reproduces this field order, so a new
+    /// slot goes at the end rather than between existing ones.
+    get_resource_view: extern "C" fn(u64, u64, u8, *mut ResourceView) -> u8,
 }
 
 impl CsEngineApi {
@@ -200,6 +203,7 @@ impl CsEngineApi {
             copy_mirror_methods: ffi_copy_mirror_methods,
             current_scope_token: super::context::ffi_current_scope_token,
             mirror_epoch: ffi_mirror_epoch,
+            get_resource_view: super::resources::ffi_get_resource_view,
         }
     }
 }
@@ -323,4 +327,29 @@ pub(super) struct NativeSystemAccess {
     pub(super) component_key_high: u64,
     /// Access mode: `0` is read-only and `1` is read-write.
     pub(super) mode: u8,
+    /// What the key names: `0` a component, `1` a resource.
+    ///
+    /// Both are 128-bit name hashes drawn from the same space, so without a
+    /// discriminator a resource read would be authorized by a component entry
+    /// that happened to hash alike, and the scheduler would record a component
+    /// access where a resource access was meant - two systems writing one
+    /// resource would then be free to run together.
+    pub(super) kind: u8,
+}
+
+/// Borrowed view of one resource's bytes, handed to managed code.
+///
+/// The resource counterpart of [`ComponentChunk`], and much smaller for the
+/// obvious reason: a resource is one value, so there is no length to iterate,
+/// no archetype to identify and no per-row tick column - only the bytes, their
+/// width, and the invocation the view was issued to.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct ResourceView {
+    /// Pointer to the resource's first byte in engine storage.
+    pub(super) data: *mut u8,
+    /// Width of the stored value, for the managed side to check its struct against.
+    pub(super) length: u32,
+    /// Token of the managed invocation this view was issued to.
+    pub(super) scope_token: u32,
 }

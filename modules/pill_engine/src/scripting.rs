@@ -16,7 +16,6 @@
 // Standard library
 
 // External crates
-use trait_type_map::TraitAccessible;
 
 // Current crate
 use crate::commands::CommandQueue;
@@ -82,7 +81,7 @@ impl<'a> ScriptContext<'a> {
     /// Gets an immutable reference to a component on any entity.
     pub fn get_component<T>(&self, entity: Entity) -> Option<&T>
     where
-        T: Component + TraitAccessible<dyn Component>,
+        T: Component,
     {
         self.world.get_component::<T>(entity)
     }
@@ -102,7 +101,7 @@ impl<'a> ScriptContext<'a> {
     /// but in practice is sound - will never lead to any issues.
     pub fn get_component_mut<T>(&mut self, entity: Entity) -> Option<&mut T>
     where
-        T: Component + TraitAccessible<dyn Component>,
+        T: Component,
     {
         // Step 1: Acquire a raw pointer to the component storage slot. The
         // lookup returns `None` when the entity is missing or does not carry `T`.
@@ -158,7 +157,7 @@ impl<'a> ScriptContext<'a> {
     /// The component will be added after all scripts finish updating.
     pub fn add_component<T>(&mut self, entity: Entity, component: T)
     where
-        T: Component + TraitAccessible<dyn Component> + Send,
+        T: Component + Send,
     {
         self.commands.add_component_to_entity(entity, component);
     }

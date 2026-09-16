@@ -108,9 +108,8 @@ impl Time {
     pub(crate) fn advance(&mut self) {
         let now = Instant::now();
         self.last_frame = now.duration_since(self.frame_start);
-        self.delta = Duration::from_secs_f32(
-            self.last_frame.as_secs_f32().min(MAXIMUM_DELTA_SECONDS),
-        );
+        self.delta =
+            Duration::from_secs_f32(self.last_frame.as_secs_f32().min(MAXIMUM_DELTA_SECONDS));
         self.frame_start = now;
         self.elapsed = now.duration_since(self.startup);
         // Saturating rather than wrapping: at 1000 fps this takes ~584 million

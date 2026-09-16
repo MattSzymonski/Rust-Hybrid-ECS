@@ -314,9 +314,7 @@ impl AssetManager {
         if !self.is_live(handle) {
             return None;
         }
-        self.columns
-            .get_storage::<T>()
-            .get(handle.index as usize)
+        self.columns.get_storage::<T>().get(handle.index as usize)
     }
 
     /// Mutably borrow the asset `handle` refers to, or `None` when it is stale.
@@ -497,7 +495,8 @@ impl AssetManager {
             return;
         }
         self.columns.register_type_storage::<T>();
-        self.metadata.insert(TypeId::of::<T>(), AssetColumn::default());
+        self.metadata
+            .insert(TypeId::of::<T>(), AssetColumn::default());
     }
 }
 

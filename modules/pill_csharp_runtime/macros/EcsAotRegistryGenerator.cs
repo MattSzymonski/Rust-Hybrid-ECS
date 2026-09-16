@@ -40,6 +40,9 @@ namespace PillCSharpRuntimeMacros
         // FullyQualifiedFormat renders with the `global::` prefix, so the
         // comparison strings must carry it too.
         private const string CommandsTypeName = "global::TracyLive.Commands";
+        private const string IResourceParameterTypeName = "global::TracyLive.IResourceParameter";
+        private const string ResTypeName = "global::TracyLive.Res<";
+        private const string ResMutTypeName = "global::TracyLive.ResMut<";
         private const string IQueryDescriptorTypeName = "global::TracyLive.IQueryDescriptor";
 
         /// <summary>Fully-qualified symbol rendering with `global::` prefixes.</summary>
@@ -190,6 +193,37 @@ namespace PillCSharpRuntimeMacros
         private static bool IsCommands(ITypeSymbol type) =>
             type.ToDisplayString(FullyQualified) == CommandsTypeName;
 
+        /// <summary>
+        /// Classify one parameter as a resource declaration, returning its
+        /// access mode: 0 for <c>Res&lt;T&gt;</c>, 1 for <c>ResMut&lt;T&gt;</c>.
+        /// </summary>
+        /// <remarks>
+        /// Matched on the open generic's display prefix rather than on a symbol
+        /// comparison, because the generator has no reference to the runtime's
+        /// closed types. The interface check is what keeps that prefix from
+        /// matching an unrelated type someone happens to name the same way.
+        /// </remarks>
+        private static byte? ResourceMode(ITypeSymbol type)
+        {
+            bool declaresContract = false;
+            foreach (INamedTypeSymbol implemented in type.AllInterfaces)
+            {
+                if (implemented.ToDisplayString(FullyQualified) == IResourceParameterTypeName)
+                {
+                    declaresContract = true;
+                    break;
+                }
+            }
+            if (!declaresContract)
+                return null;
+            string name = type.ToDisplayString(FullyQualified);
+            if (name.StartsWith(ResMutTypeName, StringComparison.Ordinal))
+                return 1;
+            if (name.StartsWith(ResTypeName, StringComparison.Ordinal))
+                return 0;
+            return null;
+        }
+
         /// <summary>Whether a type is assignable to the IQueryDescriptor contract.</summary>
         private static bool IsQueryType(ITypeSymbol type)
         {
@@ -226,6 +260,8 @@ namespace PillCSharpRuntimeMacros
                     usesCommands = true;
                     continue;
                 }
+                if (ResourceMode(parameter.Type) is not null)
+                    continue;
                 if (!IsQueryType(parameter.Type))
                     return null; // non-query, non-Commands parameter: unsupported
             }
@@ -236,7 +272,7 @@ namespace PillCSharpRuntimeMacros
             for (int parameterIndex = 0; parameterIndex < method.Parameters.Length; parameterIndex++)
             {
                 IParameterSymbol parameter = method.Parameters[parameterIndex];
-                if (IsCommands(parameter.Type))
+                if (IsCommands(parameter.Type) || ResourceMode(parameter.Type) is not null)
                     continue;
                 string field = $"s_query_{index}_{parameterIndex}";
                 string queryType = parameter.Type.ToDisplayString(FullyQualified);
@@ -250,12 +286,26 @@ namespace PillCSharpRuntimeMacros
             List<string> arguments = new();
             List<string> descriptors = new();
             List<string> queryNames = new();
+            List<string> resourceAccesses = new();
             for (int parameterIndex = 0; parameterIndex < method.Parameters.Length; parameterIndex++)
             {
                 IParameterSymbol parameter = method.Parameters[parameterIndex];
                 if (IsCommands(parameter.Type))
                 {
                     arguments.Add("default");
+                    continue;
+                }
+                // Res<T> and ResMut<T> carry no state - every access re-asks
+                // the host - so the default value is the whole parameter, and
+                // only the declaration it implies has to be recorded.
+                if (ResourceMode(parameter.Type) is byte mode)
+                {
+                    arguments.Add("default");
+                    string resource = ((INamedTypeSymbol)parameter.Type)
+                        .TypeArguments[0].ToDisplayString(FullyQualified);
+                    resourceAccesses.Add(
+                        $"global::TracyLive.Loader.ResourceAccessRegistration" +
+                        $".Of<{resource}>((byte){mode})");
                     continue;
                 }
                 arguments.Add(queryFields[parameterIndex]);
@@ -271,7 +321,10 @@ namespace PillCSharpRuntimeMacros
                 $"            new global::TracyLive.Loader.AotSystemRegistration(" +
                 $"\"{name}\", new global::TracyLive.QueryDescriptor?[] {{ {string.Join(", ", descriptors)} }}, " +
                 $"new string[] {{ {string.Join(", ", queryNames)} }}, " +
-                $"{(usesCommands ? "true" : "false")}, {runMethod})");
+                $"{(usesCommands ? "true" : "false")}, " +
+                $"new global::TracyLive.Loader.ResourceAccessRegistration[] " +
+                $"{{ {string.Join(", ", resourceAccesses)} }}, " +
+                $"{runMethod})");
             return name;
         }
 

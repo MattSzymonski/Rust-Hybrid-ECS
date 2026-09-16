@@ -25,7 +25,15 @@ namespace TracyLive.Loader;
 // =============================================================================
 
 /// <summary>One 128-bit component ID and its native access mode.</summary>
-internal readonly record struct ManagedAccess(ulong ComponentKey, ulong ComponentKeyHigh, byte Mode);
+internal readonly record struct ManagedAccess(
+    ulong ComponentKey, ulong ComponentKeyHigh, byte Mode, byte Kind)
+{
+    /// <summary>The key names a component column.</summary>
+    internal const byte ComponentKind = 0;
+
+    /// <summary>The key names a world resource.</summary>
+    internal const byte ResourceKind = 1;
+}
 
 /// <summary>Compiled managed system plus its scheduler declaration.</summary>
 /// <remarks>
@@ -98,10 +106,12 @@ internal enum PollStatus : byte
     /// <remarks>
     /// The managed side cannot decide this one. Whether a manifest change can
     /// be applied depends on what each component is bound to natively - a
-    /// dynamic column can be relaid out and its rows migrated, a mirror of a
-    /// Rust type cannot - and only the host knows those bindings. So the swap
-    /// stops here, the host is handed the manifest to accept or refuse, and it
-    /// answers with commit or abort.
+    /// descriptor column can be relaid out and its rows migrated, a mirror of a
+    /// Rust type cannot - and only the host holds those bindings.
+    ///
+    /// So the swap stops here and waits. Applying the manifest *after* swapping
+    /// would leave a running assembly against a world that never took its
+    /// layout; parking first means a refusal costs an unload and nothing else.
     /// </remarks>
     ManifestPending = 3,
 }
@@ -148,7 +158,7 @@ internal sealed class ProjectHost
     /// <remarks>
     /// Nothing about the running generation changes while a version sits here:
     /// its context is loaded but not installed, so an abort costs an unload and
-    /// leaves the world untouched.
+    /// leaves the world exactly as it was.
     /// </remarks>
     private sealed record PendingReload(
         ProjectContext Context,
@@ -231,9 +241,18 @@ internal sealed class ProjectHost
             {
                 QueryDescriptor?[] queries = registration.Queries ?? [];
                 ValidateQueries(registration.Name, queries, registration.QueryNames);
+                // The two postures must declare identical access, or a system
+                // that works in development would be refused its resource in
+                // the shipping build. Same list, same order, different source.
+                ManagedAccess[] accesses = MergeAccesses(queries)
+                    .Concat((registration.ResourceAccesses ?? [])
+                        .Select(resource => new ManagedAccess(
+                            resource.Low, resource.High, resource.Mode,
+                            ManagedAccess.ResourceKind)))
+                    .ToArray();
                 return new ManagedSystem(
                     registration.Name,
-                    MergeAccesses(queries),
+                    accesses,
                     queries,
                     registration.UsesCommands,
                     registration.Run);
@@ -361,8 +380,10 @@ internal sealed class ProjectHost
         // exists to watch, so a reload poll is always a no-op.
         if (!RuntimeFeature.IsDynamicCodeSupported)
             return (byte)PollStatus.NoChange;
-        // A version already waiting on the host's verdict owns the slot; polling
-        // again would load a second one on top of it.
+        // A version already waiting on the host's verdict owns the slot;
+        // polling again would load a second one on top of it. The host answers
+        // within the same frame, so this is a guard rather than a state the
+        // loader sits in.
         if (_pending is not null)
             return (byte)PollStatus.ManifestPending;
         var now = DateTime.UtcNow;
@@ -390,12 +411,8 @@ internal sealed class ProjectHost
 
         try
         {
-            PollStatus outcome = Load(isReload: true);
-            if (outcome == PollStatus.ManifestPending)
+            if (Load(isReload: true) == PollStatus.ManifestPending)
             {
-                // Loaded and validated, but not installed: the host decides
-                // whether the world can take this manifest, then answers with
-                // commit or abort.
                 Console.WriteLine(
                     "[csharp_runtime] " +
                     $"{Path.GetFileName(_assemblyPath)} changed its component manifest; " +
@@ -528,12 +545,9 @@ internal sealed class ProjectHost
                 throw new InvalidOperationException(
                     "C# startup methods changed; restart the host. Startup methods are not rerun during hot reload.");
 
-            // A changed manifest is not refused here any more: whether it can
-            // be applied depends on the native bindings, which only the host
-            // knows. The version parks fully loaded and validated, and the swap
-            // waits for the host's answer - so a refusal costs an unload rather
-            // than leaving a swapped assembly against a world that never took
-            // its layout.
+            // A changed manifest parks rather than refusing: whether it can be
+            // applied depends on the native bindings, which only the host
+            // holds. It answers with commit or abort.
             if (isReload && !_componentManifest.AsSpan().SequenceEqual(manifest))
             {
                 _pending = new PendingReload(
@@ -572,9 +586,7 @@ internal sealed class ProjectHost
     public ReadOnlySpan<byte> PendingComponentManifest =>
         _pending is null ? ReadOnlySpan<byte>.Empty : _pending.Manifest;
 
-    /// <summary>
-    /// Install the parked version after the host accepted its manifest.
-    /// </summary>
+    /// <summary>Install the parked version; the host accepted its manifest.</summary>
     /// <remarks>
     /// The host has already relaid out the columns the new manifest asks for,
     /// so the world and this assembly agree the moment the swap lands.
@@ -599,16 +611,22 @@ internal sealed class ProjectHost
         _lastWriteUtc = pending.WriteUtc;
         if (oldContext is not null)
             RetireContext(oldContext);
+
+        // A commit is a completed reload, so it reports like one. The two paths
+        // reaching this point - an ordinary swap and a manifest the host
+        // applied first - are one event to anything watching the log, and the
+        // suites wait on this line.
+        Console.WriteLine(
+            $"[csharp_runtime] reloaded {Path.GetFileName(_assemblyPath)} " +
+            $"(retired {_retiredCount}, collected {_collectedCount})");
     }
 
-    /// <summary>
-    /// Discard the parked version after the host refused its manifest.
-    /// </summary>
+    /// <summary>Discard the parked version; the host refused its manifest.</summary>
     /// <remarks>
-    /// The running generation never moved, so this only unloads what was
-    /// loaded speculatively. The write time is remembered either way, so the
-    /// same refused bytes are not re-examined twice a second for as long as
-    /// the source stays that way.
+    /// The running generation never moved, so this unloads what was loaded
+    /// speculatively and nothing else. The write time is remembered either way,
+    /// so the same refused bytes are not re-examined twice a second for as long
+    /// as the source stays that way.
     /// </remarks>
     public void AbortPendingReload()
     {
@@ -701,6 +719,12 @@ internal sealed class ProjectHost
 
         var queries = new List<QueryDescriptor?>(parameters.Length);
         var queryNames = new List<string?>(parameters.Length);
+        // Keyed by resource identity rather than by whole access, so a second
+        // declaration is caught whatever its mode. Two entries for one resource
+        // would tell the scheduler nothing new, and a Res<T> beside a ResMut<T>
+        // would hand the same bytes out as readable and writable at once - the
+        // aliasing ValidateQueries refuses between two query parameters.
+        var resourceAccesses = new Dictionary<(ulong Low, ulong High), ManagedAccess>();
         bool usesCommands = false;
         var arguments = new List<Expression>(parameters.Length);
         foreach (ParameterInfo parameter in parameters)
@@ -712,6 +736,16 @@ internal sealed class ProjectHost
                     throw new InvalidOperationException($"{method} declares Commands more than once.");
                 usesCommands = true;
                 arguments.Add(Expression.Default(typeof(Commands)));
+                continue;
+            }
+            if (TryDescribeResourceParameter(parameterType, out ManagedAccess resourceAccess))
+            {
+                var key = (resourceAccess.ComponentKey, resourceAccess.ComponentKeyHigh);
+                if (!resourceAccesses.TryAdd(key, resourceAccess))
+                    throw new InvalidOperationException(
+                        $"{method} declares resource {parameterType.GetGenericArguments()[0].FullName} " +
+                        "more than once; one Res<T> or ResMut<T> parameter per resource.");
+                arguments.Add(Expression.Default(parameterType));
                 continue;
             }
             if (!typeof(IQueryDescriptor).IsAssignableFrom(parameterType))
@@ -738,7 +772,50 @@ internal sealed class ProjectHost
         var call = Expression.Call(method, arguments);
         Action runner = Expression.Lambda<Action>(call).Compile();
         string name = $"{method.DeclaringType?.FullName}.{method.Name}";
-        return new ManagedSystem(name, MergeAccesses(queryArray), queryArray, usesCommands, runner);
+        // Component and resource accesses go to the scheduler in one list,
+        // distinguished by kind: the native side derives one SystemAccess from
+        // it, and a system's whole declaration has to arrive together for the
+        // scheduler to order it against its peers.
+        ManagedAccess[] accesses = MergeAccesses(queryArray)
+            .Concat(resourceAccesses.Values
+                .OrderBy(access => access.ComponentKeyHigh)
+                .ThenBy(access => access.ComponentKey))
+            .ToArray();
+        return new ManagedSystem(name, accesses, queryArray, usesCommands, runner);
+    }
+
+    /// <summary>
+    /// Describe a <c>Res&lt;T&gt;</c> or <c>ResMut&lt;T&gt;</c> parameter as one
+    /// reflected access, or report that the parameter is something else.
+    /// </summary>
+    /// <remarks>
+    /// The declaration is read off the closed generic type rather than an
+    /// instance: <see cref="IResourceParameter"/>'s members are static
+    /// abstract, so there is nothing to construct, and reflecting over the
+    /// generic definition keeps this AOT-safe - no MakeGenericMethod is
+    /// involved, which NativeAOT could not service over a value type anyway.
+    /// </remarks>
+    private static bool TryDescribeResourceParameter(Type parameterType, out ManagedAccess access)
+    {
+        access = default;
+        if (!parameterType.IsGenericType ||
+            !typeof(IResourceParameter).IsAssignableFrom(parameterType))
+            return false;
+        Type definition = parameterType.GetGenericTypeDefinition();
+        QueryAccess mode;
+        if (definition == typeof(Res<>))
+            mode = QueryAccess.Read;
+        else if (definition == typeof(ResMut<>))
+            mode = QueryAccess.Write;
+        else
+            return false;
+        Type resource = parameterType.GetGenericArguments()[0];
+        // The resource's declared identity, not its C# type name: a resource
+        // that meets a Rust module halfway is registered under the name both
+        // sides write down, and the access has to name the same thing.
+        StableComponentId id = Engine.StableIdOf(ResourceNames.Of(resource));
+        access = new ManagedAccess(id.Low, id.High, (byte)mode, ManagedAccess.ResourceKind);
+        return true;
     }
 
     /// <summary>
@@ -814,7 +891,8 @@ internal sealed class ProjectHost
                 }
                 indexByKey[key] = merged.Count;
                 merged.Add(new ManagedAccess(
-                    term.ComponentKey, term.ComponentKeyHigh, (byte)term.Access));
+                    term.ComponentKey, term.ComponentKeyHigh, (byte)term.Access,
+                    ManagedAccess.ComponentKind));
             }
         }
         return merged.ToArray();

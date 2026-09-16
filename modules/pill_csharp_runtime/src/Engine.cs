@@ -296,6 +296,47 @@ public static unsafe class Engine
     }
 
     /// <summary>
+    /// Ask the host for one resource's bytes under the requested access.
+    /// </summary>
+    /// <remarks>
+    /// Thin on purpose: the status byte is turned into a message by
+    /// <c>ResourceAccess</c>, which knows the resource type and can name it.
+    /// </remarks>
+    internal static byte GetResourceView(
+        StableComponentId id, byte mode, NativeResourceView* output)
+    {
+        if (_api.GetResourceView == null)
+            return 1;
+        return _api.GetResourceView(id.Low, id.High, mode, output);
+    }
+
+    /// <summary>
+    /// Reject a resource view that was issued to an earlier managed invocation.
+    /// </summary>
+    /// <remarks>
+    /// Debug builds only, like <see cref="ValidateChunkScope"/>. A resource
+    /// reference cannot normally go stale - every access re-asks the host - but
+    /// a system that stashes one in a local and reads it from a lambda that
+    /// runs later would, and this is what names that rather than reading
+    /// storage the reload has since moved.
+    /// </remarks>
+    [Conditional("DEBUG")]
+    internal static void ValidateResourceScope(uint issuedToScope, string resource)
+    {
+        uint current = CurrentScopeToken;
+        if (issuedToScope == current)
+            return;
+        throw new InvalidOperationException(
+            $"The view of resource {resource} was issued to " +
+            (issuedToScope == 0 ? "no managed invocation" : $"invocation {issuedToScope}") +
+            (current == 0
+                ? ", and no ECS system is running on this thread now."
+                : $", but invocation {current} is running now.") +
+            " A resource reference is valid only inside the [EcsSystem] call that " +
+            "produced it; read it again, or copy the value out.");
+    }
+
+    /// <summary>
     /// Native size of one component row, after the manifest and the runtime
     /// have been proved to agree.
     /// </summary>
@@ -380,12 +421,20 @@ public static unsafe class Engine
     /// <summary>Build the stable component ID shared with the Rust adapter.</summary>
     internal static ulong ComponentKey(Type type) => ComponentStableId(type).Low;
     internal static ulong ComponentKeyHigh(Type type) => ComponentStableId(type).High;
-    internal static StableComponentId ComponentStableId(Type type)
-    {
-        string name = type.FullName ?? type.Name;
-        return new StableComponentId(HashName(name, 0xcbf29ce484222325),
+    internal static StableComponentId ComponentStableId(Type type) =>
+        StableIdOf(type.FullName ?? type.Name);
+
+    /// <summary>
+    /// The stable 128-bit identity of one declared name.
+    /// </summary>
+    /// <remarks>
+    /// A component's name is always its full type name; a resource may declare
+    /// its own, so the hash is reachable from a string as well as a type. Both
+    /// go through here, so the two can never drift apart.
+    /// </remarks>
+    internal static StableComponentId StableIdOf(string name) =>
+        new StableComponentId(HashName(name, 0xcbf29ce484222325),
             HashName(name, 0x84222325cbf29ce4));
-    }
 
     internal static bool TryGetChunk(
         QueryTermDescriptor term,

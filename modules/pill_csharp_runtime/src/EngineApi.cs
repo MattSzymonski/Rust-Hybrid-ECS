@@ -69,6 +69,43 @@ public unsafe struct EngineApi
     /// the assembly swap that would normally carry one.
     /// </summary>
     public delegate* unmanaged[Cdecl]<uint> MirrorEpoch;
+
+    /// <summary>
+    /// Fill a <see cref="NativeResourceView"/> for one resource the active
+    /// system declared.
+    /// </summary>
+    /// <remarks>
+    /// Arguments are the stable identity's low and high halves, the requested
+    /// mode (<c>0</c> read, <c>1</c> write) and the output view. Status
+    /// <c>0</c> filled it, <c>1</c> the identity names no registered resource,
+    /// <c>2</c> the system did not declare this access, <c>3</c> no system is
+    /// running on this thread, <c>4</c> the world holds no value yet, and
+    /// <c>5</c> the caller passed no output buffer.
+    /// </remarks>
+    public delegate* unmanaged[Cdecl]<ulong, ulong, byte, NativeResourceView*, byte> GetResourceView;
+}
+
+/// <summary>
+/// Borrowed view of one resource's bytes. Valid only for the managed system
+/// invocation that asked for it.
+/// </summary>
+/// <remarks>
+/// A resource is one value, so this carries far less than
+/// <see cref="NativeComponentChunk"/>: no archetype identity, no row count and
+/// no per-row tick column, only the bytes, their width, and the invocation the
+/// view was issued to.
+/// </remarks>
+[StructLayout(LayoutKind.Sequential)]
+public struct NativeResourceView
+{
+    /// <summary>Pointer to the resource's first byte in engine storage.</summary>
+    internal IntPtr Data;
+
+    /// <summary>Width of the stored value, checked against the managed struct.</summary>
+    internal uint Length;
+
+    /// <summary>Token of the managed invocation this view was issued to.</summary>
+    internal uint ScopeToken;
 }
 
 /// <summary>

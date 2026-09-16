@@ -233,6 +233,11 @@ impl ReloadTransaction<'_> {
         // mapped (Step 6), which keeps those function pointers valid.
         let previous_metadata_by_name = engine.world().capture_persist_type_metadata();
         let previous_manifest = engine.world().persist_type_manifest();
+        // The resource half of the same capture, and needed for the same
+        // reason: a resource's serializer is monomorphized for the shape the
+        // retiring build declared, and it is the only code that can read the
+        // stored value once the arriving build changes that shape.
+        let previous_resource_manifest = engine.world().persist_resource_manifest();
 
         // Step 4: Swap the systems. Only the systems this subject owns are
         // removed, so everything else in the scheduler keeps running across the
@@ -566,6 +571,24 @@ impl ReloadTransaction<'_> {
                 );
             }
         }
+        // Step 5a: Migrate reshaped resources. `rehome_resources` above swapped
+        // each live resource's function table without touching its bytes, so a
+        // resource whose fields changed would otherwise be read through the new
+        // type over the old value's memory. Matched by persistence name, like
+        // components, and run while the retiring image is still mapped because
+        // the old serializer lives in it.
+        let migrated_resources = engine
+            .world_mut()
+            .migrate_changed_persistable_resources(&previous_resource_manifest);
+        if !migrated_resources.is_empty() {
+            debug!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = self.subject,
+                migrated_resources = ?migrated_resources,
+                "reshaped resources migrated"
+            );
+        }
+
         analytics::record_migrate(
             self.subject,
             migrate_started.elapsed().as_secs_f64() * 1000.0,

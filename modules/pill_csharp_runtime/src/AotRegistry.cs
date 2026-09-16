@@ -30,18 +30,77 @@ public readonly struct AotSystemRegistration
     /// <summary>Whether the system declared a Commands parameter.</summary>
     public bool UsesCommands { get; }
 
+    /// <summary>
+    /// Resources the system declared, as stable identity plus access mode, in
+    /// parameter order.
+    /// </summary>
+    public ResourceAccessRegistration[] ResourceAccesses { get; }
+
     /// <summary>Direct, reflection-free runner for the Rust scheduler.</summary>
     public Action Run { get; }
 
     /// <summary>Describe one generated system registration.</summary>
     public AotSystemRegistration(
         string name, QueryDescriptor?[] queries, string[] queryNames, bool usesCommands, Action run)
+        : this(name, queries, queryNames, usesCommands, [], run)
+    {
+    }
+
+    /// <summary>Describe one generated system registration, resources included.</summary>
+    public AotSystemRegistration(
+        string name, QueryDescriptor?[] queries, string[] queryNames, bool usesCommands,
+        ResourceAccessRegistration[] resourceAccesses, Action run)
     {
         Name = name;
         Queries = queries;
         QueryNames = queryNames;
         UsesCommands = usesCommands;
+        ResourceAccesses = resourceAccesses;
         Run = run;
+    }
+}
+
+/// <summary>One resource a generated system declared, and how it reaches it.</summary>
+public readonly struct ResourceAccessRegistration
+{
+    /// <summary>Low half of the resource's stable 128-bit identity.</summary>
+    public ulong Low { get; }
+
+    /// <summary>High half of the resource's stable 128-bit identity.</summary>
+    public ulong High { get; }
+
+    /// <summary>Access mode: <c>0</c> read, <c>1</c> read-write.</summary>
+    public byte Mode { get; }
+
+    /// <summary>Describe one declared resource access.</summary>
+    public ResourceAccessRegistration(ulong low, ulong high, byte mode)
+    {
+        Low = low;
+        High = high;
+        Mode = mode;
+    }
+
+    /// <summary>
+    /// Build the declaration for one resource type and access mode.
+    /// </summary>
+    /// <remarks>
+    /// The generated registry calls this rather than writing a precomputed
+    /// hash, so the identity has exactly one definition in the process. A
+    /// duplicate would be a second place for the managed and native sides to
+    /// disagree about what a resource is called, and it would disagree first
+    /// for a nested struct - whose name Roslyn and reflection spell differently
+    /// - and again for any resource that declares its own name, which a
+    /// generator reading only the type would never see.
+    ///
+    /// Generic over an unmanaged <typeparamref name="T"/> named directly in
+    /// generated source, so NativeAOT sees a closed instantiation at compile
+    /// time - no <c>MakeGenericMethod</c>, which it cannot service over a value
+    /// type.
+    /// </remarks>
+    public static ResourceAccessRegistration Of<T>(byte mode) where T : unmanaged
+    {
+        StableComponentId id = ResourceTypeMetadata<T>.StableId;
+        return new ResourceAccessRegistration(id.Low, id.High, mode);
     }
 }
 

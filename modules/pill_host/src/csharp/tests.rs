@@ -27,7 +27,9 @@ use super::backend::{
     MAX_ACCESSES_PER_SYSTEM, MAX_COMPONENT_MANIFEST_BYTES, MAX_SYSTEMS_PER_ASSEMBLY,
 };
 #[cfg(feature = "hot_reload")]
-use super::backend::{poll_status_is_known, POLL_NO_CHANGE, POLL_REJECTED, POLL_RELOADED};
+use super::backend::{
+    poll_status_is_known, POLL_MANIFEST_PENDING, POLL_NO_CHANGE, POLL_REJECTED, POLL_RELOADED,
+};
 use super::commands::{
     ffi_queue_add_component, ffi_queue_create, ffi_queue_destroy, ffi_queue_remove_component,
     ffi_reserve_entity,
@@ -43,6 +45,7 @@ use super::context::ActiveSystemGuard;
 use super::queries::{
     ffi_entity_count, ffi_get_archetype_chunk, ffi_get_component_chunk, ffi_get_entity_chunk,
 };
+use super::resources::resource_target;
 
 // =============================================================================
 // Constants
@@ -92,6 +95,7 @@ fn native_access(name: &str, mode: u8) -> NativeSystemAccess {
         component_key: id as u64,
         component_key_high: (id >> 64) as u64,
         mode,
+        kind: 0,
     }
 }
 
@@ -562,6 +566,7 @@ fn managed_manifest_registers_and_queries_a_new_dynamic_component() {
         component_key: stable_id.0 as u64,
         component_key_high: (stable_id.0 >> 64) as u64,
         mode: 1,
+        kind: 0,
     }];
     let mut chunk = empty_chunk();
     {
@@ -710,6 +715,7 @@ fn dynamic_chunk_stride_comes_from_the_live_column() {
         component_key: stable_id.0 as u64,
         component_key_high: (stable_id.0 >> 64) as u64,
         mode: 1,
+        kind: 0,
     }];
     let mut chunk = empty_chunk();
     {
@@ -1382,7 +1388,12 @@ fn unknown_poll_status_is_a_typed_error() {
     assert!(poll_status_is_known(POLL_NO_CHANGE));
     assert!(poll_status_is_known(POLL_RELOADED));
     assert!(poll_status_is_known(POLL_REJECTED));
-    assert!(!poll_status_is_known(3));
+    // A parked version is a status the host answers, not one it rejects.
+    // Leaving it unknown is what made a C# declaration edit wedge the reload
+    // loop: the loader parked, the host reported an unknown status, and every
+    // later poll returned the same thing.
+    assert!(poll_status_is_known(POLL_MANIFEST_PENDING));
+    assert!(!poll_status_is_known(4));
     assert!(!poll_status_is_known(u8::MAX));
 
     let error = pill_core::error::CSharpError::UnknownPollStatus { status: 9 };
@@ -1766,7 +1777,300 @@ fn the_apply_refuses_what_it_cannot_migrate() {
     let error = apply_component_manifest_on_reload(&mut engine, &duplicated, &store)
         .expect_err("a duplicate is refused");
     assert!(
-        error.to_string().contains("duplicate component"),
+        error.to_string().contains("duplicate declaration"),
         "the refusal names the cause: {error}"
+    );
+}
+
+// =============================================================================
+// Managed resources
+// =============================================================================
+
+/// Serialises every test that touches the managed resource binding table.
+///
+/// The table is one process-wide map, because a resource is one value per world
+/// rather than one per archetype. Cargo runs these tests on parallel threads in
+/// a single process, so without this they would register into each other's
+/// table and fail by interference rather than by defect.
+static RESOURCE_TABLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take the resource-table lock and start from an empty table.
+///
+/// The guard is returned so it lives for the body of the test. A poisoned lock
+/// is recovered rather than propagated: it means an earlier resource test
+/// panicked, which is already reported, and turning that into a cascade of
+/// secondary failures hides the one that matters.
+fn resource_test_scope() -> std::sync::MutexGuard<'static, ()> {
+    let guard = RESOURCE_TABLE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    super::resources::reset_resource_bindings_for_test();
+    guard
+}
+
+/// Build the serialized manifest for one managed resource.
+///
+/// Same document shape as a component's, with the `kind` tag that tells the
+/// two apart - which is the whole of what a resource entry adds on the wire.
+fn resource_manifest_bytes(
+    name: &str,
+    size: usize,
+    alignment: usize,
+    schema_hash: u64,
+    fields: Vec<serde_json::Value>,
+) -> Vec<u8> {
+    let stable_id = stable_component_id(&format!("TracyLive.{name}"));
+    serde_json::to_vec(&serde_json::json!([{
+        "stable_id_low": stable_id.0 as u64,
+        "stable_id_high": (stable_id.0 >> 64) as u64,
+        "full_name": format!("TracyLive.{name}"),
+        "size": size,
+        "alignment": alignment,
+        "schema_hash": schema_hash,
+        "shared": false,
+        "kind": "resource",
+        "fields": fields,
+    }]))
+    .expect("the test manifest serializes")
+}
+
+/// The engine id a registered managed resource was bound to.
+///
+/// Asked of the binding table rather than recomputed, so the test checks the
+/// id the host actually uses instead of a second opinion about what it is.
+fn resource_id_of(name: &str) -> pill_engine::ResourceId {
+    resource_target(stable_component_id(&format!("TracyLive.{name}")))
+        .expect("the resource is registered")
+        .0
+}
+
+/// A manifest resource entry registers the resource and seeds its value.
+///
+/// The seed is the point: a managed declaration is all there is - nothing on
+/// the C# side inserts a resource the way a Rust `init` does - so a resource
+/// registered and left empty would fail the first `Res<T>` access in the frame
+/// that follows.
+#[test]
+fn a_manifest_resource_is_registered_and_seeded() {
+    let _table = resource_test_scope();
+    let mut engine = Engine::new();
+    let manifest = resource_manifest_bytes(
+        "Tuning",
+        8,
+        4,
+        11,
+        vec![manifest_field("speed", 0, 4), manifest_field("gain", 4, 4)],
+    );
+
+    let bindings = register_component_manifest(&mut engine, &manifest, ComponentBindings::new())
+        .expect("a resource-only manifest registers");
+
+    assert!(
+        bindings.is_empty(),
+        "a resource entry registers no component column"
+    );
+    assert_eq!(
+        engine
+            .world()
+            .foreign_resource_bytes(resource_id_of("Tuning")),
+        Some(&[0_u8; 8][..]),
+        "the resource starts as a defined all-zero value"
+    );
+}
+
+/// A managed resource is snapshot-visible as soon as it is registered.
+#[test]
+fn a_manifest_resource_joins_the_snapshot() {
+    let _table = resource_test_scope();
+    let mut engine = Engine::new();
+    let manifest = resource_manifest_bytes("Saved", 4, 4, 3, vec![manifest_field("count", 0, 4)]);
+    register_component_manifest(&mut engine, &manifest, ComponentBindings::new())
+        .expect("the manifest registers");
+    engine
+        .world_mut()
+        .insert_foreign_resource_bytes(resource_id_of("Saved"), &7_u32.to_ne_bytes())
+        .expect("the payload is the declared width");
+
+    let snapshot = engine.world().snapshot_resources();
+
+    assert!(
+        snapshot.payload("TracyLive.Saved").is_some(),
+        "a managed resource reaches a snapshot without any Rust type to derive from"
+    );
+}
+
+/// A resource entry marked shared is refused where it is declared.
+#[test]
+fn a_shared_resource_entry_is_refused() {
+    let _table = resource_test_scope();
+    let mut engine = Engine::new();
+    let stable_id = stable_component_id("TracyLive.Confused");
+    let manifest = serde_json::to_vec(&serde_json::json!([{
+        "stable_id_low": stable_id.0 as u64,
+        "stable_id_high": (stable_id.0 >> 64) as u64,
+        "full_name": "TracyLive.Confused",
+        "size": 4,
+        "alignment": 4,
+        "schema_hash": 1,
+        "shared": true,
+        "kind": "resource",
+        "fields": [manifest_field("value", 0, 4)],
+    }]))
+    .expect("the test manifest serializes");
+
+    let Err(error) = register_component_manifest(&mut engine, &manifest, ComponentBindings::new())
+    else {
+        panic!("a shared resource has no native binding to be shared with");
+    };
+
+    assert!(
+        error.to_plain_message().contains("marked shared"),
+        "the refusal names what is wrong: {}",
+        error.to_plain_message()
+    );
+}
+
+/// A reshaped resource keeps its value and moves its bytes by field name.
+#[test]
+fn a_reshaped_resource_is_migrated_on_reload() {
+    let _table = resource_test_scope();
+    let mut engine = Engine::new();
+    let before = resource_manifest_bytes(
+        "Relaid",
+        8,
+        4,
+        1,
+        vec![manifest_field("a", 0, 4), manifest_field("b", 4, 4)],
+    );
+    let store = BindingStore::new(
+        register_component_manifest(&mut engine, &before, ComponentBindings::new())
+            .expect("the manifest registers"),
+    );
+    let id = resource_id_of("Relaid");
+    engine
+        .world_mut()
+        .insert_foreign_resource_bytes(id, &[1.0_f32, 2.0].map(f32::to_ne_bytes).concat())
+        .expect("the payload is the declared width");
+
+    // `b` first, then `a`, then a field that did not exist.
+    let after = resource_manifest_bytes(
+        "Relaid",
+        12,
+        4,
+        2,
+        vec![
+            manifest_field("b", 0, 4),
+            manifest_field("a", 4, 4),
+            manifest_field("c", 8, 4),
+        ],
+    );
+    let report = apply_component_manifest_on_reload(&mut engine, &after, &store)
+        .expect("a reshaped resource migrates");
+
+    assert_eq!(
+        report.resources_migrated,
+        vec!["TracyLive.Relaid".to_string()]
+    );
+    let mut expected = [2.0_f32, 1.0].map(f32::to_ne_bytes).concat();
+    expected.extend_from_slice(&[0_u8; 4]);
+    assert_eq!(
+        engine.world().foreign_resource_bytes(id),
+        Some(expected.as_slice()),
+        "values follow their field names and the new field starts zeroed"
+    );
+}
+
+/// A resource the arriving manifest stops declaring is refused, not dropped.
+#[test]
+fn a_resource_dropped_from_the_manifest_is_refused() {
+    let _table = resource_test_scope();
+    let mut engine = Engine::new();
+    let before = resource_manifest_bytes("Vanishing", 4, 4, 1, vec![manifest_field("a", 0, 4)]);
+    let store = BindingStore::new(
+        register_component_manifest(&mut engine, &before, ComponentBindings::new())
+            .expect("the manifest registers"),
+    );
+
+    let empty = serde_json::to_vec(&serde_json::json!([])).expect("an empty manifest serializes");
+    let error = apply_component_manifest_on_reload(&mut engine, &empty, &store)
+        .expect_err("a dropped resource cannot be retired here");
+
+    assert!(
+        error
+            .to_plain_message()
+            .contains("disappeared from the manifest"),
+        "the refusal names what is wrong: {}",
+        error.to_plain_message()
+    );
+}
+
+/// A reflected resource access reaches the scheduler as a resource.
+///
+/// Component and resource keys are both 128-bit name hashes, so only the kind
+/// byte tells them apart: recorded as a component, two systems writing one
+/// resource would be free to run in the same batch.
+#[test]
+fn a_resource_access_is_derived_as_a_resource() {
+    let _table = resource_test_scope();
+    let mut engine = Engine::new();
+    let manifest = resource_manifest_bytes("Scheduled", 4, 4, 1, vec![manifest_field("a", 0, 4)]);
+    register_component_manifest(&mut engine, &manifest, ComponentBindings::new())
+        .expect("the manifest registers");
+    let stable_id = stable_component_id("TracyLive.Scheduled");
+
+    let writer = derive_system_access(
+        &[NativeSystemAccess {
+            component_key: stable_id.0 as u64,
+            component_key_high: (stable_id.0 >> 64) as u64,
+            mode: 1,
+            kind: 1,
+        }],
+        &ComponentBindings::new(),
+    )
+    .expect("the resource is registered");
+    let reader = derive_system_access(
+        &[NativeSystemAccess {
+            component_key: stable_id.0 as u64,
+            component_key_high: (stable_id.0 >> 64) as u64,
+            mode: 0,
+            kind: 1,
+        }],
+        &ComponentBindings::new(),
+    )
+    .expect("the resource is registered");
+
+    assert!(
+        writer.conflicts_with(&reader),
+        "a writer and a reader of one resource cannot share a batch"
+    );
+    assert!(
+        !reader.conflicts_with(&reader),
+        "two readers of one resource can"
+    );
+}
+
+/// A resource access for a key no manifest registered is refused by name.
+#[test]
+fn an_unregistered_resource_access_is_refused() {
+    let _table = resource_test_scope();
+    let stable_id = stable_component_id("TracyLive.NeverDeclared");
+
+    let error = derive_system_access(
+        &[NativeSystemAccess {
+            component_key: stable_id.0 as u64,
+            component_key_high: (stable_id.0 >> 64) as u64,
+            mode: 0,
+            kind: 1,
+        }],
+        &ComponentBindings::new(),
+    )
+    .expect_err("nothing registered this resource");
+
+    assert!(
+        error
+            .to_plain_message()
+            .contains("unregistered resource key"),
+        "the refusal says resource rather than component: {}",
+        error.to_plain_message()
     );
 }

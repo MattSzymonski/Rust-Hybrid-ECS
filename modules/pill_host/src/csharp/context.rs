@@ -31,6 +31,16 @@ use super::components::{ComponentBindings, StableComponentId};
 // Constants
 // =============================================================================
 
+/// Access-list discriminator for a component key.
+pub(super) const ACCESS_KIND_COMPONENT: u8 = 0;
+
+/// Access-list discriminator for a resource key.
+pub(super) const ACCESS_KIND_RESOURCE: u8 = 1;
+
+// =============================================================================
+// Constants
+// =============================================================================
+
 thread_local! {
     /// Complete managed invocation scope for the current thread.
     ///
@@ -87,7 +97,9 @@ impl ActiveSystemGuard {
     ///
     /// Production systems use [`Self::set_with_commands`] because the scheduler
     /// always supplies a queue even when the managed signature omits Commands.
-    #[cfg(test)]
+    /// Only the windowed test build has a native component to bind, so the
+    /// headless posture never compiles the tests that reach this.
+    #[cfg(all(test, feature = "rendering"))]
     pub(super) fn set(
         world: &mut World,
         access: &[NativeSystemAccess],
@@ -330,6 +342,24 @@ pub(super) fn archetype_was_observed(archetype: ArchetypeId) -> Option<bool> {
 /// A write declaration also permits reads; a read declaration never permits
 /// writes. `None` means no managed system is currently active on this thread.
 pub(super) fn access_is_authorized(key: StableComponentId, requested_mode: u8) -> Option<bool> {
+    declared_access(ACCESS_KIND_COMPONENT, key, requested_mode)
+}
+
+/// The resource counterpart of [`access_is_authorized`].
+///
+/// Separate rather than a flag on the component check because the two answer
+/// about different declarations that happen to share a key space: a resource
+/// and a component may be named alike, and a component entry must never
+/// authorize a reach into resource storage.
+pub(super) fn resource_access_is_authorized(
+    key: StableComponentId,
+    requested_mode: u8,
+) -> Option<bool> {
+    declared_access(ACCESS_KIND_RESOURCE, key, requested_mode)
+}
+
+/// Scan the active system's reflected access list for one declaration.
+fn declared_access(kind: u8, key: StableComponentId, requested_mode: u8) -> Option<bool> {
     ACTIVE_SCOPE.with(|slot| {
         let (pointer, len) = slot.get()?.access;
         if pointer.is_null() {
@@ -339,7 +369,9 @@ pub(super) fn access_is_authorized(key: StableComponentId, requested_mode: u8) -
         // system closure and clears the scope before that invocation returns.
         let accesses = unsafe { std::slice::from_raw_parts(pointer, len) };
         Some(accesses.iter().any(|access| {
-            StableComponentId::from_halves(access.component_key, access.component_key_high) == key
+            access.kind == kind
+                && StableComponentId::from_halves(access.component_key, access.component_key_high)
+                    == key
                 && (requested_mode == 0 || access.mode == requested_mode)
         }))
     })

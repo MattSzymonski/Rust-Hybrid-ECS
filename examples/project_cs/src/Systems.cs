@@ -13,9 +13,11 @@
 // both projects run the same demo against the same world. Three things cannot
 // be expressed the same way on the managed side, and each is named where it
 // matters:
-// 1. Managed systems have no resources. `SimulationTime` is a static, and the
-//    ball system stamps it before reading it - the counterpart of the Rust
-//    `update_time_system` writing the resource every other system reads.
+// 1. `SimulationTime` is an engine resource here, as it is in Rust, reached
+//    through `ResMut<T>`. The ball system stamps it before reading it rather
+//    than a separate time system writing it, because the scheduler orders
+//    systems by access and does not promise which of two disjoint ones runs
+//    first - stamping where the value is used needs no such promise.
 // 2. A startup cannot query, so filling the world up to a target count - which
 //    the Rust init checks by counting entities - is done by the spawn systems:
 //    they run every frame and create only what is missing, which is also what
@@ -80,31 +82,51 @@ internal static class ProjectConstants
 // =============================================================================
 
 /// <summary>
-/// Wall-clock delta between frames, standing in for the Rust `SimulationTime`
-/// resource that managed systems do not have.
+/// Wall-clock delta between frames, the managed twin of the Rust project's
+/// `SimulationTime` resource.
 /// </summary>
-internal static class SimulationTime
+/// <remarks>
+/// A resource rather than a static, which is what makes it survive a hot
+/// reload: a static lives in the collectible load context the reload replaces,
+/// so the clock would restart on every code edit, while the resource's bytes
+/// are the engine's and outlive the assembly.
+///
+/// The timestamp is carried in the resource for the same reason. A zero one
+/// means "never stamped", which is what a freshly created resource reads as,
+/// so the first frame after a cold start falls back to the fixed delta instead
+/// of measuring against the epoch.
+/// </remarks>
+[EcsResource]
+[StructLayout(LayoutKind.Sequential)]
+public struct SimulationTime
 {
-    private static long _lastFrame = Stopwatch.GetTimestamp();
+    /// <summary>Seconds the previous frame took.</summary>
+    public float DeltaSeconds;
 
-    /// <summary>Seconds the previous frame took, starting at the fixed delta.</summary>
-    internal static float DeltaSeconds { get; private set; } = FixedDeltaTime;
+    /// <summary>Stopwatch timestamp of the previous stamp, or zero if never.</summary>
+    public long LastFrameTimestamp;
+}
 
+/// <summary>Stamping helper for <see cref="SimulationTime"/>.</summary>
+internal static class SimulationClock
+{
     /// <summary>
-    /// Stamps the time elapsed since the previous frame.
+    /// Stamps the time elapsed since the previous frame into the resource.
     /// </summary>
     /// <remarks>
     /// Clamped because a breakpoint or a slow reload can stretch a single frame
     /// far enough to throw a ball straight through a wall.
     /// </remarks>
-    internal static void Stamp()
+    internal static void Stamp(ref SimulationTime time)
     {
         long now = Stopwatch.GetTimestamp();
-        DeltaSeconds = Math.Clamp(
-            (float)Stopwatch.GetElapsedTime(_lastFrame, now).TotalSeconds,
-            0.0f,
-            0.1f);
-        _lastFrame = now;
+        time.DeltaSeconds = time.LastFrameTimestamp == 0
+            ? FixedDeltaTime
+            : Math.Clamp(
+                (float)Stopwatch.GetElapsedTime(time.LastFrameTimestamp, now).TotalSeconds,
+                0.0f,
+                0.1f);
+        time.LastFrameTimestamp = now;
     }
 }
 
@@ -153,10 +175,13 @@ public static class BallPhysicsSystem
     }
 
     [EcsSystem]
-    public static void Run(Query<Write<PhysicsState>, Write<Position>, Write<Sprite>> query)
+    public static void Run(
+        ResMut<SimulationTime> time,
+        Query<Write<PhysicsState>, Write<Position>, Write<Sprite>> query)
     {
-        SimulationTime.Stamp();
-        float deltaSeconds = SimulationTime.DeltaSeconds;
+        ref SimulationTime simulation = ref time.Value;
+        SimulationClock.Stamp(ref simulation);
+        float deltaSeconds = simulation.DeltaSeconds;
 
         foreach (var row in query.Rows())
         {

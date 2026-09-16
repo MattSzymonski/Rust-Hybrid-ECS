@@ -484,19 +484,11 @@ pub enum ConfigError {
     InvalidOptionalModuleName { name: String },
 
     /// The settings file lists one optional module twice.
-    #[message(
-        "project settings file lists optional module ",
-        value(name),
-        " twice"
-    )]
+    #[message("project settings file lists optional module ", value(name), " twice")]
     DuplicateOptionalModuleName { name: String },
 
     /// A configured optional module has no sibling directory to build from.
-    #[message(
-        "optional module ",
-        value(name),
-        " has no directory under optional/"
-    )]
+    #[message("optional module ", value(name), " has no directory under optional/")]
     OptionalModuleDirectoryMissing { name: String },
 }
 
@@ -883,6 +875,14 @@ pub enum CSharpError {
     /// A reflected access references a component the host never registered.
     #[message("C# system references unregistered component key ", value(key))]
     UnregisteredComponent { key: String },
+
+    /// A reflected access references a resource the host never registered.
+    ///
+    /// Almost always a resource struct that a system declares through
+    /// `Res<T>`/`ResMut<T>` without carrying `[EcsResource]`, so the manifest
+    /// never told the host it existed.
+    #[message("C# system references unregistered resource key ", value(key))]
+    UnregisteredResource { key: String },
 
     /// A managed string passed to hostfxr contains an interior NUL.
     #[message(".NET host string contains an interior NUL")]

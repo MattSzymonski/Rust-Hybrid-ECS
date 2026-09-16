@@ -33,6 +33,14 @@ public struct NativeSystemAccess
 
     /// <summary>Access mode: zero for read, one for write.</summary>
     public byte Mode;
+
+    /// <summary>What the key names: zero a component, one a resource.</summary>
+    /// <remarks>
+    /// Both are 128-bit name hashes from one space, so only this tells them
+    /// apart. Without it the host resolves a resource access against the
+    /// component table and reports the key as unregistered.
+    /// </remarks>
+    public byte Kind;
 }
 
 // =============================================================================
@@ -83,9 +91,13 @@ public static unsafe class LoaderInterop
     /// every slot after it - or when a struct the exports exchange changes
     /// shape. Bumped to 4 by the mirror-epoch slot and to 5 by the const
     /// <c>Entities</c> pointer in <c>NativeComponentChunk</c>, which a stale
-    /// runtime would otherwise read as a 48-byte struct.
+    /// runtime would otherwise read as a 48-byte struct. Bumped to 9 by
+    /// resources, which added both a slot (<c>GetResourceView</c>) and a field
+    /// to an exchanged struct (<c>NativeSystemAccess.Kind</c>) - a stale
+    /// runtime would leave that field unwritten and every resource access
+    /// would be resolved against the component table.
     /// </summary>
-    public const uint InteropContractVersion = 8;
+    public const uint InteropContractVersion = 9;
 
     /// <summary>Return the unmanaged ABI contract version for host validation.</summary>
 #if !PILL_AOT
@@ -261,6 +273,7 @@ public static unsafe class LoaderInterop
             output->ComponentKey = access.ComponentKey;
             output->ComponentKeyHigh = access.ComponentKeyHigh;
             output->Mode = access.Mode;
+            output->Kind = access.Kind;
             return 1;
         }
         catch (Exception e)
@@ -442,9 +455,7 @@ public static unsafe class LoaderInterop
         }
     }
 
-    /// <summary>
-    /// Install the pending version; the host accepted its manifest.
-    /// </summary>
+    /// <summary>Install the pending version; the host accepted its manifest.</summary>
     /// <returns>One on success; zero after reporting a failure.</returns>
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_commit_reload")]
@@ -465,9 +476,7 @@ public static unsafe class LoaderInterop
         }
     }
 
-    /// <summary>
-    /// Discard the pending version; the host refused its manifest.
-    /// </summary>
+    /// <summary>Discard the pending version; the host refused its manifest.</summary>
     /// <returns>One on success; zero after reporting a failure.</returns>
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_abort_reload")]

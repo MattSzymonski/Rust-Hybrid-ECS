@@ -14,7 +14,6 @@
 //! `Send + Sync` so it can be shared across Rayon threads.
 
 // External crates
-use trait_type_map::ErasedVecStorage;
 
 // Current crate
 use super::change_detection::Mut;
@@ -111,7 +110,7 @@ impl QueryTarget for Entity {
 /// and reports the component as a read for system dependency analysis.
 impl<T: Component> QueryTarget for &T {
     type Item<'a> = &'a T;
-    type State = SendPtr<ErasedVecStorage<dyn Component>>;
+    type State = SendPtr<crate::archetype::DynamicColumn>;
 
     fn component_ids() -> Vec<ComponentId> {
         vec![ComponentId::of::<T>()]
@@ -130,7 +129,7 @@ impl<T: Component> QueryTarget for &T {
             ]
         );
         SendPtr::new(
-            archetype.component_storages.column_of::<T>() as *const ErasedVecStorage<dyn Component>
+            archetype.component_storages.column_of::<T>() as *const crate::archetype::DynamicColumn
         )
     }
 
@@ -152,7 +151,7 @@ impl<T: Component> QueryTarget for &T {
 pub struct MutFetchState<T: Component> {
     /// Raw pointer to the component values storage, cached to avoid
     /// re-locating the storage on every row fetch.
-    values: SendPtrMut<ErasedVecStorage<dyn Component>>,
+    values: SendPtrMut<crate::archetype::DynamicColumn>,
     /// Raw pointer to the per-entity change-detection ticks storage.
     ticks: SendPtrMut<Vec<ComponentTicks>>,
     /// The world tick for this run, stored on `Mut<T>` at fetch time.
@@ -205,7 +204,7 @@ impl<T: Component> QueryTarget for &mut T {
             ]
         );
         let values = SendPtrMut::new(archetype.component_storages.column_of_mut::<T>()
-            as *mut ErasedVecStorage<dyn Component>);
+            as *mut crate::archetype::DynamicColumn);
         let ticks_vec = archetype
             .component_ticks
             .get_mut(&ComponentId::of::<T>())
