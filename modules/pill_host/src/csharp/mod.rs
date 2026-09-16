@@ -30,6 +30,8 @@ mod components;
 mod context;
 /// Low-level .NET hosting bootstrap used by the C# project backend.
 mod csharp_runtime;
+/// C# component manifest schema, field validation, and engine type mapping.
+mod manifest;
 /// Native callbacks used by C# query enumerators.
 mod queries;
 /// Managed resource registration and the callback that serves resource bytes.

@@ -4,7 +4,8 @@
 //!
 //! - Define native ABI mirrors for shared managed components.
 //! - Resolve stable managed identities to native or dynamic bindings.
-//! - Validate and register reflected component manifests.
+//! - Register reflected component manifests; the schema model and its
+//!   validation live in [`manifest`](super::manifest).
 //!
 //! # Design
 //!
@@ -34,9 +35,13 @@ use pill_engine::component_registry::ComponentFieldDescriptor;
 #[cfg(feature = "rendering")]
 use pill_engine::Component;
 use pill_engine::{ComponentId, Engine, World};
-use serde::Deserialize;
 
 // Current crate
+use super::manifest::{
+    format_field_layout_line, managed_field_layout, manifest_field_tag, plan_tag,
+    validate_field_manifest, validate_sibling_non_overlap, ManagedComponentManifest,
+    ManagedFieldManifest, ManifestEntryKind,
+};
 use super::resources::{ManagedResourceDeclaration, ResourceFieldLayout};
 
 // Current crate
@@ -45,50 +50,6 @@ use super::abi::ComponentChunk;
 // windowed-only, so a headless build never reaches this.
 #[cfg(feature = "rendering")]
 use super::context::active_scope_token;
-
-// =============================================================================
-// Constants
-// =============================================================================
-
-/// Maximum nesting depth accepted in a managed component field tree.
-///
-/// Real component layouts never exceed a handful of levels. The budget stays
-/// below `serde_json`'s own parser recursion limit so this validation, not an
-/// opaque parser error, rejects pathological manifests.
-const MAX_FIELD_NESTING_DEPTH: usize = 32;
-
-/// Field types a dynamic component is allowed to contain.
-///
-/// This is the enforcement behind `DynamicColumn`'s `unsafe impl Send`/`Sync`
-/// and its lack of drop glue. That storage is a raw byte buffer: rows are moved
-/// with `ptr::copy` and the buffer is freed without running any destructor, so
-/// every field must be a blittable value with no ownership, no interior
-/// pointer, and nothing to release.
-///
-/// Before this list existed the only check on a field's type was that its name
-/// was non-empty, so a manifest declaring a managed reference passed validation
-/// and the resulting column was shared across threads on a promise nothing
-/// verified.
-///
-/// `"struct"` denotes a nested value type; its own fields are validated
-/// recursively against this same list, so allowing it does not open a hole.
-const BLITTABLE_FIELD_TYPES: &[&str] = &[
-    "System.Byte",
-    "System.SByte",
-    "System.Int16",
-    "System.UInt16",
-    "System.Int32",
-    "System.UInt32",
-    "System.Int64",
-    "System.UInt64",
-    "System.IntPtr",
-    "System.UIntPtr",
-    "System.Single",
-    "System.Double",
-    "System.Boolean",
-    "System.Char",
-    "struct",
-];
 
 // =============================================================================
 // Types + Impls
@@ -381,66 +342,6 @@ where
     Ok(boxed_component_adder(component))
 }
 
-/// Deserialized entry from the managed component manifest.
-#[derive(Deserialize)]
-struct ManagedComponentManifest {
-    /// Low 64 bits of the stable component identity.
-    stable_id_low: u64,
-    /// High 64 bits of the stable component identity.
-    stable_id_high: u64,
-    /// Canonical full name used to recompute and verify the identity.
-    full_name: String,
-    /// Total byte size of the component layout.
-    size: usize,
-    /// Required byte alignment of the component layout.
-    alignment: usize,
-    /// Hash of the managed field schema used to match native mirrors.
-    schema_hash: u64,
-    /// Whether the managed side expects a native engine binding.
-    shared: bool,
-    /// What the entry declares: a component, or a resource.
-    ///
-    /// Defaulted so a manifest written before resources existed still parses as
-    /// a list of components; the managed side always writes the tag now, and
-    /// the default is what keeps an older generation's payload readable during
-    /// a reload that straddles the change.
-    #[serde(default)]
-    kind: ManifestEntryKind,
-    /// Top-level field descriptions of the component layout.
-    fields: Vec<ManagedFieldManifest>,
-}
-
-/// What one managed manifest entry declares.
-///
-/// Resources ride in the same array as components rather than a second
-/// document, so one transfer and one registration transaction cover a whole
-/// generation's declaration - a resource that registered while its project's
-/// components were refused would be a half-applied manifest.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum ManifestEntryKind {
-    /// Per-entity storage, registered as a column.
-    #[default]
-    Component,
-    /// One value for the whole world, registered as a foreign resource.
-    Resource,
-}
-
-/// Deserialized field entry within a managed component manifest.
-#[derive(Deserialize)]
-struct ManagedFieldManifest {
-    /// Field name as it appears in the managed schema.
-    name: String,
-    /// Byte offset of the field within its containing struct.
-    offset: usize,
-    /// Byte size of the field.
-    size: usize,
-    /// Canonical managed type name of the field.
-    primitive_type: String,
-    /// Nested field descriptions when this field is a struct.
-    fields: Vec<ManagedFieldManifest>,
-}
-
 /// Register one engine-owned component and bind its managed name and schema to
 /// the callbacks required by queries and deferred commands.
 #[cfg(feature = "rendering")]
@@ -616,220 +517,6 @@ pub(super) fn module_native_bindings(
         _ => true,
     });
     bindings
-}
-
-/// Reject sibling fields that share any byte range.
-///
-/// Conflicting interpretations of the same storage would corrupt data
-/// silently, so overlaps and duplicated offsets are invalid layouts.
-///
-/// # Errors
-///
-/// Returns an error naming the first pair of sibling fields that overlap.
-fn validate_sibling_non_overlap(
-    fields: &[ManagedFieldManifest],
-    parent_name: &str,
-) -> Result<(), String> {
-    for (index, left) in fields.iter().enumerate() {
-        let left_end = left.offset.saturating_add(left.size);
-        for right in &fields[index + 1..] {
-            let right_end = right.offset.saturating_add(right.size);
-            if left.offset < right_end && right.offset < left_end {
-                return Err(format!(
-                    "managed fields {} and {} overlap inside {parent_name}",
-                    left.name, right.name
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Verify that a field and every nested field fit within the byte range of
-/// the struct that directly contains it, and that sibling fields never
-/// overlap.
-///
-/// The field tree is walked with an explicit worklist so deeply nested input
-/// consumes heap rather than stack, and the depth budget rejects pathological
-/// manifests before they cost real work.
-///
-/// # Errors
-///
-/// Returns an error when a field overflows its containing struct, names an
-/// empty field or type, declares a type outside [`BLITTABLE_FIELD_TYPES`], or
-/// exceeds the maximum nesting depth.
-fn validate_field_manifest(field: &ManagedFieldManifest, parent_size: usize) -> Result<(), String> {
-    // Each entry carries the field to inspect, the size of the struct that
-    // directly contains it, and that branch's current nesting depth.
-    let mut worklist = vec![(field, parent_size, 0_usize)];
-    while let Some((field, parent_size, depth)) = worklist.pop() {
-        let end = field
-            .offset
-            .checked_add(field.size)
-            .ok_or("managed field range overflow")?;
-        if field.name.is_empty() || field.primitive_type.is_empty() || end > parent_size {
-            return Err("managed field lies outside its component layout".into());
-        }
-        // Reject anything that is not a blittable value type. `DynamicColumn`
-        // copies rows as raw bytes and frees its buffer without running drop
-        // glue, so a field owning a resource would be duplicated on move and
-        // leaked on free - and sharing such a column across threads, which the
-        // engine does, would be unsound.
-        if !BLITTABLE_FIELD_TYPES.contains(&field.primitive_type.as_str()) {
-            return Err(format!(
-                "managed field {} has non-blittable type {}; dynamic components                  must contain only unmanaged value types",
-                field.name, field.primitive_type
-            ));
-        }
-        // The depth check runs after the field validates so the error always
-        // names a well-formed field.
-        if depth >= MAX_FIELD_NESTING_DEPTH {
-            return Err(format!(
-                "managed field {} exceeds the maximum nesting depth of {MAX_FIELD_NESTING_DEPTH}",
-                field.name
-            ));
-        }
-        validate_sibling_non_overlap(&field.fields, &field.name)?;
-        for nested in &field.fields {
-            worklist.push((nested, field.size, depth + 1));
-        }
-    }
-    Ok(())
-}
-
-/// Map a managed primitive type onto the engine's field type-tag vocabulary.
-///
-/// Returns `None` for blittable types the engine cannot decode (the field is
-/// then omitted from the registered layout but keeps its bytes in storage).
-fn managed_primitive_tag(primitive_type: &str) -> Option<&'static str> {
-    match primitive_type {
-        "System.Byte" => Some("u8"),
-        "System.SByte" => Some("i8"),
-        "System.Int16" => Some("i16"),
-        "System.UInt16" => Some("u16"),
-        "System.Int32" => Some("i32"),
-        "System.UInt32" => Some("u32"),
-        "System.Int64" => Some("i64"),
-        "System.UInt64" => Some("u64"),
-        "System.Single" => Some("f32"),
-        "System.Double" => Some("f64"),
-        "System.Boolean" => Some("bool"),
-        // `System.Char` is a blittable UTF-16 code unit with the same size as
-        // the engine's `u16`; exposing it that way keeps the field editable.
-        "System.Char" => Some("u16"),
-        _ => None,
-    }
-}
-
-/// The engine-vocabulary tag one manifest field carries.
-///
-/// Mirrors what [`managed_field_layout`] records for the same field, so a plan
-/// built from a manifest compares like with like.
-fn manifest_field_tag(field: &ManagedFieldManifest) -> &'static str {
-    if field.primitive_type == "struct" {
-        return "struct";
-    }
-    managed_primitive_tag(&field.primitive_type).unwrap_or("unsupported")
-}
-
-/// Reduce a field's type tag to what the migration plan should compare.
-///
-/// The registry records a nested struct as `struct:<owner>::<field>` for the
-/// editor's benefit, while a manifest only knows that the field is a struct.
-/// Comparing those verbatim would mark every nested field retyped - and would
-/// do it again whenever a component is renamed, because the owner is part of
-/// the tag. Both sides are folded to `struct`, so the plan asks the question it
-/// actually means: is this field still a struct?
-fn plan_tag(type_tag: &str) -> &str {
-    if type_tag.starts_with("struct:") {
-        "struct"
-    } else {
-        type_tag
-    }
-}
-
-/// Convert a managed component manifest's field tree into engine descriptors.
-///
-/// Primitive leaves map onto the engine's type-tag vocabulary so the editor
-/// can decode and edit them. Nested `struct:` fields stay opaque: the engine
-/// has no struct walking, so their bytes are visible but not interpretable.
-/// Field names and struct tags are interned, so a component re-registered on
-/// every reload costs its strings once rather than once per reload.
-/// Strings handed to the engine as `&'static str`, deduplicated by content.
-///
-/// `ComponentFieldDescriptor` holds `&'static str` because the derive builds it
-/// in an artifact's static data. A manifest-declared component has no statics
-/// to borrow from, so its strings have to be given the same lifetime by hand.
-///
-/// Doing that with a bare `Box::leak` per registration is what this replaces:
-/// the C# project re-registers its components on every reload, so the leak grew
-/// with reload count rather than with the number of distinct names. Interning
-/// bounds it by the project's type set, which is the intended cost - a name a
-/// component keeps across a hundred reloads is stored once.
-static INTERNED_FIELD_STRINGS: std::sync::Mutex<Option<HashSet<&'static str>>> =
-    std::sync::Mutex::new(None);
-
-/// Return a `&'static str` equal to `value`, allocating only on first sight.
-fn intern(value: &str) -> &'static str {
-    let mut guard = INTERNED_FIELD_STRINGS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let table = guard.get_or_insert_with(HashSet::new);
-    if let Some(existing) = table.get(value) {
-        return existing;
-    }
-    // First sight: this is the one allocation the string ever costs.
-    let leaked: &'static str = Box::leak(value.to_owned().into_boxed_str());
-    table.insert(leaked);
-    leaked
-}
-
-fn managed_field_layout(
-    component_name: &str,
-    fields: &[ManagedFieldManifest],
-) -> Vec<ComponentFieldDescriptor> {
-    let mut layout = Vec::new();
-    for field in fields {
-        if field.primitive_type == "struct" {
-            layout.push(ComponentFieldDescriptor {
-                name: intern(&field.name),
-                type_tag: intern(&format!("struct:{component_name}::{}", field.name)),
-                offset: field.offset,
-                size: field.size,
-                align: 1,
-                element_count: 0,
-            });
-            continue;
-        }
-        let Some(type_tag) = managed_primitive_tag(&field.primitive_type) else {
-            continue;
-        };
-        layout.push(ComponentFieldDescriptor {
-            name: intern(&field.name),
-            type_tag,
-            offset: field.offset,
-            size: field.size,
-            align: 1,
-            element_count: 0,
-        });
-    }
-    layout
-}
-
-/// Render a registered field layout as one stable, parseable line so
-/// integration suites can assert the managed manifest reached the engine
-/// intact: `name@offset:size:type_tag` entries joined by `|`.
-fn format_field_layout_line(layout: &[ComponentFieldDescriptor]) -> String {
-    layout
-        .iter()
-        .map(|field| {
-            format!(
-                "{}@{}:{}:{}",
-                field.name, field.offset, field.size, field.type_tag
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("|")
 }
 
 /// Validate and register all components discovered in the managed assembly.
