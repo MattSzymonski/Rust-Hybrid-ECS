@@ -37,6 +37,7 @@ import builtins
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -522,6 +523,108 @@ def has_crash_signals(output: str) -> bool:
     return PANIC_TOKEN in output or ACCESS_VIOLATION_TOKEN in output
 
 
+# =============================================================================
+# Host lock: one host-driving script at a time
+# =============================================================================
+
+# Every script that drives `pill_standalone` kills leftover hosts, builds into
+# the shared `modules/target` and edits shared fixture sources, so two of them
+# in one window fight over all three. That was paid for once already: a
+# migration scenario looked flaky until the cause turned out to be a second
+# suite started in parallel, each one's `kill_stale_hosts` killing the other's
+# host (storage plan, section K). The fix is an exclusive lock on a
+# machine-global file, taken by every process that owns a host and held until
+# the process exits - the OS releases it on death, so there is no stale lock to
+# recover from.
+HOST_LOCK_PATH = Path(tempfile.gettempdir()) / "pill_host_suite.lock"
+
+# The open descriptor holding the lock, once this process has it. A dict keeps
+# the module-level mutation one obvious line instead of a `global` statement in
+# every function that touches it; None means "not held".
+_HOST_LOCK = {"fd": None}  # type: Dict[str, Optional[int]]
+
+# Fixed-width PID record: always 12 bytes, so a later holder can overwrite it
+# without truncation and a reader can decode it with a plain strip().
+_HOST_LOCK_RECORD_WIDTH = 12
+
+
+def _lock_fd_nonblocking(fd: int) -> bool:
+    """Tries to take the exclusive lock on `fd`; False if another process holds it."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def ensure_host_lock(poll_seconds: float = 1.0) -> None:
+    """Takes the machine-global host lock, waiting for any current holder.
+
+    Idempotent within one process: the first call locks, later calls return.
+    One line is printed when the call has to wait, naming the holder's PID from
+    the lock file, so a queued run explains itself instead of looking hung. The
+    lock is released by `release_host_lock`, or by process exit - which is why
+    a killed suite never leaves the next one stuck.
+    """
+    if _HOST_LOCK["fd"] is not None:
+        return
+    fd = os.open(HOST_LOCK_PATH, os.O_CREAT | os.O_RDWR)
+    waited = False
+    while not _lock_fd_nonblocking(fd):
+        if not waited:
+            holder = ""
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                raw = os.read(fd, _HOST_LOCK_RECORD_WIDTH).decode("ascii", "replace").strip()
+                if raw.isdigit():
+                    holder = f" (held by PID {raw})"
+            except OSError:
+                pass
+            print(
+                f"  [WAIT] Another host-driving suite holds {HOST_LOCK_PATH}{holder};"
+                " waiting for it to finish."
+            )
+            waited = True
+        time.sleep(poll_seconds)
+    # Record who holds it, for the next process that has to wait.
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, f"{os.getpid():>{_HOST_LOCK_RECORD_WIDTH}}".encode("ascii"))
+    except OSError:
+        pass
+    _HOST_LOCK["fd"] = fd
+
+
+def release_host_lock() -> None:
+    """Releases the host lock early; process exit releases it either way."""
+    fd = _HOST_LOCK["fd"]
+    if fd is None:
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+        _HOST_LOCK["fd"] = None
+
+
 def launch_process(
     command: Sequence[str],
     cwd: Path,
@@ -535,7 +638,11 @@ def launch_process(
     A dead reader stops draining the pipe, the host then blocks on its next
     write, and every later assertion times out for a reason that has nothing to
     do with what it tests - so this is correctness, not tolerance.
+
+    Takes the host lock before launching: a process that owns a host owns the
+    shared build directories and fixture sources too.
     """
+    ensure_host_lock()
     process = subprocess.Popen(
         list(command),
         cwd=str(cwd),
@@ -568,7 +675,13 @@ def terminate_process(process: subprocess.Popen, monitor: OutputMonitor) -> None
 
 
 def kill_stale_hosts() -> None:
-    """Best-effort cleanup of leftover host processes that lock shared DLLs."""
+    """Best-effort cleanup of leftover host processes that lock shared DLLs.
+
+    Takes the host lock first: killing without it would kill the host a
+    concurrent suite is driving - the exact interference this lock exists to
+    stop - while killing under it can only hit a leak from an earlier run.
+    """
+    ensure_host_lock()
     if os.name == "nt":
         subprocess.run(
             ["taskkill", "/IM", "pill_standalone.exe", "/F"],
@@ -634,4 +747,7 @@ __all__ = [
     "launch_process",
     "terminate_process",
     "kill_stale_hosts",
+    "HOST_LOCK_PATH",
+    "ensure_host_lock",
+    "release_host_lock",
 ]

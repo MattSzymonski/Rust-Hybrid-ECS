@@ -28,7 +28,8 @@ standalone from a console. Performance measurement lives in
 | `test_basic.py` | The CI fast checks: `cargo fmt --check` and `cargo clippy -D warnings` over the workspace, **`cargo test --workspace` in both feature configurations** (default and `hot_patch` - the feature is additive, so the default run never compiles the live-patching code and left 62 tests outside every lane until this was added), plus launcher-driven native/WASM builds, the WASM size budget, a dev-server smoke test and the native performance benchmark. The three launcher-driven checks SKIP in this repository (no PillLauncher project layout); fmt, clippy and the tests run for real. |
 | `test_coding_standards.py` | Pill comment & layout lint over every `.rs` file: `//!` module header with a `# Responsibilities` section, `// SAFETY:` above unsafe blocks, `///` docs on public items, ordered import-group headers, and `mod tests` as the last top-level section. Ported from `run_coding_standards_test.sh`, which now just invokes it. Exit 0 clean / 1 violations / 2 usage error. |
 | `test_examples.py` | Builds every example under `examples/` in release and reports artifact sizes. Examples are discovered by convention (a `Cargo.toml` or a `*.csproj`), so adding one needs no edit. Ported from `run_examples_tests.sh`, which now just invokes it. |
-| `devops/core/suite_common.py` | Not a test, and not in this directory. Single source of truth for paths, log tokens, timeouts, the color `print` wrapper, the `OutputMonitor` (rolling buffer + counter-tick tail), atomic source editing, and host process helpers. Shared by all four suites (audit opportunity 5.14) **and** by the hot-reload harness and cold-start startup timing in `devops/benchmarks/`, which is why it lives in `devops/core/`. A reworded host log token must keep both sides working. |
+| `run_all.py` | Not a test either: the batch entry point. Runs every suite above in the documented order, streams each suite's own output, and ends with a PASS/FAIL summary and a non-zero exit when anything failed. `--list` prints the order, `--only NAME ...` picks suites, `--keep-going` runs the rest after a failure. |
+| `devops/core/suite_common.py` | Not a test, and not in this directory. Single source of truth for paths, log tokens, timeouts, the color `print` wrapper, the `OutputMonitor` (rolling buffer + counter-tick tail), atomic source editing, and host process helpers. Shared by every suite (audit opportunity 5.14) **and** by the hot-reload harness and cold-start startup timing in `devops/benchmarks/`, which is why it lives in `devops/core/`; it also owns the machine-global host lock (`ensure_host_lock`) that serializes host-driving suites. A reworded host log token must keep both sides working. |
 
 ## Quick start
 
@@ -36,6 +37,10 @@ standalone from a console. Performance measurement lives in
 # Full net via one entry point (recommended)
 bash devops/ci_cd/run_hot_reload_tests.sh                 # 4 suites
 bash devops/ci_cd/run_hot_reload_tests.sh --skip-build    # fastest lane
+
+# Every suite, in order, with one summary
+python devops/tests/run_all.py
+python devops/tests/run_all.py --only test_hot_reload_migration.py
 
 # Individual suites
 python devops/tests/test_hot_reload_suite.py
@@ -60,6 +65,16 @@ touch (`examples/project_rs/project_settings.yaml`, `devops/tests/project/src/li
 `examples/project_rs/src/lib.rs`, `examples/project_cs/src/Systems.cs`,
 `modules/optional/pill_spline/src/lib.rs`, the generated mirror files) is
 backed up at startup and restored afterwards.
+
+Suites that drive a host serialize themselves. `ensure_host_lock`
+(`devops/core/suite_common.py`) takes a machine-global exclusive lock before a
+suite kills stale hosts or launches one, prints a single `[WAIT]` line while
+another suite holds it, and is released by process exit - so two host-driving
+suites started at once queue instead of each one's stale-host cleanup killing
+the other's host, which is how a migration scenario once read as flaky. The
+host-free suites (`test_harness_parsing.py`, `test_coding_standards.py`,
+`test_log_contract.py`) do not take the lock and stay safe to run beside
+anything.
 
 ## Performance measurement (moved)
 
