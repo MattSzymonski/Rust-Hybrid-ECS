@@ -46,6 +46,15 @@
     <ProjectReference Include="../../modules/pill_csharp_runtime/generators/PillIterationGenerators.csproj"
                       OutputItemType="Analyzer"
                       ReferenceOutputAssembly="false" />
+
+    <!-- The gameplay scripting rules (PILLxxxx). They exist because this is the
+         assembly that hot-reloads: an await that escapes its frame, a static a
+         parallel batch races on, or a static event that roots the retiring load
+         context are all things the runtime either refuses a run later or cannot
+         detect at all. Reporting them here makes them build errors instead. -->
+    <ProjectReference Include="../../modules/pill_csharp_runtime/analyzers/PillScriptAnalyzers.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
 
   <ItemGroup>

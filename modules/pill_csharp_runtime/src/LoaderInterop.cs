@@ -12,6 +12,8 @@
 //   catches failures locally and returns a neutral status where applicable.
 
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 
 namespace TracyLive.Loader;
 
@@ -37,6 +39,39 @@ public struct NativeSystemAccess
 // Unmanaged Entry Points
 // =============================================================================
 
+/// <summary>
+/// Captures any continuation an <c>[EcsSystem]</c> method tries to schedule.
+/// </summary>
+/// <remarks>
+/// A system runs inside a scheduled scope that ends when it returns. An
+/// <c>await</c> suspends the method, the scope is torn down, and the
+/// continuation would resume with no world and possibly a stale chunk pointer.
+///
+/// Unity solves the same problem by posting continuations back to the main
+/// thread, because a Unity object stays valid across the gap. That does not
+/// transfer: a continuation here resuming on the right thread but after the
+/// scope is gone still has no world. So this context records the violation and
+/// drops the continuation - the async method simply never resumes, which is
+/// the only outcome that cannot corrupt anything. The dropped state machine is
+/// unreferenced afterwards, so it neither leaks nor roots the load context.
+///
+/// Installed for the duration of one invocation rather than once at startup,
+/// because <see cref="SynchronizationContext.Current"/> is per-thread and
+/// systems run on native worker threads the managed side never sees created.
+/// </remarks>
+internal sealed class EcsFrameContext : SynchronizationContext
+{
+    private readonly string _description;
+
+    internal EcsFrameContext(string description) => _description = description;
+
+    public override void Post(SendOrPostCallback d, object? state) => Report();
+
+    public override void Send(SendOrPostCallback d, object? state) => Report();
+
+    private void Report() => LoaderInterop.ReportAwaitOutsideFrame(_description);
+}
+
 /// <summary>Stable native entry points used by the Rust scheduler bridge.</summary>
 public static unsafe class LoaderInterop
 {
@@ -50,7 +85,7 @@ public static unsafe class LoaderInterop
     /// <c>Entities</c> pointer in <c>NativeComponentChunk</c>, which a stale
     /// runtime would otherwise read as a 48-byte struct.
     /// </summary>
-    public const uint InteropContractVersion = 6;
+    public const uint InteropContractVersion = 8;
 
     /// <summary>Return the unmanaged ABI contract version for host validation.</summary>
 #if !PILL_AOT
@@ -71,6 +106,7 @@ public static unsafe class LoaderInterop
         try
         {
             Engine.Bind(api);
+            InstallThreadFailureHandlers();
             var dir = Environment.GetEnvironmentVariable("ECS_CSHARP_PROJECT_DIR")
                 ?? AppContext.BaseDirectory;
             var assembly = Environment.GetEnvironmentVariable("ECS_CSHARP_PROJECT_ASSEMBLY")
@@ -84,6 +120,37 @@ public static unsafe class LoaderInterop
             Console.Error.WriteLine($"[csharp_runtime] Init failed: {e}");
             return 0;
         }
+    }
+
+    /// <summary>Whether the process-wide failure handlers are installed.</summary>
+    private static bool _threadFailureHandlersInstalled;
+
+    /// <summary>
+    /// Name failures that happen on threads the boundary does not wrap.
+    /// </summary>
+    /// <remarks>
+    /// Every export catches before the native ABI, but a thread a script
+    /// started has no such wrapper: an unhandled exception there terminates
+    /// the process with a .NET stack and no engine context, and an unobserved
+    /// task exception is dropped silently. Neither can be prevented from here,
+    /// so both are at least attributed to the rule they broke.
+    /// </remarks>
+    private static void InstallThreadFailureHandlers()
+    {
+        if (_threadFailureHandlersInstalled)
+            return;
+        _threadFailureHandlersInstalled = true;
+        AppDomain.CurrentDomain.UnhandledException += (_, args) =>
+            Console.Error.WriteLine(
+                "[csharp_runtime] unhandled exception on a script-owned thread. The ECS API is " +
+                "valid only on the thread the scheduler called you on, and only before you " +
+                "return." + Environment.NewLine + args.ExceptionObject);
+        TaskScheduler.UnobservedTaskException += (_, args) =>
+        {
+            Console.Error.WriteLine(
+                $"[csharp_runtime] unobserved exception on a script-started task: {args.Exception}");
+            args.SetObserved();
+        };
     }
 
     /// <summary>Return the number of systems in the active project version.</summary>
@@ -253,19 +320,54 @@ public static unsafe class LoaderInterop
 #endif
     public static byte RunSystem(uint systemIndex)
     {
+        int index = checked((int)systemIndex);
+        // A system that awaits would return here with work still outstanding;
+        // the context catches the continuation before it escapes the frame.
+        SynchronizationContext? previousContext = SynchronizationContext.Current;
+        SynchronizationContext.SetSynchronizationContext(
+            new EcsFrameContext(_host?.DescribeSystem(index) ?? $"system {systemIndex}"));
+        // Per-system allocation attribution. The counter is thread-local and a
+        // system runs to completion on one thread, so the delta is exactly what
+        // this system allocated, including anything it called.
+        long allocatedBefore = GC.GetAllocatedBytesForCurrentThread();
         try
         {
             if (_host is null)
                 return 0;
-            _host.RunSystem(checked((int)systemIndex));
+            _host.RunSystem(index);
             return 1;
         }
         catch (Exception e)
         {
             Console.Error.WriteLine($"[csharp_runtime] system {systemIndex} failed: {e}");
-            _host?.SetSystemError((int)systemIndex, e.Message);
+            _host?.SetSystemError(index, e.Message);
             return 0;
         }
+        finally
+        {
+            _host?.RecordAllocation(
+                index, GC.GetAllocatedBytesForCurrentThread() - allocatedBefore);
+            SynchronizationContext.SetSynchronizationContext(previousContext);
+        }
+    }
+
+    /// <summary>
+    /// Record that a system tried to schedule work past the end of its frame.
+    /// </summary>
+    /// <remarks>
+    /// Routed into the per-system error channel so the violation surfaces the
+    /// same way a thrown exception does, naming the system, instead of
+    /// vanishing onto a thread pool.
+    /// </remarks>
+    internal static void ReportAwaitOutsideFrame(string description)
+    {
+        string message =
+            $"{description} scheduled a continuation (await, Task or Timer) that would run " +
+            "after the system returned. The ECS API is valid only on the thread the scheduler " +
+            "called you on, and only before you return, so the continuation was dropped. Keep " +
+            "state in a component and advance it each frame instead.";
+        Console.Error.WriteLine($"[csharp_runtime] {message}");
+        _host?.SetSystemErrorByName(description, message);
     }
 
     /// <summary>Return the UTF-8 byte count of one system's last error message.</summary>
@@ -307,6 +409,81 @@ public static unsafe class LoaderInterop
         catch (Exception e)
         {
             Console.Error.WriteLine($"[csharp_runtime] CopySystemErrorMessage failed: {e}");
+            return 0;
+        }
+    }
+
+    /// <summary>Return the byte count of the pending version's manifest.</summary>
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_pending_manifest_length")]
+#endif
+    public static uint PendingManifestLength() =>
+        checked((uint)(_host?.PendingComponentManifest.Length ?? 0));
+
+    /// <summary>Copy the pending version's UTF-8 JSON component manifest.</summary>
+    /// <returns>One on success, zero for invalid input or no pending version.</returns>
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_copy_pending_manifest")]
+#endif
+    public static byte CopyPendingManifest(byte* output, uint capacity)
+    {
+        try
+        {
+            if (_host is null || output is null ||
+                capacity < _host.PendingComponentManifest.Length)
+                return 0;
+            _host.PendingComponentManifest.CopyTo(new Span<byte>(output, checked((int)capacity)));
+            return 1;
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"[csharp_runtime] CopyPendingManifest failed: {e}");
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// Install the pending version; the host accepted its manifest.
+    /// </summary>
+    /// <returns>One on success; zero after reporting a failure.</returns>
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_commit_reload")]
+#endif
+    public static byte CommitReload()
+    {
+        try
+        {
+            if (_host is null)
+                return 0;
+            _host.CommitPendingReload();
+            return 1;
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"[csharp_runtime] CommitReload failed: {e}");
+            return 0;
+        }
+    }
+
+    /// <summary>
+    /// Discard the pending version; the host refused its manifest.
+    /// </summary>
+    /// <returns>One on success; zero after reporting a failure.</returns>
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_abort_reload")]
+#endif
+    public static byte AbortReload()
+    {
+        try
+        {
+            if (_host is null)
+                return 0;
+            _host.AbortPendingReload();
+            return 1;
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"[csharp_runtime] AbortReload failed: {e}");
             return 0;
         }
     }

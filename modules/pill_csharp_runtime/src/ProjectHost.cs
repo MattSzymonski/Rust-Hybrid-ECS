@@ -90,6 +90,20 @@ internal enum PollStatus : byte
 
     /// <summary>The new assembly was rejected; the old one stays loaded.</summary>
     Rejected = 2,
+
+    /// <summary>
+    /// A behaviour-compatible assembly is loaded and waiting, but its component
+    /// manifest differs from the one in force.
+    /// </summary>
+    /// <remarks>
+    /// The managed side cannot decide this one. Whether a manifest change can
+    /// be applied depends on what each component is bound to natively - a
+    /// dynamic column can be relaid out and its rows migrated, a mirror of a
+    /// Rust type cannot - and only the host knows those bindings. So the swap
+    /// stops here, the host is handed the manifest to accept or refuse, and it
+    /// answers with commit or abort.
+    /// </remarks>
+    ManifestPending = 3,
 }
 
 // =============================================================================
@@ -110,7 +124,14 @@ internal sealed class ProjectHost
     /// </summary>
     private sealed class ProjectContext : AssemblyLoadContext
     {
-        public ProjectContext() : base(isCollectible: true) { }
+        public ProjectContext() : base(isCollectible: true)
+        {
+            // Dropping the resolved delegate cache here rather than only
+            // before a successful swap covers every unload path, the
+            // rejection one included, and keeps the runtime from being the
+            // thing that holds a retiring context alive.
+            Unloading += _ => Engine.ReloadMirrorMethods();
+        }
 
         protected override Assembly? Load(AssemblyName assemblyName)
         {
@@ -119,6 +140,25 @@ internal sealed class ProjectHost
             return null;
         }
     }
+
+    /// <summary>
+    /// One loaded, validated project version waiting on the host's verdict
+    /// about its component manifest.
+    /// </summary>
+    /// <remarks>
+    /// Nothing about the running generation changes while a version sits here:
+    /// its context is loaded but not installed, so an abort costs an unload and
+    /// leaves the world untouched.
+    /// </remarks>
+    private sealed record PendingReload(
+        ProjectContext Context,
+        ManagedSystem[] Systems,
+        ManagedStartup[] Startups,
+        byte[] Manifest,
+        DateTime WriteUtc);
+
+    /// <summary>The version awaiting a verdict, if any.</summary>
+    private PendingReload? _pending;
 
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(500);
     private readonly string _assemblyPath;
@@ -210,11 +250,89 @@ internal sealed class ProjectHost
         _componentManifest = ComponentManifestBuilder.Build(
             systems, AotRegistry.ProjectAssembly);
         _lastSystemErrors = new string?[systems.Length];
+        _lastAllocatedBytes = new long[systems.Length];
     }
 
     /// <summary>Invoke a discovered system by its stable index.</summary>
     public void RunSystem(int index) => _systems[index].Run();
     public void RunStartup(int index) => _startups[index].Run();
+
+    /// <summary>Name one system for a diagnostic, without throwing on a bad index.</summary>
+    public string DescribeSystem(int systemIndex) =>
+        (uint)systemIndex < (uint)_systems.Length ? _systems[systemIndex].Name : $"system {systemIndex}";
+
+    /// <summary>Bytes the last run of each system allocated on the managed heap.</summary>
+    private long[] _lastAllocatedBytes = [];
+
+    /// <summary>Record what one system's last run allocated.</summary>
+    /// <remarks>
+    /// Attribution, not prevention: the query path itself allocates nothing, so
+    /// a non-zero figure here is always the script's own. Surfacing it per
+    /// system is what turns a frame spike into a name.
+    /// </remarks>
+    public void RecordAllocation(int systemIndex, long bytes)
+    {
+        if ((uint)systemIndex < (uint)_lastAllocatedBytes.Length)
+            _lastAllocatedBytes[systemIndex] = bytes;
+    }
+
+    /// <summary>Bytes the last run of one system allocated, or zero.</summary>
+    public long GetAllocatedBytes(int systemIndex) =>
+        (uint)systemIndex < (uint)_lastAllocatedBytes.Length ? _lastAllocatedBytes[systemIndex] : 0;
+
+    /// <summary>When the allocation summary was last written.</summary>
+    private DateTime _lastAllocationReportUtc = DateTime.UtcNow;
+
+    /// <summary>Interval between allocation summaries.</summary>
+    private static readonly TimeSpan AllocationReportInterval = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Periodically name the systems that allocate on the managed heap.
+    /// </summary>
+    /// <remarks>
+    /// The query path allocates nothing - rows and enumerators are ref structs
+    /// and the generated wrappers do not box - so any figure here is the
+    /// script's own. It matters more than the raw number suggests: the worker
+    /// threads that run systems become attached managed threads, so a
+    /// collection triggered by one system suspends the whole pool.
+    ///
+    /// Reported on an interval rather than per frame, because the point is to
+    /// notice a steady allocator, not to narrate every frame.
+    /// </remarks>
+    private void ReportAllocationsIfDue()
+    {
+        DateTime now = DateTime.UtcNow;
+        if (now - _lastAllocationReportUtc < AllocationReportInterval)
+            return;
+        _lastAllocationReportUtc = now;
+        var offenders = new List<string>();
+        for (int index = 0; index < _lastAllocatedBytes.Length; index++)
+        {
+            if (_lastAllocatedBytes[index] > 0)
+                offenders.Add($"{_systems[index].Name} ({_lastAllocatedBytes[index]} B/frame)");
+        }
+        if (offenders.Count > 0)
+            Console.WriteLine(
+                "[csharp_runtime] managed systems allocating per frame: " +
+                string.Join(", ", offenders));
+    }
+
+    /// <summary>Record a failure against the system with this reflected name.</summary>
+    /// <remarks>
+    /// The frame-scope context knows which system it was installed for by name
+    /// rather than by index, because that is what makes its message readable.
+    /// </remarks>
+    public void SetSystemErrorByName(string systemName, string message)
+    {
+        for (int index = 0; index < _systems.Length; index++)
+        {
+            if (_systems[index].Name == systemName)
+            {
+                SetSystemError(index, message);
+                return;
+            }
+        }
+    }
 
     /// <summary>Return the last failure message recorded for one system, if any.</summary>
     public string GetSystemError(int systemIndex) =>
@@ -238,10 +356,15 @@ internal sealed class ProjectHost
     /// </summary>
     public byte PollReload()
     {
+        ReportAllocationsIfDue();
         // NativeAOT builds are static shipping artifacts: no project assembly
         // exists to watch, so a reload poll is always a no-op.
         if (!RuntimeFeature.IsDynamicCodeSupported)
             return (byte)PollStatus.NoChange;
+        // A version already waiting on the host's verdict owns the slot; polling
+        // again would load a second one on top of it.
+        if (_pending is not null)
+            return (byte)PollStatus.ManifestPending;
         var now = DateTime.UtcNow;
         if (now - _lastPollUtc < PollInterval)
             return (byte)PollStatus.NoChange;
@@ -267,7 +390,18 @@ internal sealed class ProjectHost
 
         try
         {
-            Load(isReload: true);
+            PollStatus outcome = Load(isReload: true);
+            if (outcome == PollStatus.ManifestPending)
+            {
+                // Loaded and validated, but not installed: the host decides
+                // whether the world can take this manifest, then answers with
+                // commit or abort.
+                Console.WriteLine(
+                    "[csharp_runtime] " +
+                    $"{Path.GetFileName(_assemblyPath)} changed its component manifest; " +
+                    "awaiting the host's verdict");
+                return (byte)PollStatus.ManifestPending;
+            }
             Console.WriteLine(
                 $"[csharp_runtime] reloaded {Path.GetFileName(_assemblyPath)} " +
                 $"(retired {_retiredCount}, collected {_collectedCount})");
@@ -365,7 +499,7 @@ internal sealed class ProjectHost
     /// Load one assembly version, validate its scheduler signature, then swap
     /// it atomically with the active collectible context.
     /// </summary>
-    private void Load(bool isReload)
+    private PollStatus Load(bool isReload)
     {
         var bytes = ReadAllBytesWithRetry(_assemblyPath);
         var context = new ProjectContext();
@@ -390,12 +524,23 @@ internal sealed class ProjectHost
                     systems.Select(s => s.Signature)))
                 throw new InvalidOperationException(
                     "C# system names or query signatures changed; restart the host to rebuild the Rust scheduler.");
-            if (isReload && !_componentManifest.AsSpan().SequenceEqual(manifest))
-                throw new InvalidOperationException(
-                    "C# component identities or layouts changed; restart the host to rebuild the native component registry.");
             if (isReload && !_startups.Select(s => s.Name).SequenceEqual(startups.Select(s => s.Name)))
                 throw new InvalidOperationException(
                     "C# startup methods changed; restart the host. Startup methods are not rerun during hot reload.");
+
+            // A changed manifest is not refused here any more: whether it can
+            // be applied depends on the native bindings, which only the host
+            // knows. The version parks fully loaded and validated, and the swap
+            // waits for the host's answer - so a refusal costs an unload rather
+            // than leaving a swapped assembly against a world that never took
+            // its layout.
+            if (isReload && !_componentManifest.AsSpan().SequenceEqual(manifest))
+            {
+                _pending = new PendingReload(
+                    context, systems, startups, manifest,
+                    File.GetLastWriteTimeUtc(_assemblyPath));
+                return PollStatus.ManifestPending;
+            }
 
             var oldContext = _context;
             // The new assembly carries its own mirror delegate types (each
@@ -410,15 +555,69 @@ internal sealed class ProjectHost
             _startups = startups;
             _componentManifest = manifest;
             _lastSystemErrors = new string?[systems.Length];
+            _lastAllocatedBytes = new long[systems.Length];
             _lastWriteUtc = File.GetLastWriteTimeUtc(_assemblyPath);
             if (oldContext is not null)
                 RetireContext(oldContext);
+            return PollStatus.Reloaded;
         }
         catch
         {
             RetireContext(context);
             throw;
         }
+    }
+
+    /// <summary>UTF-8 manifest of the version awaiting a verdict.</summary>
+    public ReadOnlySpan<byte> PendingComponentManifest =>
+        _pending is null ? ReadOnlySpan<byte>.Empty : _pending.Manifest;
+
+    /// <summary>
+    /// Install the parked version after the host accepted its manifest.
+    /// </summary>
+    /// <remarks>
+    /// The host has already relaid out the columns the new manifest asks for,
+    /// so the world and this assembly agree the moment the swap lands.
+    /// </remarks>
+    public void CommitPendingReload()
+    {
+        if (_pending is null)
+            return;
+        PendingReload pending = _pending;
+        _pending = null;
+
+        ProjectContext? oldContext = _context;
+        // Same ordering as the ordinary swap: drop the old context's resolved
+        // delegates before it retires, so nothing holds it back.
+        Engine.ReloadMirrorMethods();
+        _context = pending.Context;
+        _systems = pending.Systems;
+        _startups = pending.Startups;
+        _componentManifest = pending.Manifest;
+        _lastSystemErrors = new string?[pending.Systems.Length];
+        _lastAllocatedBytes = new long[pending.Systems.Length];
+        _lastWriteUtc = pending.WriteUtc;
+        if (oldContext is not null)
+            RetireContext(oldContext);
+    }
+
+    /// <summary>
+    /// Discard the parked version after the host refused its manifest.
+    /// </summary>
+    /// <remarks>
+    /// The running generation never moved, so this only unloads what was
+    /// loaded speculatively. The write time is remembered either way, so the
+    /// same refused bytes are not re-examined twice a second for as long as
+    /// the source stays that way.
+    /// </remarks>
+    public void AbortPendingReload()
+    {
+        if (_pending is null)
+            return;
+        PendingReload pending = _pending;
+        _pending = null;
+        _lastWriteUtc = pending.WriteUtc;
+        RetireContext(pending.Context);
     }
 
     // =========================================================================
@@ -428,6 +627,7 @@ internal sealed class ProjectHost
     /// <summary>Discover attributed static methods in deterministic order.</summary>
     internal static ManagedSystem[] DiscoverSystems(Assembly assembly)
     {
+        ReportAttributedInstanceMethods(assembly);
         return assembly.GetTypes()
             .SelectMany(type => type.GetMethods(
                 BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static))
@@ -436,6 +636,35 @@ internal sealed class ProjectHost
             .ThenBy(method => method.Name, StringComparer.Ordinal)
             .Select(CreateSystem)
             .ToArray();
+    }
+
+    /// <summary>
+    /// Name attributed instance methods, which discovery cannot register.
+    /// </summary>
+    /// <remarks>
+    /// Discovery looks for static methods only, so an <c>[EcsSystem]</c> on an
+    /// instance method is not merely rejected - it is invisible. The system
+    /// never runs and nothing says why, which is the one declaration mistake
+    /// here that produces no symptom at all. One extra reflection pass over an
+    /// assembly that is already being reflected over buys a name.
+    /// </remarks>
+    private static void ReportAttributedInstanceMethods(Assembly assembly)
+    {
+        foreach (Type type in assembly.GetTypes())
+        {
+            foreach (MethodInfo method in type.GetMethods(
+                         BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+            {
+                bool attributed =
+                    method.GetCustomAttribute<EcsSystemAttribute>() is not null ||
+                    method.GetCustomAttribute<EcsStartupAttribute>() is not null;
+                if (attributed)
+                    Console.Error.WriteLine(
+                        $"[csharp_runtime] {type.FullName}.{method.Name} carries an ECS attribute " +
+                        "but is an instance method, so it was not registered and will never run. " +
+                        "Make it static.");
+            }
+        }
     }
 
     /// <summary>Upper bound on the total parameters one managed system may declare.</summary>

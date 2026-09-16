@@ -45,6 +45,13 @@ thread_local! {
     /// component or entity access first, and without that precondition the
     /// entity path would enumerate any component set the world holds.
     static OBSERVED_ARCHETYPES: RefCell<HashSet<ArchetypeId>> = RefCell::new(HashSet::new());
+    /// Monotonic per-thread invocation counter stamped into every chunk.
+    ///
+    /// Zero means "no managed system is running on this thread", so it doubles
+    /// as the out-of-scope answer. The counter only moves forward, which is
+    /// what makes a token from an earlier invocation compare unequal to the
+    /// current one without anything having to be cleared on the way out.
+    static SCOPE_TOKEN: Cell<u32> = const { Cell::new(0) };
 }
 
 // =============================================================================
@@ -63,6 +70,8 @@ struct ActiveScopeData {
     access: (*const NativeSystemAccess, usize),
     bindings: *const ComponentBindings,
     uses_commands: bool,
+    /// Token stamped into every chunk issued during this invocation.
+    scope_token: u32,
 }
 
 /// Guards the thread-local invocation scope for exactly one scheduled managed
@@ -145,6 +154,18 @@ impl ActiveSystemGuard {
 
         // Step 3: Commit the whole scope in one assignment. Cell::set cannot
         // panic, so from this point on the guard's Drop owns the teardown.
+        // Take this invocation's token before committing the scope. Wrapping
+        // skips zero, which is reserved for "no scope", so a wrapped counter
+        // can never make an out-of-scope chunk look current.
+        let scope_token = SCOPE_TOKEN.with(|slot| {
+            let next = match slot.get().wrapping_add(1) {
+                0 => 1,
+                value => value,
+            };
+            slot.set(next);
+            next
+        });
+
         ACTIVE_SCOPE.with(|slot| {
             slot.set(Some(ActiveScopeData {
                 world: world as *mut World,
@@ -152,6 +173,7 @@ impl ActiveSystemGuard {
                 access: (access.as_ptr(), access.len()),
                 bindings: bindings as *const ComponentBindings,
                 uses_commands,
+                scope_token,
             }));
         });
         Some(Self)
@@ -234,6 +256,20 @@ pub(super) fn with_active_world<R>(f: impl FnOnce(&mut World) -> R) -> Option<R>
         // managed invocation and clears it before the borrowed world expires.
         (!pointer.is_null()).then(|| unsafe { f(&mut *pointer) })
     })
+}
+
+/// Token of the invocation active on this thread, or zero when none is.
+///
+/// Every chunk carries the value current when it was issued, so managed code
+/// can tell a chunk belonging to the call it is inside from one kept since an
+/// earlier invocation.
+pub(super) fn active_scope_token() -> u32 {
+    ACTIVE_SCOPE.with(|slot| slot.get().map_or(0, |scope| scope.scope_token))
+}
+
+/// FFI view of [`active_scope_token`], published in the engine API table.
+pub(super) extern "C" fn ffi_current_scope_token() -> u32 {
+    active_scope_token()
 }
 
 /// Reports whether a managed system scope exists without dereferencing its world.

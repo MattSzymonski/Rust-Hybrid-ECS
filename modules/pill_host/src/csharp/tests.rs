@@ -412,6 +412,9 @@ fn empty_chunk() -> ComponentChunk {
         element_size: 0,
         ticks: std::ptr::null_mut(),
         change_tick: 0,
+        // Zero is the "no scope" token, which is what an unfilled output slot
+        // should carry: a chunk the host never wrote is not valid anywhere.
+        scope_token: 0,
     }
 }
 

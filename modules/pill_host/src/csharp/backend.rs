@@ -60,6 +60,15 @@ pub(crate) const POLL_RELOADED: u8 = 1;
 #[cfg(feature = "hot_reload")]
 /// Poll rejected the new assembly; the old version stays loaded.
 pub(crate) const POLL_REJECTED: u8 = 2;
+#[cfg(feature = "hot_reload")]
+/// A behaviour-compatible assembly is loaded and waiting, but its component
+/// manifest differs from the one in force.
+///
+/// The managed loader cannot decide this: whether a manifest change can be
+/// applied depends on what each component is bound to natively, and only the
+/// host holds those bindings. The swap therefore stops, the host applies the
+/// manifest, and answers with commit or abort.
+pub(crate) const POLL_MANIFEST_PENDING: u8 = 3;
 
 /// Maximum UTF-8 byte length accepted for a managed system name.
 const MAX_SYSTEM_NAME_BYTES: u32 = 1024;
@@ -88,7 +97,7 @@ pub(super) const MAX_ACCESSES_PER_SYSTEM: u32 = 1024;
 /// `entities` pointer, which a stale runtime would otherwise read as a
 /// 48-byte struct. The host refuses to start against a runtime built for a
 /// different version.
-const INTEROP_CONTRACT_VERSION: u32 = 6;
+const INTEROP_CONTRACT_VERSION: u32 = 8;
 
 // =============================================================================
 // Types + Impls
@@ -130,6 +139,14 @@ type CopySystemErrorMessageFn = extern "system" fn(u32, *mut u8, u32) -> u8;
 /// Signature polling the collectible loader for a new project assembly and
 /// reporting the swap outcome through the status codes below.
 type PollReloadFn = extern "system" fn() -> u8;
+/// Signature returning the pending manifest's byte length.
+type PendingManifestLengthFn = extern "system" fn() -> u32;
+/// Signature copying the pending manifest into a caller buffer.
+type CopyPendingManifestFn = extern "system" fn(*mut u8, u32) -> u8;
+/// Signature installing the pending version after the host accepted it.
+type CommitReloadFn = extern "system" fn() -> u8;
+/// Signature discarding the pending version after the host refused it.
+type AbortReloadFn = extern "system" fn() -> u8;
 
 /// Reflected metadata of one managed system, captured at startup.
 ///
@@ -175,6 +192,18 @@ pub(crate) enum ManagedRuntimeContext {
 pub(crate) struct CSharpRuntime {
     /// Unmanaged export polling the collectible loader for a rebuilt assembly.
     poll_reload: PollReloadFn,
+    /// Byte length of the manifest a parked version carries.
+    #[cfg(feature = "hot_reload")]
+    pending_manifest_length: PendingManifestLengthFn,
+    /// Copies the parked version's manifest for validation.
+    #[cfg(feature = "hot_reload")]
+    copy_pending_manifest: CopyPendingManifestFn,
+    /// Installs the parked version once its manifest is in force.
+    #[cfg(feature = "hot_reload")]
+    commit_reload: CommitReloadFn,
+    /// Discards the parked version when its manifest cannot be applied.
+    #[cfg(feature = "hot_reload")]
+    abort_reload: AbortReloadFn,
     /// Unmanaged export reporting the number of registered scheduler systems.
     system_count: SystemCountFn,
     /// Unmanaged export reporting how many accesses one system declared.
@@ -338,6 +367,26 @@ impl CSharpRuntime {
         // Kept under its own name: the value below shadows it, and reading the
         // manifest again after a swap needs the export, not the first length.
         let manifest_length_export = manifest_length;
+        // The reload handshake: a version whose manifest changed parks until
+        // the host has applied it, then commits or aborts.
+        #[cfg(feature = "hot_reload")]
+        let pending_manifest_length = runtime.get_unmanaged_fn::<PendingManifestLengthFn>(
+            &assembly,
+            &type_name,
+            "PendingManifestLength",
+        )?;
+        #[cfg(feature = "hot_reload")]
+        let copy_pending_manifest = runtime.get_unmanaged_fn::<CopyPendingManifestFn>(
+            &assembly,
+            &type_name,
+            "CopyPendingManifest",
+        )?;
+        #[cfg(feature = "hot_reload")]
+        let commit_reload =
+            runtime.get_unmanaged_fn::<CommitReloadFn>(&assembly, &type_name, "CommitReload")?;
+        #[cfg(feature = "hot_reload")]
+        let abort_reload =
+            runtime.get_unmanaged_fn::<AbortReloadFn>(&assembly, &type_name, "AbortReload")?;
         let system_name_length = runtime.get_unmanaged_fn::<SystemNameLengthFn>(
             &assembly,
             &type_name,
@@ -549,6 +598,14 @@ impl CSharpRuntime {
             last_poll_status: POLL_NO_CHANGE,
             system_snapshot,
             manifest_length: manifest_length_export,
+            #[cfg(feature = "hot_reload")]
+            pending_manifest_length,
+            #[cfg(feature = "hot_reload")]
+            copy_pending_manifest,
+            #[cfg(feature = "hot_reload")]
+            commit_reload,
+            #[cfg(feature = "hot_reload")]
+            abort_reload,
             copy_manifest,
             applied_manifest: manifest,
             bindings,
@@ -632,6 +689,16 @@ impl CSharpRuntime {
         let copy_system_error = runtime
             .get_unmanaged_fn::<CopySystemErrorMessageFn>("pill_copy_system_error_message")?;
         let poll_reload = runtime.get_unmanaged_fn::<PollReloadFn>("pill_poll_reload")?;
+        #[cfg(feature = "hot_reload")]
+        let pending_manifest_length =
+            runtime.get_unmanaged_fn::<PendingManifestLengthFn>("pill_pending_manifest_length")?;
+        #[cfg(feature = "hot_reload")]
+        let copy_pending_manifest =
+            runtime.get_unmanaged_fn::<CopyPendingManifestFn>("pill_copy_pending_manifest")?;
+        #[cfg(feature = "hot_reload")]
+        let commit_reload = runtime.get_unmanaged_fn::<CommitReloadFn>("pill_commit_reload")?;
+        #[cfg(feature = "hot_reload")]
+        let abort_reload = runtime.get_unmanaged_fn::<AbortReloadFn>("pill_abort_reload")?;
 
         // Step 2: initialize the bridge and register the component manifest.
         let api = Box::new(CsEngineApi::new(mirror_methods));
@@ -780,6 +847,14 @@ impl CSharpRuntime {
             last_poll_status: POLL_NO_CHANGE,
             system_snapshot,
             manifest_length: manifest_length_export,
+            #[cfg(feature = "hot_reload")]
+            pending_manifest_length,
+            #[cfg(feature = "hot_reload")]
+            copy_pending_manifest,
+            #[cfg(feature = "hot_reload")]
+            commit_reload,
+            #[cfg(feature = "hot_reload")]
+            abort_reload,
             copy_manifest,
             applied_manifest: manifest,
             bindings,

@@ -17,7 +17,9 @@
 //   native chunk, with no per-row column lookup and no per-row column copy.
 
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -240,7 +242,7 @@ public static unsafe class Engine
     private static uint _mirrorEpoch;
 
     /// <summary>Bind the native function table for all subsequent queries.</summary>
-    public static void Bind(EngineApi* api)
+    internal static void Bind(EngineApi* api)
     {
         _api = *api;
         ReloadMirrorMethods();
@@ -255,7 +257,55 @@ public static unsafe class Engine
     /// does not stand in the way of it either way; see the trust note in the
     /// project's `.csproj`.
     /// </remarks>
-    public static void Bind(IntPtr api) => Bind((EngineApi*)api);
+    internal static void Bind(IntPtr api) => Bind((EngineApi*)api);
+
+    /// <summary>
+    /// Token of the managed invocation running on this thread, or zero outside
+    /// one.
+    /// </summary>
+    internal static uint CurrentScopeToken =>
+        _api.CurrentScopeToken == null ? 0u : _api.CurrentScopeToken();
+
+    /// <summary>
+    /// Reject a chunk that was issued to an earlier managed invocation.
+    /// </summary>
+    /// <remarks>
+    /// Debug builds only, which is the same posture Unity takes with its job
+    /// safety system: the checks run while you are developing and compile out
+    /// of the build you ship, because validating on every row access would
+    /// cost the data plane the property that makes it worth having.
+    ///
+    /// A mismatch means a chunk outlived the call that produced it. The
+    /// storage it points at may have been moved by an archetype migration,
+    /// freed, or unloaded with its module.
+    /// </remarks>
+    [Conditional("DEBUG")]
+    internal static void ValidateChunkScope(uint issuedToScope, string component)
+    {
+        uint current = CurrentScopeToken;
+        if (issuedToScope == current)
+            return;
+        throw new InvalidOperationException(
+            $"The component chunk for {component} was issued to " +
+            (issuedToScope == 0 ? "no managed invocation" : $"invocation {issuedToScope}") +
+            (current == 0
+                ? ", and no ECS system is running on this thread now."
+                : $", but invocation {current} is running now.") +
+            " Chunks are valid only inside the [EcsSystem] call that produced them; " +
+            "copy the value out, or re-run the query.");
+    }
+
+    /// <summary>
+    /// Native size of one component row, after the manifest and the runtime
+    /// have been proved to agree.
+    /// </summary>
+    /// <remarks>
+    /// Exists so the agreement check is reachable from a test: resolving
+    /// <c>ComponentTypeMetadata&lt;T&gt;</c> is what runs it, and a query or a
+    /// deferred command is otherwise the only way to get there.
+    /// </remarks>
+    internal static int ComponentSizeOf<T>() where T : unmanaged =>
+        ComponentTypeMetadata<T>.Size;
 
     /// <summary>Return the active native world's entity count.</summary>
     /// <exception cref="InvalidOperationException">
@@ -518,6 +568,64 @@ internal readonly record struct StableComponentId(ulong Low, ulong High);
 /// not memory safety: the addresses these methods exchange are raw, and the
 /// project's code is trusted the same way any other code the user builds is.
 /// </summary>
+/// <summary>
+/// The address of a live value the runtime handed out.
+/// </summary>
+/// <remarks>
+/// A script cannot construct one: the field and the constructor are both
+/// internal, so the only way to hold a row address is to have been given it by
+/// <see cref="MirrorMethods.AddressOf{T}(ref T)"/>. That does not make the
+/// address safe to *keep* - it points into a native archetype column that a
+/// structural change or a module reload can move - it makes it impossible to
+/// invent, which removes the accidental path without pretending to remove the
+/// deliberate one.
+/// </remarks>
+public readonly struct RowPointer
+{
+    internal readonly IntPtr Address;
+    internal RowPointer(IntPtr address) => Address = address;
+}
+
+/// <summary>
+/// A mirrored-method trampoline address the host published for the module
+/// generation currently loaded.
+/// </summary>
+/// <remarks>
+/// Opaque for the same reason as <see cref="RowPointer"/>, and with a shorter
+/// life: a module reload republishes the table at fresh addresses, so a
+/// trampoline resolved before a reload is stale after it.
+/// </remarks>
+public readonly struct MirrorTrampoline
+{
+    internal readonly IntPtr Address;
+    internal MirrorTrampoline(IntPtr address) => Address = address;
+}
+
+/// <summary>
+/// A borrowed window over a native buffer, exactly as a Rust trampoline
+/// reported it.
+/// </summary>
+/// <remarks>
+/// The pointer and the length always travel together and can only be produced
+/// by a trampoline call, so managed code cannot pair an address with a length
+/// of its own choosing. The lease ends when the call that produced it returns:
+/// anything that resizes or replaces the container on the Rust side
+/// invalidates it.
+/// </remarks>
+public readonly struct BufferView
+{
+    internal readonly IntPtr Data;
+
+    /// <summary>Number of elements the trampoline reported.</summary>
+    public readonly int Length;
+
+    internal BufferView(IntPtr data, IntPtr length)
+    {
+        Data = data;
+        Length = checked((int)length);
+    }
+}
+
 public static class MirrorMethods
 {
     // Concurrent collections because `Resolve` is reachable from scheduled
@@ -555,10 +663,10 @@ public static class MirrorMethods
     /// accessors that call it through the <c>Invoke*</c> helpers.
     /// </summary>
     /// <exception cref="InvalidOperationException">
-    /// No trampoline is registered for the method — most often because the
+    /// No trampoline is registered for the method - most often because the
     /// module was statically linked rather than loaded as a dynamic library.
     /// </exception>
-    public static IntPtr Address(string typeName, string method)
+    public static MirrorTrampoline Address(string typeName, string method)
     {
         if (!Addresses.TryGetValue((typeName, method), out IntPtr address))
         {
@@ -567,7 +675,7 @@ public static class MirrorMethods
                 "Mirrored methods are only available when the declaring module is " +
                 "loaded as a dynamic library by the developer host.");
         }
-        return address;
+        return new MirrorTrampoline(address);
     }
 
     /// <summary>
@@ -588,7 +696,8 @@ public static class MirrorMethods
         {
             return (T)cached.Delegate;
         }
-        T created = (T)Marshal.GetDelegateForFunctionPointer(Address(typeName, method), typeof(T));
+        T created = (T)Marshal.GetDelegateForFunctionPointer(
+            Address(typeName, method).Address, typeof(T));
         Cache[key] = (generation, created);
         return created;
     }
@@ -599,45 +708,66 @@ public static class MirrorMethods
     // boundary call per member use, no delegate stub, no marshalling.
 
     /// <summary>
-    /// Call a `(row, out data, out length)` trampoline — a `Vec`/`String` view
-    /// or the count view of a `Vec<String>`.
+    /// Call a `(row, out data, out length)` trampoline - a `Vec`/`String` view
+    /// or the count view of a `Vec&lt;String&gt;`.
     /// </summary>
     public static unsafe byte InvokeView(
-        IntPtr address, IntPtr row, out IntPtr data, out IntPtr length)
-        => ((delegate* unmanaged[Cdecl]<IntPtr, out IntPtr, out IntPtr, byte>)address)(
-            row, out data, out length);
+        MirrorTrampoline address, RowPointer row, out BufferView view)
+    {
+        byte status = ((delegate* unmanaged[Cdecl]<IntPtr, out IntPtr, out IntPtr, byte>)
+            address.Address)(row.Address, out IntPtr data, out IntPtr length);
+        view = new BufferView(data, length);
+        return status;
+    }
 
     /// <summary>Call a `(row, count)` trampoline that resizes a container field.</summary>
-    public static unsafe byte InvokeResize(IntPtr address, IntPtr row, IntPtr count)
-        => ((delegate* unmanaged[Cdecl]<IntPtr, IntPtr, byte>)address)(row, count);
+    public static unsafe byte InvokeResize(MirrorTrampoline address, RowPointer row, int count)
+        => ((delegate* unmanaged[Cdecl]<IntPtr, IntPtr, byte>)address.Address)(
+            row.Address, (IntPtr)count);
 
     /// <summary>
-    /// Call a `(row, index, out data, out length)` trampoline — one element of
-    /// a `Vec<String>` (status: 0 reachable, 1 dead row, 2 out of range).
+    /// Call a `(row, index, out data, out length)` trampoline - one element of
+    /// a `Vec&lt;String&gt;` (status: 0 reachable, 1 dead row, 2 out of range).
     /// </summary>
     public static unsafe byte InvokeItem(
-        IntPtr address, IntPtr row, IntPtr index, out IntPtr data, out IntPtr length)
-        => ((delegate* unmanaged[Cdecl]<IntPtr, IntPtr, out IntPtr, out IntPtr, byte>)address)(
-            row, index, out data, out length);
+        MirrorTrampoline address, RowPointer row, int index, out BufferView view)
+    {
+        byte status = ((delegate* unmanaged[Cdecl]<IntPtr, IntPtr, out IntPtr, out IntPtr, byte>)
+            address.Address)(row.Address, (IntPtr)index, out IntPtr data, out IntPtr length);
+        view = new BufferView(data, length);
+        return status;
+    }
 
     /// <summary>
     /// Call a `(row, index, utf8, length)` trampoline that replaces one
-    /// element of a `Vec<String>` (status: 0 ok, 1 dead row, 2 out of range,
-    /// 3 invalid UTF-8).
+    /// element of a `Vec&lt;String&gt;` (status: 0 ok, 1 dead row, 2 out of
+    /// range, 3 invalid UTF-8).
     /// </summary>
+    /// <remarks>
+    /// The payload crosses as a span rather than an address and a length, so
+    /// the caller cannot pair a pointer with a length of its own choosing, and
+    /// generated accessors no longer pin a byte array by hand.
+    /// </remarks>
     public static unsafe byte InvokeSetItem(
-        IntPtr address, IntPtr row, IntPtr index, IntPtr utf8, IntPtr length)
-        => ((delegate* unmanaged[Cdecl]<IntPtr, IntPtr, IntPtr, IntPtr, byte>)address)(
-            row, index, utf8, length);
+        MirrorTrampoline address, RowPointer row, int index, ReadOnlySpan<byte> utf8)
+    {
+        fixed (byte* payload = utf8)
+            return ((delegate* unmanaged[Cdecl]<IntPtr, IntPtr, IntPtr, IntPtr, byte>)
+                address.Address)(
+                    row.Address, (IntPtr)index, (IntPtr)payload, (IntPtr)utf8.Length);
+    }
 
     /// <summary>
-    /// Call a `(row, utf8, length)` trampoline — writing a `String` field or
-    /// appending to a `Vec<String>`.
+    /// Call a `(row, utf8, length)` trampoline - writing a `String` field or
+    /// appending to a `Vec&lt;String&gt;`.
     /// </summary>
     public static unsafe byte InvokeUtf8Write(
-        IntPtr address, IntPtr row, IntPtr utf8, IntPtr length)
-        => ((delegate* unmanaged[Cdecl]<IntPtr, IntPtr, IntPtr, byte>)address)(
-            row, utf8, length);
+        MirrorTrampoline address, RowPointer row, ReadOnlySpan<byte> utf8)
+    {
+        fixed (byte* payload = utf8)
+            return ((delegate* unmanaged[Cdecl]<IntPtr, IntPtr, IntPtr, byte>)address.Address)(
+                row.Address, (IntPtr)payload, (IntPtr)utf8.Length);
+    }
 
     /// <summary>
     /// Address of a live value passed by reference, for generated heap-field
@@ -647,8 +777,9 @@ public static class MirrorMethods
     /// row, the native column slot - so a trampoline reached through it reads
     /// and writes the real container rather than a copy of its header.
     /// </summary>
-    public static unsafe IntPtr AddressOf<T>(ref T value) where T : unmanaged
-        => (IntPtr)global::System.Runtime.CompilerServices.Unsafe.AsPointer(ref value);
+    public static unsafe RowPointer AddressOf<T>(ref T value) where T : unmanaged
+        => new RowPointer(
+            (IntPtr)global::System.Runtime.CompilerServices.Unsafe.AsPointer(ref value));
 }
 
 /// <summary>
@@ -664,12 +795,49 @@ public static class MirrorMethods
 /// </summary>
 public static class ComponentViews
 {
-    /// <summary>Writable span over <paramref name="count"/> elements at <paramref name="data"/>.</summary>
-    public static unsafe Span<T> AsSpan<T>(IntPtr data, int count) where T : unmanaged
+    /// <summary>Writable span over the buffer a trampoline reported.</summary>
+    public static unsafe Span<T> AsSpan<T>(BufferView view) where T : unmanaged
+        => view.Length == 0 ? Span<T>.Empty : new Span<T>((void*)view.Data, view.Length);
+
+    /// <summary>Read-only span over the buffer a trampoline reported.</summary>
+    public static unsafe ReadOnlySpan<T> AsReadOnlySpan<T>(BufferView view) where T : unmanaged
+        => view.Length == 0 ? ReadOnlySpan<T>.Empty : new ReadOnlySpan<T>((void*)view.Data, view.Length);
+
+    /// <summary>Decode a UTF-8 buffer a trampoline reported into a string.</summary>
+    /// <remarks>
+    /// The copy is the point: the view is a lease that ends when the call that
+    /// produced it returns, and a string is the only form of the data that can
+    /// outlive it.
+    /// </remarks>
+    public static string ToUtf8String(BufferView view)
+        => view.Length == 0
+            ? string.Empty
+            : Marshal.PtrToStringUTF8(view.Data, view.Length) ?? string.Empty;
+
+    /// <summary>
+    /// Span over an engine-owned dynamic buffer whose `(ptr, len, cap)` handle
+    /// is mirrored into a component row.
+    /// </summary>
+    /// <remarks>
+    /// Separate from <see cref="AsSpan{T}(BufferView)"/> because this handle is
+    /// mirrored *data* rather than the result of a trampoline call: the pointer
+    /// is read out of the row itself, so there is no call to hand back a
+    /// <see cref="BufferView"/>. Generated accessors are the only intended
+    /// caller, and they read the pointer from private fields of the generated
+    /// mirror struct.
+    ///
+    /// This is the one raw entry point left in the public surface. It survives
+    /// because the alternative would be to expose the mirror's handle fields,
+    /// which is strictly worse. The address-stability contract that makes a
+    /// retained handle legal at all is the buffer allocator's, not this
+    /// method's: resizing is a native call that ends every outstanding lease.
+    /// </remarks>
+    public static unsafe Span<T> OverDynamicBuffer<T>(UIntPtr data, int count) where T : unmanaged
         => count == 0 ? Span<T>.Empty : new Span<T>((void*)data, count);
 
-    /// <summary>Read-only span over <paramref name="count"/> elements at <paramref name="data"/>.</summary>
-    public static unsafe ReadOnlySpan<T> AsReadOnlySpan<T>(IntPtr data, int count) where T : unmanaged
+    /// <summary>Read-only twin of <see cref="OverDynamicBuffer{T}"/>.</summary>
+    public static unsafe ReadOnlySpan<T> OverDynamicBufferReadOnly<T>(UIntPtr data, int count)
+        where T : unmanaged
         => count == 0 ? ReadOnlySpan<T>.Empty : new ReadOnlySpan<T>((void*)data, count);
 }
 
@@ -682,7 +850,40 @@ internal static class ComponentTypeMetadata<T> where T : unmanaged
 {
     internal static readonly StableComponentId StableId =
         Engine.ComponentStableId(typeof(T));
-    internal static readonly int Size = Marshal.SizeOf<T>();
+
+    /// <summary>
+    /// Native size of one component row, taken from the runtime itself.
+    /// </summary>
+    /// <remarks>
+    /// <c>Unsafe.SizeOf&lt;T&gt;()</c> is the number a row write actually
+    /// touches: <c>((T*)column.Data)[row] = value</c> moves exactly this many
+    /// bytes. <c>NativeLayout</c> predicts the same number by walking fields,
+    /// because NativeAOT denies it <c>Marshal.SizeOf</c>, and the manifest the
+    /// host registers a column stride from is built from that prediction.
+    ///
+    /// If the two ever disagree the column stride is wrong and every row write
+    /// runs off the end of its slot, so the prediction is checked against the
+    /// authority here - the one place a real <c>T</c> is in scope, which keeps
+    /// the check working under NativeAOT where <c>MakeGenericMethod</c> over a
+    /// value type is not available. Every component reachable from a query row
+    /// or a deferred command resolves this class, so the check covers the
+    /// whole reachable set without a registry to keep in sync.
+    /// </remarks>
+    internal static readonly int Size = SizeCheckedAgainstManifest();
+
+    /// <summary>Return the runtime size after proving the manifest agrees.</summary>
+    private static int SizeCheckedAgainstManifest()
+    {
+        int actual = Unsafe.SizeOf<T>();
+        int describedByManifest = TracyLive.Loader.NativeLayout.SizeOf(typeof(T));
+        if (describedByManifest != actual)
+            throw new InvalidOperationException(
+                $"Component {typeof(T).FullName} is {actual} bytes to the runtime but the " +
+                $"component manifest describes {describedByManifest}. The native column would " +
+                "be strided by the manifest size, so every row write would address the wrong " +
+                "bytes. Remove StructLayout Pack, or declare an explicit Size that matches.");
+        return actual;
+    }
 }
 
 // =============================================================================
@@ -793,6 +994,8 @@ internal readonly record struct ArchetypeKey(ulong Low, ulong High);
 internal struct QueryColumn
 {
     internal QueryTermDescriptor Term;
+    /// <summary>Invocation the chunk behind this column was issued to.</summary>
+    internal uint ScopeToken;
     internal IntPtr Data;
     internal int Length;
     internal bool Present;
@@ -915,7 +1118,14 @@ public readonly unsafe ref struct QueryRow
             if (!column.Term.IsEntity && column.Term.ComponentKey == key.Low &&
                 column.Term.ComponentKeyHigh == key.High &&
                 column.Term.Access == access && column.Term.Optional == optional)
+            {
+                // Every typed accessor resolves its column here, so one check
+                // covers Read, Write, OptionalRead and OptionalWrite. Compiled
+                // out of release builds.
+                if (column.Present)
+                    Engine.ValidateChunkScope(column.ScopeToken, typeof(T).FullName ?? typeof(T).Name);
                 return column;
+            }
         }
         throw new InvalidOperationException(
             $"This query does not declare {(optional ? "optional " : "")}{access.ToString().ToLowerInvariant()} " +
@@ -1041,6 +1251,7 @@ public ref struct QueryEnumerator
                     Present = present,
                     Ticks = present ? chunk.Ticks : IntPtr.Zero,
                     ChangeTick = present ? chunk.ChangeTick : 0,
+                    ScopeToken = present ? chunk.ScopeToken : 0,
                 });
             }
 

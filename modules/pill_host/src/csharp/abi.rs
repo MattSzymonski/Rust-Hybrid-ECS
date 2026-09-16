@@ -165,6 +165,8 @@ pub(super) struct CsEngineApi {
     mirror_method_count: extern "C" fn() -> u32,
     /// Copy the mirrored-method rows into a managed-owned buffer.
     copy_mirror_methods: extern "C" fn(*mut MirrorMethodEntry, u32) -> u32,
+    /// Token of the managed invocation active on the calling thread, or zero.
+    current_scope_token: extern "C" fn() -> u32,
     /// Report the epoch of the mirror-method table.
     ///
     /// Appended last on purpose: the managed mirror struct reproduces this
@@ -196,6 +198,7 @@ impl CsEngineApi {
             queue_remove_component: ffi_queue_remove_component,
             mirror_method_count: ffi_mirror_method_count,
             copy_mirror_methods: ffi_copy_mirror_methods,
+            current_scope_token: super::context::ffi_current_scope_token,
             mirror_epoch: ffi_mirror_epoch,
         }
     }
@@ -294,6 +297,17 @@ pub(super) struct ComponentChunk {
     pub(super) ticks: *mut ComponentTicks,
     /// World tick of the last modification to this column.
     pub(super) change_tick: u32,
+    /// Token of the managed invocation this chunk was issued to.
+    ///
+    /// [`ActiveSystemGuard`](super::context::ActiveSystemGuard) stamps the
+    /// value current when the chunk was handed out; managed debug builds
+    /// compare it before dereferencing, so a chunk kept past its invocation is
+    /// a named error rather than a read of storage that has since moved.
+    ///
+    /// Free: the field lands in the four bytes of tail padding the struct
+    /// already carried on a 64-bit target, so the layout is unchanged in size
+    /// and alignment.
+    pub(super) scope_token: u32,
 }
 
 /// One reflected scheduler access, where `0` is read and `1` is write.

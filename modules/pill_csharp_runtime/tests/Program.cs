@@ -167,6 +167,22 @@ internal static class TestSystems
     }
 }
 
+/// <summary>
+/// A component whose packed layout the manifest cannot model.
+/// </summary>
+/// <remarks>
+/// `NativeLayout` computes a component's size with natural alignment, so this
+/// is 8 bytes to the manifest and 5 to the runtime. A column strided by the
+/// manifest figure would leave three bytes of every row unwritten, and the
+/// mismatch is what `ComponentTypeMetadata<T>` exists to catch.
+/// </remarks>
+[StructLayout(LayoutKind.Sequential, Pack = 1)]
+internal struct PackedProbe
+{
+    public byte Flag;
+    public float Value;
+}
+
 internal static unsafe class MockNativeWorld
 {
     internal static TestPosition* Positions;
@@ -305,6 +321,7 @@ internal static unsafe class MockNativeWorld
         MirrorMethodCount = &MirrorMethodCount,
         CopyMirrorMethods = &CopyMirrorMethods,
         MirrorEpoch = &MirrorEpoch,
+        CurrentScopeToken = &CurrentScopeToken,
     };
 
     /// <summary>
@@ -312,6 +329,19 @@ internal static unsafe class MockNativeWorld
     /// table; a test bumps it to simulate a rebind.
     /// </summary>
     internal static uint MirrorEpochValue;
+
+    /// <summary>
+    /// The invocation token the host would stamp into every chunk it issues.
+    /// </summary>
+    /// <remarks>
+    /// A test bumps this to simulate the next scheduled system invocation, so
+    /// a chunk fetched under the old value becomes exactly what a retained
+    /// chunk is in a real frame.
+    /// </remarks>
+    internal static uint ScopeTokenValue = 1;
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static uint CurrentScopeToken() => ScopeTokenValue;
 
     /// <summary>The rows <see cref="CopyMirrorMethods"/> serves.</summary>
     internal static MirrorMethodEntry[] MirroredRows = [];
@@ -421,6 +451,7 @@ internal static unsafe class MockNativeWorld
             ElementSize = checked((uint)elementSize),
             Ticks = (IntPtr)ticks,
             ChangeTick = ChangeTick,
+            ScopeToken = ScopeTokenValue,
         };
 
     /// <summary>
@@ -437,6 +468,7 @@ internal static unsafe class MockNativeWorld
         ElementSize = checked((uint)sizeof(Entity)),
         Ticks = IntPtr.Zero,
         ChangeTick = ChangeTick,
+        ScopeToken = ScopeTokenValue,
     };
 }
 
@@ -759,6 +791,75 @@ internal static class Program
                     .ToInt32(), 40, "NativeComponentChunk.Ticks offset mismatch");
                 Equal(Marshal.OffsetOf<NativeComponentChunk>(nameof(NativeComponentChunk.ChangeTick))
                     .ToInt32(), 48, "NativeComponentChunk.ChangeTick offset mismatch");
+                // The scope token rides in padding the struct already carried,
+                // which is what makes the retention guard free; if this offset
+                // ever moves past 52 the field stopped being free.
+                Equal(Marshal.OffsetOf<NativeComponentChunk>(nameof(NativeComponentChunk.ScopeToken))
+                    .ToInt32(), 52, "NativeComponentChunk.ScopeToken offset mismatch");
+            });
+
+            Test("a chunk issued to an earlier invocation is refused", () =>
+            {
+                // The host stamps every chunk with the invocation that asked
+                // for it. Bumping the mock's token between the fetch and the
+                // access is exactly what a retained chunk sees in a real
+                // frame: the storage behind it may have moved, been freed, or
+                // been unloaded with its module.
+                TestPosition* positions = stackalloc TestPosition[1];
+                NativeComponentTicks* ticks = stackalloc NativeComponentTicks[1];
+                MockNativeWorld.Positions = positions;
+                MockNativeWorld.PositionTicks = ticks;
+                MockNativeWorld.Length = 1;
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+
+                MockNativeWorld.ScopeTokenValue = 1;
+                var enumerator = new Query<Write<TestPosition>>().GetEnumerator();
+                Assert(enumerator.MoveNext(), "the query must yield a row");
+
+                MockNativeWorld.ScopeTokenValue = 2;
+                bool refused = false;
+                try
+                {
+                    enumerator.Current.Write<TestPosition>().X = 1.0f;
+                }
+                catch (InvalidOperationException)
+                {
+                    refused = true;
+                }
+#if DEBUG
+                Assert(refused, "a chunk from a finished invocation must be refused");
+#else
+                // Compiled out of release builds on purpose: validating every
+                // row access would cost the data plane the property that makes
+                // it worth having. Asserting the absence keeps the posture
+                // deliberate rather than accidental.
+                Assert(!refused, "the retention guard must not survive into a release build");
+#endif
+
+                // The guard must not fire on the ordinary path, which is the
+                // half of the contract the rejection alone cannot prove.
+                MockNativeWorld.ScopeTokenValue = 3;
+                var current = new Query<Write<TestPosition>>().GetEnumerator();
+                Assert(current.MoveNext(), "the query must yield a row");
+                current.Current.Write<TestPosition>().X = 2.0f;
+                Equal(positions[0].X, 2.0f, "a chunk used inside its own invocation must work");
+
+                MockNativeWorld.ScopeTokenValue = 1;
+                MockNativeWorld.Positions = null;
+                MockNativeWorld.PositionTicks = null;
+                MockNativeWorld.Length = 0;
+            });
+
+            Test("a component whose manifest size disagrees with the runtime is refused", () =>
+            {
+                // ComponentTypeMetadata<T> is where the manifest's predicted
+                // layout meets the runtime's own size. A packed struct is the
+                // reachable case: NativeLayout computes it with natural
+                // alignment, so the column stride and the row write disagree.
+                Throws<TypeInitializationException>(
+                    () => Engine.ComponentSizeOf<PackedProbe>(),
+                    "a packed component must be refused rather than strided wrongly");
             });
 
             Test("single-term query reports one write", () =>
@@ -1332,7 +1433,7 @@ internal static class Program
                     &MockNativeWorld.AccessorView;
                 MirrorMethods.Register("TracyLive.Probe", "entries_view", first);
                 int generation = MirrorMethods.Generation;
-                Equal(MirrorMethods.Address("TracyLive.Probe", "entries_view"), first,
+                Equal(MirrorMethods.Address("TracyLive.Probe", "entries_view").Address, first,
                     "a registered address did not resolve");
 
                 // Step 2: an op the module never published is refused with the
@@ -1349,7 +1450,7 @@ internal static class Program
                 MirrorMethods.Register("TracyLive.Probe", "entries_view", second);
                 Equal(MirrorMethods.Generation, generation + 1,
                     "a rebind must bump the generation");
-                Equal(MirrorMethods.Address("TracyLive.Probe", "entries_view"), second,
+                Equal(MirrorMethods.Address("TracyLive.Probe", "entries_view").Address, second,
                     "the rebind's address did not replace the previous one");
                 Assert(second != first, "the two test trampolines must differ");
             });
@@ -1376,37 +1477,37 @@ internal static class Program
                     (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, IntPtr, IntPtr, byte>)
                         &MockNativeWorld.AccessorUtf8Write);
 
+                RowPointer row = new RowPointer((IntPtr)32);
+                byte[] payload = new byte[] { 1, 2, 3 };
+
                 byte status = MirrorMethods.InvokeView(
                     MirrorMethods.Address("TracyLive.Probe", "entries_view"),
-                    (IntPtr)32, out IntPtr data, out IntPtr length);
+                    row, out BufferView view);
                 Equal(status, (byte)0, "view status");
-                Equal(data, (IntPtr)64, "view data");
-                Equal(length, (IntPtr)5, "view length");
+                Equal(view.Data, (IntPtr)64, "view data");
+                Equal(view.Length, 5, "view length");
 
                 byte resized = MirrorMethods.InvokeResize(
-                    MirrorMethods.Address("TracyLive.Probe", "entries_resize"),
-                    (IntPtr)32, (IntPtr)7);
+                    MirrorMethods.Address("TracyLive.Probe", "entries_resize"), row, 7);
                 Equal(resized, (byte)0, "resize status with the matching count");
                 byte refused = MirrorMethods.InvokeResize(
-                    MirrorMethods.Address("TracyLive.Probe", "entries_resize"),
-                    (IntPtr)32, (IntPtr)8);
+                    MirrorMethods.Address("TracyLive.Probe", "entries_resize"), row, 8);
                 Equal(refused, (byte)1, "resize status with a mismatched count");
 
                 byte item = MirrorMethods.InvokeItem(
                     MirrorMethods.Address("TracyLive.Probe", "entries_item"),
-                    (IntPtr)32, (IntPtr)4, out IntPtr itemData, out IntPtr itemLength);
+                    row, 4, out BufferView itemView);
                 Equal(item, (byte)2, "item status");
-                Equal(itemData, (IntPtr)40, "item data");
-                Equal(itemLength, (IntPtr)5, "item length");
+                Equal(itemView.Data, (IntPtr)40, "item data");
+                Equal(itemView.Length, 5, "item length");
 
                 byte setItem = MirrorMethods.InvokeSetItem(
                     MirrorMethods.Address("TracyLive.Probe", "entries_set_item"),
-                    (IntPtr)32, (IntPtr)4, (IntPtr)0x1000, (IntPtr)3);
+                    row, 4, payload);
                 Equal(setItem, (byte)0, "set_item status");
 
                 byte written = MirrorMethods.InvokeUtf8Write(
-                    MirrorMethods.Address("TracyLive.Probe", "entries_push"),
-                    (IntPtr)32, (IntPtr)0x1000, (IntPtr)3);
+                    MirrorMethods.Address("TracyLive.Probe", "entries_push"), row, payload);
                 Equal(written, (byte)0, "utf8 write status");
             });
 
@@ -1866,7 +1967,7 @@ internal static class Program
 
         // Mirror what a generated member caches between binds, then time the
         // call alone and the call plus the element walk.
-        IntPtr address = MirrorMethods.Address("Bench.Probe", "elements_view");
+        MirrorTrampoline address = MirrorMethods.Address("Bench.Probe", "elements_view");
         int boundGeneration = MirrorMethods.Generation;
         float callSink = 0;
         void CallOnly()
@@ -1876,8 +1977,8 @@ internal static class Program
                 address = MirrorMethods.Address("Bench.Probe", "elements_view");
                 boundGeneration = MirrorMethods.Generation;
             }
-            MirrorMethods.InvokeView(address, (IntPtr)1, out IntPtr _, out IntPtr length);
-            callSink += length;
+            MirrorMethods.InvokeView(address, new RowPointer((IntPtr)1), out BufferView view);
+            callSink += view.Length;
         }
 
         float walkSink = 0;
@@ -1888,8 +1989,8 @@ internal static class Program
                 address = MirrorMethods.Address("Bench.Probe", "elements_view");
                 boundGeneration = MirrorMethods.Generation;
             }
-            MirrorMethods.InvokeView(address, (IntPtr)1, out IntPtr data, out IntPtr length);
-            ReadOnlySpan<float> span = ComponentViews.AsReadOnlySpan<float>(data, checked((int)length));
+            MirrorMethods.InvokeView(address, new RowPointer((IntPtr)1), out BufferView view);
+            ReadOnlySpan<float> span = ComponentViews.AsReadOnlySpan<float>(view);
             float sum = 0;
             for (int element = 0; element < span.Length; element++)
                 sum += span[element];
@@ -1906,8 +2007,8 @@ internal static class Program
                 address = MirrorMethods.Address("Bench.Probe", "elements_view");
                 boundGeneration = MirrorMethods.Generation;
             }
-            MirrorMethods.InvokeView(address, (IntPtr)1, out IntPtr data, out IntPtr length);
-            ReadOnlySpan<float> span = ComponentViews.AsReadOnlySpan<float>(data, checked((int)length));
+            MirrorMethods.InvokeView(address, new RowPointer((IntPtr)1), out BufferView view);
+            ReadOnlySpan<float> span = ComponentViews.AsReadOnlySpan<float>(view);
             float sum = 0;
             foreach (ref readonly float element in span)
                 sum += element;

@@ -58,6 +58,12 @@ public unsafe struct EngineApi
     public delegate* unmanaged[Cdecl]<MirrorMethodEntry*, uint, uint> CopyMirrorMethods;
 
     /// <summary>
+    /// Token of the managed invocation active on the calling thread, or zero
+    /// when no scheduled system is running on it.
+    /// </summary>
+    public delegate* unmanaged[Cdecl]<uint> CurrentScopeToken;
+
+    /// <summary>
     /// Epoch of the mirrored-method table: bumped every time the host
     /// republishes it, so managed code can notice a rebind without waiting for
     /// the assembly swap that would normally carry one.
@@ -129,6 +135,18 @@ public struct NativeComponentChunk
 
     /// <summary>World change tick current at managed system execution.</summary>
     internal uint ChangeTick;
+
+    /// <summary>
+    /// Token of the managed invocation this chunk was issued to.
+    /// </summary>
+    /// <remarks>
+    /// Compared against the live token before the chunk is dereferenced in a
+    /// debug build, so a chunk kept past the call that produced it is a named
+    /// error instead of a read of storage that has since moved. Declared last
+    /// to match the Rust struct, where it lands in tail padding the layout
+    /// already carried and therefore costs no bytes.
+    /// </remarks>
+    internal uint ScopeToken;
 }
 
 /// <summary>ABI mirror of Rust's per-component change-detection metadata.</summary>

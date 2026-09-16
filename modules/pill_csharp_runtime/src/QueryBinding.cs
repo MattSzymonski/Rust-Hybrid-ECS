@@ -19,6 +19,7 @@
 //   change tick.
 
 using System.Diagnostics.CodeAnalysis;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 
 namespace TracyLive;
@@ -144,16 +145,39 @@ public readonly unsafe ref struct QueryRow<T1, T2, T3, T4, T5, T6, T7, T8>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private ref QueryColumn Slot(int index) => ref Unsafe.Add(ref _columns, index);
 
+    /// <summary>
+    /// Reject a column whose chunk belongs to an earlier invocation.
+    /// </summary>
+    /// <remarks>
+    /// The typed row is the hot path, so this is
+    /// <see cref="ConditionalAttribute"/> on DEBUG and the call disappears
+    /// entirely from a release build - the same posture Unity takes with its
+    /// job safety system. In a debug build it turns a read of storage that has
+    /// since moved into a named error.
+    /// </remarks>
+    [Conditional("DEBUG")]
+    private static void ValidateScope(ref QueryColumn column)
+    {
+        if (column.Present)
+            Engine.ValidateChunkScope(
+                column.ScopeToken, column.Term.ComponentType?.FullName ?? "entity");
+    }
+
     /// <summary>Read-only reference into a required slot's row.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private ref readonly T ReadFrom<T>(int index) where T : unmanaged
-        => ref ((T*)Slot(index).Data)[_row];
+    {
+        ref QueryColumn column = ref Slot(index);
+        ValidateScope(ref column);
+        return ref ((T*)column.Data)[_row];
+    }
 
     /// <summary>Writable reference into a required slot's row, marking it changed.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private ref T WriteFrom<T>(int index) where T : unmanaged
     {
         ref QueryColumn column = ref Slot(index);
+        ValidateScope(ref column);
         MarkChanged(ref column);
         return ref ((T*)column.Data)[_row];
     }
@@ -162,6 +186,7 @@ public readonly unsafe ref struct QueryRow<T1, T2, T3, T4, T5, T6, T7, T8>
     private OptionalReadRef<T> OptionalReadFrom<T>(int index) where T : unmanaged
     {
         ref QueryColumn column = ref Slot(index);
+        ValidateScope(ref column);
         return new OptionalReadRef<T>(column.Present ? &((T*)column.Data)[_row] : null);
     }
 
@@ -169,6 +194,7 @@ public readonly unsafe ref struct QueryRow<T1, T2, T3, T4, T5, T6, T7, T8>
     private OptionalWriteRef<T> OptionalWriteFrom<T>(int index) where T : unmanaged
     {
         ref QueryColumn column = ref Slot(index);
+        ValidateScope(ref column);
         return new OptionalWriteRef<T>(
             column.Present ? &((T*)column.Data)[_row] : null,
             column.Present ? &((NativeComponentTicks*)column.Ticks)[_row] : null,

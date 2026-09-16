@@ -137,8 +137,16 @@ public static class BridgeProbeStartup
 /// <summary>Reads the module's spline column and writes one of its own.</summary>
 public static class ModuleSplineBridgeDemo
 {
+    // PILL0301 warns that mutable statics in a system-declaring type are what a
+    // parallel batch races on and what a reload resets. Both statics here are
+    // touched by this one system only, so nothing races, and the reset is the
+    // behaviour the probe depends on (see the note above BRIDGE_PROBE_SOURCE).
+    // Suppressed locally rather than project-wide: when managed systems can
+    // reach engine resources, this state moves there and the pragma goes.
+#pragma warning disable PILL0301
     private static bool _seeded;
     private static long _lastReport;
+#pragma warning restore PILL0301
 
     [EcsSystem]
     public static void Run(Query<Read<global::pill_spline.Spline>> query, Commands commands)
@@ -438,7 +446,7 @@ def verify_startup(
             "[FieldOffset(4)] public float Y;",
             "[FieldOffset(8)] public float Z;",
             "public ulong GetSum()",
-            "public delegate ulong OmoMOGetSumDelegate(IntPtr self);",
+            "public delegate ulong OmoMOGetSumDelegate(global::TracyLive.RowPointer self);",
             "global::TracyLive.MirrorMethods.Resolve<OmoMOGetSumDelegate>(\"pill_spline::OmoMO\", \"get_sum\")",
             "public ulong GetA()",
             "MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1))",
@@ -951,7 +959,7 @@ def verify_codegen_rebuild() -> bool:
                 "[FieldOffset(196)] public float Elo;",
                 "[StructLayout(LayoutKind.Explicit, Size = 16)]\npublic struct OmoMO",
                 "public ulong GetSum()",
-                "public delegate ulong OmoMOGetSumDelegate(IntPtr self);",
+                "public delegate ulong OmoMOGetSumDelegate(global::TracyLive.RowPointer self);",
             ],
             should_exist=True,
             description="regenerated pill_spline mirror",

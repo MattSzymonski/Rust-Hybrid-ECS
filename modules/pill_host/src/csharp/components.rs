@@ -40,6 +40,7 @@ use trait_type_map::TraitAccessible;
 
 // Current crate
 use super::abi::ComponentChunk;
+use super::context::active_scope_token;
 
 // =============================================================================
 // Constants
@@ -281,6 +282,7 @@ fn get_component_chunk<T: Component + TraitAccessible<dyn Component>>(
     output: *mut ComponentChunk,
 ) -> u8 {
     let change_tick = world.change_tick().get();
+    let scope_token = active_scope_token();
     let Some((archetype, slice, ticks)) =
         world.component_chunk_with_ticks_mut::<T>(chunk_index as usize)
     else {
@@ -302,6 +304,7 @@ fn get_component_chunk<T: Component + TraitAccessible<dyn Component>>(
             element_size: std::mem::size_of::<T>() as u32,
             ticks: ticks.as_mut_ptr(),
             change_tick,
+            scope_token,
         });
     }
     1
@@ -319,6 +322,7 @@ fn get_component_chunk_in_archetype<T: Component + TraitAccessible<dyn Component
     output: *mut ComponentChunk,
 ) -> u8 {
     let change_tick = world.change_tick().get();
+    let scope_token = active_scope_token();
     let Some((archetype, slice, ticks)) =
         world.component_chunk_with_ticks_mut_in_archetype::<T>(archetype_id)
     else {
@@ -340,6 +344,7 @@ fn get_component_chunk_in_archetype<T: Component + TraitAccessible<dyn Component
             element_size: std::mem::size_of::<T>() as u32,
             ticks: ticks.as_mut_ptr(),
             change_tick,
+            scope_token,
         });
     }
     1

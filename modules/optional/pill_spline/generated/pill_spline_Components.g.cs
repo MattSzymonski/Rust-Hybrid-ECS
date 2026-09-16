@@ -41,7 +41,7 @@ public struct OmoMO
     /// generated C-ABI trampoline, handing it the receiver's live
     /// address without boxing or pinning it.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate ulong OmoMOGetADelegate(IntPtr self);
+    public delegate ulong OmoMOGetADelegate(global::TracyLive.RowPointer self);
 
     public ulong GetA()
     {
@@ -53,7 +53,7 @@ public struct OmoMO
     /// generated C-ABI trampoline, handing it the receiver's live
     /// address without boxing or pinning it.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate ulong OmoMOGetBDelegate(IntPtr self);
+    public delegate ulong OmoMOGetBDelegate(global::TracyLive.RowPointer self);
 
     public ulong GetB()
     {
@@ -65,7 +65,7 @@ public struct OmoMO
     /// generated C-ABI trampoline, handing it the receiver's live
     /// address without boxing or pinning it.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate ulong OmoMOGetCDelegate(IntPtr self);
+    public delegate ulong OmoMOGetCDelegate(global::TracyLive.RowPointer self);
 
     public ulong GetC()
     {
@@ -77,7 +77,7 @@ public struct OmoMO
     /// generated C-ABI trampoline, handing it the receiver's live
     /// address without boxing or pinning it.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate int OmoMOGetDDelegate(IntPtr self, int alpha, int beta);
+    public delegate int OmoMOGetDDelegate(global::TracyLive.RowPointer self, int alpha, int beta);
 
     public int GetD(int alpha, int beta)
     {
@@ -89,7 +89,7 @@ public struct OmoMO
     /// generated C-ABI trampoline, handing it the receiver's live
     /// address without boxing or pinning it.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate ulong OmoMOGetSumDelegate(IntPtr self);
+    public delegate ulong OmoMOGetSumDelegate(global::TracyLive.RowPointer self);
 
     public ulong GetSum()
     {
@@ -132,7 +132,7 @@ public struct Spline
     /// generated C-ABI trampoline, handing it the receiver's live
     /// address without boxing or pinning it.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate float SplineGetLocationXDelegate(IntPtr self, float t);
+    public delegate float SplineGetLocationXDelegate(global::TracyLive.RowPointer self, float t);
 
     public float GetLocationX(float t)
     {
@@ -144,7 +144,7 @@ public struct Spline
     /// generated C-ABI trampoline, handing it the receiver's live
     /// address without boxing or pinning it.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate float SplineGetLocationYDelegate(IntPtr self, float t);
+    public delegate float SplineGetLocationYDelegate(global::TracyLive.RowPointer self, float t);
 
     public float GetLocationY(float t)
     {
@@ -156,7 +156,7 @@ public struct Spline
     /// generated C-ABI trampoline, handing it the receiver's live
     /// address without boxing or pinning it.
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-    public delegate byte SplineSetControlPointLocationDelegate(IntPtr self, uint index, float x, float y);
+    public delegate byte SplineSetControlPointLocationDelegate(global::TracyLive.RowPointer self, uint index, float x, float y);
 
     public byte SetControlPointLocation(uint index, float x, float y)
     {

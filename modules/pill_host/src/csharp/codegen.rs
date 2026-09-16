@@ -745,9 +745,9 @@ fn emit_value_type_methods(
             .map(|(cs_type, arg_name)| format!("{cs_type} {arg_name}"))
             .collect();
         let delegate_args = if typed_arguments.is_empty() {
-            "IntPtr self".to_string()
+            "global::TracyLive.RowPointer self".to_string()
         } else {
-            format!("IntPtr self, {}", typed_arguments.join(", "))
+            format!("global::TracyLive.RowPointer self, {}", typed_arguments.join(", "))
         };
         // The receiver crosses as its live address: `AddressOf` turns the
         // `ref` into a pointer inside the runtime, so the call needs neither
@@ -918,11 +918,11 @@ fn emit_heap_field_accessors(
             let set_item_address = format!("_{camel}SetItemAddress");
             let push_address = format!("_{camel}PushAddress");
             let resize_address = format!("_{camel}ResizeAddress");
-            bound_declarations.push(format!("    private static IntPtr {view_address};"));
-            bound_declarations.push(format!("    private static IntPtr {item_address};"));
-            bound_declarations.push(format!("    private static IntPtr {set_item_address};"));
-            bound_declarations.push(format!("    private static IntPtr {push_address};"));
-            bound_declarations.push(format!("    private static IntPtr {resize_address};"));
+            bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {view_address};"));
+            bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {item_address};"));
+            bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {set_item_address};"));
+            bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {push_address};"));
+            bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {resize_address};"));
             bound_assignments.push(format!(
                 "        {view_address} = global::TracyLive.MirrorMethods.Address(\"{type_name}\", \"{view_operation}\");"
             ));
@@ -946,8 +946,8 @@ fn emit_heap_field_accessors(
         get
         {{
             EnsureAccessorsBound();
-            global::TracyLive.MirrorMethods.InvokeView({view_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out _, out IntPtr length);
-            return checked((int)length);
+            global::TracyLive.MirrorMethods.InvokeView({view_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out global::TracyLive.BufferView view);
+            return view.Length;
         }}
     }}
 
@@ -956,10 +956,10 @@ fn emit_heap_field_accessors(
     public readonly string Get{pascal}(int index)
     {{
         EnsureAccessorsBound();
-        byte status = global::TracyLive.MirrorMethods.InvokeItem({item_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), (IntPtr)index, out IntPtr data, out IntPtr length);
+        byte status = global::TracyLive.MirrorMethods.InvokeItem({item_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), index, out global::TracyLive.BufferView view);
         if (status != 0)
             throw new global::System.ArgumentOutOfRangeException(nameof(index), "the element is not reachable (the row is dead or the index is out of range)");
-        return global::System.Runtime.InteropServices.Marshal.PtrToStringUTF8(data, checked((int)length)) ?? string.Empty;
+        return global::TracyLive.ComponentViews.ToUtf8String(view);
     }}
 "#,
                 field = field.name,
@@ -974,17 +974,9 @@ fn emit_heap_field_accessors(
         public void Set{pascal}(int index, string value)
         {{
             byte[] utf8 = global::System.Text.Encoding.UTF8.GetBytes(value);
-            global::System.Runtime.InteropServices.GCHandle handle = global::System.Runtime.InteropServices.GCHandle.Alloc(utf8, global::System.Runtime.InteropServices.GCHandleType.Pinned);
-            try
-            {{
-                byte status = global::TracyLive.MirrorMethods.InvokeSetItem({set_item_address}, _row, (IntPtr)index, handle.AddrOfPinnedObject(), (IntPtr)utf8.Length);
-                if (status != 0)
-                    throw new global::System.ArgumentOutOfRangeException(nameof(index), "the element is not reachable (the row is dead or the index is out of range)");
-            }}
-            finally
-            {{
-                handle.Free();
-            }}
+            byte status = global::TracyLive.MirrorMethods.InvokeSetItem({set_item_address}, _row, index, utf8);
+            if (status != 0)
+                throw new global::System.ArgumentOutOfRangeException(nameof(index), "the element is not reachable (the row is dead or the index is out of range)");
         }}
 
         /// Append `value` to `{field}` as a new last element.
@@ -992,22 +984,14 @@ fn emit_heap_field_accessors(
         public void Push{pascal}(string value)
         {{
             byte[] utf8 = global::System.Text.Encoding.UTF8.GetBytes(value);
-            global::System.Runtime.InteropServices.GCHandle handle = global::System.Runtime.InteropServices.GCHandle.Alloc(utf8, global::System.Runtime.InteropServices.GCHandleType.Pinned);
-            try
-            {{
-                global::TracyLive.MirrorMethods.InvokeUtf8Write({push_address}, _row, handle.AddrOfPinnedObject(), (IntPtr)utf8.Length);
-            }}
-            finally
-            {{
-                handle.Free();
-            }}
+            global::TracyLive.MirrorMethods.InvokeUtf8Write({push_address}, _row, utf8);
         }}
 
         /// Resize `{field}` to `count` elements; new elements are empty strings.
         /// Mutating member: reach it through `{cs_name}RowRef.Bind`.
         public void Resize{pascal}(int count)
         {{
-            global::TracyLive.MirrorMethods.InvokeResize({resize_address}, _row, (IntPtr)count);
+            global::TracyLive.MirrorMethods.InvokeResize({resize_address}, _row, count);
         }}
 "#,
                 field = field.name,
@@ -1046,7 +1030,7 @@ fn emit_heap_field_accessors(
             let resize_operation =
                 crate::csharp::accessor_operation_name(&accessor.field_name, "resize");
             let resize_address = format!("_{camel}ResizeAddress");
-            bound_declarations.push(format!("    private static IntPtr {resize_address};"));
+            bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {resize_address};"));
             bound_assignments.push(format!(
                 "        {resize_address} = global::TracyLive.MirrorMethods.Address(\"{type_name}\", \"{resize_operation}\");"
             ));
@@ -1058,11 +1042,11 @@ fn emit_heap_field_accessors(
 
     /// Read-only lease over the engine-owned `{field}` buffer; a resize retires the block.
     public readonly ReadOnlySpan<{element_type}> {pascal} =>
-        global::TracyLive.ComponentViews.AsReadOnlySpan<{element_type}>((IntPtr){pascal}Ptr, {pascal}Count);
+        global::TracyLive.ComponentViews.OverDynamicBufferReadOnly<{element_type}>({pascal}Ptr, {pascal}Count);
 
     /// Writable lease over `{field}`: write elements in place, then resize to grow or shrink.
     public Span<{element_type}> {pascal}Mut =>
-        global::TracyLive.ComponentViews.AsSpan<{element_type}>((IntPtr){pascal}Ptr, {pascal}Count);
+        global::TracyLive.ComponentViews.OverDynamicBuffer<{element_type}>({pascal}Ptr, {pascal}Count);
 "#,
                 field = field.name,
                 pascal = pascal,
@@ -1076,7 +1060,7 @@ fn emit_heap_field_accessors(
         /// Mutating member: reach it through `{cs_name}RowRef.Bind`.
         public void Resize{pascal}(int count)
         {{
-            global::TracyLive.MirrorMethods.InvokeResize({resize_address}, _row, (IntPtr)count);
+            global::TracyLive.MirrorMethods.InvokeResize({resize_address}, _row, count);
         }}
 "#,
                 field = field.name,
@@ -1122,8 +1106,8 @@ fn emit_heap_field_accessors(
                 crate::csharp::accessor_operation_name(&accessor.field_name, "resize");
             let view_address = format!("_{camel}ViewAddress");
             let resize_address = format!("_{camel}ResizeAddress");
-            bound_declarations.push(format!("    private static IntPtr {view_address};"));
-            bound_declarations.push(format!("    private static IntPtr {resize_address};"));
+            bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {view_address};"));
+            bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {resize_address};"));
             bound_assignments.push(format!(
                 "        {view_address} = global::TracyLive.MirrorMethods.Address(\"{type_name}\", \"{view_operation}\");"
             ));
@@ -1138,8 +1122,8 @@ fn emit_heap_field_accessors(
         get
         {{
             EnsureAccessorsBound();
-            global::TracyLive.MirrorMethods.InvokeView({view_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out _, out IntPtr length);
-            return checked((int)length);
+            global::TracyLive.MirrorMethods.InvokeView({view_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out global::TracyLive.BufferView view);
+            return view.Length;
         }}
     }}
 
@@ -1149,8 +1133,8 @@ fn emit_heap_field_accessors(
         get
         {{
             EnsureAccessorsBound();
-            global::TracyLive.MirrorMethods.InvokeView({view_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out IntPtr data, out IntPtr length);
-            return global::TracyLive.ComponentViews.AsReadOnlySpan<{element_type}>(data, checked((int)length));
+            global::TracyLive.MirrorMethods.InvokeView({view_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out global::TracyLive.BufferView view);
+            return global::TracyLive.ComponentViews.AsReadOnlySpan<{element_type}>(view);
         }}
     }}
 
@@ -1160,8 +1144,8 @@ fn emit_heap_field_accessors(
         get
         {{
             EnsureAccessorsBound();
-            global::TracyLive.MirrorMethods.InvokeView({view_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out IntPtr data, out IntPtr length);
-            return global::TracyLive.ComponentViews.AsSpan<{element_type}>(data, checked((int)length));
+            global::TracyLive.MirrorMethods.InvokeView({view_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out global::TracyLive.BufferView view);
+            return global::TracyLive.ComponentViews.AsSpan<{element_type}>(view);
         }}
     }}
 "#,
@@ -1177,7 +1161,7 @@ fn emit_heap_field_accessors(
         /// Mutating member: reach it through `{cs_name}RowRef.Bind`.
         public void Resize{pascal}(int count)
         {{
-            global::TracyLive.MirrorMethods.InvokeResize({resize_address}, _row, (IntPtr)count);
+            global::TracyLive.MirrorMethods.InvokeResize({resize_address}, _row, count);
         }}
 "#,
                 field = field.name,
@@ -1199,8 +1183,8 @@ fn emit_heap_field_accessors(
         let set_operation = crate::csharp::accessor_operation_name(&accessor.field_name, "set");
         let view_address = format!("_{camel}ViewAddress");
         let set_address = format!("_{camel}SetAddress");
-        bound_declarations.push(format!("    private static IntPtr {view_address};"));
-        bound_declarations.push(format!("    private static IntPtr {set_address};"));
+        bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {view_address};"));
+        bound_declarations.push(format!("    private static global::TracyLive.MirrorTrampoline {set_address};"));
         bound_assignments.push(format!(
             "        {view_address} = global::TracyLive.MirrorMethods.Address(\"{type_name}\", \"{view_operation}\");"
         ));
@@ -1213,8 +1197,8 @@ fn emit_heap_field_accessors(
     public readonly string Get{pascal}()
     {{
         EnsureAccessorsBound();
-        global::TracyLive.MirrorMethods.InvokeView({view_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out IntPtr data, out IntPtr length);
-        return global::System.Runtime.InteropServices.Marshal.PtrToStringUTF8(data, checked((int)length)) ?? string.Empty;
+        global::TracyLive.MirrorMethods.InvokeView({view_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out global::TracyLive.BufferView view);
+        return global::TracyLive.ComponentViews.ToUtf8String(view);
     }}
 "#,
             field = field.name,
@@ -1228,15 +1212,7 @@ fn emit_heap_field_accessors(
         public void Set{pascal}(string value)
         {{
             byte[] utf8 = global::System.Text.Encoding.UTF8.GetBytes(value);
-            global::System.Runtime.InteropServices.GCHandle handle = global::System.Runtime.InteropServices.GCHandle.Alloc(utf8, global::System.Runtime.InteropServices.GCHandleType.Pinned);
-            try
-            {{
-                global::TracyLive.MirrorMethods.InvokeUtf8Write({set_address}, _row, handle.AddrOfPinnedObject(), (IntPtr)utf8.Length);
-            }}
-            finally
-            {{
-                handle.Free();
-            }}
+            global::TracyLive.MirrorMethods.InvokeUtf8Write({set_address}, _row, utf8);
         }}
 "#,
             field = field.name,
@@ -1289,7 +1265,7 @@ fn emit_heap_field_accessors(
     public ref struct {cs_name}RowRef
     {{
         /// Address of the live row this handle was bound to.
-        private IntPtr _row;
+        private global::TracyLive.RowPointer _row;
 
         /// Bind to the live row `row` refers to.
         ///
@@ -2144,7 +2120,7 @@ mod tests {
         let content = read_generated(&workspace, "pill_spline");
         // Instance method + delegate, PascalCased, resolving by Rust names.
         assert!(content.contains("public ulong GetSum()"));
-        assert!(content.contains("public delegate ulong OmoMOGetSumDelegate(IntPtr self);"));
+        assert!(content.contains("public delegate ulong OmoMOGetSumDelegate(global::TracyLive.RowPointer self);"));
         assert!(content.contains(
             "global::TracyLive.MirrorMethods.Resolve<OmoMOGetSumDelegate>(\"pill_spline::OmoMO\", \"get_sum\")"
         ));
@@ -2152,7 +2128,7 @@ mod tests {
         // the delegate and the instance method, which forwards them by value.
         assert!(content.contains("public uint Add(uint amount, float scale)"));
         assert!(content.contains(
-            "public delegate uint OmoMOAddDelegate(IntPtr self, uint amount, float scale);"
+            "public delegate uint OmoMOAddDelegate(global::TracyLive.RowPointer self, uint amount, float scale);"
         ));
         assert!(content.contains(
             "return mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), amount, scale);"
@@ -2239,7 +2215,7 @@ mod tests {
         let content = read_generated(&workspace, "pill_spline");
         assert!(content.contains("public void Reset(ulong countdown)"));
         assert!(content
-            .contains("public delegate void OmoMOResetDelegate(IntPtr self, ulong countdown);"));
+            .contains("public delegate void OmoMOResetDelegate(global::TracyLive.RowPointer self, ulong countdown);"));
         assert!(content.contains(
             "mirror(global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), countdown);"
         ));
@@ -2399,7 +2375,7 @@ mod tests {
             "_pointsResizeAddress = global::TracyLive.MirrorMethods.Address(\"pill_spline::Trail\", \"points_resize\");"
         ));
         assert!(content.contains(
-            "global::TracyLive.MirrorMethods.InvokeView(_pointsViewAddress, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out IntPtr data, out IntPtr length);"
+            "global::TracyLive.MirrorMethods.InvokeView(_pointsViewAddress, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out global::TracyLive.BufferView view);"
         ));
         // The member path is raw function pointers now: no delegate types and
         // no marshalling layer, and the bind check costs one int compare.
@@ -2410,14 +2386,14 @@ mod tests {
         assert!(content
             .contains("global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this))"));
         assert!(content.contains(
-            "global::TracyLive.ComponentViews.AsSpan<float>(data, checked((int)length))"
+            "global::TracyLive.ComponentViews.AsSpan<float>(view)"
         ));
         // The header-mutating member lives on the row-ref handle and addresses
         // the bound row, never the struct the caller is holding.
         assert!(content.contains("public ref struct TrailRowRef"));
         assert!(content.contains("public static TrailRowRef Bind(ref Trail row)"));
         assert!(content.contains(
-            "global::TracyLive.MirrorMethods.InvokeResize(_pointsResizeAddress, _row, (IntPtr)count);"
+            "global::TracyLive.MirrorMethods.InvokeResize(_pointsResizeAddress, _row, count);"
         ));
         assert!(
             !content.contains(
@@ -2474,14 +2450,14 @@ mod tests {
         );
         // Each field keeps its own address slots, so the shared resolver
         // cannot mix up two containers of the same kind.
-        assert!(content.contains("private static IntPtr _pointsViewAddress;"));
-        assert!(content.contains("private static IntPtr _nameViewAddress;"));
-        assert!(content.contains("private static IntPtr _nameSetAddress;"));
-        assert!(content.contains("private static IntPtr _pointsResizeAddress;"));
+        assert!(content.contains("private static global::TracyLive.MirrorTrampoline _pointsViewAddress;"));
+        assert!(content.contains("private static global::TracyLive.MirrorTrampoline _nameViewAddress;"));
+        assert!(content.contains("private static global::TracyLive.MirrorTrampoline _nameSetAddress;"));
+        assert!(content.contains("private static global::TracyLive.MirrorTrampoline _pointsResizeAddress;"));
     }
 
-    /// A `string` field emits a UTF-8 getter and setter, with the setter
-    /// pinning its encoded bytes for the trampoline call.
+    /// A `string` field emits a UTF-8 getter and setter; the setter hands
+    /// its encoded bytes across as a span rather than pinning them itself.
     #[test]
     fn heap_string_field_emits_text_accessors() {
         let workspace = temp_workspace("heap_string", "pill_spline");
@@ -2514,9 +2490,12 @@ mod tests {
         assert!(content.contains("[FieldOffset(0)] private readonly ulong _alignmentPad;"));
         assert!(content.contains("public readonly string GetName()"));
         assert!(content.contains("public void SetName(string value)"));
-        assert!(content.contains("Marshal.PtrToStringUTF8(data, checked((int)length))"));
+        assert!(content.contains("global::TracyLive.ComponentViews.ToUtf8String(view)"));
+        // The payload crosses as a span; the runtime helper pins it with
+        // `fixed` for the call, so no generated GCHandle remains to leak.
+        assert!(!content.contains("GCHandle"));
         assert!(content.contains(
-            "GCHandle.Alloc(utf8, global::System.Runtime.InteropServices.GCHandleType.Pinned)"
+            "global::TracyLive.MirrorMethods.InvokeUtf8Write(_nameSetAddress, _row, utf8);"
         ));
         assert!(content.contains(
             "_nameSetAddress = global::TracyLive.MirrorMethods.Address(\"pill_spline::Label\", \"name_set\");"
@@ -2576,7 +2555,7 @@ mod tests {
 
         let content = read_generated(&workspace, "pill_spline");
         assert!(content.contains("public ref struct TrailRowRef"));
-        assert!(content.contains("private IntPtr _row;"));
+        assert!(content.contains("private global::TracyLive.RowPointer _row;"));
         assert!(content.contains("public static TrailRowRef Bind(ref Trail row)"));
         assert!(content.contains(
             "return new TrailRowRef { _row = global::TracyLive.MirrorMethods.AddressOf(ref row) };"
@@ -2652,7 +2631,7 @@ mod tests {
         );
         // Element reads decode UTF-8, and an unreachable element throws
         // instead of silently reading as an empty string.
-        assert!(content.contains("Marshal.PtrToStringUTF8(data, checked((int)length))"));
+        assert!(content.contains("global::TracyLive.ComponentViews.ToUtf8String(view)"));
         assert!(
             content.contains("throw new global::System.ArgumentOutOfRangeException(nameof(index)")
         );

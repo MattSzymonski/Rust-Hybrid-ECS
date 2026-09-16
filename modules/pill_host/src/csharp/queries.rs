@@ -28,8 +28,8 @@ use pill_engine::Entity;
 use super::abi::ComponentChunk;
 use super::components::{ComponentBinding, StableComponentId};
 use super::context::{
-    access_is_authorized, archetype_was_observed, record_observed_archetype, with_active_context,
-    with_active_world,
+    access_is_authorized, active_scope_token, archetype_was_observed, record_observed_archetype,
+    with_active_context, with_active_world,
 };
 
 // =============================================================================
@@ -91,6 +91,7 @@ pub(super) extern "C" fn ffi_get_component_chunk(
                 return 2;
             };
             let change_tick = world.change_tick().get();
+            let scope_token = active_scope_token();
             let Some((archetype, data, len, ticks)) =
                 world.dynamic_component_chunk_mut(component_id, chunk_index as usize)
             else {
@@ -114,6 +115,7 @@ pub(super) extern "C" fn ffi_get_component_chunk(
                     element_size: live_size as u32,
                     ticks: ticks.as_mut_ptr(),
                     change_tick,
+                    scope_token,
                 });
             }
             1
@@ -122,6 +124,7 @@ pub(super) extern "C" fn ffi_get_component_chunk(
             component_id, size, ..
         }) => {
             let change_tick = world.change_tick().get();
+            let scope_token = active_scope_token();
             // The native twin of the dynamic path: serve the module's native
             // column as raw bytes so managed code and Rust share one storage.
             let Some((archetype, data, len, element_size, ticks)) =
@@ -158,6 +161,7 @@ pub(super) extern "C" fn ffi_get_component_chunk(
                     element_size: element_size as u32,
                     ticks: ticks.as_mut_ptr(),
                     change_tick,
+                    scope_token,
                 });
             }
             1
@@ -225,6 +229,7 @@ pub(super) extern "C" fn ffi_get_archetype_chunk(
                     element_size: std::mem::size_of::<Entity>() as u32,
                     ticks: std::ptr::null_mut(),
                     change_tick: world.change_tick().get(),
+                    scope_token: active_scope_token(),
                 });
             }
             1
@@ -257,6 +262,7 @@ pub(super) extern "C" fn ffi_get_archetype_chunk(
                 return 2;
             };
             let change_tick = world.change_tick().get();
+            let scope_token = active_scope_token();
             let Some((archetype, data, len, ticks)) =
                 world.dynamic_component_chunk_in_archetype(component_id, archetype_id)
             else {
@@ -276,6 +282,7 @@ pub(super) extern "C" fn ffi_get_archetype_chunk(
                     element_size: live_size as u32,
                     ticks: ticks.as_mut_ptr(),
                     change_tick,
+                    scope_token,
                 });
             }
             1
@@ -284,6 +291,7 @@ pub(super) extern "C" fn ffi_get_archetype_chunk(
             component_id, size, ..
         }) => {
             let change_tick = world.change_tick().get();
+            let scope_token = active_scope_token();
             let Some((archetype, data, len, element_size, ticks)) =
                 world.native_component_chunk_in_archetype(component_id, archetype_id)
             else {
@@ -313,6 +321,7 @@ pub(super) extern "C" fn ffi_get_archetype_chunk(
                     element_size: element_size as u32,
                     ticks: ticks.as_mut_ptr(),
                     change_tick,
+                    scope_token,
                 });
             }
             1
@@ -357,6 +366,7 @@ pub(super) extern "C" fn ffi_get_entity_chunk(chunk_index: u32, output: *mut Com
                 element_size: std::mem::size_of::<Entity>() as u32,
                 ticks: std::ptr::null_mut(),
                 change_tick: world.change_tick().get(),
+                scope_token: active_scope_token(),
             });
         }
         record_observed_archetype(archetype);
