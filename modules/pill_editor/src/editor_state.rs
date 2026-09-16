@@ -384,7 +384,7 @@ impl EditorCommand {
                 // Step 1: Validate and compose every component image before
                 // touching the world, so a bad seed changes nothing.
                 let mut native: Vec<Box<dyn pill_engine::commands::ComponentAdder>> = Vec::new();
-                let mut dynamic = Vec::new();
+                let mut descriptor_components = Vec::new();
                 for seed in components {
                     // Build the image first; this validates the layout rule.
                     let bytes = engine
@@ -407,7 +407,7 @@ impl EditorCommand {
                             bytes,
                         )));
                     } else {
-                        dynamic.push((component_id, bytes));
+                        descriptor_components.push((component_id, bytes));
                     }
                 }
 
@@ -415,7 +415,7 @@ impl EditorCommand {
                 // same closure that holds the world.
                 engine.queue_deferred_commands(move |world, queue| {
                     let entity = world.reserve_entity();
-                    queue.create_mixed_entity(entity, native, dynamic);
+                    queue.create_mixed_entity(entity, native, descriptor_components);
                 });
                 engine
                     .flush_deferred_commands()
@@ -456,7 +456,7 @@ impl EditorCommand {
                             )),
                         );
                     } else {
-                        queue.add_dynamic_component_to_entity(*entity, component_id, bytes);
+                        queue.add_descriptor_component_to_entity(*entity, component_id, bytes);
                     }
                 });
                 engine

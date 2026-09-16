@@ -1119,192 +1119,6 @@ pub fn verify_abi() -> bool {
 }
 
 // =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The stand-in substitution holds on this target.
-    ///
-    /// If this ever fails, the dispatch slot is unsound here and the hot-patch
-    /// feature must not be enabled.
-    #[test]
-    fn zero_sized_stand_in_is_abi_compatible() {
-        assert!(verify_abi(), "&mut ZST is not passed like &mut () here");
-    }
-
-    /// `Input` must be inferable from the function value alone, with no
-    /// turbofish. A concrete function-item type satisfies exactly one arity of
-    /// [`SystemParamFunction`], so the solver has a unique choice - and the
-    /// `#[pill_hot]` macro relies on this, because reconstructing the parameter
-    /// tuple from syntax would have to strip patterns and guess lifetimes.
-    #[test]
-    fn input_infers_from_the_function_value_alone() {
-        fn nullary() {}
-        fn fallible() -> Result<(), crate::error::SystemError> {
-            Ok(())
-        }
-
-        assert_ne!(local_implementation_address(&nullary), 0);
-        assert_ne!(local_implementation_address(&fallible), 0);
-        assert_ne!(
-            signature_hash_of(&nullary),
-            signature_hash_of(&fallible),
-            "differing return types must produce differing signatures"
-        );
-    }
-
-    #[test]
-    fn slot_reports_its_baseline() {
-        let slot = HotSlot::new();
-        slot.initialize(0x1234, 0xABCD);
-        assert_eq!(slot.current(), 0x1234);
-        assert_eq!(slot.signature_hash(), 0xABCD);
-    }
-
-    #[test]
-    fn install_replaces_the_implementation() {
-        let slot = HotSlot::new();
-        slot.initialize(0x1000, 0xFEED);
-        assert!(slot.install("movement", 0x2000, 0xFEED).is_ok());
-        assert_eq!(slot.current(), 0x2000);
-    }
-
-    /// The gate must refuse a moved signature and leave the running code alone.
-    #[test]
-    fn install_refuses_a_signature_mismatch() {
-        let slot = HotSlot::new();
-        slot.initialize(0x1000, 0xFEED);
-
-        let error = slot.install("movement", 0x2000, 0xBEEF).unwrap_err();
-        assert_eq!(
-            error,
-            HotPatchError::SignatureMismatch {
-                name: "movement".to_string(),
-                expected: 0xFEED,
-                found: 0xBEEF,
-            }
-        );
-        assert_eq!(slot.current(), 0x1000, "refused patch must not be applied");
-    }
-
-    #[test]
-    fn install_refuses_a_null_address() {
-        let slot = HotSlot::new();
-        slot.initialize(0x1000, 0xFEED);
-        assert!(slot.install("movement", 0, 0xFEED).is_err());
-        assert_eq!(slot.current(), 0x1000);
-    }
-
-    #[test]
-    fn registry_round_trips_and_forgets() {
-        let mut registry = HotPatchRegistry::new();
-        assert!(registry.is_empty());
-
-        let slot = Arc::new(HotSlot::new());
-        slot.initialize(0x1000, 0x1);
-        registry.insert("movement", Arc::clone(&slot));
-
-        assert_eq!(registry.len(), 1);
-        assert_eq!(registry.get("movement").unwrap().current(), 0x1000);
-        assert!(registry.get("absent").is_none());
-
-        registry.remove("movement");
-        assert!(registry.get("movement").is_none());
-        assert!(registry.is_empty());
-    }
-
-    /// A slot shared with a system's closure observes installs made through the
-    /// registry - the property the whole design depends on.
-    #[test]
-    fn registry_and_closure_share_one_slot() {
-        let mut registry = HotPatchRegistry::new();
-        let slot = Arc::new(HotSlot::new());
-        slot.initialize(0x1000, 0x7);
-        registry.insert("movement", Arc::clone(&slot));
-
-        registry
-            .get("movement")
-            .unwrap()
-            .install("movement", 0x2000, 0x7)
-            .expect("install");
-
-        assert_eq!(slot.current(), 0x2000, "the closure's handle must see it");
-    }
-
-    // -------------------------------------------------------------------------
-    // Registry
-    // -------------------------------------------------------------------------
-    //
-    // `#[pill_hot]` cannot be used inside `pill_engine` itself: its generated
-    // code refers to `::pill_engine`, which does not resolve in the defining
-    // crate. These tests therefore submit a descriptor by hand, exactly as the
-    // macro would, which is the same approach `component_registry` takes. The
-    // macro's own expansion is covered downstream, where it can actually run.
-
-    /// Stands in for a `#[pill_hot]` system.
-    fn registry_probe_system() {}
-
-    fn registry_probe_descriptor() -> (usize, u64) {
-        (
-            local_implementation_address(&registry_probe_system),
-            signature_hash_of(&registry_probe_system),
-        )
-    }
-
-    inventory::submit! {
-        PillHotFunctionDescriptor {
-            qualified_name: "pill_engine::hot_patch::tests::registry_probe_system",
-            resolve: registry_probe_descriptor,
-        }
-    }
-
-    #[test]
-    fn registry_resolves_a_submitted_function() {
-        let (address, hash) =
-            resolve_hot_function("pill_engine::hot_patch::tests::registry_probe_system")
-                .expect("the submitted descriptor must be discoverable");
-
-        assert_ne!(address, 0, "a resolved address must be callable");
-        assert_eq!(
-            address,
-            local_implementation_address(&registry_probe_system),
-            "the registry must report the same dispatch address the engine registers"
-        );
-        assert_eq!(hash, signature_hash_of(&registry_probe_system));
-    }
-
-    #[test]
-    fn registry_reports_nothing_for_an_unknown_name() {
-        assert!(resolve_hot_function("nothing::declares::this").is_none());
-    }
-
-    #[test]
-    fn registry_lists_its_functions() {
-        assert!(
-            hot_function_names().any(|name| name.ends_with("registry_probe_system")),
-            "a submitted function must appear in the listing"
-        );
-    }
-
-    /// Two systems with different signatures hash differently; the same
-    /// signature hashes identically across calls.
-    #[test]
-    fn signature_hash_distinguishes_signatures() {
-        fn takes_nothing() {}
-        fn takes_nothing_too() {}
-
-        let first = signature_hash::<fn(), ()>();
-        let second = signature_hash::<fn(), ()>();
-        assert_eq!(first, second, "same signature must hash stably");
-
-        let _ = (takes_nothing, takes_nothing_too);
-    }
-}
-
-// =============================================================================
 // Integration tests
 // =============================================================================
 
@@ -1331,14 +1145,18 @@ mod integration_tests {
 
                 static OBSERVED: AtomicU32 = AtomicU32::new(0);
 
+                /// The body every caller starts out pointing at; counts calls.
                 pub fn original() {
                     OBSERVED.fetch_add(1, Ordering::SeqCst);
                 }
 
+                /// The patched body; counts tenfold so a test can tell which
+                /// one actually ran.
                 pub fn replacement() {
                     OBSERVED.fetch_add(10, Ordering::SeqCst);
                 }
 
+                /// Total count observed so far, weighted by which body ran.
                 pub fn observed() -> u32 {
                     OBSERVED.load(Ordering::SeqCst)
                 }
@@ -1837,5 +1655,191 @@ mod integration_tests {
             11,
             "the newest implementation must win"
         );
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The stand-in substitution holds on this target.
+    ///
+    /// If this ever fails, the dispatch slot is unsound here and the hot-patch
+    /// feature must not be enabled.
+    #[test]
+    fn zero_sized_stand_in_is_abi_compatible() {
+        assert!(verify_abi(), "&mut ZST is not passed like &mut () here");
+    }
+
+    /// `Input` must be inferable from the function value alone, with no
+    /// turbofish. A concrete function-item type satisfies exactly one arity of
+    /// [`SystemParamFunction`], so the solver has a unique choice - and the
+    /// `#[pill_hot]` macro relies on this, because reconstructing the parameter
+    /// tuple from syntax would have to strip patterns and guess lifetimes.
+    #[test]
+    fn input_infers_from_the_function_value_alone() {
+        fn nullary() {}
+        fn fallible() -> Result<(), crate::error::SystemError> {
+            Ok(())
+        }
+
+        assert_ne!(local_implementation_address(&nullary), 0);
+        assert_ne!(local_implementation_address(&fallible), 0);
+        assert_ne!(
+            signature_hash_of(&nullary),
+            signature_hash_of(&fallible),
+            "differing return types must produce differing signatures"
+        );
+    }
+
+    #[test]
+    fn slot_reports_its_baseline() {
+        let slot = HotSlot::new();
+        slot.initialize(0x1234, 0xABCD);
+        assert_eq!(slot.current(), 0x1234);
+        assert_eq!(slot.signature_hash(), 0xABCD);
+    }
+
+    #[test]
+    fn install_replaces_the_implementation() {
+        let slot = HotSlot::new();
+        slot.initialize(0x1000, 0xFEED);
+        assert!(slot.install("movement", 0x2000, 0xFEED).is_ok());
+        assert_eq!(slot.current(), 0x2000);
+    }
+
+    /// The gate must refuse a moved signature and leave the running code alone.
+    #[test]
+    fn install_refuses_a_signature_mismatch() {
+        let slot = HotSlot::new();
+        slot.initialize(0x1000, 0xFEED);
+
+        let error = slot.install("movement", 0x2000, 0xBEEF).unwrap_err();
+        assert_eq!(
+            error,
+            HotPatchError::SignatureMismatch {
+                name: "movement".to_string(),
+                expected: 0xFEED,
+                found: 0xBEEF,
+            }
+        );
+        assert_eq!(slot.current(), 0x1000, "refused patch must not be applied");
+    }
+
+    #[test]
+    fn install_refuses_a_null_address() {
+        let slot = HotSlot::new();
+        slot.initialize(0x1000, 0xFEED);
+        assert!(slot.install("movement", 0, 0xFEED).is_err());
+        assert_eq!(slot.current(), 0x1000);
+    }
+
+    #[test]
+    fn registry_round_trips_and_forgets() {
+        let mut registry = HotPatchRegistry::new();
+        assert!(registry.is_empty());
+
+        let slot = Arc::new(HotSlot::new());
+        slot.initialize(0x1000, 0x1);
+        registry.insert("movement", Arc::clone(&slot));
+
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.get("movement").unwrap().current(), 0x1000);
+        assert!(registry.get("absent").is_none());
+
+        registry.remove("movement");
+        assert!(registry.get("movement").is_none());
+        assert!(registry.is_empty());
+    }
+
+    /// A slot shared with a system's closure observes installs made through the
+    /// registry - the property the whole design depends on.
+    #[test]
+    fn registry_and_closure_share_one_slot() {
+        let mut registry = HotPatchRegistry::new();
+        let slot = Arc::new(HotSlot::new());
+        slot.initialize(0x1000, 0x7);
+        registry.insert("movement", Arc::clone(&slot));
+
+        registry
+            .get("movement")
+            .unwrap()
+            .install("movement", 0x2000, 0x7)
+            .expect("install");
+
+        assert_eq!(slot.current(), 0x2000, "the closure's handle must see it");
+    }
+
+    // -------------------------------------------------------------------------
+    // Registry
+    // -------------------------------------------------------------------------
+    //
+    // `#[pill_hot]` cannot be used inside `pill_engine` itself: its generated
+    // code refers to `::pill_engine`, which does not resolve in the defining
+    // crate. These tests therefore submit a descriptor by hand, exactly as the
+    // macro would, which is the same approach `component_registry` takes. The
+    // macro's own expansion is covered downstream, where it can actually run.
+
+    /// Stands in for a `#[pill_hot]` system.
+    fn registry_probe_system() {}
+
+    fn registry_probe_descriptor() -> (usize, u64) {
+        (
+            local_implementation_address(&registry_probe_system),
+            signature_hash_of(&registry_probe_system),
+        )
+    }
+
+    inventory::submit! {
+        PillHotFunctionDescriptor {
+            qualified_name: "pill_engine::hot_patch::tests::registry_probe_system",
+            resolve: registry_probe_descriptor,
+        }
+    }
+
+    #[test]
+    fn registry_resolves_a_submitted_function() {
+        let (address, hash) =
+            resolve_hot_function("pill_engine::hot_patch::tests::registry_probe_system")
+                .expect("the submitted descriptor must be discoverable");
+
+        assert_ne!(address, 0, "a resolved address must be callable");
+        assert_eq!(
+            address,
+            local_implementation_address(&registry_probe_system),
+            "the registry must report the same dispatch address the engine registers"
+        );
+        assert_eq!(hash, signature_hash_of(&registry_probe_system));
+    }
+
+    #[test]
+    fn registry_reports_nothing_for_an_unknown_name() {
+        assert!(resolve_hot_function("nothing::declares::this").is_none());
+    }
+
+    #[test]
+    fn registry_lists_its_functions() {
+        assert!(
+            hot_function_names().any(|name| name.ends_with("registry_probe_system")),
+            "a submitted function must appear in the listing"
+        );
+    }
+
+    /// Two systems with different signatures hash differently; the same
+    /// signature hashes identically across calls.
+    #[test]
+    fn signature_hash_distinguishes_signatures() {
+        fn takes_nothing() {}
+        fn takes_nothing_too() {}
+
+        let first = signature_hash::<fn(), ()>();
+        let second = signature_hash::<fn(), ()>();
+        assert_eq!(first, second, "same signature must hash stably");
+
+        let _ = (takes_nothing, takes_nothing_too);
     }
 }

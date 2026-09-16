@@ -288,10 +288,25 @@ def check_safety_comments(
 def check_public_item_docs(
     lines: List[str], display_path: str, collector: ViolationCollector
 ) -> None:
-    """Requires a `///` doc comment above every public item."""
+    """Requires a `///` doc comment above every public item.
+
+    Lines inside a raw string are skipped: test fixtures embed Rust source
+    verbatim (`const PLAIN_SOURCE: &str = r#"..."#`), and the lint must read
+    that text as data rather than as items to document.
+    """
     last_doc_line = 0
+    in_raw_string = False
     for line_number, raw_line in enumerate(lines, start=1):
         line = raw_line.strip()
+        if in_raw_string:
+            if '"#' in raw_line:
+                in_raw_string = False
+            continue
+        raw_open = raw_line.find('r#"')
+        if raw_open != -1:
+            if '"#' not in raw_line[raw_open + 3 :]:
+                in_raw_string = True
+            continue
         if DOC_COMMENT_PATTERN.search(line):
             last_doc_line = line_number
             continue

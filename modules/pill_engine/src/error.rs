@@ -33,36 +33,36 @@ use crate::{archetype::ArchetypeId, ComponentId, Entity, ResourceId};
 
 /// Storage and migration failures of the archetype world.
 ///
-/// Raised when entity or dynamic-component operations violate storage
+/// Raised when entity or descriptor-component operations violate storage
 /// invariants, such as unregistered IDs, malformed byte layouts, or
 /// exceeding the component-type limit.
 #[engine_error(namespace = engine::world, runtime = ::pill_core::error)]
 #[derive(PartialEq)]
 pub enum WorldError {
-    /// The stable ID of a dynamic component cannot be zero.
-    #[message("dynamic component stable ID cannot be zero")]
-    DynamicStableIdZero,
+    /// The stable ID of a descriptor component cannot be zero.
+    #[message("descriptor component stable ID cannot be zero")]
+    DescriptorStableIdZero,
 
-    /// The size of a dynamic component cannot be zero.
-    #[message("dynamic component size cannot be zero")]
-    DynamicSizeZero,
+    /// The size of a descriptor component cannot be zero.
+    #[message("descriptor component size cannot be zero")]
+    DescriptorSizeZero,
 
-    /// The alignment of a dynamic component must be a non-zero power of two.
-    #[message("dynamic component alignment must be a non-zero power of two")]
-    DynamicAlignmentInvalid,
+    /// The alignment of a descriptor component must be a non-zero power of two.
+    #[message("descriptor component alignment must be a non-zero power of two")]
+    DescriptorAlignmentInvalid,
 
     /// The size and alignment pair does not form a valid memory layout.
-    #[message("dynamic component size and alignment do not form a valid layout")]
-    DynamicLayoutInvalid,
+    #[message("descriptor component size and alignment do not form a valid layout")]
+    DescriptorLayoutInvalid,
 
     /// The stable ID is already registered with a different name or schema.
-    #[message("dynamic component stable ID is already registered with another name or schema")]
-    DynamicAlreadyRegistered,
+    #[message("descriptor component stable ID is already registered with another name or schema")]
+    DescriptorAlreadyRegistered,
 
     /// The world's component type limit has been reached.
     ///
     /// Registration is driven by user data — a project's compile-time registry
-    /// and dynamic manifests from the managed runtime — so exceeding 128 types
+    /// and descriptor manifests from the managed runtime — so exceeding 128 types
     /// is a configuration outcome, not a programming error. The diagnostic
     /// carries the offending type name and the current count so the host can
     /// report it as a normal engine error instead of a bare panic.
@@ -80,72 +80,72 @@ pub enum WorldError {
         count: u8,
     },
 
-    /// A dynamic entity must carry at least one component.
-    #[message("a dynamic entity must contain at least one component")]
-    DynamicEntityEmpty,
+    /// A descriptor entity must carry at least one component.
+    #[message("a descriptor entity must contain at least one component")]
+    DescriptorEntityEmpty,
 
-    /// A dynamic entity cannot contain the same component twice.
-    #[message("a dynamic entity cannot contain duplicate components")]
-    DynamicDuplicateComponent,
+    /// A descriptor entity cannot contain the same component twice.
+    #[message("a descriptor entity cannot contain duplicate components")]
+    DescriptorDuplicateComponent,
 
-    /// The component ID was never registered as dynamic storage.
-    #[message("dynamic component ", debug_value(id), " is not registered")]
-    DynamicComponentNotRegistered { id: ComponentId },
+    /// The component ID was never registered as descriptor storage.
+    #[message("descriptor component ", debug_value(id), " is not registered")]
+    DescriptorComponentNotRegistered { id: ComponentId },
 
     /// The supplied bytes do not match the component's registered layout.
     #[message(
-        "dynamic component ",
+        "descriptor component ",
         debug_value(id),
         " byte length does not match its manifest"
     )]
-    DynamicByteLengthMismatch { id: ComponentId },
+    DescriptorByteLengthMismatch { id: ComponentId },
 
     /// The entity does not exist in the world.
     #[message("entity not found")]
     EntityNotFound,
 
-    /// The entity already carries the dynamic component being added.
-    #[message("entity already contains the dynamic component")]
-    DynamicComponentAlreadyPresent,
+    /// The entity already carries the descriptor component being added.
+    #[message("entity already contains the descriptor component")]
+    DescriptorComponentAlreadyPresent,
 
-    /// The entity does not carry the dynamic component being removed or set.
-    #[message("entity does not contain the dynamic component")]
-    DynamicComponentMissing,
+    /// The entity does not carry the descriptor component being removed or set.
+    #[message("entity does not contain the descriptor component")]
+    DescriptorComponentMissing,
 
-    /// A byte copy was rejected by the dynamic storage column.
-    #[message("dynamic component row or byte length is invalid")]
-    DynamicRowInvalid,
+    /// A byte copy was rejected by the descriptor storage column.
+    #[message("descriptor component row or byte length is invalid")]
+    DescriptorRowInvalid,
 
     /// A byte copy length does not match the registered element size.
-    #[message("dynamic component byte length does not match its registered size")]
-    DynamicSizeMismatch,
+    #[message("descriptor component byte length does not match its registered size")]
+    DescriptorSizeMismatch,
 
-    /// A registered dynamic component has no storage column in the archetype
+    /// A registered descriptor component has no storage column in the archetype
     /// the entity was placed in.
     ///
     /// Signals that the manifest and the archetype's columns disagree, which
     /// the manifest-driven registration path can produce if a component is
     /// registered without its storage being created.
     #[message(
-        "dynamic component ",
+        "descriptor component ",
         debug_value(component_id),
         " has no storage column in archetype ",
         debug_value(archetype_id)
     )]
-    DynamicStorageMissing {
-        /// The dynamic component whose column is absent.
+    DescriptorStorageMissing {
+        /// The descriptor component whose column is absent.
         component_id: ComponentId,
         /// The archetype that was expected to own the column.
         archetype_id: ArchetypeId,
     },
 
-    /// A dynamic column's element size disagrees with the registered layout the
-    /// migration plan was validated against.
+    /// A descriptor column's element size disagrees with the registered layout
+    /// the migration plan was validated against.
     ///
     /// Signals that a column and the storage factory describing it have drifted
     /// apart, which a partially applied relayout used to produce.
     #[message(
-        "dynamic component ",
+        "descriptor component ",
         debug_value(component_id),
         " in archetype ",
         debug_value(archetype_id),
@@ -154,7 +154,7 @@ pub enum WorldError {
         " byte elements; the registered layout declares ",
         debug_value(expected)
     )]
-    DynamicColumnLayoutMismatch {
+    ComponentColumnLayoutMismatch {
         /// The component whose column disagrees.
         component_id: ComponentId,
         /// The archetype owning the column.
@@ -689,7 +689,7 @@ pub enum CommandError {
     /// A queued command's archetype migration failed partway through.
     ///
     /// The entity's recorded location referenced an archetype that no longer
-    /// exists, or a dynamic component named by an archetype had no storage
+    /// exists, or a descriptor component named by an archetype had no storage
     /// column. Those inconsistencies are exactly what a partially applied hot
     /// reload can leave behind, so they are collected like any other command
     /// failure rather than panicking inside the flush - which for a managed
@@ -971,10 +971,10 @@ mod tests {
     /// Plain rendering preserves the semantic values of a world error.
     #[test]
     fn world_error_renders_plain_with_values() {
-        let error = WorldError::DynamicComponentNotRegistered {
-            id: ComponentId::dynamic(7),
+        let error = WorldError::DescriptorComponentNotRegistered {
+            id: ComponentId::descriptor(7),
         };
-        assert!(error.to_plain_message().contains("dynamic component"));
+        assert!(error.to_plain_message().contains("descriptor component"));
         assert!(error.to_plain_message().contains("is not registered"));
     }
 
@@ -1004,7 +1004,7 @@ mod tests {
     #[test]
     fn build_error_remains_copy() {
         let error = BuildError::ComponentNotRegistered {
-            id: ComponentId::dynamic(9),
+            id: ComponentId::descriptor(9),
         };
         let copied = error;
         assert_eq!(error, copied);

@@ -30,8 +30,9 @@ DESCRIPTION
           seed = 3), proving the connection survives a managed hot reload.
       3. csharp_codegen_rebuild - after a clean restart with the mirror file
           deleted, the host regenerates it from the module's real layout
-          before the project build (missing-file regeneration), and the
-          bridge still works.
+          before the project build (missing-file regeneration), the bridge
+          still works, and the regenerated file is byte-identical to the
+          committed bootstrap (drift in the tracked copy fails the suite).
 
     Every file the suite touches (project_settings.yaml, Components.cs, the
     generated mirror files) is backed up at startup and restored afterwards, and
@@ -82,6 +83,12 @@ DUMMY_GENERATED_FILE = (
     MODULES_ROOT / "optional" / "pill_dummy_color" / "generated"
     / "pill_dummy_color_Components.g.cs"
 )
+
+# The tracked bootstrap's bytes, captured before the first host start so the
+# codegen-rebuild check can compare the host's fresh output against the copy a
+# standalone C# build would compile. Stays None when the file is absent, in
+# which case the check only proves that regeneration happens.
+COMMITTED_MIRROR_BYTES = None
 # The suite's own probe file. Written before the host starts and removed in the
 # suite's cleanup, so the example project carries no test-only code and this
 # suite does not depend on demo text a project edit can silently change.
@@ -488,11 +495,12 @@ def verify_startup(
 
     # Slice G: each managed component's reflected field layout must reach the
     # engine's field-layout table (what makes C# components inspectable in the
-    # editor). The host logs every dynamic layout registration deterministically
-    # as `name@offset:size:type_tag` entries, so assert the well-known fields of
-    # `TracyLive.PhysicsState` (six floats, then a byte) and `TracyLive.SplineSample`.
+    # editor). The host logs every descriptor component's field layout
+    # deterministically as `name@offset:size:type_tag` entries, so assert the
+    # well-known fields of `TracyLive.PhysicsState` (six floats, then a byte)
+    # and `TracyLive.SplineSample`.
     if "managed component field layout registered" not in startup_output:
-        print("  [FAIL] No dynamic component field layout was registered at startup.")
+        print("  [FAIL] No descriptor component field layout was registered at startup.")
         print(f"  Output tail:\n{startup_output[-1600:]}")
         return False
     if "Active@24:1:u8" not in startup_output:
@@ -957,7 +965,9 @@ def verify_codegen_rebuild() -> bool:
     After the session every artifact is current. Deleting the generated mirror
     and restarting must make the host regenerate it from the module's real
     layout (missing-file path) before the managed project builds, and the
-    bridge must still work afterwards.
+    bridge must still work afterwards. The regenerated copy is also compared
+    byte-for-byte with the tracked one, because the mirror is committed for
+    standalone C# builds (see devops/tests/README.md, "Generated mirrors").
     """
     print("\n  [TEST] Codegen rebuild (mirror deleted, host restarts)...")
     if SPLINE_GENERATED_FILE.exists():
@@ -992,6 +1002,19 @@ def verify_codegen_rebuild() -> bool:
             description="regenerated pill_spline mirror",
         ):
             return False
+        # Byte-for-byte against the tracked bootstrap: the mirror is committed
+        # so standalone C# builds compile without a host run, and a tracked copy
+        # the host would no longer generate is a file no build ever checks.
+        if COMMITTED_MIRROR_BYTES is not None and (
+            SPLINE_GENERATED_FILE.read_bytes() != COMMITTED_MIRROR_BYTES
+        ):
+            print(
+                "  [FAIL] regenerated mirror differs from the committed bootstrap; "
+                "run the host once and commit "
+                f"{SPLINE_GENERATED_FILE.relative_to(WORKSPACE_ROOT)}"
+            )
+            return False
+        print("  [OK] Regenerated mirror matches the committed bootstrap.")
         # And the bridge must be live again (Rust -> C# direction).
         if not monitor.wait_for(
             f"{BRIDGE_PROBE_PREFIX} 1 spline(s), first P0.X=0, count=4",
@@ -1062,6 +1085,14 @@ def main() -> None:
         DUMMY_GENERATED_FILE,
     ):
         BACKUP.capture(path)
+
+    # Record the tracked mirror's bytes before any host run can normalize it;
+    # the codegen-rebuild check compares the host's fresh output against this
+    # copy instead of re-reading the file later, when the first session has
+    # already rewritten it.
+    global COMMITTED_MIRROR_BYTES
+    if SPLINE_GENERATED_FILE.exists():
+        COMMITTED_MIRROR_BYTES = SPLINE_GENERATED_FILE.read_bytes()
 
     kill_stale_hosts()
 

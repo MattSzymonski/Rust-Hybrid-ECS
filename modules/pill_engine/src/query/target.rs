@@ -110,7 +110,7 @@ impl QueryTarget for Entity {
 /// and reports the component as a read for system dependency analysis.
 impl<T: Component> QueryTarget for &T {
     type Item<'a> = &'a T;
-    type State = SendPtr<crate::archetype::DynamicColumn>;
+    type State = SendPtr<crate::archetype::ComponentColumn>;
 
     fn component_ids() -> Vec<ComponentId> {
         vec![ComponentId::of::<T>()]
@@ -129,7 +129,7 @@ impl<T: Component> QueryTarget for &T {
             ]
         );
         SendPtr::new(
-            archetype.component_storages.column_of::<T>() as *const crate::archetype::DynamicColumn
+            archetype.component_storages.column_of::<T>() as *const crate::archetype::ComponentColumn
         )
     }
 
@@ -151,7 +151,7 @@ impl<T: Component> QueryTarget for &T {
 pub struct MutFetchState<T: Component> {
     /// Raw pointer to the component values storage, cached to avoid
     /// re-locating the storage on every row fetch.
-    values: SendPtrMut<crate::archetype::DynamicColumn>,
+    values: SendPtrMut<crate::archetype::ComponentColumn>,
     /// Raw pointer to the per-entity change-detection ticks storage.
     ticks: SendPtrMut<Vec<ComponentTicks>>,
     /// The world tick for this run, stored on `Mut<T>` at fetch time.
@@ -204,7 +204,7 @@ impl<T: Component> QueryTarget for &mut T {
             ]
         );
         let values = SendPtrMut::new(archetype.component_storages.column_of_mut::<T>()
-            as *mut crate::archetype::DynamicColumn);
+            as *mut crate::archetype::ComponentColumn);
         let ticks_vec = archetype
             .component_ticks
             .get_mut(&ComponentId::of::<T>())

@@ -1,4 +1,9 @@
 //! Native pop-out windows for panels removed from the main dock tree.
+//!
+//! # Responsibilities
+//!
+//! - Track one native window per panel the dock has popped out.
+//! - Route window closes back into a dock action.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};

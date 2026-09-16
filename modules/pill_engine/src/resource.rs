@@ -48,7 +48,7 @@ use std::marker::PhantomData;
 use std::ptr::NonNull;
 
 // Current crate
-use crate::archetype::{DynamicFieldPlan, FieldSource};
+use crate::archetype::{FieldPlan, FieldSource};
 use crate::error::WorldError;
 use crate::world::World;
 
@@ -562,19 +562,19 @@ impl ErasedResource {
     ///
     /// Only a foreign payload may change size: a Rust value's size is its type,
     /// and `World::relayout_foreign_resource` refuses that before it gets here.
-    /// The scratch copy is the discipline a dynamic column uses as well - every
-    /// source byte is read before the destination is zeroed - so a plan that
+    /// The scratch copy is the discipline a descriptor column uses as well -
+    /// every source byte is read before the destination is zeroed - so a plan that
     /// moves fields inside the value cannot read what it overwrote.
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::DynamicRowInvalid`] when an instruction falls
+    /// Returns [`WorldError::DescriptorRowInvalid`] when an instruction falls
     /// outside the old or the new payload. Nothing is modified in that case.
     pub(crate) fn migrate_bytes(
         &mut self,
         size: usize,
         align: usize,
-        plan: &DynamicFieldPlan,
+        plan: &FieldPlan,
     ) -> Result<(), WorldError> {
         plan.validate(self.size, size)?;
 

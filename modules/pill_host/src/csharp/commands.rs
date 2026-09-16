@@ -3,7 +3,7 @@
 //! # Responsibilities
 //!
 //! - Reserve generation-checked entity handles for managed callers.
-//! - Decode managed component blobs into native or dynamic adders.
+//! - Decode managed component blobs into native or descriptor adders.
 //! - Queue create, destroy, add, and remove operations against the active
 //!   world, rejecting stale generations and undeclared scopes.
 //!
@@ -45,13 +45,13 @@ pub(super) const MAX_COMPONENTS_PER_CREATE: u32 = 1024;
 /// A decoded command component in its native or type-erased representation.
 ///
 /// The native variant carries a fully typed [`ComponentAdder`] produced by the
-/// binding's decode function; the dynamic variant carries a stable component
+/// binding's decode function; the descriptor variant carries a stable component
 /// identity plus raw bytes for late binding by the queue.
 enum DecodedCommandComponent {
     /// A concrete Rust component decoded through its native binding.
     Native(Box<dyn ComponentAdder>),
-    /// A type-erased byte payload for a dynamically registered component.
-    Dynamic(ComponentId, Vec<u8>),
+    /// A type-erased byte payload for a descriptor-registered component.
+    Descriptor(ComponentId, Vec<u8>),
 }
 
 // =============================================================================
@@ -119,18 +119,18 @@ fn decode_command_component(
             }
             decode(data, size).map(DecodedCommandComponent::Native)
         }
-        ComponentBinding::Dynamic {
+        ComponentBinding::Managed {
             component_id,
             size: expected,
             ..
         } => {
             if size != expected {
-                return Err("dynamic component blob has the wrong size".into());
+                return Err("descriptor component blob has the wrong size".into());
             }
             // SAFETY: the managed caller pins a buffer of exactly `size`
             // bytes for this callback; the bytes are copied before returning.
             let bytes = unsafe { std::slice::from_raw_parts(data, size) }.to_vec();
-            Ok(DecodedCommandComponent::Dynamic(component_id, bytes))
+            Ok(DecodedCommandComponent::Descriptor(component_id, bytes))
         }
         ComponentBinding::ModuleNative {
             component_id,
@@ -181,11 +181,11 @@ pub(super) extern "C" fn ffi_queue_create(
             // slice stays within the array the managed caller pinned for this call.
             unsafe { std::slice::from_raw_parts(blobs, count as usize) }
         };
-        // Step 3: decode every blob into a native or dynamic adder, rejecting
+        // Step 3: decode every blob into a native or descriptor adder, rejecting
         // duplicate identities, undeclared bindings, and malformed payloads.
         let mut seen = HashSet::with_capacity(blobs.len());
         let mut native = Vec::new();
-        let mut dynamic = Vec::new();
+        let mut descriptor = Vec::new();
         for blob in blobs {
             let stable =
                 StableComponentId::from_halves(blob.component_key, blob.component_key_high);
@@ -197,14 +197,14 @@ pub(super) extern "C" fn ffi_queue_create(
             };
             match decode_command_component(binding, blob.data, blob.size as usize) {
                 Ok(DecodedCommandComponent::Native(component)) => native.push(component),
-                Ok(DecodedCommandComponent::Dynamic(id, bytes)) => dynamic.push((id, bytes)),
+                Ok(DecodedCommandComponent::Descriptor(id, bytes)) => descriptor.push((id, bytes)),
                 Err(_) => return 6,
             }
         }
         // Step 4: commit the validated creation and drop the reservation so
         // the handle can be recycled by the allocator.
         reserved.remove(&entity);
-        queue.create_mixed_entity(entity, native, dynamic);
+        queue.create_mixed_entity(entity, native, descriptor);
         1
     })
     .unwrap_or_else(command_scope_error)
@@ -259,8 +259,8 @@ pub(super) extern "C" fn ffi_queue_add_component(
             Ok(DecodedCommandComponent::Native(component)) => {
                 queue.add_component_adder_to_entity(entity, component)
             }
-            Ok(DecodedCommandComponent::Dynamic(component_id, bytes)) => {
-                queue.add_dynamic_component_to_entity(entity, component_id, bytes)
+            Ok(DecodedCommandComponent::Descriptor(component_id, bytes)) => {
+                queue.add_descriptor_component_to_entity(entity, component_id, bytes)
             }
             Err(_) => return 6,
         }

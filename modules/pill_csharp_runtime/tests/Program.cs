@@ -534,7 +534,7 @@ internal static class Program
 
         try
         {
-            Test("current project discovers native and dynamic component systems", () =>
+            Test("current project discovers native and descriptor component systems", () =>
             {
                 var systems = ProjectHost.DiscoverSystems(typeof(BallPhysicsSystem).Assembly);
                 // The physics step, the three-query spline pass - the same
@@ -557,7 +557,7 @@ internal static class Program
             {
                 var systems = ProjectHost.DiscoverSystems(typeof(BallPhysicsSystem).Assembly);
                 using var json = System.Text.Json.JsonDocument.Parse(
-                    ComponentManifestBuilder.Build(systems));
+                    ProjectManifestBuilder.Build(systems));
                 var components = json.RootElement.EnumerateArray().ToArray();
                 // Position, Sprite, PhysicsState, SplineSample + the module Spline mirror.
                 Equal(components.Length, 5, "unexpected manifest component count");
@@ -576,9 +576,9 @@ internal static class Program
                 Assert(sprite.GetProperty("shared").GetBoolean(),
                     "runtime Sprite mirror must be shared");
                 Assert(!physics.GetProperty("shared").GetBoolean(),
-                    "project-owned PhysicsState must be dynamic");
+                    "project-owned PhysicsState must be descriptor-registered");
                 Assert(!sample.GetProperty("shared").GetBoolean(),
-                    "project-owned SplineSample must be dynamic");
+                    "project-owned SplineSample must be descriptor-registered");
                 Equal(sample.GetProperty("size").GetInt32(), 4, "SplineSample size mismatch");
                 Equal(sample.GetProperty("alignment").GetInt32(), 4,
                     "SplineSample alignment mismatch");
@@ -596,7 +596,7 @@ internal static class Program
             Test("manifest includes project structs used only by commands", () =>
             {
                 using var json = System.Text.Json.JsonDocument.Parse(
-                    ComponentManifestBuilder.Build([], typeof(CommandOnlyComponent).Assembly));
+                    ProjectManifestBuilder.Build([], typeof(CommandOnlyComponent).Assembly));
                 Assert(json.RootElement.EnumerateArray().Any(component =>
                         component.GetProperty("full_name").GetString() ==
                         typeof(CommandOnlyComponent).FullName),
@@ -1309,7 +1309,7 @@ internal static class Program
             {
                 var system = ProjectHost.CreateSystem(Method(nameof(TestSystems.InvalidLayout)));
                 Throws<InvalidOperationException>(
-                    () => ComponentManifestBuilder.Build([system]),
+                    () => ProjectManifestBuilder.Build([system]),
                     "bool fields must be rejected from native component manifests");
             });
 

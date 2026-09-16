@@ -1,4 +1,9 @@
 //! Dioxus view layer for the geometry-driven dock workspace.
+//!
+//! # Responsibilities
+//!
+//! - Render the dock tree from the layout model's committed state.
+//! - Translate pointer interaction into layout actions.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};

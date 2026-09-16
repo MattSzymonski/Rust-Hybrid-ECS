@@ -91,10 +91,26 @@ a row in the same commit that moves it.
 | Host, default posture | `cargo test -p pill_host --lib --offline` | 98 passed |
 | Host, rendering | `cargo test -p pill_host --features rendering --lib --offline` | 143 passed |
 | Host, shipping posture | `cargo test -p pill_host --no-default-features --lib --offline` | 25 passed |
-| Clippy | `cargo clippy` for `pill_engine`, `pill_core`, `pill_host` in each posture | clean, except the shipping posture's known warnings (plan item 2.9) |
+| Clippy | `cargo clippy` for `pill_engine`, `pill_core`, `pill_host` in each posture | clean, except the shipping posture's known warnings (32 lines measured 2026-09-17, one family; plan item 2.9) |
 | Formatting | `cargo fmt --check` | 23 pre-existing hunks (plan item 2.10) |
 | Comment & layout lint | `python devops/tests/test_coding_standards.py --root modules` | **53 violations across 29 files** - red before this work; plan item 1.7 |
 | End-to-end suites | `python devops/tests/run_all.py` | all pass; the suites serialize themselves |
+
+## Generated mirrors (policy)
+
+`modules/optional/<module>/generated/<module>_Components.g.cs` files are **tracked
+as a committed bootstrap**. They are build inputs, not artifacts: `examples/project_cs`
+links them (and so do standalone `dotnet build`s), so the C# side must compile without
+a host run. The host regenerates every module's mirror on start and reload, but writes
+only when the content differs (`pill_host/src/csharp/codegen.rs`), so a matching module
+leaves the file - and its mtime - alone.
+
+Drift between the tracked copy and what the host generates is therefore a real failure
+mode, and `test_csharp_bridge.py` catches it: the `csharp_codegen_rebuild` scenario
+captures the tracked file's bytes before the first host start, deletes the file,
+restarts the host, and requires the regenerated file to be byte-identical to the
+captured copy. When a module's real layout changes, run the host once and commit the
+regenerated file; the suite fails with that instruction if you forget.
 
 ## Performance measurement (moved)
 
@@ -132,7 +148,7 @@ invariants the audit fixes must preserve, including:
   and re-registration allocates a fresh bit (`component.rs`).
 - **Drop-at-detection** — `drop_forgotten_components` removes only the forgotten
   columns, survivors keep their data, re-seeding works (`persistence.rs`).
-- **Dynamic component coexistence** with native components in one archetype
+- **Descriptor component coexistence** with native components in one archetype
   (`world.rs`).
 
 ## Review notes (2026-08-23)

@@ -68,8 +68,8 @@ impl Component for Velocity {}
 struct Health(f32);
 impl Component for Health {}
 
-// Registers the fixture components for dynamic trait-object access, which the
-// command queue's component storage relies on.
+// Registers the fixture components with the `trait_type_map` dispatch table,
+// which the command queue's component storage relies on.
 impl_trait_accessible!(dyn Component; Position, Velocity, Health);
 
 // =============================================================================

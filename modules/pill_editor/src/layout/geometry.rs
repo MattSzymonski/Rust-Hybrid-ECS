@@ -1,3 +1,10 @@
+//! Deterministic geometry for the dock: rectangles, hit testing, split sizing.
+//!
+//! # Responsibilities
+//!
+//! - Compute panel rectangles from the layout tree, deterministically.
+//! - Hit-test pointer positions against those rectangles.
+
 use std::collections::BTreeMap;
 
 use super::model::LayoutNode;
@@ -22,6 +29,7 @@ impl Rect {
         }
     }
 
+    /// Whether the point lies inside the rectangle.
     pub fn contains(self, x: f64, y: f64) -> bool {
         x >= self.x && y >= self.y && x <= self.x + self.width && y <= self.y + self.height
     }

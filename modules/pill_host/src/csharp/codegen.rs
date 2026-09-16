@@ -1502,7 +1502,7 @@ mod tests {
     fn exposed(name: &str, size: usize, align: usize) -> ModuleExposedComponent {
         ModuleExposedComponent {
             csharp_name: name.to_string(),
-            component_id: ComponentId::dynamic(0xABCD_0001_0000_0001),
+            component_id: ComponentId::descriptor(0xABCD_0001_0000_0001),
             size,
             align,
             fields: Vec::new(),
@@ -1518,7 +1518,7 @@ mod tests {
     ) -> ModuleExposedComponent {
         ModuleExposedComponent {
             csharp_name: name.to_string(),
-            component_id: ComponentId::dynamic(0xABCD_0001_0000_0001),
+            component_id: ComponentId::descriptor(0xABCD_0001_0000_0001),
             size,
             align,
             fields,

@@ -1,3 +1,10 @@
+//! The node identifier the layout serializes and every mutation addresses.
+//!
+//! # Responsibilities
+//!
+//! - Define `NodeId` and its stable, transparent representation.
+//! - Keep ordering total, so geometry and persistence can sort by id.
+
 use serde::{Deserialize, Serialize};
 
 /// Stable identifier serialized with the workspace layout.

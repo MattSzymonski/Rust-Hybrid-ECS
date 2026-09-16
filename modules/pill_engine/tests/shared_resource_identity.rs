@@ -169,7 +169,7 @@ fn a_relayout_releases_the_new_layout() {
             32,
             8,
             2,
-            &pill_engine::archetype::DynamicFieldPlan::new(),
+            &pill_engine::archetype::FieldPlan::new(),
         )
         .expect("the empty plan fits");
     assert_eq!(migrated, 0, "no value was stored yet");

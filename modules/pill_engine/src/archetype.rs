@@ -8,8 +8,8 @@
 //!
 //! - Group entities by their exact component set into [`Archetype`] instances.
 //! - Own the contiguous, type-erased component storage for each archetype,
-//!   both native (`ComponentColumns`) and dynamically laid out
-//!   (`DynamicColumn`).
+//!   both native (`ComponentColumns`) and layout-described
+//!   (`ComponentColumn`).
 //! - Track change-detection [`ComponentTicks`] for every component instance.
 //!
 //! # Design
@@ -50,7 +50,7 @@
 //!   still vouches for a column: an exact `TypeId` (native), size and alignment
 //!   with the registry having compared the full field layout (shared), or no
 //!   Rust type at all (descriptor). The typed accessors enforce the first two
-//!   and [`DynamicColumn::get`] panics on a mismatch; a descriptor column never
+//!   and [`ComponentColumn::get`] panics on a mismatch; a descriptor column never
 //!   receives a typed call, because no Rust type names its rows.
 //! - **Alignment hosting.** A column's buffer is allocated with the row's
 //!   alignment, so a row is aligned for the type the column was built for.
@@ -94,23 +94,23 @@ pub enum StorageFactory {
     /// [`ComponentColumns`].
     ///
     /// Carries only data (type id, layout, per-type function table), never a
-    /// closure: the column is stored as a concrete [`DynamicColumn`] with no
+    /// closure: the column is stored as a concrete [`ComponentColumn`] with no
     /// trait-object vtable, so it survives module unloads; the engine
     /// refreshes its function table on every reload.
     Native(NativeColumnInfo),
     /// Carries the runtime layout of a component owned by another language.
-    Dynamic(DynamicComponentLayout),
+    Descriptor(ComponentLayout),
 }
 
 // =============================================================================
 // Blittability
 // =============================================================================
 
-/// Evidence that a dynamic component's rows are plain old data.
+/// Evidence that a descriptor component's rows are plain old data.
 ///
-/// The dynamic-component design rests on one premise: a row is
+/// The descriptor-component design rests on one premise: a row is
 /// bitwise-movable, owns nothing, and can be freed without running
-/// destructors. `DynamicColumn` copies rows with `ptr::copy`, frees buffers
+/// destructors. `ComponentColumn` copies rows with `ptr::copy`, frees buffers
 /// without touching the elements, and is `Send + Sync` on that basis - each
 /// of those is only sound while the premise holds. The witness makes the
 /// premise a value the engine stores next to the layout it protects, so a
@@ -148,7 +148,7 @@ impl Blittability {
     ///
     /// Every field of the component must be a blittable value type: no
     /// pointers, references or other owners. A caller that gets this wrong
-    /// hands `DynamicColumn` ownership it will never release.
+    /// hands `ComponentColumn` ownership it will never release.
     pub unsafe fn assume() -> Self {
         Self { _private: () }
     }
@@ -312,7 +312,7 @@ impl ColumnOps {
 }
 
 // =============================================================================
-// DynamicComponentLayout
+// ComponentLayout
 // =============================================================================
 
 /// Runtime layout for a component whose concrete type is owned by another language.
@@ -320,7 +320,7 @@ impl ColumnOps {
 /// Describes the memory footprint of an opaque component column so its rows
 /// can be copied in and out as raw bytes without knowing the concrete type.
 #[derive(Debug, Clone)]
-pub struct DynamicComponentLayout {
+pub struct ComponentLayout {
     /// Size in bytes of a single component instance.
     pub size: usize,
     /// Alignment in bytes required by a single component instance.
@@ -334,7 +334,7 @@ pub struct DynamicComponentLayout {
     pub blittability: Blittability,
 }
 
-impl DynamicComponentLayout {
+impl ComponentLayout {
     /// Builds a layout, checking that size and alignment can describe storage.
     ///
     /// The single constructor: every layout carries a [`Blittability`], so no
@@ -342,9 +342,9 @@ impl DynamicComponentLayout {
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::DynamicSizeZero`],
-    /// [`WorldError::DynamicAlignmentInvalid`] or
-    /// [`WorldError::DynamicLayoutInvalid`] when the size and alignment cannot
+    /// Returns [`WorldError::DescriptorSizeZero`],
+    /// [`WorldError::DescriptorAlignmentInvalid`] or
+    /// [`WorldError::DescriptorLayoutInvalid`] when the size and alignment cannot
     /// describe an allocation.
     pub fn new(
         size: usize,
@@ -352,7 +352,7 @@ impl DynamicComponentLayout {
         schema_hash: u64,
         blittability: Blittability,
     ) -> Result<Self, WorldError> {
-        validate_dynamic_layout(size, align)?;
+        validate_component_layout(size, align)?;
         Ok(Self {
             size,
             align,
@@ -362,26 +362,26 @@ impl DynamicComponentLayout {
     }
 }
 
-/// Check that a size and alignment can describe dynamic storage.
+/// Check that a size and alignment can describe a component layout.
 ///
 /// Shared by registration and relayout so the two can never disagree about what
 /// a usable layout is. The errors name the offending layout rather than the
 /// caller, because both callers hand the same three facts to the same engine.
-pub(crate) fn validate_dynamic_layout(size: usize, align: usize) -> Result<(), WorldError> {
+pub(crate) fn validate_component_layout(size: usize, align: usize) -> Result<(), WorldError> {
     if size == 0 {
-        return Err(WorldError::DynamicSizeZero);
+        return Err(WorldError::DescriptorSizeZero);
     }
     if align == 0 || !align.is_power_of_two() {
-        return Err(WorldError::DynamicAlignmentInvalid);
+        return Err(WorldError::DescriptorAlignmentInvalid);
     }
     if Layout::from_size_align(size, align).is_err() {
-        return Err(WorldError::DynamicLayoutInvalid);
+        return Err(WorldError::DescriptorLayoutInvalid);
     }
     Ok(())
 }
 
 // =============================================================================
-// DynamicFieldPlan
+// FieldPlan
 // =============================================================================
 
 /// One top-level field of a layout, as a migration plan sees it.
@@ -435,7 +435,7 @@ pub struct PlannedField {
 /// C# path builds one per changed component - and the engine applies it to every
 /// stored row. Anything the plan does not cover is left zero.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct DynamicFieldPlan {
+pub struct FieldPlan {
     /// The instructions, in the order they are applied.
     fields: Vec<PlannedField>,
     /// Names of fields the plan reset because their type changed.
@@ -447,7 +447,7 @@ pub struct DynamicFieldPlan {
     retyped: Vec<String>,
 }
 
-impl DynamicFieldPlan {
+impl FieldPlan {
     /// An empty plan: every byte of every new row is zero.
     #[must_use]
     pub fn new() -> Self {
@@ -533,16 +533,16 @@ impl DynamicFieldPlan {
     ///
     /// Callers run this before touching a row, so a plan that does not fit is
     /// refused while the storage is still untouched. The error is
-    /// [`WorldError::DynamicRowInvalid`]: the plan is layout-level data and
+    /// [`WorldError::DescriptorRowInvalid`]: the plan is layout-level data and
     /// carries no component id for a richer message.
     pub fn validate(&self, old_size: usize, new_size: usize) -> Result<(), WorldError> {
         for field in &self.fields {
             if out_of_bounds(field.offset, field.bytes, new_size) {
-                return Err(WorldError::DynamicRowInvalid);
+                return Err(WorldError::DescriptorRowInvalid);
             }
             if let FieldSource::OldOffset(offset) = field.source {
                 if out_of_bounds(offset, field.bytes, old_size) {
-                    return Err(WorldError::DynamicRowInvalid);
+                    return Err(WorldError::DescriptorRowInvalid);
                 }
             }
         }
@@ -580,7 +580,7 @@ fn out_of_bounds(offset: usize, bytes: usize, size: usize) -> bool {
 #[derive(Default)]
 pub struct ComponentColumns {
     /// One contiguous column per native component in the archetype.
-    columns: HashMap<ComponentId, DynamicColumn>,
+    columns: HashMap<ComponentId, ComponentColumn>,
 }
 
 impl ComponentColumns {
@@ -601,13 +601,13 @@ impl ComponentColumns {
     /// Returns the column for `component_id`, or `None` when the archetype
     /// does not store that component.
     #[inline]
-    pub fn get(&self, component_id: ComponentId) -> Option<&DynamicColumn> {
+    pub fn get(&self, component_id: ComponentId) -> Option<&ComponentColumn> {
         self.columns.get(&component_id)
     }
 
     /// Returns the column for `component_id` mutably.
     #[inline]
-    pub fn get_mut(&mut self, component_id: ComponentId) -> Option<&mut DynamicColumn> {
+    pub fn get_mut(&mut self, component_id: ComponentId) -> Option<&mut ComponentColumn> {
         self.columns.get_mut(&component_id)
     }
 
@@ -618,7 +618,7 @@ impl ComponentColumns {
     /// Panics when the archetype does not store `T`, which means the caller
     /// reached a column the archetype's mask says is not there.
     #[inline]
-    pub fn column_of<T: Component>(&self) -> &DynamicColumn {
+    pub fn column_of<T: Component>(&self) -> &ComponentColumn {
         self.get(ComponentId::of::<T>())
             .unwrap_or_else(|| missing_column::<T>())
     }
@@ -629,7 +629,7 @@ impl ComponentColumns {
     ///
     /// Panics under the same condition as [`Self::column_of`].
     #[inline]
-    pub fn column_of_mut<T: Component>(&mut self) -> &mut DynamicColumn {
+    pub fn column_of_mut<T: Component>(&mut self) -> &mut ComponentColumn {
         self.get_mut(ComponentId::of::<T>())
             .unwrap_or_else(|| missing_column::<T>())
     }
@@ -640,7 +640,7 @@ impl ComponentColumns {
     ///
     /// Panics when a column for that component already exists; an archetype
     /// builds each of its columns exactly once.
-    pub fn insert(&mut self, component_id: ComponentId, column: DynamicColumn) {
+    pub fn insert(&mut self, component_id: ComponentId, column: ComponentColumn) {
         let replaced = self.columns.insert(component_id, column);
         assert!(
             replaced.is_none(),
@@ -649,7 +649,7 @@ impl ComponentColumns {
     }
 
     /// Removes and returns the column for `component_id`.
-    pub fn remove(&mut self, component_id: ComponentId) -> Option<DynamicColumn> {
+    pub fn remove(&mut self, component_id: ComponentId) -> Option<ComponentColumn> {
         self.columns.remove(&component_id)
     }
 
@@ -686,17 +686,17 @@ fn missing_column<T: Component>() -> ! {
 }
 
 // =============================================================================
-// DynamicColumn
+// ComponentColumn
 // =============================================================================
 
 /// Aligned, densely packed storage for a type-erased component column.
 ///
 /// Owns a raw heap allocation whose element size and alignment come from a
-/// [`DynamicComponentLayout`]. Rows are written and read as raw bytes, which
+/// [`ComponentLayout`]. Rows are written and read as raw bytes, which
 /// lets components defined in other languages share storage with native ones.
-pub struct DynamicColumn {
+pub struct ComponentColumn {
     /// Runtime layout of the stored element type.
-    layout: DynamicComponentLayout,
+    layout: ComponentLayout,
     /// Per-type behaviour, replaceable when a reload brings newer glue.
     ops: ColumnOps,
     /// What a typed accessor must prove before it may read these rows.
@@ -709,7 +709,7 @@ pub struct DynamicColumn {
     capacity: usize,
 }
 
-impl DynamicColumn {
+impl ComponentColumn {
     /// Creates an empty column for the given runtime layout.
     ///
     /// No heap allocation is made until the first row is pushed.
@@ -723,12 +723,12 @@ impl DynamicColumn {
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::DynamicSizeZero`],
-    /// [`WorldError::DynamicAlignmentInvalid`] or
-    /// [`WorldError::DynamicLayoutInvalid`] when the layout cannot describe
+    /// Returns [`WorldError::DescriptorSizeZero`],
+    /// [`WorldError::DescriptorAlignmentInvalid`] or
+    /// [`WorldError::DescriptorLayoutInvalid`] when the layout cannot describe
     /// an allocation.
-    pub fn new(layout: DynamicComponentLayout) -> Result<Self, WorldError> {
-        validate_dynamic_layout(layout.size, layout.align)?;
+    pub fn new(layout: ComponentLayout) -> Result<Self, WorldError> {
+        validate_component_layout(layout.size, layout.align)?;
         let ops = ColumnOps::blittable(layout.blittability);
         Ok(Self {
             layout,
@@ -770,7 +770,7 @@ impl DynamicColumn {
         // from `info.ops` - but the layout type requires a witness, so the
         // claim is made where it is provably unused.
         let blittability = unsafe { Blittability::assume() };
-        let layout = DynamicComponentLayout::new(info.size, info.align, schema_hash, blittability)?;
+        let layout = ComponentLayout::new(info.size, info.align, schema_hash, blittability)?;
         Ok(Self {
             layout,
             ops: info.ops,
@@ -870,7 +870,7 @@ impl DynamicColumn {
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::DynamicLayoutInvalid`] when the element layout
+    /// Returns [`WorldError::DescriptorLayoutInvalid`] when the element layout
     /// cannot describe the next allocation.
     pub fn push_zeroed(&mut self) -> Result<(), WorldError> {
         self.reserve_one()?;
@@ -890,13 +890,13 @@ impl DynamicColumn {
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::DynamicSizeMismatch`] when `bytes` does not
+    /// Returns [`WorldError::DescriptorSizeMismatch`] when `bytes` does not
     /// contain exactly `element_size()` bytes, or
-    /// [`WorldError::DynamicLayoutInvalid`] when the element layout cannot
+    /// [`WorldError::DescriptorLayoutInvalid`] when the element layout cannot
     /// describe the next allocation.
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), WorldError> {
         if bytes.len() != self.layout.size {
-            return Err(WorldError::DynamicSizeMismatch);
+            return Err(WorldError::DescriptorSizeMismatch);
         }
         self.reserve_one()?;
         // SAFETY: source and destination are valid for exactly one element and
@@ -916,18 +916,18 @@ impl DynamicColumn {
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::DynamicSizeMismatch`] when the two columns have
-    /// different element sizes, [`WorldError::DynamicRowInvalid`] when `index`
-    /// is out of bounds of `source`, and [`WorldError::DynamicLayoutInvalid`]
+    /// Returns [`WorldError::DescriptorSizeMismatch`] when the two columns have
+    /// different element sizes, [`WorldError::DescriptorRowInvalid`] when `index`
+    /// is out of bounds of `source`, and [`WorldError::DescriptorLayoutInvalid`]
     /// when the element layout cannot describe the next allocation. All three
     /// travel the reporting path: a drifted column must not abort a frame from
     /// inside the command flush, where the caller can hand the error back.
     pub fn push_from(&mut self, source: &Self, index: usize) -> Result<(), WorldError> {
         if self.layout.size != source.layout.size {
-            return Err(WorldError::DynamicSizeMismatch);
+            return Err(WorldError::DescriptorSizeMismatch);
         }
         if index >= source.len {
-            return Err(WorldError::DynamicRowInvalid);
+            return Err(WorldError::DescriptorRowInvalid);
         }
         self.reserve_one()?;
         // SAFETY: both slots are allocated, aligned, non-overlapping columns.
@@ -946,11 +946,11 @@ impl DynamicColumn {
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::DynamicRowInvalid`] when `index` is out of
+    /// Returns [`WorldError::DescriptorRowInvalid`] when `index` is out of
     /// bounds or `bytes` does not contain exactly `element_size()` bytes.
     pub fn set_bytes(&mut self, index: usize, bytes: &[u8]) -> Result<(), WorldError> {
         if index >= self.len || bytes.len() != self.layout.size {
-            return Err(WorldError::DynamicRowInvalid);
+            return Err(WorldError::DescriptorRowInvalid);
         }
         // SAFETY: the checked row is initialized and bytes has one element's size.
         unsafe {
@@ -1122,13 +1122,13 @@ impl DynamicColumn {
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::DynamicLayoutInvalid`] when the capacity or the
+    /// Returns [`WorldError::DescriptorLayoutInvalid`] when the capacity or the
     /// allocation layout it implies cannot be represented.
     pub fn reserve_rows(&mut self, additional: usize) -> Result<(), WorldError> {
         let target = self
             .len
             .checked_add(additional)
-            .ok_or(WorldError::DynamicLayoutInvalid)?;
+            .ok_or(WorldError::DescriptorLayoutInvalid)?;
         self.grow_to(target)
     }
 
@@ -1224,17 +1224,17 @@ impl DynamicColumn {
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::DynamicSizeZero`],
-    /// [`WorldError::DynamicAlignmentInvalid`] or
-    /// [`WorldError::DynamicLayoutInvalid`] when the new layout cannot describe
-    /// storage, and [`WorldError::DynamicRowInvalid`] when a planned field reads
+    /// Returns [`WorldError::DescriptorSizeZero`],
+    /// [`WorldError::DescriptorAlignmentInvalid`] or
+    /// [`WorldError::DescriptorLayoutInvalid`] when the new layout cannot describe
+    /// storage, and [`WorldError::DescriptorRowInvalid`] when a planned field reads
     /// or writes past the edge of a row. Nothing is modified in either case.
     pub fn relayout(
         &mut self,
-        layout: DynamicComponentLayout,
-        plan: &DynamicFieldPlan,
+        layout: ComponentLayout,
+        plan: &FieldPlan,
     ) -> Result<usize, WorldError> {
-        validate_dynamic_layout(layout.size, layout.align)?;
+        validate_component_layout(layout.size, layout.align)?;
         plan.validate(self.layout.size, layout.size)?;
         let previous_size = self.layout.size;
         Ok(self.relayout_validated(layout, plan, previous_size))
@@ -1249,8 +1249,8 @@ impl DynamicColumn {
     /// first column, instead of leaving some columns migrated and some not.
     pub(crate) fn relayout_validated(
         &mut self,
-        layout: DynamicComponentLayout,
-        plan: &DynamicFieldPlan,
+        layout: ComponentLayout,
+        plan: &FieldPlan,
         previous_size: usize,
     ) -> usize {
         // The plan was validated against `previous_size`, so that - not this
@@ -1278,9 +1278,9 @@ impl DynamicColumn {
                 let bytes = layout
                     .size
                     .checked_mul(self.capacity)
-                    .expect("dynamic column too large");
+                    .expect("component column too large");
                 let allocation = Layout::from_size_align(bytes, layout.align)
-                    .expect("dynamic layout validated by the caller");
+                    .expect("component layout validated by the caller");
                 // SAFETY: the allocation has non-zero size, checked above.
                 let pointer = unsafe { alloc(allocation) };
                 NonNull::new(pointer).unwrap_or_else(|| handle_alloc_error(allocation))
@@ -1369,7 +1369,7 @@ impl DynamicColumn {
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::DynamicLayoutInvalid`] when the doubled capacity
+    /// Returns [`WorldError::DescriptorLayoutInvalid`] when the doubled capacity
     /// or the allocation layout it implies cannot be represented. Both used to
     /// panic instead, which a caller could not route around.
     fn reserve_one(&mut self) -> Result<(), WorldError> {
@@ -1386,7 +1386,7 @@ impl DynamicColumn {
         let new_capacity = self
             .capacity
             .checked_mul(2)
-            .ok_or(WorldError::DynamicLayoutInvalid)?
+            .ok_or(WorldError::DescriptorLayoutInvalid)?
             .max(4);
         self.grow_to(new_capacity)
     }
@@ -1400,7 +1400,7 @@ impl DynamicColumn {
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::DynamicLayoutInvalid`] when the capacity or the
+    /// Returns [`WorldError::DescriptorLayoutInvalid`] when the capacity or the
     /// allocation layout it implies cannot be represented.
     fn grow_to(&mut self, new_capacity: usize) -> Result<(), WorldError> {
         if new_capacity <= self.capacity {
@@ -1410,10 +1410,10 @@ impl DynamicColumn {
             self.layout
                 .size
                 .checked_mul(new_capacity)
-                .ok_or(WorldError::DynamicLayoutInvalid)?,
+                .ok_or(WorldError::DescriptorLayoutInvalid)?,
             self.layout.align,
         )
-        .map_err(|_| WorldError::DynamicLayoutInvalid)?;
+        .map_err(|_| WorldError::DescriptorLayoutInvalid)?;
 
         // Step 3: Allocate the new buffer and migrate the existing rows.
         // SAFETY: new_layout has non-zero size because component size is validated.
@@ -1446,8 +1446,8 @@ impl DynamicColumn {
 
 // SAFETY: Two premises, each enforced by named code rather than asserted here.
 //
-// 1. Every field of a dynamic component is a blittable value type. The
-//    evidence is held by the engine: every `DynamicComponentLayout` carries a
+// 1. Every field of a descriptor component is a blittable value type. The
+//    evidence is held by the engine: every `ComponentLayout` carries a
 //    `Blittability` witness, the host builds its own only after
 //    `BLITTABLE_FIELD_TYPES` vetted the manifest's fields, and no column can
 //    be constructed without a layout. This is what makes the raw `ptr::copy`
@@ -1456,13 +1456,13 @@ impl DynamicColumn {
 // 2. Access is serialised by the same scheduler rules as native columns - see
 //    `SystemAccess::conflicts_with`, which only takes its bitmask fast path when
 //    both systems' access masks are complete.
-unsafe impl Send for DynamicColumn {}
+unsafe impl Send for ComponentColumn {}
 // SAFETY: Shared access to a column only permits reading rows, which is sound
 // under the same two premises as `Send` above: rows are blittable value types
 // and access is serialised by the scheduler, so no write can race a read.
-unsafe impl Sync for DynamicColumn {}
+unsafe impl Sync for ComponentColumn {}
 
-impl Drop for DynamicColumn {
+impl Drop for ComponentColumn {
     /// Releases every row through the column's ops table, then frees the
     /// buffer itself.
     ///
@@ -1585,22 +1585,22 @@ impl Archetype {
                 StorageFactory::Native(info) => {
                     // Build the erased column from the registered type
                     // description. It is stored as a concrete
-                    // `DynamicColumn` (no trait-object vtable), so the
+                    // `ComponentColumn` (no trait-object vtable), so the
                     // column stays valid across module unloads, and under the
                     // component's id rather than its `TypeId`, so a component
                     // shared between binaries resolves to it from either one.
                     component_storages.insert(
                         component_id,
-                        DynamicColumn::from_native_info(*info, 0)
+                        ComponentColumn::from_native_info(*info, 0)
                             .expect("a registered native layout must describe an allocation"),
                     );
                 }
-                StorageFactory::Dynamic(layout) => {
-                    // Both paths into the registry - `register_dynamic_component`
-                    // and `relayout_dynamic_component` - validate the layout
+                StorageFactory::Descriptor(layout) => {
+                    // Both paths into the registry - `register_component_descriptor`
+                    // and the relayout pass - validate the layout
                     // before it is stored, so the column can only echo that
                     // verdict here.
-                    let column = DynamicColumn::new(layout.clone())
+                    let column = ComponentColumn::new(layout.clone())
                         .expect("registration validated this layout");
                     component_storages.insert(component_id, column);
                 }
@@ -1738,8 +1738,8 @@ mod tests {
     use super::*;
 
     /// One row of a two-field layout: `a` at 0, `b` at 4.
-    fn two_fields() -> DynamicComponentLayout {
-        DynamicComponentLayout {
+    fn two_fields() -> ComponentLayout {
+        ComponentLayout {
             size: 8,
             align: 4,
             schema_hash: 1,
@@ -1747,8 +1747,8 @@ mod tests {
         }
     }
 
-    fn column_with_rows(rows: &[[u8; 8]]) -> DynamicColumn {
-        let mut column = DynamicColumn::new(two_fields()).expect("a valid layout");
+    fn column_with_rows(rows: &[[u8; 8]]) -> ComponentColumn {
+        let mut column = ComponentColumn::new(two_fields()).expect("a valid layout");
         for row in rows {
             column.push_bytes(row).expect("row matches the layout");
         }
@@ -1762,7 +1762,7 @@ mod tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let constructed =
-            DynamicComponentLayout::new(4, 4, 7, Blittability::from_manifest_fields())
+            ComponentLayout::new(4, 4, 7, Blittability::from_manifest_fields())
                 .expect("a plain layout");
         assert_eq!(
             constructed.blittability,
@@ -1780,9 +1780,9 @@ mod tests {
             RELEASES.fetch_add(count, Ordering::SeqCst);
         }
 
-        let layout = DynamicComponentLayout::new(4, 4, 7, Blittability::from_manifest_fields())
+        let layout = ComponentLayout::new(4, 4, 7, Blittability::from_manifest_fields())
             .expect("a valid layout");
-        let mut column = DynamicColumn::new(layout).expect("a column");
+        let mut column = ComponentColumn::new(layout).expect("a column");
         column.refresh_ops(ColumnOps {
             drop_range: count_releases,
             trivial_drop: false,
@@ -1839,7 +1839,7 @@ mod tests {
             },
         ];
 
-        let plan = DynamicFieldPlan::between(&old, &new);
+        let plan = FieldPlan::between(&old, &new);
 
         assert_eq!(
             plan.fields(),
@@ -1889,7 +1889,7 @@ mod tests {
             },
         ];
 
-        let plan = DynamicFieldPlan::between(&old, &new);
+        let plan = FieldPlan::between(&old, &new);
 
         // The removed field leaves no instruction at all, and the added one is
         // an explicit zero fill rather than a missing entry.
@@ -1925,7 +1925,7 @@ mod tests {
             size: 8,
         }];
         assert_eq!(
-            DynamicFieldPlan::between(&old, &new).fields()[0].bytes,
+            FieldPlan::between(&old, &new).fields()[0].bytes,
             4,
             "the tail of a grown field has to come from the zero fill, not the old row"
         );
@@ -1942,7 +1942,7 @@ mod tests {
             offset: 0,
             size: 4,
         }];
-        assert_eq!(DynamicFieldPlan::between(&old, &new).fields()[0].bytes, 4);
+        assert_eq!(FieldPlan::between(&old, &new).fields()[0].bytes, 4);
     }
 
     #[test]
@@ -1984,11 +1984,11 @@ mod tests {
                 size: 8,
             },
         ];
-        let plan = DynamicFieldPlan::between(&old, &new);
+        let plan = FieldPlan::between(&old, &new);
 
         let rows = column
             .relayout(
-                DynamicComponentLayout {
+                ComponentLayout {
                     size: 16,
                     align: 8,
                     schema_hash: 2,
@@ -2015,7 +2015,7 @@ mod tests {
     fn relayout_of_an_equal_shape_rewrites_rows_in_place() {
         let mut column = column_with_rows(&[[1, 0, 0, 0, 2, 0, 0, 0]]);
         let before = column.as_mut_ptr();
-        let plan = DynamicFieldPlan::between(
+        let plan = FieldPlan::between(
             &[
                 LayoutField {
                     name: "a",
@@ -2048,7 +2048,7 @@ mod tests {
 
         column
             .relayout(
-                DynamicComponentLayout {
+                ComponentLayout {
                     size: 8,
                     align: 4,
                     schema_hash: 3,
@@ -2074,11 +2074,11 @@ mod tests {
     #[test]
     fn relayout_keeps_the_row_count_and_capacity() {
         let mut column = column_with_rows(&[[1, 0, 0, 0, 2, 0, 0, 0], [3, 0, 0, 0, 4, 0, 0, 0]]);
-        let plan = DynamicFieldPlan::new();
+        let plan = FieldPlan::new();
 
         column
             .relayout(
-                DynamicComponentLayout {
+                ComponentLayout {
                     size: 4,
                     align: 4,
                     schema_hash: 4,
@@ -2101,11 +2101,11 @@ mod tests {
     #[test]
     fn relayout_refuses_a_plan_that_leaves_a_row() {
         let mut column = column_with_rows(&[[1, 0, 0, 0, 2, 0, 0, 0]]);
-        let mut plan = DynamicFieldPlan::new();
+        let mut plan = FieldPlan::new();
         plan.push(4, 8, FieldSource::OldOffset(0));
 
         let result = column.relayout(
-            DynamicComponentLayout {
+            ComponentLayout {
                 size: 8,
                 align: 4,
                 schema_hash: 1,
@@ -2114,7 +2114,7 @@ mod tests {
             &plan,
         );
 
-        assert!(matches!(result, Err(WorldError::DynamicRowInvalid)));
+        assert!(matches!(result, Err(WorldError::DescriptorRowInvalid)));
         assert_eq!(
             column.bytes(0).unwrap(),
             [1, 0, 0, 0, 2, 0, 0, 0].as_slice(),
@@ -2127,27 +2127,27 @@ mod tests {
         let mut column = column_with_rows(&[]);
         assert!(matches!(
             column.relayout(
-                DynamicComponentLayout {
+                ComponentLayout {
                     size: 0,
                     align: 4,
                     schema_hash: 1,
                     blittability: Blittability::engine_verified()
                 },
-                &DynamicFieldPlan::new()
+                &FieldPlan::new()
             ),
-            Err(WorldError::DynamicSizeZero)
+            Err(WorldError::DescriptorSizeZero)
         ));
         assert!(matches!(
             column.relayout(
-                DynamicComponentLayout {
+                ComponentLayout {
                     size: 4,
                     align: 3,
                     schema_hash: 1,
                     blittability: Blittability::engine_verified()
                 },
-                &DynamicFieldPlan::new()
+                &FieldPlan::new()
             ),
-            Err(WorldError::DynamicAlignmentInvalid)
+            Err(WorldError::DescriptorAlignmentInvalid)
         ));
     }
     // =========================================================================
@@ -2172,7 +2172,7 @@ mod tests {
     /// A native column round-trips typed values through the byte buffer.
     #[test]
     fn a_native_column_pushes_and_reads_typed_rows() {
-        let mut column = DynamicColumn::new_native::<u64>(7, false).expect("layout");
+        let mut column = ComponentColumn::new_native::<u64>(7, false).expect("layout");
         column.push::<u64>(11);
         column.push::<u64>(22);
 
@@ -2191,7 +2191,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "different component type")]
     fn a_native_column_refuses_a_foreign_type() {
-        let column = DynamicColumn::new_native::<u64>(7, false).expect("layout");
+        let column = ComponentColumn::new_native::<u64>(7, false).expect("layout");
         let _ = column.as_slice::<u32>();
     }
 
@@ -2200,8 +2200,8 @@ mod tests {
     #[should_panic(expected = "descriptor-only column has no Rust type")]
     fn a_descriptor_column_refuses_typed_access() {
         let layout =
-            DynamicComponentLayout::new(8, 4, 7, Blittability::engine_verified()).expect("layout");
-        let column = DynamicColumn::new(layout).expect("column");
+            ComponentLayout::new(8, 4, 7, Blittability::engine_verified()).expect("layout");
+        let column = ComponentColumn::new(layout).expect("column");
         let _ = column.as_slice::<u64>();
     }
 
@@ -2209,7 +2209,7 @@ mod tests {
     /// binaries that reach it have different ids for one type.
     #[test]
     fn a_shared_column_accepts_a_layout_compatible_type() {
-        let mut column = DynamicColumn::new_native::<u64>(7, true).expect("layout");
+        let mut column = ComponentColumn::new_native::<u64>(7, true).expect("layout");
         column.push::<u64>(5);
         // A different type of the same shape is what the second binary's `T`
         // looks like from here.
@@ -2220,7 +2220,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "shared column layout")]
     fn a_shared_column_refuses_a_layout_mismatch() {
-        let column = DynamicColumn::new_native::<u64>(7, true).expect("layout");
+        let column = ComponentColumn::new_native::<u64>(7, true).expect("layout");
         let _ = column.as_slice::<u32>();
     }
 
@@ -2229,21 +2229,21 @@ mod tests {
     #[test]
     fn ops_report_the_drop_behaviour_of_their_lane() {
         let layout =
-            DynamicComponentLayout::new(4, 4, 7, Blittability::engine_verified()).expect("layout");
+            ComponentLayout::new(4, 4, 7, Blittability::engine_verified()).expect("layout");
         assert!(
-            DynamicColumn::new(layout)
+            ComponentColumn::new(layout)
                 .expect("column")
                 .ops()
                 .trivial_drop
         );
         assert!(
-            DynamicColumn::new_native::<u64>(7, false)
+            ComponentColumn::new_native::<u64>(7, false)
                 .expect("column")
                 .ops()
                 .trivial_drop
         );
         assert!(
-            !DynamicColumn::new_native::<DropCounted>(7, false)
+            !ComponentColumn::new_native::<DropCounted>(7, false)
                 .expect("column")
                 .ops()
                 .trivial_drop
@@ -2253,7 +2253,7 @@ mod tests {
     /// The generated table drops exactly the rows it is given, once each.
     #[test]
     fn generated_ops_drop_each_row_once() {
-        let mut column = DynamicColumn::new_native::<DropCounted>(7, false).expect("column");
+        let mut column = ComponentColumn::new_native::<DropCounted>(7, false).expect("column");
         column.push(DropCounted(1));
         column.push(DropCounted(2));
         DROPS.with(|count| count.set(0));
@@ -2271,7 +2271,7 @@ mod tests {
     /// Reserving space does not change what the column contains.
     #[test]
     fn reserving_rows_preserves_contents() {
-        let mut column = DynamicColumn::new_native::<u32>(7, false).expect("column");
+        let mut column = ComponentColumn::new_native::<u32>(7, false).expect("column");
         column.push::<u32>(9);
         column.reserve_rows(64).expect("reserve");
         assert!(column.capacity >= 65);
@@ -2293,8 +2293,8 @@ mod tests {
     fn a_descriptor_relayout_that_widens_alignment_reallocates() {
         // Two 4-byte fields, align 4 - the shape audit 4.18 widened.
         let old =
-            DynamicComponentLayout::new(12, 4, 1, Blittability::engine_verified()).expect("layout");
-        let mut column = DynamicColumn::new(old).expect("column");
+            ComponentLayout::new(12, 4, 1, Blittability::engine_verified()).expect("layout");
+        let mut column = ComponentColumn::new(old).expect("column");
         column
             .push_bytes(&[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0])
             .expect("push");
@@ -2304,8 +2304,8 @@ mod tests {
 
         // Widen to align 8, the case the native lane refuses.
         let new =
-            DynamicComponentLayout::new(16, 8, 2, Blittability::engine_verified()).expect("layout");
-        let mut plan = DynamicFieldPlan::new();
+            ComponentLayout::new(16, 8, 2, Blittability::engine_verified()).expect("layout");
+        let mut plan = FieldPlan::new();
         plan.push(0, 4, FieldSource::OldOffset(0));
         plan.push(8, 4, FieldSource::OldOffset(4));
         let migrated = column.relayout(new, &plan).expect("relayout");
@@ -2338,7 +2338,7 @@ mod tests {
             size: 4,
         }];
 
-        let plan = DynamicFieldPlan::between(&old, &new);
+        let plan = FieldPlan::between(&old, &new);
 
         // Copying would have carried the bits across: `5i32` read as `f32` is
         // 7e-45, a different number wearing the same name.
@@ -2374,7 +2374,7 @@ mod tests {
             size: 4,
         }];
 
-        let plan = DynamicFieldPlan::between(&old, &new);
+        let plan = FieldPlan::between(&old, &new);
 
         assert_eq!(
             plan.fields(),

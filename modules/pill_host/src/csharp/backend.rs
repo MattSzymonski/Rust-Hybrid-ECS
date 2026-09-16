@@ -1038,7 +1038,7 @@ impl CSharpRuntime {
     /// (plan §4.4), so today this compares two identical payloads and returns.
     /// It is here so that relaxing that refusal becomes a managed-side change:
     /// the host already knows how to migrate what a new manifest asks for - a
-    /// reshaped dynamic component is relaid out, a new one is registered, and a
+    /// reshaped descriptor component is relaid out, a new one is registered, and a
     /// native mirror or a vanished component is refused with a typed error.
     #[cfg(feature = "hot_reload")]
     fn apply_manifest_if_changed(&mut self, engine: &mut Engine) {

@@ -1,4 +1,9 @@
 //! Serializable dock model, validated mutations, and deterministic geometry.
+//!
+//! # Responsibilities
+//!
+//! - Present the layout vocabulary the editor, reducer and persistence share.
+//! - Keep each concern in its own submodule and re-export the surface here.
 
 mod action;
 mod geometry;

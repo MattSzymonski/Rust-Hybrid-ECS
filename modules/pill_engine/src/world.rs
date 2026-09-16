@@ -25,8 +25,8 @@ use pill_core::{error, warn};
 
 // Current crate
 use crate::archetype::{
-    validate_dynamic_layout, Archetype, ArchetypeId, Blittability, ComponentColumns,
-    DynamicComponentLayout, DynamicFieldPlan, StorageFactory,
+    validate_component_layout, Archetype, ArchetypeId, Blittability, ComponentColumns,
+    ComponentLayout, FieldPlan, StorageFactory,
 };
 use crate::commands::CommandQueue;
 use crate::component::{
@@ -245,18 +245,38 @@ pub struct EntityRow {
 
 /// Where a component's field layout came from.
 ///
+/// One component's field list, declared either way.
+///
 /// Native components submit a `&'static` slice from their declaring
-/// artifact's static data. Components defined by another language describe
+/// artifact's static data; components defined by another language describe
 /// themselves in a runtime manifest, so their layout is owned by the `World`
-/// instead. The editor reads either through [`World::component_field_layout`],
-/// which erases the distinction.
+/// instead. The difference is storage, not meaning, so it lives in a single
+/// `Cow`; the editor reads the list through [`World::component_field_layout`].
 #[derive(Debug, Clone)]
-pub(crate) enum ComponentFieldLayout {
-    /// Compile-time layout living in the declaring artifact's static data.
-    Static(&'static [crate::component_registry::ComponentFieldDescriptor]),
-    /// Runtime-described layout owned by the world (foreign-language
+pub(crate) struct ComponentFieldLayout(
+    std::borrow::Cow<'static, [crate::component_registry::ComponentFieldDescriptor]>,
+);
+
+impl ComponentFieldLayout {
+    /// Wrap a compile-time layout living in the declaring artifact's static data.
+    pub(crate) fn from_static(
+        fields: &'static [crate::component_registry::ComponentFieldDescriptor],
+    ) -> Self {
+        Self(std::borrow::Cow::Borrowed(fields))
+    }
+
+    /// Wrap a runtime-described layout owned by the world (foreign-language
     /// components).
-    Owned(Vec<crate::component_registry::ComponentFieldDescriptor>),
+    pub(crate) fn from_owned(
+        fields: Vec<crate::component_registry::ComponentFieldDescriptor>,
+    ) -> Self {
+        Self(std::borrow::Cow::Owned(fields))
+    }
+
+    /// The field list, whichever lane declared it.
+    pub(crate) fn fields(&self) -> &[crate::component_registry::ComponentFieldDescriptor] {
+        &self.0
+    }
 }
 
 /// Manages all entities, archetypes, and resources in the ECS.
@@ -437,8 +457,8 @@ pub struct World {
     /// Field layouts submitted by `#[derive(PillComponent)]` (static, living
     /// in the declaring artifact) or described at runtime by a foreign-language
     /// manifest (owned). Consumed by the C# mirror codegen and the editor's
-    /// generic inspector. Re-registered by each reloaded generation; a dynamic
-    /// manifest replaces rather than accumulates.
+    /// generic inspector. Re-registered by each reloaded generation; a
+    /// descriptor manifest replaces rather than accumulates.
     pub(crate) component_field_layouts: HashMap<ComponentId, ComponentFieldLayout>,
     /// First component-registration failure of the current init pass, if any.
     ///
@@ -836,7 +856,7 @@ impl World {
 
     /// Register a component together with its compile-time field layout, so
     /// the C# mirror codegen can emit a typed struct. Components registered
-    /// without field metadata (hand-registered, dynamic, or unit types) keep
+    /// without field metadata (hand-registered, descriptor, or unit types) keep
     /// the opaque ABI-blob mirror.
     pub fn register_component_with_layout<T>(
         &mut self,
@@ -845,8 +865,10 @@ impl World {
         T: Component + Clone,
     {
         self.register_component_inner::<T>(fields);
-        self.component_field_layouts
-            .insert(ComponentId::of::<T>(), ComponentFieldLayout::Static(fields));
+        self.component_field_layouts.insert(
+            ComponentId::of::<T>(),
+            ComponentFieldLayout::from_static(fields),
+        );
     }
 
     /// Return the field layout a component was registered with.
@@ -858,14 +880,12 @@ impl World {
         &self,
         component_id: ComponentId,
     ) -> Option<&[crate::component_registry::ComponentFieldDescriptor]> {
-        match self.component_field_layouts.get(&component_id) {
-            Some(ComponentFieldLayout::Static(fields)) => Some(fields),
-            Some(ComponentFieldLayout::Owned(fields)) => Some(fields),
-            None => None,
-        }
+        self.component_field_layouts
+            .get(&component_id)
+            .map(ComponentFieldLayout::fields)
     }
 
-    /// Record a runtime-described layout for a dynamic component.
+    /// Record a runtime-described layout for a descriptor component.
     ///
     /// Overwrites any previous layout for the same id, so a manifest reload
     /// replaces rather than accumulates. Used by the C# backend so managed
@@ -875,11 +895,11 @@ impl World {
     ///
     /// Returns [`ComponentFieldError::UnsupportedField`] for a descriptor that
     /// reaches past the component's registered size or names a container tag.
-    /// A dynamic row is raw bytes with no Rust value in it, so the accessors
+    /// A descriptor row is raw bytes with no Rust value in it, so the accessors
     /// have to be able to trust both: the bound keeps them inside the row, and
     /// the tag check keeps them from following a `(pointer, length)` pair the
     /// row never held.
-    pub fn register_dynamic_component_field_layout(
+    pub fn register_component_descriptor_with_layout(
         &mut self,
         component_id: ComponentId,
         fields: Vec<crate::component_registry::ComponentFieldDescriptor>,
@@ -907,12 +927,12 @@ impl World {
             {
                 return Err(crate::component_field::ComponentFieldError::UnsupportedField {
                     field: field.name.to_string(),
-                    reason: "a container tag is read as a native pointer and length, which a dynamic row does not hold",
+                    reason: "a container tag is read as a native pointer and length, which a descriptor row does not hold",
                 });
             }
         }
         self.component_field_layouts
-            .insert(component_id, ComponentFieldLayout::Owned(fields));
+            .insert(component_id, ComponentFieldLayout::from_owned(fields));
         Ok(())
     }
 
@@ -937,7 +957,7 @@ impl World {
             .iter()
             .filter_map(|(component_id, factory)| match factory {
                 StorageFactory::Native(info) => Some((*component_id, info.ops)),
-                StorageFactory::Dynamic(_) => None,
+                StorageFactory::Descriptor(_) => None,
             })
             .collect();
 
@@ -1029,11 +1049,11 @@ impl World {
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::DynamicStableIdZero`] for a zero `stable_id`,
-    /// [`WorldError::DynamicSizeZero`] for a zero `size`,
-    /// [`WorldError::DynamicAlignmentInvalid`] for a zero or non-power-of-two
-    /// `align`, [`WorldError::DynamicLayoutInvalid`] for an oversized layout,
-    /// [`WorldError::DynamicAlreadyRegistered`] when the `stable_id` is
+    /// Returns [`WorldError::DescriptorStableIdZero`] for a zero `stable_id`,
+    /// [`WorldError::DescriptorSizeZero`] for a zero `size`,
+    /// [`WorldError::DescriptorAlignmentInvalid`] for a zero or non-power-of-two
+    /// `align`, [`WorldError::DescriptorLayoutInvalid`] for an oversized layout,
+    /// [`WorldError::DescriptorAlreadyRegistered`] when the `stable_id` is
     /// already taken by a different layout or name, and
     /// [`WorldError::ComponentTypeLimitExceeded`] when the registry is full.
     ///
@@ -1044,7 +1064,7 @@ impl World {
     /// so there is no check this function could run itself that would make an
     /// owning layout safe. [`Blittability`] documents what each constructor
     /// proves.
-    pub fn register_dynamic_component(
+    pub fn register_component_descriptor(
         &mut self,
         stable_id: u128,
         name: impl Into<String>,
@@ -1054,16 +1074,16 @@ impl World {
         blittability: Blittability,
     ) -> Result<ComponentId, WorldError> {
         if stable_id == 0 {
-            return Err(WorldError::DynamicStableIdZero);
+            return Err(WorldError::DescriptorStableIdZero);
         }
         // The same three checks a relayout runs, so a layout this refuses can
         // never be one the storage would accept later.
-        validate_dynamic_layout(size, align)?;
+        validate_component_layout(size, align)?;
         let name = name.into();
-        let component_id = ComponentId::dynamic(stable_id);
+        let component_id = ComponentId::descriptor(stable_id);
         if let Some(existing) = self.storage_factories.get(&component_id) {
             return match existing {
-                StorageFactory::Dynamic(layout)
+                StorageFactory::Descriptor(layout)
                     if layout.size == size
                         && layout.align == align
                         && layout.schema_hash == schema_hash
@@ -1071,7 +1091,7 @@ impl World {
                 {
                     Ok(component_id)
                 }
-                _ => Err(WorldError::DynamicAlreadyRegistered),
+                _ => Err(WorldError::DescriptorAlreadyRegistered),
             };
         }
         // A name already claimed by a live column belongs to a different
@@ -1093,10 +1113,10 @@ impl World {
         // The registry reports the 128-type ceiling as a typed error (with the
         // offending name and current count) rather than panicking; propagate it.
         self.component_registry
-            .register_dynamic(stable_id, name, size)?;
+            .register_descriptor(stable_id, name, size)?;
         self.storage_factories.insert(
             component_id,
-            StorageFactory::Dynamic(DynamicComponentLayout::new(
+            StorageFactory::Descriptor(ComponentLayout::new(
                 size,
                 align,
                 schema_hash,
@@ -1106,16 +1126,16 @@ impl World {
         Ok(component_id)
     }
 
-    /// Replace a dynamic component's layout, migrating every stored row.
+    /// Replace a descriptor component's layout, migrating every stored row.
     ///
-    /// The one way a dynamic component's storage shape may change after
+    /// The one way a descriptor component's storage shape may change after
     /// registration. The component keeps its id, its registry bit and its
     /// archetype membership - a fresh registration would allocate a new bit
     /// index, and that index is baked into archetype masks and scheduled access
     /// masks - so only the columns' element layout and the recorded size move.
     ///
     /// `plan` says where each byte of a new row comes from
-    /// ([`DynamicFieldPlan::between`] builds one from two field lists). Anything
+    /// ([`FieldPlan::between`] builds one from two field lists). Anything
     /// it does not cover is left zero. Row order and change ticks are
     /// preserved, so entity locations stay valid and no system observes a
     /// spurious `Added`.
@@ -1127,30 +1147,30 @@ impl World {
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::DynamicSizeZero`],
-    /// [`WorldError::DynamicAlignmentInvalid`] or
-    /// [`WorldError::DynamicLayoutInvalid`] when the new layout cannot describe
-    /// storage, [`WorldError::DynamicComponentNotRegistered`] when the id is not
-    /// a registered dynamic component, [`WorldError::DynamicStorageMissing`]
+    /// Returns [`WorldError::DescriptorSizeZero`],
+    /// [`WorldError::DescriptorAlignmentInvalid`] or
+    /// [`WorldError::DescriptorLayoutInvalid`] when the new layout cannot describe
+    /// storage, [`WorldError::DescriptorComponentNotRegistered`] when the id is not
+    /// a registered descriptor component, [`WorldError::DescriptorStorageMissing`]
     /// when an archetype lists the component without a column,
-    /// [`WorldError::DynamicColumnLayoutMismatch`] when a column's element size
-    /// disagrees with the registered layout, and [`WorldError::DynamicRowInvalid`]
+    /// [`WorldError::ComponentColumnLayoutMismatch`] when a column's element size
+    /// disagrees with the registered layout, and [`WorldError::DescriptorRowInvalid`]
     /// when a planned field falls outside a row of either layout.
-    pub fn relayout_dynamic_component(
+    pub fn relayout_descriptor_component(
         &mut self,
         component_id: ComponentId,
         size: usize,
         align: usize,
         schema_hash: u64,
-        plan: &DynamicFieldPlan,
+        plan: &FieldPlan,
     ) -> Result<usize, WorldError> {
-        validate_dynamic_layout(size, align)?;
+        validate_component_layout(size, align)?;
 
         // The previous layout is what the plan's source offsets are measured
         // against, so it has to be the one the columns are actually using.
-        let Some(StorageFactory::Dynamic(previous)) = self.storage_factories.get(&component_id)
+        let Some(StorageFactory::Descriptor(previous)) = self.storage_factories.get(&component_id)
         else {
-            return Err(WorldError::DynamicComponentNotRegistered { id: component_id });
+            return Err(WorldError::DescriptorComponentNotRegistered { id: component_id });
         };
         let previous_size = previous.size;
         plan.validate(previous_size, size)?;
@@ -1160,7 +1180,7 @@ impl World {
         // entity added to them is stored at the new shape.
         // A relayout keeps the witness and the release hook: the shape
         // changes, the promise about what a row owns does not.
-        let layout = DynamicComponentLayout {
+        let layout = ComponentLayout {
             size,
             align,
             schema_hash,
@@ -1178,13 +1198,13 @@ impl World {
                 continue;
             }
             let Some(column) = archetype.component_storages.get(component_id) else {
-                return Err(WorldError::DynamicStorageMissing {
+                return Err(WorldError::DescriptorStorageMissing {
                     component_id,
                     archetype_id: *archetype_id,
                 });
             };
             if column.element_size() != previous_size {
-                return Err(WorldError::DynamicColumnLayoutMismatch {
+                return Err(WorldError::ComponentColumnLayoutMismatch {
                     component_id,
                     archetype_id: *archetype_id,
                     expected: previous_size,
@@ -1215,14 +1235,14 @@ impl World {
         // move together, or `get_layout` keeps reporting the placeholder
         // alignment registration started with.
         self.component_registry
-            .update_dynamic_layout(&component_id, &layout);
+            .update_descriptor_layout(&component_id, &layout);
         self.storage_factories
-            .insert(component_id, StorageFactory::Dynamic(layout));
+            .insert(component_id, StorageFactory::Descriptor(layout));
         Ok(migrated)
     }
 
-    /// Return a raw dynamic component column for language bindings.
-    pub fn dynamic_component_chunk_mut(
+    /// Return a raw descriptor component column for language bindings.
+    pub fn descriptor_component_chunk_mut(
         &mut self,
         component_id: ComponentId,
         chunk_index: usize,
@@ -1246,11 +1266,12 @@ impl World {
 
     /// Return a raw native component column for language bindings.
     ///
-    /// The native twin of [`Self::dynamic_component_chunk_mut`]: returns the
+    /// The native twin of [`Self::descriptor_component_chunk_mut`]: returns the
     /// contiguous row buffer of a native (Rust-registered) component as raw
     /// bytes, so the C# backend can expose components that an optional module
     /// registered without naming their concrete Rust type. Only native
-    /// components are served; dynamic components must use the dynamic variant.
+    /// components are served; descriptor components must use
+    /// [`Self::descriptor_component_chunk_mut`] instead.
     /// The returned pointer is only valid for the active managed-system
     /// invocation and must not be retained beyond it.
     pub fn native_component_chunk_mut(
@@ -1279,10 +1300,10 @@ impl World {
         Some((archetype_id, data, len, element_size, ticks))
     }
 
-    /// Return a raw dynamic component column from one already-known archetype.
+    /// Return a raw descriptor component column from one already-known archetype.
     ///
-    /// The archetype-scoped twin of [`Self::dynamic_component_chunk_mut`].
-    pub fn dynamic_component_chunk_in_archetype(
+    /// The archetype-scoped twin of [`Self::descriptor_component_chunk_mut`].
+    pub fn descriptor_component_chunk_in_archetype(
         &mut self,
         component_id: ComponentId,
         archetype_id: ArchetypeId,
@@ -1450,13 +1471,13 @@ impl World {
 
     /// Return the byte size and alignment of a registered component's layout.
     ///
-    /// Works for both native (Rust) and dynamic (foreign-language) components.
+    /// Works for both native (Rust) and descriptor (foreign-language) components.
     /// Used by the C# backend to validate that a managed mirror struct has the
     /// same ABI layout as the component an optional module registered.
     pub fn component_layout(&self, component_id: ComponentId) -> Option<(usize, usize)> {
         match self.storage_factories.get(&component_id) {
             Some(StorageFactory::Native(info)) => Some((info.size, info.align)),
-            Some(StorageFactory::Dynamic(layout)) => Some((layout.size, layout.align)),
+            Some(StorageFactory::Descriptor(layout)) => Some((layout.size, layout.align)),
             None => None,
         }
     }
@@ -1571,33 +1592,33 @@ impl World {
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::DynamicEntityEmpty`] if `components` is empty,
-    /// [`WorldError::DynamicDuplicateComponent`] if a component appears more
-    /// than once, [`WorldError::DynamicComponentNotRegistered`] if a
+    /// Returns [`WorldError::DescriptorEntityEmpty`] if `components` is empty,
+    /// [`WorldError::DescriptorDuplicateComponent`] if a component appears more
+    /// than once, [`WorldError::DescriptorComponentNotRegistered`] if a
     /// component was never registered, and
-    /// [`WorldError::DynamicByteLengthMismatch`] if a byte payload does not
+    /// [`WorldError::DescriptorByteLengthMismatch`] if a byte payload does not
     /// match its registered layout size.
-    pub fn create_dynamic_entity(
+    pub fn create_descriptor_entity(
         &mut self,
         components: &[(ComponentId, Vec<u8>)],
     ) -> Result<Entity, WorldError> {
         // Step 1: Validate the component set - non-empty, unique, registered,
         // and every payload matches its registered layout.
         if components.is_empty() {
-            return Err(WorldError::DynamicEntityEmpty);
+            return Err(WorldError::DescriptorEntityEmpty);
         }
         let mut component_ids: Vec<_> = components.iter().map(|(id, _)| *id).collect();
         component_ids.sort();
         component_ids.dedup();
         if component_ids.len() != components.len() {
-            return Err(WorldError::DynamicDuplicateComponent);
+            return Err(WorldError::DescriptorDuplicateComponent);
         }
         for (id, bytes) in components {
-            let Some(StorageFactory::Dynamic(layout)) = self.storage_factories.get(id) else {
-                return Err(WorldError::DynamicComponentNotRegistered { id: *id });
+            let Some(StorageFactory::Descriptor(layout)) = self.storage_factories.get(id) else {
+                return Err(WorldError::DescriptorComponentNotRegistered { id: *id });
             };
             if bytes.len() != layout.size {
-                return Err(WorldError::DynamicByteLengthMismatch { id: *id });
+                return Err(WorldError::DescriptorByteLengthMismatch { id: *id });
             }
         }
 
@@ -1621,7 +1642,7 @@ impl World {
             if !archetype.component_storages.contains(*id)
                 || !archetype.component_ticks.contains_key(id)
             {
-                return Err(WorldError::DynamicStorageMissing {
+                return Err(WorldError::DescriptorStorageMissing {
                     component_id: *id,
                     archetype_id,
                 });
@@ -1639,7 +1660,7 @@ impl World {
             match archetype.component_storages.get_mut(*id) {
                 Some(storage) => storage.push_bytes(bytes)?,
                 None => {
-                    return Err(WorldError::DynamicStorageMissing {
+                    return Err(WorldError::DescriptorStorageMissing {
                         component_id: *id,
                         archetype_id,
                     })
@@ -1648,7 +1669,7 @@ impl World {
             match archetype.component_ticks.get_mut(id) {
                 Some(ticks) => ticks.push(ComponentTicks::new(current_tick)),
                 None => {
-                    return Err(WorldError::DynamicStorageMissing {
+                    return Err(WorldError::DescriptorStorageMissing {
                         component_id: *id,
                         archetype_id,
                     })
@@ -1668,7 +1689,7 @@ impl World {
     }
 
     /// Read one runtime-defined component as its raw manifest bytes.
-    pub fn dynamic_component_bytes(
+    pub fn descriptor_component_bytes(
         &self,
         entity: Entity,
         component_id: ComponentId,
@@ -2192,11 +2213,11 @@ impl World {
 
     /// Replace a foreign resource's declared layout, migrating its value.
     ///
-    /// The resource twin of [`Self::relayout_dynamic_component`], and much
+    /// The resource twin of [`Self::relayout_descriptor_component`], and much
     /// smaller for the same reason a resource is smaller than a column: one
     /// value, no archetypes, no rows to keep in step. `plan` comes from the same
     /// two field lists the component path uses
-    /// ([`DynamicFieldPlan::between`]), and anything it does not cover is left
+    /// ([`FieldPlan::between`]), and anything it does not cover is left
     /// zero.
     ///
     /// Only a foreign payload is rewritten. A Rust value stored under the
@@ -2223,7 +2244,7 @@ impl World {
         size: usize,
         align: usize,
         schema_hash: u64,
-        plan: &DynamicFieldPlan,
+        plan: &FieldPlan,
     ) -> Result<usize, WorldError> {
         if !self
             .resource_factories
@@ -3050,12 +3071,12 @@ impl World {
                 // can fail only after pushing roughly 2^60 rows of one
                 // component: out of address space rather than out of layout.
                 // The fallible paths - `move_entity_to_archetype` and
-                // `relayout_dynamic_component` - hand the error back instead;
+                // `relayout_descriptor_component` - hand the error back instead;
                 // this one returns nothing, so it names the one state it
                 // cannot survive.
                 column
                     .push_zeroed()
-                    .expect("dynamic column growth cannot exhaust the address space");
+                    .expect("descriptor column growth cannot exhaust the address space");
             }
         }
 
@@ -3092,7 +3113,7 @@ impl World {
     /// Returns [`WorldError::EntityNotFound`] when the entity has no location
     /// record, [`WorldError::ArchetypeMissing`] when either the source or the
     /// destination archetype is absent from the world, and
-    /// [`WorldError::DynamicStorageMissing`] when a dynamic component named
+    /// [`WorldError::DescriptorStorageMissing`] when a descriptor component named
     /// by an archetype has no storage column — the desync a partially applied
     /// hot reload can leave behind.
     pub(crate) fn move_entity_to_archetype<F>(
@@ -3136,9 +3157,9 @@ impl World {
             return Ok(());
         }
 
-        // Step 2b: Verify the destination before anything moves. A dynamic
+        // Step 2b: Verify the destination before anything moves. A descriptor
         // component the destination archetype has no column for is the
-        // manifest/storage desync `DynamicStorageMissing` reports; finding it
+        // manifest/storage desync `DescriptorStorageMissing` reports; finding it
         // here - over the same component list the migration loop itself walks,
         // the destination archetype's own - is what keeps a failed migration
         // atomic: the destination would otherwise already hold the entity's row
@@ -3156,7 +3177,7 @@ impl World {
                     continue;
                 }
                 if !new_archetype.component_storages.contains(component_id) {
-                    return Err(WorldError::DynamicStorageMissing {
+                    return Err(WorldError::DescriptorStorageMissing {
                         component_id,
                         archetype_id: new_archetype_id,
                     });
@@ -3231,7 +3252,7 @@ impl World {
                     // descriptor component has no column: a manifest/storage
                     // desync. Fail the migration rather than leave the
                     // destination archetype short a column.
-                    return Err(WorldError::DynamicStorageMissing {
+                    return Err(WorldError::DescriptorStorageMissing {
                         component_id,
                         archetype_id: new_archetype_id,
                     });
@@ -3290,7 +3311,7 @@ impl World {
                         debug_assert_eq!(
                             column.len(),
                             new_index + 1,
-                            "a destination dynamic column did not grow by exactly one row"
+                            "a destination descriptor column did not grow by exactly one row"
                         );
                     }
                 }
@@ -3349,11 +3370,11 @@ impl World {
                     false => {
                         let Some(column) = old_archetype.component_storages.get_mut(component_id)
                         else {
-                            // A dynamic component without a column is the
+                            // A descriptor component without a column is the
                             // manifest/storage desync this function already
                             // reports during migration; surface it here too
                             // instead of panicking mid-frame.
-                            return Err(WorldError::DynamicStorageMissing {
+                            return Err(WorldError::DescriptorStorageMissing {
                                 component_id,
                                 archetype_id: old_archetype_id,
                             });
@@ -3440,17 +3461,17 @@ impl World {
                         if let Some(column) = archetype.component_storages.get_mut(*component_id) {
                             column.swap_remove_discard(old_index);
                         } else {
-                            // A dynamic component with no column has no data to
+                            // A descriptor component with no column has no data to
                             // remove, so skipping is safe. The missing column is
                             // the manifest/storage desync reported by
-                            // `WorldError::DynamicStorageMissing`; report rather
+                            // `WorldError::DescriptorStorageMissing`; report rather
                             // than panic, because this runs inside
                             // `process_frame` for managed projects.
                             warn!(
                                 target: pill_core::telemetry::telemetry_target::ECS,
                                 component_id = ?component_id,
                                 archetype_id = ?archetype.id,
-                                "destroy_entity: dynamic component has no storage column; skipping"
+                                "destroy_entity: descriptor component has no storage column; skipping"
                             );
                         }
                     }
@@ -3569,7 +3590,7 @@ impl World {
             // The entity and its archetype were validated above, so a
             // migration failure here is an internal-invariant break, not a
             // user error. Name the entity and the failure so the report is
-            // startable; the dynamic paths propagate the same failure as a
+            // startable; the descriptor paths propagate the same failure as a
             // typed error instead, because their inputs come from outside
             // the engine.
             panic!("internal invariant broken while migrating entity {entity:?}: {error}")
@@ -3664,12 +3685,12 @@ impl World {
     /// # Errors
     ///
     /// Returns [`WorldError::EntityNotFound`] if the entity does not exist,
-    /// [`WorldError::DynamicComponentAlreadyPresent`] if the entity already
-    /// carries the component, [`WorldError::DynamicComponentNotRegistered`]
+    /// [`WorldError::DescriptorComponentAlreadyPresent`] if the entity already
+    /// carries the component, [`WorldError::DescriptorComponentNotRegistered`]
     /// if the component was never registered, and
-    /// [`WorldError::DynamicByteLengthMismatch`] if `bytes` does not match
+    /// [`WorldError::DescriptorByteLengthMismatch`] if `bytes` does not match
     /// the registered layout size.
-    pub fn add_dynamic_component(
+    pub fn add_descriptor_component(
         &mut self,
         entity: Entity,
         component_id: ComponentId,
@@ -3686,14 +3707,14 @@ impl World {
             });
         };
         if old_archetype.component_types.contains(&component_id) {
-            return Err(WorldError::DynamicComponentAlreadyPresent);
+            return Err(WorldError::DescriptorComponentAlreadyPresent);
         }
         let expected_size = match self.storage_factories.get(&component_id) {
-            Some(StorageFactory::Dynamic(layout)) => layout.size,
-            _ => return Err(WorldError::DynamicComponentNotRegistered { id: component_id }),
+            Some(StorageFactory::Descriptor(layout)) => layout.size,
+            _ => return Err(WorldError::DescriptorComponentNotRegistered { id: component_id }),
         };
         if bytes.len() != expected_size {
-            return Err(WorldError::DynamicByteLengthMismatch { id: component_id });
+            return Err(WorldError::DescriptorByteLengthMismatch { id: component_id });
         }
         let mut new_ids = old_archetype.component_types.clone();
         new_ids.push(component_id);
@@ -3720,7 +3741,7 @@ impl World {
             });
         };
         let Some(storage) = archetype.component_storages.get_mut(component_id) else {
-            return Err(WorldError::DynamicStorageMissing {
+            return Err(WorldError::DescriptorStorageMissing {
                 component_id,
                 archetype_id: location.archetype_id,
             });
@@ -3730,7 +3751,7 @@ impl World {
     }
 
     /// Replace the bytes of an existing runtime-defined component row.
-    pub(crate) fn set_dynamic_component_bytes(
+    pub(crate) fn set_descriptor_component_bytes(
         &mut self,
         entity: Entity,
         component_id: ComponentId,
@@ -3743,7 +3764,7 @@ impl World {
         self.archetypes
             .get_mut(&location.archetype_id)
             .and_then(|archetype| archetype.component_storages.get_mut(component_id))
-            .ok_or(WorldError::DynamicComponentMissing)?
+            .ok_or(WorldError::DescriptorComponentMissing)?
             .set_bytes(location.index_in_archetype, bytes)
     }
 
@@ -3751,19 +3772,19 @@ impl World {
     ///
     /// # Errors
     ///
-    /// Returns [`WorldError::DynamicComponentNotRegistered`] if the component
+    /// Returns [`WorldError::DescriptorComponentNotRegistered`] if the component
     /// was never registered, plus any error reported by
-    /// [`add_dynamic_component`](Self::add_dynamic_component).
-    pub fn add_dynamic_component_default(
+    /// [`add_descriptor_component`](Self::add_descriptor_component).
+    pub fn add_descriptor_component_default(
         &mut self,
         entity: Entity,
         component_id: ComponentId,
     ) -> Result<(), WorldError> {
         let size = match self.storage_factories.get(&component_id) {
-            Some(StorageFactory::Dynamic(layout)) => layout.size,
-            _ => return Err(WorldError::DynamicComponentNotRegistered { id: component_id }),
+            Some(StorageFactory::Descriptor(layout)) => layout.size,
+            _ => return Err(WorldError::DescriptorComponentNotRegistered { id: component_id }),
         };
-        self.add_dynamic_component(entity, component_id, &vec![0; size])
+        self.add_descriptor_component(entity, component_id, &vec![0; size])
     }
 
     /// Remove a runtime-defined component while preserving every other column.
@@ -3774,9 +3795,9 @@ impl World {
     /// # Errors
     ///
     /// Returns [`WorldError::EntityNotFound`] if the entity does not exist,
-    /// and [`WorldError::DynamicComponentMissing`] if the entity does not
+    /// and [`WorldError::DescriptorComponentMissing`] if the entity does not
     /// carry the component.
-    pub fn remove_dynamic_component(
+    pub fn remove_descriptor_component(
         &mut self,
         entity: Entity,
         component_id: ComponentId,
@@ -3792,7 +3813,7 @@ impl World {
             });
         };
         if !old_archetype.component_storages.contains(component_id) {
-            return Err(WorldError::DynamicComponentMissing);
+            return Err(WorldError::DescriptorComponentMissing);
         }
         let new_ids: Vec<_> = old_archetype
             .component_types
@@ -4172,10 +4193,10 @@ mod tests {
     impl crate::resource::Resource for FreshAccountedResource {}
 
     #[test]
-    fn dynamic_components_coexist_and_survive_archetype_migration() {
+    fn descriptor_components_coexist_and_survive_archetype_migration() {
         let mut world = World::new();
         let a = world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 0xA1,
                 "Project.A",
                 4,
@@ -4185,7 +4206,7 @@ mod tests {
             )
             .unwrap();
         let b = world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 0xB2,
                 "Project.B",
                 4,
@@ -4195,7 +4216,7 @@ mod tests {
             )
             .unwrap();
         let c = world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 0xC3,
                 "Project.C",
                 8,
@@ -4205,39 +4226,39 @@ mod tests {
             )
             .unwrap();
         let entity = world
-            .create_dynamic_entity(&[
+            .create_descriptor_entity(&[
                 (a, 10_u32.to_ne_bytes().to_vec()),
                 (b, 20_u32.to_ne_bytes().to_vec()),
             ])
             .unwrap();
 
         assert_eq!(
-            world.dynamic_component_bytes(entity, a).unwrap(),
+            world.descriptor_component_bytes(entity, a).unwrap(),
             10_u32.to_ne_bytes()
         );
         assert_eq!(
-            world.dynamic_component_bytes(entity, b).unwrap(),
+            world.descriptor_component_bytes(entity, b).unwrap(),
             20_u32.to_ne_bytes()
         );
 
-        world.add_dynamic_component_default(entity, c).unwrap();
+        world.add_descriptor_component_default(entity, c).unwrap();
         assert_eq!(
-            world.dynamic_component_bytes(entity, a).unwrap(),
+            world.descriptor_component_bytes(entity, a).unwrap(),
             10_u32.to_ne_bytes()
         );
         assert_eq!(
-            world.dynamic_component_bytes(entity, b).unwrap(),
+            world.descriptor_component_bytes(entity, b).unwrap(),
             20_u32.to_ne_bytes()
         );
-        assert_eq!(world.dynamic_component_bytes(entity, c).unwrap(), [0; 8]);
+        assert_eq!(world.descriptor_component_bytes(entity, c).unwrap(), [0; 8]);
 
-        world.remove_dynamic_component(entity, b).unwrap();
+        world.remove_descriptor_component(entity, b).unwrap();
         assert_eq!(
-            world.dynamic_component_bytes(entity, a).unwrap(),
+            world.descriptor_component_bytes(entity, a).unwrap(),
             10_u32.to_ne_bytes()
         );
-        assert!(world.dynamic_component_bytes(entity, b).is_none());
-        assert_eq!(world.dynamic_component_bytes(entity, c).unwrap(), [0; 8]);
+        assert!(world.descriptor_component_bytes(entity, b).is_none());
+        assert_eq!(world.descriptor_component_bytes(entity, c).unwrap(), [0; 8]);
     }
 
     /// A relayout rewrites rows where they are: entities keep their rows, values
@@ -4247,7 +4268,7 @@ mod tests {
     fn relayout_migrates_rows_and_keeps_entities_in_their_rows() {
         let mut world = World::new();
         let component = world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 0xD4,
                 "Project.Relayout",
                 8,
@@ -4257,10 +4278,10 @@ mod tests {
             )
             .unwrap();
         let first = world
-            .create_dynamic_entity(&[(component, two_u32_row(1, 2))])
+            .create_descriptor_entity(&[(component, two_u32_row(1, 2))])
             .unwrap();
         let second = world
-            .create_dynamic_entity(&[(component, two_u32_row(3, 4))])
+            .create_descriptor_entity(&[(component, two_u32_row(3, 4))])
             .unwrap();
 
         let archetype = world.entity_locations[&first].archetype_id;
@@ -4272,7 +4293,7 @@ mod tests {
         );
 
         // `b` first, then `a`, then an eight-byte field that did not exist.
-        let plan = DynamicFieldPlan::between(
+        let plan = FieldPlan::between(
             &[
                 LayoutField {
                     name: "a",
@@ -4310,20 +4331,20 @@ mod tests {
         );
 
         let migrated = world
-            .relayout_dynamic_component(component, 16, 8, 200, &plan)
+            .relayout_descriptor_component(component, 16, 8, 200, &plan)
             .unwrap();
 
         assert_eq!(migrated, 2);
         let mut expected_first = two_u32_row(2, 1);
         expected_first.extend_from_slice(&[0_u8; 8]);
         assert_eq!(
-            world.dynamic_component_bytes(first, component).unwrap(),
+            world.descriptor_component_bytes(first, component).unwrap(),
             expected_first.as_slice()
         );
         let mut expected_second = two_u32_row(4, 3);
         expected_second.extend_from_slice(&[0_u8; 8]);
         assert_eq!(
-            world.dynamic_component_bytes(second, component).unwrap(),
+            world.descriptor_component_bytes(second, component).unwrap(),
             expected_second.as_slice()
         );
         assert_eq!(
@@ -4344,7 +4365,7 @@ mod tests {
     fn relayout_leaves_change_ticks_alone() {
         let mut world = World::new();
         let component = world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 0xD5,
                 "Project.Ticks",
                 8,
@@ -4354,7 +4375,7 @@ mod tests {
             )
             .unwrap();
         let entity = world
-            .create_dynamic_entity(&[(component, two_u32_row(1, 2))])
+            .create_descriptor_entity(&[(component, two_u32_row(1, 2))])
             .unwrap();
 
         let changed_tick = world.increment_change_tick();
@@ -4370,7 +4391,7 @@ mod tests {
         let before = ticks_of_row(&world, entity, component);
 
         world
-            .relayout_dynamic_component(component, 16, 8, 200, &DynamicFieldPlan::new())
+            .relayout_descriptor_component(component, 16, 8, 200, &FieldPlan::new())
             .unwrap();
 
         let after = ticks_of_row(&world, entity, component);
@@ -4385,7 +4406,7 @@ mod tests {
     fn relayout_keeps_the_component_id_and_its_bit() {
         let mut world = World::new();
         let component = world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 0xD6,
                 "Project.Bit",
                 8,
@@ -4397,7 +4418,7 @@ mod tests {
         let bit = world.component_registry().get_bit(&component).unwrap();
 
         world
-            .relayout_dynamic_component(component, 16, 8, 200, &DynamicFieldPlan::new())
+            .relayout_descriptor_component(component, 16, 8, 200, &FieldPlan::new())
             .unwrap();
 
         // The same id still names the same component; only its size moved.
@@ -4416,7 +4437,7 @@ mod tests {
     fn relayout_reaches_an_archetype_that_lost_its_last_row() {
         let mut world = World::new();
         let component = world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 0xD7,
                 "Project.Empty",
                 8,
@@ -4426,57 +4447,57 @@ mod tests {
             )
             .unwrap();
         let disposable = world
-            .create_dynamic_entity(&[(component, two_u32_row(1, 2))])
+            .create_descriptor_entity(&[(component, two_u32_row(1, 2))])
             .unwrap();
         let archetype = world.entity_locations[&disposable].archetype_id;
         assert!(world.destroy_entity(disposable));
 
         world
-            .relayout_dynamic_component(component, 16, 8, 200, &DynamicFieldPlan::new())
+            .relayout_descriptor_component(component, 16, 8, 200, &FieldPlan::new())
             .unwrap();
 
         let entity = world
-            .create_dynamic_entity(&[(component, vec![7_u8; 16])])
+            .create_descriptor_entity(&[(component, vec![7_u8; 16])])
             .unwrap();
         assert_eq!(
             world.entity_locations[&entity].archetype_id, archetype,
             "the empty archetype is reused, so its column is the one being tested"
         );
         assert_eq!(
-            world.dynamic_component_bytes(entity, component).unwrap(),
+            world.descriptor_component_bytes(entity, component).unwrap(),
             [7_u8; 16].as_slice()
         );
     }
 
-    /// Only a registered dynamic component has a layout to replace, and a plan
+    /// Only a registered descriptor component has a layout to replace, and a plan
     /// that does not fit both layouts is refused before anything is touched.
     #[test]
     fn relayout_refuses_what_it_cannot_migrate() {
         let mut world = World::new();
         world.register_component::<Position>();
         assert!(matches!(
-            world.relayout_dynamic_component(
+            world.relayout_descriptor_component(
                 ComponentId::of::<Position>(),
                 16,
                 8,
                 1,
-                &DynamicFieldPlan::new()
+                &FieldPlan::new()
             ),
-            Err(WorldError::DynamicComponentNotRegistered { .. })
+            Err(WorldError::DescriptorComponentNotRegistered { .. })
         ));
         assert!(matches!(
-            world.relayout_dynamic_component(
-                ComponentId::dynamic(0xEE),
+            world.relayout_descriptor_component(
+                ComponentId::descriptor(0xEE),
                 16,
                 8,
                 1,
-                &DynamicFieldPlan::new()
+                &FieldPlan::new()
             ),
-            Err(WorldError::DynamicComponentNotRegistered { .. })
+            Err(WorldError::DescriptorComponentNotRegistered { .. })
         ));
 
         let component = world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 0xD8,
                 "Project.Refused",
                 8,
@@ -4485,11 +4506,11 @@ mod tests {
                 Blittability::engine_verified(),
             )
             .unwrap();
-        let mut too_wide = DynamicFieldPlan::new();
+        let mut too_wide = FieldPlan::new();
         too_wide.push(4, 8, FieldSource::OldOffset(0));
         assert!(matches!(
-            world.relayout_dynamic_component(component, 8, 4, 100, &too_wide),
-            Err(WorldError::DynamicRowInvalid)
+            world.relayout_descriptor_component(component, 8, 4, 100, &too_wide),
+            Err(WorldError::DescriptorRowInvalid)
         ));
         assert_eq!(
             world.component_layout(component),
@@ -4501,7 +4522,7 @@ mod tests {
         // so the archetypes holding rows keep them. The destination archetype
         // is made to list the component without storing a column for it.
         let holder = world
-            .create_dynamic_entity(&[(component, 8_u64.to_ne_bytes().to_vec())])
+            .create_descriptor_entity(&[(component, 8_u64.to_ne_bytes().to_vec())])
             .unwrap();
         let stripped =
             world.get_or_create_archetype(vec![component, ComponentId::of::<Position>()]);
@@ -4513,15 +4534,15 @@ mod tests {
             .remove(component)
             .is_some());
         let row_before = world
-            .dynamic_component_bytes(holder, component)
+            .descriptor_component_bytes(holder, component)
             .expect("the entity has a row")
             .to_vec();
         assert!(matches!(
-            world.relayout_dynamic_component(component, 8, 4, 100, &DynamicFieldPlan::new()),
-            Err(WorldError::DynamicStorageMissing { .. })
+            world.relayout_descriptor_component(component, 8, 4, 100, &FieldPlan::new()),
+            Err(WorldError::DescriptorStorageMissing { .. })
         ));
         assert_eq!(
-            world.dynamic_component_bytes(holder, component),
+            world.descriptor_component_bytes(holder, component),
             Some(row_before.as_slice()),
             "a refused relayout left the row it would have migrated alone"
         );
@@ -4536,7 +4557,7 @@ mod tests {
             .component_storages
             .insert(
                 component,
-                crate::archetype::DynamicColumn::new(DynamicComponentLayout {
+                crate::archetype::ComponentColumn::new(ComponentLayout {
                     size: 8,
                     align: 4,
                     schema_hash: 100,
@@ -4554,19 +4575,19 @@ mod tests {
                 .get_mut(component)
                 .unwrap();
             column.relayout_validated(
-                DynamicComponentLayout {
+                ComponentLayout {
                     size: 16,
                     align: 4,
                     schema_hash: 100,
                     blittability: Blittability::engine_verified(),
                 },
-                &DynamicFieldPlan::new(),
+                &FieldPlan::new(),
                 8,
             );
         }
         assert!(matches!(
-            world.relayout_dynamic_component(component, 8, 4, 100, &DynamicFieldPlan::new()),
-            Err(WorldError::DynamicColumnLayoutMismatch { .. })
+            world.relayout_descriptor_component(component, 8, 4, 100, &FieldPlan::new()),
+            Err(WorldError::ComponentColumnLayoutMismatch { .. })
         ));
         assert_eq!(
             world.archetypes[&world.entity_locations[&holder].archetype_id]
@@ -4591,7 +4612,7 @@ mod tests {
         let mut world = World::new();
         world.register_component::<Position>();
         let first = world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 0xE1,
                 "Project.First",
                 4,
@@ -4601,7 +4622,7 @@ mod tests {
             )
             .unwrap();
         let second = world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 0xE2,
                 "Project.Second",
                 4,
@@ -4623,7 +4644,7 @@ mod tests {
             .is_some());
 
         let entity = world
-            .create_dynamic_entity(&[(first, 7_u32.to_ne_bytes().to_vec())])
+            .create_descriptor_entity(&[(first, 7_u32.to_ne_bytes().to_vec())])
             .unwrap();
         let source = world.entity_locations[&entity].archetype_id;
         let source_rows = world.archetypes[&source].entities.len();
@@ -4635,8 +4656,8 @@ mod tests {
         let destination_rows = world.archetypes[&destination].entities.len();
 
         assert!(matches!(
-            world.add_dynamic_component_default(entity, second),
-            Err(WorldError::DynamicStorageMissing { .. })
+            world.add_descriptor_component_default(entity, second),
+            Err(WorldError::DescriptorStorageMissing { .. })
         ));
 
         assert_eq!(world.entity_locations[&entity].archetype_id, source);
@@ -4661,7 +4682,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_component_ticks_survive_archetype_migration() {
+    fn descriptor_component_ticks_survive_archetype_migration() {
         fn ticks_for(world: &World, entity: Entity, component: ComponentId) -> ComponentTicks {
             let location = world.entity_locations[&entity];
             world.archetypes[&location.archetype_id].component_ticks[&component]
@@ -4670,7 +4691,7 @@ mod tests {
 
         let mut world = World::new();
         let retained = world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 0xA1,
                 "Project.Retained",
                 4,
@@ -4680,7 +4701,7 @@ mod tests {
             )
             .unwrap();
         let removed = world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 0xB2,
                 "Project.Removed",
                 4,
@@ -4690,7 +4711,7 @@ mod tests {
             )
             .unwrap();
         let added = world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 0xC3,
                 "Project.Added",
                 8,
@@ -4700,7 +4721,7 @@ mod tests {
             )
             .unwrap();
         let entity = world
-            .create_dynamic_entity(&[
+            .create_descriptor_entity(&[
                 (retained, 10_u32.to_ne_bytes().to_vec()),
                 (removed, 20_u32.to_ne_bytes().to_vec()),
             ])
@@ -4726,7 +4747,9 @@ mod tests {
         assert_eq!(retained_before_migration.changed, changed_tick);
 
         let addition_tick = world.increment_change_tick();
-        world.add_dynamic_component_default(entity, added).unwrap();
+        world
+            .add_descriptor_component_default(entity, added)
+            .unwrap();
 
         let retained_after_add = ticks_for(&world, entity, retained);
         let removed_after_add = ticks_for(&world, entity, removed);
@@ -4742,7 +4765,7 @@ mod tests {
         assert_eq!(added_after_add.changed, addition_tick);
 
         world.increment_change_tick();
-        world.remove_dynamic_component(entity, removed).unwrap();
+        world.remove_descriptor_component(entity, removed).unwrap();
 
         let retained_after_remove = ticks_for(&world, entity, retained);
         let added_after_remove = ticks_for(&world, entity, added);
@@ -4750,13 +4773,13 @@ mod tests {
         assert_eq!(retained_after_remove.changed, retained_after_add.changed);
         assert_eq!(added_after_remove.added, added_after_add.added);
         assert_eq!(added_after_remove.changed, added_after_add.changed);
-        assert!(world.dynamic_component_bytes(entity, removed).is_none());
+        assert!(world.descriptor_component_bytes(entity, removed).is_none());
     }
 
     /// The native byte-chunk accessor exposes a native column's rows as raw
-    /// bytes with the correct element size, mirroring the dynamic path used by
-    /// the C# backend for optional-module components. Dynamic components are
-    /// rejected by it.
+    /// bytes with the correct element size, mirroring the descriptor path used
+    /// by the C# backend for optional-module components. Descriptor components
+    /// are rejected by it.
     #[test]
     fn native_component_chunk_mut_exposes_raw_rows() {
         let mut world = World::new();
@@ -4785,21 +4808,21 @@ mod tests {
         assert_eq!(row.x, 1.0);
         assert_eq!(row.y, 2.0);
 
-        // Dynamic components are served by the dynamic accessor, not this one.
-        let dynamic = world
-            .register_dynamic_component(
+        // Descriptor components are served by the descriptor accessor, not this one.
+        let descriptor = world
+            .register_component_descriptor(
                 0xD1,
-                "NativeChunkTest.Dynamic",
+                "NativeChunkTest.Descriptor",
                 4,
                 4,
                 1,
                 Blittability::engine_verified(),
             )
             .unwrap();
-        assert!(world.native_component_chunk_mut(dynamic, 0).is_none());
+        assert!(world.native_component_chunk_mut(descriptor, 0).is_none());
         // An unknown native id is rejected too.
         let unknown = world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 0xD2,
                 "NativeChunkTest.Unknown",
                 4,
@@ -4894,16 +4917,16 @@ mod tests {
     }
 
     #[test]
-    fn invalid_dynamic_component_layouts_are_rejected() {
+    fn invalid_descriptor_component_layouts_are_rejected() {
         let mut world = World::new();
         assert!(world
-            .register_dynamic_component(1, "Zero", 0, 1, 0, Blittability::engine_verified())
+            .register_component_descriptor(1, "Zero", 0, 1, 0, Blittability::engine_verified())
             .is_err());
         assert!(world
-            .register_dynamic_component(2, "BadAlign", 4, 3, 0, Blittability::engine_verified())
+            .register_component_descriptor(2, "BadAlign", 4, 3, 0, Blittability::engine_verified())
             .is_err());
         assert!(world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 4,
                 "Oversized",
                 usize::MAX,
@@ -4913,10 +4936,10 @@ mod tests {
             )
             .is_err());
         world
-            .register_dynamic_component(3, "SchemaA", 4, 4, 10, Blittability::engine_verified())
+            .register_component_descriptor(3, "SchemaA", 4, 4, 10, Blittability::engine_verified())
             .unwrap();
         assert!(world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 3,
                 "SameSchemaDifferentName",
                 4,
@@ -4926,13 +4949,13 @@ mod tests {
             )
             .is_err());
         assert!(world
-            .register_dynamic_component(3, "SchemaB", 8, 8, 20, Blittability::engine_verified())
+            .register_component_descriptor(3, "SchemaB", 8, 8, 20, Blittability::engine_verified())
             .is_err());
 
         let valid = world
-            .register_dynamic_component(5, "Valid", 4, 4, 30, Blittability::engine_verified())
+            .register_component_descriptor(5, "Valid", 4, 4, 30, Blittability::engine_verified())
             .unwrap();
-        assert!(world.create_dynamic_entity(&[(valid, vec![0; 3])]).is_err());
+        assert!(world.create_descriptor_entity(&[(valid, vec![0; 3])]).is_err());
         assert_eq!(world.entity_count(), 0);
     }
 
@@ -6269,14 +6292,15 @@ mod tests {
         assert_eq!(world.entity_component_names(a), None);
     }
 
-    /// `entity_component_names` includes runtime-defined (dynamic) components,
-    /// and `resolve_entity_component_id` is scoped to the entity's archetype.
+    /// `entity_component_names` includes runtime-defined (descriptor)
+    /// components, and `resolve_entity_component_id` is scoped to the entity's
+    /// archetype.
     #[test]
-    fn dynamic_components_appear_and_resolution_is_archetype_scoped() {
+    fn descriptor_components_appear_and_resolution_is_archetype_scoped() {
         let mut world = World::new();
         world.register_component::<Position>();
-        let dynamic = world
-            .register_dynamic_component(
+        let descriptor = world
+            .register_component_descriptor(
                 0xABCD,
                 "Demo.Thing",
                 4,
@@ -6286,8 +6310,8 @@ mod tests {
             )
             .unwrap();
 
-        let with_dynamic = world
-            .create_dynamic_entity(&[(dynamic, 7_u32.to_ne_bytes().to_vec())])
+        let with_descriptor = world
+            .create_descriptor_entity(&[(descriptor, 7_u32.to_ne_bytes().to_vec())])
             .unwrap();
         let with_position = world
             .create_entity()
@@ -6296,15 +6320,15 @@ mod tests {
             .unwrap();
 
         let names = world
-            .entity_component_names(with_dynamic)
+            .entity_component_names(with_descriptor)
             .expect("entity alive");
         assert_eq!(names, vec!["Demo.Thing"]);
 
-        // Resolution is per-entity: the dynamic component only resolves on the
-        // entity that carries it, and Position only on its own entity.
+        // Resolution is per-entity: the descriptor component only resolves on
+        // the entity that carries it, and Position only on its own entity.
         assert_eq!(
-            world.resolve_entity_component_id(with_dynamic, "Demo.Thing"),
-            Some(dynamic)
+            world.resolve_entity_component_id(with_descriptor, "Demo.Thing"),
+            Some(descriptor)
         );
         assert_eq!(
             world.resolve_entity_component_id(with_position, "Demo.Thing"),
@@ -6316,14 +6340,14 @@ mod tests {
         );
     }
 
-    /// `registered_components` lists every type (native and dynamic), sorted.
+    /// `registered_components` lists every type (native and descriptor), sorted.
     #[test]
     fn registered_components_lists_every_type_sorted() {
         let mut world = World::new();
         world.register_component::<Velocity>();
         world.register_component::<Position>();
         world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 0x1111,
                 "Demo.Alpha",
                 4,
@@ -6501,6 +6525,8 @@ mod tests {
         /// `demo::Settings` as one artifact compiled it.
         #[derive(Debug)]
         pub struct Settings {
+            // The shape is what the identity checks carry; nothing reads the
+            // value.
             #[allow(dead_code)]
             pub value: u32,
         }
@@ -6669,7 +6695,7 @@ mod tests {
     fn relayout_republishes_the_registry_layout() {
         let mut world = World::new();
         let component_id = world
-            .register_dynamic_component(
+            .register_component_descriptor(
                 0xD9,
                 "Project.Republished",
                 8,
@@ -6679,11 +6705,11 @@ mod tests {
             )
             .unwrap();
         world
-            .create_dynamic_entity(&[(component_id, vec![0; 8])])
+            .create_descriptor_entity(&[(component_id, vec![0; 8])])
             .unwrap();
 
         world
-            .relayout_dynamic_component(component_id, 16, 8, 200, &DynamicFieldPlan::new())
+            .relayout_descriptor_component(component_id, 16, 8, 200, &FieldPlan::new())
             .expect("the empty plan fits both layouts");
 
         let record = world
@@ -6696,9 +6722,9 @@ mod tests {
             "the registration-time placeholder alignment moved with the storage"
         );
         assert_eq!(record.schema_hash, Some(200));
-        let Some(StorageFactory::Dynamic(layout)) = world.storage_factories.get(&component_id)
+        let Some(StorageFactory::Descriptor(layout)) = world.storage_factories.get(&component_id)
         else {
-            panic!("the factory is still dynamic");
+            panic!("the factory is not a descriptor factory");
         };
         assert_eq!(
             (layout.size, layout.align, layout.schema_hash),
@@ -6825,7 +6851,7 @@ mod tests {
             Err(WorldError::SharedResourceNotRegistered { .. })
         ));
         assert!(matches!(
-            world.relayout_foreign_resource(id, 8, 4, 1, &DynamicFieldPlan::new()),
+            world.relayout_foreign_resource(id, 8, 4, 1, &FieldPlan::new()),
             Err(WorldError::ForeignResourceNotRegistered { .. })
         ));
     }
@@ -6840,7 +6866,7 @@ mod tests {
             .expect("a fresh name is claimed");
 
         // `b`, then `a`, then an eight-byte field that did not exist.
-        let plan = DynamicFieldPlan::between(
+        let plan = FieldPlan::between(
             &[
                 LayoutField {
                     name: "a",
@@ -6891,7 +6917,7 @@ mod tests {
             .expect("the payload matches the new size");
         assert_eq!(
             world
-                .relayout_foreign_resource(id, 16, 8, 2, &DynamicFieldPlan::new())
+                .relayout_foreign_resource(id, 16, 8, 2, &FieldPlan::new())
                 .expect("a value is there to migrate"),
             1
         );
@@ -6918,7 +6944,7 @@ mod tests {
         // no longer even addressed to one.
         world.insert_resource(artifact_a::Settings { value: 3 });
         assert!(matches!(
-            world.relayout_foreign_resource(id, 8, 4, 2, &DynamicFieldPlan::new()),
+            world.relayout_foreign_resource(id, 8, 4, 2, &FieldPlan::new()),
             Err(WorldError::ForeignResourceNotRegistered { .. })
         ));
 
@@ -6943,7 +6969,7 @@ mod tests {
         world
             .insert_foreign_resource_bytes(fresh, &3_u32.to_ne_bytes())
             .expect("the payload matches the size");
-        let mut too_wide = DynamicFieldPlan::new();
+        let mut too_wide = FieldPlan::new();
         too_wide.push(2, 4, FieldSource::OldOffset(0));
         assert!(matches!(
             world.relayout_foreign_resource(fresh, 4, 4, 2, &too_wide),

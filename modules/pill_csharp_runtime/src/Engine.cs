@@ -39,7 +39,7 @@ public sealed class EcsStartupAttribute : Attribute;
 
 /// <summary>
 /// Marks a component whose layout the native host already knows and binds
-/// natively, rather than registering as a dynamic byte-level component.
+/// natively, rather than registering as a descriptor byte-level component.
 /// </summary>
 /// <remarks>
 /// This is the managed half of a shared ABI: the host holds a canonical schema

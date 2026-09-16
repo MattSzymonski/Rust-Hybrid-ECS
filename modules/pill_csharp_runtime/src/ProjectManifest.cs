@@ -18,7 +18,7 @@ internal sealed record ComponentFieldManifest(
     string Name, int Offset, int Size, string PrimitiveType,
     ComponentFieldManifest[] Fields);
 
-internal sealed record ComponentManifest(
+internal sealed record ProjectManifest(
     ulong StableIdLow, ulong StableIdHigh, string FullName,
     int Size, int Alignment, ulong SchemaHash, bool Shared,
     ComponentFieldManifest[] Fields, string Kind = ManifestKinds.Component);
@@ -43,12 +43,12 @@ internal static class ManifestKinds
 /// the generated context.
 /// </summary>
 [JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.SnakeCaseLower)]
-[JsonSerializable(typeof(ComponentManifest[]))]
-internal partial class ComponentManifestJsonContext : JsonSerializerContext
+[JsonSerializable(typeof(ProjectManifest[]))]
+internal partial class ProjectManifestJsonContext : JsonSerializerContext
 {
 }
 
-internal static class ComponentManifestBuilder
+internal static class ProjectManifestBuilder
 {
     internal static byte[] Build(IEnumerable<ManagedSystem> systems, Assembly? projectAssembly = null)
     {
@@ -71,7 +71,7 @@ internal static class ComponentManifestBuilder
             : projectAssembly.GetTypes()
                 .Where(type => !declaredResources.Contains(type))
                 .Where(IsProjectComponentCandidate);
-        ComponentManifest[] components = queryComponents
+        ProjectManifest[] components = queryComponents
             .Concat(declaredProjectComponents)
             .Distinct()
             .Where(type => !declaredResources.Contains(type))
@@ -86,7 +86,7 @@ internal static class ComponentManifestBuilder
             // context is the metadata source. The naming policy is stated here
             // as well as in the context attribute: when a JsonSerializerOptions
             // carries a TypeInfoResolver, its own PropertyNamingPolicy wins.
-            TypeInfoResolver = ComponentManifestJsonContext.Default,
+            TypeInfoResolver = ProjectManifestJsonContext.Default,
             PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower,
         });
     }
@@ -136,7 +136,7 @@ internal static class ComponentManifestBuilder
 
     /// <summary>
     /// Whether the native host binds this component itself rather than
-    /// registering it as a dynamic byte-level layout.
+    /// registering it as a descriptor byte-level layout.
     /// </summary>
     /// <remarks>
     /// Two sources, both meaning "the host holds a canonical schema for this
@@ -148,7 +148,7 @@ internal static class ComponentManifestBuilder
         type.IsDefined(typeof(EcsSharedComponentAttribute), inherit: false) ||
         type.Assembly == typeof(Engine).Assembly;
 
-    private static ComponentManifest Describe(Type type, string kind)
+    private static ProjectManifest Describe(Type type, string kind)
     {
         ValidateValueType(type, new HashSet<Type>());
         // A resource may declare its own identity so it can meet a Rust module
@@ -162,7 +162,7 @@ internal static class ComponentManifestBuilder
         StableComponentId id = Engine.StableIdOf(identity);
         ComponentFieldManifest[] fields = DescribeFields(type);
         string schema = SchemaText(type, fields);
-        return new ComponentManifest(
+        return new ProjectManifest(
             id.Low,
             id.High,
             identity,

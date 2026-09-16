@@ -10,7 +10,7 @@
 //! Every test drives the [`Engine`] through the same ABI entry points the
 //! managed runtime uses, always inside an [`ActiveSystemGuard`] scope so the
 //! declared scheduler access is enforced exactly as in a live frame. Shared
-//! fixtures build a representative world of shared and dynamic components,
+//! fixtures build a representative world of shared and descriptor components,
 //! while scheduler tests derive [`SystemAccess`] metadata from concise native
 //! access declarations.
 
@@ -79,7 +79,7 @@ fn test_stable_id(name: &str) -> StableComponentId {
     stable_component_id(&format!("TracyLive.{name}"))
 }
 
-/// The witness these tests hand to `register_dynamic_component`.
+/// The witness these tests hand to `register_component_descriptor`.
 ///
 /// The shapes registered here are four-byte integers named literally, which is
 /// the same evidence the production path earns by running
@@ -112,7 +112,7 @@ fn managed_access(entries: &[(&str, u8)]) -> SystemAccess {
         .iter()
         .map(|(name, mode)| native_access(name, *mode))
         .collect();
-    // Step 2: Register a dynamic binding for every component not yet shared.
+    // Step 2: Register a managed binding for every component not yet shared.
     let mut engine = Engine::new();
     let mut bindings = shared_component_bindings(&mut engine);
     for (name, _) in entries {
@@ -122,7 +122,7 @@ fn managed_access(entries: &[(&str, u8)]) -> SystemAccess {
         }
         let component_id = engine
             .world_mut()
-            .register_dynamic_component(
+            .register_component_descriptor(
                 stable_id.0,
                 format!("TracyLive.{name}"),
                 4,
@@ -133,7 +133,7 @@ fn managed_access(entries: &[(&str, u8)]) -> SystemAccess {
             .unwrap();
         bindings.insert(
             stable_id,
-            ComponentBinding::Dynamic {
+            ComponentBinding::Managed {
                 component_id,
                 size: 4,
                 align: 4,
@@ -146,7 +146,7 @@ fn managed_access(entries: &[(&str, u8)]) -> SystemAccess {
         .expect("managed access should map to native components")
 }
 
-/// Populate a representative world containing shared and dynamic components.
+/// Populate a representative world containing shared and descriptor components.
 fn setup_test_world(engine: &mut Engine) -> ComponentBindings {
     // Step 1: Register the shared `PhysicsState` component from a manifest.
     let shared = shared_component_bindings(engine);
@@ -165,7 +165,7 @@ fn setup_test_world(engine: &mut Engine) -> ComponentBindings {
         register_component_manifest(engine, &serde_json::to_vec(&manifest).unwrap(), shared)
             .unwrap();
     let physics = bindings[&stable_id].component_id();
-    // Step 2: Populate entities with both shared and dynamic components.
+    // Step 2: Populate entities with both shared and descriptor components.
     for _ in 0..TEST_WORLD_ENTITY_COUNT {
         let entity = engine
             .world_mut()
@@ -185,7 +185,7 @@ fn setup_test_world(engine: &mut Engine) -> ComponentBindings {
             .unwrap();
         engine
             .world_mut()
-            .add_dynamic_component_default(entity, physics)
+            .add_descriptor_component_default(entity, physics)
             .unwrap();
     }
     bindings
@@ -210,24 +210,24 @@ fn scheduler_for(accesses: impl IntoIterator<Item = SystemAccess>) -> SystemSche
 fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
     let mut engine = Engine::new();
     let mut bindings = shared_component_bindings(&mut engine);
-    let dynamic_a_key = stable_component_id("TracyLive.DynamicA");
-    let dynamic_b_key = stable_component_id("TracyLive.DynamicB");
-    let dynamic_a = engine
+    let descriptor_a_key = stable_component_id("TracyLive.DescriptorA");
+    let descriptor_b_key = stable_component_id("TracyLive.DescriptorB");
+    let descriptor_a = engine
         .world_mut()
-        .register_dynamic_component(
-            dynamic_a_key.0,
-            "TracyLive.DynamicA",
+        .register_component_descriptor(
+            descriptor_a_key.0,
+            "TracyLive.DescriptorA",
             4,
             4,
             1,
             test_witness(),
         )
         .unwrap();
-    let dynamic_b = engine
+    let descriptor_b = engine
         .world_mut()
-        .register_dynamic_component(
-            dynamic_b_key.0,
-            "TracyLive.DynamicB",
+        .register_component_descriptor(
+            descriptor_b_key.0,
+            "TracyLive.DescriptorB",
             4,
             4,
             2,
@@ -235,18 +235,18 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
         )
         .unwrap();
     bindings.insert(
-        dynamic_a_key,
-        ComponentBinding::Dynamic {
-            component_id: dynamic_a,
+        descriptor_a_key,
+        ComponentBinding::Managed {
+            component_id: descriptor_a,
             size: 4,
             align: 4,
             schema_hash: 1,
         },
     );
     bindings.insert(
-        dynamic_b_key,
-        ComponentBinding::Dynamic {
-            component_id: dynamic_b,
+        descriptor_b_key,
+        ComponentBinding::Managed {
+            component_id: descriptor_b,
             size: 4,
             align: 4,
             schema_hash: 2,
@@ -254,10 +254,10 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
     );
     let position_key = stable_component_id("TracyLive.Position");
     let position = Position { x: 9.0, y: 12.0 };
-    let dynamic_a_value = 41_u32;
+    let descriptor_a_value = 41_u32;
     let mut created = None;
 
-    // Step 1: Create a mixed entity holding Position and DynamicA through the
+    // Step 1: Create a mixed entity holding Position and DescriptorA through the
     // native command queue.
     engine
         .run_deferred_commands(|world, queue| {
@@ -274,9 +274,9 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
                     size: std::mem::size_of::<Position>() as u32,
                 },
                 NativeComponentBlob {
-                    component_key: dynamic_a_key.0 as u64,
-                    component_key_high: (dynamic_a_key.0 >> 64) as u64,
-                    data: std::ptr::from_ref(&dynamic_a_value).cast(),
+                    component_key: descriptor_a_key.0 as u64,
+                    component_key_high: (descriptor_a_key.0 >> 64) as u64,
+                    data: std::ptr::from_ref(&descriptor_a_value).cast(),
                     size: 4,
                 },
             ];
@@ -297,22 +297,22 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
     assert_eq!(
         engine
             .world()
-            .dynamic_component_bytes(entity, dynamic_a)
+            .descriptor_component_bytes(entity, descriptor_a)
             .unwrap(),
         41_u32.to_ne_bytes()
     );
 
-    let dynamic_b_value = 77_u32;
-    // Step 2: Swap DynamicA for DynamicB through the native command queue.
+    let descriptor_b_value = 77_u32;
+    // Step 2: Swap DescriptorA for DescriptorB through the native command queue.
     engine
         .run_deferred_commands(|world, queue| {
             let _guard = ActiveSystemGuard::set_with_commands(world, queue, &[], &bindings, true);
             assert_eq!(
                 ffi_queue_add_component(
                     &entity,
-                    dynamic_b_key.0 as u64,
-                    (dynamic_b_key.0 >> 64) as u64,
-                    std::ptr::from_ref(&dynamic_b_value).cast(),
+                    descriptor_b_key.0 as u64,
+                    (descriptor_b_key.0 >> 64) as u64,
+                    std::ptr::from_ref(&descriptor_b_value).cast(),
                     4,
                 ),
                 ABI_SUCCESS
@@ -320,8 +320,8 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
             assert_eq!(
                 ffi_queue_remove_component(
                     &entity,
-                    dynamic_a_key.0 as u64,
-                    (dynamic_a_key.0 >> 64) as u64,
+                    descriptor_a_key.0 as u64,
+                    (descriptor_a_key.0 >> 64) as u64,
                 ),
                 ABI_SUCCESS
             );
@@ -329,12 +329,12 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
         .unwrap();
     assert!(engine
         .world()
-        .dynamic_component_bytes(entity, dynamic_a)
+        .descriptor_component_bytes(entity, descriptor_a)
         .is_none());
     assert_eq!(
         engine
             .world()
-            .dynamic_component_bytes(entity, dynamic_b)
+            .descriptor_component_bytes(entity, descriptor_b)
             .unwrap(),
         77_u32.to_ne_bytes()
     );
@@ -533,7 +533,7 @@ fn archetype_chunk_lookup_resolves_components_and_entities() {
 
 /// Verify a C#-only manifest component can be registered and queried natively.
 #[test]
-fn managed_manifest_registers_and_queries_a_new_dynamic_component() {
+fn managed_manifest_registers_and_queries_a_new_descriptor_component() {
     let mut engine = Engine::new();
     let shared = shared_component_bindings(&mut engine);
     let stable_id = stable_component_id("Project.CustomOnlyInCSharp");
@@ -559,7 +559,7 @@ fn managed_manifest_registers_and_queries_a_new_dynamic_component() {
     let component_id = bindings[&stable_id].component_id();
     engine
         .world_mut()
-        .create_dynamic_entity(&[(component_id, 77_u32.to_ne_bytes().to_vec())])
+        .create_descriptor_entity(&[(component_id, 77_u32.to_ne_bytes().to_vec())])
         .unwrap();
 
     let accesses = [NativeSystemAccess {
@@ -590,14 +590,14 @@ fn managed_manifest_registers_and_queries_a_new_dynamic_component() {
     }
 }
 
-/// A newly registered dynamic component still exposes its field layout.
+/// A newly registered descriptor component still exposes its field layout.
 ///
 /// The layout computation leaks every field name and struct tag, so it moved
 /// from the top of the manifest loop - where it ran for entries that already
 /// had a binding and for manifests refused as shared - into the registration
 /// branch. The editor-visible outcome must not have changed with it.
 #[test]
-fn dynamic_registration_still_installs_field_layout() {
+fn descriptor_registration_still_installs_field_layout() {
     let mut engine = Engine::new();
     let shared = shared_component_bindings(&mut engine);
     let stable_id = stable_component_id("TracyLive.LayoutProbe");
@@ -625,7 +625,7 @@ fn dynamic_registration_still_installs_field_layout() {
     let layout = engine
         .world()
         .component_field_layout(component_id)
-        .expect("a registered dynamic component keeps its field layout");
+        .expect("a registered descriptor component keeps its field layout");
     assert_eq!(layout.len(), 1, "one manifest field means one descriptor");
     assert_eq!(layout[0].name, "Value");
     assert_eq!(layout[0].type_tag, "u32");
@@ -669,7 +669,7 @@ fn null_output_pointer_reports_invalid_argument() {
 /// serve the registered layout, and a binding that disagrees cannot change
 /// what managed code multiplies by.
 #[test]
-fn dynamic_chunk_stride_comes_from_the_live_column() {
+fn descriptor_chunk_stride_comes_from_the_live_column() {
     let mut engine = Engine::new();
     let shared = shared_component_bindings(&mut engine);
     let stable_id = stable_component_id("TracyLive.DriftProbe");
@@ -695,7 +695,7 @@ fn dynamic_chunk_stride_comes_from_the_live_column() {
     let component_id = bindings[&stable_id].component_id();
     engine
         .world_mut()
-        .create_dynamic_entity(&[(component_id, 77_u32.to_ne_bytes().to_vec())])
+        .create_descriptor_entity(&[(component_id, 77_u32.to_ne_bytes().to_vec())])
         .unwrap();
 
     // A store that disagrees with the registered column: the registration
@@ -703,7 +703,7 @@ fn dynamic_chunk_stride_comes_from_the_live_column() {
     // disagreement either way.
     bindings.insert(
         stable_id,
-        ComponentBinding::Dynamic {
+        ComponentBinding::Managed {
             component_id,
             size: 8,
             align: 8,
@@ -751,7 +751,7 @@ fn module_native_binding_rejects_live_layout_mismatch() {
     let stable_id = test_stable_id("ModuleThing");
     let module_id = engine
         .world_mut()
-        .register_dynamic_component(
+        .register_component_descriptor(
             stable_id.0,
             "TracyLive.ModuleThing",
             8,
@@ -762,7 +762,7 @@ fn module_native_binding_rejects_live_layout_mismatch() {
         .expect("the module component registers");
     engine
         .world_mut()
-        .create_dynamic_entity(&[(module_id, vec![0_u8; 8])])
+        .create_descriptor_entity(&[(module_id, vec![0_u8; 8])])
         .expect("the entity carries the registered layout");
 
     // The module forwards a size the live column does not have - a mirror
@@ -1268,9 +1268,9 @@ fn deeply_nested_manifest_is_rejected_without_stack_overflow() {
     );
 }
 
-/// A dynamic component may only contain blittable value types.
+/// A descriptor component may only contain blittable value types.
 ///
-/// `DynamicColumn` moves rows with `ptr::copy` and frees its buffer without
+/// `ComponentColumn` moves rows with `ptr::copy` and frees its buffer without
 /// running drop glue, and the engine shares those columns across threads on an
 /// `unsafe impl Send`/`Sync`. A field owning a managed resource would be
 /// duplicated on move, leaked on free, and raced on. Before this check the only
@@ -1481,7 +1481,7 @@ fn manifest_bytes(
     .expect("the test manifest serializes")
 }
 
-/// Register one dynamic test component from a manifest and hand back its
+/// Register one descriptor test component from a manifest and hand back its
 /// binding store, the way a managed project start leaves them.
 fn store_with_component(
     engine: &mut Engine,
@@ -1522,9 +1522,9 @@ fn an_unchanged_manifest_applies_nothing() {
     assert_eq!(engine.world().component_layout(component_id), Some((8, 4)));
 }
 
-/// A reshaped dynamic component keeps its entities and moves their bytes.
+/// A reshaped descriptor component keeps its entities and moves their bytes.
 #[test]
-fn a_reshaped_dynamic_component_is_migrated_on_apply() {
+fn a_reshaped_descriptor_component_is_migrated_on_apply() {
     let mut engine = Engine::new();
     let (store, _before) = store_with_component(
         &mut engine,
@@ -1538,7 +1538,7 @@ fn a_reshaped_dynamic_component_is_migrated_on_apply() {
     let component_id = store.read()[&stable_id].component_id();
     let entity = engine
         .world_mut()
-        .create_dynamic_entity(&[(component_id, [1.0_f32, 2.0].map(f32::to_ne_bytes).concat())])
+        .create_descriptor_entity(&[(component_id, [1.0_f32, 2.0].map(f32::to_ne_bytes).concat())])
         .expect("the entity carries the registered layout");
 
     // `b` first, then `a`, then two fields that did not exist.
@@ -1563,21 +1563,21 @@ fn a_reshaped_dynamic_component_is_migrated_on_apply() {
     assert_eq!(
         engine
             .world()
-            .dynamic_component_bytes(entity, component_id)
+            .descriptor_component_bytes(entity, component_id)
             .expect("the entity still carries the component"),
         expected.as_slice(),
         "values follow their field names and the new fields start zeroed"
     );
     assert_eq!(engine.world().component_layout(component_id), Some((16, 8)));
     // The table a system scope reads is the one that moved, not a copy of it.
-    let ComponentBinding::Dynamic {
+    let ComponentBinding::Managed {
         size,
         align,
         schema_hash,
         ..
     } = store.read()[&stable_id]
     else {
-        panic!("the binding is still dynamic");
+        panic!("the binding is still managed");
     };
     assert_eq!((size, align, schema_hash), (16, 8, 2));
 }
@@ -1601,7 +1601,7 @@ fn a_refused_manifest_leaves_none_of_it_applied() {
     row.extend_from_slice(&2.0_f32.to_ne_bytes());
     let entity = engine
         .world_mut()
-        .create_dynamic_entity(&[(relayout_id, row.clone())])
+        .create_descriptor_entity(&[(relayout_id, row.clone())])
         .expect("the entity carries the registered layout");
 
     // A name already claimed by a live column: the second entry's registration
@@ -1609,7 +1609,7 @@ fn a_refused_manifest_leaves_none_of_it_applied() {
     let claimed_stable_id = stable_component_id("TracyLive.Claimed");
     engine
         .world_mut()
-        .register_dynamic_component(
+        .register_component_descriptor(
             claimed_stable_id.0,
             "TracyLive.Claimed",
             4,
@@ -1625,7 +1625,7 @@ fn a_refused_manifest_leaves_none_of_it_applied() {
         .expect("the name is claimed");
     engine
         .world_mut()
-        .create_dynamic_entity(&[(claimed_id, 9_u32.to_ne_bytes().to_vec())])
+        .create_descriptor_entity(&[(claimed_id, 9_u32.to_ne_bytes().to_vec())])
         .expect("the claiming component has a live row");
 
     let store_len_before = store.read().len();
@@ -1677,14 +1677,14 @@ fn a_refused_manifest_leaves_none_of_it_applied() {
         store.read().get(&colliding_stable_id).is_none(),
         "the refused addition left no binding behind"
     );
-    let ComponentBinding::Dynamic {
+    let ComponentBinding::Managed {
         size,
         align,
         schema_hash,
         ..
     } = store.read()[&test_stable_id("Relayout")]
     else {
-        panic!("the binding is still dynamic");
+        panic!("the binding is still managed");
     };
     assert_eq!(
         (size, align, schema_hash),
@@ -1693,7 +1693,7 @@ fn a_refused_manifest_leaves_none_of_it_applied() {
     );
     assert_eq!(engine.world().component_layout(relayout_id), Some((8, 4)));
     assert_eq!(
-        engine.world().dynamic_component_bytes(entity, relayout_id),
+        engine.world().descriptor_component_bytes(entity, relayout_id),
         Some(row.as_slice()),
         "the migrated rows were migrated back"
     );
@@ -1709,7 +1709,7 @@ fn the_apply_refuses_what_it_cannot_migrate() {
     let stable_id = test_stable_id("ModuleThing");
     let module_id = engine
         .world_mut()
-        .register_dynamic_component(
+        .register_component_descriptor(
             stable_id.0,
             "TracyLive.ModuleThing",
             8,

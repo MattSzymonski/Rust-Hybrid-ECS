@@ -81,7 +81,7 @@ pub(super) extern "C" fn ffi_get_component_chunk(
     // into the managed caller's output buffer.
     let status = with_active_context(|world, bindings| match bindings.get(&stable_id).copied() {
         Some(ComponentBinding::Native { get_chunk, .. }) => get_chunk(world, chunk_index, output),
-        Some(ComponentBinding::Dynamic { component_id, .. }) => {
+        Some(ComponentBinding::Managed { component_id, .. }) => {
             // The stride comes from the live column, never from the binding's
             // copy of the layout: `data` points into that column, and only the
             // column describes what is stored there. A binding that drifted
@@ -93,7 +93,7 @@ pub(super) extern "C" fn ffi_get_component_chunk(
             let change_tick = world.change_tick().get();
             let scope_token = active_scope_token();
             let Some((archetype, data, len, ticks)) =
-                world.dynamic_component_chunk_mut(component_id, chunk_index as usize)
+                world.descriptor_component_chunk_mut(component_id, chunk_index as usize)
             else {
                 return 0;
             };
@@ -125,7 +125,7 @@ pub(super) extern "C" fn ffi_get_component_chunk(
         }) => {
             let change_tick = world.change_tick().get();
             let scope_token = active_scope_token();
-            // The native twin of the dynamic path: serve the module's native
+            // The native twin of the descriptor path: serve the module's native
             // column as raw bytes so managed code and Rust share one storage.
             let Some((archetype, data, len, element_size, ticks)) =
                 world.native_component_chunk_mut(component_id, chunk_index as usize)
@@ -149,7 +149,7 @@ pub(super) extern "C" fn ffi_get_component_chunk(
                 return 2;
             }
             let bits = archetype.0;
-            // SAFETY: identical to the dynamic arm above - pointers stay owned
+            // SAFETY: identical to the descriptor arm above - pointers stay owned
             // by the active world's archetype for the managed invocation.
             unsafe {
                 output.write(ComponentChunk {
@@ -255,7 +255,7 @@ pub(super) extern "C" fn ffi_get_archetype_chunk(
             get_chunk_in_archetype,
             ..
         }) => get_chunk_in_archetype(world, archetype_id, output),
-        Some(ComponentBinding::Dynamic { component_id, .. }) => {
+        Some(ComponentBinding::Managed { component_id, .. }) => {
             // As in the index-based callback: the stride is the live column's,
             // so a drifted binding cannot mislead managed row arithmetic.
             let Some((live_size, _)) = world.component_layout(component_id) else {
@@ -264,7 +264,7 @@ pub(super) extern "C" fn ffi_get_archetype_chunk(
             let change_tick = world.change_tick().get();
             let scope_token = active_scope_token();
             let Some((archetype, data, len, ticks)) =
-                world.dynamic_component_chunk_in_archetype(component_id, archetype_id)
+                world.descriptor_component_chunk_in_archetype(component_id, archetype_id)
             else {
                 return 0;
             };
@@ -310,7 +310,7 @@ pub(super) extern "C" fn ffi_get_archetype_chunk(
                 return 2;
             }
             let bits = archetype.0;
-            // SAFETY: identical to the dynamic arm above.
+            // SAFETY: identical to the descriptor arm above.
             unsafe {
                 output.write(ComponentChunk {
                     archetype_low: bits as u64,

@@ -1,3 +1,10 @@
+//! The layout action vocabulary: what the dock accepts and where a tab lands.
+//!
+//! # Responsibilities
+//!
+//! - Define the actions a user interaction is reduced to.
+//! - Keep them serializable: actions cross the drag/drop and persistence paths.
+
 use serde::{Deserialize, Serialize};
 
 use super::{NodeId, PanelKind};

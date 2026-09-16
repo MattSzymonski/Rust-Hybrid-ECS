@@ -1,5 +1,10 @@
 //! Dioxus editor with a live engine-rendered project viewport.
 //!
+//! # Responsibilities
+//!
+//! - Own the native window and its event loop.
+//! - Bridge the engine's renderer into that window.
+//!
 //! # Design
 //!
 //! Dioxus owns the native window and its event loop. During window creation,

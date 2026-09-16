@@ -37,6 +37,7 @@ use std::fmt::Write as _;
 use std::time::Duration;
 
 // Current crate
+use crate::archetype::ColumnIdentity;
 use crate::component::ComponentId;
 use crate::world::World;
 
@@ -64,7 +65,7 @@ struct ColumnReport {
     /// Bytes one row of this column occupies.
     stride: usize,
     /// Whether the column is byte-oriented storage owned by another language.
-    dynamic: bool,
+    descriptor: bool,
 }
 
 /// One archetype's contribution to the report.
@@ -113,7 +114,7 @@ pub struct EcsSnapshot {
     /// name it declared is the only thing there is to report.
     pub shared_resources: Vec<String>,
     /// Registered components defined by another language at runtime.
-    pub dynamic_components: Vec<String>,
+    pub descriptor_components: Vec<String>,
     /// Registered component types no archetype currently stores.
     pub unused_components: Vec<String>,
     /// The world's current change tick.
@@ -136,17 +137,17 @@ impl EcsSnapshot {
         // carry an identity other than a plain per-binary `TypeId`.
         let mut names: BTreeMap<ComponentId, String> = BTreeMap::new();
         let mut shared_components = Vec::new();
-        let mut dynamic_components = Vec::new();
+        let mut descriptor_components = Vec::new();
         for (component_id, _bit, name) in registry.registered_components() {
             names.insert(component_id, name.to_string());
             match component_id {
                 ComponentId::Shared(_) => shared_components.push(name.to_string()),
-                ComponentId::Dynamic(_) => dynamic_components.push(name.to_string()),
+                ComponentId::Descriptor(_) => descriptor_components.push(name.to_string()),
                 ComponentId::Native(_) => {}
             }
         }
         shared_components.sort();
-        dynamic_components.sort();
+        descriptor_components.sort();
 
         // Step 2: Walk the archetypes, accumulating totals and per-archetype
         // detail, and recording which components are actually stored anywhere.
@@ -170,11 +171,15 @@ impl EcsSnapshot {
                 }
                 // Row bytes, not capacity: what the stored rows actually
                 // occupy, so the total tracks entities rather than allocation.
-                let (stride, rows, dynamic) =
+                // The column records which lane built it, so the marker comes
+                // from the column itself rather than from which map it is in.
+                let (stride, rows, descriptor) =
                     if let Some(column) = archetype.component_storages.get(component_id) {
-                        (column.elem_size(), column.len(), false)
-                    } else if let Some(column) = archetype.component_storages.get(component_id) {
-                        (column.element_size(), column.len(), true)
+                        (
+                            column.elem_size(),
+                            column.len(),
+                            matches!(column.identity(), ColumnIdentity::Descriptor),
+                        )
                     } else {
                         (0, 0, false)
                     };
@@ -186,7 +191,7 @@ impl EcsSnapshot {
                         .cloned()
                         .unwrap_or_else(|| format!("{component_id:?}")),
                     stride,
-                    dynamic,
+                    descriptor,
                 });
             }
             // By mask bit, so the listing reads in the same order the set bits
@@ -240,7 +245,7 @@ impl EcsSnapshot {
             available_component_slots: registry.available_slots(),
             shared_components,
             shared_resources,
-            dynamic_components,
+            descriptor_components,
             unused_components,
             change_tick: world.change_tick().get(),
             resources: world.resource_count(),
@@ -364,7 +369,7 @@ impl EcsSnapshot {
                         "{} × {}{}",
                         archetype.entities,
                         format_bytes(column.stride),
-                        if column.dynamic { " (dyn)" } else { "" },
+                        if column.descriptor { " (desc)" } else { "" },
                     );
                     let bit = match column.bit {
                         Some(bit) => format!("bit {bit:>3}"),
@@ -384,8 +389,8 @@ impl EcsSnapshot {
         if !self.shared_resources.is_empty() {
             sections.push(("shared resources", &self.shared_resources));
         }
-        if !self.dynamic_components.is_empty() {
-            sections.push(("runtime-defined", &self.dynamic_components));
+        if !self.descriptor_components.is_empty() {
+            sections.push(("runtime-defined", &self.descriptor_components));
         }
         if !self.unused_components.is_empty() {
             sections.push(("registered, unused", &self.unused_components));

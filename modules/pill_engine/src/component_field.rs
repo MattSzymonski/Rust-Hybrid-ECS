@@ -222,7 +222,7 @@ impl std::error::Error for ComponentFieldError {}
 ///
 /// `vec:<tag>` and `dynbuf:<tag>` describe a `(pointer, length, capacity)`
 /// header and `string` the same bytes with UTF-8 meaning; all three are
-/// decoded by following a pointer the row is expected to own. A dynamic row
+/// decoded by following a pointer the row is expected to own. A descriptor row
 /// is raw bytes with no Rust value in it, so a layout claiming one of these
 /// tags on such a row promises a header that is not there.
 pub(crate) fn is_container_tag(type_tag: &str) -> bool {
@@ -466,7 +466,7 @@ impl World {
 
     /// Copy one entity's component row for `component_id` into an owned buffer.
     ///
-    /// Works for native (Rust) and dynamic (foreign-language) columns alike.
+    /// Works for native (Rust) and descriptor (foreign-language) columns alike.
     /// The caller owns the returned bytes, so no borrow outlives this call.
     fn copy_component_row_bytes(
         &self,

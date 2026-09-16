@@ -222,7 +222,7 @@ pub enum ComponentId {
     /// Component backed by a concrete Rust type, identified per binary.
     Native(TypeId),
     /// Component described at runtime by an external language manifest.
-    Dynamic(u128),
+    Descriptor(u128),
     /// Component backed by a concrete Rust type that may be linked into more
     /// than one binary, identified by the stable name it declares.
     ///
@@ -278,7 +278,7 @@ impl std::hash::Hash for ComponentId {
         match self {
             // `TypeId`'s own impl already does the 128-to-64 narrowing.
             Self::Native(type_id) => type_id.hash(state),
-            Self::Dynamic(identity) => (*identity as u64 ^ DYNAMIC_HASH_SALT).hash(state),
+            Self::Descriptor(identity) => (*identity as u64 ^ DESCRIPTOR_HASH_SALT).hash(state),
             Self::Shared(identity) => (*identity as u64 ^ SHARED_HASH_SALT).hash(state),
         }
     }
@@ -287,7 +287,7 @@ impl std::hash::Hash for ComponentId {
 /// Salts keeping the two 128-bit-identity variants from colliding with each
 /// other on identical values. Arbitrary odd constants; only their difference
 /// matters.
-const DYNAMIC_HASH_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
+const DESCRIPTOR_HASH_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
 const SHARED_HASH_SALT: u64 = 0xbf58_476d_1ce4_e5b9;
 
 impl ComponentId {
@@ -314,10 +314,10 @@ impl ComponentId {
         }
     }
 
-    /// Builds a dynamic component ID from the stable 128-bit identity
+    /// Builds a descriptor component ID from the stable 128-bit identity
     /// supplied by an external runtime manifest.
-    pub const fn dynamic(stable_id: u128) -> Self {
-        Self::Dynamic(stable_id)
+    pub const fn descriptor(stable_id: u128) -> Self {
+        Self::Descriptor(stable_id)
     }
 
     /// Wraps an existing Rust [`TypeId`] in a native component ID.
@@ -327,7 +327,7 @@ impl ComponentId {
 
     /// Returns the wrapped [`TypeId`] if this component is identified by one.
     ///
-    /// `None` for a dynamic component, which has no Rust type at all, and also
+    /// `None` for a descriptor component, which has no Rust type at all, and also
     /// for a shared one, which has a Rust type in every binary that links it
     /// but no single `TypeId` that names it. Callers asking "are these rows
     /// native storage?" want [`Self::is_native_storage`] instead; the callers
@@ -336,12 +336,12 @@ impl ComponentId {
     pub const fn native_type_id(self) -> Option<TypeId> {
         match self {
             Self::Native(type_id) => Some(type_id),
-            Self::Dynamic(_) | Self::Shared(_) => None,
+            Self::Descriptor(_) | Self::Shared(_) => None,
         }
     }
 
     /// Whether this component's rows live in a native column rather than in a
-    /// byte-oriented dynamic one.
+    /// byte-oriented descriptor one.
     ///
     /// True for [`Self::Native`] and [`Self::Shared`] alike: shared identity
     /// changes how a component is *named*, never how it is stored.
@@ -353,7 +353,7 @@ impl ComponentId {
     pub const fn shared_identity(self) -> Option<u128> {
         match self {
             Self::Shared(identity) => Some(identity),
-            Self::Native(_) | Self::Dynamic(_) => None,
+            Self::Native(_) | Self::Descriptor(_) => None,
         }
     }
 }
@@ -555,7 +555,7 @@ pub struct ComponentRegistry {
     /// Next bit index to assign to a newly registered component.
     next_bit: u8,
     /// Bit indices reclaimed by [`Self::remove`], reused before `next_bit`
-    /// advances. Without this, a dynamic manifest that retires and introduces
+    /// advances. Without this, a descriptor manifest that retires and introduces
     /// types across reloads walks `next_bit` upward until the 128-type limit
     /// aborts the process, even though live components never exceed a handful.
     free_bits: Vec<u8>,
@@ -797,14 +797,14 @@ impl ComponentRegistry {
     ///
     /// Returns [`WorldError::ComponentTypeLimitExceeded`] when the 128-type
     /// limit is reached and no bit has been reclaimed by [`Self::remove`].
-    pub fn register_dynamic(
+    pub fn register_descriptor(
         &mut self,
         stable_id: u128,
         name: impl Into<String>,
         size: usize,
     ) -> Result<u8, WorldError> {
         // Step 1: Return the existing bit index when the stable ID is already registered.
-        let component_id = ComponentId::dynamic(stable_id);
+        let component_id = ComponentId::descriptor(stable_id);
         if let Some(&bit) = self.id_to_bit.get(&component_id) {
             return Ok(bit);
         }
@@ -819,10 +819,10 @@ impl ComponentRegistry {
             });
         };
 
-        // Step 3: Record the dynamic component's metadata.
+        // Step 3: Record the descriptor component's metadata.
         self.id_to_bit.insert(component_id, bit);
         self.names.insert(component_id, name);
-        // A dynamic component's alignment lives with its storage factory, and
+        // A descriptor component's alignment lives with its storage factory, and
         // its schema hash is carried by the manifest, so the registry records
         // only what it is asked for here.
         self.layouts.insert(
@@ -860,7 +860,7 @@ impl ComponentRegistry {
     /// entirely and the host drops its orphaned data. Re-registering the same
     /// `TypeId` later simply allocates a fresh bit index again.
     ///
-    /// The freed bit is returned to the reclaim pool, so a dynamic manifest
+    /// The freed bit is returned to the reclaim pool, so a descriptor manifest
     /// that retires and introduces types across reloads reuses bits instead of
     /// walking `next_bit` toward the 128-type ceiling.
     pub fn remove(&mut self, component_id: &ComponentId) {
@@ -900,7 +900,7 @@ impl ComponentRegistry {
         self.layouts.get(component_id).copied()
     }
 
-    /// Republish a dynamic component's whole registry layout.
+    /// Republish a descriptor component's whole registry layout.
     ///
     /// The registry record and the storage factory describe one column, so a
     /// relayout that moves alignment or the schema hash has to move both:
@@ -909,10 +909,10 @@ impl ComponentRegistry {
     /// The bit index, the name and the id stay put - replacing the
     /// registration instead would allocate a fresh bit index, and that index is
     /// baked into archetype masks and scheduled access masks.
-    pub(crate) fn update_dynamic_layout(
+    pub(crate) fn update_descriptor_layout(
         &mut self,
         component_id: &ComponentId,
-        layout: &crate::archetype::DynamicComponentLayout,
+        layout: &crate::archetype::ComponentLayout,
     ) {
         if let Some(record) = self.layouts.get_mut(component_id) {
             record.size = layout.size;
@@ -1009,7 +1009,7 @@ mod tests {
         assert_eq!(registry.get_size(&component_id), None);
 
         // Re-registering works and reuses the freed bit: `remove` returns the
-        // bit to the reclaim pool, so a dynamic manifest that retires and
+        // bit to the reclaim pool, so a descriptor manifest that retires and
         // introduces types across reloads does not walk `next_bit` toward the
         // 128-type ceiling.
         let second = registry.register::<ReRegisterTestComponent>().unwrap();
@@ -1026,18 +1026,18 @@ mod tests {
     #[test]
     fn the_129th_component_type_errors_instead_of_panicking() {
         // Each tuple is a distinct fake type (distinct names), registered
-        // dynamically so the test does not need 129 real Rust types.
+        // from descriptors so the test does not need 129 real Rust types.
         let mut registry = ComponentRegistry::new();
         for index in 0..128 {
             let result =
-                registry.register_dynamic(index as u128 + 1, format!("Project.FakeType{index}"), 4);
+                registry.register_descriptor(index as u128 + 1, format!("Project.FakeType{index}"), 4);
             assert!(result.is_ok(), "slot {index} must register");
         }
 
         // One more than the ceiling: the registry reports the limit, naming
         // the offending type and the current count.
         let error = registry
-            .register_dynamic(u128::MAX, "Project.OneTooMany", 4)
+            .register_descriptor(u128::MAX, "Project.OneTooMany", 4)
             .unwrap_err();
         assert_eq!(
             error,
@@ -1050,9 +1050,9 @@ mod tests {
         // A freed bit reopens a slot, so the same registry accepts a new type
         // after `remove` - the ceiling is not a permanent dead end. The first
         // registered type (stable id 1) holds bit 0, so freeing it reopens bit 0.
-        registry.remove(&ComponentId::dynamic(1));
+        registry.remove(&ComponentId::descriptor(1));
         let reused = registry
-            .register_dynamic(u128::MAX - 1, "Project.AfterFree", 4)
+            .register_descriptor(u128::MAX - 1, "Project.AfterFree", 4)
             .unwrap();
         assert_eq!(reused, 0, "the reclaimed bit is handed out again");
     }
@@ -1064,20 +1064,20 @@ mod tests {
         let mut registry = ComponentRegistry::new();
         for index in 0..8 {
             registry
-                .register_dynamic(index as u128 + 10, format!("Project.C{index}"), 4)
+                .register_descriptor(index as u128 + 10, format!("Project.C{index}"), 4)
                 .unwrap();
         }
         assert_eq!(registry.available_slots(), 120);
 
         // Remove half the types: their bits rejoin the pool.
         for index in 0..4 {
-            registry.remove(&ComponentId::dynamic(index as u128 + 10));
+            registry.remove(&ComponentId::descriptor(index as u128 + 10));
         }
         assert_eq!(registry.available_slots(), 124);
 
         // New registrations reuse the reclaimed bits (LIFO: the most recently
         // freed first) rather than consuming fresh ones.
-        let new_bit = registry.register_dynamic(999, "Project.New", 4).unwrap();
+        let new_bit = registry.register_descriptor(999, "Project.New", 4).unwrap();
         assert_eq!(new_bit, 3, "the most recently freed bit is reused first");
         assert_eq!(registry.available_slots(), 123);
     }
@@ -1096,6 +1096,8 @@ mod tests {
             /// A copy of the shared type as one binary would declare it.
             #[derive(Clone, Debug)]
             pub struct SharedProbe {
+                // The declared shape is what the schema hash folds in; no code
+                // reads the value itself.
                 #[allow(dead_code)]
                 pub value: u32,
             }
@@ -1114,6 +1116,8 @@ mod tests {
             /// different field shape.
             #[derive(Clone, Debug)]
             pub struct SharedProbe {
+                // The declared shape is what the schema hash folds in; no code
+                // reads the value itself.
                 #[allow(dead_code)]
                 pub value: u32,
             }

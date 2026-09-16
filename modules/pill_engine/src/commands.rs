@@ -164,7 +164,7 @@ enum DeferredCommand {
         /// Native components to insert into the new archetype's storage.
         component_adders: Vec<Box<dyn ComponentAdder>>,
         /// Type-erased runtime components to write after the row exists.
-        dynamic_components: Vec<(ComponentId, Vec<u8>)>,
+        descriptor_components: Vec<(ComponentId, Vec<u8>)>,
     },
     /// Add a native component to an existing entity.
     AddComponentToEntity {
@@ -174,7 +174,7 @@ enum DeferredCommand {
         component_adder: Box<dyn ComponentAdder>,
     },
     /// Add a type-erased runtime component to an existing entity.
-    AddDynamicComponentToEntity {
+    AddDescriptorComponentToEntity {
         /// The target entity.
         entity: Entity,
         /// Runtime ID of the component type to write.
@@ -242,7 +242,7 @@ impl CommandQueue {
         self.commands.push(DeferredCommand::CreateEntity {
             entity,
             component_adders: components,
-            dynamic_components: Vec::new(),
+            descriptor_components: Vec::new(),
         });
     }
 
@@ -252,12 +252,12 @@ impl CommandQueue {
         &mut self,
         entity: Entity,
         native_components: Vec<Box<dyn ComponentAdder>>,
-        dynamic_components: Vec<(ComponentId, Vec<u8>)>,
+        descriptor_components: Vec<(ComponentId, Vec<u8>)>,
     ) {
         self.commands.push(DeferredCommand::CreateEntity {
             entity,
             component_adders: native_components,
-            dynamic_components,
+            descriptor_components,
         });
     }
 
@@ -285,14 +285,14 @@ impl CommandQueue {
     }
 
     /// Queue adding a type-erased runtime component.
-    pub fn add_dynamic_component_to_entity(
+    pub fn add_descriptor_component_to_entity(
         &mut self,
         entity: Entity,
         component_id: ComponentId,
         bytes: Vec<u8>,
     ) {
         self.commands
-            .push(DeferredCommand::AddDynamicComponentToEntity {
+            .push(DeferredCommand::AddDescriptorComponentToEntity {
                 entity,
                 component_id,
                 bytes,
@@ -358,7 +358,7 @@ impl CommandQueue {
                 DeferredCommand::CreateEntity {
                     entity,
                     component_adders,
-                    dynamic_components,
+                    descriptor_components,
                 } => {
                     // Entity creation can fail to write one or more components
                     // after the row exists; every failure is collected rather
@@ -368,7 +368,7 @@ impl CommandQueue {
                         world,
                         entity,
                         component_adders,
-                        dynamic_components,
+                        descriptor_components,
                     ) {
                         errors.append(&mut failures);
                     }
@@ -381,12 +381,12 @@ impl CommandQueue {
                     Self::execute_add_component(world, entity, component_adder, &mut errors);
                 }
 
-                DeferredCommand::AddDynamicComponentToEntity {
+                DeferredCommand::AddDescriptorComponentToEntity {
                     entity,
                     component_id,
                     bytes,
                 } => {
-                    Self::execute_add_dynamic_component(
+                    Self::execute_add_descriptor_component(
                         world,
                         entity,
                         component_id,
@@ -445,19 +445,19 @@ impl CommandQueue {
         world: &mut World,
         entity: Entity,
         component_adders: Vec<Box<dyn ComponentAdder>>,
-        dynamic_components: Vec<(ComponentId, Vec<u8>)>,
+        descriptor_components: Vec<(ComponentId, Vec<u8>)>,
     ) -> Result<(), Vec<CommandError>> {
         // Step 1: Collect the full component-ID set that defines the new archetype.
         let mut component_ids: Vec<ComponentId> = component_adders
             .iter()
             .map(|adder| adder.component_id())
             .collect();
-        component_ids.extend(dynamic_components.iter().map(|(id, _)| *id));
+        component_ids.extend(descriptor_components.iter().map(|(id, _)| *id));
 
         // Step 1b: Refuse a repeated id before the row exists. The set defines
         // the archetype's columns, so a duplicate would push two rows for one
         // entity row - or panic inside the archetype insert when it found the
-        // id already present. `create_dynamic_entity` and the C# create path
+        // id already present. `create_descriptor_entity` and the C# create path
         // de-duplicate before they get here; this entry point refuses instead
         // of guessing which row was meant.
         component_ids.sort_unstable();
@@ -488,9 +488,9 @@ impl CommandQueue {
         // `expect`, which panicked inside `process_frame` - and for a managed
         // project that unwinds across the C ABI.
         let mut errors = Vec::new();
-        for (component_id, bytes) in dynamic_components {
+        for (component_id, bytes) in descriptor_components {
             if world
-                .set_dynamic_component_bytes(entity, component_id, &bytes)
+                .set_descriptor_component_bytes(entity, component_id, &bytes)
                 .is_err()
             {
                 errors.push(CommandError::ComponentWriteFailed {
@@ -510,7 +510,7 @@ impl CommandQueue {
     ///
     /// Rejects stale entities and duplicate components, then writes the blob
     /// into the entity's component storage.
-    fn execute_add_dynamic_component(
+    fn execute_add_descriptor_component(
         world: &mut World,
         entity: Entity,
         component_id: ComponentId,
@@ -546,7 +546,7 @@ impl CommandQueue {
         // failure is collected with the rest of the batch. It used to be an
         // `expect`, which panicked inside the flush - and for a managed
         // project that unwinds across the C ABI.
-        if let Err(_error) = world.add_dynamic_component(entity, component_id, &bytes) {
+        if let Err(_error) = world.add_descriptor_component(entity, component_id, &bytes) {
             errors.push(CommandError::ComponentWriteFailed {
                 entity,
                 component_id,
@@ -611,7 +611,7 @@ impl CommandQueue {
         // destination short a component row. Report it and stop.
         let mut component_copiers = Vec::with_capacity(old_archetype.component_types.len());
         for &component_id in &old_archetype.component_types {
-            // Dynamic rows migrate as bytes inside `move_entity_to_archetype`.
+            // Descriptor rows migrate as bytes inside `move_entity_to_archetype`.
             if !component_id.is_native_storage() {
                 continue;
             }
@@ -629,7 +629,7 @@ impl CommandQueue {
 
         // Step 4: Migrate the entity row, copying surviving components and
         // writing the new component into the destination storage. A migration
-        // failure (archetype missing, dynamic column missing) is collected
+        // failure (archetype missing, component column missing) is collected
         // rather than panicking inside the flush.
         if let Err(error) = world.move_entity_to_archetype(
             entity,
@@ -713,7 +713,7 @@ impl CommandQueue {
         // being silently dropped from the move.
         let mut component_copiers = Vec::with_capacity(new_component_ids.len());
         for &component_id in &new_component_ids {
-            // Dynamic rows migrate as bytes inside `move_entity_to_archetype`.
+            // Descriptor rows migrate as bytes inside `move_entity_to_archetype`.
             if !component_id.is_native_storage() {
                 continue;
             }
@@ -1046,20 +1046,20 @@ mod tests {
     fn type_erased_commands_create_add_remove_and_destroy_through_migrations() {
         let mut world = World::new();
         world.register_component::<Position>();
-        let dynamic_a = world
-            .register_dynamic_component(
+        let descriptor_a = world
+            .register_component_descriptor(
                 0xA1,
-                "Project.DynamicA",
+                "Project.DescriptorA",
                 4,
                 4,
                 1,
                 Blittability::engine_verified(),
             )
             .unwrap();
-        let dynamic_b = world
-            .register_dynamic_component(
+        let descriptor_b = world
+            .register_component_descriptor(
                 0xB2,
-                "Project.DynamicB",
+                "Project.DescriptorB",
                 4,
                 4,
                 2,
@@ -1072,7 +1072,7 @@ mod tests {
         queue.create_mixed_entity(
             entity,
             vec![boxed_component_adder(Position { x: 3.0, y: 4.0 })],
-            vec![(dynamic_a, 11_u32.to_ne_bytes().to_vec())],
+            vec![(descriptor_a, 11_u32.to_ne_bytes().to_vec())],
         );
         assert!(
             !world.is_entity_valid(entity),
@@ -1082,16 +1082,26 @@ mod tests {
         assert_eq!(world.entity_count(), 1);
         assert_eq!(world.get_component::<Position>(entity).unwrap().x, 3.0);
         assert_eq!(
-            world.dynamic_component_bytes(entity, dynamic_a).unwrap(),
+            world
+                .descriptor_component_bytes(entity, descriptor_a)
+                .unwrap(),
             11_u32.to_ne_bytes()
         );
 
-        queue.add_dynamic_component_to_entity(entity, dynamic_b, 22_u32.to_ne_bytes().to_vec());
-        queue.remove_component_by_id(entity, dynamic_a);
+        queue.add_descriptor_component_to_entity(
+            entity,
+            descriptor_b,
+            22_u32.to_ne_bytes().to_vec(),
+        );
+        queue.remove_component_by_id(entity, descriptor_a);
         queue.execute_queued_commands(&mut world, true).unwrap();
-        assert!(world.dynamic_component_bytes(entity, dynamic_a).is_none());
+        assert!(world
+            .descriptor_component_bytes(entity, descriptor_a)
+            .is_none());
         assert_eq!(
-            world.dynamic_component_bytes(entity, dynamic_b).unwrap(),
+            world
+                .descriptor_component_bytes(entity, descriptor_b)
+                .unwrap(),
             22_u32.to_ne_bytes()
         );
         assert_eq!(world.get_component::<Position>(entity).unwrap().y, 4.0);
@@ -1351,10 +1361,10 @@ mod tests {
     #[test]
     fn a_queued_create_that_cannot_write_a_component_is_reported() {
         let mut world = World::new();
-        let dynamic_a = world
-            .register_dynamic_component(
+        let descriptor_a = world
+            .register_component_descriptor(
                 0xA1,
-                "Project.DynamicA",
+                "Project.DescriptorA",
                 4,
                 4,
                 1,
@@ -1363,13 +1373,13 @@ mod tests {
             .unwrap();
 
         // First flush materialises entity A, which creates the archetype with
-        // the dynamic storage column.
+        // the descriptor storage column.
         let entity_a = world.reserve_entity();
         let mut queue = CommandQueue::new();
         queue.create_mixed_entity(
             entity_a,
             vec![],
-            vec![(dynamic_a, 11_u32.to_ne_bytes().to_vec())],
+            vec![(descriptor_a, 11_u32.to_ne_bytes().to_vec())],
         );
         queue.execute_queued_commands(&mut world, false).unwrap();
         assert!(world.is_entity_valid(entity_a));
@@ -1382,7 +1392,7 @@ mod tests {
             .next()
             .unwrap()
             .component_storages
-            .remove(dynamic_a);
+            .remove(descriptor_a);
 
         // A second queued create reuses the existing archetype, so the row is
         // materialised but the component write fails.
@@ -1390,7 +1400,7 @@ mod tests {
         queue.create_mixed_entity(
             entity_b,
             vec![],
-            vec![(dynamic_a, 22_u32.to_ne_bytes().to_vec())],
+            vec![(descriptor_a, 22_u32.to_ne_bytes().to_vec())],
         );
         let errors = queue
             .execute_queued_commands(&mut world, true)
@@ -1401,14 +1411,14 @@ mod tests {
             [CommandError::ComponentWriteFailed {
                 entity,
                 component_id,
-            }] if *entity == entity_b && *component_id == dynamic_a
+            }] if *entity == entity_b && *component_id == descriptor_a
         ));
     }
 
-    /// A queued removal whose archetype migration hits missing dynamic
+    /// A queued removal whose archetype migration hits missing descriptor
     /// storage is reported as `MigrationFailed`, never panicked on.
     ///
-    /// The migration path used to `expect("dynamic storage missing")`, which
+    /// The migration path used to `expect("descriptor storage missing")`, which
     /// aborted the frame inside the flush. After the fix the desync is
     /// collected as a typed `WorldError` and surfaced through the command
     /// error list.
@@ -1416,10 +1426,10 @@ mod tests {
     fn a_queued_remove_whose_migration_hits_missing_storage_is_reported() {
         let mut world = World::new();
         world.register_component::<Position>();
-        let dynamic_a = world
-            .register_dynamic_component(
+        let descriptor_a = world
+            .register_component_descriptor(
                 0xA1,
-                "Project.DynamicA",
+                "Project.DescriptorA",
                 4,
                 4,
                 1,
@@ -1427,19 +1437,19 @@ mod tests {
             )
             .unwrap();
 
-        // Create an entity carrying both a native and a dynamic component, so
-        // removing the dynamic one migrates instead of destroying.
+        // Create an entity carrying both a native and a descriptor component,
+        // so removing the descriptor one migrates instead of destroying.
         let entity = world.reserve_entity();
         let mut queue = CommandQueue::new();
         queue.create_mixed_entity(
             entity,
             vec![boxed_component_adder(Position { x: 1.0, y: 2.0 })],
-            vec![(dynamic_a, 11_u32.to_ne_bytes().to_vec())],
+            vec![(descriptor_a, 11_u32.to_ne_bytes().to_vec())],
         );
         queue.execute_queued_commands(&mut world, false).unwrap();
         assert!(world.is_entity_valid(entity));
 
-        // Simulate the desync: the dynamic column vanishes from the archetype
+        // Simulate the desync: the descriptor column vanishes from the archetype
         // while its `component_types` entry survives.
         world
             .archetypes
@@ -1447,9 +1457,9 @@ mod tests {
             .next()
             .unwrap()
             .component_storages
-            .remove(dynamic_a);
+            .remove(descriptor_a);
 
-        queue.remove_component_by_id(entity, dynamic_a);
+        queue.remove_component_by_id(entity, descriptor_a);
         let errors = queue
             .execute_queued_commands(&mut world, true)
             .expect_err("a migration that cannot complete must fail the flush");

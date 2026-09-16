@@ -1,5 +1,10 @@
 //! Stage the toolchain's standard-library dylib next to `editor.exe`.
 //!
+//! # Responsibilities
+//!
+//! - Copy the toolchain's `std` dylib beside the executable.
+//! - Delegate the staging logic to `pill_hot_scan`.
+//!
 //! The engine workspace links with `-C prefer-dynamic`, so the editor imports
 //! `std-<hash>.dll` at process load. That dylib lives in the toolchain's
 //! `lib/rustlib/<host>/lib` directory, which Windows does not search; without

@@ -312,7 +312,7 @@ fn bench_archetype_explosion(criterion: &mut Criterion) {
 ///
 /// This is the pattern projectile/particle systems produce - the most recently
 /// spawned entity dies first - so every `swap_remove` removes the last row and
-/// the `index != last` guard in `DynamicColumn::swap_remove` (and the native
+/// the `index != last` guard in `ComponentColumn::swap_remove` (and the native
 /// column path) skips the redundant self-copy. The guard was added to fix the
 /// wasted `memmove` reported by audit 5.9; this benchmark pins the despawn
 /// path so a regression in it stays visible.

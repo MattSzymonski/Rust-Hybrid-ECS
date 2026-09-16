@@ -1,3 +1,10 @@
+//! Applies one layout action to the model and reports what changed.
+//!
+//! # Responsibilities
+//!
+//! - Commit a validated mutation, or refuse it with a typed error.
+//! - Report the `LayoutChange` a committed action produced.
+
 use std::collections::BTreeSet;
 use std::fmt::{Display, Formatter};
 

@@ -25,11 +25,16 @@ use std::collections::HashSet;
 
 // External crates
 use pill_core::error::CSharpError;
+use pill_engine::archetype::{FieldPlan, LayoutField};
 use pill_engine::component_registry::ComponentFieldDescriptor;
+use pill_engine::{ComponentId, Engine};
 use serde::Deserialize;
 
 // Current crate
-use super::components::{stable_component_id, StableComponentId};
+use super::components::{
+    check_binding_against_manifest, stable_component_id, BindingStore, ComponentBinding,
+    StableComponentId,
+};
 use super::resources::{ManagedResourceDeclaration, ResourceFieldLayout};
 
 /// Maximum nesting depth accepted in a managed component field tree.
@@ -39,9 +44,9 @@ use super::resources::{ManagedResourceDeclaration, ResourceFieldLayout};
 /// opaque parser error, rejects pathological manifests.
 const MAX_FIELD_NESTING_DEPTH: usize = 32;
 
-/// Field types a dynamic component is allowed to contain.
+/// Field types a descriptor component is allowed to contain.
 ///
-/// This is the enforcement behind `DynamicColumn`'s `unsafe impl Send`/`Sync`
+/// This is the enforcement behind `ComponentColumn`'s `unsafe impl Send`/`Sync`
 /// and its lack of drop glue. That storage is a raw byte buffer: rows are moved
 /// with `ptr::copy` and the buffer is freed without running any destructor, so
 /// every field must be a blittable value with no ownership, no interior
@@ -187,14 +192,14 @@ pub(super) fn validate_field_manifest(
         if field.name.is_empty() || field.primitive_type.is_empty() || end > parent_size {
             return Err("managed field lies outside its component layout".into());
         }
-        // Reject anything that is not a blittable value type. `DynamicColumn`
+        // Reject anything that is not a blittable value type. `ComponentColumn`
         // copies rows as raw bytes and frees its buffer without running drop
         // glue, so a field owning a resource would be duplicated on move and
         // leaked on free - and sharing such a column across threads, which the
         // engine does, would be unsound.
         if !BLITTABLE_FIELD_TYPES.contains(&field.primitive_type.as_str()) {
             return Err(format!(
-                "managed field {} has non-blittable type {}; dynamic components                  must contain only unmanaged value types",
+                "managed field {} has non-blittable type {}; descriptor components must contain only unmanaged value types",
                 field.name, field.primitive_type
             ));
         }
@@ -456,4 +461,138 @@ pub(super) fn split_manifest_kinds(
         }
     }
     (components, resources)
+}
+
+/// One manifest entry with everything the engine and the store can tell us
+/// resolved up front.
+///
+/// The apply phase executes these in order and re-decides nothing, which is
+/// what keeps the refusals out of the mutated state; what still goes wrong at
+/// apply time is handled by the undo journal.
+pub(super) enum PlannedManifestEntry {
+    /// The binding table already agrees with the manifest.
+    Settled,
+    /// A descriptor component the manifest adds.
+    Add {
+        stable_id: StableComponentId,
+        component: ManagedComponentManifest,
+    },
+    /// A descriptor component whose layout changed and whose rows must migrate.
+    Migrate {
+        stable_id: StableComponentId,
+        component: ManagedComponentManifest,
+        component_id: ComponentId,
+        plan: FieldPlan,
+        previous_binding: ComponentBinding,
+        previous_fields: Vec<ComponentFieldDescriptor>,
+    },
+}
+
+/// Resolve every manifest entry against the store and the engine.
+///
+/// The one refusal that lives here rather than in validation is the shared
+/// entry with no native binding; `register_manifest_entry` repeats it as a
+/// defensive check, but planning means it is raised before anything moves.
+pub(super) fn plan_manifest(
+    engine: &Engine,
+    store: &BindingStore,
+    manifest: Vec<ManagedComponentManifest>,
+) -> Result<Vec<PlannedManifestEntry>, CSharpError> {
+    let mut planned = Vec::with_capacity(manifest.len());
+    for component in manifest {
+        let stable_id =
+            StableComponentId::from_halves(component.stable_id_low, component.stable_id_high);
+        let Some(binding) = store.read().get(&stable_id).copied() else {
+            if component.shared {
+                return Err(format!(
+                    "managed shared component {} has no native engine binding",
+                    component.full_name
+                )
+                .into());
+            }
+            planned.push(PlannedManifestEntry::Add {
+                stable_id,
+                component,
+            });
+            continue;
+        };
+
+        let ComponentBinding::Managed {
+            component_id,
+            size,
+            align,
+            schema_hash,
+        } = binding
+        else {
+            check_binding_against_manifest(binding, &component)?;
+            planned.push(PlannedManifestEntry::Settled);
+            continue;
+        };
+
+        // The same layout means nothing to do; anything else is a migration.
+        if size == component.size
+            && align == component.alignment
+            && schema_hash == component.schema_hash
+        {
+            planned.push(PlannedManifestEntry::Settled);
+            continue;
+        }
+
+        let plan = build_field_plan(engine, component_id, &component.fields);
+        // The fields are captured as owned data here so the inverse plan needs
+        // no engine borrow later, when the world is being mutated again.
+        let previous_fields = engine
+            .world()
+            .component_field_layout(component_id)
+            .unwrap_or(&[])
+            .to_vec();
+        planned.push(PlannedManifestEntry::Migrate {
+            stable_id,
+            component,
+            component_id,
+            plan,
+            previous_binding: binding,
+            previous_fields,
+        });
+    }
+    Ok(planned)
+}
+
+/// Build the byte plan from the layout a component has now to the one a
+/// manifest asks for.
+///
+/// The old side comes from the world rather than from the previous manifest:
+/// the field layout registered with a descriptor component is the layout its
+/// columns actually use, which is the only thing a byte copy can be measured
+/// against.
+fn build_field_plan(
+    engine: &Engine,
+    component_id: ComponentId,
+    fields: &[ManagedFieldManifest],
+) -> FieldPlan {
+    let previous: Vec<LayoutField<'_>> = engine
+        .world()
+        .component_field_layout(component_id)
+        .unwrap_or(&[])
+        .iter()
+        .map(|field| LayoutField {
+            name: field.name,
+            type_tag: plan_tag(field.type_tag),
+            offset: field.offset,
+            size: field.size,
+        })
+        .collect();
+    // The manifest names a managed type; mapping it through the same function
+    // `managed_field_layout` uses is what makes the two sides of the diff
+    // comparable at all - otherwise every field would look retyped.
+    let next: Vec<LayoutField<'_>> = fields
+        .iter()
+        .map(|field| LayoutField {
+            name: field.name.as_str(),
+            type_tag: manifest_field_tag(field),
+            offset: field.offset,
+            size: field.size,
+        })
+        .collect();
+    FieldPlan::between(&previous, &next)
 }

@@ -18,7 +18,7 @@ use pill_engine::archetype::Blittability;
 use pill_engine::component_registry::{register_all_components, ComponentFieldDescriptor};
 use pill_engine::{ComponentId, PillComponent, World};
 
-/// A dynamic component's registered layout is validated: a descriptor that
+/// A descriptor component's registered layout is validated: a descriptor that
 /// reaches past the row or claims a container tag is refused, and the
 /// previously registered layout is left in place.
 #[test]
@@ -28,7 +28,7 @@ fn an_overflowing_field_layout_is_refused() {
     // bytes; no pointer or owner is involved.
     let witness = unsafe { Blittability::assume() };
     let component_id = world
-        .register_dynamic_component(0x51, "Heap.LayoutProbe", 8, 4, 1, witness)
+        .register_component_descriptor(0x51, "Heap.LayoutProbe", 8, 4, 1, witness)
         .expect("the component registers");
 
     let good = vec![ComponentFieldDescriptor {
@@ -40,7 +40,7 @@ fn an_overflowing_field_layout_is_refused() {
         element_count: 0,
     }];
     world
-        .register_dynamic_component_field_layout(component_id, good.clone())
+        .register_component_descriptor_with_layout(component_id, good.clone())
         .expect("a fitting layout is accepted");
 
     let overflow = vec![ComponentFieldDescriptor {
@@ -53,7 +53,7 @@ fn an_overflowing_field_layout_is_refused() {
     }];
     assert!(
         world
-            .register_dynamic_component_field_layout(component_id, overflow)
+            .register_component_descriptor_with_layout(component_id, overflow)
             .is_err(),
         "an overflowing field range is refused"
     );
@@ -68,9 +68,9 @@ fn an_overflowing_field_layout_is_refused() {
     }];
     assert!(
         world
-            .register_dynamic_component_field_layout(component_id, container)
+            .register_component_descriptor_with_layout(component_id, container)
             .is_err(),
-        "a container tag on a dynamic row is refused"
+        "a container tag on a descriptor row is refused"
     );
 
     // Both refusals left the accepted layout in place.

@@ -1,9 +1,17 @@
+//! The serializable dock tree: panels, tabsets, rows and their invariants.
+//!
+//! # Responsibilities
+//!
+//! - Model the layout as a validated tree of typed nodes.
+//! - Provide the mutation helpers the reducer commits through.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
 use super::{LayoutAction, LayoutChange, LayoutError, NodeId};
 
+/// Version of the layout document this build writes and accepts.
 pub const LAYOUT_SCHEMA_VERSION: u32 = 2;
 
 /// Direction in which a row distributes its children.
@@ -27,6 +35,7 @@ pub enum PanelKind {
 }
 
 impl PanelKind {
+    /// Human-readable name shown in a tab's title bar.
     pub const fn title(self) -> &'static str {
         match self {
             Self::Scene => "Scene",
@@ -146,6 +155,7 @@ impl LayoutModel {
         }
     }
 
+    /// The tabset stored under `id`, if that node is one.
     pub fn tabset(&self, id: NodeId) -> Option<&TabSetNode> {
         match self.node(id) {
             Some(LayoutNode::TabSet(tabset)) => Some(tabset),
@@ -153,6 +163,7 @@ impl LayoutModel {
         }
     }
 
+    /// The row stored under `id`, if that node is one.
     pub fn row(&self, id: NodeId) -> Option<&RowNode> {
         match self.node(id) {
             Some(LayoutNode::Row(row)) => Some(row),
@@ -160,12 +171,14 @@ impl LayoutModel {
         }
     }
 
+    /// Hand out the next monotonic node id.
     pub(crate) fn allocate_id(&mut self) -> NodeId {
         let id = NodeId(self.next_id);
         self.next_id += 1;
         id
     }
 
+    /// Insert one panel as a tab and return its id.
     pub(crate) fn add_tab(&mut self, panel: PanelKind, closeable: bool) -> NodeId {
         let id = self.allocate_id();
         self.nodes.insert(
@@ -179,6 +192,7 @@ impl LayoutModel {
         id
     }
 
+    /// Insert a tabset over `tabs` with `selected` active, and return its id.
     pub(crate) fn add_tabset(&mut self, tabs: Vec<NodeId>, selected: NodeId) -> NodeId {
         let id = self.allocate_id();
         self.nodes.insert(
@@ -191,6 +205,7 @@ impl LayoutModel {
         id
     }
 
+    /// Insert a row of weighted children along `axis`, and return its id.
     pub(crate) fn add_row(&mut self, axis: Axis, children: Vec<(NodeId, f32)>) -> NodeId {
         let id = self.allocate_id();
         self.nodes.insert(
@@ -206,6 +221,7 @@ impl LayoutModel {
         id
     }
 
+    /// The row or tabset that contains `child`, if any.
     pub(crate) fn parent_of(&self, child: NodeId) -> Option<NodeId> {
         self.nodes.iter().find_map(|(id, node)| match node {
             LayoutNode::Row(row) if row.children.iter().any(|entry| entry.node == child) => {
@@ -216,6 +232,7 @@ impl LayoutModel {
         })
     }
 
+    /// Validate the tree against this build's schema and structural rules.
     pub fn validate(&self) -> Result<(), LayoutError> {
         if self.schema_version != LAYOUT_SCHEMA_VERSION {
             return Err(LayoutError::UnsupportedVersion(self.schema_version));

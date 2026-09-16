@@ -30,7 +30,7 @@ use std::sync::{OnceLock, RwLock, RwLockReadGuard};
 use pill_core::error::{CSharpError, EngineMessage};
 use pill_core::telemetry::telemetry_target;
 use pill_core::{error, info, warn};
-use pill_engine::archetype::{DynamicFieldPlan, LayoutField};
+use pill_engine::archetype::{FieldPlan, LayoutField};
 use pill_engine::{Engine, ResourceId, World};
 
 // Current crate
@@ -368,7 +368,7 @@ fn relayout_one(
 ) -> Result<(), CSharpError> {
     let previous: Vec<LayoutField<'_>> = existing.fields.iter().map(layout_field).collect();
     let next: Vec<LayoutField<'_>> = arriving.fields.iter().map(layout_field).collect();
-    let plan = DynamicFieldPlan::between(&previous, &next);
+    let plan = FieldPlan::between(&previous, &next);
     let retyped = plan.retyped_fields().to_vec();
     engine
         .world_mut()

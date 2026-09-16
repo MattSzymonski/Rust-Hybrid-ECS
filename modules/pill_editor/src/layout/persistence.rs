@@ -1,4 +1,9 @@
 //! Versioned editor-layout loading and recoverable writes.
+//!
+//! # Responsibilities
+//!
+//! - Load a saved layout, refusing versions this build cannot read.
+//! - Write without destroying the previous file when a save goes wrong.
 
 use std::path::{Path, PathBuf};
 

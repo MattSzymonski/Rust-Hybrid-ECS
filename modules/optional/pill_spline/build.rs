@@ -1,3 +1,11 @@
+//! This crate's build script: emits its function-address inventory.
+//!
+//! # Responsibilities
+//!
+//! - Emit the crate's function-address inventory so the host can redirect any
+//!   of its functions with nothing annotated in the source.
+//! - Keep the work in `pill_hot_scan`, so both sides agree byte for byte.
+//
 // REQUIREMENTS
 //   Rust (stable). Run by Cargo as this crate's build script.
 //

@@ -266,7 +266,7 @@ internal sealed class ProjectHost
                 "No [EcsSystem] methods were generated for the AOT build.");
         _systems = systems;
         _startups = startups;
-        _componentManifest = ComponentManifestBuilder.Build(
+        _componentManifest = ProjectManifestBuilder.Build(
             systems, AotRegistry.ProjectAssembly);
         _lastSystemErrors = new string?[systems.Length];
         _lastAllocatedBytes = new long[systems.Length];
@@ -532,7 +532,7 @@ internal sealed class ProjectHost
                 throw new InvalidOperationException(
                     "No [EcsSystem] methods with a supported query parameter were found.");
 
-            byte[] manifest = ComponentManifestBuilder.Build(systems, assembly);
+            byte[] manifest = ProjectManifestBuilder.Build(systems, assembly);
 
             // Rust's execution graph and component registry are built at
             // startup. Behavior-only reloads are safe; changing either
