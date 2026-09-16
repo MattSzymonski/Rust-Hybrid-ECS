@@ -26,6 +26,8 @@
 *.css      text eol=lf
 *.md       text eol=lf
 .gitignore text eol=lf
+.gitattributes text eol=lf
+Dockerfile*    text eol=lf
 
 # Binary fixtures: never normalize, never diff.
 *.dll binary
