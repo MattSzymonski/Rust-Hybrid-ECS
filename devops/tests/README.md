@@ -76,6 +76,26 @@ host-free suites (`test_harness_parsing.py`, `test_coding_standards.py`,
 `test_log_contract.py`) do not take the lock and stay safe to run beside
 anything.
 
+## Gate matrix
+
+The gates a change must keep green, and what they report at `b4fc353`. Run
+them from `modules/`, with `$env:CARGO_BUILD_RUSTC_WRAPPER=""` (sccache is
+broken machine-wide) and `--offline` for host builds. Record the numbers you
+actually measure - this table is a starting point, not a promise - and update
+a row in the same commit that moves it.
+
+| Gate | Command | Expected at `b4fc353` |
+| --- | --- | --- |
+| Engine unit tests | `cargo test -p pill_engine --lib --offline` | 314 passed |
+| Engine, all targets | `cargo test -p pill_engine --offline` | all targets pass |
+| Host, default posture | `cargo test -p pill_host --lib --offline` | 98 passed |
+| Host, rendering | `cargo test -p pill_host --features rendering --lib --offline` | 143 passed |
+| Host, shipping posture | `cargo test -p pill_host --no-default-features --lib --offline` | 25 passed |
+| Clippy | `cargo clippy` for `pill_engine`, `pill_core`, `pill_host` in each posture | clean, except the shipping posture's known warnings (plan item 2.9) |
+| Formatting | `cargo fmt --check` | 23 pre-existing hunks (plan item 2.10) |
+| Comment & layout lint | `python devops/tests/test_coding_standards.py --root modules` | **53 violations across 29 files** - red before this work; plan item 1.7 |
+| End-to-end suites | `python devops/tests/run_all.py` | all pass; the suites serialize themselves |
+
 ## Performance measurement (moved)
 
 Hot-reload **performance measurement** is not a test and no longer lives here.
