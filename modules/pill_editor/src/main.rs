@@ -37,8 +37,8 @@ use dioxus::prelude::*;
 use futures_util::StreamExt;
 use pill_core::error::EngineMessage;
 use pill_host::{
-    engine_report, install_engine_report_handler, setup_rendering, FrameReport,
-    HostConfig, HostError, RenderViewport, RenderingError, RenderingHost, VirtualResolution,
+    engine_report, install_engine_report_handler, setup_rendering, FrameReport, HostConfig,
+    HostError, RenderViewport, RenderingError, RenderingHost, VirtualResolution,
 };
 
 use dock_view::DockView;

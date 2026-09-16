@@ -128,9 +128,8 @@ impl<T: Component> QueryTarget for &T {
                 ("Component type: {}", std::any::type_name::<T>())
             ]
         );
-        SendPtr::new(
-            archetype.component_storages.column_of::<T>() as *const crate::archetype::ComponentColumn
-        )
+        SendPtr::new(archetype.component_storages.column_of::<T>()
+            as *const crate::archetype::ComponentColumn)
     }
 
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {

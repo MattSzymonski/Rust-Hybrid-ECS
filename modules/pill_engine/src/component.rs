@@ -1029,8 +1029,11 @@ mod tests {
         // from descriptors so the test does not need 129 real Rust types.
         let mut registry = ComponentRegistry::new();
         for index in 0..128 {
-            let result =
-                registry.register_descriptor(index as u128 + 1, format!("Project.FakeType{index}"), 4);
+            let result = registry.register_descriptor(
+                index as u128 + 1,
+                format!("Project.FakeType{index}"),
+                4,
+            );
             assert!(result.is_ok(), "slot {index} must register");
         }
 
