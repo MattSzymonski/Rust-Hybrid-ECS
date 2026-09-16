@@ -217,7 +217,7 @@ fn bench_resource_remove(criterion: &mut Criterion) {
                         world
                     },
                     |mut world| {
-                        black_box(world.remove_resource::<ProjectTime>());
+                        black_box(world.remove_resource::<ProjectTime>().ok());
                     },
                     criterion::BatchSize::LargeInput,
                 );

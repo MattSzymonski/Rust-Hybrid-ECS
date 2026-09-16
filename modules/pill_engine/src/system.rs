@@ -166,7 +166,7 @@ where
 pub trait SystemParam: Sized {
     /// Fetches the parameter from world state.
     ///
-    /// SAFETY: Contract
+    /// # Safety
     ///
     /// The returned value has a `'static` lifetime marker but actually borrows
     /// from `world` and `queue`. Callers must ensure:
@@ -175,8 +175,21 @@ pub trait SystemParam: Sized {
     /// 2. The returned value is not stored in static/global state
     /// 3. The returned value is not moved into background threads or async tasks
     ///
-    /// Violating these invariants is undefined behavior.
-    fn fetch(world: &mut World, queue: &mut CommandQueue) -> Self;
+    /// Violating these invariants is undefined behavior. The engine's runner
+    /// (`IntoSystem::into_system` / `into_hot_system`) is the one audited
+    /// caller; a safe call from anywhere else is what this signature refuses:
+    ///
+    /// ```compile_fail
+    /// use pill_engine::system::SystemParam;
+    ///
+    /// fn fetch_safely<P: SystemParam>(
+    ///     world: &mut pill_engine::world::World,
+    ///     queue: &mut pill_engine::commands::CommandQueue,
+    /// ) {
+    ///     let _ = P::fetch(world, queue);
+    /// }
+    /// ```
+    unsafe fn fetch(world: &mut World, queue: &mut CommandQueue) -> Self;
 
     /// Reports the component access pattern for dependency analysis.
     ///
@@ -189,7 +202,7 @@ pub trait SystemParam: Sized {
 
 /// Commands is a SystemParam - provides deferred entity operations
 impl SystemParam for Commands<'static> {
-    fn fetch(world: &mut World, queue: &mut CommandQueue) -> Self {
+    unsafe fn fetch(world: &mut World, queue: &mut CommandQueue) -> Self {
         // CRITICAL RISK
         // SAFETY: Lifetime transmutation from actual borrow to 'static.
         //
@@ -218,7 +231,7 @@ impl SystemParam for Commands<'static> {
 /// This implementation allows any query pattern to be used as a system parameter
 /// without needing separate implementations for each query type.
 impl<Q: QueryTarget + 'static, F: QueryFilter + 'static> SystemParam for Query<'static, Q, F> {
-    fn fetch(world: &mut World, _queue: &mut CommandQueue) -> Self {
+    unsafe fn fetch(world: &mut World, _queue: &mut CommandQueue) -> Self {
         // SAFETY: Lifetime transmutation from actual borrow to 'static.
         //
         // This is sound IFF the caller upholds the SystemParam safety contract:
@@ -259,7 +272,7 @@ impl<Q: QueryTarget + 'static, F: QueryFilter + 'static> SystemParam for Query<'
 /// The scheduler tracks this as a resource read, allowing multiple systems
 /// to read the same resource in parallel.
 impl<T: Resource> SystemParam for Res<'static, T> {
-    fn fetch(world: &mut World, _queue: &mut CommandQueue) -> Self {
+    unsafe fn fetch(world: &mut World, _queue: &mut CommandQueue) -> Self {
         // SAFETY: Lifetime transmutation from actual borrow to 'static.
         //
         // This is sound IFF the caller upholds the SystemParam safety contract:
@@ -284,7 +297,7 @@ impl<T: Resource> SystemParam for Res<'static, T> {
 /// The scheduler tracks this as a resource write, preventing other systems
 /// from accessing the same resource in parallel.
 impl<T: Resource> SystemParam for ResMut<'static, T> {
-    fn fetch(world: &mut World, _queue: &mut CommandQueue) -> Self {
+    unsafe fn fetch(world: &mut World, _queue: &mut CommandQueue) -> Self {
         // SAFETY: Lifetime transmutation from actual borrow to 'static.
         //
         // This is sound IFF the caller upholds the SystemParam safety contract:
@@ -316,8 +329,12 @@ macro_rules! impl_system_param_tuple {
     ($($T:ident),*) => {
         #[allow(non_snake_case)]
         impl<$($T: SystemParam),*> SystemParam for ($($T,)*) {
-            fn fetch(world: &mut World, queue: &mut CommandQueue) -> Self {
-                ($($T::fetch(world, queue),)*)
+            unsafe fn fetch(world: &mut World, queue: &mut CommandQueue) -> Self {
+                // SAFETY: every element is fetched and immediately moved into
+                // the tuple this function returns, so the caller's
+                // drop-before-return obligation covers the elements exactly as
+                // it covers a single parameter.
+                unsafe { ($($T::fetch(world, queue),)*) }
             }
 
             fn report_access(access: &mut SystemAccess) {
@@ -329,7 +346,7 @@ macro_rules! impl_system_param_tuple {
 
 // Implement for tuples of different sizes (0 to 6 parameters)
 impl SystemParam for () {
-    fn fetch(_world: &mut World, _queue: &mut CommandQueue) -> Self {}
+    unsafe fn fetch(_world: &mut World, _queue: &mut CommandQueue) -> Self {}
 
     fn report_access(_access: &mut SystemAccess) {
         // Empty tuple has no access
@@ -448,7 +465,13 @@ where
     fn into_system(mut self) -> Box<dyn System> {
         Box::new(move |world: &mut World, queue: &mut CommandQueue| {
             // Resolve the system's parameters from the world and queue.
-            let input = Input::fetch(world, queue);
+            //
+            // SAFETY: `input` is dropped at the end of this closure call,
+            // before `world` and `queue` - borrowed from the caller's frame -
+            // go out of scope, and the closure returns only the system's own
+            // result, so the parameter cannot escape. That is exactly the
+            // drop-before-return invariant `fetch`'s `'static` marker assumes.
+            let input = unsafe { Input::fetch(world, queue) };
             // Invoke the wrapped function and normalize its return value.
             self.run(input).into_system_result()
         })
@@ -469,7 +492,11 @@ where
         Box::new(move |world: &mut World, queue: &mut CommandQueue| {
             // Resolve the system's parameters exactly as the non-patchable path
             // does, so a hot system and a plain one behave identically.
-            let input = Input::fetch(world, queue);
+            //
+            // SAFETY: as in `into_system` - `input` is dropped before this
+            // closure returns, so the `'static` marker never outlives the
+            // borrows it stands for.
+            let input = unsafe { Input::fetch(world, queue) };
 
             // One acquire load from a hot cache line, then an indirect call.
             // Measured at under 0.2 ns/call against a direct call, which is

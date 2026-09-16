@@ -113,6 +113,25 @@ pub trait Resource: Send + Sync + 'static {
     {
         Self::shared_name().map(crate::component::shared_component_identity)
     }
+
+    /// Structural hash of this resource's declared layout, or `None`.
+    ///
+    /// The resource counterpart of a component's schema hash: size and
+    /// alignment cannot tell `{u32, u32}` from `{f32, f32}`, so a shared
+    /// resource whose declaring types disagree only in field types is caught
+    /// by this instead of being read through the wrong `T`.
+    ///
+    /// Defaulted to `None`, and only compared when **both** sides of a claim
+    /// carry a value, so a type that does not need the extra check is not
+    /// required to lie about having one. The natural source, when the type
+    /// has a field vocabulary, is
+    /// [`component_schema_hash`](crate::component::component_schema_hash).
+    fn shared_schema_hash() -> Option<u64>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 // =============================================================================
@@ -507,8 +526,14 @@ impl ErasedResource {
     }
 
     /// Whether this box holds another language's blittable bytes.
+    ///
+    /// The answer comes from the box's own creation - a Rust value was stored
+    /// with a `TypeId` and a foreign payload without one - never from the
+    /// function table, which a re-home can replace. A table cannot redefine
+    /// what the value is, which is what keeps this predicate honest after a
+    /// mismatched re-home would otherwise have flipped it.
     pub fn is_foreign(&self) -> bool {
-        self.ops.foreign
+        self.type_id.is_none()
     }
 
     /// The stored value as raw bytes.
@@ -606,7 +631,16 @@ impl ErasedResource {
     /// after the artifact that supplied it has been reloaded or retired. A
     /// foreign box is not refreshed: see [`Self::is_foreign`] and
     /// `World::rehome_resources`.
+    ///
+    /// The table has to agree with the box's own ownership; a disagreement
+    /// would install a drop the value never had. Debug builds assert it, and
+    /// `World::rehome_resources` skips the case in release builds.
     pub fn refresh_ops(&mut self, ops: ErasedResourceOps) {
+        debug_assert_eq!(
+            ops.foreign,
+            self.type_id.is_none(),
+            "a resource's function table must agree with the ownership the box was created with"
+        );
         self.ops = ops;
     }
 

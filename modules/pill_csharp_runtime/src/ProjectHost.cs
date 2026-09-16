@@ -135,6 +135,14 @@ internal sealed class ProjectHost
     /// </summary>
     private DateTime _lastWriteUtc;
     private DateTime _lastPollUtc;
+    /// <summary>
+    /// Every context this loader has retired, weakly referenced so the check
+    /// itself never keeps one alive.
+    /// </summary>
+    private readonly List<WeakReference<ProjectContext>> _retiredContexts = new();
+    /// <summary>Versions retired since startup, and versions confirmed dead.</summary>
+    private int _retiredCount;
+    private int _collectedCount;
 
     /// <summary>Create a loader for the configured gameplay assembly.</summary>
     public ProjectHost(string assemblyPath) => _assemblyPath = assemblyPath;
@@ -239,6 +247,11 @@ internal sealed class ProjectHost
             return (byte)PollStatus.NoChange;
         _lastPollUtc = now;
 
+        // Before deciding anything: see whether the previous versions actually
+        // unloaded. The API only requests an unload, so this is the only place
+        // a leaked context becomes visible.
+        SweepRetiredContexts();
+
         DateTime written;
         try
         {
@@ -255,7 +268,9 @@ internal sealed class ProjectHost
         try
         {
             Load(isReload: true);
-            Console.WriteLine($"[csharp_runtime] reloaded {Path.GetFileName(_assemblyPath)}");
+            Console.WriteLine(
+                $"[csharp_runtime] reloaded {Path.GetFileName(_assemblyPath)} " +
+                $"(retired {_retiredCount}, collected {_collectedCount})");
             return (byte)PollStatus.Reloaded;
         }
         catch (Exception e)
@@ -271,6 +286,79 @@ internal sealed class ProjectHost
             _lastWriteUtc = written;
             return (byte)PollStatus.Rejected;
         }
+    }
+
+    /// <summary>
+    /// Count the retired assembly versions the runtime has actually released.
+    /// </summary>
+    /// <remarks>
+    /// A collectible context unloads only when nothing roots it, and
+    /// <see cref="AssemblyLoadContext.Unload"/> returns before that happens -
+    /// it cannot await a collection. Every blocker Microsoft lists for the
+    /// feature (a static holding a delegate, an event handler, a cached
+    /// <see cref="Type"/>, a thread-pool callback, a thread-static) is
+    /// something a project writes by accident, and each one leaves the whole
+    /// previous assembly - and its statics - alive with no symptom but memory
+    /// growth. Holding a weak reference and looking after a collection turns
+    /// that into an observable fact. Survivors are reported on stderr, the
+    /// same channel as the reload-failed line, and the counts ride on the
+    /// reloaded line.
+    /// </remarks>
+    private void SweepRetiredContexts()
+    {
+        if (_retiredContexts.Count == 0)
+            return;
+        // A collection is what turns "unload requested" into an answer. One
+        // pass is often enough, but a context whose assembly is referenced
+        // until the finalizer pass can need another; the loop is the pattern
+        // Microsoft's own sample uses, and it keeps a merely-slow collection
+        // from being reported as a leak.
+        for (int attempt = 0; attempt < 10 && AnyRetiredContextAlive(); attempt++)
+        {
+            GC.Collect();
+            GC.WaitForPendingFinalizers();
+        }
+        int survivors = 0;
+        for (int index = _retiredContexts.Count - 1; index >= 0; index--)
+        {
+            if (_retiredContexts[index].TryGetTarget(out _))
+            {
+                survivors++;
+                continue;
+            }
+            _retiredContexts.RemoveAt(index);
+            _collectedCount++;
+        }
+        if (survivors > 0)
+        {
+            Console.Error.WriteLine(
+                $"[csharp_runtime] {survivors} retired version(s) of " +
+                $"{Path.GetFileName(_assemblyPath)} are still loaded after " +
+                $"{_collectedCount} of {_retiredCount} reloads; something in the " +
+                "assembly roots its load context (a static event, a cached Type, " +
+                "a thread-pool callback)");
+        }
+    }
+
+    /// <summary>Whether any retired context the loader still tracks is alive.</summary>
+    private bool AnyRetiredContextAlive()
+    {
+        foreach (WeakReference<ProjectContext> reference in _retiredContexts)
+        {
+            if (reference.TryGetTarget(out _))
+                return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// Queue one retiring context for the unload check, then request the unload.
+    /// </summary>
+    private void RetireContext(ProjectContext context)
+    {
+        _retiredContexts.Add(new WeakReference<ProjectContext>(context));
+        _retiredCount++;
+        context.Unload();
     }
 
     /// <summary>
@@ -323,11 +411,12 @@ internal sealed class ProjectHost
             _componentManifest = manifest;
             _lastSystemErrors = new string?[systems.Length];
             _lastWriteUtc = File.GetLastWriteTimeUtc(_assemblyPath);
-            oldContext?.Unload();
+            if (oldContext is not null)
+                RetireContext(oldContext);
         }
         catch
         {
-            context.Unload();
+            RetireContext(context);
             throw;
         }
     }

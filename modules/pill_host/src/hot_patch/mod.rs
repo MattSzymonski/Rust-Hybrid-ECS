@@ -160,6 +160,11 @@ pub(crate) mod refusal_code {
     pub const EDITED_BEFORE_ARMING: &str = "edited-before-arming";
     /// A method was edited whose `impl` block names no simple receiver type.
     pub const UNRESOLVED_RECEIVER: &str = "unresolved-receiver";
+    /// An associated function without a receiver was edited: the generated
+    /// patch has no `Self` to compile its body against.
+    pub const ASSOCIATED_WITHOUT_RECEIVER: &str = "associated-without-receiver";
+    /// Two addressable declarations in one file share a bare name.
+    pub const DUPLICATE_DECLARATION: &str = "duplicate-declaration";
 }
 
 /// The change was in scope, but the attempt to deliver it did not complete.
@@ -254,6 +259,21 @@ impl std::fmt::Display for PatchStages {
     }
 }
 
+impl PatchStages {
+    /// Add one body's timings into the running total for the whole save.
+    ///
+    /// `classify` is measured once per save rather than once per body, so the
+    /// per-body structs leave it at zero and adding it changes nothing.
+    pub fn merge(&mut self, other: &PatchStages) {
+        self.classify += other.classify;
+        self.generate += other.generate;
+        self.flags += other.flags;
+        self.compile += other.compile;
+        self.load += other.load;
+        self.activate += other.activate;
+    }
+}
+
 // =============================================================================
 // HotPatchSession
 // =============================================================================
@@ -323,6 +343,27 @@ impl Snapshot {
     fn is_current(&self, modified: Option<SystemTime>) -> bool {
         matches!((self.modified, modified), (Some(recorded), Some(current)) if recorded == current)
     }
+}
+
+/// One file's in-scope edit, with every field the steps after classification
+/// need.
+///
+/// The four fields travel together for the same reason [`Snapshot`] is one
+/// value: the modification time is when *these* contents were read. A step that
+/// re-derives either half from a later stat pairs one observation's bytes with
+/// another's timestamp - which is how a save made during the patch came to be
+/// recorded as already delivered.
+#[derive(Debug)]
+struct ClassifiedEdit {
+    /// The changed file.
+    path: PathBuf,
+    /// Its changed bodies, sorted by name.
+    declarations: Vec<source::HotFunction>,
+    /// The file's contents as read during classification.
+    new_contents: String,
+    /// The file's modification time when those contents were read, or `None`
+    /// when the filesystem would not report one.
+    modified: Option<SystemTime>,
 }
 
 /// Drives the fast path for one project.
@@ -496,11 +537,12 @@ impl HotPatchSession {
         let classified = self.classify();
         stages.classify = classify_started.elapsed().as_secs_f64() * 1000.0;
 
-        let (path, declarations, new_contents) = match classified {
+        let edit = match classified {
             Ok(Some(found)) => found,
             Ok(None) => return PatchOutcome::Unchanged,
             Err(refusal) => return PatchOutcome::NotPatchable { refusal },
         };
+        let path = edit.path;
 
         // Step 2: Generate, compile, load and install each changed body in
         // turn. A failure part-way leaves the bodies already installed live -
@@ -515,7 +557,7 @@ impl HotPatchSession {
         // provable as its weakest body.
         let mut routes: Vec<crate::analytics::PatchRoute> = Vec::new();
         let mut copies = 0usize;
-        for declaration in &declarations {
+        for declaration in &edit.declarations {
             // The path the running artifact recorded for this function, which
             // is what both the engine registry and a slot are keyed by.
             // Derived from the file's position under the source root, so a
@@ -529,7 +571,7 @@ impl HotPatchSession {
                 engine,
                 targets,
                 patches,
-                &new_contents,
+                &edit.new_contents,
                 declaration,
                 &qualified,
                 &slot_name,
@@ -562,17 +604,14 @@ impl HotPatchSession {
 
         // Only record the new contents once every body is live, so a partial
         // failure is retried on the next change rather than treated as done.
-        // The modification time is re-read here rather than carried from
-        // classification: the file may have been written again since, and a
-        // stale time only costs one redundant read on the next attempt.
-        let modified = std::fs::metadata(&path)
-            .and_then(|metadata| metadata.modified())
-            .ok();
+        // The time recorded is the one read WITH these contents, never a fresh
+        // stat: a save that landed during the compile must leave the snapshot
+        // stale, or the next attempt skips it as already delivered.
         self.snapshots.insert(
             path,
             Snapshot {
-                contents: new_contents,
-                modified,
+                contents: edit.new_contents,
+                modified: edit.modified,
             },
         );
         PatchOutcome::Patched {
@@ -594,12 +633,11 @@ impl HotPatchSession {
     /// Identify a body-only edit of exactly one annotated function.
     ///
     /// `Ok(None)` means nothing changed. `Err` carries the reason the change is
-    /// out of scope, phrased for the console.
-    #[allow(clippy::type_complexity)]
-    fn classify(
-        &mut self,
-    ) -> Result<Option<(PathBuf, Vec<source::HotFunction>, String)>, PatchRefusal> {
-        let mut result: Option<(PathBuf, Vec<source::HotFunction>, String)> = None;
+    /// out of scope, phrased for the console. A match carries the file's
+    /// contents and the modification time read together, so the snapshot the
+    /// caller writes describes one observation rather than two.
+    fn classify(&mut self) -> Result<Option<ClassifiedEdit>, PatchRefusal> {
+        let mut result: Option<ClassifiedEdit> = None;
 
         // One directory walk, reused below. Reading every file in the crate on
         // every attempt made classification proportional to crate size rather
@@ -647,7 +685,33 @@ impl HotPatchSession {
             // emits the address inventory makes all of its functions
             // patchable, and the attribute only chooses which mechanism
             // delivers the replacement.
-            let hot: HashMap<String, source::HotFunction> = source::all_functions(&new_contents)
+            let functions = source::all_functions(&new_contents);
+            // Two declarations sharing a bare name cannot be told apart by
+            // the machinery below: the map keeps the *last* declaration while
+            // `function_bodies` keeps the *first*, so an edit to the first
+            // would install the second's body under the first's address. The
+            // scanner returns both deliberately - deduplicating by bare name
+            // once silently dropped declarations - which is why the collision
+            // is refused here, matching the module doc.
+            {
+                let mut seen: std::collections::HashSet<&str> =
+                    std::collections::HashSet::with_capacity(functions.len());
+                if let Some(duplicate) = functions
+                    .iter()
+                    .map(|function| function.name.as_str())
+                    .find(|name| !seen.insert(name))
+                {
+                    return Err(PatchRefusal::new(
+                        refusal_code::DUPLICATE_DECLARATION,
+                        format!(
+                            "{} declares two functions named `{duplicate}`; rename one of \
+                             them or split them across files",
+                            file_label(&path)
+                        ),
+                    ));
+                }
+            }
+            let hot: HashMap<String, source::HotFunction> = functions
                 .into_iter()
                 .map(|function| (function.name.clone(), function))
                 .collect();
@@ -724,9 +788,38 @@ impl HotPatchSession {
                         ),
                     ));
                 }
+                // A receiver-less associated function has no `Self` to carry:
+                // the generated patch emits the body at the top level, where
+                // `Self` cannot be named, so the compile is doomed. Refused
+                // here the outcome is a cheap `NotPatchable` instead of a patch
+                // failure plus a full reload.
+                if !declaration.takes_receiver
+                    && (declaration.self_type.is_some() || declaration.trait_name.is_some())
+                {
+                    let owner = match (&declaration.trait_name, &declaration.self_type) {
+                        (Some(trait_name), Some(self_type)) => {
+                            format!("`{trait_name}` for `{self_type}`")
+                        }
+                        (Some(trait_name), None) => format!("the `{trait_name}` trait"),
+                        (None, Some(self_type)) => format!("`{self_type}`"),
+                        (None, None) => "its `impl` block".to_string(),
+                    };
+                    return Err(PatchRefusal::new(
+                        refusal_code::ASSOCIATED_WITHOUT_RECEIVER,
+                        format!(
+                            "`{function}` is an associated function without a receiver in \
+                             {owner}; a patch has no `Self` to compile its body against"
+                        ),
+                    ));
+                }
                 declarations.push(declaration);
             }
-            result = Some((path, declarations, new_contents));
+            result = Some(ClassifiedEdit {
+                path,
+                declarations,
+                new_contents,
+                modified,
+            });
         }
 
         // Nothing changed - but if a watched file is newer than the baseline,
@@ -768,8 +861,14 @@ impl HotPatchSession {
         declaration: &source::HotFunction,
         qualified: &str,
         slot_name: &str,
-        stages: &mut PatchStages,
+        totals: &mut PatchStages,
     ) -> Result<ApplyResult, PatchRefusal> {
+        // Per-body timings. `apply` runs once per changed body while the
+        // caller's accumulator spans the whole save, so each body fills its
+        // own struct and merges it into the total on success; writing the
+        // total directly made the reported breakdown describe the last body
+        // alone whenever one save changed several.
+        let mut stages = PatchStages::default();
         let function = declaration.name.as_str();
         let kind = declaration.kind;
         self.counter += 1;
@@ -926,6 +1025,33 @@ impl HotPatchSession {
         let route: crate::analytics::PatchRoute;
         let copies: usize;
 
+        // One past the highest number this function already carries, so each
+        // function is numbered independently and a rollback does not renumber
+        // the history it rolled back over.
+        let generation = self
+            .generations
+            .iter()
+            .filter(|existing| existing.function == qualified)
+            .map(|existing| existing.number)
+            .max()
+            .unwrap_or(0)
+            + 1;
+        // Park the image before a single byte is written. `Library` unmaps on
+        // drop, and both routes below can refuse early - a stub already written
+        // into another artifact names an address inside this image, so a
+        // refusal must leave it owned rather than free it. The image is
+        // process-wide, not owned by this session: a later patch of a
+        // different crate has to reach the copies inside it. The routes below
+        // see the graveyard *without* this entry, so a patch image is never
+        // offered its own replacement.
+        patches.push(LoadedPatch {
+            function: qualified.to_string(),
+            generation,
+            library,
+        });
+        let library = &patches[patches.len() - 1].library;
+        let existing_patches = &patches[..patches.len() - 1];
+
         // Install at the frame boundary. Both routes refuse a signature that no
         // longer matches, so a reshaped function can never be applied behind a
         // call site compiled for the old shape.
@@ -935,7 +1061,7 @@ impl HotPatchSession {
             // library. One install reaches every caller.
             source::HotFunctionKind::System => {
                 let lookup_name = format!("{PATCH_NAME_PREFIX}{qualified}");
-                let (found, hash) = resolve_in(&library, &lookup_name)
+                let (found, hash) = resolve_in(library, &lookup_name)
                     .map_err(|detail| PatchRefusal::new(failure_code::RESOLVE, detail))?;
                 engine
                     .hot_patch(qualified, found, hash)
@@ -956,11 +1082,11 @@ impl HotPatchSession {
             // No attribute, so no slot exists to install into: the running
             // copies are redirected by overwriting their first bytes.
             source::HotFunctionKind::PlainFunction if !declaration.annotated => {
-                let found = resolve_patch_address(&library)
+                let found = resolve_patch_address(library)
                     .map_err(|detail| PatchRefusal::new(failure_code::RESOLVE, detail))?;
                 prologue_restores = prologue_patch_everywhere(
                     targets,
-                    patches,
+                    existing_patches,
                     qualified,
                     found,
                     &declaration.signature,
@@ -979,10 +1105,16 @@ impl HotPatchSession {
                 } else {
                     format!("{crate_name}::{function}")
                 };
-                let (found, found_signature) = resolve_plain_in(&library, &lookup_name)
+                let (found, found_signature) = resolve_plain_in(library, &lookup_name)
                     .map_err(|detail| PatchRefusal::new(failure_code::RESOLVE, detail))?;
-                copies = install_everywhere(targets, patches, slot_name, found, &found_signature)
-                    .map_err(|detail| PatchRefusal::new(failure_code::INSTALL, detail))?;
+                copies = install_everywhere(
+                    targets,
+                    existing_patches,
+                    slot_name,
+                    found,
+                    &found_signature,
+                )
+                .map_err(|detail| PatchRefusal::new(failure_code::INSTALL, detail))?;
                 address = found;
                 signature = found_signature;
                 route = crate::analytics::PatchRoute::ArtifactSlot;
@@ -990,17 +1122,6 @@ impl HotPatchSession {
         }
         stages.activate = activate_started.elapsed().as_secs_f64() * 1000.0;
 
-        // One past the highest number this function already carries, so each
-        // function is numbered independently and a rollback does not renumber
-        // the history it rolled back over.
-        let generation = self
-            .generations
-            .iter()
-            .filter(|existing| existing.function == qualified)
-            .map(|existing| existing.number)
-            .max()
-            .unwrap_or(0)
-            + 1;
         self.generations.push(Generation {
             prologue_history_dropped: false,
             function: qualified.to_string(),
@@ -1020,13 +1141,6 @@ impl HotPatchSession {
             prologue_restores,
             installed_at: Instant::now(),
         });
-        // The image itself is process-wide, not owned by this session: a later
-        // patch of a DIFFERENT crate has to reach the copies inside it.
-        patches.push(LoadedPatch {
-            function: qualified.to_string(),
-            generation,
-            library,
-        });
         self.active_generations
             .insert(qualified.to_string(), generation);
         debug!(
@@ -1036,6 +1150,8 @@ impl HotPatchSession {
             generations = self.generations.len(),
             "patch generation installed"
         );
+        totals.merge(&stages);
+
         Ok(ApplyResult {
             generation,
             artifact_bytes,
@@ -1350,7 +1466,7 @@ impl HotPatchSession {
     /// The captured compiler flags, asking cargo on first use.
     fn rustc_line(&mut self) -> Result<&CargoRustcLine, String> {
         if self.rustc_line.is_none() {
-            let cache = compile::flags_cache_path(&self.package);
+            let cache = compile::flags_cache_path(&self.workspace_root, &self.package);
             // Deliberately NOT the crate root. The flags describe the dependency
             // graph and feature set, which a source edit cannot change - and the
             // crate root is precisely the file being edited, so including it
@@ -1379,6 +1495,19 @@ impl HotPatchSession {
                     .join(crate::config::module_build_artifact_directory())
                     .join(format!("lib{}.rlib", self.package)),
             );
+            // The cargo configuration and the pinned toolchain decide the same
+            // flags from outside the manifest: a wrapper, a target directory
+            // override, or a toolchain switch changes what a replayed line
+            // means without moving `Cargo.toml` or the lockfile. Added only
+            // when they exist, because `load_if_fresh` refuses an unreadable
+            // input and an unconditional push would disable the cache in
+            // workspaces that have neither file.
+            for relative in [".cargo/config.toml", "rust-toolchain.toml"] {
+                let input = self.workspace_root.join(relative);
+                if input.exists() {
+                    freshness.push(input);
+                }
+            }
             let line = match CargoRustcLine::load_if_fresh(&cache, &freshness, &self.build_command)
             {
                 Some(cached) => cached,
@@ -1438,6 +1567,72 @@ fn file_label(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A fan-out that reaches no copy is reported rather than treated as
+    /// success, and the image parked in the graveyard is untouched by the
+    /// refusal - which is what keeps a refusal from unmapping an image another
+    /// artifact may already jump into.
+    #[test]
+    fn a_fan_out_that_reaches_nothing_keeps_the_patch_image_owned() {
+        // SAFETY: a system library with no relationship to this crate, loaded
+        // only so the graveyard holds a real image.
+        let library = unsafe { Library::new("kernel32.dll") }.expect("kernel32.dll loads");
+        let patches = vec![LoadedPatch {
+            function: String::from("demo::function"),
+            generation: 1,
+            library,
+        }];
+
+        let error = match prologue_patch_everywhere(&[], &patches, "demo::function", 0, "fn()") {
+            Ok(_) => panic!("a fan-out with no artifacts cannot succeed"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("no loaded artifact reports an address"),
+            "the refusal explains why nothing was reached: {error}"
+        );
+        assert_eq!(
+            patches.len(),
+            1,
+            "the image is still owned by the graveyard"
+        );
+    }
+
+    /// An image whose resolver export cannot be resolved is an error, not an
+    /// artifact that links nothing.
+    ///
+    /// `Ok(false)` means "asked, and this image does not carry the crate", and
+    /// every caller skips those. Folding an image that cannot be interrogated
+    /// into that answer would leave a copy running old code while the console
+    /// reports a provable install, so the error makes the caller fall back to
+    /// a reload.
+    #[test]
+    fn patch_without_its_resolver_export_is_an_error() {
+        // SAFETY: a system library with no relationship to this crate, loaded
+        // only so the patch holds a real image with no resolver export.
+        let library = unsafe { Library::new("kernel32.dll") }.expect("kernel32.dll loads");
+        let patch = LoadedPatch {
+            function: String::from("demo::function"),
+            generation: 1,
+            library,
+        };
+
+        let install = patch
+            .install_plain_function("demo::function", 0, "fn()")
+            .expect_err("an image that cannot be interrogated cannot answer `not here`");
+        assert!(
+            install.contains("pill_patch_resolve_install") && install.contains("demo::function"),
+            "the refusal names the export and the patch it was missing from: {install}"
+        );
+
+        let reset = patch
+            .reset_plain_function("demo::function")
+            .expect_err("a rollback must not treat an un-interrogable image as declaring nothing");
+        assert!(
+            reset.contains("pill_patch_resolve_reset"),
+            "the refusal names the export the reset needs: {reset}"
+        );
+    }
 
     /// The generated source must carry the prefixed name and the distinct
     /// resolver export, because both prevent a silent collision with the copy
@@ -1519,10 +1714,13 @@ mod tests {
         std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
 
         let classified = session.classify().expect("body-only edit must be accepted");
-        let (_, declaration, _) = classified.expect("a change must be reported");
-        assert_eq!(declaration.len(), 1, "one body changed");
-        assert_eq!(declaration[0].name, "get_color_a");
-        assert_eq!(declaration[0].kind, source::HotFunctionKind::PlainFunction);
+        let edit = classified.expect("a change must be reported");
+        assert_eq!(edit.declarations.len(), 1, "one body changed");
+        assert_eq!(edit.declarations[0].name, "get_color_a");
+        assert_eq!(
+            edit.declarations[0].kind,
+            source::HotFunctionKind::PlainFunction
+        );
 
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -1640,6 +1838,37 @@ mod tests {
     fn classify_accepts_a_trait_method_body() {
         let directory = std::env::temp_dir().join("pill_classify_trait_method");
         let _ = std::fs::remove_dir_all(&directory);
+        let source = "pub struct Spline(u32);\n\nimpl Shape for Spline {
+fn size(&self) -> u32 { 1 }\n}\n";
+        let mut session = session_over(&directory, source);
+
+        std::fs::write(directory.join("lib.rs"), source.replace("{ 1 }", "{ 2 }"))
+            .expect("write edit");
+
+        let edit = session
+            .classify()
+            .expect("a trait method body is in scope")
+            .expect("the change must be reported");
+        assert_eq!(edit.declarations.len(), 1);
+        assert_eq!(edit.declarations[0].name, "size");
+        assert_eq!(edit.declarations[0].self_type.as_deref(), Some("Spline"));
+        assert_eq!(edit.declarations[0].trait_name.as_deref(), Some("Shape"));
+        assert!(edit.new_contents.contains("{ 2 }"));
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A receiver-less associated function is refused at classification.
+    ///
+    /// `fn default() -> Self` has no receiver to carry, so the generated patch
+    /// would emit the body at the top level, where `Self` cannot be named - a
+    /// doomed compile that cost a patch failure plus a full reload. The refusal
+    /// names the trait and the type, because either alone leaves the reader
+    /// hunting for which `impl` block was meant.
+    #[test]
+    fn classify_refuses_a_receiverless_trait_function() {
+        let directory = std::env::temp_dir().join("pill_classify_receiverless");
+        let _ = std::fs::remove_dir_all(&directory);
         let source = "pub struct Spline(u32);\n\nimpl Default for Spline {
 fn default() -> Self { Spline(1) }\n}\n";
         let mut session = session_over(&directory, source);
@@ -1650,15 +1879,20 @@ fn default() -> Self { Spline(1) }\n}\n";
         )
         .expect("write edit");
 
-        let (_, declarations, contents) = session
+        let refusal = session
             .classify()
-            .expect("a trait method body is in scope")
-            .expect("the change must be reported");
-        assert_eq!(declarations.len(), 1);
-        assert_eq!(declarations[0].name, "default");
-        assert_eq!(declarations[0].self_type.as_deref(), Some("Spline"));
-        assert_eq!(declarations[0].trait_name.as_deref(), Some("Default"));
-        assert!(contents.contains("Spline(2)"));
+            .expect_err("a receiver-less associated function cannot be patched");
+        assert_eq!(
+            refusal.code,
+            refusal_code::ASSOCIATED_WITHOUT_RECEIVER,
+            "{}",
+            refusal.detail
+        );
+        assert!(
+            refusal.detail.contains("Default") && refusal.detail.contains("Spline"),
+            "the refusal names the trait and the type: {}",
+            refusal.detail
+        );
 
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -1855,12 +2089,12 @@ fn size(&self) -> u32 { 222 }\n}\n";
         let edited = HOT_SOURCE.replace("value * SPEED", "value * SPEED * 3.0");
         std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
 
-        let (path, declarations, _) = session
+        let edit = session
             .classify()
             .expect("the untouched file must be skipped, not re-read")
             .expect("a change must be reported");
-        assert_eq!(path.file_name().unwrap(), "lib.rs");
-        assert_eq!(declarations[0].name, "movement");
+        assert_eq!(edit.path.file_name().unwrap(), "lib.rs");
+        assert_eq!(edit.declarations[0].name, "movement");
 
         // And the stale snapshot is still there: proof the file was never read.
         assert!(
@@ -1888,12 +2122,60 @@ fn size(&self) -> u32 { 222 }\n}\n";
         let edited = PLAIN_SOURCE.replace("133.0", "144.0");
         std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
 
-        let (_, declarations, contents) = session
+        let edit = session
             .classify()
             .expect("a body-only edit is in scope")
             .expect("the changed file must be re-read and reported");
-        assert_eq!(declarations[0].name, "get_color_a");
-        assert!(contents.contains("144.0"));
+        assert_eq!(edit.declarations[0].name, "get_color_a");
+        assert!(edit.new_contents.contains("144.0"));
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Classification hands on the modification time it read WITH the contents.
+    ///
+    /// The pair is what `try_patch` stores as the new snapshot. It used to
+    /// re-stat the file after installing the patch, pairing older contents with
+    /// a newer time - so a save made during the compile was recorded as already
+    /// delivered and then skipped by the modification-time gate.
+    #[test]
+    fn classify_returns_the_time_of_the_contents_it_read() {
+        let directory = std::env::temp_dir().join("pill_classify_modified_pair");
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut session = session_over(&directory, PLAIN_SOURCE);
+
+        // Same coarse-timestamp guard as the other re-read tests: a write
+        // landing in the recorded tick would look unchanged.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let edited = PLAIN_SOURCE.replace("133.0", "144.0");
+        std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
+
+        let edit = session
+            .classify()
+            .expect("a body-only edit is in scope")
+            .expect("the change must be reported");
+        let on_disk = std::fs::metadata(directory.join("lib.rs"))
+            .and_then(|metadata| metadata.modified())
+            .ok();
+        assert_eq!(
+            edit.modified, on_disk,
+            "the time must describe the contents that were read"
+        );
+        assert!(edit.new_contents.contains("144.0"));
+
+        // Replayed as the snapshot a successful patch stores: current against
+        // its own moment, and stale against a later touch - which is what makes
+        // a save during the patch re-readable rather than silently shipped.
+        let recorded = edit.modified.expect("a temp directory reports a time");
+        let replayed = Snapshot {
+            contents: edit.new_contents,
+            modified: edit.modified,
+        };
+        assert!(replayed.is_current(Some(recorded)));
+        assert!(
+            !replayed.is_current(Some(recorded + std::time::Duration::from_secs(1))),
+            "a touch after the read must not count as delivered"
+        );
 
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -2063,6 +2345,32 @@ fn helper(value: f32) -> f32 {
 }
 "#;
 
+    /// One file declaring `draw` twice, in two `impl` blocks.
+    const DUPLICATE_NAME_SOURCE: &str = r#"
+use pill_engine::*;
+
+struct Alpha {
+    value: f32,
+}
+
+struct Beta {
+    value: f32,
+}
+
+impl Alpha {
+    #[pill_hot]
+    fn draw(&self) -> f32 {
+        self.value * 1.0
+    }
+}
+
+impl Beta {
+    fn draw(&self) -> f32 {
+        self.value * 2.0
+    }
+}
+"#;
+
     /// The headline classification: a body-only edit of an annotated function
     /// is identified, and names the right function.
     #[test]
@@ -2075,11 +2383,11 @@ fn helper(value: f32) -> f32 {
         std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
 
         let classified = session.classify().expect("body-only edit must be accepted");
-        let (_, declaration, contents) = classified.expect("a change must be reported");
-        assert_eq!(declaration.len(), 1, "one body changed");
-        assert_eq!(declaration[0].name, "movement");
-        assert_eq!(declaration[0].kind, source::HotFunctionKind::System);
-        assert!(contents.contains("value * SPEED * 2.0"));
+        let edit = classified.expect("a change must be reported");
+        assert_eq!(edit.declarations.len(), 1, "one body changed");
+        assert_eq!(edit.declarations[0].name, "movement");
+        assert_eq!(edit.declarations[0].kind, source::HotFunctionKind::System);
+        assert!(edit.new_contents.contains("value * SPEED * 2.0"));
 
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -2187,7 +2495,7 @@ fn helper(value: f32) -> f32 {
             .expect("the changed body must be detected");
         assert!(
             classified
-                .1
+                .declarations
                 .iter()
                 .any(|declaration| declaration.name == "movement"),
             "the edited body should be the one reported"
@@ -2212,11 +2520,12 @@ fn helper(value: f32) -> f32 {
             .replace("value - 1.0", "value - 9.0");
         std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
 
-        let (_, declarations, _) = session
+        let edit = session
             .classify()
             .expect("two body-only edits are in scope")
             .expect("a change must be reported");
-        let names: Vec<&str> = declarations
+        let names: Vec<&str> = edit
+            .declarations
             .iter()
             .map(|declaration| declaration.name.as_str())
             .collect();
@@ -2227,6 +2536,49 @@ fn helper(value: f32) -> f32 {
         );
 
         let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Stage timings add up across the bodies of one save.
+    ///
+    /// `apply` runs once per changed body with the same accumulator, and the
+    /// total it reports spans all of them: writing instead of adding made the
+    /// breakdown describe the last body alone, exactly when a slow multi-body
+    /// save is the one being diagnosed.
+    #[test]
+    fn stage_timings_accumulate_across_bodies() {
+        let mut total = PatchStages {
+            classify: 1.0,
+            ..PatchStages::default()
+        };
+        let first = PatchStages {
+            generate: 2.0,
+            flags: 3.0,
+            compile: 4.0,
+            load: 5.0,
+            activate: 6.0,
+            ..PatchStages::default()
+        };
+        let second = PatchStages {
+            generate: 7.0,
+            flags: 8.0,
+            compile: 9.0,
+            load: 10.0,
+            activate: 11.0,
+            ..PatchStages::default()
+        };
+
+        total.merge(&first);
+        total.merge(&second);
+
+        assert_eq!(
+            total.classify, 1.0,
+            "classify is measured once per save, not per body"
+        );
+        assert_eq!(total.generate, 9.0);
+        assert_eq!(total.flags, 11.0);
+        assert_eq!(total.compile, 13.0);
+        assert_eq!(total.load, 15.0);
+        assert_eq!(total.activate, 17.0);
     }
 
     /// Two changed files in one edit are refused with their own code.
@@ -2254,6 +2606,37 @@ fn helper(value: f32) -> f32 {
             refusal.code,
             refusal_code::MULTIPLE_FILES,
             "{}",
+            refusal.detail
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// Two addressable declarations sharing a bare name are refused rather
+    /// than patched by guesswork: the classifier's declaration map keeps the
+    /// last one while body scanning keeps the first, so the body installed
+    /// and the address it replaces would belong to different functions.
+    #[test]
+    fn duplicate_bare_names_are_refused() {
+        let directory = std::env::temp_dir().join("pill_classify_duplicate_names");
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut session = session_over(&directory, DUPLICATE_NAME_SOURCE);
+
+        let edited = DUPLICATE_NAME_SOURCE.replace("self.value * 1.0", "self.value * 9.0");
+        std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
+
+        let refusal = session
+            .classify()
+            .expect_err("two declarations named `draw` cannot be told apart");
+        assert_eq!(
+            refusal.code,
+            refusal_code::DUPLICATE_DECLARATION,
+            "{}",
+            refusal.detail
+        );
+        assert!(
+            refusal.detail.contains("draw"),
+            "the refusal names the colliding declaration: {}",
             refusal.detail
         );
 
@@ -2370,6 +2753,61 @@ fn helper(value: f32) -> f32 {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// A reload clears the active generation of slot-delivered history too.
+    ///
+    /// The rebuilt artifact re-creates the slot with its own body, so a
+    /// generation that was live before the reload is not running any more -
+    /// and a rollback that trusted the stale entry would install a body from
+    /// the previous revision into the fresh artifact.
+    #[test]
+    fn a_reload_forgets_slot_generations() {
+        let directory = std::env::temp_dir().join("pill_reload_forgets_slots");
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut session = session_over(&directory, HOT_SOURCE);
+
+        // A generation delivered into a slot, as `apply` records one: no
+        // prologue was written, so there is nothing for the reload to prune.
+        session.generations.push(Generation {
+            function: "project::movement".to_string(),
+            number: 1,
+            address: 0x1000,
+            kind: source::HotFunctionKind::System,
+            signature_hash: 7,
+            lookup_name: "project::movement".to_string(),
+            signature: String::new(),
+            prologue_restores: Vec::new(),
+            prologue_history_dropped: false,
+            installed_at: Instant::now(),
+        });
+        session
+            .active_generations
+            .insert("project::movement".to_string(), 1);
+        assert_eq!(session.active_generation("project::movement"), 1);
+
+        // The reload.
+        session.forget_prologue_patches();
+
+        assert_eq!(
+            session.active_generation("project::movement"),
+            0,
+            "the rebuilt artifact runs its own body, not the pre-reload patch"
+        );
+        assert!(!session.knows_function("project::movement"));
+
+        // Rolling back to the pre-reload generation must be refused rather
+        // than re-installing a body from a previous revision.
+        let mut engine = Engine::new();
+        let detail = session
+            .rollback(&mut engine, &[], &[], "project::movement", 1)
+            .expect_err("a generation from before the reload cannot be re-installed");
+        assert!(
+            detail.contains("has not been patched in this session"),
+            "the refusal says there is no history to roll back to: {detail}"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
     /// An un-annotated function is patchable: the attribute chooses which
     /// mechanism delivers the replacement, not whether one is possible at all.
     ///
@@ -2389,13 +2827,16 @@ fn helper(value: f32) -> f32 {
         )
         .expect("write edit");
 
-        let (_, declaration, _) = session
+        let edit = session
             .classify()
             .expect("an un-annotated body edit is in scope")
             .expect("a change must be reported");
-        assert_eq!(declaration.len(), 1, "one body changed");
-        assert_eq!(declaration[0].name, "ordinary");
-        assert_eq!(declaration[0].kind, source::HotFunctionKind::PlainFunction);
+        assert_eq!(edit.declarations.len(), 1, "one body changed");
+        assert_eq!(edit.declarations[0].name, "ordinary");
+        assert_eq!(
+            edit.declarations[0].kind,
+            source::HotFunctionKind::PlainFunction
+        );
 
         let _ = std::fs::remove_dir_all(&directory);
     }
@@ -2428,12 +2869,12 @@ fn helper(value: f32) -> f32 {
         let edited = HOT_SOURCE.replace("value + 1.0", "value + 9.0");
         std::fs::write(directory.join("lib.rs"), &edited).expect("write edit");
 
-        let (_, declaration, _) = session
+        let edit = session
             .classify()
             .expect("a body-only edit is in scope")
             .expect("a change must be reported");
-        assert_eq!(declaration.len(), 1, "one body changed");
-        assert_eq!(declaration[0].name, "helper");
+        assert_eq!(edit.declarations.len(), 1, "one body changed");
+        assert_eq!(edit.declarations[0].name, "helper");
 
         let _ = std::fs::remove_dir_all(&directory);
     }

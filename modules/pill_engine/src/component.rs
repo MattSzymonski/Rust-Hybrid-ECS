@@ -629,14 +629,6 @@ impl ComponentRegistry {
     /// [`Self::remove`](ComponentRegistry::remove). Registration is driven by
     /// user data, so exceeding the limit is a configuration outcome, not a
     /// programming error - it is reported rather than panicked on.
-    ///
-    /// # Panics (debug only)
-    ///
-    /// Panics when a type is re-registered with a different size than was
-    /// recorded the first time. That means a hot reload replaced the
-    /// definition without the registry noticing: the stored layout is now
-    /// stale, and everything reading size from here - the byte-level bindings
-    /// handed to C#, the persistence migration - would work from the old one.
     pub fn register<T: Component>(&mut self) -> Result<Registration, WorldError> {
         self.register_with_layout::<T>(&[])
     }
@@ -713,7 +705,19 @@ impl ComponentRegistry {
                 // it describes the definition now in force.
                 _ => {}
             }
-            self.layouts.insert(component_id, layout);
+            // A layout-less re-registration (`register::<T>()`, fields `&[]`)
+            // records no schema hash of its own. Carry a recorded one forward:
+            // the record may gain evidence, never lose it - otherwise the
+            // shared-layout check above takes its permissive arm forever, and
+            // two binaries that disagree about a component's fields register
+            // silently.
+            let mut merged = layout;
+            if merged.schema_hash.is_none() {
+                if let Some(recorded) = recorded {
+                    merged.schema_hash = recorded.schema_hash;
+                }
+            }
+            self.layouts.insert(component_id, merged);
             return Ok(Registration::AlreadyPresent(bit));
         }
         // Step 2: Assign the next bit - either one reclaimed by `remove`, or a
@@ -896,15 +900,24 @@ impl ComponentRegistry {
         self.layouts.get(component_id).copied()
     }
 
-    /// Update the recorded size of a dynamic component whose storage was relaid out.
+    /// Republish a dynamic component's whole registry layout.
     ///
-    /// Only the size moves. The bit index, the name and the layout's
-    /// deliberately absent schema hash stay as registered: replacing the
+    /// The registry record and the storage factory describe one column, so a
+    /// relayout that moves alignment or the schema hash has to move both:
+    /// `get_layout`/`get_size` read here, and the placeholder alignment
+    /// registration started with would describe a layout that never existed.
+    /// The bit index, the name and the id stay put - replacing the
     /// registration instead would allocate a fresh bit index, and that index is
     /// baked into archetype masks and scheduled access masks.
-    pub(crate) fn update_dynamic_size(&mut self, component_id: &ComponentId, size: usize) {
-        if let Some(layout) = self.layouts.get_mut(component_id) {
-            layout.size = size;
+    pub(crate) fn update_dynamic_layout(
+        &mut self,
+        component_id: &ComponentId,
+        layout: &crate::archetype::DynamicComponentLayout,
+    ) {
+        if let Some(record) = self.layouts.get_mut(component_id) {
+            record.size = layout.size;
+            record.align = layout.align;
+            record.schema_hash = Some(layout.schema_hash);
         }
     }
 
@@ -1067,5 +1080,83 @@ mod tests {
         let new_bit = registry.register_dynamic(999, "Project.New", 4).unwrap();
         assert_eq!(new_bit, 3, "the most recently freed bit is reused first");
         assert_eq!(registry.available_slots(), 123);
+    }
+
+    /// A layout-less re-registration must not disarm the shared-layout check:
+    /// the recorded schema hash survives it, so a later declaration with the
+    /// same size but a different field shape is still refused.
+    #[test]
+    fn schema_hash_survives_layout_less_reregistration() {
+        // Two copies of one shared type, as two binaries compile them: same
+        // final type name (so the name check passes) and same size, differing
+        // only in the declared field shape the schema hash covers.
+        mod first_copy {
+            use crate::component::Component;
+
+            #[derive(Clone, Debug)]
+            pub struct SharedProbe {
+                #[allow(dead_code)]
+                pub value: u32,
+            }
+            impl Component for SharedProbe {
+                fn shared_name() -> Option<&'static str> {
+                    Some("audit::SharedProbe")
+                }
+            }
+            trait_type_map::impl_trait_accessible!(dyn Component; SharedProbe);
+        }
+
+        mod second_copy {
+            use crate::component::Component;
+
+            #[derive(Clone, Debug)]
+            pub struct SharedProbe {
+                #[allow(dead_code)]
+                pub value: u32,
+            }
+            impl Component for SharedProbe {
+                fn shared_name() -> Option<&'static str> {
+                    Some("audit::SharedProbe")
+                }
+            }
+            trait_type_map::impl_trait_accessible!(dyn Component; SharedProbe);
+        }
+
+        static FIELDS_A: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {
+            name: "first",
+            type_tag: "u32",
+            offset: 0,
+            size: 4,
+            align: 4,
+            element_count: 0,
+        }];
+        static FIELDS_B: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {
+            name: "second",
+            type_tag: "u32",
+            offset: 0,
+            size: 4,
+            align: 4,
+            element_count: 0,
+        }];
+
+        let mut registry = ComponentRegistry::new();
+        let _first_declaration = registry
+            .register_with_layout::<first_copy::SharedProbe>(FIELDS_A)
+            .expect("the first declaration is recorded");
+
+        // The old bug: this registration carries no fields, so it used to
+        // overwrite the recorded hash with `None`, after which the check below
+        // took its permissive arm forever.
+        let _re_registration = registry
+            .register::<first_copy::SharedProbe>()
+            .expect("re-registration is idempotent");
+
+        let error = registry
+            .register_with_layout::<second_copy::SharedProbe>(FIELDS_B)
+            .expect_err("the hash recorded by the first declaration must survive");
+        assert!(matches!(
+            error,
+            WorldError::SharedComponentLayoutMismatch { .. }
+        ));
     }
 }

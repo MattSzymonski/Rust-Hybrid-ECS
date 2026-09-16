@@ -80,8 +80,11 @@ SAMPLE_OFFSET_PATTERN = re.compile(
 )
 
 # Vertical position the probe reports before any offset is applied: the
-# project-owned spline's Catmull-Rom midpoint at t = 0.5 (one decimal).
-BASE_PROBE_MIDPOINT_Y = 288.75
+# project-owned reference spline's Catmull-Rom midpoint at t = 0.5 (one
+# decimal). The reference spans five collinear spawn points 150 apart from
+# x=90 at y=120, so the midpoint is the middle point, (390, 120); the same
+# geometry the cascade suite documents.
+BASE_PROBE_MIDPOINT_Y = 120.0
 
 ORIGINAL_CONTENT: str = ""
 
@@ -126,7 +129,7 @@ def plan_value_edit(content: str) -> Tuple[str, str, str]:
     new_offset_text = f"{new_offset:.1f}"
     new_line = f"{match.group(1)}const SAMPLE_VERTICAL_OFFSET: f32 = {new_offset_text};"
     new_y = BASE_PROBE_MIDPOINT_Y + new_offset
-    return match.group(0), new_line, f"midpoint (400.0, {new_y:.1f})"
+    return match.group(0), new_line, f"midpoint (390.0, {new_y:.1f})"
 
 
 # =============================================================================
@@ -182,8 +185,13 @@ def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
             "--package",
             "pill_standalone",
             "--no-default-features",
+            # `rendering` is required rather than optional: examples/project_rs
+            # links `pill_master_renderer`, so a host without it resolves
+            # `pill_core` differently from the project and the project DLL
+            # fails to load with "The specified procedure could not be found"
+            # (os error 127), the same reason the cascade suite pins it.
             "--features",
-            "hot_reload",
+            "hot_reload,rendering",
         ],
         MODULES_ROOT,
         process_environment,
@@ -207,8 +215,10 @@ def build_workspace() -> bool:
                 "-p",
                 "pill_standalone",
                 "--no-default-features",
+                # Matches the launch below; see the note there for why the
+                # project needs a rendering host.
                 "--features",
-                "hot_reload",
+                "hot_reload,rendering",
             ],
             cwd=str(MODULES_ROOT),
             capture_output=True,

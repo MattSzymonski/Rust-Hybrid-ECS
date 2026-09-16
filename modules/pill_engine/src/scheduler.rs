@@ -66,16 +66,19 @@ impl TypeKey {
 /// [`conflicts_with`]: SystemAccess::conflicts_with
 #[derive(Debug, Clone, Default)]
 pub struct SystemAccess {
-    /// Components read immutably (&T) - registration phase
-    pub reads: HashSet<ComponentId>,
-    /// Components written mutably (&mut T) - registration phase
-    pub writes: HashSet<ComponentId>,
+    /// Components read immutably (&T).
+    ///
+    /// Private behind [`add_read`](SystemAccess::add_read) precisely so the
+    /// bitmask cache cannot be left describing a set that no longer exists.
+    reads: HashSet<ComponentId>,
+    /// Components written mutably (&mut T).
+    writes: HashSet<ComponentId>,
     /// Whether the system uses Commands (requires exclusive World access)
     pub uses_commands: bool,
     /// Resources read immutably (`Res<T>`)
-    pub resource_reads: HashSet<ResourceId>,
+    resource_reads: HashSet<ResourceId>,
     /// Resources written mutably (`ResMut<T>`)
-    pub resource_writes: HashSet<ResourceId>,
+    resource_writes: HashSet<ResourceId>,
 
     /// Precomputed read bitmask for O(1) conflict detection.
     ///
@@ -88,22 +91,13 @@ pub struct SystemAccess {
     /// after registration; empty until then.
     writes_mask: ComponentMask,
 
-    /// Sorted copy of `resource_reads`, built by
-    /// [`build_component_masks`](SystemAccess::build_component_masks) so the
-    /// resource-conflict check in [`conflicts_with`](SystemAccess::conflicts_with)
-    /// can use an allocation-free merge intersection instead of hashing every
-    /// pair. Kept in lockstep with the set it mirrors; a length mismatch means
-    /// the set changed after the sort and the check falls back to the sets.
-    resource_reads_sorted: Vec<ResourceId>,
-    /// Sorted copy of `resource_writes`, as above.
-    resource_writes_sorted: Vec<ResourceId>,
-
     /// Whether the bitmasks describe **every** access in the sets above.
     ///
     /// False until [`build_component_masks`](SystemAccess::build_component_masks)
     /// runs, and false again afterwards if any accessed component had no bit in
     /// the registry at that moment - which happens whenever a system is
-    /// registered before the component it touches.
+    /// registered before the component it touches - or if any access is added
+    /// after the build.
     ///
     /// This flag is the difference between a fast answer and a wrong one. A
     /// mask that silently omits a component makes two systems writing it look
@@ -127,6 +121,7 @@ impl SystemAccess {
     #[inline]
     pub fn add_read(&mut self, component_id: ComponentId) {
         self.reads.insert(component_id);
+        self.invalidate_masks();
     }
 
     /// Registers `component_id` as mutable (`&mut T`) access for this system.
@@ -136,6 +131,18 @@ impl SystemAccess {
     #[inline]
     pub fn add_write(&mut self, component_id: ComponentId) {
         self.writes.insert(component_id);
+        self.invalidate_masks();
+    }
+
+    /// Marks the bitmask cache stale after a set changes.
+    ///
+    /// `conflicts_with` may only take the bitmask path while the masks
+    /// describe *every* access; a set mutated after `build_component_masks` no
+    /// longer is, and the complete sets take over until the next build. The
+    /// sets are private so this cannot be bypassed.
+    #[inline]
+    fn invalidate_masks(&mut self) {
+        self.masks_complete = false;
     }
 
     /// Marks whether this system uses [`Commands`](crate::Commands).
@@ -188,15 +195,6 @@ impl SystemAccess {
             }
         }
         self.masks_complete = complete;
-
-        // Snapshot the resource sets in sorted order so the resource-conflict
-        // check can merge-intersect instead of hashing each pair. The sorted
-        // caches are only valid while the sets they mirror keep the same
-        // length; `conflicts_with` checks that before trusting them.
-        self.resource_reads_sorted = self.resource_reads.iter().copied().collect();
-        self.resource_reads_sorted.sort_unstable();
-        self.resource_writes_sorted = self.resource_writes.iter().copied().collect();
-        self.resource_writes_sorted.sort_unstable();
     }
 
     /// Whether the bitmasks currently describe every access this system makes.
@@ -266,59 +264,22 @@ impl SystemAccess {
 
         // Step 3: Resource conflicts.
         //
-        // Resources get the same treatment the component masks do - a
-        // precomputed sorted snapshot, checked with an allocation-free merge
-        // intersection instead of `HashSet::is_disjoint` on every pair. The
-        // snapshot is trusted only while the live set keeps the same length;
-        // if a caller mutated `resource_reads`/`resource_writes` after
-        // `build_component_masks`, the length check falls back to the sets,
-        // which are always the source of truth.
-        let reads_in_sync = self.resource_reads.len() == self.resource_reads_sorted.len()
-            && other.resource_reads.len() == other.resource_reads_sorted.len();
-        let writes_in_sync = self.resource_writes.len() == self.resource_writes_sorted.len()
-            && other.resource_writes.len() == other.resource_writes_sorted.len();
-        if reads_in_sync && writes_in_sync {
-            if !sorted_disjoint(&self.resource_writes_sorted, &other.resource_writes_sorted) {
-                return true;
-            }
-            if !sorted_disjoint(&self.resource_writes_sorted, &other.resource_reads_sorted) {
-                return true;
-            }
-            if !sorted_disjoint(&self.resource_reads_sorted, &other.resource_writes_sorted) {
-                return true;
-            }
-        } else {
-            if !self.resource_writes.is_disjoint(&other.resource_writes) {
-                return true;
-            }
-            if !self.resource_writes.is_disjoint(&other.resource_reads) {
-                return true;
-            }
-            if !self.resource_reads.is_disjoint(&other.resource_writes) {
-                return true;
-            }
+        // The sets are small (a handful of ids), so they answer directly. A
+        // length-keyed snapshot used to stand in for them, which trusted a
+        // same-size *replacement* - `remove(A)` + `insert(B)` keeps the length
+        // and changes the conflict.
+        if !self.resource_writes.is_disjoint(&other.resource_writes) {
+            return true;
+        }
+        if !self.resource_writes.is_disjoint(&other.resource_reads) {
+            return true;
+        }
+        if !self.resource_reads.is_disjoint(&other.resource_writes) {
+            return true;
         }
 
         false
     }
-}
-
-/// Whether two sorted, deduplicated slices share no element.
-///
-/// Walks both slices with a single index each (merge intersection), O(n + m)
-/// and allocation-free. Both inputs must be sorted ascending; duplicates
-/// within one slice are harmless (the walk still finds any shared value).
-#[inline]
-fn sorted_disjoint(left: &[ResourceId], right: &[ResourceId]) -> bool {
-    let (mut left_index, mut right_index) = (0, 0);
-    while left_index < left.len() && right_index < right.len() {
-        match left[left_index].cmp(&right[right_index]) {
-            std::cmp::Ordering::Less => left_index += 1,
-            std::cmp::Ordering::Greater => right_index += 1,
-            std::cmp::Ordering::Equal => return false,
-        }
-    }
-    true
 }
 
 // =============================================================================
@@ -1479,6 +1440,76 @@ mod mask_completeness_tests {
     impl Component for Foo {}
     struct Bar;
     impl Component for Bar {}
+    struct ResOne;
+    impl crate::resource::Resource for ResOne {}
+    struct ResTwo;
+    impl crate::resource::Resource for ResTwo {}
+    struct ResThree;
+    impl crate::resource::Resource for ResThree {}
+
+    /// An access added after the masks were built falls back to the complete
+    /// sets: the mask no longer describes the system, so the fast path must not
+    /// be trusted with it.
+    #[test]
+    fn an_access_added_after_mask_build_still_conflicts() {
+        let mut registry = ComponentRegistry::new();
+        registry.register_bit::<Foo>().unwrap();
+        registry.register_bit::<Bar>().unwrap();
+
+        let mut a = SystemAccess::new();
+        a.add_write(ComponentId::of::<Foo>());
+        a.build_component_masks(&registry);
+
+        let mut b = SystemAccess::new();
+        b.add_write(ComponentId::of::<Bar>());
+        b.build_component_masks(&registry);
+        assert!(!a.conflicts_with(&b), "disjoint while the masks hold");
+
+        // The set grows after the build; the flag has to fall.
+        a.add_write(ComponentId::of::<Bar>());
+        assert!(
+            !a.masks_are_complete(),
+            "a post-build addition invalidates the mask cache"
+        );
+        assert!(
+            a.conflicts_with(&b),
+            "the sets are the source of truth and report the shared write"
+        );
+    }
+
+    /// Equal-length resource sets are compared by content, not by size: two
+    /// systems whose resource sets differ while sharing one id still conflict.
+    #[test]
+    fn a_same_length_resource_edit_still_conflicts() {
+        use crate::resource::ResourceId;
+
+        let mut registry = ComponentRegistry::new();
+        registry.register_bit::<Foo>().unwrap();
+        registry.register_bit::<Bar>().unwrap();
+
+        let mut reader = SystemAccess::new();
+        reader.add_read(ComponentId::of::<Foo>());
+        reader.add_resource_read(ResourceId::of::<ResOne>());
+        reader.add_resource_read(ResourceId::of::<ResTwo>());
+        reader.build_component_masks(&registry);
+
+        let mut writer = SystemAccess::new();
+        writer.add_write(ComponentId::of::<Bar>());
+        writer.add_resource_write(ResourceId::of::<ResTwo>());
+        writer.add_resource_write(ResourceId::of::<ResThree>());
+        writer.build_component_masks(&registry);
+
+        assert_eq!(
+            reader.resource_reads.len(),
+            writer.resource_writes.len(),
+            "the two sets are the same size"
+        );
+        assert!(
+            reader.conflicts_with(&writer),
+            "the shared resource id is a conflict at any set size"
+        );
+        assert!(writer.conflicts_with(&reader));
+    }
 
     /// A system registered before its component has incomplete masks, and must
     /// say so rather than reporting an empty access set.

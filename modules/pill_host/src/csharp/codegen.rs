@@ -806,8 +806,7 @@ fn emit_value_type_methods(
 /// resize (one boundary call per element, never a span); a `String` field
 /// becomes a getter and a setter.
 ///
-/// Each member that calls native code takes the row's address with
-/// `MirrorMethods.AddressOf(ref Unsafe.AsRef(in this))` and calls the
+/// Each member that calls native code passes the row's address to the
 /// module's trampoline through a `MirrorMethods.Invoke*` helper, so the
 /// buffer is read and written where it lives: one boundary call per member
 /// use, none per element. Those calls go through raw C-ABI function pointers
@@ -817,6 +816,20 @@ fn emit_value_type_methods(
 /// fresh base address, so the addresses of the previous bind would dangle.
 /// All of it stays safe C#, so the reloadable project assembly needs no
 /// `AllowUnsafeBlocks`.
+///
+/// Read-only members stay on the value type and address it with
+/// `MirrorMethods.AddressOf(ref Unsafe.AsRef(in this))`; reading through a
+/// copy reads the same container header, so a copy is harmless there.
+///
+/// The members that MUTATE a container header - every `Resize`, `Set` and
+/// `Push`, the calls whose trampoline reallocates through the address it is
+/// handed - are emitted on a nested `ref struct {Name}RowRef` instead, bound
+/// once to the live row with `Bind(ref row)`. A C# struct is copied on
+/// assignment, so a mutator on the value type would reallocate through the
+/// copy and leave the live row pointing at the freed block; on the row-ref
+/// type that call does not compile, and the handle itself copies as a
+/// pointer. The bind check runs once per handle, because every member of the
+/// handle addresses the same row in the same invocation.
 ///
 /// Every span is a lease, not ownership: resizing or replacing the container
 /// invalidates it, exactly as a `&mut Vec` would in Rust.
@@ -845,7 +858,13 @@ fn emit_heap_field_accessors(
     let mut bound_declarations: Vec<String> = Vec::new();
     let mut bound_assignments: Vec<String> = Vec::new();
 
+    // The first container's member name, used in the row-ref type's doc
+    // example; every container has at least one mutating member.
+    let example_pascal = snake_to_pascal(containers[0].name);
+
     let mut output = String::new();
+    // Header-mutating members, emitted on the nested row-ref type at the end.
+    let mut mutators = String::new();
     for field in containers {
         let Some(accessor) = accessors
             .iter()
@@ -942,52 +961,58 @@ fn emit_heap_field_accessors(
             throw new global::System.ArgumentOutOfRangeException(nameof(index), "the element is not reachable (the row is dead or the index is out of range)");
         return global::System.Runtime.InteropServices.Marshal.PtrToStringUTF8(data, checked((int)length)) ?? string.Empty;
     }}
-
-    /// Replace element `index` of `{field}` with `value`, encoded as UTF-8.
-    public void Set{pascal}(int index, string value)
-    {{
-        EnsureAccessorsBound();
-        byte[] utf8 = global::System.Text.Encoding.UTF8.GetBytes(value);
-        global::System.Runtime.InteropServices.GCHandle handle = global::System.Runtime.InteropServices.GCHandle.Alloc(utf8, global::System.Runtime.InteropServices.GCHandleType.Pinned);
-        try
-        {{
-            byte status = global::TracyLive.MirrorMethods.InvokeSetItem({set_item_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), (IntPtr)index, handle.AddrOfPinnedObject(), (IntPtr)utf8.Length);
-            if (status != 0)
-                throw new global::System.ArgumentOutOfRangeException(nameof(index), "the element is not reachable (the row is dead or the index is out of range)");
-        }}
-        finally
-        {{
-            handle.Free();
-        }}
-    }}
-
-    /// Append `value` to `{field}` as a new last element.
-    public void Push{pascal}(string value)
-    {{
-        EnsureAccessorsBound();
-        byte[] utf8 = global::System.Text.Encoding.UTF8.GetBytes(value);
-        global::System.Runtime.InteropServices.GCHandle handle = global::System.Runtime.InteropServices.GCHandle.Alloc(utf8, global::System.Runtime.InteropServices.GCHandleType.Pinned);
-        try
-        {{
-            global::TracyLive.MirrorMethods.InvokeUtf8Write({push_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), handle.AddrOfPinnedObject(), (IntPtr)utf8.Length);
-        }}
-        finally
-        {{
-            handle.Free();
-        }}
-    }}
-
-    /// Resize `{field}` to `count` elements; new elements are empty strings.
-    public void Resize{pascal}(int count)
-    {{
-        EnsureAccessorsBound();
-        global::TracyLive.MirrorMethods.InvokeResize({resize_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), (IntPtr)count);
-    }}
 "#,
                 field = field.name,
                 pascal = pascal,
                 view_address = view_address,
                 item_address = item_address,
+            ));
+            mutators.push_str(&format!(
+                r#"
+        /// Replace element `index` of `{field}` with `value`, encoded as UTF-8.
+        /// Mutating member: reach it through `{cs_name}RowRef.Bind`.
+        public void Set{pascal}(int index, string value)
+        {{
+            byte[] utf8 = global::System.Text.Encoding.UTF8.GetBytes(value);
+            global::System.Runtime.InteropServices.GCHandle handle = global::System.Runtime.InteropServices.GCHandle.Alloc(utf8, global::System.Runtime.InteropServices.GCHandleType.Pinned);
+            try
+            {{
+                byte status = global::TracyLive.MirrorMethods.InvokeSetItem({set_item_address}, _row, (IntPtr)index, handle.AddrOfPinnedObject(), (IntPtr)utf8.Length);
+                if (status != 0)
+                    throw new global::System.ArgumentOutOfRangeException(nameof(index), "the element is not reachable (the row is dead or the index is out of range)");
+            }}
+            finally
+            {{
+                handle.Free();
+            }}
+        }}
+
+        /// Append `value` to `{field}` as a new last element.
+        /// Mutating member: reach it through `{cs_name}RowRef.Bind`.
+        public void Push{pascal}(string value)
+        {{
+            byte[] utf8 = global::System.Text.Encoding.UTF8.GetBytes(value);
+            global::System.Runtime.InteropServices.GCHandle handle = global::System.Runtime.InteropServices.GCHandle.Alloc(utf8, global::System.Runtime.InteropServices.GCHandleType.Pinned);
+            try
+            {{
+                global::TracyLive.MirrorMethods.InvokeUtf8Write({push_address}, _row, handle.AddrOfPinnedObject(), (IntPtr)utf8.Length);
+            }}
+            finally
+            {{
+                handle.Free();
+            }}
+        }}
+
+        /// Resize `{field}` to `count` elements; new elements are empty strings.
+        /// Mutating member: reach it through `{cs_name}RowRef.Bind`.
+        public void Resize{pascal}(int count)
+        {{
+            global::TracyLive.MirrorMethods.InvokeResize({resize_address}, _row, (IntPtr)count);
+        }}
+"#,
+                field = field.name,
+                pascal = pascal,
+                cs_name = cs_name,
                 set_item_address = set_item_address,
                 push_address = push_address,
                 resize_address = resize_address,
@@ -1038,19 +1063,25 @@ fn emit_heap_field_accessors(
     /// Writable lease over `{field}`: write elements in place, then resize to grow or shrink.
     public Span<{element_type}> {pascal}Mut =>
         global::TracyLive.ComponentViews.AsSpan<{element_type}>((IntPtr){pascal}Ptr, {pascal}Count);
-
-    /// Resize `{field}` to `count` elements; new elements take the element type's `default`.
-    /// Native code reallocates - the elements live in engine-owned memory.
-    public void Resize{pascal}(int count)
-    {{
-        EnsureAccessorsBound();
-        global::TracyLive.MirrorMethods.InvokeResize({resize_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), (IntPtr)count);
-    }}
 "#,
                 field = field.name,
                 pascal = pascal,
                 element_tag = element_tag,
                 element_type = element_type,
+            ));
+            mutators.push_str(&format!(
+                r#"
+        /// Resize `{field}` to `count` elements; new elements take the element type's `default`.
+        /// Native code reallocates - the elements live in engine-owned memory.
+        /// Mutating member: reach it through `{cs_name}RowRef.Bind`.
+        public void Resize{pascal}(int count)
+        {{
+            global::TracyLive.MirrorMethods.InvokeResize({resize_address}, _row, (IntPtr)count);
+        }}
+"#,
+                field = field.name,
+                pascal = pascal,
+                cs_name = cs_name,
                 resize_address = resize_address,
             ));
             continue;
@@ -1133,19 +1164,25 @@ fn emit_heap_field_accessors(
             return global::TracyLive.ComponentViews.AsSpan<{element_type}>(data, checked((int)length));
         }}
     }}
-
-    /// Resize `{field}` to `count` elements; new elements take the element type's `default`.
-    public void Resize{pascal}(int count)
-    {{
-        EnsureAccessorsBound();
-        global::TracyLive.MirrorMethods.InvokeResize({resize_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), (IntPtr)count);
-    }}
 "#,
                 field = field.name,
                 pascal = pascal,
                 element_tag = element_tag,
                 element_type = element_type,
                 view_address = view_address,
+            ));
+            mutators.push_str(&format!(
+                r#"
+        /// Resize `{field}` to `count` elements; new elements take the element type's `default`.
+        /// Mutating member: reach it through `{cs_name}RowRef.Bind`.
+        public void Resize{pascal}(int count)
+        {{
+            global::TracyLive.MirrorMethods.InvokeResize({resize_address}, _row, (IntPtr)count);
+        }}
+"#,
+                field = field.name,
+                pascal = pascal,
+                cs_name = cs_name,
                 resize_address = resize_address,
             ));
             continue;
@@ -1179,26 +1216,32 @@ fn emit_heap_field_accessors(
         global::TracyLive.MirrorMethods.InvokeView({view_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), out IntPtr data, out IntPtr length);
         return global::System.Runtime.InteropServices.Marshal.PtrToStringUTF8(data, checked((int)length)) ?? string.Empty;
     }}
-
-    /// Replace `{field}` with `value`, encoded as UTF-8.
-    public void Set{pascal}(string value)
-    {{
-        EnsureAccessorsBound();
-        byte[] utf8 = global::System.Text.Encoding.UTF8.GetBytes(value);
-        global::System.Runtime.InteropServices.GCHandle handle = global::System.Runtime.InteropServices.GCHandle.Alloc(utf8, global::System.Runtime.InteropServices.GCHandleType.Pinned);
-        try
-        {{
-            global::TracyLive.MirrorMethods.InvokeUtf8Write({set_address}, global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this)), handle.AddrOfPinnedObject(), (IntPtr)utf8.Length);
-        }}
-        finally
-        {{
-            handle.Free();
-        }}
-    }}
 "#,
             field = field.name,
             pascal = pascal,
             view_address = view_address,
+        ));
+        mutators.push_str(&format!(
+            r#"
+        /// Replace `{field}` with `value`, encoded as UTF-8.
+        /// Mutating member: reach it through `{cs_name}RowRef.Bind`.
+        public void Set{pascal}(string value)
+        {{
+            byte[] utf8 = global::System.Text.Encoding.UTF8.GetBytes(value);
+            global::System.Runtime.InteropServices.GCHandle handle = global::System.Runtime.InteropServices.GCHandle.Alloc(utf8, global::System.Runtime.InteropServices.GCHandleType.Pinned);
+            try
+            {{
+                global::TracyLive.MirrorMethods.InvokeUtf8Write({set_address}, _row, handle.AddrOfPinnedObject(), (IntPtr)utf8.Length);
+            }}
+            finally
+            {{
+                handle.Free();
+            }}
+        }}
+"#,
+            field = field.name,
+            pascal = pascal,
+            cs_name = cs_name,
             set_address = set_address,
         ));
     }
@@ -1210,8 +1253,9 @@ fn emit_heap_field_accessors(
 
     /// Re-resolve this struct's heap-field trampoline addresses after a host
     /// (re)bind and remember which bind they came from: one int compare per
-    /// member use, and no lookup at all while the host stays bound.
-    private static void EnsureAccessorsBound()
+    /// member use, and no lookup at all while the host stays bound. Shared
+    /// with `{cs_name}RowRef`, which checks it once in `Bind`.
+    internal static void EnsureAccessorsBound()
     {{
         int generation = global::TracyLive.MirrorMethods.Generation;
         if (_accessorsBoundGeneration == generation)
@@ -1220,8 +1264,49 @@ fn emit_heap_field_accessors(
         _accessorsBoundGeneration = generation;
     }}
 "#,
+            cs_name = cs_name,
             declarations = bound_declarations.join("\n"),
             assignments = bound_assignments.join("\n"),
+        ));
+    }
+    // The header-mutating members, on a handle that can only name a live row.
+    if !mutators.is_empty() {
+        output.push_str(&format!(
+            r#"
+    /// Borrowed handle to one live `{cs_name}` row.
+    ///
+    /// A C# struct is copied on assignment, so a mutating member on the value
+    /// type reallocates through the copy and leaves the live row pointing at
+    /// the freed block - `var copy = row.Write<{cs_name}>(); copy.Resize{pascal}(8);`
+    /// was exactly that. The mutating members live here instead and address
+    /// the row `Bind` captured, and copying this handle copies only the
+    /// pointer.
+    ///
+    /// ```csharp
+    /// {cs_name}.{cs_name}RowRef live = {cs_name}.{cs_name}RowRef.Bind(ref row.Write<{cs_name}>());
+    /// live.Resize{pascal}(8);
+    /// ```
+    public ref struct {cs_name}RowRef
+    {{
+        /// Address of the live row this handle was bound to.
+        private IntPtr _row;
+
+        /// Bind to the live row `row` refers to.
+        ///
+        /// `row` must be a `ref` to the row itself, which `row.Write<T>()`
+        /// returns; the compiler refuses a copy here. The bind check runs once,
+        /// because every member below addresses this same row in this same
+        /// invocation.
+        public static {cs_name}RowRef Bind(ref {cs_name} row)
+        {{
+            {cs_name}.EnsureAccessorsBound();
+            return new {cs_name}RowRef {{ _row = global::TracyLive.MirrorMethods.AddressOf(ref row) }};
+        }}
+{mutators}    }}
+"#,
+            cs_name = cs_name,
+            pascal = example_pascal,
+            mutators = mutators,
         ));
     }
     Ok(output)
@@ -2320,13 +2405,26 @@ mod tests {
         // no marshalling layer, and the bind check costs one int compare.
         assert!(!content.contains("UnmanagedFunctionPointer"));
         assert!(!content.contains("Resolve<"));
-        assert!(content.contains("private static void EnsureAccessorsBound()"));
+        assert!(content.contains("internal static void EnsureAccessorsBound()"));
         assert!(content.contains("if (_accessorsBoundGeneration == generation)"));
         assert!(content
             .contains("global::TracyLive.MirrorMethods.AddressOf(ref Unsafe.AsRef(in this))"));
         assert!(content.contains(
             "global::TracyLive.ComponentViews.AsSpan<float>(data, checked((int)length))"
         ));
+        // The header-mutating member lives on the row-ref handle and addresses
+        // the bound row, never the struct the caller is holding.
+        assert!(content.contains("public ref struct TrailRowRef"));
+        assert!(content.contains("public static TrailRowRef Bind(ref Trail row)"));
+        assert!(content.contains(
+            "global::TracyLive.MirrorMethods.InvokeResize(_pointsResizeAddress, _row, (IntPtr)count);"
+        ));
+        assert!(
+            !content.contains(
+                "InvokeResize(_pointsResizeAddress, global::TracyLive.MirrorMethods.AddressOf"
+            ),
+            "a resize must never reallocate through a struct the caller may have copied"
+        );
     }
 
     /// A struct with several container fields resolves all of their
@@ -2362,7 +2460,15 @@ mod tests {
         let content = read_generated(&workspace, "pill_spline");
         assert_eq!(
             content
-                .matches("private static void EnsureAccessorsBound()")
+                .matches("internal static void EnsureAccessorsBound()")
+                .count(),
+            1
+        );
+        // Both container kinds' mutators share the single `Bind` of the one
+        // row-ref handle the struct emits.
+        assert_eq!(
+            content
+                .matches("public static LoadoutRowRef Bind(ref Loadout row)")
                 .count(),
             1
         );
@@ -2418,6 +2524,70 @@ mod tests {
         assert!(
             content.contains("global::TracyLive.MirrorMethods.InvokeUtf8Write(_nameSetAddress,")
         );
+        // The setter is a header mutator: it is on the row-ref handle and
+        // writes through the bound row's address, not the caller's struct.
+        assert!(content.contains("public ref struct LabelRowRef"));
+        assert!(content.contains("public static LabelRowRef Bind(ref Label row)"));
+        assert!(content
+            .contains("global::TracyLive.MirrorMethods.InvokeUtf8Write(_nameSetAddress, _row,"));
+        assert!(
+            !content.contains(
+                "InvokeUtf8Write(_nameSetAddress, global::TracyLive.MirrorMethods.AddressOf"
+            ),
+            "a setter must never write through a struct the caller may have copied"
+        );
+    }
+
+    /// Header-mutating members exist only on the row-ref handle, and the
+    /// handle binds to a live row with `Bind(ref ...)`.
+    ///
+    /// A value-type mutator reallocates through whatever struct the caller
+    /// holds: `var copy = row.Write<Trail>(); copy.ResizePoints(8);` resized
+    /// the real container and stored the new header into the copy, leaving
+    /// the live row pointing at the freed block. Copying the handle copies a
+    /// pointer, and the copying call form stops compiling.
+    #[test]
+    fn heap_mutators_require_a_row_ref() {
+        let workspace = temp_workspace("heap_row_ref", "pill_spline");
+        let component = exposed_typed(
+            "pill_spline.Trail",
+            32,
+            8,
+            vec![
+                field("points", "vec:f32", 0, 24, 8),
+                field("kind", "u32", 24, 4, 4),
+            ],
+        );
+        let accessors = [resolved_accessor(
+            "pill_spline::Trail",
+            "points",
+            "vec",
+            "f32",
+        )];
+        generate_module_components_csharp(
+            &workspace,
+            "pill_spline",
+            &[component],
+            &[],
+            &[],
+            &accessors,
+        )
+        .unwrap();
+
+        let content = read_generated(&workspace, "pill_spline");
+        assert!(content.contains("public ref struct TrailRowRef"));
+        assert!(content.contains("private IntPtr _row;"));
+        assert!(content.contains("public static TrailRowRef Bind(ref Trail row)"));
+        assert!(content.contains(
+            "return new TrailRowRef { _row = global::TracyLive.MirrorMethods.AddressOf(ref row) };"
+        ));
+        // The bind checks the trampoline addresses once for the whole handle.
+        assert!(content.contains("Trail.EnsureAccessorsBound();"));
+        // Read-only members stay on the value type, and the mutating member's
+        // documentation points at the handle.
+        assert!(content.contains("public readonly int PointsCount"));
+        assert!(content.contains("reach it through `TrailRowRef.Bind`"));
+        assert!(content.contains("live.ResizePoints(8);"));
     }
 
     /// A `vec:string` field emits per-element accessors: count, get, set,

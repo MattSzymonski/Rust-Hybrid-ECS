@@ -28,7 +28,7 @@ use pill_core::error::CSharpError;
 use pill_core::error::{EngineMessage, HostError};
 use pill_core::telemetry::telemetry_target;
 use pill_core::utils::format_error_chain;
-use pill_core::{error, info};
+use pill_core::{error, info, warn};
 use pill_engine::Engine;
 #[cfg(feature = "hot_reload")]
 use pill_engine::EngineApi;
@@ -47,7 +47,7 @@ use crate::csharp::ModuleExposedComponent;
 #[cfg(feature = "hot_reload")]
 use crate::native_library::cleanup_temporary_files;
 #[cfg(feature = "hot_reload")]
-use crate::optional_module::OptionalModuleSlot;
+use crate::optional_module::{OptionalModuleSlot, ReloadOutcome};
 #[cfg(feature = "hot_reload")]
 use crate::project_module::LoadedProject;
 #[cfg(feature = "hot_reload")]
@@ -105,10 +105,33 @@ pub struct Host {
     /// Optional modules, each with its own watcher and reload transaction.
     #[cfg(feature = "hot_reload")]
     optional_modules: Vec<OptionalModuleSlot>,
+    /// Counter bumped by the project watcher on every relevant source save.
+    ///
+    /// One producer (the watcher) and two consumers: `try_project_fast_path`,
+    /// which consumes an edit its patch delivered, and the Step 5 reload
+    /// transaction, which rebuilds from it.
     #[cfg(feature = "hot_reload")]
-    reload_generation: Arc<AtomicU64>,
+    source_edit_generation: Arc<AtomicU64>,
+    /// The `source_edit_generation` value the frame loop last acted on.
     #[cfg(feature = "hot_reload")]
-    last_processed_generation: u64,
+    last_processed_source_edit: u64,
+    /// Counter bumped by the reload pipeline itself when it owes the project a
+    /// rebuild: a reloaded module the project links directly, or a module swap
+    /// that changed the C# mirror surface.
+    ///
+    /// Separate from [`Self::source_edit_generation`] on purpose. The two mean
+    /// different things - "a source save arrived" versus "a rebuilt module
+    /// crate must be re-embedded" - and while one counter carried both, a
+    /// fast-path patch of the project's own edit consumed the cascade's bump
+    /// along with the edit, silently skipping the rebuild. No fast path
+    /// consumes this counter, so the rebuild stays owed until
+    /// `loaded_project.reload` runs. Written and read by the frame thread
+    /// alone, which is why it is a plain integer rather than an atomic.
+    #[cfg(feature = "hot_reload")]
+    queued_reload_generation: u64,
+    /// The `queued_reload_generation` value the frame loop last rebuilt for.
+    #[cfg(feature = "hot_reload")]
+    last_processed_queued_reload: u64,
     /// Per-function fast path, when the project opted in with `#[pill_hot]`.
     ///
     /// `None` when the feature is off, when no function is annotated, or when
@@ -569,12 +592,12 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
         Err(error) => return Err(fail_setup(engine, error)),
     };
 
-    let reload_generation = Arc::new(AtomicU64::new(0));
+    let source_edit_generation = Arc::new(AtomicU64::new(0));
     if let Err(error) = spawn_source_watcher(
         workspace_root.clone(),
         &module_config.name,
         &module_config.watch_directory,
-        Arc::clone(&reload_generation),
+        Arc::clone(&source_edit_generation),
     ) {
         return Err(fail_setup(engine, error.into()));
     }
@@ -640,8 +663,10 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
         engine_api,
         loaded_project,
         optional_modules,
-        reload_generation,
-        last_processed_generation: 0,
+        source_edit_generation,
+        last_processed_source_edit: 0,
+        queued_reload_generation: 0,
+        last_processed_queued_reload: 0,
         #[cfg(feature = "hot_patch")]
         hot_patch,
         #[cfg(feature = "hot_patch")]
@@ -875,8 +900,8 @@ fn try_module_fast_path(_host: &mut Host) {}
 /// full rebuild; anything refused falls through to it.
 #[cfg(feature = "hot_patch")]
 fn try_project_fast_path(host: &mut Host) {
-    let pending = host.reload_generation.load(Ordering::Acquire);
-    if pending == host.last_processed_generation {
+    let pending = host.source_edit_generation.load(Ordering::Acquire);
+    if pending == host.last_processed_source_edit {
         return;
     }
 
@@ -900,8 +925,10 @@ fn try_project_fast_path(host: &mut Host) {
         // The edit is fully accounted for; skip the rebuild. Recorded as the
         // generation observed above rather than a fresh read: a save that
         // arrived while the patch compiled is a different edit that nothing has
-        // delivered, and must stay pending.
-        host.last_processed_generation = pending;
+        // delivered, and must stay pending. Only the source-edit counter is
+        // consumed here; a queued reload is not an edit any patch could have
+        // delivered, so it stays owed.
+        host.last_processed_source_edit = pending;
         host.bump_editor_revision();
     }
 }
@@ -1045,7 +1072,7 @@ fn run_reload_steps(host: &mut Host) {
         engine,
         engine_api,
         workspace_root,
-        reload_generation,
+        queued_reload_generation,
         module_config,
         ..
     } = &mut *host;
@@ -1054,32 +1081,51 @@ fn run_reload_steps(host: &mut Host) {
     // only the sessions whose sources were rebuilt need a new baseline.
     let mut reloaded_modules: Vec<usize> = Vec::new();
     for (index, slot) in optional_modules.iter_mut().enumerate() {
-        if slot.reload_if_changed(engine, engine_api, workspace_root) {
-            reloaded_modules.push(index);
-            // The reloaded image is unpatched and every recorded prologue
-            // address points into the previous one. Noted here and acted on
-            // once the borrow below ends; forgetting is idempotent, so doing it
-            // once after the loop is the same as doing it per reload.
-            any_module_reloaded = true;
-            info!(
-                target: telemetry_target::HOT_RELOAD,
-                module = slot.name(),
-                "optional module reload processed"
-            );
-            // A module the project links directly is compiled into the project
-            // DLL as well as its own DLL, so after the module swaps, the
-            // project still runs the old embedded copy of that crate. Queue a
-            // project reload so the new code reaches the project too; the
-            // existing transaction below handles build, rollback, and schema
-            // migration. The check is cheap: one small manifest read.
-            if project_depends_on_crate(workspace_root, module_config, slot.name()) {
+        match slot.reload_if_changed(engine, engine_api, workspace_root) {
+            ReloadOutcome::Reloaded { generation } => {
+                reloaded_modules.push(index);
+                // The reloaded image is unpatched and every recorded prologue
+                // address points into the previous one. Noted here and acted on
+                // once the borrow below ends; forgetting is idempotent, so doing it
+                // once after the loop is the same as doing it per reload.
+                any_module_reloaded = true;
                 info!(
                     target: telemetry_target::HOT_RELOAD,
                     module = slot.name(),
-                    "module is a direct dependency of the project; queuing a project reload"
+                    generation,
+                    "optional module reload processed"
                 );
-                reload_generation.fetch_add(1, Ordering::Release);
+                // A module the project links directly is compiled into the project
+                // DLL as well as its own DLL, so after the module swaps, the
+                // project still runs the old embedded copy of that crate. Queue a
+                // project reload so the new code reaches the project too; the
+                // existing transaction below handles build, rollback, and schema
+                // migration. The check is cheap: one small manifest read.
+                if project_depends_on_crate(workspace_root, module_config, slot.name()) {
+                    info!(
+                        target: telemetry_target::HOT_RELOAD,
+                        module = slot.name(),
+                        "module is a direct dependency of the project; queuing a project reload"
+                    );
+                    // Owed on the pipeline's own counter, never the watcher's:
+                    // no fast path consumes this one, so a patch of the
+                    // project's own edit cannot swallow this rebuild.
+                    *queued_reload_generation += 1;
+                }
             }
+            ReloadOutcome::Failed { generation } => {
+                // The old generation is still current: its patches are still
+                // installed, its baselines are still accurate and its prologue
+                // records are still the rollback path, so none of the success
+                // bookkeeping below may run for it.
+                warn!(
+                    target: telemetry_target::HOT_RELOAD,
+                    module = slot.name(),
+                    generation,
+                    "optional module reload failed; keeping the previous generation and its patch state"
+                );
+            }
+            ReloadOutcome::Unchanged => {}
         }
     }
 
@@ -1134,7 +1180,7 @@ fn run_reload_steps(host: &mut Host) {
                 target: telemetry_target::HOT_RELOAD,
                 "module reload changed the C# mirror surface; queuing a C# project reload"
             );
-            reload_generation.fetch_add(1, Ordering::Release);
+            *queued_reload_generation += 1;
         }
     }
 
@@ -1152,14 +1198,22 @@ fn run_reload_steps(host: &mut Host) {
     try_project_fast_path(host);
 
     // Step 5: Process a pending project reload before running systems.
-    // The watcher bumps a generation counter; reloading while it differs from
-    // the last processed value means events that arrive during a reload are
-    // never lost.
-    let generation = host.reload_generation.load(Ordering::Acquire);
-    if generation != host.last_processed_generation {
+    // Two counters feed this, one meaning each. The watcher's source-edit
+    // counter says an edit arrived and nothing has delivered it yet; the
+    // pipeline's queued-reload counter says a rebuilt module crate still has
+    // to be re-embedded into the project image. Setting a counter is how a
+    // producer states its reason, and recording the observed values after the
+    // reload is how the frame loop marks exactly those reasons handled - so a
+    // save that arrives mid-build stays pending instead of being swallowed.
+    let source_edits = host.source_edit_generation.load(Ordering::Acquire);
+    let queued_reloads = host.queued_reload_generation;
+    if source_edits != host.last_processed_source_edit
+        || queued_reloads != host.last_processed_queued_reload
+    {
         info!(
             target: telemetry_target::HOT_RELOAD,
-            generation,
+            generation = source_edits,
+            queued = queued_reloads,
             "hot reload triggered"
         );
 
@@ -1176,7 +1230,7 @@ fn run_reload_steps(host: &mut Host) {
             // A save during the build advances the generation beyond this
             // baseline, which cancels the in-flight compilation; the next
             // frame observes the newer generation and rebuilds.
-            Some((&host.reload_generation, generation)),
+            Some((&host.source_edit_generation, source_edits)),
         );
         // The baseline the reload ran against, not a fresh read. A save during
         // the build advances the counter past it and cancels the compilation
@@ -1184,7 +1238,10 @@ fn run_reload_steps(host: &mut Host) {
         // the build it cancelled produced nothing, stranding the edit on disk.
         // Recording the baseline is what lets the next frame observe it and
         // rebuild - which is what the cancellation is for.
-        host.last_processed_generation = generation;
+        host.last_processed_source_edit = source_edits;
+        // The rebuild the cascade asked for has happened; a later module swap
+        // bumps the counter again.
+        host.last_processed_queued_reload = queued_reloads;
 
         // The project now runs the sources on disk, so the patch classifier's
         // baseline has to say so too. Skipping this is what makes one refused

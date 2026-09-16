@@ -91,6 +91,50 @@ fn setup_world() -> World {
 // Basic Query Tests
 // =============================================================================
 
+/// A query whose target component is never registered matches nothing and
+/// panics nowhere: the unresolved id is recorded instead of dropped from the
+/// mask, which used to make "not registered" mean "matches everything".
+#[test]
+fn query_before_registration_matches_nothing() {
+    let mut world = World::new();
+    // `Position` is deliberately not registered here.
+    let mut query = Query::<&Position>::new(&mut world);
+    assert_eq!(query.iter_mut().count(), 0);
+
+    // The mutable shape takes the same path.
+    let mut query = Query::<&mut Position>::new(&mut world);
+    assert_eq!(query.iter_mut().count(), 0);
+}
+
+/// `With<T>` for an unregistered `T` matches nothing rather than everything:
+/// no archetype can hold a component that was never registered.
+#[test]
+fn an_unregistered_with_filter_matches_nothing() {
+    let mut world = World::new();
+    world.register_component::<Position>();
+    world.register_component::<Velocity>();
+    world
+        .create_entity()
+        .with(Position { x: 1.0, y: 2.0 })
+        .build()
+        .unwrap();
+
+    let mut query = Query::<(Entity,), With<Health>>::new(&mut world);
+    assert_eq!(
+        query.iter_mut().count(),
+        0,
+        "an unregistered With<T> cannot match"
+    );
+
+    // Once the component is registered the filter answers its real question.
+    world.register_component::<Health>();
+    let mut query = Query::<(Entity,), With<Health>>::new(&mut world);
+    assert_eq!(query.iter_mut().count(), 0, "the entity does not carry it");
+    world.create_entity().with(Health(1)).build().unwrap();
+    let mut query = Query::<(Entity,), With<Health>>::new(&mut world);
+    assert_eq!(query.iter_mut().count(), 1);
+}
+
 /// Verifies that querying an empty world yields zero results.
 #[test]
 fn test_query_empty_world() {
@@ -221,6 +265,83 @@ fn test_query_first_empty() {
     assert!(query.first().is_none());
 }
 
+/// `first()` agrees with `iter_mut().next()` even with several matching
+/// archetypes.
+///
+/// Both now walk the same sorted matching-archetype cache; the previous fast
+/// path walked the archetype `HashMap` in its per-instance randomized order,
+/// so `first` could name a different row than every other iterator.
+#[test]
+fn first_agrees_with_iteration_order() {
+    let mut world = setup_world();
+
+    // Four distinct archetypes containing `Position`, each with its own `x`
+    // so a disagreement about which archetype comes first is visible.
+    let cases: [(&str, f32); 4] = [
+        ("position", 11.0),
+        ("velocity", 22.0),
+        ("health", 33.0),
+        ("both", 44.0),
+    ];
+    for (kind, x) in cases {
+        let mut builder = world.create_entity().with(Position { x, y: 0.0 });
+        if kind == "velocity" || kind == "both" {
+            builder = builder.with(Velocity { x: 0.0, y: 0.0 });
+        }
+        if kind == "health" || kind == "both" {
+            builder = builder.with(Health(1));
+        }
+        builder.build().unwrap();
+    }
+
+    let mut query = Query::<(&Position,)>::new(&mut world);
+    let first_x = query.first().map(|(position,)| position.x);
+    let iter_x = query.iter_mut().next().map(|(position,)| position.x);
+    assert!(first_x.is_some(), "the world holds four matching archetypes");
+    assert_eq!(
+        first_x, iter_x,
+        "`first` must return the row `iter_mut().next()` returns"
+    );
+}
+
+/// A filter with a row-level predicate and no archetype scoping produces no
+/// filter pairs, which the fast paths used to read as "accepts everything" -
+/// so a filter rejecting every row still answered from row counts.
+#[test]
+fn row_only_filters_are_not_skipped() {
+    /// Rejects every row without declaring any component scope.
+    struct RejectAll;
+    impl QueryFilter for RejectAll {
+        type State = ();
+        fn init_state(
+            _archetype: &mut crate::archetype::Archetype,
+            _last_run: crate::Tick,
+            _this_run: crate::Tick,
+        ) -> Self::State {
+        }
+        fn matches(_state: &Self::State, _index: usize) -> bool {
+            false
+        }
+    }
+
+    let mut world = setup_world();
+    for index in 0..5 {
+        world
+            .create_entity()
+            .with(Position {
+                x: index as f32,
+                y: 0.0,
+            })
+            .build()
+            .unwrap();
+    }
+
+    let mut query = Query::<(&Position,), RejectAll>::new(&mut world);
+    assert!(query.first().is_none(), "a rejecting filter matches no row");
+    assert!(query.is_empty(), "a rejecting filter matches no row");
+    assert_eq!(query.entity_count(), 0, "a rejecting filter matches no row");
+}
+
 /// Verifies that `Entity` can be included in the query data tuple.
 #[test]
 fn test_query_entity_access() {
@@ -271,11 +392,19 @@ fn test_par_iter_basic() {
 }
 
 /// Verifies that explicit batch sizes are respected during parallel iteration.
+///
+/// The world is sized from the pool so the parallel path runs at all (a world
+/// under `threads × MINIMUM_SLICE_SIZE` takes the sequential fallback), which
+/// makes the geometry arithmetic instead of a lower bound: slices of exactly
+/// 100, grouped contiguously across the pool.
 #[test]
 fn test_par_iter_with_batch_size() {
     let mut world = setup_world();
+    let num_threads = rayon::current_num_threads();
+    let batch_size = 100usize;
+    let entity_count = (num_threads * 1024).div_ceil(batch_size) * batch_size;
 
-    for _ in 0..1000 {
+    for _ in 0..entity_count {
         world
             .create_entity()
             .with(Position { x: 0.0, y: 0.0 })
@@ -286,16 +415,33 @@ fn test_par_iter_with_batch_size() {
     let mut query = Query::<(&mut Position,)>::new(&mut world);
     let stats = query
         .par_iter_mut()
-        .with_batch_size(100)
+        .with_batch_size(batch_size)
         .tracked()
         .for_each(|(mut pos,)| {
             pos.x = 1.0;
         });
 
     let stats = stats.unwrap();
-    assert_eq!(stats.total_entities, 1000);
-    assert!(stats.batch_count > 0);
-    assert!(stats.min_batch_size >= 100 || stats.batch_count == 1);
+    assert_eq!(stats.total_entities, entity_count);
+
+    // With every slice exactly `batch_size` long and the slices grouped
+    // contiguously across the pool, each thread group's processed count is
+    // `batch_size × (its slice count)`: `base` slices each, plus one more for
+    // the first `remainder` groups. Ignoring `with_batch_size` changes the
+    // slice lengths (the default spans 256..4096), so these equalities fail
+    // where the old `|| batch_count == 1` escape could not.
+    let slices = entity_count / batch_size;
+    let base = slices / num_threads;
+    let remainder = slices % num_threads;
+    assert_eq!(
+        stats.batch_count, num_threads,
+        "slices must be grouped contiguously across the pool"
+    );
+    assert_eq!(stats.min_batch_size, batch_size * base);
+    assert_eq!(
+        stats.max_batch_size,
+        batch_size * (base + usize::from(remainder > 0))
+    );
 }
 
 /// Verifies that tracked parallel iteration returns valid `BatchStats`.
@@ -440,36 +586,54 @@ fn test_report_component_access_mixed() {
     assert_eq!(writes.len(), 1);
 }
 
-/// Verifies that `report_component_access` panics on duplicate mutable
-/// component types in debug builds.
+/// Verifies that `report_component_access` refuses duplicate mutable
+/// component types in every build, not only debug ones.
 ///
 /// A `Query<(&mut Position, &mut Position)>` would create aliasing `&mut`
-/// references to the same storage, which is undefined behaviour; the
-/// `debug_assert!` inside `report_component_access` must reject it.
+/// references to the same storage, which is undefined behaviour.
 #[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "duplicate mutable component types")]
+#[should_panic(expected = "reads and writes the same component")]
 fn test_duplicate_mutable_types_rejected() {
-    // Query<(&mut Position, &mut Position)> would create aliasing &mut
-    // references to the same storage - UB. The debug_assert! inside
-    // report_component_access() must catch this.
     let _ = <(&mut Position, &mut Position)>::report_component_access();
 }
 
-/// Verifies that `has_duplicate_writes` correctly detects duplicate component writes.
+/// Verifies the aliasing predicate: two writes of one id, or a read beside a
+/// write, are found; duplicate reads are not aliasing.
 #[test]
-fn test_has_duplicate_writes_detection() {
-    use crate::query::target::has_duplicate_writes;
+fn test_find_aliasing_component_detection() {
+    use crate::query::target::find_aliasing_component;
     let id = ComponentId::of::<Position>();
-    assert!(!has_duplicate_writes(&[]));
-    assert!(!has_duplicate_writes(&[id]));
-    assert!(!has_duplicate_writes(&[id, ComponentId::of::<Velocity>()]));
-    assert!(has_duplicate_writes(&[id, id]));
-    assert!(has_duplicate_writes(&[
-        id,
-        ComponentId::of::<Velocity>(),
-        id
-    ]));
+    let other = ComponentId::of::<Velocity>();
+    assert_eq!(find_aliasing_component(&[], &[]), None);
+    assert_eq!(find_aliasing_component(&[], &[id]), None);
+    assert_eq!(find_aliasing_component(&[id, other], &[]), None);
+    assert_eq!(
+        find_aliasing_component(&[id, id], &[]),
+        None,
+        "two reads of one component are not aliasing"
+    );
+    assert_eq!(find_aliasing_component(&[], &[id, id]), Some(id));
+    assert_eq!(find_aliasing_component(&[id], &[id]), Some(id));
+    assert_eq!(find_aliasing_component(&[other], &[id]), None);
+}
+
+/// Construction is where aliasing is refused: `Query::new` runs the same
+/// predicate registration does, so a directly built query cannot skip it.
+#[test]
+#[should_panic(expected = "reads and writes the same component")]
+fn test_read_write_alias_rejected_at_construction() {
+    let mut world = World::new();
+    world.register_component::<Position>();
+    let _ = Query::<(&Position, &mut Position)>::new(&mut world);
+}
+
+/// A duplicated read is not aliasing and must keep constructing fine.
+#[test]
+fn test_duplicate_reads_construct_fine() {
+    let mut world = World::new();
+    world.register_component::<Position>();
+    let mut query = Query::<(&Position, &Position)>::new(&mut world);
+    assert_eq!(query.iter_mut().count(), 0);
 }
 
 /// Verifies that `Entity` reports zero component IDs.
@@ -1126,6 +1290,16 @@ fn test_filter_or_par_iter() {
         50,
         "Or filter with par_iter should find all entities"
     );
+    // Every matching entity exactly once: this is the test that drives
+    // `F::init_state` through the parallel closure, so a slice visited twice
+    // or skipped altogether changes the count above.
+    let mut distinct = std::collections::HashSet::new();
+    for entity in &hits {
+        assert!(
+            distinct.insert(entity.id()),
+            "an entity was visited by two slices"
+        );
+    }
 }
 
 /// Verifies that `Or` with a unit `()` branch is always true.

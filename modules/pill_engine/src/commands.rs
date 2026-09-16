@@ -86,10 +86,7 @@ pub trait ComponentAdder: Send {
     ///
     /// The caller is responsible for having created the storage row for this
     /// adder's component type before invoking this method.
-    fn add_component_to_storage(
-        self: Box<Self>,
-        new_storage: &mut ComponentColumns,
-    );
+    fn add_component_to_storage(self: Box<Self>, new_storage: &mut ComponentColumns);
 }
 
 /// Typed component adder that knows the concrete type `T`.
@@ -108,10 +105,7 @@ impl<T: Component + TraitAccessible<dyn Component> + Send> ComponentAdder
         ComponentId::of::<T>()
     }
 
-    fn add_component_to_storage(
-        self: Box<Self>,
-        new_storage: &mut ComponentColumns,
-    ) {
+    fn add_component_to_storage(self: Box<Self>, new_storage: &mut ComponentColumns) {
         // The storage row for `T` was allocated by the caller; append the
         // component value to it to finish the insertion.
         new_storage.column_of_mut::<T>().push::<T>(self.component);
@@ -136,10 +130,7 @@ impl ComponentAdder for ByteComponentAdder {
         self.component_id
     }
 
-    fn add_component_to_storage(
-        self: Box<Self>,
-        new_storage: &mut ComponentColumns,
-    ) {
+    fn add_component_to_storage(self: Box<Self>, new_storage: &mut ComponentColumns) {
         // The storage row for the native component was allocated by the
         // caller; copy the raw ABI bytes into it.
         assert!(
@@ -466,6 +457,24 @@ impl CommandQueue {
             .collect();
         component_ids.extend(dynamic_components.iter().map(|(id, _)| *id));
 
+        // Step 1b: Refuse a repeated id before the row exists. The set defines
+        // the archetype's columns, so a duplicate would push two rows for one
+        // entity row - or panic inside the archetype insert when it found the
+        // id already present. `create_dynamic_entity` and the C# create path
+        // de-duplicate before they get here; this entry point refuses instead
+        // of guessing which row was meant.
+        component_ids.sort_unstable();
+        if let Some(duplicate) = component_ids
+            .windows(2)
+            .find(|pair| pair[0] == pair[1])
+            .map(|pair| pair[0])
+        {
+            return Err(vec![CommandError::DuplicateComponent {
+                entity,
+                component_id: duplicate,
+            }]);
+        }
+
         // Step 2: Insert the entity row and write its native components into storage.
         world.insert_entity_with_components(entity, component_ids, |storage| {
             for component_adder in component_adders {
@@ -598,12 +607,28 @@ impl CommandQueue {
         new_component_ids.sort();
 
         // Step 3: Collect the copiers that preserve each surviving component
-        // during the archetype migration.
-        let component_copiers: Vec<_> = old_archetype
-            .component_types
-            .iter()
-            .filter_map(|component_id| world.component_copiers.get(component_id).copied())
-            .collect();
+        // during the archetype migration. A native component whose copier is
+        // gone - `forget_component_type` purges them while archetypes can
+        // still list the id - cannot be carried across, and migrating without
+        // it would move the entity and its tick rows while leaving the
+        // destination short a component row. Report it and stop.
+        let mut component_copiers = Vec::with_capacity(old_archetype.component_types.len());
+        for &component_id in &old_archetype.component_types {
+            // Dynamic rows migrate as bytes inside `move_entity_to_archetype`.
+            if !component_id.is_native_storage() {
+                continue;
+            }
+            match world.component_copiers.get(&component_id).copied() {
+                Some(component_copier) => component_copiers.push(component_copier),
+                None => {
+                    errors.push(CommandError::MissingComponentCopier {
+                        entity,
+                        component_id,
+                    });
+                    return;
+                }
+            }
+        }
 
         // Step 4: Migrate the entity row, copying surviving components and
         // writing the new component into the destination storage. A migration
@@ -686,11 +711,26 @@ impl CommandQueue {
 
         // Step 4: Migrate surviving components to the new archetype. A
         // migration failure is collected rather than panicking inside the
-        // flush, matching `execute_add_component`.
-        let component_copiers: Vec<_> = new_component_ids
-            .iter()
-            .filter_map(|component_id| world.component_copiers.get(component_id).copied())
-            .collect();
+        // flush, matching `execute_add_component`. The same goes for a
+        // surviving component whose copier is gone: it is reported instead of
+        // being silently dropped from the move.
+        let mut component_copiers = Vec::with_capacity(new_component_ids.len());
+        for &component_id in &new_component_ids {
+            // Dynamic rows migrate as bytes inside `move_entity_to_archetype`.
+            if !component_id.is_native_storage() {
+                continue;
+            }
+            match world.component_copiers.get(&component_id).copied() {
+                Some(component_copier) => component_copiers.push(component_copier),
+                None => {
+                    errors.push(CommandError::MissingComponentCopier {
+                        entity,
+                        component_id,
+                    });
+                    return;
+                }
+            }
+        }
 
         if let Err(error) = world.move_entity_to_archetype(
             entity,
@@ -883,6 +923,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archetype::Blittability;
     use crate::world::World;
     use trait_type_map::impl_trait_accessible;
 
@@ -898,10 +939,17 @@ mod tests {
         y: f32,
     }
 
+    /// A third component, used to force a migration in the copier test.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    struct Health {
+        value: u32,
+    }
+
     impl Component for Position {}
     impl Component for Velocity {}
+    impl Component for Health {}
 
-    impl_trait_accessible!(dyn Component; Position, Velocity);
+    impl_trait_accessible!(dyn Component; Position, Velocity, Health);
 
     /// Tests basic entity creation through the deferred command queue.
     ///
@@ -1002,10 +1050,24 @@ mod tests {
         let mut world = World::new();
         world.register_component::<Position>();
         let dynamic_a = world
-            .register_dynamic_component(0xA1, "Project.DynamicA", 4, 4, 1)
+            .register_dynamic_component(
+                0xA1,
+                "Project.DynamicA",
+                4,
+                4,
+                1,
+                Blittability::engine_verified(),
+            )
             .unwrap();
         let dynamic_b = world
-            .register_dynamic_component(0xB2, "Project.DynamicB", 4, 4, 2)
+            .register_dynamic_component(
+                0xB2,
+                "Project.DynamicB",
+                4,
+                4,
+                2,
+                Blittability::engine_verified(),
+            )
             .unwrap();
         let entity = world.reserve_entity();
         let mut queue = CommandQueue::new();
@@ -1070,6 +1132,82 @@ mod tests {
                 ..
             }]
         ));
+    }
+
+    /// A queued creation that lists one component twice is refused before the
+    /// entity row exists, naming the component and leaving no partial entity.
+    #[test]
+    fn mixed_create_with_duplicate_id_reports_error() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let entity = world.reserve_entity();
+        let archetypes_before = world.archetypes.len();
+
+        let mut queue = CommandQueue::new();
+        queue.create_mixed_entity(
+            entity,
+            vec![
+                boxed_component_adder(Position { x: 1.0, y: 2.0 }),
+                boxed_component_adder(Position { x: 3.0, y: 4.0 }),
+            ],
+            Vec::new(),
+        );
+        let errors = queue.execute_queued_commands(&mut world, true).unwrap_err();
+        assert!(matches!(
+            errors.as_slice(),
+            [CommandError::DuplicateComponent { component_id, .. }]
+                if *component_id == ComponentId::of::<Position>()
+        ));
+
+        assert!(
+            !world.entity_locations.contains_key(&entity),
+            "a refused creation leaves no entity behind"
+        );
+        assert_eq!(
+            world.archetypes.len(),
+            archetypes_before,
+            "no archetype was created for the refused set"
+        );
+    }
+
+    /// A component whose copier was purged cannot be carried across a
+    /// migration, and the attempt is reported instead of silently leaving the
+    /// destination short a component row.
+    #[test]
+    fn add_component_with_purged_copier_reports_migration_failure() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Velocity>();
+        world.register_component::<Health>();
+        let entity = world
+            .create_entity()
+            .with(Position { x: 1.0, y: 2.0 })
+            .with(Velocity { x: 3.0, y: 4.0 })
+            .build()
+            .unwrap();
+
+        // The half-applied purge `forget_component_type` leaves behind: the
+        // archetype still lists the component and its row is intact, but the
+        // copier a migration needs is gone.
+        world
+            .component_copiers
+            .remove(&ComponentId::of::<Velocity>());
+
+        let mut queue = CommandQueue::new();
+        queue.add_component_adder_to_entity(entity, boxed_component_adder(Health { value: 5 }));
+        let errors = queue.execute_queued_commands(&mut world, true).unwrap_err();
+        assert!(matches!(
+            errors.as_slice(),
+            [CommandError::MissingComponentCopier { component_id, .. }]
+                if *component_id == ComponentId::of::<Velocity>()
+        ));
+
+        // The entity stayed in its two-component archetype with both rows
+        // readable, and the component that could not be reached was not added.
+        assert_eq!(world.entity_count(), 1);
+        assert_eq!(world.get_component::<Position>(entity).unwrap().x, 1.0);
+        assert_eq!(world.get_component::<Velocity>(entity).unwrap().x, 3.0);
+        assert!(world.get_component::<Health>(entity).is_none());
     }
 
     /// Tests entity archetype migration and automatic cleanup when components are removed.
@@ -1217,7 +1355,14 @@ mod tests {
     fn a_queued_create_that_cannot_write_a_component_is_reported() {
         let mut world = World::new();
         let dynamic_a = world
-            .register_dynamic_component(0xA1, "Project.DynamicA", 4, 4, 1)
+            .register_dynamic_component(
+                0xA1,
+                "Project.DynamicA",
+                4,
+                4,
+                1,
+                Blittability::engine_verified(),
+            )
             .unwrap();
 
         // First flush materialises entity A, which creates the archetype with
@@ -1275,7 +1420,14 @@ mod tests {
         let mut world = World::new();
         world.register_component::<Position>();
         let dynamic_a = world
-            .register_dynamic_component(0xA1, "Project.DynamicA", 4, 4, 1)
+            .register_dynamic_component(
+                0xA1,
+                "Project.DynamicA",
+                4,
+                4,
+                1,
+                Blittability::engine_verified(),
+            )
             .unwrap();
 
         // Create an entity carrying both a native and a dynamic component, so

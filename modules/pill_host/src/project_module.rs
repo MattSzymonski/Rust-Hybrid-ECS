@@ -161,10 +161,15 @@ mod loaded {
                         .world()
                         .persist_type_names_registered_since(registration_sequence);
                     // What this generation registered, for the same reason the
-                    // type names are kept.
+                    // type names are kept - and claimed in the world, so one
+                    // subject's retirement cannot take a shared resource out
+                    // from under another.
                     let registered_resource_ids = engine
                         .world()
                         .resource_ids_registered_since(resource_registration_sequence);
+                    engine
+                        .world_mut()
+                        .retain_resource_claims(&registered_resource_ids);
                     Ok(Self::Native {
                         current: library,
                         old_libraries: Vec::new(),
@@ -227,7 +232,9 @@ mod loaded {
                                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                                 "C# build complete; polling managed loader"
                             );
-                            runtime.poll_reload(engine);
+                            // A refusal keeps the currently loaded assembly;
+                            // `poll_reload` logs it once per distinct status.
+                            let _ = runtime.poll_reload(engine);
                         }
                         Err(error) => {
                             error!(
@@ -247,7 +254,8 @@ mod loaded {
             // every frame so a successful build is eventually observed even when
             // the assembly was not ready during the source-triggered reload call.
             if let Self::CSharp(runtime) = self {
-                runtime.poll_reload(engine);
+                // Already logged once per distinct status inside the poll.
+                let _ = runtime.poll_reload(engine);
             }
         }
 

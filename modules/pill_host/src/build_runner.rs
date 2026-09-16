@@ -21,7 +21,7 @@
 // Standard library
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -309,6 +309,43 @@ fn artifacts_are_host_built(
     };
     let recorded = std::fs::read_to_string(artifact_stamp_path(workspace_root, module_name));
     recorded.is_ok_and(|recorded| recorded == current)
+}
+
+/// Confirm a staged artifact set still matches the stamp just recorded for it.
+///
+/// The build that produced these files has exited, but a cancelled build's
+/// surviving grandchildren can still write into the staging directory, which
+/// is shared with everything else building the same crate. When the stamp no
+/// longer matches, the copy about to be loaded is not the one this host built,
+/// so the build fails here instead of being loaded as if nothing had changed.
+///
+/// # Errors
+///
+/// Returns [`BuildError::StagedArtifactChanged`] when the stamp no longer
+/// matches the files on disk.
+fn confirm_staged_artifacts(
+    workspace_root: &Path,
+    module_name: &str,
+    watch_directory: &str,
+    build_command: &[String],
+    produced: &[PathBuf],
+) -> Result<(), BuildError> {
+    if artifacts_are_host_built(
+        workspace_root,
+        module_name,
+        watch_directory,
+        build_command,
+        produced,
+    ) {
+        return Ok(());
+    }
+    Err(BuildError::StagedArtifactChanged {
+        name: module_name.to_string(),
+        path: produced
+            .first()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+    })
 }
 
 /// Whether a module's build artifact is already newer than every input a
@@ -601,6 +638,9 @@ pub(crate) fn apply_cargo_host_overrides(command: &mut Command, workspace_root: 
 struct VerboseCapture {
     /// Crate name to look for, which is the module's name.
     crate_name: String,
+    /// Workspace the build runs in, so the flags cache lands in that
+    /// workspace's own build tree rather than a shared temporary directory.
+    workspace_root: PathBuf,
     /// Reader thread and the line it found, once joined.
     reader: Option<std::thread::JoinHandle<Option<crate::hot_patch::CargoRustcLine>>>,
 }
@@ -611,7 +651,12 @@ impl VerboseCapture {
     ///
     /// Returns `None` for a non-cargo build (the managed backend's `dotnet`),
     /// which has no rustc line to harvest and must keep its inherited streams.
-    fn arm(command: &mut Command, program: &str, name: &str) -> Option<Self> {
+    fn arm(
+        command: &mut Command,
+        program: &str,
+        name: &str,
+        workspace_root: &Path,
+    ) -> Option<Self> {
         if program != "cargo" {
             return None;
         }
@@ -622,6 +667,7 @@ impl VerboseCapture {
         command.arg("-v").stderr(std::process::Stdio::piped());
         Some(Self {
             crate_name: name.to_string(),
+            workspace_root: workspace_root.to_path_buf(),
             reader: None,
         })
     }
@@ -671,7 +717,7 @@ impl VerboseCapture {
         let Ok(Some(line)) = reader.join() else {
             return;
         };
-        let cache = crate::hot_patch::flags_cache_path(name);
+        let cache = crate::hot_patch::flags_cache_path(&self.workspace_root, name);
         match line.save(&cache, build_command) {
             Ok(()) => debug!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -737,6 +783,347 @@ fn without_ansi(line: &str) -> String {
     plain
 }
 
+// =============================================================================
+// Build Process Tree
+// =============================================================================
+
+/// How long a stopped build's process tree is given to disappear.
+///
+/// Termination is asynchronous and the next build starts against the same
+/// `CARGO_TARGET_DIR` immediately afterwards, so this wait is what keeps a
+/// dying compiler from holding cargo's package lock across the handover.
+const TREE_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A build's whole process tree, on platforms that can name one.
+///
+/// Killing the direct child reaches cargo alone: the rustc and linker
+/// grandchildren survive, keep writing into the shared module build tree, and
+/// can hold cargo's package lock - making the next build block for its whole
+/// timeout and then be reported as `TimedOut`, which reads as an edit that was
+/// ignored. A Windows job object makes the tree the unit of termination: every
+/// process cargo spawns inherits membership, and
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` guarantees the tree dies even when the
+/// last handle is closed rather than a termination being requested.
+#[cfg(windows)]
+struct BuildProcessTree {
+    /// The job object handle, closed on drop.
+    job: isize,
+}
+
+/// A build's whole process tree, where the platform has no job equivalent.
+///
+/// The direct child is killed instead, which is all those platforms offer
+/// here; the type exists so the call sites need no platform `cfg` of their own.
+#[cfg(not(windows))]
+struct BuildProcessTree;
+
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`: closing the last handle to the job
+/// kills every process still in it.
+#[cfg(windows)]
+const JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: u32 = 0x0000_2000;
+
+/// `JobObjectExtendedLimitInformation`, the information class through which
+/// the kill-on-close limit is set.
+#[cfg(windows)]
+const JOB_OBJECT_EXTENDED_LIMIT_INFORMATION: u32 = 9;
+
+/// `JobObjectBasicAccountingInformation`, the information class that reports
+/// how many processes a job currently holds.
+#[cfg(windows)]
+const JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION: u32 = 1;
+
+// The `kernel32` entry points that make a job object the unit of build
+// cancellation. Declared here rather than pulled from a crate with
+// `windows-sys`, whose features would unify with the modules' dependency graph
+// and split the shared engine crates into differently featured variants - the
+// same reason the process-memory counters are declared by hand in `analytics`.
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateJobObjectW(attributes: *mut std::ffi::c_void, name: *const u16) -> isize;
+    fn SetInformationJobObject(
+        job: isize,
+        information_class: u32,
+        information: *const std::ffi::c_void,
+        length: u32,
+    ) -> i32;
+    fn AssignProcessToJobObject(job: isize, process: isize) -> i32;
+    fn TerminateJobObject(job: isize, exit_code: u32) -> i32;
+    fn QueryInformationJobObject(
+        job: isize,
+        information_class: u32,
+        information: *mut std::ffi::c_void,
+        length: u32,
+        returned_length: *mut u32,
+    ) -> i32;
+    fn OpenProcess(access: u32, inherit: i32, process_id: u32) -> isize;
+    fn CloseHandle(handle: isize) -> i32;
+}
+
+/// `JOBOBJECT_BASIC_LIMIT_INFORMATION`, the limits half of the job's extended
+/// limit information.
+///
+/// Only `limit_flags` is ever set; the rest is present because the kernel
+/// reads the whole structure through the pointer.
+#[cfg(windows)]
+#[repr(C)]
+struct JobObjectBasicLimitInformation {
+    per_process_user_time_limit: i64,
+    per_job_user_time_limit: i64,
+    limit_flags: u32,
+    minimum_working_set_size: usize,
+    maximum_working_set_size: usize,
+    active_process_limit: u32,
+    affinity: usize,
+    priority_class: u32,
+    scheduling_class: u32,
+}
+
+/// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`, the layout the extended-limit
+/// information class names.
+#[cfg(windows)]
+#[repr(C)]
+struct JobObjectExtendedLimitInformation {
+    basic_limit_information: JobObjectBasicLimitInformation,
+    /// `IO_COUNTERS`, six `ULONGLONG`s, only ever zeroed.
+    io_info: [u64; 6],
+    process_memory_limit: usize,
+    job_memory_limit: usize,
+    peak_process_memory_used: usize,
+    peak_job_memory_used: usize,
+}
+
+/// `JOBOBJECT_BASIC_ACCOUNTING_INFORMATION`, whose `active_processes` field is
+/// what the drain wait polls.
+#[cfg(windows)]
+#[repr(C)]
+struct JobObjectBasicAccountingInformation {
+    total_user_time: i64,
+    total_kernel_time: i64,
+    this_period_total_user_time: i64,
+    this_period_total_kernel_time: i64,
+    total_page_fault_count: u32,
+    total_processes: u32,
+    active_processes: u32,
+    total_terminated_processes: u32,
+}
+
+#[cfg(windows)]
+impl BuildProcessTree {
+    /// Create a job that kills whatever is still in it when its handle closes.
+    ///
+    /// `None` when Windows refuses; the caller then falls back to killing the
+    /// direct child, which is exactly what happens on platforms without jobs.
+    fn create() -> Option<Self> {
+        // SAFETY: a null security descriptor and an unnamed job are both
+        // valid; the call returns a handle this code owns on success.
+        let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+        if job == 0 {
+            return None;
+        }
+        let limits = JobObjectExtendedLimitInformation {
+            basic_limit_information: JobObjectBasicLimitInformation {
+                per_process_user_time_limit: 0,
+                per_job_user_time_limit: 0,
+                limit_flags: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                minimum_working_set_size: 0,
+                maximum_working_set_size: 0,
+                active_process_limit: 0,
+                affinity: 0,
+                priority_class: 0,
+                scheduling_class: 0,
+            },
+            io_info: [0; 6],
+            process_memory_limit: 0,
+            job_memory_limit: 0,
+            peak_process_memory_used: 0,
+            peak_job_memory_used: 0,
+        };
+        // SAFETY: a live job handle, a structure whose layout matches the
+        // named information class, and that structure's own size.
+        let configured = unsafe {
+            SetInformationJobObject(
+                job,
+                JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+                std::ptr::addr_of!(limits).cast(),
+                std::mem::size_of::<JobObjectExtendedLimitInformation>() as u32,
+            )
+        };
+        if configured == 0 {
+            // A job that cannot promise to kill its tree is worse than none:
+            // the caller would stop using `Child::kill` for no benefit, so the
+            // handle is closed and the job treated as unavailable.
+            // SAFETY: the handle is live and owned by this function.
+            unsafe { CloseHandle(job) };
+            return None;
+        }
+        Some(Self { job })
+    }
+
+    /// Join a freshly spawned process to the job, so the compiler and linker
+    /// invocations it starts inherit membership.
+    ///
+    /// A process started before the join would sit outside the tree, which is
+    /// why the caller creates the job before spawning and joins immediately
+    /// after.
+    fn join(&self, process_id: u32) -> bool {
+        // PROCESS_TERMINATE and PROCESS_SET_QUOTA: the two rights assigning a
+        // process to a job requires.
+        const ASSIGN_ACCESS: u32 = 0x0001 | 0x0100;
+        // SAFETY: an access mask, no handle inheritance, and the process id of
+        // a child the caller has not yet waited on.
+        let process = unsafe { OpenProcess(ASSIGN_ACCESS, 0, process_id) };
+        if process == 0 {
+            return false;
+        }
+        // SAFETY: both handles are live; the job handle is owned by `self` and
+        // the job keeps its own reference to the process.
+        let assigned = unsafe { AssignProcessToJobObject(self.job, process) } != 0;
+        // SAFETY: the process handle is owned by this function.
+        unsafe { CloseHandle(process) };
+        assigned
+    }
+
+    /// Terminate every process still in the job.
+    fn terminate(&self) {
+        // SAFETY: a live job handle, and a non-zero exit code because zero
+        // would read as a successful exit to anything that reaps one of these
+        // processes.
+        unsafe { TerminateJobObject(self.job, 1) };
+    }
+
+    /// How many processes the job still holds.
+    fn active_processes(&self) -> u32 {
+        let mut accounting = JobObjectBasicAccountingInformation {
+            total_user_time: 0,
+            total_kernel_time: 0,
+            this_period_total_user_time: 0,
+            this_period_total_kernel_time: 0,
+            total_page_fault_count: 0,
+            total_processes: 0,
+            active_processes: 0,
+            total_terminated_processes: 0,
+        };
+        // SAFETY: a live job handle, a structure whose layout matches the
+        // named information class, and that structure's own size; the optional
+        // returned-length pointer is null.
+        let queried = unsafe {
+            QueryInformationJobObject(
+                self.job,
+                JOB_OBJECT_BASIC_ACCOUNTING_INFORMATION,
+                std::ptr::addr_of_mut!(accounting).cast(),
+                std::mem::size_of::<JobObjectBasicAccountingInformation>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if queried == 0 {
+            // An unanswerable query is treated as "something may still be
+            // running": the drain wait then times out and says so, which is
+            // the safe reading for a function about to hand the staging
+            // directory to the next build.
+            return 1;
+        }
+        accounting.active_processes
+    }
+
+    /// Wait until the job reports no live process, or the deadline passes.
+    ///
+    /// Returns whether the tree emptied.
+    fn wait_until_empty(&self, deadline: Instant) -> bool {
+        loop {
+            if self.active_processes() == 0 {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for BuildProcessTree {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from `CreateJobObjectW` and is closed
+        // exactly once, here. Closing the last handle is what
+        // `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` makes lethal to anything still
+        // in the job.
+        unsafe { CloseHandle(self.job) };
+    }
+}
+
+/// Create the tree for a build about to be spawned.
+///
+/// Must run before the spawn: a process started before it joins would sit
+/// outside the tree and survive a cancellation.
+#[cfg(windows)]
+fn create_process_tree() -> Option<BuildProcessTree> {
+    BuildProcessTree::create()
+}
+
+/// Platforms without job objects have nothing to create; `Child::kill` is the
+/// whole of the vocabulary there.
+#[cfg(not(windows))]
+fn create_process_tree() -> Option<BuildProcessTree> {
+    None
+}
+
+/// Join a freshly spawned child to its build's tree.
+///
+/// A refusal is reported rather than fatal: the build still runs, it just
+/// keeps the weaker guarantee that a cancellation reaches the direct child.
+#[cfg(windows)]
+fn join_process_tree(tree: Option<&BuildProcessTree>, child: &Child) {
+    let Some(tree) = tree else {
+        return;
+    };
+    if !tree.join(child.id()) {
+        warn!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            process_id = child.id(),
+            "could not join the build process to its job object; a cancelled build will only stop the direct child"
+        );
+    }
+}
+
+/// Nothing to join on platforms without job objects.
+#[cfg(not(windows))]
+fn join_process_tree(_tree: Option<&BuildProcessTree>, _child: &Child) {}
+
+/// Stop a build and its whole tree.
+///
+/// The tree is terminated first and then waited for, because the next build
+/// starts against the same `CARGO_TARGET_DIR` as soon as this returns: an
+/// orphan still holding cargo's package lock would make that build block for
+/// its whole timeout, and an orphan writing into the staging directory would
+/// race the artifact the host is about to load.
+#[cfg(windows)]
+fn stop_process_tree(tree: Option<&BuildProcessTree>, child: &mut Child) {
+    let Some(tree) = tree else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    };
+    tree.terminate();
+    let _ = child.wait();
+    if !tree.wait_until_empty(Instant::now() + TREE_DRAIN_TIMEOUT) {
+        warn!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            active_processes = tree.active_processes(),
+            "a stopped build's process tree is still running; the next build may block on cargo's package lock or see its staged artifacts rewritten"
+        );
+    }
+}
+
+/// Kill the direct child: without a job object, a grandchild cannot be reached
+/// at all.
+#[cfg(not(windows))]
+fn stop_process_tree(_tree: Option<&BuildProcessTree>, child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 /// Run one module's build command to completion.
 ///
 /// Shared by the project module and by optional modules so both use the same
@@ -790,11 +1177,16 @@ pub(crate) fn run_build_command(
     // Ask this build to say which rustc invocation it used, so the fast patch
     // pipeline never has to run a build of its own to find out.
     #[cfg(feature = "hot_patch")]
-    let capture = VerboseCapture::arm(&mut command, program, name);
+    let capture = VerboseCapture::arm(&mut command, program, name, workspace_root);
+    // The tree is created before the spawn so the child can never run outside
+    // it, and joined immediately after: a process started between the two
+    // would survive a cancellation of the rest.
+    let process_tree = create_process_tree();
     let mut child = command.spawn().map_err(|source| BuildError::SpawnFailed {
         name: name.to_string(),
         source,
     })?;
+    join_process_tree(process_tree.as_ref(), &child);
     // Started before the watchdog loop: cargo's stderr must be drained while
     // the build runs, or the pipe fills and the compiler blocks forever.
     #[cfg(feature = "hot_patch")]
@@ -818,8 +1210,7 @@ pub(crate) fn run_build_command(
         if cancel_flag
             .is_some_and(|(generation, baseline)| generation.load(Ordering::Acquire) != baseline)
         {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_process_tree(process_tree.as_ref(), &mut child);
             return Err(BuildError::Cancelled);
         }
         if let Some(status) = child.try_wait().map_err(|source| BuildError::WaitFailed {
@@ -833,8 +1224,7 @@ pub(crate) fn run_build_command(
             cargo_peak_bytes = cargo_peak_bytes.max(peak);
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            stop_process_tree(process_tree.as_ref(), &mut child);
             return Err(BuildError::TimedOut {
                 name: name.to_string(),
                 seconds: BUILD_TIMEOUT.as_secs(),
@@ -1023,6 +1413,17 @@ pub(crate) fn build_project_module(
             &config.build_command,
             &produced,
         );
+
+        // Then confirm the stamp still describes what is on disk: a compiler
+        // orphaned by an earlier cancellation writes into these shared slots,
+        // and what it writes must not be loaded as this build's output.
+        confirm_staged_artifacts(
+            workspace_root,
+            &config.name,
+            &config.watch_directory,
+            &config.build_command,
+            &produced,
+        )?;
     }
 
     // Step 4: Confirm the resolved artifact exists before reporting success.
@@ -1408,6 +1809,16 @@ pub(crate) fn build_optional_module(
         &produced,
     );
 
+    // Same recheck as the project path: the staged copy is only loadable if it
+    // is still the one this build wrote.
+    confirm_staged_artifacts(
+        workspace_root,
+        &config.name,
+        &config.watch_directory,
+        &config.build_command,
+        &produced,
+    )?;
+
     if !hot_output.exists() {
         return Err(BuildError::OutputMissing {
             path: hot_output.display().to_string(),
@@ -1665,6 +2076,51 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A cancelled build must stop its whole tree, not just cargo.
+    ///
+    /// Cargo is the direct child, but the compiler and linker it starts are
+    /// grandchildren: killing the child leaves them running against the same
+    /// shared build tree, where they hold cargo's package lock - the next
+    /// build then blocks until its timeout and reads as an ignored edit - and
+    /// can write over an artifact between staging and loading. The job object
+    /// is what makes the tree the unit of termination, so this test drives one
+    /// through the same helpers `run_build_command` uses.
+    #[cfg(windows)]
+    #[test]
+    fn cancelled_build_kills_the_whole_tree() {
+        // `cmd /C` starts a long-running grandchild and waits for it: one
+        // direct child with one process below, the shape of a cargo build.
+        let mut command = Command::new("cmd");
+        command
+            .args(["/C", "ping", "-n", "60", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        let tree = create_process_tree();
+        assert!(tree.is_some(), "a job object must be creatable here");
+        let mut child = command.spawn().expect("cmd must spawn");
+        join_process_tree(tree.as_ref(), &child);
+
+        // Wait for the grandchild to join the job. That inheritance is the
+        // property under test, so a tree of one process would prove nothing.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tree.as_ref().expect("created above").active_processes() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the grandchild must join the job"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        stop_process_tree(tree.as_ref(), &mut child);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while tree.as_ref().expect("created above").active_processes() != 0 {
+            assert!(Instant::now() < deadline, "the tree must be gone");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     fn test_workspace() -> (PathBuf, PathBuf) {

@@ -45,6 +45,13 @@ use super::ResolvedMirrorMethod;
 static MIRROR_METHOD_TABLE: std::sync::Mutex<Option<MirrorMethodTable>> =
     std::sync::Mutex::new(None);
 
+/// Epoch of the mirror-method table.
+///
+/// Bumped after every republish, so managed code can tell that the addresses it
+/// holds were resolved against a table that no longer exists - without waiting
+/// for the assembly swap that would normally carry a rebind.
+static MIRROR_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// One send-safe row of the mirror-method table.
 struct MirrorMethodRow {
     /// Index into [`MirrorMethodTable::names`] of the fully-qualified Rust
@@ -86,6 +93,14 @@ extern "C" fn ffi_mirror_method_count() -> u32 {
         .unwrap_or(0)
 }
 
+/// Report the epoch of the mirror-method table.
+///
+/// Managed code polls this before resolving a mirrored method: a value it has
+/// not seen means the addresses it cached belong to an older published table.
+extern "C" fn ffi_mirror_epoch() -> u32 {
+    MIRROR_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Copy up to `max` mirror-method rows into `out`; returns the count written.
 ///
 /// # Safety
@@ -122,8 +137,11 @@ extern "C" fn ffi_copy_mirror_methods(out: *mut MirrorMethodEntry, max: u32) -> 
 /// `MAX_COMPONENTS_PER_CREATE` component blobs per call.
 #[repr(C)]
 pub(super) struct CsEngineApi {
-    /// Number of live entities in the active world.
-    entity_count: extern "C" fn() -> u32,
+    /// Write the number of live entities in the active world.
+    ///
+    /// `0` wrote the count, `3` no managed system is scheduled, and `5` the
+    /// caller passed no output buffer.
+    entity_count: extern "C" fn(*mut u32) -> u8,
     /// Fill a [`ComponentChunk`] for one archetype/component pair.
     get_component_chunk: extern "C" fn(u64, u64, u8, u32, *mut ComponentChunk) -> u8,
     /// Fill a [`ComponentChunk`] for one component of an already-known archetype.
@@ -147,6 +165,12 @@ pub(super) struct CsEngineApi {
     mirror_method_count: extern "C" fn() -> u32,
     /// Copy the mirrored-method rows into a managed-owned buffer.
     copy_mirror_methods: extern "C" fn(*mut MirrorMethodEntry, u32) -> u32,
+    /// Report the epoch of the mirror-method table.
+    ///
+    /// Appended last on purpose: the managed mirror struct reproduces this
+    /// field order, so a new slot goes at the end rather than between existing
+    /// ones.
+    mirror_epoch: extern "C" fn() -> u32,
 }
 
 impl CsEngineApi {
@@ -172,6 +196,7 @@ impl CsEngineApi {
             queue_remove_component: ffi_queue_remove_component,
             mirror_method_count: ffi_mirror_method_count,
             copy_mirror_methods: ffi_copy_mirror_methods,
+            mirror_epoch: ffi_mirror_epoch,
         }
     }
 }
@@ -205,6 +230,9 @@ pub(crate) fn publish_mirror_methods(mirror_methods: &[ResolvedMirrorMethod]) {
         names.push(method_name);
     }
     *MIRROR_METHOD_TABLE.lock().unwrap() = Some(MirrorMethodTable { names, rows });
+    // Bumped after the rows are stored, so a managed refresh triggered by this
+    // value copies the new table rather than the one it replaced.
+    MIRROR_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
 }
 
 /// One pinned managed component value supplied to a deferred command.
@@ -227,13 +255,16 @@ pub(super) struct NativeComponentBlob {
 ///
 /// # Managed-side obligations
 ///
-/// - `data` and `ticks` point into engine-owned storage and remain valid only
-///   for the duration of the scheduled managed invocation that received them;
-///   they must never be cached or dereferenced in a later invocation.
+/// - `data`, `entities` and `ticks` point into engine-owned storage and remain
+///   valid only for the duration of the scheduled managed invocation that
+///   received them; they must never be cached or dereferenced in a later
+///   invocation.
 /// - Managed code may write through `data` only for components the system
 ///   declared with write access, and must stay within `len * element_size`.
+/// - Entity columns carry their rows in `entities`, a const pointer, and leave
+///   `data` null; nothing outside the engine may write entity rows.
 /// - `ticks` may be null for read-only columns; entity columns always carry
-///   null ticks and their `data` must never be written through.
+///   null ticks.
 ///
 /// # Layout limits
 ///
@@ -246,7 +277,15 @@ pub(super) struct ComponentChunk {
     /// High half of the archetype identifier the column belongs to.
     pub(super) archetype_high: u64,
     /// Pointer to the first element of the contiguous column storage.
+    ///
+    /// Null for entity columns, whose rows arrive in `entities` instead.
     pub(super) data: *mut std::ffi::c_void,
+    /// Pointer to the first `Entity` of the archetype's entity column.
+    ///
+    /// Const, and null for component columns: the read-only contract that used
+    /// to live only in this documentation is now part of the ABI, so an aliasing
+    /// write through an entity column cannot be expressed by accident.
+    pub(super) entities: *const std::ffi::c_void,
     /// Number of elements stored in the column.
     pub(super) len: u32,
     /// Byte size of a single column element.

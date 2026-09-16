@@ -42,9 +42,15 @@ public static unsafe class LoaderInterop
 {
     /// <summary>
     /// Unmanaged ABI contract version shared with the Rust host.
-    /// Bump whenever any unmanaged export signature changes.
+    /// Bump whenever any unmanaged export signature changes, when the
+    /// <c>EngineApi</c> struct's field layout does - the runtime copies that
+    /// struct field by field, so a new slot makes the two sides disagree about
+    /// every slot after it - or when a struct the exports exchange changes
+    /// shape. Bumped to 4 by the mirror-epoch slot and to 5 by the const
+    /// <c>Entities</c> pointer in <c>NativeComponentChunk</c>, which a stale
+    /// runtime would otherwise read as a 48-byte struct.
     /// </summary>
-    public const uint InteropContractVersion = 3;
+    public const uint InteropContractVersion = 6;
 
     /// <summary>Return the unmanaged ABI contract version for host validation.</summary>
 #if !PILL_AOT

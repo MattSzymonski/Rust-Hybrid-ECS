@@ -6,13 +6,19 @@
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
 
-    <!-- Deliberately omitted by default: AllowUnsafeBlocks. This is the
-         assembly you edit constantly (Systems.cs) and hot-reload while the
-         host runs — it must not be able to construct raw pointers, so the
-         compiler itself refuses to build unsafe code here. See
-         csharp_features.md's "Trust and sandboxing model" section.
+    <!-- Deliberately omitted by default: AllowUnsafeBlocks. The JIT-reloaded
+         assembly is trusted code - it is your project, and the host compiles
+         and loads it with the same rights as anything else the user runs.
+         This switch guards the `unsafe` KEYWORD, not memory safety: the
+         runtime's safe surface still hands out raw addresses
+         (`Engine.Bind(IntPtr)`, `MirrorMethods.Address`, a ComponentChunk's
+         row base), and `System.Runtime.CompilerServices.Unsafe` is ordinary
+         safe-to-call API that the generated mirrors already use. Leaving the
+         keyword off keeps accidental pointer code out of the common path; it
+         is not a sandbox. See csharp_features.md's "Trust and sandboxing
+         model" section.
 
-         The NativeAOT shipping posture is the exception: the assembly is
+         The NativeAOT shipping posture needs the keyword: the assembly is
          compiled into a static image that is never hot-reloaded, and the
          `AotExports.cs` export forwarders it carries need raw pointers to
          re-export the loader ABI from the AOT root. `unsafe` is therefore

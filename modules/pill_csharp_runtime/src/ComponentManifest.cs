@@ -122,6 +122,14 @@ internal static class ComponentManifestBuilder
         if (!type.IsValueType || type.IsAutoLayout)
             throw new InvalidOperationException(
                 $"Component {type.FullName} must be a sequential or explicit-layout value type.");
+        // An explicit layout is readable only through the offsets its fields
+        // carry, and its stride only through a declared size; without one the
+        // host would allocate a column the managed side cannot stride, so the
+        // shape is refused where it is described rather than measured wrongly.
+        if (type.IsExplicitLayout && (type.StructLayoutAttribute?.Size ?? 0) <= 0)
+            throw new InvalidOperationException(
+                $"Component {type.FullName} declares LayoutKind.Explicit without a Size; " +
+                "add [StructLayout(LayoutKind.Explicit, Size = N)] or use a sequential layout.");
         if (!visiting.Add(type))
             throw new InvalidOperationException($"Component {type.FullName} has a recursive layout.");
         foreach (var field in type.GetFields(

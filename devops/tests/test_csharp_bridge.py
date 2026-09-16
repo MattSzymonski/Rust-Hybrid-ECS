@@ -195,6 +195,15 @@ public static class ModuleSplineBridgeDemo
 
 # The host's collectible loader prints this after a successful assembly swap.
 CSHARP_RELOADED_TOKEN = "[csharp_runtime] reloaded project_cs.dll"
+# The same line carries the unload ledger: versions retired by a swap and
+# versions a collection has confirmed dead. An accepted reload retires one more
+# than it has collected, because the context it just unloaded has not been
+# observed by a sweep yet.
+CSHARP_RELOAD_LEDGER_PREFIX = "reloaded project_cs.dll (retired "
+CSHARP_RETIRED_SURVIVOR_TOKEN = "are still loaded after"
+CSHARP_RELOAD_LEDGER_PATTERN = re.compile(
+    r"\[csharp_runtime\] reloaded project_cs\.dll \(retired (\d+), collected (\d+)\)"
+)
 # The host's reload poll accepts the swap only when system/signature/manifest
 # identity is unchanged (behavior-only reload).
 CSHARP_RELOAD_COMPLETE_TOKEN = "C# hot reload complete"
@@ -653,22 +662,25 @@ SESSION_SCENARIOS = [
             ScenarioPhase(
                 edits=[(PROJECT_CS_PROBE_CS, [BRIDGE_PROBE_PREFIX_EDIT])],
                 wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
+                required_tokens=[CSHARP_RELOADED_TOKEN, CSHARP_RELOAD_LEDGER_PREFIX],
                 forbidden_tokens=[CSHARP_RELOAD_REJECTED_TOKEN, PANIC_TOKEN,
-                                  ACCESS_VIOLATION_TOKEN],
+                                  ACCESS_VIOLATION_TOKEN, CSHARP_RETIRED_SURVIVOR_TOKEN],
                 alive_tokens=[(BRIDGE_PROBE_V2_PREFIX, PROBE_TIMEOUT)],
             ),
             ScenarioPhase(
                 edits=[(PROJECT_CS_PROBE_CS, [BRIDGE_PROBE_V2_TO_V3_EDIT])],
                 wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
+                required_tokens=[CSHARP_RELOADED_TOKEN, CSHARP_RELOAD_LEDGER_PREFIX],
                 forbidden_tokens=[CSHARP_RELOAD_REJECTED_TOKEN, PANIC_TOKEN,
-                                  ACCESS_VIOLATION_TOKEN],
+                                  ACCESS_VIOLATION_TOKEN, CSHARP_RETIRED_SURVIVOR_TOKEN],
                 alive_tokens=[(BRIDGE_PROBE_V3_PREFIX, PROBE_TIMEOUT)],
             ),
             ScenarioPhase(
                 edits=[(PROJECT_CS_PROBE_CS, [BRIDGE_PROBE_V3_TO_V4_EDIT])],
                 wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
+                required_tokens=[CSHARP_RELOADED_TOKEN, CSHARP_RELOAD_LEDGER_PREFIX],
                 forbidden_tokens=[CSHARP_RELOAD_REJECTED_TOKEN, PANIC_TOKEN,
-                                  ACCESS_VIOLATION_TOKEN],
+                                  ACCESS_VIOLATION_TOKEN, CSHARP_RETIRED_SURVIVOR_TOKEN],
                 alive_tokens=[(BRIDGE_PROBE_V4_PREFIX, PROBE_TIMEOUT)],
             ),
         ],
@@ -829,6 +841,46 @@ def launch_host():
     return launch_process([str(HOST_EXE)], MODULES_ROOT, environment)
 
 
+def verify_unload_ledger(session_output: str) -> bool:
+    """Asserts every accepted reload reported a healthy unload ledger.
+
+    A collectible context unloads only once nothing roots it, and
+    `AssemblyLoadContext.Unload` cannot await that: a static holding a
+    delegate, an event handler, a cached Type, a thread-pool callback or a
+    thread-static in the old assembly keeps the whole version alive with no
+    symptom but memory growth. The reload line therefore carries
+    `retired N, collected M` from the weak-reference sweep that ran just
+    before it. At the moment of a reload the context that reload just
+    unloaded has not been observed by a sweep yet, so a healthy ledger is
+    `M <= N <= M + 1` and never goes backwards; a rooted version prints its
+    own stderr survivor warning, which is forbidden outright.
+    """
+    matches = CSHARP_RELOAD_LEDGER_PATTERN.findall(session_output)
+    if not matches:
+        print("  [FAIL] No reload line carried the unload ledger; the check never ran.")
+        return False
+    previous_retired = 0
+    for retired_text, collected_text in matches:
+        retired, collected = int(retired_text), int(collected_text)
+        if not collected <= retired <= collected + 1:
+            print(
+                f"  [FAIL] Unload ledger out of step: retired {retired}, "
+                f"collected {collected}; retired assemblies are accumulating."
+            )
+            return False
+        if retired < previous_retired:
+            print(f"  [FAIL] Unload ledger went backwards: retired {retired} "
+                  f"after {previous_retired}.")
+            return False
+        previous_retired = retired
+    if CSHARP_RETIRED_SURVIVOR_TOKEN in session_output:
+        print("  [FAIL] A retired project assembly is still loaded; see the "
+              "survivor warning in the host output.")
+        return False
+    print(f"  [OK] Unload ledger healthy across {len(matches)} reload line(s).")
+    return True
+
+
 def run_csharp_session() -> bool:
     """Writes the C# project's settings, launches the host, and runs the scenarios."""
     print("\n  [TEST] Launching standalone host with project_cs...")
@@ -852,6 +904,9 @@ def run_csharp_session() -> bool:
             if not run_scenario(scenario, monitor):
                 session_passed = False
                 break
+
+        if session_passed and not verify_unload_ledger(monitor.output_since(0)):
+            session_passed = False
 
         if session_passed:
             print("\n  [PASS] C# session completed.")

@@ -71,7 +71,7 @@ pub use pill_engine::module_abi::MODULE_ABI_VERSION as OPTIONAL_MODULE_ABI_VERSI
 // it describes the contract a module crate is compiled against, which is true
 // whether or not this host can load one.
 #[cfg(feature = "hot_reload")]
-pub(crate) use slot::OptionalModuleSlot;
+pub(crate) use slot::{OptionalModuleSlot, ReloadOutcome};
 
 #[cfg(feature = "hot_reload")]
 mod slot {
@@ -88,10 +88,12 @@ mod slot {
         /// Retired generations, kept mapped because engine-owned pointers and
         /// vtables may still refer to their code.
         old_libraries: Vec<NativeLibrary>,
-        /// Bumped by this module's watcher when its sources change.
-        reload_generation: Arc<AtomicU64>,
-        /// Last generation the frame loop acted on.
-        last_processed_generation: u64,
+        /// Bumped by this module's watcher when its sources change. The slot
+        /// has exactly one producer - its own watcher - so this counter never
+        /// conflates a source save with anything the reload pipeline queues.
+        source_edit_generation: Arc<AtomicU64>,
+        /// Last source-edit generation the frame loop acted on.
+        last_processed_source_edit: u64,
         /// Persistable component type names the last `init` registered, used to
         /// detect types the next generation forgets to re-register.
         registered_type_names: Vec<String>,
@@ -102,6 +104,38 @@ mod slot {
         /// registered, exposed to the C# backend so `project_cs` can use the
         /// module's native components through byte-level bindings.
         exposed_component_names: Vec<String>,
+    }
+
+    /// What a module reload attempt did.
+    ///
+    /// Three states, not a `bool`: the caller performs success bookkeeping
+    /// only on [`Reloaded`] - patch baselines are re-synced, prologue records
+    /// are forgotten, and the editor revision moves - while a failed attempt
+    /// must do none of that (the previous image is still current, its patches
+    /// are still installed, and its recorded prologues are still the rollback
+    /// path), and "nothing was pending" is not an attempt at all. The
+    /// generation is carried so the log lines name the edit the outcome
+    /// belongs to instead of whatever the counter reads by the time they run.
+    ///
+    /// [`Reloaded`]: ReloadOutcome::Reloaded
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum ReloadOutcome {
+        /// The watcher has signalled nothing new; no attempt was made.
+        Unchanged,
+        /// The new generation built, initialized and was swapped in.
+        Reloaded {
+            /// The source-edit generation this reload delivered.
+            generation: u64,
+        },
+        /// The build produced nothing usable or the swap was refused; the
+        /// previous generation is still current.
+        ///
+        /// No error string: every refusal already logs its own reason where it
+        /// is detected, and carrying a second copy here would print it twice.
+        Failed {
+            /// The source-edit generation the attempt was made for.
+            generation: u64,
+        },
     }
 
     impl OptionalModuleSlot {
@@ -117,7 +151,7 @@ mod slot {
             workspace_root: &Path,
             config: &OptionalModuleConfig,
             owner: SystemOwner,
-            reload_generation: Arc<AtomicU64>,
+            source_edit_generation: Arc<AtomicU64>,
         ) -> Result<Self, HostError> {
             // Step 1: Compile the module through the shared command runner.
             let output_path = build_optional_module(workspace_root, config, None)?;
@@ -175,10 +209,15 @@ mod slot {
                 .into());
             }
             // What this generation's `init` registered; kept so the next
-            // reload can tell which types the new one stopped owning.
+            // reload can tell which types the new one stopped owning. The
+            // claim is recorded in the world too, so retiring it from this
+            // subject alone will not destroy a value another subject shares.
             let registered_resource_ids = engine
                 .world()
                 .resource_ids_registered_since(resource_registration_sequence);
+            engine
+                .world_mut()
+                .retain_resource_claims(&registered_resource_ids);
             let registered_type_names = engine
                 .world()
                 .persist_type_names_registered_since(registration_sequence);
@@ -200,8 +239,8 @@ mod slot {
                 owner,
                 current: library,
                 old_libraries: Vec::new(),
-                reload_generation,
-                last_processed_generation: 0,
+                source_edit_generation,
+                last_processed_source_edit: 0,
                 registered_type_names,
                 registered_resource_ids,
                 exposed_component_names,
@@ -210,18 +249,23 @@ mod slot {
 
         /// Reload this module when its watcher signalled a source change.
         ///
-        /// Returns true when a reload was attempted, so the caller can report it.
-        /// Every module keeps its own counter, so this never rebuilds another
-        /// module or the project.
+        /// Returns [`ReloadOutcome::Reloaded`] when a new generation replaced
+        /// the current one, [`ReloadOutcome::Failed`] when an attempt was made
+        /// and the previous generation was kept, and
+        /// [`ReloadOutcome::Unchanged`] when nothing was pending. The caller
+        /// gates its success bookkeeping on the outcome: a failed attempt
+        /// leaves every patch, baseline and record of the current generation
+        /// in place. Every module keeps its own counter, so this never
+        /// rebuilds another module or the project.
         pub(crate) fn reload_if_changed(
             &mut self,
             engine: &mut Engine,
             engine_api: &EngineApi,
             workspace_root: &Path,
-        ) -> bool {
-            let generation = self.reload_generation.load(Ordering::Acquire);
-            if generation == self.last_processed_generation {
-                return false;
+        ) -> ReloadOutcome {
+            let generation = self.source_edit_generation.load(Ordering::Acquire);
+            if generation == self.last_processed_source_edit {
+                return ReloadOutcome::Unchanged;
             }
 
             info!(
@@ -230,7 +274,7 @@ mod slot {
                 generation,
                 "optional module reload triggered"
             );
-            self.reload(engine, engine_api, workspace_root, generation);
+            let outcome = self.reload(engine, engine_api, workspace_root, generation);
 
             // The generation observed BEFORE the reload, deliberately, not a fresh
             // read. A save during the build advances the counter past this value,
@@ -241,8 +285,8 @@ mod slot {
             // rebuilds with it. This is also what makes the build cancellation in
             // `run_build_command` mean anything: it aborts the moment the counter
             // moves, precisely so the newer sources win.
-            self.last_processed_generation = generation;
-            true
+            self.last_processed_source_edit = generation;
+            outcome
         }
 
         /// Invoke the optional per-frame hook, when the module exports one.
@@ -264,8 +308,8 @@ mod slot {
         /// generation it acted on back to [`Self::consume_pending_reload`].
         #[cfg(feature = "hot_patch")]
         pub(crate) fn pending_reload_generation(&self) -> Option<u64> {
-            let generation = self.reload_generation.load(Ordering::Acquire);
-            (generation != self.last_processed_generation).then_some(generation)
+            let generation = self.source_edit_generation.load(Ordering::Acquire);
+            (generation != self.last_processed_source_edit).then_some(generation)
         }
 
         /// Mark one observed generation as handled without rebuilding.
@@ -280,7 +324,7 @@ mod slot {
         /// handled would strand the edit on disk.
         #[cfg(feature = "hot_patch")]
         pub(crate) fn consume_pending_reload(&mut self, generation: u64) {
-            self.last_processed_generation = generation;
+            self.last_processed_source_edit = generation;
         }
 
         /// The module's currently loaded library, as a patch target.
@@ -318,20 +362,26 @@ mod slot {
         }
 
         /// Rebuild and swap one generation, keeping the previous one on any failure.
+        ///
+        /// Returns [`ReloadOutcome::Reloaded`] when the swap happened; every
+        /// refusal on the way - build, load, ABI, or a rolled-back init -
+        /// reports [`ReloadOutcome::Failed`] carrying the generation, so the
+        /// caller can skip the bookkeeping that only a replaced image
+        /// justifies and still log which edit was lost.
         fn reload(
             &mut self,
             engine: &mut Engine,
             engine_api: &EngineApi,
             workspace_root: &Path,
             generation: u64,
-        ) {
+        ) -> ReloadOutcome {
             // Step 1: Compile before touching engine state, so a compiler error can
             // never remove the systems of the working generation. A newer save
             // during the build cancels it and the next frame retries.
             let output_path = match build_optional_module(
                 workspace_root,
                 &self.config,
-                Some((&self.reload_generation, generation)),
+                Some((&self.source_edit_generation, generation)),
             ) {
                 Ok(path) => path,
                 Err(error) => {
@@ -341,7 +391,7 @@ mod slot {
                         error = %error,
                         "build failed; keeping the old module generation"
                     );
-                    return;
+                    return ReloadOutcome::Failed { generation };
                 }
             };
 
@@ -361,7 +411,7 @@ mod slot {
                         error = %error,
                         "failed to load the new library; keeping the old module generation"
                     );
-                    return;
+                    return ReloadOutcome::Failed { generation };
                 }
             };
             if let Err(error) = check_abi_version(&new_library, &self.config.name) {
@@ -371,7 +421,7 @@ mod slot {
                     error = %error,
                     "rejected the new library; keeping the old module generation"
                 );
-                return;
+                return ReloadOutcome::Failed { generation };
             }
 
             // Steps 3 to 6 are identical for every subject and live in one place:
@@ -390,11 +440,12 @@ mod slot {
             let Some(commit) = transaction.commit(engine, engine_api, new_library) else {
                 // The new generation failed to initialize and the previous one
                 // was restored; nothing swapped.
-                return;
+                return ReloadOutcome::Failed { generation };
             };
             // Refresh the C#-exposed component set to the new generation's
             // registrations (plain and persistable alike).
             self.exposed_component_names = commit.exposed_component_names;
+            ReloadOutcome::Reloaded { generation }
         }
     }
 

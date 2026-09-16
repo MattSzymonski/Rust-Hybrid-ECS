@@ -121,7 +121,7 @@ impl HotPatchSession {
             .collect()
     }
 
-    /// Forget every prologue patch, because the images they refer to are gone.
+    /// Forget the patch history a reload has invalidated.
     ///
     /// A reload replaces an artifact's image, so the addresses recorded when a
     /// prologue was overwritten no longer name that function - and the freshly
@@ -129,8 +129,11 @@ impl HotPatchSession {
     /// bytes back to a stale address would corrupt whatever now occupies it, so
     /// the record is dropped rather than kept.
     ///
-    /// Slot-delivered generations are untouched: a slot is re-created by the
-    /// new artifact and re-installed through the registry, not by address.
+    /// Slot-delivered generations keep their records but lose their active
+    /// entry: the rebuilt artifact re-creates its slot from the new sources,
+    /// so the baseline is whatever the artifact now ships, and a rollback must
+    /// not re-install a body from a previous revision into it. A new patch of
+    /// the function makes the history reachable again from that baseline.
     pub(crate) fn forget_prologue_patches(&mut self) {
         let mut functions: Vec<String> = Vec::new();
         for generation in &mut self.generations {
@@ -142,15 +145,20 @@ impl HotPatchSession {
                 }
             }
         }
+        // Every function, not only the prologue-patched ones. A reload
+        // re-creates the slot from the rebuilt artifact, so a slot-delivered
+        // generation is as dead as a prologue patch over there: what runs now
+        // is the artifact's own body. Leaving the entry in place made
+        // `active_generation` name a generation that is not executing and let
+        // a rollback install a body from a previous revision into the fresh
+        // image. The `Generation` records stay - the listing and their
+        // `prologue_history_dropped` refusal still describe what happened -
+        // but nothing is reachable for a rollback until a new patch
+        // re-registers the function.
+        self.active_generations.clear();
+
         if functions.is_empty() {
             return;
-        }
-
-        // The history no longer describes anything: the new image was compiled
-        // from the current sources, so it already behaves like the newest
-        // generation, and none of the recorded addresses point into it.
-        for function in &functions {
-            self.active_generations.remove(function);
         }
 
         // Said out loud rather than logged, because a developer who just rolled

@@ -20,6 +20,7 @@
 //! callers can correct it directly.
 
 // Standard library
+use std::collections::HashSet;
 use std::env;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -637,22 +638,66 @@ impl HostConfig {
             })?
             .to_string();
 
-        // Step 4: Resolve the optional modules and validate every configured
-        // module before any build work starts.
-        let optional_modules: Vec<OptionalModuleConfig> = project_settings
-            .modules
-            .iter()
-            .map(|name| OptionalModuleConfig::workspace_member(name))
-            .collect();
-        for module in &optional_modules {
-            module.validate()?;
-        }
+        // Step 4: Resolve the optional modules, validating every name before
+        // it is interpolated into a watch path and a cargo selector. A
+        // traversal or duplicate entry, or one with no directory under
+        // `optional/`, is a configuration error here rather than a watch on
+        // an arbitrary directory, a malformed `--package`, or a second copy
+        // of a module already loading.
+        let optional_root = env::current_dir()
+            .map_err(|_| ConfigError::ProjectDirectoryMissing {
+                path: project_path.clone(),
+            })?
+            .join(OPTIONAL_MODULE_DIRECTORY);
+        let optional_modules =
+            Self::resolve_optional_modules(&project_settings.modules, &optional_root)?;
         Ok(Self {
             name: project_name,
             build_binary_name,
             project,
             optional_modules,
         })
+    }
+
+    /// Resolve the settings file's module names against the `optional/`
+    /// directory.
+    ///
+    /// Split from [`Self::from_environment`] so the validation is testable
+    /// without moving the process's working directory, which no test in this
+    /// crate does and which would race the parallel test threads. The order
+    /// of the checks is the order the errors matter in: a name that is not a
+    /// crate directory is refused before anything is derived from it, a
+    /// repeat is refused before a second copy of the module could load, and
+    /// the sibling directory is required before the module is configured at
+    /// all.
+    fn resolve_optional_modules(
+        names: &[String],
+        optional_root: &Path,
+    ) -> Result<Vec<OptionalModuleConfig>, ConfigError> {
+        let mut seen_names: HashSet<&str> = HashSet::new();
+        let mut modules = Vec::new();
+        for name in names {
+            let name = name.trim();
+            if !is_valid_module_directory_name(name) {
+                return Err(ConfigError::InvalidOptionalModuleName {
+                    name: name.to_string(),
+                });
+            }
+            if !seen_names.insert(name) {
+                return Err(ConfigError::DuplicateOptionalModuleName {
+                    name: name.to_string(),
+                });
+            }
+            if !optional_root.join(name).is_dir() {
+                return Err(ConfigError::OptionalModuleDirectoryMissing {
+                    name: name.to_string(),
+                });
+            }
+            let module = OptionalModuleConfig::workspace_member(name);
+            module.validate()?;
+            modules.push(module);
+        }
+        Ok(modules)
     }
 }
 
@@ -1067,8 +1112,13 @@ fn dependency_sub_table_key(section: &str) -> Option<&str> {
 /// `name` and `build_binary_name` are required (the display/window title and
 /// the artifact file base respectively); the rest is optional classic package
 /// metadata.
+///
+/// Unknown keys are refused rather than dropped: `module:` instead of
+/// `modules:` used to parse cleanly into an empty list, so the host started
+/// with no optional modules and no diagnostic - the opposite of what this
+/// parser's contract promises.
 #[derive(Debug, Default, serde::Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ProjectSettingsFile {
     /// Project display name; required, used as the window title.
     name: Option<String>,
@@ -1089,6 +1139,23 @@ struct ProjectSettingsFile {
 /// Whether a value is a safe artifact file base: letters, digits, underscores.
 fn is_valid_build_binary_name(value: &str) -> bool {
     !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Whether a value is a usable optional-module directory name.
+///
+/// The name is a path segment under `optional/` and a cargo package selector,
+/// so it is checked harder than `build_binary_name`: a leading digit is
+/// refused (crate directories start with a letter), `-` is allowed because
+/// real crate directories use it, and every other character - path
+/// separators, spaces, dots - is rejected rather than interpolated into a
+/// watch path.
+fn is_valid_module_directory_name(value: &str) -> bool {
+    let mut characters = value.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && characters.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Read the project's own settings file from the project root.
@@ -1571,6 +1638,92 @@ serde = { version = "1", features = ["derive"] }
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
         assert!(read_project_settings_file(&directory).unwrap().is_none());
+    }
+
+    /// A misspelled key is an error rather than a silently different module
+    /// set: `module:` instead of `modules:` used to parse into `Vec::new()`.
+    #[test]
+    fn unknown_settings_key_is_rejected() {
+        let directory = temp_root().join("project_settings_unknown_key");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("project_settings.yaml"),
+            "name: \"Bouncing Balls\"\nbuild_binary_name: \"BouncingBalls\"\nmodule:\n  - \"pill_spline\"\n",
+        )
+        .unwrap();
+
+        let error =
+            read_project_settings_file(&directory).expect_err("an unknown key must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("module"),
+            "the refusal names the offending key: {message}"
+        );
+    }
+
+    /// Optional-module names are validated before they become a watch path
+    /// and a cargo selector.
+    ///
+    /// `workspace_member` interpolates the name into both with no check of
+    /// its own, so `../pill_spline` used to point the watcher outside
+    /// `optional/` and hand cargo a malformed `--package`. This drives the
+    /// resolution `from_environment` runs, so it needs no process-wide
+    /// working directory.
+    #[test]
+    fn rejects_traversal_and_duplicate_module_names() {
+        let root = temp_root().join("optional_module_names");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("optional").join("pill_spline")).unwrap();
+        let optional_root = root.join("optional");
+
+        let traversal = HostConfig::resolve_optional_modules(
+            &[String::from("../pill_spline")],
+            &optional_root,
+        );
+        assert!(
+            matches!(&traversal, Err(ConfigError::InvalidOptionalModuleName { .. })),
+            "a traversal entry must be refused: {traversal:?}"
+        );
+
+        let duplicate = HostConfig::resolve_optional_modules(
+            &[String::from("pill_spline"), String::from("pill_spline")],
+            &optional_root,
+        );
+        assert!(
+            matches!(
+                &duplicate,
+                Err(ConfigError::DuplicateOptionalModuleName { .. })
+            ),
+            "a repeated entry must be refused: {duplicate:?}"
+        );
+
+        let missing = HostConfig::resolve_optional_modules(
+            &[String::from("pill_absent")],
+            &optional_root,
+        );
+        assert!(
+            matches!(
+                &missing,
+                Err(ConfigError::OptionalModuleDirectoryMissing { .. })
+            ),
+            "a name without a sibling directory must be refused: {missing:?}"
+        );
+
+        let resolved = HostConfig::resolve_optional_modules(
+            &[String::from("pill_spline")],
+            &optional_root,
+        )
+        .expect("a real sibling directory resolves");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "pill_spline");
+        assert_eq!(
+            resolved[0].watch_directory,
+            "optional/pill_spline/src",
+            "the validated name still derives the documented watch path"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // =========================================================================

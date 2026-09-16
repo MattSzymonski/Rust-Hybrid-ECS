@@ -21,6 +21,7 @@
 
 // Standard library
 use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -97,14 +98,18 @@ fn is_relevant_event(kind: &EventKind) -> bool {
 ///
 /// Both sides are canonicalized so symlinked directories cannot smuggle
 /// events from outside the watch tree, and the remaining policy is applied
-/// to the resulting relative path.
+/// to the resulting relative path. Deleted paths resolve through their
+/// nearest surviving ancestor (see
+/// [`canonicalize_through_existing_ancestor`]) because a file that was just
+/// removed cannot be canonicalized at all.
 fn is_relevant_path(path: &Path, watch_root: &Path) -> bool {
     let Ok(canonical_root) = watch_root.canonicalize() else {
         return false;
     };
-    let Ok(canonical_path) = path.canonicalize() else {
-        // Events for files deleted between notification and check carry no
-        // source content; skipping them is harmless.
+    // The deletion events the filter above deliberately accepts used to die
+    // here: `Path::canonicalize` cannot succeed for a removed file, so the
+    // resolver walks to the nearest surviving ancestor instead.
+    let Some(canonical_path) = canonicalize_through_existing_ancestor(path) else {
         return false;
     };
     if !canonical_path.starts_with(&canonical_root) {
@@ -114,6 +119,35 @@ fn is_relevant_path(path: &Path, watch_root: &Path) -> bool {
     // strip cannot fail.
     let relative = canonical_path.strip_prefix(&canonical_root).unwrap();
     is_relevant_relative_path(relative)
+}
+
+/// Canonicalize a path that may no longer exist.
+///
+/// `Path::canonicalize` needs every component to exist, which a just-deleted
+/// file cannot satisfy. This walks `Path::ancestors` to the first level that
+/// canonicalizes and re-joins the missing tail lexically, so a path that does
+/// exist resolves exactly as `canonicalize` would and a removed one still
+/// resolves to the place it occupied. A `..` in the missing tail is refused:
+/// the ancestor walk already resolved the directory structure, and letting a
+/// component climb back out of it would hand the watch-root check a path it
+/// would then trust.
+fn canonicalize_through_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut missing_tail: Vec<&OsStr> = Vec::new();
+    for ancestor in path.ancestors() {
+        if let Ok(mut resolved) = ancestor.canonicalize() {
+            for component in missing_tail.iter().rev() {
+                if *component == OsStr::new("..") {
+                    return None;
+                }
+                resolved.push(component);
+            }
+            return Some(resolved);
+        }
+        if let Some(name) = ancestor.file_name() {
+            missing_tail.push(name);
+        }
+    }
+    None
 }
 
 /// Whether a path relative to the canonical watch root should trigger a
@@ -371,6 +405,32 @@ mod tests {
         assert!(!is_relevant_relative_path(Path::new("src/main.rs~")));
         assert!(!is_relevant_relative_path(Path::new("src/.main.rs.swp")));
         assert!(!is_relevant_relative_path(Path::new("src/main.rs.swx")));
+    }
+
+    /// Verifies that deleting a source file inside the watch tree stays
+    /// relevant, which a plain `canonicalize` cannot express, while deletion
+    /// of editor noise and of files outside the root stays irrelevant.
+    #[test]
+    fn deleted_source_files_stay_relevant() {
+        let base = std::env::temp_dir().join(format!("pill_watcher_delete_{}", std::process::id()));
+        let watch_root = base.join("watch");
+        std::fs::create_dir_all(watch_root.join("src")).unwrap();
+
+        let deleted = watch_root.join("src").join("project.rs");
+        std::fs::write(&deleted, "// test").unwrap();
+        std::fs::remove_file(&deleted).unwrap();
+        assert!(
+            is_relevant_path(&deleted, &watch_root),
+            "a removed source file must still be relevant"
+        );
+
+        let outside = base.join("outside.rs");
+        assert!(!is_relevant_path(&outside, &watch_root));
+
+        let noise = watch_root.join("src").join("main.rs.swx");
+        assert!(!is_relevant_path(&noise, &watch_root));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// Verifies that paths outside the watch root are rejected, which also

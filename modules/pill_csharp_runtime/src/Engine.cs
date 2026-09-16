@@ -16,6 +16,7 @@
 //   at JIT time and return writable or read-only references into the active
 //   native chunk, with no per-row column lookup and no per-row column copy.
 
+using System.Collections.Concurrent;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -236,6 +237,7 @@ public interface IQueryDescriptor
 public static unsafe class Engine
 {
     private static EngineApi _api;
+    private static uint _mirrorEpoch;
 
     /// <summary>Bind the native function table for all subsequent queries.</summary>
     public static void Bind(EngineApi* api)
@@ -245,10 +247,52 @@ public static unsafe class Engine
     }
 
     /// <summary>Bind an unmanaged pointer received by the exported loader API.</summary>
+    /// <remarks>
+    /// This is the sharpest edge on the safe surface: anything holding a
+    /// plausible <see cref="IntPtr"/> can bind an arbitrary function table.
+    /// That is deliberate - hot-reloadable project code is trusted, and the
+    /// loader handshake has no safer channel - and <c>AllowUnsafeBlocks</c>
+    /// does not stand in the way of it either way; see the trust note in the
+    /// project's `.csproj`.
+    /// </remarks>
     public static void Bind(IntPtr api) => Bind((EngineApi*)api);
 
     /// <summary>Return the active native world's entity count.</summary>
-    public static uint EntityCount() => _api.EntityCount();
+    /// <exception cref="InvalidOperationException">
+    /// No managed system is scheduled on the native side.
+    /// </exception>
+    public static uint EntityCount()
+    {
+        uint count;
+        byte status = _api.EntityCount(&count);
+        if (status == 0)
+            return count;
+        if (status == 3)
+            throw new InvalidOperationException(
+                "EntityCount is only available while a system is scheduled.");
+        throw new InvalidOperationException($"EntityCount failed with native status {status}.");
+    }
+
+    /// <summary>
+    /// Re-copy the host's mirrored-method table when the host has republished
+    /// it since the last copy.
+    ///
+    /// The assembly swap that normally carries a rebind waits on a queued
+    /// project build - seconds at best, and never if that build fails - while
+    /// the trampoline addresses from the previous bind already point into the
+    /// retiring module generation. Checking the host's epoch before resolving
+    /// a mirrored method closes that window on the calling thread.
+    /// </summary>
+    internal static void RefreshMirrorMethodsIfStale()
+    {
+        // A host that never bound this runtime has no table to refresh, and no
+        // call into the native table is possible either.
+        if (_api.MirrorEpoch == null)
+            return;
+        if (_api.MirrorEpoch() == _mirrorEpoch)
+            return;
+        ReloadMirrorMethods();
+    }
 
     /// <summary>
     /// Re-copy the host's mirrored-method table into <see cref="MirrorMethods"/>
@@ -262,6 +306,11 @@ public static unsafe class Engine
     /// </summary>
     internal static void ReloadMirrorMethods()
     {
+        // The epoch is read *before* the rows: a publish that lands while they
+        // are being copied then leaves a newer epoch behind, so the next
+        // refresh copies again instead of trusting a half-updated view.
+        if (_api.MirrorEpoch != null)
+            _mirrorEpoch = _api.MirrorEpoch();
         MirrorMethods.Reset();
         uint count = _api.MirrorMethodCount();
         if (count == 0)
@@ -366,6 +415,12 @@ public static unsafe class Engine
 
     private static void ValidateStatus(byte status, string name, QueryAccess access)
     {
+        // Status 5 reports a caller bug on this side: every managed call site
+        // passes a real result buffer, so a null one reached the native table
+        // by some other route.
+        if (status == 5)
+            throw new ArgumentException(
+                $"The native query for {name} was given no result buffer.", nameof(status));
         if (status == 2)
             throw new InvalidOperationException($"Component {name} is not registered by the Rust host.");
         if (status == 3)
@@ -458,13 +513,21 @@ internal readonly record struct StableComponentId(ulong Low, ulong High);
 /// (guarded by <see cref="Generation"/>) and call it through the
 /// <c>Invoke*</c> helpers below, which use C-ABI function pointers with no
 /// marshalling between managed and native code. Both paths stay callable from
-/// safe C#, so the reloadable project assembly needs no
-/// <c>AllowUnsafeBlocks</c>.
+/// code compiled without the `unsafe` keyword, so the reloadable project
+/// assembly needs no <c>AllowUnsafeBlocks</c> - which guards that keyword,
+/// not memory safety: the addresses these methods exchange are raw, and the
+/// project's code is trusted the same way any other code the user builds is.
 /// </summary>
 public static class MirrorMethods
 {
-    private static readonly Dictionary<(string TypeName, string Method), IntPtr> Addresses = new();
-    private static readonly Dictionary<(string TypeName, string Method), Delegate> Cache = new();
+    // Concurrent collections because `Resolve` is reachable from scheduled
+    // systems, and the scheduler runs batches of disjoint systems on parallel
+    // threads: a plain `Dictionary` mutated from two of them at once is a lost
+    // update at best and a corrupted bucket chain at worst. Every operation
+    // here is a single `TryGetValue` or indexer write, so the concurrent forms
+    // cover it without a lock.
+    private static readonly ConcurrentDictionary<(string TypeName, string Method), IntPtr> Addresses = new();
+    private static readonly ConcurrentDictionary<(string TypeName, string Method), (int Generation, Delegate Delegate)> Cache = new();
     private static int _generation;
 
     /// <summary>
@@ -514,11 +577,19 @@ public static class MirrorMethods
     /// <typeparam name="T">The generated delegate type for the method.</typeparam>
     public static T Resolve<T>(string typeName, string method) where T : Delegate
     {
+        // A host republish since the last check invalidates every address this
+        // cache holds; refreshing first means the generation read below is the
+        // one the entries are compared against.
+        Engine.RefreshMirrorMethodsIfStale();
         (string, string) key = (typeName, method);
-        if (Cache.TryGetValue(key, out Delegate? cached))
-            return (T)cached;
+        int generation = Generation;
+        if (Cache.TryGetValue(key, out (int Generation, Delegate Delegate) cached)
+            && cached.Generation == generation)
+        {
+            return (T)cached.Delegate;
+        }
         T created = (T)Marshal.GetDelegateForFunctionPointer(Address(typeName, method), typeof(T));
-        Cache[key] = created;
+        Cache[key] = (generation, created);
         return created;
     }
 
@@ -958,10 +1029,14 @@ public ref struct QueryEnumerator
 
                 if (present && chunk.Length != driverChunk.Length)
                     throw new InvalidOperationException("ECS component chunk lengths are inconsistent.");
+                // Entity rows arrive in the const `Entities` slot, which the
+                // native ABI leaves the writable `Data` slot null for; the
+                // joined column keeps one row-base field either way.
+                IntPtr rows = term.IsEntity ? chunk.Entities : chunk.Data;
                 SetColumn(i, new QueryColumn
                 {
                     Term = term,
-                    Data = chunk.Data,
+                    Data = rows,
                     Length = present ? checked((int)chunk.Length) : 0,
                     Present = present,
                     Ticks = present ? chunk.Ticks : IntPtr.Zero,

@@ -330,19 +330,25 @@ def plan_edit(crate: Crate) -> bool:
 # that up - executed directly, the process dies in the loader before it can
 # print anything. Building through the same command also guarantees the binary
 # carries the `hot_patch` feature, which is the whole subject of this test.
+#
+# `rendering` is required rather than optional: examples/project_rs links
+# `pill_master_renderer`, so a host without it resolves `pill_core` differently
+# from the project and the project DLL fails to load with "The specified
+# procedure could not be found" (os error 127), the same reason the cascade
+# suite pins it.
 HOST_LAUNCH_COMMAND = [
     "cargo",
     "run",
     "-p",
     "pill_standalone",
     "--features",
-    "pill_host/hot_patch",
+    "pill_host/hot_patch,rendering",
 ]
 
 
 def build_host() -> bool:
     """Build the standalone host with the hot-patch feature enabled."""
-    print("  [BUILD] cargo build -p pill_standalone --features pill_host/hot_patch")
+    print("  [BUILD] cargo build -p pill_standalone --features pill_host/hot_patch,rendering")
     completed = subprocess.run(
         [
             "cargo",
@@ -350,7 +356,7 @@ def build_host() -> bool:
             "-p",
             "pill_standalone",
             "--features",
-            "pill_host/hot_patch",
+            "pill_host/hot_patch,rendering",
         ],
         cwd=str(MODULES_ROOT),
         capture_output=True,

@@ -192,11 +192,19 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
     start_index = monitor.line_count
 
     for phase in scenario.phases:
+        # Captured per phase, not per scenario. Waiting from the scenario's
+        # start index lets phase 1's reload line satisfy phase 2's wait, which
+        # returns immediately and then checks phase 2's required tokens while
+        # its build is still running - reported as a missing token with the
+        # reload finishing moments later. The C# bridge suite carries the same
+        # per-phase capture for the same reason.
+        phase_index = monitor.line_count
+
         for path, replacements in phase.edits:
             if not apply_replacements(path, replacements):
                 return False
 
-        if not monitor.wait_for(phase.wait_token, RELOAD_TIMEOUT, start_index):
+        if not monitor.wait_for(phase.wait_token, RELOAD_TIMEOUT, phase_index):
             output = monitor.output_since(start_index)
             if has_crash_signals(output):
                 print(f"  [FAIL] Crash detected in scenario: {scenario.name}")

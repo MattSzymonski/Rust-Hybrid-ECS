@@ -49,7 +49,6 @@ mod hot_patch;
 #[cfg(feature = "hot_patch")]
 pub use hot_patch::PatchGeneration;
 
-/// Complete standalone application runner owned by the host crate.
 /// Windowed-frontend and rendering errors, owned by the host because the
 /// host owns the event loop and the renderer.
 #[cfg(feature = "rendering")]
@@ -65,6 +64,7 @@ mod project_module;
 #[cfg(feature = "hot_reload")]
 mod reload;
 
+/// Complete standalone application runner owned by the host crate.
 mod runner;
 /// Engine ownership and frontend-facing frame orchestration.
 mod runtime;

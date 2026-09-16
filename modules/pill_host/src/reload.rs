@@ -48,7 +48,7 @@ use std::time::Instant;
 
 // External crates
 use pill_core::{debug, error, info, warn};
-use pill_engine::{Engine, EngineApi, SystemOwner};
+use pill_engine::{ComponentId, Engine, EngineApi, SystemOwner, World};
 
 // Current crate
 use crate::analytics;
@@ -174,13 +174,54 @@ impl ReloadTransaction<'_> {
         }
     }
 
+    /// Park a library in the graveyard, evicting the oldest generation when
+    /// the bound is crossed - but only once no surviving column still needs
+    /// its tables.
+    ///
+    /// A retired image is never unmapped at the moment it stops being current:
+    /// pointers into it - storage tables, patch stubs, persist metadata - can
+    /// still be live. The eviction log line is what identifies a later fault
+    /// as belonging to an image released here rather than somewhere else.
+    ///
+    /// The `world` argument turns "a bound of two generations is sound" into a
+    /// checked claim: a column whose component id has no factory left still
+    /// holds a function table from whichever image created it, so a non-zero
+    /// [`World::columns_without_factory`] count defers the unmap with a warning
+    /// rather than risking a call into freed memory.
+    fn retire_library(&mut self, library: NativeLibrary, world: &World) {
+        self.old_libraries.push(library);
+        if self.old_libraries.len() > MAX_GRAVEYARD_GENERATIONS {
+            if world.columns_without_factory() != 0 {
+                warn!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    subject = self.subject,
+                    generations = self.old_libraries.len(),
+                    columns = world.columns_without_factory(),
+                    "deferring eviction: native columns still reference a retired image"
+                );
+                return;
+            }
+            // Dropping the evicted generation unmaps its image and deletes its
+            // temporary file on disk. Logged before the drop: anything still
+            // holding a pointer into that image faults inside it, and this line
+            // is what tells that apart from a crash somewhere else.
+            info!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                subject = self.subject,
+                generations = self.old_libraries.len(),
+                "evicting the oldest retired generation"
+            );
+            drop(self.old_libraries.remove(0));
+        }
+    }
+
     /// Run the whole sequence against an already-loaded replacement.
     ///
     /// Returns `None` when the new generation failed to initialize and the
     /// previous one was restored, in which case nothing was swapped and the
     /// caller keeps running what it had.
     pub(crate) fn commit(
-        self,
+        mut self,
         engine: &mut Engine,
         engine_api: &EngineApi,
         new_library: NativeLibrary,
@@ -249,10 +290,13 @@ impl ReloadTransaction<'_> {
             // `clear_systems_owned_by` retires systems and their dispatch slots
             // but not component registrations, and a component's storage factory
             // holds function pointers into the image that registered it - the
-            // one about to be dropped and unmapped at the end of this branch.
-            let failed_registrations = engine
+            // one about to be retired at the end of this branch. Ids, not names:
+            // the rollback generation re-registers the same names under fresh
+            // `TypeId`s, so only the ids tell its entries apart from the failed
+            // generation's leftovers.
+            let failed_ids = engine
                 .world()
-                .registered_component_names_since(component_registration_sequence);
+                .registered_component_ids_since(component_registration_sequence);
             // The resource half of the same capture: the ids the failed
             // generation claimed, to be compared against what the rollback
             // generation re-claims below.
@@ -281,29 +325,44 @@ impl ReloadTransaction<'_> {
                 );
             }
 
-            // Anything the rollback re-registered is safe: registering a type
-            // overwrites its factory with pointers into the still-mapped
-            // generation. What is left over is a type only the failed generation
-            // knew about, whose factory would keep pointing into an unmapped
-            // image. No entity can carry such a type - the generation that
-            // defines it never finished initialising - so this frees registry
-            // entries rather than data.
-            let rollback_registrations = engine
+            // Anything the rollback re-registered is safe: its fresh id holds
+            // fresh factories pointing into the still-mapped generation. What
+            // is left over is an id only the failed generation registered,
+            // whose factory keeps pointing into the image being retired. Its
+            // rows go too: the generated wrapper drains the registration-error
+            // slot after the user's `init`, so a failing init can already have
+            // spawned entities carrying the type - and those rows would be
+            // dropped through an unmapped image at the next despawn.
+            let rollback_ids = engine
                 .world()
-                .registered_component_names_since(rollback_sequence);
-            let stranded: Vec<String> = failed_registrations
+                .registered_component_ids_since(rollback_sequence);
+            let stranded: Vec<ComponentId> = failed_ids
                 .into_iter()
-                .filter(|name| !rollback_registrations.contains(name))
+                .filter(|id| !rollback_ids.contains(id))
                 .collect();
             if !stranded.is_empty() {
                 warn!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     module = self.subject,
-                    types = stranded.join(", ").as_str(),
-                    "dropping registrations from the failed generation; their storage factories point into the image being unmapped"
+                    count = stranded.len(),
+                    ids = ?stranded,
+                    "dropping registrations from the failed generation; their storage factories point into the image being retired"
                 );
-                engine.world_mut().drop_forgotten_components(&stranded);
+                let dropped = engine.world_mut().drop_forgotten_component_ids(&stranded);
+                debug!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    dropped, "removed rows that belonged to the failed generation"
+                );
             }
+            // The purge above is meant to leave nothing listing a stranded id;
+            // assert it so a future change that misses a path fails here, in a
+            // debug build, rather than as a crash inside a retired image.
+            debug_assert!(
+                stranded
+                    .iter()
+                    .all(|id| !engine.world().any_archetype_lists_component(*id)),
+                "a stranded component id still has an archetype entry after the purge"
+            );
 
             // Resources need the stronger version of the same treatment. A
             // component column's factory is re-pointed by re-registration, but a
@@ -332,8 +391,15 @@ impl ReloadTransaction<'_> {
             // same way the success path does. Every id the failed generation
             // touched has either been re-claimed (table refreshed by the rollback
             // init) or dropped just above, so no table still points into the
-            // image about to be unmapped.
+            // failing image.
             engine.world_mut().rehome_resources();
+            // Retire the failed image instead of unmapping it. The purge above
+            // is designed to leave nothing pointing into it, but "designed to"
+            // is not a proof: an image that is parked costs a `FreeLibrary`
+            // later, while one that is unmapped costs a crash if any pointer
+            // survived. The graveyard's own bound is what eventually releases
+            // it.
+            self.retire_library(new_library, engine.world());
             return None;
         }
 
@@ -400,7 +466,20 @@ impl ReloadTransaction<'_> {
             .filter(|id| !claimed_now.contains(id))
             .copied()
             .collect();
+        // The claim list is a delta between generations, so the world's claim
+        // refcount moves by the same delta: ids this generation newly claims
+        // gain a claim, and the retired ones lose theirs. `drop_resources`
+        // then skips whatever another subject still claims - a shared resource
+        // the project stopped registering must survive for a module that did
+        // not stop.
+        let newly_claimed: Vec<pill_engine::ResourceId> = claimed_now
+            .iter()
+            .filter(|id| !self.registered_resource_ids.contains(id))
+            .copied()
+            .collect();
+        engine.world_mut().retain_resource_claims(&newly_claimed);
         if !retired.is_empty() {
+            engine.world_mut().release_resource_claims(&retired);
             let dropped = engine.world_mut().drop_resources(&retired);
             debug!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -492,24 +571,27 @@ impl ReloadTransaction<'_> {
             migrate_started.elapsed().as_secs_f64() * 1000.0,
         );
 
+        // Step 5b: Prove every surviving native column still owns a mapped
+        // function table before the retiring image can ever be evicted. A
+        // column whose id has no factory is the "same name, fresh TypeId" case
+        // the name-keyed forgotten-type sweep cannot reach - the name resolves
+        // to the new id - so it is dropped here, through the table of the
+        // generation that produced it, while that generation is still mapped.
+        let orphaned_columns = engine.world_mut().drop_columns_without_factory();
+        if orphaned_columns != 0 {
+            debug!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = self.subject,
+                orphaned_columns,
+                "dropped native columns whose registration is gone"
+            );
+        }
+
         // Step 6: Retire the previous library without unmapping it. Component
         // operations and persist metadata registered by that generation may
         // still be referenced by engine-owned pointers.
-        self.old_libraries
-            .push(std::mem::replace(&mut *self.current, new_library));
-        if self.old_libraries.len() > MAX_GRAVEYARD_GENERATIONS {
-            // Dropping the evicted generation unmaps its image and deletes its
-            // temporary file on disk. Logged before the drop: anything still
-            // holding a pointer into that image faults inside it, and this line
-            // is what tells that apart from a crash somewhere else.
-            info!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                subject = self.subject,
-                generations = self.old_libraries.len(),
-                "evicting the oldest retired generation"
-            );
-            drop(self.old_libraries.remove(0));
-        }
+        let previous_library = std::mem::replace(&mut *self.current, new_library);
+        self.retire_library(previous_library, engine.world());
 
         analytics::record_reload(self.subject);
 

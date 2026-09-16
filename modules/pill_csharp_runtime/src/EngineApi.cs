@@ -19,8 +19,12 @@ namespace TracyLive;
 [StructLayout(LayoutKind.Sequential)]
 public unsafe struct EngineApi
 {
-    /// <summary>Return the entity count from the currently scheduled world.</summary>
-    public delegate* unmanaged[Cdecl]<uint> EntityCount;
+    /// <summary>
+    /// Write the entity count from the currently scheduled world.
+    /// Status <c>0</c> wrote the count, <c>3</c> means no system is scheduled,
+    /// and <c>5</c> means the caller passed no output buffer.
+    /// </summary>
+    public delegate* unmanaged[Cdecl]<uint*, byte> EntityCount;
 
     /// <summary>Request one native archetype column by component ID and mode.</summary>
     public delegate* unmanaged[Cdecl]<ulong, ulong, byte, uint, NativeComponentChunk*, byte> GetComponentChunk;
@@ -52,6 +56,13 @@ public unsafe struct EngineApi
 
     /// <summary>Copy the mirrored-method rows into a caller-owned buffer.</summary>
     public delegate* unmanaged[Cdecl]<MirrorMethodEntry*, uint, uint> CopyMirrorMethods;
+
+    /// <summary>
+    /// Epoch of the mirrored-method table: bumped every time the host
+    /// republishes it, so managed code can notice a rebind without waiting for
+    /// the assembly swap that would normally carry one.
+    /// </summary>
+    public delegate* unmanaged[Cdecl]<uint> MirrorEpoch;
 }
 
 /// <summary>
@@ -96,7 +107,16 @@ public struct NativeComponentChunk
     internal ulong ArchetypeHigh;
 
     /// <summary>Pointer to the first component in the contiguous native column.</summary>
+    /// <remarks>Null for entity columns, whose rows arrive in <see cref="Entities"/>.</remarks>
     internal IntPtr Data;
+
+    /// <summary>Pointer to the first entity of an archetype's entity column.</summary>
+    /// <remarks>
+    /// Entity rows are const on the native side and arrive only through this
+    /// slot, separate from the writable <see cref="Data"/>; the query join
+    /// reads this one for entity terms.
+    /// </remarks>
+    internal IntPtr Entities;
 
     /// <summary>Number of component values in the column.</summary>
     internal uint Length;

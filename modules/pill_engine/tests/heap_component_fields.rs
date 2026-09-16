@@ -8,8 +8,71 @@
 
 use std::collections::HashSet;
 
+use pill_engine::archetype::Blittability;
 use pill_engine::component_registry::{register_all_components, ComponentFieldDescriptor};
 use pill_engine::{ComponentId, PillComponent, World};
+
+/// A dynamic component's registered layout is validated: a descriptor that
+/// reaches past the row or claims a container tag is refused, and the
+/// previously registered layout is left in place.
+#[test]
+fn an_overflowing_field_layout_is_refused() {
+    let mut world = World::new();
+    // SAFETY: this row is eight bytes the test never reads as anything but
+    // bytes; no pointer or owner is involved.
+    let witness = unsafe { Blittability::assume() };
+    let component_id = world
+        .register_dynamic_component(0x51, "Heap.LayoutProbe", 8, 4, 1, witness)
+        .expect("the component registers");
+
+    let good = vec![ComponentFieldDescriptor {
+        name: "value",
+        type_tag: "u32",
+        offset: 0,
+        size: 4,
+        align: 4,
+        element_count: 0,
+    }];
+    world
+        .register_dynamic_component_field_layout(component_id, good.clone())
+        .expect("a fitting layout is accepted");
+
+    let overflow = vec![ComponentFieldDescriptor {
+        name: "whole",
+        type_tag: "u32",
+        offset: usize::MAX,
+        size: 4,
+        align: 4,
+        element_count: 0,
+    }];
+    assert!(
+        world
+            .register_dynamic_component_field_layout(component_id, overflow)
+            .is_err(),
+        "an overflowing field range is refused"
+    );
+
+    let container = vec![ComponentFieldDescriptor {
+        name: "text",
+        type_tag: "string",
+        offset: 0,
+        size: 8,
+        align: 4,
+        element_count: 0,
+    }];
+    assert!(
+        world
+            .register_dynamic_component_field_layout(component_id, container)
+            .is_err(),
+        "a container tag on a dynamic row is refused"
+    );
+
+    // Both refusals left the accepted layout in place.
+    assert_eq!(
+        world.component_field_layout(component_id),
+        Some(good.as_slice())
+    );
+}
 
 /// A persistable component mixing both container kinds with an inline scalar,
 /// the way real gameplay data does.
@@ -311,11 +374,7 @@ fn heap_fields_migrate_with_serde_and_survive_the_fast_path() {
     // remains in place, which is what makes the common reload cheap and keeps
     // outstanding heap pointers valid.
     let previous = world.capture_persist_type_metadata();
-    let report = world.migrate_changed_persistable_components(
-        &previous,
-        &HashSet::new(),
-        None,
-    );
+    let report = world.migrate_changed_persistable_components(&previous, &HashSet::new(), None);
     assert_eq!(report.migrated_type_count, 0);
     let probe = world
         .get_component::<HeapProbe>(entity)
@@ -450,11 +509,7 @@ fn vec_string_contents_migrate_with_serde_and_survive_the_fast_path() {
     let buffer = list.names.as_ptr();
 
     let previous = world.capture_persist_type_metadata();
-    let report = world.migrate_changed_persistable_components(
-        &previous,
-        &HashSet::new(),
-        None,
-    );
+    let report = world.migrate_changed_persistable_components(&previous, &HashSet::new(), None);
     assert_eq!(report.migrated_type_count, 0);
     let list = world
         .get_component::<NameList>(entity)

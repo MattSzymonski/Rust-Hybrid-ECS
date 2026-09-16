@@ -31,8 +31,9 @@
 use pill_core::math::Vector3f;
 use pill_engine::*;
 
-// The build script scans this crate and submits one address entry per function,
-// so the host can resolve any of them by qualified path with nothing annotated.
+// The build script scans this crate and emits one address entry per function
+// into `function_inventory.rs`; the `include!` is what makes every function
+// resolvable by qualified path with nothing in this file annotated.
 include!(concat!(env!("OUT_DIR"), "/function_inventory.rs"));
 use serde::{Deserialize, Serialize};
 
@@ -53,12 +54,37 @@ const DEMO_SPLINE_COUNT: usize = 1;
 
 /// Extra vertical offset applied to every sampled position.
 ///
-/// Zero in normal operation. It is a named, code-level constant so the
-/// hot-reload integration suites have a single value to edit in this module's
-/// source and observe the change propagate through a cascade reload to a
-/// dependent project's probe (module *data* persists across reloads, so only
-/// code like this is observable that way).
+/// Compiled only when `test-hooks` is on: the hot-reload integration suites
+/// edit this single value in the source and observe the change propagate
+/// through a cascade reload to a dependent project's probe (module *data*
+/// persists across reloads, so only code like this is observable that way). A
+/// default build has no such constant to find, and samples the plain curve.
+#[cfg(feature = "test-hooks")]
 const SAMPLE_VERTICAL_OFFSET: f32 = 0.0;
+
+/// More control points than a [`Spline`] can hold.
+///
+/// Returned by [`Spline::try_from_points`]; it names both counts so a caller
+/// can trim the path without reading [`MAX_CONTROL_POINTS`] first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TooManyControlPoints {
+    /// How many points the caller supplied.
+    pub supplied: usize,
+    /// How many a spline can hold ([`MAX_CONTROL_POINTS`]).
+    pub capacity: usize,
+}
+
+impl std::fmt::Display for TooManyControlPoints {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{} control points supplied but a spline holds at most {}",
+            self.supplied, self.capacity
+        )
+    }
+}
+
+impl std::error::Error for TooManyControlPoints {}
 
 // =============================================================================
 // Component
@@ -166,9 +192,16 @@ pub struct OmoMO {
 #[pill_mirror_impl]
 impl OmoMO {
     /// Sum of both coordinates; mirrored to C# as `GetSum()`.
+    ///
+    /// Integration builds add one so a hot-reload suite can watch the mirror
+    /// trampoline change value; shipping builds return the plain sum.
+    #[doc(hidden)]
     #[pill_mirror_method]
     pub fn get_sum(&self) -> u64 {
-        self.x + self.y + 1
+        let sum = self.x + self.y;
+        #[cfg(feature = "test-hooks")]
+        let sum = sum + 1;
+        sum
     }
 
     /// The `x` coordinate; mirrored to C# as `GetA()`.
@@ -198,12 +231,35 @@ impl Spline {
     ///
     /// Points beyond [`MAX_CONTROL_POINTS`] are ignored rather than treated as
     /// an error, so a caller assembling a path procedurally cannot fail here.
+    /// Use [`Self::try_from_points`] when a truncated path would be worse than
+    /// an error.
     pub fn from_points(points: &[Vector3f]) -> Self {
         let mut spline = Self::default();
         let used_count = points.len().min(MAX_CONTROL_POINTS);
         spline.control_points[..used_count].copy_from_slice(&points[..used_count]);
         spline.control_point_count = used_count as u32;
         spline
+    }
+
+    /// Build a spline from control points, refusing more than the capacity.
+    ///
+    /// The checked counterpart of [`Self::from_points`], for callers who would
+    /// rather hear about a too-long path than silently receive a truncated
+    /// one. The capacity is checked before any copying, so a refused input
+    /// leaves nothing half-built.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TooManyControlPoints`] naming both counts when `points` is
+    /// longer than [`MAX_CONTROL_POINTS`].
+    pub fn try_from_points(points: &[Vector3f]) -> Result<Self, TooManyControlPoints> {
+        if points.len() > MAX_CONTROL_POINTS {
+            return Err(TooManyControlPoints {
+                supplied: points.len(),
+                capacity: MAX_CONTROL_POINTS,
+            });
+        }
+        Ok(Self::from_points(points))
     }
 
     /// The active control points, without the unused tail of the array.
@@ -272,15 +328,27 @@ impl Spline {
                     end
                 };
                 let base = catmull_rom(before_start, start, end, after_end, local_t);
-                Vector3f::new(base.x, base.y + SAMPLE_VERTICAL_OFFSET, base.z)
+                // Integration builds shift the sampled height so a code change
+                // is observable through a cascade reload; shipping builds
+                // compute only the curve.
+                #[cfg(feature = "test-hooks")]
+                let base = Vector3f::new(base.x, base.y + SAMPLE_VERTICAL_OFFSET, base.z);
+                base
             }
         }
     }
 
     /// Dummy alpha channel, delegated straight through to `pill_dummy_color`.
+    ///
+    /// Integration builds offset it so a hot-patch suite can observe the body
+    /// change; shipping builds return exactly what the colour module returns.
+    #[doc(hidden)]
     #[pill_hot_fn]
     pub fn get_color_a(&self) -> f32 {
-        pill_dummy_color::get_color_a() + 1450.0
+        let color = pill_dummy_color::get_color_a();
+        #[cfg(feature = "test-hooks")]
+        let color = color + 1450.0;
+        color
     }
 }
 
@@ -464,6 +532,81 @@ mod tests {
             .get_location_at(0.5)
             .abs_diff_eq(Vector3f::new(5.0, 10.0, -15.0), EPSILON));
         assert!(spline.get_location_at(1.0).abs_diff_eq(end, EPSILON));
+    }
+
+    /// A default build computes only the documented math: no sampled-height
+    /// offset, no mirrored-sum shift, no colour passthrough constant.
+    #[test]
+    #[cfg(not(feature = "test-hooks"))]
+    fn shipping_math_is_unshifted() {
+        let omo = OmoMO { x: 12, y: 34 };
+        assert_eq!(omo.get_sum(), 12 + 34, "the mirrored sum is the plain sum");
+
+        let spline = Spline::default();
+        assert_eq!(
+            spline.get_color_a(),
+            pill_dummy_color::get_color_a(),
+            "the colour passthrough adds nothing in a default build"
+        );
+
+        // The geometry the integration suites sample: five collinear points
+        // 150 apart from x=90 at y=120, whose midpoint is the middle point.
+        let points: [Vector3f; 5] =
+            std::array::from_fn(|index| Vector3f::new(90.0 + 150.0 * index as f32, 120.0, 0.0));
+        let midpoint = Spline::from_points(&points).get_location_at(0.5);
+        assert!(
+            midpoint.abs_diff_eq(Vector3f::new(390.0, 120.0, 0.0), EPSILON),
+            "a default build samples the plain curve: {midpoint:?}"
+        );
+    }
+
+    /// The hooks shift exactly the values the integration suites watch.
+    #[test]
+    #[cfg(feature = "test-hooks")]
+    fn test_hooks_shift_the_observed_values() {
+        let omo = OmoMO { x: 12, y: 34 };
+        assert_eq!(omo.get_sum(), 12 + 34 + 1);
+
+        let spline = Spline::default();
+        assert_eq!(
+            spline.get_color_a(),
+            pill_dummy_color::get_color_a() + 1450.0
+        );
+
+        let points: [Vector3f; 5] =
+            std::array::from_fn(|index| Vector3f::new(90.0 + 150.0 * index as f32, 120.0, 0.0));
+        let midpoint = Spline::from_points(&points).get_location_at(0.5);
+        assert!(
+            midpoint.abs_diff_eq(
+                Vector3f::new(390.0, 120.0 + SAMPLE_VERTICAL_OFFSET, 0.0),
+                EPSILON
+            ),
+            "the sampled midpoint carries the test offset: {midpoint:?}"
+        );
+    }
+
+    /// A too-long path is refused by the checked constructor, with both counts.
+    #[test]
+    fn try_from_points_reports_overflow() {
+        let point = Vector3f::new(1.0, 2.0, 3.0);
+
+        let overflow = vec![point; MAX_CONTROL_POINTS + 1];
+        let error = Spline::try_from_points(&overflow)
+            .expect_err("more points than capacity must be refused");
+        assert_eq!(error.supplied, MAX_CONTROL_POINTS + 1);
+        assert_eq!(error.capacity, MAX_CONTROL_POINTS);
+        assert!(
+            error.to_string().contains("at most"),
+            "the message names the capacity: {error}"
+        );
+
+        let full = vec![point; MAX_CONTROL_POINTS];
+        let spline = Spline::try_from_points(&full).expect("exactly capacity fits");
+        assert_eq!(spline.control_points().len(), MAX_CONTROL_POINTS);
+
+        let partial = vec![point; 3];
+        let spline = Spline::try_from_points(&partial).expect("three points fit");
+        assert_eq!(spline.control_points().len(), 3);
     }
 
     /// The curve passes exactly through every control point, which is the

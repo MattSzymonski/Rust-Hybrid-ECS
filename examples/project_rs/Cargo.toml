@@ -26,7 +26,12 @@ pill_master_renderer = { path = "../../modules/optional/rendering/pill_master_re
 # `project_init` about why this crate must not also be loaded as a module.
 # `default-features = false` is a defensive no-op: `module-abi` is opt-in now,
 # so the `pill_module_*` exports stay off in this build either way.
-pill_spline = { path = "../../modules/optional/pill_spline", default-features = false }
+# `test-hooks` keeps the module's demo observables - the sampled height
+# offset, the `GetSum` shift - that the hot-reload and bridge suites edit and
+# watch for; a default build of the module computes only the documented math.
+pill_spline = { path = "../../modules/optional/pill_spline", default-features = false, features = [
+    "test-hooks",
+] }
 # Dummy optional modules, linked directly purely to exercise their structs and
 # free functions from the project. `default-features = false` is a defensive
 # no-op (each crate's `module-abi` feature is opt-in), kept so that a future

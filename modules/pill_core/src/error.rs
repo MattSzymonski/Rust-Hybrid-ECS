@@ -473,6 +473,31 @@ pub enum ConfigError {
         " must declare a `build_binary_name` with only letters, digits and underscores (no spaces or special characters)"
     )]
     InvalidBuildBinaryName { path: String },
+
+    /// An optional-module name in the settings file is not a usable crate
+    /// directory name.
+    #[message(
+        "project settings file lists optional module ",
+        value(name),
+        ", which is not a crate directory name (letters, digits, `_`, `-`; must start with a letter)"
+    )]
+    InvalidOptionalModuleName { name: String },
+
+    /// The settings file lists one optional module twice.
+    #[message(
+        "project settings file lists optional module ",
+        value(name),
+        " twice"
+    )]
+    DuplicateOptionalModuleName { name: String },
+
+    /// A configured optional module has no sibling directory to build from.
+    #[message(
+        "optional module ",
+        value(name),
+        " has no directory under optional/"
+    )]
+    OptionalModuleDirectoryMissing { name: String },
 }
 
 /// Project-module build execution failures.
@@ -545,6 +570,17 @@ pub enum BuildError {
         #[source]
         source: std::io::Error,
     },
+
+    /// A staged artifact changed after the build that produced it finished.
+    #[message(
+        "staged artifact ",
+        name_style(path),
+        " no longer matches what was built for ",
+        name_style(name),
+        "; another build or a cancelled compiler is writing to the staging directory"
+    )]
+    #[diagnostic(help("retry the build; check for a stray rustc or linker process"))]
+    StagedArtifactChanged { name: String, path: String },
 }
 
 /// Native project-library loading and initialization failures.
@@ -774,6 +810,32 @@ pub enum CSharpError {
     )]
     ManifestLengthOutOfRange { length: u32, limit: u32 },
 
+    /// A managed-reported system or access count exceeds what the host reflects.
+    ///
+    /// The counts size host allocations before any item is read, so they are
+    /// checked against fixed caps; without them a buggy assembly could ask for
+    /// an allocation that aborts the process instead of failing startup.
+    #[message(
+        "managed-reported count ",
+        value(count),
+        " exceeds the supported limit of ",
+        value(limit)
+    )]
+    SystemCountOutOfRange { count: u32, limit: u32 },
+
+    /// The reflected system snapshot could not be allocated.
+    #[message("out of memory allocating the reflected system snapshot")]
+    SystemSnapshotAllocationFailed,
+
+    /// The managed loader reported a reload status the host does not know.
+    ///
+    /// The poll answers `0` (nothing happened), `1` (swapped) or `2`
+    /// (rejected). Anything else is an ABI drift or a loader-level failure, and
+    /// filing it as "nothing happened" left the previous assembly running with
+    /// no indication anywhere.
+    #[message("the managed loader reported unknown reload status ", value(status))]
+    UnknownPollStatus { status: u8 },
+
     /// The manifest buffer could not be allocated.
     #[message("out of memory allocating the component manifest buffer")]
     ManifestAllocationFailed,
@@ -841,7 +903,6 @@ impl From<serde_json::Error> for CSharpError {
         Self::ManifestParseFailed { source }
     }
 }
-
 
 // =============================================================================
 // Host Error Composition

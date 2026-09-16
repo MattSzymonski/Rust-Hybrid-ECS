@@ -150,6 +150,16 @@ pub enum ComponentFieldError {
         /// The requested component type name.
         component: String,
     },
+    /// The component was resolved through a live entity, but its column or row
+    /// is missing from the archetype.
+    ///
+    /// This is a registration/storage desync, not a dead handle: the entity
+    /// exists and it carries the component's id, so the storage the id names
+    /// should be there.
+    ComponentStorageMissing {
+        /// The component type name.
+        component: String,
+    },
     /// The component is registered but has no registered field layout, so it
     /// cannot be inspected or edited generically.
     ComponentHasNoFieldLayout {
@@ -208,6 +218,17 @@ impl std::fmt::Display for ComponentFieldError {
 
 impl std::error::Error for ComponentFieldError {}
 
+/// Whether a field's type tag names a heap-backed container.
+///
+/// `vec:<tag>` and `dynbuf:<tag>` describe a `(pointer, length, capacity)`
+/// header and `string` the same bytes with UTF-8 meaning; all three are
+/// decoded by following a pointer the row is expected to own. A dynamic row
+/// is raw bytes with no Rust value in it, so a layout claiming one of these
+/// tags on such a row promises a header that is not there.
+pub(crate) fn is_container_tag(type_tag: &str) -> bool {
+    type_tag == "string" || type_tag.starts_with("vec:") || type_tag.starts_with("dynbuf:")
+}
+
 impl ComponentFieldError {
     /// A short, stable diagnostic for console surfacing.
     pub(crate) fn summary(&self) -> String {
@@ -215,6 +236,9 @@ impl ComponentFieldError {
             Self::EntityNotFound => "entity is not alive".to_string(),
             Self::ComponentNotFound { component } => {
                 format!("component `{component}` is not on this entity")
+            }
+            Self::ComponentStorageMissing { component } => {
+                format!("component `{component}` has no storage column or row in the archetype")
             }
             Self::ComponentHasNoFieldLayout { component } => {
                 format!("component `{component}` has no registered field layout")
@@ -536,10 +560,14 @@ impl World {
                 field: field_name.to_string(),
             })?;
 
-        // Step 3: Copy the row and decode the single field.
+        // Step 3: Copy the row and decode the single field. A copy that comes
+        // back empty after both lookups succeeded is a storage desync, not a
+        // dead handle, so it reports the component by name.
         let row_bytes = self
             .copy_component_row_bytes(archetype_id, row, component_id)
-            .ok_or(ComponentFieldError::EntityNotFound)?;
+            .ok_or(ComponentFieldError::ComponentStorageMissing {
+                component: component_name.to_string(),
+            })?;
         Ok(decode_field(&row_bytes, descriptor))
     }
 
@@ -566,7 +594,9 @@ impl World {
         let layout = self.owned_field_layout(component_id, component_name)?;
         let row_bytes = self
             .copy_component_row_bytes(archetype_id, row, component_id)
-            .ok_or(ComponentFieldError::EntityNotFound)?;
+            .ok_or(ComponentFieldError::ComponentStorageMissing {
+                component: component_name.to_string(),
+            })?;
 
         // Step 3: Decode every field from the one row image.
         Ok(layout
@@ -724,10 +754,11 @@ impl World {
             archetype_id,
             row,
             component_id,
+            component_name,
             write.row_offset,
             &write.bytes,
         )?;
-        self.stamp_row_changed(archetype_id, row, component_id, current_tick)
+        self.stamp_row_changed(archetype_id, row, component_id, component_name, current_tick)
     }
 
     /// Build a zero-initialised component image for a registered type name,
@@ -846,16 +877,28 @@ impl World {
         // a between-frame edit must be visible to `Changed<T>` filters.
         let row_offset = descriptor.offset + index * element_size;
         let current_tick = self.increment_change_tick();
-        self.apply_row_write(archetype_id, row, component_id, row_offset, &bytes)?;
-        self.stamp_row_changed(archetype_id, row, component_id, current_tick)
+        self.apply_row_write(
+            archetype_id,
+            row,
+            component_id,
+            component_name,
+            row_offset,
+            &bytes,
+        )?;
+        self.stamp_row_changed(archetype_id, row, component_id, component_name, current_tick)
     }
 
     /// Overwrite `bytes.len()` bytes at `row_offset` of one component row.
+    ///
+    /// `component_name` only feeds the error paths: the caller resolved the
+    /// component through the entity, so a missing column or row here is a
+    /// storage desync and reports the component the caller named.
     fn apply_row_write(
         &mut self,
         archetype_id: ArchetypeId,
         row: usize,
         component_id: ComponentId,
+        component_name: &str,
         row_offset: usize,
         bytes: &[u8],
     ) -> Result<(), ComponentFieldError> {
@@ -868,14 +911,15 @@ impl World {
                 let element_size;
                 let destination;
                 {
-                    let column = archetype
-                        .component_storages
-                        .get_mut(component_id)
-                        .ok_or(ComponentFieldError::ComponentNotFound {
-                            component: String::new(),
-                        })?;
+                    let column = archetype.component_storages.get_mut(component_id).ok_or(
+                        ComponentFieldError::ComponentStorageMissing {
+                            component: component_name.to_string(),
+                        },
+                    )?;
                     if row >= column.len() {
-                        return Err(ComponentFieldError::EntityNotFound);
+                        return Err(ComponentFieldError::ComponentStorageMissing {
+                            component: component_name.to_string(),
+                        });
                     }
                     element_size = column.elem_size();
                     // SAFETY: `row < column.len()` was checked above, so the
@@ -884,12 +928,18 @@ impl World {
                     // statement.
                     destination = unsafe { column.as_mut_ptr().add(row * element_size) };
                 }
-                if row_offset + bytes.len() > element_size {
+                // Checked arithmetic on the way to the write: a wrapping sum
+                // would pass a caller-supplied offset near `usize::MAX` and
+                // let the copy below run off the row.
+                let Some(end) = row_offset
+                    .checked_add(bytes.len())
+                    .filter(|end| *end <= element_size)
+                else {
                     return Err(ComponentFieldError::UnsupportedField {
                         field: String::new(),
                         reason: "write extends past the component row",
                     });
-                }
+                };
                 // SAFETY: the destination row is initialized (`row < len`) and
                 // the payload fits within it (checked above); the column is not
                 // reallocated while this borrow is held.
@@ -897,7 +947,7 @@ impl World {
                     std::ptr::copy_nonoverlapping(
                         bytes.as_ptr(),
                         destination.add(row_offset),
-                        bytes.len(),
+                        end - row_offset,
                     );
                 }
                 Ok(())
@@ -913,30 +963,39 @@ impl World {
                     let column = archetype
                         .dynamic_component_storages
                         .get_mut(&component_id)
-                        .ok_or(ComponentFieldError::ComponentNotFound {
-                            component: String::new(),
+                        .ok_or(ComponentFieldError::ComponentStorageMissing {
+                            component: component_name.to_string(),
                         })?;
                     element_size = column.element_size();
                     if row >= column.len() {
-                        return Err(ComponentFieldError::EntityNotFound);
+                        return Err(ComponentFieldError::ComponentStorageMissing {
+                            component: component_name.to_string(),
+                        });
                     }
                     row_bytes = column
                         .bytes(row)
-                        .ok_or(ComponentFieldError::EntityNotFound)?
+                        .ok_or(ComponentFieldError::ComponentStorageMissing {
+                            component: component_name.to_string(),
+                        })?
                         .to_vec();
                 }
-                if row_offset + bytes.len() > element_size {
+                // The same checked arithmetic as the native branch: the row
+                // slice below would otherwise be ranged with a wrapped sum.
+                let Some(end) = row_offset
+                    .checked_add(bytes.len())
+                    .filter(|end| *end <= element_size)
+                else {
                     return Err(ComponentFieldError::UnsupportedField {
                         field: String::new(),
                         reason: "write extends past the component row",
                     });
-                }
-                let target = row_bytes
-                    .get_mut(row_offset..row_offset + bytes.len())
-                    .ok_or(ComponentFieldError::UnsupportedField {
+                };
+                let target = row_bytes.get_mut(row_offset..end).ok_or(
+                    ComponentFieldError::UnsupportedField {
                         field: String::new(),
                         reason: "write extends past the component row",
-                    })?;
+                    },
+                )?;
                 target.copy_from_slice(bytes);
                 let archetype = self
                     .archetypes
@@ -945,12 +1004,14 @@ impl World {
                 let column = archetype
                     .dynamic_component_storages
                     .get_mut(&component_id)
-                    .ok_or(ComponentFieldError::ComponentNotFound {
-                        component: String::new(),
+                    .ok_or(ComponentFieldError::ComponentStorageMissing {
+                        component: component_name.to_string(),
                     })?;
                 column
                     .set_bytes(row, &row_bytes)
-                    .map_err(|_| ComponentFieldError::EntityNotFound)
+                    .map_err(|_| ComponentFieldError::ComponentStorageMissing {
+                        component: component_name.to_string(),
+                    })
             }
         }
     }
@@ -961,6 +1022,7 @@ impl World {
         archetype_id: ArchetypeId,
         row: usize,
         component_id: ComponentId,
+        component_name: &str,
         tick: Tick,
     ) -> Result<(), ComponentFieldError> {
         let archetype = self
@@ -968,13 +1030,15 @@ impl World {
             .get_mut(&archetype_id)
             .ok_or(ComponentFieldError::EntityNotFound)?;
         let ticks = archetype.component_ticks.get_mut(&component_id).ok_or(
-            ComponentFieldError::ComponentNotFound {
-                component: String::new(),
+            ComponentFieldError::ComponentStorageMissing {
+                component: component_name.to_string(),
             },
         )?;
-        let row_ticks = ticks
-            .get_mut(row)
-            .ok_or(ComponentFieldError::EntityNotFound)?;
+        let row_ticks = ticks.get_mut(row).ok_or(
+            ComponentFieldError::ComponentStorageMissing {
+                component: component_name.to_string(),
+            },
+        )?;
         row_ticks.set_changed(tick);
         Ok(())
     }
@@ -1001,6 +1065,16 @@ mod tests {
     }
     impl Component for SampleComponent {}
     trait_type_map::impl_trait_accessible!(dyn Component; SampleComponent);
+
+    /// A second registered type the sample entity's archetype never carries,
+    /// used to drive the write path into its storage-missing arms.
+    #[repr(C)]
+    #[derive(Debug, Clone, PartialEq)]
+    struct OtherComponent {
+        value: u32,
+    }
+    impl Component for OtherComponent {}
+    trait_type_map::impl_trait_accessible!(dyn Component; OtherComponent);
 
     // A hand-rolled registration mirroring what #[derive(PillComponent)] emits.
     static SAMPLE_FIELDS: &[ComponentFieldDescriptor] = &[
@@ -1199,6 +1273,47 @@ mod tests {
             Err(ComponentFieldError::FieldNotFound {
                 component: name.to_string(),
                 field: "missing_field".to_string(),
+            })
+        );
+    }
+
+    /// A storage miss names the component instead of blaming the entity.
+    ///
+    /// The entry points resolve the component through a live entity, so a
+    /// column or row that is missing after that point is a registration
+    /// desync; `EntityNotFound` sent callers looking for a dead handle that is
+    /// right there.
+    #[test]
+    fn storage_missing_names_the_component() {
+        // The summary names the component and cannot be read as a dead handle.
+        let summary = ComponentFieldError::ComponentStorageMissing {
+            component: "demo::Settings".to_string(),
+        }
+        .summary();
+        assert!(summary.contains("demo::Settings"), "{summary}");
+        assert!(!summary.contains("entity"), "{summary}");
+
+        // And the write path reports it: the entity lives, but its archetype
+        // holds no column for the registered component it does not carry.
+        let mut world = test_world();
+        world.register_component::<OtherComponent>();
+        let entity = world
+            .create_entity()
+            .with(sample_value())
+            .build()
+            .expect("entity builds");
+        let (archetype_id, row) = world.entity_row_location(entity).expect("entity is live");
+        assert_eq!(
+            world.apply_row_write(
+                archetype_id,
+                row,
+                ComponentId::of::<OtherComponent>(),
+                "OtherComponent",
+                0,
+                &[0u8; 4],
+            ),
+            Err(ComponentFieldError::ComponentStorageMissing {
+                component: "OtherComponent".to_string(),
             })
         );
     }

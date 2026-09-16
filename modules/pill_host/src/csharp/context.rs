@@ -19,6 +19,7 @@ use std::collections::HashSet;
 
 // External crates
 use pill_core::error;
+use pill_engine::archetype::ArchetypeId;
 use pill_engine::commands::CommandQueue;
 use pill_engine::{Entity, World};
 
@@ -37,6 +38,13 @@ thread_local! {
     static ACTIVE_SCOPE: Cell<Option<ActiveScopeData>> = const { Cell::new(None) };
     /// Handles reserved during this invocation and not yet consumed by create.
     static ACTIVE_RESERVED: RefCell<HashSet<Entity>> = RefCell::new(HashSet::new());
+    /// Archetype ids served to managed code during this invocation.
+    ///
+    /// The entity path (`mode == 2` of the archetype chunk callback) answers
+    /// only for these: a managed term reaches an archetype through validated
+    /// component or entity access first, and without that precondition the
+    /// entity path would enumerate any component set the world holds.
+    static OBSERVED_ARCHETYPES: RefCell<HashSet<ArchetypeId>> = RefCell::new(HashSet::new());
 }
 
 // =============================================================================
@@ -127,6 +135,13 @@ impl ActiveSystemGuard {
                 reserved.clear();
             }
         });
+        // Every invocation starts with no archetype observed: the entity path
+        // answers for what THIS system reached through a validated term.
+        OBSERVED_ARCHETYPES.with(|slot| {
+            if let Ok(mut observed) = slot.try_borrow_mut() {
+                observed.clear();
+            }
+        });
 
         // Step 3: Commit the whole scope in one assignment. Cell::set cannot
         // panic, so from this point on the guard's Drop owns the teardown.
@@ -163,6 +178,11 @@ impl Drop for ActiveSystemGuard {
                             world.release_entity(entity);
                         }
                     }
+                }
+            });
+            OBSERVED_ARCHETYPES.with(|observed_slot| {
+                if let Ok(mut observed) = observed_slot.try_borrow_mut() {
+                    observed.clear();
                 }
             });
             scope_slot.set(None);
@@ -234,6 +254,38 @@ pub(super) fn with_active_context<R>(
         // SAFETY: ActiveSystemGuard installs and clears the complete scope
         // for exactly the managed invocation.
         Some(unsafe { f(&mut *scope.world, &*scope.bindings) })
+    })
+}
+
+/// Record that an archetype was served to managed code through a validated
+/// term during the active invocation.
+///
+/// Called by the chunk callbacks on every successful component or entity
+/// lookup; the entity path then serves this archetype's entity column later in
+/// the same invocation.
+pub(super) fn record_observed_archetype(archetype: ArchetypeId) {
+    OBSERVED_ARCHETYPES.with(|slot| {
+        if let Ok(mut observed) = slot.try_borrow_mut() {
+            observed.insert(archetype);
+        }
+    });
+}
+
+/// Whether a validated term has already served this archetype in the active
+/// invocation.
+///
+/// `None` means no managed system is active on this thread, matching
+/// [`access_is_authorized`]'s answer for the same condition.
+pub(super) fn archetype_was_observed(archetype: ArchetypeId) -> Option<bool> {
+    ACTIVE_SCOPE.with(|slot| {
+        slot.get()?;
+        OBSERVED_ARCHETYPES.with(|observed| {
+            Some(
+                observed
+                    .try_borrow()
+                    .is_ok_and(|observed| observed.contains(&archetype)),
+            )
+        })
     })
 }
 

@@ -1,5 +1,3 @@
-//! Complete standalone application runner owned by the host crate.
-//!
 //! The non-rendering build drives frames in a tight headless loop.
 //! The rendering build owns `winit`, creates the native window,
 //! asks host setup to attach the engine renderer,

@@ -33,7 +33,7 @@ use crate::config::ParallelProcessingConfig;
 use crate::error::{SystemError, SystemFailure};
 use crate::scheduler::{SystemAccess, SystemScheduler};
 use crate::system::{IntoSystem, System, SystemParam};
-use crate::world::{set_per_thread_last_run_tick, World};
+use crate::world::{set_per_thread_last_run_tick, set_per_thread_this_run_tick, World};
 
 // =============================================================================
 // RegisteredSystem
@@ -284,9 +284,7 @@ impl Engine {
 
         // Engine-owned systems, registered before any project or module runs.
         // Attributed to `SystemOwner::ENGINE`, which no reload retires.
-        engine.register_ecs_diagnostics_system(Some(
-            crate::diagnostics::DEFAULT_REPORT_INTERVAL,
-        ));
+        engine.register_ecs_diagnostics_system(Some(crate::diagnostics::DEFAULT_REPORT_INTERVAL));
         engine
     }
 }
@@ -376,7 +374,10 @@ impl Engine {
                     // due, so a stalled frame does not leave a backlog that
                     // prints several reports in a row to catch up.
                     next_report = Some(elapsed + interval);
-                    println!("{}", crate::diagnostics::EcsSnapshot::gather(world).render());
+                    println!(
+                        "{}",
+                        crate::diagnostics::EcsSnapshot::gather(world).render()
+                    );
                     Ok(())
                 },
             );
@@ -1221,6 +1222,17 @@ impl Engine {
                     .map(|&system_index| self.systems[system_index].last_run)
                     .collect();
 
+                // Reserve one tick per batch member on this thread, before any
+                // pointer is handed out: this is the last point where
+                // `&mut self.world` is legitimately held, and it is what keeps
+                // the workers from read-modify-writing the shared counter.
+                // Disabled members reserve too, so indices stay aligned with
+                // `systems_batch`.
+                let this_runs: Vec<u32> = systems_batch
+                    .iter()
+                    .map(|_| self.world.increment_change_tick().get())
+                    .collect();
+
                 // - Prepare raw pointers for parallel access -
                 //
                 // Rust's borrow checker prevents us from passing `&mut self.world`,
@@ -1295,6 +1307,8 @@ impl Engine {
 
                     let previous_override =
                         set_per_thread_last_run_tick(Some(Tick::new(last_runs[i])));
+                    let previous_this_run =
+                        set_per_thread_this_run_tick(Some(Tick::new(this_runs[i])));
 
                     // SAFETY: The scheduler proved that the systems in this
                     // batch access disjoint components and resources, so no two
@@ -1335,6 +1349,7 @@ impl Engine {
                         registered_system.last_duration = elapsed;
                     }
 
+                    set_per_thread_this_run_tick(previous_this_run);
                     set_per_thread_last_run_tick(previous_override);
                 });
 
@@ -1469,6 +1484,56 @@ mod tests {
         assert!(failures
             .iter()
             .any(|failure| failure.system == "second_failure"));
+    }
+
+    /// Every parallel batch member gets exactly one reserved tick: queries
+    /// inside one system see the same tick however often they ask, and two
+    /// systems in one batch never share one - which is what keeps the shared
+    /// counter out of the workers' hands.
+    #[test]
+    fn parallel_batch_systems_receive_one_tick_each() {
+        let observed: Arc<std::sync::Mutex<Vec<[u32; 2]>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let mut engine = Engine::new();
+        for name in ["tick_first", "tick_second"] {
+            let observed = Arc::clone(&observed);
+            // SAFETY: both systems declare no component or resource access at
+            // all, so the scheduler batches them together and they touch
+            // nothing but the tick counter.
+            unsafe {
+                engine.register_system_with_access(
+                    name,
+                    SystemAccess::new(),
+                    move |world: &mut World, _queue: &mut CommandQueue| {
+                        let first = world.increment_change_tick().get();
+                        let second = world.increment_change_tick().get();
+                        observed
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .push([first, second]);
+                        Ok(())
+                    },
+                );
+            }
+        }
+
+        engine.process_frame().unwrap();
+
+        let observed = observed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(observed.len(), 2, "both systems ran");
+        for ticks in observed.iter() {
+            assert_eq!(
+                ticks[0], ticks[1],
+                "one system's run carries one tick, however many queries ask for it"
+            );
+        }
+        assert_ne!(
+            observed[0][0], observed[1][0],
+            "each batch member reserves its own tick"
+        );
     }
 
     /// Clearing one module's systems leaves every other owner's systems

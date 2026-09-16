@@ -115,6 +115,23 @@ pub enum StaticProjectBackend {
     },
 }
 
+impl StaticProjectBackend {
+    /// Whether this backend loads a managed assembly that needs component
+    /// bindings.
+    ///
+    /// A predicate rather than an enum match at the call site: both managed
+    /// postures load an assembly, and the exhaustive match that used to sit in
+    /// [`StaticProject::initialize`] silently handed the AOT one an empty
+    /// binding list - module components had no byte-level bindings in a
+    /// shipping build while the same project worked everywhere else.
+    pub(crate) fn loads_managed_code(&self) -> bool {
+        matches!(
+            self,
+            StaticProjectBackend::CSharp { .. } | StaticProjectBackend::CSharpAot { .. }
+        )
+    }
+}
+
 /// A project and its optional modules, compiled into the host binary.
 ///
 /// Replaces [`HostConfig`](crate::HostConfig) for a shipping build. There is no
@@ -167,7 +184,7 @@ impl StaticProject {
         // component the modules registered, so the names have to be collected
         // as each module initializes rather than reconstructed afterwards.
         let mut exposed_names: Vec<String> = Vec::new();
-        let wants_bindings = matches!(self.backend, StaticProjectBackend::CSharp { .. });
+        let wants_bindings = self.backend.loads_managed_code();
 
         for (index, module) in self.modules.iter().enumerate() {
             // The same helper `runtime::setup` uses, so a module gets the
@@ -324,6 +341,29 @@ fn initialize_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every backend that loads a managed assembly collects module bindings;
+    /// the NativeAOT posture needs them exactly as the hostfxr one does.
+    #[test]
+    fn managed_backends_collect_module_bindings() {
+        let config = CSharpModuleConfig::new("csharp_runtime", "runtime", "project_cs", "project");
+        let csharp = StaticProjectBackend::CSharp {
+            config: config.clone(),
+            root: PathBuf::from("."),
+        };
+        let aot = StaticProjectBackend::CSharpAot {
+            config,
+            root: PathBuf::from("."),
+        };
+        let native = StaticProjectBackend::Native { init: no_op };
+
+        assert!(csharp.loads_managed_code());
+        assert!(
+            aot.loads_managed_code(),
+            "the AOT posture loads a managed assembly too"
+        );
+        assert!(!native.loads_managed_code());
+    }
 
     /// A module that registers nothing, for shape assertions.
     fn no_op(_engine: &mut Engine) -> u32 {

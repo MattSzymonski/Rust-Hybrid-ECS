@@ -41,4 +41,13 @@ default = []
 # `#[no_mangle]` symbol names into one binary is a linker error; the standalone
 # build the host hot-loads passes `--features module-abi` so it stays
 # discoverable.
-module-abi = []
+#
+# It implies `test-hooks` because the hot-reload and C# bridge suites drive
+# loadable module builds through this feature and assert the demo math (the
+# mirrored `get_sum` value, the moving sampled midpoint). A statically linked
+# shipping build passes neither feature and computes only the documented math.
+module-abi = ["test-hooks"]
+# Gates the demo observables the integration suites edit: the sampled height
+# offset, the mirrored sum shift and the hot-patchable colour offset. Off by
+# default, so a shipping crate carries no scaffolding to explain away.
+test-hooks = []

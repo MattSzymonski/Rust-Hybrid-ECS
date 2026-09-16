@@ -170,16 +170,16 @@ impl EcsSnapshot {
                 }
                 // Row bytes, not capacity: what the stored rows actually
                 // occupy, so the total tracks entities rather than allocation.
-                let (stride, rows, dynamic) =
-                    if let Some(column) = archetype.component_storages.get(component_id) {
-                        (column.elem_size(), column.len(), false)
-                    } else if let Some(column) =
-                        archetype.dynamic_component_storages.get(&component_id)
-                    {
-                        (column.element_size(), column.len(), true)
-                    } else {
-                        (0, 0, false)
-                    };
+                let (stride, rows, dynamic) = if let Some(column) =
+                    archetype.component_storages.get(component_id)
+                {
+                    (column.elem_size(), column.len(), false)
+                } else if let Some(column) = archetype.dynamic_component_storages.get(&component_id)
+                {
+                    (column.element_size(), column.len(), true)
+                } else {
+                    (0, 0, false)
+                };
                 total_bytes += stride * rows;
                 columns.push(ColumnReport {
                     bit: registry.get_bit(&component_id),
@@ -345,10 +345,18 @@ impl EcsSnapshot {
                         "  archetype 0x{:x} · {} {} · {} in {} column{}",
                         archetype.id,
                         archetype.entities,
-                        if archetype.entities == 1 { "entity" } else { "entities" },
+                        if archetype.entities == 1 {
+                            "entity"
+                        } else {
+                            "entities"
+                        },
                         format_bytes(archetype.total_bytes),
                         archetype.columns.len(),
-                        if archetype.columns.len() == 1 { "" } else { "s" },
+                        if archetype.columns.len() == 1 {
+                            ""
+                        } else {
+                            "s"
+                        },
                     ),
                 );
                 for column in &archetype.columns {
@@ -585,7 +593,7 @@ mod tests {
 
         // Dropping the shared resource takes its claim with it, so the section
         // disappears rather than naming a name the world no longer holds.
-        world.remove_resource::<SharedSettings>();
+        let _ = world.remove_resource::<SharedSettings>();
         assert!(EcsSnapshot::gather(&world).shared_resources.is_empty());
     }
 }

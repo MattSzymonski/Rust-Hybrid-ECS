@@ -48,6 +48,21 @@ internal struct CommandOnlyComponent { public uint Value; }
 [StructLayout(LayoutKind.Sequential)]
 internal struct InvalidBoolComponent { public bool Value; }
 
+/// A deliberately padded sequential layout: the CLR inserts padding before `B`
+/// and before `D`, which is exactly what a mis-ordered walk reports wrongly.
+[StructLayout(LayoutKind.Sequential)]
+internal struct PaddedProbe { public byte A; public long B; public short C; public int D; }
+
+/// An explicit layout that declares no size. The CLR sizes it at 68 bytes; a
+/// sequential walk would answer 4.
+[StructLayout(LayoutKind.Explicit)]
+internal struct ExplicitWithoutSizeProbe { [FieldOffset(64)] public int A; }
+
+/// A component carrying the size-less explicit probe, so the manifest path has
+/// something real to refuse.
+[StructLayout(LayoutKind.Sequential)]
+internal struct ExplicitMemberComponent { public ExplicitWithoutSizeProbe Probe; }
+
 internal static class TestSystems
 {
     internal static bool WasRun;
@@ -93,6 +108,8 @@ internal static class TestSystems
     public static void Unsupported(string value) { }
 
     public static void InvalidLayout(Query<Read<InvalidBoolComponent>> query) { }
+
+    public static void ExplicitLayoutMember(Query<Read<ExplicitMemberComponent>> query) { }
 
     public static void CommandsOnly(Commands commands) { }
 
@@ -167,7 +184,13 @@ internal static unsafe class MockNativeWorld
     internal static int QueuedDestroys;
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
-    internal static uint EntityCount() => Length;
+    internal static byte EntityCount(uint* output)
+    {
+        if (output is null)
+            return 5;
+        *output = Length;
+        return 0;
+    }
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     internal static byte GetComponentChunk(
@@ -189,7 +212,7 @@ internal static unsafe class MockNativeWorld
             return 0;
         if (mode == 2)
         {
-            *output = Chunk(Entities, null, sizeof(Entity));
+            *output = EntityChunk(Entities);
             return 1;
         }
         if (!TryResolveChunk(key, keyHigh, mode, out var chunk))
@@ -231,7 +254,7 @@ internal static unsafe class MockNativeWorld
     {
         if (index != 0)
             return 0;
-        *output = Chunk(Entities, null, sizeof(Entity));
+        *output = EntityChunk(Entities);
         return 1;
     }
 
@@ -281,13 +304,51 @@ internal static unsafe class MockNativeWorld
         QueueRemoveComponent = &QueueRemoveComponent,
         MirrorMethodCount = &MirrorMethodCount,
         CopyMirrorMethods = &CopyMirrorMethods,
+        MirrorEpoch = &MirrorEpoch,
     };
 
-    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
-    internal static uint MirrorMethodCount() => 0;
+    /// <summary>
+    /// The epoch the host would bump when it republishes its mirror-method
+    /// table; a test bumps it to simulate a rebind.
+    /// </summary>
+    internal static uint MirrorEpochValue;
+
+    /// <summary>The rows <see cref="CopyMirrorMethods"/> serves.</summary>
+    internal static MirrorMethodEntry[] MirroredRows = [];
+
+    /// <summary>Managed shape of the `(row, out data, out length)` trampoline.</summary>
+    internal delegate byte ViewDelegate(IntPtr row, out IntPtr data, out IntPtr length);
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
-    internal static uint CopyMirrorMethods(MirrorMethodEntry* entries, uint max) => 0;
+    internal static uint MirrorMethodCount() => (uint)MirroredRows.Length;
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static uint CopyMirrorMethods(MirrorMethodEntry* entries, uint max)
+    {
+        uint written = 0;
+        foreach (MirrorMethodEntry row in MirroredRows)
+        {
+            if (written >= max)
+                break;
+            entries[written] = row;
+            written++;
+        }
+        return written;
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    internal static uint MirrorEpoch() => MirrorEpochValue;
+
+    /// <summary>Publish one mirrored method and bump the epoch, as the host does.</summary>
+    internal static void PublishMirrorRow(string typeName, string method, IntPtr address)
+    {
+        MirrorMethodEntry row = default;
+        row.TypeName = Marshal.StringToHGlobalAnsi(typeName);
+        row.Method = Marshal.StringToHGlobalAnsi(method);
+        row.Address = address;
+        MirroredRows = [row];
+        MirrorEpochValue++;
+    }
 
     internal static void ResetCommands()
     {
@@ -361,6 +422,22 @@ internal static unsafe class MockNativeWorld
             Ticks = (IntPtr)ticks,
             ChangeTick = ChangeTick,
         };
+
+    /// <summary>
+    /// Entity column chunk: the native ABI hands entity rows out through the
+    /// const <c>Entities</c> slot and leaves the writable <c>Data</c> slot
+    /// null, so the mock reproduces exactly that shape.
+    /// </summary>
+    private static NativeComponentChunk EntityChunk(void* data) => new()
+    {
+        ArchetypeLow = 7,
+        ArchetypeHigh = 11,
+        Entities = (IntPtr)data,
+        Length = Length,
+        ElementSize = checked((uint)sizeof(Entity)),
+        Ticks = IntPtr.Zero,
+        ChangeTick = ChangeTick,
+    };
 }
 
 // =============================================================================
@@ -631,18 +708,57 @@ internal static class Program
                     "Sprite.Color offset mismatch");
             });
 
+            Test("padded sequential layouts agree with Marshal", () =>
+            {
+                // Pins the order of the align-vs-test steps: `B` follows a byte
+                // field, so its offset exists only after the alignment step has
+                // run for `B` itself.
+                Equal(Marshal.SizeOf<PaddedProbe>(), 24, "the CLR sizes PaddedProbe at 24");
+                Equal(NativeLayout.SizeOf(typeof(PaddedProbe)), Marshal.SizeOf<PaddedProbe>(),
+                    "NativeLayout.SizeOf must agree with Marshal");
+                foreach (string field in new[] { nameof(PaddedProbe.A), nameof(PaddedProbe.B),
+                                                 nameof(PaddedProbe.C), nameof(PaddedProbe.D) })
+                {
+                    Equal(Marshal.OffsetOf<PaddedProbe>(field).ToInt32(),
+                        NativeLayout.FieldOffset(typeof(PaddedProbe), field),
+                        $"PaddedProbe.{field} offset must agree with Marshal");
+                }
+            });
+
+            Test("explicit layouts answer offsets from their attributes and refuse a missing size", () =>
+            {
+                Equal(Marshal.SizeOf<ExplicitWithoutSizeProbe>(), 68,
+                    "the CLR sizes the size-less explicit probe at 68");
+                Equal(NativeLayout.FieldOffset(typeof(ExplicitWithoutSizeProbe),
+                        nameof(ExplicitWithoutSizeProbe.A)), 64,
+                    "an explicit field's offset comes from its FieldOffset attribute");
+                // The size, by contrast, is unknowable without the declared
+                // stride - answering 4 is the corruption this refuses. The
+                // refusal fires at term creation, before anything registers,
+                // and the nested-member case reaches it through the same walk.
+                Throws<InvalidOperationException>(
+                    () => NativeLayout.SizeOf(typeof(ExplicitWithoutSizeProbe)),
+                    "an explicit layout with no declared size cannot be measured");
+                Throws<InvalidOperationException>(
+                    () => ProjectHost.CreateSystem(
+                        Method(nameof(TestSystems.ExplicitLayoutMember))),
+                    "a query term over a size-less explicit component must be refused");
+            });
+
             Test("native change tracking ABI layout is stable", () =>
             {
                 Equal(Marshal.SizeOf<NativeComponentTicks>(), 8,
                     "NativeComponentTicks size mismatch");
                 Equal(Marshal.OffsetOf<NativeComponentTicks>(nameof(NativeComponentTicks.Changed))
                     .ToInt32(), 4, "NativeComponentTicks.Changed offset mismatch");
-                Equal(Marshal.SizeOf<NativeComponentChunk>(), 48,
+                Equal(Marshal.SizeOf<NativeComponentChunk>(), 56,
                     "NativeComponentChunk size mismatch");
+                Equal(Marshal.OffsetOf<NativeComponentChunk>(nameof(NativeComponentChunk.Entities))
+                    .ToInt32(), 24, "NativeComponentChunk.Entities offset mismatch");
                 Equal(Marshal.OffsetOf<NativeComponentChunk>(nameof(NativeComponentChunk.Ticks))
-                    .ToInt32(), 32, "NativeComponentChunk.Ticks offset mismatch");
+                    .ToInt32(), 40, "NativeComponentChunk.Ticks offset mismatch");
                 Equal(Marshal.OffsetOf<NativeComponentChunk>(nameof(NativeComponentChunk.ChangeTick))
-                    .ToInt32(), 40, "NativeComponentChunk.ChangeTick offset mismatch");
+                    .ToInt32(), 48, "NativeComponentChunk.ChangeTick offset mismatch");
             });
 
             Test("single-term query reports one write", () =>
@@ -1127,6 +1243,84 @@ internal static class Program
                 var runSystem = (delegate* unmanaged<uint, byte>)&LoaderInterop.RunSystem;
                 Equal(runSystem(99), 0,
                     "invalid managed system index reported success");
+            });
+
+            Test("Resolve rebinds after the host republishes the table", () =>
+            {
+                MockNativeWorld.MirroredRows = [];
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+
+                // Step 1: the host publishes one trampoline and resolves it.
+                IntPtr first = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, IntPtr*, IntPtr*, byte>)
+                    &MockNativeWorld.AccessorView;
+                MockNativeWorld.PublishMirrorRow("TracyLive.Probe", "entries_view", first);
+                MockNativeWorld.ViewDelegate resolved =
+                    MirrorMethods.Resolve<MockNativeWorld.ViewDelegate>(
+                        "TracyLive.Probe", "entries_view");
+                resolved((IntPtr)32, out IntPtr firstData, out IntPtr firstLength);
+                Equal(firstData, (IntPtr)64, "the first trampoline's data");
+                Equal(firstLength, (IntPtr)5, "the first trampoline's length");
+
+                // Step 2: the host republishes with a fresh address and bumps
+                // its epoch. The cached delegate belongs to the previous bind,
+                // so the next resolve has to reach the new trampoline without
+                // waiting for an assembly swap.
+                IntPtr second = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, IntPtr*, IntPtr*, byte>)
+                    &MockNativeWorld.AccessorViewSecond;
+                MockNativeWorld.PublishMirrorRow("TracyLive.Probe", "entries_view", second);
+                resolved = MirrorMethods.Resolve<MockNativeWorld.ViewDelegate>(
+                    "TracyLive.Probe", "entries_view");
+                resolved((IntPtr)32, out IntPtr secondData, out IntPtr secondLength);
+                Equal(secondData, (IntPtr)48, "the republished trampoline's data");
+                Equal(secondLength, (IntPtr)9, "the republished trampoline's length");
+            });
+
+            Test("concurrent Resolve keeps the cache consistent", () =>
+            {
+                // A bound host with a stable epoch: the staleness check must
+                // not wipe the table while the threads churn it.
+                MockNativeWorld.MirroredRows = [];
+                EngineApi api = MockNativeWorld.Api();
+                Engine.Bind(&api);
+
+                IntPtr address = (IntPtr)(delegate* unmanaged[Cdecl]<IntPtr, IntPtr*, IntPtr*, byte>)
+                    &MockNativeWorld.AccessorView;
+                MirrorMethods.Reset();
+                MirrorMethods.Register("TracyLive.Probe", "entries_view", address);
+
+                Exception? failure = null;
+                Thread[] threads = new Thread[8];
+                for (int index = 0; index < threads.Length; index++)
+                {
+                    threads[index] = new Thread(() =>
+                    {
+                        try
+                        {
+                            for (int iteration = 0; iteration < 2_000; iteration++)
+                            {
+                                MockNativeWorld.ViewDelegate resolved =
+                                    MirrorMethods.Resolve<MockNativeWorld.ViewDelegate>(
+                                        "TracyLive.Probe", "entries_view");
+                                if (resolved is null)
+                                    throw new InvalidOperationException("resolve returned null");
+                                // Re-register periodically so the address table
+                                // churns while other threads read and insert.
+                                if ((iteration & 0xFF) == 0)
+                                    MirrorMethods.Register("TracyLive.Probe", "entries_view", address);
+                            }
+                        }
+                        catch (Exception error)
+                        {
+                            failure = error;
+                        }
+                    });
+                    threads[index].Start();
+                }
+                foreach (Thread thread in threads)
+                    thread.Join();
+                if (failure is not null)
+                    throw new InvalidOperationException($"concurrent resolve failed: {failure}");
             });
 
             Test("accessor addresses resolve and re-resolve across a host rebind", () =>

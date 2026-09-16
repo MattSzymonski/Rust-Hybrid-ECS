@@ -24,16 +24,16 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use pill_core::error::{CSharpError, EngineMessage};
 use pill_core::info;
 use pill_core::telemetry::telemetry_target;
-use pill_engine::archetype::{ArchetypeId, DynamicFieldPlan, LayoutField};
+use pill_engine::archetype::{ArchetypeId, Blittability, DynamicFieldPlan, LayoutField};
 // The native binding path is windowed-only (its components come from the
 // renderer), so these three are unused in a headless build.
 #[cfg(feature = "rendering")]
 use pill_engine::commands::boxed_component_adder;
 use pill_engine::commands::ComponentAdder;
 use pill_engine::component_registry::ComponentFieldDescriptor;
-use pill_engine::{ComponentId, Engine, World};
 #[cfg(feature = "rendering")]
 use pill_engine::Component;
+use pill_engine::{ComponentId, Engine, World};
 use serde::Deserialize;
 #[cfg(feature = "rendering")]
 use trait_type_map::TraitAccessible;
@@ -297,6 +297,7 @@ fn get_component_chunk<T: Component + TraitAccessible<dyn Component>>(
             archetype_low: bits as u64,
             archetype_high: (bits >> 64) as u64,
             data: slice.as_mut_ptr().cast(),
+            entities: std::ptr::null(),
             len: slice.len() as u32,
             element_size: std::mem::size_of::<T>() as u32,
             ticks: ticks.as_mut_ptr(),
@@ -334,6 +335,7 @@ fn get_component_chunk_in_archetype<T: Component + TraitAccessible<dyn Component
             archetype_low: bits as u64,
             archetype_high: (bits >> 64) as u64,
             data: slice.as_mut_ptr().cast(),
+            entities: std::ptr::null(),
             len: slice.len() as u32,
             element_size: std::mem::size_of::<T>() as u32,
             ticks: ticks.as_mut_ptr(),
@@ -551,12 +553,33 @@ pub(super) fn module_native_bindings(
             },
         );
     }
-    // Validate that every exposed component is still registered in the live
-    // engine; an unknown id would surface only later as an empty column.
+    // Validate every binding against the live column before it is handed out.
+    // An id that is gone yields no binding, and one whose registered layout
+    // disagrees with the facts the module forwarded would surface later as a
+    // wrong-size chunk served to managed code - which is why a mismatch is
+    // logged and dropped here instead.
     bindings.retain(|_, binding| match binding {
-        ComponentBinding::ModuleNative { component_id, .. } => {
-            engine.world().component_layout(*component_id).is_some()
-        }
+        ComponentBinding::ModuleNative {
+            component_id,
+            size,
+            align,
+            ..
+        } => match engine.world().component_layout(*component_id) {
+            Some((live_size, live_align)) if live_size == *size && live_align == *align => true,
+            Some((live_size, live_align)) => {
+                pill_core::error!(
+                    target: telemetry_target::ECS,
+                    component_id = ?component_id,
+                    forwarded_size = *size,
+                    forwarded_align = *align,
+                    live_size,
+                    live_align,
+                    "module component binding disagrees with the live column; dropping it"
+                );
+                false
+            }
+            None => false,
+        },
         _ => true,
     });
     bindings
@@ -742,10 +765,6 @@ pub(super) fn register_component_manifest(
     for component in parse_and_validate_manifest(bytes)? {
         let stable_id =
             StableComponentId::from_halves(component.stable_id_low, component.stable_id_high);
-        // Compute the editor layout up front: the manifest name is moved into
-        // `register_dynamic_component` below, and the borrow must end first.
-        let field_layout = managed_field_layout(&component.full_name, &component.fields);
-        let component_name = component.full_name.clone();
 
         if let Some(binding) = bindings.get(&stable_id).copied() {
             check_binding_against_manifest(binding, &component)?;
@@ -760,6 +779,13 @@ pub(super) fn register_component_manifest(
             )
             .into());
         }
+        // The editor layout is computed here, not at the top of the loop: it
+        // leaks every field name and struct tag, and entries that already had
+        // a binding - or a manifest just refused as shared - must not leak
+        // anything. Both reads happen before the name moves into
+        // `register_dynamic_component` below.
+        let component_name = component.full_name.clone();
+        let field_layout = managed_field_layout(&component.full_name, &component.fields);
         let id = engine
             .world_mut()
             .register_dynamic_component(
@@ -768,6 +794,10 @@ pub(super) fn register_component_manifest(
                 component.size,
                 component.alignment,
                 component.schema_hash,
+                // `parse_and_validate_manifest` ran `BLITTABLE_FIELD_TYPES`
+                // over every field before this point, so the witness is the
+                // record of a check rather than a restatement of the promise.
+                Blittability::from_manifest_fields(),
             )
             .map_err(|error| CSharpError::ManifestInvalid {
                 message: error.to_plain_message(),
@@ -781,6 +811,16 @@ pub(super) fn register_component_manifest(
                 schema_hash: component.schema_hash,
             },
         );
+        // The binding and the registered column are two records of one layout,
+        // and two records can drift. Asserted where both are written, so a
+        // future path that relayouts the column without the store fails in
+        // debug builds at its source; the chunk path itself serves the live
+        // column, so it cannot mis-stride no matter what the store says.
+        debug_assert_eq!(
+            engine.world().component_layout(id),
+            Some((component.size, component.alignment)),
+            "the column just registered must match the binding just stored"
+        );
 
         // Slice G: give the editor the same field vocabulary `#[derive(PillComponent)]`
         // produces, so a C# component shows named, editable fields instead of
@@ -793,7 +833,10 @@ pub(super) fn register_component_manifest(
         );
         engine
             .world_mut()
-            .register_dynamic_component_field_layout(id, field_layout);
+            .register_dynamic_component_field_layout(id, field_layout)
+            .map_err(|error| CSharpError::ManifestInvalid {
+                message: error.to_string(),
+            })?;
     }
     Ok(bindings)
 }
@@ -804,9 +847,7 @@ pub(super) fn register_component_manifest(
 /// exactly what the startup path validates. Every check here is a property of
 /// the manifest alone - identity, uniqueness, and the shape of each layout - so
 /// both callers can run it before either touches the world.
-fn parse_and_validate_manifest(
-    bytes: &[u8],
-) -> Result<Vec<ManagedComponentManifest>, CSharpError> {
+fn parse_and_validate_manifest(bytes: &[u8]) -> Result<Vec<ManagedComponentManifest>, CSharpError> {
     // Step 1: Parse and validate every entry against canonical identities.
     let manifest: Vec<ManagedComponentManifest> = serde_json::from_slice(bytes)?;
     let mut seen = HashSet::new();
@@ -871,7 +912,16 @@ fn check_binding_against_manifest(
             schema_hash,
             ..
         } => (size, align, Some(schema_hash)),
-        ComponentBinding::ModuleNative { size, align, .. } => (size, align, None),
+        ComponentBinding::ModuleNative { size, align, .. } => {
+            // No schema hash to compare: the managed manifest's hash is an FNV
+            // over a C#-only schema text (managed type names, nested-struct
+            // recursion) that the engine's flat field descriptors cannot
+            // reproduce, so a hash invented here would refuse healthy mirrors.
+            // The mirror is regenerated from the module's own descriptors on
+            // every reload, and `module_native_bindings` validates the binding
+            // against the live column before it is handed out.
+            (size, align, None)
+        }
     };
     if size != component.size || align != component.alignment {
         return Err(format!(
@@ -915,8 +965,12 @@ pub(super) struct ManifestApplyReport {
 ///   storage retired (a byte-storage analogue of `drop_forgotten_components`,
 ///   planned as slice 3b).
 ///
-/// The whole manifest is validated before any of it is applied, so a refusal
-/// leaves the world and the bindings as they were.
+/// The whole manifest is planned before any of it is applied: every entry is
+/// resolved to a no-op, a check, an addition or a migration first, so the
+/// refusals validation cannot foresee - a shared entry with no binding, an
+/// engine registration or relayout error - leave the world and the bindings as
+/// they were. Residual failures during application are unwound from a journal,
+/// so "as they were" holds for every exit and not only the planned ones.
 ///
 /// # Errors
 ///
@@ -955,20 +1009,97 @@ pub(super) fn apply_component_manifest_on_reload(
         });
     }
 
-    // Step 2: Apply each entry.
+    // Step 2: Resolve every entry before the first mutation. The borrowed
+    // reads below (`store`, `engine`) are read-only, so a refusal here leaves
+    // both untouched.
+    let planned = plan_manifest(engine, store, manifest)?;
+
+    // Step 3: Execute the plan, journalling one undo per applied entry. A
+    // refusal the plan could not see - the engine rejecting a registration, a
+    // relayout meeting a column that drifted beneath it - unwinds the journal
+    // in reverse before the error is returned.
+    let mut undos: Vec<ManifestUndo> = Vec::with_capacity(planned.len());
     let mut report = ManifestApplyReport::default();
+    for entry in planned {
+        match apply_planned_entry(engine, store, entry, &mut report) {
+            Ok(Some(undo)) => undos.push(undo),
+            Ok(None) => {}
+            Err(error) => {
+                rollback_manifest_apply(engine, store, undos);
+                return Err(error);
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// One manifest entry with everything the engine and the store can tell us
+/// resolved up front.
+///
+/// The apply phase executes these in order and re-decides nothing, which is
+/// what keeps the refusals out of the mutated state; what still goes wrong at
+/// apply time is handled by the undo journal.
+enum PlannedManifestEntry {
+    /// The binding table already agrees with the manifest.
+    Settled,
+    /// A dynamic component the manifest adds.
+    Add {
+        stable_id: StableComponentId,
+        component: ManagedComponentManifest,
+    },
+    /// A dynamic component whose layout changed and whose rows must migrate.
+    Migrate {
+        stable_id: StableComponentId,
+        component: ManagedComponentManifest,
+        component_id: ComponentId,
+        plan: DynamicFieldPlan,
+        previous_binding: ComponentBinding,
+        previous_fields: Vec<ComponentFieldDescriptor>,
+    },
+}
+
+/// One applied entry, recorded so a later refusal can be undone.
+enum ManifestUndo {
+    /// The entry registered a dynamic component.
+    Added {
+        stable_id: StableComponentId,
+        component_id: ComponentId,
+    },
+    /// The entry migrated a dynamic component to a new shape.
+    Migrated {
+        stable_id: StableComponentId,
+        component_id: ComponentId,
+        previous_binding: ComponentBinding,
+        previous_fields: Vec<ComponentFieldDescriptor>,
+    },
+}
+
+/// Resolve every manifest entry against the store and the engine.
+///
+/// The one refusal that lives here rather than in validation is the shared
+/// entry with no native binding; `register_manifest_entry` repeats it as a
+/// defensive check, but planning means it is raised before anything moves.
+fn plan_manifest(
+    engine: &Engine,
+    store: &BindingStore,
+    manifest: Vec<ManagedComponentManifest>,
+) -> Result<Vec<PlannedManifestEntry>, CSharpError> {
+    let mut planned = Vec::with_capacity(manifest.len());
     for component in manifest {
         let stable_id =
             StableComponentId::from_halves(component.stable_id_low, component.stable_id_high);
         let Some(binding) = store.read().get(&stable_id).copied() else {
-            let added_name = component.full_name.clone();
-            register_manifest_entry(engine, store, stable_id, component)?;
-            info!(
-                target: telemetry_target::HOT_RELOAD,
-                component = %added_name,
-                "managed component registered on reload"
-            );
-            report.added.push(added_name);
+            if component.shared {
+                return Err(format!(
+                    "managed shared component {} has no native engine binding",
+                    component.full_name
+                )
+                .into());
+            }
+            planned.push(PlannedManifestEntry::Add {
+                stable_id,
+                component,
+            });
             continue;
         };
 
@@ -980,6 +1111,7 @@ pub(super) fn apply_component_manifest_on_reload(
         } = binding
         else {
             check_binding_against_manifest(binding, &component)?;
+            planned.push(PlannedManifestEntry::Settled);
             continue;
         };
 
@@ -988,44 +1120,243 @@ pub(super) fn apply_component_manifest_on_reload(
             && align == component.alignment
             && schema_hash == component.schema_hash
         {
+            planned.push(PlannedManifestEntry::Settled);
             continue;
         }
 
         let plan = build_field_plan(engine, component_id, &component.fields);
-        let migrated_rows = engine
-            .world_mut()
-            .relayout_dynamic_component(
-                component_id,
-                component.size,
-                component.alignment,
-                component.schema_hash,
-                &plan,
-            )
-            .map_err(|error| CSharpError::ManifestInvalid {
-                message: error.to_plain_message(),
-            })?;
-        store.write().insert(
+        // The fields are captured as owned data here so the inverse plan needs
+        // no engine borrow later, when the world is being mutated again.
+        let previous_fields = engine
+            .world()
+            .component_field_layout(component_id)
+            .unwrap_or(&[])
+            .to_vec();
+        planned.push(PlannedManifestEntry::Migrate {
             stable_id,
-            ComponentBinding::Dynamic {
-                component_id,
-                size: component.size,
-                align: component.alignment,
-                schema_hash: component.schema_hash,
-            },
-        );
-        engine.world_mut().register_dynamic_component_field_layout(
+            component,
             component_id,
-            managed_field_layout(&component.full_name, &component.fields),
-        );
-        info!(
-            target: telemetry_target::HOT_RELOAD,
-            component = %component.full_name,
-            rows = migrated_rows,
-            "managed component layout migrated"
-        );
-        report.migrated.push(component.full_name);
+            plan,
+            previous_binding: binding,
+            previous_fields,
+        });
     }
-    Ok(report)
+    Ok(planned)
+}
+
+/// Execute one planned entry, reporting what it changed.
+///
+/// Returns the undo it journalled, if any: `Settled` entries change nothing
+/// and need none.
+fn apply_planned_entry(
+    engine: &mut Engine,
+    store: &BindingStore,
+    entry: PlannedManifestEntry,
+    report: &mut ManifestApplyReport,
+) -> Result<Option<ManifestUndo>, CSharpError> {
+    match entry {
+        PlannedManifestEntry::Settled => Ok(None),
+        PlannedManifestEntry::Add {
+            stable_id,
+            component,
+        } => {
+            let added_name = component.full_name.clone();
+            register_manifest_entry(engine, store, stable_id, component)?;
+            // The undo needs the id the registration minted, and the store
+            // entry just written is the only place that knows it.
+            let Some(component_id) = store
+                .read()
+                .get(&stable_id)
+                .map(|binding| binding.component_id())
+            else {
+                return Err(CSharpError::ManifestInvalid {
+                    message: format!(
+                        "component {added_name} was registered but the binding table has no entry for it"
+                    ),
+                });
+            };
+            info!(
+                target: telemetry_target::HOT_RELOAD,
+                component = %added_name,
+                "managed component registered on reload"
+            );
+            report.added.push(added_name);
+            Ok(Some(ManifestUndo::Added {
+                stable_id,
+                component_id,
+            }))
+        }
+        PlannedManifestEntry::Migrate {
+            stable_id,
+            component,
+            component_id,
+            plan,
+            previous_binding,
+            previous_fields,
+        } => {
+            let migrated_rows = engine
+                .world_mut()
+                .relayout_dynamic_component(
+                    component_id,
+                    component.size,
+                    component.alignment,
+                    component.schema_hash,
+                    &plan,
+                )
+                .map_err(|error| CSharpError::ManifestInvalid {
+                    message: error.to_plain_message(),
+                })?;
+            store.write().insert(
+                stable_id,
+                ComponentBinding::Dynamic {
+                    component_id,
+                    size: component.size,
+                    align: component.alignment,
+                    schema_hash: component.schema_hash,
+                },
+            );
+            engine
+                .world_mut()
+                .register_dynamic_component_field_layout(
+                    component_id,
+                    managed_field_layout(&component.full_name, &component.fields),
+                )
+                .map_err(|error| CSharpError::ManifestInvalid {
+                    message: error.to_string(),
+                })?;
+            info!(
+                target: telemetry_target::HOT_RELOAD,
+                component = %component.full_name,
+                rows = migrated_rows,
+                "managed component layout migrated"
+            );
+            report.migrated.push(component.full_name);
+            Ok(Some(ManifestUndo::Migrated {
+                stable_id,
+                component_id,
+                previous_binding,
+                previous_fields,
+            }))
+        }
+    }
+}
+
+/// Undo every applied entry, newest first.
+///
+/// Best effort by design: a rollback that fails leaves the process mixed, so
+/// the failure is logged with the component it concerns rather than raised
+/// over the original refusal, which is the error the caller needs.
+fn rollback_manifest_apply(engine: &mut Engine, store: &BindingStore, undos: Vec<ManifestUndo>) {
+    for undo in undos.into_iter().rev() {
+        match undo {
+            ManifestUndo::Added {
+                stable_id,
+                component_id,
+            } => {
+                store.write().remove(&stable_id);
+                // `drop_forgotten_component_ids` removes the rows and every
+                // registration artifact of the id, which is exactly what an
+                // added-then-refused component has to give back.
+                let dropped = engine
+                    .world_mut()
+                    .drop_forgotten_component_ids(&[component_id]);
+                info!(
+                    target: telemetry_target::HOT_RELOAD,
+                    dropped,
+                    "rolled back a managed component registered by a refused manifest"
+                );
+            }
+            ManifestUndo::Migrated {
+                stable_id,
+                component_id,
+                previous_binding,
+                previous_fields,
+            } => {
+                let ComponentBinding::Dynamic {
+                    size,
+                    align,
+                    schema_hash,
+                    ..
+                } = previous_binding
+                else {
+                    // Only dynamic bindings are ever journalled as migrated.
+                    continue;
+                };
+                let plan = rollback_field_plan(engine, component_id, &previous_fields);
+                match engine.world_mut().relayout_dynamic_component(
+                    component_id,
+                    size,
+                    align,
+                    schema_hash,
+                    &plan,
+                ) {
+                    Ok(restored_rows) => {
+                        store.write().insert(stable_id, previous_binding);
+                        if let Err(error) = engine
+                            .world_mut()
+                            .register_dynamic_component_field_layout(component_id, previous_fields)
+                        {
+                            // The rows are back but the editor's vocabulary
+                            // is not; name the component and keep unwinding.
+                            pill_core::error!(
+                                target: telemetry_target::HOT_RELOAD,
+                                component_id = ?component_id,
+                                error = %error,
+                                "could not restore the component's field layout during rollback"
+                            );
+                        }
+                        info!(
+                            target: telemetry_target::HOT_RELOAD,
+                            rows = restored_rows,
+                            "rolled back a managed component layout migration"
+                        );
+                    }
+                    Err(error) => {
+                        // The rows could not be put back; name the component
+                        // so the mixed state is diagnosable rather than silent.
+                        pill_core::error!(
+                            target: telemetry_target::HOT_RELOAD,
+                            component_id = ?component_id,
+                            error = %error.to_plain_message(),
+                            "could not undo a manifest layout migration"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Build the plan that puts a component back to a recorded field layout.
+///
+/// The inverse of [`build_field_plan`] for the rollback path: the engine's
+/// current layout is the source, and the descriptors captured before the
+/// migration are the destination.
+fn rollback_field_plan(
+    engine: &Engine,
+    component_id: ComponentId,
+    previous_fields: &[ComponentFieldDescriptor],
+) -> DynamicFieldPlan {
+    let current: Vec<LayoutField<'_>> = engine
+        .world()
+        .component_field_layout(component_id)
+        .unwrap_or(&[])
+        .iter()
+        .map(|field| LayoutField {
+            name: field.name,
+            offset: field.offset,
+            size: field.size,
+        })
+        .collect();
+    let target: Vec<LayoutField<'_>> = previous_fields
+        .iter()
+        .map(|field| LayoutField {
+            name: field.name,
+            offset: field.offset,
+            size: field.size,
+        })
+        .collect();
+    DynamicFieldPlan::between(&current, &target)
 }
 
 /// Register one manifest entry that the bindings table has no entry for.
@@ -1055,6 +1386,9 @@ fn register_manifest_entry(
             component.size,
             component.alignment,
             component.schema_hash,
+            // The entry was parsed by `parse_and_validate_manifest`, whose
+            // `BLITTABLE_FIELD_TYPES` check is what earns this witness.
+            Blittability::from_manifest_fields(),
         )
         .map_err(|error| CSharpError::ManifestInvalid {
             message: error.to_plain_message(),
@@ -1070,7 +1404,10 @@ fn register_manifest_entry(
     );
     engine
         .world_mut()
-        .register_dynamic_component_field_layout(id, field_layout);
+        .register_dynamic_component_field_layout(id, field_layout)
+        .map_err(|error| CSharpError::ManifestInvalid {
+            message: error.to_string(),
+        })?;
     Ok(())
 }
 

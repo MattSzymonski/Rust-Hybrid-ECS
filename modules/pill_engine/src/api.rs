@@ -93,6 +93,15 @@ pub type ReserveEntitiesFn = unsafe extern "C" fn(engine: *mut c_void, capacity:
 /// fatal.
 pub const MAX_ENTITIES_PER_RESERVE: u64 = 1 << 24;
 
+/// Status returned by the two raw-registration entry points, which the v1 ABI
+/// advertises but the engine does not implement.
+///
+/// A caller can branch on this value instead of reading a bare failure as any
+/// other error. The two slots stay in the table on purpose: taking them out
+/// would shift every later `repr(C)` function pointer for artifacts already
+/// built against v1.
+pub const API_NOT_IMPLEMENTED: i32 = -2;
+
 // =============================================================================
 // EngineApi
 // =============================================================================
@@ -128,7 +137,11 @@ pub const MAX_ENTITIES_PER_RESERVE: u64 = 1 << 24;
 ///
 /// ```c
 /// void project_init(const EngineApi* api) {
-///     api->register_component(api->engine_handle, "Position", 8, 4);
+///     // Raw registration is not implemented in ABI v1: it validates its
+///     // arguments and returns API_NOT_IMPLEMENTED (-2).
+///     if (api->register_component(api->engine_handle, "Position", 8, 4) < 0) {
+///         /* fall back to the constructors the module ships */
+///     }
 ///     api->set_fps_limit(api->engine_handle, 60.0);
 /// }
 /// ```
@@ -146,6 +159,9 @@ pub struct EngineApi {
     /// **Rust consumers**: prefer `engine.world_mut().register_component::<T>()`
     /// via the `engine_handle` cast instead — it is type-safe and automatic.
     /// This function pointer exists for non-Rust language bindings.
+    ///
+    /// Not implemented in ABI v1: the wrapper validates its arguments and
+    /// returns [`API_NOT_IMPLEMENTED`].
     pub register_component: ComponentRegisterFn,
 
     // --- System Registration (raw) ---
@@ -157,6 +173,9 @@ pub struct EngineApi {
     ///
     /// The registered function receives the engine handle and must use the
     /// [`EngineApi`] function pointers for all world interaction.
+    ///
+    /// Not implemented in ABI v1: the wrapper validates its arguments and
+    /// returns [`API_NOT_IMPLEMENTED`].
     pub register_system_raw: SystemRegisterRawFn,
 
     // --- Frame Processing ---
@@ -292,16 +311,19 @@ unsafe extern "C" fn api_register_component(
             .to_str()
             .unwrap_or("(invalid utf-8)")
     };
-    // Step 3: Report the unimplemented operation and fail the call.
-    eprintln!(
-        "[engine_api] register_component_raw is not yet implemented. \
-         Tried to register '{}' ({} bytes, align {}). \
-         Use the typed Rust API instead.",
-        name_str, _size_in_bytes, _alignment_in_bytes,
-    );
+    // Step 3: Report the unimplemented operation and fail the call with the
+    // documented status. The note is debug-only: a released host may run with
+    // a redirected console, and the status is what a caller can act on.
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "[engine_api] register_component_raw is not yet implemented. \
+             Tried to register '{}' ({} bytes, align {}). \
+             Use the typed Rust API instead.",
+            name_str, _size_in_bytes, _alignment_in_bytes,
+        );
+    }
 
-    // Return error for now — raw registration needs engine-side support.
-    -1
+    API_NOT_IMPLEMENTED
 }
 
 /// C-callable wrapper for raw system registration.
@@ -332,17 +354,20 @@ unsafe extern "C" fn api_register_system_raw(
             .unwrap_or("(invalid utf-8)")
     };
 
-    // Step 3: Report the unimplemented operation and fail the call.
-    eprintln!(
-        "[engine_api] register_system_raw is not yet implemented. \
-         Tried to register system '{}'. \
-         Use the typed Rust API instead.",
-        name_str,
-    );
+    // Step 3: Report the unimplemented operation and fail the call with the
+    // documented status. The note is debug-only: a released host may run with
+    // a redirected console, and the status is what a caller can act on.
+    if cfg!(debug_assertions) {
+        eprintln!(
+            "[engine_api] register_system_raw is not yet implemented. \
+             Tried to register system '{}'. \
+             Use the typed Rust API instead.",
+            name_str,
+        );
+    }
 
     let _ = _system_function;
-    // Return error for now — raw system registration needs engine-side support.
-    -1
+    API_NOT_IMPLEMENTED
 }
 
 /// C-callable wrapper around `Engine::process_frame`.
@@ -538,6 +563,40 @@ mod abi_guard_tests {
         assert_eq!(
             status, -1,
             "a request beyond MAX_ENTITIES_PER_RESERVE must be refused"
+        );
+    }
+
+    /// The two raw-registration stubs answer with the documented status
+    /// instead of a bare failure, so a binding can branch on "not
+    /// implemented" without reading the console.
+    #[test]
+    fn raw_registration_entry_points_report_not_implemented() {
+        /// A function pointer the stub never invokes.
+        unsafe extern "C" fn does_nothing(_engine: *mut c_void) {}
+
+        let mut engine = Engine::new();
+        let api = EngineApi::new(&mut engine);
+        let name = std::ffi::CString::new("position").expect("no NUL byte");
+        let handle = api.engine_handle;
+
+        // SAFETY: the handle addresses a live engine, the name outlives the
+        // calls, and the system function pointer is never invoked.
+        unsafe {
+            assert_eq!(
+                (api.register_component)(handle, name.as_ptr(), 8, 4),
+                API_NOT_IMPLEMENTED,
+                "raw component registration reports the documented status"
+            );
+            assert_eq!(
+                (api.register_system_raw)(handle, name.as_ptr(), does_nothing),
+                API_NOT_IMPLEMENTED,
+                "raw system registration reports the documented status"
+            );
+        }
+        assert_eq!(
+            engine.world().entity_count(),
+            0,
+            "a refused registration must change nothing"
         );
     }
 

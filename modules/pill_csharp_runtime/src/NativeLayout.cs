@@ -9,15 +9,18 @@
 // JIT path, because the component manifest is the contract the native host
 // registers.
 //
-// Layout rules implemented (matching .NET sequential unmanaged layout for the
-// component shapes this runtime accepts):
+// Layout rules implemented (matching .NET unmanaged layout for the component
+// shapes this runtime accepts):
 // - a `[StructLayout(Size = N)]` value is authoritative (generated mirrors);
+// - an explicit layout's field offsets come from `[FieldOffset]`, which is the
+//   only honest source for them, and its size must be declared;
 // - primitive fields and enums use their natural size/alignment;
 // - nested value types recurse;
-// - a struct's size is its fields' aligned sum, padded to its alignment
-//   (the maximum field alignment).
+// - a sequential struct's size is its fields' aligned sum, padded to its
+//   alignment (the maximum field alignment).
 
 using System.Reflection;
+using System.Runtime.InteropServices;
 
 namespace TracyLive.Loader;
 
@@ -76,6 +79,14 @@ internal static class NativeLayout
         int? declaredSize = type.StructLayoutAttribute?.Size;
         if (declaredSize is > 0)
             return declaredSize.Value;
+        // An explicit layout without a declared size is not something the walk
+        // below can answer: it would report the sequential sum, which for
+        // `[FieldOffset(64)] int A` is 4 bytes against the CLR's 68. Refusing
+        // is the only honest answer, and the type's owner knows it should have
+        // carried `Size =`.
+        if (type.IsExplicitLayout)
+            throw new InvalidOperationException(
+                $"explicit-layout type {type.FullName} declares no StructLayout Size");
         if (type.IsPrimitive || type.IsEnum)
             return PrimitiveSize(type);
         int offset = 0;
@@ -109,13 +120,39 @@ internal static class NativeLayout
     /// <summary>Byte offset of one instance field within its declaring struct.</summary>
     internal static int FieldOffset(Type type, string fieldName)
     {
+        // Explicit layouts carry their offsets as attributes; the sequential
+        // walk below would report declaration order and silently disagree with
+        // them, so the two shapes answer from their own source.
+        if (type.IsExplicitLayout)
+            return ExplicitFieldOffset(type, fieldName);
+
+        // Align first, then test the name: a field's offset exists only after
+        // the padding the CLR inserts for it, and testing before aligning is
+        // what made a padded struct report the previous field's end.
         int offset = 0;
         foreach (FieldInfo field in Fields(type))
         {
+            offset = AlignUp(offset, AlignmentOf(field.FieldType));
             if (field.Name == fieldName)
                 return offset;
-            offset = AlignUp(offset, AlignmentOf(field.FieldType));
             offset += SizeOf(field.FieldType);
+        }
+        throw new InvalidOperationException(
+            $"field {type.FullName}.{fieldName} does not exist");
+    }
+
+    /// <summary>Offset of one field of an explicit-layout type, from its attribute.</summary>
+    private static int ExplicitFieldOffset(Type type, string fieldName)
+    {
+        foreach (FieldInfo field in Fields(type))
+        {
+            if (field.Name != fieldName)
+                continue;
+            FieldOffsetAttribute? attribute = field.GetCustomAttribute<FieldOffsetAttribute>();
+            if (attribute is null)
+                throw new InvalidOperationException(
+                    $"explicit-layout field {type.FullName}.{fieldName} declares no FieldOffset");
+            return attribute.Value;
         }
         throw new InvalidOperationException(
             $"field {type.FullName}.{fieldName} does not exist");

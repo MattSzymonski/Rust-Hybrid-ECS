@@ -139,6 +139,32 @@ pub enum WorldError {
         archetype_id: ArchetypeId,
     },
 
+    /// A dynamic column's element size disagrees with the registered layout the
+    /// migration plan was validated against.
+    ///
+    /// Signals that a column and the storage factory describing it have drifted
+    /// apart, which a partially applied relayout used to produce.
+    #[message(
+        "dynamic component ",
+        debug_value(component_id),
+        " in archetype ",
+        debug_value(archetype_id),
+        " has ",
+        debug_value(actual),
+        " byte elements; the registered layout declares ",
+        debug_value(expected)
+    )]
+    DynamicColumnLayoutMismatch {
+        /// The component whose column disagrees.
+        component_id: ComponentId,
+        /// The archetype owning the column.
+        archetype_id: ArchetypeId,
+        /// The size the registered layout declares.
+        expected: usize,
+        /// The size the column's elements are stored at.
+        actual: usize,
+    },
+
     /// A foreign resource declaration carries no name to be identified by.
     #[message("a foreign resource must declare a name")]
     ForeignResourceNameEmpty,
@@ -169,6 +195,18 @@ pub enum WorldError {
     #[message("resource ", debug_value(id), " is not a registered shared resource")]
     SharedResourceNotRegistered {
         /// The resource that was asked for.
+        id: ResourceId,
+    },
+
+    /// The id's registered table belongs to a Rust type, so foreign bytes
+    /// cannot be stored under it.
+    #[message(
+        "resource ",
+        debug_value(id),
+        " is registered by a Rust type; foreign bytes cannot replace its value"
+    )]
+    ForeignResourceFactoryIsNative {
+        /// The resource the payload was offered to.
         id: ResourceId,
     },
 
@@ -212,6 +250,71 @@ pub enum WorldError {
         id: ResourceId,
     },
 
+    /// A shared id holds a value of another shape, so removing it as `T` is
+    /// refused instead of destroying what is there.
+    ///
+    /// A shared id is derived from a written-down name, which lets a Rust type
+    /// that never registered reach another language's slot. The box's own
+    /// identity check is what refuses the take; the value, its ticks, its
+    /// factory and its claim are left in place, so the caller learns why
+    /// instead of losing the resource on the way to `None`.
+    #[message(
+        "shared resource ",
+        debug_value(id),
+        " does not hold a ",
+        value(requested_type),
+        "; a shared id is name-derived, so the removal is refused rather than destroying another type's value"
+    )]
+    SharedResourceHoldsAnotherType {
+        /// The shared id the removal targeted.
+        id: ResourceId,
+        /// The Rust type the removal asked for.
+        requested_type: &'static str,
+    },
+
+    /// Two different shared resource names hash to one identity.
+    ///
+    /// The id of a shared resource is a 128-bit hash of its name, and a hash
+    /// collision would make one slot answer to two names - each declaration
+    /// silently joining the other's resource. The recorded string is the
+    /// evidence the id cannot carry, so it is compared on every claim.
+    #[message(
+        "shared resource names ",
+        name_style(shared_name),
+        " and ",
+        name_style(existing_name),
+        " hash to one identity; rename one of them"
+    )]
+    SharedResourceIdentityCollision {
+        /// The name claiming the id now.
+        shared_name: String,
+        /// The name that already claimed it.
+        existing_name: String,
+    },
+
+    /// One shared resource name, two different field shapes.
+    ///
+    /// Size and alignment cannot tell `{u32, u32}` from `{f32, f32}`; when both
+    /// declarations carry a schema hash, the shapes can be compared and a
+    /// reinterpretation becomes a refusal instead of a silent misread.
+    #[message(
+        "shared resource ",
+        name_style(shared_name),
+        " is declared with two different field shapes (existing hash ",
+        value(existing_hash),
+        ", incoming hash ",
+        value(incoming_hash),
+        "); rebuild every artifact that links it against one definition"
+    )]
+    SharedResourceSchemaMismatch {
+        /// The shared name both registrations declared.
+        shared_name: String,
+        /// Schema hash recorded by the registration that got there first.
+        existing_hash: u64,
+        /// Schema hash of the type being registered now.
+        incoming_hash: u64,
+    },
+
     /// Two live registrations claim the same component type name under
     /// different [`ComponentId`]s.
     ///
@@ -235,7 +338,7 @@ pub enum WorldError {
         value(live_rows),
         " live rows, and ",
         debug_value(incoming_id),
-        " is registering now); declare it `#[pill(shared)]` so both          registrations bind to one column"
+        " is registering now); declare it `#[pill(shared)]` so both registrations bind to one column"
     )]
     ComponentNameCollision {
         /// The type name both registrations claim.
@@ -246,6 +349,45 @@ pub enum WorldError {
         incoming_id: ComponentId,
         /// How many rows the existing column still holds.
         live_rows: usize,
+    },
+
+    /// A persistable component was re-registered by a superseding generation
+    /// with a layout the previous generation's column cannot host.
+    ///
+    /// The migration rebuilds the old column after reading the rows the
+    /// incoming generation spawned into it through the incoming type, in
+    /// slots spaced for the old layout. A wider alignment - or a stride that
+    /// is not a multiple of it - makes those reads misaligned, which aborts
+    /// debug hosts and is undefined behaviour in release, so the registration
+    /// is refused and the host rolls the reload back instead.
+    ///
+    /// A size change that keeps the alignment is not refused: the old
+    /// column's slots stay validly aligned for the incoming type, and the
+    /// add-a-field reloads depend on that shape migrating.
+    #[message(
+        "component ",
+        name_style(type_name),
+        " was re-registered with a different size or alignment (existing: ",
+        value(existing_size),
+        " bytes / ",
+        value(existing_align),
+        " align; incoming: ",
+        value(incoming_size),
+        " bytes / ",
+        value(incoming_align),
+        " align); keeping the running generation"
+    )]
+    ComponentLayoutChanged {
+        /// The type name both registrations claim.
+        type_name: String,
+        /// Size of the layout the existing column was built for.
+        existing_size: usize,
+        /// Alignment of that layout.
+        existing_align: usize,
+        /// Size of the type being registered now.
+        incoming_size: usize,
+        /// Alignment of the type being registered now.
+        incoming_align: usize,
     },
 
     /// Two different Rust types claim the same shared resource name.
@@ -425,6 +567,26 @@ pub enum WorldError {
     },
 }
 
+/// The refusal logged when two live registrations claim one component type
+/// name.
+///
+/// One source of truth for the sentence the host prints: the
+/// [`WorldError::ComponentNameCollision`] record and the log line beside it
+/// both point at this constant, so a second guard site cannot drift into its
+/// own wording - or its own source-wrap spaces.
+pub(crate) const COMPONENT_NAME_COLLISION_REFUSAL: &str =
+    "two live registrations claim one component type name; refusing to evict the peer's persist entries";
+
+/// The refusal logged when a reloading generation re-registers a persistable
+/// component with a layout the previous generation's column cannot host.
+///
+/// One source of truth for the sentence the host prints and the migration
+/// suite greps for, following [`COMPONENT_NAME_COLLISION_REFUSAL`]: the
+/// [`WorldError::ComponentLayoutChanged`] record and the log line beside it
+/// both point here.
+pub(crate) const COMPONENT_LAYOUT_CHANGED_REFUSAL: &str =
+    "was re-registered with a different size or alignment; keeping the running generation";
+
 // =============================================================================
 // Command Errors
 // =============================================================================
@@ -463,6 +625,24 @@ pub enum CommandError {
         component_id: ComponentId,
     },
 
+    /// The queued creation listed one component id more than once.
+    ///
+    /// The id set defines the archetype's columns, so a duplicate would push
+    /// two rows for one entity row - or panic inside the archetype insert when
+    /// it found the id already present. Both are refused here, before the
+    /// entity row exists, so a rejected command leaves no partial entity.
+    #[message(
+        "entity ",
+        debug_value(entity),
+        " was asked to carry component ",
+        debug_value(component_id),
+        " twice"
+    )]
+    DuplicateComponent {
+        entity: Entity,
+        component_id: ComponentId,
+    },
+
     /// The entity already possesses the component being added.
     #[message(
         "entity ",
@@ -483,6 +663,25 @@ pub enum CommandError {
         debug_value(component_id)
     )]
     ComponentNotFound {
+        entity: Entity,
+        component_id: ComponentId,
+    },
+
+    /// A queued migration cannot copy a component it has to carry across.
+    ///
+    /// `forget_component_type` purges a forgotten type's copier while
+    /// archetypes can still list the id, so a migration can meet a component
+    /// whose rows it cannot copy. Reported rather than skipped: skipping it
+    /// moved the entity and its tick rows while leaving the destination short
+    /// a component row, and the mismatch surfaced later as a stale column.
+    #[message(
+        "entity ",
+        debug_value(entity),
+        " cannot migrate component ",
+        debug_value(component_id),
+        ": its copier is no longer registered"
+    )]
+    MissingComponentCopier {
         entity: Entity,
         component_id: ComponentId,
     },

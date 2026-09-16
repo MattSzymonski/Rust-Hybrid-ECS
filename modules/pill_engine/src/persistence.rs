@@ -51,7 +51,10 @@ use trait_type_map::{ErasedVecStorage, TraitAccessible};
 use crate::archetype::ComponentColumns;
 use crate::component::{Component, ComponentId};
 use crate::entity::Entity;
-use crate::error::{PersistenceError, WorldError};
+use crate::error::{
+    PersistenceError, WorldError, COMPONENT_LAYOUT_CHANGED_REFUSAL,
+    COMPONENT_NAME_COLLISION_REFUSAL,
+};
 use crate::world::World;
 
 // =============================================================================
@@ -206,37 +209,23 @@ impl World {
             + Default
             + 'static,
     {
-        // Step 1: Perform the standard component registration (bit index,
-        // storage factory, copier), carrying the field layout so the registry
-        // can check a repeat registration against the first one.
-        self.register_component_inner::<T>(fields);
-
         let component_id = ComponentId::of::<T>();
         // The persist maps are keyed by name and resolved against the name the
         // registry recorded, so both must use the same one: a shared
-        // component's declared name, an ordinary component's Rust path.
+        // component's declared name, an ordinary component's Rust path. Both
+        // of these answer before any registration exists, which is what lets
+        // the collision guard run first.
         let type_name = crate::component::ComponentRegistry::registered_name::<T>();
+        // Whether a predecessor was announced as superseded is consumed by the
+        // collision guard below, so the layout guard remembers it first.
+        let superseding = self.superseded_persist_names.contains(&type_name);
 
-        // Step 2: Purge stale persist entries left over from previous
-        // registrations of the same type name.  This handles the case where
-        // a component struct is changed and then changed back — the compiler
-        // may assign the same TypeId, but old entries from intermediate
-        // shapes still pollute the persist maps.
-        //
-        // Eviction is what makes name resolution unambiguous later, so it must
-        // only ever remove a *superseded* generation. A same-name entry whose
-        // column still holds rows is not superseded - it is a concurrent peer,
-        // registered by another binary that linked the same component type and
-        // therefore got its own `TypeId` for it. Evicting that entry would drop
-        // its inserter, and every row it owns would be silently discarded at
-        // the next reload, so the collision is reported instead.
-        let stale_ids: Vec<ComponentId> = self
-            .component_registry
-            .registered_components()
-            .filter(|(_, _, name)| *name == type_name)
-            .map(|(id, _, _)| id)
-            .filter(|id| *id != component_id)
-            .collect();
+        // Step 1: Refuse a name collision before the registration happens.
+        // This guard used to run *after* `register_component_inner`, which its
+        // `return` then left half-applied: a fresh bit, a name entry, a
+        // storage factory pointing into the image about to be discarded and a
+        // registration-log entry all survived, so the name resolved to two
+        // ids and every retry consumed one bit toward the 128-type ceiling.
         if let Some((existing_id, live_rows)) =
             self.live_component_with_name(&type_name, component_id)
         {
@@ -256,11 +245,84 @@ impl World {
                     target: pill_core::telemetry::telemetry_target::ECS,
                     type_name = %type_name,
                     live_rows,
-                    "two live registrations claim one component type name;                  refusing to evict the peer's persist entries"
+                    message = COMPONENT_NAME_COLLISION_REFUSAL
                 );
                 return;
             }
         }
+
+        // Step 1b: Refuse a layout the predecessor's columns cannot host.
+        //
+        // Migration reads the rows the incoming generation spawned into the
+        // old column through the incoming type, in slots `existing.size`
+        // bytes apart inside a buffer sized and aligned for the old layout.
+        // Every slot address must therefore stay validly aligned for the
+        // incoming type: its alignment may not exceed the buffer's, and the
+        // old stride must be a multiple of it. A size change that keeps the
+        // alignment - adding an `f32` field, the shape the add-a-field
+        // reloads use - is still migratable and passes; widening a field to
+        // `f64` is not, and letting it through aborts debug hosts in the
+        // migration.
+        //
+        // Every same-name registration is checked rather than one: older
+        // generations can still be listed under the name, and the migration
+        // picks the predecessor by name, so any column that cannot host the
+        // incoming rows is a reason to refuse.
+        if superseding {
+            let incoming_size = std::mem::size_of::<T>();
+            let incoming_align = std::mem::align_of::<T>();
+            for existing_id in self.component_ids_with_name(&type_name) {
+                if let Some(existing_layout) = self.component_registry.get_layout(&existing_id) {
+                    if incoming_align > existing_layout.align
+                        || existing_layout.size % incoming_align != 0
+                    {
+                        self.record_registration_error(WorldError::ComponentLayoutChanged {
+                            type_name: type_name.clone(),
+                            existing_size: existing_layout.size,
+                            existing_align: existing_layout.align,
+                            incoming_size,
+                            incoming_align,
+                        });
+                        error!(
+                            target: pill_core::telemetry::telemetry_target::ECS,
+                            type_name = %type_name,
+                            existing_size = existing_layout.size,
+                            existing_align = existing_layout.align,
+                            incoming_size,
+                            incoming_align,
+                            message = COMPONENT_LAYOUT_CHANGED_REFUSAL
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
+        // Step 2: Perform the standard component registration (bit index,
+        // storage factory, copier), carrying the field layout so the registry
+        // can check a repeat registration against the first one.
+        self.register_component_inner::<T>(fields);
+
+        // Step 3: Purge stale persist entries left over from previous
+        // registrations of the same type name.  This handles the case where
+        // a component struct is changed and then changed back — the compiler
+        // may assign the same TypeId, but old entries from intermediate
+        // shapes still pollute the persist maps.
+        //
+        // Eviction is what makes name resolution unambiguous later, so it must
+        // only ever remove a *superseded* generation. A same-name entry whose
+        // column still holds rows is not superseded - it is a concurrent peer,
+        // registered by another binary that linked the same component type and
+        // therefore got its own `TypeId` for it. Evicting that entry would drop
+        // its inserter, and every row it owns would be silently discarded at
+        // the next reload, so the collision is reported instead.
+        let stale_ids: Vec<ComponentId> = self
+            .component_registry
+            .registered_components()
+            .filter(|(_, _, name)| *name == type_name)
+            .map(|(id, _, _)| id)
+            .filter(|id| *id != component_id)
+            .collect();
         for stale_id in &stale_ids {
             self.persist_serializers.remove(stale_id);
             self.persist_inserters.remove(stale_id);
@@ -269,7 +331,7 @@ impl World {
         // re-inserted below with the new function.
         self.persist_deserializers.remove(&type_name);
 
-        // Step 3: Store the fresh monomorphized serialize, deserialize, and
+        // Step 4: Store the fresh monomorphized serialize, deserialize, and
         // insert function pointers plus the schema hash for the new shape.
         self.persist_serializers.insert(
             component_id,
@@ -740,8 +802,22 @@ impl World {
     pub fn registered_component_names_since(&self, sequence: u64) -> Vec<String> {
         self.component_registration_log
             .iter()
-            .filter(|(_, registration_sequence)| *registration_sequence >= sequence)
-            .map(|(type_name, _)| type_name.clone())
+            .filter(|(_, _, registration_sequence)| *registration_sequence >= sequence)
+            .map(|(type_name, _, _)| type_name.clone())
+            .collect()
+    }
+
+    /// Ids of all component types registered after `sequence`.
+    ///
+    /// The id-level twin of [`Self::registered_component_names_since`]: a
+    /// rebuilt image gets a fresh `TypeId` for every name it declares, so a
+    /// failed generation's entries can be told apart from a rollback
+    /// generation's re-registration of the same names only by id.
+    pub fn registered_component_ids_since(&self, sequence: u64) -> Vec<ComponentId> {
+        self.component_registration_log
+            .iter()
+            .filter(|(_, _, registration_sequence)| *registration_sequence >= sequence)
+            .map(|(_, component_id, _)| *component_id)
             .collect()
     }
 
@@ -754,18 +830,80 @@ impl World {
     /// from every entity frees its columns now, while the generation that last
     /// registered the type is still mapped, so the drop can never call into an
     /// evicted DLL. Returns the number of entities whose data was removed.
+    ///
+    /// Every native id sharing the name loses its rows, not just the one a
+    /// name resolver returns: an ambiguous name resolves to nothing at all, and
+    /// a superseded generation's rows would otherwise outlive the registration
+    /// purge that `forget_component_type` then performs for all of them.
     pub fn drop_forgotten_components(&mut self, type_names: &[String]) -> usize {
         let mut dropped_entities = 0;
         for type_name in type_names {
-            let Some(component_id) = self.resolve_component_id_by_name_logged(type_name) else {
-                continue;
-            };
             // Native columns only; type-erased foreign-language columns are
             // not part of the native forgotten-type path. Shared components
-            // are native, so they are covered here.
+            // are native, so they are covered here. A name none of whose ids
+            // is native is left alone entirely, including its name-keyed
+            // entries: it belongs to a live peer, not to a forgotten type.
+            let native_ids: Vec<ComponentId> = self
+                .component_registry
+                .registered_components()
+                .filter(|(_, _, name)| *name == type_name)
+                .map(|(component_id, _, _)| component_id)
+                .filter(|component_id| component_id.is_native_storage())
+                .collect();
+            if native_ids.is_empty() {
+                continue;
+            }
+
+            for component_id in native_ids {
+                // Collect the entities carrying this component up front so the
+                // mutable borrows during removal never overlap the iteration.
+                let entities: Vec<Entity> = self
+                    .entity_locations
+                    .iter()
+                    .filter(|(_, location)| {
+                        self.archetypes
+                            .get(&location.archetype_id)
+                            .is_some_and(|archetype| {
+                                archetype.component_types.contains(&component_id)
+                            })
+                    })
+                    .map(|(entity, _)| *entity)
+                    .collect();
+
+                for entity in entities {
+                    if self.remove_component_by_id(entity, component_id).is_ok() {
+                        dropped_entities += 1;
+                    }
+                }
+            }
+
+            self.forget_component_type(type_name);
+        }
+        dropped_entities
+    }
+
+    /// Drop every column belonging to the given component ids and forget their
+    /// registrations.
+    ///
+    /// The id-keyed counterpart of [`Self::drop_forgotten_components`], used by
+    /// the host when a failed generation's registrations have to go: the ids
+    /// are the only handle that separates them from a rollback generation's
+    /// re-registration of the same names. Rows are removed through
+    /// `remove_component_by_id`, so a type the failed generation's `init`
+    /// managed to give rows to does not leak them into an image that is about
+    /// to be retired. A name-keyed entry (deserializer, schema hash) goes only
+    /// when no surviving registration still claims the name.
+    pub fn drop_forgotten_component_ids(&mut self, component_ids: &[ComponentId]) -> usize {
+        let mut dropped_entities = 0;
+        for &component_id in component_ids {
             if !component_id.is_native_storage() {
                 continue;
             }
+            let type_name = self
+                .component_registry
+                .registered_components()
+                .find(|(id, _, _)| *id == component_id)
+                .map(|(_, _, name)| name.to_string());
 
             // Collect the entities carrying this component up front so the
             // mutable borrows during removal never overlap the iteration.
@@ -786,9 +924,56 @@ impl World {
                 }
             }
 
-            self.forget_component_type(type_name);
+            self.retire_registration(component_id);
+            if let Some(name) = type_name {
+                let still_claimed = self
+                    .component_registry
+                    .registered_components()
+                    .any(|(_, _, other)| other == name.as_str());
+                if !still_claimed {
+                    self.persist_deserializers.remove(&name);
+                    self.persist_schema_hashes.remove(&name);
+                }
+            }
         }
         dropped_entities
+    }
+
+    /// Retire one registration, releasing its bit only when no archetype still
+    /// maps a mask carrying it.
+    ///
+    /// The mask *is* the archetype id, so a bit that returns to the pool while
+    /// an archetype references it aliases two component sets onto one id: the
+    /// next registration that reuses the bit would reach the stale archetype
+    /// through `get_or_create_archetype` and be served its columns. The sweeps
+    /// that precede both callers rehome every entity holding the type, so the
+    /// archetypes carrying the bit are empty and are dropped here. A non-empty
+    /// one means rows still reference the bit, and then the registration is
+    /// removed *without* releasing the bit - a leaked bit is recoverable, an
+    /// aliased archetype is not.
+    fn retire_registration(&mut self, component_id: ComponentId) {
+        let bit = self.component_registry.get_bit(&component_id);
+        let rows_still_reference_bit = bit.is_some_and(|bit| {
+            self.archetypes.values().any(|archetype| {
+                archetype.component_mask.has_bit(bit) && !archetype.entities.is_empty()
+            })
+        });
+        debug_assert!(
+            !rows_still_reference_bit,
+            "an archetype with live rows references the component bit being released"
+        );
+        if !rows_still_reference_bit {
+            if let Some(bit) = bit {
+                self.archetypes
+                    .retain(|_, archetype| !archetype.component_mask.has_bit(bit));
+            }
+            self.component_registry.remove(&component_id);
+        }
+        self.storage_factories.remove(&component_id);
+        self.retired_native_storage_ops.remove(&component_id);
+        self.component_copiers.remove(&component_id);
+        self.persist_serializers.remove(&component_id);
+        self.persist_inserters.remove(&component_id);
     }
 
     /// Remove every registration artifact for one forgotten component type so
@@ -803,11 +988,7 @@ impl World {
             .map(|(id, _, _)| id)
             .collect();
         for stale_id in &stale_ids {
-            self.component_registry.remove(stale_id);
-            self.storage_factories.remove(stale_id);
-            self.component_copiers.remove(stale_id);
-            self.persist_serializers.remove(stale_id);
-            self.persist_inserters.remove(stale_id);
+            self.retire_registration(*stale_id);
         }
         self.persist_deserializers.remove(type_name);
         self.persist_schema_hashes.remove(type_name);
@@ -1126,6 +1307,16 @@ impl World {
 
             if !component_id.is_native_storage() {
                 return Err(PersistenceError::NativeStorageExpected { component_id });
+            }
+            // Drop the old column through the glue that wrote it. The re-home
+            // pass already stamped the arriving generation's table onto every
+            // column, and old-layout values must not be released by code that
+            // never allocated them; `register_component_inner` captured the
+            // retiring table when the incoming registration replaced it.
+            if let Some(retiring_ops) = self.retired_native_storage_ops.get(&component_id) {
+                if let Some(column) = archetype.component_storages.get_mut(component_id) {
+                    column.refresh_ops(*retiring_ops);
+                }
             }
             if archetype.component_storages.remove(component_id).is_none() {
                 return Err(PersistenceError::StorageRemovalFailed { component_id });
@@ -1527,6 +1718,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::archetype::Blittability;
 
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
     struct DropTestForgottenComponent {
@@ -1554,6 +1746,136 @@ mod tests {
         }
     }
     trait_type_map::impl_trait_accessible!(dyn Component; DropTestSupersedingComponent);
+
+    /// A persistable component whose column is 8 bytes / align 4.
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    struct LayoutHostComponent {
+        a: u32,
+        b: u32,
+    }
+    impl Component for LayoutHostComponent {}
+    trait_type_map::impl_trait_accessible!(dyn Component; LayoutHostComponent);
+
+    /// Declares the host's name while widening `b` to `f64` - the f32-to-f64
+    /// shape that registers 16 bytes / align 8 over the host's column.
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    struct LayoutWidenedComponent {
+        a: u32,
+        b: f64,
+    }
+    impl Component for LayoutWidenedComponent {
+        fn shared_name() -> Option<&'static str> {
+            Some(std::any::type_name::<LayoutHostComponent>())
+        }
+    }
+    trait_type_map::impl_trait_accessible!(dyn Component; LayoutWidenedComponent);
+
+    /// Same name, same alignment, one field more: the add-a-field shape that
+    /// must keep registering (and migrating).
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    struct LayoutGrownComponent {
+        a: u32,
+        b: u32,
+        c: u32,
+    }
+    impl Component for LayoutGrownComponent {
+        fn shared_name() -> Option<&'static str> {
+            Some(std::any::type_name::<LayoutHostComponent>())
+        }
+    }
+    trait_type_map::impl_trait_accessible!(dyn Component; LayoutGrownComponent);
+
+    /// The refusal sentence is printed verbatim into host logs and grepped by
+    /// humans, so it carries no source-wrap artifacts.
+    #[test]
+    fn collision_refusal_message_has_no_wrap_spaces() {
+        assert!(
+            !COMPONENT_NAME_COLLISION_REFUSAL.contains("  "),
+            "{COMPONENT_NAME_COLLISION_REFUSAL}"
+        );
+        assert!(!COMPONENT_NAME_COLLISION_REFUSAL.contains('\n'));
+        assert!(COMPONENT_NAME_COLLISION_REFUSAL.ends_with("persist entries"));
+    }
+
+    /// A superseding registration whose layout the old column cannot host is
+    /// refused before anything registers: the host rolls the reload back and
+    /// the running generation keeps its storage, instead of the migration
+    /// reading the new alignment out of the old column's slots.
+    #[test]
+    fn a_layout_the_old_column_cannot_host_is_refused() {
+        let mut world = World::new();
+        world.register_persistable_component::<LayoutHostComponent>();
+        let host_id = ComponentId::of::<LayoutHostComponent>();
+        let type_name = std::any::type_name::<LayoutHostComponent>().to_string();
+        let entity = world
+            .create_entity()
+            .with(LayoutHostComponent { a: 1, b: 2 })
+            .build()
+            .unwrap();
+        let _ = world.take_registration_error();
+
+        // The rebuilt image's registration: same name, wider alignment.
+        world.supersede_persist_registrations(std::slice::from_ref(&type_name));
+        world.register_persistable_component::<LayoutWidenedComponent>();
+
+        let error = world
+            .take_registration_error()
+            .expect("a layout the old column cannot host must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("was re-registered with a different size"),
+            "the refusal keeps the sentence the migration suite greps for: {message}"
+        );
+        match error {
+            WorldError::ComponentLayoutChanged {
+                existing_size,
+                existing_align,
+                incoming_size,
+                incoming_align,
+                ..
+            } => {
+                assert_eq!((existing_size, existing_align), (8, 4));
+                assert_eq!((incoming_size, incoming_align), (16, 8));
+            }
+            other => panic!("expected a ComponentLayoutChanged refusal, got {other:?}"),
+        }
+
+        // Nothing registered, and the predecessor kept its registration.
+        assert_eq!(
+            world.component_registry().registered_components().count(),
+            1,
+            "a refused registration leaves the registry as it was"
+        );
+        assert_eq!(world.live_row_count(host_id), 1);
+        assert!(world.entity_locations.contains_key(&entity));
+        assert!(!world
+            .storage_factories
+            .contains_key(&ComponentId::of::<LayoutWidenedComponent>()));
+    }
+
+    /// A size change that keeps the alignment registers: the old column's
+    /// slots stay validly aligned for the incoming type, which is what the
+    /// add-a-field reload scenarios depend on.
+    #[test]
+    fn a_size_change_that_keeps_the_alignment_registers() {
+        let mut world = World::new();
+        world.register_persistable_component::<LayoutHostComponent>();
+        let type_name = std::any::type_name::<LayoutHostComponent>().to_string();
+        let _ = world.take_registration_error();
+
+        world.supersede_persist_registrations(std::slice::from_ref(&type_name));
+        world.register_persistable_component::<LayoutGrownComponent>();
+
+        assert!(
+            world.take_registration_error().is_none(),
+            "a wider field of the same alignment must register"
+        );
+        let grown_layout = world
+            .component_registry()
+            .get_layout(&ComponentId::of::<LayoutGrownComponent>())
+            .expect("the successor is registered");
+        assert_eq!((grown_layout.size, grown_layout.align), (12, 4));
+    }
 
     /// Dropping a forgotten type removes its columns from every entity while
     /// entities that carry other components survive with those intact.
@@ -1624,6 +1946,131 @@ mod tests {
             .build()
             .unwrap();
         assert!(world.entity_locations.contains_key(&reseeded));
+    }
+
+    /// Every native id sharing the forgotten name loses its rows, not just the
+    /// one a name resolver returns: an ambiguous name resolved to nothing at
+    /// all, so the purge used to skip both generations while
+    /// `forget_component_type` removed their registrations anyway.
+    #[test]
+    fn forget_strips_rows_for_every_id_sharing_the_name() {
+        let mut world = World::new();
+        world.register_persistable_component::<DropTestForgottenComponent>();
+        let first_id = ComponentId::of::<DropTestForgottenComponent>();
+        let type_name = std::any::type_name::<DropTestForgottenComponent>().to_string();
+
+        let first_entity = world
+            .create_entity()
+            .with(DropTestForgottenComponent { value: 1 })
+            .build()
+            .unwrap();
+        assert_eq!(world.live_row_count(first_id), 1);
+
+        // A rebuilt image's registration: same name, fresh id, its own rows.
+        world.supersede_persist_registrations(std::slice::from_ref(&type_name));
+        world.register_persistable_component::<DropTestSupersedingComponent>();
+        let second_id = ComponentId::of::<DropTestSupersedingComponent>();
+        assert_ne!(second_id, first_id);
+        let second_entity = world
+            .create_entity()
+            .with(DropTestSupersedingComponent { value: 2 })
+            .build()
+            .unwrap();
+        assert_eq!(world.live_row_count(second_id), 1);
+
+        let dropped = world.drop_forgotten_components(std::slice::from_ref(&type_name));
+        assert_eq!(
+            dropped, 2,
+            "both generations' rows are stripped, not just one id's"
+        );
+        assert!(!world.entity_locations.contains_key(&first_entity));
+        assert!(!world.entity_locations.contains_key(&second_entity));
+        assert!(!world.storage_factories.contains_key(&first_id));
+        assert!(!world.storage_factories.contains_key(&second_id));
+        assert!(!world.component_copiers.contains_key(&first_id));
+        assert!(!world.component_copiers.contains_key(&second_id));
+    }
+
+    /// A refused persistable registration changes nothing: the guard runs
+    /// before the registration does, so no bit, name entry, storage factory or
+    /// log entry is created for a call that returns without registering.
+    #[test]
+    fn a_refused_persistable_registration_changes_nothing() {
+        let mut world = World::new();
+        world.register_persistable_component::<DropTestForgottenComponent>();
+        // A peer with live rows under the same name: without the supersede
+        // announcement the guard refuses instead of evicting it.
+        world.register_persistable_component::<DropTestSupersedingComponent>();
+        let peer_id = ComponentId::of::<DropTestSupersedingComponent>();
+        let peer = world
+            .create_entity()
+            .with(DropTestSupersedingComponent { value: 1 })
+            .build()
+            .unwrap();
+        assert_eq!(world.live_row_count(peer_id), 1);
+        let _ = world.take_registration_error();
+
+        let registry_count = world.component_registry().registered_components().count();
+        for attempt in 0..3 {
+            world.register_persistable_component::<DropTestForgottenComponent>();
+            let error = world
+                .take_registration_error()
+                .unwrap_or_else(|| panic!("attempt {attempt} must be refused"));
+            assert!(matches!(error, WorldError::ComponentNameCollision { .. }));
+            assert_eq!(
+                world.component_registry().registered_components().count(),
+                registry_count,
+                "a refused attempt leaves the registry as it was"
+            );
+        }
+        assert!(world.entity_locations.contains_key(&peer));
+        assert_eq!(
+            world.live_row_count(peer_id),
+            1,
+            "the peer keeps its rows across every refused attempt"
+        );
+    }
+
+    /// The id-keyed purge removes the rows and every registration artifact of
+    /// the ids it is given, while a same-name re-registration - the rollback
+    /// generation, with a fresh id - keeps the name-keyed entries alive.
+    #[test]
+    fn stranded_ids_lose_their_rows_and_factories() {
+        let mut world = World::new();
+        world.register_persistable_component::<DropTestForgottenComponent>();
+        let stranded_id = ComponentId::of::<DropTestForgottenComponent>();
+        let type_name = std::any::type_name::<DropTestForgottenComponent>().to_string();
+
+        let entity = world
+            .create_entity()
+            .with(DropTestForgottenComponent { value: 4 })
+            .build()
+            .unwrap();
+        assert_eq!(world.live_row_count(stranded_id), 1);
+
+        // The rollback generation re-registers the same name under a fresh id,
+        // exactly as a rebuilt image does.
+        world.supersede_persist_registrations(std::slice::from_ref(&type_name));
+        world.register_persistable_component::<DropTestSupersedingComponent>();
+        let successor_id = ComponentId::of::<DropTestSupersedingComponent>();
+        assert_ne!(successor_id, stranded_id);
+
+        let dropped = world.drop_forgotten_component_ids(&[stranded_id]);
+        assert_eq!(dropped, 1, "the stranded type's row was removed with it");
+
+        // The failed generation's id holds nothing anywhere...
+        assert!(!world.entity_locations.contains_key(&entity));
+        assert!(!world.storage_factories.contains_key(&stranded_id));
+        assert!(!world.component_copiers.contains_key(&stranded_id));
+        assert!(!world.persist_serializers.contains_key(&stranded_id));
+        assert!(!world.persist_inserters.contains_key(&stranded_id));
+
+        // ...while the rollback generation's own entries survive, including
+        // the name-keyed ones the two registrations share.
+        assert!(world.persist_serializers.contains_key(&successor_id));
+        assert!(world.persist_inserters.contains_key(&successor_id));
+        assert!(world.persist_deserializers.contains_key(&type_name));
+        assert!(world.persist_schema_hashes.contains_key(&type_name));
     }
 
     /// The registration log distinguishes a type that was dropped entirely
@@ -1703,7 +2150,14 @@ mod tests {
         // A second component claiming the same name arrives - the in-process
         // stand-in for a second binary that linked the same type.
         let error = world
-            .register_dynamic_component(0x5EED, type_name.clone(), 4, 4, 0)
+            .register_dynamic_component(
+                0x5EED,
+                type_name.clone(),
+                4,
+                4,
+                0,
+                Blittability::engine_verified(),
+            )
             .unwrap_err();
 
         match error {
@@ -1740,7 +2194,14 @@ mod tests {
             0
         );
 
-        let result = world.register_dynamic_component(0x5EED, type_name, 4, 4, 0);
+        let result = world.register_dynamic_component(
+            0x5EED,
+            type_name,
+            4,
+            4,
+            0,
+            Blittability::engine_verified(),
+        );
         assert!(
             result.is_ok(),
             "an empty same-name column is a dead generation, not a peer: {result:?}"
@@ -1790,6 +2251,120 @@ mod tests {
             world.take_registration_error(),
             Some(WorldError::ComponentNameCollision { .. })
         ));
+    }
+
+    // =========================================================================
+    // Retiring drop glue across an in-place migration
+    // =========================================================================
+
+    /// Rows dropped by each stand-in's glue, so a migration can be asked
+    /// *which* generation's destructor released the old values.
+    static RETIRING_GLUE_DROPS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+    static ARRIVING_GLUE_DROPS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// The retiring generation of a shared persistable type.
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    struct RetiringGlueComponent {
+        #[allow(dead_code)]
+        value: u32,
+    }
+    impl Component for RetiringGlueComponent {
+        fn shared_name() -> Option<&'static str> {
+            Some("audit::DropGlue")
+        }
+    }
+    impl Drop for RetiringGlueComponent {
+        fn drop(&mut self) {
+            RETIRING_GLUE_DROPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    trait_type_map::impl_trait_accessible!(dyn Component; RetiringGlueComponent);
+
+    /// The arriving generation: same declared name and shape, different glue.
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    struct ArrivingGlueComponent {
+        #[allow(dead_code)]
+        value: u32,
+    }
+    impl Component for ArrivingGlueComponent {
+        fn shared_name() -> Option<&'static str> {
+            Some("audit::DropGlue")
+        }
+    }
+    impl Drop for ArrivingGlueComponent {
+        fn drop(&mut self) {
+            ARRIVING_GLUE_DROPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    trait_type_map::impl_trait_accessible!(dyn Component; ArrivingGlueComponent);
+
+    /// The in-place migration drops old-layout rows through the glue that wrote
+    /// them. The sequence that used to break it: the arriving generation's
+    /// registration replaces the factory, `rehome_native_columns` stamps the
+    /// arriving table onto the still-old column, and only then does the
+    /// migration consume that column.
+    #[test]
+    fn in_place_migration_drops_old_rows_through_the_retiring_glue() {
+        use std::sync::atomic::Ordering;
+
+        let mut world = World::new();
+        world.register_persistable_component::<RetiringGlueComponent>();
+        let component_id = ComponentId::of::<RetiringGlueComponent>();
+        let type_name =
+            crate::component::ComponentRegistry::registered_name::<RetiringGlueComponent>()
+                .to_string();
+
+        let entity = world
+            .create_entity()
+            .with(RetiringGlueComponent { value: 3 })
+            .build()
+            .unwrap();
+        assert!(world.entity_locations.contains_key(&entity));
+        world.rehome_native_columns();
+
+        // Capture the retiring generation's serializer while it is still the
+        // registered one, then stand in for the rebuilt image's registration.
+        let serialize_old = world.persist_serializers[&component_id];
+        world.register_persistable_component::<ArrivingGlueComponent>();
+        let serialize_current = world.persist_serializers[&component_id];
+        let deserialize_new = world.persist_deserializers[&type_name];
+        let insert_new = world.persist_inserters[&component_id];
+
+        // The re-home the reload runs before migration stamps the arriving
+        // generation's table onto the old column - the state that produced the
+        // invalid free.
+        world.rehome_native_columns();
+
+        let retiring_before = RETIRING_GLUE_DROPS.load(Ordering::SeqCst);
+        let arriving_before = ARRIVING_GLUE_DROPS.load(Ordering::SeqCst);
+        let migrated = world
+            .migrate_component_column_in_place(
+                component_id,
+                serialize_old,
+                serialize_current,
+                deserialize_new,
+                insert_new,
+                None,
+            )
+            .expect("the in-place migration runs on a native column");
+        assert_eq!(migrated, 1);
+
+        assert_eq!(
+            RETIRING_GLUE_DROPS.load(Ordering::SeqCst),
+            retiring_before + 1,
+            "the old row is released by the generation that allocated it"
+        );
+        // `deserialize_component` materializes a `T::default()` schema baseline
+        // per row, and that baseline is dropped through the arriving type's
+        // glue. One row was migrated, so exactly one arriving drop is the
+        // baseline - the old row itself must not be among them.
+        assert_eq!(
+            ARRIVING_GLUE_DROPS.load(Ordering::SeqCst),
+            arriving_before + 1,
+            "the arriving glue released only its own schema baseline, never the old row"
+        );
     }
 
     /// Re-registering a persistable type while its own column holds rows is
@@ -1848,7 +2423,14 @@ mod tests {
         // (see the empty-column test above) and both are now visible to the
         // unfiltered resolver.
         world
-            .register_dynamic_component(0x5EED, type_name.clone(), 4, 4, 0)
+            .register_dynamic_component(
+                0x5EED,
+                type_name.clone(),
+                4,
+                4,
+                0,
+                Blittability::engine_verified(),
+            )
             .unwrap();
 
         let error = world

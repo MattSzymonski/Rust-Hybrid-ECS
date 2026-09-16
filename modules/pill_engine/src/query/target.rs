@@ -129,8 +129,9 @@ impl<T: Component> QueryTarget for &T {
                 ("Component type: {}", std::any::type_name::<T>())
             ]
         );
-        SendPtr::new(archetype.component_storages.column_of::<T>()
-            as *const ErasedVecStorage<dyn Component>)
+        SendPtr::new(
+            archetype.component_storages.column_of::<T>() as *const ErasedVecStorage<dyn Component>
+        )
     }
 
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
@@ -262,11 +263,15 @@ macro_rules! impl_query_target_tuple {
                     writes.extend(w);
                 )*
 
-                // Check for duplicate mutable component types in the tuple, which would create aliasing `&mut` references - UB.
-                debug_assert!(
-                    !$crate::query::target::has_duplicate_writes(&writes),
-                    "Query tuple contains duplicate mutable component types \
-                     (e.g. Query<(&mut T, &mut T)>). This is not allowed"
+                // A tuple that aliases one component - two writes, or a read
+                // beside a write - produces overlapping borrows of one row,
+                // which is undefined behavior the moment iteration starts.
+                // This refuses in release too: the debug-only form let every
+                // optimized build through.
+                assert!(
+                    $crate::query::target::find_aliasing_component(&reads, &writes).is_none(),
+                    "query tuple reads and writes the same component; \
+                     Query<(&mut T, &mut T)> and Query<(&T, &mut T)> are not allowed"
                 );
                 (reads, writes)
             }
@@ -308,19 +313,25 @@ impl_query_target_tuple!(A, B, C, D, E);
 // Free Functions
 // =============================================================================
 
-/// Returns `true` when `writes` contains any duplicate [`ComponentId`],
-/// which would mean a query tuple has two `&mut T` elements for the same
-/// `T`. That pattern creates aliasing `&mut` references - UB.
+/// Returns the first [`ComponentId`] a target both reads and writes, or writes
+/// twice - the aliasing that produces overlapping `&`/`&mut` borrows of one
+/// row, which is undefined behavior.
+///
+/// Catches both shapes the old duplicate-write check missed: two writes of one
+/// component (`Query<(&mut T, &mut T)>`) and a read aliasing a write
+/// (`Query<(&T, &mut T)>`, where `Mut<T>` writes the value *and* the tick the
+/// `&T` reads).
 #[inline]
-pub(crate) fn has_duplicate_writes(writes: &[ComponentId]) -> bool {
-    // Small-N linear scan: tuples are at most arity 4 (or 8 in the
-    // future), so O(n²) with n ≤ 8 is cheaper than allocating a HashSet.
-    for (i, a) in writes.iter().enumerate() {
-        for b in &writes[i + 1..] {
-            if a == b {
-                return true;
-            }
+pub(crate) fn find_aliasing_component(
+    reads: &[ComponentId],
+    writes: &[ComponentId],
+) -> Option<ComponentId> {
+    // Small-N linear scan: tuples are at most arity 6, so O(n²) with n ≤ 8 is
+    // cheaper than allocating a HashSet on the construction path.
+    for (index, write) in writes.iter().enumerate() {
+        if writes[index + 1..].contains(write) || reads.contains(write) {
+            return Some(*write);
         }
     }
-    false
+    None
 }

@@ -97,17 +97,23 @@ pub struct CargoRustcLine {
 
 /// Where a package's captured flags are cached between processes.
 ///
-/// The system temporary directory rather than the build tree, because the
-/// cache describes the CURRENT host's universe and must not be mistaken for a
-/// build artifact; its freshness is decided by
-/// [`CargoRustcLine::load_if_fresh`], not by its location.
+/// Inside the workspace's private build tree, not the system temporary
+/// directory: two checkouts of this repository share `/tmp`, and a cache
+/// written by one was replayed by the other as if it described its own
+/// dependency graph - the same metadata and `TypeId` drift the rest of this
+/// subsystem goes to great lengths to prevent. Keying the path on the
+/// workspace root makes a foreign cache unreachable rather than merely
+/// detectable.
 ///
 /// Shared by the two writers so they cannot disagree: the fast-patch pipeline,
 /// which captures on demand, and [`crate::build_runner::run_build_command`],
 /// which harvests the same line for free out of a build it was going to run
 /// anyway.
-pub(crate) fn flags_cache_path(package: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("pill_hotpatch_{package}.flags"))
+pub(crate) fn flags_cache_path(workspace_root: &Path, package: &str) -> PathBuf {
+    workspace_root
+        .join(crate::config::MODULE_BUILD_TARGET_DIRECTORY)
+        .join("hotpatch-flags")
+        .join(format!("{package}.flags"))
 }
 
 /// Pull the invocation for `crate_name` out of one line of cargo's `-v` output.
@@ -211,11 +217,7 @@ impl CargoRustcLine {
         // then reports `error[E0463]` and every edit falls back to a full
         // reload.
         if program == "cargo" {
-            command.envs(
-                crate::config::spawned_build_environment()
-                    .into_iter()
-                    .map(|(key, value)| (key, value)),
-            );
+            command.envs(crate::config::spawned_build_environment());
             crate::build_runner::apply_cargo_host_overrides(&mut command, workspace_dir);
         }
         let output = command
@@ -1187,6 +1189,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&directory);
     }
 
+    /// Two checkouts must not share one flags cache.
+    ///
+    /// The path used to be `temp_dir()/pill_hotpatch_<package>.flags`, which
+    /// named the same file for every clone of this repository on the machine.
+    /// Scoping it to the workspace root is what makes a replay always describe
+    /// the dependency graph the running module was built against.
+    #[test]
+    fn flags_cache_path_is_workspace_scoped() {
+        let first = flags_cache_path(Path::new("C:/work/one"), "project");
+        let second = flags_cache_path(Path::new("C:/work/two"), "project");
+
+        assert_ne!(
+            first, second,
+            "two checkouts must not share one flags cache"
+        );
+        assert!(
+            first.starts_with(Path::new("C:/work/one")),
+            "the cache lives inside its own workspace: {}",
+            first.display()
+        );
+        assert_eq!(
+            first.file_name().and_then(|name| name.to_str()),
+            Some("project.flags")
+        );
+    }
+
     #[test]
     fn load_rejects_a_stale_cache() {
         let command = vec!["cargo".to_string(), "build".to_string()];
@@ -1201,6 +1229,23 @@ mod tests {
         std::fs::write(&manifest, "[package]").expect("write manifest");
 
         assert!(CargoRustcLine::load_if_fresh(&cache, &[manifest], &command).is_none());
+
+        // The cargo configuration and the pinned toolchain change what a
+        // replay means without moving a manifest: a wrapper, a target
+        // directory override or a toolchain switch lives there. Each is
+        // written after the cache, so each input must be refused on its own.
+        for relative in [".cargo/config.toml", "rust-toolchain.toml"] {
+            let input = directory.join(relative);
+            if let Some(parent) = input.parent() {
+                std::fs::create_dir_all(parent).expect("create config directory");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            std::fs::write(&input, "").expect("write config input");
+            assert!(
+                CargoRustcLine::load_if_fresh(&cache, &[input], &command).is_none(),
+                "a newer {relative} must invalidate the cache"
+            );
+        }
         let _ = std::fs::remove_dir_all(&directory);
     }
 }

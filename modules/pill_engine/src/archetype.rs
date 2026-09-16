@@ -77,6 +77,58 @@ pub enum StorageFactory {
 }
 
 // =============================================================================
+// Blittability
+// =============================================================================
+
+/// Evidence that a dynamic component's rows are plain old data.
+///
+/// The dynamic-component design rests on one premise: a row is
+/// bitwise-movable, owns nothing, and can be freed without running
+/// destructors. `DynamicColumn` copies rows with `ptr::copy`, frees buffers
+/// without touching the elements, and is `Send + Sync` on that basis - each
+/// of those is only sound while the premise holds. The witness makes the
+/// premise a value the engine stores next to the layout it protects, so a
+/// column cannot be built without one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Blittability {
+    /// Private unit field: the only ways in are the constructors below.
+    _private: (),
+}
+
+impl Blittability {
+    /// The witness a manifest-driven registration carries.
+    ///
+    /// `pill_host::csharp::components` calls this only after its
+    /// `BLITTABLE_FIELD_TYPES` check rejected every field type that is not a
+    /// blittable value type, so holding one of these means the fields were
+    /// vetted. The name records where the check ran.
+    pub fn from_manifest_fields() -> Self {
+        Self { _private: () }
+    }
+
+    /// The witness for shapes written out in this crate's tests.
+    ///
+    /// Test registrations name value-type fields literally; production code
+    /// outside the crate reaches the checkout through
+    /// [`Self::from_manifest_fields`].
+    #[cfg(test)]
+    pub(crate) fn engine_verified() -> Self {
+        Self { _private: () }
+    }
+
+    /// Claims the witness without a check.
+    ///
+    /// # Safety
+    ///
+    /// Every field of the component must be a blittable value type: no
+    /// pointers, references or other owners. A caller that gets this wrong
+    /// hands `DynamicColumn` ownership it will never release.
+    pub unsafe fn assume() -> Self {
+        Self { _private: () }
+    }
+}
+
+// =============================================================================
 // DynamicComponentLayout
 // =============================================================================
 
@@ -92,6 +144,46 @@ pub struct DynamicComponentLayout {
     pub align: usize,
     /// Hash identifying the component's schema across language boundaries.
     pub schema_hash: u64,
+    /// Evidence that rows of this shape are plain old data.
+    ///
+    /// Carried so the column that stores the rows never has to re-derive the
+    /// premise: `Send`, `Sync` and the destructor-free paths all cite it.
+    pub blittability: Blittability,
+    /// Optional per-row release hook, `None` for the blittable rows used today.
+    ///
+    /// Exists so a future owning layout has somewhere to run its destructor:
+    /// the two places that assume no drop glue - `Drop` and `swap_remove`
+    /// below - already consult it.
+    pub drop_fn: Option<unsafe fn(*mut u8)>,
+}
+
+impl DynamicComponentLayout {
+    /// Builds a layout, checking that size and alignment can describe storage.
+    ///
+    /// The single constructor: every layout carries a [`Blittability`], so no
+    /// column exists without one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::DynamicSizeZero`],
+    /// [`WorldError::DynamicAlignmentInvalid`] or
+    /// [`WorldError::DynamicLayoutInvalid`] when the size and alignment cannot
+    /// describe an allocation.
+    pub fn new(
+        size: usize,
+        align: usize,
+        schema_hash: u64,
+        blittability: Blittability,
+    ) -> Result<Self, WorldError> {
+        validate_dynamic_layout(size, align)?;
+        Ok(Self {
+            size,
+            align,
+            schema_hash,
+            blittability,
+            drop_fn: None,
+        })
+    }
 }
 
 /// Check that a size and alignment can describe dynamic storage.
@@ -409,27 +501,25 @@ impl DynamicColumn {
     ///
     /// This is a POD-only container: rows are copied as raw bytes and the
     /// buffer is freed without running element destructors, so the layout
-    /// must describe a blittable value type. `pill_host::csharp::components`
-    /// enforces that through `BLITTABLE_FIELD_TYPES` before any layout is
-    /// registered; the debug assertion below is a second line of defense for
-    /// any caller that constructs a layout directly.
-    pub fn new(layout: DynamicComponentLayout) -> Self {
-        debug_assert!(
-            layout.size > 0
-                && layout.align > 0
-                && layout.align.is_power_of_two()
-                && std::alloc::Layout::from_size_align(layout.size, layout.align).is_ok(),
-            "invalid DynamicComponentLayout: size {} align {} (must be a valid, \
-             non-zero POD layout)",
-            layout.size,
-            layout.align
-        );
-        Self {
+    /// must describe a blittable value type carrying a [`Blittability`]
+    /// witness. The layout's own validity is re-checked here, in every build
+    /// profile, so a directly constructed column cannot defer the discovery
+    /// of a degenerate layout to its first growth.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::DynamicSizeZero`],
+    /// [`WorldError::DynamicAlignmentInvalid`] or
+    /// [`WorldError::DynamicLayoutInvalid`] when the layout cannot describe
+    /// an allocation.
+    pub fn new(layout: DynamicComponentLayout) -> Result<Self, WorldError> {
+        validate_dynamic_layout(layout.size, layout.align)?;
+        Ok(Self {
             layout,
             data: NonNull::dangling(),
             len: 0,
             capacity: 0,
-        }
+        })
     }
 
     /// Returns the number of initialized rows in this column.
@@ -468,8 +558,13 @@ impl DynamicColumn {
     /// Appends a zero-initialized row to this column.
     ///
     /// Grows the column when needed and leaves the new row's bytes zeroed.
-    pub fn push_zeroed(&mut self) {
-        self.reserve_one();
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::DynamicLayoutInvalid`] when the element layout
+    /// cannot describe the next allocation.
+    pub fn push_zeroed(&mut self) -> Result<(), WorldError> {
+        self.reserve_one()?;
         // SAFETY: reserve_one guarantees one writable, correctly aligned slot.
         unsafe {
             std::ptr::write_bytes(
@@ -479,6 +574,7 @@ impl DynamicColumn {
             )
         };
         self.len += 1;
+        Ok(())
     }
 
     /// Appends a row containing a copy of the given bytes.
@@ -486,12 +582,14 @@ impl DynamicColumn {
     /// # Errors
     ///
     /// Returns [`WorldError::DynamicSizeMismatch`] when `bytes` does not
-    /// contain exactly `element_size()` bytes.
+    /// contain exactly `element_size()` bytes, or
+    /// [`WorldError::DynamicLayoutInvalid`] when the element layout cannot
+    /// describe the next allocation.
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), WorldError> {
         if bytes.len() != self.layout.size {
             return Err(WorldError::DynamicSizeMismatch);
         }
-        self.reserve_one();
+        self.reserve_one()?;
         // SAFETY: source and destination are valid for exactly one element and
         // cannot overlap because the source is outside this column's spare slot.
         unsafe {
@@ -507,14 +605,22 @@ impl DynamicColumn {
 
     /// Copies the row at `index` from another column and appends it here.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics when the two columns have different element sizes or when
-    /// `index` is out of bounds of `source`.
-    pub fn push_from(&mut self, source: &Self, index: usize) {
-        assert_eq!(self.layout.size, source.layout.size);
-        assert!(index < source.len);
-        self.reserve_one();
+    /// Returns [`WorldError::DynamicSizeMismatch`] when the two columns have
+    /// different element sizes, [`WorldError::DynamicRowInvalid`] when `index`
+    /// is out of bounds of `source`, and [`WorldError::DynamicLayoutInvalid`]
+    /// when the element layout cannot describe the next allocation. All three
+    /// travel the reporting path: a drifted column must not abort a frame from
+    /// inside the command flush, where the caller can hand the error back.
+    pub fn push_from(&mut self, source: &Self, index: usize) -> Result<(), WorldError> {
+        if self.layout.size != source.layout.size {
+            return Err(WorldError::DynamicSizeMismatch);
+        }
+        if index >= source.len {
+            return Err(WorldError::DynamicRowInvalid);
+        }
+        self.reserve_one()?;
         // SAFETY: both slots are allocated, aligned, non-overlapping columns.
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -524,6 +630,7 @@ impl DynamicColumn {
             );
         }
         self.len += 1;
+        Ok(())
     }
 
     /// Overwrites the row at `index` with a copy of the given bytes.
@@ -588,7 +695,8 @@ impl DynamicColumn {
     ) -> Result<usize, WorldError> {
         validate_dynamic_layout(layout.size, layout.align)?;
         plan.validate(self.layout.size, layout.size)?;
-        Ok(self.relayout_validated(layout, plan))
+        let previous_size = self.layout.size;
+        Ok(self.relayout_validated(layout, plan, previous_size))
     }
 
     /// [`Self::relayout`] for a caller that has already validated.
@@ -602,9 +710,18 @@ impl DynamicColumn {
         &mut self,
         layout: DynamicComponentLayout,
         plan: &DynamicFieldPlan,
+        previous_size: usize,
     ) -> usize {
+        // The plan was validated against `previous_size`, so that - not this
+        // column's current element size - is what the scratch copy and the
+        // source stride have to be. A disagreement is an internal break: the
+        // world-level relayout verifies every column before calling here.
+        debug_assert_eq!(
+            previous_size, self.layout.size,
+            "a column's element size disagrees with the layout its plan was validated against"
+        );
         let rows = self.len;
-        let old_size = self.layout.size;
+        let old_size = previous_size;
         let old_align = self.layout.align;
         let old_data = self.data;
         let in_place = layout.size == old_size && layout.align == old_align;
@@ -686,6 +803,13 @@ impl DynamicColumn {
     /// Panics when `index` is out of bounds.
     pub fn swap_remove(&mut self, index: usize) {
         assert!(index < self.len);
+        // Run the release hook, if one was registered, before the row's bytes
+        // are overwritten by the swap-in. With no hook this is the same pure
+        // byte move it has always been.
+        if let Some(drop_fn) = self.layout.drop_fn {
+            // SAFETY: index < len, so the row is initialized and addressable.
+            unsafe { drop_fn(self.data.as_ptr().add(index * self.layout.size)) };
+        }
         let last = self.len - 1;
         if index != last {
             // SAFETY: both rows are within this allocation; copy permits overlap.
@@ -701,10 +825,16 @@ impl DynamicColumn {
     }
 
     /// Ensures capacity for at least one more row, growing the buffer when full.
-    fn reserve_one(&mut self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::DynamicLayoutInvalid`] when the doubled capacity
+    /// or the allocation layout it implies cannot be represented. Both used to
+    /// panic instead, which a caller could not route around.
+    fn reserve_one(&mut self) -> Result<(), WorldError> {
         // Step 1: Early-exit when the column still has a spare slot.
         if self.len < self.capacity {
-            return;
+            return Ok(());
         }
 
         // Step 2: Compute the doubled capacity and the layout it requires.
@@ -712,15 +842,19 @@ impl DynamicColumn {
         // The floor is applied *after* doubling. Applying it before made the
         // first allocation eight rows rather than four, over-allocating every
         // manifest-driven column on first use.
-        let new_capacity = self.capacity.checked_mul(2).unwrap_or(4).max(4);
+        let new_capacity = self
+            .capacity
+            .checked_mul(2)
+            .ok_or(WorldError::DynamicLayoutInvalid)?
+            .max(4);
         let new_layout = Layout::from_size_align(
             self.layout
                 .size
                 .checked_mul(new_capacity)
-                .expect("dynamic column too large"),
+                .ok_or(WorldError::DynamicLayoutInvalid)?,
             self.layout.align,
         )
-        .expect("invalid dynamic component layout");
+        .map_err(|_| WorldError::DynamicLayoutInvalid)?;
 
         // Step 3: Allocate the new buffer and migrate the existing rows.
         // SAFETY: new_layout has non-zero size because component size is validated.
@@ -747,16 +881,19 @@ impl DynamicColumn {
         // Step 4: Adopt the new allocation as the column's buffer.
         self.data = new_data;
         self.capacity = new_capacity;
+        Ok(())
     }
 }
 
 // SAFETY: Two premises, each enforced by named code rather than asserted here.
 //
-// 1. Every field of a dynamic component is a blittable value type, enforced by
-//    `BLITTABLE_FIELD_TYPES` in `pill_host::csharp::components`, which rejects
-//    any manifest declaring a managed reference. This is what makes the raw
-//    `ptr::copy` in `swap_remove` and the destructor-free `Drop` below correct:
-//    there is no ownership to duplicate or release.
+// 1. Every field of a dynamic component is a blittable value type. The
+//    evidence is held by the engine: every `DynamicComponentLayout` carries a
+//    `Blittability` witness, the host builds its own only after
+//    `BLITTABLE_FIELD_TYPES` vetted the manifest's fields, and no column can
+//    be constructed without a layout. This is what makes the raw `ptr::copy`
+//    in `swap_remove` and the destructor-free paths below correct: there is no
+//    ownership to duplicate or release.
 // 2. Access is serialised by the same scheduler rules as native columns - see
 //    `SystemAccess::conflicts_with`, which only takes its bitmask fast path when
 //    both systems' access masks are complete.
@@ -767,18 +904,22 @@ unsafe impl Send for DynamicColumn {}
 unsafe impl Sync for DynamicColumn {}
 
 impl Drop for DynamicColumn {
-    /// Frees the buffer. **No element destructor runs, by design.**
+    /// Releases every row through the layout's hook, if it has one, then frees
+    /// the buffer itself.
     ///
-    /// Every field of a dynamic component is a blittable value type - enforced
-    /// by `BLITTABLE_FIELD_TYPES` in `pill_host::csharp::components`, which
-    /// rejects any manifest declaring otherwise - so a row owns nothing that
-    /// needs releasing. That is also what makes the raw `ptr::copy` in
-    /// `swap_remove` correct: moving a row cannot duplicate ownership.
-    ///
-    /// If dynamic components ever need to own a resource, this is the first
-    /// place that has to change: `DynamicComponentLayout` would need an
-    /// optional `drop_fn`, called here and from `swap_remove`.
+    /// Rows of a blittable component own nothing, so their hook is `None` and
+    /// this is the destructor-free teardown the POD design promises. The hook
+    /// exists for the day a dynamic component does own something: `
+    /// [`DynamicComponentLayout::drop_fn`]` is where its release runs, and
+    /// `swap_remove` above calls the same hook for the row it overwrites.
     fn drop(&mut self) {
+        if let Some(drop_fn) = self.layout.drop_fn {
+            for index in 0..self.len {
+                // SAFETY: rows 0..len are initialized and in bounds; the hook
+                // is the component owner's own release function.
+                unsafe { drop_fn(self.data.as_ptr().add(index * self.layout.size)) };
+            }
+        }
         if self.capacity != 0 {
             // SAFETY: this is the live allocation created by reserve_one.
             unsafe {
@@ -888,8 +1029,13 @@ impl Archetype {
                         .insert(component_id, ErasedVecStorage::<dyn Component>::new(*info));
                 }
                 StorageFactory::Dynamic(layout) => {
-                    dynamic_component_storages
-                        .insert(component_id, DynamicColumn::new(layout.clone()));
+                    // Both paths into the registry - `register_dynamic_component`
+                    // and `relayout_dynamic_component` - validate the layout
+                    // before it is stored, so the column can only echo that
+                    // verdict here.
+                    let column = DynamicColumn::new(layout.clone())
+                        .expect("registration validated this layout");
+                    dynamic_component_storages.insert(component_id, column);
                 }
             }
             component_ticks.insert(component_id, Vec::new());
@@ -1031,15 +1177,75 @@ mod tests {
             size: 8,
             align: 4,
             schema_hash: 1,
+            blittability: Blittability::engine_verified(),
+            drop_fn: None,
         }
     }
 
     fn column_with_rows(rows: &[[u8; 8]]) -> DynamicColumn {
-        let mut column = DynamicColumn::new(two_fields());
+        let mut column = DynamicColumn::new(two_fields()).expect("a valid layout");
         for row in rows {
             column.push_bytes(row).expect("row matches the layout");
         }
         column
+    }
+
+    /// A layout carries its witness, and a layout with a release hook has that
+    /// hook run once per live row - by `Drop` and by `swap_remove`.
+    #[test]
+    fn a_layout_keeps_its_witness_and_drop_hook() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let constructed =
+            DynamicComponentLayout::new(4, 4, 7, Blittability::from_manifest_fields())
+                .expect("a plain layout");
+        assert_eq!(
+            constructed.blittability,
+            Blittability::from_manifest_fields(),
+            "the constructor stores the witness it was handed"
+        );
+        assert!(
+            constructed.drop_fn.is_none(),
+            "a blittable layout starts without a release hook"
+        );
+
+        // The hook is what an owning layout would get instead of the promise
+        // that nothing needs releasing. Counting calls is the cheapest way to
+        // hold both call sites - `Drop` and `swap_remove` - to one call per
+        // row.
+        static RELEASES: AtomicUsize = AtomicUsize::new(0);
+        unsafe fn count_release(_row: *mut u8) {
+            RELEASES.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let mut column = DynamicColumn::new(DynamicComponentLayout {
+            size: 4,
+            align: 4,
+            schema_hash: 7,
+            // SAFETY: the only field is four bytes the test reads as bytes; the
+            // hook counts releases rather than running a real destructor.
+            blittability: unsafe { Blittability::assume() },
+            drop_fn: Some(count_release),
+        })
+        .expect("a valid layout");
+
+        column
+            .push_zeroed()
+            .expect("the first row grows the column");
+        column.push_zeroed().expect("the second row fits");
+        column.swap_remove(0);
+        assert_eq!(
+            RELEASES.load(Ordering::SeqCst),
+            1,
+            "swap_remove releases the row it overwrites"
+        );
+
+        drop(column);
+        assert_eq!(
+            RELEASES.load(Ordering::SeqCst),
+            2,
+            "Drop releases the one row still live"
+        );
     }
 
     #[test]
@@ -1210,6 +1416,8 @@ mod tests {
                     size: 16,
                     align: 8,
                     schema_hash: 2,
+                    blittability: Blittability::engine_verified(),
+                    drop_fn: None,
                 },
                 &plan,
             )
@@ -1265,6 +1473,8 @@ mod tests {
                     size: 8,
                     align: 4,
                     schema_hash: 3,
+                    blittability: Blittability::engine_verified(),
+                    drop_fn: None,
                 },
                 &plan,
             )
@@ -1294,6 +1504,8 @@ mod tests {
                     size: 4,
                     align: 4,
                     schema_hash: 4,
+                    blittability: Blittability::engine_verified(),
+                    drop_fn: None,
                 },
                 &plan,
             )
@@ -1320,6 +1532,8 @@ mod tests {
                 size: 8,
                 align: 4,
                 schema_hash: 1,
+                blittability: Blittability::engine_verified(),
+                drop_fn: None,
             },
             &plan,
         );
@@ -1340,7 +1554,9 @@ mod tests {
                 DynamicComponentLayout {
                     size: 0,
                     align: 4,
-                    schema_hash: 1
+                    schema_hash: 1,
+                    blittability: Blittability::engine_verified(),
+                    drop_fn: None
                 },
                 &DynamicFieldPlan::new()
             ),
@@ -1351,7 +1567,9 @@ mod tests {
                 DynamicComponentLayout {
                     size: 4,
                     align: 3,
-                    schema_hash: 1
+                    schema_hash: 1,
+                    blittability: Blittability::engine_verified(),
+                    drop_fn: None
                 },
                 &DynamicFieldPlan::new()
             ),

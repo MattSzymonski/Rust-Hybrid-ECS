@@ -111,10 +111,62 @@ fn module_world_engine_dylib(workspace_root: &Path) -> Option<PathBuf> {
 }
 
 /// Byte equality for two DLL files.
+///
+/// Gated on length first, because both files are multi-megabyte engine
+/// dylibs compared on every `load_copy` and a length mismatch is a proof of
+/// inequality. Everything else goes through [`files_equal_streaming`]:
+/// timestamps cannot answer either way - a copied file keeps or renews them
+/// while staying byte-identical, and two files can share a timestamp while
+/// differing - and this comparison decides whether a module shares the host's
+/// engine instance or gets its own staged copy. A false "different" would map
+/// `pill_core.dll` twice and break the one-instance contract the engine's raw
+/// pointers rely on, so only exact bytes may answer "equal".
 fn files_equal(left: &Path, right: &Path) -> bool {
-    match (std::fs::read(left), std::fs::read(right)) {
-        (Ok(left_bytes), Ok(right_bytes)) => left_bytes == right_bytes,
-        _ => false,
+    if let (Ok(left_metadata), Ok(right_metadata)) =
+        (std::fs::metadata(left), std::fs::metadata(right))
+    {
+        if left_metadata.len() != right_metadata.len() {
+            return false;
+        }
+    }
+    // Unreadable metadata falls through rather than answering "different":
+    // the streaming compare still answers, a locked file included.
+    files_equal_streaming(left, right)
+}
+
+/// Exact byte compare of two files through two reused buffers.
+///
+/// The fallback for [`files_equal`] once metadata has not already answered;
+/// exits on the first differing chunk, so a differing pair costs one 64 KiB
+/// read per side instead of a whole-file read on each.
+fn files_equal_streaming(left: &Path, right: &Path) -> bool {
+    use std::io::Read;
+
+    let (Ok(mut left_file), Ok(mut right_file)) =
+        (std::fs::File::open(left), std::fs::File::open(right))
+    else {
+        return false;
+    };
+    let mut left_buffer = vec![0u8; 64 * 1024];
+    let mut right_buffer = vec![0u8; 64 * 1024];
+    loop {
+        let left_read = match left_file.read(&mut left_buffer) {
+            Ok(read) => read,
+            Err(_) => return false,
+        };
+        let right_read = match right_file.read(&mut right_buffer) {
+            Ok(read) => read,
+            Err(_) => return false,
+        };
+        if left_read != right_read {
+            return false;
+        }
+        if left_read == 0 {
+            return true;
+        }
+        if left_buffer[..left_read] != right_buffer[..right_read] {
+            return false;
+        }
     }
 }
 
@@ -290,6 +342,43 @@ pub(crate) struct NativeLibrary {
     temporary_path: PathBuf,
 }
 
+/// A copied artifact path that deletes itself if the load never takes it over.
+///
+/// `load_copy` writes the copy before the library exists, so the `?` on a
+/// rejected load used to leave the file behind for the life of the process:
+/// the `Drop` that removes it lives on `NativeLibrary`, which the failure path
+/// never constructs. The guard owns the path from the moment the copy succeeds
+/// and is disarmed only once the library owns the file.
+struct TemporaryCopy {
+    /// The copied file, or `None` once the library has taken it over.
+    path: Option<PathBuf>,
+}
+
+impl TemporaryCopy {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    /// The copied file, which the guard still owns.
+    fn path(&self) -> &Path {
+        self.path.as_deref().expect("the copy is disarmed")
+    }
+
+    /// Hand the file to the library that just mapped it.
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TemporaryCopy {
+    fn drop(&mut self) {
+        let Some(path) = self.path.take() else {
+            return;
+        };
+        remove_temporary_file(&path);
+    }
+}
+
 /// Fetch the artifact's `#[pill_mirror_method]` descriptors, each with the
 /// exported address of its `#[no_mangle]` trampoline.
 ///
@@ -344,9 +433,12 @@ impl NativeLibrary {
                 source,
             }
         })?;
+        // From here the copy exists, and every path that does not hand it to a
+        // `NativeLibrary` must delete it again; the guard owns that duty.
+        let mut temporary_copy = TemporaryCopy::new(temporary_path);
         debug!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-            path = %temporary_path.display(),
+            path = %temporary_copy.path().display(),
             "copied project DLL"
         );
 
@@ -367,23 +459,32 @@ impl NativeLibrary {
         }
 
         // Step 3: Load the copy and validate its required exports.
-        // SAFETY: `temporary_path` was just written by `std::fs::copy` from
-        // the freshly built output, so it is a complete native module on
-        // disk. `Self::load` validates the required exports before returning,
-        // and the returned `ProjectLibrary` owns the mapping for its lifetime.
         let load_started = Instant::now();
-        // SAFETY: `temporary_path` is a complete native module on disk - it was
-        // written by `std::fs::copy` immediately above - and `Self::load`
-        // validates the required exports before returning; see the fuller
-        // justification above the copy.
+        // SAFETY: `temporary_copy.path()` is a complete native module on
+        // disk - it was written by `std::fs::copy` immediately above - and
+        // `Self::load` validates the required exports before returning; see
+        // the fuller justification above the copy.
         let native_library = unsafe {
             Self::load(
-                &temporary_path,
-                temporary_path.clone(),
+                temporary_copy.path(),
+                temporary_copy.path().to_path_buf(),
                 entry_points,
                 isolated_engine,
             )
-        }?;
+        }
+        .inspect_err(|_| {
+            // The guard removes the copy when this function returns the error.
+            // The staged engine dylib it would have loaded against needs the
+            // same treatment when this attempt asked for isolation, because
+            // nothing else deletes it for the life of the process. A dylib a
+            // live library maps cannot be deleted on Windows, so a removal
+            // failure is ignored: another module may already be using it, and
+            // the next attempt stages a fresh copy either way.
+            if isolated_engine {
+                let _ = std::fs::remove_file(temporary_directory.join("pill_core.dll"));
+            }
+        })?;
+        temporary_copy.disarm();
         analytics::record_load(module_name, load_started.elapsed().as_secs_f64() * 1000.0);
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -880,12 +981,14 @@ impl NativeLibrary {
     ///
     /// The declaration is the compatibility gate for the prologue route: it is
     /// the only chance to refuse a reshaped function, because overwriting the
-    /// first bytes of a function can check nothing about what it jumps to.
+    /// first bytes of a function can check nothing about what it jumps to. An
+    /// artifact whose inventory carries no declaration reports `None` for it,
+    /// which the gate refuses rather than exempts.
     ///
-    /// Returns `None` when this artifact exports no address resolver or has no
-    /// entry for the name.
+    /// Returns `None` overall when this artifact exports no address resolver or
+    /// has no entry for the name.
     #[cfg(feature = "hot_patch")]
-    pub(crate) fn function_address(&self, qualified_name: &str) -> Option<(usize, String)> {
+    pub(crate) fn function_address(&self, qualified_name: &str) -> Option<(usize, Option<String>)> {
         let library = self.library.as_ref()?;
         // SAFETY: the symbol is looked up by the name the ABI macros generate,
         // with the signature they define. The pointer stays valid because
@@ -905,12 +1008,12 @@ impl NativeLibrary {
             return None;
         }
         let signature = if signature_pointer.is_null() {
-            String::new()
+            None
         } else {
             // SAFETY: the artifact wrote a pointer and length describing a
             // `&'static str` inside its own image.
             let bytes = unsafe { std::slice::from_raw_parts(signature_pointer, signature_length) };
-            String::from_utf8_lossy(bytes).into_owned()
+            Some(String::from_utf8_lossy(bytes).into_owned())
         };
         Some((address, signature))
     }
@@ -962,18 +1065,27 @@ impl Drop for NativeLibrary {
             "unmapping module copy"
         );
         drop(self.library.take());
-        if let Err(error) = std::fs::remove_file(&self.temporary_path) {
-            eprintln!(
-                "[host] Failed to remove temporary DLL {}: {error}",
-                self.temporary_path.display()
-            );
-        }
+        remove_temporary_file(&self.temporary_path);
     }
 }
 
 // =============================================================================
 // Free Functions
 // =============================================================================
+
+/// Delete one temporary copy, reporting failures rather than swallowing them.
+///
+/// Shared by [`NativeLibrary`]'s `Drop` and [`TemporaryCopy`]'s, which remove
+/// the same kind of file for the same reason and must say the same thing when
+/// the removal fails.
+fn remove_temporary_file(path: &Path) {
+    if let Err(error) = std::fs::remove_file(path) {
+        eprintln!(
+            "[host] Failed to remove temporary DLL {}: {error}",
+            path.display()
+        );
+    }
+}
 
 /// Directory used by this host process for temporary native-library copies.
 ///
@@ -1047,5 +1159,104 @@ pub(crate) fn cleanup_temporary_files(workspace_root: &Path) {
                 }
             }
         }
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::{files_equal, TemporaryCopy};
+    use std::time::{Duration, SystemTime};
+
+    /// Stamp one fixed modification time onto a file, so the metadata gate in
+    /// `files_equal` is decided by this test rather than by clock resolution.
+    fn set_modified(path: &std::path::Path, stamp: SystemTime) {
+        let file = std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open to set the timestamp");
+        file.set_modified(stamp).expect("set modification time");
+    }
+
+    /// The length gate and the streaming compare answer one question: equal
+    /// bytes are equal, and both a length mismatch and a same-length
+    /// difference are not. Timestamps must not decide: the identical pair
+    /// below deliberately carries different modification times.
+    #[test]
+    fn files_equal_gates_length_and_compares_bytes() {
+        let directory = std::env::temp_dir().join("pill_files_equal");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create directory");
+
+        let first = directory.join("first.dll");
+        let second = directory.join("second.dll");
+        let stamp = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+
+        std::fs::write(&first, b"engine bytes").expect("write first");
+        std::fs::write(&second, b"engine bytes").expect("write second");
+        set_modified(&first, stamp);
+        // A copied dylib keeps its bytes but not its timestamp; comparing the
+        // two as "different" would stage an isolated engine and map
+        // `pill_core.dll` twice.
+        set_modified(&second, stamp + Duration::from_secs(1));
+        assert!(
+            files_equal(&first, &second),
+            "identical bytes compare equal regardless of timestamps"
+        );
+
+        // Same length, one differing byte: the streaming compare must catch
+        // what the length gate cannot.
+        std::fs::write(&second, b"engine ByteS").expect("write one differing byte");
+        set_modified(&second, stamp);
+        assert!(
+            !files_equal(&first, &second),
+            "same length but different bytes compare unequal"
+        );
+
+        // Shorter file: the length gate answers.
+        std::fs::write(&second, b"engine").expect("truncate second");
+        set_modified(&second, stamp);
+        assert!(
+            !files_equal(&first, &second),
+            "a length mismatch compares unequal"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    /// A load that never happens still removes the copy the guard owns, and a
+    /// disarmed guard leaves the file for the library's own `Drop`.
+    #[test]
+    fn an_abandoned_copy_is_removed() {
+        let directory = std::env::temp_dir().join("pill_temporary_copy");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).expect("create directory");
+
+        let abandoned = directory.join("abandoned.dll");
+        std::fs::write(&abandoned, b"copy").expect("write abandoned copy");
+        {
+            let _guard = TemporaryCopy::new(abandoned.clone());
+        }
+        assert!(
+            !abandoned.exists(),
+            "the guard removes the copy when the load never took it over"
+        );
+
+        let kept = directory.join("kept.dll");
+        std::fs::write(&kept, b"copy").expect("write kept copy");
+        {
+            let mut guard = TemporaryCopy::new(kept.clone());
+            let _ = guard.path();
+            guard.disarm();
+        }
+        assert!(
+            kept.exists(),
+            "a disarmed guard leaves the file to the library that mapped it"
+        );
+
+        let _ = std::fs::remove_dir_all(&directory);
     }
 }

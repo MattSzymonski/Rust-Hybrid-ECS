@@ -23,7 +23,7 @@
 //! serializable data.
 
 // Standard library
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 // External crates
 use pill_core::error;
@@ -282,19 +282,20 @@ fn spline_path_system(
 // Spline probe
 // =============================================================================
 
-/// Counts frames so the spline probe reports at a readable interval.
+/// Timestamps the last spline probe report so the cadence is wall-clock.
 struct SplineProbeState {
-    frame_count: u64,
+    last_report: Instant,
 }
 
 impl Resource for SplineProbeState {}
 
-/// How often the probe reports, in frames.
+/// How often the probe reports, on the wall clock.
 ///
 /// The demo runs uncapped, so a per-frame report would drown the log and a
-/// once-a-second one would make the integration suites' waits depend on the
-/// frame rate of the machine. Sub-second keeps those waits proportional.
-const SPLINE_REPORT_INTERVAL_FRAMES: u64 = 600;
+/// frame-count interval would make the cadence - and every suite waiting on a
+/// report - depend on the machine's frame rate. Wall-clock time is what a
+/// human reading the log observes, and what the waits can bound.
+const SPLINE_REPORT_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Reports how many splines the project can see, and samples the curve.
 ///
@@ -316,10 +317,10 @@ fn spline_probe_system(
             name: String::from("SplineProbeState"),
         });
     };
-    state.frame_count += 1;
-    if state.frame_count % SPLINE_REPORT_INTERVAL_FRAMES != 0 {
+    if state.last_report.elapsed() < SPLINE_REPORT_INTERVAL {
         return Ok(());
     }
+    state.last_report = Instant::now();
 
     let mut visible_spline_count = 0;
     for spline in splines.iter_mut() {
@@ -403,9 +404,9 @@ pub fn init(engine: &mut Engine) -> u32 {
     engine.register_system("simulation_time", update_time_system);
     engine.register_system("ball_physics", physics_system);
     engine.register_system("spline_path", spline_path_system);
-    engine
-        .world_mut()
-        .insert_resource(SplineProbeState { frame_count: 0 });
+    engine.world_mut().insert_resource(SplineProbeState {
+        last_report: Instant::now(),
+    });
     engine.register_system("spline_probe", spline_probe_system);
 
     // The spline entity. `Spline` is registered by the linked `pill_spline`

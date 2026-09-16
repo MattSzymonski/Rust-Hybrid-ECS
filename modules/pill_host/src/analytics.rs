@@ -61,9 +61,21 @@ fn cargo_timings_directory() -> String {
     )
 }
 
-/// Subdirectory, relative to the workspace root, where cargo writes each
+/// Directory, relative to the workspace root, where cargo writes each
 /// compiled crate's fingerprint JSON.
-const CARGO_FINGERPRINT_DIRECTORY: &str = "target/debug/.fingerprint";
+///
+/// Derived from the same private build tree as [`cargo_timings_directory`]:
+/// every build the host spawns runs with `CARGO_TARGET_DIR` pointing at
+/// [`crate::config::MODULE_BUILD_TARGET_DIRECTORY`], so a hardcoded
+/// `target/debug/.fingerprint` only ever found fingerprints left by the
+/// developer's own `cargo build`. The `deps=` detail was therefore empty for
+/// exactly the builds it describes.
+fn cargo_fingerprint_directory() -> String {
+    format!(
+        "{}/.fingerprint",
+        crate::config::module_build_artifact_directory()
+    )
+}
 
 /// Whether a module was rebuilt from scratch or skipped by the up-to-date fast path.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -124,7 +136,10 @@ pub(crate) fn inspect_pe(path: &Path) -> Option<PeInspection> {
     let number_of_sections = u16::from_le_bytes(data[coff + 2..coff + 4].try_into().ok()?) as usize;
     let size_of_optional = u16::from_le_bytes(data[coff + 16..coff + 18].try_into().ok()?) as usize;
     let opt = coff + 20;
-    if opt + size_of_optional > data.len() {
+    // 60 bytes covers every fixed field read below; the deepest is the
+    // `SizeOfImage` at offset 56. The file's own `SizeOfOptionalHeader` must
+    // not be able to vouch for a header shorter than the reads that follow.
+    if size_of_optional < 60 || opt + size_of_optional > data.len() {
         return None;
     }
     let magic = u16::from_le_bytes(data[opt..opt + 2].try_into().ok()?);
@@ -477,7 +492,7 @@ pub(crate) fn parse_latest_cargo_timings(workspace_root: &Path) -> Option<CargoT
 /// dependency. Returns an empty vector when the fingerprint is missing (for
 /// example before the first build of a fresh workspace).
 pub(crate) fn read_cargo_deps(workspace_root: &Path, crate_name: &str) -> Vec<String> {
-    let fingerprint_directory = workspace_root.join(CARGO_FINGERPRINT_DIRECTORY);
+    let fingerprint_directory = workspace_root.join(cargo_fingerprint_directory());
     let Ok(entries) = std::fs::read_dir(&fingerprint_directory) else {
         return Vec::new();
     };
@@ -1514,6 +1529,41 @@ const CONCURRENCY_DATA = [
         }
     }
 
+    /// A truncated optional header must degrade the report, not panic.
+    ///
+    /// The guard used to trust the file's own `SizeOfOptionalHeader`, so a
+    /// header declaring 40 bytes passed it and the `SizeOfImage` read at
+    /// offset 56 indexed past the buffer. Both files below panic on the old
+    /// code; the guard now refuses them before anything is read.
+    #[test]
+    fn a_truncated_optional_header_degrades_to_none() {
+        // 132 bytes: enough for the COFF header and 40 optional-header bytes
+        // starting at 0x58, not enough for the `SizeOfImage` field at 0x90.
+        for declared_size in [0u16, 40] {
+            let mut image = vec![0u8; 132];
+            image[0..2].copy_from_slice(b"MZ");
+            image[0x3c..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+            image[0x40..0x44].copy_from_slice(b"PE\0\0");
+            let coff = 0x44usize;
+            image[coff + 2..coff + 4].copy_from_slice(&1u16.to_le_bytes());
+            image[coff + 16..coff + 18].copy_from_slice(&declared_size.to_le_bytes());
+            // A valid PE32 magic, so the parse reaches the `SizeOfImage` read
+            // the guard has to stop it before.
+            image[0x58..0x5a].copy_from_slice(&0x10bu16.to_le_bytes());
+
+            let path = std::env::temp_dir().join(format!(
+                "pill_pe_truncated_{}_{declared_size}.dll",
+                std::process::id()
+            ));
+            std::fs::write(&path, &image).unwrap();
+            assert!(
+                inspect_pe(&path).is_none(),
+                "a {declared_size}-byte optional header must degrade to None"
+            );
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
     /// The dependency reader extracts names from the fingerprint's
     /// array-of-arrays `deps` field.
     #[test]
@@ -1527,8 +1577,12 @@ const CONCURRENCY_DATA = [
             std::process::id()
         ));
         let fingerprint = root
-            .join(CARGO_FINGERPRINT_DIRECTORY)
+            .join(cargo_fingerprint_directory())
             .join("pill_dummy_math-0123456789abcdef");
+        assert!(
+            cargo_fingerprint_directory().contains("target/hot/build"),
+            "fingerprints live in the private build tree the host actually fills"
+        );
         std::fs::create_dir_all(&fingerprint).unwrap();
         std::fs::write(
             fingerprint.join("lib-pill_dummy_math.json"),

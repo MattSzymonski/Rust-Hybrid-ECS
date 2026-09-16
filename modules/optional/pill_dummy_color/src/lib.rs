@@ -19,9 +19,9 @@
 use pill_engine::Engine;
 use pill_engine::{pill_hot_fn, pill_module};
 
-// SPIKE: the build script scans this crate and submits one address entry per
-// function, so the host can resolve any of them by qualified path with nothing
-// in this file annotated. One `include!` per crate replaces every attribute.
+// The build script scans this crate and emits one address entry per function
+// into `function_inventory.rs`; the `include!` is what makes every function
+// resolvable by qualified path with nothing in this file annotated.
 include!(concat!(env!("OUT_DIR"), "/function_inventory.rs"));
 
 // =============================================================================

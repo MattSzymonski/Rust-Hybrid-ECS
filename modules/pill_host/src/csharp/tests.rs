@@ -16,26 +16,33 @@
 
 // External crates
 use pill_core::error::EngineMessage;
-use pill_engine::{ComponentTicks, Engine, Entity, SystemAccess, SystemError, SystemScheduler};
+use pill_engine::{
+    ComponentId, ComponentTicks, Engine, Entity, SystemAccess, SystemError, SystemScheduler,
+};
 
 // Current crate
 use super::abi::{ComponentChunk, NativeComponentBlob, NativeSystemAccess};
 use super::backend::{
-    derive_system_access, is_supported_manifest_length, MAX_COMPONENT_MANIFEST_BYTES,
+    checked_access_count, checked_system_count, derive_system_access, is_supported_manifest_length,
+    MAX_ACCESSES_PER_SYSTEM, MAX_COMPONENT_MANIFEST_BYTES, MAX_SYSTEMS_PER_ASSEMBLY,
 };
+#[cfg(feature = "hot_reload")]
+use super::backend::{poll_status_is_known, POLL_NO_CHANGE, POLL_REJECTED, POLL_RELOADED};
 use super::commands::{
     ffi_queue_add_component, ffi_queue_create, ffi_queue_destroy, ffi_queue_remove_component,
     ffi_reserve_entity,
 };
 use super::components::{
-    apply_component_manifest_on_reload, register_component_manifest, shared_component_bindings,
-    stable_component_id, BindingStore, Color, ComponentBinding, ComponentBindings, Position, Sprite,
-    StableComponentId,
+    apply_component_manifest_on_reload, module_native_bindings, register_component_manifest,
+    shared_component_bindings, stable_component_id, BindingStore, Color, ComponentBinding,
+    ComponentBindings, ModuleExposedComponent, Position, Sprite, StableComponentId,
 };
 // `Color`, `Position` and `Sprite` above are the renderer's components,
 // re-exported by `components` from `pill_master_renderer`.
 use super::context::ActiveSystemGuard;
-use super::queries::{ffi_get_archetype_chunk, ffi_get_component_chunk, ffi_get_entity_chunk};
+use super::queries::{
+    ffi_entity_count, ffi_get_archetype_chunk, ffi_get_component_chunk, ffi_get_entity_chunk,
+};
 
 // =============================================================================
 // Constants
@@ -51,6 +58,11 @@ const ABI_OUT_OF_SCOPE: u8 = 3;
 const ABI_COMMAND_SCOPE_DENIED: u8 = 4;
 const ABI_STALE_ENTITY_GENERATION: u8 = 5;
 
+/// Undeclared access on the query path: a component mode the system never
+/// declared, or an archetype no validated term served before the entity path
+/// asked for it (the same code, because both are "not declared").
+const ABI_UNDECLARED_ACCESS: u8 = 4;
+
 /// Number of entities populated by [`setup_test_world`]; row-count assertions
 /// must agree with this bound.
 const TEST_WORLD_ENTITY_COUNT: usize = 100;
@@ -62,6 +74,15 @@ const TEST_WORLD_ENTITY_COUNT: usize = 100;
 /// Return the stable ID used by a component in the shared `TracyLive` namespace.
 fn test_stable_id(name: &str) -> StableComponentId {
     stable_component_id(&format!("TracyLive.{name}"))
+}
+
+/// The witness these tests hand to `register_dynamic_component`.
+///
+/// The shapes registered here are four-byte integers named literally, which is
+/// the same evidence the production path earns by running
+/// `BLITTABLE_FIELD_TYPES` over a manifest.
+fn test_witness() -> pill_engine::archetype::Blittability {
+    pill_engine::archetype::Blittability::from_manifest_fields()
 }
 
 /// Build one ABI access descriptor for a named test component.
@@ -97,7 +118,14 @@ fn managed_access(entries: &[(&str, u8)]) -> SystemAccess {
         }
         let component_id = engine
             .world_mut()
-            .register_dynamic_component(stable_id.0, format!("TracyLive.{name}"), 4, 4, 1)
+            .register_dynamic_component(
+                stable_id.0,
+                format!("TracyLive.{name}"),
+                4,
+                4,
+                1,
+                test_witness(),
+            )
             .unwrap();
         bindings.insert(
             stable_id,
@@ -182,11 +210,25 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
     let dynamic_b_key = stable_component_id("TracyLive.DynamicB");
     let dynamic_a = engine
         .world_mut()
-        .register_dynamic_component(dynamic_a_key.0, "TracyLive.DynamicA", 4, 4, 1)
+        .register_dynamic_component(
+            dynamic_a_key.0,
+            "TracyLive.DynamicA",
+            4,
+            4,
+            1,
+            test_witness(),
+        )
         .unwrap();
     let dynamic_b = engine
         .world_mut()
-        .register_dynamic_component(dynamic_b_key.0, "TracyLive.DynamicB", 4, 4, 2)
+        .register_dynamic_component(
+            dynamic_b_key.0,
+            "TracyLive.DynamicB",
+            4,
+            4,
+            2,
+            test_witness(),
+        )
         .unwrap();
     bindings.insert(
         dynamic_a_key,
@@ -365,6 +407,7 @@ fn empty_chunk() -> ComponentChunk {
         archetype_low: 0,
         archetype_high: 0,
         data: std::ptr::null_mut(),
+        entities: std::ptr::null(),
         len: 0,
         element_size: 0,
         ticks: std::ptr::null_mut(),
@@ -388,14 +431,17 @@ unsafe fn simulate_managed_write(chunk: &ComponentChunk, row: usize) {
     }
 }
 
-/// Pin the component-tick fields to the layout consumed by managed code.
+/// Pin the component-tick fields to the layout consumed by managed code in
+/// `EngineApi.cs`, field for field and offset for offset.
 #[test]
 fn component_chunk_change_tracking_abi_layout_is_stable() {
     assert_eq!(std::mem::size_of::<ComponentTicks>(), 8);
     assert_eq!(std::mem::offset_of!(ComponentTicks, changed), 4);
-    assert_eq!(std::mem::size_of::<ComponentChunk>(), 48);
-    assert_eq!(std::mem::offset_of!(ComponentChunk, ticks), 32);
-    assert_eq!(std::mem::offset_of!(ComponentChunk, change_tick), 40);
+    assert_eq!(std::mem::size_of::<ComponentChunk>(), 56);
+    assert_eq!(std::mem::offset_of!(ComponentChunk, data), 16);
+    assert_eq!(std::mem::offset_of!(ComponentChunk, entities), 24);
+    assert_eq!(std::mem::offset_of!(ComponentChunk, ticks), 40);
+    assert_eq!(std::mem::offset_of!(ComponentChunk, change_tick), 48);
 }
 
 /// Verify the archetype-scoped chunk lookup resolves the remaining terms of
@@ -413,10 +459,7 @@ fn archetype_chunk_lookup_resolves_components_and_entities() {
 
     let position_id = test_stable_id("Position");
     let sprite_id = test_stable_id("Sprite");
-    let accesses = [
-        native_access("Position", 1),
-        native_access("Sprite", 0),
-    ];
+    let accesses = [native_access("Position", 1), native_access("Sprite", 0)];
     let mut chunk = empty_chunk();
     let mut sprite_chunk = empty_chunk();
     let mut entity_chunk = empty_chunk();
@@ -425,10 +468,7 @@ fn archetype_chunk_lookup_resolves_components_and_entities() {
 
         // Step 1: one index-based lookup yields the archetype identity the
         // managed enumerator would carry in its driver chunk.
-        assert_eq!(
-            get_test_chunk("Position", 1, 0, &mut chunk),
-            ABI_SUCCESS
-        );
+        assert_eq!(get_test_chunk("Position", 1, 0, &mut chunk), ABI_SUCCESS);
 
         // Step 2: the archetype-scoped twin resolves the same column directly.
         assert_eq!(
@@ -540,6 +580,245 @@ fn managed_manifest_registers_and_queries_a_new_dynamic_component() {
         // `u32` inside the component column.
         assert_eq!(unsafe { *(chunk.data as *const u32) }, 77);
     }
+}
+
+/// A newly registered dynamic component still exposes its field layout.
+///
+/// The layout computation leaks every field name and struct tag, so it moved
+/// from the top of the manifest loop - where it ran for entries that already
+/// had a binding and for manifests refused as shared - into the registration
+/// branch. The editor-visible outcome must not have changed with it.
+#[test]
+fn dynamic_registration_still_installs_field_layout() {
+    let mut engine = Engine::new();
+    let shared = shared_component_bindings(&mut engine);
+    let stable_id = stable_component_id("TracyLive.LayoutProbe");
+    let manifest = serde_json::json!([{
+        "stable_id_low": stable_id.0 as u64,
+        "stable_id_high": (stable_id.0 >> 64) as u64,
+        "full_name": "TracyLive.LayoutProbe",
+        "size": 4,
+        "alignment": 4,
+        "schema_hash": 9,
+        "shared": false,
+        "fields": [{
+            "name": "Value",
+            "offset": 0,
+            "size": 4,
+            "primitive_type": "System.UInt32",
+            "fields": []
+        }]
+    }]);
+    let bindings =
+        register_component_manifest(&mut engine, &serde_json::to_vec(&manifest).unwrap(), shared)
+            .unwrap();
+    let component_id = bindings[&stable_id].component_id();
+
+    let layout = engine
+        .world()
+        .component_field_layout(component_id)
+        .expect("a registered dynamic component keeps its field layout");
+    assert_eq!(layout.len(), 1, "one manifest field means one descriptor");
+    assert_eq!(layout[0].name, "Value");
+    assert_eq!(layout[0].type_tag, "u32");
+}
+
+/// A caller that passes nowhere to write gets a status, not silent truncation.
+///
+/// `0` means "end of iteration" to every managed caller, so answering a null
+/// output buffer with it turned a binding bug into a query that found no rows.
+/// Status `5` names the mistake, and the managed `ValidateStatus` maps it to
+/// an `ArgumentException`.
+#[test]
+fn null_output_pointer_reports_invalid_argument() {
+    assert_eq!(
+        ffi_get_component_chunk(0, 0, 0, 0, std::ptr::null_mut()),
+        5,
+        "a component chunk with no output buffer is a caller bug"
+    );
+    assert_eq!(
+        ffi_get_archetype_chunk(0, 0, 0, 0, 0, std::ptr::null_mut()),
+        5,
+        "an archetype chunk with no output buffer is a caller bug"
+    );
+    assert_eq!(
+        ffi_get_entity_chunk(0, std::ptr::null_mut()),
+        5,
+        "an entity chunk with no output buffer is a caller bug"
+    );
+    assert_eq!(
+        ffi_entity_count(std::ptr::null_mut()),
+        5,
+        "an entity count with no output buffer is a caller bug"
+    );
+}
+
+/// The served stride is the live column's, not the binding's copy.
+///
+/// Managed row arithmetic trusts `element_size`; if a binding ever described a
+/// different layout than the column its pointer addresses, every row after the
+/// first would be read at the wrong offset. The chunk callbacks therefore
+/// serve the registered layout, and a binding that disagrees cannot change
+/// what managed code multiplies by.
+#[test]
+fn dynamic_chunk_stride_comes_from_the_live_column() {
+    let mut engine = Engine::new();
+    let shared = shared_component_bindings(&mut engine);
+    let stable_id = stable_component_id("TracyLive.DriftProbe");
+    let manifest = serde_json::json!([{
+        "stable_id_low": stable_id.0 as u64,
+        "stable_id_high": (stable_id.0 >> 64) as u64,
+        "full_name": "TracyLive.DriftProbe",
+        "size": 4,
+        "alignment": 4,
+        "schema_hash": 7,
+        "shared": false,
+        "fields": [{
+            "name": "Value",
+            "offset": 0,
+            "size": 4,
+            "primitive_type": "System.UInt32",
+            "fields": []
+        }]
+    }]);
+    let mut bindings =
+        register_component_manifest(&mut engine, &serde_json::to_vec(&manifest).unwrap(), shared)
+            .unwrap();
+    let component_id = bindings[&stable_id].component_id();
+    engine
+        .world_mut()
+        .create_dynamic_entity(&[(component_id, 77_u32.to_ne_bytes().to_vec())])
+        .unwrap();
+
+    // A store that disagrees with the registered column: the registration
+    // path asserts the two agree, and the serving path must be immune to the
+    // disagreement either way.
+    bindings.insert(
+        stable_id,
+        ComponentBinding::Dynamic {
+            component_id,
+            size: 8,
+            align: 8,
+            schema_hash: 7,
+        },
+    );
+
+    let accesses = [NativeSystemAccess {
+        component_key: stable_id.0 as u64,
+        component_key_high: (stable_id.0 >> 64) as u64,
+        mode: 1,
+    }];
+    let mut chunk = empty_chunk();
+    {
+        let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
+        assert_eq!(
+            ffi_get_component_chunk(
+                stable_id.0 as u64,
+                (stable_id.0 >> 64) as u64,
+                1,
+                0,
+                &mut chunk,
+            ),
+            ABI_SUCCESS
+        );
+        assert_eq!(chunk.len, 1);
+        assert_eq!(
+            chunk.element_size, 4,
+            "the stride must be the live column's, not the binding's copy"
+        );
+        // SAFETY: the query returned success and the asserted length and
+        // element size guarantee the chunk data pointer addresses one valid
+        // `u32` inside the component column.
+        assert_eq!(unsafe { *(chunk.data as *const u32) }, 77);
+    }
+}
+
+/// A module binding whose forwarded layout disagrees with the live column is
+/// dropped at build time, and a stale binding that still reaches a query fails
+/// closed instead of asserting.
+#[test]
+fn module_native_binding_rejects_live_layout_mismatch() {
+    let mut engine = Engine::new();
+    let stable_id = test_stable_id("ModuleThing");
+    let module_id = engine
+        .world_mut()
+        .register_dynamic_component(
+            stable_id.0,
+            "TracyLive.ModuleThing",
+            8,
+            4,
+            1,
+            test_witness(),
+        )
+        .expect("the module component registers");
+    engine
+        .world_mut()
+        .create_dynamic_entity(&[(module_id, vec![0_u8; 8])])
+        .expect("the entity carries the registered layout");
+
+    // The module forwards a size the live column does not have - a mirror
+    // built against a stale generation - and its binding is dropped rather
+    // than handed to managed code.
+    let exposed = [ModuleExposedComponent {
+        csharp_name: "TracyLive.ModuleThing".to_string(),
+        component_id: module_id,
+        size: 16,
+        align: 4,
+        fields: Vec::new(),
+    }];
+    let agreed = module_native_bindings(&mut engine, &exposed);
+    assert!(
+        agreed.is_empty(),
+        "a binding that disagrees with the live column is not handed out"
+    );
+
+    // A binding that predates the column change and is already in a store
+    // fails the query arm with the "unknown component" status instead of the
+    // debug assertion that aborted debug hosts and vanished in release.
+    //
+    // `Sprite` stands in for the module's component here: it is real native
+    // storage, which is exactly what the `ModuleNative` arm serves, and its
+    // live layout is what the stale binding is compared against.
+    let mut bindings = shared_component_bindings(&mut engine);
+    let sprite_stable_id = test_stable_id("Sprite");
+    bindings.insert(
+        sprite_stable_id,
+        ComponentBinding::ModuleNative {
+            component_id: ComponentId::of::<Sprite>(),
+            // Deliberately not the live layout, so the arm has to refuse.
+            size: 64,
+            align: 4,
+        },
+    );
+    engine
+        .world_mut()
+        .create_entity()
+        .with(Sprite {
+            width: 1.0,
+            height: 1.0,
+            color: Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 1.0,
+            },
+        })
+        .build()
+        .unwrap();
+    let accesses = [native_access("Sprite", 1)];
+    let mut chunk = empty_chunk();
+    let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
+    assert_eq!(
+        ffi_get_component_chunk(
+            sprite_stable_id.0 as u64,
+            (sprite_stable_id.0 >> 64) as u64,
+            1,
+            0,
+            &mut chunk,
+        ),
+        2,
+        "a wrong-size binding reports failure instead of aborting"
+    );
 }
 
 /// Verify a shared managed mirror with a different field schema is rejected.
@@ -692,7 +971,7 @@ fn one_managed_row_write_is_visible_to_rust_changed_filter() {
 
     // SAFETY: the entity chunk was fetched successfully and row `37` indexes
     // a live entity within its declared length.
-    let expected = unsafe { *((entity_chunk.data as *const pill_engine::Entity).add(37)) };
+    let expected = unsafe { *((entity_chunk.entities as *const pill_engine::Entity).add(37)) };
     let mut changed =
         pill_engine::Query::<(pill_engine::Entity,), pill_engine::Changed<Position>>::new(
             engine.world_mut(),
@@ -758,7 +1037,7 @@ fn disjoint_managed_writes_mark_the_correct_tick_columns() {
 
     // SAFETY: the entity chunk was fetched successfully and each queried row
     // indexes a live entity within the chunk's declared length.
-    let entity_at = |row| unsafe { *((entities.data as *const pill_engine::Entity).add(row)) };
+    let entity_at = |row| unsafe { *((entities.entities as *const pill_engine::Entity).add(row)) };
     let mut changed_positions = pill_engine::Query::<
         (pill_engine::Entity,),
         pill_engine::Changed<Position>,
@@ -793,9 +1072,98 @@ fn entity_chunks_are_available_only_during_a_managed_system() {
             chunk.element_size as usize,
             std::mem::size_of::<pill_engine::Entity>()
         );
-        assert!(!chunk.data.is_null());
+        assert!(
+            chunk.data.is_null(),
+            "entity rows must not be reachable through the writable `data` slot"
+        );
+        assert!(
+            !chunk.entities.is_null(),
+            "entity rows arrive in `entities`"
+        );
     }
     assert_eq!(ffi_get_entity_chunk(0, &mut chunk), ABI_OUT_OF_SCOPE);
+}
+
+/// Entity columns are handed out through the const `entities` slot only.
+///
+/// The writable `data` slot stays null for them, so an aliasing write into
+/// engine-owned entity rows cannot be written by accident the way it could
+/// when both kinds of column shared one pointer field.
+#[test]
+fn entity_chunks_expose_a_const_pointer() {
+    let mut engine = Engine::new();
+    let bindings = setup_test_world(&mut engine);
+    let mut chunk = empty_chunk();
+    {
+        let _guard = ActiveSystemGuard::set(engine.world_mut(), &[], &bindings);
+        assert_eq!(ffi_get_entity_chunk(0, &mut chunk), ABI_SUCCESS);
+        assert!(
+            chunk.data.is_null(),
+            "the writable slot must stay null for entity rows"
+        );
+        assert!(
+            !chunk.entities.is_null(),
+            "entity rows are served through the const slot"
+        );
+    }
+}
+
+/// The entity path serves only archetypes a validated term already reached.
+///
+/// Without that precondition, `mode == 2` would answer for any archetype id a
+/// managed caller cared to guess - an oracle for component sets nothing
+/// declared. The precondition lives per invocation, so it is gone again for
+/// the next system, and outside a managed invocation the out-of-scope answer
+/// takes precedence.
+#[test]
+fn mode_two_serves_only_observed_archetypes() {
+    let mut engine = Engine::new();
+    let bindings = setup_test_world(&mut engine);
+    let accesses = [native_access("Position", 0)];
+    // The id, learned the way the world itself knows it; the managed path
+    // never holds one before a validated term served it.
+    let archetype = engine
+        .world()
+        .entity_chunk(0)
+        .expect("the world has an archetype")
+        .0;
+    let low = archetype.0 as u64;
+    let high = (archetype.0 >> 64) as u64;
+    let mut chunk = empty_chunk();
+
+    assert_eq!(
+        ffi_get_archetype_chunk(low, high, 0, 0, 2, &mut chunk),
+        ABI_OUT_OF_SCOPE,
+        "outside a managed invocation the scope answer comes first"
+    );
+    {
+        let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
+
+        // Step 1: a fresh id is refused, because nothing declared it.
+        assert_eq!(
+            ffi_get_archetype_chunk(low, high, 0, 0, 2, &mut chunk),
+            ABI_UNDECLARED_ACCESS,
+            "an unobserved archetype must not be servable"
+        );
+
+        // Step 2: once a validated component term served the archetype, its
+        // entity column resolves.
+        assert_eq!(get_test_chunk("Position", 0, 0, &mut chunk), ABI_SUCCESS);
+        assert_eq!(
+            ffi_get_archetype_chunk(low, high, 0, 0, 2, &mut chunk),
+            ABI_SUCCESS
+        );
+        assert_eq!(chunk.len as usize, TEST_WORLD_ENTITY_COUNT);
+        assert!(!chunk.entities.is_null());
+    }
+
+    // Step 3: the observation does not survive the invocation.
+    let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
+    assert_eq!(
+        ffi_get_archetype_chunk(low, high, 0, 0, 2, &mut chunk),
+        ABI_UNDECLARED_ACCESS,
+        "each invocation starts with no archetype observed"
+    );
 }
 
 /// Verify a managed system that reports failure is recorded as a drained
@@ -1003,6 +1371,24 @@ fn overlapping_component_fields_are_rejected() {
     );
 }
 
+/// The three poll codes are the loader's whole vocabulary, and anything else
+/// is a typed error naming the code instead of a silent "nothing happened".
+#[cfg(feature = "hot_reload")]
+#[test]
+fn unknown_poll_status_is_a_typed_error() {
+    assert!(poll_status_is_known(POLL_NO_CHANGE));
+    assert!(poll_status_is_known(POLL_RELOADED));
+    assert!(poll_status_is_known(POLL_REJECTED));
+    assert!(!poll_status_is_known(3));
+    assert!(!poll_status_is_known(u8::MAX));
+
+    let error = pill_core::error::CSharpError::UnknownPollStatus { status: 9 };
+    assert!(
+        error.to_string().contains('9'),
+        "the message names the code: {error}"
+    );
+}
+
 /// Verifies that managed-reported manifest lengths are bounded before any
 /// host allocation happens.
 #[test]
@@ -1014,6 +1400,34 @@ fn manifest_length_bounds_reject_empty_and_oversized_values() {
         MAX_COMPONENT_MANIFEST_BYTES + 1
     ));
     assert!(!is_supported_manifest_length(u32::MAX));
+}
+
+/// Verifies that the counts a managed assembly reports are bounded before they
+/// size a host allocation, with the offending count and the limit carried in
+/// the refusal.
+#[test]
+fn system_counts_beyond_the_caps_are_refused() {
+    assert_eq!(
+        checked_system_count(MAX_SYSTEMS_PER_ASSEMBLY).unwrap(),
+        MAX_SYSTEMS_PER_ASSEMBLY as usize,
+        "the cap itself is accepted"
+    );
+    assert!(matches!(
+        checked_system_count(MAX_SYSTEMS_PER_ASSEMBLY + 1),
+        Err(pill_core::error::CSharpError::SystemCountOutOfRange { count, limit })
+            if count == MAX_SYSTEMS_PER_ASSEMBLY + 1 && limit == MAX_SYSTEMS_PER_ASSEMBLY
+    ));
+
+    assert_eq!(
+        checked_access_count(MAX_ACCESSES_PER_SYSTEM).unwrap(),
+        MAX_ACCESSES_PER_SYSTEM as usize,
+        "the cap itself is accepted"
+    );
+    assert!(matches!(
+        checked_access_count(MAX_ACCESSES_PER_SYSTEM + 1),
+        Err(pill_core::error::CSharpError::SystemCountOutOfRange { count, limit })
+            if count == MAX_ACCESSES_PER_SYSTEM + 1 && limit == MAX_ACCESSES_PER_SYSTEM
+    ));
 }
 
 // =============================================================================
@@ -1066,7 +1480,8 @@ fn store_with_component(
     let manifest = manifest_bytes(name, size, alignment, schema_hash, fields);
     let shared = shared_component_bindings(engine);
     let store = BindingStore::new(
-        register_component_manifest(engine, &manifest, shared).expect("the test manifest registers"),
+        register_component_manifest(engine, &manifest, shared)
+            .expect("the test manifest registers"),
     );
     (store, manifest)
 }
@@ -1109,10 +1524,7 @@ fn a_reshaped_dynamic_component_is_migrated_on_apply() {
     let component_id = store.read()[&stable_id].component_id();
     let entity = engine
         .world_mut()
-        .create_dynamic_entity(&[(
-            component_id,
-            [1.0_f32, 2.0].map(f32::to_ne_bytes).concat(),
-        )])
+        .create_dynamic_entity(&[(component_id, [1.0_f32, 2.0].map(f32::to_ne_bytes).concat())])
         .expect("the entity carries the registered layout");
 
     // `b` first, then `a`, then two fields that did not exist.
@@ -1156,6 +1568,123 @@ fn a_reshaped_dynamic_component_is_migrated_on_apply() {
     assert_eq!((size, align, schema_hash), (16, 8, 2));
 }
 
+/// A manifest whose application fails partway leaves none of it applied: the
+/// journal is unwound, so the store, the bindings and the migrated rows are
+/// byte-identical to their values before the call.
+#[test]
+fn a_refused_manifest_leaves_none_of_it_applied() {
+    let mut engine = Engine::new();
+    let (store, _manifest) = store_with_component(
+        &mut engine,
+        "Relayout",
+        8,
+        4,
+        1,
+        vec![manifest_field("a", 0, 4), manifest_field("b", 4, 4)],
+    );
+    let relayout_id = store.read()[&test_stable_id("Relayout")].component_id();
+    let mut row = 1.0_f32.to_ne_bytes().to_vec();
+    row.extend_from_slice(&2.0_f32.to_ne_bytes());
+    let entity = engine
+        .world_mut()
+        .create_dynamic_entity(&[(relayout_id, row.clone())])
+        .expect("the entity carries the registered layout");
+
+    // A name already claimed by a live column: the second entry's registration
+    // is refused by the engine, which no amount of validation can foresee.
+    let claimed_stable_id = stable_component_id("TracyLive.Claimed");
+    engine
+        .world_mut()
+        .register_dynamic_component(
+            claimed_stable_id.0,
+            "TracyLive.Claimed",
+            4,
+            4,
+            9,
+            test_witness(),
+        )
+        .expect("the claiming component registers");
+    let claimed_id = engine
+        .world()
+        .resolve_component_id_by_name_any("TracyLive.Claimed")
+        .expect("the name resolves to its registration")
+        .expect("the name is claimed");
+    engine
+        .world_mut()
+        .create_dynamic_entity(&[(claimed_id, 9_u32.to_ne_bytes().to_vec())])
+        .expect("the claiming component has a live row");
+
+    let store_len_before = store.read().len();
+
+    // Entry 1 reshapes `Relayout` and migrates its row; entry 2 is a second
+    // component claiming the taken name, so it fails after entry 1 applied.
+    let relayout_entry = serde_json::json!({
+        "stable_id_low": test_stable_id("Relayout").0 as u64,
+        "stable_id_high": (test_stable_id("Relayout").0 >> 64) as u64,
+        "full_name": "TracyLive.Relayout",
+        "size": 16,
+        "alignment": 8,
+        "schema_hash": 2,
+        "shared": false,
+        "fields": [
+            manifest_field("b", 0, 4),
+            manifest_field("a", 4, 4),
+            manifest_field("c", 8, 4),
+            manifest_field("d", 12, 4),
+        ],
+    });
+    // A fresh stable id under the claimed *name*: same identity would land on
+    // the idempotent re-registration path instead of colliding.
+    let colliding_stable_id = stable_component_id("TracyLive.ClaimedV2");
+    let claimed_entry = serde_json::json!({
+        "stable_id_low": colliding_stable_id.0 as u64,
+        "stable_id_high": (colliding_stable_id.0 >> 64) as u64,
+        "full_name": "TracyLive.Claimed",
+        "size": 4,
+        "alignment": 4,
+        "schema_hash": 9,
+        "shared": false,
+        "fields": [manifest_field("value", 0, 4)],
+    });
+    let refused = serde_json::to_vec(&serde_json::json!([relayout_entry, claimed_entry]))
+        .expect("the refused manifest serializes");
+
+    let error = apply_component_manifest_on_reload(&mut engine, &refused, &store)
+        .expect_err("a name claimed by a live column refuses the entry");
+    assert!(
+        error.to_string().contains("Claimed"),
+        "the refusal names the colliding component: {error}"
+    );
+
+    // Everything is as it was: same store size, the binding still describes
+    // the old shape, the layout is back and the row is byte-for-byte intact.
+    assert_eq!(store.read().len(), store_len_before);
+    assert!(
+        store.read().get(&colliding_stable_id).is_none(),
+        "the refused addition left no binding behind"
+    );
+    let ComponentBinding::Dynamic {
+        size,
+        align,
+        schema_hash,
+        ..
+    } = store.read()[&test_stable_id("Relayout")]
+    else {
+        panic!("the binding is still dynamic");
+    };
+    assert_eq!(
+        (size, align, schema_hash),
+        (8, 4, 1),
+        "the binding rolled back to the shape the world is in now"
+    );
+    assert_eq!(engine.world().component_layout(relayout_id), Some((8, 4)));
+    assert_eq!(
+        engine.world().dynamic_component_bytes(entity, relayout_id),
+        Some(row.as_slice()),
+        "the migrated rows were migrated back"
+    );
+}
+
 /// The three refusals: a module mirror that changed, a vanished component, and
 /// a manifest that cannot be trusted.
 #[test]
@@ -1166,7 +1695,14 @@ fn the_apply_refuses_what_it_cannot_migrate() {
     let stable_id = test_stable_id("ModuleThing");
     let module_id = engine
         .world_mut()
-        .register_dynamic_component(stable_id.0, "TracyLive.ModuleThing", 8, 4, 1)
+        .register_dynamic_component(
+            stable_id.0,
+            "TracyLive.ModuleThing",
+            8,
+            4,
+            1,
+            test_witness(),
+        )
         .expect("the module component registers");
     let mut bindings = shared_component_bindings(&mut engine);
     bindings.insert(
@@ -1178,19 +1714,11 @@ fn the_apply_refuses_what_it_cannot_migrate() {
         },
     );
     let store = BindingStore::new(bindings);
-    let changed = manifest_bytes(
-        "ModuleThing",
-        16,
-        8,
-        2,
-        vec![manifest_field("a", 0, 4)],
-    );
+    let changed = manifest_bytes("ModuleThing", 16, 8, 2, vec![manifest_field("a", 0, 4)]);
     let error = apply_component_manifest_on_reload(&mut engine, &changed, &store)
         .expect_err("a module mirror cannot change");
     assert!(
-        error
-            .to_string()
-            .contains("native component uses 8/4"),
+        error.to_string().contains("native component uses 8/4"),
         "the refusal names both layouts: {error}"
     );
 

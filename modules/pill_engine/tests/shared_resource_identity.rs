@@ -92,12 +92,181 @@ impl Resource for UnrelatedSettings {
     }
 }
 
+/// One artifact's copy of a hashed resource: same name, same size, one field
+/// shape.
+pub mod hashed_a {
+    /// `demo::Hashed` as one artifact compiled it.
+    pub struct Settings {
+        pub value: u32,
+    }
+    impl pill_engine::Resource for Settings {
+        fn shared_name() -> Option<&'static str> {
+            Some("demo::Hashed")
+        }
+        fn shared_schema_hash() -> Option<u64> {
+            Some(0x1111)
+        }
+    }
+}
+
+/// The other artifact's copy of the same name: `{u32}` reinterpreted as another
+/// shape that agrees on size and alignment, which only the hooks can tell apart.
+pub mod hashed_b {
+    /// `demo::Hashed` as the other artifact compiled it.
+    pub struct Settings {
+        pub value: u32,
+    }
+    impl pill_engine::Resource for Settings {
+        fn shared_name() -> Option<&'static str> {
+            Some("demo::Hashed")
+        }
+        fn shared_schema_hash() -> Option<u64> {
+            Some(0x2222)
+        }
+    }
+}
+
+/// A Rust resource declaring the foreign slot's name at another shape, so its
+/// id collides with a value it cannot be read as.
+pub mod identity_probe {
+    /// `identity::Guarded`, declared wider than the foreign payload.
+    #[derive(Debug)]
+    pub struct Guarded {
+        pub first: u32,
+        pub second: u32,
+    }
+    impl pill_engine::Resource for Guarded {
+        fn shared_name() -> Option<&'static str> {
+            Some("identity::Guarded")
+        }
+    }
+}
+
 /// An ordinary resource, to show the default identity is untouched.
 #[derive(Debug, Default)]
 struct PlainCounter {
     value: u32,
 }
 impl Resource for PlainCounter {}
+
+/// A relayout moves the claim with the factory: the migrated shape can be
+/// re-declared, and the shape it came from is refused as stale.
+#[test]
+fn a_relayout_releases_the_new_layout() {
+    let mut world = World::new();
+    let id = world
+        .register_foreign_resource("identity::Reshaped", "Reshaped", 16, 8, 1)
+        .expect("a fresh name is claimed");
+
+    let migrated = world
+        .relayout_foreign_resource(
+            id,
+            32,
+            8,
+            2,
+            &pill_engine::archetype::DynamicFieldPlan::new(),
+        )
+        .expect("the empty plan fits");
+    assert_eq!(migrated, 0, "no value was stored yet");
+
+    world
+        .register_foreign_resource("identity::Reshaped", "Reshaped", 32, 8, 2)
+        .expect("the migrated layout re-declares");
+    let error = world
+        .register_foreign_resource("identity::Reshaped", "Reshaped", 16, 8, 1)
+        .expect_err("the pre-migration layout is stale");
+    assert!(matches!(
+        error,
+        pill_engine::error::WorldError::SharedResourceLayoutMismatch { .. }
+    ));
+}
+
+/// A refused removal is a no-op: the take is attempted before anything is
+/// torn down, and the box it hands back is put where it was.
+#[test]
+fn a_refused_removal_leaves_everything_in_place() {
+    let mut world = World::new();
+    let id = world
+        .register_foreign_resource("identity::Guarded", "Guarded", 4, 4, 7)
+        .expect("a fresh name is claimed");
+    world
+        .insert_foreign_resource_bytes(id, &9_u32.to_ne_bytes())
+        .expect("the payload matches the size");
+
+    // `stale_artifact::Settings` declares `demo::Settings`; this probe declares
+    // `identity::Guarded` at eight bytes instead of four, so its take has to
+    // fail while everything under the id stays standing.
+    let error = world
+        .remove_resource::<identity_probe::Guarded>()
+        .expect_err("a differently-shaped Rust type cannot take the value");
+    assert!(matches!(
+        error,
+        pill_engine::error::WorldError::SharedResourceHoldsAnotherType { id: reported, .. }
+            if reported == id
+    ));
+
+    assert_eq!(
+        world.foreign_resource_bytes(id),
+        Some(9_u32.to_ne_bytes().as_slice()),
+        "the value is still there"
+    );
+    assert_eq!(world.foreign_resource_layout(id), Some((4, 4, 7)));
+    assert_eq!(
+        world.shared_resource_names(),
+        vec!["identity::Guarded".to_string()],
+        "the claim is still recorded"
+    );
+}
+
+/// The existence query answers readability, not id-presence: a foreign shape
+/// under a shared id is not a `T`, so `has_resource` agrees with
+/// `get_resource`, and `resource_holder` is what answers "something is there".
+#[test]
+fn has_resource_reports_the_readable_shape_not_the_id() {
+    let mut world = World::new();
+    let id = world
+        .register_foreign_resource("demo::Settings", "Project.Settings", 4, 4, 7)
+        .expect("the name is claimed");
+    world
+        .insert_foreign_resource_bytes(id, &7_u32.to_ne_bytes())
+        .expect("the payload matches");
+
+    // `stale_artifact::Settings` declares the same name at sixteen bytes.
+    assert!(
+        !world.has_resource::<stale_artifact::Settings>(),
+        "id presence must not answer for a shape the value cannot be read as"
+    );
+    assert!(world.get_resource::<stale_artifact::Settings>().is_none());
+    assert!(
+        world
+            .resource_holder::<stale_artifact::Settings>()
+            .is_some(),
+        "the holder accessor is what names the stored shape"
+    );
+
+    // The readable copy still answers both questions the same way.
+    assert!(world.has_resource::<artifact_a::Settings>());
+    assert!(world.get_resource::<artifact_a::Settings>().is_some());
+}
+
+/// Two copies whose declared fields disagree are refused even though name,
+/// size and alignment all agree: the schema hook is the only evidence that can
+/// tell a reinterpretation from a matching pair.
+#[test]
+fn differing_shapes_under_one_name_are_refused() {
+    let mut world = World::new();
+    world.register_resource::<hashed_a::Settings>();
+    assert!(world.take_registration_error().is_none());
+
+    world.register_resource::<hashed_b::Settings>();
+    let error = world
+        .take_registration_error()
+        .expect("the second shape is refused");
+    assert!(matches!(
+        error,
+        pill_engine::error::WorldError::SharedResourceSchemaMismatch { .. }
+    ));
+}
 
 /// A second ordinary resource, for the disjointness half of the scheduler test.
 #[derive(Debug, Default)]
@@ -182,6 +351,7 @@ fn a_resource_can_be_removed_through_the_other_copy() {
 
     let taken = world
         .remove_resource::<artifact_b::Settings>()
+        .expect("the removal is not refused")
         .expect("the other copy can take ownership");
     assert_eq!(taken.value, 7);
 
@@ -694,7 +864,10 @@ fn ordinary_resources_are_unaffected() {
     // Two ordinary resources are two slots.
     assert_eq!(world.resource_count(), 2);
 
-    let taken = world.remove_resource::<PlainCounter>().expect("removable");
+    let taken = world
+        .remove_resource::<PlainCounter>()
+        .expect("the removal is not refused")
+        .expect("removable");
     assert_eq!(taken.value, 3);
     assert_eq!(world.resource_count(), 1);
 }

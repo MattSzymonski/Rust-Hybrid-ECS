@@ -381,10 +381,11 @@ class Scenario:
     expected_migration_entity_counts: Sequence[Tuple[str, int]] = ()
     expected_witness_tokens: Sequence[str] = ()
 
-    # A rejected reload never reaches "hot reload complete": the engine refuses
-    # the generation (its debug guard catches the mismatch) and the host rolls
-    # back to the running one. The scenario waits for the rollback marker instead
-    # and treats the assertion panic as the expected outcome rather than a crash.
+    # A rejected reload never reaches "hot reload complete": the engine
+    # refuses the generation with a diagnostic and the host rolls back to the
+    # running one. The scenario waits for the rollback marker instead, and the
+    # refusal must arrive without a panic - the crash this scenario used to
+    # end on was exactly the guard being missing.
     expect_rejected_reload: bool = False
 
 
@@ -543,11 +544,13 @@ def run_scenario(scenario: Scenario, monitor: OutputMonitor) -> bool:
 
     crash_signals = has_crash_signals(output)
     if scenario.expect_rejected_reload:
-        # The rejection is an assertion inside the engine. Seeing its panic here
-        # proves the guard fired; the counter-tick check above already proved the
-        # host survived it and kept serving the previous generation.
-        if not crash_signals:
-            print(f"  [FAIL] Expected a rejection panic, saw none: {scenario.name}")
+        # A refused reload is a clean rejection: the engine records the refusal
+        # diagnostic (the required-token check below finds it), the host rolls
+        # the generation back (the settle token above), and the running
+        # generation keeps serving. Any panic in the window is a real crash -
+        # it is precisely what this scenario used to end on.
+        if crash_signals:
+            print(f"  [FAIL] Crash token observed in a rejected scenario: {scenario.name}")
             print(f"  Output tail:\n{output[-1600:]}")
             return False
     elif crash_signals:
@@ -875,7 +878,7 @@ def build_scenarios() -> List[Scenario]:
             forbidden_tokens=[SELECTIVE_START_TOKEN],
         ),
         Scenario(
-            name="Widen SpatialPosition.horizontal f32 -> f64 (rejected: component size must stay stable)",
+            name="Widen SpatialPosition.horizontal f32 -> f64 (refused: the old column cannot host the new alignment)",
             replacements=[(SPATIAL_POSITION_REORDERED, SPATIAL_POSITION_WIDENED)],
             expect_counter_tick=True,
             expect_rejected_reload=True,

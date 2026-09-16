@@ -26,8 +26,8 @@ use trait_type_map::{ErasedVecStorageInfo, TraitAccessible};
 
 // Current crate
 use crate::archetype::{
-    validate_dynamic_layout, Archetype, ArchetypeId, ComponentColumns, DynamicComponentLayout,
-    DynamicFieldPlan, StorageFactory,
+    validate_dynamic_layout, Archetype, ArchetypeId, Blittability, ComponentColumns,
+    DynamicComponentLayout, DynamicFieldPlan, StorageFactory,
 };
 use crate::commands::CommandQueue;
 use crate::component::{
@@ -71,19 +71,36 @@ const REGISTRATION_HEADROOM_WARNING_THRESHOLD: usize = 16;
 //      first → each thread sees its own value, no sharing, no race.
 //   4. After the system finishes: restore the previous value (usually None).
 //
-// In sequential mode the override stays None, so queries fall back to the
-// shared world.system_last_run field - no thread-local overhead.
+// The same storage reserves each parallel system's "this run" tick. A batch
+// runs every system against the same world, so a bump there would be an
+// unsynchronized read-modify-write; instead the engine allocates one tick per
+// batch member on the dispatch thread and installs it here, and
+// `increment_change_tick` serves it without touching the shared counter.
+//
+// In sequential mode both overrides stay None, so queries fall back to the
+// shared world fields - no thread-local overhead.
 
 thread_local! {
     /// Each thread's private "my system last ran at tick ___" value.
     /// `None` means "not in a parallel batch - use the world field."
     static PER_THREAD_LAST_RUN_TICK: std::cell::Cell<Option<Tick>> =
         const { std::cell::Cell::new(None) };
+
+    /// The tick reserved for the system running on this thread.
+    /// `None` means "bump the shared counter"; `Some` is the one value the
+    /// engine allocated for this batch member before dispatch.
+    static PER_THREAD_THIS_RUN_TICK: std::cell::Cell<Option<Tick>> =
+        const { std::cell::Cell::new(None) };
 }
 
 #[inline]
 fn per_thread_last_run_tick() -> Option<Tick> {
     PER_THREAD_LAST_RUN_TICK.with(|cell| cell.get())
+}
+
+#[inline]
+fn per_thread_this_run_tick() -> Option<Tick> {
+    PER_THREAD_THIS_RUN_TICK.with(|cell| cell.get())
 }
 
 /// Whether a size and alignment can describe a foreign resource's allocation.
@@ -104,6 +121,13 @@ fn is_valid_foreign_layout(size: usize, align: usize) -> bool {
 #[inline]
 pub(crate) fn set_per_thread_last_run_tick(value: Option<Tick>) -> Option<Tick> {
     PER_THREAD_LAST_RUN_TICK.with(|cell| cell.replace(value))
+}
+
+/// Store the tick reserved for the system about to run on this thread,
+/// returning the old value so the caller can restore it afterwards.
+#[inline]
+pub(crate) fn set_per_thread_this_run_tick(value: Option<Tick>) -> Option<Tick> {
+    PER_THREAD_THIS_RUN_TICK.with(|cell| cell.replace(value))
 }
 
 // =============================================================================
@@ -194,6 +218,13 @@ pub struct SharedResourceClaim {
     pub size: usize,
     /// Alignment in bytes the claiming type declared.
     pub align: usize,
+    /// Structural hash of the claiming type's layout, when one is available.
+    ///
+    /// Foreign declarations carry theirs from the manifest; Rust declarations
+    /// carry whatever [`Resource::shared_schema_hash`] answers, which defaults
+    /// to `None`. Compared only when both sides have one, so the check is
+    /// extra evidence rather than a new requirement.
+    pub schema_hash: Option<u64>,
 }
 
 // =============================================================================
@@ -246,6 +277,17 @@ pub struct World {
     pub(crate) entity_locations: HashMap<Entity, EntityLocation>,
     /// Storage factories for creating component storage by TypeId
     pub(crate) storage_factories: HashMap<ComponentId, StorageFactory>,
+    /// The native function table each id held before its latest registration
+    /// replaced it.
+    ///
+    /// The in-place migration consumes columns that still hold the *old*
+    /// layout's values, so it has to release them through the glue that wrote
+    /// them; by the time it runs, `rehome_native_columns` has already stamped
+    /// the arriving generation's table onto every column.
+    /// `register_component_inner` records the outgoing table here so the
+    /// migration can put it back for the removal that drops those rows.
+    pub(crate) retired_native_storage_ops:
+        HashMap<ComponentId, trait_type_map::ErasedVecStorageOps<dyn Component>>,
     /// Component copiers for moving entities between archetypes
     pub(crate) component_copiers: HashMap<ComponentId, ComponentCopier>,
     /// Script component types (ComponentId, component mask bit)
@@ -282,14 +324,25 @@ pub struct World {
     pub(crate) shared_resource_claims: HashMap<ResourceId, SharedResourceClaim>,
     /// Monotonic counter stamped onto each resource registration.
     pub(crate) resource_registration_sequence: u64,
-    /// Every resource registration in order, so the host can enumerate exactly
-    /// which resource types one artifact's `init` claimed.
+    /// First registration sequence stamped for each resource id.
     ///
-    /// The resource twin of `component_registration_log`, and needed for the
+    /// The resource twin of the component registration log, and needed for the
     /// same reason: `resource_factories` accumulates and never forgets, so it
     /// cannot distinguish "registered by the generation now running" from
-    /// "registered by a generation that has since been retired".
-    pub(crate) resource_registration_log: Vec<(ResourceId, u64)>,
+    /// "registered by a generation that has since been retired". One entry per
+    /// id, not per registration: `insert_resource` documents itself as the
+    /// *replace* path, and stamping every replacement grew this for the
+    /// process lifetime while each reload diff scanned and sorted it.
+    pub(crate) resource_registration_stamps: HashMap<ResourceId, u64>,
+    /// How many subjects currently claim each resource id.
+    ///
+    /// A shared id can be registered *by name* from more than one subject -
+    /// the project and a module, say - and `drop_resources` is how one of them
+    /// retires what its generation stopped registering. Without this count the
+    /// first subject to retire the id destroys a value the other still uses,
+    /// claim and all. Ids with no entry are dropped unconditionally, exactly
+    /// as before.
+    pub(crate) resource_claim_counts: HashMap<ResourceId, u32>,
     /// Monotonically increasing world tick used for change detection.
     ///
     /// Bumped once per frame by the [`Engine`](crate::engine::Engine) and
@@ -366,7 +419,7 @@ pub struct World {
     pub(crate) component_registration_sequence: u64,
     /// Chronological `(type_name, sequence)` log of every component
     /// registration, plain and persistable alike.
-    pub(crate) component_registration_log: Vec<(String, u64)>,
+    pub(crate) component_registration_log: Vec<(String, ComponentId, u64)>,
     /// Field layouts submitted by `#[derive(PillComponent)]` (static, living
     /// in the declaring artifact) or described at runtime by a foreign-language
     /// manifest (owned). Consumed by the C# mirror codegen and the editor's
@@ -391,6 +444,7 @@ impl World {
             archetypes: HashMap::new(),
             entity_locations: HashMap::new(),
             storage_factories: HashMap::new(),
+            retired_native_storage_ops: HashMap::new(),
             component_copiers: HashMap::new(),
             script_components: Vec::new(),
             script_updaters: HashMap::new(),
@@ -400,7 +454,8 @@ impl World {
             resource_factories: HashMap::new(),
             shared_resource_claims: HashMap::new(),
             resource_registration_sequence: 0,
-            resource_registration_log: Vec::new(),
+            resource_registration_stamps: HashMap::new(),
+            resource_claim_counts: HashMap::new(),
             change_tick: 0,
             system_last_run: 0,
             archetype_generation: 0,
@@ -686,9 +741,15 @@ impl World {
         // Record the registration chronologically so the host can enumerate
         // which types one module's init registered at all (plain or
         // persistable), which is how a type dropped from a reloaded module is
-        // told apart from one merely downgraded to a plain component.
-        self.component_registration_log
-            .push((type_name, self.component_registration_sequence));
+        // told apart from one merely downgraded to a plain component. The id is
+        // recorded beside the name because a rebuilt image gets a fresh
+        // `TypeId` per name: comparing ids is what tells a failed generation's
+        // leftovers apart from a rollback generation's re-registration.
+        self.component_registration_log.push((
+            type_name,
+            component_id,
+            self.component_registration_sequence,
+        ));
         self.component_registration_sequence = self.component_registration_sequence.wrapping_add(1);
 
         // Register the storage factory as plain DATA (type id, layout, and a
@@ -714,6 +775,14 @@ impl World {
         } else {
             ErasedVecStorageInfo::<dyn Component>::of::<T>()
         };
+        // Keep the table that is about to be replaced: the migration that
+        // consumes old-layout columns must drop them through the glue that
+        // wrote them, and by then this registration's table is the one stamped
+        // on every column - see `migrate_component_column_in_place`.
+        if let Some(StorageFactory::Native(previous)) = self.storage_factories.get(&component_id) {
+            self.retired_native_storage_ops
+                .insert(component_id, previous.ops);
+        }
         self.storage_factories
             .insert(component_id, StorageFactory::Native(storage_info));
 
@@ -783,13 +852,50 @@ impl World {
     /// Overwrites any previous layout for the same id, so a manifest reload
     /// replaces rather than accumulates. Used by the C# backend so managed
     /// components become field-inspectable in the editor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ComponentFieldError::UnsupportedField`] for a descriptor that
+    /// reaches past the component's registered size or names a container tag.
+    /// A dynamic row is raw bytes with no Rust value in it, so the accessors
+    /// have to be able to trust both: the bound keeps them inside the row, and
+    /// the tag check keeps them from following a `(pointer, length)` pair the
+    /// row never held.
     pub fn register_dynamic_component_field_layout(
         &mut self,
         component_id: ComponentId,
         fields: Vec<crate::component_registry::ComponentFieldDescriptor>,
-    ) {
+    ) -> Result<(), crate::component_field::ComponentFieldError> {
+        let component_size = self.component_registry.get_size(&component_id);
+        for field in &fields {
+            let Some(end) = field.offset.checked_add(field.size) else {
+                return Err(
+                    crate::component_field::ComponentFieldError::UnsupportedField {
+                        field: field.name.to_string(),
+                        reason: "the field's range overflows",
+                    },
+                );
+            };
+            if component_size.is_some_and(|size| end > size) {
+                return Err(
+                    crate::component_field::ComponentFieldError::UnsupportedField {
+                        field: field.name.to_string(),
+                        reason: "the field extends past the component's registered size",
+                    },
+                );
+            }
+            if !component_id.is_native_storage()
+                && crate::component_field::is_container_tag(field.type_tag)
+            {
+                return Err(crate::component_field::ComponentFieldError::UnsupportedField {
+                    field: field.name.to_string(),
+                    reason: "a container tag is read as a native pointer and length, which a dynamic row does not hold",
+                });
+            }
+        }
         self.component_field_layouts
             .insert(component_id, ComponentFieldLayout::Owned(fields));
+        Ok(())
     }
 
     /// Re-home every native column's per-type function table.
@@ -830,6 +936,74 @@ impl World {
         }
     }
 
+    /// Native columns the world still stores although no factory describes
+    /// their component id.
+    ///
+    /// A column outlives its registration when a type is re-registered under a
+    /// fresh id - the rebuilt image's "same name, fresh `TypeId`" case - and
+    /// the old id is never swept: the archetype keeps the id in its mask and
+    /// the column in its storage, but no factory is left to describe the type.
+    /// The host's reload path uses this as the gate on unmapping a retired
+    /// image, because a column's drop table lives in the image that produced
+    /// it.
+    pub fn columns_without_factory(&self) -> usize {
+        self.archetypes
+            .values()
+            .flat_map(|archetype| archetype.component_types.iter())
+            .filter(|component_id| {
+                component_id.is_native_storage()
+                    && !self.storage_factories.contains_key(component_id)
+            })
+            .count()
+    }
+
+    /// Drop every native column whose component id has no factory left.
+    ///
+    /// The id-keyed counterpart of `drop_forgotten_components`: the name-keyed
+    /// sweep cannot reach these, because the name resolves to whatever
+    /// registration claimed it last while the stale column keeps the id the
+    /// previous generation minted. Each affected component is removed from
+    /// every entity that carries it, which empties the archetypes holding it
+    /// and drops their columns through the table that is still mapped while
+    /// this runs. Returns the number of orphaned component ids swept.
+    pub fn drop_columns_without_factory(&mut self) -> usize {
+        // Step 1: Collect the orphaned ids across every archetype. Deduplicated
+        // by hand: the list is a handful of entries at most, and a `HashSet`
+        // would hide the ordering.
+        let mut orphaned_ids: Vec<ComponentId> = Vec::new();
+        for archetype in self.archetypes.values() {
+            for &component_id in &archetype.component_types {
+                if component_id.is_native_storage()
+                    && !self.storage_factories.contains_key(&component_id)
+                    && !orphaned_ids.contains(&component_id)
+                {
+                    orphaned_ids.push(component_id);
+                }
+            }
+        }
+
+        // Step 2: Remove each orphaned component from every entity carrying
+        // it. The entities are collected up front so the mutable borrows
+        // during removal never overlap the iteration, exactly as in
+        // `drop_forgotten_components`.
+        for component_id in &orphaned_ids {
+            let entities: Vec<Entity> = self
+                .entity_locations
+                .iter()
+                .filter(|(_, location)| {
+                    self.archetypes
+                        .get(&location.archetype_id)
+                        .is_some_and(|archetype| archetype.component_types.contains(component_id))
+                })
+                .map(|(entity, _)| *entity)
+                .collect();
+            for entity in entities {
+                let _ = self.remove_component_by_id(entity, *component_id);
+            }
+        }
+        orphaned_ids.len()
+    }
+
     /// Register an unmanaged component described by an external language.
     ///
     /// Re-registering an identical layout and name for the same `stable_id`
@@ -844,6 +1018,14 @@ impl World {
     /// [`WorldError::DynamicAlreadyRegistered`] when the `stable_id` is
     /// already taken by a different layout or name, and
     /// [`WorldError::ComponentTypeLimitExceeded`] when the registry is full.
+    ///
+    /// `blittability` is the caller's evidence that every field of the
+    /// component is a blittable value type. It is required, not optional:
+    /// the storage built from this layout copies rows with `ptr::copy`, frees
+    /// them without running element destructors, and is shared across threads,
+    /// so there is no check this function could run itself that would make an
+    /// owning layout safe. [`Blittability`] documents what each constructor
+    /// proves.
     pub fn register_dynamic_component(
         &mut self,
         stable_id: u128,
@@ -851,6 +1033,7 @@ impl World {
         size: usize,
         align: usize,
         schema_hash: u64,
+        blittability: Blittability,
     ) -> Result<ComponentId, WorldError> {
         if stable_id == 0 {
             return Err(WorldError::DynamicStableIdZero);
@@ -895,11 +1078,12 @@ impl World {
             .register_dynamic(stable_id, name, size)?;
         self.storage_factories.insert(
             component_id,
-            StorageFactory::Dynamic(DynamicComponentLayout {
+            StorageFactory::Dynamic(DynamicComponentLayout::new(
                 size,
                 align,
                 schema_hash,
-            }),
+                blittability,
+            )?),
         );
         Ok(component_id)
     }
@@ -930,9 +1114,10 @@ impl World {
     /// [`WorldError::DynamicLayoutInvalid`] when the new layout cannot describe
     /// storage, [`WorldError::DynamicComponentNotRegistered`] when the id is not
     /// a registered dynamic component, [`WorldError::DynamicStorageMissing`]
-    /// when an archetype lists the component without a column, and
-    /// [`WorldError::DynamicRowInvalid`] when a planned field falls outside a
-    /// row of either layout.
+    /// when an archetype lists the component without a column,
+    /// [`WorldError::DynamicColumnLayoutMismatch`] when a column's element size
+    /// disagrees with the registered layout, and [`WorldError::DynamicRowInvalid`]
+    /// when a planned field falls outside a row of either layout.
     pub fn relayout_dynamic_component(
         &mut self,
         component_id: ComponentId,
@@ -955,32 +1140,67 @@ impl World {
         // Every archetype holding the component, including the ones with no
         // rows: their columns must carry the new element layout so the next
         // entity added to them is stored at the new shape.
+        // A relayout keeps the witness and the release hook: the shape
+        // changes, the promise about what a row owns does not.
         let layout = DynamicComponentLayout {
             size,
             align,
             schema_hash,
+            blittability: previous.blittability,
+            drop_fn: previous.drop_fn,
         };
-        let mut migrated = 0;
-        for archetype in self.archetypes.values_mut() {
+
+        // Step 1: Verify every column before touching one. The plan and the
+        // factory were checked above; what remains is the possibility that a
+        // column disagrees with the factory - the desync a partially applied
+        // relayout used to produce - so the whole set is checked first and the
+        // report names the column that disagrees.
+        let mut targets = Vec::new();
+        for (archetype_id, archetype) in &self.archetypes {
             if !archetype.component_types.contains(&component_id) {
                 continue;
             }
-            let Some(column) = archetype.dynamic_component_storages.get_mut(&component_id) else {
+            let Some(column) = archetype.dynamic_component_storages.get(&component_id) else {
                 return Err(WorldError::DynamicStorageMissing {
                     component_id,
-                    archetype_id: archetype.id,
+                    archetype_id: *archetype_id,
                 });
             };
-            migrated += column.relayout_validated(layout.clone(), plan);
+            if column.element_size() != previous_size {
+                return Err(WorldError::DynamicColumnLayoutMismatch {
+                    component_id,
+                    archetype_id: *archetype_id,
+                    expected: previous_size,
+                    actual: column.element_size(),
+                });
+            }
+            targets.push(*archetype_id);
+        }
+
+        // Step 2: Migrate. Every column here was verified a moment ago and
+        // nothing in between reshapes the map, so the lookups cannot miss.
+        let mut migrated = 0;
+        for archetype_id in targets {
+            let archetype = self
+                .archetypes
+                .get_mut(&archetype_id)
+                .expect("the verification pass listed only present archetypes");
+            let column = archetype
+                .dynamic_component_storages
+                .get_mut(&component_id)
+                .expect("the verification pass checked the column is present");
+            migrated += column.relayout_validated(layout.clone(), plan, previous_size);
         }
 
         // Publish the new layout to everyone who reads it back: the storage
         // factory the chunk accessors consult, and the registry copy the
-        // diagnostics and later registrations compare against.
+        // diagnostics and later registrations compare against. Both records
+        // move together, or `get_layout` keeps reporting the placeholder
+        // alignment registration started with.
+        self.component_registry
+            .update_dynamic_layout(&component_id, &layout);
         self.storage_factories
             .insert(component_id, StorageFactory::Dynamic(layout));
-        self.component_registry
-            .update_dynamic_size(&component_id, size);
         Ok(migrated)
     }
 
@@ -1122,6 +1342,17 @@ impl World {
             .sum()
     }
 
+    /// Whether any archetype still lists this component id.
+    ///
+    /// The host's failed-generation cleanup uses this to assert, in debug
+    /// builds, that a stranded id is really gone - rows, columns and tables -
+    /// before the image that defined it is retired from the graveyard.
+    pub fn any_archetype_lists_component(&self, component_id: ComponentId) -> bool {
+        self.archetypes
+            .values()
+            .any(|archetype| archetype.component_types.contains(&component_id))
+    }
+
     /// The first registered component other than `excluding` that claims
     /// `type_name` and still holds rows, with that row count.
     ///
@@ -1143,6 +1374,23 @@ impl World {
             .filter(|(id, _, name)| *name == type_name && *id != excluding)
             .map(|(id, _, _)| (id, self.live_row_count(id)))
             .find(|(_, live_rows)| *live_rows > 0)
+    }
+
+    /// Every registered component that claims `type_name`, in registration
+    /// order.
+    ///
+    /// Unlike [`Self::live_component_with_name`] this neither requires live
+    /// rows nor excludes an id. A rebuilt image usually gets the compiler's id
+    /// back for an unchanged type, so a superseding registration's predecessor
+    /// is often the entry *with* the incoming id, and older generations can
+    /// still be listed under the same name - every candidate has to be
+    /// considered, not one of them.
+    pub(crate) fn component_ids_with_name(&self, type_name: &str) -> Vec<ComponentId> {
+        self.component_registry
+            .registered_components()
+            .filter(|(_, _, name)| *name == type_name)
+            .map(|(id, _, _)| id)
+            .collect()
     }
 
     /// Resolve a component ID from its registered type name, without the
@@ -1579,8 +1827,18 @@ impl World {
     /// Called by the [`Engine`](crate::engine::Engine) once per frame and
     /// by mutable queries when they begin iteration so that mutations
     /// performed during the same frame can still be distinguished by tick.
+    ///
+    /// A parallel batch runs every one of its systems against the same world,
+    /// so bumping here would be an unsynchronized read-modify-write. The
+    /// engine therefore allocates one tick per batch member on the dispatch
+    /// thread and installs it as this thread's override; inside a system the
+    /// reserved value is returned however often it is asked for, and the
+    /// shared counter is left untouched.
     #[inline]
     pub fn increment_change_tick(&mut self) -> Tick {
+        if let Some(reserved) = per_thread_this_run_tick() {
+            return reserved;
+        }
         self.change_tick = self.change_tick.wrapping_add(1);
         Tick::new(self.change_tick)
     }
@@ -1757,9 +2015,11 @@ impl World {
     /// [`WorldError::ForeignResourceNameEmpty`] for an empty name,
     /// [`WorldError::ForeignResourceLayoutInvalid`] for a layout that cannot
     /// describe an allocation, [`WorldError::SharedResourceNameConflict`] when
-    /// two Rust types disagree about the name, and
+    /// two Rust types disagree about the name,
     /// [`WorldError::SharedResourceLayoutMismatch`] when the declared layout
-    /// disagrees with the one already claimed.
+    /// disagrees with the one already claimed, and
+    /// [`WorldError::ForeignResourceHoldsRustValue`] when a Rust value is
+    /// stored under the id.
     pub fn register_foreign_resource(
         &mut self,
         name: &str,
@@ -1775,9 +2035,27 @@ impl World {
             return Err(WorldError::ForeignResourceLayoutInvalid { size, align });
         }
         let id = ResourceId::Shared(crate::component::shared_component_identity(name));
-        if let Some(error) = self.claim_shared_resource(id, name, declaring_type, size, align, true)
-        {
+        if let Some(error) = self.claim_shared_resource(
+            id,
+            name,
+            declaring_type,
+            size,
+            align,
+            true,
+            Some(schema_hash),
+        ) {
             return Err(error);
+        }
+        // A stored Rust value fixes what is under the id - its destructor is
+        // bound to its type - so a foreign declaration cannot take the id over.
+        // `relayout_foreign_resource` refuses the same state; refusing here too
+        // means the disagreement never reaches `rehome_resources`.
+        if self
+            .resources
+            .get(&id)
+            .is_some_and(|value| !value.is_foreign())
+        {
+            return Err(WorldError::ForeignResourceHoldsRustValue { id });
         }
         self.resource_factories
             .insert(id, ErasedResourceOps::foreign(size, align, schema_hash));
@@ -1787,9 +2065,11 @@ impl World {
 
     /// Store a value for a shared resource, from another language's bytes.
     ///
-    /// Replaces whatever is stored under the id: a Rust value's destructor runs
-    /// first and its bytes are never reinterpreted as the new payload. The
-    /// change tick is stamped, because a value appearing is a change.
+    /// Replaces a foreign payload under the id; the change tick is stamped,
+    /// because a value appearing is a change. A Rust value is never replaced:
+    /// its destructor is bound to its type, so admitting foreign bytes would
+    /// drop it through code that never allocated it. That refusal is
+    /// [`WorldError::ForeignResourceFactoryIsNative`].
     ///
     /// The id has to name a registered *shared* resource, one whose identity is
     /// a declared name. A Rust type's private resource is identified by its
@@ -1799,7 +2079,8 @@ impl World {
     /// # Errors
     ///
     /// [`WorldError::SharedResourceNotRegistered`] when the id is not a
-    /// registered shared resource, and
+    /// registered shared resource, [`WorldError::ForeignResourceFactoryIsNative`]
+    /// when the id's table is a Rust type's, and
     /// [`WorldError::ForeignResourceBytesMismatch`] when the payload is not
     /// exactly the registered size.
     pub fn insert_foreign_resource_bytes(
@@ -1810,6 +2091,9 @@ impl World {
         let Some(ops) = self.shared_resource_ops(id) else {
             return Err(WorldError::SharedResourceNotRegistered { id });
         };
+        if !ops.foreign {
+            return Err(WorldError::ForeignResourceFactoryIsNative { id });
+        }
         if bytes.len() != ops.size {
             return Err(WorldError::ForeignResourceBytesMismatch {
                 id,
@@ -1829,11 +2113,15 @@ impl World {
 
     /// The stored bytes of a shared resource, for another language to read.
     ///
-    /// `None` when the id is not a registered shared resource, or when nothing
-    /// is stored under it yet.
+    /// `None` when the id is not a registered shared resource, when nothing is
+    /// stored under it yet, or when the stored value is a Rust one: bytes are
+    /// for foreign payloads, whose layout is the whole of what they are.
     pub fn foreign_resource_bytes(&self, id: ResourceId) -> Option<&[u8]> {
-        self.shared_resource_ops(id)?;
-        self.resources.get(&id).map(ErasedResource::bytes)
+        self.foreign_resource_ops(id)?;
+        self.resources
+            .get(&id)
+            .filter(|resource| resource.is_foreign())
+            .map(ErasedResource::bytes)
     }
 
     /// The stored bytes of a shared resource, mutably, with its ticks.
@@ -1846,11 +2134,18 @@ impl World {
     /// A caller writing here is responsible for writing a value the stored type
     /// accepts, exactly as a generated mirror is for the component rows it
     /// writes in place.
+    ///
+    /// A Rust value refuses, as it does for [`Self::foreign_resource_bytes`],
+    /// and the refusal costs nothing: the `changed` tick is not stamped for a
+    /// view that is never handed out.
     pub fn foreign_resource_bytes_mut(
         &mut self,
         id: ResourceId,
     ) -> Option<(&mut [u8], &mut ComponentTicks)> {
-        self.shared_resource_ops(id)?;
+        self.foreign_resource_ops(id)?;
+        if !self.resources.get(&id)?.is_foreign() {
+            return None;
+        }
         let changed = Tick::new(self.change_tick);
         let ticks = self.resource_ticks.get_mut(&id)?;
         ticks.set_changed(changed);
@@ -1924,6 +2219,15 @@ impl World {
         }
 
         let next = ErasedResourceOps::foreign(size, align, schema_hash);
+        // The claim is the second record of this resource's shape, and the one
+        // the next declaration is checked against, so it moves with the
+        // factory on both paths. Left behind, it made the migrated shape
+        // unre-declarable and let a stale declaration revert the factory.
+        if let Some(claim) = self.shared_resource_claims.get_mut(&id) {
+            claim.size = size;
+            claim.align = align;
+            claim.schema_hash = Some(schema_hash);
+        }
         let Some(value) = self.resources.get_mut(&id) else {
             self.resource_factories.insert(id, next);
             return Ok(0);
@@ -1945,10 +2249,31 @@ impl World {
         self.resource_factories.get(&id).copied()
     }
 
-    /// Stamp one resource registration into the chronological log.
+    /// The per-type table of a registered shared resource, when that table
+    /// belongs to foreign bytes.
+    ///
+    /// The byte accessors go through this one. `shared_resource_ops` answers
+    /// "is this a shared id at all", which the foreign insert needs in order to
+    /// tell a private id from one whose table is a Rust type's; a byte view, by
+    /// contrast, is only meaningful for a payload with no Rust type anywhere,
+    /// so both the table and the box have to say so.
+    fn foreign_resource_ops(&self, id: ResourceId) -> Option<ErasedResourceOps> {
+        self.shared_resource_ops(id).filter(|ops| ops.foreign)
+    }
+
+    /// Stamp one resource registration, keeping one entry per id.
+    ///
+    /// The stamp is the id's most recent registration, not its first. The host
+    /// diffs [`Self::resource_ids_registered_since`] after an artifact's `init`
+    /// to decide which resources that generation still claims, and a
+    /// generation re-claims its resources by re-registering them - the
+    /// documented replace path of `insert_resource`. Keeping only the first
+    /// stamp made every reload read its own resources as retired and drop them
+    /// out from under the systems that were still running. The map stays
+    /// proportional to distinct resources, and the diff reports each id once.
     fn note_resource_registration(&mut self, id: ResourceId) {
-        self.resource_registration_log
-            .push((id, self.resource_registration_sequence));
+        self.resource_registration_stamps
+            .insert(id, self.resource_registration_sequence);
         self.resource_registration_sequence = self.resource_registration_sequence.wrapping_add(1);
     }
 
@@ -1967,13 +2292,12 @@ impl World {
     /// exactly the captured value.
     pub fn resource_ids_registered_since(&self, sequence: u64) -> Vec<ResourceId> {
         let mut ids: Vec<ResourceId> = self
-            .resource_registration_log
+            .resource_registration_stamps
             .iter()
-            .filter(|(_, stamped)| *stamped >= sequence)
+            .filter(|(_, stamped)| **stamped >= sequence)
             .map(|(id, _)| *id)
             .collect();
         ids.sort_unstable();
-        ids.dedup();
         ids
     }
 
@@ -2026,6 +2350,7 @@ impl World {
             std::mem::size_of::<T>(),
             std::mem::align_of::<T>(),
             false,
+            <T as Resource>::shared_schema_hash(),
         ) {
             None => true,
             Some(error) => {
@@ -2059,6 +2384,10 @@ impl World {
     /// Returns the error, and does not record it: the Rust wrapper above
     /// records what its drain has to see, while a foreign declaration's caller
     /// is the one that must act on the refusal.
+    // Seven facts about one declaration, each of them read from the manifest
+    // or the Rust type rather than derived: grouping them into a struct would
+    // hide that every field is a separate claim about the same resource.
+    #[allow(clippy::too_many_arguments)]
     fn claim_shared_resource(
         &mut self,
         id: ResourceId,
@@ -2067,6 +2396,7 @@ impl World {
         size: usize,
         align: usize,
         foreign: bool,
+        schema_hash: Option<u64>,
     ) -> Option<WorldError> {
         let incoming = SharedResourceClaim {
             shared_name: shared_name.to_string(),
@@ -2074,8 +2404,26 @@ impl World {
             foreign,
             size,
             align,
+            schema_hash,
         };
         if let Some(existing) = self.shared_resource_claims.get(&id) {
+            // The id is a hash of the name, so two different names sharing it
+            // are an identity collision: one slot would answer to both. The
+            // recorded string is what tells the two apart.
+            if existing.shared_name != shared_name {
+                let error = WorldError::SharedResourceIdentityCollision {
+                    shared_name: shared_name.to_string(),
+                    existing_name: existing.shared_name.clone(),
+                };
+                error!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    shared_name = %shared_name,
+                    existing_name = %existing.shared_name,
+                    error = %error,
+                    "two shared resource names hash to one identity"
+                );
+                return Some(error);
+            }
             if !existing.foreign
                 && !incoming.foreign
                 && existing.declaring_type != incoming.declaring_type
@@ -2118,6 +2466,27 @@ impl World {
                 );
                 return Some(error);
             }
+            // Both sides carrying a hash means both declared a field shape, and
+            // equal size/align is exactly the case a hash catches: {u32, u32}
+            // and {f32, f32} agree on layout and not on fields.
+            if let (Some(existing_hash), Some(incoming_hash)) =
+                (existing.schema_hash, incoming.schema_hash)
+            {
+                if existing_hash != incoming_hash {
+                    let error = WorldError::SharedResourceSchemaMismatch {
+                        shared_name: shared_name.to_string(),
+                        existing_hash,
+                        incoming_hash,
+                    };
+                    error!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        shared_name = %shared_name,
+                        error = %error,
+                        "shared resource registered with two different field shapes"
+                    );
+                    return Some(error);
+                }
+            }
         }
         match self.shared_resource_claims.get(&id) {
             None => {
@@ -2153,12 +2522,26 @@ impl World {
     /// drops nothing and points at this crate's code, which outlives every
     /// artifact. Refreshing it from the factories would let a Rust type that
     /// shares the name hand its own destructor to bytes it does not own.
+    ///
+    /// A table that claims foreign ownership over a Rust value is left alone
+    /// too. Registration paths refuse that state, but a stale table could in
+    /// principle reach it, and the table would then drop nothing: the value
+    /// would leak silently. Keeping its own destructor is the lesser cost, and
+    /// the disagreement is reported rather than swallowed.
     pub fn rehome_resources(&mut self) {
         for (id, resource) in &mut self.resources {
             if resource.is_foreign() {
                 continue;
             }
             if let Some(&ops) = self.resource_factories.get(id) {
+                if ops.foreign {
+                    error!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        resource = ?id,
+                        "a Rust resource is declared foreign; keeping its own drop"
+                    );
+                    continue;
+                }
                 resource.refresh_ops(ops);
             }
         }
@@ -2178,39 +2561,119 @@ impl World {
     /// [`resource_ids_registered_since`](Self::resource_ids_registered_since)
     /// across the two generations to find those ids.
     ///
+    /// An id another subject still claims through
+    /// [`retain_resource_claims`](Self::retain_resource_claims) is skipped: the
+    /// value's drop function belongs to the generation that inserted it, and
+    /// the subject retiring now is not necessarily that one.
+    ///
     /// Returns how many were actually present and dropped.
     pub fn drop_resources(&mut self, ids: &[ResourceId]) -> usize {
         let mut dropped = 0;
         for id in ids {
+            // Another subject's claim keeps the value alive.
+            if self
+                .resource_claim_counts
+                .get(id)
+                .is_some_and(|count| *count > 0)
+            {
+                continue;
+            }
             if self.resources.remove(id).is_some() {
                 dropped += 1;
             }
             self.resource_ticks.remove(id);
             self.resource_factories.remove(id);
             self.shared_resource_claims.remove(id);
+            // The id is unregistered now, so a later registration is a fresh
+            // one and has to be visible to the next "registered since" diff.
+            self.resource_registration_stamps.remove(id);
         }
         dropped
     }
 
-    /// Remove a resource and return it if it existed
-    pub fn remove_resource<T: Resource>(&mut self) -> Option<T> {
+    /// Record one claim per id on a resource this subject registered.
+    ///
+    /// The count is what [`drop_resources`](Self::drop_resources) consults
+    /// before releasing an id one subject retired: a shared name can be
+    /// registered from several subjects, and only the last of them to let go
+    /// should destroy the value.
+    pub fn retain_resource_claims(&mut self, ids: &[ResourceId]) {
+        for id in ids {
+            *self.resource_claim_counts.entry(*id).or_insert(0) += 1;
+        }
+    }
+
+    /// Drop one claim per id, releasing a value once its last claim goes.
+    ///
+    /// A claim an id never had is a no-op, and a release that takes the count
+    /// to zero removes the entry, so a later `retain` starts a fresh count.
+    pub fn release_resource_claims(&mut self, ids: &[ResourceId]) {
+        for id in ids {
+            if let Some(count) = self.resource_claim_counts.get_mut(id) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    self.resource_claim_counts.remove(id);
+                }
+            }
+        }
+    }
+
+    /// Remove a resource and return it if it existed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::SharedResourceHoldsAnotherType`] when the id holds
+    /// a value this `T` cannot be read as - the case a shared, name-derived id
+    /// makes reachable. The take is attempted first and the box is put back on
+    /// refusal, so nothing about the stored resource is touched: not its value,
+    /// its ticks, its factory or its claim.
+    pub fn remove_resource<T: Resource>(&mut self) -> Result<Option<T>, WorldError> {
         let id = ResourceId::of::<T>();
+        let Some(erased) = self.resources.remove(&id) else {
+            return Ok(None);
+        };
+        let value = match erased.take::<T>() {
+            Ok(value) => value,
+            Err(erased) => {
+                // The comment above used to promise this and the code did the
+                // opposite: `and_then(..ok())` dropped the returned box, taking
+                // the value, its ticks, its factory and its claim with it.
+                self.resources.insert(id, erased);
+                return Err(WorldError::SharedResourceHoldsAnotherType {
+                    id,
+                    requested_type: std::any::type_name::<T>(),
+                });
+            }
+        };
         self.resource_ticks.remove(&id);
         self.resource_factories.remove(&id);
         self.shared_resource_claims.remove(&id);
-        // A refused take hands the box back rather than destroying it, so
-        // a wrong-type removal leaves the resource in place - but the id is
-        // derived from `T`, so a mismatch here would be an internal-invariant
-        // break rather than a caller error.
-        self.resources
-            .remove(&id)
-            .and_then(|erased| erased.take::<T>().ok())
+        self.resource_registration_stamps.remove(&id);
+        Ok(Some(value))
     }
 
-    /// Check if a resource exists
+    /// Check whether a resource exists *and* can be read as `T`.
+    ///
+    /// The same question [`Self::get_resource`] answers: for a shared id a
+    /// differently-shaped value under the name is not a `T`, so existence and
+    /// readability agree instead of one reporting the id and the other the
+    /// readable shape. [`Self::resource_holder`] answers the shape question for
+    /// a caller that needs to know what is stored.
     #[must_use]
     pub fn has_resource<T: Resource>(&self) -> bool {
-        self.resources.contains_key(&ResourceId::of::<T>())
+        self.resources
+            .get(&ResourceId::of::<T>())
+            .is_some_and(|erased| erased.holds::<T>())
+    }
+
+    /// The stored box under `T`'s resource id, whatever shape it holds.
+    ///
+    /// For a caller whose id exists but whose type does not read: the box
+    /// answers `holds::<T>()` and `has_shared_identity()`. `None` means the id
+    /// has no resource at all.
+    #[must_use]
+    pub fn resource_holder<T: Resource>(&self) -> Option<&crate::resource::ErasedResource> {
+        self.resources.get(&ResourceId::of::<T>())
     }
 
     /// Debug-only: Clear the set of mutably-borrowed resources.
@@ -2449,8 +2912,22 @@ impl World {
         // identifies the component set, so no separate lookup table is needed.
         let archetype_id = ArchetypeId(component_mask.bits());
 
-        // Hot path: archetype already exists (most common case)
-        if self.archetypes.contains_key(&archetype_id) {
+        // Hot path: archetype already exists (most common case).
+        //
+        // A hit is trusted on the strength of the bit-release rule: a bit only
+        // returns to the pool once every archetype carrying it has been
+        // dropped, so the cached component set cannot be a different one. The
+        // assertion holds that invariant here if the release path is ever
+        // bypassed - the mask *is* the id, so an alias would serve the wrong
+        // columns with no other symptom.
+        if let Some(existing) = self.archetypes.get(&archetype_id) {
+            debug_assert!(
+                existing.component_types.len() == component_ids.len()
+                    && component_ids
+                        .iter()
+                        .all(|component_id| existing.component_types.contains(component_id)),
+                "a recycled component bit aliased two component sets onto one archetype id"
+            );
             return archetype_id;
         }
 
@@ -2539,7 +3016,16 @@ impl World {
         // overwrites the zero bytes before the new entity becomes observable.
         for &component_id in &archetype.component_types {
             if let Some(column) = archetype.dynamic_component_storages.get_mut(&component_id) {
-                column.push_zeroed();
+                // The layout reached storage only after validation, so this
+                // can fail only after pushing roughly 2^60 rows of one
+                // component: out of address space rather than out of layout.
+                // The fallible paths - `move_entity_to_archetype` and
+                // `relayout_dynamic_component` - hand the error back instead;
+                // this one returns nothing, so it names the one state it
+                // cannot survive.
+                column
+                    .push_zeroed()
+                    .expect("dynamic column growth cannot exhaust the address space");
             }
         }
 
@@ -2620,6 +3106,37 @@ impl World {
             return Ok(());
         }
 
+        // Step 2b: Verify the destination before anything moves. A dynamic
+        // component the destination archetype has no column for is the
+        // manifest/storage desync `DynamicStorageMissing` reports; finding it
+        // here - over the same component list the migration loop itself walks,
+        // the destination archetype's own - is what keeps a failed migration
+        // atomic: the destination would otherwise already hold the entity's row
+        // while the source still holds the entity.
+        {
+            let new_archetype =
+                self.archetypes
+                    .get(&new_archetype_id)
+                    .ok_or(WorldError::ArchetypeMissing {
+                        entity,
+                        archetype_id: new_archetype_id,
+                    })?;
+            for &component_id in &new_archetype.component_types {
+                if component_id.is_native_storage() {
+                    continue;
+                }
+                if !new_archetype
+                    .dynamic_component_storages
+                    .contains_key(&component_id)
+                {
+                    return Err(WorldError::DynamicStorageMissing {
+                        component_id,
+                        archetype_id: new_archetype_id,
+                    });
+                }
+            }
+        }
+
         // Step 3: Migrate the entity. We need simultaneous access to two
         // archetypes, which the borrow checker cannot express through the
         // HashMap, so take raw pointers to both entries. The early-return
@@ -2697,9 +3214,9 @@ impl World {
                     continue;
                 };
                 if let Some(source) = old_archetype.dynamic_component_storages.get(&component_id) {
-                    destination.push_from(source, old_index);
+                    destination.push_from(source, old_index)?;
                 } else {
-                    destination.push_zeroed();
+                    destination.push_zeroed()?;
                 }
             }
 
@@ -2733,6 +3250,36 @@ impl World {
                     .entry(component_id)
                     .or_default()
                     .push(new_tick);
+            }
+
+            // Every destination column grew by exactly one row, and so did
+            // every tick column. A miss here means the migration left the
+            // destination short a row - the desync the pre-flight above exists
+            // to prevent.
+            debug_assert_eq!(
+                new_archetype.entities.len(),
+                new_index + 1,
+                "the migrated entity is the destination's last row"
+            );
+            for &component_id in new_component_ids {
+                if !component_id.is_native_storage() {
+                    if let Some(column) =
+                        new_archetype.dynamic_component_storages.get(&component_id)
+                    {
+                        debug_assert_eq!(
+                            column.len(),
+                            new_index + 1,
+                            "a destination dynamic column did not grow by exactly one row"
+                        );
+                    }
+                }
+                if let Some(ticks) = new_archetype.component_ticks.get(&component_id) {
+                    debug_assert_eq!(
+                        ticks.len(),
+                        new_index + 1,
+                        "a destination tick column did not grow by exactly one row"
+                    );
+                }
             }
 
             // Update entity location
@@ -3598,17 +4145,52 @@ mod tests {
 
     impl_trait_accessible!(dyn Component; Position, Velocity, Health);
 
+    /// A resource used to pin registration-stamp behaviour.
+    #[derive(Debug, Default)]
+    struct AccountedResource {
+        value: u32,
+    }
+    impl crate::resource::Resource for AccountedResource {}
+
+    /// A second one, so a fresh registration can be told from a replacement.
+    #[derive(Debug, Default)]
+    struct FreshAccountedResource {
+        value: u32,
+    }
+    impl crate::resource::Resource for FreshAccountedResource {}
+
     #[test]
     fn dynamic_components_coexist_and_survive_archetype_migration() {
         let mut world = World::new();
         let a = world
-            .register_dynamic_component(0xA1, "Project.A", 4, 4, 11)
+            .register_dynamic_component(
+                0xA1,
+                "Project.A",
+                4,
+                4,
+                11,
+                Blittability::engine_verified(),
+            )
             .unwrap();
         let b = world
-            .register_dynamic_component(0xB2, "Project.B", 4, 4, 22)
+            .register_dynamic_component(
+                0xB2,
+                "Project.B",
+                4,
+                4,
+                22,
+                Blittability::engine_verified(),
+            )
             .unwrap();
         let c = world
-            .register_dynamic_component(0xC3, "Project.C", 8, 8, 33)
+            .register_dynamic_component(
+                0xC3,
+                "Project.C",
+                8,
+                8,
+                33,
+                Blittability::engine_verified(),
+            )
             .unwrap();
         let entity = world
             .create_dynamic_entity(&[
@@ -3653,7 +4235,14 @@ mod tests {
     fn relayout_migrates_rows_and_keeps_entities_in_their_rows() {
         let mut world = World::new();
         let component = world
-            .register_dynamic_component(0xD4, "Project.Relayout", 8, 4, 100)
+            .register_dynamic_component(
+                0xD4,
+                "Project.Relayout",
+                8,
+                4,
+                100,
+                Blittability::engine_verified(),
+            )
             .unwrap();
         let first = world
             .create_dynamic_entity(&[(component, two_u32_row(1, 2))])
@@ -3738,7 +4327,14 @@ mod tests {
     fn relayout_leaves_change_ticks_alone() {
         let mut world = World::new();
         let component = world
-            .register_dynamic_component(0xD5, "Project.Ticks", 8, 4, 100)
+            .register_dynamic_component(
+                0xD5,
+                "Project.Ticks",
+                8,
+                4,
+                100,
+                Blittability::engine_verified(),
+            )
             .unwrap();
         let entity = world
             .create_dynamic_entity(&[(component, two_u32_row(1, 2))])
@@ -3772,7 +4368,14 @@ mod tests {
     fn relayout_keeps_the_component_id_and_its_bit() {
         let mut world = World::new();
         let component = world
-            .register_dynamic_component(0xD6, "Project.Bit", 8, 4, 100)
+            .register_dynamic_component(
+                0xD6,
+                "Project.Bit",
+                8,
+                4,
+                100,
+                Blittability::engine_verified(),
+            )
             .unwrap();
         let bit = world.component_registry().get_bit(&component).unwrap();
 
@@ -3796,7 +4399,14 @@ mod tests {
     fn relayout_reaches_an_archetype_that_lost_its_last_row() {
         let mut world = World::new();
         let component = world
-            .register_dynamic_component(0xD7, "Project.Empty", 8, 4, 100)
+            .register_dynamic_component(
+                0xD7,
+                "Project.Empty",
+                8,
+                4,
+                100,
+                Blittability::engine_verified(),
+            )
             .unwrap();
         let disposable = world
             .create_dynamic_entity(&[(component, two_u32_row(1, 2))])
@@ -3849,7 +4459,14 @@ mod tests {
         ));
 
         let component = world
-            .register_dynamic_component(0xD8, "Project.Refused", 8, 4, 100)
+            .register_dynamic_component(
+                0xD8,
+                "Project.Refused",
+                8,
+                4,
+                100,
+                Blittability::engine_verified(),
+            )
             .unwrap();
         let mut too_wide = DynamicFieldPlan::new();
         too_wide.push(4, 8, FieldSource::OldOffset(0));
@@ -3861,6 +4478,160 @@ mod tests {
             world.component_layout(component),
             Some((8, 4)),
             "a refused plan leaves the registered layout as it was"
+        );
+
+        // A column that goes missing is reported before the first migration,
+        // so the archetypes holding rows keep them. The destination archetype
+        // is made to list the component without storing a column for it.
+        let holder = world
+            .create_dynamic_entity(&[(component, 8_u64.to_ne_bytes().to_vec())])
+            .unwrap();
+        let stripped =
+            world.get_or_create_archetype(vec![component, ComponentId::of::<Position>()]);
+        assert!(world
+            .archetypes
+            .get_mut(&stripped)
+            .unwrap()
+            .dynamic_component_storages
+            .remove(&component)
+            .is_some());
+        let row_before = world
+            .dynamic_component_bytes(holder, component)
+            .expect("the entity has a row")
+            .to_vec();
+        assert!(matches!(
+            world.relayout_dynamic_component(component, 8, 4, 100, &DynamicFieldPlan::new()),
+            Err(WorldError::DynamicStorageMissing { .. })
+        ));
+        assert_eq!(
+            world.dynamic_component_bytes(holder, component),
+            Some(row_before.as_slice()),
+            "a refused relayout left the row it would have migrated alone"
+        );
+
+        // Put the stripped column back, then drift one behind the factory's
+        // back: the size mismatch is reported too, and the column keeps its
+        // drifted shape instead of being silently rewritten.
+        world
+            .archetypes
+            .get_mut(&stripped)
+            .unwrap()
+            .dynamic_component_storages
+            .insert(
+                component,
+                crate::archetype::DynamicColumn::new(DynamicComponentLayout {
+                    size: 8,
+                    align: 4,
+                    schema_hash: 100,
+                    blittability: Blittability::engine_verified(),
+                    drop_fn: None,
+                })
+                .expect("the drifted layout is still a valid allocation layout"),
+            );
+        {
+            let location = world.entity_locations[&holder];
+            let column = world
+                .archetypes
+                .get_mut(&location.archetype_id)
+                .unwrap()
+                .dynamic_component_storages
+                .get_mut(&component)
+                .unwrap();
+            column.relayout_validated(
+                DynamicComponentLayout {
+                    size: 16,
+                    align: 4,
+                    schema_hash: 100,
+                    blittability: Blittability::engine_verified(),
+                    drop_fn: None,
+                },
+                &DynamicFieldPlan::new(),
+                8,
+            );
+        }
+        assert!(matches!(
+            world.relayout_dynamic_component(component, 8, 4, 100, &DynamicFieldPlan::new()),
+            Err(WorldError::DynamicColumnLayoutMismatch { .. })
+        ));
+        assert_eq!(
+            world.archetypes[&world.entity_locations[&holder].archetype_id]
+                .dynamic_component_storages[&component]
+                .element_size(),
+            16,
+            "the mismatched column was reported, not rewritten"
+        );
+        assert_eq!(
+            world.component_layout(component),
+            Some((8, 4)),
+            "the factory still carries the registered layout"
+        );
+    }
+
+    /// A failed migration is atomic: the pre-flight refuses the destination
+    /// before the entity's row, its columns or its location move anywhere.
+    #[test]
+    fn migration_failure_leaves_both_archetypes_untouched() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let first = world
+            .register_dynamic_component(
+                0xE1,
+                "Project.First",
+                4,
+                4,
+                1,
+                Blittability::engine_verified(),
+            )
+            .unwrap();
+        let second = world
+            .register_dynamic_component(
+                0xE2,
+                "Project.Second",
+                4,
+                4,
+                2,
+                Blittability::engine_verified(),
+            )
+            .unwrap();
+
+        // Make the {first, second} destination exist, then manufacture the
+        // desync: it lists `second` without storing a column for it.
+        let destination = world.get_or_create_archetype(vec![first, second]);
+        assert!(world
+            .archetypes
+            .get_mut(&destination)
+            .unwrap()
+            .dynamic_component_storages
+            .remove(&second)
+            .is_some());
+
+        let entity = world
+            .create_dynamic_entity(&[(first, 7_u32.to_ne_bytes().to_vec())])
+            .unwrap();
+        let source = world.entity_locations[&entity].archetype_id;
+        let source_rows = world.archetypes[&source].entities.len();
+        let source_column = world.archetypes[&source].dynamic_component_storages[&first].len();
+        let destination_rows = world.archetypes[&destination].entities.len();
+
+        assert!(matches!(
+            world.add_dynamic_component_default(entity, second),
+            Err(WorldError::DynamicStorageMissing { .. })
+        ));
+
+        assert_eq!(world.entity_locations[&entity].archetype_id, source);
+        assert_eq!(
+            world.archetypes[&source].entities.len(),
+            source_rows,
+            "the source kept its row while the destination refused the migration"
+        );
+        assert_eq!(
+            world.archetypes[&source].dynamic_component_storages[&first].len(),
+            source_column
+        );
+        assert_eq!(
+            world.archetypes[&destination].entities.len(),
+            destination_rows,
+            "the destination never received the entity"
         );
     }
 
@@ -3874,13 +4645,34 @@ mod tests {
 
         let mut world = World::new();
         let retained = world
-            .register_dynamic_component(0xA1, "Project.Retained", 4, 4, 11)
+            .register_dynamic_component(
+                0xA1,
+                "Project.Retained",
+                4,
+                4,
+                11,
+                Blittability::engine_verified(),
+            )
             .unwrap();
         let removed = world
-            .register_dynamic_component(0xB2, "Project.Removed", 4, 4, 22)
+            .register_dynamic_component(
+                0xB2,
+                "Project.Removed",
+                4,
+                4,
+                22,
+                Blittability::engine_verified(),
+            )
             .unwrap();
         let added = world
-            .register_dynamic_component(0xC3, "Project.Added", 8, 8, 33)
+            .register_dynamic_component(
+                0xC3,
+                "Project.Added",
+                8,
+                8,
+                33,
+                Blittability::engine_verified(),
+            )
             .unwrap();
         let entity = world
             .create_dynamic_entity(&[
@@ -3970,12 +4762,26 @@ mod tests {
 
         // Dynamic components are served by the dynamic accessor, not this one.
         let dynamic = world
-            .register_dynamic_component(0xD1, "NativeChunkTest.Dynamic", 4, 4, 1)
+            .register_dynamic_component(
+                0xD1,
+                "NativeChunkTest.Dynamic",
+                4,
+                4,
+                1,
+                Blittability::engine_verified(),
+            )
             .unwrap();
         assert!(world.native_component_chunk_mut(dynamic, 0).is_none());
         // An unknown native id is rejected too.
         let unknown = world
-            .register_dynamic_component(0xD2, "NativeChunkTest.Unknown", 4, 4, 2)
+            .register_dynamic_component(
+                0xD2,
+                "NativeChunkTest.Unknown",
+                4,
+                4,
+                2,
+                Blittability::engine_verified(),
+            )
             .unwrap();
         assert!(world.native_component_chunk_mut(unknown, 0).is_none());
     }
@@ -4013,30 +4819,93 @@ mod tests {
         assert_eq!(position.y, -3.25);
     }
 
+    /// The id-keyed sweep releases a column whose factory was purged, empty
+    /// or not: the archetype stops listing the id and no column without a
+    /// table maker is left behind for a graveyard eviction to invalidate.
+    #[test]
+    fn a_column_whose_factory_vanished_is_dropped_before_eviction() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Velocity>();
+        let component_id = ComponentId::of::<Position>();
+        // Two components, so the entity survives the sweep and its destination
+        // archetype can be inspected.
+        let entity = world
+            .create_entity()
+            .with(Position { x: 1.0, y: 2.0 })
+            .with(Velocity { x: 3.0, y: 4.0 })
+            .build()
+            .unwrap();
+
+        // What `forget_component_type` leaves when a rebuilt image re-registers
+        // the name under a fresh id: the archetype keeps the id and its column,
+        // while the factory that describes them is gone.
+        world.storage_factories.remove(&component_id);
+        assert_eq!(
+            world.columns_without_factory(),
+            1,
+            "the column is the only one without a factory"
+        );
+
+        let dropped = world.drop_columns_without_factory();
+        assert_eq!(dropped, 1, "the orphaned id was the one swept");
+        assert_eq!(
+            world.columns_without_factory(),
+            0,
+            "no column without a function table survives the sweep"
+        );
+        let location = world.entity_locations[&entity];
+        assert!(
+            !world.archetypes[&location.archetype_id]
+                .component_types
+                .contains(&component_id),
+            "the entity no longer lists the swept component"
+        );
+        assert_eq!(
+            world.get_component::<Velocity>(entity).unwrap().x,
+            3.0,
+            "the surviving component kept its value through the migration"
+        );
+    }
+
     #[test]
     fn invalid_dynamic_component_layouts_are_rejected() {
         let mut world = World::new();
         assert!(world
-            .register_dynamic_component(1, "Zero", 0, 1, 0)
+            .register_dynamic_component(1, "Zero", 0, 1, 0, Blittability::engine_verified())
             .is_err());
         assert!(world
-            .register_dynamic_component(2, "BadAlign", 4, 3, 0)
+            .register_dynamic_component(2, "BadAlign", 4, 3, 0, Blittability::engine_verified())
             .is_err());
         assert!(world
-            .register_dynamic_component(4, "Oversized", usize::MAX, 1, 0)
+            .register_dynamic_component(
+                4,
+                "Oversized",
+                usize::MAX,
+                1,
+                0,
+                Blittability::engine_verified()
+            )
             .is_err());
         world
-            .register_dynamic_component(3, "SchemaA", 4, 4, 10)
+            .register_dynamic_component(3, "SchemaA", 4, 4, 10, Blittability::engine_verified())
             .unwrap();
         assert!(world
-            .register_dynamic_component(3, "SameSchemaDifferentName", 4, 4, 10)
+            .register_dynamic_component(
+                3,
+                "SameSchemaDifferentName",
+                4,
+                4,
+                10,
+                Blittability::engine_verified()
+            )
             .is_err());
         assert!(world
-            .register_dynamic_component(3, "SchemaB", 8, 8, 20)
+            .register_dynamic_component(3, "SchemaB", 8, 8, 20, Blittability::engine_verified())
             .is_err());
 
         let valid = world
-            .register_dynamic_component(5, "Valid", 4, 4, 30)
+            .register_dynamic_component(5, "Valid", 4, 4, 30, Blittability::engine_verified())
             .unwrap();
         assert!(world.create_dynamic_entity(&[(valid, vec![0; 3])]).is_err());
         assert_eq!(world.entity_count(), 0);
@@ -5382,7 +6251,14 @@ mod tests {
         let mut world = World::new();
         world.register_component::<Position>();
         let dynamic = world
-            .register_dynamic_component(0xABCD, "Demo.Thing", 4, 4, 99)
+            .register_dynamic_component(
+                0xABCD,
+                "Demo.Thing",
+                4,
+                4,
+                99,
+                Blittability::engine_verified(),
+            )
             .unwrap();
 
         let with_dynamic = world
@@ -5422,7 +6298,14 @@ mod tests {
         world.register_component::<Velocity>();
         world.register_component::<Position>();
         world
-            .register_dynamic_component(0x1111, "Demo.Alpha", 4, 4, 1)
+            .register_dynamic_component(
+                0x1111,
+                "Demo.Alpha",
+                4,
+                4,
+                1,
+                Blittability::engine_verified(),
+            )
             .unwrap();
 
         let registered = world.registered_components();
@@ -5616,6 +6499,186 @@ mod tests {
             .unwrap()
             .has_shared_identity());
         assert!(world.take_registration_error().is_none());
+    }
+
+    /// A released bit cannot alias two component sets: the archetype that
+    /// carried it is gone before the bit is reusable, so the next type to take
+    /// it gets its own column and its own archetype.
+    #[test]
+    fn recycled_bit_does_not_alias_archetypes() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        world.register_component::<Velocity>();
+        let velocity_id = ComponentId::of::<Velocity>();
+        let released_bit = world
+            .component_registry()
+            .get_bit(&velocity_id)
+            .expect("registered");
+        let kept = world
+            .create_entity()
+            .with(Position { x: 1.0, y: 2.0 })
+            .with(Velocity { x: 0.0, y: 0.0 })
+            .build()
+            .unwrap();
+
+        let dropped =
+            world.drop_forgotten_components(&[std::any::type_name::<Velocity>().to_string()]);
+        assert_eq!(dropped, 1, "the entity's velocity row was rehomed out");
+        assert_eq!(
+            world.component_registry().get_bit(&velocity_id),
+            None,
+            "the registration is gone with the rows"
+        );
+
+        // The next registration takes the freed bit...
+        world.register_component::<Health>();
+        let health_id = ComponentId::of::<Health>();
+        assert_eq!(
+            world.component_registry().get_bit(&health_id),
+            Some(released_bit),
+            "the freed bit is the one reused"
+        );
+
+        // ...and the archetype it creates is its own, holding exactly its row.
+        let health_entity = world
+            .create_entity()
+            .with(Position { x: 3.0, y: 4.0 })
+            .with(Health { hp: 5 })
+            .build()
+            .unwrap();
+        assert_eq!(world.live_row_count(health_id), 1);
+        assert_eq!(world.live_row_count(ComponentId::of::<Position>()), 2);
+        assert_eq!(
+            world.archetypes.len(),
+            2,
+            "position-only and position+health are two archetypes"
+        );
+        let location = world.entity_locations[&health_entity];
+        let archetype = &world.archetypes[&location.archetype_id];
+        assert!(archetype.component_types.contains(&health_id));
+        assert!(!archetype.component_types.contains(&velocity_id));
+        assert!(world.entity_locations.contains_key(&kept));
+    }
+
+    /// A re-registration updates the id's stamp instead of adding an entry:
+    /// the window stays proportional to distinct resources, and a generation
+    /// that re-registers its resources is exactly what the host's reload diff
+    /// has to see.
+    #[test]
+    fn a_re_registered_resource_stays_one_registration() {
+        let mut world = World::new();
+        world.insert_resource(AccountedResource { value: 1 });
+        let sequence = world.resource_registration_sequence();
+
+        world.insert_resource(AccountedResource { value: 2 });
+        world.insert_resource(AccountedResource { value: 3 });
+        assert_eq!(
+            world.get_resource::<AccountedResource>().unwrap().value,
+            3,
+            "the replacement really replaced the value"
+        );
+        let id = crate::resource::ResourceId::of::<AccountedResource>();
+        assert_eq!(
+            world.resource_ids_registered_since(sequence),
+            vec![id],
+            "a re-registration inside the window is reported, exactly once"
+        );
+
+        world.insert_resource(FreshAccountedResource { value: 4 });
+        assert_eq!(
+            world
+                .get_resource::<FreshAccountedResource>()
+                .unwrap()
+                .value,
+            4
+        );
+        let mut claimed = world.resource_ids_registered_since(sequence);
+        claimed.sort_unstable();
+        let mut expected = vec![
+            id,
+            crate::resource::ResourceId::of::<FreshAccountedResource>(),
+        ];
+        expected.sort_unstable();
+        assert_eq!(
+            claimed, expected,
+            "the fresh id joins the window; nothing accumulates per insert"
+        );
+        assert_eq!(
+            world.resource_registration_stamps.len(),
+            2,
+            "one entry per distinct id, however many times it was written"
+        );
+    }
+
+    /// A resource another subject still claims is not dropped by one subject's
+    /// retirement: the claim refcount keeps the value alive until the last
+    /// claimant lets go.
+    #[test]
+    fn a_shared_claim_survives_one_subjects_retirement() {
+        let mut world = World::new();
+        let id = crate::resource::ResourceId::of::<AccountedResource>();
+        world.insert_resource(AccountedResource { value: 1 });
+
+        // Two subjects registered it.
+        world.retain_resource_claims(&[id]);
+        world.retain_resource_claims(&[id]);
+
+        // One retires it: the value stays, claim and all.
+        world.release_resource_claims(&[id]);
+        assert_eq!(
+            world.drop_resources(&[id]),
+            0,
+            "a live claim keeps the value standing"
+        );
+        assert!(world.get_resource::<AccountedResource>().is_some());
+
+        // The last claimant retires it too.
+        world.release_resource_claims(&[id]);
+        assert_eq!(world.drop_resources(&[id]), 1, "the last release frees it");
+        assert!(world.get_resource::<AccountedResource>().is_none());
+    }
+
+    /// A relayout republishes the whole registry layout - alignment and schema
+    /// hash included - so `get_layout` never describes a column that is gone.
+    #[test]
+    fn relayout_republishes_the_registry_layout() {
+        let mut world = World::new();
+        let component_id = world
+            .register_dynamic_component(
+                0xD9,
+                "Project.Republished",
+                8,
+                4,
+                100,
+                Blittability::engine_verified(),
+            )
+            .unwrap();
+        world
+            .create_dynamic_entity(&[(component_id, vec![0; 8])])
+            .unwrap();
+
+        world
+            .relayout_dynamic_component(component_id, 16, 8, 200, &DynamicFieldPlan::new())
+            .expect("the empty plan fits both layouts");
+
+        let record = world
+            .component_registry()
+            .get_layout(&component_id)
+            .expect("registered");
+        assert_eq!(record.size, 16);
+        assert_eq!(
+            record.align, 8,
+            "the registration-time placeholder alignment moved with the storage"
+        );
+        assert_eq!(record.schema_hash, Some(200));
+        let Some(StorageFactory::Dynamic(layout)) = world.storage_factories.get(&component_id)
+        else {
+            panic!("the factory is still dynamic");
+        };
+        assert_eq!(
+            (layout.size, layout.align, layout.schema_hash),
+            (record.size, record.align, record.schema_hash.unwrap())
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -5830,27 +6893,34 @@ mod tests {
         ));
 
         // Declaring it foreign again - what the managed side does on every
-        // reload - reaches the stored value, and that is what refuses.
-        world
-            .register_foreign_resource("demo::Settings", "Project.Settings", 4, 4, 1)
-            .expect("the layout still matches");
+        // reload - is refused: the stored value's destructor is the price of
+        // admitting the declaration, so it is not admitted.
         assert!(matches!(
-            world.relayout_foreign_resource(id, 8, 4, 2, &DynamicFieldPlan::new()),
+            world.register_foreign_resource("demo::Settings", "Project.Settings", 4, 4, 1),
             Err(WorldError::ForeignResourceHoldsRustValue { .. })
         ));
+        assert_eq!(
+            world.foreign_resource_layout(id),
+            None,
+            "the Rust value's table still owns the id"
+        );
 
-        // Foreign bytes replace it, and then only the plan is in the way.
+        // A declaration that was foreign from the start keeps its payload
+        // checks: there, only the plan is in the way of a resize.
+        let fresh = world
+            .register_foreign_resource("demo::Other", "Project.Other", 4, 4, 1)
+            .expect("a fresh name is claimed");
         world
-            .insert_foreign_resource_bytes(id, &3_u32.to_ne_bytes())
+            .insert_foreign_resource_bytes(fresh, &3_u32.to_ne_bytes())
             .expect("the payload matches the size");
         let mut too_wide = DynamicFieldPlan::new();
         too_wide.push(2, 4, FieldSource::OldOffset(0));
         assert!(matches!(
-            world.relayout_foreign_resource(id, 4, 4, 2, &too_wide),
+            world.relayout_foreign_resource(fresh, 4, 4, 2, &too_wide),
             Err(WorldError::ForeignResourcePlanOutOfBounds { .. })
         ));
         assert_eq!(
-            world.foreign_resource_layout(id),
+            world.foreign_resource_layout(fresh),
             Some((4, 4, 1)),
             "a refused relayout leaves the declaration as it was"
         );
@@ -5868,17 +6938,17 @@ mod tests {
             .insert_foreign_resource_bytes(id, &9_u32.to_ne_bytes())
             .expect("the payload matches the size");
 
-        // The Rust owner registers and stores a value of its own...
+        // The Rust owner registers the same name, which makes the declaration
+        // Rust's while the stored bytes stay foreign - the split a re-home has
+        // to respect. Without the skip it would hand these bytes the Rust
+        // type's destructor, freeing memory that type never allocated.
         world.register_resource::<artifact_a::Settings>();
-        world.insert_resource(artifact_a::Settings { value: 4 });
-        assert!(!world.resources[&id].is_foreign());
-
-        // ...and a later foreign insert makes the box foreign again. From here
-        // a re-home would hand it the Rust destructor without the skip.
-        world
-            .insert_foreign_resource_bytes(id, &5_u32.to_ne_bytes())
-            .expect("the payload matches the size");
         assert!(world.resources[&id].is_foreign());
+        assert_eq!(
+            world.resource_factories.get(&id).map(|ops| ops.foreign),
+            Some(false),
+            "the Rust registration owns the declaration again"
+        );
 
         world.rehome_resources();
 
@@ -5887,8 +6957,62 @@ mod tests {
             "a foreign box keeps its own drop, whatever the factories say"
         );
         assert_eq!(
-            world.foreign_resource_bytes(id),
-            Some(5_u32.to_ne_bytes().as_slice())
+            world.resources[&id].bytes(),
+            9_u32.to_ne_bytes().as_slice(),
+            "leaving the table alone leaves the payload alone too"
+        );
+    }
+
+    /// A foreign declaration cannot take over an id that stores a Rust value:
+    /// the value's destructor is bound to its type, so its bytes are never
+    /// reinterpreted - and the table that would have dropped nothing stays out.
+    #[test]
+    fn foreign_registration_refuses_a_stored_rust_value() {
+        let mut world = World::new();
+        world.register_resource::<artifact_a::Settings>();
+        world.insert_resource(artifact_a::Settings { value: 7 });
+        let id = crate::resource::ResourceId::of::<artifact_a::Settings>();
+
+        assert!(matches!(
+            world.register_foreign_resource("demo::Settings", "Project.Settings", 4, 4, 1),
+            Err(WorldError::ForeignResourceHoldsRustValue { .. })
+        ));
+        assert_eq!(
+            world.resource_factories.get(&id).map(|ops| ops.foreign),
+            Some(false),
+            "the Rust registration still owns the id"
+        );
+        assert_eq!(
+            world
+                .get_resource::<artifact_a::Settings>()
+                .map(|v| v.value),
+            Some(7),
+            "the refusal left the value alone"
+        );
+    }
+
+    /// Byte views are for foreign payloads only: a Rust value that declares a
+    /// shared name is not served as bytes, and the refusal costs nothing - no
+    /// tick is stamped and no payload is displaced.
+    #[test]
+    fn foreign_byte_views_refuse_a_rust_owned_resource() {
+        let mut world = World::new();
+        world.register_resource::<artifact_a::Settings>();
+        world.insert_resource(artifact_a::Settings { value: 5 });
+        let id = crate::resource::ResourceId::of::<artifact_a::Settings>();
+
+        assert!(world.foreign_resource_bytes(id).is_none());
+        assert!(world.foreign_resource_bytes_mut(id).is_none());
+        assert!(matches!(
+            world.insert_foreign_resource_bytes(id, &5_u32.to_ne_bytes()),
+            Err(WorldError::ForeignResourceFactoryIsNative { .. })
+        ));
+        assert_eq!(
+            world
+                .get_resource::<artifact_a::Settings>()
+                .map(|v| v.value),
+            Some(5),
+            "the value survived the refusals"
         );
     }
 }

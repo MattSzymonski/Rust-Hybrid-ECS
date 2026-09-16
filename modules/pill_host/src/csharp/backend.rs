@@ -67,11 +67,28 @@ const MAX_SYSTEM_NAME_BYTES: u32 = 1024;
 /// Maximum UTF-8 byte length accepted for a managed system error message.
 const MAX_SYSTEM_ERROR_BYTES: u32 = 4096;
 
+/// Upper bound on the number of systems one managed assembly may report.
+///
+/// The count sizes the startup snapshot before a single system is reflected,
+/// so it needs the same kind of bound the manifest lengths above have: 4,096
+/// systems is far past any real project and keeps the snapshot under a
+/// megabyte even with its access lists.
+pub(super) const MAX_SYSTEMS_PER_ASSEMBLY: u32 = 4096;
+
+/// Upper bound on the accesses one managed system may declare.
+pub(super) const MAX_ACCESSES_PER_SYSTEM: u32 = 1024;
+
 /// Unmanaged ABI contract version shared with `csharp_runtime`.
 ///
-/// Bump whenever any `UnmanagedCallersOnly` export signature changes; the host
-/// refuses to start against a runtime built for a different version.
-const INTEROP_CONTRACT_VERSION: u32 = 3;
+/// Bump whenever any `UnmanagedCallersOnly` export signature changes, when
+/// the [`CsEngineApi`] table's field layout does - the managed runtime copies
+/// that struct field by field, so a new slot makes the two sides disagree
+/// about every slot after it - or when a struct the exports exchange changes
+/// shape. Bumped to 4 by the mirror-epoch slot and to 5 by the chunk's const
+/// `entities` pointer, which a stale runtime would otherwise read as a
+/// 48-byte struct. The host refuses to start against a runtime built for a
+/// different version.
+const INTEROP_CONTRACT_VERSION: u32 = 6;
 
 // =============================================================================
 // Types + Impls
@@ -439,10 +456,13 @@ impl CSharpRuntime {
         if count == 0 {
             return Err(CSharpError::NoSystems);
         }
-        let mut system_snapshot = Vec::with_capacity(count as usize);
+        let mut system_snapshot = Vec::new();
+        system_snapshot
+            .try_reserve_exact(checked_system_count(count)?)
+            .map_err(|_| CSharpError::SystemSnapshotAllocationFailed)?;
         for system_index in 0..count {
             let system_access_count = access_count(system_index);
-            let mut managed_access = Vec::with_capacity(system_access_count as usize);
+            let mut managed_access = Vec::with_capacity(checked_access_count(system_access_count)?);
             for access_index in 0..system_access_count {
                 let mut item = NativeSystemAccess {
                     component_key: 0,
@@ -457,6 +477,10 @@ impl CSharpRuntime {
                 }
                 managed_access.push(item);
             }
+            // The reflected count and the recorded accesses move together: a
+            // future early exit inside the fill loop must not leave the
+            // snapshot short of what the managed side reported.
+            debug_assert_eq!(managed_access.len(), system_access_count as usize);
 
             let uses_commands = system_uses_commands(system_index) != 0;
             let mut access = derive_system_access(&managed_access, &bindings.read())?;
@@ -672,10 +696,13 @@ impl CSharpRuntime {
         if count == 0 {
             return Err(CSharpError::NoSystems);
         }
-        let mut system_snapshot = Vec::with_capacity(count as usize);
+        let mut system_snapshot = Vec::new();
+        system_snapshot
+            .try_reserve_exact(checked_system_count(count)?)
+            .map_err(|_| CSharpError::SystemSnapshotAllocationFailed)?;
         for system_index in 0..count {
             let system_access_count = access_count(system_index);
-            let mut managed_access = Vec::with_capacity(system_access_count as usize);
+            let mut managed_access = Vec::with_capacity(checked_access_count(system_access_count)?);
             for access_index in 0..system_access_count {
                 let mut item = NativeSystemAccess {
                     component_key: 0,
@@ -690,6 +717,10 @@ impl CSharpRuntime {
                 }
                 managed_access.push(item);
             }
+            // The reflected count and the recorded accesses move together: a
+            // future early exit inside the fill loop must not leave the
+            // snapshot short of what the managed side reported.
+            debug_assert_eq!(managed_access.len(), system_access_count as usize);
 
             let uses_commands = system_uses_commands(system_index) != 0;
             let mut access = derive_system_access(&managed_access, &bindings.read())?;
@@ -761,10 +792,30 @@ impl CSharpRuntime {
     ///
     /// The managed loader validates the rebuilt assembly's component manifest
     /// and system signatures before swapping. A rejection is logged once per
-    #[cfg(feature = "hot_reload")]
     /// attempt so the per-frame poll cannot drown the terminal in messages.
-    pub(crate) fn poll_reload(&mut self, engine: &mut Engine) -> u8 {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CSharpError::UnknownPollStatus`] for a code outside
+    /// [`POLL_NO_CHANGE`], [`POLL_RELOADED`] and [`POLL_REJECTED`]: a status the
+    /// host cannot interpret is a failure to report, not a change that never
+    /// happened. The currently loaded assembly is kept either way.
+    #[cfg(feature = "hot_reload")]
+    pub(crate) fn poll_reload(&mut self, engine: &mut Engine) -> Result<u8, CSharpError> {
         let status = (self.poll_reload)();
+        if !poll_status_is_known(status) {
+            // Logged once per distinct code: the poll runs every frame and a
+            // persistent unknown status must not drown the terminal.
+            if self.last_poll_status != status {
+                error!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    status,
+                    "the managed loader reported an unknown reload status; keeping the currently loaded assembly"
+                );
+            }
+            self.last_poll_status = status;
+            return Err(CSharpError::UnknownPollStatus { status });
+        }
         if status == POLL_REJECTED && self.last_poll_status != POLL_REJECTED {
             error!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -790,7 +841,7 @@ impl CSharpRuntime {
             }
         }
         self.last_poll_status = status;
-        status
+        Ok(status)
     }
 
     /// Apply the swapped assembly's component manifest when it differs from the
@@ -896,12 +947,47 @@ impl CSharpRuntime {
 // Free Functions
 // =============================================================================
 
+/// Whether a managed-reported poll status is one this host understands.
+///
+/// The three codes are the loader's whole vocabulary; the set is a helper so a
+/// test can pin it without a live runtime.
+#[cfg(feature = "hot_reload")]
+pub(super) fn poll_status_is_known(status: u8) -> bool {
+    matches!(status, POLL_NO_CHANGE | POLL_RELOADED | POLL_REJECTED)
+}
+
 /// Whether a managed-reported manifest length lies within the supported range.
 ///
 /// Rejects zero and any value above [`MAX_COMPONENT_MANIFEST_BYTES`], so a
 /// buggy managed assembly can never drive an unbounded host allocation.
 pub(super) fn is_supported_manifest_length(length: u32) -> bool {
     (1..=MAX_COMPONENT_MANIFEST_BYTES).contains(&length)
+}
+
+/// Validates a managed-reported system count before it sizes a host allocation.
+///
+/// `Vec::with_capacity` aborts the process when the allocation fails, so the
+/// count is checked against [`MAX_SYSTEMS_PER_ASSEMBLY`] first and refused as
+/// a typed error instead.
+pub(super) fn checked_system_count(count: u32) -> Result<usize, CSharpError> {
+    if count > MAX_SYSTEMS_PER_ASSEMBLY {
+        return Err(CSharpError::SystemCountOutOfRange {
+            count,
+            limit: MAX_SYSTEMS_PER_ASSEMBLY,
+        });
+    }
+    Ok(count as usize)
+}
+
+/// Validates a managed-reported access count; see [`checked_system_count`].
+pub(super) fn checked_access_count(count: u32) -> Result<usize, CSharpError> {
+    if count > MAX_ACCESSES_PER_SYSTEM {
+        return Err(CSharpError::SystemCountOutOfRange {
+            count,
+            limit: MAX_ACCESSES_PER_SYSTEM,
+        });
+    }
+    Ok(count as usize)
 }
 
 /// Fetch the reflected managed name for one system.
