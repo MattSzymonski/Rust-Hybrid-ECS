@@ -24,8 +24,13 @@
 use std::collections::HashSet;
 
 // External crates
+use pill_core::error::CSharpError;
 use pill_engine::component_registry::ComponentFieldDescriptor;
 use serde::Deserialize;
+
+// Current crate
+use super::components::{stable_component_id, StableComponentId};
+use super::resources::{ManagedResourceDeclaration, ResourceFieldLayout};
 
 /// Maximum nesting depth accepted in a managed component field tree.
 ///
@@ -342,4 +347,113 @@ pub(super) fn format_field_layout_line(layout: &[ComponentFieldDescriptor]) -> S
         })
         .collect::<Vec<_>>()
         .join("|")
+}
+
+/// Parse a managed manifest and check every entry against its own identity.
+///
+/// Split out of `register_component_manifest` so the reload path validates
+/// exactly what the startup path validates. Every check here is a property of
+/// the manifest alone - identity, uniqueness, and the shape of each layout - so
+/// both callers can run it before either touches the world.
+pub(super) fn parse_and_validate_manifest(
+    bytes: &[u8],
+) -> Result<Vec<ManagedComponentManifest>, CSharpError> {
+    // Step 1: Parse and validate every entry against canonical identities.
+    let manifest: Vec<ManagedComponentManifest> = serde_json::from_slice(bytes)?;
+    let mut seen = HashSet::new();
+    for component in &manifest {
+        let stable_id =
+            StableComponentId::from_halves(component.stable_id_low, component.stable_id_high);
+        if stable_component_id(&component.full_name) != stable_id {
+            return Err(format!(
+                "managed component {} has an ID that does not match its canonical full name",
+                component.full_name
+            )
+            .into());
+        }
+        if !seen.insert(stable_id) {
+            // Components and resources share one identity space, so this also
+            // catches a resource whose declared name collides with a component's
+            // type name - two entries that would answer to one slot.
+            return Err(format!(
+                "duplicate declaration {} in managed manifest",
+                component.full_name
+            )
+            .into());
+        }
+        if component.size == 0
+            || u32::try_from(component.size).is_err()
+            || component.alignment == 0
+            || !component.alignment.is_power_of_two()
+            || std::alloc::Layout::from_size_align(component.size, component.alignment).is_err()
+        {
+            return Err(format!(
+                "invalid layout for managed component {}",
+                component.full_name
+            )
+            .into());
+        }
+
+        // Sibling fields of the component itself must not overlap either.
+        validate_sibling_non_overlap(&component.fields, &component.full_name)?;
+        for field in &component.fields {
+            validate_field_manifest(field, component.size)?;
+        }
+
+        // A resource is a singleton, so "the host already binds this natively"
+        // has nothing to mean for one: there is no column to bind and no native
+        // mirror to validate against. Refused where it is declared rather than
+        // silently ignored, so a mis-marked struct is a named error.
+        if component.kind == ManifestEntryKind::Resource && component.shared {
+            return Err(format!(
+                "managed resource {} is marked shared; resources have no native binding",
+                component.full_name
+            )
+            .into());
+        }
+    }
+    Ok(manifest)
+}
+
+/// Split one parsed manifest into its component and resource halves.
+///
+/// Both halves went through the same identity, layout and field validation
+/// above; only what they are registered as differs.
+pub(super) fn split_manifest_kinds(
+    manifest: Vec<ManagedComponentManifest>,
+) -> (
+    Vec<ManagedComponentManifest>,
+    Vec<ManagedResourceDeclaration>,
+) {
+    let mut components = Vec::new();
+    let mut resources = Vec::new();
+    for entry in manifest {
+        match entry.kind {
+            ManifestEntryKind::Component => components.push(entry),
+            ManifestEntryKind::Resource => {
+                // The tags are folded through the same function the component
+                // plan uses, so a resource migration compares the two sides of
+                // its diff in one vocabulary rather than marking every nested
+                // field retyped.
+                let fields = entry
+                    .fields
+                    .iter()
+                    .map(|field| ResourceFieldLayout {
+                        name: field.name.clone(),
+                        type_tag: manifest_field_tag(field).to_owned(),
+                        offset: field.offset,
+                        size: field.size,
+                    })
+                    .collect();
+                resources.push(ManagedResourceDeclaration {
+                    full_name: entry.full_name,
+                    size: entry.size,
+                    align: entry.alignment,
+                    schema_hash: entry.schema_hash,
+                    fields,
+                });
+            }
+        }
+    }
+    (components, resources)
 }

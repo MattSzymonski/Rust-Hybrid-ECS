@@ -6,6 +6,11 @@
 //! These tests pin the shapes the engine must refuse, and pin that the refusal
 //! is a typed error rather than a debug-only assertion or a panic deep inside
 //! the first growth.
+//!
+//! # Responsibilities
+//!
+//! - Pin the layout shapes the engine must refuse, as typed errors.
+//! - Keep the refusals at registration rather than at first growth.
 
 use pill_engine::archetype::{Blittability, DynamicColumn, DynamicComponentLayout};
 use pill_engine::world::WorldError;

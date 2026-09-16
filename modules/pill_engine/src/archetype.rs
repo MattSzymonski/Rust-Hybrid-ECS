@@ -40,6 +40,33 @@
 //! (now the removed entity's data) is popped, and the swapped entity's
 //! location is updated in the `entity_locations` map. This keeps arrays
 //! dense without gaps, maintaining O(1) removal.
+//!
+//! # Invariants
+//!
+//! The raw-byte storage rests on four rules, each enforced at the boundary
+//! that can check it:
+//!
+//! - **Element identity.** [`ColumnIdentity`] records how much the compiler
+//!   still vouches for a column: an exact `TypeId` (native), size and alignment
+//!   with the registry having compared the full field layout (shared), or no
+//!   Rust type at all (descriptor). The typed accessors enforce the first two
+//!   and [`DynamicColumn::get`] panics on a mismatch; a descriptor column never
+//!   receives a typed call, because no Rust type names its rows.
+//! - **Alignment hosting.** A column's buffer is allocated with the row's
+//!   alignment, so a row is aligned for the type the column was built for.
+//!   Registration refuses a layout change the old buffer cannot host (the 4.18
+//!   guard in `world.rs`): rows spawned into the old column would otherwise be
+//!   read through the incoming type at the old stride.
+//! - **Ops discipline.** Everything that depends on what the bytes mean goes
+//!   through [`ColumnOps`], which is plain data a reload refreshes before any
+//!   row is touched. `drop_range` runs exactly once per initialized row - on
+//!   truncation, on `Drop`, and never for a column whose `trivial_drop` is set
+//!   - and [`Blittability`] is the witness that makes a plain-data claim
+//!   checkable rather than assumed.
+//! - **Row lifecycle.** `len` counts initialized rows: growth leaves the new
+//!   tail uninitialized until a write fills it, and `swap_remove` moves the tail
+//!   row over the hole before dropping the length, so no row is read or dropped
+//!   twice.
 
 // Standard library
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};

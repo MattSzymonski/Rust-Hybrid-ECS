@@ -1093,6 +1093,7 @@ mod tests {
         mod first_copy {
             use crate::component::Component;
 
+            /// A copy of the shared type as one binary would declare it.
             #[derive(Clone, Debug)]
             pub struct SharedProbe {
                 #[allow(dead_code)]
@@ -1109,6 +1110,8 @@ mod tests {
         mod second_copy {
             use crate::component::Component;
 
+            /// The same type as another binary would declare it: same name,
+            /// different field shape.
             #[derive(Clone, Debug)]
             pub struct SharedProbe {
                 #[allow(dead_code)]

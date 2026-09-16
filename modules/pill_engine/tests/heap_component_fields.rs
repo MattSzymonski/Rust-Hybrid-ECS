@@ -5,6 +5,12 @@
 //! address, and the reload-migration behavior that heap data depends on —
 //! serde round-tripping a changed schema while an unchanged one keeps the live
 //! allocation in place.
+//!
+//! # Responsibilities
+//!
+//! - Cover the derive's container tag vocabulary end to end.
+//! - Exercise the generated accessor trampolines reached through row addresses.
+//! - Pin reload migration of heap fields, live allocation included.
 
 use std::collections::HashSet;
 

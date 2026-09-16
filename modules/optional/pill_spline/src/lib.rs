@@ -182,6 +182,9 @@ const _: () = assert!(core::mem::offset_of!(Vector3f, x) == 0);
 const _: () = assert!(core::mem::offset_of!(Vector3f, y) == 4);
 const _: () = assert!(core::mem::offset_of!(Vector3f, z) == 8);
 
+/// A mirrored value type used by the interop suites: two coordinates, and a
+/// handful of mirrored methods that prove the trampoline surface changes
+/// between generations.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PillMirror)]
 pub struct OmoMO {
@@ -210,16 +213,20 @@ impl OmoMO {
         self.x + 1200
     }
 
+    /// The `y` coordinate; mirrored to C# as `GetB()`.
     #[pill_mirror_method]
     pub fn get_b(&self) -> u64 {
         self.y + 1200
     }
 
+    /// A constant; mirrored to C# as `GetC()` - a call that takes no state.
     #[pill_mirror_method]
     pub fn get_c(&self) -> u64 {
         666
     }
 
+    /// Sum of two arguments; mirrored to C# as `GetD(int, int)` and used as
+    /// the argument-conversion probe.
     #[pill_mirror_method]
     pub fn get_d(&self, alpha: i32, beta: i32) -> i32 {
         alpha + beta

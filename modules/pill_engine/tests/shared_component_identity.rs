@@ -1,5 +1,11 @@
 //! Integration tests for components that keep one identity across binaries.
 //!
+//! # Responsibilities
+//!
+//! - Pin that one shared name binds two distinct types to one component.
+//! - Pin the peer-collision refusal when the name is removed, and the
+//!   two-registrant reload that competes for one column's function table.
+//!
 //! # What is being simulated
 //!
 //! The situation these tests exist for cannot be reproduced literally in one
@@ -192,9 +198,7 @@ fn entities_spawned_from_either_copy_share_one_archetype() {
         "two copies of one component must not produce two archetypes"
     );
     assert_eq!(archetypes[0].entities.len(), 2);
-    assert!(archetypes[0]
-        .entities
-        .contains(&from_project));
+    assert!(archetypes[0].entities.contains(&from_project));
     assert!(archetypes[0].entities.contains(&from_module));
 
     // And both rows live in one column.
@@ -272,10 +276,7 @@ fn a_read_query_through_one_copy_sees_rows_created_by_the_other() {
         .unwrap();
 
     let mut query = Query::<(&ProjectSpline,)>::new(&mut world);
-    let mut tensions: Vec<f32> = query
-        .iter_mut()
-        .map(|(spline,)| spline.tension)
-        .collect();
+    let mut tensions: Vec<f32> = query.iter_mut().map(|(spline,)| spline.tension).collect();
     tensions.sort_by(f32::total_cmp);
     assert_eq!(tensions, vec![1.0, 2.0]);
 }
@@ -311,8 +312,7 @@ fn a_change_tick_written_by_one_copy_is_seen_by_the_other() {
     }
 
     // The project's `Changed` filter, keyed on its own type, observes it.
-    let mut query =
-        Query::<(&ProjectSpline,), Changed<ProjectSpline>>::new(&mut world);
+    let mut query = Query::<(&ProjectSpline,), Changed<ProjectSpline>>::new(&mut world);
     assert_eq!(
         query.iter_mut().count(),
         1,
@@ -537,7 +537,10 @@ fn ordinary_components_keep_separate_identities() {
         .archetypes_iter()
         .filter(|archetype| !archetype.entities.is_empty())
         .count();
-    assert_eq!(populated, 2, "unrelated components stay in their own columns");
+    assert_eq!(
+        populated, 2,
+        "unrelated components stay in their own columns"
+    );
 }
 
 // =============================================================================
@@ -606,7 +609,10 @@ fn a_shared_row_can_be_removed_without_disturbing_its_neighbours() {
     world.remove_component::<ModuleSpline>(entity).unwrap();
 
     assert!(world.get_component::<ProjectSpline>(entity).is_none());
-    assert_eq!(world.get_component::<PlainMarker>(entity).unwrap().value, 11);
+    assert_eq!(
+        world.get_component::<PlainMarker>(entity).unwrap().value,
+        11
+    );
     assert_eq!(world.live_row_count(ComponentId::of::<ProjectSpline>()), 0);
 }
 

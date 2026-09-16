@@ -51,8 +51,11 @@ use pill_core::{debug, info, warn};
 use pill_engine::Engine;
 
 // Current crate
+/// Patch compilation: the rustc invocation and its artifacts.
 pub(crate) mod compile;
+/// Patch generations: the history a route can lead back through.
 pub(crate) mod generations;
+/// Patch routes: where a body is installed and how calls reach it.
 pub(crate) mod routes;
 
 // A function's patch history and the routes back through it.

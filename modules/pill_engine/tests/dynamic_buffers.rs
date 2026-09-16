@@ -4,6 +4,12 @@
 //! generated trampolines, the archetype-move behavior (the handle is copied,
 //! the block is not), migration through serde, the unchanged-schema fast path,
 //! and balanced ownership of the engine's native memory.
+//!
+//! # Responsibilities
+//!
+//! - Exercise the derive's `dynbuf:` tag and the `DynamicBuffer` API.
+//! - Pin the address-stability contract across archetype moves and reloads.
+//! - Pin balanced ownership of the shared native allocation service.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -238,11 +244,7 @@ fn buffer_contents_survive_migration_and_the_fast_path() {
     // The unchanged-schema fast path visits no value at all: the same block
     // stays in place, which is what keeps outstanding views valid.
     let previous = world.capture_persist_type_metadata();
-    let report = world.migrate_changed_persistable_components(
-        &previous,
-        &HashSet::new(),
-        None,
-    );
+    let report = world.migrate_changed_persistable_components(&previous, &HashSet::new(), None);
     assert_eq!(report.migrated_type_count, 0);
     let trail = world
         .get_component::<Trail>(entity)

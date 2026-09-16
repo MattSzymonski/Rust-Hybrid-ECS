@@ -1,4 +1,8 @@
 //! Constants shared between the host and optional engine modules.
+//!
+//! # Responsibilities
+//!
+//! - Define the optional-module ABI revision the host and every module read.
 
 /// Revision of the optional-module C-ABI export contract.
 ///

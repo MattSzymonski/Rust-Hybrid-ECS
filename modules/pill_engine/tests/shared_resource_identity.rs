@@ -1,5 +1,10 @@
 //! Integration tests for resources that keep one identity across artifacts.
 //!
+//! # Responsibilities
+//!
+//! - Pin that one shared resource name binds two distinct types to one value.
+//! - Pin rehoming that refreshes the ops table without touching the bytes.
+//!
 //! # What is being simulated
 //!
 //! The situation cannot be reproduced literally in one test binary: it needs

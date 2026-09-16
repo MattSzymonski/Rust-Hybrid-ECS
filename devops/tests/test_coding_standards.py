@@ -17,8 +17,9 @@ DESCRIPTION
     Checks performed:
       1. module header   - every file opens with a `//!` block and contains a
                            `# Responsibilities` section.
-      2. safety comments - every `unsafe` token has a `// SAFETY:` (or
-                           `# Safety`) justification within a bounded window
+      2. safety comments - every `unsafe` token outside a string literal has a
+                           `// SAFETY:` (or `# Safety`) justification within a
+                           bounded window
                            above it.
       3. public docs     - every `pub` item (fn/struct/enum/trait/const/
                            static/type/mod) is preceded by a `///` doc comment.
@@ -217,6 +218,34 @@ def check_module_header(
 # =============================================================================
 
 
+def first_code_match(pattern, line: str):
+    """Returns the first match of `pattern` that is not inside a double-quoted string.
+
+    The lint reads Rust as text, and `unsafe` appears inside string literals in
+    this codebase - the host's codegen carries a C# keyword table that lists the
+    word. A quoted token is data, not a declaration, so counting unescaped
+    quotes before the `unsafe` word itself (an odd count means the word sits
+    inside a string) tells the two apart without parsing Rust. The count starts
+    at the word, not at the match, because the surrounding pattern deliberately
+    includes the character on either side of it.
+    """
+    for match in pattern.finditer(line):
+        word_start = match.start() + match.group(0).find("unsafe")
+        prefix = line[:word_start]
+        quotes = 0
+        index = 0
+        while index < len(prefix):
+            if prefix[index] == "\\":
+                index += 2
+                continue
+            if prefix[index] == '"':
+                quotes += 1
+            index += 1
+        if quotes % 2 == 0:
+            return match
+    return None
+
+
 def check_safety_comments(
     lines: List[str], display_path: str, collector: ViolationCollector
 ) -> None:
@@ -224,7 +253,8 @@ def check_safety_comments(
 
     `unsafe fn` / `extern` / `const` / `trait` signature declarations are
     exempt: their contract belongs in a `/// # Safety` doc, not in a
-    `// SAFETY:` comment above the signature.
+    `// SAFETY:` comment above the signature. A token inside a string literal
+    is data, not code, and is skipped entirely.
     """
     last_safety_line = 0
     for line_number, line in enumerate(lines, start=1):
@@ -235,9 +265,11 @@ def check_safety_comments(
             continue
         if BLANK_LINE_PATTERN.search(line):
             continue
-        if not UNSAFE_TOKEN_PATTERN.search(line):
+        if first_code_match(UNSAFE_TOKEN_PATTERN, line) is None:
             continue
-        if not UNSAFE_BLOCK_PATTERN.search(line) and UNSAFE_DECLARATION_PATTERN.search(line):
+        if first_code_match(UNSAFE_BLOCK_PATTERN, line) is None and first_code_match(
+            UNSAFE_DECLARATION_PATTERN, line
+        ) is not None:
             continue
         if last_safety_line == 0 or line_number - last_safety_line > SAFETY_WINDOW_LINES:
             collector.record(

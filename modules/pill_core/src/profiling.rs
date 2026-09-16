@@ -287,6 +287,7 @@ mod enabled {
 // Full `profiling` feature - plots, messages, thread naming
 // ============================================================================
 
+/// Extended profiling helpers, compiled only with the `profiling` feature.
 #[cfg(feature = "profiling")]
 pub mod profiling_extras {
     // Standard library

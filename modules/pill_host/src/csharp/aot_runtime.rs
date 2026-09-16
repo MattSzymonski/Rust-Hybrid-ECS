@@ -7,6 +7,11 @@
 //! with `libloading` and resolves the same `pill_*` exports directly by symbol
 //! name - no hostfxr, no installed .NET, no JIT.
 //!
+//! # Responsibilities
+//!
+//! - Load the AOT-published native library and resolve the `pill_*` exports.
+//! - Keep the loader's call surface identical to the hostfxr path's.
+//!
 //! Everything downstream (system discovery, scheduler registration, per-frame
 //! dispatch) is identical to the hostfxr path; only how the function pointers
 //! are obtained differs.

@@ -1,4 +1,9 @@
 //! ANSI console helpers for the host's hot-reload log.
+//!
+//! # Responsibilities
+//!
+//! - Decide once whether colors are on (terminal attached, `PILL_ANSI`, `NO_COLOR`).
+//! - Keep piped output plain so harnesses parse it unchanged.
 //
 //   Colors are opt-in and disabled automatically when stdout is not a
 //   terminal, so the benchmark harness (which pipes the host's stdout and
