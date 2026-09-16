@@ -606,14 +606,25 @@ impl ErasedResource {
         unsafe {
             std::ptr::write_bytes(self.data.as_ptr(), 0, size);
             for field in plan.fields() {
-                let FieldSource::OldOffset(offset) = field.source else {
-                    continue;
-                };
-                std::ptr::copy_nonoverlapping(
-                    scratch.as_ptr().add(offset),
-                    self.data.as_ptr().add(field.offset),
-                    field.bytes,
-                );
+                match field.source {
+                    FieldSource::OldOffset(offset) => {
+                        std::ptr::copy_nonoverlapping(
+                            scratch.as_ptr().add(offset),
+                            self.data.as_ptr().add(field.offset),
+                            field.bytes,
+                        );
+                    }
+                    // The payload was zeroed above, and a default is checked to
+                    // fit its field when it is set.
+                    FieldSource::Default { bytes, len } => {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            self.data.as_ptr().add(field.offset),
+                            usize::from(len),
+                        );
+                    }
+                    FieldSource::ZeroFill => {}
+                }
             }
         }
 

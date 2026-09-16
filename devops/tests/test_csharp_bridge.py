@@ -578,6 +578,69 @@ COMPONENT_LAYOUT_EDIT = (
     "    /// <summary>Curve parameter this dot samples, running from 0.0 to 1.0.</summary>\n    public float T;\n\n    /// <summary>Added by the suite; changes the component's layout.</summary>\n    public float Extra;\n}",
 )
 
+# The same shape of change, with a declared non-zero default for the added
+# field: the host must migrate the column and fill the new field from the
+# default, not zero. The sample system below prints the field once after the
+# swap, which is what turns "filled from the default" into an assertion.
+COMPONENT_DEFAULT_FIELD_EDIT = (
+    "    /// <summary>Curve parameter this dot samples, running from 0.0 to 1.0.</summary>\n    public float T;\n}",
+    "    /// <summary>Curve parameter this dot samples, running from 0.0 to 1.0.</summary>\n    public float T;\n\n    /// <summary>Added by the suite; its field default must survive the migration.</summary>\n    [EcsFieldDefault(7.5f)]\n    public float Extra;\n}",
+)
+
+# The print witness for COMPONENT_DEFAULT_FIELD_EDIT. A latch static and a
+# body-only print line: neither touches a system's query signature, so the
+# swap stays legal while the manifest change rides the parked path.
+SYSTEM_EXTRA_LATCH_EDIT = (
+    "public static class SplinePathSystem\n{\n    [EcsSystem]",
+    "public static class SplinePathSystem\n{\n    // Written by devops/tests/test_csharp_bridge.py while the suite runs:\n    // reports the migrated field default once per assembly.\n#pragma warning disable PILL0301\n    private static bool extraLogged;\n#pragma warning restore PILL0301\n\n    [EcsSystem]",
+)
+SYSTEM_EXTRA_PRINT_EDIT = (
+    "                ref var sample = ref sampleRow.SplineSample;\n                ref var position = ref sampleRow.Position;",
+    "                ref var sample = ref sampleRow.SplineSample;\n                if (!extraLogged)\n                {\n                    extraLogged = true;\n                    Console.WriteLine($\"[project_cs] sample extra={sample.Extra}\");\n                }\n                ref var position = ref sampleRow.Position;",
+)
+
+# `7.5f` through `"R"` formatting; anything else means the added field was
+# reset to zero instead of filled from its declared default.
+SAMPLE_EXTRA_TOKEN = "[project_cs] sample extra=7.5"
+
+# The retirement probes: a resource and a component declared only by the probe
+# file and referenced by no query signature, so adding and removing them is a
+# manifest-only change that rides the parked path exactly as a layout change
+# does. The component is seeded with three rows, which is what makes its
+# retirement visible as data going away rather than a declaration blink.
+PROBE_RETIREMENT_RESOURCE_ADD = (
+    "public static class ModuleSplineBridgeDemo\n{",
+    "/// <summary>Declared, then retired, by devops/tests/test_csharp_bridge.py.</summary>\n"
+    "[EcsResource]\n"
+    "public struct ProbeSettings\n"
+    "{\n"
+    "    public float Gain;\n"
+    "}\n\n"
+    "public static class ModuleSplineBridgeDemo\n{",
+)
+PROBE_RETIREMENT_MARKER_ADD = (
+    "public static class ModuleSplineBridgeDemo\n{",
+    "/// <summary>Seeded, then retired, by devops/tests/test_csharp_bridge.py.</summary>\n"
+    "public struct ProbeMarker\n"
+    "{\n"
+    "    public float Value;\n"
+    "}\n\n"
+    "public static class ModuleSplineBridgeDemo\n{",
+)
+PROBE_RETIREMENT_MARKER_SEED = (
+    "        if (!_seeded)\n        {\n            _seeded = true;",
+    "        if (!_seeded)\n        {\n            _seeded = true;\n"
+    "            for (int index = 0; index < 3; index++)\n"
+    "                commands.CreateEntity().With(new ProbeMarker { Value = index }).Build();\n"
+    '            Console.WriteLine("[project_cs] probe retirement markers seeded");',
+)
+
+MARKERS_SEEDED_TOKEN = "probe retirement markers seeded"
+# The retirement logs: three rows go with the component, and the unclaimed
+# resource is dropped outright.
+COMPONENT_RETIREMENT_TOKEN = "components=1 entities=3"
+RESOURCE_RETIREMENT_TOKEN = "resources=1 dropped=1"
+
 # Renames an [EcsSystem] method of the probe file. Rust builds its execution
 # graph once at startup from these names, so the set has to stay stable until a
 # restart.
@@ -739,6 +802,135 @@ SESSION_SCENARIOS = [
             )
         ],
         restore_after=[PROJECT_CS_COMPONENTS_CS],
+    ),
+    # A field added with a declared default starts from that value instead of
+    # zero, and the next generation sees it: the sample system prints the
+    # migrated field once after the swap. The two Systems.cs edits are a latch
+    # static and a body-only print, so the parked manifest stays the only
+    # contract change the swap carries.
+    Scenario(
+        name="csharp_migrates_field_default",
+        phases=[
+            ScenarioPhase(
+                edits=[
+                    (PROJECT_CS_COMPONENTS_CS, [COMPONENT_DEFAULT_FIELD_EDIT]),
+                    (
+                        PROJECT_CS_SYSTEMS_CS,
+                        [SYSTEM_EXTRA_LATCH_EDIT, SYSTEM_EXTRA_PRINT_EDIT],
+                    ),
+                ],
+                wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
+                required_tokens=[
+                    CSHARP_MANIFEST_PENDING_TOKEN,
+                    CSHARP_RELOAD_COMPLETE_TOKEN,
+                ],
+                forbidden_tokens=[
+                    CSHARP_RELOAD_REJECTED_TOKEN,
+                    CSHARP_REJECT_COMPONENT_REASON,
+                    PANIC_TOKEN,
+                    ACCESS_VIOLATION_TOKEN,
+                ],
+                # The value witness: 7.5 can only appear if the added field was
+                # filled from its declared default; zero would print 0.
+                wait_after=[(SAMPLE_EXTRA_TOKEN, PROBE_TIMEOUT)],
+                alive_tokens=[(BRIDGE_PROBE_PREFIX, PROBE_TIMEOUT)],
+            )
+        ],
+        restore_after=[PROJECT_CS_COMPONENTS_CS, PROJECT_CS_SYSTEMS_CS],
+    ),
+    # Retirement: a declaration the manifest stops naming is not a refusal
+    # anymore. A deliberately unreferenced component (seeded with three rows)
+    # and a deliberately unreferenced resource are declared, then removed, and
+    # the host's own retirement lines say what went: three rows with the
+    # component, the resource dropped outright. Both probes are referenced by
+    # no query signature, so every phase here is a manifest-only change.
+    Scenario(
+        name="csharp_retires_vanished_declarations",
+        phases=[
+            ScenarioPhase(
+                edits=[
+                    (
+                        PROJECT_CS_PROBE_CS,
+                        [
+                            PROBE_RETIREMENT_RESOURCE_ADD,
+                            PROBE_RETIREMENT_MARKER_ADD,
+                            PROBE_RETIREMENT_MARKER_SEED,
+                        ],
+                    ),
+                ],
+                wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
+                required_tokens=[
+                    CSHARP_MANIFEST_PENDING_TOKEN,
+                    CSHARP_RELOAD_COMPLETE_TOKEN,
+                ],
+                forbidden_tokens=[
+                    CSHARP_RELOAD_REJECTED_TOKEN,
+                    PANIC_TOKEN,
+                    ACCESS_VIOLATION_TOKEN,
+                ],
+                # The new assembly's first frame seeds the rows the next phase
+                # retires; seeing this proves the registration landed.
+                wait_after=[(MARKERS_SEEDED_TOKEN, PROBE_TIMEOUT)],
+                alive_tokens=[(BRIDGE_PROBE_PREFIX, PROBE_TIMEOUT)],
+            ),
+            ScenarioPhase(
+                edits=[
+                    (
+                        PROJECT_CS_PROBE_CS,
+                        [
+                            (
+                                PROBE_RETIREMENT_MARKER_SEED[1],
+                                PROBE_RETIREMENT_MARKER_SEED[0],
+                            ),
+                            (
+                                PROBE_RETIREMENT_MARKER_ADD[1],
+                                PROBE_RETIREMENT_MARKER_ADD[0],
+                            ),
+                        ],
+                    ),
+                ],
+                wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
+                required_tokens=[
+                    CSHARP_MANIFEST_PENDING_TOKEN,
+                    CSHARP_RELOAD_COMPLETE_TOKEN,
+                    COMPONENT_RETIREMENT_TOKEN,
+                ],
+                forbidden_tokens=[
+                    CSHARP_RELOAD_REJECTED_TOKEN,
+                    CSHARP_REJECT_COMPONENT_REASON,
+                    PANIC_TOKEN,
+                    ACCESS_VIOLATION_TOKEN,
+                ],
+                alive_tokens=[(BRIDGE_PROBE_PREFIX, PROBE_TIMEOUT)],
+            ),
+            ScenarioPhase(
+                edits=[
+                    (
+                        PROJECT_CS_PROBE_CS,
+                        [
+                            (
+                                PROBE_RETIREMENT_RESOURCE_ADD[1],
+                                PROBE_RETIREMENT_RESOURCE_ADD[0],
+                            ),
+                        ],
+                    ),
+                ],
+                wait_token=CSHARP_RELOAD_COMPLETE_TOKEN,
+                required_tokens=[
+                    CSHARP_MANIFEST_PENDING_TOKEN,
+                    CSHARP_RELOAD_COMPLETE_TOKEN,
+                    RESOURCE_RETIREMENT_TOKEN,
+                ],
+                forbidden_tokens=[
+                    CSHARP_RELOAD_REJECTED_TOKEN,
+                    CSHARP_REJECT_COMPONENT_REASON,
+                    PANIC_TOKEN,
+                    ACCESS_VIOLATION_TOKEN,
+                ],
+                alive_tokens=[(BRIDGE_PROBE_PREFIX, PROBE_TIMEOUT)],
+            ),
+        ],
+        restore_after=[PROJECT_CS_PROBE_CS],
     ),
     rejection_scenario(
         "csharp_rejects_system_signature_change",

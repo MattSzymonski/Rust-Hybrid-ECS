@@ -27,8 +27,11 @@ use std::time::{Duration, Instant};
 use pill_core::error::CSharpError;
 use pill_core::error::{EngineMessage, HostError};
 use pill_core::telemetry::telemetry_target;
+#[cfg_attr(not(feature = "hot_reload"), allow(unused_imports))]
 use pill_core::utils::format_error_chain;
-use pill_core::{error, info, warn};
+#[cfg_attr(not(feature = "hot_reload"), allow(unused_imports))]
+use pill_core::warn;
+use pill_core::{error, info};
 use pill_engine::Engine;
 #[cfg(feature = "hot_reload")]
 use pill_engine::EngineApi;
@@ -256,6 +259,7 @@ impl Host {
     /// The increment itself is the editor's cache-invalidation signal; the
     /// log line exists so integration suites can assert a bump happened
     /// without driving a GUI.
+    #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
     fn bump_editor_revision(&mut self) {
         self.editor_revision = self.editor_revision.wrapping_add(1);
         info!(
@@ -1217,12 +1221,11 @@ fn run_reload_steps(host: &mut Host) {
             "hot reload triggered"
         );
 
-        // The project image is about to be replaced, and the graveyard unmaps
-        // it two generations later, so every recorded prologue address is now
-        // stale for the same reason a module reload makes them stale.
-        forget_prologue_records(host);
-
-        host.loaded_project.reload(
+        // The project image about to be replaced unmaps two generations later,
+        // so every recorded prologue address inside it goes stale the moment
+        // the swap commits - the same clear a module reload performs, gated
+        // the same way.
+        let replaced = host.loaded_project.reload(
             &mut host.engine,
             &host.engine_api,
             &host.workspace_root,
@@ -1232,6 +1235,12 @@ fn run_reload_steps(host: &mut Host) {
             // frame observes the newer generation and rebuilds.
             Some((&host.source_edit_generation, source_edits)),
         );
+        // A failed or refused reload keeps the current image, whose patches
+        // are still installed and whose recorded prologues are still their
+        // rollback route, so the records are dropped only on a real swap.
+        if replaced {
+            forget_prologue_records(host);
+        }
         // The baseline the reload ran against, not a fresh read. A save during
         // the build advances the counter past it and cancels the compilation
         // above; recording the newer value would mark that save as handled when
@@ -1275,7 +1284,11 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     // The managed loader watches the built assembly instead of source files.
     // Only a reloading build has a managed loader to poll.
     #[cfg(feature = "hot_reload")]
-    host.loaded_project.poll_managed_reload(&mut host.engine);
+    if host.loaded_project.poll_managed_reload(&mut host.engine) {
+        // The loader's debounce outlived Step 5, so the swap landed here. The
+        // records go stale for the same reason and are cleared the same way.
+        forget_prologue_records(host);
+    }
 
     // Step 7: Execute one scheduler frame and report its failures.
     if let Err(errors) = host.engine.process_frame() {

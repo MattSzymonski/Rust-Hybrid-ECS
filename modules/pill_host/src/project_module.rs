@@ -192,6 +192,13 @@ mod loaded {
         /// Rebuild and replace the active module while preserving a working old
         /// generation whenever compilation, loading, or registration fails.
         ///
+        /// Returns whether the running image was replaced. Every failed branch
+        /// - build error, load refusal, rolled-back init - keeps the current
+        /// image and reports `false`, so the caller can gate the bookkeeping
+        /// that only a replacement invalidates - patch records pointing into
+        /// an image the graveyard will unmap - on there being a replacement at
+        /// all.
+        ///
         /// `cancel_flag` is the watcher's reload signal: a newer save during the
         /// build aborts the in-flight compilation and the next frame retries.
         pub(crate) fn reload(
@@ -201,7 +208,7 @@ mod loaded {
             workspace_root: &Path,
             config: &ProjectModuleConfig,
             cancel_flag: Option<(&AtomicU64, u64)>,
-        ) {
+        ) -> bool {
             match self {
                 // Native reload owns schema migration and DLL lifetime handling, so
                 // keep that transaction isolated in one dedicated function.
@@ -234,7 +241,14 @@ mod loaded {
                             );
                             // A refusal keeps the currently loaded assembly;
                             // `poll_reload` logs it once per distinct status.
-                            let _ = runtime.poll_reload(engine);
+                            // The loader's debounce can outlive this call, in
+                            // which case the swap lands in a later frame's
+                            // `poll_managed_reload`; only a swap this poll
+                            // reports counts as a replacement here.
+                            matches!(
+                                runtime.poll_reload(engine),
+                                Ok(crate::csharp::POLL_RELOADED)
+                            )
                         }
                         Err(error) => {
                             error!(
@@ -242,6 +256,7 @@ mod loaded {
                                 error = %error,
                                 "C# build failed; keeping the currently loaded C# project assembly"
                             );
+                            false
                         }
                     }
                 }
@@ -249,14 +264,23 @@ mod loaded {
         }
 
         /// Poll the collectible managed loader after its assembly debounce.
-        pub(crate) fn poll_managed_reload(&mut self, engine: &mut Engine) {
+        ///
+        /// Returns whether this poll landed an assembly swap. The debounce can
+        /// outlive the frame that triggered the build, so a swap - and the
+        /// bookkeeping it invalidates - is observed here as often as in
+        /// `reload`'s own poll.
+        pub(crate) fn poll_managed_reload(&mut self, engine: &mut Engine) -> bool {
             // Source and assembly watchers have independent debounce windows. Poll
             // every frame so a successful build is eventually observed even when
             // the assembly was not ready during the source-triggered reload call.
             if let Self::CSharp(runtime) = self {
                 // Already logged once per distinct status inside the poll.
-                let _ = runtime.poll_reload(engine);
+                return matches!(
+                    runtime.poll_reload(engine),
+                    Ok(crate::csharp::POLL_RELOADED)
+                );
             }
+            false
         }
 
         /// Invoke the native compatibility update hook after scheduler systems.
@@ -291,7 +315,7 @@ mod loaded {
         workspace_root: &Path,
         config: &ProjectModuleConfig,
         cancel_flag: Option<(&AtomicU64, u64)>,
-    ) {
+    ) -> bool {
         // Step 1: Compile the new module before touching engine state, so a
         // compiler error can never remove the systems of the working generation.
         let output_path = match build_project_module(workspace_root, config, cancel_flag) {
@@ -302,7 +326,7 @@ mod loaded {
                     error = %error,
                     "build failed; keeping the old project module"
                 );
-                return;
+                return false;
             }
         };
 
@@ -322,7 +346,7 @@ mod loaded {
                     error = %error,
                     "failed to load the new library; keeping the old project module"
                 );
-                return;
+                return false;
             }
         };
 
@@ -340,7 +364,11 @@ mod loaded {
             registered_resource_ids,
         };
         // The project reports no component names onward; only a module's reach
-        // the C# backend.
-        let _ = transaction.commit(engine, engine_api, new_library);
+        // the C# backend. The commit is the swap: `None` means the new
+        // generation failed to initialize and the previous one was restored,
+        // so the caller is told nothing was replaced.
+        transaction
+            .commit(engine, engine_api, new_library)
+            .is_some()
     }
 }

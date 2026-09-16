@@ -23,7 +23,7 @@
 //! scope struct, and every installer that fills it, unchanged.
 
 // Standard library
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{OnceLock, RwLock, RwLockReadGuard};
 
 // External crates
@@ -51,6 +51,9 @@ use super::context::{resource_access_is_authorized, with_active_world, ACCESS_KI
 pub(super) struct ResourceBinding {
     /// Engine id the resource was registered under.
     pub(super) resource_id: ResourceId,
+    /// Declared name the registration was made under, kept so a retirement
+    /// can report what the manifest stopped naming.
+    pub(super) name: String,
     /// Width of the declared layout in bytes.
     pub(super) size: usize,
     /// Hash of the managed field schema the registration was made with.
@@ -84,6 +87,9 @@ pub(super) struct ResourceFieldLayout {
     pub(super) offset: usize,
     /// Byte width of the field.
     pub(super) size: usize,
+    /// Bytes a declared default writes for this field when a reload adds or
+    /// resets it, already parsed against the field's declared type.
+    pub(super) default: Option<Vec<u8>>,
 }
 
 /// Every managed resource, keyed by the stable identity of its full name.
@@ -195,8 +201,11 @@ pub(super) fn resource_target(key: StableComponentId) -> Option<(ResourceId, usi
 /// - **reshaped** - the schema hash moved, so the stored bytes are migrated
 ///   field by field into the new layout, matched by name.
 ///
-/// What this path cannot do at all - retiring a resource the manifest stopped
-/// naming - is refused before anything is applied. What can still fail while
+/// What this path cannot do at all - a resource entry an alias claims as
+/// someone else's past - is refused before anything is applied; a declaration
+/// the manifest merely stopped naming is retired after the rest of the apply,
+/// through `drop_resources`, which skips a value another subject still claims.
+/// What can still fail while
 /// applying is handled differently from the component path, which unwinds an
 /// undo journal: a relayout moves bytes into a narrower shape, so reversing it
 /// would invent the bytes it dropped. Instead the binding table is published on
@@ -206,10 +215,49 @@ pub(super) fn resource_target(key: StableComponentId) -> Option<(ResourceId, usi
 /// # Errors
 ///
 /// Returns a [`CSharpError`] when the engine refuses a registration or a
-/// relayout, and when the arriving manifest has stopped declaring a resource
-/// the previous generation registered - retiring a resource's storage is
-/// `drop_resources`' job and needs the retiring image, which this path does not
-/// have.
+/// relayout, or when one entry collects predecessors through more than one
+/// alias.
+/// Resolve the arriving resources' aliases to bindings still in the table.
+///
+/// The resource twin of the component resolver, and pure host bookkeeping: a
+/// managed resource's stable id is the hash of its declared name, so the
+/// predecessor is found by hashing the alias rather than by asking the engine,
+/// which keeps no name map for resources. An alias naming no live binding is
+/// ignored - it describes no storage this path owns, and a later registration
+/// under it is an ordinary addition.
+///
+/// # Errors
+///
+/// Returns [`CSharpError`] when one entry collects predecessors through more
+/// than one alias: two old registrations cannot both be its past, and picking
+/// one would silently drop the other's value.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+fn resolve_resource_renames(
+    previous: &ResourceBindings,
+    resources: &[ManagedResourceDeclaration],
+) -> Result<HashMap<StableComponentId, (StableComponentId, String)>, CSharpError> {
+    let mut renames = HashMap::new();
+    for resource in resources {
+        let successor = stable_component_id(&resource.full_name);
+        for alias in &resource.aliases {
+            let predecessor = stable_component_id(alias);
+            if !previous.contains_key(&predecessor) {
+                continue;
+            }
+            if renames.contains_key(&successor) {
+                return Err(CSharpError::ManifestInvalid {
+                    message: format!(
+                        "managed resource {} declares aliases for more than one previous registration",
+                        resource.full_name
+                    ),
+                });
+            }
+            renames.insert(successor, (predecessor, alias.clone()));
+        }
+    }
+    Ok(renames)
+}
+
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 pub(super) fn apply_resource_manifest_on_reload(
     engine: &mut Engine,
@@ -220,22 +268,24 @@ pub(super) fn apply_resource_manifest_on_reload(
         .iter()
         .map(|resource| (stable_component_id(&resource.full_name), resource))
         .collect();
+    // Aliases resolve before the refusal below, exactly as they do on the
+    // component side: an arriving entry whose alias names a binding still in
+    // the table is a rename, and its predecessor is not a disappearance.
+    let renames = resolve_resource_renames(&previous, resources)?;
+    let renamed_sources: HashSet<StableComponentId> =
+        renames.values().map(|(source, _)| *source).collect();
 
-    // Step 1: Refuse what this path cannot do, before it does anything. A
-    // resource the manifest stopped naming keeps its value and its claim, and
-    // nothing here can release either safely.
-    let retired = previous
+    // Step 1: Collect the resources the manifest stopped naming, to be
+    // retired after everything else has applied. Collected here because an
+    // alias in the arriving manifest can claim one of them as a rename - its
+    // value and claims would move, not drop - and retired last because a
+    // retirement cannot be journalled: nothing may run after it that could
+    // fail.
+    let vanished: Vec<StableComponentId> = previous
         .keys()
-        .filter(|key| !arriving.contains_key(*key))
-        .count();
-    if retired != 0 {
-        return Err(CSharpError::ManifestInvalid {
-            message: format!(
-                "{retired} managed resource(s) disappeared from the manifest; \
-                 restart the host to retire their storage"
-            ),
-        });
-    }
+        .filter(|key| !arriving.contains_key(*key) && !renamed_sources.contains(*key))
+        .copied()
+        .collect();
 
     // Step 2: Apply, carrying the new bindings forward as each one settles.
     //
@@ -250,6 +300,59 @@ pub(super) fn apply_resource_manifest_on_reload(
     let mut report = ResourceApplyReport::default();
     for resource in resources {
         let key = stable_component_id(&resource.full_name);
+        // A rename: the arrival supersedes a binding through its alias, so the
+        // successor registers exactly as a fresh declaration and the
+        // predecessor's value and claims move onto it before the predecessor
+        // declaration is dropped.
+        if let Some((predecessor_key, alias)) = renames.get(&key) {
+            let predecessor = bindings
+                .remove(predecessor_key)
+                .expect("the resolver only lists predecessors that are in the live table");
+            let resource_id = match register_one(engine, resource) {
+                Ok(resource_id) => resource_id,
+                Err(error) => {
+                    bindings.insert(*predecessor_key, predecessor);
+                    publish_resource_bindings(bindings);
+                    return Err(error);
+                }
+            };
+            let plan = resource_field_plan(&predecessor.fields, &resource.fields);
+            let retyped = plan.retyped_fields().to_vec();
+            match engine.world_mut().remap_foreign_resource(
+                predecessor.resource_id,
+                resource_id,
+                &plan,
+            ) {
+                Ok(_) => {
+                    bindings.insert(key, binding_for(resource_id, resource));
+                    report
+                        .renamed
+                        .push(format!("{alias} -> {}", resource.full_name));
+                    if !retyped.is_empty() {
+                        warn!(
+                            target: telemetry_target::HOT_RELOAD,
+                            resource = %resource.full_name,
+                            fields = %retyped.join(", "),
+                            "managed resource fields changed type and were reset to their zero bytes"
+                        );
+                    }
+                    info!(
+                        target: telemetry_target::HOT_RELOAD,
+                        resource = %resource.full_name,
+                        predecessor = %alias,
+                        "managed resource renamed and its value migrated"
+                    );
+                }
+                Err(error) => {
+                    bindings.insert(*predecessor_key, predecessor);
+                    publish_resource_bindings(bindings);
+                    return Err(CSharpError::ManifestInvalid {
+                        message: error.to_plain_message(),
+                    });
+                }
+            }
+            continue;
+        }
         let Some(existing) = previous.get(&key) else {
             match register_one(engine, resource) {
                 Ok(resource_id) => {
@@ -285,6 +388,30 @@ pub(super) fn apply_resource_manifest_on_reload(
         bindings.insert(key, binding_for(existing.resource_id, resource));
         report.migrated.push(resource.full_name.clone());
     }
+
+    // Step 3: Retire the declarations the manifest stopped naming.
+    // `drop_resources` skips an id another subject still claims, so a shared
+    // resource a module keeps declaring loses only this subject's binding;
+    // the drop itself runs while the assembly that declared the value is
+    // still mapped, which is the timing the engine requires.
+    if !vanished.is_empty() {
+        let retired_ids: Vec<ResourceId> = vanished
+            .iter()
+            .filter_map(|key| bindings.get(key).map(|binding| binding.resource_id))
+            .collect();
+        let dropped = engine.world_mut().drop_resources(&retired_ids);
+        for key in &vanished {
+            if let Some(binding) = bindings.remove(key) {
+                report.retired.push(binding.name);
+            }
+        }
+        info!(
+            target: telemetry_target::HOT_RELOAD,
+            resources = retired_ids.len(),
+            dropped,
+            "retired managed resource declarations the manifest stopped naming"
+        );
+    }
     publish_resource_bindings(bindings);
     Ok(report)
 }
@@ -297,6 +424,12 @@ pub(super) struct ResourceApplyReport {
     pub(super) added: Vec<String>,
     /// Resources whose field layout changed and whose bytes were migrated.
     pub(super) migrated: Vec<String>,
+    /// Resources renamed from an earlier declaration, as `old name -> new
+    /// name`, with their value and claims carried across.
+    pub(super) renamed: Vec<String>,
+    /// Resources whose declaration was retired because the manifest stopped
+    /// naming it, as the name the registration was made under.
+    pub(super) retired: Vec<String>,
     /// Resources whose schema was byte-for-byte compatible.
     pub(super) unchanged: usize,
 }
@@ -361,14 +494,35 @@ fn register_one(
 /// memory, and a field the new shape dropped is left behind. Exactly the rule a
 /// reshaped managed component's rows follow, because it is the same plan.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+/// Build the byte plan from one resource shape to another, with declared
+/// defaults applied to the fields the diff leaves empty.
+///
+/// Shared by a reshape and a rename because the two differ only in which id
+/// the plan runs against; `set_default` is a no-op on a copied field, which is
+/// what keeps a changed default from masking a carried value.
+fn resource_field_plan(
+    previous: &[ResourceFieldLayout],
+    arriving: &[ResourceFieldLayout],
+) -> FieldPlan {
+    let previous_fields: Vec<LayoutField<'_>> = previous.iter().map(layout_field).collect();
+    let next_fields: Vec<LayoutField<'_>> = arriving.iter().map(layout_field).collect();
+    let mut plan = FieldPlan::between(&previous_fields, &next_fields);
+    for field in arriving {
+        let Some(bytes) = &field.default else {
+            continue;
+        };
+        plan.set_default(field.offset, bytes)
+            .expect("the field default was validated against the planned resource field");
+    }
+    plan
+}
+
 fn relayout_one(
     engine: &mut Engine,
     existing: &ResourceBinding,
     arriving: &ManagedResourceDeclaration,
 ) -> Result<(), CSharpError> {
-    let previous: Vec<LayoutField<'_>> = existing.fields.iter().map(layout_field).collect();
-    let next: Vec<LayoutField<'_>> = arriving.fields.iter().map(layout_field).collect();
-    let plan = FieldPlan::between(&previous, &next);
+    let plan = resource_field_plan(&existing.fields, &arriving.fields);
     let retyped = plan.retyped_fields().to_vec();
     engine
         .world_mut()
@@ -418,6 +572,7 @@ fn layout_field(field: &ResourceFieldLayout) -> LayoutField<'_> {
 fn binding_for(resource_id: ResourceId, resource: &ManagedResourceDeclaration) -> ResourceBinding {
     ResourceBinding {
         resource_id,
+        name: resource.full_name.clone(),
         size: resource.size,
         schema_hash: resource.schema_hash,
         fields: resource.fields.clone(),
@@ -443,10 +598,12 @@ pub(super) struct ManagedResourceDeclaration {
     pub(super) align: usize,
     /// Hash of the managed field schema.
     pub(super) schema_hash: u64,
+    /// Names this resource used to be declared under; a rename migrates the
+    /// stored value instead of refusing the manifest.
+    pub(super) aliases: Vec<String>,
     /// The declared field layout, used to plan a reload's byte migration.
     pub(super) fields: Vec<ResourceFieldLayout>,
 }
-
 // =============================================================================
 // FFI
 // =============================================================================

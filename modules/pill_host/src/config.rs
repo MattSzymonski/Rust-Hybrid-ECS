@@ -285,6 +285,7 @@ pub(crate) fn spawned_build_environment() -> Vec<(String, String)> {
 /// dylibs it maps where its own profile put them rather than always in
 /// `target/debug`. A host built with `--target` (the dioxus CLI) lives under
 /// `target/<triple>/<profile>`; a native one under `target/<profile>`.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 pub(crate) fn host_target_directory() -> String {
     match host_target_triple() {
         Some(triple) => format!("target/{triple}/{HOST_PROFILE_DIRECTORY}"),
@@ -1537,6 +1538,7 @@ mod tests {
     use super::*;
 
     /// A native project manifest that links the optional module directly.
+    #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
     const DEPENDENT_MANIFEST: &str = r#"
 [package]
 name = "project"
@@ -1547,6 +1549,7 @@ pill_spline = { path = "../../modules/optional/pill_spline" }
 "#;
 
     /// A native project manifest with no optional-module dependency.
+    #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
     const INDEPENDENT_MANIFEST: &str = r#"
 [package]
 name = "project"
@@ -1557,6 +1560,7 @@ serde = { version = "1", features = ["derive"] }
 "#;
 
     /// A native `ProjectModuleConfig` for dependency-check tests.
+    #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
     fn native_config(manifest_path: Option<&str>) -> ProjectModuleConfig {
         ProjectModuleConfig {
             name: "project".to_string(),
@@ -1572,6 +1576,7 @@ serde = { version = "1", features = ["derive"] }
     }
 
     /// A managed `ProjectModuleConfig`; it carries no Rust manifest path.
+    #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
     fn csharp_config() -> ProjectModuleConfig {
         ProjectModuleConfig {
             name: "project_cs".to_string(),
@@ -1599,6 +1604,7 @@ serde = { version = "1", features = ["derive"] }
     /// Each call starts from a clean subdirectory and tests remove only their
     /// own subdirectory when done, so parallel tests never delete a manifest
     /// another test is still reading.
+    #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
     fn write_manifest(subdirectory: &str, contents: &str) -> PathBuf {
         let directory = temp_root().join(subdirectory);
         let _ = std::fs::remove_dir_all(&directory);
@@ -1677,12 +1683,13 @@ serde = { version = "1", features = ["derive"] }
         std::fs::create_dir_all(root.join("optional").join("pill_spline")).unwrap();
         let optional_root = root.join("optional");
 
-        let traversal = HostConfig::resolve_optional_modules(
-            &[String::from("../pill_spline")],
-            &optional_root,
-        );
+        let traversal =
+            HostConfig::resolve_optional_modules(&[String::from("../pill_spline")], &optional_root);
         assert!(
-            matches!(&traversal, Err(ConfigError::InvalidOptionalModuleName { .. })),
+            matches!(
+                &traversal,
+                Err(ConfigError::InvalidOptionalModuleName { .. })
+            ),
             "a traversal entry must be refused: {traversal:?}"
         );
 
@@ -1698,10 +1705,8 @@ serde = { version = "1", features = ["derive"] }
             "a repeated entry must be refused: {duplicate:?}"
         );
 
-        let missing = HostConfig::resolve_optional_modules(
-            &[String::from("pill_absent")],
-            &optional_root,
-        );
+        let missing =
+            HostConfig::resolve_optional_modules(&[String::from("pill_absent")], &optional_root);
         assert!(
             matches!(
                 &missing,
@@ -1710,16 +1715,13 @@ serde = { version = "1", features = ["derive"] }
             "a name without a sibling directory must be refused: {missing:?}"
         );
 
-        let resolved = HostConfig::resolve_optional_modules(
-            &[String::from("pill_spline")],
-            &optional_root,
-        )
-        .expect("a real sibling directory resolves");
+        let resolved =
+            HostConfig::resolve_optional_modules(&[String::from("pill_spline")], &optional_root)
+                .expect("a real sibling directory resolves");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "pill_spline");
         assert_eq!(
-            resolved[0].watch_directory,
-            "optional/pill_spline/src",
+            resolved[0].watch_directory, "optional/pill_spline/src",
             "the validated name still derives the documented watch path"
         );
 

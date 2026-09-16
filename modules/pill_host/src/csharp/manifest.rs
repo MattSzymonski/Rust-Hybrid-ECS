@@ -21,7 +21,7 @@
 //! writes one, so there is no serializer to keep in step with.
 
 // Standard library
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 // External crates
 use pill_core::error::CSharpError;
@@ -33,7 +33,7 @@ use serde::Deserialize;
 // Current crate
 use super::components::{
     check_binding_against_manifest, stable_component_id, BindingStore, ComponentBinding,
-    StableComponentId,
+    RenameSource, StableComponentId,
 };
 use super::resources::{ManagedResourceDeclaration, ResourceFieldLayout};
 
@@ -102,6 +102,16 @@ pub(super) struct ManagedComponentManifest {
     /// a reload that straddles the change.
     #[serde(default)]
     pub(super) kind: ManifestEntryKind,
+    /// Names this entry's type used to be declared under.
+    ///
+    /// A rename is expressed here rather than as a new entry: the host resolves
+    /// each alias to the registration that answered to it and moves that
+    /// registration's rows onto this entry, so the rename reads as a
+    /// migration instead of a retirement plus an add. Defaulted for the same
+    /// reason `kind` is - a manifest written before aliases existed still
+    /// parses.
+    #[serde(default)]
+    pub(super) aliases: Vec<String>,
     /// Top-level field descriptions of the component layout.
     pub(super) fields: Vec<ManagedFieldManifest>,
 }
@@ -133,6 +143,9 @@ pub(super) struct ManagedFieldManifest {
     pub(super) size: usize,
     /// Canonical managed type name of the field.
     pub(super) primitive_type: String,
+    /// Literal a newly added or reset field starts from, instead of zero.
+    #[serde(default)]
+    pub(super) default: Option<String>,
     /// Nested field descriptions when this field is a struct.
     pub(super) fields: Vec<ManagedFieldManifest>,
 }
@@ -203,6 +216,27 @@ pub(super) fn validate_field_manifest(
                 field.name, field.primitive_type
             ));
         }
+        // A default is for the leaves: a struct has no literal form, and a
+        // nested default would be a second layout language to validate. The
+        // literal is checked against the field's own type here, so a mismatch
+        // is a named refusal rather than a marshalling surprise later.
+        if let Some(literal) = &field.default {
+            if !field.fields.is_empty() {
+                return Err(format!(
+                    "managed field {} declares a default, but defaults are only supported on primitive fields",
+                    field.name
+                ));
+            }
+            let bytes = parse_default_bytes(&field.primitive_type, literal)?;
+            if bytes.len() != field.size {
+                return Err(format!(
+                    "managed field {} declares a default of {} byte(s) for a {}-byte field",
+                    field.name,
+                    bytes.len(),
+                    field.size
+                ));
+            }
+        }
         // The depth check runs after the field validates so the error always
         // names a well-formed field.
         if depth >= MAX_FIELD_NESTING_DEPTH {
@@ -254,6 +288,69 @@ pub(super) fn manifest_field_tag(field: &ManagedFieldManifest) -> &'static str {
     managed_primitive_tag(&field.primitive_type).unwrap_or("unsupported")
 }
 
+/// Parse one field default literal into native-endian bytes.
+///
+/// Deliberately literals only: an expression the AOT posture could not
+/// evaluate would be a default that exists in the manifest and not in the
+/// running world. The literal is checked against the field's own declared
+/// type, so a mismatch is a named validation error rather than a marshalling
+/// surprise later and the managed side is free to format its number however
+/// the language does.
+pub(super) fn parse_default_bytes(primitive_type: &str, literal: &str) -> Result<Vec<u8>, String> {
+    let trimmed = literal.trim();
+    let invalid = || format!("field default `{literal}` is not a valid {primitive_type} literal");
+    match primitive_type {
+        "System.Byte" => trimmed
+            .parse::<u8>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        "System.SByte" => trimmed
+            .parse::<i8>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        "System.Int16" => trimmed
+            .parse::<i16>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        "System.UInt16" | "System.Char" => trimmed
+            .parse::<u16>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        "System.Int32" => trimmed
+            .parse::<i32>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        "System.UInt32" => trimmed
+            .parse::<u32>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        "System.Int64" => trimmed
+            .parse::<i64>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        "System.UInt64" => trimmed
+            .parse::<u64>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        "System.Single" => trimmed
+            .parse::<f32>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        "System.Double" => trimmed
+            .parse::<f64>()
+            .map(|value| value.to_ne_bytes().to_vec())
+            .map_err(|_| invalid()),
+        "System.Boolean" => match trimmed {
+            "true" => Ok(vec![1]),
+            "false" => Ok(vec![0]),
+            _ => Err(invalid()),
+        },
+        _ => Err(format!(
+            "field default `{literal}` names a type with no supported literal form ({primitive_type})"
+        )),
+    }
+}
+
 /// Reduce a field's type tag to what the migration plan should compare.
 ///
 /// The registry records a nested struct as `struct:<owner>::<field>` for the
@@ -262,6 +359,7 @@ pub(super) fn manifest_field_tag(field: &ManagedFieldManifest) -> &'static str {
 /// do it again whenever a component is renamed, because the owner is part of
 /// the tag. Both sides are folded to `struct`, so the plan asks the question it
 /// actually means: is this field still a struct?
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 pub(super) fn plan_tag(type_tag: &str) -> &str {
     if type_tag.starts_with("struct:") {
         "struct"
@@ -366,6 +464,7 @@ pub(super) fn parse_and_validate_manifest(
     // Step 1: Parse and validate every entry against canonical identities.
     let manifest: Vec<ManagedComponentManifest> = serde_json::from_slice(bytes)?;
     let mut seen = HashSet::new();
+    let mut alias_owners: HashMap<&str, &str> = HashMap::new();
     for component in &manifest {
         let stable_id =
             StableComponentId::from_halves(component.stable_id_low, component.stable_id_high);
@@ -385,6 +484,34 @@ pub(super) fn parse_and_validate_manifest(
                 component.full_name
             )
             .into());
+        }
+        for alias in &component.aliases {
+            // Resolution is one hop against live names only, so an alias that
+            // is itself a declared name (or another entry's alias) has no
+            // unambiguous predecessor to find. Refused here rather than
+            // resolved by precedence, because the wrong choice would move a
+            // live registration's rows.
+            if alias.trim().is_empty() {
+                return Err(format!(
+                    "managed component {} declares an empty alias",
+                    component.full_name
+                )
+                .into());
+            }
+            if manifest.iter().any(|other| other.full_name == *alias) {
+                return Err(format!(
+                    "managed component {} declares alias `{alias}`, which is a live declaration",
+                    component.full_name
+                )
+                .into());
+            }
+            if let Some(owner) = alias_owners.insert(alias.as_str(), &component.full_name) {
+                return Err(format!(
+                    "alias `{alias}` is declared by both {owner} and {}",
+                    component.full_name
+                )
+                .into());
+            }
         }
         if component.size == 0
             || u32::try_from(component.size).is_err()
@@ -448,6 +575,10 @@ pub(super) fn split_manifest_kinds(
                         type_tag: manifest_field_tag(field).to_owned(),
                         offset: field.offset,
                         size: field.size,
+                        default: field.default.as_ref().map(|literal| {
+                            parse_default_bytes(&field.primitive_type, literal)
+                                .expect("the field default was validated during parsing")
+                        }),
                     })
                     .collect();
                 resources.push(ManagedResourceDeclaration {
@@ -455,6 +586,7 @@ pub(super) fn split_manifest_kinds(
                     size: entry.size,
                     align: entry.alignment,
                     schema_hash: entry.schema_hash,
+                    aliases: entry.aliases,
                     fields,
                 });
             }
@@ -469,6 +601,7 @@ pub(super) fn split_manifest_kinds(
 /// The apply phase executes these in order and re-decides nothing, which is
 /// what keeps the refusals out of the mutated state; what still goes wrong at
 /// apply time is handled by the undo journal.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 pub(super) enum PlannedManifestEntry {
     /// The binding table already agrees with the manifest.
     Settled,
@@ -476,6 +609,14 @@ pub(super) enum PlannedManifestEntry {
     Add {
         stable_id: StableComponentId,
         component: ManagedComponentManifest,
+    },
+    /// A descriptor component the manifest renamed: the entry reached a
+    /// predecessor through one of its aliases, and the predecessor's rows have
+    /// to move onto the successor's registration.
+    Rename {
+        stable_id: StableComponentId,
+        component: ManagedComponentManifest,
+        predecessor: RenameSource,
     },
     /// A descriptor component whose layout changed and whose rows must migrate.
     Migrate {
@@ -493,10 +634,12 @@ pub(super) enum PlannedManifestEntry {
 /// The one refusal that lives here rather than in validation is the shared
 /// entry with no native binding; `register_manifest_entry` repeats it as a
 /// defensive check, but planning means it is raised before anything moves.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 pub(super) fn plan_manifest(
     engine: &Engine,
     store: &BindingStore,
     manifest: Vec<ManagedComponentManifest>,
+    renames: &HashMap<StableComponentId, RenameSource>,
 ) -> Result<Vec<PlannedManifestEntry>, CSharpError> {
     let mut planned = Vec::with_capacity(manifest.len());
     for component in manifest {
@@ -510,12 +653,35 @@ pub(super) fn plan_manifest(
                 )
                 .into());
             }
-            planned.push(PlannedManifestEntry::Add {
-                stable_id,
-                component,
-            });
+            // An alias that reached a predecessor turns this entry into a
+            // rename; without one it is an ordinary addition.
+            if let Some(predecessor) = renames.get(&stable_id) {
+                planned.push(PlannedManifestEntry::Rename {
+                    stable_id,
+                    component,
+                    predecessor: predecessor.clone(),
+                });
+            } else {
+                planned.push(PlannedManifestEntry::Add {
+                    stable_id,
+                    component,
+                });
+            }
             continue;
         };
+
+        // A successor's stable id is derived from its new name, so a store hit
+        // here means the name was already registered while its aliases still
+        // name an earlier registration. Refused rather than settled: settling
+        // would strand the predecessor's rows in a binding nothing tracks.
+        if renames.contains_key(&stable_id) {
+            return Err(format!(
+                "managed component {} is already registered, but its aliases name an earlier \
+                 registration; a rename must declare a new name",
+                component.full_name
+            )
+            .into());
+        }
 
         let ComponentBinding::Managed {
             component_id,
@@ -565,7 +731,8 @@ pub(super) fn plan_manifest(
 /// the field layout registered with a descriptor component is the layout its
 /// columns actually use, which is the only thing a byte copy can be measured
 /// against.
-fn build_field_plan(
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+pub(super) fn build_field_plan(
     engine: &Engine,
     component_id: ComponentId,
     fields: &[ManagedFieldManifest],
@@ -594,5 +761,18 @@ fn build_field_plan(
             size: field.size,
         })
         .collect();
-    FieldPlan::between(&previous, &next)
+    let mut plan = FieldPlan::between(&previous, &next);
+    // Declared defaults fill the fields the diff leaves empty - an added field
+    // or one whose type changed. `set_default` is a no-op on a copied field,
+    // which is what keeps a changed default from masking a carried value.
+    for field in fields {
+        let Some(literal) = &field.default else {
+            continue;
+        };
+        let bytes = parse_default_bytes(&field.primitive_type, literal)
+            .expect("the manifest default was validated before the plan was built");
+        plan.set_default(field.offset, &bytes)
+            .expect("the manifest default was validated against the planned field");
+    }
+    plan
 }

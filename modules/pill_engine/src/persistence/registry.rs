@@ -175,12 +175,32 @@ impl World {
     /// managed to give rows to does not leak them into an image that is about
     /// to be retired. A name-keyed entry (deserializer, schema hash) goes only
     /// when no surviving registration still claims the name.
+    ///
+    /// The sweep itself lives in [`Self::retire_component_storage`], which is
+    /// also its public face: the two differ in caller, not in what they do.
     pub fn drop_forgotten_component_ids(&mut self, component_ids: &[ComponentId]) -> usize {
+        self.retire_component_storage(component_ids)
+    }
+
+    /// Retire the storage of the given component ids.
+    ///
+    /// The general form of the id-keyed sweep: every entity carrying an id
+    /// loses that one component through `remove_component_by_id`, the
+    /// registration is retired (its bit released when no archetype with live
+    /// rows still references it, the rule [`Self::retire_registration`]
+    /// documents), and a name-keyed entry (deserializer, schema hash) goes only
+    /// when no surviving registration still claims the name.
+    ///
+    /// Covers the descriptor lane, unlike the name-based
+    /// [`Self::drop_forgotten_components`]: a managed component has no Rust
+    /// type to name it by, so the host reaches it through the id its binding
+    /// held. That is also what the host uses when a reloaded manifest stopped
+    /// naming a managed component.
+    ///
+    /// Returns how many entities lost data.
+    pub fn retire_component_storage(&mut self, component_ids: &[ComponentId]) -> usize {
         let mut dropped_entities = 0;
         for &component_id in component_ids {
-            if !component_id.is_native_storage() {
-                continue;
-            }
             let type_name = self
                 .component_registry
                 .registered_components()
@@ -256,6 +276,16 @@ impl World {
         self.component_copiers.remove(&component_id);
         self.persist_serializers.remove(&component_id);
         self.persist_inserters.remove(&component_id);
+    }
+
+    /// Retire a registration for callers outside this module.
+    ///
+    /// [`Self::retire_registration`] is module-private because the sweeps that
+    /// call it must run first; `World`'s descriptor remap performs that sweep
+    /// itself (it empties the source before calling), and lives outside this
+    /// module, so it needs the door.
+    pub(crate) fn retire_component_registration(&mut self, component_id: ComponentId) {
+        self.retire_registration(component_id);
     }
 
     /// Remove every registration artifact for one forgotten component type so

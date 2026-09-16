@@ -15,8 +15,8 @@
 //! dependency on wgpu or an async executor.
 
 // External crates
-use pill_engine::engine::Engine;
 use crate::component::{RenderViewport, VirtualResolution};
+use pill_engine::engine::Engine;
 
 // Current crate
 use crate::sprite::SpriteRenderer;

@@ -26,7 +26,7 @@ use pill_core::{error, warn};
 // Current crate
 use crate::archetype::{
     validate_component_layout, Archetype, ArchetypeId, Blittability, ComponentColumns,
-    ComponentLayout, FieldPlan, StorageFactory,
+    ComponentLayout, FieldPlan, FieldSource, StorageFactory,
 };
 use crate::commands::CommandQueue;
 use crate::component::{
@@ -1241,6 +1241,113 @@ impl World {
         Ok(migrated)
     }
 
+    /// Move every row of one descriptor component into another and retire the
+    /// source registration.
+    ///
+    /// The rename half of the managed manifest's storage story: a successor
+    /// registration derives its id from its own name, so rows cannot stay put
+    /// the way a relayout keeps them. Each row is reshaped through `plan` - the
+    /// same [`FieldPlan`] a relayout uses, measured from the source's field
+    /// layout to the successor's - and added to the successor before it is
+    /// removed from the source, so an entity whose only component this is
+    /// survives instead of being destroyed when the removal empties it.
+    ///
+    /// The source registration is retired once every row has moved: its name
+    /// claim, registry entry and storage factory go, and its bit is released
+    /// when no archetype with live rows still references it. A second remap out
+    /// of the source is therefore impossible, which is what the caller wants:
+    /// the source no longer exists.
+    ///
+    /// Returns the number of rows moved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::DescriptorRemapSelf`] when both ids are equal,
+    /// [`WorldError::DescriptorComponentNotRegistered`] when either id is not a
+    /// registered descriptor component,
+    /// [`WorldError::DescriptorComponentAlreadyPresent`] when the successor
+    /// already carries rows (a fresh registration has none; merging two row
+    /// sets would make the plan's source side wrong for half its input),
+    /// [`WorldError::DescriptorRowInvalid`] when the plan does not fit the two
+    /// layouts, and [`WorldError::DescriptorStorageMissing`] when an archetype
+    /// lists the source without a column.
+    pub fn remap_descriptor_component(
+        &mut self,
+        old_component_id: ComponentId,
+        new_component_id: ComponentId,
+        plan: &FieldPlan,
+    ) -> Result<usize, WorldError> {
+        if old_component_id == new_component_id {
+            return Err(WorldError::DescriptorRemapSelf);
+        }
+        let old_size = match self.storage_factories.get(&old_component_id) {
+            Some(StorageFactory::Descriptor(layout)) => layout.size,
+            _ => {
+                return Err(WorldError::DescriptorComponentNotRegistered {
+                    id: old_component_id,
+                })
+            }
+        };
+        let new_size = match self.storage_factories.get(&new_component_id) {
+            Some(StorageFactory::Descriptor(layout)) => layout.size,
+            _ => {
+                return Err(WorldError::DescriptorComponentNotRegistered {
+                    id: new_component_id,
+                })
+            }
+        };
+        plan.validate(old_size, new_size)?;
+        if self.live_row_count(new_component_id) != 0 {
+            return Err(WorldError::DescriptorComponentAlreadyPresent);
+        }
+
+        // Step 1: Read and reshape every row before the first mutation, so a
+        // row the plan cannot describe fails before anything has moved. The
+        // plan was validated against the registered sizes, so the slices in
+        // here are in bounds.
+        let mut moves: Vec<(Entity, Vec<u8>)> = Vec::new();
+        for (archetype_id, archetype) in &self.archetypes {
+            if !archetype.component_types.contains(&old_component_id) {
+                continue;
+            }
+            let Some(column) = archetype.component_storages.get(old_component_id) else {
+                return Err(WorldError::DescriptorStorageMissing {
+                    component_id: old_component_id,
+                    archetype_id: *archetype_id,
+                });
+            };
+            for (row, entity) in archetype.entities.iter().enumerate() {
+                let old_bytes = column.bytes(row).ok_or(WorldError::DescriptorRowInvalid)?;
+                let mut new_bytes = vec![0_u8; new_size];
+                for planned in plan.fields() {
+                    let FieldSource::OldOffset(source_offset) = planned.source else {
+                        continue;
+                    };
+                    new_bytes[planned.offset..planned.offset + planned.bytes]
+                        .copy_from_slice(&old_bytes[source_offset..source_offset + planned.bytes]);
+                }
+                moves.push((*entity, new_bytes));
+            }
+        }
+
+        // Step 2: Move every row. Add first, remove second: the two columns
+        // coexist for a moment and the entity never loses its last component.
+        let mut moved_rows = 0;
+        for (entity, new_bytes) in moves {
+            self.add_descriptor_component(entity, new_component_id, &new_bytes)?;
+            self.remove_component_by_id(entity, old_component_id)
+                .map_err(|_| WorldError::DescriptorComponentMissing)?;
+            moved_rows += 1;
+        }
+
+        // Step 3: The source holds no rows now; retire it so its name can be
+        // declared again and its bit returns to the pool. Every archetype that
+        // carried it was emptied by Step 2, which is the precondition the
+        // retirement's bit rule checks.
+        self.retire_component_registration(old_component_id);
+        Ok(moved_rows)
+    }
+
     /// Return a raw descriptor component column for language bindings.
     pub fn descriptor_component_chunk_mut(
         &mut self,
@@ -2283,6 +2390,95 @@ impl World {
             .map_err(|_error| WorldError::ForeignResourcePlanOutOfBounds { id })?;
         self.resource_factories.insert(id, next);
         Ok(1)
+    }
+
+    /// Move a foreign resource's value onto another id and retire the source
+    /// declaration.
+    ///
+    /// The resource twin of [`Self::remap_descriptor_component`] and the
+    /// rename half of the managed manifest's resource story: a successor
+    /// declaration derives its id from its own name, so the stored value is
+    /// reshaped through `plan` - measured from the source's field list to the
+    /// successor's - written under the successor, and the source is then
+    /// dropped. Any payload already under the successor is replaced; a fresh
+    /// declaration's zero seed is the expected case, and the moved value is
+    /// the only meaningful one there.
+    ///
+    /// The source's claims move to the successor wholesale, so the source's
+    /// value is released here only when no other subject still declares the
+    /// old name, and the successor ends up protected exactly as the source
+    /// was.
+    ///
+    /// Returns 1 when a value was moved and 0 when the source had none stored,
+    /// which is the case for a resource nobody has written yet.
+    ///
+    /// # Errors
+    ///
+    /// [`WorldError::ForeignResourceRemapSelf`] when both ids are equal,
+    /// [`WorldError::ForeignResourceNotRegistered`] when either id is not a
+    /// registered foreign declaration, and
+    /// [`WorldError::ForeignResourceHoldsRustValue`] when a Rust value is
+    /// stored under either id.
+    pub fn remap_foreign_resource(
+        &mut self,
+        old_id: ResourceId,
+        new_id: ResourceId,
+        plan: &FieldPlan,
+    ) -> Result<usize, WorldError> {
+        if old_id == new_id {
+            return Err(WorldError::ForeignResourceRemapSelf);
+        }
+        let Some((old_size, _, _)) = self.foreign_resource_layout(old_id) else {
+            return Err(WorldError::ForeignResourceNotRegistered { id: old_id });
+        };
+        let Some((new_size, _, _)) = self.foreign_resource_layout(new_id) else {
+            return Err(WorldError::ForeignResourceNotRegistered { id: new_id });
+        };
+        if self
+            .resources
+            .get(&old_id)
+            .is_some_and(|value| !value.is_foreign())
+            || self
+                .resources
+                .get(&new_id)
+                .is_some_and(|value| !value.is_foreign())
+        {
+            return Err(WorldError::ForeignResourceHoldsRustValue { id: old_id });
+        }
+
+        // Step 1: Read and reshape the stored value before anything moves.
+        // `FieldPlan::validate` speaks descriptor rows, so the bounds are
+        // checked here and reported with the resource's own variant.
+        let mut moved = 0;
+        if let Some(old_bytes) = self.foreign_resource_bytes(old_id).map(<[u8]>::to_vec) {
+            let mut new_bytes = vec![0_u8; new_size];
+            for planned in plan.fields() {
+                let FieldSource::OldOffset(source_offset) = planned.source else {
+                    continue;
+                };
+                if planned.offset + planned.bytes > new_size
+                    || source_offset + planned.bytes > old_size
+                {
+                    return Err(WorldError::ForeignResourcePlanOutOfBounds { id: old_id });
+                }
+                new_bytes[planned.offset..planned.offset + planned.bytes]
+                    .copy_from_slice(&old_bytes[source_offset..source_offset + planned.bytes]);
+            }
+            // Step 2: Write it under the successor. The insert stamps the
+            // change tick, so a reader observes the move as the change it is.
+            self.insert_foreign_resource_bytes(new_id, &new_bytes)?;
+            moved = 1;
+        }
+
+        // Step 3: Move the claims and drop the source. The claims are taken
+        // wholesale rather than released one by one: whoever declared the old
+        // name still needs the resource under its new one.
+        let claims = self.resource_claim_counts.remove(&old_id).unwrap_or(0);
+        if claims > 0 {
+            *self.resource_claim_counts.entry(new_id).or_insert(0) += claims;
+        }
+        self.drop_resources(&[old_id]);
+        Ok(moved)
     }
 
     /// The per-type table of a registered shared resource, if the id names one.
@@ -4399,6 +4595,386 @@ mod tests {
         assert_eq!(after.changed, changed_tick);
     }
 
+    /// A remap carries rows from the predecessor registration to the
+    /// successor: the values move, the successor answers to its own name, the
+    /// predecessor's registration is retired, and an entity whose only
+    /// component this is survives the move.
+    #[test]
+    fn remap_moves_rows_to_the_successor_and_retires_the_source() {
+        let mut world = World::new();
+        let old = world
+            .register_component_descriptor(
+                0xE5,
+                "Project.OldName",
+                8,
+                4,
+                200,
+                Blittability::engine_verified(),
+            )
+            .unwrap();
+        let new = world
+            .register_component_descriptor(
+                0xF6,
+                "Project.NewName",
+                8,
+                4,
+                200,
+                Blittability::engine_verified(),
+            )
+            .unwrap();
+        let companion = world
+            .register_component_descriptor(
+                0x1A,
+                "Project.Companion",
+                4,
+                4,
+                9,
+                Blittability::engine_verified(),
+            )
+            .unwrap();
+        // One entity carries only the component being moved: the
+        // add-before-remove order is what keeps it alive.
+        let alone = world
+            .create_descriptor_entity(&[(old, two_u32_row(7, 8))])
+            .unwrap();
+        let paired = world
+            .create_descriptor_entity(&[
+                (old, two_u32_row(1, 2)),
+                (companion, 3_u32.to_ne_bytes().to_vec()),
+            ])
+            .unwrap();
+
+        let fields = vec![
+            LayoutField {
+                name: "a",
+                type_tag: "u32",
+                offset: 0,
+                size: 4,
+            },
+            LayoutField {
+                name: "b",
+                type_tag: "u32",
+                offset: 4,
+                size: 4,
+            },
+        ];
+        let plan = FieldPlan::between(&fields, &fields);
+        let moved = world.remap_descriptor_component(old, new, &plan).unwrap();
+
+        assert_eq!(moved, 2);
+        assert_eq!(
+            world.descriptor_component_bytes(alone, new).unwrap(),
+            two_u32_row(7, 8)
+        );
+        assert_eq!(
+            world.descriptor_component_bytes(paired, new).unwrap(),
+            two_u32_row(1, 2)
+        );
+        assert_eq!(
+            world.descriptor_component_bytes(paired, companion).unwrap(),
+            3_u32.to_ne_bytes(),
+            "the companion column survives the move"
+        );
+        assert!(world.descriptor_component_bytes(alone, old).is_none());
+        assert!(
+            world.storage_factories.get(&old).is_none(),
+            "the predecessor's registration is retired"
+        );
+        assert_eq!(
+            world
+                .resolve_component_id_by_name_any("Project.OldName")
+                .unwrap(),
+            None,
+            "the old name is free again"
+        );
+        assert_eq!(
+            world
+                .resolve_component_id_by_name_any("Project.NewName")
+                .unwrap(),
+            Some(new)
+        );
+    }
+
+    /// The plan's field mapping is what moves, not the bytes: a shape with a
+    /// moved field and an added one reorders and zero-fills, exactly as a
+    /// relayout would.
+    #[test]
+    fn remap_reshapes_rows_through_the_plan() {
+        let mut world = World::new();
+        let old = world
+            .register_component_descriptor(
+                0xE6,
+                "Project.PlanOld",
+                8,
+                4,
+                300,
+                Blittability::engine_verified(),
+            )
+            .unwrap();
+        let new = world
+            .register_component_descriptor(
+                0xF7,
+                "Project.PlanNew",
+                12,
+                4,
+                301,
+                Blittability::engine_verified(),
+            )
+            .unwrap();
+        let entity = world
+            .create_descriptor_entity(&[(old, two_u32_row(1, 2))])
+            .unwrap();
+
+        let plan = FieldPlan::between(
+            &[
+                LayoutField {
+                    name: "a",
+                    type_tag: "u32",
+                    offset: 0,
+                    size: 4,
+                },
+                LayoutField {
+                    name: "b",
+                    type_tag: "u32",
+                    offset: 4,
+                    size: 4,
+                },
+            ],
+            &[
+                LayoutField {
+                    name: "b",
+                    type_tag: "u32",
+                    offset: 0,
+                    size: 4,
+                },
+                LayoutField {
+                    name: "a",
+                    type_tag: "u32",
+                    offset: 4,
+                    size: 4,
+                },
+                LayoutField {
+                    name: "added",
+                    type_tag: "u32",
+                    offset: 8,
+                    size: 4,
+                },
+            ],
+        );
+        world.remap_descriptor_component(old, new, &plan).unwrap();
+
+        let mut expected = 2_u32.to_ne_bytes().to_vec();
+        expected.extend_from_slice(&1_u32.to_ne_bytes());
+        expected.extend_from_slice(&0_u32.to_ne_bytes());
+        assert_eq!(
+            world.descriptor_component_bytes(entity, new).unwrap(),
+            expected.as_slice()
+        );
+    }
+
+    /// A plan default rides the plan: an added field is filled with the
+    /// supplied bytes instead of zero, and setting one on a copied field is a
+    /// no-op rather than an overwrite.
+    #[test]
+    fn a_plan_default_fills_an_added_field_and_never_overrides_a_copied_one() {
+        let mut world = World::new();
+        let component = world
+            .register_component_descriptor(
+                0xD8,
+                "Project.Defaults",
+                8,
+                4,
+                100,
+                Blittability::engine_verified(),
+            )
+            .unwrap();
+        let entity = world
+            .create_descriptor_entity(&[(component, two_u32_row(1, 2))])
+            .unwrap();
+
+        let mut plan = FieldPlan::between(
+            &[
+                LayoutField {
+                    name: "a",
+                    type_tag: "u32",
+                    offset: 0,
+                    size: 4,
+                },
+                LayoutField {
+                    name: "b",
+                    type_tag: "u32",
+                    offset: 4,
+                    size: 4,
+                },
+            ],
+            &[
+                LayoutField {
+                    name: "a",
+                    type_tag: "u32",
+                    offset: 0,
+                    size: 4,
+                },
+                LayoutField {
+                    name: "b",
+                    type_tag: "u32",
+                    offset: 4,
+                    size: 4,
+                },
+                LayoutField {
+                    name: "added",
+                    type_tag: "u32",
+                    offset: 8,
+                    size: 4,
+                },
+            ],
+        );
+        plan.set_default(8, &6_u32.to_ne_bytes())
+            .expect("the added field has a planned slot");
+        // A default on a copied field is accepted and ignored, so the carried
+        // value survives even a default declared for it.
+        plan.set_default(0, &9_u32.to_ne_bytes())
+            .expect("setting on a copied field is accepted");
+
+        world
+            .relayout_descriptor_component(component, 12, 4, 101, &plan)
+            .unwrap();
+
+        let mut expected = 1_u32.to_ne_bytes().to_vec();
+        expected.extend_from_slice(&2_u32.to_ne_bytes());
+        expected.extend_from_slice(&6_u32.to_ne_bytes());
+        assert_eq!(
+            world.descriptor_component_bytes(entity, component).unwrap(),
+            expected.as_slice(),
+            "the added field takes its default and the copied fields keep their values"
+        );
+    }
+
+    /// Retiring a descriptor component's storage removes its rows and its
+    /// registration, and frees the name and the bit for a later declaration -
+    /// the contract a managed manifest's removed type rides on.
+    #[test]
+    fn retire_component_storage_frees_a_descriptor_component() {
+        let mut world = World::new();
+        let component = world
+            .register_component_descriptor(
+                0xB9,
+                "Project.Retired",
+                4,
+                4,
+                400,
+                Blittability::engine_verified(),
+            )
+            .unwrap();
+        let companion = world
+            .register_component_descriptor(
+                0xCA,
+                "Project.Stays",
+                4,
+                4,
+                401,
+                Blittability::engine_verified(),
+            )
+            .unwrap();
+        let entity = world
+            .create_descriptor_entity(&[
+                (component, 5_u32.to_ne_bytes().to_vec()),
+                (companion, 6_u32.to_ne_bytes().to_vec()),
+            ])
+            .unwrap();
+
+        let affected = world.retire_component_storage(&[component]);
+
+        assert_eq!(affected, 1, "the retired component's row went");
+        assert!(world
+            .descriptor_component_bytes(entity, component)
+            .is_none());
+        assert_eq!(
+            world.descriptor_component_bytes(entity, companion).unwrap(),
+            6_u32.to_ne_bytes(),
+            "the companion column survives the retirement"
+        );
+        assert!(
+            world.storage_factories.get(&component).is_none(),
+            "the registration is forgotten"
+        );
+        assert_eq!(
+            world
+                .resolve_component_id_by_name_any("Project.Retired")
+                .unwrap(),
+            None,
+            "the name is free again"
+        );
+
+        // The name and the bit can be taken by a later declaration.
+        let replacement = world
+            .register_component_descriptor(
+                0xCB,
+                "Project.Retired",
+                4,
+                4,
+                402,
+                Blittability::engine_verified(),
+            )
+            .unwrap();
+        assert_eq!(
+            world
+                .resolve_component_id_by_name_any("Project.Retired")
+                .unwrap(),
+            Some(replacement)
+        );
+    }
+
+    /// The resource twin: the value moves onto the successor's id, claims
+    /// travel with it, and the source declaration is dropped once they have.
+    #[test]
+    fn remap_foreign_resource_moves_the_value_and_the_claim() {
+        let mut world = World::new();
+        let old = world
+            .register_foreign_resource("Project.OldSettings", "Project.OldSettings", 8, 4, 77)
+            .unwrap();
+        world
+            .insert_foreign_resource_bytes(old, &two_u32_row(5, 6))
+            .unwrap();
+        let new = world
+            .register_foreign_resource("Project.NewSettings", "Project.NewSettings", 8, 4, 77)
+            .unwrap();
+        // The host seeds a fresh declaration with zeroes; the moved value
+        // replaces that seed.
+        world
+            .insert_foreign_resource_bytes(new, &[0_u8; 8])
+            .unwrap();
+        world.retain_resource_claims(&[old]);
+
+        let fields = vec![
+            LayoutField {
+                name: "a",
+                type_tag: "u32",
+                offset: 0,
+                size: 4,
+            },
+            LayoutField {
+                name: "b",
+                type_tag: "u32",
+                offset: 4,
+                size: 4,
+            },
+        ];
+        let plan = FieldPlan::between(&fields, &fields);
+        let moved = world.remap_foreign_resource(old, new, &plan).unwrap();
+
+        assert_eq!(moved, 1);
+        assert_eq!(
+            world.foreign_resource_bytes(new).unwrap(),
+            two_u32_row(5, 6)
+        );
+        assert!(
+            world.foreign_resource_layout(old).is_none(),
+            "the source declaration is dropped once its claims moved"
+        );
+        assert_eq!(world.resource_claim_counts.get(&new).copied(), Some(1));
+        assert!(!world.resource_claim_counts.contains_key(&old));
+    }
+
     /// The id and the registry bit survive, because they are baked into
     /// archetype masks and scheduled access masks: a relayout must update the
     /// layout in place, never re-register the component.
@@ -4955,7 +5531,9 @@ mod tests {
         let valid = world
             .register_component_descriptor(5, "Valid", 4, 4, 30, Blittability::engine_verified())
             .unwrap();
-        assert!(world.create_descriptor_entity(&[(valid, vec![0; 3])]).is_err());
+        assert!(world
+            .create_descriptor_entity(&[(valid, vec![0; 3])])
+            .is_err());
         assert_eq!(world.entity_count(), 0);
     }
 

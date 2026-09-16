@@ -29,7 +29,6 @@ use wgpu::util::DeviceExt;
 // Constants
 // =============================================================================
 
-
 /// WGSL source for the sprite render pipeline.
 ///
 /// Declares the `Viewport` uniform, the per-instance vertex inputs, and both

@@ -264,7 +264,11 @@ pub fn find_function(source: &str, name: &str) -> Option<FunctionText> {
 /// the wrong function bounds.
 pub fn find_function_in(source: &str, mask: &[bool], name: &str) -> Option<FunctionText> {
     let bytes = source.as_bytes();
-    debug_assert_eq!(mask.len(), bytes.len(), "the mask must describe this source");
+    debug_assert_eq!(
+        mask.len(),
+        bytes.len(),
+        "the mask must describe this source"
+    );
     let needle = format!("fn {name}");
     let needle_bytes = needle.as_bytes();
 
@@ -909,11 +913,8 @@ fn scan_named_functions(
             && mask[index..index + KEYWORD.len()]
                 .iter()
                 .all(|byte_is_code| *byte_is_code);
-        let preceded_ok = index == 0
-            || matches!(
-                bytes[index - 1],
-                b'\n' | b'\r' | b'\t' | b' ' | b'}' | b';'
-            );
+        let preceded_ok =
+            index == 0 || matches!(bytes[index - 1], b'\n' | b'\r' | b'\t' | b' ' | b'}' | b';');
         if !is_keyword || !preceded_ok {
             index += 1;
             continue;
@@ -1902,7 +1903,10 @@ fn quoted() -> &'static str {
             names.contains("install") && names.contains("default"),
             "the sample must contain functions below the body-less declaration"
         );
-        assert_eq!(strip_function_bodies(source, &names), reference_strip(source, &names));
+        assert_eq!(
+            strip_function_bodies(source, &names),
+            reference_strip(source, &names)
+        );
     }
 
     /// A declaration whose braces do not resolve must not stop the scan.

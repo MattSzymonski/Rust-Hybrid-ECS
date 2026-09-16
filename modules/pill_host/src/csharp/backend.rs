@@ -31,10 +31,11 @@ use pill_engine::{Engine, SystemAccess, SystemError, World};
 // Current crate
 use super::abi::{CsEngineApi, NativeSystemAccess};
 use super::aot_runtime::AotRuntimeContext;
+#[cfg_attr(not(feature = "hot_reload"), allow(unused_imports))]
+use super::components::apply_component_manifest_on_reload;
 use super::components::{
-    apply_component_manifest_on_reload, module_native_bindings, register_component_manifest,
-    shared_component_bindings, BindingStore, ComponentBindings, ModuleExposedComponent,
-    StableComponentId,
+    module_native_bindings, register_component_manifest, shared_component_bindings, BindingStore,
+    ComponentBindings, ModuleExposedComponent, StableComponentId,
 };
 use super::context::ActiveSystemGuard;
 use super::csharp_runtime::DotnetRuntimeContext;
@@ -139,12 +140,16 @@ type CopySystemErrorMessageFn = extern "system" fn(u32, *mut u8, u32) -> u8;
 /// reporting the swap outcome through the status codes below.
 type PollReloadFn = extern "system" fn() -> u8;
 /// Signature returning the parked manifest's byte length.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 type PendingManifestLengthFn = extern "system" fn() -> u32;
 /// Signature copying the parked manifest into a caller buffer.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 type CopyPendingManifestFn = extern "system" fn(*mut u8, u32) -> u8;
 /// Signature installing the parked version once its manifest is in force.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 type CommitReloadFn = extern "system" fn() -> u8;
 /// Signature discarding the parked version when its manifest is refused.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 type AbortReloadFn = extern "system" fn() -> u8;
 
 /// Reflected metadata of one managed system, captured at startup.
@@ -174,8 +179,10 @@ struct ManagedSystemSnapshot {
 #[cfg_attr(feature = "hot_reload", allow(dead_code))]
 pub(crate) enum ManagedRuntimeContext {
     /// CoreCLR booted through hostfxr (framework-dependent posture).
+    #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
     Dotnet(DotnetRuntimeContext),
     /// A NativeAOT library loaded directly (self-contained posture).
+    #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
     Aot(AotRuntimeContext),
 }
 
@@ -970,8 +977,12 @@ impl CSharpRuntime {
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     added = report.added.len(),
                     migrated = report.migrated.len(),
+                    renamed = report.renamed.len(),
+                    retired = report.retired.len(),
                     resources_added = report.resources_added.len(),
                     resources_migrated = report.resources_migrated.len(),
+                    resources_renamed = report.resources_renamed.len(),
+                    resources_retired = report.resources_retired.len(),
                     "C# hot reload complete"
                 );
                 POLL_RELOADED
@@ -1078,8 +1089,12 @@ impl CSharpRuntime {
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                     added = report.added.len(),
                     migrated = report.migrated.len(),
+                    renamed = report.renamed.len(),
+                    retired = report.retired.len(),
                     resources_added = report.resources_added.len(),
                     resources_migrated = report.resources_migrated.len(),
+                    resources_renamed = report.resources_renamed.len(),
+                    resources_retired = report.resources_retired.len(),
                     "applied the reloaded assembly's component and resource manifest"
                 );
                 self.applied_manifest = manifest;

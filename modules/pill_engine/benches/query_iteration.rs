@@ -676,9 +676,7 @@ fn bench_slice_ceiling(criterion: &mut Criterion) {
                 y: (i * 2) as f32,
             })
             .collect();
-        let velocities: Vec<Velocity> = (0..count)
-            .map(|_| Velocity { x: 0.1, y: 0.2 })
-            .collect();
+        let velocities: Vec<Velocity> = (0..count).map(|_| Velocity { x: 0.1, y: 0.2 }).collect();
 
         // Step 2: read-only pass - two loads and an add per row.
         group.bench_with_input(BenchmarkId::new("read", count), &count, |benchmark, _| {

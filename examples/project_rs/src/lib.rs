@@ -188,11 +188,10 @@ pub fn simulate_ball(state: &mut PhysicsState) {
 /// Returns [`SystemError::MissingResource`] when `SimulationTime` is absent.
 #[pill_hot]
 fn physics_system(
-    mut commands: Commands,
     mut time: ResMut<SimulationTime>,
     mut query: Query<(&mut PhysicsState, &mut Position, &mut Sprite)>,
 ) -> Result<(), SystemError> {
-    let Some(mut time) = time.get_mut() else {
+    let Some(time) = time.get_mut() else {
         return Err(SystemError::MissingResource {
             name: String::from("SimulationTime"),
         });

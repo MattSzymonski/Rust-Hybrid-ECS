@@ -66,6 +66,32 @@ public sealed class EcsResourceAttribute : Attribute
     public string? Name { get; }
 }
 
+/// <summary>
+/// Declares a name this resource used to be known by, so a rename carries its
+/// stored value instead of reading as a disappearance.
+/// </summary>
+/// <remarks>
+/// The resource twin of <see cref="EcsComponentAliasAttribute"/>: the host
+/// resolves the old name to the registration that answered to it, moves the
+/// value and the claims onto this type's new identity, and drops the old
+/// declaration. One hop only, and the alias must name a registration that is
+/// still live when the manifest arrives.
+/// </remarks>
+[AttributeUsage(AttributeTargets.Struct, AllowMultiple = true)]
+public sealed class EcsResourceAliasAttribute : Attribute
+{
+    /// <summary>Declare one previous name of this resource.</summary>
+    /// <param name="oldName">
+    /// The declared identity the resource was registered under - the explicit
+    /// <see cref="EcsResourceAttribute.Name"/> when it had one, its full type
+    /// name otherwise.
+    /// </param>
+    public EcsResourceAliasAttribute(string oldName) => OldName = oldName;
+
+    /// <summary>The previous name this declaration claims.</summary>
+    public string OldName { get; }
+}
+
 /// <summary>Compile-time metadata every resource system parameter carries.</summary>
 /// <remarks>
 /// Static abstract members, like <see cref="IQueryTerm"/>, so system discovery

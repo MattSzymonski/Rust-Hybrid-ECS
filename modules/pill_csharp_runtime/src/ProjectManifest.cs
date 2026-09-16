@@ -16,12 +16,12 @@ namespace TracyLive.Loader;
 
 internal sealed record ComponentFieldManifest(
     string Name, int Offset, int Size, string PrimitiveType,
-    ComponentFieldManifest[] Fields);
+    ComponentFieldManifest[] Fields, string? Default = null);
 
 internal sealed record ProjectManifest(
     ulong StableIdLow, ulong StableIdHigh, string FullName,
     int Size, int Alignment, ulong SchemaHash, bool Shared,
-    ComponentFieldManifest[] Fields, string Kind = ManifestKinds.Component);
+    ComponentFieldManifest[] Fields, string Kind, string[] Aliases);
 
 /// <summary>
 /// What one manifest entry declares. Resources ride in the same array as
@@ -173,7 +173,29 @@ internal static class ProjectManifestBuilder
             // registers it from this declaration and holds no rival schema.
             kind == ManifestKinds.Component && IsShared(type),
             fields,
-            kind);
+            kind,
+            DeclaredAliases(type, kind));
+    }
+
+    /// <summary>
+    /// The previous names a type declares, sorted so the manifest is stable
+    /// across runs - reflection order is not promised to be.
+    /// </summary>
+    private static string[] DeclaredAliases(Type type, string kind)
+    {
+        Type attributeType = kind == ManifestKinds.Resource
+            ? typeof(EcsResourceAliasAttribute)
+            : typeof(EcsComponentAliasAttribute);
+        return type.GetCustomAttributes(attributeType, inherit: false)
+            .Select(attribute => attribute switch
+            {
+                EcsResourceAliasAttribute resource => resource.OldName,
+                EcsComponentAliasAttribute component => component.OldName,
+                _ => string.Empty,
+            })
+            .Where(oldName => oldName.Length != 0)
+            .OrderBy(oldName => oldName, StringComparer.Ordinal)
+            .ToArray();
     }
 
     private static void ValidateValueType(Type type, HashSet<Type> visiting)
@@ -221,12 +243,19 @@ internal static class ProjectManifestBuilder
                 ? Enum.GetUnderlyingType(field.FieldType)
                 : field.FieldType;
             bool primitive = valueType.IsPrimitive;
+            // A declared default travels with the field as text, and the host
+            // refuses one that does not parse as the field's type. Read on
+            // nested fields too, so the host's refusal names it rather than
+            // the attribute being silently ignored.
+            var declaredDefault = (EcsFieldDefaultAttribute?)Attribute.GetCustomAttribute(
+                field, typeof(EcsFieldDefaultAttribute), inherit: false);
             return new ComponentFieldManifest(
                 field.Name,
                 NativeLayout.FieldOffset(type, field.Name),
                 NativeLayout.SizeOf(valueType),
                 primitive ? valueType.FullName! : "struct",
-                primitive ? [] : DescribeFields(valueType));
+                primitive ? [] : DescribeFields(valueType),
+                declaredDefault?.Literal);
         })
         .ToArray();
 

@@ -45,6 +45,8 @@ mod resources;
 // exposes the type as `csharp::CSharpRuntime` so the parent host module has a
 // single, stable import path.
 pub(crate) use backend::CSharpRuntime;
+#[cfg(feature = "hot_reload")]
+pub(crate) use backend::POLL_RELOADED;
 
 /// Aggregate of the native components optional modules exposed to managed code.
 pub(crate) use components::{resolve_exposed_component_id, ModuleExposedComponent};
@@ -53,6 +55,7 @@ pub(crate) use components::{resolve_exposed_component_id, ModuleExposedComponent
 /// host's module loader and the C# backend. Defined here (not in the
 /// `hot_reload`-gated `native_library` module) because the C# backend is
 /// compiled in every host configuration.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedMirrorMethod {
     /// Fully-qualified Rust type name the method belongs to.
@@ -148,6 +151,7 @@ pub(crate) use codegen::generate_module_components_csharp;
 
 /// Rebuild the mirror-method table the managed runtime reads, after an
 /// optional module reload changes its trampoline addresses or method set.
+#[cfg_attr(not(feature = "hot_reload"), allow(unused_imports))]
 pub(crate) use abi::publish_mirror_methods;
 
 // =============================================================================

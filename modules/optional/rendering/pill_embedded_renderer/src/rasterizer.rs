@@ -148,7 +148,9 @@ fn draw_sprite(
     let [red, green, blue, alpha] = instance.color;
 
     // A fully transparent sprite contributes nothing; skip before any maths.
-    if !(alpha > ALPHA_TRANSPARENT) {
+    // Spelled as `is_nan || <=` rather than `!(alpha > ALPHA_TRANSPARENT)` so the
+    // NaN case is explicit: a NaN alpha must skip, not fall through.
+    if alpha.is_nan() || alpha <= ALPHA_TRANSPARENT {
         return;
     }
 
@@ -205,8 +207,9 @@ fn project_span(
 ) -> Option<(u32, u32)> {
     // A non-finite or non-positive extent has no pixels to cover. Checking
     // `extent > 0.0` also rejects NaN, which would otherwise survive the
-    // comparisons below and produce a garbage range.
-    if !(extent > 0.0) || !origin.is_finite() || !scale.is_finite() {
+    // comparisons below and produce a garbage range - `is_nan || <= 0.0` spells
+    // that out rather than negating the positive test.
+    if extent.is_nan() || extent <= 0.0 || !origin.is_finite() || !scale.is_finite() {
         return None;
     }
 

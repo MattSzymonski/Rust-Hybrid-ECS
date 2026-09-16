@@ -933,8 +933,8 @@ pub(crate) fn InspectorTab(editor: Arc<EditorContext>) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pill_master_renderer::{register_components, Color, Sprite};
     use pill_engine::Engine;
+    use pill_master_renderer::{register_components, Color, Sprite};
 
     /// A `Sprite`-carrying entity surfaces width/height as ordinary scalar
     /// rows plus one colour group whose flattened `color.*` channels are
@@ -986,7 +986,10 @@ mod tests {
     #[test]
     fn color_component_groups_bare_channels() {
         let mut engine = Engine::new();
-        engine.world_mut().register_component::<Color>();
+        // Field-editable inspection comes from the layout-carrying registration
+        // (`register_components` registers Color with its field table); a plain
+        // `register_component::<Color>` is an opaque blob with no rows to group.
+        register_components(engine.world_mut());
         let entity = engine
             .world_mut()
             .create_entity()

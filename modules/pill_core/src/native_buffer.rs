@@ -132,7 +132,11 @@ pub unsafe fn allocate(byte_capacity: usize, element_align: usize) -> *mut u8 {
 pub unsafe fn retain(elements: *mut u8, element_align: usize) {
     // SAFETY: the caller guarantees `elements` belongs to a live block, so the
     // header ahead of it is a live, initialised `AtomicUsize`.
-    let header = unsafe { elements.sub(header_size(element_align)).cast::<AtomicUsize>() };
+    let header = unsafe {
+        elements
+            .sub(header_size(element_align))
+            .cast::<AtomicUsize>()
+    };
     // SAFETY: same guarantee as above.
     unsafe { (*header).fetch_add(1, Ordering::Relaxed) };
 }
@@ -149,7 +153,11 @@ pub unsafe fn retain(elements: *mut u8, element_align: usize) {
 pub unsafe fn release(elements: *mut u8, byte_capacity: usize, element_align: usize) {
     // SAFETY: the caller guarantees `elements` belongs to a live block, so the
     // header ahead of it is a live, initialised `AtomicUsize`.
-    let header = unsafe { elements.sub(header_size(element_align)).cast::<AtomicUsize>() };
+    let header = unsafe {
+        elements
+            .sub(header_size(element_align))
+            .cast::<AtomicUsize>()
+    };
     // SAFETY: same guarantee as above; `AcqRel` pairs the count with every
     // other retain/release so the last releaser sees all prior writes.
     let previous = unsafe { (*header).fetch_sub(1, Ordering::AcqRel) };
@@ -181,7 +189,11 @@ pub unsafe fn release(elements: *mut u8, byte_capacity: usize, element_align: us
 pub unsafe fn reference_count(elements: *mut u8, element_align: usize) -> usize {
     // SAFETY: the caller guarantees `elements` belongs to a live block, so the
     // header ahead of it is a live, initialised `AtomicUsize`.
-    let header = unsafe { elements.sub(header_size(element_align)).cast::<AtomicUsize>() };
+    let header = unsafe {
+        elements
+            .sub(header_size(element_align))
+            .cast::<AtomicUsize>()
+    };
     // SAFETY: same guarantee as above.
     unsafe { (*header).load(Ordering::Acquire) }
 }

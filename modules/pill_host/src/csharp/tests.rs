@@ -42,6 +42,7 @@ use super::components::{
 // `Color`, `Position` and `Sprite` above are the renderer's components,
 // re-exported by `components` from `pill_master_renderer`.
 use super::context::ActiveSystemGuard;
+use super::manifest::parse_and_validate_manifest;
 use super::queries::{
     ffi_entity_count, ffi_get_archetype_chunk, ffi_get_component_chunk, ffi_get_entity_chunk,
 };
@@ -1459,6 +1460,24 @@ fn manifest_field(name: &str, offset: usize, size: usize) -> serde_json::Value {
     })
 }
 
+/// Build one top-level field entry that declares a default literal.
+fn manifest_field_with_default(
+    name: &str,
+    offset: usize,
+    size: usize,
+    primitive_type: &str,
+    default: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "name": name,
+        "offset": offset,
+        "size": size,
+        "primitive_type": primitive_type,
+        "default": default,
+        "fields": [],
+    })
+}
+
 /// Build the serialized manifest for one four-byte-fielded test component.
 fn manifest_bytes(
     name: &str,
@@ -1476,6 +1495,30 @@ fn manifest_bytes(
         "alignment": alignment,
         "schema_hash": schema_hash,
         "shared": false,
+        "fields": fields,
+    }]))
+    .expect("the test manifest serializes")
+}
+
+/// Build the serialized manifest for one entry that declares aliases.
+fn manifest_bytes_with_aliases(
+    name: &str,
+    aliases: &[&str],
+    size: usize,
+    alignment: usize,
+    schema_hash: u64,
+    fields: Vec<serde_json::Value>,
+) -> Vec<u8> {
+    let stable_id = stable_component_id(&format!("TracyLive.{name}"));
+    serde_json::to_vec(&serde_json::json!([{
+        "stable_id_low": stable_id.0 as u64,
+        "stable_id_high": (stable_id.0 >> 64) as u64,
+        "full_name": format!("TracyLive.{name}"),
+        "size": size,
+        "alignment": alignment,
+        "schema_hash": schema_hash,
+        "shared": false,
+        "aliases": aliases,
         "fields": fields,
     }]))
     .expect("the test manifest serializes")
@@ -1580,6 +1623,397 @@ fn a_reshaped_descriptor_component_is_migrated_on_apply() {
         panic!("the binding is still managed");
     };
     assert_eq!((size, align, schema_hash), (16, 8, 2));
+}
+
+/// A rename declared through an alias migrates the predecessor's rows onto
+/// the successor instead of being refused as a disappearance.
+#[test]
+fn a_renamed_component_carries_its_rows_through_the_alias() {
+    // The apply path reads the process-wide resource table too, so this test
+    // needs the same exclusivity the resource tests take or a leftover entry
+    // from one of them reads as a vanished resource.
+    let _table = resource_test_scope();
+    let mut engine = Engine::new();
+    let (store, _before) = store_with_component(
+        &mut engine,
+        "OldName",
+        8,
+        4,
+        7,
+        vec![manifest_field("a", 0, 4), manifest_field("b", 4, 4)],
+    );
+    let old_id = store.read()[&test_stable_id("OldName")].component_id();
+    let entity = engine
+        .world_mut()
+        .create_descriptor_entity(&[(old_id, [1.0_f32, 2.0].map(f32::to_ne_bytes).concat())])
+        .expect("the entity carries the registered layout");
+
+    let after = manifest_bytes_with_aliases(
+        "NewName",
+        &["TracyLive.OldName"],
+        8,
+        4,
+        7,
+        vec![manifest_field("a", 0, 4), manifest_field("b", 4, 4)],
+    );
+    let report = apply_component_manifest_on_reload(&mut engine, &after, &store)
+        .expect("an aliased rename migrates");
+
+    assert_eq!(
+        report.renamed,
+        vec!["TracyLive.OldName -> TracyLive.NewName".to_string()]
+    );
+    assert!(report.added.is_empty(), "a rename is not an addition");
+    assert!(report.migrated.is_empty(), "a rename is not a relayout");
+    let new_id = store.read()[&test_stable_id("NewName")].component_id();
+    assert!(
+        !store.read().contains_key(&test_stable_id("OldName")),
+        "the predecessor key is gone from the binding table"
+    );
+    assert_eq!(
+        engine
+            .world()
+            .descriptor_component_bytes(entity, new_id)
+            .expect("the successor holds the row"),
+        [1.0_f32, 2.0].map(f32::to_ne_bytes).concat().as_slice()
+    );
+    assert!(engine
+        .world()
+        .descriptor_component_bytes(entity, old_id)
+        .is_none());
+    assert_eq!(
+        engine
+            .world()
+            .resolve_component_id_by_name_any("TracyLive.OldName")
+            .unwrap(),
+        None,
+        "the old name is free again"
+    );
+    assert_eq!(
+        engine
+            .world()
+            .resolve_component_id_by_name_any("TracyLive.NewName")
+            .unwrap(),
+        Some(new_id)
+    );
+
+    // Applying the same manifest again settles: the alias no longer resolves
+    // to anything, so there is no predecessor left to rename.
+    let again = apply_component_manifest_on_reload(&mut engine, &after, &store)
+        .expect("the second application settles");
+    assert!(again.renamed.is_empty());
+}
+
+/// A field added with a default starts from that value, not zero.
+#[test]
+fn an_added_field_starts_from_its_declared_default() {
+    let _table = resource_test_scope();
+    let mut engine = Engine::new();
+    let (store, _before) = store_with_component(
+        &mut engine,
+        "Defaults",
+        4,
+        4,
+        1,
+        vec![manifest_field("a", 0, 4)],
+    );
+    let stable_id = test_stable_id("Defaults");
+    let component_id = store.read()[&stable_id].component_id();
+    let entity = engine
+        .world_mut()
+        .create_descriptor_entity(&[(component_id, 1.0_f32.to_ne_bytes().to_vec())])
+        .expect("the entity carries the registered layout");
+
+    let after = manifest_bytes(
+        "Defaults",
+        8,
+        4,
+        2,
+        vec![
+            manifest_field("a", 0, 4),
+            manifest_field_with_default("added", 4, 4, "System.Single", "7.5"),
+        ],
+    );
+    let report = apply_component_manifest_on_reload(&mut engine, &after, &store)
+        .expect("the added field migrates");
+
+    assert_eq!(report.migrated, vec!["TracyLive.Defaults".to_string()]);
+    let mut expected = 1.0_f32.to_ne_bytes().to_vec();
+    expected.extend_from_slice(&7.5_f32.to_ne_bytes());
+    assert_eq!(
+        engine
+            .world()
+            .descriptor_component_bytes(entity, component_id)
+            .unwrap(),
+        expected.as_slice(),
+        "the carried value survives and the added field takes its default"
+    );
+}
+
+/// A default declares what an empty field starts from; a field the row already
+/// carries keeps its value even when the default for it changed.
+#[test]
+fn a_changed_default_never_resets_a_carried_field() {
+    let _table = resource_test_scope();
+    let mut engine = Engine::new();
+    let (store, _before) = store_with_component(
+        &mut engine,
+        "Kept",
+        4,
+        4,
+        1,
+        vec![manifest_field("a", 0, 4)],
+    );
+    let stable_id = test_stable_id("Kept");
+    let component_id = store.read()[&stable_id].component_id();
+    let entity = engine
+        .world_mut()
+        .create_descriptor_entity(&[(component_id, 1.0_f32.to_ne_bytes().to_vec())])
+        .expect("the entity carries the registered layout");
+
+    // Same shape, new schema hash (which is what makes it a migration) and a
+    // new default for the same field.
+    let after = manifest_bytes(
+        "Kept",
+        4,
+        4,
+        2,
+        vec![manifest_field_with_default(
+            "a",
+            0,
+            4,
+            "System.Single",
+            "9.5",
+        )],
+    );
+    apply_component_manifest_on_reload(&mut engine, &after, &store).expect("the reshape migrates");
+
+    assert_eq!(
+        engine
+            .world()
+            .descriptor_component_bytes(entity, component_id)
+            .unwrap(),
+        1.0_f32.to_ne_bytes().as_slice(),
+        "a default never overwrites a value that was carried"
+    );
+}
+
+/// A default that does not parse as its field's type, or that sits on a struct
+/// field, is refused where the manifest is parsed.
+#[test]
+fn field_defaults_are_validated_against_their_field_type() {
+    let wrong_type = manifest_bytes(
+        "BadDefault",
+        4,
+        4,
+        1,
+        vec![manifest_field_with_default(
+            "a",
+            0,
+            4,
+            "System.Int32",
+            "1.5",
+        )],
+    );
+    let error = match parse_and_validate_manifest(&wrong_type) {
+        Ok(_) => panic!("a default that does not parse as the field's type is refused"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_plain_message().contains("is not a valid"),
+        "the refusal names the reason: {error}"
+    );
+
+    let nested_id = stable_component_id("TracyLive.NestedDefault");
+    let nested_default = serde_json::to_vec(&serde_json::json!([{
+        "stable_id_low": nested_id.0 as u64,
+        "stable_id_high": (nested_id.0 >> 64) as u64,
+        "full_name": "TracyLive.NestedDefault",
+        "size": 4,
+        "alignment": 4,
+        "schema_hash": 1,
+        "shared": false,
+        "fields": [{
+            "name": "inner",
+            "offset": 0,
+            "size": 4,
+            "primitive_type": "System.Single",
+            "default": "1.0",
+            "fields": [manifest_field("leaf", 0, 4)],
+        }],
+    }]))
+    .expect("the test manifest serializes");
+    let error = match parse_and_validate_manifest(&nested_default) {
+        Ok(_) => panic!("a default on a struct field is refused"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_plain_message()
+            .contains("only supported on primitive fields"),
+        "the refusal names the reason: {error}"
+    );
+}
+
+/// The resource twin: a field added to a resource with a default starts from
+/// it instead of zero.
+#[test]
+fn a_resource_field_added_with_a_default_starts_from_it() {
+    let _table = resource_test_scope();
+    let mut engine = Engine::new();
+    let before = resource_manifest_bytes("Tuned", 4, 4, 11, vec![manifest_field("speed", 0, 4)]);
+    register_component_manifest(&mut engine, &before, ComponentBindings::new())
+        .expect("the resource registers");
+    engine
+        .world_mut()
+        .insert_foreign_resource_bytes(resource_id_of("Tuned"), &1.0_f32.to_ne_bytes())
+        .expect("the payload is the declared width");
+
+    let after = resource_manifest_bytes(
+        "Tuned",
+        8,
+        4,
+        12,
+        vec![
+            manifest_field("speed", 0, 4),
+            manifest_field_with_default("gain", 4, 4, "System.Single", "2.5"),
+        ],
+    );
+    let store = BindingStore::new(ComponentBindings::new());
+    let report = apply_component_manifest_on_reload(&mut engine, &after, &store)
+        .expect("the resource reshape migrates");
+
+    assert_eq!(
+        report.resources_migrated,
+        vec!["TracyLive.Tuned".to_string()]
+    );
+    let mut expected = 1.0_f32.to_ne_bytes().to_vec();
+    expected.extend_from_slice(&2.5_f32.to_ne_bytes());
+    assert_eq!(
+        engine
+            .world()
+            .foreign_resource_bytes(resource_id_of("Tuned"))
+            .expect("the value is stored"),
+        expected.as_slice(),
+        "the carried value survives and the added field takes its default"
+    );
+}
+
+/// A managed component the manifest stopped naming is retired: its rows go,
+/// its registration goes, and a later declaration of the same name starts
+/// clean instead of colliding with storage nothing tracks.
+#[test]
+fn a_vanished_component_is_retired_on_apply() {
+    let _table = resource_test_scope();
+    let mut engine = Engine::new();
+    let (store, _manifest) = store_with_component(
+        &mut engine,
+        "Vanished",
+        4,
+        4,
+        1,
+        vec![manifest_field("a", 0, 4)],
+    );
+    let stable_id = test_stable_id("Vanished");
+    let component_id = store.read()[&stable_id].component_id();
+    let entity = engine
+        .world_mut()
+        .create_descriptor_entity(&[(component_id, 1.0_f32.to_ne_bytes().to_vec())])
+        .expect("the entity carries the registered layout");
+
+    let empty = serde_json::to_vec(&serde_json::json!([])).expect("an empty manifest serializes");
+    let report = apply_component_manifest_on_reload(&mut engine, &empty, &store)
+        .expect("a vanished component is retired, not refused");
+
+    assert_eq!(report.retired, vec!["TracyLive.Vanished".to_string()]);
+    assert!(
+        !store.read().contains_key(&stable_id),
+        "the binding is gone from the table"
+    );
+    assert!(
+        engine
+            .world()
+            .descriptor_component_bytes(entity, component_id)
+            .is_none(),
+        "the row is gone"
+    );
+    // The entity carried only the retired component, and retiring removes it
+    // like any removal, so the entity itself is gone too.
+    assert_eq!(engine.world().entity_count(), 0);
+    assert_eq!(
+        engine
+            .world()
+            .resolve_component_id_by_name_any("TracyLive.Vanished")
+            .unwrap(),
+        None,
+        "the registration is gone, so the name is free again"
+    );
+
+    // Re-declaring the name later is an ordinary addition, not a collision
+    // with storage nothing tracks anymore.
+    let readded = manifest_bytes("Vanished", 4, 4, 1, vec![manifest_field("a", 0, 4)]);
+    let report = apply_component_manifest_on_reload(&mut engine, &readded, &store)
+        .expect("the name can be declared again");
+    assert_eq!(report.added, vec!["TracyLive.Vanished".to_string()]);
+}
+
+/// Alias rules are enforced where the manifest is parsed, so a colliding or
+/// empty alias never reaches planning.
+#[test]
+fn alias_validation_refuses_empty_and_colliding_names() {
+    let empty =
+        manifest_bytes_with_aliases("Aliased", &["  "], 4, 4, 1, vec![manifest_field("a", 0, 4)]);
+    let error = match parse_and_validate_manifest(&empty) {
+        Ok(_) => panic!("an empty alias is refused"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_plain_message().contains("empty alias"),
+        "the refusal names the reason: {error}"
+    );
+
+    let entry = |name: &str, aliases: &[&str]| {
+        let stable_id = stable_component_id(&format!("TracyLive.{name}"));
+        serde_json::json!({
+            "stable_id_low": stable_id.0 as u64,
+            "stable_id_high": (stable_id.0 >> 64) as u64,
+            "full_name": format!("TracyLive.{name}"),
+            "size": 4,
+            "alignment": 4,
+            "schema_hash": 1,
+            "shared": false,
+            "aliases": aliases,
+            "fields": [manifest_field("a", 0, 4)],
+        })
+    };
+
+    let live_collision = serde_json::to_vec(&serde_json::json!([
+        entry("Live", &[]),
+        entry("Other", &["TracyLive.Live"]),
+    ]))
+    .expect("the test manifest serializes");
+    let error = match parse_and_validate_manifest(&live_collision) {
+        Ok(_) => panic!("an alias naming a live declaration is refused"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_plain_message().contains("live declaration"),
+        "the refusal names the reason: {error}"
+    );
+
+    let duplicate_alias = serde_json::to_vec(&serde_json::json!([
+        entry("First", &["TracyLive.Gone"]),
+        entry("Second", &["TracyLive.Gone"]),
+    ]))
+    .expect("the test manifest serializes");
+    let error = match parse_and_validate_manifest(&duplicate_alias) {
+        Ok(_) => panic!("one alias claimed twice is refused"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_plain_message().contains("declared by both"),
+        "the refusal names both owners: {error}"
+    );
 }
 
 /// A manifest whose application fails partway leaves none of it applied: the
@@ -1693,7 +2127,9 @@ fn a_refused_manifest_leaves_none_of_it_applied() {
     );
     assert_eq!(engine.world().component_layout(relayout_id), Some((8, 4)));
     assert_eq!(
-        engine.world().descriptor_component_bytes(entity, relayout_id),
+        engine
+            .world()
+            .descriptor_component_bytes(entity, relayout_id),
         Some(row.as_slice()),
         "the migrated rows were migrated back"
     );
@@ -1734,25 +2170,6 @@ fn the_apply_refuses_what_it_cannot_migrate() {
     assert!(
         error.to_string().contains("native component uses 8/4"),
         "the refusal names both layouts: {error}"
-    );
-
-    // A component the manifest stopped naming: its storage would have to be
-    // retired, which this path does not do yet.
-    let mut engine = Engine::new();
-    let (store, _manifest) = store_with_component(
-        &mut engine,
-        "Vanished",
-        4,
-        4,
-        1,
-        vec![manifest_field("a", 0, 4)],
-    );
-    let empty = serde_json::to_vec(&serde_json::json!([])).expect("an empty manifest serializes");
-    let error = apply_component_manifest_on_reload(&mut engine, &empty, &store)
-        .expect_err("a vanished component is refused");
-    assert!(
-        error.to_string().contains("disappeared from the manifest"),
-        "the refusal names the reason: {error}"
     );
 
     // A duplicated identity never reaches the world.
@@ -1834,6 +2251,32 @@ fn resource_manifest_bytes(
     .expect("the test manifest serializes")
 }
 
+/// Build the serialized manifest for one managed resource that declares
+/// aliases.
+fn resource_manifest_bytes_with_aliases(
+    name: &str,
+    aliases: &[&str],
+    size: usize,
+    alignment: usize,
+    schema_hash: u64,
+    fields: Vec<serde_json::Value>,
+) -> Vec<u8> {
+    let stable_id = stable_component_id(&format!("TracyLive.{name}"));
+    serde_json::to_vec(&serde_json::json!([{
+        "stable_id_low": stable_id.0 as u64,
+        "stable_id_high": (stable_id.0 >> 64) as u64,
+        "full_name": format!("TracyLive.{name}"),
+        "size": size,
+        "alignment": alignment,
+        "schema_hash": schema_hash,
+        "shared": false,
+        "kind": "resource",
+        "aliases": aliases,
+        "fields": fields,
+    }]))
+    .expect("the test manifest serializes")
+}
+
 /// The engine id a registered managed resource was bound to.
 ///
 /// Asked of the binding table rather than recomputed, so the test checks the
@@ -1897,6 +2340,67 @@ fn a_manifest_resource_joins_the_snapshot() {
         snapshot.payload("TracyLive.Saved").is_some(),
         "a managed resource reaches a snapshot without any Rust type to derive from"
     );
+}
+
+/// A resource rename declared through an alias moves the stored value onto
+/// the successor instead of being refused as a disappearance.
+#[test]
+fn a_renamed_resource_carries_its_value_through_the_alias() {
+    let _table = resource_test_scope();
+    let mut engine = Engine::new();
+    let before = resource_manifest_bytes(
+        "OldSettings",
+        8,
+        4,
+        11,
+        vec![manifest_field("speed", 0, 4), manifest_field("gain", 4, 4)],
+    );
+    register_component_manifest(&mut engine, &before, ComponentBindings::new())
+        .expect("the resource registers");
+    let old_id = resource_id_of("OldSettings");
+    engine
+        .world_mut()
+        .insert_foreign_resource_bytes(old_id, &[1.0_f32, 2.0].map(f32::to_ne_bytes).concat())
+        .expect("the payload is the declared width");
+
+    let after = resource_manifest_bytes_with_aliases(
+        "NewSettings",
+        &["TracyLive.OldSettings"],
+        8,
+        4,
+        11,
+        vec![manifest_field("speed", 0, 4), manifest_field("gain", 4, 4)],
+    );
+    let store = BindingStore::new(ComponentBindings::new());
+    let report = apply_component_manifest_on_reload(&mut engine, &after, &store)
+        .expect("an aliased resource rename migrates");
+
+    assert_eq!(
+        report.resources_renamed,
+        vec!["TracyLive.OldSettings -> TracyLive.NewSettings".to_string()]
+    );
+    assert!(
+        resource_target(test_stable_id("OldSettings")).is_none(),
+        "the old binding is gone from the table"
+    );
+    assert_eq!(
+        engine
+            .world()
+            .foreign_resource_bytes(resource_id_of("NewSettings")),
+        Some(&[1.0_f32, 2.0].map(f32::to_ne_bytes).concat()[..]),
+        "the value moved onto the successor"
+    );
+    assert_eq!(
+        engine.world().foreign_resource_layout(old_id),
+        None,
+        "the predecessor declaration is dropped"
+    );
+
+    // Applying the same manifest again settles: the alias no longer names a
+    // live binding, so there is no predecessor left to rename.
+    let again = apply_component_manifest_on_reload(&mut engine, &after, &store)
+        .expect("the second application settles");
+    assert!(again.resources_renamed.is_empty());
 }
 
 /// A resource entry marked shared is refused where it is declared.
@@ -1980,9 +2484,10 @@ fn a_reshaped_resource_is_migrated_on_reload() {
     );
 }
 
-/// A resource the arriving manifest stops declaring is refused, not dropped.
+/// A resource the arriving manifest stops declaring is retired: its value and
+/// declaration go, and an unclaimed id is dropped outright.
 #[test]
-fn a_resource_dropped_from_the_manifest_is_refused() {
+fn a_resource_dropped_from_the_manifest_is_retired() {
     let _table = resource_test_scope();
     let mut engine = Engine::new();
     let before = resource_manifest_bytes("Vanishing", 4, 4, 1, vec![manifest_field("a", 0, 4)]);
@@ -1990,17 +2495,59 @@ fn a_resource_dropped_from_the_manifest_is_refused() {
         register_component_manifest(&mut engine, &before, ComponentBindings::new())
             .expect("the manifest registers"),
     );
+    let id = resource_id_of("Vanishing");
+    engine
+        .world_mut()
+        .insert_foreign_resource_bytes(id, &7_u32.to_ne_bytes())
+        .expect("the payload is the declared width");
 
     let empty = serde_json::to_vec(&serde_json::json!([])).expect("an empty manifest serializes");
-    let error = apply_component_manifest_on_reload(&mut engine, &empty, &store)
-        .expect_err("a dropped resource cannot be retired here");
+    let report = apply_component_manifest_on_reload(&mut engine, &empty, &store)
+        .expect("a dropped resource is retired, not refused");
 
+    assert_eq!(
+        report.resources_retired,
+        vec!["TracyLive.Vanishing".to_string()]
+    );
     assert!(
-        error
-            .to_plain_message()
-            .contains("disappeared from the manifest"),
-        "the refusal names what is wrong: {}",
-        error.to_plain_message()
+        resource_target(stable_component_id("TracyLive.Vanishing")).is_none(),
+        "the binding is gone from the table"
+    );
+    assert_eq!(
+        engine.world().foreign_resource_layout(id),
+        None,
+        "the value and its declaration are gone"
+    );
+}
+
+/// A shared resource another subject still claims survives the retirement of
+/// this subject's declaration: `drop_resources` releases only unclaimed ids.
+#[test]
+fn a_claimed_resource_survives_a_dropped_declaration() {
+    let _table = resource_test_scope();
+    let mut engine = Engine::new();
+    let before = resource_manifest_bytes("Shared", 4, 4, 1, vec![manifest_field("a", 0, 4)]);
+    let store = BindingStore::new(
+        register_component_manifest(&mut engine, &before, ComponentBindings::new())
+            .expect("the manifest registers"),
+    );
+    let id = resource_id_of("Shared");
+    engine
+        .world_mut()
+        .insert_foreign_resource_bytes(id, &7_u32.to_ne_bytes())
+        .expect("the payload is the declared width");
+    // A module declaring the same name holds a claim; the drop must skip it.
+    engine.world_mut().retain_resource_claims(&[id]);
+
+    let empty = serde_json::to_vec(&serde_json::json!([])).expect("an empty manifest serializes");
+    let report = apply_component_manifest_on_reload(&mut engine, &empty, &store)
+        .expect("the declaration is retired");
+
+    assert_eq!(report.resources_retired.len(), 1);
+    assert_eq!(
+        engine.world().foreign_resource_bytes(id),
+        Some(&7_u32.to_ne_bytes()[..]),
+        "the claimed value survives this subject's retirement"
     );
 }
 

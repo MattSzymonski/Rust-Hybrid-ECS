@@ -415,6 +415,14 @@ pub enum FieldSource {
     /// Leave the field zeroed. The relayout zeroes every row before it applies
     /// the plan, so a field with no source is defined rather than stale.
     ZeroFill,
+    /// Write a default the caller supplied - a manifest's declared value for an
+    /// added or retyped field - over the zeroed destination.
+    Default {
+        /// The default value's bytes, native-endian, left-aligned.
+        bytes: [u8; 8],
+        /// How many of the leading bytes are part of the value.
+        len: u8,
+    },
 }
 
 /// One instruction in a migration plan.
@@ -523,6 +531,40 @@ impl FieldPlan {
         &self.fields
     }
 
+    /// Give one planned field a default value to write instead of zero.
+    ///
+    /// Meant for fields an added or reshaped layout leaves empty. A field the
+    /// plan already copies keeps its carried value and this is a no-op, so a
+    /// declared default can never overwrite a value that survived the reload.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::DescriptorRowInvalid`] when no planned field
+    /// starts at `offset`, when `bytes` is longer than a field can carry
+    /// (eight bytes - the widest primitive), or when it is longer than the
+    /// planned field itself.
+    pub fn set_default(&mut self, offset: usize, bytes: &[u8]) -> Result<(), WorldError> {
+        if bytes.len() > 8 {
+            return Err(WorldError::DescriptorRowInvalid);
+        }
+        let Some(field) = self.fields.iter_mut().find(|field| field.offset == offset) else {
+            return Err(WorldError::DescriptorRowInvalid);
+        };
+        if matches!(field.source, FieldSource::OldOffset(_)) {
+            return Ok(());
+        }
+        if bytes.len() > field.bytes {
+            return Err(WorldError::DescriptorRowInvalid);
+        }
+        let mut padded = [0_u8; 8];
+        padded[..bytes.len()].copy_from_slice(bytes);
+        field.source = FieldSource::Default {
+            bytes: padded,
+            len: bytes.len() as u8,
+        };
+        Ok(())
+    }
+
     /// Whether the plan carries no instructions.
     #[must_use]
     pub fn is_empty(&self) -> bool {
@@ -540,10 +582,22 @@ impl FieldPlan {
             if out_of_bounds(field.offset, field.bytes, new_size) {
                 return Err(WorldError::DescriptorRowInvalid);
             }
-            if let FieldSource::OldOffset(offset) = field.source {
-                if out_of_bounds(offset, field.bytes, old_size) {
-                    return Err(WorldError::DescriptorRowInvalid);
+            match field.source {
+                FieldSource::OldOffset(offset) => {
+                    if out_of_bounds(offset, field.bytes, old_size) {
+                        return Err(WorldError::DescriptorRowInvalid);
+                    }
                 }
+                // The value has to fit the planned field and the destination;
+                // the remainder of the field keeps its zeroed fill.
+                FieldSource::Default { len, .. } => {
+                    if usize::from(len) > field.bytes
+                        || out_of_bounds(field.offset, usize::from(len), new_size)
+                    {
+                        return Err(WorldError::DescriptorRowInvalid);
+                    }
+                }
+                FieldSource::ZeroFill => {}
             }
         }
         Ok(())
@@ -1301,14 +1355,26 @@ impl ComponentColumn {
                     let destination = new_data.as_ptr().add(row * layout.size);
                     std::ptr::write_bytes(destination, 0, layout.size);
                     for field in plan.fields() {
-                        let FieldSource::OldOffset(offset) = field.source else {
-                            continue;
-                        };
-                        std::ptr::copy_nonoverlapping(
-                            scratch.as_ptr().add(offset),
-                            destination.add(field.offset),
-                            field.bytes,
-                        );
+                        match field.source {
+                            FieldSource::OldOffset(offset) => {
+                                std::ptr::copy_nonoverlapping(
+                                    scratch.as_ptr().add(offset),
+                                    destination.add(field.offset),
+                                    field.bytes,
+                                );
+                            }
+                            // The destination row is zeroed above; a default is
+                            // checked to fit the field when it is set, so only
+                            // its leading bytes move and the rest stays zero.
+                            FieldSource::Default { bytes, len } => {
+                                std::ptr::copy_nonoverlapping(
+                                    bytes.as_ptr(),
+                                    destination.add(field.offset),
+                                    usize::from(len),
+                                );
+                            }
+                            FieldSource::ZeroFill => {}
+                        }
                     }
                 }
             }
@@ -1761,9 +1827,8 @@ mod tests {
     fn a_layout_keeps_its_witness_and_a_column_releases_through_its_ops() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let constructed =
-            ComponentLayout::new(4, 4, 7, Blittability::from_manifest_fields())
-                .expect("a plain layout");
+        let constructed = ComponentLayout::new(4, 4, 7, Blittability::from_manifest_fields())
+            .expect("a plain layout");
         assert_eq!(
             constructed.blittability,
             Blittability::from_manifest_fields(),
@@ -2292,8 +2357,7 @@ mod tests {
     #[test]
     fn a_descriptor_relayout_that_widens_alignment_reallocates() {
         // Two 4-byte fields, align 4 - the shape audit 4.18 widened.
-        let old =
-            ComponentLayout::new(12, 4, 1, Blittability::engine_verified()).expect("layout");
+        let old = ComponentLayout::new(12, 4, 1, Blittability::engine_verified()).expect("layout");
         let mut column = ComponentColumn::new(old).expect("column");
         column
             .push_bytes(&[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0])
@@ -2303,8 +2367,7 @@ mod tests {
             .expect("push");
 
         // Widen to align 8, the case the native lane refuses.
-        let new =
-            ComponentLayout::new(16, 8, 2, Blittability::engine_verified()).expect("layout");
+        let new = ComponentLayout::new(16, 8, 2, Blittability::engine_verified()).expect("layout");
         let mut plan = FieldPlan::new();
         plan.push(0, 4, FieldSource::OldOffset(0));
         plan.push(8, 4, FieldSource::OldOffset(4));

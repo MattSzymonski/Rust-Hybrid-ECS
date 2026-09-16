@@ -59,6 +59,10 @@ pub enum WorldError {
     #[message("descriptor component stable ID is already registered with another name or schema")]
     DescriptorAlreadyRegistered,
 
+    /// A descriptor component cannot be remapped onto itself.
+    #[message("descriptor component cannot be remapped onto itself")]
+    DescriptorRemapSelf,
+
     /// The world's component type limit has been reached.
     ///
     /// Registration is driven by user data — a project's compile-time registry
@@ -190,6 +194,10 @@ pub enum WorldError {
         /// The resource that was asked for.
         id: ResourceId,
     },
+
+    /// A foreign resource cannot be remapped onto itself.
+    #[message("foreign resource cannot be remapped onto itself")]
+    ForeignResourceRemapSelf,
 
     /// The id does not name a registered shared resource.
     #[message("resource ", debug_value(id), " is not a registered shared resource")]

@@ -310,7 +310,9 @@ fn initialize_one(
     // user's function. Idempotent, so running it once per entry point costs one
     // pass over a static list and keeps this identical to the wrappers rather
     // than merely equivalent to them.
-    pill_engine::component_registry::register_all_components(engine.world_mut());
+    // The failure, if any, is also recorded in the world's registration-error
+    // slot, which the caller checks below; the direct error would duplicate it.
+    let _ = pill_engine::component_registry::register_all_components(engine.world_mut());
 
     if let Some(owner) = owner {
         engine.begin_module_registration(owner);
