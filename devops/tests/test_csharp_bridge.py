@@ -228,7 +228,6 @@ CSHARP_RELOAD_REJECTED_TOKEN = "C# reload rejected"
 # prints its single generic line. Asserting on these is what tells a developer
 # which of the three contracts they broke, and pins the wording that tells them.
 CSHARP_LOAD_FAILED_TOKEN = "[csharp_runtime] reload failed:"
-CSHARP_REJECT_SIGNATURE_REASON = "C# system names or query signatures changed"
 CSHARP_REJECT_COMPONENT_REASON = "C# component identities or layouts changed"
 # The loader parks a version whose manifest changed and waits for the host's
 # verdict; seeing this proves the handshake ran rather than the swap simply
@@ -649,6 +648,12 @@ SYSTEM_NAME_EDIT = (
     "public static void Renamed(Query<Read<global::pill_spline.Spline>> query, Commands commands)",
 )
 
+# The host's log line for a re-registration, which is the only thing that tells
+# a rebuilt scheduler apart from a behaviour-only swap in the output.
+CSHARP_SYSTEMS_REREGISTERED_TOKEN = (
+    "re-registered the project's managed systems after a signature change"
+)
+
 # Renames an [EcsStartup] method. Startups are not re-run on reload, so a change
 # to the set is refused rather than silently ignored.
 STARTUP_NAME_EDIT = (
@@ -932,12 +937,34 @@ SESSION_SCENARIOS = [
         ],
         restore_after=[PROJECT_CS_PROBE_CS],
     ),
-    rejection_scenario(
-        "csharp_rejects_system_signature_change",
-        PROJECT_CS_PROBE_CS,
-        SYSTEM_NAME_EDIT,
-        CSHARP_REJECT_SIGNATURE_REASON,
-        BRIDGE_PROBE_PREFIX,
+    # Renaming a system changes the metadata the scheduler was built from, and
+    # that used to be refused with "restart the host". It is now rebuilt: the
+    # host clears the project's systems and re-registers them from the arriving
+    # assembly. Three things have to hold, and the third is the one a rebuild
+    # can plausibly get wrong - the reload completes, the host says it
+    # re-registered, and the renamed system is still running afterwards.
+    Scenario(
+        name="csharp_reregisters_on_system_signature_change",
+        phases=[
+            ScenarioPhase(
+                edits=[(PROJECT_CS_PROBE_CS, [SYSTEM_NAME_EDIT])],
+                wait_token=CSHARP_SYSTEMS_REREGISTERED_TOKEN,
+                required_tokens=[
+                    CSHARP_SYSTEMS_REREGISTERED_TOKEN,
+                    CSHARP_RELOAD_COMPLETE_TOKEN,
+                ],
+                forbidden_tokens=[
+                    CSHARP_RELOAD_REJECTED_TOKEN,
+                    PANIC_TOKEN,
+                    ACCESS_VIOLATION_TOKEN,
+                ],
+                # The renamed system keeps printing, which is what proves the
+                # re-registration produced a running system and not just a
+                # cleared one.
+                alive_tokens=[(BRIDGE_PROBE_PREFIX, PROBE_TIMEOUT)],
+            )
+        ],
+        restore_after=[PROJECT_CS_PROBE_CS],
     ),
     rejection_scenario(
         "csharp_rejects_startup_change",

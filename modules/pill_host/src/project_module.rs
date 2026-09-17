@@ -192,12 +192,12 @@ mod loaded {
         /// Rebuild and replace the active module while preserving a working old
         /// generation whenever compilation, loading, or registration fails.
         ///
-        /// Returns whether the running image was replaced. Every failed branch
-        /// - build error, load refusal, rolled-back init - keeps the current
-        /// image and reports `false`, so the caller can gate the bookkeeping
-        /// that only a replacement invalidates - patch records pointing into
-        /// an image the graveyard will unmap - on there being a replacement at
-        /// all.
+        /// Returns whether the running image was replaced. Every failed
+        /// branch (a build error, a load refusal, a rolled-back init) keeps the
+        /// current image and reports `false`, so the caller can gate the
+        /// bookkeeping that only a replacement invalidates - patch records
+        /// pointing into an image the graveyard will unmap - on there being a
+        /// replacement at all.
         ///
         /// `cancel_flag` is the watcher's reload signal: a newer save during the
         /// build aborts the in-flight compilation and the next frame retries.

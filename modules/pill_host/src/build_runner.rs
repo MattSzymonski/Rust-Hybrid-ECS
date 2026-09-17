@@ -224,8 +224,19 @@ fn artifact_stamp_path(workspace_root: &Path, module_name: &str) -> PathBuf {
         .join(format!("{module_name}.txt"))
 }
 
-/// Describe the artifacts a build produced, together with the sources and the
-/// command that produced them.
+/// Describe the artifacts a build produced, together with the host identity,
+/// the sources and the command that produced them.
+///
+/// `build_info` is [`current_build_info`]: the toolchain and the host's feature
+/// set, profile, target and spawned environment. It belongs in the stamp rather
+/// than only in the workspace-wide marker, because the marker cannot answer this
+/// question per module. `record_build_info` rewrites that one file as soon as
+/// any module is rebuilt, so on a host feature change the first module rebuilds
+/// (correctly), overwrites the marker, and every module checked after it
+/// compares equal and skips its build - loading an artifact built against the
+/// engine variant the first rebuild just replaced. That presents as os error 127
+/// at load, naming nothing, and it is what made the three `hot_patch` e2e suites
+/// fail whenever one of them ran after a suite with a different feature set.
 ///
 /// `source_identity` is the watch directory, which is what distinguishes two
 /// projects that share a package name - and therefore an output path, a stamp
@@ -235,13 +246,18 @@ fn artifact_stamp_path(workspace_root: &Path, module_name: &str) -> PathBuf {
 /// Returns `None` when any artifact is missing or unreadable, which the callers
 /// treat as "not host-built" and therefore as a reason to run cargo.
 fn artifact_stamp(
+    build_info: &str,
     source_identity: &str,
     build_command: &[String],
     artifacts: &[PathBuf],
 ) -> Option<String> {
     // The separator cannot appear in a command argument, so two different
     // argument lists can never produce the same line.
-    let mut lines = vec![source_identity.to_string(), build_command.join("\u{1}")];
+    let mut lines = vec![
+        build_info.to_string(),
+        source_identity.to_string(),
+        build_command.join("\u{1}"),
+    ];
     for path in artifacts {
         let metadata = std::fs::metadata(path).ok()?;
         let modified = metadata
@@ -271,7 +287,12 @@ fn record_artifact_stamp(
     build_command: &[String],
     artifacts: &[PathBuf],
 ) {
-    let Some(stamp) = artifact_stamp(source_identity, build_command, artifacts) else {
+    let Some(stamp) = artifact_stamp(
+        &current_build_info(),
+        source_identity,
+        build_command,
+        artifacts,
+    ) else {
         return;
     };
     let path = artifact_stamp_path(workspace_root, module_name);
@@ -304,7 +325,12 @@ fn artifacts_are_host_built(
     build_command: &[String],
     artifacts: &[PathBuf],
 ) -> bool {
-    let Some(current) = artifact_stamp(source_identity, build_command, artifacts) else {
+    let Some(current) = artifact_stamp(
+        &current_build_info(),
+        source_identity,
+        build_command,
+        artifacts,
+    ) else {
         return false;
     };
     let recorded = std::fs::read_to_string(artifact_stamp_path(workspace_root, module_name));
@@ -1911,6 +1937,46 @@ mod tests {
                 std::slice::from_ref(&output)
             ),
             "an artifact the host did not write must be rebuilt, not loaded"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The same artifact built under a different host identity is a different
+    /// artifact, which is what makes the check feature-aware PER MODULE.
+    ///
+    /// The workspace-wide build-info marker cannot answer this. It is rewritten
+    /// by the first module that rebuilds after a host feature change, so every
+    /// module checked after that one compares equal and skips its build while
+    /// still holding an artifact built against the engine variant that rebuild
+    /// just replaced - which loads as os error 127 and names nothing.
+    #[test]
+    fn a_different_host_identity_is_a_different_stamp() {
+        let (root, _) = test_workspace();
+        let output = root.join("target/debug/module.dll");
+        let command = vec!["cargo".to_string(), "build".to_string()];
+        let artifacts = std::slice::from_ref(&output);
+
+        let windowed = artifact_stamp(
+            "rustc 1.95.0
+rendering+hot_patch",
+            "module/src",
+            &command,
+            artifacts,
+        )
+        .expect("the artifact exists");
+        let headless = artifact_stamp(
+            "rustc 1.95.0
+no-rendering+hot_patch",
+            "module/src",
+            &command,
+            artifacts,
+        )
+        .expect("the artifact exists");
+
+        assert_ne!(
+            windowed, headless,
+            "a host feature change must not leave a module's stamp unchanged"
         );
 
         std::fs::remove_dir_all(&root).unwrap();

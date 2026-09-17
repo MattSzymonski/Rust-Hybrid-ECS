@@ -43,7 +43,6 @@
 
 // External crates
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use trait_type_map::impl_trait_accessible;
 
 // Current crate
 use pill_engine::*;
@@ -115,7 +114,6 @@ struct MassiveData([[f64; 4]; 8]); // 8×4 f64 = 32 × 8B = 256 B
 impl Component for MassiveData {}
 
 // Marks the shared components as trait-accessible for the ECS storage layer.
-impl_trait_accessible!(dyn Component; Position, Velocity, Health, Enemy, Frozen, LargeData, MassiveData);
 
 // =============================================================================
 // Benchmarks

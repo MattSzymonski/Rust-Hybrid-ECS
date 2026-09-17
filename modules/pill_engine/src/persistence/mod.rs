@@ -100,14 +100,12 @@ mod tests {
         value: u32,
     }
     impl Component for DropTestForgottenComponent {}
-    trait_type_map::impl_trait_accessible!(dyn Component; DropTestForgottenComponent);
 
     #[derive(Clone, Debug)]
     struct DropTestKeptComponent {
         value: u32,
     }
     impl Component for DropTestKeptComponent {}
-    trait_type_map::impl_trait_accessible!(dyn Component; DropTestKeptComponent);
 
     /// A distinct type that *declares* another type's name, standing in for the
     /// registration a rebuilt image makes: same name, fresh `TypeId`.
@@ -120,7 +118,6 @@ mod tests {
             Some(std::any::type_name::<DropTestForgottenComponent>())
         }
     }
-    trait_type_map::impl_trait_accessible!(dyn Component; DropTestSupersedingComponent);
 
     /// A persistable component whose column is 8 bytes / align 4.
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -129,7 +126,6 @@ mod tests {
         b: u32,
     }
     impl Component for LayoutHostComponent {}
-    trait_type_map::impl_trait_accessible!(dyn Component; LayoutHostComponent);
 
     /// Declares the host's name while widening `b` to `f64` - the f32-to-f64
     /// shape that registers 16 bytes / align 8 over the host's column.
@@ -143,7 +139,6 @@ mod tests {
             Some(std::any::type_name::<LayoutHostComponent>())
         }
     }
-    trait_type_map::impl_trait_accessible!(dyn Component; LayoutWidenedComponent);
 
     /// Same name, same alignment, one field more: the add-a-field shape that
     /// must keep registering (and migrating).
@@ -158,7 +153,6 @@ mod tests {
             Some(std::any::type_name::<LayoutHostComponent>())
         }
     }
-    trait_type_map::impl_trait_accessible!(dyn Component; LayoutGrownComponent);
 
     /// The refusal sentence is printed verbatim into host logs and grepped by
     /// humans, so it carries no source-wrap artifacts.
@@ -657,7 +651,6 @@ mod tests {
             RETIRING_GLUE_DROPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
-    trait_type_map::impl_trait_accessible!(dyn Component; RetiringGlueComponent);
 
     /// The arriving generation: same declared name and shape, different glue.
     #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -677,7 +670,6 @@ mod tests {
             ARRIVING_GLUE_DROPS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
-    trait_type_map::impl_trait_accessible!(dyn Component; ArrivingGlueComponent);
 
     /// The in-place migration drops old-layout rows through the glue that wrote
     /// them. The sequence that used to break it: the arriving generation's

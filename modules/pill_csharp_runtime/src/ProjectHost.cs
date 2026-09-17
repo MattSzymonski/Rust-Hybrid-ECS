@@ -534,13 +534,11 @@ internal sealed class ProjectHost
 
             byte[] manifest = ProjectManifestBuilder.Build(systems, assembly);
 
-            // Rust's execution graph and component registry are built at
-            // startup. Behavior-only reloads are safe; changing either
-            // contract needs a restart so native metadata cannot go stale.
-            if (isReload && !_systems.Select(s => s.Signature).SequenceEqual(
-                    systems.Select(s => s.Signature)))
-                throw new InvalidOperationException(
-                    "C# system names or query signatures changed; restart the host to rebuild the Rust scheduler.");
+            // A changed system set is no longer refused: the host clears the
+            // project's systems and re-registers them from this assembly's
+            // reflected metadata, so the scheduler is rebuilt rather than left
+            // stale. Startups are different and still refuse - they are not
+            // re-run on reload, so a changed set would silently never execute.
             if (isReload && !_startups.Select(s => s.Name).SequenceEqual(startups.Select(s => s.Name)))
                 throw new InvalidOperationException(
                     "C# startup methods changed; restart the host. Startup methods are not rerun during hot reload.");

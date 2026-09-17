@@ -29,7 +29,6 @@ pill_hot_scan = { path = "../pill_hot_scan" }
 # The editor's unit tests hand-write tiny `impl Component` test doubles and
 # need `impl_trait_accessible!` to reach them through the engine's storage;
 # production code never touches this crate.
-trait_type_map = { path = "../../../Trait-Type-Map" }
 # The inspector tests assert against the real renderer `Sprite` layout - the
 # flattened `color.*` channels the colour picker consumes - so they need the
 # actual component rather than a stand-in. Production code reaches the

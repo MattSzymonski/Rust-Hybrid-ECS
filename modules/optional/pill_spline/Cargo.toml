@@ -18,7 +18,6 @@ pill_hot_scan = { path = "../../pill_hot_scan" }
 [dependencies]
 pill_core = { path = "../../pill_core" }
 pill_engine = { path = "../../pill_engine" }
-trait_type_map = { path = "../../../../Trait-Type-Map" }
 serde = { version = "1", features = ["derive"] }
 # `default-features = false` keeps `pill_dummy_color`'s `pill_module_*` exports
 # off in this build. Since `module-abi` is opt-in (not a default) this is a

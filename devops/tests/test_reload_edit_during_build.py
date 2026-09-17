@@ -61,8 +61,18 @@ MODULE_NAME = "pill_spline"
 
 # Launched through cargo because `-C prefer-dynamic` means the binary needs the
 # toolchain's `std-*.dll` on the loader path, which `cargo run` sets up.
+#
+# `rendering` is required, not a preference, and this suite ran without it for
+# its whole history. `examples/project_rs` links `pill_master_renderer`
+# directly, which turns on features in crates `pill_core` also depends on. The
+# host binary links its own `pill_core.dll`, so a host built without
+# `rendering` resolves a different variant than the project does - and Windows
+# keeps one module of a given name per process, so the project DLL loads
+# against the host's copy and fails with "The specified procedure could not be
+# found" (os error 127), naming nothing. The sibling hot-patch suites pass the
+# same pair. See `test_shared_component_identity.py` for the same note.
 HOST_LAUNCH_COMMAND = [
-    "cargo", "run", "-p", "pill_standalone", "--features", "pill_host/hot_patch",
+    "cargo", "run", "-p", "pill_standalone", "--features", "pill_host/hot_patch,rendering",
 ]
 
 # The structured logger appends fields with no separator, so the token is
@@ -92,9 +102,9 @@ def count_occurrences(output: str, token: str) -> int:
 
 def build_host() -> bool:
     """Build the standalone host with the hot-patch feature enabled."""
-    print("  [BUILD] cargo build -p pill_standalone --features pill_host/hot_patch")
+    print("  [BUILD] cargo build -p pill_standalone --features pill_host/hot_patch,rendering")
     completed = subprocess.run(
-        ["cargo", "build", "-p", "pill_standalone", "--features", "pill_host/hot_patch"],
+        ["cargo", "build", "-p", "pill_standalone", "--features", "pill_host/hot_patch,rendering"],
         cwd=str(MODULES_ROOT), capture_output=True, text=True,
         timeout=BUILD_TIMEOUT_SECONDS,
     )

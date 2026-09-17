@@ -493,7 +493,6 @@ mod tests {
         enabled: bool,
     }
     impl pill_engine::Component for DemoComponent {}
-    trait_type_map::impl_trait_accessible!(dyn pill_engine::Component; DemoComponent);
 
     /// Hand-written layout mirroring what `#[derive(PillComponent)]` emits.
     static DEMO_FIELDS: &[ComponentFieldDescriptor] = &[
@@ -602,7 +601,6 @@ mod tests {
         values: [i16; 3],
     }
     impl pill_engine::Component for ArrayComponent {}
-    trait_type_map::impl_trait_accessible!(dyn pill_engine::Component; ArrayComponent);
 
     static ARRAY_FIELDS: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {
         name: "values",

@@ -86,6 +86,13 @@ EXCLUDED_DIRECTORY_NAMES = {
     ".git",
     "pill_standalone_temp",
     "build",
+    # `local/` is gitignored scratch - experiment labs, notes, one-off probes.
+    # It is not engine source and is not tracked, so holding it to the engine's
+    # comment and layout rules only ever produced noise. Excluding it here
+    # rather than in one caller is what makes a bare run and a `--root modules`
+    # run agree, which is the disagreement that made `run_all.py` red while the
+    # documented gate was green.
+    "local",
 }
 
 # =============================================================================

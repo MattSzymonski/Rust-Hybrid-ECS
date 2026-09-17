@@ -25,7 +25,6 @@
 // =============================================================================
 
 // External crates
-use trait_type_map::impl_trait_accessible;
 
 // Current crate
 use pill_engine::*;
@@ -68,7 +67,6 @@ struct Health(f32);
 impl Component for Health {}
 
 // Make components accessible through trait objects
-impl_trait_accessible!(dyn Component; Position, Velocity, Health);
 
 // =============================================================================
 // Systems

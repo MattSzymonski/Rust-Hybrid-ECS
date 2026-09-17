@@ -25,7 +25,6 @@
 
 // External crates
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use trait_type_map::impl_trait_accessible;
 
 // Current crate
 use pill_engine::*;
@@ -87,7 +86,6 @@ impl Component for Stamina {}
 
 // Registers every fixture type with the trait-object type map so the
 // benchmarked [`World`] can store them behind `dyn Component`.
-impl_trait_accessible!(dyn Component; Position, Velocity, Health, Armor, Mana, Stamina);
 
 // =============================================================================
 // Benchmarks

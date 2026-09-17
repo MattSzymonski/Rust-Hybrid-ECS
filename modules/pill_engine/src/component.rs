@@ -985,7 +985,6 @@ mod tests {
         #[derive(Clone, Debug)]
         struct ReRegisterTestComponent;
         impl Component for ReRegisterTestComponent {}
-        trait_type_map::impl_trait_accessible!(dyn Component; ReRegisterTestComponent);
 
         let mut registry = ComponentRegistry::new();
         let component_id = ComponentId::of::<ReRegisterTestComponent>();
@@ -1109,7 +1108,6 @@ mod tests {
                     Some("audit::SharedProbe")
                 }
             }
-            trait_type_map::impl_trait_accessible!(dyn Component; SharedProbe);
         }
 
         mod second_copy {
@@ -1129,7 +1127,6 @@ mod tests {
                     Some("audit::SharedProbe")
                 }
             }
-            trait_type_map::impl_trait_accessible!(dyn Component; SharedProbe);
         }
 
         static FIELDS_A: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {

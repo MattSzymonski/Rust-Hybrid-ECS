@@ -15,7 +15,6 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 pill_core = { path = "../../pill_core" }
 pill_engine = { path = "../../pill_engine" }
-trait_type_map = { path = "../../../../Trait-Type-Map" }
 serde = { version = "1", features = ["derive"] }
 
 [features]

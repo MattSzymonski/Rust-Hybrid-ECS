@@ -45,7 +45,6 @@ pill_dummy_text = { path = "../../modules/optional/pill_dummy_text", default-fea
 pill_dummy_color = { path = "../../modules/optional/pill_dummy_color", default-features = false }
 pill_dummy_timer = { path = "../../modules/optional/pill_dummy_timer", default-features = false }
 pill_dummy_random = { path = "../../modules/optional/pill_dummy_random", default-features = false }
-trait_type_map = { path = "../../../Trait-Type-Map" }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 

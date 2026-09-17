@@ -30,7 +30,6 @@
 // External crates
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use pill_engine::{Component, Entity, Query, World};
-use trait_type_map::impl_trait_accessible;
 
 // =============================================================================
 // Constants
@@ -79,7 +78,6 @@ impl Component for Velocity {}
 
 // Registers the component types as trait-accessible so the type-erased
 // query machinery can downcast to them at runtime.
-impl_trait_accessible!(dyn Component; Position, Velocity);
 
 // =============================================================================
 // Free Functions

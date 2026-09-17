@@ -26,7 +26,6 @@
 
 // External crates
 use pill_engine::*;
-use trait_type_map::impl_trait_accessible;
 
 // ============================================================================
 // Components
@@ -55,7 +54,6 @@ struct Velocity {
 impl Component for Velocity {}
 
 // Required for component storage
-impl_trait_accessible!(dyn Component; Position, Velocity);
 
 // ============================================================================
 // Resources

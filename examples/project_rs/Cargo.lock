@@ -1123,7 +1123,6 @@ dependencies = [
  "pill_engine",
  "pollster",
  "thiserror 2.0.20",
- "trait_type_map",
  "wgpu",
 ]
 
@@ -1136,7 +1135,6 @@ dependencies = [
  "pill_engine",
  "pill_hot_scan",
  "serde",
- "trait_type_map",
 ]
 
 [[package]]
@@ -1214,7 +1212,6 @@ dependencies = [
  "pill_spline",
  "serde",
  "tracing",
- "trait_type_map",
 ]
 
 [[package]]

@@ -922,7 +922,6 @@ mod tests {
     use super::*;
     use crate::archetype::Blittability;
     use crate::world::World;
-    use trait_type_map::impl_trait_accessible;
 
     #[derive(Debug, Clone, Copy, PartialEq)]
     struct Position {
@@ -945,8 +944,6 @@ mod tests {
     impl Component for Position {}
     impl Component for Velocity {}
     impl Component for Health {}
-
-    impl_trait_accessible!(dyn Component; Position, Velocity, Health);
 
     /// Tests basic entity creation through the deferred command queue.
     ///

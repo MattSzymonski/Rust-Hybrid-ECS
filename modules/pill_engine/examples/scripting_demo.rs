@@ -17,7 +17,6 @@
 
 // External crates
 use pill_engine::*;
-use trait_type_map::impl_trait_accessible;
 
 // =============================================================================
 // Counter
@@ -102,7 +101,6 @@ struct Position {
 impl Component for Position {}
 
 // Make components accessible through trait objects
-impl_trait_accessible!(dyn Component; Counter, Position);
 
 // =============================================================================
 // Entry Point

@@ -724,7 +724,7 @@ fn resolve_aliases(
             let predecessor = store.read().iter().find_map(|(stable_id, binding)| {
                 (binding.component_id() == component_id
                     && matches!(binding, ComponentBinding::Managed { .. }))
-                .then(|| (*stable_id, *binding))
+                .then_some((*stable_id, *binding))
             });
             let Some((predecessor_stable_id, binding)) = predecessor else {
                 continue;

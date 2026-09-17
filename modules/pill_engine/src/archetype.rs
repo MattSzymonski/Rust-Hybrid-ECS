@@ -360,17 +360,72 @@ impl ComponentLayout {
             blittability,
         })
     }
+
+    /// The same, for a layout a Rust type described rather than a manifest.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::new`], except that a zero size is accepted - see
+    /// [`validate_native_component_layout`].
+    pub fn new_native(
+        size: usize,
+        align: usize,
+        schema_hash: u64,
+        blittability: Blittability,
+    ) -> Result<Self, WorldError> {
+        validate_native_component_layout(size, align)?;
+        Ok(Self {
+            size,
+            align,
+            schema_hash,
+            blittability,
+        })
+    }
 }
 
-/// Check that a size and alignment can describe a component layout.
+/// A non-null, correctly aligned pointer for a column that owns no allocation.
+///
+/// `NonNull::dangling()` would give address 1, which is aligned for `u8` and
+/// not for anything wider - and a zero-sized column *keeps* this pointer for
+/// life, because it never allocates, so its rows are read and written through
+/// it. Deriving the address from the element's alignment is what makes those
+/// accesses well-formed; it is the same trick `NonNull::<T>::dangling` plays,
+/// spelled for an alignment known only at run time.
+fn unallocated_pointer(align: usize) -> NonNull<u8> {
+    debug_assert!(align.is_power_of_two(), "alignment was validated");
+    // SAFETY: a validated alignment is a power of two, so it is never zero.
+    unsafe { NonNull::new_unchecked(align as *mut u8) }
+}
+
+/// Check that a size and alignment can describe a *descriptor* component layout.
 ///
 /// Shared by registration and relayout so the two can never disagree about what
 /// a usable layout is. The errors name the offending layout rather than the
 /// caller, because both callers hand the same three facts to the same engine.
+///
+/// A zero width is refused here and allowed by
+/// [`validate_native_component_layout`], and the split is deliberate. A
+/// descriptor's width arrives from a manifest another language wrote, where
+/// zero means the declaration is wrong - C# has no zero-sized struct, an empty
+/// one is a byte wide. A Rust type's width is a fact the compiler computed, and
+/// zero is the ordinary tag/marker idiom (`struct Enemy;`). Refusing both was
+/// the regression this split repairs: the native path fed the refusal into an
+/// `.expect`, so declaring a marker component aborted the process.
 pub(crate) fn validate_component_layout(size: usize, align: usize) -> Result<(), WorldError> {
     if size == 0 {
         return Err(WorldError::DescriptorSizeZero);
     }
+    validate_native_component_layout(size, align)
+}
+
+/// Check that a size and alignment can describe a *native* component layout.
+///
+/// As [`validate_component_layout`], minus the zero-width refusal: a zero-sized
+/// Rust type is a marker component, and its column simply owns no allocation.
+pub(crate) fn validate_native_component_layout(
+    size: usize,
+    align: usize,
+) -> Result<(), WorldError> {
     if align == 0 || !align.is_power_of_two() {
         return Err(WorldError::DescriptorAlignmentInvalid);
     }
@@ -784,11 +839,12 @@ impl ComponentColumn {
     pub fn new(layout: ComponentLayout) -> Result<Self, WorldError> {
         validate_component_layout(layout.size, layout.align)?;
         let ops = ColumnOps::blittable(layout.blittability);
+        let data = unallocated_pointer(layout.align);
         Ok(Self {
             layout,
             ops,
             identity: ColumnIdentity::Descriptor,
-            data: NonNull::dangling(),
+            data,
             len: 0,
             capacity: 0,
         })
@@ -824,7 +880,8 @@ impl ComponentColumn {
         // from `info.ops` - but the layout type requires a witness, so the
         // claim is made where it is provably unused.
         let blittability = unsafe { Blittability::assume() };
-        let layout = ComponentLayout::new(info.size, info.align, schema_hash, blittability)?;
+        let layout = ComponentLayout::new_native(info.size, info.align, schema_hash, blittability)?;
+        let data = unallocated_pointer(layout.align);
         Ok(Self {
             layout,
             ops: info.ops,
@@ -833,7 +890,7 @@ impl ComponentColumn {
             } else {
                 ColumnIdentity::Native(info.type_id)
             },
-            data: NonNull::dangling(),
+            data,
             len: 0,
             capacity: 0,
         })
@@ -1326,8 +1383,10 @@ impl ComponentColumn {
         // because a relayout is not a reason to re-grow on the next push.
         let mut new_data = old_data;
         if !in_place {
-            new_data = if self.capacity == 0 {
-                NonNull::dangling()
+            new_data = if self.capacity == 0 || layout.size == 0 {
+                // Nothing to hold, so nothing to allocate - a shape that became
+                // a marker keeps only its row count.
+                unallocated_pointer(layout.align)
             } else {
                 let bytes = layout
                     .size
@@ -1385,7 +1444,9 @@ impl ComponentColumn {
         // test `Drop` uses, so a column that never allocated never reaches
         // `dealloc`.
         if !in_place {
-            if self.capacity != 0 {
+            // As in `Drop`: a zero-sized predecessor allocated nothing, however
+            // much capacity it reported.
+            if self.capacity != 0 && old_size != 0 {
                 // SAFETY: this is the live allocation, created with this layout.
                 unsafe {
                     dealloc(
@@ -1472,6 +1533,14 @@ impl ComponentColumn {
         if new_capacity <= self.capacity {
             return Ok(());
         }
+        // A zero-sized element has no bytes to hold, so there is nothing to
+        // allocate and every row is the same (aligned, dangling) address. The
+        // capacity is still tracked, because `reserve_one` doubles it and the
+        // row count is the column's only real state.
+        if self.layout.size == 0 {
+            self.capacity = new_capacity;
+            return Ok(());
+        }
         let new_layout = Layout::from_size_align(
             self.layout
                 .size
@@ -1547,7 +1616,9 @@ impl Drop for ComponentColumn {
             // element type, and the table is the one that wrote them.
             unsafe { (self.ops.drop_range)(self.data.as_ptr(), self.len) };
         }
-        if self.capacity != 0 {
+        // `size != 0` joins the capacity test because a zero-sized column
+        // reports a capacity it never allocated for.
+        if self.capacity != 0 && self.layout.size != 0 {
             // SAFETY: this is the live allocation created by reserve_one.
             unsafe {
                 dealloc(
@@ -1658,7 +1729,7 @@ impl Archetype {
                     component_storages.insert(
                         component_id,
                         ComponentColumn::from_native_info(*info, 0)
-                            .expect("a registered native layout must describe an allocation"),
+                            .expect("a registered native layout is valid by construction"),
                     );
                 }
                 StorageFactory::Descriptor(layout) => {

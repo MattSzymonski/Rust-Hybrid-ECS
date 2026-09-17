@@ -91,6 +91,44 @@ EXTERNALLY_PRODUCED: Dict[str, str] = {
         "Composed at runtime from the component's type name and its verdict.",
     "'project::LinearVelocity' -> migrating":
         "Composed at runtime from the component's type name and its verdict.",
+    "'project::MarkerTrail' -> migrating":
+        "Composed at runtime from the component's type name and its verdict.",
+    "are still loaded after":
+        "Emitted by the .NET bridge (ProjectHost.cs), whose source is C# "
+        "rather than Rust.",
+    "awaiting the host's verdict":
+        "Emitted by the .NET bridge (ProjectHost.cs), whose source is C# "
+        "rather than Rust.",
+    "components=1 entities=3":
+        "Composed at runtime: `components` and `entities` are structured "
+        "fields on the retirement line in csharp/components.rs, and their "
+        "values are counts.",
+    "resources=1 dropped=1":
+        "Composed at runtime: `resources` and `dropped` are structured fields "
+        "on the resource-retirement line in csharp/components.rs, and their "
+        "values are counts.",
+    "existing=1":
+        "Composed at runtime: `existing` is a structured field on "
+        "pill_spline's registration line, and its value is a count.",
+    "[project_cs] sample extra=7.5":
+        "Printed by C# that test_csharp_bridge.py injects into "
+        "examples/project_cs during the run, to witness a field default.",
+    "probe retirement markers seeded":
+        "Printed by C# that test_csharp_bridge.py injects into "
+        "examples/project_cs during the run, to witness declaration "
+        "retirement.",
+    "SHARED RESOURCE PROBE":
+        "Printed by Rust that test_shared_component_identity.py injects into "
+        "the project during the run.",
+    "SHARED RESOURCE WRITER MODULE":
+        "Printed by Rust that test_shared_component_identity.py injects into "
+        "pill_spline during the run.",
+    "SHARED RESOURCE WRITER PROJECT":
+        "Printed by Rust that test_shared_component_identity.py injects into "
+        "the project during the run.",
+    "TIME SURVIVAL PROBE":
+        "Printed by Rust that test_shared_component_identity.py injects into "
+        "the project during the run.",
 }
 
 # Tokens whose whole point is to distinguish one reload subject from another.

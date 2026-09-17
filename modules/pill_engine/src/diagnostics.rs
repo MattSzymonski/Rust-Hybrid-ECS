@@ -437,14 +437,12 @@ mod tests {
         _y: f32,
     }
     impl Component for Position {}
-    trait_type_map::impl_trait_accessible!(dyn Component; Position);
 
     #[derive(Clone, Debug)]
     struct Velocity {
         _x: f32,
     }
     impl Component for Velocity {}
-    trait_type_map::impl_trait_accessible!(dyn Component; Velocity);
 
     /// An empty world reports zeroes rather than failing, and says so in place
     /// of printing an empty archetype list.

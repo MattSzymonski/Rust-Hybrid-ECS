@@ -34,7 +34,6 @@
 use pill_engine::{
     Added, Changed, Commands, Component, Engine, Entity, Query, ResMut, Resource, With, Without,
 };
-use trait_type_map::impl_trait_accessible;
 
 // ============================================================================
 // Position
@@ -97,8 +96,6 @@ impl Component for Player {}
 // ============================================================================
 // Trait-object registration
 // ============================================================================
-
-impl_trait_accessible!(dyn Component; Position, Velocity, Health, Player);
 
 // ============================================================================
 // FrameCounter

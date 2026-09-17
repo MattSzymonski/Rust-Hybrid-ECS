@@ -42,7 +42,6 @@
 
 // External crates
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use trait_type_map::impl_trait_accessible;
 
 // Current crate
 use pill_engine::*;
@@ -99,8 +98,6 @@ impl Component for RenderData {}
 #[derive(Debug, Clone)]
 struct PhysicsData([[f32; 4]; 8]);
 impl Component for PhysicsData {}
-
-impl_trait_accessible!(dyn Component; Position, Velocity, Health, Enemy, Mass, GravityForce, RenderData, PhysicsData);
 
 // =============================================================================
 // Profile

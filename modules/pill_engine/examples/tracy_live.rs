@@ -31,7 +31,6 @@ use std::time::Instant;
 
 // External crates
 use pill_engine::*;
-use trait_type_map::impl_trait_accessible;
 
 // =============================================================================
 // Position
@@ -135,7 +134,6 @@ impl Component for PhysicsData {}
 
 // Registers all eight component types with the trait-type map so the ECS can
 // type-erase them behind the `Component` trait object.
-impl_trait_accessible!(dyn Component; Position, Velocity, Health, Enemy, Mass, GravityForce, RenderData, PhysicsData);
 
 // =============================================================================
 // Systems

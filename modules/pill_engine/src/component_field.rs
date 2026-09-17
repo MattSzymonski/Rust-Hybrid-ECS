@@ -1273,7 +1273,6 @@ mod tests {
         an_array: [i16; 3],
     }
     impl Component for SampleComponent {}
-    trait_type_map::impl_trait_accessible!(dyn Component; SampleComponent);
 
     /// A second registered type the sample entity's archetype never carries,
     /// used to drive the write path into its storage-missing arms.
@@ -1283,7 +1282,6 @@ mod tests {
         value: u32,
     }
     impl Component for OtherComponent {}
-    trait_type_map::impl_trait_accessible!(dyn Component; OtherComponent);
 
     // A hand-rolled registration mirroring what #[derive(PillComponent)] emits.
     static SAMPLE_FIELDS: &[ComponentFieldDescriptor] = &[

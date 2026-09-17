@@ -30,7 +30,6 @@ use std::any::TypeId;
 // External crates
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use pill_engine::*;
-use trait_type_map::impl_trait_accessible;
 
 // =============================================================================
 // Constants
@@ -77,7 +76,6 @@ macro_rules! define_components {
             struct $name(f32);
             impl Component for $name {}
         )*
-        impl_trait_accessible!(dyn Component; $($name),*);
     };
 }
 

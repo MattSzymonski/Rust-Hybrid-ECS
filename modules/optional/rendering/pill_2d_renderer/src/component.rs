@@ -34,7 +34,6 @@
 use pill_engine::component::Component;
 use pill_engine::component_registry::ComponentFieldDescriptor;
 use pill_engine::world::World;
-use trait_type_map::impl_trait_accessible;
 
 // =============================================================================
 // Components
@@ -53,7 +52,6 @@ pub struct Position {
     pub y: f32,
 }
 impl Component for Position {}
-impl_trait_accessible!(dyn Component; Position);
 
 /// Plain RGBA color, backend-agnostic (0.0-1.0 per channel).
 ///
@@ -72,7 +70,6 @@ pub struct Color {
     pub a: f32,
 }
 impl Component for Color {}
-impl_trait_accessible!(dyn Component; Color);
 
 impl Color {
     /// Opaque white, the default fill color of [`Sprite`].
@@ -110,7 +107,6 @@ pub struct Sprite {
     pub color: Color,
 }
 impl Component for Sprite {}
-impl_trait_accessible!(dyn Component; Sprite);
 
 impl Default for Sprite {
     fn default() -> Self {
@@ -481,7 +477,6 @@ unsafe fn read_shared_component<T: Copy>(row: *const u8) -> T {
 mod shared_component_tests {
     use super::*;
     use pill_engine::component::ComponentId;
-    use trait_type_map::impl_trait_accessible;
 
     /// Layout-compatible stand-in with a different TypeId than Position.
     #[repr(C)]
@@ -492,7 +487,6 @@ mod shared_component_tests {
     }
 
     impl Component for ForeignPosition {}
-    impl_trait_accessible!(dyn Component; ForeignPosition);
 
     /// Layout-compatible stand-in with a different TypeId than Sprite.
     #[repr(C)]
@@ -504,7 +498,6 @@ mod shared_component_tests {
     }
 
     impl Component for ForeignSprite {}
-    impl_trait_accessible!(dyn Component; ForeignSprite);
 
     /// Shared renderer layouts can be read even when their native TypeIds
     /// originate from a different compilation unit.

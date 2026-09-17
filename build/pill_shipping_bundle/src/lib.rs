@@ -1,18 +1,49 @@
-//! Committed stub for the generated shipping bundle.
-//!
-//! The real bundle declares the project and every optional module its
-//! `project_settings.yaml` selects, and exposes the `static_project()` entry
-//! point `pill_standalone` calls under `static_project` / `static_csharp`.
-//! It is written by `devops/tools/generate_shipping_bundle.py`, which
-//! overwrites this file.
-//!
-//! This placeholder exists purely so the path dependency resolves. Cargo reads
-//! every workspace manifest before it evaluates features, so without a
-//! directory here even a plain debug build fails - see the note in
-//! `pill_standalone/Cargo.toml`. Nothing links this stub: the features that
-//! would pull the bundle in are off in a dev build, and a shipping build has
-//! replaced the file by the time they are on.
-//!
-//! It is intentionally empty rather than a no-op `static_project()`: a
-//! shipping build that somehow reached this stub should fail to compile with
-//! a missing-function error, not silently launch with no project.
+//! Generated shipping bundle - do not edit. Regenerated from
+//! the project's `project_settings.yaml` by
+//! `devops/tools/generate_shipping_bundle.py`.
+
+use pill_host::{StaticModule, StaticProject, StaticProjectBackend};
+
+/// Every selected optional module, in `project_settings.yaml` order.
+pub const STATIC_MODULES: &[StaticModule] = &[
+    StaticModule {
+        name: "pill_spline",
+        init: pill_spline::register,
+    },
+    StaticModule {
+        name: "pill_dummy_math",
+        init: pill_dummy_math::register,
+    },
+    StaticModule {
+        name: "pill_dummy_text",
+        init: pill_dummy_text::register,
+    },
+    StaticModule {
+        name: "pill_dummy_color",
+        init: pill_dummy_color::register,
+    },
+    StaticModule {
+        name: "pill_dummy_timer",
+        init: pill_dummy_timer::register,
+    },
+    StaticModule {
+        name: "pill_dummy_random",
+        init: pill_dummy_random::register,
+    },
+];
+
+/// The project backend for this shipping project.
+pub fn project_backend() -> StaticProjectBackend {
+    StaticProjectBackend::Native {
+        init: project::init,
+    }
+}
+
+/// The complete shipping project: modules first, then the project.
+pub fn static_project() -> StaticProject {
+    StaticProject {
+        name: "Bouncing Balls",
+        backend: project_backend(),
+        modules: STATIC_MODULES,
+    }
+}

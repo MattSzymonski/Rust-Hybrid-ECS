@@ -26,6 +26,8 @@ use pill_core::error::CSharpError;
 #[cfg(feature = "hot_reload")]
 use pill_core::{error, info};
 use pill_engine::commands::CommandQueue;
+#[cfg(feature = "hot_reload")]
+use pill_engine::SystemOwner;
 use pill_engine::{Engine, SystemAccess, SystemError, World};
 
 // Current crate
@@ -168,6 +170,12 @@ struct ManagedSystemSnapshot {
     accesses: Box<[NativeSystemAccess]>,
     /// Whether the managed system declared a Commands parameter.
     uses_commands: bool,
+    /// The name the system was registered under, after the synthetic fallback.
+    ///
+    /// Recorded because a rename changes nothing else a reload can observe -
+    /// not the accesses, not the Commands flag - yet it is the identity the
+    /// scheduler, the profiler and every log line report.
+    name: Box<str>,
 }
 
 /// Owns one hosted managed runtime: CoreCLR through hostfxr, or a loaded
@@ -218,6 +226,13 @@ pub(crate) struct CSharpRuntime {
     get_access: GetSystemAccessFn,
     /// Unmanaged export reporting whether one system declares a Commands parameter.
     system_uses_commands: SystemUsesCommandsFn,
+    /// Every export a re-registration pass needs.
+    ///
+    /// Held so a reload can rebuild the scheduler's managed systems from the
+    /// arriving assembly. The four fields above duplicate members of this
+    /// bundle because the reload's cheap comparison path reads them directly,
+    /// one system at a time, without cloning anything.
+    exports: SystemExports,
     #[cfg(feature = "hot_reload")]
     /// Outcome of the most recent reload poll, for one-shot rejection logging.
     last_poll_status: u8,
@@ -243,6 +258,151 @@ pub(crate) struct CSharpRuntime {
     _runtime: ManagedRuntimeContext,
     /// Keeps the native API table alive so registered closures stay valid.
     _api: Box<CsEngineApi>,
+}
+
+/// The managed exports one system-registration pass needs.
+///
+/// Bundled rather than passed loose because the pass has three callers - the
+/// reloading backend's start, the AOT backend's start, and the reload that
+/// re-registers a changed system set. Nine loose function pointers per call
+/// site is how the two startups came to hold character-identical copies of the
+/// same loop, which then had to be kept in step by hand.
+#[derive(Clone, Copy)]
+struct SystemExports {
+    /// Reports how many systems the assembly registered.
+    system_count: SystemCountFn,
+    /// Reports how many accesses one system declared.
+    access_count: SystemAccessCountFn,
+    /// Copies one system's reflected accesses into a caller buffer.
+    get_access: GetSystemAccessFn,
+    /// Reports whether one system declares a Commands parameter.
+    system_uses_commands: SystemUsesCommandsFn,
+    /// Invokes one system for a frame.
+    run_system: RunSystemFn,
+    /// Byte length of one system's reflected name.
+    system_name_length: SystemNameLengthFn,
+    /// Copies that name into a caller buffer.
+    copy_system_name: CopySystemNameFn,
+    /// Byte length of the message a failed system left.
+    system_error_length: SystemErrorMessageLengthFn,
+    /// Copies that message into a caller buffer.
+    copy_system_error: CopySystemErrorMessageFn,
+}
+
+/// Reflect every managed system and register it with the scheduler.
+///
+/// The single registration path: both startups and the reload re-registration
+/// call it, which is what keeps "how a system is registered" from drifting
+/// between the posture that starts one and the posture that replaces one. The
+/// returned snapshot is the metadata a later reload compares against to decide
+/// whether the set changed at all.
+///
+/// # Errors
+///
+/// Returns [`CSharpError::NoSystems`] for an assembly that registered none,
+/// [`CSharpError::SystemAccessFailed`] when an access cannot be read, and
+/// whatever [`derive_system_access`] refuses - an unregistered component or
+/// resource key, or an unknown access mode.
+fn register_managed_systems(
+    engine: &mut Engine,
+    bindings: &Arc<BindingStore>,
+    exports: SystemExports,
+) -> Result<Vec<ManagedSystemSnapshot>, CSharpError> {
+    let count = (exports.system_count)();
+    if count == 0 {
+        return Err(CSharpError::NoSystems);
+    }
+    let mut system_snapshot = Vec::new();
+    system_snapshot
+        .try_reserve_exact(checked_system_count(count)?)
+        .map_err(|_| CSharpError::SystemSnapshotAllocationFailed)?;
+    for system_index in 0..count {
+        let system_access_count = (exports.access_count)(system_index);
+        let mut managed_access = Vec::with_capacity(checked_access_count(system_access_count)?);
+        for access_index in 0..system_access_count {
+            let mut item = NativeSystemAccess {
+                component_key: 0,
+                component_key_high: 0,
+                mode: 0,
+                kind: 0,
+            };
+            if (exports.get_access)(system_index, access_index, &mut item) == 0 {
+                return Err(CSharpError::SystemAccessFailed {
+                    system: system_index,
+                    access: access_index,
+                });
+            }
+            managed_access.push(item);
+        }
+        // The reflected count and the recorded accesses move together: a
+        // future early exit inside the fill loop must not leave the snapshot
+        // short of what the managed side reported.
+        debug_assert_eq!(managed_access.len(), system_access_count as usize);
+
+        let uses_commands = (exports.system_uses_commands)(system_index) != 0;
+        let mut access = derive_system_access(&managed_access, &bindings.read())?;
+        access.set_uses_commands(uses_commands);
+        // Prefer the reflected managed name (type and method) so profiling and
+        // scheduler debugging show real identities; fall back to a synthetic
+        // index-based name when the export is unavailable.
+        let name = resolved_system_name(
+            exports.system_name_length,
+            exports.copy_system_name,
+            system_index,
+        );
+        // Snapshot the reflected metadata before moving the access list into
+        // the scheduler closure, so a later reload can tell a behaviour-only
+        // swap from one that changed a signature.
+        system_snapshot.push(ManagedSystemSnapshot {
+            accesses: managed_access.clone().into_boxed_slice(),
+            uses_commands,
+            name: name.as_str().into(),
+        });
+        let managed_access = managed_access.into_boxed_slice();
+        let system_bindings = Arc::clone(bindings);
+        let run_system = exports.run_system;
+        let system_error_length = exports.system_error_length;
+        let copy_system_error = exports.copy_system_error;
+        // SAFETY: `derive_system_access` has resolved every managed access and
+        // the closure exposes the world only under that exact list.
+        unsafe {
+            engine.register_system_with_access(
+                name,
+                access,
+                move |world: &mut World, queue: &mut CommandQueue| -> Result<(), SystemError> {
+                    // Without a scope every managed callback this system makes
+                    // would fail, so report it as a system error rather than
+                    // running it blind. One read of the live table for the
+                    // whole run: a reload can add or reshape a component
+                    // between frames, and the scope has to describe the
+                    // storage this run actually touches.
+                    let system_bindings = system_bindings.read();
+                    let Some(_guard) = ActiveSystemGuard::set_with_commands(
+                        world,
+                        queue,
+                        &managed_access,
+                        &system_bindings,
+                        uses_commands,
+                    ) else {
+                        return Err(SystemError::Managed {
+                            message: "nested managed system invocation".to_string(),
+                        });
+                    };
+                    if run_system(system_index) == 0 {
+                        return Err(SystemError::Managed {
+                            message: managed_system_error_message(
+                                system_error_length,
+                                copy_system_error,
+                                system_index,
+                            ),
+                        });
+                    }
+                    Ok(())
+                },
+            );
+        }
+    }
+    Ok(system_snapshot)
 }
 
 /// Resolves one managed artifact (a runtime assembly, its `runtimeconfig.json`,
@@ -507,93 +667,18 @@ impl CSharpRuntime {
 
         // Step 4: Reflect each system's accesses and register it with the
         // scheduler under the exact resolved read/write list.
-        let count = system_count();
-        if count == 0 {
-            return Err(CSharpError::NoSystems);
-        }
-        let mut system_snapshot = Vec::new();
-        system_snapshot
-            .try_reserve_exact(checked_system_count(count)?)
-            .map_err(|_| CSharpError::SystemSnapshotAllocationFailed)?;
-        for system_index in 0..count {
-            let system_access_count = access_count(system_index);
-            let mut managed_access = Vec::with_capacity(checked_access_count(system_access_count)?);
-            for access_index in 0..system_access_count {
-                let mut item = NativeSystemAccess {
-                    component_key: 0,
-                    component_key_high: 0,
-                    mode: 0,
-                    kind: 0,
-                };
-                if get_access(system_index, access_index, &mut item) == 0 {
-                    return Err(CSharpError::SystemAccessFailed {
-                        system: system_index,
-                        access: access_index,
-                    });
-                }
-                managed_access.push(item);
-            }
-            // The reflected count and the recorded accesses move together: a
-            // future early exit inside the fill loop must not leave the
-            // snapshot short of what the managed side reported.
-            debug_assert_eq!(managed_access.len(), system_access_count as usize);
-
-            let uses_commands = system_uses_commands(system_index) != 0;
-            let mut access = derive_system_access(&managed_access, &bindings.read())?;
-            access.set_uses_commands(uses_commands);
-            // Snapshot the reflected metadata before moving the access list
-            // into the scheduler closure, so reloads can verify that the
-            // managed side never changes it silently.
-            system_snapshot.push(ManagedSystemSnapshot {
-                accesses: managed_access.clone().into_boxed_slice(),
-                uses_commands,
-            });
-            let managed_access = managed_access.into_boxed_slice();
-            let system_bindings = Arc::clone(&bindings);
-            // Prefer the reflected managed name (type and method) so profiling
-            // and scheduler debugging show real identities; fall back to a
-            // synthetic index-based name when the export is unavailable.
-            let name = managed_system_name(system_name_length, copy_system_name, system_index)
-                .unwrap_or_else(|| format!("csharp_system_{system_index}"));
-            // SAFETY: `derive_system_access` has resolved every managed access
-            // and the closure exposes the world only under that exact list.
-            unsafe {
-                engine.register_system_with_access(
-                    name,
-                    access,
-                    move |world: &mut World, queue: &mut CommandQueue| -> Result<(), SystemError> {
-                        // As above: without a scope every managed callback
-                        // this system makes would fail, so report it as a
-                        // system error rather than running it blind. The live
-                        // table is locked for the whole run, so a component a
-                        // reload reshaped between frames is not read here
-                        // through the layout it had at registration.
-                        let system_bindings = system_bindings.read();
-                        let Some(_guard) = ActiveSystemGuard::set_with_commands(
-                            world,
-                            queue,
-                            &managed_access,
-                            &system_bindings,
-                            uses_commands,
-                        ) else {
-                            return Err(SystemError::Managed {
-                                message: "nested managed system invocation".to_string(),
-                            });
-                        };
-                        if run_system(system_index) == 0 {
-                            return Err(SystemError::Managed {
-                                message: managed_system_error_message(
-                                    system_error_length,
-                                    copy_system_error,
-                                    system_index,
-                                ),
-                            });
-                        }
-                        Ok(())
-                    },
-                );
-            }
-        }
+        let exports = SystemExports {
+            system_count,
+            access_count,
+            get_access,
+            system_uses_commands,
+            run_system,
+            system_name_length,
+            copy_system_name,
+            system_error_length,
+            copy_system_error,
+        };
+        let system_snapshot = register_managed_systems(engine, &bindings, exports)?;
 
         Ok(Self {
             poll_reload,
@@ -601,6 +686,7 @@ impl CSharpRuntime {
             access_count,
             get_access,
             system_uses_commands,
+            exports,
             #[cfg(feature = "hot_reload")]
             last_poll_status: POLL_NO_CHANGE,
             system_snapshot,
@@ -766,84 +852,18 @@ impl CSharpRuntime {
             })?;
 
         // Step 4: register each system with the scheduler under its accesses.
-        let count = system_count();
-        if count == 0 {
-            return Err(CSharpError::NoSystems);
-        }
-        let mut system_snapshot = Vec::new();
-        system_snapshot
-            .try_reserve_exact(checked_system_count(count)?)
-            .map_err(|_| CSharpError::SystemSnapshotAllocationFailed)?;
-        for system_index in 0..count {
-            let system_access_count = access_count(system_index);
-            let mut managed_access = Vec::with_capacity(checked_access_count(system_access_count)?);
-            for access_index in 0..system_access_count {
-                let mut item = NativeSystemAccess {
-                    component_key: 0,
-                    component_key_high: 0,
-                    mode: 0,
-                    kind: 0,
-                };
-                if get_access(system_index, access_index, &mut item) == 0 {
-                    return Err(CSharpError::SystemAccessFailed {
-                        system: system_index,
-                        access: access_index,
-                    });
-                }
-                managed_access.push(item);
-            }
-            // The reflected count and the recorded accesses move together: a
-            // future early exit inside the fill loop must not leave the
-            // snapshot short of what the managed side reported.
-            debug_assert_eq!(managed_access.len(), system_access_count as usize);
-
-            let uses_commands = system_uses_commands(system_index) != 0;
-            let mut access = derive_system_access(&managed_access, &bindings.read())?;
-            access.set_uses_commands(uses_commands);
-            system_snapshot.push(ManagedSystemSnapshot {
-                accesses: managed_access.clone().into_boxed_slice(),
-                uses_commands,
-            });
-            let managed_access = managed_access.into_boxed_slice();
-            let system_bindings = Arc::clone(&bindings);
-            let name = managed_system_name(system_name_length, copy_system_name, system_index)
-                .unwrap_or_else(|| format!("csharp_system_{system_index}"));
-            // SAFETY: `derive_system_access` has resolved every managed access
-            // and the closure exposes the world only under that exact list.
-            unsafe {
-                engine.register_system_with_access(
-                    name,
-                    access,
-                    move |world: &mut World, queue: &mut CommandQueue| -> Result<(), SystemError> {
-                        // One read of the live table for this run: a reload can
-                        // add a component or reshape one between frames, and the
-                        // scope has to describe the storage this run touches.
-                        let system_bindings = system_bindings.read();
-                        let Some(_guard) = ActiveSystemGuard::set_with_commands(
-                            world,
-                            queue,
-                            &managed_access,
-                            &system_bindings,
-                            uses_commands,
-                        ) else {
-                            return Err(SystemError::Managed {
-                                message: "nested managed system invocation".to_string(),
-                            });
-                        };
-                        if run_system(system_index) == 0 {
-                            return Err(SystemError::Managed {
-                                message: managed_system_error_message(
-                                    system_error_length,
-                                    copy_system_error,
-                                    system_index,
-                                ),
-                            });
-                        }
-                        Ok(())
-                    },
-                );
-            }
-        }
+        let exports = SystemExports {
+            system_count,
+            access_count,
+            get_access,
+            system_uses_commands,
+            run_system,
+            system_name_length,
+            copy_system_name,
+            system_error_length,
+            copy_system_error,
+        };
+        let system_snapshot = register_managed_systems(engine, &bindings, exports)?;
 
         Ok(Self {
             poll_reload,
@@ -851,6 +871,7 @@ impl CSharpRuntime {
             access_count,
             get_access,
             system_uses_commands,
+            exports,
             #[cfg(feature = "hot_reload")]
             last_poll_status: POLL_NO_CHANGE,
             system_snapshot,
@@ -907,25 +928,25 @@ impl CSharpRuntime {
         }
         #[cfg(feature = "hot_reload")]
         if status == POLL_MANIFEST_PENDING {
-            return Ok(self.decide_parked_manifest(engine));
+            return self.decide_parked_manifest(engine);
         }
         if status == POLL_RELOADED {
-            if self.verify_systems_unchanged() {
-                info!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                    "C# hot reload complete"
-                );
-                // The swap is done and the manifest it carried may differ.
-                // Applying it here, before the frame's systems run, is what
-                // puts a migrated row in place before the new generation reads
-                // one.
-                self.apply_manifest_if_changed(engine);
-            } else {
-                error!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                    "reloaded assembly exposes different system metadata than the registered snapshot; restart the host to re-register systems"
-                );
+            // A changed system set is rebuilt rather than refused. The
+            // comparison stays because it is what keeps the ordinary
+            // behaviour-only swap cheap: that swap keeps its scheduler graph
+            // and pays one metadata comparison, and only a real signature
+            // change pays for a clear and a re-registration.
+            if !self.verify_systems_unchanged() {
+                self.reregister_systems(engine)?;
             }
+            info!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                "C# hot reload complete"
+            );
+            // The swap is done and the manifest it carried may differ.
+            // Applying it here, before the frame's systems run, is what puts a
+            // migrated row in place before the new generation reads one.
+            self.apply_manifest_if_changed(engine);
         }
         self.last_poll_status = status;
         Ok(status)
@@ -943,24 +964,20 @@ impl CSharpRuntime {
     ///
     /// Returns the status the caller should report: `POLL_RELOADED` when the
     /// swap happened, `POLL_REJECTED` when it did not.
+    ///
+    /// # Errors
+    ///
+    /// Whatever re-registering the arriving assembly's systems refuses, when
+    /// the committed version changed them.
     #[cfg(feature = "hot_reload")]
-    fn decide_parked_manifest(&mut self, engine: &mut Engine) -> u8 {
+    fn decide_parked_manifest(&mut self, engine: &mut Engine) -> Result<u8, CSharpError> {
         let Some(manifest) = self.read_pending_manifest() else {
             self.abort_parked("its component manifest could not be read");
-            return POLL_REJECTED;
+            return Ok(POLL_REJECTED);
         };
 
         match apply_component_manifest_on_reload(engine, &manifest, &self.bindings) {
             Ok(report) => {
-                // The same defence the ordinary reload path runs: a managed
-                // assembly whose system metadata drifted from the registered
-                // snapshot would run against stale index bindings. Checked
-                // before the swap here, so a mismatch costs an abort rather
-                // than a running generation.
-                if !self.verify_systems_unchanged() {
-                    self.abort_parked("its system metadata differs from the registered snapshot");
-                    return POLL_REJECTED;
-                }
                 if (self.commit_reload)() == 0 {
                     // The manifest is in force but the swap did not happen, so
                     // the running assembly now disagrees with the world. Say so
@@ -970,7 +987,15 @@ impl CSharpRuntime {
                         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                         "the managed loader failed to install a version whose manifest was already applied; restart the host"
                     );
-                    return POLL_REJECTED;
+                    return Ok(POLL_REJECTED);
+                }
+                // Only the commit swaps the managed system table, so this is
+                // the first point at which the exports describe the arriving
+                // assembly rather than the outgoing one - which is why the
+                // comparison cannot sit beside the manifest check above, where
+                // it could only ever compare the running set against itself.
+                if !self.verify_systems_unchanged() {
+                    self.reregister_systems(engine)?;
                 }
                 self.applied_manifest = manifest;
                 info!(
@@ -985,11 +1010,11 @@ impl CSharpRuntime {
                     resources_retired = report.resources_retired.len(),
                     "C# hot reload complete"
                 );
-                POLL_RELOADED
+                Ok(POLL_RELOADED)
             }
             Err(error) => {
                 self.abort_parked(&error.to_string());
-                POLL_REJECTED
+                Ok(POLL_REJECTED)
             }
         }
     }
@@ -1107,14 +1132,46 @@ impl CSharpRuntime {
         }
     }
 
-    /// Re-reflect the active project assembly and verify that its system metadata
-    /// still matches the snapshot captured at startup.
+    /// Rebuild the scheduler's managed systems from the arriving assembly.
     ///
-    /// The managed loader already rejects swaps whose system signatures
-    /// changed, so this is defense in depth: a mismatch means the loader
-    /// validation and the host snapshot disagree, and continuing would run
+    /// Only the project's systems are cleared, so a module's survive untouched
+    /// (the same scoping a module reload relies on). This runs between frames,
+    /// at the point the swap is applied, because clearing systems while the
+    /// scheduler is walking them is not safe.
+    ///
+    /// The snapshot is replaced only on success: a failed re-registration
+    /// leaves the world with no managed systems, and the snapshot has to
+    /// describe that rather than the set that is gone.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`register_managed_systems`] refuses - most often a system
+    /// declaring a component or resource the arriving manifest never
+    /// registered.
     #[cfg(feature = "hot_reload")]
-    /// stale index bindings.
+    fn reregister_systems(&mut self, engine: &mut Engine) -> Result<(), CSharpError> {
+        let removed = engine.clear_systems_owned_by(SystemOwner::PROJECT);
+        self.system_snapshot.clear();
+        self.system_snapshot = register_managed_systems(engine, &self.bindings, self.exports)?;
+        info!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            removed,
+            registered = self.system_snapshot.len(),
+            "re-registered the project's managed systems after a signature change"
+        );
+        Ok(())
+    }
+
+    /// Re-reflect the active project assembly and report whether its system
+    /// metadata still matches the snapshot captured at registration.
+    ///
+    /// This is no longer a gate but a fork: a match means the swap changed only
+    /// behaviour, so the scheduler graph stands and the reload costs one
+    /// comparison, while a mismatch sends the reload through
+    /// [`CSharpRuntime::reregister_systems`] to rebuild that graph. Comparing
+    /// first is worth it because the match is the common case - most reloads
+    /// edit a system body, not its signature.
+    #[cfg(feature = "hot_reload")]
     fn verify_systems_unchanged(&self) -> bool {
         let count = (self.system_count)();
         if count as usize != self.system_snapshot.len() {
@@ -1141,6 +1198,17 @@ impl CSharpRuntime {
                 }
             }
             if ((self.system_uses_commands)(system_index) != 0) != snapshot.uses_commands {
+                return false;
+            }
+            // Resolved the same way registration resolves it, fallback
+            // included, so an assembly that exposes no name export compares
+            // equal instead of re-registering on every single poll.
+            if resolved_system_name(
+                self.exports.system_name_length,
+                self.exports.copy_system_name,
+                system_index,
+            ) != *snapshot.name
+            {
                 return false;
             }
         }
@@ -1209,6 +1277,22 @@ pub(super) fn checked_access_count(count: u32) -> Result<usize, CSharpError> {
 ///
 /// Returns `None` when the name is missing, oversized, or not valid UTF-8;
 /// callers fall back to a synthetic index-based name.
+/// The name a system is registered under: the reflected one, or a synthetic
+/// fallback when the assembly exposes none.
+///
+/// Separate from [`managed_system_name`] because two callers must agree on the
+/// fallback - registration records what this returns, and the reload compares
+/// against it. A fallback applied in only one of them would make every poll of
+/// a nameless assembly look like a rename.
+fn resolved_system_name(
+    name_length: SystemNameLengthFn,
+    copy_name: CopySystemNameFn,
+    system_index: u32,
+) -> String {
+    managed_system_name(name_length, copy_name, system_index)
+        .unwrap_or_else(|| format!("csharp_system_{system_index}"))
+}
+
 fn managed_system_name(
     name_length: SystemNameLengthFn,
     copy_name: CopySystemNameFn,

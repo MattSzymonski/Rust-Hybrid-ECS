@@ -383,7 +383,7 @@ static INTERNED_FIELD_STRINGS: std::sync::Mutex<Option<HashSet<&'static str>>> =
     std::sync::Mutex::new(None);
 
 /// Return a `&'static str` equal to `value`, allocating only on first sight.
-fn intern(value: &str) -> &'static str {
+pub(super) fn intern(value: &str) -> &'static str {
     let mut guard = INTERNED_FIELD_STRINGS
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());

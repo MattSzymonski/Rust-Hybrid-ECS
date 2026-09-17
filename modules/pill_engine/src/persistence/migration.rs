@@ -329,7 +329,7 @@ impl World {
             archetype.component_storages.insert(
                 component_id,
                 crate::archetype::ComponentColumn::from_native_info(*info, 0)
-                    .expect("a registered native layout must describe an allocation"),
+                    .expect("a registered native layout is valid by construction"),
             );
 
             for component in migrated_components {

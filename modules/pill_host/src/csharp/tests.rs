@@ -2621,3 +2621,58 @@ fn an_unregistered_resource_access_is_refused() {
         error.to_plain_message()
     );
 }
+
+/// A managed resource's field layout reaches the engine, and survives a reshape.
+///
+/// The host is the only holder of a foreign resource's field names, so this is
+/// what makes one inspectable at all - and a reload that moves the fields has
+/// to republish them, because the engine drops the layout with the shape it
+/// described.
+#[test]
+fn a_managed_resource_publishes_its_field_layout() {
+    let _table = resource_test_scope();
+    let mut engine = Engine::new();
+    let before = resource_manifest_bytes(
+        "Inspectable",
+        8,
+        4,
+        1,
+        vec![manifest_field("a", 0, 4), manifest_field("b", 4, 4)],
+    );
+    let store = BindingStore::new(
+        register_component_manifest(&mut engine, &before, ComponentBindings::new())
+            .expect("the manifest registers"),
+    );
+    let id = resource_id_of("Inspectable");
+
+    let fields = engine
+        .world()
+        .resource_field_layout(id)
+        .expect("registration published the layout");
+    assert_eq!(fields.len(), 2);
+    assert_eq!(fields[0].name, "a");
+    assert_eq!(fields[1].offset, 4);
+
+    // A reshape moves the fields; the arriving layout has to replace the one
+    // the relayout dropped.
+    let after = resource_manifest_bytes(
+        "Inspectable",
+        12,
+        4,
+        2,
+        vec![
+            manifest_field("b", 0, 4),
+            manifest_field("a", 4, 4),
+            manifest_field("c", 8, 4),
+        ],
+    );
+    apply_component_manifest_on_reload(&mut engine, &after, &store)
+        .expect("a reshaped resource migrates");
+
+    let fields = engine
+        .world()
+        .resource_field_layout(id)
+        .expect("the reload republished the layout");
+    assert_eq!(fields.len(), 3, "the arriving shape is what is served");
+    assert_eq!(fields[0].name, "b", "and it is the arriving order");
+}

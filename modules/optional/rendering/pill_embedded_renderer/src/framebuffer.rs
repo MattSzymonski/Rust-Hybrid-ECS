@@ -166,23 +166,16 @@ impl Framebuffer {
 
     /// Blend a horizontal span over the existing pixels.
     ///
-    /// `alpha` is source coverage in 0.0-1.0. Source-over compositing, matching
-    /// the `ALPHA_BLENDING` state the wgpu backend sets, so both renderers
-    /// agree on what a translucent sprite looks like.
+    /// `color` is linear RGBA in 0.0-1.0, in the channel order a sprite
+    /// instance already stores it, with alpha as source coverage. Source-over
+    /// compositing, matching the `ALPHA_BLENDING` state the wgpu backend sets,
+    /// so both renderers agree on what a translucent sprite looks like.
     #[inline]
-    pub fn blend_span(
-        &mut self,
-        y: u32,
-        x_start: u32,
-        x_end: u32,
-        red: f32,
-        green: f32,
-        blue: f32,
-        alpha: f32,
-    ) {
+    pub fn blend_span(&mut self, y: u32, x_start: u32, x_end: u32, color: [f32; 4]) {
         let Some((start, end)) = self.span_bounds(y, x_start, x_end) else {
             return;
         };
+        let [red, green, blue, alpha] = color;
         let inverse = 1.0 - alpha;
         for pixel in &mut self.pixels[start..end] {
             let (destination_red, destination_green, destination_blue) = unpack_rgb565(*pixel);
@@ -319,10 +312,10 @@ mod tests {
         let mut framebuffer = Framebuffer::new(2, 1);
         framebuffer.clear(pack_rgb565(0.0, 0.0, 1.0));
 
-        framebuffer.blend_span(0, 0, 1, 1.0, 0.0, 0.0, 1.0);
+        framebuffer.blend_span(0, 0, 1, [1.0, 0.0, 0.0, 1.0]);
         assert_eq!(framebuffer.pixel(0, 0), Some(pack_rgb565(1.0, 0.0, 0.0)));
 
-        framebuffer.blend_span(0, 1, 2, 1.0, 0.0, 0.0, 0.0);
+        framebuffer.blend_span(0, 1, 2, [1.0, 0.0, 0.0, 0.0]);
         assert_eq!(framebuffer.pixel(1, 0), Some(pack_rgb565(0.0, 0.0, 1.0)));
     }
 
@@ -331,7 +324,7 @@ mod tests {
     fn blending_mixes_source_and_destination() {
         let mut framebuffer = Framebuffer::new(1, 1);
         framebuffer.clear(0x0000);
-        framebuffer.blend_span(0, 0, 1, 1.0, 1.0, 1.0, 0.5);
+        framebuffer.blend_span(0, 0, 1, [1.0, 1.0, 1.0, 0.5]);
 
         let (red, green, blue) = unpack_rgb565(framebuffer.pixel(0, 0).expect("in bounds"));
         for channel in [red, green, blue] {

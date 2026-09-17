@@ -4,9 +4,8 @@
 //! # Responsibilities
 //!
 //! - [`derive(PillComponent)`] turns one component type into everything the
-//!   engine needs to know about it: the [`Component`] impl, the
-//!   [`TraitAccessible`] impl, and a descriptor submitted into this artifact's
-//!   compile-time registry. Persistable components (those marked
+//!   engine needs to know about it: the [`Component`] impl and a descriptor
+//!   submitted into this artifact's compile-time registry. Persistable components (those marked
 //!   `#[pill(persistable)]`) are additionally registered for schema migration,
 //!   and they drive the aggregate project schema fingerprint — no hand-written
 //!   registration list or fingerprint hash to keep in sync.
@@ -28,7 +27,6 @@
 //! types is impossible by construction.
 //!
 //! [`Component`]: ::pill_engine::Component
-//! [`TraitAccessible`]: ::trait_type_map::TraitAccessible
 //! [`inventory`]: https://docs.rs/inventory
 
 extern crate proc_macro;
@@ -46,7 +44,6 @@ use syn::{parse_macro_input, spanned::Spanned, DeriveInput, ItemFn};
 ///
 /// Generates:
 /// - `impl Component for T`
-/// - the `TraitAccessible<dyn Component>` impl
 /// - a descriptor submitted into this artifact's compile-time registry
 ///
 /// Supported helper attributes:
@@ -210,8 +207,6 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
         impl ::pill_engine::Component for #ident {
             #shared_name_impl
         }
-        ::trait_type_map::impl_trait_accessible!(dyn ::pill_engine::Component; #ident);
-
         #declared_layout
 
         #field_accessors

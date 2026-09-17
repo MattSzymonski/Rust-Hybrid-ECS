@@ -185,7 +185,7 @@ fn draw_sprite(
     }
 
     for y in y_start..y_end {
-        framebuffer.blend_span(y, x_start, x_end, red, green, blue, alpha);
+        framebuffer.blend_span(y, x_start, x_end, instance.color);
     }
 }
 

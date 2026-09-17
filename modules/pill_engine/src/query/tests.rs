@@ -22,7 +22,6 @@
 //! [`Or`] short-circuiting and duplicate-write detection logic.
 
 // External crates
-use trait_type_map::impl_trait_accessible;
 
 // Current crate
 use super::*;
@@ -67,7 +66,6 @@ impl Component for Health {}
 
 // Registers the three fixture components with the `trait_type_map` dispatch
 // table so queries and the scheduler can access them by type.
-impl_trait_accessible!(dyn Component; Position, Velocity, Health);
 
 // =============================================================================
 // Test Helpers

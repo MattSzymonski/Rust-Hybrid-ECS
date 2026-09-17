@@ -279,7 +279,6 @@ mod tests {
         value: u32,
     }
     impl Component for TestPersistableComponent {}
-    trait_type_map::impl_trait_accessible!(dyn Component; TestPersistableComponent);
 
     fn register_test_persistable(world: &mut World) {
         world.register_persistable_component::<TestPersistableComponent>();
@@ -288,7 +287,6 @@ mod tests {
     #[derive(Clone, Debug)]
     struct TestPlainComponent;
     impl Component for TestPlainComponent {}
-    trait_type_map::impl_trait_accessible!(dyn Component; TestPlainComponent);
 
     fn register_test_plain(world: &mut World) {
         world.register_component::<TestPlainComponent>();

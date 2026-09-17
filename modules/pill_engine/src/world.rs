@@ -333,6 +333,16 @@ pub struct World {
     /// generation that re-registers a type without re-inserting its value
     /// still contributes a table pointing at code that is mapped.
     pub(crate) resource_factories: HashMap<ResourceId, ErasedResourceOps>,
+    /// Declared field layout of each foreign resource, when its declarer sent
+    /// one.
+    ///
+    /// The resource twin of `component_field_layouts`, and kept for the same
+    /// reason: a foreign resource's bytes are opaque without it, so the editor
+    /// and any reader that wants named fields has nothing to go on. It is
+    /// separate from `resource_factories` because a layout is optional - a
+    /// resource registered without one still works, it just is not
+    /// inspectable.
+    pub(crate) resource_field_layouts: HashMap<ResourceId, ComponentFieldLayout>,
     /// For each shared resource id, the Rust type that claimed it and the
     /// layout it declared.
     ///
@@ -486,6 +496,7 @@ impl World {
             resources: HashMap::new(),
             resource_ticks: HashMap::new(),
             resource_factories: HashMap::new(),
+            resource_field_layouts: HashMap::new(),
             shared_resource_claims: HashMap::new(),
             resource_registration_sequence: 0,
             resource_registration_stamps: HashMap::new(),
@@ -2146,6 +2157,78 @@ impl World {
         true
     }
 
+    /// The declared field layout of a foreign resource, if one was recorded.
+    ///
+    /// The resource twin of [`Self::component_field_layout`]. `None` means the
+    /// resource was registered without a layout, which is the ordinary state
+    /// for a Rust resource: its fields are a Rust type's, not a manifest's.
+    #[must_use]
+    pub fn resource_field_layout(
+        &self,
+        resource_id: ResourceId,
+    ) -> Option<&[crate::component_registry::ComponentFieldDescriptor]> {
+        self.resource_field_layouts
+            .get(&resource_id)
+            .map(ComponentFieldLayout::fields)
+    }
+
+    /// Record the declared field layout of a foreign resource.
+    ///
+    /// Overwrites any previous layout for the same id, so a manifest reload
+    /// replaces rather than accumulates - the same rule
+    /// [`Self::register_component_descriptor_with_layout`] follows.
+    ///
+    /// **A relayout clears the stored layout**, so this has to be called again
+    /// after one. That is deliberate: serving the previous generation's offsets
+    /// over the migrated bytes would be worse than serving nothing, and a
+    /// caller that forgets loses inspectability rather than correctness.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ComponentFieldError::UnsupportedField`](crate::component_field::ComponentFieldError::UnsupportedField)
+    /// for a descriptor that reaches past the resource's registered size or
+    /// names a container tag. A foreign resource's bytes are as opaque as a
+    /// descriptor row, so it needs both checks for the same reason: the bound
+    /// keeps a reader inside the value, and the tag check keeps it from
+    /// following a `(pointer, length)` pair the bytes never held.
+    pub fn register_resource_field_layout(
+        &mut self,
+        resource_id: ResourceId,
+        fields: Vec<crate::component_registry::ComponentFieldDescriptor>,
+    ) -> Result<(), crate::component_field::ComponentFieldError> {
+        let resource_size = self
+            .resource_factories
+            .get(&resource_id)
+            .map(|ops| ops.size);
+        for field in &fields {
+            let Some(end) = field.offset.checked_add(field.size) else {
+                return Err(
+                    crate::component_field::ComponentFieldError::UnsupportedField {
+                        field: field.name.to_string(),
+                        reason: "the field's range overflows",
+                    },
+                );
+            };
+            if resource_size.is_some_and(|size| end > size) {
+                return Err(
+                    crate::component_field::ComponentFieldError::UnsupportedField {
+                        field: field.name.to_string(),
+                        reason: "the field extends past the resource's registered size",
+                    },
+                );
+            }
+            if crate::component_field::is_container_tag(field.type_tag) {
+                return Err(crate::component_field::ComponentFieldError::UnsupportedField {
+                    field: field.name.to_string(),
+                    reason: "a container tag is read as a native pointer and length, which a foreign resource's bytes do not hold",
+                });
+            }
+        }
+        self.resource_field_layouts
+            .insert(resource_id, ComponentFieldLayout::from_owned(fields));
+        Ok(())
+    }
+
     /// Declare a resource defined by another language, without storing a value.
     ///
     /// The foreign-language counterpart of [`Self::register_resource`], for a
@@ -2383,12 +2466,17 @@ impl World {
         }
         let Some(value) = self.resources.get_mut(&id) else {
             self.resource_factories.insert(id, next);
+            self.resource_field_layouts.remove(&id);
             return Ok(0);
         };
         value
             .migrate_bytes(size, align, plan)
             .map_err(|_error| WorldError::ForeignResourcePlanOutOfBounds { id })?;
         self.resource_factories.insert(id, next);
+        // The stored layout described the shape that just moved, so it is
+        // dropped rather than left to be served over the migrated bytes. The
+        // declarer re-registers it, exactly as it does for a component.
+        self.resource_field_layouts.remove(&id);
         Ok(1)
     }
 
@@ -2825,6 +2913,7 @@ impl World {
             }
             self.resource_ticks.remove(id);
             self.resource_factories.remove(id);
+            self.resource_field_layouts.remove(id);
             self.shared_resource_claims.remove(id);
             // The id is unregistered now, so a later registration is a fresh
             // one and has to be visible to the next "registered since" diff.
@@ -4335,7 +4424,6 @@ mod layout_tests {
 mod tests {
     use super::*;
     use crate::archetype::{FieldSource, LayoutField};
-    use trait_type_map::impl_trait_accessible;
 
     /// The change-detection ticks of one entity's row for one component.
     fn ticks_of_row(world: &World, entity: Entity, component: ComponentId) -> ComponentTicks {
@@ -4371,8 +4459,6 @@ mod tests {
     impl Component for Position {}
     impl Component for Velocity {}
     impl Component for Health {}
-
-    impl_trait_accessible!(dyn Component; Position, Velocity, Health);
 
     /// A resource used to pin registration-stamp behaviour.
     #[derive(Debug, Default)]
@@ -4677,7 +4763,7 @@ mod tests {
         );
         assert!(world.descriptor_component_bytes(alone, old).is_none());
         assert!(
-            world.storage_factories.get(&old).is_none(),
+            !world.storage_factories.contains_key(&old),
             "the predecessor's registration is retired"
         );
         assert_eq!(
@@ -4894,7 +4980,7 @@ mod tests {
             "the companion column survives the retirement"
         );
         assert!(
-            world.storage_factories.get(&component).is_none(),
+            !world.storage_factories.contains_key(&component),
             "the registration is forgotten"
         );
         assert_eq!(
@@ -7647,6 +7733,285 @@ mod tests {
                 .map(|v| v.value),
             Some(5),
             "the value survived the refusals"
+        );
+    }
+
+    /// A zero-sized Rust type is a component like any other.
+    ///
+    /// This is the tag/marker idiom (`struct Enemy;`), and the unification broke it:
+    /// the native registration path fed the descriptor lane's zero-width refusal
+    /// into an `.expect`, so declaring a marker aborted the process. No test
+    /// covered the case, which is why every gate stayed green through the change.
+    #[test]
+    fn a_zero_sized_component_lives_a_full_life() {
+        #[derive(Clone, Debug, Default)]
+        struct Enemy;
+        impl Component for Enemy {}
+
+        #[derive(Clone, Debug, Default)]
+        struct Health {
+            points: u32,
+        }
+        impl Component for Health {}
+
+        let mut world = World::new();
+        world.register_component::<Enemy>();
+        world.register_component::<Health>();
+
+        // Spawn: a marker alone, and a marker beside a sized component, so the
+        // zero-sized column is exercised both as an archetype's only column and as
+        // one of several.
+        let lone = world.create_entity().with(Enemy).build().unwrap();
+        let paired = world
+            .create_entity()
+            .with(Enemy)
+            .with(Health { points: 7 })
+            .build()
+            .unwrap();
+
+        assert!(world.get_component::<Enemy>(lone).is_some());
+        assert!(world.get_component::<Enemy>(paired).is_some());
+
+        // Column contents: a marker is a filter, which is the whole reason to
+        // declare one, so both rows have to be in the column the filter reads.
+        let marker = ComponentId::of::<Enemy>();
+        let rows: usize = world
+            .archetypes
+            .values()
+            .filter_map(|archetype| archetype.component_storages.get(marker))
+            .map(|column| column.len())
+            .sum();
+        assert_eq!(
+            rows, 2,
+            "both markers occupy a row in the zero-sized column"
+        );
+
+        // Archetype move: adding a component migrates every column, the zero-sized
+        // one included, and its rows have no bytes to carry.
+        world
+            .add_component(lone, Health { points: 3 })
+            .expect("the marker's entity accepts another component");
+        assert!(world.get_component::<Enemy>(lone).is_some());
+        assert_eq!(world.get_component::<Health>(lone).unwrap().points, 3);
+
+        // Removal: the swap-remove that closes the gap copies zero bytes, and the
+        // surviving row must still be found.
+        world
+            .remove_component::<Enemy>(paired)
+            .expect("the marker comes off");
+        assert!(world.get_component::<Enemy>(paired).is_none());
+        assert!(
+            world.get_component::<Enemy>(lone).is_some(),
+            "removing one marker leaves the other"
+        );
+        assert_eq!(
+            world.get_component::<Health>(paired).unwrap().points,
+            7,
+            "the sized companion is untouched by the marker's removal"
+        );
+
+        // Destruction: the column frees a buffer it never allocated.
+        assert!(world.destroy_entity(lone), "the entity is destroyed");
+        assert!(world.get_component::<Enemy>(lone).is_none());
+    }
+
+    /// A zero-sized component with a wider alignment is still addressable.
+    ///
+    /// A column that never allocates keeps its dangling pointer for life, so that
+    /// pointer has to be aligned for the element rather than for `u8`. Reading a
+    /// row through a misaligned pointer is undefined behaviour even when the row
+    /// has no bytes, so this pins the alignment rather than the size.
+    #[test]
+    fn an_over_aligned_zero_sized_component_is_addressable() {
+        #[derive(Clone, Debug, Default)]
+        #[repr(align(16))]
+        struct AlignedTag;
+        impl Component for AlignedTag {}
+
+        assert_eq!(std::mem::size_of::<AlignedTag>(), 0);
+        assert_eq!(std::mem::align_of::<AlignedTag>(), 16);
+
+        let mut world = World::new();
+        world.register_component::<AlignedTag>();
+        let entity = world.create_entity().with(AlignedTag).build().unwrap();
+
+        assert!(world.get_component::<AlignedTag>(entity).is_some());
+    }
+
+    /// A zero-width *descriptor* declaration stays refused.
+    ///
+    /// The verdict is split, not loosened: a descriptor's width arrives from a
+    /// manifest another language wrote, where zero means that declaration is wrong.
+    /// Pinned so a later change cannot quietly collapse the two rules back into
+    /// one and start accepting a malformed manifest.
+    #[test]
+    fn a_zero_width_descriptor_component_is_still_refused() {
+        let mut world = World::new();
+
+        let refused = world.register_component_descriptor(
+            0x2E_0001,
+            "probe::ZeroWidth".to_string(),
+            0,
+            4,
+            11,
+            Blittability::from_manifest_fields(),
+        );
+
+        assert!(
+            matches!(refused, Err(WorldError::DescriptorSizeZero)),
+            "a zero-width manifest declaration is a declaration error, not a marker"
+        );
+    }
+
+    /// A foreign resource's declared fields are stored and served back.
+    ///
+    /// Without this a foreign resource is opaque bytes: the editor has nothing
+    /// to name, and neither does anything else that wants more than a width.
+    #[test]
+    fn a_foreign_resource_serves_its_declared_field_layout() {
+        let mut world = World::new();
+        let id = world
+            .register_foreign_resource("probe::Tuning", "Probe.Tuning", 8, 4, 1)
+            .expect("a valid foreign layout registers");
+
+        assert!(
+            world.resource_field_layout(id).is_none(),
+            "a resource registered without a layout is simply not inspectable"
+        );
+
+        world
+            .register_resource_field_layout(
+                id,
+                vec![
+                    crate::component_registry::ComponentFieldDescriptor {
+                        name: "speed",
+                        type_tag: "f32",
+                        offset: 0,
+                        size: 4,
+                        align: 4,
+                        element_count: 0,
+                    },
+                    crate::component_registry::ComponentFieldDescriptor {
+                        name: "gain",
+                        type_tag: "f32",
+                        offset: 4,
+                        size: 4,
+                        align: 4,
+                        element_count: 0,
+                    },
+                ],
+            )
+            .expect("the fields fit the registered size");
+
+        let fields = world
+            .resource_field_layout(id)
+            .expect("the layout is stored");
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].name, "speed");
+        assert_eq!(fields[1].offset, 4);
+    }
+
+    /// A field layout that cannot describe the resource is refused.
+    ///
+    /// Both checks the descriptor-component path applies, for the same reason:
+    /// a foreign resource's bytes are as opaque as a descriptor row, so a
+    /// reader has to be kept inside the value and away from any pointer pair
+    /// the bytes never held.
+    #[test]
+    fn an_impossible_resource_field_layout_is_refused() {
+        let mut world = World::new();
+        let id = world
+            .register_foreign_resource("probe::Narrow", "Probe.Narrow", 4, 4, 1)
+            .expect("a valid foreign layout registers");
+
+        let past_the_end = world.register_resource_field_layout(
+            id,
+            vec![crate::component_registry::ComponentFieldDescriptor {
+                name: "wide",
+                type_tag: "u64",
+                offset: 0,
+                size: 8,
+                align: 8,
+                element_count: 0,
+            }],
+        );
+        assert!(
+            past_the_end.is_err(),
+            "a field may not reach past the value"
+        );
+
+        let container = world.register_resource_field_layout(
+            id,
+            vec![crate::component_registry::ComponentFieldDescriptor {
+                name: "items",
+                type_tag: "vec:f32",
+                offset: 0,
+                size: 4,
+                align: 4,
+                element_count: 0,
+            }],
+        );
+        assert!(
+            container.is_err(),
+            "a container tag would be read as a pointer and length the bytes do not hold"
+        );
+    }
+
+    /// A relayout drops the layout it described.
+    ///
+    /// Serving the previous generation's offsets over migrated bytes would be
+    /// worse than serving nothing, so the engine forgets and the declarer
+    /// re-publishes - which is what the host does on the same pass.
+    #[test]
+    fn a_relayout_drops_the_stored_resource_field_layout() {
+        let mut world = World::new();
+        let id = world
+            .register_foreign_resource("probe::Moving", "Probe.Moving", 4, 4, 1)
+            .expect("a valid foreign layout registers");
+        world
+            .register_resource_field_layout(
+                id,
+                vec![crate::component_registry::ComponentFieldDescriptor {
+                    name: "value",
+                    type_tag: "u32",
+                    offset: 0,
+                    size: 4,
+                    align: 4,
+                    element_count: 0,
+                }],
+            )
+            .expect("the field fits");
+        assert!(world.resource_field_layout(id).is_some());
+
+        let plan = FieldPlan::between(
+            &[LayoutField {
+                name: "value",
+                type_tag: "u32",
+                offset: 0,
+                size: 4,
+            }],
+            &[
+                LayoutField {
+                    name: "value",
+                    type_tag: "u32",
+                    offset: 0,
+                    size: 4,
+                },
+                LayoutField {
+                    name: "added",
+                    type_tag: "u32",
+                    offset: 4,
+                    size: 4,
+                },
+            ],
+        );
+        world
+            .relayout_foreign_resource(id, 8, 4, 2, &plan)
+            .expect("the wider shape is valid");
+
+        assert!(
+            world.resource_field_layout(id).is_none(),
+            "the layout that described the old shape is forgotten"
         );
     }
 }

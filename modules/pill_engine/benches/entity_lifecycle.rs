@@ -38,7 +38,6 @@
 
 // External crates
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use trait_type_map::impl_trait_accessible;
 
 // Current crate
 use pill_engine::*;
@@ -80,7 +79,6 @@ struct Health(f32);
 impl Component for Health {}
 
 // Marks the shared components as trait-accessible for the ECS storage layer.
-impl_trait_accessible!(dyn Component; Transform, Velocity, Health);
 
 // =============================================================================
 // Benchmarks
@@ -283,7 +281,6 @@ fn bench_create_many_components(criterion: &mut Criterion) {
     #[derive(Debug, Clone)]
     struct Stamina(f32);
     impl Component for Stamina {}
-    impl_trait_accessible!(dyn Component; Armor, Mana, Stamina);
 
     for &count in &[100, 1_000, 10_000] {
         group.bench_with_input(

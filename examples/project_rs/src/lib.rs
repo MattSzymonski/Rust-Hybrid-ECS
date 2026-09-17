@@ -365,7 +365,7 @@ fn ball_spawn_state(index: usize) -> PhysicsState {
         delta_time: FIXED_DELTA_TIME,
         position_x: 90.0 + index as f32 * 150.0,
         position_y: 120.0,
-        velocity_x: if index % 2 == 0 {
+        velocity_x: if index.is_multiple_of(2) {
             BOUNCE_VELOCITY_X
         } else {
             -BOUNCE_VELOCITY_X

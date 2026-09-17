@@ -26,7 +26,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 // External crates
-use trait_type_map::impl_trait_accessible;
 
 // Current crate
 use pill_engine::{Component, Engine, Query, ResMut, Resource};
@@ -182,7 +181,6 @@ struct Obstacle;
 impl Component for Obstacle {}
 
 // Make all components accessible via the Component trait for TraitTypeMap
-impl_trait_accessible!(dyn Component; Transform, Velocity, BoxCollider, Obstacle);
 
 // =============================================================================
 // Systems

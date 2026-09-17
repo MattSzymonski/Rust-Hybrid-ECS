@@ -1591,7 +1591,6 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "tracing",
- "trait_type_map",
 ]
 
 [[package]]
@@ -2424,7 +2423,6 @@ dependencies = [
  "pill_spline",
  "serde",
  "tracing",
- "trait_type_map",
 ]
 
 [[package]]
@@ -4220,7 +4218,6 @@ dependencies = [
  "pill_engine",
  "pollster",
  "thiserror 2.0.19",
- "trait_type_map",
  "wgpu",
 ]
 
@@ -4301,7 +4298,6 @@ name = "pill_embedded_renderer"
 version = "0.1.0"
 dependencies = [
  "pill_engine",
- "trait_type_map",
 ]
 
 [[package]]
@@ -4353,7 +4349,6 @@ dependencies = [
  "serde_yaml",
  "thiserror 2.0.19",
  "tracing",
- "trait_type_map",
  "winit",
 ]
 
@@ -4372,13 +4367,22 @@ dependencies = [
  "pill_engine",
  "pollster",
  "thiserror 2.0.19",
- "trait_type_map",
  "wgpu",
 ]
 
 [[package]]
 name = "pill_shipping_bundle"
 version = "0.0.0"
+dependencies = [
+ "pill_dummy_color",
+ "pill_dummy_math",
+ "pill_dummy_random",
+ "pill_dummy_text",
+ "pill_dummy_timer",
+ "pill_host",
+ "pill_spline",
+ "project",
+]
 
 [[package]]
 name = "pill_spline"
@@ -4389,7 +4393,6 @@ dependencies = [
  "pill_engine",
  "pill_hot_scan",
  "serde",
- "trait_type_map",
 ]
 
 [[package]]
@@ -4411,7 +4414,6 @@ dependencies = [
  "pill_core",
  "pill_engine",
  "serde",
- "trait_type_map",
 ]
 
 [[package]]
@@ -4674,6 +4676,23 @@ checksum = "4488a4a36b9a4ba6b9334a32a39971f77c1436ec82c38707bce707699cc3bbcb"
 dependencies = [
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "project"
+version = "0.1.0"
+dependencies = [
+ "pill_core",
+ "pill_dummy_color",
+ "pill_dummy_math",
+ "pill_dummy_random",
+ "pill_dummy_text",
+ "pill_dummy_timer",
+ "pill_engine",
+ "pill_master_renderer",
+ "pill_spline",
+ "serde",
+ "tracing",
 ]
 
 [[package]]

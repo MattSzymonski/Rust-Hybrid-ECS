@@ -31,12 +31,14 @@ use pill_core::error::{CSharpError, EngineMessage};
 use pill_core::telemetry::telemetry_target;
 use pill_core::{error, info, warn};
 use pill_engine::archetype::{FieldPlan, LayoutField};
+use pill_engine::component_registry::ComponentFieldDescriptor;
 use pill_engine::{Engine, ResourceId, World};
 
 // Current crate
 use super::abi::ResourceView;
 use super::components::{stable_component_id, StableComponentId};
 use super::context::{resource_access_is_authorized, with_active_world, ACCESS_KIND_RESOURCE};
+use super::manifest::intern;
 
 // =============================================================================
 // Types
@@ -258,6 +260,31 @@ fn resolve_resource_renames(
     Ok(renames)
 }
 
+/// Apply a reloaded generation's resource declarations to the live world.
+///
+/// Five outcomes per resource, decided by comparing the arriving declaration
+/// against the binding the previous generation left behind:
+///
+/// - **unchanged** - the schema hash matches, so the stored bytes are still
+///   valid under the arriving struct and nothing is touched, which is what
+///   keeps a resource's value across an ordinary reload;
+/// - **added** - no binding yet, so it registers exactly as at startup;
+/// - **reshaped** - the schema hash moved, so the stored bytes migrate field by
+///   field into the new layout, matched by name;
+/// - **renamed** - an alias claims a binding still in the table, so the value
+///   and the claims move onto the successor and the predecessor is dropped;
+/// - **retired** - the manifest stopped naming it and no alias claimed it, so
+///   its value and binding go.
+///
+/// Ordering is the design: aliases resolve first, so a rename is never mistaken
+/// for a disappearance; retirements run last, because a retirement cannot be
+/// journalled and nothing that could fail may run after it.
+///
+/// # Errors
+///
+/// Returns a [`CSharpError`] when an alias is malformed or claims more than one
+/// predecessor, and when the engine refuses a registration, a relayout or a
+/// remap.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 pub(super) fn apply_resource_manifest_on_reload(
     engine: &mut Engine,
@@ -457,6 +484,7 @@ fn register_one(
     engine
         .world_mut()
         .register_persistable_foreign_resource(&resource.full_name);
+    publish_field_layout(engine, resource_id, resource);
 
     // Seed the value, because a managed declaration is all there is: nothing
     // on the managed side inserts a resource the way a Rust `init` calls
@@ -548,6 +576,9 @@ fn relayout_one(
             "managed resource fields changed type; their values were reset"
         );
     }
+    // The engine dropped the stored layout with the shape it described, so the
+    // arriving one is published here rather than left to the next startup.
+    publish_field_layout(engine, existing.resource_id, arriving);
     info!(
         target: telemetry_target::HOT_RELOAD,
         resource = %arriving.full_name,
@@ -555,6 +586,52 @@ fn relayout_one(
         "managed resource migrated to a new layout"
     );
     Ok(())
+}
+
+/// Hand the engine the field layout this declaration carries.
+///
+/// A foreign resource's bytes are opaque without it, so this is what makes one
+/// inspectable - the resource twin of the field layout a managed component's
+/// registration publishes. Reported rather than propagated when the engine
+/// refuses it: inspectability is not worth failing a reload over, and the
+/// resource itself is already registered and usable by then.
+///
+/// Called again after a relayout, because the engine drops the stored layout
+/// when the shape moves rather than serve the old offsets over new bytes.
+fn publish_field_layout(
+    engine: &mut Engine,
+    resource_id: ResourceId,
+    resource: &ManagedResourceDeclaration,
+) {
+    if resource.fields.is_empty() {
+        return;
+    }
+    let descriptors: Vec<ComponentFieldDescriptor> = resource
+        .fields
+        .iter()
+        .map(|field| ComponentFieldDescriptor {
+            name: intern(&field.name),
+            type_tag: intern(&field.type_tag),
+            offset: field.offset,
+            size: field.size,
+            // A managed resource's fields are leaves of the blittable
+            // vocabulary, so alignment is the field's own width and there is
+            // no array arity to carry.
+            align: field.size.max(1),
+            element_count: 0,
+        })
+        .collect();
+    if let Err(error) = engine
+        .world_mut()
+        .register_resource_field_layout(resource_id, descriptors)
+    {
+        warn!(
+            target: telemetry_target::HOT_RELOAD,
+            resource = %resource.full_name,
+            error = %error,
+            "managed resource field layout refused; the resource works but is not inspectable"
+        );
+    }
 }
 
 /// Borrow one recorded field as the plan's layout view.

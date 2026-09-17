@@ -29,7 +29,6 @@
 
 // External crates
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use trait_type_map::impl_trait_accessible;
 
 // Current crate
 use pill_engine::*;
@@ -67,10 +66,6 @@ impl Component for Velocity {}
 #[derive(Debug, Clone)]
 struct Health(f32);
 impl Component for Health {}
-
-// Registers the fixture components with the `trait_type_map` dispatch table,
-// which the command queue's component storage relies on.
-impl_trait_accessible!(dyn Component; Position, Velocity, Health);
 
 // =============================================================================
 // Resources
