@@ -680,6 +680,40 @@ struct ReloadEvent {
     cargo_crates: Vec<(String, u64)>,
 }
 
+/// How many distinct fallback reasons the tally remembers.
+///
+/// A cap rather than a growing list: the counters below still total every
+/// refusal and failure, so a long session loses only the listing of a ninth
+/// distinct cause, never the count.
+#[cfg(feature = "hot_patch")]
+const MAX_TRACKED_FALLBACK_REASONS: usize = 8;
+
+/// How much of one explanation is kept. Compiler errors can run long, and this
+/// line sits inside a reload report that has to stay readable.
+#[cfg(feature = "hot_patch")]
+const MAX_FALLBACK_DETAIL_CHARS: usize = 160;
+
+/// Why one change fell back to a full reload instead of patching.
+///
+/// Identical causes collapse into one entry with a count, because the usual
+/// case is the same edit failing the same way on every save - five separate
+/// copies of one compiler error would bury the reload line they explain.
+struct PatchFallback {
+    /// Qualified function, or `None` when the fast path declined before it
+    /// could attribute the change to one.
+    function: Option<String>,
+    /// `refused` when the fast path declined, `failed` when it tried and could
+    /// not finish. The distinction matters: a refusal is a precondition the
+    /// change did not meet, a failure means the patch itself did not build.
+    outcome: &'static str,
+    /// Short machine-readable cause, such as `compile` or `edited-before-arming`.
+    code: String,
+    /// The explanation, trimmed to its first line and capped.
+    detail: String,
+    /// How many times this exact cause repeated.
+    count: u64,
+}
+
 /// Process-wide analytics state, guarded because the build watchdog polls
 /// child memory from the main frame thread.
 struct Analytics {
@@ -705,6 +739,8 @@ struct Analytics {
     /// Patches that were attempted and failed, leaving the previous
     /// implementation running.
     patch_failures: u64,
+    /// Why the fast path did not take, one entry per distinct cause.
+    patch_fallbacks: Vec<PatchFallback>,
 }
 
 /// The process-wide collector, initialized on first use.
@@ -725,6 +761,7 @@ fn analytics() -> &'static Mutex<Analytics> {
             patches: 0,
             patch_refusals: 0,
             patch_failures: 0,
+            patch_fallbacks: Vec::new(),
         })
     })
 }
@@ -933,20 +970,65 @@ pub(crate) fn record_patch(
 
 /// Record that the fast path declined a change and fell through to a reload.
 #[cfg(feature = "hot_patch")]
-pub(crate) fn record_patch_refusal() {
+pub(crate) fn record_patch_refusal(code: &str, detail: &str) {
     let mut collector = analytics()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     collector.patch_refusals += 1;
+    remember_fallback(&mut collector, None, "refused", code, detail);
 }
 
 /// Record that a patch was attempted and failed, keeping the previous code.
 #[cfg(feature = "hot_patch")]
-pub(crate) fn record_patch_failure() {
+pub(crate) fn record_patch_failure(function: &str, code: &str, detail: &str) {
     let mut collector = analytics()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     collector.patch_failures += 1;
+    remember_fallback(&mut collector, Some(function), "failed", code, detail);
+}
+
+/// Fold one fallback reason into the tally, collapsing repeats.
+///
+/// Keyed on function, outcome and code rather than on the detail text, so a
+/// compiler message that shifts a column number between saves does not read as
+/// a new cause.
+#[cfg(feature = "hot_patch")]
+fn remember_fallback(
+    collector: &mut Analytics,
+    function: Option<&str>,
+    outcome: &'static str,
+    code: &str,
+    detail: &str,
+) {
+    if let Some(existing) = collector.patch_fallbacks.iter_mut().find(|entry| {
+        entry.function.as_deref() == function && entry.outcome == outcome && entry.code == code
+    }) {
+        existing.count += 1;
+        return;
+    }
+    if collector.patch_fallbacks.len() >= MAX_TRACKED_FALLBACK_REASONS {
+        return;
+    }
+    // Only the first line: the host already summarizes a compiler failure into
+    // one, and anything multi-line here would break the report's shape.
+    let first_line = detail.lines().next().unwrap_or("").trim();
+    let trimmed: String = if first_line.chars().count() > MAX_FALLBACK_DETAIL_CHARS {
+        first_line
+            .chars()
+            .take(MAX_FALLBACK_DETAIL_CHARS)
+            .chain("...".chars())
+            .collect()
+    } else {
+        first_line.to_string()
+    };
+    collector.patch_fallbacks.push(PatchFallback {
+        function: function.map(str::to_string),
+        outcome,
+        code: code.to_string(),
+        detail: trimmed,
+        count: 1,
+    });
 }
 
 /// Print the running patch / refusal / failure tally, when there is one.
@@ -967,6 +1049,26 @@ fn print_patch_tally() {
         console::yellow(&collector.patch_refusals.to_string()),
         console::yellow(&collector.patch_failures.to_string()),
     );
+    // The counts say a reload ran; these lines say why. Printed here rather
+    // than left to the moment of failure, which has long scrolled past by the
+    // time the reload report appears.
+    for fallback in &collector.patch_fallbacks {
+        let repeats = if fallback.count > 1 {
+            format!(" x{}", fallback.count)
+        } else {
+            String::new()
+        };
+        println!(
+            "    {} {} {}{}",
+            fallback.function.as_deref().unwrap_or("(change)"),
+            fallback.outcome,
+            console::dim(&format!("({})", fallback.code)),
+            repeats,
+        );
+        if !fallback.detail.is_empty() {
+            println!("        {}", console::dim(&fallback.detail));
+        }
+    }
 }
 
 /// Record the host process's current and peak memory (called at setup end).

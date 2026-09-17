@@ -219,7 +219,9 @@ def run(
             (
                 "native",
                 "NATIVE (project_rs + pill_spline)",
-                harness.NATIVE_YAML,
+                harness.NATIVE_PROJECT_ROOT,
+                "../examples/project_rs",
+                harness.NATIVE_SETTINGS,
                 [harness.SPLINE_EDIT, harness.CASCADE_EDIT, harness.PROJECT_EDIT],
             )
         )
@@ -228,7 +230,9 @@ def run(
             (
                 "csharp",
                 "CSHARP (project_cs + pill_spline)",
-                harness.CSHARP_YAML,
+                harness.CSHARP_PROJECT_ROOT,
+                "../examples/project_cs",
+                harness.CSHARP_SETTINGS,
                 [harness.CSHARP_EDIT],
             )
         )
@@ -245,11 +249,20 @@ def run(
             if not harness.build_host():
                 raise RuntimeError("Could not build pill_standalone for measurement.")
 
-        for session_key, session_title, yaml_content, hooks in session_definitions:
+        for (
+            session_key,
+            session_title,
+            project_root,
+            project_path,
+            settings_content,
+            hooks,
+        ) in session_definitions:
             before = set(timings_by_case)
             succeeded = harness.run_session(
                 session_title,
-                yaml_content,
+                project_root,
+                project_path,
+                settings_content,
                 hooks,
                 iterations,
                 warmup,
@@ -298,7 +311,7 @@ def run(
             "title": session_title,
             "startup": _startup_to_json(startup_by_session.get(session_key)),
         }
-        for session_key, session_title, _, _ in session_definitions
+        for session_key, session_title, _, _, _, _ in session_definitions
     ]
 
     measurement = {

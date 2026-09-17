@@ -1,0 +1,15 @@
+# Project settings for the managed (C#) iteration benchmark project.
+#
+# Deliberately minimal. This project exists to measure one thing - the cost of
+# iterating components from C# - so it declares no optional modules and draws
+# nothing. Every module it loaded would add native work to a frame whose whole
+# point is to contain only managed iteration, and a renderer would add a GPU
+# present to the same frame.
+
+name: "CSharp Iteration Benchmark"
+build_binary_name: "CSharpIterationBenchmark"
+version: "0.1.0"
+author: "Matt Szymonski"
+description: "Managed component-iteration benchmark, the counterpart of pill_engine's query_iteration Criterion target."
+
+modules: []

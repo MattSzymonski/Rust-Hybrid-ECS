@@ -1,0 +1,44 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+
+    <!-- This is a library, but the Rust host loads it via hostfxr, which
+         needs a runtimeconfig.json describing the target framework. -->
+    <GenerateRuntimeConfigurationFiles>true</GenerateRuntimeConfigurationFiles>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Named query-row iteration: `foreach (var row in query.Rows())` with one
+         named accessor per term. The wrappers must be generated into THIS
+         compilation, so the generator is referenced here rather than flowing in
+         with the runtime reference - project-referenced analyzers are not
+         transitive. This benchmark measures that generated iteration path, so
+         the reference is the point rather than a convenience. -->
+    <ProjectReference Include="../../modules/pill_csharp_runtime/generators/PillIterationGenerators.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+
+    <!-- The gameplay scripting rules (PILLxxxx). Kept even though this project
+         never hot-reloads in anger: a benchmark that quietly violated a rule
+         the real projects must follow would be measuring a path they cannot
+         use. -->
+    <ProjectReference Include="../../modules/pill_csharp_runtime/analyzers/PillScriptAnalyzers.csproj"
+                      OutputItemType="Analyzer"
+                      ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- For Engine.cs's safe generic query facade. The benchmark's own
+         component structs live in this project. -->
+    <ProjectReference Include="../../modules/pill_csharp_runtime/csharp_runtime.csproj" />
+  </ItemGroup>
+
+  <!-- No module mirrors and no renderer components, unlike examples/project_cs.
+       This project declares `modules: []`, so there is nothing to mirror, and
+       it draws nothing, so it imports no renderer component. -->
+
+</Project>

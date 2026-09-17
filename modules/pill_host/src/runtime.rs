@@ -1615,7 +1615,7 @@ fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
                 detail = refusal.detail.as_str(),
                 "fast patch refused; falling back to a reload"
             );
-            analytics::record_patch_refusal();
+            analytics::record_patch_refusal(refusal.code, refusal.detail.as_str());
             false
         }
         crate::hot_patch::PatchOutcome::Failed {
@@ -1640,7 +1640,11 @@ fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
                 active_generation,
                 "fast patch failed; the previous implementation is still running"
             );
-            analytics::record_patch_failure();
+            analytics::record_patch_failure(
+                function.as_str(),
+                failure.code,
+                failure.detail.as_str(),
+            );
             false
         }
         crate::hot_patch::PatchOutcome::Unchanged => false,

@@ -162,7 +162,7 @@ SPLINE_EDIT = EditHook(
 PROJECT_EDIT = EditHook(
     label="project_reload",
     path=PROJECT_RS_LIB_RS,
-    edit=("BOUNCE_VELOCITY_Y: f32 = -500.0", "BOUNCE_VELOCITY_Y: f32 = -501.0"),
+    edit=("BOUNCE_VELOCITY_Y: f32 = -800.0", "BOUNCE_VELOCITY_Y: f32 = -801.0"),
     wait_token="[analytics] reload project ",
     settle_token="[analytics] reload project ",
     analytics_name="project",
@@ -418,11 +418,30 @@ def summary_stats(timings: Sequence[ReloadTiming]) -> Dict[str, float]:
 
 
 def build_host() -> bool:
-    """Builds the standalone host once before the script runs."""
+    """Builds the standalone host once before the script runs.
+
+    `rendering` is required, not a preference. The native session drives
+    `examples/project_rs`, which links `pill_master_renderer` directly, and
+    that turns on features in crates `pill_core` also depends on. The host
+    binary links its own `pill_core.dll`, so a host built without `rendering`
+    resolves a different variant than the project does. Windows keeps one
+    module of a given name per process, so the project DLL then fails to load
+    with "The specified procedure could not be found" (os error 127), naming
+    nothing. `test_hot_reload_suite.py` pins the same pair for the same reason.
+    """
     print("\n  [PREP] Building pill_standalone (offline)...")
     try:
         result = subprocess.run(
-            ["cargo", "build", "--package", "pill_standalone", "--offline"],
+            [
+                "cargo",
+                "build",
+                "--package",
+                "pill_standalone",
+                "--no-default-features",
+                "--features",
+                "hot_reload,rendering",
+                "--offline",
+            ],
             cwd=str(MODULES_ROOT),
             capture_output=True,
             text=True,

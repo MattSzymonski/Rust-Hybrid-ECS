@@ -284,7 +284,7 @@ impl Engine {
 
         // Engine-owned systems, registered before any project or module runs.
         // Attributed to `SystemOwner::ENGINE`, which no reload retires.
-        engine.register_ecs_diagnostics_system(Some(crate::diagnostics::DEFAULT_REPORT_INTERVAL));
+        // engine.register_ecs_diagnostics_system(Some(crate::diagnostics::DEFAULT_REPORT_INTERVAL));
         engine
     }
 }
