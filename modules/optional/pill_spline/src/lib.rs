@@ -301,6 +301,7 @@ impl Spline {
     /// that range. Degenerate splines still answer sensibly: an empty spline
     /// samples to the origin, a single point samples to itself, and two points
     /// interpolate in a straight line.
+    #[pill_hot_fn]
     pub fn get_location_at(&self, t: f32) -> Vector3f {
         let points = self.control_points();
         match points.len() {
@@ -339,7 +340,7 @@ impl Spline {
                 // is observable through a cascade reload; shipping builds
                 // compute only the curve.
                 #[cfg(feature = "test-hooks")]
-                let base = Vector3f::new(base.x, base.y + SAMPLE_VERTICAL_OFFSET, base.z);
+                let base = Vector3f::new(base.x, base.y + 0.0, base.z);
                 base
             }
         }
@@ -405,7 +406,7 @@ impl Spline {
 ///
 /// `before_start` and `after_end` are the neighbouring control points that give
 /// the segment its tangents; `local_t` runs from 0.0 at `start` to 1.0 at `end`.
-fn catmull_rom(
+pub fn catmull_rom(
     before_start: Vector3f,
     start: Vector3f,
     end: Vector3f,

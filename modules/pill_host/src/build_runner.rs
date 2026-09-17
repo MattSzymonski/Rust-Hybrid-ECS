@@ -1287,6 +1287,101 @@ pub(crate) fn run_build_command(
     Ok(())
 }
 
+/// Add the compiler-command-line capture to a managed project's build.
+///
+/// A native build is returned unchanged. For a C# build this appends the two
+/// MSBuild properties that make the build report its own `csc` invocation:
+/// `ProvideCommandLineArgs` populates the item group, and the injected targets
+/// file writes it out. Neither changes what is compiled - only whether the
+/// build leaves behind a record of how it compiled it.
+///
+/// A missing targets file silently leaves the command alone, which costs the
+/// fast reload path and nothing else.
+#[cfg(feature = "hot_reload")]
+fn with_compiler_argument_capture(
+    workspace_root: &Path,
+    config: &ProjectModuleConfig,
+) -> Vec<String> {
+    let mut build_command = config.build_command.clone();
+    if !matches!(&config.backend, ProjectModuleBackend::CSharp(_)) {
+        return build_command;
+    }
+    let targets = workspace_root.join(crate::config::CSHARP_COMPILER_ARGUMENTS_TARGETS);
+    if !targets.is_file() {
+        return build_command;
+    }
+    build_command.push("-p:ProvideCommandLineArgs=true".to_string());
+    build_command.push(format!(
+        "-p:CustomAfterMicrosoftCSharpTargets={}",
+        targets.display()
+    ));
+    build_command
+}
+
+/// Build the managed assembly that compiles C# projects in-process.
+///
+/// Built separately from every managed project because nothing references it:
+/// Roslyn is large and hostile to NativeAOT, so keeping it out of each project's
+/// reference graph is what keeps it out of a shipping bundle. The build is
+/// skipped entirely when the assembly is already newer than its sources, which
+/// is the normal case and makes this free at startup.
+///
+/// # Errors
+///
+/// Returns [`BuildError::OutputMissing`] when the compiler project or its
+/// output assembly is absent, or whatever [`run_build_command`] reports.
+#[cfg(feature = "hot_reload")]
+pub(crate) fn build_csharp_compiler(workspace_root: &Path) -> Result<PathBuf, BuildError> {
+    let manifest = workspace_root.join(crate::config::CSHARP_COMPILER_MANIFEST);
+    if !manifest.is_file() {
+        return Err(BuildError::OutputMissing {
+            path: manifest.display().to_string(),
+        });
+    }
+    let output_path = workspace_root
+        .join(crate::config::CSHARP_COMPILER_OUTPUT_SUBDIRECTORY)
+        .join(format!(
+            "{}.dll",
+            crate::config::CSHARP_COMPILER_ASSEMBLY_NAME
+        ));
+    if output_path.is_file()
+        && is_build_up_to_date(
+            workspace_root,
+            &output_path,
+            &manifest,
+            crate::config::CSHARP_COMPILER_WATCH_DIRECTORY,
+        )
+    {
+        return Ok(output_path);
+    }
+
+    info!(
+        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        "building the in-process C# compiler"
+    );
+    let build_command = vec![
+        "dotnet".to_string(),
+        "build".to_string(),
+        crate::config::CSHARP_COMPILER_MANIFEST.to_string(),
+        "-c".to_string(),
+        "Release".to_string(),
+        "--nologo".to_string(),
+    ];
+    run_build_command(
+        workspace_root,
+        crate::config::CSHARP_COMPILER_ASSEMBLY_NAME,
+        &build_command,
+        &[],
+        None,
+    )?;
+    if !output_path.exists() {
+        return Err(BuildError::OutputMissing {
+            path: output_path.display().to_string(),
+        });
+    }
+    Ok(output_path)
+}
+
 /// Build the selected project module and return its expected output artifact.
 ///
 /// # Errors
@@ -1405,10 +1500,18 @@ pub(crate) fn build_project_module(
         }
     }
 
+    // A managed build also captures the compiler command line MSBuild computed,
+    // so a later hot reload can replay it in-process instead of paying for
+    // MSBuild again. See `crate::csharp::fast_compile`.
+    #[cfg(feature = "hot_reload")]
+    let build_command = with_compiler_argument_capture(workspace_root, config);
+    #[cfg(not(feature = "hot_reload"))]
+    let build_command = config.build_command.clone();
+
     run_build_command(
         workspace_root,
         &config.name,
-        &config.build_command,
+        &build_command,
         &config.build_environment,
         cancel_flag,
     )?;

@@ -368,6 +368,19 @@ internal sealed class ProjectHost
             _lastSystemErrors[systemIndex] = message;
     }
 
+    /// <summary>Let the next <see cref="PollReload"/> run without waiting.</summary>
+    ///
+    /// <remarks>
+    /// The poll interval exists because the loader cannot tell when a build has
+    /// finished writing the assembly, so it samples instead. When the host
+    /// compiles the project in-process it does know: it wrote the file itself,
+    /// through an atomic rename. Telling the loader so turns the interval's
+    /// average quarter-second of waiting into nothing, and only in the case
+    /// where the certainty is real - a `dotnet build` still copies the assembly
+    /// non-atomically, and that path keeps sampling.
+    /// </remarks>
+    public void RequestImmediatePoll() => _lastPollUtc = DateTime.MinValue;
+
     /// <summary>
     /// Poll the project DLL timestamp and reload a newer build.
     /// Returns the swap outcome so the Rust host can distinguish a clean

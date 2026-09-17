@@ -264,7 +264,7 @@ impl Engine {
         world.insert_resource(crate::time::Time::new());
         world.insert_resource(crate::asset::AssetManager::new());
 
-        let mut engine = Self {
+        let engine = Self {
             systems: Vec::new(),
             queue: CommandQueue::new(),
             world,
@@ -284,6 +284,7 @@ impl Engine {
 
         // Engine-owned systems, registered before any project or module runs.
         // Attributed to `SystemOwner::ENGINE`, which no reload retires.
+        // The binding needs to be `mut` again when this line is re-enabled.
         // engine.register_ecs_diagnostics_system(Some(crate::diagnostics::DEFAULT_REPORT_INTERVAL));
         engine
     }

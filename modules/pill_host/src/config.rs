@@ -46,6 +46,42 @@ const CSHARP_RUNTIME_OUTPUT_SUBDIRECTORY: &str = "pill_csharp_runtime/bin/Releas
 /// Default target framework used for the managed project output path.
 const CSHARP_TARGET_FRAMEWORK: &str = "net8.0";
 
+/// Workspace-relative manifest of the in-process C# compiler.
+///
+/// Deliberately not a member of any managed project's reference graph: Roslyn
+/// is large and NativeAOT-hostile, so the compiler is built and loaded only in
+/// the hot-reload posture and never reaches a shipping bundle.
+#[cfg(feature = "hot_reload")]
+pub(crate) const CSHARP_COMPILER_MANIFEST: &str =
+    "pill_csharp_compiler/pill_csharp_compiler.csproj";
+
+/// Assembly name of the in-process C# compiler.
+#[cfg(feature = "hot_reload")]
+pub(crate) const CSHARP_COMPILER_ASSEMBLY_NAME: &str = "pill_csharp_compiler";
+
+/// Workspace-relative output directory of the in-process C# compiler.
+#[cfg(feature = "hot_reload")]
+pub(crate) const CSHARP_COMPILER_OUTPUT_SUBDIRECTORY: &str =
+    "pill_csharp_compiler/bin/Release/net8.0";
+
+/// Workspace-relative source directory of the in-process C# compiler.
+#[cfg(feature = "hot_reload")]
+pub(crate) const CSHARP_COMPILER_WATCH_DIRECTORY: &str = "pill_csharp_compiler/src";
+
+/// Workspace-relative MSBuild file that captures a project's compiler command
+/// line, injected into a managed project's build.
+#[cfg(feature = "hot_reload")]
+pub(crate) const CSHARP_COMPILER_ARGUMENTS_TARGETS: &str =
+    "pill_csharp_compiler/build/PillCaptureCompilerArgs.targets";
+
+/// File the capture target writes inside a managed project's `obj` directory.
+///
+/// Named here and in the targets file, which is the whole contract between
+/// them: MSBuild derives the directory from the project it is building, and the
+/// host derives the same path from the project's output directory.
+#[cfg(feature = "hot_reload")]
+const CSHARP_COMPILER_ARGUMENTS_FILE: &str = "pill_compiler_args.rsp";
+
 /// Workspace-relative directory holding every optional module crate.
 ///
 /// The workspace manifest globs this directory, so a module is discovered by
@@ -393,6 +429,26 @@ impl CSharpModuleConfig {
             project_assembly_name: project_assembly_name.into(),
             project_output_subdirectory: project_output_subdirectory.into(),
         }
+    }
+
+    /// Workspace-relative path of this project's captured compiler command line.
+    ///
+    /// The project's build writes it into the project's own `obj` directory, so
+    /// it is derived from the output directory rather than stored: that
+    /// directory is `<project>/bin/Release/<framework>` by construction, and its
+    /// fourth ancestor is the project root.
+    ///
+    /// Returns `None` when the output directory has no such shape, which is the
+    /// shipping posture - a bundle keeps the assembly flat beside the
+    /// executable. That posture never hot reloads, so it never needs a capture.
+    #[cfg(feature = "hot_reload")]
+    pub(crate) fn compiler_arguments_file(&self) -> Option<PathBuf> {
+        let output_directory = Path::new(&self.project_output_subdirectory);
+        let project_root = output_directory.ancestors().nth(3)?;
+        if project_root.as_os_str().is_empty() {
+            return None;
+        }
+        Some(project_root.join("obj").join(CSHARP_COMPILER_ARGUMENTS_FILE))
     }
 }
 

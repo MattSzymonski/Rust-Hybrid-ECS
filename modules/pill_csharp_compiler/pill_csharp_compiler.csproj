@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+
+    <!-- The unmanaged entry points the Rust host resolves through hostfxr take
+         raw UTF-8 pointers, exactly as csharp_runtime's LoaderInterop does. -->
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <!-- This assembly is loaded as a plugin: the host hands hostfxr this path
+         and hostfxr resolves the dependencies from the .deps.json beside it.
+         EnableDynamicLoading is the property that produces that file, the
+         runtimeconfig.json, and local copies of every package assembly - all
+         three are required for Roslyn to resolve here. -->
+    <EnableDynamicLoading>true</EnableDynamicLoading>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- The compiler itself. Pinned to the same version the source generators
+         and the gameplay analyzers are built against, because this process
+         loads those assemblies into its own load context: a newer Roslyn here
+         than they were compiled for would fail to bind their entry types. -->
+    <PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.8.0" />
+  </ItemGroup>
+
+  <!-- Deliberately not referenced by csharp_runtime, and never by a gameplay
+       project. Roslyn is tens of megabytes and is hostile to NativeAOT, so it
+       must not reach the shipping posture; the host loads this assembly only
+       in the hot-reload posture and only to compile. -->
+
+</Project>

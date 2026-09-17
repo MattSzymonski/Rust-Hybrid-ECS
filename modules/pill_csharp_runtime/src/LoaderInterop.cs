@@ -97,13 +97,36 @@ public static unsafe class LoaderInterop
     /// runtime would leave that field unwritten and every resource access
     /// would be resolved against the component table.
     /// </summary>
-    public const uint InteropContractVersion = 9;
+    public const uint InteropContractVersion = 10;
 
     /// <summary>Return the unmanaged ABI contract version for host validation.</summary>
 #if !PILL_AOT
     [UnmanagedCallersOnly(EntryPoint = "pill_interop_version")]
 #endif
     public static uint InteropVersion() => InteropContractVersion;
+
+    /// <summary>Tell the loader a new project assembly is already on disk.</summary>
+    ///
+    /// <remarks>
+    /// Called by the host after it compiles the project in-process, which is the
+    /// one case where the assembly's completeness is known rather than sampled.
+    /// It only clears the poll interval; the very next <c>PollReload</c> does
+    /// the real work and reports the outcome as usual.
+    /// </remarks>
+#if !PILL_AOT
+    [UnmanagedCallersOnly(EntryPoint = "pill_notify_assembly_replaced")]
+#endif
+    public static void NotifyAssemblyReplaced()
+    {
+        try
+        {
+            _host?.RequestImmediatePoll();
+        }
+        catch (Exception e)
+        {
+            Console.Error.WriteLine($"[csharp_runtime] NotifyAssemblyReplaced failed: {e}");
+        }
+    }
 
     // The stable runtime owns exactly one active collectible project loader.
     private static ProjectHost? _host;

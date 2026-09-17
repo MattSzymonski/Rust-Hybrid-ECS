@@ -1468,6 +1468,12 @@ fn parse_patch_arguments(attribute: TokenStream) -> Result<PatchArguments, syn::
 /// a slot, so every caller - including ones in other crates that linked this one
 /// statically - goes through the redirect.
 ///
+/// An inherent method is supported as well, and takes a different shape: its
+/// body cannot be renamed because it uses `self`, so it is emitted in place and
+/// the dispatcher sits in front of it. A method parameter must therefore be a
+/// plain binding, because that is the name the dispatcher forwards by -
+/// destructure the value inside the body instead.
+///
 /// # A crate linked into several artifacts
 ///
 /// The slot is a `static` in whichever artifact compiled the function. A crate
@@ -1509,20 +1515,48 @@ pub fn pill_hot_fn(attribute: TokenStream, item: TokenStream) -> TokenStream {
     // hoisted body would have to name the receiver type.
     let receiver = signature.receiver().cloned();
 
-    // Rebuild the argument list: the dispatcher needs plain names to forward,
-    // and a pattern like `mut value` or `(a, b)` cannot be forwarded as-is.
+    // Build the argument list. A free function's body is hoisted under its
+    // original signature, so its dispatcher may rename every parameter and
+    // forward the renamed values. A method keeps its body inline and forwards
+    // through the names that body uses, so its declaration keeps each pattern
+    // exactly as written and the forwarded name is the one the pattern binds.
     let mut parameter_names = Vec::new();
     let mut parameter_declarations = Vec::new();
+    let mut parameter_declaration_shapes = Vec::new();
     let mut parameter_types = Vec::new();
     for (index, argument) in signature.inputs.iter().enumerate() {
         let syn::FnArg::Typed(typed) = argument else {
             continue;
         };
-        let name = format_ident!("argument_{index}");
         let argument_type = &*typed.ty;
-        parameter_names.push(quote! { #name });
-        parameter_declarations.push(quote! { #name: #argument_type });
         parameter_types.push(quote! { #argument_type });
+        if receiver.is_some() {
+            // A destructuring pattern binds no single name to forward, and the
+            // inline body is emitted verbatim below, so it is refused here
+            // with the reason rather than surfacing as an unresolved name
+            // inside the body.
+            let syn::Pat::Ident(identifier) = &*typed.pat else {
+                return syn::Error::new_spanned(
+                    &typed.pat,
+                    concat!(
+                        "`#[pill_hot_fn]` on a method requires a plain parameter ",
+                        "binding: the body is emitted in place, and the dispatcher ",
+                        "forwards through the names it uses. Bind the value to a ",
+                        "name here and destructure it inside the body."
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            };
+            let identifier = &identifier.ident;
+            parameter_names.push(quote! { #identifier });
+            parameter_declarations.push(quote! { #typed });
+            parameter_declaration_shapes.push(quote! { #identifier: #argument_type });
+        } else {
+            let name = format_ident!("argument_{index}");
+            parameter_names.push(quote! { #name });
+            parameter_declarations.push(quote! { #name: #argument_type });
+        }
     }
 
     let return_type = &signature.output;
@@ -1576,6 +1610,16 @@ pub fn pill_hot_fn(attribute: TokenStream, item: TokenStream) -> TokenStream {
         None => quote! { #(#parameter_declarations),* },
     };
 
+    // The declaration used by the body-less trait a method patch is carried in:
+    // binding modifiers are stripped, because `mut value` in a signature without
+    // a body trips the `patterns_in_fns_without_body` lint. The implementation
+    // that carries the body keeps every pattern exactly as written, which is
+    // what the body itself needs.
+    let trait_declarations = match &receiver {
+        Some(receiver) => quote! { #receiver #(, #parameter_declaration_shapes)* },
+        None => quote! { #(#parameter_declarations),* },
+    };
+
     // A generated patch for an inherent method. The body names `self`, so it
     // cannot be copied into a free function - but a LOCAL trait may be
     // implemented for a foreign type, and a trait method has the same call
@@ -1601,7 +1645,7 @@ pub fn pill_hot_fn(attribute: TokenStream, item: TokenStream) -> TokenStream {
         let expanded = quote! {
             /// The replacement body, in a local trait so it keeps using `self`.
             trait PillHotMethodPatch {
-                fn #fn_ident(#declarations) #return_type;
+                fn #fn_ident(#trait_declarations) #return_type;
             }
 
             impl PillHotMethodPatch for #self_type {

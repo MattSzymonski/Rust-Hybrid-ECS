@@ -26,6 +26,9 @@ mod codegen;
 mod commands;
 /// C# component identities, native bindings, and manifest registration.
 mod components;
+#[cfg(feature = "hot_reload")]
+/// In-process Roslyn compilation of the C# project, replacing MSBuild on reload.
+mod fast_compile;
 /// Thread-local access scope installed around one scheduled C# system.
 mod context;
 /// Low-level .NET hosting bootstrap used by the C# project backend.
@@ -47,6 +50,10 @@ mod resources;
 pub(crate) use backend::CSharpRuntime;
 #[cfg(feature = "hot_reload")]
 pub(crate) use backend::POLL_RELOADED;
+
+/// What one in-process compile attempt produced, reported to the reload path.
+#[cfg(feature = "hot_reload")]
+pub(crate) use fast_compile::FastCompileOutcome;
 
 /// Aggregate of the native components optional modules exposed to managed code.
 pub(crate) use components::{resolve_exposed_component_id, ModuleExposedComponent};

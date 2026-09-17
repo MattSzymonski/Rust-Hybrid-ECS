@@ -233,32 +233,23 @@ mod loaded {
                 // manifest and system signatures before swapping; poll_reload
                 // reports the outcome and logs any rejection.
                 Self::CSharp(runtime) => {
-                    match build_project_module(workspace_root, config, cancel_flag) {
-                        Ok(_) => {
-                            info!(
-                                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                                "C# build complete; polling managed loader"
-                            );
-                            // A refusal keeps the currently loaded assembly;
-                            // `poll_reload` logs it once per distinct status.
-                            // The loader's debounce can outlive this call, in
-                            // which case the swap lands in a later frame's
-                            // `poll_managed_reload`; only a swap this poll
-                            // reports counts as a replacement here.
-                            matches!(
-                                runtime.poll_reload(engine),
-                                Ok(crate::csharp::POLL_RELOADED)
-                            )
-                        }
-                        Err(error) => {
-                            error!(
-                                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                                error = %error,
-                                "C# build failed; keeping the currently loaded C# project assembly"
-                            );
-                            false
-                        }
+                    if !recompile_csharp(runtime, workspace_root, config, cancel_flag) {
+                        return false;
                     }
+                    info!(
+                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        "C# build complete; polling managed loader"
+                    );
+                    // A refusal keeps the currently loaded assembly;
+                    // `poll_reload` logs it once per distinct status.
+                    // The loader's debounce can outlive this call, in
+                    // which case the swap lands in a later frame's
+                    // `poll_managed_reload`; only a swap this poll
+                    // reports counts as a replacement here.
+                    matches!(
+                        runtime.poll_reload(engine),
+                        Ok(crate::csharp::POLL_RELOADED)
+                    )
                 }
             }
         }
@@ -296,6 +287,66 @@ mod loaded {
     // =============================================================================
     // Free Functions
     // =============================================================================
+
+    /// Produce a new C# project assembly, in-process when that is possible.
+    ///
+    /// Returns whether an assembly the managed loader can pick up now exists.
+    ///
+    /// The in-process compiler replays the compiler command line the startup
+    /// build captured, which takes tens of milliseconds where a `dotnet build`
+    /// of the same edit takes one to three seconds. It cannot answer every
+    /// reload - a source file added or removed changes the command line itself -
+    /// and it may not exist at all, so both cases fall through to the full build
+    /// that every reload used to run. That build also refreshes the capture,
+    /// which is what makes the reload after it fast again.
+    fn recompile_csharp(
+        runtime: &CSharpRuntime,
+        workspace_root: &Path,
+        config: &ProjectModuleConfig,
+        cancel_flag: Option<(&AtomicU64, u64)>,
+    ) -> bool {
+        let fallback_reason = match runtime.fast_compile(workspace_root, &config.watch_directory) {
+            Some(crate::csharp::FastCompileOutcome::Compiled { milliseconds }) => {
+                info!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    module = config.name.as_str(),
+                    compile_ms = format!("{milliseconds:.1}").as_str(),
+                    "C# compiled in-process"
+                );
+                return true;
+            }
+            // Errors in the developer's own source. Reported as-is and not
+            // retried through MSBuild: a full build would spend seconds
+            // reaching the same diagnostics.
+            Some(crate::csharp::FastCompileOutcome::Failed { diagnostics }) => {
+                error!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    "C# compilation failed; keeping the currently loaded C# project assembly"
+                );
+                print!("{diagnostics}");
+                return false;
+            }
+            Some(crate::csharp::FastCompileOutcome::Unavailable { reason }) => reason,
+            None => "no in-process compiler is loaded".to_string(),
+        };
+
+        info!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            reason = fallback_reason.as_str(),
+            "falling back to a full C# build"
+        );
+        match build_project_module(workspace_root, config, cancel_flag) {
+            Ok(_) => true,
+            Err(error) => {
+                error!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    error = %error,
+                    "C# build failed; keeping the currently loaded C# project assembly"
+                );
+                false
+            }
+        }
+    }
 
     /// Reload one native generation and migrate components whose persisted schema
     /// changed across the module boundary.

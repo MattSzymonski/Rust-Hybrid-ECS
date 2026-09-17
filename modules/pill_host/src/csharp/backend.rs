@@ -41,6 +41,8 @@ use super::components::{
 };
 use super::context::ActiveSystemGuard;
 use super::csharp_runtime::DotnetRuntimeContext;
+#[cfg(feature = "hot_reload")]
+use super::fast_compile::{FastCompileOutcome, FastCompiler};
 use super::ResolvedMirrorMethod;
 use crate::CSharpModuleConfig;
 
@@ -98,8 +100,9 @@ pub(super) const MAX_ACCESSES_PER_SYSTEM: u32 = 1024;
 /// shape. Bumped to 4 by the mirror-epoch slot and to 5 by the chunk's const
 /// `entities` pointer, which a stale runtime would otherwise read as a
 /// 48-byte struct. The host refuses to start against a runtime built for a
-/// different version.
-const INTEROP_CONTRACT_VERSION: u32 = 9;
+/// different version. Bumped to 10 by `NotifyAssemblyReplaced`, which the
+/// in-process compile path calls to collapse the loader's poll interval.
+const INTEROP_CONTRACT_VERSION: u32 = 10;
 
 // =============================================================================
 // Types + Impls
@@ -141,6 +144,9 @@ type CopySystemErrorMessageFn = extern "system" fn(u32, *mut u8, u32) -> u8;
 /// Signature polling the collectible loader for a new project assembly and
 /// reporting the swap outcome through the status codes below.
 type PollReloadFn = extern "system" fn() -> u8;
+/// Signature telling the loader a new assembly is already complete on disk.
+#[cfg(feature = "hot_reload")]
+type NotifyAssemblyReplacedFn = extern "system" fn();
 /// Signature returning the parked manifest's byte length.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 type PendingManifestLengthFn = extern "system" fn() -> u32;
@@ -254,6 +260,22 @@ pub(crate) struct CSharpRuntime {
     /// place: each run locks it, which is what makes a reshaped component's new
     /// layout visible without re-registering the systems that read it.
     bindings: Arc<BindingStore>,
+    /// Clears the loader's poll interval after an in-process compile.
+    ///
+    /// Only useful together with the compiler above: the certainty it reports is
+    /// exactly the certainty an in-process compile produces. `None` in the AOT
+    /// posture, which never reloads - and which would otherwise oblige every
+    /// shipped project to re-export a symbol it can never call, since NativeAOT
+    /// exports only from the root assembly.
+    #[cfg(feature = "hot_reload")]
+    notify_assembly_replaced: Option<NotifyAssemblyReplacedFn>,
+    /// The in-process Roslyn compiler, when one could be loaded.
+    ///
+    /// `None` leaves every reload on the ordinary `dotnet build` path, which is
+    /// the AOT posture's permanent state and the reloading posture's fallback
+    /// when the compiler cannot be built or loaded.
+    #[cfg(feature = "hot_reload")]
+    fast_compiler: Option<FastCompiler>,
     /// Keeps the hosted .NET runtime alive for the host's lifetime.
     _runtime: ManagedRuntimeContext,
     /// Keeps the native API table alive so registered closures stay valid.
@@ -488,6 +510,12 @@ impl CSharpRuntime {
         std::env::set_var("ECS_CSHARP_PROJECT_ASSEMBLY", project_assembly_name);
 
         let runtime = DotnetRuntimeContext::new(&runtime_config)?;
+        // Started here rather than at the end of startup so its background
+        // warmup - about 1.6 seconds of JIT and metadata reading - overlaps
+        // component registration, the startup methods and system registration
+        // instead of landing on the developer's first edit.
+        #[cfg(feature = "hot_reload")]
+        let fast_compiler = FastCompiler::try_new(&runtime, workspace_root, config);
         let type_name = format!(
             "TracyLive.Loader.LoaderInterop, {}",
             config.runtime_assembly_name
@@ -587,6 +615,12 @@ impl CSharpRuntime {
         )?;
         let poll_reload =
             runtime.get_unmanaged_fn::<PollReloadFn>(&assembly, &type_name, "PollReload")?;
+        #[cfg(feature = "hot_reload")]
+        let notify_assembly_replaced = Some(runtime.get_unmanaged_fn::<NotifyAssemblyReplacedFn>(
+            &assembly,
+            &type_name,
+            "NotifyAssemblyReplaced",
+        )?);
 
         // Step 2: Initialize the runtime bridge and register the component
         // manifest copied from the managed assembly.
@@ -702,9 +736,40 @@ impl CSharpRuntime {
             copy_manifest,
             applied_manifest: manifest,
             bindings,
+            #[cfg(feature = "hot_reload")]
+            notify_assembly_replaced,
+            #[cfg(feature = "hot_reload")]
+            fast_compiler,
             _runtime: ManagedRuntimeContext::Dotnet(runtime),
             _api: api,
         })
+    }
+
+    /// Recompile the project in-process, when a compiler could be loaded.
+    ///
+    /// `None` means there is no fast path at all and the caller must build
+    /// normally; a [`FastCompileOutcome::Unavailable`] means the fast path
+    /// exists but cannot answer this particular reload.
+    #[cfg(feature = "hot_reload")]
+    pub(crate) fn fast_compile(
+        &self,
+        workspace_root: &Path,
+        watch_directory: &str,
+    ) -> Option<FastCompileOutcome> {
+        let outcome = self
+            .fast_compiler
+            .as_ref()?
+            .compile(workspace_root, watch_directory);
+        // The loader samples the assembly's timestamp on an interval because it
+        // cannot otherwise tell a finished build from a half-copied one. This
+        // compile wrote the file itself, through an atomic rename, so the next
+        // poll can skip that wait entirely.
+        if matches!(outcome, FastCompileOutcome::Compiled { .. }) {
+            if let Some(notify) = self.notify_assembly_replaced {
+                notify();
+            }
+        }
+        Some(outcome)
     }
 
     /// Start a NativeAOT-published library, resolve the loader exports by
@@ -887,6 +952,11 @@ impl CSharpRuntime {
             copy_manifest,
             applied_manifest: manifest,
             bindings,
+            // A NativeAOT bundle ships no compiler and never reloads.
+            #[cfg(feature = "hot_reload")]
+            notify_assembly_replaced: None,
+            #[cfg(feature = "hot_reload")]
+            fast_compiler: None,
             _runtime: ManagedRuntimeContext::Aot(runtime),
             _api: api,
         })
