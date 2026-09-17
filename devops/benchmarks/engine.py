@@ -17,8 +17,9 @@ DESCRIPTION
     axis: any stored measurement against any other.
 
 USAGE
-  python devops/benchmarks/engine.py [--bench TARGET] [--quick]
-      [--profile NAME] [--skip-run] [--no-profile-overrides] [--json]
+  python devops/benchmarks/engine.py [--bench TARGET] [--quick] [--plots]
+      [--full-sampling] [--profile NAME] [--skip-run] [--no-profile-overrides]
+      [--json]
 
   Identical as a Pill Lab subcommand, which borrows this file's parser:
   python devops/pill_lab/pill_lab.py engine --bench minimal --quick
@@ -81,6 +82,28 @@ KNOWN_BENCH_TARGETS = (
 BENCH_RUSTFLAGS = " "
 BENCH_PROFILE_OVERRIDES = ('profile.release.panic="unwind"',)
 
+# Criterion's sampling defaults - 100 samples, 5s measurement, 3s warm-up -
+# cost about 9.5 s per benchmark case. These settings cost about 4.6 s, which
+# is what takes a run of `archetype_migration` + `query_iteration` (73 cases)
+# from roughly 17 minutes to 8.
+#
+# This is deliberately NOT a precision tradeoff worth agonizing over. Repeated
+# runs of IDENTICAL code on this machine differ by 6-28% per benchmark, and by
+# about 5% in aggregate between sessions, so the sampling error these settings
+# widen is already swamped by machine state. Resolution here comes from
+# repeating a measurement and interleaving the two sides being compared, not
+# from spending longer inside one run. Pass `--full-sampling` for Criterion's
+# defaults when comparing against numbers recorded under them.
+REDUCED_SAMPLING_ARGUMENTS = (
+    "--warm-up-time", "1",
+    "--measurement-time", "2",
+    "--sample-size", "50",
+)
+
+# Passing any of these explicitly means the caller is steering sampling itself,
+# so the profile above stands aside rather than fighting them.
+SAMPLING_FLAGS = ("--warm-up-time", "--measurement-time", "--sample-size", "--quick")
+
 
 def build_command(
     bench_targets: Sequence[str],
@@ -88,6 +111,8 @@ def build_command(
     profile: Optional[str],
     extra_arguments: Sequence[str],
     profile_overrides: bool = True,
+    plots: bool = False,
+    full_sampling: bool = False,
 ) -> List[str]:
     """Assembles the `cargo bench` command line for the requested selection.
 
@@ -107,6 +132,23 @@ def build_command(
     harness_arguments = list(extra_arguments)
     if quick:
         harness_arguments.append("--quick")
+    # Criterion renders about eighteen SVGs per benchmark, and with gnuplot
+    # absent it falls back to the plotters backend, which is slow: on a
+    # 73-benchmark run those 1,300 files were roughly 40% of the wall time.
+    # Nothing here reads them - pill_lab parses `estimates.json`, and the
+    # legacy HTML report draws its own sparklines from the same numbers - so
+    # they are skipped unless someone explicitly wants Criterion's own report.
+    # This changes no measurement: plotting happens after a benchmark's samples
+    # are collected and analyzed.
+    if not plots:
+        harness_arguments.append("--noplot")
+    # Only when the caller has not taken the wheel: an explicit --sample-size
+    # (or --quick) in `--bench-args` must win over the default profile.
+    caller_steers_sampling = any(
+        argument.split("=")[0] in SAMPLING_FLAGS for argument in harness_arguments
+    )
+    if not full_sampling and not caller_steers_sampling:
+        harness_arguments += list(REDUCED_SAMPLING_ARGUMENTS)
     if harness_arguments:
         command.append("--")
         command += harness_arguments
@@ -116,6 +158,8 @@ def build_command(
 def run(
     bench_targets: Sequence[str] = (),
     quick: bool = False,
+    plots: bool = False,
+    full_sampling: bool = False,
     profile: Optional[str] = None,
     extra_arguments: Sequence[str] = (),
     skip_run: bool = False,
@@ -132,7 +176,7 @@ def run(
     afterwards, so a failed measurement can never be stored as a good one.
     """
     command = build_command(
-        bench_targets, quick, profile, extra_arguments, profile_overrides
+        bench_targets, quick, profile, extra_arguments, profile_overrides, plots, full_sampling
     )
     environment = os.environ.copy()
     if profile_overrides:
@@ -185,6 +229,7 @@ def run(
     )
     measurement["bench_targets"] = list(bench_targets) or ["<all>"]
     measurement["quick"] = quick
+    measurement["sampling"] = "criterion-default" if full_sampling else "reduced"
     measurement["profile"] = profile or "bench"
 
     regressed = len(criterion.detect_regressions(benchmarks))
@@ -256,6 +301,24 @@ def add_arguments(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="Do not run cargo; capture the existing target/criterion output",
     )
     parser.add_argument(
+        "--full-sampling",
+        action="store_true",
+        help=(
+            "Use Criterion's default sampling (100 samples, 5s measurement, "
+            "3s warm-up) instead of the reduced profile. Roughly doubles the "
+            "run time; needed only to compare against numbers recorded under "
+            "the defaults."
+        ),
+    )
+    parser.add_argument(
+        "--plots",
+        action="store_true",
+        help=(
+            "Render Criterion's own SVG plots and HTML report. Off by default: "
+            "nothing here reads them and they dominate the run's wall time."
+        ),
+    )
+    parser.add_argument(
         "--no-profile-overrides",
         action="store_true",
         help=(
@@ -293,6 +356,8 @@ def execute(arguments: argparse.Namespace) -> int:
     result = run(
         bench_targets=arguments.bench,
         quick=arguments.quick,
+        plots=arguments.plots,
+        full_sampling=arguments.full_sampling,
         profile=arguments.profile,
         extra_arguments=arguments.bench_args,
         skip_run=arguments.skip_run,
