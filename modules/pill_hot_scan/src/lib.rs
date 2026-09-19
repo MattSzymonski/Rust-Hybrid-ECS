@@ -1023,6 +1023,66 @@ const ABI_ENTRY_POINT_ATTRIBUTES: &[&str] = &["pill_module]", "pill_project]"];
 /// byte. When they were separate implementations, every inherent method silently
 /// failed to patch.
 ///
+/// Absolute path of the file Cargo compiles as this crate's root.
+///
+/// Defaults to `src/lib.rs`, and a `[lib] path = "..."` in the manifest moves
+/// it elsewhere. The distinction matters because the crate root contributes no
+/// module segment while every other file contributes one: treating a renamed
+/// root as a module would prefix every emitted path with a module that does not
+/// exist, and the generated inventory would not compile.
+///
+/// A crate renames its root to give the file a name unique across the
+/// dependency graph. Every crate has a `src/lib.rs`, so a debugger that falls
+/// back to matching a breakpoint by file name - which it must, for a module the
+/// host loads at runtime and that is therefore unmapped when the breakpoint is
+/// set - has hundreds of wrong candidates to choose between.
+///
+/// The manifest is scanned by hand rather than parsed: this crate deliberately
+/// has no dependencies, because the host links it as well as every build
+/// script, and a TOML parser here would follow into both.
+///
+/// Public because the host derives the same module paths when it compiles a
+/// patch, and the two must agree exactly: a patch registered under a path the
+/// inventory does not hold is a patch that never dispatches.
+pub fn crate_root_file(manifest_directory: &Path) -> PathBuf {
+    let default_root = manifest_directory.join("src").join("lib.rs");
+    let Ok(manifest) = std::fs::read_to_string(manifest_directory.join("Cargo.toml")) else {
+        return default_root;
+    };
+    let mut inside_lib_section = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        // Section headers switch the scan on and off; a comment or a blank line
+        // between them does not, so only `[`-prefixed lines are considered.
+        if line.starts_with('[') {
+            inside_lib_section = line == "[lib]";
+            continue;
+        }
+        if !inside_lib_section || line.starts_with('#') {
+            continue;
+        }
+        let Some(assignment) = line.strip_prefix("path") else {
+            continue;
+        };
+        let Some(value) = assignment.trim_start().strip_prefix('=') else {
+            continue;
+        };
+        // Manifest paths are always `/`-separated; join the components one at a
+        // time so the result uses the platform separator and compares equal to
+        // the paths the directory walk produces.
+        let value = value.trim().trim_matches('"');
+        if value.is_empty() {
+            continue;
+        }
+        let mut root = manifest_directory.to_path_buf();
+        for component in value.split('/') {
+            root.push(component);
+        }
+        return root;
+    }
+    default_root
+}
+
 /// # Panics
 ///
 /// Panics when the generated file cannot be written, which would otherwise leave
@@ -1032,6 +1092,7 @@ pub fn generate_function_inventory() {
         std::env::var("CARGO_MANIFEST_DIR").expect("build scripts always have CARGO_MANIFEST_DIR"),
     );
     let source_directory = manifest_directory.join("src");
+    let crate_root = crate_root_file(&manifest_directory);
     let output_directory =
         PathBuf::from(std::env::var("OUT_DIR").expect("build scripts always have OUT_DIR"));
     let crate_name = std::env::var("CARGO_PKG_NAME")
@@ -1101,10 +1162,13 @@ pub fn generate_function_inventory() {
             .split('/')
             .map(str::to_string)
             .collect();
-        if segments
-            .last()
-            .is_some_and(|last| last == "lib" || last == "mod")
-        {
+        // The crate root names no module of its own, whatever it is called;
+        // `mod.rs` is named by the directory holding it. Comparing the whole
+        // path rather than the file stem keeps a submodule that happens to
+        // share the root's name from being mistaken for it.
+        if file == crate_root {
+            segments.clear();
+        } else if segments.last().is_some_and(|last| last == "mod") {
             segments.pop();
         }
 

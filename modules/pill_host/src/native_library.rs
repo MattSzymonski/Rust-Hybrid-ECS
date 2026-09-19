@@ -416,14 +416,34 @@ impl NativeLibrary {
             .map(|duration| duration.as_nanos())
             .unwrap_or_default();
         let counter = TEMPORARY_COPY_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let extension = build_output
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .unwrap_or("dll");
-        // Prefix with the module name so several modules, each reloading on
-        // its own schedule, never collide inside one process directory.
-        let temporary_path =
-            temporary_directory.join(format!("{module_name}_{timestamp}_{counter}.{extension}"));
+        // One directory per generation rather than one uniquely named file in
+        // a directory shared by all of them.
+        //
+        // The image names its PDB by bare file name, so a debugger resolves it
+        // against the directory the module was loaded from. Generations
+        // sharing a directory would therefore have to share one PDB file, and
+        // the reload after the first would find that file held open by the
+        // debugger and impossible to replace - leaving the new generation with
+        // the previous one's symbols, which do not match it.
+        //
+        // The module name still prefixes the directory so several modules,
+        // each reloading on its own schedule, never collide inside one process
+        // directory.
+        let generation_directory =
+            temporary_directory.join(format!("{module_name}_{timestamp}_{counter}"));
+        std::fs::create_dir_all(&generation_directory).map_err(|source| {
+            LibraryError::TemporaryDirectory {
+                directory: generation_directory.display().to_string(),
+                source,
+            }
+        })?;
+        // Keeping the build output's own file name lets the PDB beside it keep
+        // the name the image records, which is what makes the lookup work.
+        let temporary_path = generation_directory.join(
+            build_output
+                .file_name()
+                .unwrap_or_else(|| std::ffi::OsStr::new("module.dll")),
+        );
 
         // Step 2: Copy the built library to the unique temporary path.
         std::fs::copy(build_output, &temporary_path).map_err(|source| {
@@ -433,6 +453,48 @@ impl NativeLibrary {
                 source,
             }
         })?;
+        // Step 2a: Place the module's debug symbols beside the copy.
+        //
+        // `rust-lld` records the PDB in the image as a bare file name rather
+        // than an absolute path, so a debugger resolves it against whatever
+        // directory the module was loaded from - this temporary one, not the
+        // build output it was copied from. Without this the loaded module has
+        // no symbols at all, and no breakpoint in module source can bind.
+        //
+        // Hard linked rather than copied: a module PDB runs to tens of
+        // megabytes and both paths are under the workspace root, so the link
+        // costs nothing while a copy would be paid on every reload of every
+        // module.
+        //
+        // Best effort by design. A build carrying no debug info has no PDB,
+        // and a link that cannot be made costs symbols rather than the module,
+        // so nothing here may fail the load.
+        let symbol_source = build_output.with_extension("pdb");
+        if let Some(symbol_name) = symbol_source.file_name() {
+            if symbol_source.is_file() {
+                // The image names the PDB by bare file name, so the copy has to
+                // keep that name and sit in the directory the module loads
+                // from - this generation's own, so reloads never contend for
+                // one file the debugger may already hold open.
+                let symbol_target = generation_directory.join(symbol_name);
+                let staged = std::fs::hard_link(&symbol_source, &symbol_target)
+                    .or_else(|_| std::fs::copy(&symbol_source, &symbol_target).map(|_| ()));
+                match staged {
+                    Ok(()) => debug!(
+                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        path = %symbol_target.display(),
+                        "staged module debug symbols beside the loaded copy"
+                    ),
+                    Err(error) => debug!(
+                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        path = %symbol_source.display(),
+                        %error,
+                        "module debug symbols not staged; module code will have no debugger symbols"
+                    ),
+                }
+            }
+        }
+
         // From here the copy exists, and every path that does not hand it to a
         // `NativeLibrary` must delete it again; the guard owns that duty.
         let mut temporary_copy = TemporaryCopy::new(temporary_path);

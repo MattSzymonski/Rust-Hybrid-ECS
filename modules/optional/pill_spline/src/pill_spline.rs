@@ -118,6 +118,7 @@ pub struct Spline {
     pub control_point_count: u32,
 
     pub elo: f32,
+    ///////
 }
 
 impl Default for Spline {
@@ -318,7 +319,7 @@ impl Spline {
                 let segment_count = points.len() - 1;
                 let scaled = t.clamp(0.0, 1.0) * segment_count as f32;
                 let segment_index = (scaled.floor() as usize).min(segment_count - 1);
-                let local_t = scaled - segment_index as f32;
+                let local_t = scaled - segment_index as f32 + 4.0;
 
                 let start = points[segment_index];
                 let end = points[segment_index + 1];

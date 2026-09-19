@@ -421,7 +421,15 @@ impl HotPatchSession {
         build_command: &[String],
     ) -> Option<Self> {
         let source_root = workspace_root.join(watch_directory);
-        let crate_root = source_root.join("lib.rs");
+        // The crate root is `src/lib.rs` unless the manifest's `[lib] path`
+        // moves it, which optional modules do so their file name is unique
+        // across the dependency graph. Resolved through the same helper the
+        // build script uses, because a root mistaken for a module would prefix
+        // every patch name with a segment the inventory does not carry.
+        let crate_root = source_root
+            .parent()
+            .map(source::crate_root_file)
+            .unwrap_or_else(|| source_root.join("lib.rs"));
         // The staged copy, not cargo's per-crate slot. Both the project and
         // every optional module write their `rlib` to an unhashed path that any
         // other build of the same package overwrites, and a patch that linked
@@ -1347,8 +1355,16 @@ impl HotPatchSession {
     /// `module_path!()` inside the crate follows the file tree, so a function in
     /// `src/lib.rs` sits at `crate`, and one in `src/color.rs` at
     /// `crate::color`.
+    ///
+    /// The crate root contributes no segment whatever it is named: a manifest
+    /// may point `[lib] path` at a file other than `lib.rs`, and treating that
+    /// file as a module would name every function in the crate one segment too
+    /// deep.
     fn module_segments(&self, path: &Path) -> Vec<String> {
         let mut segments = vec![self.package.clone()];
+        if path == self.crate_root {
+            return segments;
+        }
         let Ok(relative) = path.strip_prefix(&self.source_root) else {
             return segments;
         };
