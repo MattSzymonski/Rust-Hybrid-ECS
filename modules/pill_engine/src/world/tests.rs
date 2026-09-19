@@ -794,7 +794,7 @@ fn relayout_refuses_what_it_cannot_migrate() {
         .component_storages
         .insert(
             component,
-            crate::archetype::ComponentColumn::new(ComponentLayout {
+            crate::archetype::ComponentColumn::new(ColumnLayout {
                 size: 8,
                 align: 4,
                 schema_hash: 100,
@@ -812,7 +812,7 @@ fn relayout_refuses_what_it_cannot_migrate() {
             .get_mut(component)
             .unwrap();
         column.relayout_validated(
-            ComponentLayout {
+            ColumnLayout {
                 size: 16,
                 align: 4,
                 schema_hash: 100,

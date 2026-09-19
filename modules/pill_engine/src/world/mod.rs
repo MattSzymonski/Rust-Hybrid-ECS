@@ -36,8 +36,8 @@ use pill_core::{error, warn};
 
 // Current crate
 use crate::archetype::{
-    validate_component_layout, Archetype, ArchetypeId, Blittability, ComponentColumns,
-    ComponentLayout, FieldPlan, FieldSource, StorageFactory,
+    validate_component_layout, Archetype, ArchetypeId, Blittability, ColumnLayout,
+    ComponentColumns, FieldPlan, FieldSource, StorageFactory,
 };
 use crate::commands::CommandQueue;
 use crate::component::{

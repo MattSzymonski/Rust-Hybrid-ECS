@@ -24,7 +24,7 @@
 //! ## What the numbers should show
 //!
 //! Row access is expected to be *identical*, not merely close: both kinds of
-//! column are the same contiguous `ErasedVecStorage`, and both are indexed by
+//! column are the same contiguous `ComponentColumn`, and both are indexed by
 //! `get_unchecked::<T>(row)`, which is a base pointer plus `row * size_of::<T>()`.
 //! Nothing about the declared identity reaches the loop body.
 //!

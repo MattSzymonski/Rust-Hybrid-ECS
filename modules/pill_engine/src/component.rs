@@ -371,6 +371,10 @@ impl ComponentId {
 /// diagnostic; for a shared one it is a soundness requirement, because two
 /// binaries reach one column through it and nothing else proves they agree
 /// about what a row contains.
+///
+/// This is the registration's layout, not the stored column's -
+/// [`ColumnLayout`](crate::archetype::ColumnLayout) is that one, and its
+/// `schema_hash` is a plain `u64` rather than the `Option` below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ComponentLayout {
     /// Byte size of one component value.
@@ -938,7 +942,7 @@ impl ComponentRegistry {
     pub(crate) fn update_descriptor_layout(
         &mut self,
         component_id: &ComponentId,
-        layout: &crate::archetype::ComponentLayout,
+        layout: &crate::archetype::ColumnLayout,
     ) {
         if let Some(record) = self.layouts.get_mut(component_id) {
             record.size = layout.size;

@@ -47,26 +47,6 @@ impl World {
         }
     }
 
-    /// Return one archetype-sized component chunk for language bindings.
-    ///
-    /// `chunk_index` is relative to archetypes containing `T`. The entity
-    /// ID identifies the archetype shared by corresponding chunks of other
-    /// component types.
-    pub fn component_chunk_mut<T>(&mut self, chunk_index: usize) -> Option<(ArchetypeId, &mut [T])>
-    where
-        T: Component,
-    {
-        let component_id = ComponentId::of::<T>();
-        let archetype = self
-            .archetypes
-            .values_mut()
-            .filter(|archetype| archetype.component_types.contains(&component_id))
-            .nth(chunk_index)?;
-        let archetype_id = archetype.id;
-        let storage = archetype.component_storages.column_of_mut::<T>();
-        Some((archetype_id, storage.as_mut_slice::<T>()))
-    }
-
     /// Return one component chunk together with its parallel change-tick column.
     ///
     /// Language bindings use this form when exposing writable component data.
@@ -225,7 +205,7 @@ impl World {
         // Register the storage factory as plain DATA (type id, layout, and a
         // per-type function table) instead of a closure that would be
         // monomorphized into this generation's DLL. The engine builds the
-        // actual column in `Archetype::new` as a concrete `Box<ErasedVecStorage>`
+        // actual column in `Archetype::new` as a concrete `ComponentColumn`
         // with no trait-object vtable, and re-homes its function table on
         // every reload, so columns survive DLL unloads.
         //
@@ -528,12 +508,7 @@ impl World {
             .register_descriptor(stable_id, name, size)?;
         self.storage_factories.insert(
             component_id,
-            StorageFactory::Descriptor(ComponentLayout::new(
-                size,
-                align,
-                schema_hash,
-                blittability,
-            )?),
+            StorageFactory::Descriptor(ColumnLayout::new(size, align, schema_hash, blittability)?),
         );
         Ok(component_id)
     }
@@ -592,7 +567,7 @@ impl World {
         // entity added to them is stored at the new shape.
         // A relayout keeps the witness and the release hook: the shape
         // changes, the promise about what a row owns does not.
-        let layout = ComponentLayout {
+        let layout = ColumnLayout {
             size,
             align,
             schema_hash,
@@ -1239,7 +1214,7 @@ impl World {
     /// if the component was never registered, and
     /// [`WorldError::DescriptorByteLengthMismatch`] if `bytes` does not match
     /// the registered layout size.
-    pub fn add_descriptor_component(
+    pub(crate) fn add_descriptor_component(
         &mut self,
         entity: Entity,
         component_id: ComponentId,

@@ -107,6 +107,11 @@ pub(super) const MAX_ACCESSES_PER_SYSTEM: u32 = 1024;
 /// 48-byte struct. The host refuses to start against a runtime built for a
 /// different version. Bumped to 10 by `NotifyAssemblyReplaced`, which the
 /// in-process compile path calls to collapse the loader's poll interval.
+///
+/// Collapsing the four length/copy export pairs into one pair keyed by a
+/// payload-kind number would save six exports here and six resolutions
+/// across `start` and `start_aot`. It was proposed and declined: see the
+/// design note in `LoaderInterop.cs` for why the named exports are kept.
 const INTEROP_CONTRACT_VERSION: u32 = 10;
 
 // =============================================================================

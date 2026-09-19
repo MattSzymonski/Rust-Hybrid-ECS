@@ -429,8 +429,9 @@ pub(crate) type SerializeComponentFn = fn(storage: &ComponentColumns, index: usi
 /// by serde's `default` / `ignore` behaviour.
 pub(crate) type DeserializeComponentFn = fn(bytes: &[u8]) -> Option<Box<dyn Component>>;
 
-/// Downcasts a `Box<dyn Component>` to its concrete type and pushes it
-/// into the appropriate `VecStorage<T>` inside the storage map.
+/// Downcasts a `Box<dyn Component>` to its concrete type and pushes it into
+/// the appropriate [`ComponentColumn`](crate::archetype::ComponentColumn)
+/// inside the storage map.
 pub(crate) type InsertComponentFn =
     fn(storage: &mut ComponentColumns, component: Box<dyn Component>);
 

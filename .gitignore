@@ -7,6 +7,11 @@
 # Hot-reload runtime temp copies
 modules/pill_standalone_temp/
 
+# Captured run output. A redirected host run drops these wherever it was
+# started, including the cargo workspace root; one was tracked for a while.
+# A capture worth keeping goes under `local/`, which is ignored below.
+*.log
+
 # Host-generated project workspace member (created at runtime)
 modules/optional/host_project_*/
 

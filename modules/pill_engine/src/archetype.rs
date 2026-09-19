@@ -99,7 +99,7 @@ pub enum StorageFactory {
     /// refreshes its function table on every reload.
     Native(NativeColumnInfo),
     /// Carries the runtime layout of a component owned by another language.
-    Descriptor(ComponentLayout),
+    Descriptor(ColumnLayout),
 }
 
 // =============================================================================
@@ -161,11 +161,11 @@ impl Blittability {
 /// Everything an archetype needs to build a column for a Rust component type,
 /// as plain data.
 ///
-/// The engine's replacement for `ErasedVecStorageInfo`, and it exists for the
-/// same reason that type carries data rather than a closure: a factory that
-/// captured a generation's code would keep an unmapped image's vtable alive.
-/// It differs in dropping the `dyn Component` upcasts, which nothing in this
-/// engine ever called.
+/// The engine's own replacement for [`trait_type_map::ErasedVecStorageInfo`],
+/// and it carries data for the same reason that one does: a factory that
+/// captured a generation's code would keep that image's vtable alive after the
+/// graveyard unmapped it. It differs in dropping the `dyn Component` upcasts,
+/// which nothing in this engine ever called.
 #[derive(Debug, Clone, Copy)]
 pub struct NativeColumnInfo {
     /// Runtime identity of the element type.
@@ -254,9 +254,10 @@ pub enum ColumnIdentity {
 ///   validated vocabulary is plain data - drop is a no-op, move is `memcpy`,
 ///   default is a zero fill.
 ///
-/// Like [`ErasedVecStorageInfo`], the table is *data*, never a trait object:
-/// a column that outlives the DLL that filled it can be re-pointed at the new
-/// generation's table instead of dangling into an unmapped image.
+/// Like [`trait_type_map::ErasedVecStorageOps`], the table is *data*, never a
+/// trait object: a column that outlives the DLL that filled it can be
+/// re-pointed at the new generation's table instead of dangling into an
+/// unmapped image.
 #[derive(Clone, Copy)]
 pub struct ColumnOps {
     /// Drop `count` initialized rows starting at `ptr`, or nothing for plain
@@ -319,15 +320,23 @@ impl ColumnOps {
 }
 
 // =============================================================================
-// ComponentLayout
+// ColumnLayout
 // =============================================================================
 
 /// Runtime layout for a component whose concrete type is owned by another language.
 ///
 /// Describes the memory footprint of an opaque component column so its rows
 /// can be copied in and out as raw bytes without knowing the concrete type.
+///
+/// Not to be confused with [`ComponentLayout`](crate::component::ComponentLayout),
+/// which is the registry's record of a registration. The difference is in the
+/// schema hash: a column always has one, because a column only exists once
+/// something described the rows well enough to store them, while a
+/// registration's is `Option` and is `None` for a hand-registered or unit
+/// type. Holding this one, `schema_hash` is always evidence; holding that one,
+/// its absence is the case the shared-component check has to tolerate.
 #[derive(Debug, Clone)]
-pub struct ComponentLayout {
+pub struct ColumnLayout {
     /// Size in bytes of a single component instance.
     pub size: usize,
     /// Alignment in bytes required by a single component instance.
@@ -341,7 +350,7 @@ pub struct ComponentLayout {
     pub blittability: Blittability,
 }
 
-impl ComponentLayout {
+impl ColumnLayout {
     /// Builds a layout, checking that size and alignment can describe storage.
     ///
     /// The single constructor: every layout carries a [`Blittability`], so no
@@ -684,15 +693,16 @@ fn out_of_bounds(offset: usize, bytes: usize, size: usize) -> bool {
 /// The native component columns of one archetype, keyed by [`ComponentId`].
 ///
 /// This replaced a `TraitTypeMap` keyed by [`TypeId`](std::any::TypeId). That
-/// map was already storing a concrete `ErasedVecStorage` per entry rather than
-/// a trait object, so the only thing it contributed was the key - and `TypeId`
-/// is the wrong key here. A component type linked into two binaries has two
-/// `TypeId`s, so the binary that did not create the column could not find it,
-/// while the engine identifies the same component by one [`ComponentId`] every
-/// other structure is already keyed on: the registry's bit, the archetype's
-/// `component_types`, the tick vectors, the storage factories. Keying the
-/// columns the same way makes a shared component reachable from either binary
-/// and removes a translation step from every lookup.
+/// map was already storing a concrete `trait_type_map::ErasedVecStorage` per
+/// entry rather than a trait object, so the only thing it contributed was the
+/// key - and `TypeId` is the wrong key here. A component type linked into two
+/// binaries has two `TypeId`s, so the binary that did not create the column
+/// could not find it, while the engine identifies the same component by one
+/// [`ComponentId`] every other structure is already keyed on: the registry's
+/// bit, the archetype's `component_types`, the tick vectors, the storage
+/// factories. Keying the columns the same way makes a shared component
+/// reachable from either binary and removes a translation step from every
+/// lookup.
 #[derive(Default)]
 pub struct ComponentColumns {
     /// One contiguous column per native component in the archetype.
@@ -808,11 +818,11 @@ fn missing_column<T: Component>() -> ! {
 /// Aligned, densely packed storage for a type-erased component column.
 ///
 /// Owns a raw heap allocation whose element size and alignment come from a
-/// [`ComponentLayout`]. Rows are written and read as raw bytes, which
+/// [`ColumnLayout`]. Rows are written and read as raw bytes, which
 /// lets components defined in other languages share storage with native ones.
 pub struct ComponentColumn {
     /// Runtime layout of the stored element type.
-    layout: ComponentLayout,
+    layout: ColumnLayout,
     /// Per-type behaviour, replaceable when a reload brings newer glue.
     ops: ColumnOps,
     /// What a typed accessor must prove before it may read these rows.
@@ -852,7 +862,7 @@ impl ComponentColumn {
     /// [`WorldError::DescriptorAlignmentInvalid`] or
     /// [`WorldError::DescriptorLayoutInvalid`] when the layout cannot describe
     /// an allocation.
-    pub fn new(layout: ComponentLayout) -> Result<Self, WorldError> {
+    pub fn new(layout: ColumnLayout) -> Result<Self, WorldError> {
         validate_component_layout(layout.size, layout.align)?;
         let ops = ColumnOps::blittable(layout.blittability);
         let data = unallocated_pointer(layout.align);
@@ -897,7 +907,7 @@ impl ComponentColumn {
         // from `info.ops` - but the layout type requires a witness, so the
         // claim is made where it is provably unused.
         let blittability = unsafe { Blittability::assume() };
-        let layout = ComponentLayout::new_native(info.size, info.align, schema_hash, blittability)?;
+        let layout = ColumnLayout::new_native(info.size, info.align, schema_hash, blittability)?;
         let data = unallocated_pointer(layout.align);
         Ok(Self {
             layout,
@@ -1528,7 +1538,7 @@ impl ComponentColumn {
     /// or writes past the edge of a row. Nothing is modified in either case.
     pub fn relayout(
         &mut self,
-        layout: ComponentLayout,
+        layout: ColumnLayout,
         plan: &FieldPlan,
     ) -> Result<usize, WorldError> {
         validate_component_layout(layout.size, layout.align)?;
@@ -1546,7 +1556,7 @@ impl ComponentColumn {
     /// first column, instead of leaving some columns migrated and some not.
     pub(crate) fn relayout_validated(
         &mut self,
-        layout: ComponentLayout,
+        layout: ColumnLayout,
         plan: &FieldPlan,
         previous_size: usize,
     ) -> usize {
@@ -1800,7 +1810,7 @@ impl ComponentColumn {
 // SAFETY: Two premises, each enforced by named code rather than asserted here.
 //
 // 1. Every field of a descriptor component is a blittable value type. The
-//    evidence is held by the engine: every `ComponentLayout` carries a
+//    evidence is held by the engine: every `ColumnLayout` carries a
 //    `Blittability` witness, the host builds its own only after
 //    `BLITTABLE_FIELD_TYPES` vetted the manifest's fields, and no column can
 //    be constructed without a layout. This is what makes the raw `ptr::copy`
@@ -2081,8 +2091,8 @@ mod tests {
     use crate::component::Tick;
 
     /// One row of a two-field layout: `a` at 0, `b` at 4.
-    fn two_fields() -> ComponentLayout {
-        ComponentLayout {
+    fn two_fields() -> ColumnLayout {
+        ColumnLayout {
             size: 8,
             align: 4,
             schema_hash: 1,
@@ -2104,7 +2114,7 @@ mod tests {
     fn a_layout_keeps_its_witness_and_a_column_releases_through_its_ops() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let constructed = ComponentLayout::new(4, 4, 7, Blittability::from_manifest_fields())
+        let constructed = ColumnLayout::new(4, 4, 7, Blittability::from_manifest_fields())
             .expect("a plain layout");
         assert_eq!(
             constructed.blittability,
@@ -2122,7 +2132,7 @@ mod tests {
             RELEASES.fetch_add(count, Ordering::SeqCst);
         }
 
-        let layout = ComponentLayout::new(4, 4, 7, Blittability::from_manifest_fields())
+        let layout = ColumnLayout::new(4, 4, 7, Blittability::from_manifest_fields())
             .expect("a valid layout");
         let mut column = ComponentColumn::new(layout).expect("a column");
         // Rows go in while the column still reports plain data, then the
@@ -2335,7 +2345,7 @@ mod tests {
 
         let rows = column
             .relayout(
-                ComponentLayout {
+                ColumnLayout {
                     size: 16,
                     align: 8,
                     schema_hash: 2,
@@ -2395,7 +2405,7 @@ mod tests {
 
         column
             .relayout(
-                ComponentLayout {
+                ColumnLayout {
                     size: 8,
                     align: 4,
                     schema_hash: 3,
@@ -2425,7 +2435,7 @@ mod tests {
 
         column
             .relayout(
-                ComponentLayout {
+                ColumnLayout {
                     size: 4,
                     align: 4,
                     schema_hash: 4,
@@ -2452,7 +2462,7 @@ mod tests {
         plan.push(4, 8, FieldSource::OldOffset(0));
 
         let result = column.relayout(
-            ComponentLayout {
+            ColumnLayout {
                 size: 8,
                 align: 4,
                 schema_hash: 1,
@@ -2474,7 +2484,7 @@ mod tests {
         let mut column = column_with_rows(&[]);
         assert!(matches!(
             column.relayout(
-                ComponentLayout {
+                ColumnLayout {
                     size: 0,
                     align: 4,
                     schema_hash: 1,
@@ -2486,7 +2496,7 @@ mod tests {
         ));
         assert!(matches!(
             column.relayout(
-                ComponentLayout {
+                ColumnLayout {
                     size: 4,
                     align: 3,
                     schema_hash: 1,
@@ -2546,8 +2556,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "descriptor-only column has no Rust type")]
     fn a_descriptor_column_refuses_typed_access() {
-        let layout =
-            ComponentLayout::new(8, 4, 7, Blittability::engine_verified()).expect("layout");
+        let layout = ColumnLayout::new(8, 4, 7, Blittability::engine_verified()).expect("layout");
         let column = ComponentColumn::new(layout).expect("column");
         let _ = column.as_slice::<u64>();
     }
@@ -2575,8 +2584,7 @@ mod tests {
     /// generated one reports the truth about its element type.
     #[test]
     fn ops_report_the_drop_behaviour_of_their_lane() {
-        let layout =
-            ComponentLayout::new(4, 4, 7, Blittability::engine_verified()).expect("layout");
+        let layout = ColumnLayout::new(4, 4, 7, Blittability::engine_verified()).expect("layout");
         assert!(
             ComponentColumn::new(layout)
                 .expect("column")
@@ -2685,8 +2693,8 @@ mod tests {
         column.set_row_ticks(1, ComponentTicks::new(Tick(22)));
 
         // A wider, more strongly aligned shape forces a fresh allocation.
-        let widened = ComponentLayout::new(16, 8, 77, Blittability::engine_verified())
-            .expect("a valid layout");
+        let widened =
+            ColumnLayout::new(16, 8, 77, Blittability::engine_verified()).expect("a valid layout");
         column
             .relayout(widened, &FieldPlan::new())
             .expect("an empty plan zeroes every row");
@@ -2720,7 +2728,7 @@ mod tests {
     #[test]
     fn a_descriptor_relayout_that_widens_alignment_reallocates() {
         // Two 4-byte fields, align 4 - the shape audit 4.18 widened.
-        let old = ComponentLayout::new(12, 4, 1, Blittability::engine_verified()).expect("layout");
+        let old = ColumnLayout::new(12, 4, 1, Blittability::engine_verified()).expect("layout");
         let mut column = ComponentColumn::new(old).expect("column");
         column
             .push_bytes(&[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0])
@@ -2730,7 +2738,7 @@ mod tests {
             .expect("push");
 
         // Widen to align 8, the case the native lane refuses.
-        let new = ComponentLayout::new(16, 8, 2, Blittability::engine_verified()).expect("layout");
+        let new = ColumnLayout::new(16, 8, 2, Blittability::engine_verified()).expect("layout");
         let mut plan = FieldPlan::new();
         plan.push(0, 4, FieldSource::OldOffset(0));
         plan.push(8, 4, FieldSource::OldOffset(4));

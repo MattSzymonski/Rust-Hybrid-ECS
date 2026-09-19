@@ -10,6 +10,15 @@
 // - Methods are marked UnmanagedCallersOnly and resolved through hostfxr.
 // - No exception may cross the native ABI boundary; every exported operation
 //   catches failures locally and returns a neutral status where applicable.
+// - Each byte payload gets its own named length/copy pair rather than one
+//   generic pair taking a payload-kind number. This is deliberate and has
+//   been proposed and declined: two exports per payload is the price of a
+//   wrong name failing at load, in the host's get_unmanaged_fn, naming the
+//   export it could not find. Under a numeric kind the same mistake becomes
+//   a runtime mis-dispatch on a live ABI that AOT projects forward by hand.
+//   Payloads are added rarely, and each one is an ABI change that bumps
+//   INTEROP_CONTRACT_VERSION and is reviewed anyway, so the per-payload cost
+//   buys load-time diagnosis at the point where the two languages meet.
 
 using System.Runtime.InteropServices;
 using System.Threading;

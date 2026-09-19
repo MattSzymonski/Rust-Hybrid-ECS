@@ -13,7 +13,7 @@
 //! - Pin the layout shapes the engine must refuse, as typed errors.
 //! - Keep the refusals at registration rather than at first growth.
 
-use pill_engine::archetype::{Blittability, ComponentColumn, ComponentLayout};
+use pill_engine::archetype::{Blittability, ColumnLayout, ComponentColumn};
 use pill_engine::world::WorldError;
 
 /// A layout the constructor refuses is refused with the error that names the
@@ -25,15 +25,15 @@ fn degenerate_layouts_are_typed_errors() {
     // the checks under test refuse.
     let witness = unsafe { Blittability::assume() };
     assert!(matches!(
-        ComponentLayout::new(0, 4, 1, witness),
+        ColumnLayout::new(0, 4, 1, witness),
         Err(WorldError::DescriptorSizeZero)
     ));
     assert!(matches!(
-        ComponentLayout::new(4, 3, 1, witness),
+        ColumnLayout::new(4, 3, 1, witness),
         Err(WorldError::DescriptorAlignmentInvalid)
     ));
     assert!(matches!(
-        ComponentLayout::new(usize::MAX, 1, 1, witness),
+        ColumnLayout::new(usize::MAX, 1, 1, witness),
         Err(WorldError::DescriptorLayoutInvalid)
     ));
 
@@ -41,7 +41,7 @@ fn degenerate_layouts_are_typed_errors() {
     // constructor would have refused. It validates again, in every build
     // profile: a debug-only assertion used to leave release builds accepting
     // these until the first push ran off the end of the buffer.
-    let zero_sized = ComponentLayout {
+    let zero_sized = ColumnLayout {
         size: 0,
         align: 4,
         schema_hash: 1,
@@ -52,7 +52,7 @@ fn degenerate_layouts_are_typed_errors() {
         Err(WorldError::DescriptorSizeZero)
     ));
 
-    let misaligned = ComponentLayout {
+    let misaligned = ColumnLayout {
         size: 4,
         align: 3,
         schema_hash: 1,
@@ -70,7 +70,7 @@ fn degenerate_layouts_are_typed_errors() {
 fn an_unrepresentable_growth_is_a_layout_error() {
     // One element of this size still describes a layout; four of them overflow
     // `usize`, so the refusal happens in `reserve_one` before any allocation.
-    let unallocatable_growth = ComponentLayout {
+    let unallocatable_growth = ColumnLayout {
         size: usize::MAX / 4 + 8,
         align: 8,
         schema_hash: 1,

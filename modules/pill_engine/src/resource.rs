@@ -317,11 +317,11 @@ impl<T: Resource> std::fmt::Debug for ResHandle<T> {
 /// go with it, as plain data.
 ///
 /// Function pointers rather than a vtable, for the same reason
-/// `ErasedVecStorageOps` exists on the component side: a `Box<dyn Any>` carries
-/// its destructor in a vtable that lives in the image of whichever artifact
-/// created the value, and resources outlive the module that inserted them -
-/// nothing clears them on reload. A table that is plain data can be replaced
-/// when the code it points at is about to be unmapped.
+/// [`ColumnOps`](crate::archetype::ColumnOps) is on the component side: a
+/// `Box<dyn Any>` carries its destructor in a vtable that lives in the image
+/// of whichever artifact created the value, and resources outlive the module
+/// that inserted them - nothing clears them on reload. A table that is plain
+/// data can be replaced when the code it points at is about to be unmapped.
 ///
 /// Only a drop is needed. Unlike a component column, a resource is never
 /// upcast to a trait object, so there are no `up_ref`/`up_mut`/`take_boxed`
