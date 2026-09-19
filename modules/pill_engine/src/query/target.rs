@@ -148,11 +148,10 @@ impl<T: Component> QueryTarget for &T {
 /// Cached pointers used by mutable component queries to construct `Mut<T>`
 /// without re-locating the underlying storage on every access.
 pub struct MutFetchState<T: Component> {
-    /// Raw pointer to the component values storage, cached to avoid
-    /// re-locating the storage on every row fetch.
+    /// Raw pointer to the component column, cached to avoid re-locating the
+    /// storage on every row fetch. The column owns its change-detection ticks,
+    /// so one pointer reaches both the value and its metadata.
     values: SendPtrMut<crate::archetype::ComponentColumn>,
-    /// Raw pointer to the per-entity change-detection ticks storage.
-    ticks: SendPtrMut<Vec<ComponentTicks>>,
     /// The world tick for this run, stored on `Mut<T>` at fetch time.
     this_run: Tick,
     /// Ties the state to the queried component type.
@@ -204,31 +203,25 @@ impl<T: Component> QueryTarget for &mut T {
         );
         let values = SendPtrMut::new(archetype.component_storages.column_of_mut::<T>()
             as *mut crate::archetype::ComponentColumn);
-        let ticks_vec = archetype
-            .component_ticks
-            .get_mut(&ComponentId::of::<T>())
-            .expect("component_ticks vec missing for type - archetype not properly initialized")
-            as *mut Vec<ComponentTicks>;
-        let ticks = SendPtrMut::new(ticks_vec);
         MutFetchState {
             values,
-            ticks,
             this_run,
             _marker: std::marker::PhantomData,
         }
     }
 
     fn fetch_with_state<'a>(state: &Self::State, index: usize) -> Self::Item<'a> {
-        // SAFETY: Disjoint per-row access guaranteed by the scheduler. Both
-        // pointers are valid for the lifetime of the iteration. The query loop
-        // invariant guarantees `index < archetype.len() == storage.len()`,
-        // so unchecked access is sound. Mutating through Mut::deref_mut
-        // updates ticks[index].changed without requiring atomics because
-        // no other thread observes this row.
+        // SAFETY: Disjoint per-row access guaranteed by the scheduler. The
+        // pointer is valid for the lifetime of the iteration. The query loop
+        // invariant guarantees `index < archetype.len() == column.len()`, so
+        // unchecked access is sound, and the row and its ticks are separate
+        // fields of the column, so the two references do not overlap. Mutating
+        // through Mut::deref_mut updates the row's `changed` tick without
+        // requiring atomics because no other thread observes this row.
         unsafe {
-            let value: &'a mut T = (*state.values.as_ptr()).get_mut_unchecked::<T>(index);
-            let ticks: &'a mut ComponentTicks =
-                &mut *(*state.ticks.as_ptr()).as_mut_ptr().add(index);
+            let column = state.values.as_ptr();
+            let value: &'a mut T = (*column).get_mut_unchecked::<T>(index);
+            let ticks: &'a mut ComponentTicks = (*column).row_ticks_mut_unchecked(index);
             Mut::new(value, ticks, state.this_run)
         }
     }

@@ -25,8 +25,19 @@ Rust project (headless):
 - `set PROJECT_PATH=../examples/project_rs` then `cargo run --package pill_standalone`
 - or, in PowerShell: `$env:PROJECT_PATH = "../examples/project_rs"; cargo run --package pill_standalone`
 
-Rust project (windowed): run
-`cargo run --package pill_standalone --features rendering`.
+Rust project (windowed): the same, with `--features rendering`.
+
+**The host and the project must resolve the same dependency graph.** Cargo
+folds a dependency's resolved features into the dependent's `-C metadata`, and
+that hash is part of every symbol name `pill_core.dll` exports, so a host and a
+project that resolve different graphs link two incompatible engine dylibs and
+the project fails to load. That is why a project depends on
+`pill_master_renderer` with `default-features = false`: `Position` and `Color`
+come from `pill_engine`, `Sprite` needs only the renderer's data half, and wgpu
+stays out of the project's graph so a headless host and a windowed one can both
+load it. Should the two ever diverge anyway, the host names both dylibs rather
+than letting the loader report it as "The specified procedure could not be
+found".
 
 Live per-function hot patching is on by default in dev builds: a body-only
 edit to a `#[pill_hot]` system is compiled on its own and swapped into the

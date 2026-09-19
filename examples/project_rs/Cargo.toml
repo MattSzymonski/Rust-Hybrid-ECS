@@ -13,17 +13,21 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 pill_engine = { path = "../../modules/pill_engine" }
 pill_core = { path = "../../modules/pill_core" }
-# The renderer, for its components: `Position`, `Sprite` and `Color` are
-# renderer concepts and live with the pipeline that draws them, not in the ECS
-# core. A project that wants sprites depends on the renderer and calls
-# `register_components`.
+# The renderer, for `Sprite`: a quad with a width, a height and a fill is the
+# renderer's own idea of a thing to draw, so it lives with the pipeline that
+# draws it. `Position` and `Color` are universal and come from `pill_engine`
+# instead.
 #
-# NOTE: this crate carries `wgpu`, so linking it puts the graphics stack into
-# this `cdylib` and into every hot patch of it. See the cost note in
-# `pill_master_renderer`'s crate docs for what that buys and what it costs.
-pill_master_renderer = { path = "../../modules/optional/rendering/pill_master_renderer" }
+# `default-features = false` drops the crate's `gpu` feature, which is what
+# keeps wgpu out of this `cdylib` and out of every hot patch of it. It also
+# keeps this project loadable by a headless host: cargo folds a dependency's
+# resolved features into `-C metadata`, so a project that linked wgpu resolved
+# a different `pill_core.dll` than a host without the renderer had mapped, and
+# failed to load. A windowed host turns the feature back on through its own
+# graph, and both sides unify alike either way.
+pill_master_renderer = { path = "../../modules/optional/rendering/pill_master_renderer", default-features = false }
 # Linked directly so the project can name the `Spline` type. See the note in
-# `project_init` about why this crate must not also be loaded as a module.
+# `init` about why this crate must not also be loaded as a module.
 # `default-features = false` is a defensive no-op: `module-abi` is opt-in now,
 # so the `pill_module_*` exports stay off in this build either way.
 # `test-hooks` keeps the module's demo observables - the sampled height

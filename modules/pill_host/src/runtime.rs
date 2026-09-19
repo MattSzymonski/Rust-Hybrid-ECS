@@ -1312,10 +1312,10 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     // Managed games run entirely as scheduler systems. Native games retain
     // this compatibility update hook after their scheduled work.
     //
-    // Both hooks are optional DLL exports (`project_update`,
-    // `pill_module_update`) that the attribute macros do not generate, so a
-    // statically linked build has nothing to call: its gameplay runs entirely
-    // through scheduler systems, which Step 7 already ran.
+    // The hook is one optional DLL export (`pill_module_update`) that neither
+    // attribute macro generates, so a statically linked build has nothing to
+    // call: its gameplay runs entirely through scheduler systems, which Step 7
+    // already ran.
     #[cfg(feature = "hot_reload")]
     {
         host.loaded_project.update(&host.engine_api);

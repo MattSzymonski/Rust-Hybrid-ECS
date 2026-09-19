@@ -33,8 +33,12 @@ mod fast_compile;
 mod context;
 /// Low-level .NET hosting bootstrap used by the C# project backend.
 mod csharp_runtime;
+/// The two-call protocol every managed payload crosses the boundary through.
+mod managed_buffer;
 /// C# component manifest schema, field validation, and engine type mapping.
 mod manifest;
+/// The one apply pipeline every manifest kind runs through.
+mod manifest_apply;
 /// Native callbacks used by C# query enumerators.
 mod queries;
 /// Managed resource registration and the callback that serves resource bytes.

@@ -400,7 +400,7 @@ mod tests {
             ORDER.lock().unwrap().push("module");
             0
         }
-        fn project_init(_engine: &mut Engine) -> u32 {
+        fn project_module_init(_engine: &mut Engine) -> u32 {
             ORDER.lock().unwrap().push("project");
             0
         }
@@ -412,7 +412,9 @@ mod tests {
         let mut engine = Engine::new();
         let project = StaticProject {
             name: "project",
-            backend: StaticProjectBackend::Native { init: project_init },
+            backend: StaticProjectBackend::Native {
+                init: project_module_init,
+            },
             modules: MODULES,
         };
         project.initialize(&mut engine).expect("both succeed");

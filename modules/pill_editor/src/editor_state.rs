@@ -682,7 +682,8 @@ mod tests {
     /// which is the path the Inspector uses to repaint sprites live.
     #[test]
     fn set_field_on_renderer_sprite_repaints_color_channels() {
-        use pill_master_renderer::{register_components, Color, Sprite};
+        use pill_engine::common_components::Color;
+        use pill_master_renderer::{register_components, Sprite};
 
         let mut engine = Engine::new();
         register_components(engine.world_mut());

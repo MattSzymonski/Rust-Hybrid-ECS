@@ -589,7 +589,7 @@ pub enum BuildError {
 /// Native project-library loading and initialization failures.
 ///
 /// Covers the temporary-directory staging, the copy into place, dynamic
-/// loading, and the `project_init` entry-point contract.
+/// loading, and the `pill_module_init` entry-point contract.
 #[engine_error(namespace = host::library)]
 pub enum LibraryError {
     /// The per-process temporary directory could not be created.
@@ -625,18 +625,61 @@ pub enum LibraryError {
         source: libloading::Error,
     },
 
-    /// The library does not export a required entry point.
+    /// The artifact was linked against a different engine dylib than the host
+    /// has mapped, so the loader cannot resolve its imports.
+    ///
+    /// Cargo folds a dependency's resolved features into the dependent's
+    /// `-C metadata`, and that hash is part of every symbol name `pill_core`
+    /// exports. Two builds that resolve different graphs therefore produce two
+    /// `pill_core.dll` files whose symbols do not match, and the artifact built
+    /// against one cannot load against the other. Windows reports that as
+    /// `LoadLibrary` error 127, "The specified procedure could not be found",
+    /// which names neither the dylib nor the feature that moved.
+    ///
+    /// Staging the matching dylib beside the artifact does not help: the loader
+    /// resolves a DLL that is already mapped by its module name, whatever
+    /// directory the new one sits in, and the host mapped `pill_core.dll`
+    /// before it built anything.
     #[message(
-        "native project library is missing required export ",
+        "native library for ",
+        name_style(subject),
+        " was built against a different engine dylib than this host runs, so its ",
+        "imports cannot resolve. The host maps ",
+        name_style(host_engine),
+        " and the artifact links ",
+        name_style(module_engine),
+        ". The two builds resolved different dependency graphs, which changes ",
+        "every exported symbol name; the usual cause is a headless host against ",
+        "a project that links the renderer. Either run the host with the ",
+        "feature set the project implies (`--features rendering` for the ",
+        "renderer), or build the host and the project in one cargo invocation ",
+        "so both resolve the same graph"
+    )]
+    EngineDylibMismatch {
+        subject: String,
+        host_engine: String,
+        module_engine: String,
+    },
+
+    /// The library does not export a required entry point.
+    ///
+    /// Names the subject as well as the symbol: a project and an optional
+    /// module export the same entry points, so the symbol alone no longer says
+    /// which artifact is missing it.
+    #[message(
+        "native library for ",
+        name_style(subject),
+        " is missing required export ",
         name_style(symbol)
     )]
     MissingExport {
+        subject: String,
         symbol: String,
         #[source]
         source: libloading::Error,
     },
 
-    /// `project_init` reported a failed generation.
+    /// `pill_module_init` reported a failed generation.
     #[message("project module initialization failed with status ", value(status))]
     InitializationFailed { status: u32 },
 }
@@ -983,6 +1026,36 @@ where
 
 #[cfg(test)]
 mod tests {
+    /// The engine-dylib mismatch names both dylibs and both ways out.
+    ///
+    /// This is the message that replaces `os error 127`, which named neither
+    /// the dylib nor the feature that moved, so the parts a reader has to act
+    /// on are worth pinning.
+    #[test]
+    fn engine_dylib_mismatch_names_both_dylibs_and_the_remedy() {
+        let error = LibraryError::EngineDylibMismatch {
+            subject: "project".to_string(),
+            host_engine: "target/debug/pill_core.dll".to_string(),
+            module_engine: "target/hot/pill_core.dll".to_string(),
+        };
+        let message = error.to_string();
+
+        assert!(message.contains("project"), "names the subject: {message}");
+        assert!(
+            message.contains("target/debug/pill_core.dll")
+                && message.contains("target/hot/pill_core.dll"),
+            "names both dylibs: {message}"
+        );
+        assert!(
+            message.contains("--features rendering"),
+            "names the remedy: {message}"
+        );
+        assert!(
+            !message.contains("  "),
+            "no run of spaces from a wrapped message literal: {message}"
+        );
+    }
+
     use super::*;
     use miette::Diagnostic as _;
 

@@ -14,7 +14,8 @@
 //!   the panic guard and engine-pointer reconstruction that every module
 //!   otherwise hand-writes.
 //! - [`attribute(PillProject)`] does the same for the project ABI
-//!   (`project_init`, `project_update`, `project_schema_fingerprint`).
+//!   (`pill_module_init`, `pill_module_abi_version`,
+//!   `project_schema_fingerprint`).
 //!
 //! # Design
 //!
@@ -48,7 +49,7 @@ use syn::{parse_macro_input, spanned::Spanned, DeriveInput, ItemFn};
 ///
 /// Supported helper attributes:
 /// - `#[pill(persistable)]` - the component is schema-migrated across reloads
-///   (requires `Clone + Serialize + DeserializeOwned + Default`, matching
+///   (requires `Serialize + DeserializeOwned + Default`, matching
 ///   [`World::register_persistable_component`]).
 /// - `#[pill(shared)]` - the component keeps one identity across every binary
 ///   that links it, instead of a separate one per binary. Use it for a type
@@ -67,7 +68,7 @@ use syn::{parse_macro_input, spanned::Spanned, DeriveInput, ItemFn};
 ///   (a span over the live buffer, a count, a resize; get/set for text) that
 ///   call derive-generated C-ABI trampolines, so managed code reads and writes
 ///   the real container in place. Resizing a `Vec` field needs `E: Default +
-///   Clone`, which the component's own `Clone` already half implies;
+///   Clone`, which the supported element types all satisfy;
 /// - `Vec<String>` is supported too, through per-element accessors: its
 ///   elements are separately allocated, so managed code gets `Count`, `GetX`,
 ///   `SetX`, `PushX` and `ResizeX` (one boundary call per element) instead of
@@ -468,9 +469,10 @@ fn emit_heap_field_accessor(
                     // mutation needs, so the exclusive reference is valid for
                     // the whole call.
                     let component = unsafe { &mut *(row as *mut #type_ident) };
-                    // `resize` needs `E: Clone`, which every registered
-                    // component already satisfies: `Vec<E>: Clone` is part of
-                    // the component's own `Clone`.
+                    // `resize` needs `E: Default + Clone`. The derive only
+                    // accepts a primitive or a `#[derive(PillMirror)]` struct
+                    // as `E`, and both are, so the bound is satisfied by the
+                    // field's element type rather than by the component's.
                     component.#field_ident.resize(
                         new_length,
                         ::core::default::Default::default(),
@@ -2038,6 +2040,92 @@ fn hot_patch_resolver_export(
     }
 }
 
+/// Emit the `pill_module_init` entry point every loadable artifact exports.
+///
+/// One body for both attributes. A project and an optional module are the same
+/// DLL contract: they export the same symbols, are loaded the same way, reload
+/// through the same transaction and retire into the same graveyard. What used
+/// to distinguish them was a symbol prefix, which is a difference in a string
+/// rather than in a contract, so the entry point is written once here and each
+/// attribute supplies only the `#[cfg]` gate its artifact needs.
+///
+/// `gate` is empty for a project, which is always built as its own artifact,
+/// and `#[cfg(feature = "module-abi")]` for a module, which may instead be
+/// linked into one as an ordinary dependency - where a second definition of a
+/// `#[no_mangle]` symbol is a link error.
+fn module_init_export(
+    gate: &proc_macro2::TokenStream,
+    init_fn: &proc_macro2::Ident,
+) -> proc_macro2::TokenStream {
+    quote! {
+        /// Registers this artifact against the host engine; returns zero on
+        /// success.
+        ///
+        /// # Safety
+        ///
+        /// `api` must be a valid [`EngineApi`] pointer owned by the host and
+        /// kept alive for the whole duration of this call.
+        ///
+        /// [`EngineApi`]: ::pill_engine::EngineApi
+        #gate
+        #[no_mangle]
+        pub unsafe extern "C" fn pill_module_init(api: *const ::pill_engine::EngineApi) -> u32 {
+            // A panic must never unwind across the C ABI boundary, so it is
+            // converted into a non-zero status and the host keeps the previous
+            // generation. `catch_unwind` lives in `std::panic` (not `core`),
+            // because unwinding is a std-level feature.
+            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
+                // SAFETY: The host guarantees `api` points at a live `EngineApi`
+                // whose `engine_handle` addresses the single engine instance,
+                // and that both outlive this call. The engine is not otherwise
+                // borrowed while an artifact initializes, so the reconstructed
+                // `&mut Engine` is unique.
+                let api = unsafe { &*api };
+                let engine = unsafe { &mut *(api.engine_handle as *mut ::pill_engine::Engine) };
+                if let Err(_error) =
+                    ::pill_engine::component_registry::register_all_components(engine.world_mut())
+                {
+                    // The engine logged the first-class diagnostic; fail the
+                    // init so the host rolls the reload back instead of running
+                    // with a half-registered component set.
+                    return u32::MAX;
+                }
+                let status = #init_fn(engine);
+                // That drain runs before the user's own registration code, so a
+                // guard raised from there - a shared resource name claimed by
+                // two types, or one registered with two layouts - is recorded
+                // after it has been read. Read the slot once more, so such a
+                // conflict fails the init instead of being recorded and
+                // forgotten.
+                if engine.world_mut().take_registration_error().is_some() {
+                    return u32::MAX;
+                }
+                status
+            }));
+            result.unwrap_or(u32::MAX)
+        }
+    }
+}
+
+/// Emit the ABI revision export the host reads before it calls anything else.
+///
+/// Shared for the same reason [`module_init_export`] is: the revision belongs
+/// to the one loadable-artifact contract, not to one kind of artifact.
+fn module_abi_version_export(gate: &proc_macro2::TokenStream) -> proc_macro2::TokenStream {
+    quote! {
+        /// Loadable-artifact ABI revision this crate was built against.
+        #gate
+        const PILL_MODULE_ABI_VERSION: u32 = ::pill_engine::module_abi::MODULE_ABI_VERSION;
+
+        /// ABI revision, checked by the host before anything else is called.
+        #gate
+        #[no_mangle]
+        pub extern "C" fn pill_module_abi_version() -> u32 {
+            PILL_MODULE_ABI_VERSION
+        }
+    }
+}
+
 // =============================================================================
 // #[pill_module]
 // =============================================================================
@@ -2074,6 +2162,12 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
         &format_ident!("pill_hot_resolve"),
         &quote! { #[cfg(all(feature = "module-abi", debug_assertions))] },
     );
+    // The loadable-artifact contract, gated: a module crate is often linked
+    // into another artifact as an ordinary dependency, where a second
+    // definition of a `#[no_mangle]` symbol is a link error.
+    let module_abi_gate = quote! { #[cfg(feature = "module-abi")] };
+    let abi_version_export = module_abi_version_export(&module_abi_gate);
+    let init_export = module_init_export(&module_abi_gate, fn_ident);
 
     let expanded = quote! {
         // Emitted unconditionally. What `module-abi` gates is the `#[no_mangle]`
@@ -2087,9 +2181,7 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
 
         #hot_patch_resolver
 
-        /// Optional-module ABI revision this crate was built against.
-        #[cfg(feature = "module-abi")]
-        const PILL_MODULE_ABI_VERSION: u32 = ::pill_engine::module_abi::MODULE_ABI_VERSION;
+        #abi_version_export
 
         /// Name reported to the host for diagnostics; null-terminated for the
         /// C ABI. Derived from the crate name so it can never drift from the
@@ -2097,14 +2189,6 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
         #[cfg(feature = "module-abi")]
         const PILL_MODULE_NAME: &[u8] =
             ::core::concat!(::core::env!("CARGO_PKG_NAME"), "\0").as_bytes();
-
-        /// Module ABI revision, checked by the host before anything else is
-        /// called.
-        #[cfg(feature = "module-abi")]
-        #[no_mangle]
-        pub extern "C" fn pill_module_abi_version() -> u32 {
-            PILL_MODULE_ABI_VERSION
-        }
 
         /// Human-readable module name used in host log messages.
         #[cfg(feature = "module-abi")]
@@ -2219,52 +2303,7 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
             count
         }
 
-        /// Registers the module against the host engine; returns zero on
-        /// success.
-        ///
-        /// # Safety
-        ///
-        /// `api` must be a valid [`EngineApi`] pointer owned by the host and
-        /// kept alive for the whole duration of this call.
-        ///
-        /// [`EngineApi`]: ::pill_engine::EngineApi
-        #[cfg(feature = "module-abi")]
-        #[no_mangle]
-        pub unsafe extern "C" fn pill_module_init(api: *const ::pill_engine::EngineApi) -> u32 {
-            // A panic must never unwind across the C ABI boundary, so it is
-            // converted into a non-zero status and the host keeps the previous
-            // generation. `catch_unwind` lives in `std::panic` (not `core`),
-            // because unwinding is a std-level feature.
-            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                // SAFETY: The host guarantees `api` points at a live `EngineApi`
-                // whose `engine_handle` addresses the single engine instance,
-                // and that both outlive this call. The engine is not otherwise
-                // borrowed while a module initializes, so the reconstructed
-                // `&mut Engine` is unique.
-                let api = unsafe { &*api };
-                let engine = unsafe { &mut *(api.engine_handle as *mut ::pill_engine::Engine) };
-                if let Err(_error) =
-                    ::pill_engine::component_registry::register_all_components(engine.world_mut())
-                {
-                    // The engine logged the first-class diagnostic; fail the
-                    // init so the host rolls the reload back instead of running
-                    // with a half-registered component set.
-                    return u32::MAX;
-                }
-                let status = #fn_ident(engine);
-                // That drain runs before the user's own registration code, so a
-                // guard raised from there - a shared resource name claimed by
-                // two types, or one registered with two layouts - is recorded
-                // after it has been read. Read the slot once more, so such a
-                // conflict fails the init instead of being recorded and
-                // forgotten.
-                if engine.world_mut().take_registration_error().is_some() {
-                    return u32::MAX;
-                }
-                status
-            }));
-            result.unwrap_or(u32::MAX)
-        }
+        #init_export
     };
 
     expanded.into()
@@ -2274,14 +2313,22 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
 // #[pill_project]
 // =============================================================================
 
-/// Wraps a project's `init` function and generates the project-module ABI
-/// exports (`project_init`, `project_update`, `project_schema_fingerprint`).
+/// Wraps a project's `init` function and generates the loadable-artifact
+/// exports (`pill_module_init`, `pill_module_abi_version`) plus the
+/// project-only `project_schema_fingerprint`.
 ///
 /// The annotated function must have the signature
 /// `fn(engine: &mut Engine) -> u32`. The macro auto-registers every component
 /// declared with `#[derive(PillComponent)]` in this artifact before calling
 /// the wrapped function, and generates the schema fingerprint from the same
 /// registry, so adding a component can never leave the fingerprint stale.
+///
+/// The entry points are the same ones [`macro@pill_module`] emits, because a
+/// project and an optional module are one DLL contract: the host loads both the
+/// same way, reloads both through the same transaction, and used to tell them
+/// apart only by a symbol prefix. What remains project-specific is the schema
+/// fingerprint, which a module has no equivalent of, and the ungated exports -
+/// a project is always built as its own artifact.
 #[proc_macro_attribute]
 pub fn pill_project(_attribute: TokenStream, item: TokenStream) -> TokenStream {
     let item_fn = parse_macro_input!(item as ItemFn);
@@ -2292,62 +2339,21 @@ pub fn pill_project(_attribute: TokenStream, item: TokenStream) -> TokenStream {
         &format_ident!("pill_hot_resolve"),
         &quote! { #[cfg(debug_assertions)] },
     );
+    // The same loadable-artifact contract a module emits, ungated: a project is
+    // always built as its own artifact, so there is no second definition to
+    // collide with.
+    let ungated = quote! {};
+    let abi_version_export = module_abi_version_export(&ungated);
+    let init_export = module_init_export(&ungated, fn_ident);
 
     let expanded = quote! {
         #item_fn
 
         #hot_patch_resolver
 
-        /// Registers the project's components, resources, and systems; returns
-        /// zero on success.
-        ///
-        /// # Safety
-        ///
-        /// `api` must be a valid [`EngineApi`] pointer owned by the host for
-        /// the complete duration of this call.
-        ///
-        /// [`EngineApi`]: ::pill_engine::EngineApi
-        #[no_mangle]
-        pub unsafe extern "C" fn project_init(api: *const ::pill_engine::EngineApi) -> u32 {
-            // A panic must never unwind across the C ABI boundary, so it is
-            // converted into a non-zero status and the host keeps the previous
-            // generation. `catch_unwind` lives in `std::panic` (not `core`),
-            // because unwinding is a std-level feature.
-            let result = ::std::panic::catch_unwind(::std::panic::AssertUnwindSafe(|| {
-                // SAFETY: The host guarantees `api` points at a live `EngineApi`
-                // whose `engine_handle` addresses the single engine instance,
-                // and that both outlive this call. The engine is not otherwise
-                // borrowed while a project initializes, so the reconstructed
-                // `&mut Engine` is unique.
-                let api = unsafe { &*api };
-                let engine = unsafe { &mut *(api.engine_handle as *mut ::pill_engine::Engine) };
-                if let Err(_error) =
-                    ::pill_engine::component_registry::register_all_components(engine.world_mut())
-                {
-                    // The engine logged the first-class diagnostic; fail the
-                    // init so the host rolls the reload back instead of running
-                    // with a half-registered component set.
-                    return u32::MAX;
-                }
-                let status = #fn_ident(engine);
-                // That drain runs before the user's own registration code, so a
-                // guard raised from there - a shared resource name claimed by
-                // two types, or one registered with two layouts - is recorded
-                // after it has been read. Read the slot once more, so such a
-                // conflict fails the init instead of being recorded and
-                // forgotten.
-                if engine.world_mut().take_registration_error().is_some() {
-                    return u32::MAX;
-                }
-                status
-            }));
-            result.unwrap_or(u32::MAX)
-        }
+        #abi_version_export
 
-        /// Optional per-frame hook; gameplay is executed entirely by
-        /// scheduler-managed ECS systems.
-        #[no_mangle]
-        pub extern "C" fn project_update(_api: *const ::pill_engine::EngineApi) {}
+        #init_export
 
         /// Aggregate schema fingerprint of every persistable component,
         /// computed from the compile-time registry.

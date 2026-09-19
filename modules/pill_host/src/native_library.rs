@@ -13,23 +13,33 @@
 //!
 //! # Design
 //!
-//! The native ABI is a fixed export contract:
+//! The native ABI is a fixed export contract, and there is exactly one of it.
+//! A project and an optional module are the same loadable artifact - same
+//! exports, same loader, same reload transaction, same graveyard - so the
+//! loader has nothing to parameterise:
 //!
-//! - `project_init(*const EngineApi) -> u32` — required. Registers components
-//!   and systems before the first frame and returns zero on success; any
-//!   other status aborts the load transaction.
-//! - `project_update(*const EngineApi)` — optional. Called once per frame for
-//!   modules that keep the legacy explicit update hook.
+//! - `pill_module_init(*const EngineApi) -> u32` — required. Registers
+//!   components and systems before the first frame and returns zero on
+//!   success; any other status aborts the load transaction.
+//! - `pill_module_update(*const EngineApi)` — optional. Called once per frame
+//!   by an artifact that keeps an explicit update hook.
+//! - `pill_module_abi_version() -> u32` — optional, read before anything else
+//!   is called so an incompatible artifact is rejected rather than invoked.
 //!
-//! Both exports are resolved and cached when the library is loaded, so the
-//! frame loop never performs a dynamic lookup or panics on a missing
-//! optional export. `project_init` must be idempotent: a failed generation is
-//! rolled back by re-initializing the previous module.
+//! The exports are resolved and cached when the library is loaded, so the
+//! frame loop never performs a dynamic lookup or panics on a missing optional
+//! export. `pill_module_init` must be idempotent: a failed generation is
+//! rolled back by re-initializing the previous artifact.
+//!
+//! What differs between a project and a module is policy, not contract - a
+//! project is singular where modules are an ordered list, and a module's
+//! components are mirrored to C# - and that lives in the config and the reload
+//! transaction rather than here.
 
 // Standard library
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 // External crates
 #[cfg(windows)]
@@ -52,6 +62,29 @@ use crate::csharp::{ResolvedFieldAccessor, ResolvedMirrorMethod};
 
 /// Directory where temporary native-library copies are stored.
 const TEMPORARY_DIRECTORY: &str = "pill_standalone_temp";
+
+/// How long another process's staging directory is left alone after its last
+/// write.
+///
+/// This is the liveness check, and it is deliberately a clock rather than a
+/// process probe. A running host stages a fresh copy of every DLL it loads and
+/// of every one it reloads, so its directory's modification time keeps moving;
+/// one that has not been written to for this long belonged to a process that
+/// is gone. The window is generous because the cost of waiting is a few
+/// megabytes of disk and the cost of being wrong is deleting the staging of a
+/// host that is still running - and on Windows that deletion half-succeeds,
+/// taking the files that are not mapped and leaving the ones that are.
+const STAGING_GRACE_PERIOD: Duration = Duration::from_secs(60 * 60);
+
+/// Maximum number of other processes' staging directories kept.
+///
+/// The backstop for the grace period above: without it, a developer who starts
+/// many hosts in one hour accumulates one directory per host until the hour is
+/// up. Bounded the way the retired-image graveyard is bounded - keep N, evict
+/// the oldest, say so - and the oldest-first order is what makes it safe to
+/// apply to directories still inside the grace period, because a live host's
+/// directory is the most recently written of them all.
+const MAX_RETAINED_STAGING_DIRECTORIES: usize = 8;
 
 /// Monotonic suffix ensuring temporary copies never collide, even when the
 /// system clock repeats or moves backwards.
@@ -81,6 +114,46 @@ fn engine_dylib_needs_isolation(workspace_root: &Path) -> bool {
         return true;
     }
     !files_equal(&module_engine, &host_engine)
+}
+
+/// Explain a load failure that an engine-dylib mismatch accounts for.
+///
+/// A missing export is almost never a missing export. The usual cause is that
+/// the artifact was linked against one `pill_core.dll` and is being loaded
+/// against another: cargo folds a dependency's resolved features into the
+/// dependent's `-C metadata`, that hash is part of every symbol name the dylib
+/// exports, and two builds that resolve different dependency graphs therefore
+/// disagree about names the loader can only report as "procedure not found".
+///
+/// Passing the original error through unchanged leaves the reader with
+/// `os error 127` and nothing to act on, so a failure that coincides with two
+/// differing engine dylibs is re-reported as the mismatch it is - with both
+/// paths and the two ways out.
+fn diagnose_load_failure(
+    error: LibraryError,
+    workspace_root: &Path,
+    module_name: &str,
+) -> LibraryError {
+    // Only a load failure can be this; a missing export or a failed copy has
+    // already said something specific and true.
+    if !matches!(error, LibraryError::LoadFailed { .. }) {
+        return error;
+    }
+    let Some(module_engine) = module_world_engine_dylib(workspace_root) else {
+        return error;
+    };
+    let host_engine = workspace_root
+        .join(crate::config::host_target_directory())
+        .join("pill_core.dll");
+    if host_engine.is_file() && files_equal(&module_engine, &host_engine) {
+        // The two agree, so whatever failed is not this.
+        return error;
+    }
+    LibraryError::EngineDylibMismatch {
+        subject: module_name.to_string(),
+        host_engine: host_engine.display().to_string(),
+        module_engine: module_engine.display().to_string(),
+    }
 }
 
 /// Copy the module-world engine dylib into `directory` so a module loaded from
@@ -282,33 +355,22 @@ const FIELD_ACCESSOR_COUNT_SYMBOL: &[u8] = b"pill_field_accessor_descriptor_coun
 /// buffer.
 const FIELD_ACCESSOR_COPY_SYMBOL: &[u8] = b"pill_copy_field_accessor_descriptors";
 
-/// Export names one loaded native library is expected to provide.
+/// Required registration entry point of a loadable artifact.
 ///
-/// The project module and optional engine modules use different export names
-/// so one crate can implement both contracts, and so an optional module can
-/// carry a version guard the older project contract never had.
-pub(crate) struct NativeEntryPoints {
-    /// Required registration entry point.
-    pub init_symbol: &'static [u8],
-    /// Optional per-frame entry point.
-    pub update_symbol: &'static [u8],
-    /// Optional ABI revision export, read at load time when present.
-    pub abi_version_symbol: &'static [u8],
-}
+/// One name for both kinds. A project and an optional module export the same
+/// symbols, load the same way, reload through the same transaction and retire
+/// into the same graveyard; what used to separate them was a prefix on these
+/// three names, which is a difference in a string rather than in a contract.
+/// The differences that are real - a project is singular where modules are an
+/// ordered list, a module's components are mirrored to C# - are policy, and
+/// live in the config and the reload transaction rather than in the loader.
+const MODULE_INIT_SYMBOL: &[u8] = b"pill_module_init";
 
-/// Export contract of the project module.
-pub(crate) const PROJECT_ENTRY_POINTS: NativeEntryPoints = NativeEntryPoints {
-    init_symbol: b"project_init",
-    update_symbol: b"project_update",
-    abi_version_symbol: b"project_abi_version",
-};
+/// Optional per-frame entry point of a loadable artifact.
+const MODULE_UPDATE_SYMBOL: &[u8] = b"pill_module_update";
 
-/// Export contract of an optional engine module.
-pub(crate) const OPTIONAL_MODULE_ENTRY_POINTS: NativeEntryPoints = NativeEntryPoints {
-    init_symbol: b"pill_module_init",
-    update_symbol: b"pill_module_update",
-    abi_version_symbol: b"pill_module_abi_version",
-};
+/// Optional ABI revision export, read at load time when present.
+const MODULE_ABI_VERSION_SYMBOL: &[u8] = b"pill_module_abi_version";
 
 /// Owns one loaded native library, either the project or an optional module.
 ///
@@ -393,12 +455,11 @@ impl NativeLibrary {
     ///
     /// Returns an error if the temporary directory cannot be created, the
     /// built library cannot be copied, or the copy is not a valid native
-    /// library exporting the required `project_init` symbol.
+    /// library exporting the required `pill_module_init` symbol.
     pub(crate) fn load_copy(
         build_output: &Path,
         workspace_root: &Path,
         module_name: &str,
-        entry_points: &NativeEntryPoints,
     ) -> Result<Self, LibraryError> {
         // Step 1: Prepare this process's temporary directory and a unique
         // target path. Scoping the directory per process id keeps concurrent
@@ -515,6 +576,11 @@ impl NativeLibrary {
         // by the build; when the two copies are byte-identical (a plain CLI
         // host) the module keeps loading the host's single instance exactly as
         // before.
+        //
+        // Staging is a best effort, not a guarantee, and Step 3 says so when it
+        // does not pay off: the loader resolves an already-mapped DLL by module
+        // name, so a second `pill_core.dll` only wins where the host has not
+        // mapped one - which on Windows is never.
         let isolated_engine = engine_dylib_needs_isolation(workspace_root);
         if isolated_engine {
             stage_module_engine_dylib(workspace_root, &temporary_directory);
@@ -530,7 +596,7 @@ impl NativeLibrary {
             Self::load(
                 temporary_copy.path(),
                 temporary_copy.path().to_path_buf(),
-                entry_points,
+                module_name,
                 isolated_engine,
             )
         }
@@ -545,7 +611,8 @@ impl NativeLibrary {
             if isolated_engine {
                 let _ = std::fs::remove_file(temporary_directory.join("pill_core.dll"));
             }
-        })?;
+        })
+        .map_err(|error| diagnose_load_failure(error, workspace_root, module_name))?;
         temporary_copy.disarm();
         analytics::record_load(module_name, load_started.elapsed().as_secs_f64() * 1000.0);
         info!(
@@ -758,12 +825,12 @@ impl NativeLibrary {
     ///
     /// # Safety
     ///
-    /// `path` must point to a valid native library whose `project_init` export
-    /// uses the expected C ABI.
+    /// `path` must point to a valid native library whose `pill_module_init`
+    /// export uses the expected C ABI.
     unsafe fn load(
         path: &Path,
         temporary_path: PathBuf,
-        entry_points: &NativeEntryPoints,
+        module_name: &str,
         isolated_engine: bool,
     ) -> Result<Self, LibraryError> {
         // Step 1: Open the native library and map it into this process.
@@ -824,29 +891,32 @@ impl NativeLibrary {
             }
         };
 
-        // Step 2: Resolve the required `project_init` export.
-        // SAFETY: `project_init` is a mandatory export of the native ABI
-        // contract, so every supported module provides it, and it is resolved
+        // Step 2: Resolve the required `pill_module_init` export. The subject's
+        // name travels with the refusal, because one contract means the symbol
+        // no longer says which artifact is missing it.
+        // SAFETY: `pill_module_init` is a mandatory export of the native ABI
+        // contract, so every supported artifact provides it, and it is resolved
         // here as a pointer with the statically known C ABI signature. The
         // pointer stays valid because the `library` handle keeps the module
-        // mapped for the lifetime of the returned `ProjectLibrary`.
+        // mapped for the lifetime of the returned `NativeLibrary`.
         let module_init: Symbol<ModuleInitFn> = unsafe {
             library
-                .get(entry_points.init_symbol)
+                .get(MODULE_INIT_SYMBOL)
                 .map_err(|source| LibraryError::MissingExport {
-                    symbol: String::from_utf8_lossy(entry_points.init_symbol).to_string(),
+                    subject: module_name.to_string(),
+                    symbol: String::from_utf8_lossy(MODULE_INIT_SYMBOL).to_string(),
                     source,
                 })?
         };
 
-        // Step 3: Resolve the optional `project_update` export.
-        // SAFETY: `project_update` is optional; when present it is resolved as a
+        // Step 3: Resolve the optional `pill_module_update` export.
+        // SAFETY: the export is optional; when present it is resolved as a
         // pointer with the statically known C ABI signature, and when absent
-        // the lookup fails and the error is discarded, leaving `project_update`
-        // as `None`. The pointer stays valid because the `library` handle
-        // keeps the module mapped.
+        // the lookup fails and the error is discarded, leaving the hook as
+        // `None`. The pointer stays valid because the `library` handle keeps
+        // the module mapped.
         let module_update: Option<Symbol<ModuleUpdateFn>> =
-            unsafe { library.get(entry_points.update_symbol) }.ok();
+            unsafe { library.get(MODULE_UPDATE_SYMBOL) }.ok();
 
         // Step 4: Read the optional ABI revision before any other call, so a
         // caller can reject an incompatible module without ever handing it a
@@ -856,7 +926,7 @@ impl NativeLibrary {
         // library is mapped. It takes no arguments and returns a plain integer,
         // so the call cannot touch host state.
         let abi_version: Option<u32> =
-            unsafe { library.get::<ModuleAbiVersionFn>(entry_points.abi_version_symbol) }
+            unsafe { library.get::<ModuleAbiVersionFn>(MODULE_ABI_VERSION_SYMBOL) }
                 .ok()
                 .map(|symbol| unsafe { symbol() });
 
@@ -952,7 +1022,7 @@ impl NativeLibrary {
 
     /// Call the optional native per-frame update entry point, when exported.
     ///
-    /// Modules that omit `project_update` run entirely through their registered
+    /// Artifacts that omit `pill_module_update` run entirely through their registered
     /// scheduler systems, so a missing export is a no-op rather than an error.
     pub(crate) fn call_update(&self, api: &EngineApi) {
         if let Some(module_update) = self.module_update {
@@ -1162,10 +1232,16 @@ pub(crate) fn process_temporary_directory(workspace_root: &Path) -> PathBuf {
 
 /// Whether a process with the given id is still running.
 ///
-/// Linux probes `/proc` directly. Other platforms cannot probe process
-/// liveness cheaply, so stale directories are detected by attempting the
-/// removal: a live process keeps its mapped modules locked and the deletion
-/// fails naturally.
+/// An exact answer where one is cheap, and only there: Linux probes `/proc`
+/// directly, and every other platform answers "not alive" rather than paying
+/// for a process-table walk on a path that runs once at startup.
+///
+/// That is safe because it is not the only check. A negative answer here does
+/// not authorise a removal - it hands the decision to
+/// [`STAGING_GRACE_PERIOD`], which asks when the directory was last written to
+/// instead of who owns it. A live host writes to its staging on every load, so
+/// the clock recognises it on every platform; this function only lets Linux
+/// skip the wait.
 fn process_is_alive(pid: u32) -> bool {
     #[cfg(target_os = "linux")]
     {
@@ -1180,14 +1256,26 @@ fn process_is_alive(pid: u32) -> bool {
 
 /// Remove temporary copies left by earlier runs of this host process.
 ///
-/// Directories belonging to other, still-running host instances are skipped;
-/// stale directories from crashed processes are removed. Removal failures are
-/// reported instead of swallowed.
+/// Three rules, in order. This process's own directory always goes - a
+/// previous run under the same process id left it, and nothing of ours is
+/// mapped yet. Another process's directory goes once it has been quiet for
+/// [`STAGING_GRACE_PERIOD`], which is how a dead host is told from a live one
+/// without probing the process table. And whatever survives both is capped at
+/// [`MAX_RETAINED_STAGING_DIRECTORIES`], oldest evicted first, so a burst of
+/// host runs inside one grace period cannot accumulate without bound.
+///
+/// Removal failures are reported rather than swallowed, because on Windows a
+/// failure is informative: a live host keeps its mapped modules locked, so a
+/// refusal is the operating system saying the directory is still in use.
 pub(crate) fn cleanup_temporary_files(workspace_root: &Path) {
     let temporary_root = workspace_root.join(TEMPORARY_DIRECTORY);
     let Ok(entries) = std::fs::read_dir(&temporary_root) else {
         return;
     };
+
+    let own_pid = std::process::id();
+    let mut candidates: Vec<(u32, SystemTime, PathBuf)> = Vec::new();
+
     for entry in entries.filter_map(Result::ok) {
         let Some(pid) = entry
             .file_name()
@@ -1196,29 +1284,109 @@ pub(crate) fn cleanup_temporary_files(workspace_root: &Path) {
         else {
             continue;
         };
-        if pid != std::process::id() && process_is_alive(pid) {
+        let path = entry.path();
+
+        if pid == own_pid {
+            remove_staging_directory(&path, pid, "left by an earlier run of this process");
             continue;
         }
-        match std::fs::remove_dir_all(entry.path()) {
-            Ok(()) => {
-                if pid != std::process::id() {
-                    println!("[host] Cleaned up stale temporary files from process {pid}.");
-                }
+
+        // The Linux probe is exact and answers first; everywhere else it
+        // reports "not alive" by design and the clock decides instead.
+        if process_is_alive(pid) {
+            continue;
+        }
+
+        candidates.push((pid, staging_last_write(&path), path));
+    }
+
+    let ages: Vec<(u32, SystemTime)> = candidates
+        .iter()
+        .map(|(pid, modified, _)| (*pid, *modified))
+        .collect();
+    for (index, reason) in staging_directories_to_evict(&ages, SystemTime::now()) {
+        let (pid, _, path) = &candidates[index];
+        remove_staging_directory(path, *pid, reason);
+    }
+}
+
+/// Choose which of the other processes' staging directories to remove.
+///
+/// Two rules. A directory quiet for at least [`STAGING_GRACE_PERIOD`] belonged
+/// to a process that is gone, so it goes. Whatever is left is capped at
+/// [`MAX_RETAINED_STAGING_DIRECTORIES`], least recently written first - which
+/// is both the least likely to belong to a running host and the one whose disk
+/// is most worth reclaiming.
+///
+/// Pure, and separated from the removal for that reason: the policy is the part
+/// worth pinning, and pinning it here needs neither a filesystem nor a second
+/// host process.
+fn staging_directories_to_evict(
+    candidates: &[(u32, SystemTime)],
+    now: SystemTime,
+) -> Vec<(usize, &'static str)> {
+    let mut evictions: Vec<(usize, &'static str)> = Vec::new();
+    let mut retained: Vec<(SystemTime, usize)> = Vec::new();
+
+    for (index, (_, modified)) in candidates.iter().enumerate() {
+        let quiet_for = now
+            .duration_since(*modified)
+            .unwrap_or_else(|_| Duration::from_secs(0));
+        if quiet_for >= STAGING_GRACE_PERIOD {
+            evictions.push((index, "stale"));
+        } else {
+            retained.push((*modified, index));
+        }
+    }
+
+    if retained.len() > MAX_RETAINED_STAGING_DIRECTORIES {
+        retained.sort_by_key(|(modified, _)| *modified);
+        let excess = retained.len() - MAX_RETAINED_STAGING_DIRECTORIES;
+        for (_, index) in retained.iter().take(excess) {
+            evictions.push((*index, "over the retained-staging bound"));
+        }
+    }
+
+    evictions
+}
+
+/// When a staging directory was last written to.
+///
+/// Falls back to the epoch when the timestamp cannot be read, which makes an
+/// unreadable directory look maximally stale: it is the one state in which
+/// leaving it forever is worse than attempting a removal that will simply fail
+/// if the files are in use.
+fn staging_last_write(path: &Path) -> SystemTime {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+/// Remove one staging directory, saying which one and why.
+///
+/// A failure for another process's directory is expected rather than
+/// exceptional - a live host holds its mapped modules - so it is reported as a
+/// note instead of an error.
+fn remove_staging_directory(path: &Path, pid: u32, reason: &str) {
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {
+            if pid != std::process::id() {
+                println!("[host] Cleaned up temporary files from process {pid} ({reason}).");
             }
-            Err(error) => {
-                if pid == std::process::id() {
-                    eprintln!(
-                        "[host] Could not remove temporary directory {}: {error}",
-                        entry.path().display()
-                    );
-                } else {
-                    // On platforms without process probing the removal may
-                    // fail simply because another live host holds the files.
-                    println!(
-                        "[host] Temporary directory {} left in place (possibly still in use): {error}",
-                        entry.path().display()
-                    );
-                }
+        }
+        Err(error) => {
+            if pid == std::process::id() {
+                eprintln!(
+                    "[host] Could not remove temporary directory {}: {error}",
+                    path.display()
+                );
+            } else {
+                // On platforms without process probing the removal may fail
+                // simply because another live host holds the files.
+                println!(
+                    "[host] Temporary directory {} left in place (possibly still in use): {error}",
+                    path.display()
+                );
             }
         }
     }
@@ -1230,8 +1398,70 @@ pub(crate) fn cleanup_temporary_files(workspace_root: &Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::{files_equal, TemporaryCopy};
+    use super::{
+        files_equal, staging_directories_to_evict, TemporaryCopy, MAX_RETAINED_STAGING_DIRECTORIES,
+        STAGING_GRACE_PERIOD,
+    };
     use std::time::{Duration, SystemTime};
+
+    /// A directory that has been quiet past the grace period is stale; one
+    /// written to recently is left alone.
+    ///
+    /// The grace period is the liveness check: a running host stages a copy on
+    /// every load and every reload, so a recent write is the evidence that its
+    /// process is still there. Deleting it would take whatever of its staging
+    /// is not currently mapped and leave the rest.
+    #[test]
+    fn a_quiet_staging_directory_is_stale_and_a_recent_one_is_not() {
+        let now = SystemTime::now();
+        let quiet = now - STAGING_GRACE_PERIOD - Duration::from_secs(1);
+        let recent = now - Duration::from_secs(1);
+
+        let evictions = staging_directories_to_evict(&[(101, quiet), (202, recent)], now);
+
+        assert_eq!(evictions, vec![(0, "stale")]);
+    }
+
+    /// Past the retained bound, the least recently written go first.
+    ///
+    /// Oldest-first is what makes the bound safe to apply inside the grace
+    /// period at all: a live host's directory is the most recently written of
+    /// them, so it is the last one the bound would ever reach.
+    #[test]
+    fn the_retained_bound_evicts_the_least_recently_written_first() {
+        let now = SystemTime::now();
+        // One more than the bound allows, all well inside the grace period,
+        // each a second older than the next.
+        let count = MAX_RETAINED_STAGING_DIRECTORIES + 2;
+        let candidates: Vec<(u32, SystemTime)> = (0..count)
+            .map(|index| {
+                let age = Duration::from_secs((count - index) as u64);
+                (index as u32, now - age)
+            })
+            .collect();
+
+        let evictions = staging_directories_to_evict(&candidates, now);
+
+        assert_eq!(
+            evictions,
+            vec![
+                (0, "over the retained-staging bound"),
+                (1, "over the retained-staging bound")
+            ],
+            "the two oldest go, and the most recently written - a live host's - stays"
+        );
+    }
+
+    /// Inside the bound and inside the grace period, nothing is evicted.
+    #[test]
+    fn staging_directories_within_both_rules_are_kept() {
+        let now = SystemTime::now();
+        let candidates: Vec<(u32, SystemTime)> = (0..MAX_RETAINED_STAGING_DIRECTORIES)
+            .map(|index| (index as u32, now - Duration::from_secs(index as u64)))
+            .collect();
+
+        assert!(staging_directories_to_evict(&candidates, now).is_empty());
+    }
 
     /// Stamp one fixed modification time onto a file, so the metadata gate in
     /// `files_equal` is decided by this test rather than by clock resolution.

@@ -11,6 +11,11 @@
 //! The crate root is a thin re-export layer. All implementation lives in
 //! submodules ([`world`], [`query`], [`scheduler`], etc.). Users import
 //! everything from `pill_engine` without needing deep module paths.
+//!
+//! The module ABI is **Rust-to-Rust by design**: a loaded project or module
+//! receives an [`EngineApi`] carrying a pointer to the host's engine and calls
+//! the typed API through it. There is no language-neutral plugin table - see
+//! [`api`] for why one was removed rather than completed.
 
 // ===== Constants =====
 
@@ -28,7 +33,7 @@ static ALLOC: tracy_client::ProfiledAllocator<std::alloc::System> =
 
 // ===== Public Modules =====
 
-/// Language-agnostic engine API for external hot-reloadable project consumers.
+/// The module entry-point contract passed to hot-reloadable artifacts.
 pub mod api;
 
 /// Archetype-based component storage with structure-of-arrays layout.
@@ -50,6 +55,9 @@ pub mod component;
 
 /// Compile-time component registry driven by `#[derive(PillComponent)]`.
 pub mod component_registry;
+
+/// Components the engine defines because more than one consumer needs them.
+pub mod common_components;
 
 /// Generic type-erased component field access for editor-style tools.
 pub mod component_field;
@@ -112,6 +120,9 @@ pub mod world;
 pub use api::EngineApi;
 pub use asset::{Asset, AssetManager, Handle};
 pub use commands::{CommandError, Commands};
+pub use common_components::{
+    register_common_components, Color, Position, COLOR_FIELD_LAYOUT, POSITION_FIELD_LAYOUT,
+};
 pub use component::{Component, ComponentId, ComponentTicks, Tick};
 pub use component_field::{ComponentFieldError, FieldValue};
 pub use dynamic_buffer::DynamicBuffer;
@@ -122,7 +133,7 @@ pub use hot_patch::{
     HotPatchError, HotPatchRegistry, HotSlot, PillHotFunctionDescriptor, PillHotSlotDescriptor,
     PlainSlot,
 };
-pub use persistence::{ComponentSnapshot, PersistResourceManifestEntry, ResourceSnapshot};
+pub use persistence::{PersistResourceManifestEntry, ResourceSnapshot};
 pub use query::{
     Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,
 };

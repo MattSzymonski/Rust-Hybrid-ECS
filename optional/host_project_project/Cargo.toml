@@ -16,7 +16,7 @@ crate-type = ["cdylib", "rlib"]
 pill_engine = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/pill_engine" }
 pill_core = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/pill_core" }
 # Linked directly so the project can name the `Spline` type. See the note in
-# `project_init` about why this crate must not also be loaded as a module.
+# `init` about why this crate must not also be loaded as a module.
 # `default-features = false` is a defensive no-op: `module-abi` is opt-in now,
 # so the `pill_module_*` exports stay off in this build either way.
 pill_spline = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/optional/pill_spline", default-features = false }

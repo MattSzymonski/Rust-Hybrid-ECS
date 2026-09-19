@@ -43,6 +43,11 @@ use super::context::ActiveSystemGuard;
 use super::csharp_runtime::DotnetRuntimeContext;
 #[cfg(feature = "hot_reload")]
 use super::fast_compile::{FastCompileOutcome, FastCompiler};
+use super::managed_buffer::{fetch_managed_buffer, manifest_fetch_error};
+// Only the reload path distinguishes the failure kinds; a shipping build maps
+// them all through `manifest_fetch_error` and never names them.
+#[cfg(feature = "hot_reload")]
+use super::managed_buffer::ManagedBufferError;
 use super::ResolvedMirrorMethod;
 use crate::CSharpModuleConfig;
 
@@ -727,29 +732,17 @@ impl CSharpRuntime {
             return Err(CSharpError::RuntimeInitFailed);
         }
 
-        // The manifest length comes from managed code, so it must be bounded
-        // before the host allocates anything from it.
-        let manifest_length = manifest_length();
-        if !is_supported_manifest_length(manifest_length) {
-            return Err(CSharpError::ManifestLengthOutOfRange {
-                length: manifest_length,
-                limit: MAX_COMPONENT_MANIFEST_BYTES,
-            });
-        }
-
-        // Reserve explicitly so an allocation failure surfaces as a regular
-        // error instead of aborting the host process.
-        let mut manifest = Vec::new();
-        manifest
-            .try_reserve_exact(manifest_length as usize)
-            .map_err(|_| CSharpError::ManifestAllocationFailed)?;
-        manifest.resize(manifest_length as usize, 0);
-
-        // The managed contract rejects any caller buffer smaller than the
-        // manifest, so a successful copy guarantees a complete payload.
-        if copy_manifest(manifest.as_mut_ptr(), manifest_length) == 0 {
-            return Err(CSharpError::ManifestCopyFailed);
-        }
+        // The length comes from managed code, so it is bounded before the host
+        // allocates anything from it and the reservation is fallible; both are
+        // the shared protocol's doing.
+        // The exports are `extern "system"` function pointers, which do not
+        // implement the `Fn` traits, so each is wrapped in a closure that does.
+        let manifest = fetch_managed_buffer(
+            || manifest_length(),
+            |pointer, length| copy_manifest(pointer, length),
+            MAX_COMPONENT_MANIFEST_BYTES,
+        )
+        .map_err(manifest_fetch_error)?;
         let bindings = Arc::new(BindingStore::new(register_component_manifest(
             engine, &manifest, bindings,
         )?));
@@ -964,21 +957,14 @@ impl CSharpRuntime {
             return Err(CSharpError::RuntimeInitFailed);
         }
 
-        let manifest_length = manifest_length();
-        if !is_supported_manifest_length(manifest_length) {
-            return Err(CSharpError::ManifestLengthOutOfRange {
-                length: manifest_length,
-                limit: MAX_COMPONENT_MANIFEST_BYTES,
-            });
-        }
-        let mut manifest = Vec::new();
-        manifest
-            .try_reserve_exact(manifest_length as usize)
-            .map_err(|_| CSharpError::ManifestAllocationFailed)?;
-        manifest.resize(manifest_length as usize, 0);
-        if copy_manifest(manifest.as_mut_ptr(), manifest_length) == 0 {
-            return Err(CSharpError::ManifestCopyFailed);
-        }
+        // The exports are `extern "system"` function pointers, which do not
+        // implement the `Fn` traits, so each is wrapped in a closure that does.
+        let manifest = fetch_managed_buffer(
+            || manifest_length(),
+            |pointer, length| copy_manifest(pointer, length),
+            MAX_COMPONENT_MANIFEST_BYTES,
+        )
+        .map_err(manifest_fetch_error)?;
         let bindings = Arc::new(BindingStore::new(register_component_manifest(
             engine, &manifest, bindings,
         )?));
@@ -1207,33 +1193,12 @@ impl CSharpRuntime {
     /// Copy the parked version's manifest, or `None` when it cannot be read.
     #[cfg(feature = "hot_reload")]
     fn read_pending_manifest(&self) -> Option<Vec<u8>> {
-        let length = (self.pending_manifest_length)();
-        if !is_supported_manifest_length(length) {
-            error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                length,
-                "the parked assembly reported a component manifest length outside the accepted range"
-            );
-            return None;
-        }
-        let mut manifest = Vec::new();
-        if manifest.try_reserve_exact(length as usize).is_err() {
-            error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                length,
-                "could not reserve a buffer for the parked component manifest"
-            );
-            return None;
-        }
-        manifest.resize(length as usize, 0);
-        if (self.copy_pending_manifest)(manifest.as_mut_ptr(), length) == 0 {
-            error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                "could not copy the parked component manifest"
-            );
-            return None;
-        }
-        Some(manifest)
+        read_reported_manifest(
+            || (self.pending_manifest_length)(),
+            |pointer, length| (self.copy_pending_manifest)(pointer, length),
+            "parked",
+            "",
+        )
     }
 
     /// Tell the managed loader to discard the parked version, and say why.
@@ -1263,32 +1228,14 @@ impl CSharpRuntime {
     /// native mirror or a vanished component is refused with a typed error.
     #[cfg(feature = "hot_reload")]
     fn apply_manifest_if_changed(&mut self, engine: &mut Engine) {
-        let length = (self.manifest_length)();
-        if !is_supported_manifest_length(length) {
-            error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                length,
-                "the reloaded assembly reported a component manifest length outside the accepted range; keeping the applied manifest"
-            );
+        let Some(manifest) = read_reported_manifest(
+            || (self.manifest_length)(),
+            |pointer, length| (self.copy_manifest)(pointer, length),
+            "reloaded",
+            "; keeping the applied manifest",
+        ) else {
             return;
-        }
-        let mut manifest = Vec::new();
-        if manifest.try_reserve_exact(length as usize).is_err() {
-            error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                length,
-                "could not reserve a buffer for the reloaded component manifest; keeping the applied manifest"
-            );
-            return;
-        }
-        manifest.resize(length as usize, 0);
-        if (self.copy_manifest)(manifest.as_mut_ptr(), length) == 0 {
-            error!(
-                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                "could not copy the reloaded component manifest; keeping the applied manifest"
-            );
-            return;
-        }
+        };
         if manifest == self.applied_manifest {
             return;
         }
@@ -1430,12 +1377,46 @@ pub(super) fn poll_status_is_known(status: u8) -> bool {
     }
 }
 
-/// Whether a managed-reported manifest length lies within the supported range.
+/// Read one reported component manifest, reporting why not in the caller's own
+/// words.
 ///
-/// Rejects zero and any value above [`MAX_COMPONENT_MANIFEST_BYTES`], so a
-/// buggy managed assembly can never drive an unbounded host allocation.
-pub(super) fn is_supported_manifest_length(length: u32) -> bool {
-    (1..=MAX_COMPONENT_MANIFEST_BYTES).contains(&length)
+/// The parked manifest and the reloaded one are read the same way and differ
+/// only in how the failure reads to an operator: which assembly reported it,
+/// and what the host does next. Both are said here rather than twice, so the
+/// two can no longer drift into describing different protocols.
+#[cfg(feature = "hot_reload")]
+fn read_reported_manifest(
+    length: impl FnOnce() -> u32,
+    copy: impl FnOnce(*mut u8, u32) -> u8,
+    assembly: &str,
+    consequence: &str,
+) -> Option<Vec<u8>> {
+    match fetch_managed_buffer(length, copy, MAX_COMPONENT_MANIFEST_BYTES) {
+        Ok(manifest) => Some(manifest),
+        Err(ManagedBufferError::LengthOutOfRange { length, .. }) => {
+            error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                length,
+                "the {assembly} assembly reported a component manifest length outside the accepted range{consequence}"
+            );
+            None
+        }
+        Err(ManagedBufferError::AllocationFailed { length }) => {
+            error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                length,
+                "could not reserve a buffer for the {assembly} component manifest{consequence}"
+            );
+            None
+        }
+        Err(ManagedBufferError::CopyFailed) => {
+            error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                "could not copy the {assembly} component manifest{consequence}"
+            );
+            None
+        }
+    }
 }
 
 /// Validates a managed-reported system count before it sizes a host allocation.
@@ -1484,19 +1465,22 @@ fn resolved_system_name(
         .unwrap_or_else(|| format!("csharp_system_{system_index}"))
 }
 
+/// Copy one managed system's declared name.
+///
+/// A thin wrapper over the shared two-call protocol that closes over the system
+/// index; a name the managed side does not report, reports too long, or fails
+/// to copy is all one answer here - there is no name to use.
 fn managed_system_name(
     name_length: SystemNameLengthFn,
     copy_name: CopySystemNameFn,
     system_index: u32,
 ) -> Option<String> {
-    let length = name_length(system_index);
-    if length == 0 || length > MAX_SYSTEM_NAME_BYTES {
-        return None;
-    }
-    let mut buffer = vec![0_u8; length as usize];
-    if copy_name(system_index, buffer.as_mut_ptr(), length) == 0 {
-        return None;
-    }
+    let buffer = fetch_managed_buffer(
+        || name_length(system_index),
+        |pointer, length| copy_name(system_index, pointer, length),
+        MAX_SYSTEM_NAME_BYTES,
+    )
+    .ok()?;
     String::from_utf8(buffer).ok()
 }
 
@@ -1510,15 +1494,14 @@ fn managed_system_error_message(
     system_index: u32,
 ) -> String {
     const NEUTRAL_MESSAGE: &str = "managed system reported failure";
-    let length = length(system_index);
-    if length == 0 || length > MAX_SYSTEM_ERROR_BYTES {
-        return String::from(NEUTRAL_MESSAGE);
+    match fetch_managed_buffer(
+        || length(system_index),
+        |pointer, message_length| copy(system_index, pointer, message_length),
+        MAX_SYSTEM_ERROR_BYTES,
+    ) {
+        Ok(buffer) => String::from_utf8_lossy(&buffer).into_owned(),
+        Err(_) => String::from(NEUTRAL_MESSAGE),
     }
-    let mut buffer = vec![0_u8; length as usize];
-    if copy(system_index, buffer.as_mut_ptr(), length) == 0 {
-        return String::from(NEUTRAL_MESSAGE);
-    }
-    String::from_utf8_lossy(&buffer).into_owned()
 }
 
 /// Translate managed component modes into native scheduler metadata.

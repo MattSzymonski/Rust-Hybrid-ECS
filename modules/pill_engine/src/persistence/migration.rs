@@ -28,7 +28,7 @@ impl World {
     /// Migrate only changed persistable components.
     ///
     /// For each changed type name, this uses the old serializer (captured before
-    /// reload) and the new deserializer/inserter (registered by new project_init)
+    /// reload) and the new deserializer/inserter (registered by the new init)
     /// to rewrite only the affected component columns.
     ///
     /// `pre_swap_entities` is the set of entities that existed before the
@@ -346,17 +346,23 @@ impl World {
     /// archetypes containing the new component id.
     ///
     /// Serializes each old component value, deserializes it with the new
-    /// schema (falling back to `{}`), copies the unchanged components through
-    /// their registered copiers, and re-inserts the migrated component.  Used
-    /// when a reload changes the [`ComponentId`] assigned to a type name.
+    /// schema (falling back to `{}`), moves the unchanged components across
+    /// bitwise, and re-inserts the migrated component.  Used when a reload
+    /// changes the [`ComponentId`] assigned to a type name.
+    ///
+    /// Entities are moved from the back of the source archetype forward, so
+    /// every unchanged column hands over its last row and the rows that remain
+    /// keep the indices the serialized values were read at. The old column is
+    /// deliberately not moved: it still holds the retiring generation's values
+    /// and is released with the source archetype.
     ///
     /// # Errors
     ///
     /// Returns [`PersistenceError::DeserializationFailed`] when a migrated
-    /// value cannot be decoded with either the snapshot bytes or `{}`,
+    /// value cannot be decoded with either the stored bytes or `{}`,
     /// [`PersistenceError::DestinationArchetypeMissing`] when the destination
-    /// archetype cannot be created, and [`PersistenceError::CopierMissing`]
-    /// when an unchanged component has no registered copier.
+    /// archetype cannot be created, and [`PersistenceError::ColumnMoveFailed`]
+    /// when an unchanged column cannot hand its row to the destination.
     pub(super) fn migrate_component_across_archetypes(
         &mut self,
         old_component_id: ComponentId,
@@ -378,7 +384,7 @@ impl World {
         for source_archetype_id in source_archetype_ids {
             // Step 2: Remove the source archetype and compute its destination
             // component set with the old id replaced by the new one.
-            let Some(source_archetype) = self.archetypes.remove(&source_archetype_id) else {
+            let Some(mut source_archetype) = self.archetypes.remove(&source_archetype_id) else {
                 continue;
             };
 
@@ -420,8 +426,12 @@ impl World {
             }
 
             // Step 4: Move each entity into the destination archetype,
-            // copying the unchanged components and inserting the migrated
+            // handing over the unchanged components and inserting the migrated
             // one, then re-record its location and per-component ticks.
+            //
+            // Back to front: a column hands over its last row, which
+            // `take_row_from` removes without reordering, so the rows still
+            // waiting keep the indices their serialized values were read at.
             let Some(destination_archetype) = self.archetypes.get_mut(&destination_archetype_id)
             else {
                 return Err(PersistenceError::DestinationArchetypeMissing);
@@ -429,54 +439,61 @@ impl World {
 
             let current_tick = crate::component::Tick::new(self.change_tick);
 
-            for (entity_index, component) in migrated_components.into_iter().enumerate() {
+            for (entity_index, component) in migrated_components.into_iter().enumerate().rev() {
                 let entity = source_archetype.entities[entity_index];
                 let destination_index = destination_archetype.entities.len();
                 destination_archetype.entities.push(entity);
 
                 for source_component_id in &source_archetype.component_types {
+                    // The old column keeps its rows: they hold the retiring
+                    // generation's values, which were read out above and are
+                    // released when the source archetype drops.
                     if *source_component_id == old_component_id {
                         continue;
                     }
 
-                    let Some(&copy_component) = self.component_copiers.get(source_component_id)
+                    let Some(source_column) = source_archetype
+                        .component_storages
+                        .get_mut(*source_component_id)
                     else {
-                        return Err(PersistenceError::CopierMissing {
+                        continue;
+                    };
+                    let Some(destination_column) = destination_archetype
+                        .component_storages
+                        .get_mut(*source_component_id)
+                    else {
+                        return Err(PersistenceError::ColumnMoveFailed {
                             component_id: *source_component_id,
                         });
                     };
-
-                    copy_component(
-                        &source_archetype.component_storages,
-                        &mut destination_archetype.component_storages,
-                        entity_index,
-                    );
+                    // A bitwise hand-over rather than a clone: the row's bytes
+                    // and the ownership they carry move together, and the
+                    // source releases the row without running drop glue.
+                    destination_column
+                        .take_row_from(source_column, entity_index)
+                        .map_err(|_| PersistenceError::ColumnMoveFailed {
+                            component_id: *source_component_id,
+                        })?;
                 }
 
                 insert_new_component(&mut destination_archetype.component_storages, component);
 
-                for destination_component_id in &destination_archetype.component_types {
-                    let tick = if *destination_component_id == new_component_id {
-                        source_archetype
-                            .component_ticks
-                            .get(&old_component_id)
-                            .and_then(|ticks| ticks.get(entity_index))
-                            .copied()
-                            .unwrap_or(crate::component::ComponentTicks::new(current_tick))
-                    } else {
-                        source_archetype
-                            .component_ticks
-                            .get(destination_component_id)
-                            .and_then(|ticks| ticks.get(entity_index))
-                            .copied()
-                            .unwrap_or(crate::component::ComponentTicks::new(current_tick))
-                    };
-
-                    destination_archetype
-                        .component_ticks
-                        .entry(*destination_component_id)
-                        .or_default()
-                        .push(tick);
+                // A carried column brought its ticks across with its row. The
+                // rewritten component did not: its value was decoded from the
+                // old column, so its ticks are copied from there by hand, which
+                // is what keeps a migrated component from looking freshly added
+                // to every `Changed<T>` system.
+                let rewritten_ticks = source_archetype
+                    .component_storages
+                    .get(old_component_id)
+                    .and_then(|column| column.row_ticks(entity_index))
+                    .copied()
+                    .unwrap_or(crate::component::ComponentTicks::new(current_tick));
+                if let Some(column) = destination_archetype
+                    .component_storages
+                    .get_mut(new_component_id)
+                {
+                    column.set_row_ticks(destination_index, rewritten_ticks);
                 }
 
                 self.entity_locations.insert(

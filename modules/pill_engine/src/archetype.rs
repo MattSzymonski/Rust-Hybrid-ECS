@@ -823,6 +823,15 @@ pub struct ComponentColumn {
     len: usize,
     /// Number of rows the current allocation can hold.
     capacity: usize,
+    /// Change-detection metadata for row `i` at index `i`.
+    ///
+    /// Owned by the column rather than kept beside it, so a push grows both and
+    /// a removal shrinks both: the two can no longer disagree, because there is
+    /// only one length to maintain. A tick is plain data - no code pointers -
+    /// so it carries none of the [`ColumnOps`] lifetime concerns, and it is
+    /// deliberately a separate allocation rather than interleaved with the
+    /// rows, so iteration locality over the component data is unchanged.
+    ticks: Vec<ComponentTicks>,
 }
 
 impl ComponentColumn {
@@ -854,6 +863,7 @@ impl ComponentColumn {
             data,
             len: 0,
             capacity: 0,
+            ticks: Vec::new(),
         })
     }
 
@@ -900,6 +910,7 @@ impl ComponentColumn {
             data,
             len: 0,
             capacity: 0,
+            ticks: Vec::new(),
         })
     }
 
@@ -984,15 +995,18 @@ impl ComponentColumn {
 
     /// Refuse a raw-byte write when this column's rows own resources.
     ///
-    /// The byte mutators below move and overwrite rows with `memcpy` and never
-    /// consult [`ColumnOps::drop_range`], which is exactly right for the plain
-    /// data the descriptor lane stores and exactly wrong for a native column
-    /// whose element type has a destructor: overwriting would leak the old
-    /// value, and copying would leave two columns owning one allocation.
+    /// The byte mutators below write rows with `memcpy` and never consult
+    /// [`ColumnOps::drop_range`], which is exactly right for the plain data a
+    /// descriptor column stores and exactly wrong for a column whose element
+    /// type has a destructor: writing a row would leak the value it replaced,
+    /// and a caller supplying the bytes has nothing to hand ownership of.
     ///
-    /// Every current caller already routes native ids away from these methods.
-    /// This turns that caller obligation into an enforced one, so a future
-    /// caller that gets it wrong receives an error rather than a double free.
+    /// [`Self::take_row_from`] is deliberately outside this rule: a move
+    /// transfers ownership rather than fabricating it, so it is correct for
+    /// every column. Every other byte mutator is a write from outside, and
+    /// this turns what used to be a caller obligation into an enforced one,
+    /// so a future caller that gets it wrong receives an error rather than a
+    /// leak.
     ///
     /// # Errors
     ///
@@ -1027,6 +1041,7 @@ impl ComponentColumn {
                 self.layout.size,
             )
         };
+        self.ticks.push(ComponentTicks::default());
         self.len += 1;
         Ok(())
     }
@@ -1054,25 +1069,39 @@ impl ComponentColumn {
                 self.layout.size,
             );
         }
+        self.ticks.push(ComponentTicks::default());
         self.len += 1;
         Ok(())
     }
 
-    /// Copies the row at `index` from another column and appends it here.
+    /// Moves the row at `index` out of `source` and appends it here.
+    ///
+    /// This is how an entity changes archetype, and it is the only way a row
+    /// leaves one column for another. Ownership transfers with the bytes: they
+    /// are copied here and the source row is then released **without** running
+    /// drop glue, because whatever it owned is now owned by this column. That
+    /// is what makes it correct for a column whose rows hold resources - a
+    /// `Vec`, a `String`, a dynamic buffer - which the byte-copying mutators
+    /// refuse outright.
+    ///
+    /// Both halves happen here, in one call, so drop-exactly-once is a property
+    /// of the operation rather than an obligation on the caller: there is no
+    /// intermediate state in which a caller could forget to release the source
+    /// or release it twice.
+    ///
+    /// A move makes no plain-data claim - ownership is what it transfers - but
+    /// it can still be the push that grows this column, so reserve first
+    /// ([`Self::reserve_row`]) when a multi-column move must not fail partway.
     ///
     /// # Errors
     ///
     /// Returns [`WorldError::DescriptorSizeMismatch`] when the two columns have
-    /// different element sizes, [`WorldError::DescriptorRowInvalid`] when `index`
-    /// is out of bounds of `source`, and [`WorldError::DescriptorLayoutInvalid`]
-    /// when the element layout cannot describe the next allocation. All three
-    /// travel the reporting path: a drifted column must not abort a frame from
-    /// inside the command flush, where the caller can hand the error back.
-    pub fn push_from(&mut self, source: &Self, index: usize) -> Result<(), WorldError> {
-        // Both sides: the destination must not later drop a row it only copied,
-        // and the source must not own one it has handed away.
-        self.require_plain_data()?;
-        source.require_plain_data()?;
+    /// different element sizes, [`WorldError::DescriptorRowInvalid`] when
+    /// `index` is out of bounds of `source`, and
+    /// [`WorldError::DescriptorLayoutInvalid`] when the element layout cannot
+    /// describe the next allocation. Nothing is moved in any of those cases, so
+    /// the source keeps its row.
+    pub fn take_row_from(&mut self, source: &mut Self, index: usize) -> Result<(), WorldError> {
         if self.layout.size != source.layout.size {
             return Err(WorldError::DescriptorSizeMismatch);
         }
@@ -1080,7 +1109,9 @@ impl ComponentColumn {
             return Err(WorldError::DescriptorRowInvalid);
         }
         self.reserve_one()?;
-        // SAFETY: both slots are allocated, aligned, non-overlapping columns.
+        // SAFETY: `reserve_one` guarantees one writable, correctly aligned slot
+        // here, the source row is initialized and within its allocation, and the
+        // two columns are distinct objects so the regions cannot overlap.
         unsafe {
             std::ptr::copy_nonoverlapping(
                 source.data.as_ptr().add(index * source.layout.size),
@@ -1088,8 +1119,31 @@ impl ComponentColumn {
                 self.layout.size,
             );
         }
+        // The row's change-detection metadata travels with it, which is what
+        // makes a migrated component keep the ticks it was carrying instead of
+        // looking freshly added to every `Changed<T>` system.
+        self.ticks
+            .push(source.ticks.get(index).copied().unwrap_or_default());
         self.len += 1;
+        source.swap_remove_forget(index);
         Ok(())
+    }
+
+    /// Reserve room for one more row, growing by the column's own policy.
+    ///
+    /// Exposed so a caller moving a whole entity's row can make every
+    /// destination column ready before it moves the first one, which is what
+    /// turns a multi-column move into an all-or-nothing operation. Prefer this
+    /// over [`Self::reserve_rows`] for a single row: `reserve_rows` allocates
+    /// the exact target, which would defeat amortized growth if it ran on every
+    /// archetype move.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::DescriptorLayoutInvalid`] when the doubled
+    /// capacity or the allocation layout it implies cannot be represented.
+    pub fn reserve_row(&mut self) -> Result<(), WorldError> {
+        self.reserve_one()
     }
 
     /// Overwrites the row at `index` with a copy of the given bytes.
@@ -1112,6 +1166,91 @@ impl ComponentColumn {
             );
         }
         Ok(())
+    }
+
+    // ---------------------------------------------------------------------
+    // Change detection
+    //
+    // A column's ticks live beside its rows, indexed the same way, so nothing
+    // outside has to keep a second container in step with this one. `relayout`
+    // needs no tick handling for the same reason: reshaping a row does not
+    // change which rows exist, and the ticks are part of the column being
+    // reshaped rather than something left behind.
+    // ---------------------------------------------------------------------
+
+    /// Change-detection metadata for every row, in row order.
+    pub fn ticks(&self) -> &[ComponentTicks] {
+        &self.ticks
+    }
+
+    /// Mutable change-detection metadata for every row, in row order.
+    pub fn ticks_mut(&mut self) -> &mut [ComponentTicks] {
+        &mut self.ticks
+    }
+
+    /// Change-detection metadata for one row, or `None` when out of bounds.
+    pub fn row_ticks(&self, index: usize) -> Option<&ComponentTicks> {
+        self.ticks.get(index)
+    }
+
+    /// Mutable change-detection metadata for one row, or `None` when out of
+    /// bounds.
+    pub fn row_ticks_mut(&mut self, index: usize) -> Option<&mut ComponentTicks> {
+        self.ticks.get_mut(index)
+    }
+
+    /// Replace one row's change-detection metadata.
+    ///
+    /// Returns `false` when `index` names no row, so a caller that computed the
+    /// row elsewhere finds out rather than silently writing nothing.
+    pub fn set_row_ticks(&mut self, index: usize, ticks: ComponentTicks) -> bool {
+        match self.ticks.get_mut(index) {
+            Some(slot) => {
+                *slot = ticks;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Mutable change-detection metadata for one row, with no bounds check.
+    ///
+    /// # Safety
+    ///
+    /// `index` must be in range, and no other reference to that row's ticks may
+    /// exist for the lifetime of the returned one. The query layer resolves the
+    /// bound once per archetype rather than per row, which is why this exists.
+    pub unsafe fn row_ticks_mut_unchecked(&mut self, index: usize) -> &mut ComponentTicks {
+        // SAFETY: the caller guarantees the index and the exclusivity.
+        unsafe { &mut *self.ticks.as_mut_ptr().add(index) }
+    }
+
+    /// The typed rows and their ticks, both mutable at once.
+    ///
+    /// Rows and ticks are separate fields, so one call can hand out both
+    /// without the caller needing two independent borrows of the column - which
+    /// is what the parallel tick map used to provide and what the language
+    /// bindings need to expose writable component data.
+    ///
+    /// # Panics
+    ///
+    /// If `T` is not this column's element type.
+    pub fn rows_and_ticks_mut<T: 'static>(&mut self) -> (&mut [T], &mut [ComponentTicks]) {
+        self.assert_element_type::<T>();
+        // SAFETY: the element type was just checked, rows `0..len` are
+        // initialized, and the buffer is allocated and aligned for `T`.
+        let rows =
+            unsafe { std::slice::from_raw_parts_mut(self.data.as_ptr().cast::<T>(), self.len) };
+        (rows, &mut self.ticks)
+    }
+
+    /// The raw row buffer and the ticks beside it, both mutable at once.
+    ///
+    /// The type-erased twin of [`Self::rows_and_ticks_mut`], for the language
+    /// bindings that address rows as bytes. The pointer is valid only until the
+    /// column next grows or is dropped.
+    pub fn raw_rows_and_ticks_mut(&mut self) -> (*mut u8, usize, &mut [ComponentTicks]) {
+        (self.data.as_ptr(), self.len, &mut self.ticks)
     }
 
     /// Returns the raw bytes of the row at `index`, or `None` when out of bounds.
@@ -1151,6 +1290,7 @@ impl ComponentColumn {
         self.assert_element_type::<T>();
         self.reserve_one()
             .expect("a native column must be able to grow for one more row");
+        self.ticks.push(ComponentTicks::default());
         // SAFETY: `reserve_one` guaranteed capacity for one more row, and the
         // element type was just checked, so the slot is correctly aligned and
         // sized for `T`. `write` does not drop the uninitialized destination.
@@ -1262,6 +1402,7 @@ impl ComponentColumn {
                 );
             }
             self.len = last;
+            self.ticks.swap_remove(index);
             taken
         }
     }
@@ -1280,7 +1421,9 @@ impl ComponentColumn {
             .len
             .checked_add(additional)
             .ok_or(WorldError::DescriptorLayoutInvalid)?;
-        self.grow_to(target)
+        self.grow_to(target)?;
+        self.ticks.reserve(additional);
+        Ok(())
     }
 
     /// Size of one row in bytes, under the name the erased column used.
@@ -1363,7 +1506,10 @@ impl ComponentColumn {
     /// Rewrite every row into a new layout, following `plan`.
     ///
     /// The column keeps its row count and its row order, so indices callers
-    /// hold - every `EntityLocation` that names a row among them - stay valid.
+    /// hold - every `EntityLocation` that names a row among them - stay valid,
+    /// and its change ticks come across untouched: a reshaped component has not
+    /// been added or changed, and the ticks are part of the column being
+    /// reshaped rather than a second container left behind by the reallocation.
     /// Anything the plan does not cover is zeroed, which is how a field added to
     /// a foreign-language component starts at a defined value instead of a byte
     /// left over from the previous shape.
@@ -1501,6 +1647,37 @@ impl ComponentColumn {
         rows
     }
 
+    /// Removes the row at `index` without releasing what it owns.
+    ///
+    /// [`Self::swap_remove_discard`] minus the `drop_range` call, for the one
+    /// situation in which that call would be wrong: the caller has moved this
+    /// row elsewhere, so its resources now belong to another column and
+    /// releasing them here would be a double free.
+    ///
+    /// Private because the move is the only correct way to reach it:
+    /// [`Self::take_row_from`] pairs it with the push that took ownership, so a
+    /// forgotten row is never left with no owner at all.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `index` is out of bounds.
+    fn swap_remove_forget(&mut self, index: usize) {
+        assert!(index < self.len);
+        let last = self.len - 1;
+        if index != last {
+            // SAFETY: both rows are within this allocation; copy permits overlap.
+            unsafe {
+                std::ptr::copy(
+                    self.data.as_ptr().add(last * self.layout.size),
+                    self.data.as_ptr().add(index * self.layout.size),
+                    self.layout.size,
+                );
+            }
+        }
+        self.len = last;
+        self.ticks.swap_remove(index);
+    }
+
     /// Removes the row at `index` by swapping in the last row.
     ///
     /// Keeps the column dense and runs in O(1), but does not preserve row
@@ -1530,6 +1707,7 @@ impl ComponentColumn {
             }
         }
         self.len = last;
+        self.ticks.swap_remove(index);
     }
 
     /// Ensures capacity for at least one more row, growing the buffer when full.
@@ -1713,15 +1891,6 @@ pub struct Archetype {
     pub component_storages: ComponentColumns,
     /// Entities currently stored in this archetype.
     pub entities: Vec<Entity>,
-    /// Per-component-instance change-detection metadata.
-    ///
-    /// For each `ComponentId` in `component_types`, the matching
-    /// `Vec<ComponentTicks>` is kept in lockstep with the underlying
-    /// component storage: row `i` of the tick vec corresponds to row `i`
-    /// of the component vec for the same entity. Maintenance happens in
-    /// `World` whenever entities are inserted, moved between archetypes,
-    /// or destroyed.
-    pub component_ticks: HashMap<ComponentId, Vec<ComponentTicks>>,
 }
 
 impl Archetype {
@@ -1748,8 +1917,6 @@ impl Archetype {
             [("Component types in this archetype: {}", component_count)]
         );
         let mut component_storages = ComponentColumns::with_capacity(component_count);
-        let mut component_ticks: HashMap<ComponentId, Vec<ComponentTicks>> =
-            HashMap::with_capacity(component_count);
 
         // Step 2: Create storage for each component type using its factory.
         for &component_id in &component_types {
@@ -1782,7 +1949,6 @@ impl Archetype {
                     component_storages.insert(component_id, column);
                 }
             }
-            component_ticks.insert(component_id, Vec::new());
         }
 
         // Step 3: Emit allocation telemetry and assemble the archetype.
@@ -1798,7 +1964,6 @@ impl Archetype {
             component_mask,
             component_storages,
             entities: Vec::new(),
-            component_ticks,
         }
     }
 
@@ -1913,6 +2078,7 @@ impl Archetype {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::component::Tick;
 
     /// One row of a two-field layout: `a` at 0, `b` at 4.
     fn two_fields() -> ComponentLayout {
@@ -2447,6 +2613,87 @@ mod tests {
 
         // The rows were consumed by hand, so the column must not drop them again.
         std::mem::forget(column);
+    }
+
+    /// A column's ticks track its rows through every mutator, by construction.
+    ///
+    /// This is the invariant the parallel `HashMap<ComponentId,
+    /// Vec<ComponentTicks>>` used to carry by hand across 21 maintenance sites
+    /// in `World`, guarded by a panic and two debug assertions whose only job
+    /// was to catch the desync. With the ticks owned by the column there is one
+    /// length to maintain, so the desync is unrepresentable rather than
+    /// checked - and this test is what pins that every mutator maintains it.
+    #[test]
+    fn a_columns_ticks_track_its_rows_through_every_mutator() {
+        let mut column = ComponentColumn::new_native::<u32>(7, false).expect("column");
+        assert_eq!(column.ticks().len(), column.len());
+
+        column.push::<u32>(1);
+        column.push::<u32>(2);
+        column.push::<u32>(3);
+        assert_eq!(column.ticks().len(), 3);
+        assert_eq!(column.ticks().len(), column.len());
+
+        column.set_row_ticks(1, ComponentTicks::new(Tick(42)));
+        assert_eq!(column.row_ticks(1).expect("row 1 exists").added, Tick(42));
+
+        // A swap-remove moves the tail tick over the hole exactly as it moves
+        // the tail row, so row 1 keeps carrying row 1's metadata.
+        column.swap_remove_discard(0);
+        assert_eq!(column.ticks().len(), 2);
+        assert_eq!(column.ticks().len(), column.len());
+        assert_eq!(column.row_ticks(1).expect("row 1 exists").added, Tick(42));
+
+        assert_eq!(column.swap_remove::<u32>(0), 3);
+        assert_eq!(column.ticks().len(), column.len());
+
+        // A move hands the row and its metadata to the destination together.
+        let mut destination = ComponentColumn::new_native::<u32>(7, false).expect("column");
+        destination
+            .take_row_from(&mut column, 0)
+            .expect("the two columns have one shape");
+        assert_eq!(column.ticks().len(), column.len());
+        assert_eq!(destination.ticks().len(), destination.len());
+        assert_eq!(
+            destination.row_ticks(0).expect("the moved row").added,
+            Tick(42),
+            "a moved row keeps the ticks it was carrying"
+        );
+
+        // The byte lanes maintain it too.
+        let mut descriptor = ComponentColumn::new(two_fields()).expect("column");
+        descriptor.push_zeroed().expect("push");
+        descriptor.push_bytes(&[0; 8]).expect("push");
+        assert_eq!(descriptor.ticks().len(), 2);
+        assert_eq!(descriptor.ticks().len(), descriptor.len());
+        descriptor.swap_remove_discard(0);
+        assert_eq!(descriptor.ticks().len(), descriptor.len());
+    }
+
+    /// A relayout reshapes rows without disturbing their change ticks.
+    ///
+    /// The column reallocates its buffer, and the ticks it carries have to come
+    /// across with it: a reshaped component has not been added or changed, so a
+    /// `Changed<T>` system must not see the whole world light up after a hot
+    /// reload that only moved a field.
+    #[test]
+    fn a_relayout_carries_the_column_ticks_across_the_reallocation() {
+        let mut column = ComponentColumn::new(two_fields()).expect("column");
+        column.push_bytes(&[1, 0, 0, 0, 2, 0, 0, 0]).expect("push");
+        column.push_bytes(&[3, 0, 0, 0, 4, 0, 0, 0]).expect("push");
+        column.set_row_ticks(0, ComponentTicks::new(Tick(11)));
+        column.set_row_ticks(1, ComponentTicks::new(Tick(22)));
+
+        // A wider, more strongly aligned shape forces a fresh allocation.
+        let widened = ComponentLayout::new(16, 8, 77, Blittability::engine_verified())
+            .expect("a valid layout");
+        column
+            .relayout(widened, &FieldPlan::new())
+            .expect("an empty plan zeroes every row");
+
+        assert_eq!(column.ticks().len(), column.len());
+        assert_eq!(column.row_ticks(0).expect("row 0").added, Tick(11));
+        assert_eq!(column.row_ticks(1).expect("row 1").added, Tick(22));
     }
 
     /// Reserving space does not change what the column contains.

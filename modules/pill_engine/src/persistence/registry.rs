@@ -25,6 +25,79 @@ use super::*;
 // =============================================================================
 
 impl World {
+    /// Look up the single [`ComponentId`] a component type name resolves to.
+    ///
+    /// After multiple hot-reloads the component registry can hold one entry
+    /// per reload, each with a different `TypeId` but the same type name.
+    /// What reduces those to one candidate is **eviction**: registering a new
+    /// generation purges every same-name entry from `persist_inserters`
+    /// (see [`Self::register_persistable_component`]), so the
+    /// `persist_inserters` filter below leaves exactly one.
+    ///
+    /// The bit index is deliberately *not* used as a tiebreak. It is not a
+    /// recency ordering: `ComponentRegistry::allocate_bit` hands out bits
+    /// reclaimed by `remove` before advancing `next_bit`, so a later
+    /// registration can receive a lower bit than an earlier one. Since
+    /// eviction already guarantees uniqueness, more than one surviving
+    /// candidate is a bug rather than something to break a tie on, and it is
+    /// reported as [`WorldError::ComponentNameAmbiguous`].
+    ///
+    /// [`persist_registration_sequence`](Self::persist_registration_sequence)
+    /// is the true chronological ordering, if a recency tiebreak is ever
+    /// genuinely wanted.
+    pub(super) fn resolve_component_id_by_name(
+        &self,
+        type_name: &str,
+    ) -> Result<Option<ComponentId>, WorldError> {
+        let mut candidates = self
+            .component_registry
+            .registered_components()
+            .filter(|(_, _, name)| *name == type_name)
+            .filter(|(id, _, _)| self.persist_inserters.contains_key(id))
+            .map(|(id, _, _)| id);
+
+        let Some(first) = candidates.next() else {
+            return Ok(None);
+        };
+        // Any second candidate means eviction did not collapse the set, so
+        // picking either one would silently bind half the rows to the wrong
+        // column.
+        let extra = candidates.count();
+        if extra > 0 {
+            return Err(WorldError::ComponentNameAmbiguous {
+                type_name: type_name.to_string(),
+                count: extra + 1,
+            });
+        }
+        Ok(Some(first))
+    }
+
+    /// [`Self::resolve_component_id_by_name`] for callers that cannot return
+    /// an error, degrading an ambiguous name to "unresolved".
+    ///
+    /// Every such caller already has a safe answer for an unresolved name -
+    /// skip the row, omit the manifest entry, drop nothing - so reporting the
+    /// ambiguity and taking that path is strictly better than the previous
+    /// `max_by_key(bit)` tiebreak, which silently picked one of the candidates
+    /// and could bind rows to the wrong column.
+    pub(super) fn resolve_component_id_by_name_logged(
+        &self,
+        type_name: &str,
+    ) -> Option<ComponentId> {
+        match self.resolve_component_id_by_name(type_name) {
+            Ok(component_id) => component_id,
+            Err(error) => {
+                error!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    type_name = %type_name,
+                    error = %error,
+                    "component type name is ambiguous; treating it as unresolved"
+                );
+                None
+            }
+        }
+    }
+
     /// Return current persistable component manifest.
     pub fn persist_type_manifest(&self) -> Vec<PersistTypeManifestEntry> {
         let mut entries: Vec<PersistTypeManifestEntry> = self
@@ -273,7 +346,6 @@ impl World {
         }
         self.storage_factories.remove(&component_id);
         self.retired_native_storage_ops.remove(&component_id);
-        self.component_copiers.remove(&component_id);
         self.persist_serializers.remove(&component_id);
         self.persist_inserters.remove(&component_id);
     }

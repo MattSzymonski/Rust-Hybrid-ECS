@@ -1,63 +1,23 @@
-//! Component-side persistence: the snapshot shape and the per-type metadata.
+//! Component-side persistence: the per-type metadata the reload compares.
 //!
 //! # Responsibilities
 //!
-//! - Defines [`ComponentSnapshot`], the per-entity capture of component rows,
-//!   and [`PersistTypeMetadata`] / [`PersistTypeManifestEntry`], which the
-//!   reload transaction compares before and after the swap.
-//! - Restores both lanes of captured data: boxed Rust values from the native
-//!   lane and ready-made row images from the descriptor lane.
+//! - Defines [`PersistTypeMetadata`] and [`PersistTypeManifestEntry`], which
+//!   the reload transaction compares before and after the swap to decide which
+//!   component types need migrating.
+//! - Registers the per-type serialize/deserialize/insert glue that selective
+//!   migration reads and writes rows through.
 //!
 //! # Design
 //!
-//! [`RestoredComponent`] is the join between the two lanes: a snapshot entry
-//! either carries a `Box<dyn Component>` for its registered inserter to place,
-//! or a complete row image that is pushed into the column as bytes. The
-//! snapshot itself stays lane-agnostic: it records type names and payloads.
+//! The glue is keyed by name rather than by `TypeId`, because a rebuilt image
+//! gives every type a fresh `TypeId` for the same name and the name is the only
+//! thing two generations agree on. Registration evicts a superseded
+//! generation's entries so a name resolves to exactly one live registration.
 
 use super::*;
 
-// =============================================================================
-// ComponentSnapshot
-// =============================================================================
-
-/// One component recovered from a snapshot, in whichever form its lane uses.
-///
-/// The native lane produces a boxed Rust value that an inserter downcasts; the
-/// descriptor lane produces the row bytes directly, because there is no Rust
-/// type to box and the column stores bytes anyway.
-pub(super) enum RestoredComponent {
-    /// A Rust value, to be placed by its registered inserter.
-    Native(Box<dyn Component>),
-    /// A complete row image, ready to push into the column.
-    Descriptor(Vec<u8>),
-}
-
-/// Captured component data for all entities at a point in time.
-///
-/// Used to preserve project state across hot-reloads.  Components are
-/// matched by type **name** (a string like `"project::Position"`), not by
-/// `TypeId`, so schema changes (added/removed fields) are handled by
-/// serde's default-value / ignore-unknown behaviour.
-///
-/// # Examples
-///
-/// ```
-/// use pill_engine::ComponentSnapshot;
-///
-/// let snapshot = ComponentSnapshot {
-///     entries: vec![vec![("project::Position".to_string(), b"{}".to_vec())]],
-/// };
-/// assert_eq!(snapshot.entity_count(), 1);
-/// ```
-#[derive(Debug, Default)]
-pub struct ComponentSnapshot {
-    /// Each entry represents one entity to recreate.
-    /// Inner vec: list of `(component_type_name, json_bytes)`.
-    pub entries: Vec<Vec<(String, Vec<u8>)>>,
-}
-
-/// Snapshot of one persistable component type registration.
+/// One persistable component type's registration, as the reload sees it.
 ///
 /// Captured before reload so the host can compare old and new schemas and
 /// selectively migrate only changed component types.
@@ -100,13 +60,6 @@ pub struct SelectiveMigrationReport {
     pub skipped_type_names: Vec<String>,
 }
 
-impl ComponentSnapshot {
-    /// Number of entity snapshots stored.
-    pub fn entity_count(&self) -> usize {
-        self.entries.len()
-    }
-}
-
 // =============================================================================
 // World — Persistable Component Registration
 // =============================================================================
@@ -115,9 +68,8 @@ impl World {
     /// Register a component type that supports persistence and schema migration.
     ///
     /// In addition to the normal component registration (bit index, storage
-    /// factory, copier), this stores serialize/deserialize/insert function
-    /// pointers so the engine can snapshot and restore this component type
-    /// during hot-reload.
+    /// factory), this stores serialize/deserialize/insert function pointers so
+    /// the engine can migrate this component type during hot-reload.
     ///
     /// The type `T` must implement `serde::Serialize + serde::DeserializeOwned`
     /// so that JSON can round-trip its data.  When the struct shape changes
@@ -132,7 +84,7 @@ impl World {
     /// against `Vec<String>`) can never compare equal.
     pub fn register_persistable_component<T>(&mut self)
     where
-        T: Component + Clone + Serialize + DeserializeOwned + Default + 'static,
+        T: Component + Serialize + DeserializeOwned + Default + 'static,
     {
         self.register_persistable_component_inner::<T>(&[]);
     }
@@ -147,7 +99,7 @@ impl World {
         &mut self,
         fields: &'static [crate::component_registry::ComponentFieldDescriptor],
     ) where
-        T: Component + Clone + Serialize + DeserializeOwned + Default + 'static,
+        T: Component + Serialize + DeserializeOwned + Default + 'static,
     {
         let component_id = ComponentId::of::<T>();
         // The persist maps are keyed by name and resolved against the name the
@@ -239,7 +191,7 @@ impl World {
         }
 
         // Step 2: Perform the standard component registration (bit index,
-        // storage factory, copier), carrying the field layout so the registry
+        // storage factory), carrying the field layout so the registry
         // can check a repeat registration against the first one.
         self.register_component_inner::<T>(fields);
 
@@ -340,7 +292,7 @@ impl World {
         &mut self,
         fields: &'static [crate::component_registry::ComponentFieldDescriptor],
     ) where
-        T: Component + Clone + Serialize + DeserializeOwned + Default + 'static,
+        T: Component + Serialize + DeserializeOwned + Default + 'static,
     {
         self.register_persistable_component_inner::<T>(fields);
         self.component_field_layouts.insert(
@@ -420,7 +372,7 @@ where
     }
 }
 
-/// Downcast and push a boxed component into the concrete VecStorage.
+/// Downcast and push a boxed component into the concrete column.
 pub(super) fn insert_boxed_component<T>(
     storage: &mut ComponentColumns,
     component: Box<dyn Component>,
@@ -432,7 +384,7 @@ pub(super) fn insert_boxed_component<T>(
     // outstanding, and `Box::from_raw` takes ownership back exactly once.
     // The `*mut T` cast is sound because the concrete type of `component`
     // is guaranteed to match `T`: the caller resolves this function pointer
-    // via the type-name lookup in `restore_from_snapshot`, so the fat
+    // via the type-name lookup in `migrate_single_component_type`, so the fat
     // pointer's data and vtable are valid for `T`.  `*typed` is moved out
     // and pushed into storage, ending the box's ownership without a
     // double-free.

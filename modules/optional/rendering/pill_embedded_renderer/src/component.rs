@@ -31,6 +31,7 @@
 //! a host-typed query.
 
 // External crates
+use pill_engine::common_components::{register_common_components, Color, Position};
 use pill_engine::component::Component;
 use pill_engine::component_registry::ComponentFieldDescriptor;
 use pill_engine::world::World;
@@ -38,59 +39,6 @@ use pill_engine::world::World;
 // =============================================================================
 // Components
 // =============================================================================
-
-/// World-space position of an entity's top-left draw origin, in pixels.
-///
-/// Position is a renderer component, resolved by the sprite pipeline through
-/// the shared ABI by stable type name rather than by Rust `TypeId`.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
-pub struct Position {
-    /// Horizontal pixel coordinate of the draw origin.
-    pub x: f32,
-    /// Vertical pixel coordinate of the draw origin.
-    pub y: f32,
-}
-impl Component for Position {}
-
-/// Plain RGBA color, backend-agnostic (0.0-1.0 per channel).
-///
-/// `#[repr(C)]` with normalized float channels so the byte layout is shared
-/// with the C# runtime as part of the renderer ABI.
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Color {
-    /// Red channel.
-    pub r: f32,
-    /// Green channel.
-    pub g: f32,
-    /// Blue channel.
-    pub b: f32,
-    /// Alpha channel.
-    pub a: f32,
-}
-impl Component for Color {}
-
-impl Color {
-    /// Opaque white, the default fill color of [`Sprite`].
-    pub const WHITE: Color = Color {
-        r: 1.0,
-        g: 1.0,
-        b: 1.0,
-        a: 1.0,
-    };
-
-    /// Construct a color from its red, green, blue, and alpha channels.
-    pub const fn new(r: f32, g: f32, b: f32, a: f32) -> Self {
-        Self { r, g, b, a }
-    }
-}
-
-impl Default for Color {
-    fn default() -> Self {
-        Self::WHITE
-    }
-}
 
 /// Axis-aligned colored rectangle drawn at an entity's [`Position`].
 ///
@@ -122,71 +70,9 @@ impl Default for Sprite {
 // Shared component field layouts (editor inspectability)
 // =============================================================================
 
-/// Hand-written `repr(C)` offsets mirroring the shared renderer structs, for
-/// the editor's generic field API.
-///
-/// These types are part of the shared renderer ABI and cannot carry
-/// `#[derive(PillComponent)]` - the derive lives in `pill_engine_macros` and
-/// expects to own the type - so without these layouts the editor would show
-/// them with no fields at all. [`register_components`] attaches them.
-///
-/// `Sprite::color` is flattened into per-channel scalars at absolute offsets
-/// (`color.r` … `color.a`) so the editor can render it as a colour picker over
-/// the generic scalar read/write path instead of an opaque byte blob.
-const POSITION_FIELD_LAYOUT: &[ComponentFieldDescriptor] = &[
-    ComponentFieldDescriptor {
-        name: "x",
-        type_tag: "f32",
-        offset: 0,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-    ComponentFieldDescriptor {
-        name: "y",
-        type_tag: "f32",
-        offset: 4,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-];
-
-/// `Color` is itself a component; register its channels like the derive would.
-const COLOR_FIELD_LAYOUT: &[ComponentFieldDescriptor] = &[
-    ComponentFieldDescriptor {
-        name: "r",
-        type_tag: "f32",
-        offset: 0,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-    ComponentFieldDescriptor {
-        name: "g",
-        type_tag: "f32",
-        offset: 4,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-    ComponentFieldDescriptor {
-        name: "b",
-        type_tag: "f32",
-        offset: 8,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-    ComponentFieldDescriptor {
-        name: "a",
-        type_tag: "f32",
-        offset: 12,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-];
+// =============================================================================
+// Field layouts (editor inspectability)
+// =============================================================================
 
 /// `Sprite { width, height, color }` with `color` flattened into channels.
 const SPRITE_FIELD_LAYOUT: &[ComponentFieldDescriptor] = &[
@@ -247,13 +133,13 @@ const SPRITE_FIELD_LAYOUT: &[ComponentFieldDescriptor] = &[
 /// `register_component_with_layout` so the components arrive field-editable in
 /// the inspector rather than as opaque blobs.
 ///
-/// This replaces a catalog that used to live inside `pill_engine` and was
-/// consulted by every `register_component` call: the layouts belong with the
-/// types, and a world that never draws no longer pays a name comparison per
-/// registered component.
+/// [`Position`] and [`Color`] are the engine's, so registering them is
+/// delegated rather than restated: a project that wants them without a
+/// renderer calls
+/// [`register_common_components`](pill_engine::common_components::register_common_components)
+/// directly and links no GPU code at all.
 pub fn register_components(world: &mut World) {
-    world.register_component_with_layout::<Position>(POSITION_FIELD_LAYOUT);
-    world.register_component_with_layout::<Color>(COLOR_FIELD_LAYOUT);
+    register_common_components(world);
     world.register_component_with_layout::<Sprite>(SPRITE_FIELD_LAYOUT);
 }
 
@@ -542,7 +428,7 @@ mod shared_component_tests {
     /// `register_components` attaches them, so the renderer components are
     /// field-editable in the inspector without carrying the derive macro.
     #[test]
-    fn shared_layouts_match_struct_layout_and_attach_on_registration() {
+    fn the_sprite_layout_matches_its_struct_and_attaches_on_registration() {
         // Channel order and byte sizes come straight from the compiler.
         assert_eq!(std::mem::size_of::<Position>(), 8);
         assert_eq!(std::mem::size_of::<Color>(), 16);
@@ -560,24 +446,6 @@ mod shared_component_tests {
                 assert_eq!(field.element_count, 0);
             }
         };
-
-        assert_matches(
-            POSITION_FIELD_LAYOUT,
-            &[
-                ("x", std::mem::offset_of!(Position, x), 4),
-                ("y", std::mem::offset_of!(Position, y), 4),
-            ],
-        );
-
-        assert_matches(
-            COLOR_FIELD_LAYOUT,
-            &[
-                ("r", std::mem::offset_of!(Color, r), 4),
-                ("g", std::mem::offset_of!(Color, g), 4),
-                ("b", std::mem::offset_of!(Color, b), 4),
-                ("a", std::mem::offset_of!(Color, a), 4),
-            ],
-        );
 
         // `Sprite.color` is flattened into per-channel scalars at absolute
         // offsets so the inspector renders it as one colour group.

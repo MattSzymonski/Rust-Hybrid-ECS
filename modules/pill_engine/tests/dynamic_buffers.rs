@@ -173,8 +173,8 @@ fn archetype_move_copies_the_handle_not_the_block() {
     let address = before.points.as_ptr();
     let bytes = native_buffer::live_bytes();
 
-    // Adding a component moves the entity into a new archetype, which copies
-    // every surviving component through its registered copier.
+    // Adding a component moves the entity into a new archetype, which hands
+    // every surviving component's row to the destination column bitwise.
     world
         .add_component::<Marker>(entity, Marker { value: 5 })
         .expect("component is added");

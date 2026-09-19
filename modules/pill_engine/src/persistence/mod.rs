@@ -2,14 +2,22 @@
 //!
 //! # Responsibilities
 //!
-//! - Snapshots all entity component data before a hot-reload using serde_json.
-//! - Restores data after new component types are registered, matching old→new
-//!   components by type name (not TypeId), so renamed/reshaped components are
-//!   handled gracefully.
 //! - Stores per-component-type serialize/deserialize/insert function pointers
 //!   registered alongside each persistable component.
+//! - Migrates, in place, only the component types whose schema a reload
+//!   changed, matching old→new components by type name (not `TypeId`), so
+//!   renamed and reshaped components are handled gracefully.
+//! - Keeps the registration bookkeeping the reload transaction compares across
+//!   the swap: the persistable type manifest, the sequence markers, and the
+//!   forget paths for registrations whose owner is gone.
 //!
 //! # Design
+//!
+//! Selective migration is the one mechanism that runs: the reload transaction
+//! captures each persistable type's metadata before the swap, registers the
+//! arriving generation, and rewrites only the columns whose schema hash moved.
+//! Everything else keeps its bytes, so a reload costs work proportional to
+//! what actually changed rather than to the size of the world.
 //!
 //! Uses **serde_json** (not bincode) because JSON is self-describing:
 //! field names are embedded in the payload, so adding/removing fields does
@@ -30,12 +38,9 @@
 //! does not call any destructors through old vtables — function pointers
 //! are trivially overwritten.
 //!
-//! During snapshot: iterate every archetype, call `serialize` for each
-//! (entity, component_type) pair.
-//!
-//! During restore: destroy all existing entities, then for each snapshot
-//! entry, `deserialize` → `Option<Box<dyn Component>>`, call `insert_boxed`
-//! into the target archetype's storage.
+//! During migration: read each row of a changed column through the *retiring*
+//! generation's `serialize`, decode it with the arriving generation's
+//! `deserialize`, and place it with that generation's `insert_boxed`.
 
 // Standard library
 use std::collections::hash_map::DefaultHasher;
@@ -65,7 +70,6 @@ mod components;
 mod migration;
 mod registry;
 mod resources;
-mod snapshot;
 
 pub use components::*;
 pub use registry::*;
@@ -78,7 +82,7 @@ pub use resources::*;
 // These fields are added to the `World` struct (see `world.rs`):
 //
 // ```ignore
-// /// Per-component-type serialize fn for snapshotting.
+// /// Per-component-type serialize fn for reading rows during migration.
 // pub(crate) persist_serializers: HashMap<ComponentId, SerializeComponentFn>,
 // /// Per-type-name deserialize fn for restoring.
 // pub(crate) persist_deserializers: HashMap<String, DeserializeComponentFn>,
@@ -356,8 +360,6 @@ mod tests {
         assert!(!world.entity_locations.contains_key(&second_entity));
         assert!(!world.storage_factories.contains_key(&first_id));
         assert!(!world.storage_factories.contains_key(&second_id));
-        assert!(!world.component_copiers.contains_key(&first_id));
-        assert!(!world.component_copiers.contains_key(&second_id));
     }
 
     /// A refused persistable registration changes nothing: the guard runs
@@ -430,7 +432,6 @@ mod tests {
         // The failed generation's id holds nothing anywhere...
         assert!(!world.entity_locations.contains_key(&entity));
         assert!(!world.storage_factories.contains_key(&stranded_id));
-        assert!(!world.component_copiers.contains_key(&stranded_id));
         assert!(!world.persist_serializers.contains_key(&stranded_id));
         assert!(!world.persist_inserters.contains_key(&stranded_id));
 
@@ -844,212 +845,6 @@ mod tests {
             None
         );
     }
-    // =========================================================================
-    // Descriptor-only persistence (C.3)
-    // =========================================================================
-
-    /// Register a descriptor-only component with a two-field layout.
-    ///
-    /// Mirrors what the C# manifest path registers: a blittable row plus the
-    /// field descriptors that describe it, which together are everything the
-    /// generic codec needs.
-    fn register_probe_descriptor_component(world: &mut World, name: &str) -> ComponentId {
-        let component_id = world
-            .register_component_descriptor(
-                0xC3_0001,
-                name.to_string(),
-                8,
-                4,
-                77,
-                Blittability::engine_verified(),
-            )
-            .expect("a valid descriptor layout registers");
-        world
-            .register_component_descriptor_with_layout(
-                component_id,
-                vec![
-                    crate::component_registry::ComponentFieldDescriptor {
-                        name: "health",
-                        type_tag: "i32",
-                        offset: 0,
-                        size: 4,
-                        align: 4,
-                        element_count: 0,
-                    },
-                    crate::component_registry::ComponentFieldDescriptor {
-                        name: "speed",
-                        type_tag: "f32",
-                        offset: 4,
-                        size: 4,
-                        align: 4,
-                        element_count: 0,
-                    },
-                ],
-            )
-            .expect("the layout fits the registered size");
-        component_id
-    }
-
-    /// A descriptor-only component survives a snapshot and restore.
-    ///
-    /// Before the descriptor codec existed this component was absent from the
-    /// snapshot entirely: `snapshot_components` consulted `persist_serializers`,
-    /// which only a Rust type can populate, so a C#-declared component was
-    /// silently dropped by a save.
-    #[test]
-    fn a_descriptor_only_component_round_trips_through_a_snapshot() {
-        let mut world = World::new();
-        let component_id = register_probe_descriptor_component(&mut world, "probe::Stats");
-
-        let entity = world.create_entity().build().unwrap();
-        world
-            .add_descriptor_component(entity, component_id, &[7, 0, 0, 0, 0, 0, 160, 64])
-            .expect("the row is the registered width");
-
-        let snapshot = world.snapshot_components();
-        assert_eq!(snapshot.entries.len(), 1, "the entity reached the snapshot");
-        assert_eq!(
-            snapshot.entries[0].len(),
-            1,
-            "its descriptor component reached the snapshot"
-        );
-        assert_eq!(snapshot.entries[0][0].0, "probe::Stats");
-
-        world.restore_from_snapshot(&snapshot);
-
-        let restored: Vec<Entity> = world.entity_locations.keys().copied().collect();
-        assert_eq!(restored.len(), 1, "one entity comes back");
-        let location = world.entity_locations[&restored[0]];
-        let archetype = &world.archetypes[&location.archetype_id];
-        let row = archetype
-            .component_storages
-            .get(component_id)
-            .expect("the restored archetype owns the column")
-            .bytes(location.index_in_archetype)
-            .expect("the row exists");
-        assert_eq!(
-            row,
-            &[7, 0, 0, 0, 0, 0, 160, 64],
-            "every byte of the row survives the round trip"
-        );
-    }
-
-    /// A field the snapshot does not carry restores to defined bytes.
-    #[test]
-    fn a_field_added_since_the_snapshot_restores_zeroed() {
-        let fields = [
-            crate::component_registry::ComponentFieldDescriptor {
-                name: "health",
-                type_tag: "i32",
-                offset: 0,
-                size: 4,
-                align: 4,
-                element_count: 0,
-            },
-            crate::component_registry::ComponentFieldDescriptor {
-                name: "shield",
-                type_tag: "i32",
-                offset: 4,
-                size: 4,
-                align: 4,
-                element_count: 0,
-            },
-        ];
-
-        // A snapshot written before `shield` existed.
-        let image = crate::component_field::descriptor_row_image(br#"{"health":9}"#, &fields, 8)
-            .expect("the payload is an object");
-
-        assert_eq!(&image[0..4], &9i32.to_le_bytes(), "the carried field lands");
-        assert_eq!(
-            &image[4..8],
-            &[0, 0, 0, 0],
-            "the added field starts defined rather than reading stale memory"
-        );
-    }
-
-    /// A reordered field follows its name, not its position.
-    #[test]
-    fn a_reordered_field_restores_by_name() {
-        let before = [
-            crate::component_registry::ComponentFieldDescriptor {
-                name: "health",
-                type_tag: "i32",
-                offset: 0,
-                size: 4,
-                align: 4,
-                element_count: 0,
-            },
-            crate::component_registry::ComponentFieldDescriptor {
-                name: "speed",
-                type_tag: "i32",
-                offset: 4,
-                size: 4,
-                align: 4,
-                element_count: 0,
-            },
-        ];
-        // The same two fields, swapped.
-        let after = [
-            crate::component_registry::ComponentFieldDescriptor {
-                name: "speed",
-                type_tag: "i32",
-                offset: 0,
-                size: 4,
-                align: 4,
-                element_count: 0,
-            },
-            crate::component_registry::ComponentFieldDescriptor {
-                name: "health",
-                type_tag: "i32",
-                offset: 4,
-                size: 4,
-                align: 4,
-                element_count: 0,
-            },
-        ];
-
-        let mut row = Vec::new();
-        row.extend_from_slice(&11i32.to_le_bytes());
-        row.extend_from_slice(&22i32.to_le_bytes());
-        let json = crate::component_field::serialize_descriptor_row(&row, &before);
-
-        let image = crate::component_field::descriptor_row_image(&json, &after, 8)
-            .expect("the payload is an object");
-        assert_eq!(
-            &image[0..4],
-            &22i32.to_le_bytes(),
-            "speed moved to offset 0"
-        );
-        assert_eq!(
-            &image[4..8],
-            &11i32.to_le_bytes(),
-            "health moved to offset 4"
-        );
-    }
-
-    /// A field the codec cannot interpret still survives the round trip.
-    ///
-    /// The editor refuses to *write* a `struct:` field; persistence must still
-    /// *preserve* it, which is why the two paths do not share a rule.
-    #[test]
-    fn an_uninterpretable_field_round_trips_as_bytes() {
-        let fields = [crate::component_registry::ComponentFieldDescriptor {
-            name: "nested",
-            type_tag: "struct:probe::Inner",
-            offset: 0,
-            size: 4,
-            align: 4,
-            element_count: 0,
-        }];
-
-        let row = [1u8, 2, 3, 4];
-        let json = crate::component_field::serialize_descriptor_row(&row, &fields);
-        let image = crate::component_field::descriptor_row_image(&json, &fields, 4)
-            .expect("the payload is an object");
-        assert_eq!(&image[..], &row[..], "the opaque bytes come back unchanged");
-    }
-
     // =========================================================================
     // Resource persistence
     // =========================================================================

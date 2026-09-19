@@ -39,7 +39,7 @@ mod loaded {
     use crate::analytics;
     use crate::build_runner::build_project_module;
     use crate::csharp::CSharpRuntime;
-    use crate::native_library::{NativeLibrary, PROJECT_ENTRY_POINTS};
+    use crate::native_library::NativeLibrary;
     use crate::{ProjectModuleBackend, ProjectModuleConfig};
 
     // =============================================================================
@@ -62,10 +62,10 @@ mod loaded {
             /// Old DLLs intentionally remain mapped because engine-owned function
             /// pointers and vtables may still refer to their code.
             old_libraries: Vec<NativeLibrary>,
-            /// Persistable component type names the last `project_init` registered,
+            /// Persistable component type names the last `pill_module_init` registered,
             /// used to detect types the next generation forgets to re-register.
             registered_type_names: Vec<String>,
-            /// Resource ids the last `project_init` registered, so a type the
+            /// Resource ids the last `pill_module_init` registered, so a type the
             /// project stops owning can be dropped while its image is mapped.
             registered_resource_ids: Vec<pill_engine::ResourceId>,
         },
@@ -91,7 +91,7 @@ mod loaded {
         /// # Errors
         ///
         /// Returns `HostError` when the module fails to compile, when the native
-        /// library cannot be loaded, or when the module's `project_init` reports a
+        /// library cannot be loaded, or when the module's `pill_module_init` reports a
         /// non-zero initialization status.
         pub(crate) fn start(
             engine: &mut Engine,
@@ -112,12 +112,8 @@ mod loaded {
                     // Native build outputs cannot be loaded in place on Windows:
                     // the OS locks a mapped DLL. Load a uniquely named copy so the
                     // next compilation remains free to replace the original.
-                    let library = NativeLibrary::load_copy(
-                        &output_path,
-                        workspace_root,
-                        &config.name,
-                        &PROJECT_ENTRY_POINTS,
-                    )?;
+                    let library =
+                        NativeLibrary::load_copy(&output_path, workspace_root, &config.name)?;
 
                     // Native modules register their components and systems through
                     // the stable EngineApi table before the first frame is run.
@@ -399,12 +395,8 @@ mod loaded {
         // Step 2: Load and validate the replacement library transactionally.
         // Keep `current` untouched until a complete replacement library is ready
         // to initialize.
-        let new_library = match NativeLibrary::load_copy(
-            &output_path,
-            workspace_root,
-            &config.name,
-            &PROJECT_ENTRY_POINTS,
-        ) {
+        let new_library = match NativeLibrary::load_copy(&output_path, workspace_root, &config.name)
+        {
             Ok(library) => library,
             Err(error) => {
                 error!(

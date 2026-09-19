@@ -928,7 +928,7 @@ pub(crate) fn record_reload(name: &str) {
 /// the patch's analogue of a module's cargo build; `stage` is everything that
 /// prepares the thing to build (classification, source generation and the flag
 /// capture); `load` is `LoadLibrary`; and `init` is the install that makes the
-/// new code live, which is what `project_init` does for a reload. `migrate` is
+/// new code live, which is what `pill_module_init` does for a reload. `migrate` is
 /// always zero because a patch cannot change a component schema - that is
 /// precisely the kind of edit it refuses.
 #[cfg(feature = "hot_patch")]

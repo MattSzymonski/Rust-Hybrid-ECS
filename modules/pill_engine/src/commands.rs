@@ -603,44 +603,16 @@ impl CommandQueue {
         new_component_ids.push(new_component_id);
         new_component_ids.sort();
 
-        // Step 3: Collect the copiers that preserve each surviving component
-        // during the archetype migration. A native component whose copier is
-        // gone - `forget_component_type` purges them while archetypes can
-        // still list the id - cannot be carried across, and migrating without
-        // it would move the entity and its tick rows while leaving the
-        // destination short a component row. Report it and stop.
-        let mut component_copiers = Vec::with_capacity(old_archetype.component_types.len());
-        for &component_id in &old_archetype.component_types {
-            // Descriptor rows migrate as bytes inside `move_entity_to_archetype`.
-            if !component_id.is_native_storage() {
-                continue;
-            }
-            match world.component_copiers.get(&component_id).copied() {
-                Some(component_copier) => component_copiers.push(component_copier),
-                None => {
-                    errors.push(CommandError::MissingComponentCopier {
-                        entity,
-                        component_id,
-                    });
-                    return;
-                }
-            }
-        }
-
-        // Step 4: Migrate the entity row, copying surviving components and
-        // writing the new component into the destination storage. A migration
-        // failure (archetype missing, component column missing) is collected
-        // rather than panicking inside the flush.
-        if let Err(error) = world.move_entity_to_archetype(
-            entity,
-            new_component_ids,
-            |old_storage, new_storage, old_index| {
-                for component_copier in component_copiers.iter() {
-                    component_copier(old_storage, new_storage, old_index);
-                }
+        // Step 3: Migrate the entity row. Every surviving component is carried
+        // by the move itself, so the only thing left to write is the component
+        // being added. A migration failure (archetype missing, component column
+        // missing) is collected rather than panicking inside the flush.
+        if let Err(error) =
+            world.move_entity_to_archetype(entity, new_component_ids, |new_storage| {
                 component_adder.add_component_to_storage(new_storage);
-            },
-        ) {
+                Ok(())
+            })
+        {
             errors.push(CommandError::MigrationFailed {
                 entity,
                 reason: error.to_string(),
@@ -706,38 +678,11 @@ impl CommandQueue {
             return;
         }
 
-        // Step 4: Migrate surviving components to the new archetype. A
-        // migration failure is collected rather than panicking inside the
-        // flush, matching `execute_add_component`. The same goes for a
-        // surviving component whose copier is gone: it is reported instead of
-        // being silently dropped from the move.
-        let mut component_copiers = Vec::with_capacity(new_component_ids.len());
-        for &component_id in &new_component_ids {
-            // Descriptor rows migrate as bytes inside `move_entity_to_archetype`.
-            if !component_id.is_native_storage() {
-                continue;
-            }
-            match world.component_copiers.get(&component_id).copied() {
-                Some(component_copier) => component_copiers.push(component_copier),
-                None => {
-                    errors.push(CommandError::MissingComponentCopier {
-                        entity,
-                        component_id,
-                    });
-                    return;
-                }
-            }
-        }
-
-        if let Err(error) = world.move_entity_to_archetype(
-            entity,
-            new_component_ids,
-            |old_storage, new_storage, old_index| {
-                for component_copier in component_copiers.iter() {
-                    component_copier(old_storage, new_storage, old_index);
-                }
-            },
-        ) {
+        // Step 4: Migrate surviving components to the new archetype. The move
+        // carries them; the removed component is left behind in the source
+        // archetype and released there. A migration failure is collected rather
+        // than panicking inside the flush, matching `execute_add_component`.
+        if let Err(error) = world.move_entity_to_archetype(entity, new_component_ids, |_| Ok(())) {
             errors.push(CommandError::MigrationFailed {
                 entity,
                 reason: error.to_string(),
@@ -919,6 +864,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+
     use super::*;
     use crate::archetype::Blittability;
     use crate::world::World;
@@ -935,11 +883,60 @@ mod tests {
         y: f32,
     }
 
-    /// A third component, used to force a migration in the copier test.
+    /// A third component, used to force an archetype migration.
     #[derive(Debug, Clone, Copy, PartialEq)]
     struct Health {
         value: u32,
     }
+
+    /// Counts how many `OwningComponent` values are alive.
+    ///
+    /// An archetype move must not change it: the row travels bitwise, so no
+    /// value is created and none is destroyed on the way.
+    static OWNING_COMPONENTS_ALIVE: AtomicUsize = AtomicUsize::new(0);
+
+    /// Serializes the tests that read the process-wide live count, which would
+    /// otherwise see each other's values while cargo runs them in parallel.
+    static OWNING_COMPONENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Take the live-count lock, ignoring a poisoning left by a failed test:
+    /// the counter is reset below either way, and a second failure reported as
+    /// a poisoned lock hides the assertion that actually matters.
+    fn owning_component_test_guard() -> MutexGuard<'static, ()> {
+        let guard = OWNING_COMPONENT_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        OWNING_COMPONENTS_ALIVE.store(0, Ordering::SeqCst);
+        guard
+    }
+
+    /// A component that owns a heap allocation, so a clone-and-drop move is
+    /// distinguishable from a bitwise one by more than a counter.
+    #[derive(Debug)]
+    struct OwningComponent {
+        payload: Vec<u32>,
+    }
+
+    impl OwningComponent {
+        fn new(payload: Vec<u32>) -> Self {
+            OWNING_COMPONENTS_ALIVE.fetch_add(1, Ordering::SeqCst);
+            Self { payload }
+        }
+    }
+
+    impl Clone for OwningComponent {
+        fn clone(&self) -> Self {
+            Self::new(self.payload.clone())
+        }
+    }
+
+    impl Drop for OwningComponent {
+        fn drop(&mut self) {
+            OWNING_COMPONENTS_ALIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl Component for OwningComponent {}
 
     impl Component for Position {}
     impl Component for Velocity {}
@@ -1174,44 +1171,101 @@ mod tests {
         );
     }
 
-    /// A component whose copier was purged cannot be carried across a
-    /// migration, and the attempt is reported instead of silently leaving the
-    /// destination short a component row.
+    /// An archetype migration moves a component that owns memory; it does not
+    /// clone it and drop the original.
+    ///
+    /// This is the property the copier used to break. A row travelled by deep
+    /// clone followed by a deep drop, so a component holding a `Vec` paid an
+    /// allocation and a free on every archetype change, and any `Clone` impl
+    /// with side effects ran during what the engine calls a relocation. The
+    /// live count is the witness: it may not move while the entity does, and it
+    /// must reach zero exactly once when the entity is destroyed.
     #[test]
-    fn add_component_with_purged_copier_reports_migration_failure() {
+    fn a_migration_moves_an_owning_component_rather_than_cloning_it() {
+        let _guard = owning_component_test_guard();
         let mut world = World::new();
-        world.register_component::<Position>();
-        world.register_component::<Velocity>();
+        world.register_component::<OwningComponent>();
         world.register_component::<Health>();
+
         let entity = world
             .create_entity()
-            .with(Position { x: 1.0, y: 2.0 })
-            .with(Velocity { x: 3.0, y: 4.0 })
+            .with(OwningComponent::new(vec![7, 8, 9]))
             .build()
             .unwrap();
+        assert_eq!(OWNING_COMPONENTS_ALIVE.load(Ordering::SeqCst), 1);
 
-        // The half-applied purge `forget_component_type` leaves behind: the
-        // archetype still lists the component and its row is intact, but the
-        // copier a migration needs is gone.
-        world
-            .component_copiers
-            .remove(&ComponentId::of::<Velocity>());
-
+        // Adding a component migrates the entity to another archetype, which is
+        // what carries the owning component across.
         let mut queue = CommandQueue::new();
         queue.add_component_adder_to_entity(entity, boxed_component_adder(Health { value: 5 }));
-        let errors = queue.execute_queued_commands(&mut world, true).unwrap_err();
-        assert!(matches!(
-            errors.as_slice(),
-            [CommandError::MissingComponentCopier { component_id, .. }]
-                if *component_id == ComponentId::of::<Velocity>()
-        ));
+        queue.execute_queued_commands(&mut world, true).unwrap();
 
-        // The entity stayed in its two-component archetype with both rows
-        // readable, and the component that could not be reached was not added.
-        assert_eq!(world.entity_count(), 1);
-        assert_eq!(world.get_component::<Position>(entity).unwrap().x, 1.0);
-        assert_eq!(world.get_component::<Velocity>(entity).unwrap().x, 3.0);
-        assert!(world.get_component::<Health>(entity).is_none());
+        assert_eq!(
+            OWNING_COMPONENTS_ALIVE.load(Ordering::SeqCst),
+            1,
+            "a move creates no second value and destroys no first one"
+        );
+        assert_eq!(
+            world
+                .get_component::<OwningComponent>(entity)
+                .expect("the component came across")
+                .payload,
+            vec![7, 8, 9],
+            "the moved row still owns its allocation"
+        );
+
+        // Removing it migrates the entity back, again carrying the row.
+        let mut queue = CommandQueue::new();
+        queue.remove_component_from_entity::<Health>(entity);
+        queue.execute_queued_commands(&mut world, true).unwrap();
+        assert_eq!(
+            OWNING_COMPONENTS_ALIVE.load(Ordering::SeqCst),
+            1,
+            "the return migration is a move as well"
+        );
+
+        // Destroying the entity is the one place the value is released, and it
+        // is released exactly once.
+        assert!(world.destroy_entity(entity));
+        assert_eq!(
+            OWNING_COMPONENTS_ALIVE.load(Ordering::SeqCst),
+            0,
+            "the moved row is dropped exactly once, by whoever owns it last"
+        );
+    }
+
+    /// A component the migration leaves behind is released, not leaked.
+    ///
+    /// The counterpart of the test above: the source archetype forgets the rows
+    /// it handed over and drops the ones it did not, so removing a component
+    /// that owns memory frees it there and then.
+    #[test]
+    fn a_removed_owning_component_is_dropped_by_the_archetype_it_leaves() {
+        let _guard = owning_component_test_guard();
+        let mut world = World::new();
+        world.register_component::<OwningComponent>();
+        world.register_component::<Health>();
+
+        let entity = world
+            .create_entity()
+            .with(OwningComponent::new(vec![1, 2]))
+            .with(Health { value: 3 })
+            .build()
+            .unwrap();
+        assert_eq!(OWNING_COMPONENTS_ALIVE.load(Ordering::SeqCst), 1);
+
+        let mut queue = CommandQueue::new();
+        queue.remove_component_from_entity::<OwningComponent>(entity);
+        queue.execute_queued_commands(&mut world, true).unwrap();
+
+        assert_eq!(
+            OWNING_COMPONENTS_ALIVE.load(Ordering::SeqCst),
+            0,
+            "the component that did not travel is released by the source archetype"
+        );
+        assert!(world.get_component::<OwningComponent>(entity).is_none());
+        assert_eq!(world.get_component::<Health>(entity).unwrap().value, 3);
+        assert!(world.destroy_entity(entity));
     }
 
     /// Tests entity archetype migration and automatic cleanup when components are removed.
@@ -1412,15 +1466,16 @@ mod tests {
         ));
     }
 
-    /// A queued removal whose archetype migration hits missing descriptor
-    /// storage is reported as `MigrationFailed`, never panicked on.
+    /// A queued removal of the very component whose storage vanished completes
+    /// and leaves the entity consistent.
     ///
-    /// The migration path used to `expect("descriptor storage missing")`, which
-    /// aborted the frame inside the flush. After the fix the desync is
-    /// collected as a typed `WorldError` and surfaced through the command
-    /// error list.
+    /// The migration used to refuse this, because the source release walked
+    /// every component the source archetype named and demanded a column for
+    /// each. Now a component the destination does not take has nothing left to
+    /// release, so the removal is exactly the repair the desynced entity needs:
+    /// it lands in a well-formed archetype and the broken one is retired.
     #[test]
-    fn a_queued_remove_whose_migration_hits_missing_storage_is_reported() {
+    fn a_queued_remove_of_a_component_whose_storage_vanished_completes() {
         let mut world = World::new();
         world.register_component::<Position>();
         let descriptor_a = world
@@ -1457,6 +1512,81 @@ mod tests {
             .remove(descriptor_a);
 
         queue.remove_component_by_id(entity, descriptor_a);
+        queue
+            .execute_queued_commands(&mut world, true)
+            .expect("removing the component whose column is gone has nothing to release");
+
+        assert!(world.is_entity_valid(entity));
+        assert_eq!(world.get_component::<Position>(entity).unwrap().x, 1.0);
+        assert!(
+            world
+                .descriptor_component_bytes(entity, descriptor_a)
+                .is_none(),
+            "the removed component is gone from the entity"
+        );
+        assert_eq!(
+            world.archetypes.len(),
+            1,
+            "the archetype whose column vanished was emptied and retired"
+        );
+    }
+
+    /// A migration that cannot carry a column across is reported as
+    /// `MigrationFailed`, never panicked on.
+    ///
+    /// The migration path used to `expect("descriptor storage missing")`, which
+    /// aborted the frame inside the flush. The desync is collected as a typed
+    /// `WorldError` and surfaced through the command error list instead - and
+    /// it is refused before anything moves, so the entity stays where it was.
+    #[test]
+    fn a_queued_migration_that_cannot_carry_a_column_is_reported() {
+        let mut world = World::new();
+        world.register_component::<Position>();
+        let descriptor_a = world
+            .register_component_descriptor(
+                0xA1,
+                "Project.DescriptorA",
+                4,
+                4,
+                1,
+                Blittability::engine_verified(),
+            )
+            .unwrap();
+        let descriptor_b = world
+            .register_component_descriptor(
+                0xA2,
+                "Project.DescriptorB",
+                4,
+                4,
+                1,
+                Blittability::engine_verified(),
+            )
+            .unwrap();
+
+        let entity = world.reserve_entity();
+        let mut queue = CommandQueue::new();
+        queue.create_mixed_entity(
+            entity,
+            vec![boxed_component_adder(Position { x: 1.0, y: 2.0 })],
+            vec![
+                (descriptor_a, 11_u32.to_ne_bytes().to_vec()),
+                (descriptor_b, 22_u32.to_ne_bytes().to_vec()),
+            ],
+        );
+        queue.execute_queued_commands(&mut world, false).unwrap();
+
+        // The desync, this time on a component the migration has to carry:
+        // removing `descriptor_b` leaves `descriptor_a` to travel, and it has
+        // no column to travel from.
+        world
+            .archetypes
+            .values_mut()
+            .next()
+            .unwrap()
+            .component_storages
+            .remove(descriptor_a);
+
+        queue.remove_component_by_id(entity, descriptor_b);
         let errors = queue
             .execute_queued_commands(&mut world, true)
             .expect_err("a migration that cannot complete must fail the flush");
@@ -1466,5 +1596,11 @@ mod tests {
             [CommandError::MigrationFailed { entity: failed_entity, .. }]
                 if *failed_entity == entity
         ));
+        assert_eq!(
+            world.descriptor_component_bytes(entity, descriptor_b),
+            Some(&22_u32.to_ne_bytes()[..]),
+            "a refused migration leaves the entity where it was, with the              component the removal targeted still on it"
+        );
+        assert_eq!(world.get_component::<Position>(entity).unwrap().x, 1.0);
     }
 }

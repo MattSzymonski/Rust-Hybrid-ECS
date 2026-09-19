@@ -933,8 +933,9 @@ pub(crate) fn InspectorTab(editor: Arc<EditorContext>) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pill_engine::common_components::Color;
     use pill_engine::Engine;
-    use pill_master_renderer::{register_components, Color, Sprite};
+    use pill_master_renderer::{register_components, Sprite};
 
     /// A `Sprite`-carrying entity surfaces width/height as ordinary scalar
     /// rows plus one colour group whose flattened `color.*` channels are

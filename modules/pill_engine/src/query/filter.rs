@@ -39,7 +39,7 @@ use super::ptr::SendPtr;
 ///    pair per inner filter.
 ///
 /// 2. Row-level: [`init_state`] caches per-archetype data (e.g. a
-///    pointer into `component_ticks`) and [`matches`] is invoked for each
+///    pointer into the column's ticks) and [`matches`] is invoked for each
 ///    candidate row. This drives [`Changed`] and [`Added`].
 ///
 /// The trivial filter `()` matches every row.
@@ -175,15 +175,17 @@ impl<T: Component> QueryFilter for Without<T> {
 // =============================================================================
 
 /// Per-row state shared by `Changed<T>` and `Added<T>`: a `Send` pointer to
-/// the archetype's tick vector plus the comparison window.
+/// the filtered component's ticks plus the comparison window.
 ///
 /// When the component is not present in the archetype (possible when
 /// `Changed<T>` appears inside an [`Or`] whose other branch matched),
 /// `ticks` is `None` and all rows are rejected.
 pub struct TickFilterState {
-    /// Raw pointer to the archetype's `Vec<ComponentTicks>` for the filtered
+    /// Raw pointer to the first of the column's ticks for the filtered
     /// component; `None` when the component is absent from the archetype.
-    ticks: Option<SendPtr<Vec<ComponentTicks>>>,
+    ticks: Option<SendPtr<ComponentTicks>>,
+    /// How many ticks that pointer addresses, for the debug bounds check.
+    tick_count: usize,
     /// Tick recorded when the owning system last ran.
     last_run: Tick,
     /// Tick recorded for the current run of the owning system.
@@ -191,11 +193,12 @@ pub struct TickFilterState {
 }
 
 impl TickFilterState {
-    /// Builds state pointing at the archetype's tick vector for the component
-    /// that is present in that archetype.
-    fn new(ticks_vec: &Vec<ComponentTicks>, last_run: Tick, this_run: Tick) -> Self {
+    /// Builds state pointing at the ticks of a column that is present in the
+    /// archetype being iterated.
+    fn new(ticks: &[ComponentTicks], last_run: Tick, this_run: Tick) -> Self {
         Self {
-            ticks: Some(SendPtr::new(ticks_vec as *const Vec<ComponentTicks>)),
+            ticks: Some(SendPtr::new(ticks.as_ptr())),
+            tick_count: ticks.len(),
             last_run,
             this_run,
         }
@@ -206,6 +209,7 @@ impl TickFilterState {
     fn missing() -> Self {
         Self {
             ticks: None,
+            tick_count: 0,
             last_run: Tick(0),
             this_run: Tick(0),
         }
@@ -225,28 +229,27 @@ impl TickFilterState {
         // SAFETY: `is_present()` returned `true` (enforced by the caller
         // contract in `/// # Safety` and the `debug_assert!` above), so the
         // `Option` is `Some` and `unwrap_unchecked` cannot panic. The stored
-        // pointer was created in `new` from a `&Vec<ComponentTicks>` owned by
-        // the archetype, which outlives this state - state lives for one query
-        // iteration during which the archetype is neither mutated nor
-        // deallocated - so dereferencing it yields a valid `Vec`. `index` is
-        // a row index into that archetype, and the tick vector is kept in
-        // lockstep with the archetype's row count, so `index` is in bounds.
+        // pointer was created in `new` from a `&[ComponentTicks]` owned by a
+        // column of the archetype, which outlives this state - state lives for
+        // one query iteration during which the archetype is neither mutated nor
+        // deallocated - so dereferencing it yields a valid slice. `index` is a
+        // row index into that archetype, and a column's ticks are grown and
+        // shrunk by the column's own mutators, so they have exactly one row per
+        // component row and `index` is in bounds.
         // SAFETY: as documented above.
-        let ticks = unsafe { &*self.ticks.as_ref().unwrap_unchecked().as_ptr() };
-        // The lockstep claim above is the whole justification for eliding the
-        // bounds check, and `World` treats the same invariant as worth checking
-        // at migration time (`old ticks vec out of sync with components`). If it
-        // can fail there it can fail here, so assert it in debug builds - the
-        // release path is unchanged.
+        let ticks = unsafe { self.ticks.as_ref().unwrap_unchecked().as_ptr() };
+        // The row-count claim above is what justifies eliding the bounds check.
+        // It is a property of `ComponentColumn` rather than of any caller, but
+        // it is cheap to re-state in debug builds - the release path is
+        // unchanged.
         debug_assert!(
-            index < ticks.len(),
-            "row {index} is out of bounds for {} component ticks; the tick              vector has fallen out of lockstep with the archetype's rows",
-            ticks.len()
+            index < self.tick_count,
+            "row {index} is out of bounds for {} component ticks",
+            self.tick_count
         );
         // SAFETY: `index` is a row index into the archetype this state was
-        // built from, and the tick vector is kept in lockstep with that
-        // archetype's row count.
-        unsafe { ticks.get_unchecked(index) }
+        // built from, and a column has exactly one tick per row.
+        unsafe { &*ticks.add(index) }
     }
 }
 
@@ -268,8 +271,8 @@ impl<T: Component> QueryFilter for Changed<T> {
     }
 
     fn init_state(archetype: &mut Archetype, last_run: Tick, this_run: Tick) -> Self::State {
-        match archetype.component_ticks.get(&ComponentId::of::<T>()) {
-            Some(ticks_vec) => TickFilterState::new(ticks_vec, last_run, this_run),
+        match archetype.component_storages.get(ComponentId::of::<T>()) {
+            Some(column) => TickFilterState::new(column.ticks(), last_run, this_run),
             // Component not in this archetype - possible when Changed<T>
             // appears inside an Or whose other branch matched the archetype.
             None => TickFilterState::missing(),
@@ -310,8 +313,8 @@ impl<T: Component> QueryFilter for Added<T> {
     }
 
     fn init_state(archetype: &mut Archetype, last_run: Tick, this_run: Tick) -> Self::State {
-        match archetype.component_ticks.get(&ComponentId::of::<T>()) {
-            Some(ticks_vec) => TickFilterState::new(ticks_vec, last_run, this_run),
+        match archetype.component_storages.get(ComponentId::of::<T>()) {
+            Some(column) => TickFilterState::new(column.ticks(), last_run, this_run),
             None => TickFilterState::missing(),
         }
     }
@@ -372,7 +375,7 @@ macro_rules! impl_query_filter_tuple {
                 // dropped as soon as that element's call returns, so the
                 // borrows are sequential and never simultaneously alive. Every
                 // filter `init_state` implementation only reads archetype
-                // metadata (e.g. the `component_ticks` map), never mutating
+                // metadata (e.g. a column's change ticks), never mutating
                 // it, so no aliasing or mutation violation can occur.
                 unsafe { ($($T::init_state(&mut *archetype_ptr, last_run, this_run),)*) }
             }
@@ -454,7 +457,7 @@ macro_rules! impl_query_filter_or {
                 // dropped as soon as that element's call returns, so the
                 // borrows are sequential and never simultaneously alive. Every
                 // filter `init_state` implementation only reads archetype
-                // metadata (e.g. the `component_ticks` map), never mutating
+                // metadata (e.g. a column's change ticks), never mutating
                 // it, so no aliasing or mutation violation can occur.
                 unsafe { ($($T::init_state(&mut *archetype_ptr, last_run, this_run),)*) }
             }

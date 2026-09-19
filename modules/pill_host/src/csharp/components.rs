@@ -6,6 +6,9 @@
 //! - Resolve stable managed identities to native or managed bindings.
 //! - Register reflected component manifests; the schema model and its
 //!   validation live in [`manifest`](super::manifest).
+//! - Supply the component half of the shared reload pipeline, as
+//!   [`COMPONENT_SUBJECT`]; the stages it runs through live in
+//!   [`manifest_apply`](super::manifest_apply).
 //!
 //! # Design
 //!
@@ -16,9 +19,15 @@
 //! hashed from its canonical full name, and [`ComponentBinding`] records
 //! whether storage is backed by a concrete Rust type or by a managed layout of
 //! raw bytes.
+//!
+//! A reload does not have its own apply loop. It hands the binding table and
+//! the arriving declarations to the one pipeline every manifest kind runs
+//! through, along with the actions that make a component a component: what its
+//! aliases resolve against, which live bindings it may retire, and what
+//! registering, migrating, renaming and retiring managed storage do.
 
 // Standard library
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 // External crates
@@ -39,7 +48,10 @@ use pill_engine::{ComponentId, Engine, World};
 // Current crate
 use super::manifest::{
     build_field_plan, format_field_layout_line, managed_field_layout, parse_and_validate_manifest,
-    plan_manifest, plan_tag, split_manifest_kinds, ManagedComponentManifest, PlannedManifestEntry,
+    plan_tag, split_manifest_kinds, ManagedComponentManifest,
+};
+use super::manifest_apply::{
+    apply_manifest, BindingTable, ManifestSubject, RenamePredecessor, Settlement,
 };
 
 // Current crate
@@ -53,15 +65,20 @@ use super::context::active_scope_token;
 // Types + Impls
 // =============================================================================
 
-// The renderer's components, which managed physics writes into directly.
+// The components managed physics writes into directly.
 //
-// They live in `pill_master_renderer` with the pipeline that draws them, so they
-// are reachable only in a windowed build. A headless host registers no native
-// binding for them: a managed project that declares a `Sprite` mirror still
-// works, falling through to the managed byte-level binding like any other
-// component the host does not know natively.
+// `Position` and `Color` are the engine's - universal enough that every
+// renderer and most projects want the same two - while `Sprite` lives in
+// `pill_master_renderer` with the pipeline that draws it. Both imports stay
+// gated because it is the *native binding* that is windowed-only, not the
+// types: a headless host registers no native binding for any of them, and a
+// managed project that declares a `Sprite` mirror still works, falling through
+// to the managed byte-level binding like any other component the host does not
+// know natively.
 #[cfg(feature = "rendering")]
-pub(super) use pill_master_renderer::{Color, Position, Sprite};
+pub(super) use pill_engine::common_components::{Color, Position};
+#[cfg(feature = "rendering")]
+pub(super) use pill_master_renderer::Sprite;
 
 /// Stable 128-bit identity derived from a managed component's canonical name.
 ///
@@ -670,92 +687,6 @@ pub(super) fn check_binding_against_manifest(
     Ok(())
 }
 
-/// The registration one manifest entry's alias resolved to.
-///
-/// Captured whole because applying a rename retires the predecessor: by the
-/// time the rows have moved, the registration is gone and this record is the
-/// only description of what was there.
-#[derive(Clone)]
-pub(super) struct RenameSource {
-    /// Store key the predecessor was bound under.
-    pub(super) stable_id: StableComponentId,
-    /// Declared name the alias resolved to, for reporting.
-    pub(super) name: String,
-    /// The predecessor's binding, for the undo and for its engine id.
-    pub(super) binding: ComponentBinding,
-    /// The predecessor's field layout, for the inverse plan.
-    pub(super) fields: Vec<ComponentFieldDescriptor>,
-}
-
-/// Resolve every entry's aliases to the registrations they used to name.
-///
-/// One hop, against live registrations only: an alias names something that is
-/// still registered (otherwise there are no rows to carry), and the entry it
-/// lands on becomes a rename instead of an add. An alias that resolves to
-/// nothing, or to something without a managed binding, is left alone: it names
-/// no storage this path owns, and a later registration under it is an ordinary
-/// add.
-///
-/// # Errors
-///
-/// Returns [`CSharpError`] when the name is ambiguous, or when one entry
-/// collects predecessors through more than one alias: two old registrations
-/// cannot both be its past, and picking one would silently drop the other's
-/// rows.
-#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
-fn resolve_aliases(
-    engine: &Engine,
-    store: &BindingStore,
-    manifest: &[ManagedComponentManifest],
-) -> Result<HashMap<StableComponentId, RenameSource>, CSharpError> {
-    let mut renames: HashMap<StableComponentId, RenameSource> = HashMap::new();
-    for entry in manifest {
-        let successor = StableComponentId::from_halves(entry.stable_id_low, entry.stable_id_high);
-        for alias in &entry.aliases {
-            let resolved = engine
-                .world()
-                .resolve_component_id_by_name_any(alias)
-                .map_err(|error| CSharpError::ManifestInvalid {
-                    message: error.to_plain_message(),
-                })?;
-            let Some(component_id) = resolved else {
-                continue;
-            };
-            let predecessor = store.read().iter().find_map(|(stable_id, binding)| {
-                (binding.component_id() == component_id
-                    && matches!(binding, ComponentBinding::Managed { .. }))
-                .then_some((*stable_id, *binding))
-            });
-            let Some((predecessor_stable_id, binding)) = predecessor else {
-                continue;
-            };
-            if renames.contains_key(&successor) {
-                return Err(CSharpError::ManifestInvalid {
-                    message: format!(
-                        "managed component {} declares aliases for more than one previous registration",
-                        entry.full_name
-                    ),
-                });
-            }
-            let fields = engine
-                .world()
-                .component_field_layout(component_id)
-                .unwrap_or(&[])
-                .to_vec();
-            renames.insert(
-                successor,
-                RenameSource {
-                    stable_id: predecessor_stable_id,
-                    name: alias.clone(),
-                    binding,
-                    fields,
-                },
-            );
-        }
-    }
-    Ok(renames)
-}
-
 /// What one applied manifest changed, for the caller's log line.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 #[derive(Debug, Default)]
@@ -798,16 +729,15 @@ pub(super) struct ManifestApplyReport {
 ///   because picking one would silently drop the other's rows.
 ///
 /// A managed component the manifest stopped naming is not refused: its storage
-/// is retired after the rest of the plan has been applied, so the dev loop
-/// does not demand a restart for a removed type. The retirement is collected
-/// in Step 1 and executed in Step 4, the point after which nothing may fail.
+/// is retired after everything else has applied, so the dev loop does not
+/// demand a restart for a removed type.
 ///
-/// The whole manifest is planned before any of it is applied: every entry is
-/// resolved to a no-op, a check, an addition or a migration first, so the
-/// refusals validation cannot foresee - a shared entry with no binding, an
-/// engine registration or relayout error - leave the world and the bindings as
-/// they were. Residual failures during application are unwound from a journal,
-/// so "as they were" holds for every exit and not only the planned ones.
+/// The stages themselves - resolve aliases, collect what vanished, resolve
+/// every entry before mutating anything, apply with a journal, unwind on a
+/// refusal, retire last - are [`super::manifest_apply`]'s, shared with the
+/// resource kind. What is component-specific lives in [`COMPONENT_SUBJECT`]:
+/// the identity, the refusals above, and what registering, migrating, renaming
+/// and retiring a managed column actually do.
 ///
 /// # Errors
 ///
@@ -822,119 +752,52 @@ pub(super) fn apply_component_manifest_on_reload(
     let (manifest, resources) = split_manifest_kinds(parse_and_validate_manifest(bytes)?);
     // Resources settle first and on their own terms: they own no column, so a
     // component refused afterwards leaves nothing of theirs half-applied, and a
-    // resource entry that reached the component planner would be planned as a
+    // resource entry that reached the component pipeline would be resolved as a
     // column to add.
-    let resource_report = super::resources::apply_resource_manifest_on_reload(engine, &resources)?;
-    // Aliases resolve before the vanished-component refusal below: an entry
-    // whose alias reaches a still-registered predecessor turns that
-    // predecessor from a disappearance into a rename.
-    let renames = resolve_aliases(engine, store, &manifest)?;
-    let live: HashSet<StableComponentId> = manifest
-        .iter()
-        .map(|component| {
-            StableComponentId::from_halves(component.stable_id_low, component.stable_id_high)
-        })
-        .collect();
+    let resource_outcome = super::resources::apply_resource_manifest_on_reload(engine, &resources)?;
 
-    // Step 1: Collect the managed components the manifest stopped naming, to
-    // be retired after the plan. Collected here rather than retired here for
-    // two reasons: an alias in the arriving manifest can claim one of them as
-    // a rename (its rows would move, not drop), and a retirement cannot be
-    // journalled - so nothing may run after it that could fail.
-    let renamed_sources: HashSet<StableComponentId> =
-        renames.values().map(|source| source.stable_id).collect();
-    let vanished: Vec<(StableComponentId, ComponentId, String)> = store
-        .read()
-        .iter()
-        .filter(|(id, binding)| {
-            !live.contains(id)
-                && !renamed_sources.contains(id)
-                && matches!(binding, ComponentBinding::Managed { .. })
-        })
-        .map(|(stable_id, binding)| {
-            let component_id = binding.component_id();
-            let name = engine
-                .world()
-                .registered_components()
-                .iter()
-                .find(|(_, id)| *id == component_id)
-                .map(|(name, _)| name.clone())
-                .unwrap_or_default();
-            (*stable_id, component_id, name)
-        })
-        .collect();
+    // The component table is handed to the shared pipeline as a plain map and
+    // published whole when it comes back, which is what makes the table half of
+    // the rollback all-or-nothing: nothing observes an intermediate state,
+    // because there is no intermediate state to observe.
+    let previous = store.read().clone();
+    let (result, table) = apply_manifest(&COMPONENT_SUBJECT, engine, previous, &manifest);
+    *store.write() = table;
+    let outcome = result?;
 
-    // Step 2: Resolve every entry before the first mutation. The borrowed
-    // reads below (`store`, `engine`) are read-only, so a refusal here leaves
-    // both untouched.
-    let planned = plan_manifest(engine, store, manifest, &renames)?;
-
-    // Step 3: Execute the plan, journalling one undo per applied entry. A
-    // refusal the plan could not see - the engine rejecting a registration, a
-    // relayout meeting a column that drifted beneath it - unwinds the journal
-    // in reverse before the error is returned.
-    let mut undos: Vec<ManifestUndo> = Vec::with_capacity(planned.len());
-    let mut report = ManifestApplyReport {
-        resources_added: resource_report.added,
-        resources_migrated: resource_report.migrated,
-        resources_renamed: resource_report.renamed,
-        resources_retired: resource_report.retired,
-        ..ManifestApplyReport::default()
-    };
-    for entry in planned {
-        match apply_planned_entry(engine, store, entry, &mut report) {
-            Ok(Some(undo)) => undos.push(undo),
-            Ok(None) => {}
-            Err(error) => {
-                rollback_manifest_apply(engine, store, undos);
-                return Err(error);
-            }
-        }
-    }
-
-    // Step 4: Retire the storage of every managed component the manifest
-    // stopped naming, now that every add and migration has been applied and
-    // journalled. Nothing may fail after this: a retirement drops bytes and
-    // cannot be undone, which is why it runs last rather than during the
-    // plan.
-    if !vanished.is_empty() {
-        let retired_ids: Vec<ComponentId> = vanished
-            .iter()
-            .map(|(_, component_id, _)| *component_id)
-            .collect();
-        let affected_entities = engine.world_mut().retire_component_storage(&retired_ids);
-        for (stable_id, _, name) in &vanished {
-            store.write().remove(stable_id);
-            report.retired.push(name.clone());
-        }
-        info!(
-            target: telemetry_target::HOT_RELOAD,
-            components = vanished.len(),
-            entities = affected_entities,
-            "retired managed component storage the manifest stopped naming"
-        );
-    }
-    Ok(report)
+    Ok(ManifestApplyReport {
+        migrated: outcome.migrated,
+        added: outcome.added,
+        renamed: outcome.renamed,
+        retired: outcome.retired,
+        resources_added: resource_outcome.added,
+        resources_migrated: resource_outcome.migrated,
+        resources_renamed: resource_outcome.renamed,
+        resources_retired: resource_outcome.retired,
+    })
 }
 
-/// One applied entry, recorded so a later refusal can be undone.
+// =============================================================================
+// The component manifest subject
+// =============================================================================
+
+/// One applied component entry, recorded so a later refusal can be undone.
+///
+/// Engine state only: the binding table's half of an undo belongs to the
+/// pipeline, which knows exactly what it wrote where.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
-enum ManifestUndo {
+pub(super) enum ComponentUndo {
     /// The entry registered a managed component.
-    Added {
-        stable_id: StableComponentId,
-        component_id: ComponentId,
-    },
+    Added { component_id: ComponentId },
     /// The entry migrated a managed component to a new shape.
     Migrated {
-        stable_id: StableComponentId,
         component_id: ComponentId,
         previous_binding: ComponentBinding,
         previous_fields: Vec<ComponentFieldDescriptor>,
     },
     /// The entry renamed a managed component from an earlier registration.
     Renamed {
-        stable_id: StableComponentId,
+        successor_id: ComponentId,
         predecessor_stable_id: StableComponentId,
         predecessor_name: String,
         predecessor_binding: ComponentBinding,
@@ -942,363 +805,476 @@ enum ManifestUndo {
     },
 }
 
-/// Execute one planned entry, reporting what it changed.
+/// The actions the shared apply pipeline needs for managed components.
 ///
-/// Returns the undo it journalled, if any: `Settled` entries change nothing
-/// and need none.
+/// Everything a component does differently from a resource, and nothing else:
+/// the six stages themselves live in [`super::manifest_apply`].
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
-fn apply_planned_entry(
+pub(super) const COMPONENT_SUBJECT: ManifestSubject<
+    ManagedComponentManifest,
+    ComponentBinding,
+    ComponentUndo,
+> = ManifestSubject {
+    kind: "component",
+    identity: |component| {
+        StableComponentId::from_halves(component.stable_id_low, component.stable_id_high)
+    },
+    name: |component| component.full_name.as_str(),
+    aliases: |component| &component.aliases,
+    binding_name: component_binding_name,
+    // Only managed storage is this pipeline's to retire: a native or
+    // module-native binding describes a column Rust owns, and a manifest that
+    // stops naming it says nothing about that column's lifetime.
+    is_governed: |binding| matches!(binding, ComponentBinding::Managed { .. }),
+    resolve_alias: resolve_component_alias,
+    check_addable: |component| {
+        if component.shared {
+            return Err(format!(
+                "managed shared component {} has no native engine binding",
+                component.full_name
+            )
+            .into());
+        }
+        Ok(())
+    },
+    settle: settle_component,
+    register: register_component_entry,
+    reshape: reshape_component_entry,
+    rename: rename_component_entry,
+    retire: |engine, bindings| {
+        let retired: Vec<ComponentId> = bindings
+            .iter()
+            .map(|binding| binding.component_id())
+            .collect();
+        engine.world_mut().retire_component_storage(&retired)
+    },
+    undo: undo_component_entry,
+};
+
+/// The name a live binding's component is registered under.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+fn component_binding_name(engine: &Engine, binding: &ComponentBinding) -> String {
+    let component_id = binding.component_id();
+    engine
+        .world()
+        .registered_components()
+        .iter()
+        .find(|(_, id)| *id == component_id)
+        .map(|(name, _)| name.clone())
+        .unwrap_or_default()
+}
+
+/// Resolve one alias to the managed binding it names, if any.
+///
+/// The alias is a name the engine knows, so it resolves through the registry
+/// first and the table is searched for whatever binding holds that id. A
+/// resolution that lands on a native binding is ignored: it names a column Rust
+/// owns, and a managed entry cannot inherit its rows.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+fn resolve_component_alias(
+    engine: &Engine,
+    table: &BindingTable<ComponentBinding>,
+    alias: &str,
+) -> Result<Option<StableComponentId>, CSharpError> {
+    let resolved = engine
+        .world()
+        .resolve_component_id_by_name_any(alias)
+        .map_err(|error| CSharpError::ManifestInvalid {
+            message: error.to_plain_message(),
+        })?;
+    let Some(component_id) = resolved else {
+        return Ok(None);
+    };
+    Ok(table.iter().find_map(|(stable_id, binding)| {
+        (binding.component_id() == component_id
+            && matches!(binding, ComponentBinding::Managed { .. }))
+        .then_some(*stable_id)
+    }))
+}
+
+/// Decide what an arriving entry means for the binding already registered.
+///
+/// A native or module-native binding is never migrated: the Rust side did not
+/// change, so a mirror that disagrees is simply wrong and is refused by the
+/// same check startup applies.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+fn settle_component(
+    _engine: &Engine,
+    binding: &ComponentBinding,
+    component: &ManagedComponentManifest,
+) -> Result<Settlement, CSharpError> {
+    let ComponentBinding::Managed {
+        size,
+        align,
+        schema_hash,
+        ..
+    } = binding
+    else {
+        check_binding_against_manifest(*binding, component)?;
+        return Ok(Settlement::Unchanged);
+    };
+    // The same layout means nothing to do; anything else is a migration.
+    if *size == component.size
+        && *align == component.alignment
+        && *schema_hash == component.schema_hash
+    {
+        return Ok(Settlement::Unchanged);
+    }
+    Ok(Settlement::Reshaped)
+}
+
+/// Register one manifest entry the binding table has no entry for.
+///
+/// The startup path in one function: anything that reaches here is managed
+/// storage with its editor-facing field layout, because a shared entry with no
+/// native binding was refused before the plan.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+fn register_component_entry(
     engine: &mut Engine,
-    store: &BindingStore,
-    entry: PlannedManifestEntry,
-    report: &mut ManifestApplyReport,
-) -> Result<Option<ManifestUndo>, CSharpError> {
-    match entry {
-        PlannedManifestEntry::Settled => Ok(None),
-        PlannedManifestEntry::Add {
-            stable_id,
-            component,
-        } => {
-            let added_name = component.full_name.clone();
-            register_manifest_entry(engine, store, stable_id, component)?;
-            // The undo needs the id the registration minted, and the store
-            // entry just written is the only place that knows it.
-            let Some(component_id) = store
-                .read()
-                .get(&stable_id)
-                .map(|binding| binding.component_id())
-            else {
-                return Err(CSharpError::ManifestInvalid {
-                    message: format!(
-                        "component {added_name} was registered but the binding table has no entry for it"
-                    ),
-                });
-            };
+    stable_id: StableComponentId,
+    component: &ManagedComponentManifest,
+) -> Result<(ComponentBinding, Option<ComponentUndo>), CSharpError> {
+    let component_id = register_managed_storage(engine, stable_id, component)?;
+    info!(
+        target: telemetry_target::HOT_RELOAD,
+        component = %component.full_name,
+        "managed component registered on reload"
+    );
+    Ok((
+        managed_binding(component_id, component),
+        Some(ComponentUndo::Added { component_id }),
+    ))
+}
+
+/// Migrate one managed component's rows into the arriving layout.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+fn reshape_component_entry(
+    engine: &mut Engine,
+    _stable_id: StableComponentId,
+    existing: &ComponentBinding,
+    component: &ManagedComponentManifest,
+) -> Result<(ComponentBinding, Option<ComponentUndo>), CSharpError> {
+    let component_id = existing.component_id();
+    let plan = build_field_plan(engine, component_id, &component.fields);
+    // The fields are captured as owned data before the migration, so the
+    // inverse plan needs no engine borrow later, when the world is being
+    // mutated again.
+    let previous_fields = engine
+        .world()
+        .component_field_layout(component_id)
+        .unwrap_or(&[])
+        .to_vec();
+    let migrated_rows = engine
+        .world_mut()
+        .relayout_descriptor_component(
+            component_id,
+            component.size,
+            component.alignment,
+            component.schema_hash,
+            &plan,
+        )
+        .map_err(|error| CSharpError::ManifestInvalid {
+            message: error.to_plain_message(),
+        })?;
+    engine
+        .world_mut()
+        .register_component_descriptor_with_layout(
+            component_id,
+            managed_field_layout(&component.full_name, &component.fields),
+        )
+        .map_err(|error| CSharpError::ManifestInvalid {
+            message: error.to_string(),
+        })?;
+    info!(
+        target: telemetry_target::HOT_RELOAD,
+        component = %component.full_name,
+        rows = migrated_rows,
+        "managed component layout migrated"
+    );
+    // A field that changed type keeps its name but loses its value, so saying
+    // nothing would leave a reset looking like a migration that worked.
+    // Reported per component rather than per field so the line stays readable
+    // when a rewrite touches several at once.
+    report_retyped_fields(&component.full_name, &plan);
+    Ok((
+        managed_binding(component_id, component),
+        Some(ComponentUndo::Migrated {
+            component_id,
+            previous_binding: *existing,
+            previous_fields,
+        }),
+    ))
+}
+
+/// Register the successor of a renamed component and move the rows across.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+fn rename_component_entry(
+    engine: &mut Engine,
+    stable_id: StableComponentId,
+    predecessor: &RenamePredecessor<'_, ComponentBinding>,
+    component: &ManagedComponentManifest,
+) -> Result<(ComponentBinding, Option<ComponentUndo>), CSharpError> {
+    let predecessor_id = predecessor.binding.component_id();
+    let predecessor_name = predecessor.alias.to_string();
+    let predecessor_fields = engine
+        .world()
+        .component_field_layout(predecessor_id)
+        .unwrap_or(&[])
+        .to_vec();
+    // The plan is measured from the predecessor's live field layout, which
+    // registering the successor neither touches nor moves a row of; both happen
+    // below, in this order, so a failure in either leaves the undo's record
+    // describing what was there.
+    let plan = build_field_plan(engine, predecessor_id, &component.fields);
+    let successor_id = register_managed_storage(engine, stable_id, component)?;
+    let migrated_rows = engine
+        .world_mut()
+        .remap_descriptor_component(predecessor_id, successor_id, &plan)
+        .map_err(|error| CSharpError::ManifestInvalid {
+            message: error.to_plain_message(),
+        })?;
+    info!(
+        target: telemetry_target::HOT_RELOAD,
+        component = %component.full_name,
+        predecessor = %predecessor_name,
+        rows = migrated_rows,
+        "managed component renamed and rows migrated"
+    );
+    report_retyped_fields(&component.full_name, &plan);
+    Ok((
+        managed_binding(successor_id, component),
+        Some(ComponentUndo::Renamed {
+            successor_id,
+            predecessor_stable_id: predecessor.identity,
+            predecessor_name,
+            predecessor_binding: *predecessor.binding,
+            predecessor_fields,
+        }),
+    ))
+}
+
+/// Reverse one applied component entry, best effort.
+///
+/// A rollback that fails leaves the process mixed, so the failure is logged
+/// with the component it concerns rather than raised over the original refusal,
+/// which is the error the caller needs.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+fn undo_component_entry(engine: &mut Engine, undo: ComponentUndo) {
+    match undo {
+        ComponentUndo::Added { component_id } => {
+            // `drop_forgotten_component_ids` removes the rows and every
+            // registration artifact of the id, which is exactly what an
+            // added-then-refused component has to give back.
+            let dropped = engine
+                .world_mut()
+                .drop_forgotten_component_ids(&[component_id]);
             info!(
                 target: telemetry_target::HOT_RELOAD,
-                component = %added_name,
-                "managed component registered on reload"
+                dropped,
+                "rolled back a managed component registered by a refused manifest"
             );
-            report.added.push(added_name);
-            Ok(Some(ManifestUndo::Added {
-                stable_id,
-                component_id,
-            }))
         }
-        PlannedManifestEntry::Migrate {
-            stable_id,
-            component,
+        ComponentUndo::Migrated {
             component_id,
-            plan,
             previous_binding,
             previous_fields,
         } => {
-            let migrated_rows = engine
-                .world_mut()
-                .relayout_descriptor_component(
-                    component_id,
-                    component.size,
-                    component.alignment,
-                    component.schema_hash,
-                    &plan,
-                )
-                .map_err(|error| CSharpError::ManifestInvalid {
-                    message: error.to_plain_message(),
-                })?;
-            store.write().insert(
-                stable_id,
-                ComponentBinding::Managed {
-                    component_id,
-                    size: component.size,
-                    align: component.alignment,
-                    schema_hash: component.schema_hash,
-                },
-            );
-            engine
-                .world_mut()
-                .register_component_descriptor_with_layout(
-                    component_id,
-                    managed_field_layout(&component.full_name, &component.fields),
-                )
-                .map_err(|error| CSharpError::ManifestInvalid {
-                    message: error.to_string(),
-                })?;
-            info!(
-                target: telemetry_target::HOT_RELOAD,
-                component = %component.full_name,
-                rows = migrated_rows,
-                "managed component layout migrated"
-            );
-            // A field that changed type keeps its name but loses its value, so
-            // saying nothing would leave a reset looking like a migration that
-            // worked. Reported per component rather than per field so the line
-            // stays readable when a rewrite touches several at once.
-            if !plan.retyped_fields().is_empty() {
-                info!(
-                    target: telemetry_target::HOT_RELOAD,
-                    component = %component.full_name,
-                    fields = %plan.retyped_fields().join(", "),
-                    "managed component fields changed type and were reset to their default bytes"
-                );
-            }
-            report.migrated.push(component.full_name);
-            Ok(Some(ManifestUndo::Migrated {
-                stable_id,
-                component_id,
-                previous_binding,
-                previous_fields,
-            }))
-        }
-        PlannedManifestEntry::Rename {
-            stable_id,
-            component,
-            predecessor,
-        } => {
-            let successor_name = component.full_name.clone();
-            // The plan is measured from the predecessor's live field layout,
-            // which registration of the successor neither touches nor moves a
-            // row of; both happen below, in this order, so a failure in either
-            // leaves the undo's record describing what was there.
-            let plan = build_field_plan(
-                engine,
-                predecessor.binding.component_id(),
-                &component.fields,
-            );
-            register_manifest_entry(engine, store, stable_id, component)?;
-            // The id the registration minted, read back from the store entry
-            // just written.
-            let Some(successor_id) = store
-                .read()
-                .get(&stable_id)
-                .map(|binding| binding.component_id())
+            let ComponentBinding::Managed {
+                size,
+                align,
+                schema_hash,
+                ..
+            } = previous_binding
             else {
-                return Err(CSharpError::ManifestInvalid {
-                    message: format!(
-                        "component {successor_name} was registered but the binding table has no entry for it"
-                    ),
-                });
+                // Only managed bindings are ever journalled as migrated.
+                return;
             };
-            let migrated_rows = engine
-                .world_mut()
-                .remap_descriptor_component(predecessor.binding.component_id(), successor_id, &plan)
-                .map_err(|error| CSharpError::ManifestInvalid {
-                    message: error.to_plain_message(),
-                })?;
-            store.write().remove(&predecessor.stable_id);
-            info!(
-                target: telemetry_target::HOT_RELOAD,
-                component = %successor_name,
-                predecessor = %predecessor.name,
-                rows = migrated_rows,
-                "managed component renamed and rows migrated"
-            );
-            if !plan.retyped_fields().is_empty() {
-                info!(
-                    target: telemetry_target::HOT_RELOAD,
-                    component = %successor_name,
-                    fields = %plan.retyped_fields().join(", "),
-                    "managed component fields changed type and were reset to their default bytes"
-                );
+            let plan = rollback_field_plan(engine, component_id, &previous_fields);
+            match engine.world_mut().relayout_descriptor_component(
+                component_id,
+                size,
+                align,
+                schema_hash,
+                &plan,
+            ) {
+                Ok(restored_rows) => {
+                    if let Err(error) = engine
+                        .world_mut()
+                        .register_component_descriptor_with_layout(component_id, previous_fields)
+                    {
+                        // The rows are back but the editor's vocabulary is not;
+                        // name the component and keep unwinding.
+                        pill_core::error!(
+                            target: telemetry_target::HOT_RELOAD,
+                            component_id = ?component_id,
+                            error = %error,
+                            "could not restore the component's field layout during rollback"
+                        );
+                    }
+                    info!(
+                        target: telemetry_target::HOT_RELOAD,
+                        rows = restored_rows,
+                        "rolled back a managed component layout migration"
+                    );
+                }
+                Err(error) => {
+                    // The rows could not be put back; name the component so the
+                    // mixed state is diagnosable rather than silent.
+                    pill_core::error!(
+                        target: telemetry_target::HOT_RELOAD,
+                        component_id = ?component_id,
+                        error = %error.to_plain_message(),
+                        "could not undo a manifest layout migration"
+                    );
+                }
             }
-            report
-                .renamed
-                .push(format!("{} -> {successor_name}", predecessor.name));
-            Ok(Some(ManifestUndo::Renamed {
-                stable_id,
-                predecessor_stable_id: predecessor.stable_id,
-                predecessor_name: predecessor.name,
-                predecessor_binding: predecessor.binding,
-                predecessor_fields: predecessor.fields,
-            }))
+        }
+        ComponentUndo::Renamed {
+            successor_id,
+            predecessor_stable_id,
+            predecessor_name,
+            predecessor_binding,
+            predecessor_fields,
+        } => {
+            let ComponentBinding::Managed {
+                size,
+                align,
+                schema_hash,
+                ..
+            } = predecessor_binding
+            else {
+                // Only managed bindings are ever journalled as renamed.
+                return;
+            };
+            // The predecessor's id derives from its stable id, so re-registering
+            // the old name restores the same id the remap retired. The rows move
+            // back through the inverse plan, and that remap retires the
+            // successor's registration in turn.
+            let restored = engine.world_mut().register_component_descriptor(
+                predecessor_stable_id.0,
+                predecessor_name.clone(),
+                size,
+                align,
+                schema_hash,
+                Blittability::from_manifest_fields(),
+            );
+            let restored_id = match restored {
+                Ok(id) => id,
+                Err(error) => {
+                    pill_core::error!(
+                        target: telemetry_target::HOT_RELOAD,
+                        component = %predecessor_name,
+                        error = %error.to_plain_message(),
+                        "could not re-register a renamed component's predecessor during rollback"
+                    );
+                    return;
+                }
+            };
+            let plan = rollback_field_plan(engine, successor_id, &predecessor_fields);
+            match engine
+                .world_mut()
+                .remap_descriptor_component(successor_id, restored_id, &plan)
+            {
+                Ok(rows) => {
+                    if let Err(error) = engine
+                        .world_mut()
+                        .register_component_descriptor_with_layout(restored_id, predecessor_fields)
+                    {
+                        pill_core::error!(
+                            target: telemetry_target::HOT_RELOAD,
+                            component = %predecessor_name,
+                            error = %error,
+                            "could not restore the renamed component's field layout during rollback"
+                        );
+                    }
+                    info!(
+                        target: telemetry_target::HOT_RELOAD,
+                        component = %predecessor_name,
+                        rows,
+                        "rolled back a managed component rename"
+                    );
+                }
+                Err(error) => {
+                    pill_core::error!(
+                        target: telemetry_target::HOT_RELOAD,
+                        component = %predecessor_name,
+                        error = %error.to_plain_message(),
+                        "could not move a renamed component's rows back during rollback"
+                    );
+                }
+            }
         }
     }
 }
 
-/// Undo every applied entry, newest first.
+/// Register one manifest entry as managed descriptor storage with its layout.
 ///
-/// Best effort by design: a rollback that fails leaves the process mixed, so
-/// the failure is logged with the component it concerns rather than raised
-/// over the original refusal, which is the error the caller needs.
+/// Shared by the add and rename actions, which differ only in what happens to
+/// the rows afterwards.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
-fn rollback_manifest_apply(engine: &mut Engine, store: &BindingStore, undos: Vec<ManifestUndo>) {
-    for undo in undos.into_iter().rev() {
-        match undo {
-            ManifestUndo::Added {
-                stable_id,
-                component_id,
-            } => {
-                store.write().remove(&stable_id);
-                // `drop_forgotten_component_ids` removes the rows and every
-                // registration artifact of the id, which is exactly what an
-                // added-then-refused component has to give back.
-                let dropped = engine
-                    .world_mut()
-                    .drop_forgotten_component_ids(&[component_id]);
-                info!(
-                    target: telemetry_target::HOT_RELOAD,
-                    dropped,
-                    "rolled back a managed component registered by a refused manifest"
-                );
-            }
-            ManifestUndo::Migrated {
-                stable_id,
-                component_id,
-                previous_binding,
-                previous_fields,
-            } => {
-                let ComponentBinding::Managed {
-                    size,
-                    align,
-                    schema_hash,
-                    ..
-                } = previous_binding
-                else {
-                    // Only managed bindings are ever journalled as migrated.
-                    continue;
-                };
-                let plan = rollback_field_plan(engine, component_id, &previous_fields);
-                match engine.world_mut().relayout_descriptor_component(
-                    component_id,
-                    size,
-                    align,
-                    schema_hash,
-                    &plan,
-                ) {
-                    Ok(restored_rows) => {
-                        store.write().insert(stable_id, previous_binding);
-                        if let Err(error) = engine
-                            .world_mut()
-                            .register_component_descriptor_with_layout(
-                                component_id,
-                                previous_fields,
-                            )
-                        {
-                            // The rows are back but the editor's vocabulary
-                            // is not; name the component and keep unwinding.
-                            pill_core::error!(
-                                target: telemetry_target::HOT_RELOAD,
-                                component_id = ?component_id,
-                                error = %error,
-                                "could not restore the component's field layout during rollback"
-                            );
-                        }
-                        info!(
-                            target: telemetry_target::HOT_RELOAD,
-                            rows = restored_rows,
-                            "rolled back a managed component layout migration"
-                        );
-                    }
-                    Err(error) => {
-                        // The rows could not be put back; name the component
-                        // so the mixed state is diagnosable rather than silent.
-                        pill_core::error!(
-                            target: telemetry_target::HOT_RELOAD,
-                            component_id = ?component_id,
-                            error = %error.to_plain_message(),
-                            "could not undo a manifest layout migration"
-                        );
-                    }
-                }
-            }
-            ManifestUndo::Renamed {
-                stable_id,
-                predecessor_stable_id,
-                predecessor_name,
-                predecessor_binding,
-                predecessor_fields,
-            } => {
-                let ComponentBinding::Managed {
-                    size,
-                    align,
-                    schema_hash,
-                    ..
-                } = predecessor_binding
-                else {
-                    // Only managed bindings are ever journalled as renamed.
-                    continue;
-                };
-                let Some(successor_id) = store
-                    .read()
-                    .get(&stable_id)
-                    .map(|binding| binding.component_id())
-                else {
-                    continue;
-                };
-                // The predecessor's id derives from its stable id, so
-                // re-registering the old name restores the same id the remap
-                // retired. The rows move back through the inverse plan, and
-                // that remap retires the successor's registration in turn.
-                let restored = engine.world_mut().register_component_descriptor(
-                    predecessor_stable_id.0,
-                    predecessor_name.clone(),
-                    size,
-                    align,
-                    schema_hash,
-                    Blittability::from_manifest_fields(),
-                );
-                let restored_id = match restored {
-                    Ok(id) => id,
-                    Err(error) => {
-                        pill_core::error!(
-                            target: telemetry_target::HOT_RELOAD,
-                            component = %predecessor_name,
-                            error = %error.to_plain_message(),
-                            "could not re-register a renamed component's predecessor during rollback"
-                        );
-                        continue;
-                    }
-                };
-                let plan = rollback_field_plan(engine, successor_id, &predecessor_fields);
-                match engine.world_mut().remap_descriptor_component(
-                    successor_id,
-                    restored_id,
-                    &plan,
-                ) {
-                    Ok(rows) => {
-                        store.write().remove(&stable_id);
-                        store
-                            .write()
-                            .insert(predecessor_stable_id, predecessor_binding);
-                        if let Err(error) = engine
-                            .world_mut()
-                            .register_component_descriptor_with_layout(
-                                restored_id,
-                                predecessor_fields,
-                            )
-                        {
-                            pill_core::error!(
-                                target: telemetry_target::HOT_RELOAD,
-                                component = %predecessor_name,
-                                error = %error,
-                                "could not restore the renamed component's field layout during rollback"
-                            );
-                        }
-                        info!(
-                            target: telemetry_target::HOT_RELOAD,
-                            component = %predecessor_name,
-                            rows,
-                            "rolled back a managed component rename"
-                        );
-                    }
-                    Err(error) => {
-                        pill_core::error!(
-                            target: telemetry_target::HOT_RELOAD,
-                            component = %predecessor_name,
-                            error = %error.to_plain_message(),
-                            "could not move a renamed component's rows back during rollback"
-                        );
-                    }
-                }
-            }
-        }
+fn register_managed_storage(
+    engine: &mut Engine,
+    stable_id: StableComponentId,
+    component: &ManagedComponentManifest,
+) -> Result<ComponentId, CSharpError> {
+    let field_layout = managed_field_layout(&component.full_name, &component.fields);
+    let component_id = engine
+        .world_mut()
+        .register_component_descriptor(
+            stable_id.0,
+            component.full_name.clone(),
+            component.size,
+            component.alignment,
+            component.schema_hash,
+            // The entry was parsed by `parse_and_validate_manifest`, whose
+            // `BLITTABLE_FIELD_TYPES` check is what earns this witness.
+            Blittability::from_manifest_fields(),
+        )
+        .map_err(|error| CSharpError::ManifestInvalid {
+            message: error.to_plain_message(),
+        })?;
+    engine
+        .world_mut()
+        .register_component_descriptor_with_layout(component_id, field_layout)
+        .map_err(|error| CSharpError::ManifestInvalid {
+            message: error.to_string(),
+        })?;
+    Ok(component_id)
+}
+
+/// The binding one arriving manifest entry describes.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+fn managed_binding(
+    component_id: ComponentId,
+    component: &ManagedComponentManifest,
+) -> ComponentBinding {
+    ComponentBinding::Managed {
+        component_id,
+        size: component.size,
+        align: component.alignment,
+        schema_hash: component.schema_hash,
     }
+}
+
+/// Report the fields a migration reset, once per component.
+#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+fn report_retyped_fields(component_name: &str, plan: &FieldPlan) {
+    if plan.retyped_fields().is_empty() {
+        return;
+    }
+    info!(
+        target: telemetry_target::HOT_RELOAD,
+        component = %component_name,
+        fields = %plan.retyped_fields().join(", "),
+        "managed component fields changed type and were reset to their default bytes"
+    );
 }
 
 /// Build the plan that puts a component back to a recorded field layout.
 ///
-/// The inverse of [`super::manifest::build_field_plan`] for the rollback path: the engine's
-/// current layout is the source, and the descriptors captured before the
-/// migration are the destination.
+/// The inverse of [`super::manifest::build_field_plan`] for the rollback path:
+/// the engine's current layout is the source, and the descriptors captured
+/// before the migration are the destination.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 fn rollback_field_plan(
     engine: &Engine,
@@ -1327,57 +1303,4 @@ fn rollback_field_plan(
         })
         .collect();
     FieldPlan::between(&current, &target)
-}
-
-/// Register one manifest entry that the bindings table has no entry for.
-///
-/// The startup path in one function: a shared component needs a native binding
-/// the manifest cannot conjure, and anything else becomes managed storage with
-/// its editor-facing field layout.
-#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
-fn register_manifest_entry(
-    engine: &mut Engine,
-    store: &BindingStore,
-    stable_id: StableComponentId,
-    component: ManagedComponentManifest,
-) -> Result<(), CSharpError> {
-    if component.shared {
-        return Err(format!(
-            "managed shared component {} has no native engine binding",
-            component.full_name
-        )
-        .into());
-    }
-    let field_layout = managed_field_layout(&component.full_name, &component.fields);
-    let id = engine
-        .world_mut()
-        .register_component_descriptor(
-            stable_id.0,
-            component.full_name.clone(),
-            component.size,
-            component.alignment,
-            component.schema_hash,
-            // The entry was parsed by `parse_and_validate_manifest`, whose
-            // `BLITTABLE_FIELD_TYPES` check is what earns this witness.
-            Blittability::from_manifest_fields(),
-        )
-        .map_err(|error| CSharpError::ManifestInvalid {
-            message: error.to_plain_message(),
-        })?;
-    store.write().insert(
-        stable_id,
-        ComponentBinding::Managed {
-            component_id: id,
-            size: component.size,
-            align: component.alignment,
-            schema_hash: component.schema_hash,
-        },
-    );
-    engine
-        .world_mut()
-        .register_component_descriptor_with_layout(id, field_layout)
-        .map_err(|error| CSharpError::ManifestInvalid {
-            message: error.to_string(),
-        })?;
-    Ok(())
 }

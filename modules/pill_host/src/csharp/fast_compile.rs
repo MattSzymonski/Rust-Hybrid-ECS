@@ -39,6 +39,7 @@ use pill_core::{info, warn};
 
 // Current crate
 use super::csharp_runtime::DotnetRuntimeContext;
+use super::managed_buffer::fetch_managed_buffer;
 use crate::config::{
     CSHARP_COMPILER_ASSEMBLY_NAME, CSHARP_COMPILER_OUTPUT_SUBDIRECTORY,
 };
@@ -63,6 +64,14 @@ const COMPILE_STATUS_COMPILED: i32 = 0;
 
 /// `CompilerInterop.Compile` returned: the project has errors.
 const COMPILE_STATUS_FAILED: i32 = 1;
+
+/// Upper bound for one compile's diagnostics text.
+///
+/// A failing build reports kilobytes; the cap is generous enough that no real
+/// diagnostic set reaches it, and it is here so a compiler reporting a corrupt
+/// length cannot drive the host into an allocation it dies on. This site had no
+/// bound at all before the two-call protocol became shared.
+const MAX_DIAGNOSTICS_BYTES: u32 = 4 * 1024 * 1024;
 
 // =============================================================================
 // Managed Export Signatures
@@ -305,16 +314,23 @@ impl FastCompiler {
     }
 
     /// Read back the last compile's diagnostics as UTF-8.
+    ///
+    /// A compile with nothing to say reports no diagnostics at all, which is an
+    /// empty string rather than a failure; anything else that goes wrong is
+    /// reported as text, because the caller is already on a failure path and
+    /// has nowhere better to put an error.
     fn diagnostics(&self) -> String {
-        let length = (self.diagnostics_length)();
-        if length == 0 {
+        if (self.diagnostics_length)() == 0 {
             return String::new();
         }
-        let mut buffer = vec![0u8; length as usize];
-        if (self.copy_diagnostics)(buffer.as_mut_ptr(), length) == 0 {
-            return "the compiler reported diagnostics that could not be read".to_string();
+        match fetch_managed_buffer(
+            || (self.diagnostics_length)(),
+            |pointer, length| (self.copy_diagnostics)(pointer, length),
+            MAX_DIAGNOSTICS_BYTES,
+        ) {
+            Ok(buffer) => String::from_utf8_lossy(&buffer).into_owned(),
+            Err(_) => "the compiler reported diagnostics that could not be read".to_string(),
         }
-        String::from_utf8_lossy(&buffer).into_owned()
     }
 }
 

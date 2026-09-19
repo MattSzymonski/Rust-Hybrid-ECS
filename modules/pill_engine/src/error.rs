@@ -684,25 +684,6 @@ pub enum CommandError {
         component_id: ComponentId,
     },
 
-    /// A queued migration cannot copy a component it has to carry across.
-    ///
-    /// `forget_component_type` purges a forgotten type's copier while
-    /// archetypes can still list the id, so a migration can meet a component
-    /// whose rows it cannot copy. Reported rather than skipped: skipping it
-    /// moved the entity and its tick rows while leaving the destination short
-    /// a component row, and the mismatch surfaced later as a stale column.
-    #[message(
-        "entity ",
-        debug_value(entity),
-        " cannot migrate component ",
-        debug_value(component_id),
-        ": its copier is no longer registered"
-    )]
-    MissingComponentCopier {
-        entity: Entity,
-        component_id: ComponentId,
-    },
-
     /// A queued command's archetype migration failed partway through.
     ///
     /// The entity's recorded location referenced an archetype that no longer
@@ -776,8 +757,9 @@ pub enum BuildError {
 /// Migration failures of persistable component columns.
 ///
 /// Raised while moving persisted component data between schemas: missing
-/// deserializers, storage factories, or copiers, or bytes that fail to
-/// decode into the new layout.
+/// deserializers or storage factories, a column that cannot hand its rows to
+/// the destination archetype, or bytes that fail to decode into the new
+/// layout.
 #[engine_error(namespace = engine::persistence, runtime = ::pill_core::error)]
 pub enum PersistenceError {
     /// The component type is not registered in the current world.
@@ -857,12 +839,20 @@ pub enum PersistenceError {
     )]
     NativeStorageExpected { component_id: ComponentId },
 
-    /// No component copier is registered for the component.
+    /// An unchanged column could not hand its row to the destination.
+    ///
+    /// The cross-archetype migration moves every column it does not rewrite
+    /// straight into the destination archetype. A destination that has no
+    /// column for one of them, or one whose rows are a different width, is the
+    /// registry/storage desync a partially applied reload leaves behind, and
+    /// the migration reports it rather than leaving the entity split between
+    /// two archetypes.
     #[message(
-        "no component copier is registered for component ",
-        debug_value(component_id)
+        "component ",
+        debug_value(component_id),
+        " could not be moved into the destination archetype"
     )]
-    CopierMissing { component_id: ComponentId },
+    ColumnMoveFailed { component_id: ComponentId },
 
     /// The destination archetype vanished immediately after creation.
     #[message("destination archetype missing after creation")]

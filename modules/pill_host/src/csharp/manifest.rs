@@ -31,10 +31,7 @@ use pill_engine::{ComponentId, Engine};
 use serde::Deserialize;
 
 // Current crate
-use super::components::{
-    check_binding_against_manifest, stable_component_id, BindingStore, ComponentBinding,
-    RenameSource, StableComponentId,
-};
+use super::components::{stable_component_id, StableComponentId};
 use super::resources::{ManagedResourceDeclaration, ResourceFieldLayout};
 
 /// Maximum nesting depth accepted in a managed component field tree.
@@ -639,135 +636,6 @@ pub(super) fn split_manifest_kinds(
         }
     }
     (components, resources)
-}
-
-/// One manifest entry with everything the engine and the store can tell us
-/// resolved up front.
-///
-/// The apply phase executes these in order and re-decides nothing, which is
-/// what keeps the refusals out of the mutated state; what still goes wrong at
-/// apply time is handled by the undo journal.
-#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
-pub(super) enum PlannedManifestEntry {
-    /// The binding table already agrees with the manifest.
-    Settled,
-    /// A descriptor component the manifest adds.
-    Add {
-        stable_id: StableComponentId,
-        component: ManagedComponentManifest,
-    },
-    /// A descriptor component the manifest renamed: the entry reached a
-    /// predecessor through one of its aliases, and the predecessor's rows have
-    /// to move onto the successor's registration.
-    Rename {
-        stable_id: StableComponentId,
-        component: ManagedComponentManifest,
-        predecessor: RenameSource,
-    },
-    /// A descriptor component whose layout changed and whose rows must migrate.
-    Migrate {
-        stable_id: StableComponentId,
-        component: ManagedComponentManifest,
-        component_id: ComponentId,
-        plan: FieldPlan,
-        previous_binding: ComponentBinding,
-        previous_fields: Vec<ComponentFieldDescriptor>,
-    },
-}
-
-/// Resolve every manifest entry against the store and the engine.
-///
-/// The one refusal that lives here rather than in validation is the shared
-/// entry with no native binding; `register_manifest_entry` repeats it as a
-/// defensive check, but planning means it is raised before anything moves.
-#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
-pub(super) fn plan_manifest(
-    engine: &Engine,
-    store: &BindingStore,
-    manifest: Vec<ManagedComponentManifest>,
-    renames: &HashMap<StableComponentId, RenameSource>,
-) -> Result<Vec<PlannedManifestEntry>, CSharpError> {
-    let mut planned = Vec::with_capacity(manifest.len());
-    for component in manifest {
-        let stable_id =
-            StableComponentId::from_halves(component.stable_id_low, component.stable_id_high);
-        let Some(binding) = store.read().get(&stable_id).copied() else {
-            if component.shared {
-                return Err(format!(
-                    "managed shared component {} has no native engine binding",
-                    component.full_name
-                )
-                .into());
-            }
-            // An alias that reached a predecessor turns this entry into a
-            // rename; without one it is an ordinary addition.
-            if let Some(predecessor) = renames.get(&stable_id) {
-                planned.push(PlannedManifestEntry::Rename {
-                    stable_id,
-                    component,
-                    predecessor: predecessor.clone(),
-                });
-            } else {
-                planned.push(PlannedManifestEntry::Add {
-                    stable_id,
-                    component,
-                });
-            }
-            continue;
-        };
-
-        // A successor's stable id is derived from its new name, so a store hit
-        // here means the name was already registered while its aliases still
-        // name an earlier registration. Refused rather than settled: settling
-        // would strand the predecessor's rows in a binding nothing tracks.
-        if renames.contains_key(&stable_id) {
-            return Err(format!(
-                "managed component {} is already registered, but its aliases name an earlier \
-                 registration; a rename must declare a new name",
-                component.full_name
-            )
-            .into());
-        }
-
-        let ComponentBinding::Managed {
-            component_id,
-            size,
-            align,
-            schema_hash,
-        } = binding
-        else {
-            check_binding_against_manifest(binding, &component)?;
-            planned.push(PlannedManifestEntry::Settled);
-            continue;
-        };
-
-        // The same layout means nothing to do; anything else is a migration.
-        if size == component.size
-            && align == component.alignment
-            && schema_hash == component.schema_hash
-        {
-            planned.push(PlannedManifestEntry::Settled);
-            continue;
-        }
-
-        let plan = build_field_plan(engine, component_id, &component.fields);
-        // The fields are captured as owned data here so the inverse plan needs
-        // no engine borrow later, when the world is being mutated again.
-        let previous_fields = engine
-            .world()
-            .component_field_layout(component_id)
-            .unwrap_or(&[])
-            .to_vec();
-        planned.push(PlannedManifestEntry::Migrate {
-            stable_id,
-            component,
-            component_id,
-            plan,
-            previous_binding: binding,
-            previous_fields,
-        });
-    }
-    Ok(planned)
 }
 
 /// Build the byte plan from the layout a component has now to the one a

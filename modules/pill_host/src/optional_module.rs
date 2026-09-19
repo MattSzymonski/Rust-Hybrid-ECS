@@ -45,7 +45,7 @@ use crate::analytics;
 #[cfg(feature = "hot_reload")]
 use crate::build_runner::build_optional_module;
 #[cfg(feature = "hot_reload")]
-use crate::native_library::{NativeLibrary, OPTIONAL_MODULE_ENTRY_POINTS};
+use crate::native_library::NativeLibrary;
 #[cfg(feature = "hot_reload")]
 use crate::OptionalModuleConfig;
 
@@ -158,12 +158,7 @@ mod slot {
 
             // Step 2: Load a uniquely named copy so the next compilation stays free
             // to replace the build output while this generation remains mapped.
-            let library = NativeLibrary::load_copy(
-                &output_path,
-                workspace_root,
-                &config.name,
-                &OPTIONAL_MODULE_ENTRY_POINTS,
-            )?;
+            let library = NativeLibrary::load_copy(&output_path, workspace_root, &config.name)?;
 
             // Step 3: Check the contract before handing the module anything.
             check_abi_version(&library, &config.name)?;
@@ -397,23 +392,19 @@ mod slot {
 
             // Step 2: Load and validate the replacement transactionally, leaving
             // the active generation untouched until it is ready to initialize.
-            let new_library = match NativeLibrary::load_copy(
-                &output_path,
-                workspace_root,
-                &self.config.name,
-                &OPTIONAL_MODULE_ENTRY_POINTS,
-            ) {
-                Ok(library) => library,
-                Err(error) => {
-                    error!(
-                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                        module = self.config.name.as_str(),
-                        error = %error,
-                        "failed to load the new library; keeping the old module generation"
-                    );
-                    return ReloadOutcome::Failed { generation };
-                }
-            };
+            let new_library =
+                match NativeLibrary::load_copy(&output_path, workspace_root, &self.config.name) {
+                    Ok(library) => library,
+                    Err(error) => {
+                        error!(
+                            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                            module = self.config.name.as_str(),
+                            error = %error,
+                            "failed to load the new library; keeping the old module generation"
+                        );
+                        return ReloadOutcome::Failed { generation };
+                    }
+                };
             if let Err(error) = check_abi_version(&new_library, &self.config.name) {
                 error!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,

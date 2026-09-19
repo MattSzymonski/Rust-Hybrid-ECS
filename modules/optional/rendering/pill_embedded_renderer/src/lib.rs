@@ -68,11 +68,17 @@ pub mod renderer;
 
 // The renderer's public surface, so callers name `pill_embedded_renderer::Sprite`
 // rather than reaching through the module that happens to declare it.
+// `Position` and `Color` are the engine's - every renderer and most
+// projects want the same two, so they are defined once in
+// `pill_engine` rather than copied into each pipeline. Re-exported
+// here so a caller that already names them through this crate keeps
+// working, and so `register_components` reads as one contract.
 pub use component::{
-    register_components, sprite_instances, Color, Position, RenderViewport, Sprite, SpriteInstance,
+    register_components, sprite_instances, RenderViewport, Sprite, SpriteInstance,
     VirtualResolution,
 };
 pub use framebuffer::{pack_rgb565, unpack_rgb565, Framebuffer, BYTES_PER_PIXEL};
+pub use pill_engine::common_components::{Color, Position};
 pub use rasterizer::SpriteRasterizer;
 pub use renderer::Renderer;
 

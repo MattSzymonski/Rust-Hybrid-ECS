@@ -19,6 +19,8 @@
 //! project's copy of the type and `ModuleSpline` for the module DLL's copy;
 //! everything below is written from that reading.
 
+use std::collections::HashSet;
+
 use pill_engine::component::ComponentRegistry;
 use pill_engine::query::{Changed, Query};
 use pill_engine::{ComponentId, PillComponent, World};
@@ -547,10 +549,10 @@ fn ordinary_components_keep_separate_identities() {
 // Paths that move rows rather than read them
 // =============================================================================
 
-/// Moving an entity between archetypes copies its shared component's row
-/// through the registered copier, which belongs to whichever copy registered
-/// last. That is only sound because both copies describe one type, so this
-/// pins that a row written by one survives a move driven by the other.
+/// Moving an entity between archetypes hands its shared component's row to the
+/// destination column bitwise. Both copies resolve to one column, so a row
+/// written through either one travels the same way; this pins that a row
+/// written by one survives a move driven by the other.
 #[test]
 fn a_shared_row_survives_an_archetype_move() {
     let mut world = World::new();
@@ -651,15 +653,17 @@ pub mod module_persisted {
 use module_persisted::PersistedSpline as ModulePersistedSpline;
 use project_persisted::PersistedSpline as ProjectPersistedSpline;
 
-/// Rows survive a snapshot and restore no matter which copy registered them.
+/// Rows survive a reload migration no matter which copy registered them.
 ///
 /// This is the failure the whole plan started from. Before shared identity the
 /// two copies were two components with the same type name, and registering the
 /// second evicted the first's inserter from the persist maps - so at the next
 /// reload the evicted copy's rows were dropped with no error at all. With one
-/// identity there is only ever one registration to evict or keep.
+/// identity there is only ever one registration to evict or keep, which is what
+/// lets the selective migration resolve the name to a single id and carry every
+/// row across.
 #[test]
-fn shared_rows_survive_a_snapshot_and_restore_from_either_copy() {
+fn shared_rows_survive_a_migration_from_either_copy() {
     let mut world = World::new();
     world.register_persistable_component::<ProjectPersistedSpline>();
     world.register_persistable_component::<ModulePersistedSpline>();
@@ -686,27 +690,40 @@ fn shared_rows_survive_a_snapshot_and_restore_from_either_copy() {
         .build()
         .unwrap();
 
-    let snapshot = world.snapshot_components();
-    assert_eq!(snapshot.entity_count(), 2);
+    // The reload the host performs: capture the retiring generation's glue,
+    // let both copies register again exactly as their `init` functions would,
+    // and migrate the shared name. A name that resolved to two registrations
+    // would fail here rather than silently dropping one copy's rows.
+    let previous = world.capture_persist_type_metadata();
+    world.register_persistable_component::<ProjectPersistedSpline>();
+    world.register_persistable_component::<ModulePersistedSpline>();
+    let changed = HashSet::from(["pill_spline::PersistedSpline".to_string()]);
+    let report = world.migrate_changed_persistable_components(&previous, &changed, None);
+    assert_eq!(
+        report.migrated_type_count, 1,
+        "the shared name migrates as one type"
+    );
+    assert!(
+        report.skipped_type_names.is_empty(),
+        "no copy may be skipped: {:?}",
+        report.skipped_type_names
+    );
+    assert_eq!(
+        report.migrated_entity_count, 2,
+        "both copies' rows are carried across"
+    );
 
-    // A fresh world stands in for the world after a reload, with both copies
-    // registering again exactly as their `init` functions would.
-    let mut reloaded = World::new();
-    reloaded.register_persistable_component::<ProjectPersistedSpline>();
-    reloaded.register_persistable_component::<ModulePersistedSpline>();
-    reloaded.restore_from_snapshot(&snapshot);
-
-    let mut query = Query::<(&ProjectPersistedSpline,)>::new(&mut reloaded);
-    let mut restored: Vec<(f32, u32)> = query
+    let mut query = Query::<(&ProjectPersistedSpline,)>::new(&mut world);
+    let mut migrated: Vec<(f32, u32)> = query
         .iter_mut()
         .map(|(spline,)| (spline.tension, spline.segments))
         .collect();
-    restored.sort_by(|left, right| left.0.total_cmp(&right.0));
+    migrated.sort_by(|left, right| left.0.total_cmp(&right.0));
 
     assert_eq!(
-        restored,
+        migrated,
         vec![(1.0, 1), (2.0, 2)],
-        "neither copy's rows may be dropped by the restore"
+        "neither copy's rows may be dropped by the migration"
     );
 }
 

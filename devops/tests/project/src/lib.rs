@@ -6,12 +6,12 @@
 //! - Implements a single `counter_system` that prints a timestamp at threshold.
 //! - Prints per-generation value witnesses for the components migration must
 //!   preserve, so tests can assert values, not just entity counts.
-//! - Exports `project_init` and `project_update` for the standalone host.
+//! - Exports `pill_module_init` for the standalone host.
 //!
 //! # Design
 //!
 //! This crate is compiled as a `cdylib` (dynamic library). The standalone
-//! host loads it at runtime and calls `project_init` to register the component
+//! host loads it at runtime and calls `pill_module_init` to register the component
 //! and system. When source files change, the host rebuilds and reloads this
 //! module without restarting. Component data is preserved across reloads
 //! via JSON serialization and matched by type name.

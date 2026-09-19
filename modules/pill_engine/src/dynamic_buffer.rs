@@ -13,13 +13,17 @@
 //!
 //! ## Why not a `Vec` field
 //!
-//! The archetype copier is `Clone`-based: moving an entity between archetypes
-//! deep-copies every component it keeps. A `Vec` field therefore reallocates
-//! and copies its whole heap on every structural change, and the copy's
-//! address has no stability a managed view could rely on - the source block is
-//! freed as soon as the moved-from slot is dropped. A C#-visible `(ptr, len)`
-//! read from such a field would be exactly the retained raw pointer the
-//! interop rule forbids.
+//! A `Vec`'s buffer belongs to the allocator of whichever DLL created it, and
+//! a hot reload retires that DLL. The engine's shared allocation service owns
+//! a `DynamicBuffer`'s block instead, so the block outlives the generation
+//! that filled it and is freed by code that is still mapped. Growth is the
+//! second difference: a `Vec` reallocates in place of its old buffer, which
+//! ends any managed view of it, while a block's address is stable for as long
+//! as a handle to it exists.
+//!
+//! Archetype migration is *not* one of the differences. A row moves bitwise,
+//! so a `Vec` field and a buffer handle both keep their address when the
+//! entity changes archetype.
 //!
 //! ## Reference-counted handles, copy-on-write
 //!
@@ -27,9 +31,9 @@
 //! [`pill_core::native_buffer`]: memory whose address never changes while the
 //! block is alive, and whose free path is the shared allocation service rather
 //! than whatever code happens to be current. `Clone` *retains* the block - the
-//! clone shares it, address and all - so an archetype move copies the handle
-//! and never the elements. Mutation while a block is shared copies it first,
-//! so two handles never write through one another.
+//! clone shares it, address and all - so duplicating a component duplicates
+//! the handle and never the elements. Mutation while a block is shared copies
+//! it first, so two handles never write through one another.
 //!
 //! ## The address-stability contract
 //!
@@ -39,9 +43,10 @@
 //! - **A block's address is stable for as long as any handle to it exists.**
 //!   Growth allocates a new block (and releases the old reference); it never
 //!   relocates a live one, and nothing else moves elements at all.
-//! - **Archetype migration moves the handle, never the block.** The copier's
-//!   `Clone` is a reference count, so a component's elements stay exactly
-//!   where they were across structural changes.
+//! - **Archetype migration moves the handle, never the block.** A row travels
+//!   bitwise between archetypes, so the handle's bytes move and its reference
+//!   count does not change; a component's elements stay exactly where they
+//!   were across structural changes.
 //! - **Resizing is the one operation that can retire a block**, and it is
 //!   therefore the operation that ends any outstanding element view: take a
 //!   view, use it, drop it before resizing. (Views taken through one handle

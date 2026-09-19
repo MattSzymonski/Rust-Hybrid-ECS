@@ -376,7 +376,8 @@ const PROJECT_SETTINGS_FILE: &str = "project_settings.yaml";
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum ProjectModuleBackend {
-    /// A native shared library exporting `project_init` and `project_update`.
+    /// A native shared library exporting `pill_module_init` and, optionally,
+    /// `pill_module_update`.
     NativeLibrary {
         /// Library name without the platform prefix or suffix.
         library_name: String,

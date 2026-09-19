@@ -23,15 +23,31 @@ pill_core_macros = { path = "../../../pill_core_macros" }
 pill_engine = { path = "../../../pill_engine" }
 # `impl_trait_accessible!` for the renderer components, so the ECS can reach
 # them through its type-erased `dyn Component` storage.
-wgpu = "26.0.1"
-bytemuck = { version = "1", features = ["derive"] }
-pollster = "0.4"
+# The GPU half, behind the `gpu` feature. Optional so a project can depend on
+# this crate for `Sprite` alone and keep wgpu out of its dependency graph - see
+# the feature's own note for why that is worth a feature rather than a split.
+wgpu = { version = "26.0.1", optional = true }
+bytemuck = { version = "1", features = ["derive"], optional = true }
+pollster = { version = "0.4", optional = true }
 # Expanded into by `#[engine_error]`, which builds on `thiserror` for the
 # `Error` impl and `miette` for the diagnostic derive.
 thiserror = "2"
 miette = { version = "7", features = ["derive"] }
 
 [features]
-# Deliberately empty. This crate is reached only through `pill_host`'s
-# `rendering` feature, so it has nothing of its own to gate.
-default = []
+# The wgpu pipeline: the surface, the device, the sprite render pass, and the
+# failure type whose every variant wraps a `wgpu` error. On by default, because
+# anything that links this crate to *draw* wants all of it.
+#
+# A project links this crate only to name `Sprite`, and turns the feature off
+# (`default-features = false`). That matters beyond binary size: cargo folds a
+# dependency's resolved features into the dependent's `-C metadata`, and that
+# hash is part of every symbol name `pill_core.dll` exports. A project that
+# dragged wgpu into its graph therefore linked a different engine dylib than a
+# headless host had mapped, and failed to load with nothing but
+# "The specified procedure could not be found".
+#
+# What is left with the feature off is `component`: `Sprite`, the viewport
+# types, and the collection pass - all plain data that names no `wgpu` type.
+default = ["gpu"]
+gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]

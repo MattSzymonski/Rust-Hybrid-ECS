@@ -23,8 +23,8 @@ use super::*;
 
 /// Captured resource values at a point in time.
 ///
-/// The resource twin of [`ComponentSnapshot`], and keyed the same way and for
-/// the same reason: an entry names its resource by the string both generations
+/// Keyed by name for the reason every persistence payload is: an entry names
+/// its resource by the string both generations
 /// write down, never by an id, because an id is a `TypeId` in one process and a
 /// name hash in another while the name is what a save file can carry.
 ///

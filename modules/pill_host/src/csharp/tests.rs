@@ -23,8 +23,8 @@ use pill_engine::{
 // Current crate
 use super::abi::{ComponentChunk, NativeComponentBlob, NativeSystemAccess};
 use super::backend::{
-    checked_access_count, checked_system_count, derive_system_access, is_supported_manifest_length,
-    MAX_ACCESSES_PER_SYSTEM, MAX_COMPONENT_MANIFEST_BYTES, MAX_SYSTEMS_PER_ASSEMBLY,
+    checked_access_count, checked_system_count, derive_system_access, MAX_ACCESSES_PER_SYSTEM,
+    MAX_COMPONENT_MANIFEST_BYTES, MAX_SYSTEMS_PER_ASSEMBLY,
 };
 #[cfg(feature = "hot_reload")]
 use super::backend::{
@@ -39,6 +39,7 @@ use super::components::{
     shared_component_bindings, stable_component_id, BindingStore, Color, ComponentBinding,
     ComponentBindings, ModuleExposedComponent, Position, Sprite, StableComponentId,
 };
+use super::managed_buffer::{fetch_managed_buffer, ManagedBufferError};
 // `Color`, `Position` and `Sprite` above are the renderer's components,
 // re-exported by `components` from `pill_master_renderer`.
 use super::context::ActiveSystemGuard;
@@ -1406,15 +1407,29 @@ fn unknown_poll_status_is_a_typed_error() {
 
 /// Verifies that managed-reported manifest lengths are bounded before any
 /// host allocation happens.
+///
+/// The bound lives in the shared two-call protocol now, so this exercises it
+/// through the limit the manifest path passes: the generic behaviour is pinned
+/// beside the helper, and what is pinned here is that the manifest kind is the
+/// one asking for `MAX_COMPONENT_MANIFEST_BYTES`.
 #[test]
 fn manifest_length_bounds_reject_empty_and_oversized_values() {
-    assert!(!is_supported_manifest_length(0));
-    assert!(is_supported_manifest_length(1));
-    assert!(is_supported_manifest_length(MAX_COMPONENT_MANIFEST_BYTES));
-    assert!(!is_supported_manifest_length(
-        MAX_COMPONENT_MANIFEST_BYTES + 1
-    ));
-    assert!(!is_supported_manifest_length(u32::MAX));
+    /// Run the protocol against a reported length, with a copy that refuses.
+    ///
+    /// A refused copy is the success case here: reaching it means the length
+    /// was accepted, which is what the bound is being tested for.
+    fn accepts(length: u32) -> bool {
+        matches!(
+            fetch_managed_buffer(|| length, |_, _| 0, MAX_COMPONENT_MANIFEST_BYTES),
+            Err(ManagedBufferError::CopyFailed)
+        )
+    }
+
+    assert!(!accepts(0));
+    assert!(accepts(1));
+    assert!(accepts(MAX_COMPONENT_MANIFEST_BYTES));
+    assert!(!accepts(MAX_COMPONENT_MANIFEST_BYTES + 1));
+    assert!(!accepts(u32::MAX));
 }
 
 /// Verifies that the counts a managed assembly reports are bounded before they

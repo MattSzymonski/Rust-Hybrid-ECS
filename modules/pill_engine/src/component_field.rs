@@ -1039,13 +1039,10 @@ impl World {
             .archetypes
             .get_mut(&archetype_id)
             .ok_or(ComponentFieldError::EntityNotFound)?;
-        let ticks = archetype.component_ticks.get_mut(&component_id).ok_or(
-            ComponentFieldError::ComponentStorageMissing {
-                component: component_name.to_string(),
-            },
-        )?;
-        let row_ticks = ticks
-            .get_mut(row)
+        let row_ticks = archetype
+            .component_storages
+            .get_mut(component_id)
+            .and_then(|column| column.row_ticks_mut(row))
             .ok_or(ComponentFieldError::ComponentStorageMissing {
                 component: component_name.to_string(),
             })?;
@@ -1057,205 +1054,6 @@ impl World {
 // =============================================================================
 // Tests
 // =============================================================================
-
-// =============================================================================
-// Descriptor-driven persistence codec
-// =============================================================================
-//
-// The generic half of the storage model's ops interface. A component declared
-// in another language has no Rust type, so there is no serde glue to call and
-// no `Box<dyn Component>` to produce - but it does have a field layout, and
-// that is enough to read and write its rows.
-//
-// One implementation serves every descriptor-only component, which is why this
-// is a pair of free functions rather than a per-type table: a function pointer
-// would be indirection with exactly one destination behind it.
-//
-// The rules differ deliberately from the editor's `encode_field_write` above.
-// The editor refuses to write a field it cannot interpret, because letting
-// someone edit a `struct:` field through a stale image is how data gets
-// corrupted. Persistence has the opposite obligation: a field it cannot
-// interpret must still survive the round trip, so its bytes are copied
-// verbatim. Refusing to interpret and refusing to preserve are different jobs.
-
-/// JSON key under which an uninterpretable field's raw bytes are stored.
-const OPAQUE_BYTES_KEY: &str = "$bytes";
-
-/// Encode one decoded field value as JSON.
-fn field_value_to_json(value: &FieldValue) -> Option<serde_json::Value> {
-    use serde_json::Value;
-    Some(match value {
-        FieldValue::F32(inner) => Value::from(*inner),
-        FieldValue::F64(inner) => Value::from(*inner),
-        FieldValue::I8(inner) => Value::from(*inner),
-        FieldValue::I16(inner) => Value::from(*inner),
-        FieldValue::I32(inner) => Value::from(*inner),
-        FieldValue::I64(inner) => Value::from(*inner),
-        FieldValue::U8(inner) => Value::from(*inner),
-        FieldValue::U16(inner) => Value::from(*inner),
-        FieldValue::U32(inner) => Value::from(*inner),
-        FieldValue::U64(inner) => Value::from(*inner),
-        FieldValue::Bool(inner) => Value::from(*inner),
-        FieldValue::Usize(inner) => Value::from(*inner as u64),
-        FieldValue::Isize(inner) => Value::from(*inner as i64),
-        FieldValue::Array(values) => Value::Array(
-            values
-                .iter()
-                .map(field_value_to_json)
-                .collect::<Option<Vec<_>>>()?,
-        ),
-        // Wrapped in an object rather than written as a bare array so a decoder
-        // can tell "bytes I could not interpret" from "an array of u8".
-        FieldValue::Opaque { bytes, .. } => {
-            let mut object = serde_json::Map::new();
-            object.insert(
-                OPAQUE_BYTES_KEY.to_string(),
-                Value::Array(bytes.iter().map(|byte| Value::from(*byte)).collect()),
-            );
-            Value::Object(object)
-        }
-        // Heap-backed fields cannot appear on a descriptor-only component: the
-        // validated vocabulary is blittable, so there is no owner to follow.
-        FieldValue::List { .. } | FieldValue::Text(_) => return None,
-    })
-}
-
-/// Write one scalar from JSON at `offset`, returning whether it matched.
-fn write_json_scalar(
-    image: &mut [u8],
-    offset: usize,
-    tag: &str,
-    value: &serde_json::Value,
-) -> bool {
-    let Some(size) = scalar_size(tag) else {
-        return false;
-    };
-    if offset + size > image.len() {
-        return false;
-    }
-    let decoded = match tag {
-        "f32" => value.as_f64().map(|inner| FieldValue::F32(inner as f32)),
-        "f64" => value.as_f64().map(FieldValue::F64),
-        "i8" => value.as_i64().map(|inner| FieldValue::I8(inner as i8)),
-        "i16" => value.as_i64().map(|inner| FieldValue::I16(inner as i16)),
-        "i32" => value.as_i64().map(|inner| FieldValue::I32(inner as i32)),
-        "i64" => value.as_i64().map(FieldValue::I64),
-        "u8" => value.as_u64().map(|inner| FieldValue::U8(inner as u8)),
-        "u16" => value.as_u64().map(|inner| FieldValue::U16(inner as u16)),
-        "u32" => value.as_u64().map(|inner| FieldValue::U32(inner as u32)),
-        "u64" => value.as_u64().map(FieldValue::U64),
-        "bool" => value.as_bool().map(FieldValue::Bool),
-        "usize" => value
-            .as_u64()
-            .map(|inner| FieldValue::Usize(inner as usize)),
-        "isize" => value
-            .as_i64()
-            .map(|inner| FieldValue::Isize(inner as isize)),
-        _ => None,
-    };
-    let Some(decoded) = decoded else {
-        return false;
-    };
-    let mut encoded = Vec::with_capacity(size);
-    if !encode_scalar(tag, &decoded, &mut encoded) || encoded.len() != size {
-        return false;
-    }
-    image[offset..offset + size].copy_from_slice(&encoded);
-    true
-}
-
-/// Write one JSON value into `image` at the descriptor's offset.
-///
-/// Returns whether the field was written. A field the JSON describes in a shape
-/// the descriptor does not expect is left as the zero bytes the image arrived
-/// with, which is the same "starts defined" behaviour the byte-level migration
-/// plan gives a newly added field.
-fn write_json_field(
-    image: &mut [u8],
-    descriptor: &ComponentFieldDescriptor,
-    value: &serde_json::Value,
-) -> bool {
-    let tag = descriptor.type_tag;
-    let end = descriptor.offset.saturating_add(descriptor.size);
-    if end > image.len() {
-        return false;
-    }
-
-    // An uninterpretable field round-trips as the bytes it was stored with.
-    if let Some(bytes) = value
-        .get(OPAQUE_BYTES_KEY)
-        .and_then(|inner| inner.as_array())
-    {
-        if bytes.len() != descriptor.size {
-            return false;
-        }
-        for (index, byte) in bytes.iter().enumerate() {
-            let Some(byte) = byte.as_u64() else {
-                return false;
-            };
-            image[descriptor.offset + index] = byte as u8;
-        }
-        return true;
-    }
-
-    if let Some(inner_tag) = tag.strip_prefix("array:") {
-        let (Some(values), Some(element_size)) = (value.as_array(), scalar_size(inner_tag)) else {
-            return false;
-        };
-        for (index, element) in values.iter().enumerate() {
-            let offset = descriptor.offset + index * element_size;
-            if offset + element_size > end {
-                return false;
-            }
-            if !write_json_scalar(image, offset, inner_tag, element) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    write_json_scalar(image, descriptor.offset, tag, value)
-}
-
-/// Serialize one descriptor-only component row into snapshot JSON.
-pub(crate) fn serialize_descriptor_row(
-    row_bytes: &[u8],
-    fields: &[ComponentFieldDescriptor],
-) -> Vec<u8> {
-    let mut object = serde_json::Map::new();
-    for descriptor in fields {
-        if let Some(value) = field_value_to_json(&decode_field(row_bytes, descriptor)) {
-            object.insert(descriptor.name.to_string(), value);
-        }
-    }
-    serde_json::to_vec(&serde_json::Value::Object(object)).unwrap_or_else(|_| b"{}".to_vec())
-}
-
-/// Rebuild a descriptor-only component row from snapshot JSON.
-///
-/// Fields are matched by name, so a reordered or moved field follows its name.
-/// A field the snapshot does not carry keeps the image's zero bytes, which is
-/// how a field added since the snapshot starts defined rather than reading
-/// whatever happened to be next in memory.
-///
-/// Returns `None` only when the JSON is not an object. A single field that
-/// cannot be read is skipped rather than failing the row, so one unreadable
-/// field does not cost an entity every other field it had.
-pub(crate) fn descriptor_row_image(
-    json: &[u8],
-    fields: &[ComponentFieldDescriptor],
-    size: usize,
-) -> Option<Vec<u8>> {
-    let parsed: serde_json::Value = serde_json::from_slice(json).ok()?;
-    let object = parsed.as_object()?;
-    let mut image = vec![0u8; size];
-    for descriptor in fields {
-        if let Some(value) = object.get(descriptor.name) {
-            write_json_field(&mut image, descriptor, value);
-        }
-    }
-    Some(image)
-}
 
 #[cfg(test)]
 mod tests {
@@ -1536,17 +1334,28 @@ mod tests {
         let name = "pill_engine::component_field::tests::SampleComponent";
         let before = world.change_tick();
 
-        let _ = world.read_component_field(entity, name, "a_float").unwrap();
-        let ticks = &world.archetypes.values().next().unwrap().component_ticks;
         let component_id = ComponentId::of::<SampleComponent>();
-        let row_ticks = ticks.get(&component_id).unwrap()[0];
+        let row_ticks_of = |world: &World| {
+            *world
+                .archetypes
+                .values()
+                .next()
+                .unwrap()
+                .component_storages
+                .get(component_id)
+                .unwrap()
+                .row_ticks(0)
+                .unwrap()
+        };
+
+        let _ = world.read_component_field(entity, name, "a_float").unwrap();
+        let row_ticks = row_ticks_of(&world);
         assert!(!row_ticks.changed.is_newer_than(before, world.change_tick()));
 
         world
             .write_component_field(entity, name, "a_float", FieldValue::F32(2.0))
             .expect("write succeeds");
-        let ticks = &world.archetypes.values().next().unwrap().component_ticks;
-        let row_ticks = ticks.get(&component_id).unwrap()[0];
+        let row_ticks = row_ticks_of(&world);
         assert!(row_ticks.changed.is_newer_than(before, world.change_tick()));
     }
 
