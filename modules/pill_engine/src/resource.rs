@@ -48,6 +48,8 @@ use std::marker::PhantomData;
 use std::ptr::NonNull;
 
 // Current crate
+use pill_core::error;
+
 use crate::archetype::{FieldPlan, FieldSource};
 use crate::error::WorldError;
 use crate::world::World;
@@ -647,11 +649,21 @@ impl ErasedResource {
     /// would install a drop the value never had. Debug builds assert it, and
     /// `World::rehome_resources` skips the case in release builds.
     pub fn refresh_ops(&mut self, ops: ErasedResourceOps) {
-        debug_assert_eq!(
-            ops.foreign,
-            self.type_id.is_none(),
-            "a resource's function table must agree with the ownership the box was created with"
-        );
+        // A table that disagrees with the box's ownership would install a drop
+        // the value never had, or none where one is needed. `rehome_resources`
+        // already filters this case out, so reaching it means a caller got it
+        // wrong - refuse the swap and say so rather than corrupting the box.
+        // Keeping the existing table is the safe half of the disagreement: the
+        // value is still released by whatever produced it.
+        if ops.foreign != self.type_id.is_none() {
+            error!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                foreign_table = ops.foreign,
+                foreign_box = self.type_id.is_none(),
+                "a resource's function table disagrees with the ownership its box was created with; keeping the existing table"
+            );
+            return;
+        }
         self.ops = ops;
     }
 

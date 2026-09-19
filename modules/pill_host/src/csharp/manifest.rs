@@ -77,6 +77,32 @@ const BLITTABLE_FIELD_TYPES: &[&str] = &[
     "struct",
 ];
 
+/// Natural alignment of each blittable leaf type, for the offset check.
+///
+/// A managed struct laid out sequentially places every field at a multiple of
+/// its own alignment, so a manifest that does not is describing a packed or
+/// hand-written layout. The engine's own reflection decodes fields with
+/// `from_ne_bytes` over a byte slice and so tolerates any offset, but the
+/// managed side reads the same bytes as real typed fields - and a `double` at
+/// an odd offset is a fault on some targets and a silent tear on others.
+///
+/// `struct` is absent deliberately: a nested struct's alignment is whatever its
+/// widest leaf requires, and each of those leaves is checked in turn when the
+/// walk descends into it.
+fn natural_alignment(primitive_type: &str) -> Option<usize> {
+    let alignment = match primitive_type {
+        "System.Byte" | "System.SByte" | "System.Boolean" => 1,
+        "System.Int16" | "System.UInt16" | "System.Char" => 2,
+        "System.Int32" | "System.UInt32" | "System.Single" => 4,
+        "System.Int64" | "System.UInt64" | "System.Double" => 8,
+        // Pointer-width on the host, which is what the managed side marshals
+        // them as; the engine only ever stores their bytes.
+        "System.IntPtr" | "System.UIntPtr" => std::mem::size_of::<usize>(),
+        _ => return None,
+    };
+    Some(alignment)
+}
+
 /// Deserialized entry from the managed component manifest.
 #[derive(Deserialize)]
 pub(super) struct ManagedComponentManifest {
@@ -188,7 +214,8 @@ pub(super) fn validate_sibling_non_overlap(
 /// # Errors
 ///
 /// Returns an error when a field overflows its containing struct, names an
-/// empty field or type, declares a type outside [`BLITTABLE_FIELD_TYPES`], or
+/// empty field or type, declares a type outside [`BLITTABLE_FIELD_TYPES`],
+/// sits at an offset that is not a multiple of its natural alignment, or
 /// exceeds the maximum nesting depth.
 pub(super) fn validate_field_manifest(
     field: &ManagedFieldManifest,
@@ -215,6 +242,25 @@ pub(super) fn validate_field_manifest(
                 "managed field {} has non-blittable type {}; descriptor components must contain only unmanaged value types",
                 field.name, field.primitive_type
             ));
+        }
+        // A field placed off its natural alignment describes a packed or
+        // hand-written layout. The analyzer refuses `StructLayout.Pack` on the
+        // managed side (PILL0402), but the analyzer is a compile-time lint on
+        // one project's source while this manifest is the runtime trust
+        // boundary - a project built without the analyzer reference reaches the
+        // host with nothing in between.
+        //
+        // The offset is relative to the containing struct, and a struct's own
+        // offset is checked against its parent by the same rule, so a field is
+        // correctly aligned within the component exactly when every step of
+        // that chain is.
+        if let Some(alignment) = natural_alignment(&field.primitive_type) {
+            if field.offset % alignment != 0 {
+                return Err(format!(
+                    "managed field {} of type {} sits at offset {}, which is not a multiple of its {}-byte alignment",
+                    field.name, field.primitive_type, field.offset, alignment
+                ));
+            }
         }
         // A default is for the leaves: a struct has no literal form, and a
         // nested default would be a second layout language to validate. The

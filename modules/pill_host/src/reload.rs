@@ -54,6 +54,16 @@ use pill_engine::{ComponentId, Engine, EngineApi, SystemOwner, World};
 use crate::analytics;
 use crate::native_library::NativeLibrary;
 
+/// Consecutive deferred evictions tolerated before the warning becomes an
+/// error.
+///
+/// The eviction gate is correct to defer while a column still references a
+/// retired image, but a gate that defers forever is a slow address-space leak
+/// wearing a warning. Escalating makes a genuinely stuck state visible while
+/// there is still room to act on it, without turning the ordinary one-off
+/// deferral into noise.
+const MAX_DEFERRED_EVICTIONS: u32 = 3;
+
 /// Maximum number of retired generations kept mapped per subject.
 ///
 /// The immediately previous generation must stay mapped because engine-owned
@@ -191,16 +201,35 @@ impl ReloadTransaction<'_> {
     fn retire_library(&mut self, library: NativeLibrary, world: &World) {
         self.old_libraries.push(library);
         if self.old_libraries.len() > MAX_GRAVEYARD_GENERATIONS {
-            if world.columns_without_factory() != 0 {
-                warn!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                    subject = self.subject,
-                    generations = self.old_libraries.len(),
-                    columns = world.columns_without_factory(),
-                    "deferring eviction: native columns still reference a retired image"
-                );
+            let orphaned = world.columns_without_factory();
+            if orphaned != 0 {
+                let deferrals = Self::deferred_eviction_count(self.subject, true);
+                // One deferral is ordinary - a column is mid-migration and the
+                // next reload clears it. A run of them is not: nothing is
+                // releasing those columns, so every future reload adds a mapped
+                // image that can never be evicted.
+                if deferrals >= MAX_DEFERRED_EVICTIONS {
+                    error!(
+                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        subject = self.subject,
+                        generations = self.old_libraries.len(),
+                        columns = orphaned,
+                        consecutive_deferrals = deferrals,
+                        "eviction has been deferred repeatedly: native columns still reference retired images and are not being released, so every reload now leaks a mapped image"
+                    );
+                } else {
+                    warn!(
+                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                        subject = self.subject,
+                        generations = self.old_libraries.len(),
+                        columns = orphaned,
+                        "deferring eviction: native columns still reference a retired image"
+                    );
+                }
                 return;
             }
+            // The gate opened, so whatever held those columns is gone.
+            Self::deferred_eviction_count(self.subject, false);
             // Dropping the evicted generation unmaps its image and deletes its
             // temporary file on disk. Logged before the drop: anything still
             // holding a pointer into that image faults inside it, and this line
@@ -213,6 +242,29 @@ impl ReloadTransaction<'_> {
             );
             drop(self.old_libraries.remove(0));
         }
+    }
+
+    /// Count consecutive deferred evictions for one subject.
+    ///
+    /// `defer` increments and returns the new count; clearing resets it to zero
+    /// and returns zero. Keyed by subject because the project and each optional
+    /// module retire independently, and one stuck subject should not mask or be
+    /// masked by another.
+    fn deferred_eviction_count(subject: &str, defer: bool) -> u32 {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+        static COUNTS: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+        let mut guard = COUNTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let counts = guard.get_or_insert_with(HashMap::new);
+        if !defer {
+            counts.remove(subject);
+            return 0;
+        }
+        let entry = counts.entry(subject.to_string()).or_insert(0);
+        *entry = entry.saturating_add(1);
+        *entry
     }
 
     /// Run the whole sequence against an already-loaded replacement.

@@ -124,6 +124,15 @@ pub enum WorldError {
     #[message("descriptor component byte length does not match its registered size")]
     DescriptorSizeMismatch,
 
+    /// A raw-byte write was attempted on a column whose rows own resources.
+    ///
+    /// The byte mutators copy and overwrite rows without consulting the
+    /// element's drop glue, which is correct only for plain data. On a column
+    /// whose type has a real destructor the same calls would leak the
+    /// overwritten value, or hand two columns ownership of one allocation.
+    #[message("raw-byte writes are not valid on a column whose rows own resources")]
+    ColumnRowsAreNotPlainData,
+
     /// A registered descriptor component has no storage column in the archetype
     /// the entity was placed in.
     ///

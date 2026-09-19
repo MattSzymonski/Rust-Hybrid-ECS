@@ -218,9 +218,16 @@ pub enum ColumnIdentity {
     /// A Rust component compiled into more than one binary, so each binary has
     /// a different `TypeId` for one type and the layout is the only check left.
     ///
-    /// The caller takes on what `TypeId` was discharging: matching size and
+    /// The caller takes on what `TypeId` was discharging. Matching size and
     /// alignment is necessary but not sufficient, so the registry compares the
-    /// full field layout before a column is created with this identity.
+    /// declared field layout through a schema hash - **when both sides declare
+    /// one**. A component registered without field descriptors carries no such
+    /// evidence, and the comparison falls back to size and alignment alone,
+    /// which cannot tell `{f32, f32}` from `{u32, u32}`. That fallback is
+    /// deliberate (a hand-registered component is otherwise unregisterable) and
+    /// is warned about once per component id at registration, but it is a
+    /// convention rather than an invariant: a shared component should always be
+    /// registered with its field descriptors.
     Shared,
     /// No Rust type names these rows; they are reached as bytes.
     ///
@@ -975,6 +982,30 @@ impl ComponentColumn {
         self.data.as_ptr()
     }
 
+    /// Refuse a raw-byte write when this column's rows own resources.
+    ///
+    /// The byte mutators below move and overwrite rows with `memcpy` and never
+    /// consult [`ColumnOps::drop_range`], which is exactly right for the plain
+    /// data the descriptor lane stores and exactly wrong for a native column
+    /// whose element type has a destructor: overwriting would leak the old
+    /// value, and copying would leave two columns owning one allocation.
+    ///
+    /// Every current caller already routes native ids away from these methods.
+    /// This turns that caller obligation into an enforced one, so a future
+    /// caller that gets it wrong receives an error rather than a double free.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorldError::ColumnRowsAreNotPlainData`] when the column's ops
+    /// table reports a non-trivial drop.
+    #[inline]
+    fn require_plain_data(&self) -> Result<(), WorldError> {
+        if self.ops.trivial_drop {
+            return Ok(());
+        }
+        Err(WorldError::ColumnRowsAreNotPlainData)
+    }
+
     /// Appends a zero-initialized row to this column.
     ///
     /// Grows the column when needed and leaves the new row's bytes zeroed.
@@ -982,8 +1013,11 @@ impl ComponentColumn {
     /// # Errors
     ///
     /// Returns [`WorldError::DescriptorLayoutInvalid`] when the element layout
-    /// cannot describe the next allocation.
+    /// cannot describe the next allocation, or
+    /// [`WorldError::ColumnRowsAreNotPlainData`] when the column's rows own
+    /// resources - see [`Self::require_plain_data`].
     pub fn push_zeroed(&mut self) -> Result<(), WorldError> {
+        self.require_plain_data()?;
         self.reserve_one()?;
         // SAFETY: reserve_one guarantees one writable, correctly aligned slot.
         unsafe {
@@ -1006,6 +1040,7 @@ impl ComponentColumn {
     /// [`WorldError::DescriptorLayoutInvalid`] when the element layout cannot
     /// describe the next allocation.
     pub fn push_bytes(&mut self, bytes: &[u8]) -> Result<(), WorldError> {
+        self.require_plain_data()?;
         if bytes.len() != self.layout.size {
             return Err(WorldError::DescriptorSizeMismatch);
         }
@@ -1034,6 +1069,10 @@ impl ComponentColumn {
     /// travel the reporting path: a drifted column must not abort a frame from
     /// inside the command flush, where the caller can hand the error back.
     pub fn push_from(&mut self, source: &Self, index: usize) -> Result<(), WorldError> {
+        // Both sides: the destination must not later drop a row it only copied,
+        // and the source must not own one it has handed away.
+        self.require_plain_data()?;
+        source.require_plain_data()?;
         if self.layout.size != source.layout.size {
             return Err(WorldError::DescriptorSizeMismatch);
         }
@@ -1060,6 +1099,7 @@ impl ComponentColumn {
     /// Returns [`WorldError::DescriptorRowInvalid`] when `index` is out of
     /// bounds or `bytes` does not contain exactly `element_size()` bytes.
     pub fn set_bytes(&mut self, index: usize, bytes: &[u8]) -> Result<(), WorldError> {
+        self.require_plain_data()?;
         if index >= self.len || bytes.len() != self.layout.size {
             return Err(WorldError::DescriptorRowInvalid);
         }
@@ -1919,15 +1959,20 @@ mod tests {
         let layout = ComponentLayout::new(4, 4, 7, Blittability::from_manifest_fields())
             .expect("a valid layout");
         let mut column = ComponentColumn::new(layout).expect("a column");
-        column.refresh_ops(ColumnOps {
-            drop_range: count_releases,
-            trivial_drop: false,
-        });
-
+        // Rows go in while the column still reports plain data, then the
+        // counting table is installed. The byte mutators refuse a column whose
+        // rows own resources, so populating first is now the only order that
+        // works - and it is the honest one: a real column reaches a
+        // non-trivial table by re-homing, never by being born with one and
+        // then filled with zeroed bytes.
         column
             .push_zeroed()
             .expect("the first row grows the column");
         column.push_zeroed().expect("the second row fits");
+        column.refresh_ops(ColumnOps {
+            drop_range: count_releases,
+            trivial_drop: false,
+        });
         column.swap_remove_discard(0);
         assert_eq!(
             RELEASES.load(Ordering::SeqCst),

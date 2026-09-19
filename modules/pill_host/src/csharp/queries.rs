@@ -58,7 +58,7 @@ fn record_served_archetype(status: u8, output: *mut ComponentChunk) {
 /// `1` returns a chunk, `2` is unknown component, `3` is out-of-scope access,
 /// `4` is an undeclared access mode, and `5` reports a caller bug - the output
 /// buffer is null, which the managed side maps to an `ArgumentException`.
-pub(super) extern "C" fn ffi_get_component_chunk(
+fn ffi_get_component_chunk_guarded(
     key_low: u64,
     key_high: u64,
     mode: u8,
@@ -173,6 +173,28 @@ pub(super) extern "C" fn ffi_get_component_chunk(
     status
 }
 
+/// Panic-guarded entry point for [`ffi_get_component_chunk_guarded`].
+///
+/// A panic crossing an `extern "C"` boundary aborts the process. The
+/// managed side already has a per-system error channel built for a
+/// misbehaving system, so an engine assertion reached through this
+/// callback reports `5` - the status this callback already
+/// uses for a call it could not serve - and lets the frame's error path
+/// name the system, rather than killing the host mid-frame.
+pub(super) extern "C" fn ffi_get_component_chunk(
+    key_low: u64,
+    key_high: u64,
+    mode: u8,
+    chunk_index: u32,
+    output: *mut ComponentChunk,
+) -> u8 {
+    super::context::guard_managed_callback(
+        "ffi_get_component_chunk",
+        5,
+        || ffi_get_component_chunk_guarded(key_low, key_high, mode, chunk_index, output),
+    )
+}
+
 /// Return one component chunk of an archetype the managed enumerator already
 /// identified through its driver chunk.
 ///
@@ -184,7 +206,7 @@ pub(super) extern "C" fn ffi_get_component_chunk(
 /// `4` is an undeclared access mode, and `5` reports a null output buffer. A
 /// `mode` of `2` requests the archetype's entity column instead, which carries
 /// no component access to validate.
-pub(super) extern "C" fn ffi_get_archetype_chunk(
+fn ffi_get_archetype_chunk_guarded(
     archetype_low: u64,
     archetype_high: u64,
     key_low: u64,
@@ -333,12 +355,35 @@ pub(super) extern "C" fn ffi_get_archetype_chunk(
     status
 }
 
+/// Panic-guarded entry point for [`ffi_get_archetype_chunk_guarded`].
+///
+/// A panic crossing an `extern "C"` boundary aborts the process. The
+/// managed side already has a per-system error channel built for a
+/// misbehaving system, so an engine assertion reached through this
+/// callback reports `5` - the status this callback already
+/// uses for a call it could not serve - and lets the frame's error path
+/// name the system, rather than killing the host mid-frame.
+pub(super) extern "C" fn ffi_get_archetype_chunk(
+    archetype_low: u64,
+    archetype_high: u64,
+    key_low: u64,
+    key_high: u64,
+    mode: u8,
+    output: *mut ComponentChunk,
+) -> u8 {
+    super::context::guard_managed_callback(
+        "ffi_get_archetype_chunk",
+        5,
+        || ffi_get_archetype_chunk_guarded(archetype_low, archetype_high, key_low, key_high, mode, output),
+    )
+}
+
 /// Return the `chunk_index`th archetype entity column.
 ///
 /// The slice written to `output` contains `Entity` values for one archetype
 /// and is only valid while the managed system that triggered the callback is
 /// active; callers must not retain it beyond the invocation.
-pub(super) extern "C" fn ffi_get_entity_chunk(chunk_index: u32, output: *mut ComponentChunk) -> u8 {
+fn ffi_get_entity_chunk_guarded(chunk_index: u32, output: *mut ComponentChunk) -> u8 {
     // Step 1: Reject a null output buffer before touching the world; the
     // caller-bug status, not end-of-iteration.
     if output.is_null() {
@@ -375,6 +420,22 @@ pub(super) extern "C" fn ffi_get_entity_chunk(chunk_index: u32, output: *mut Com
     .unwrap_or(3)
 }
 
+/// Panic-guarded entry point for [`ffi_get_entity_chunk_guarded`].
+///
+/// A panic crossing an `extern "C"` boundary aborts the process. The
+/// managed side already has a per-system error channel built for a
+/// misbehaving system, so an engine assertion reached through this
+/// callback reports `5` - the status this callback already
+/// uses for a call it could not serve - and lets the frame's error path
+/// name the system, rather than killing the host mid-frame.
+pub(super) extern "C" fn ffi_get_entity_chunk(chunk_index: u32, output: *mut ComponentChunk) -> u8 {
+    super::context::guard_managed_callback(
+        "ffi_get_entity_chunk",
+        5,
+        || ffi_get_entity_chunk_guarded(chunk_index, output),
+    )
+}
+
 /// Write the current entity count while a managed system is active.
 ///
 /// Status codes: `0` wrote the count, `3` no managed system is scheduled (a
@@ -384,7 +445,7 @@ pub(super) extern "C" fn ffi_get_entity_chunk(chunk_index: u32, output: *mut Com
 ///
 /// The count is `u32` by ABI design; worlds above ~4.29 billion entities are
 /// unsupported (see the `ComponentChunk` layout-limits documentation).
-pub(super) extern "C" fn ffi_entity_count(output: *mut u32) -> u8 {
+fn ffi_entity_count_guarded(output: *mut u32) -> u8 {
     if output.is_null() {
         return 5;
     }
@@ -395,4 +456,20 @@ pub(super) extern "C" fn ffi_entity_count(output: *mut u32) -> u8 {
     // `u32` for the duration of this call.
     unsafe { output.write(count) };
     0
+}
+
+/// Panic-guarded entry point for [`ffi_entity_count_guarded`].
+///
+/// A panic crossing an `extern "C"` boundary aborts the process. The
+/// managed side already has a per-system error channel built for a
+/// misbehaving system, so an engine assertion reached through this
+/// callback reports `5` - the status this callback already
+/// uses for a call it could not serve - and lets the frame's error path
+/// name the system, rather than killing the host mid-frame.
+pub(super) extern "C" fn ffi_entity_count(output: *mut u32) -> u8 {
+    super::context::guard_managed_callback(
+        "ffi_entity_count",
+        5,
+        || ffi_entity_count_guarded(output),
+    )
 }

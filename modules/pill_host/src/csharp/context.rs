@@ -224,6 +224,47 @@ impl Drop for ActiveSystemGuard {
     }
 }
 
+/// Run one managed FFI callback, turning a panic into its failure status.
+///
+/// Since Rust 1.81 a panic crossing an `extern "C"` boundary aborts the process
+/// rather than being undefined, so this converts a loud process kill into the
+/// refusal the callback already knows how to report. The managed side then
+/// fails the running system through the existing per-system error channel,
+/// which is what that channel was built for.
+///
+/// The panic payload is logged here because the status code alone cannot carry
+/// it: a caller seeing `5` learns the call failed, not that an engine assertion
+/// fired inside it.
+///
+/// `AssertUnwindSafe` is required because these callbacks take raw pointers,
+/// which are never `UnwindSafe`. The assertion is sound for the reason the
+/// boundary exists: a failed callback leaves the frame's work incomplete, and
+/// the deferred command queue and the invocation scope are both torn down as a
+/// unit when the system that owns them reports failure.
+pub(super) fn guard_managed_callback(
+    callback: &'static str,
+    failure_status: u8,
+    body: impl FnOnce() -> u8,
+) -> u8 {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(status) => status,
+        Err(payload) => {
+            let detail = payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "a non-string panic payload".to_string());
+            error!(
+                target: pill_core::telemetry::telemetry_target::ECS,
+                callback,
+                detail = detail.as_str(),
+                "a managed callback panicked; reporting failure to the calling system instead of aborting"
+            );
+            failure_status
+        }
+    }
+}
+
 // =============================================================================
 // Free Functions
 // =============================================================================

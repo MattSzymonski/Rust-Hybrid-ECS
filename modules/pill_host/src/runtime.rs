@@ -506,10 +506,9 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
     }
 
     // Step 2: Resolve the workspace root and print the selected configuration.
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .ok_or(HostError::WorkspaceRootUndetermined)?
-        .to_path_buf();
+    // The engine owns this root (see [`crate::config::engine_workspace_root`]),
+    // so it does not depend on the directory the process was launched from.
+    let workspace_root = crate::config::engine_workspace_root()?;
 
     print_startup_configuration(&workspace_root, &module_config);
 

@@ -22,6 +22,8 @@ use std::any::TypeId;
 use std::collections::HashMap;
 
 // Current crate
+use pill_core::warn;
+
 use crate::component_registry::ComponentFieldDescriptor;
 use crate::error::WorldError;
 
@@ -552,6 +554,10 @@ pub struct ComponentRegistry {
     /// lives in the declaring artifact's read-only data and dangles once a
     /// module DLL is unloaded, while the registry outlives every module.
     shared_declaring_types: HashMap<ComponentId, String>,
+    /// Shared components already reported as registered without field
+    /// descriptors, so the warning fires once per id rather than once per
+    /// registration - a reload re-registers the same types every time.
+    shared_without_layout_reported: std::collections::HashSet<ComponentId>,
     /// Next bit index to assign to a newly registered component.
     next_bit: u8,
     /// Bit indices reclaimed by [`Self::remove`], reused before `next_bit`
@@ -600,6 +606,7 @@ impl ComponentRegistry {
             names: HashMap::new(),
             layouts: HashMap::new(),
             shared_declaring_types: HashMap::new(),
+            shared_without_layout_reported: std::collections::HashSet::new(),
             next_bit: 0,
             free_bits: Vec::new(),
         }
@@ -679,6 +686,25 @@ impl ComponentRegistry {
                             incoming_type: incoming.to_string(),
                         });
                     }
+                }
+            }
+            // A shared component with no field descriptors cannot be checked
+            // structurally: `is_compatible_with` falls back to size and
+            // alignment, which agree for `{f32,f32}` and `{u32,u32}` alike. The
+            // fallback is deliberate - a hand-registered component carries no
+            // evidence either way - but taking it silently is not, because the
+            // whole point of shared identity is that two binaries agree about
+            // one row's contents. Reported once per component id.
+            if let Some(shared_name) = T::shared_name() {
+                if layout.schema_hash.is_none()
+                    && self.shared_without_layout_reported.insert(component_id)
+                {
+                    warn!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        shared_name,
+                        type_name = std::any::type_name::<T>(),
+                        "shared component registered without field descriptors; cross-binary agreement falls back to size and alignment, which cannot tell two same-shaped layouts apart"
+                    );
                 }
             }
             let recorded = self.layouts.get(&component_id).copied();

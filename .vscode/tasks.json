@@ -1,0 +1,57 @@
+{
+    // Build tasks used as `preLaunchTask` by the debug configurations in
+    // launch.json. Each mirrors the flags of the equivalent `cargo run`
+    // command, minus `run`, so the debugger launches the binary itself.
+    "version": "2.0.0",
+    "tasks": [
+        {
+            // Debug build of the standalone host with the rendering backend.
+            // Matches `cargo run --package pill_standalone --features rendering --offline`.
+            "label": "build standalone (debug)",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--package",
+                "pill_standalone",
+                "--features",
+                "rendering",
+                "--offline"
+            ],
+            // The cargo workspace is `modules/`, not the repository root.
+            "options": {
+                "cwd": "${workspaceFolder}/modules"
+            },
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "build"
+        },
+        {
+            // Same build with per-function hot patching disabled. Use this
+            // when setting breakpoints inside registered systems: with
+            // `hot_patch` on, a system dispatches through a replaceable slot
+            // and a patched implementation runs at a new address, so a
+            // breakpoint bound to the original body stops being hit.
+            "label": "build standalone (debug, no hot patch)",
+            "type": "shell",
+            "command": "cargo",
+            "args": [
+                "build",
+                "--package",
+                "pill_standalone",
+                "--no-default-features",
+                "--features",
+                "hot_reload,rendering",
+                "--offline"
+            ],
+            "options": {
+                "cwd": "${workspaceFolder}/modules"
+            },
+            "problemMatcher": [
+                "$rustc"
+            ],
+            "group": "build"
+        }
+    ]
+}

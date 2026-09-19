@@ -448,7 +448,11 @@ impl CSharpModuleConfig {
         if project_root.as_os_str().is_empty() {
             return None;
         }
-        Some(project_root.join("obj").join(CSHARP_COMPILER_ARGUMENTS_FILE))
+        Some(
+            project_root
+                .join("obj")
+                .join(CSHARP_COMPILER_ARGUMENTS_FILE),
+        )
     }
 }
 
@@ -660,10 +664,7 @@ impl HostConfig {
         // of the optional-module list and of the required `name` /
         // `build_binary_name`, so a missing file is a configuration error
         // reported as such, not masked as a missing field.
-        let current_dir = env::current_dir().map_err(|_| ConfigError::ProjectDirectoryMissing {
-            path: project_path.clone(),
-        })?;
-        let project_root = current_dir.join(&project_path);
+        let project_root = engine_workspace_root()?.join(&project_path);
         let settings_path = project_root.join(PROJECT_SETTINGS_FILE);
         let project_settings = read_project_settings_file(&project_root)?.ok_or(
             ConfigError::ProjectSettingsFileMissing {
@@ -701,11 +702,7 @@ impl HostConfig {
         // `optional/`, is a configuration error here rather than a watch on
         // an arbitrary directory, a malformed `--package`, or a second copy
         // of a module already loading.
-        let optional_root = env::current_dir()
-            .map_err(|_| ConfigError::ProjectDirectoryMissing {
-                path: project_path.clone(),
-            })?
-            .join(OPTIONAL_MODULE_DIRECTORY);
+        let optional_root = engine_workspace_root()?.join(OPTIONAL_MODULE_DIRECTORY);
         let optional_modules =
             Self::resolve_optional_modules(&project_settings.modules, &optional_root)?;
         Ok(Self {
@@ -827,13 +824,13 @@ impl ProjectModuleConfig {
     /// Returns a [`ConfigError`] when the directory cannot be inspected, no
     /// supported manifest exists, or a manifest field cannot be read.
     fn from_path(project_path: &str) -> Result<Self, ConfigError> {
-        // Step 1: Resolve the directory against the working directory. The
-        // host is launched from the workspace root, so `cwd` matches the root
-        // that every stored path is relative to.
-        let current_dir = env::current_dir().map_err(|_| ConfigError::ProjectDirectoryMissing {
-            path: project_path.to_string(),
-        })?;
-        let project_root = current_dir.join(project_path);
+        // Step 1: Resolve the directory against the engine workspace root, not
+        // the working directory. A launcher that sets its own working
+        // directory (`dx serve` runs the editor from `pill_editor/`) would
+        // otherwise resolve the project and the `optional/` directory it lives
+        // beside to directories that do not exist.
+        let workspace_root = engine_workspace_root()?;
+        let project_root = workspace_root.join(project_path);
         if !project_root.is_dir() {
             return Err(ConfigError::ProjectDirectoryMissing {
                 path: project_path.to_string(),
@@ -843,7 +840,7 @@ impl ProjectModuleConfig {
         // Step 2: Detect the backend from the manifest files in the directory.
         let cargo_manifest = project_root.join("Cargo.toml");
         if cargo_manifest.is_file() {
-            return Self::native_from_manifest(&current_dir, project_path, &cargo_manifest);
+            return Self::native_from_manifest(&workspace_root, project_path, &cargo_manifest);
         }
         let csproj_manifest = find_csproj_manifest(&project_root)?;
         Self::csharp_from_manifest(project_path, &csproj_manifest)
@@ -1000,6 +997,31 @@ impl ProjectModuleConfig {
 /// absent, so callers can fix the launch environment in one step.
 fn required_environment(variable: &'static str) -> Result<String, ConfigError> {
     env::var(variable).map_err(|_| ConfigError::MissingEnvironmentVariable { variable })
+}
+
+/// Directory holding the engine workspace: the base every stored relative path
+/// is resolved against.
+///
+/// Derived from this crate's own build location, which is a compile-time fact,
+/// rather than from the process's working directory. The two coincide only when
+/// the host is started from the workspace root, and that coincidence is not
+/// something a launcher owes the engine: the dioxus CLI runs the editor with
+/// its working directory set to `pill_editor/`, which resolved `optional/`
+/// under the editor crate and made the host refuse to start with
+/// [`ConfigError::OptionalModuleDirectoryMissing`]. `cargo run` from the
+/// workspace root, the test suites and every spawned build agree on this root
+/// instead of on whatever directory the process happens to occupy.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::EngineWorkspaceRootUndetermined`] when the manifest
+/// directory has no parent, which cannot happen for a checked-out workspace but
+/// is reported rather than guessed at.
+pub(crate) fn engine_workspace_root() -> Result<PathBuf, ConfigError> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or(ConfigError::EngineWorkspaceRootUndetermined)
 }
 
 /// Locate the single `.csproj` manifest inside a project directory.

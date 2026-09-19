@@ -74,7 +74,7 @@ fn command_scope_error() -> u8 {
 ///
 /// Reservations that are never consumed by a create are returned to the
 /// entity allocator automatically when the invocation scope ends.
-pub(super) extern "C" fn ffi_reserve_entity(output: *mut Entity) -> u8 {
+fn ffi_reserve_entity_guarded(output: *mut Entity) -> u8 {
     if output.is_null() {
         return 6;
     }
@@ -91,6 +91,22 @@ pub(super) extern "C" fn ffi_reserve_entity(output: *mut Entity) -> u8 {
         1
     })
     .unwrap_or_else(command_scope_error)
+}
+
+/// Panic-guarded entry point for [`ffi_reserve_entity_guarded`].
+///
+/// A panic crossing an `extern "C"` boundary aborts the process. The
+/// managed side already has a per-system error channel built for a
+/// misbehaving system, so an engine assertion reached through this
+/// callback reports `6` - the status this callback already
+/// uses for a call it could not serve - and lets the frame's error path
+/// name the system, rather than killing the host mid-frame.
+pub(super) extern "C" fn ffi_reserve_entity(output: *mut Entity) -> u8 {
+    super::context::guard_managed_callback(
+        "ffi_reserve_entity",
+        6,
+        || ffi_reserve_entity_guarded(output),
+    )
 }
 
 /// Validate and copy a component blob into the representation understood by
@@ -154,7 +170,7 @@ fn decode_command_component(
 ///
 /// Rejects more than [`MAX_COMPONENTS_PER_CREATE`] blobs as part of the
 /// documented ABI contract.
-pub(super) extern "C" fn ffi_queue_create(
+fn ffi_queue_create_guarded(
     entity: *const Entity,
     blobs: *const NativeComponentBlob,
     count: u32,
@@ -210,8 +226,28 @@ pub(super) extern "C" fn ffi_queue_create(
     .unwrap_or_else(command_scope_error)
 }
 
+/// Panic-guarded entry point for [`ffi_queue_create_guarded`].
+///
+/// A panic crossing an `extern "C"` boundary aborts the process. The
+/// managed side already has a per-system error channel built for a
+/// misbehaving system, so an engine assertion reached through this
+/// callback reports `6` - the status this callback already
+/// uses for a call it could not serve - and lets the frame's error path
+/// name the system, rather than killing the host mid-frame.
+pub(super) extern "C" fn ffi_queue_create(
+    entity: *const Entity,
+    blobs: *const NativeComponentBlob,
+    count: u32,
+) -> u8 {
+    super::context::guard_managed_callback(
+        "ffi_queue_create",
+        6,
+        || ffi_queue_create_guarded(entity, blobs, count),
+    )
+}
+
 /// Queue destruction only for a currently live generation.
-pub(super) extern "C" fn ffi_queue_destroy(entity: *const Entity) -> u8 {
+fn ffi_queue_destroy_guarded(entity: *const Entity) -> u8 {
     if entity.is_null() {
         return 6;
     }
@@ -230,8 +266,24 @@ pub(super) extern "C" fn ffi_queue_destroy(entity: *const Entity) -> u8 {
     .unwrap_or_else(command_scope_error)
 }
 
+/// Panic-guarded entry point for [`ffi_queue_destroy_guarded`].
+///
+/// A panic crossing an `extern "C"` boundary aborts the process. The
+/// managed side already has a per-system error channel built for a
+/// misbehaving system, so an engine assertion reached through this
+/// callback reports `6` - the status this callback already
+/// uses for a call it could not serve - and lets the frame's error path
+/// name the system, rather than killing the host mid-frame.
+pub(super) extern "C" fn ffi_queue_destroy(entity: *const Entity) -> u8 {
+    super::context::guard_managed_callback(
+        "ffi_queue_destroy",
+        6,
+        || ffi_queue_destroy_guarded(entity),
+    )
+}
+
 /// Queue a component addition selected by stable managed identity.
-pub(super) extern "C" fn ffi_queue_add_component(
+fn ffi_queue_add_component_guarded(
     entity: *const Entity,
     key_low: u64,
     key_high: u64,
@@ -269,8 +321,30 @@ pub(super) extern "C" fn ffi_queue_add_component(
     .unwrap_or_else(command_scope_error)
 }
 
+/// Panic-guarded entry point for [`ffi_queue_add_component_guarded`].
+///
+/// A panic crossing an `extern "C"` boundary aborts the process. The
+/// managed side already has a per-system error channel built for a
+/// misbehaving system, so an engine assertion reached through this
+/// callback reports `6` - the status this callback already
+/// uses for a call it could not serve - and lets the frame's error path
+/// name the system, rather than killing the host mid-frame.
+pub(super) extern "C" fn ffi_queue_add_component(
+    entity: *const Entity,
+    key_low: u64,
+    key_high: u64,
+    data: *const u8,
+    size: u32,
+) -> u8 {
+    super::context::guard_managed_callback(
+        "ffi_queue_add_component",
+        6,
+        || ffi_queue_add_component_guarded(entity, key_low, key_high, data, size),
+    )
+}
+
 /// Queue component removal without requiring a concrete Rust type.
-pub(super) extern "C" fn ffi_queue_remove_component(
+fn ffi_queue_remove_component_guarded(
     entity: *const Entity,
     key_low: u64,
     key_high: u64,
@@ -296,4 +370,24 @@ pub(super) extern "C" fn ffi_queue_remove_component(
         1
     })
     .unwrap_or_else(command_scope_error)
+}
+
+/// Panic-guarded entry point for [`ffi_queue_remove_component_guarded`].
+///
+/// A panic crossing an `extern "C"` boundary aborts the process. The
+/// managed side already has a per-system error channel built for a
+/// misbehaving system, so an engine assertion reached through this
+/// callback reports `6` - the status this callback already
+/// uses for a call it could not serve - and lets the frame's error path
+/// name the system, rather than killing the host mid-frame.
+pub(super) extern "C" fn ffi_queue_remove_component(
+    entity: *const Entity,
+    key_low: u64,
+    key_high: u64,
+) -> u8 {
+    super::context::guard_managed_callback(
+        "ffi_queue_remove_component",
+        6,
+        || ffi_queue_remove_component_guarded(entity, key_low, key_high),
+    )
 }

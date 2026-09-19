@@ -696,7 +696,7 @@ pub(super) struct ManagedResourceDeclaration {
 /// The order matters: scope is checked before the table, so a call from outside
 /// a system reports that rather than reporting a resource it could not have
 /// reached anyway.
-pub(super) extern "C" fn ffi_get_resource_view(
+fn ffi_get_resource_view_guarded(
     stable_id_low: u64,
     stable_id_high: u64,
     mode: u8,
@@ -720,6 +720,27 @@ pub(super) extern "C" fn ffi_get_resource_view(
         fill_resource_view(world, resource_id, declared_size, mode, output)
     });
     status.unwrap_or(3)
+}
+
+/// Panic-guarded entry point for [`ffi_get_resource_view_guarded`].
+///
+/// A panic crossing an `extern "C"` boundary aborts the process. The
+/// managed side already has a per-system error channel built for a
+/// misbehaving system, so an engine assertion reached through this
+/// callback reports `5` - the status this callback already
+/// uses for a call it could not serve - and lets the frame's error path
+/// name the system, rather than killing the host mid-frame.
+pub(super) extern "C" fn ffi_get_resource_view(
+    stable_id_low: u64,
+    stable_id_high: u64,
+    mode: u8,
+    output: *mut ResourceView,
+) -> u8 {
+    super::context::guard_managed_callback(
+        "ffi_get_resource_view",
+        5,
+        || ffi_get_resource_view_guarded(stable_id_low, stable_id_high, mode, output),
+    )
 }
 
 /// Write one resource's live bytes into the caller's view.

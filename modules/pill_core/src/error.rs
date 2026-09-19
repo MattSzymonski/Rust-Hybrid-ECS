@@ -380,6 +380,17 @@ pub enum ConfigError {
     #[message("required environment variable ", value(variable), " is not set")]
     MissingEnvironmentVariable { variable: &'static str },
 
+    /// The directory the engine workspace lives in could not be determined.
+    ///
+    /// Every stored path is relative to that directory, and it is derived from
+    /// this crate's own build location rather than from the process's working
+    /// directory: the two agree only when the host happens to be started from
+    /// the workspace root, and a launcher that sets its own working directory
+    /// (the dioxus CLI runs the editor from `pill_editor/`) would otherwise
+    /// resolve `optional/` to a directory that does not exist.
+    #[message("engine workspace root could not be determined from the host build")]
+    EngineWorkspaceRootUndetermined,
+
     /// The configured project directory does not exist.
     #[message("project directory does not exist: ", name_style(path))]
     ProjectDirectoryMissing { path: String },
@@ -937,10 +948,6 @@ pub enum HostError {
     /// The managed backend failed to start.
     #[transparent]
     CSharp(#[from] CSharpError),
-
-    /// The workspace root cannot be derived from the manifest directory.
-    #[message("cannot determine the workspace root")]
-    WorkspaceRootUndetermined,
 }
 
 // =============================================================================

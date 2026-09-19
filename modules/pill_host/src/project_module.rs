@@ -246,10 +246,7 @@ mod loaded {
                     // which case the swap lands in a later frame's
                     // `poll_managed_reload`; only a swap this poll
                     // reports counts as a replacement here.
-                    matches!(
-                        runtime.poll_reload(engine),
-                        Ok(crate::csharp::POLL_RELOADED)
-                    )
+                    managed_poll_replaced_assembly(runtime, engine)
                 }
             }
         }
@@ -265,11 +262,7 @@ mod loaded {
             // every frame so a successful build is eventually observed even when
             // the assembly was not ready during the source-triggered reload call.
             if let Self::CSharp(runtime) = self {
-                // Already logged once per distinct status inside the poll.
-                return matches!(
-                    runtime.poll_reload(engine),
-                    Ok(crate::csharp::POLL_RELOADED)
-                );
+                return managed_poll_replaced_assembly(runtime, engine);
             }
             false
         }
@@ -287,6 +280,28 @@ mod loaded {
     // =============================================================================
     // Free Functions
     // =============================================================================
+
+    /// Poll the managed loader and report whether it swapped the assembly.
+    ///
+    /// Exists so the poll's error is reported rather than dropped. `poll_reload`
+    /// logs the statuses it understands, but a `CSharpError` returned through
+    /// `?` - re-registration refusing an arriving assembly's systems is the one
+    /// that matters - reaches the caller as a plain `Err` that both call sites
+    /// used to discard. A project left with no systems and nothing on the
+    /// console is the worst outcome available here, so it is logged loudly.
+    fn managed_poll_replaced_assembly(runtime: &mut CSharpRuntime, engine: &mut Engine) -> bool {
+        match runtime.poll_reload(engine) {
+            Ok(status) => status == crate::csharp::POLL_RELOADED,
+            Err(error) => {
+                error!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    error = %error,
+                    "the managed reload poll failed; the project may now be running without its systems"
+                );
+                false
+            }
+        }
+    }
 
     /// Produce a new C# project assembly, in-process when that is possible.
     ///

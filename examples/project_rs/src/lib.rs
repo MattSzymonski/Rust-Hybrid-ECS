@@ -344,7 +344,7 @@ fn spline_probe_system(
     // copy of `pill_core`, so its tracing dispatcher has no subscriber and log
     // lines emitted here never reach the host's telemetry.
     println!(
-        "[project] xxsees {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), colorx {:.2}",
+        "[project] 12xxsees {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), colorx {:.2}",
         midpoint.x, midpoint.y, color
     );
 

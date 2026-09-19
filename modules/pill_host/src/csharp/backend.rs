@@ -242,6 +242,17 @@ pub(crate) struct CSharpRuntime {
     #[cfg(feature = "hot_reload")]
     /// Outcome of the most recent reload poll, for one-shot rejection logging.
     last_poll_status: u8,
+    /// Set once the world has taken a manifest whose assembly never loaded.
+    ///
+    /// The one outcome the commit handshake cannot make safe by ordering: the
+    /// manifest is applied while the outgoing assembly still runs, so a refusal
+    /// normally costs an unload and nothing else - but if the *commit* fails
+    /// after that, the world holds layouts belonging to an assembly that was
+    /// never installed. Every later frame would read migrated rows through the
+    /// old assembly's expectations, so the project's systems are cleared and
+    /// this latches to keep them cleared until the host restarts.
+    #[cfg(feature = "hot_reload")]
+    manifest_applied_without_assembly: bool,
     /// Metadata snapshot the active assembly is verified against after reload.
     system_snapshot: Vec<ManagedSystemSnapshot>,
     /// Unmanaged export reporting the current component manifest's length.
@@ -325,17 +336,53 @@ struct SystemExports {
 /// [`CSharpError::SystemAccessFailed`] when an access cannot be read, and
 /// whatever [`derive_system_access`] refuses - an unregistered component or
 /// resource key, or an unknown access mode.
-fn register_managed_systems(
-    engine: &mut Engine,
+/// One managed system resolved and validated, but not yet handed to the engine.
+///
+/// The split this type exists for is the point: resolving a system can fail -
+/// an access naming a component nobody registered is exactly what
+/// `derive_system_access` refuses - while handing a resolved system to the
+/// scheduler cannot. Preparing every system before registering any of them is
+/// what lets a reload refuse a bad assembly with the previous generation's
+/// systems still installed, instead of clearing them first and discovering the
+/// refusal with nothing left to run.
+struct PreparedManagedSystem {
+    /// Name the system registers under, after the synthetic fallback.
+    name: String,
+    /// Scheduler access list, already resolved against the binding table.
+    access: SystemAccess,
+    /// Reflected managed accesses the run closure installs its scope from.
+    managed_access: Box<[NativeSystemAccess]>,
+    /// Whether the managed system declared a `Commands` parameter.
+    uses_commands: bool,
+    /// Managed discovery index this system is dispatched by.
+    system_index: u32,
+    /// Metadata a later reload compares to tell a behaviour swap from a
+    /// signature change.
+    snapshot: ManagedSystemSnapshot,
+}
+
+/// Resolve every managed system without touching the engine.
+///
+/// This is the half that can fail. It reads each system's reflected accesses,
+/// resolves them against the binding table, and captures the metadata the
+/// scheduler closure needs - but registers nothing, so a failure here leaves
+/// the engine exactly as it was.
+///
+/// # Errors
+///
+/// Returns [`CSharpError::NoSystems`] when the assembly declares none, and
+/// whatever `derive_system_access` refuses when an access names a component or
+/// resource that is not registered.
+fn prepare_managed_systems(
     bindings: &Arc<BindingStore>,
     exports: SystemExports,
-) -> Result<Vec<ManagedSystemSnapshot>, CSharpError> {
+) -> Result<Vec<PreparedManagedSystem>, CSharpError> {
     let count = (exports.system_count)();
     if count == 0 {
         return Err(CSharpError::NoSystems);
     }
-    let mut system_snapshot = Vec::new();
-    system_snapshot
+    let mut prepared = Vec::new();
+    prepared
         .try_reserve_exact(checked_system_count(count)?)
         .map_err(|_| CSharpError::SystemSnapshotAllocationFailed)?;
     for system_index in 0..count {
@@ -375,12 +422,45 @@ fn register_managed_systems(
         // Snapshot the reflected metadata before moving the access list into
         // the scheduler closure, so a later reload can tell a behaviour-only
         // swap from one that changed a signature.
-        system_snapshot.push(ManagedSystemSnapshot {
+        let snapshot = ManagedSystemSnapshot {
             accesses: managed_access.clone().into_boxed_slice(),
             uses_commands,
             name: name.as_str().into(),
+        };
+        prepared.push(PreparedManagedSystem {
+            name,
+            access,
+            managed_access: managed_access.into_boxed_slice(),
+            uses_commands,
+            system_index,
+            snapshot,
         });
-        let managed_access = managed_access.into_boxed_slice();
+    }
+    Ok(prepared)
+}
+
+/// Hand every prepared system to the scheduler.
+///
+/// The half that cannot fail. Every access was resolved by
+/// [`prepare_managed_systems`], so nothing here can refuse, which is what makes
+/// the caller's clear-then-register sequence safe.
+fn commit_managed_systems(
+    engine: &mut Engine,
+    bindings: &Arc<BindingStore>,
+    exports: SystemExports,
+    prepared: Vec<PreparedManagedSystem>,
+) -> Vec<ManagedSystemSnapshot> {
+    let mut system_snapshot = Vec::with_capacity(prepared.len());
+    for system in prepared {
+        let PreparedManagedSystem {
+            name,
+            access,
+            managed_access,
+            uses_commands,
+            system_index,
+            snapshot,
+        } = system;
+        system_snapshot.push(snapshot);
         let system_bindings = Arc::clone(bindings);
         let run_system = exports.run_system;
         let system_error_length = exports.system_error_length;
@@ -424,7 +504,25 @@ fn register_managed_systems(
             );
         }
     }
-    Ok(system_snapshot)
+    system_snapshot
+}
+
+/// Resolve and register every managed system in one step.
+///
+/// The startup path's entry point: there is nothing installed yet, so the
+/// prepare/commit split buys nothing and the two halves run back to back. A
+/// reload calls them separately - see `CSharpRuntime::reregister_systems`.
+///
+/// # Errors
+///
+/// Whatever [`prepare_managed_systems`] refuses.
+fn register_managed_systems(
+    engine: &mut Engine,
+    bindings: &Arc<BindingStore>,
+    exports: SystemExports,
+) -> Result<Vec<ManagedSystemSnapshot>, CSharpError> {
+    let prepared = prepare_managed_systems(bindings, exports)?;
+    Ok(commit_managed_systems(engine, bindings, exports, prepared))
 }
 
 /// Resolves one managed artifact (a runtime assembly, its `runtimeconfig.json`,
@@ -737,6 +835,8 @@ impl CSharpRuntime {
             applied_manifest: manifest,
             bindings,
             #[cfg(feature = "hot_reload")]
+            manifest_applied_without_assembly: false,
+            #[cfg(feature = "hot_reload")]
             notify_assembly_replaced,
             #[cfg(feature = "hot_reload")]
             fast_compiler,
@@ -952,6 +1052,8 @@ impl CSharpRuntime {
             copy_manifest,
             applied_manifest: manifest,
             bindings,
+            #[cfg(feature = "hot_reload")]
+            manifest_applied_without_assembly: false,
             // A NativeAOT bundle ships no compiler and never reloads.
             #[cfg(feature = "hot_reload")]
             notify_assembly_replaced: None,
@@ -976,6 +1078,12 @@ impl CSharpRuntime {
     /// happened. The currently loaded assembly is kept either way.
     #[cfg(feature = "hot_reload")]
     pub(crate) fn poll_reload(&mut self, engine: &mut Engine) -> Result<u8, CSharpError> {
+        // A world that took a manifest whose assembly never loaded cannot be
+        // reconciled by another poll: the mismatch is already in the world's
+        // layouts. Stay stopped rather than swapping a second assembly on top.
+        if self.manifest_applied_without_assembly {
+            return Ok(POLL_REJECTED);
+        }
         let status = (self.poll_reload)();
         if !poll_status_is_known(status) {
             // Logged once per distinct code: the poll runs every frame and a
@@ -1050,12 +1158,19 @@ impl CSharpRuntime {
             Ok(report) => {
                 if (self.commit_reload)() == 0 {
                     // The manifest is in force but the swap did not happen, so
-                    // the running assembly now disagrees with the world. Say so
-                    // loudly: this is the one outcome the handshake cannot make
-                    // safe by ordering alone.
+                    // the running assembly now disagrees with the world. This is
+                    // the one outcome the handshake cannot make safe by ordering
+                    // alone, and continuing to schedule the project's systems
+                    // against a world they no longer describe is the one
+                    // response that cannot be right - so they are cleared and
+                    // the runtime latches until the host restarts.
+                    let removed = engine.clear_systems_owned_by(SystemOwner::PROJECT);
+                    self.system_snapshot.clear();
+                    self.manifest_applied_without_assembly = true;
                     error!(
                         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                        "the managed loader failed to install a version whose manifest was already applied; restart the host"
+                        cleared_systems = removed,
+                        "the managed loader failed to install a version whose manifest was already applied; the project's systems have been stopped - restart the host"
                     );
                     return Ok(POLL_REJECTED);
                 }
@@ -1220,9 +1335,15 @@ impl CSharpRuntime {
     /// registered.
     #[cfg(feature = "hot_reload")]
     fn reregister_systems(&mut self, engine: &mut Engine) -> Result<(), CSharpError> {
+        // Resolve everything first. A refusal here - an access naming a
+        // component the arriving assembly never registered is the usual one -
+        // must leave the running generation's systems in place, because there
+        // is nothing to fall back to once they are cleared.
+        let prepared = prepare_managed_systems(&self.bindings, self.exports)?;
         let removed = engine.clear_systems_owned_by(SystemOwner::PROJECT);
         self.system_snapshot.clear();
-        self.system_snapshot = register_managed_systems(engine, &self.bindings, self.exports)?;
+        self.system_snapshot =
+            commit_managed_systems(engine, &self.bindings, self.exports, prepared);
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             removed,
