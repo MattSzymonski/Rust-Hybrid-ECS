@@ -321,6 +321,17 @@ def measure_host_startup(
     environment = os.environ.copy()
     # The project is selected by PROJECT_PATH; pin it to the native example so
     # the measurement is deterministic regardless of the caller's shell.
+    #
+    # NOTE: the example declared five placeholder `pill_dummy_*` modules until
+    # 2026-09-19 and now declares only `pill_spline`, so both startup cases got
+    # faster by five modules' worth of DLL load, watcher and graveyard, and by
+    # four crate builds - `pill_dummy_color` is still compiled, because
+    # `pill_spline` depends on it to exercise a module-to-module rlib edge.
+    # Measurements taken before that change describe a different project and
+    # must not be compared against ones taken after it; re-baseline rather than
+    # reading a trend across the boundary. The multi-module path those five
+    # covered now lives in `devops/tests/project`, which the migration suite
+    # runs.
     environment["PROJECT_PATH"] = "../examples/project_rs"
 
     started = time.monotonic()

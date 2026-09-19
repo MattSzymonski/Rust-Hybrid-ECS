@@ -5,30 +5,11 @@
 use pill_host::{StaticModule, StaticProject, StaticProjectBackend};
 
 /// Every selected optional module, in `project_settings.yaml` order.
+#[rustfmt::skip]
 pub const STATIC_MODULES: &[StaticModule] = &[
     StaticModule {
         name: "pill_spline",
         init: pill_spline::register,
-    },
-    StaticModule {
-        name: "pill_dummy_math",
-        init: pill_dummy_math::register,
-    },
-    StaticModule {
-        name: "pill_dummy_text",
-        init: pill_dummy_text::register,
-    },
-    StaticModule {
-        name: "pill_dummy_color",
-        init: pill_dummy_color::register,
-    },
-    StaticModule {
-        name: "pill_dummy_timer",
-        init: pill_dummy_timer::register,
-    },
-    StaticModule {
-        name: "pill_dummy_random",
-        init: pill_dummy_random::register,
     },
 ];
 

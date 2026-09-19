@@ -2,9 +2,27 @@
 #
 # The fixture project is selected by PROJECT_PATH; this file supplies the
 # required project `name` / `build_binary_name` and its optional-module list.
+#
+# The five `pill_dummy_*` modules are here, and deliberately not in the example
+# projects. Loading several modules at once is a path worth exercising, but it
+# is a test's job rather than every developer's: declared in an example it cost
+# every cold start and every reload cascade five crates to build, five DLLs to
+# load, five watchers and five graveyards, and it made the engine's own
+# benchmarks measure a configuration no real project has.
+#
+# `test_hot_reload_migration.py` runs this file as committed - it sets
+# PROJECT_PATH here and writes no settings of its own - so the multi-module
+# path is covered on every default test run. `test_hot_reload_suite.py`
+# overwrites this file per session and restores it afterwards, so its own
+# module lists are unaffected by what is listed here.
 
 name: "Fixture Project"
 build_binary_name: "FixtureProject"
 
 modules:
   - "pill_spline"
+  - "pill_dummy_math"
+  - "pill_dummy_text"
+  - "pill_dummy_color"
+  - "pill_dummy_timer"
+  - "pill_dummy_random"

@@ -317,6 +317,11 @@ def build_library_source(
         "use pill_host::{StaticModule, StaticProject, StaticProjectBackend};",
         "",
         "/// Every selected optional module, in `project_settings.yaml` order.",
+        # One entry per line regardless of count. rustfmt collapses a
+        # single-element array onto one line, so without this the generated
+        # file fails `cargo fmt --check` for any project selecting exactly one
+        # module - a repository-wide gate failing on output nobody edits.
+        "#[rustfmt::skip]",
         "pub const STATIC_MODULES: &[StaticModule] = &[",
     ]
     for module in modules:

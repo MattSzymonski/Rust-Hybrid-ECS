@@ -7,8 +7,3 @@ edition = "2021"
 pill_host = { path = "../../modules/pill_host", default-features = false }
 project = { path = "../../examples/project_rs" }
 pill_spline = { path = "../../modules/optional/pill_spline", default-features = false }
-pill_dummy_math = { path = "../../modules/optional/pill_dummy_math", default-features = false }
-pill_dummy_text = { path = "../../modules/optional/pill_dummy_text", default-features = false }
-pill_dummy_color = { path = "../../modules/optional/pill_dummy_color", default-features = false }
-pill_dummy_timer = { path = "../../modules/optional/pill_dummy_timer", default-features = false }
-pill_dummy_random = { path = "../../modules/optional/pill_dummy_random", default-features = false }
