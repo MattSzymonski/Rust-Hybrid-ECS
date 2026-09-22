@@ -36,12 +36,8 @@ public struct Color
 
 [EcsSharedComponent]
 [StructLayout(LayoutKind.Sequential)]
-public struct PbrRenderableComponent {
+public struct MeshRendererComponent {
     public ulong Mesh, Material;
-    public float R, G, B, A;
-    public float Metallic, Roughness;
-    public byte Visible;
-    public static PbrRenderableComponent FromColor(Color color) => new() { R=color.R,G=color.G,B=color.B,A=color.A,Roughness=0.5f,Visible=1 };
 }
 [EcsSharedComponent]
 [StructLayout(LayoutKind.Sequential)]

@@ -7,39 +7,27 @@ edition = "2021"
 workspace = true
 
 [lib]
-# Host-linked renderer, never a hot-loaded project module.
 crate-type = ["rlib"]
 
 [dependencies]
-trait_type_map = { path = "../../../../../Trait-Type-Map" }
-half = { version = "2", optional = true }
-anyhow = { version = "1", optional = true }
-glob = { version = "0.3", optional = true }
-png = { version = "0.17", optional = true }
-tobj = { version = "3", optional = true }
-gltf = { version = "1", features = ["import"], optional = true }
-
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-glam = { version = "0.33", features = ["serde"] }
-
 pill_core = { path = "../../../pill_core" }
 pill_core_macros = { path = "../../../pill_core_macros" }
 pill_engine = { path = "../../../pill_engine" }
-wgpu = { version = "26.0.1", optional = true }
-bytemuck = { version = "1", features = ["derive"], optional = true }
-pollster = { version = "0.4", optional = true }
+trait_type_map = { path = "../../../../../Trait-Type-Map" }
+
+serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 miette = { version = "7", features = ["derive"] }
+glam = { version = "0.33", features = ["serde", "bytemuck"] }
+winit = "0.30.12"
+bytemuck = { version = "1.4", features = ["derive"] }
+wgpu = "25.0.0"
+pollster = "0.4"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+egui = { version = "0.32.1", optional = true }
+egui-wgpu = { version = "0.32.1", features = ["winit"], optional = true }
+egui-winit = { version = "0.32.1", features = ["clipboard"], optional = true }
 
 [features]
-# Contract-only dependencies disable defaults; tooling enables asset-cooking.
-default = ["gpu"]
-gpu = ["dep:half","dep:wgpu", "dep:bytemuck", "dep:pollster"]
-
-asset-cooking = ["dep:anyhow", "dep:glob", "dep:png", "dep:tobj", "dep:gltf", "dep:bytemuck"]
-
-[[bin]]
-name = "pill-cook"
-path = "src/cook_main.rs"
-required-features = ["asset-cooking"]
+debug_ui = ["dep:egui", "dep:egui-wgpu", "dep:egui-winit"]

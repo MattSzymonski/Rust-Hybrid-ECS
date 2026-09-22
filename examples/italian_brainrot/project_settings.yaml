@@ -1,0 +1,7 @@
+name: "Italian Brainrot"
+build_binary_name: "ItalianBrainrot"
+version: "0.1.0"
+author: "Matt Szymonski"
+description: "Three rotating Chimpanzini Bananini render styles."
+
+modules: []

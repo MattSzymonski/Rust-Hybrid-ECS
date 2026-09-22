@@ -678,26 +678,26 @@ mod tests {
     }
 
     /// The editor's generic field write reaches the real shared renderer
-    /// `PbrRenderableComponent` layout (flattened `color.r` … `color.a` at absolute offsets),
+    /// `MeshRendererComponent` layout (flattened `color.r` … `color.a` at absolute offsets),
     /// which is the path the Inspector uses to edit materials live.
     #[test]
-    fn set_field_on_renderer_material_updates_roughness() {
-        use pill_master_renderer::{register_components, PbrRenderableComponent};
+    fn set_field_on_renderer_light_updates_intensity() {
+        use pill_master_renderer::{register_components, DirectionalLightComponent};
         let mut engine = Engine::new();
         register_components(engine.world_mut());
         let entity = engine
             .world_mut()
             .create_entity()
-            .with(PbrRenderableComponent::default())
+            .with(DirectionalLightComponent::default())
             .build()
             .unwrap();
-        let name = std::any::type_name::<PbrRenderableComponent>().to_string();
+        let name = std::any::type_name::<DirectionalLightComponent>().to_string();
         let failures = EditorCommand::apply(
             &mut engine,
             &[EditorCommand::SetField {
                 entity,
                 component: name.clone(),
-                field: "roughness".into(),
+                field: "intensity".into(),
                 value: FieldValue::F32(0.8),
             }],
         );

@@ -39,6 +39,8 @@
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 
 // External crates
 use trait_type_map::{TraitAccessible, TraitTypeMap, VecOptionFamily};
@@ -76,6 +78,113 @@ use crate::resource::Resource;
 pub trait Asset: Send + Sync + 'static {}
 
 // =============================================================================
+// AssetLoader
+// =============================================================================
+
+/// Source used to initialize an asset from a project file or embedded bytes.
+///
+/// Relative paths resolve below the configured asset root. A project normally
+/// sets that root to its `res` directory once during initialization.
+#[derive(Debug, Clone)]
+pub enum AssetLoader {
+    Path(PathBuf),
+    Bytes(Box<[u8]>),
+}
+
+/// Failure to resolve or read an [`AssetLoader`].
+#[derive(Debug, thiserror::Error)]
+pub enum AssetLoadError {
+    #[error("asset path was not found: {path}")]
+    PathNotFound { path: PathBuf },
+    #[error("failed to read asset {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("asset {label} is not valid UTF-8: {source}")]
+    Utf8 {
+        label: String,
+        #[source]
+        source: std::string::FromUtf8Error,
+    },
+    #[error("failed to decode asset {label}: {detail}")]
+    Decode { label: String, detail: String },
+}
+
+pub type AssetLoadResult<T> = Result<T, AssetLoadError>;
+
+static ASSET_ROOT: OnceLock<RwLock<PathBuf>> = OnceLock::new();
+
+impl AssetLoader {
+    /// Set the directory relative [`Self::Path`] values resolve beneath.
+    pub fn set_root(path: impl Into<PathBuf>) {
+        let root = ASSET_ROOT.get_or_init(|| RwLock::new(PathBuf::new()));
+        *root.write().expect("asset root lock poisoned") = path.into();
+    }
+
+    /// Return the currently configured asset root, if one was set.
+    pub fn root() -> Option<PathBuf> {
+        let root = ASSET_ROOT.get()?.read().ok()?.clone();
+        (!root.as_os_str().is_empty()).then_some(root)
+    }
+
+    /// Read this source into owned bytes.
+    pub fn load(&self) -> AssetLoadResult<Vec<u8>> {
+        match self {
+            Self::Bytes(bytes) => Ok(bytes.to_vec()),
+            Self::Path(path) => {
+                let path = resolve_asset_path(path)
+                    .ok_or_else(|| AssetLoadError::PathNotFound { path: path.clone() })?;
+                std::fs::read(&path).map_err(|source| AssetLoadError::Read { path, source })
+            }
+        }
+    }
+
+    /// Read this source as UTF-8 text.
+    pub fn load_string(&self) -> AssetLoadResult<String> {
+        let label = match self {
+            Self::Path(path) => path.display().to_string(),
+            Self::Bytes(_) => "embedded bytes".to_owned(),
+        };
+        String::from_utf8(self.load()?).map_err(|source| AssetLoadError::Utf8 { label, source })
+    }
+}
+
+fn resolve_asset_path(path: &Path) -> Option<PathBuf> {
+    if path.is_absolute() && path.is_file() {
+        return Some(path.to_owned());
+    }
+    if let Some(root) = AssetLoader::root() {
+        let candidate = root.join(path);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    if path.is_file() {
+        return Some(path.to_owned());
+    }
+    let candidate = Path::new("res").join(path);
+    if candidate.is_file() {
+        return Some(candidate);
+    }
+    if let Some(project) = std::env::var_os("PROJECT_PATH") {
+        let candidate = PathBuf::from(project).join("res").join(path);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|executable| {
+            executable
+                .parent()
+                .map(|parent| parent.join("res").join(path))
+        })
+        .filter(|candidate| candidate.is_file())
+}
+
+// =============================================================================
 // Handle
 // =============================================================================
 
@@ -90,6 +199,7 @@ pub trait Asset: Send + Sync + 'static {}
 /// or - if that manager happens to have a live slot at the same index and
 /// generation - to an unrelated asset. Worlds hold one manager, so this does
 /// not arise in ordinary use.
+#[repr(C)]
 pub struct Handle<T: Asset> {
     /// Slot index within this type's column.
     index: u32,
@@ -103,6 +213,13 @@ pub struct Handle<T: Asset> {
 }
 
 impl<T: Asset> Handle<T> {
+    /// Sentinel for an optional asset reference that has not been assigned.
+    pub const INVALID: Self = Self {
+        index: u32::MAX,
+        generation: u32::MAX,
+        _marker: PhantomData,
+    };
+
     /// Slot index this handle addresses.
     #[inline]
     pub fn index(self) -> u32 {
@@ -113,6 +230,29 @@ impl<T: Asset> Handle<T> {
     #[inline]
     pub fn generation(self) -> u32 {
         self.generation
+    }
+}
+
+impl<T: Asset> Default for Handle<T> {
+    fn default() -> Self {
+        Self::INVALID
+    }
+}
+
+impl<T: Asset> serde::Serialize for Handle<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        (self.index, self.generation).serialize(serializer)
+    }
+}
+
+impl<'de, T: Asset> serde::Deserialize<'de> for Handle<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let (index, generation) = <(u32, u32)>::deserialize(deserializer)?;
+        Ok(Self {
+            index,
+            generation,
+            _marker: PhantomData,
+        })
     }
 }
 
@@ -267,6 +407,8 @@ pub struct AssetManager {
     columns: TraitTypeMap<dyn Asset, VecOptionFamily>,
     /// Slot bookkeeping for each column, keyed by the same type.
     metadata: HashMap<TypeId, AssetColumn>,
+    /// Changes whenever stored asset data may have changed.
+    revision: u64,
 }
 
 // SAFETY: Every value the map holds is an `Asset`, and `Asset` requires
@@ -296,6 +438,11 @@ impl AssetManager {
     /// front - a project that loads no meshes carries no mesh column.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Monotonic change counter used by renderer upload caches.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     /// Store `asset` and return a handle to it.
@@ -328,6 +475,8 @@ impl AssetManager {
                 index
             }
         };
+
+        self.revision = self.revision.wrapping_add(1);
 
         Handle {
             index,
@@ -431,6 +580,7 @@ impl AssetManager {
         if !self.is_live(handle) {
             return None;
         }
+        self.revision = self.revision.wrapping_add(1);
         self.columns
             .get_storage_mut::<T>()
             .get_mut(handle.index as usize)
@@ -565,6 +715,8 @@ impl AssetManager {
         if let Some(guid) = metadata.guids.remove(&handle.index) {
             metadata.by_guid.remove(&guid);
         }
+
+        self.revision = self.revision.wrapping_add(1);
 
         Some(asset)
     }
@@ -860,6 +1012,23 @@ mod tests {
         assert_eq!(assets.get(handle), Some(&Texture(2)));
     }
 
+    /// Render upload caches can cheaply observe every data-changing operation.
+    #[test]
+    fn revision_changes_when_asset_data_can_change() {
+        let mut assets = AssetManager::new();
+        let initial = assets.revision();
+        let handle = assets.add(Texture(1));
+        let after_add = assets.revision();
+        assert_ne!(after_add, initial);
+
+        assets.get_mut(handle).expect("live handle").0 = 2;
+        let after_mutation = assets.revision();
+        assert_ne!(after_mutation, after_add);
+
+        assets.remove(handle);
+        assert_ne!(assets.revision(), after_mutation);
+    }
+
     /// Removing yields the asset and invalidates the handle.
     #[test]
     fn removing_returns_the_asset_and_invalidates_the_handle() {
@@ -1008,5 +1177,31 @@ mod tests {
             .get_resource::<AssetManager>()
             .expect("manager was inserted");
         assert_eq!(stored.get(handle), Some(&Mesh("rock")));
+    }
+
+    #[test]
+    fn asset_loader_returns_embedded_bytes() {
+        let loader = AssetLoader::Bytes(vec![1, 2, 3].into_boxed_slice());
+        assert_eq!(loader.load().unwrap(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn asset_loader_resolves_paths_below_its_root() {
+        let root = std::env::temp_dir().join(format!(
+            "pill-asset-loader-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("sample.wgsl"), b"shader").unwrap();
+        AssetLoader::set_root(&root);
+
+        let bytes = AssetLoader::Path("sample.wgsl".into()).load().unwrap();
+
+        assert_eq!(bytes, b"shader");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

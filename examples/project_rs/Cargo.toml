@@ -14,18 +14,8 @@ crate-type = ["cdylib", "rlib"]
 pill_audio = { path = "../../modules/extensions/pill_audio", default-features = false }
 pill_engine = { path = "../../modules/pill_engine" }
 pill_core = { path = "../../modules/pill_core" }
-# The renderer, for `PbrRenderableComponent`: a quad with a width, a height and a fill is the
-# renderer's own idea of a thing to draw, so it lives with the pipeline that
-# draws it. `Position` and `Color` are universal and come from `pill_engine`
-# instead.
-#
-# `default-features = false` drops the crate's `gpu` feature, which is what
-# keeps wgpu out of this `cdylib` and out of every hot patch of it. It also
-# keeps this project loadable by a headless host: cargo folds a dependency's
-# resolved features into `-C metadata`, so a project that linked wgpu resolved
-# a different `pill_core.dll` than a host without the renderer had mapped, and
-# failed to load. A windowed host turns the feature back on through its own
-# graph, and both sides unify alike either way.
+# Renderer asset and component types are created by the project; the host owns
+# the renderer instance and its window surface.
 pill_master_renderer = { path = "../../modules/extensions/rendering/pill_master_renderer", default-features = false }
 # Linked directly so the project can name the `Spline` type. See the note in
 # `init` about why this crate must not also be loaded as a module.

@@ -172,7 +172,7 @@ pub(crate) use abi::publish_mirror_methods;
 /// Integration-style unit tests for the native/C# ECS boundary.
 ///
 /// Gated on `rendering` because the fixtures are the renderer's own components
-/// (`Position`, `PbrRenderableComponent`, `Color`): they are the shared-ABI types the managed
+/// (`Position`, `MeshRendererComponent`, `Color`): they are the shared-ABI types the managed
 /// side mirrors, so they are what these tests must exercise, and they live in
 /// `pill_master_renderer`, which only a windowed host links. `cargo test` on the
 /// editor or any windowed frontend runs them; `--no-default-features` does not.
