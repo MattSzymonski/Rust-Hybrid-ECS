@@ -1,172 +1,165 @@
-//! Renderer data contract: the sprite components and the viewport types.
+//! Shared scene contracts for the PBR renderer.
 //!
 //! # Responsibilities
 //!
-//! - Defines [`Position`], [`Color`] and [`Sprite`], the components describing
-//!   where and how to draw an entity as a colored rectangle.
-//! - Publishes their editor field layouts through [`register_components`], so a
-//!   world that registers them exposes their fields to the inspector.
-//! - Defines [`RenderViewport`] and [`VirtualResolution`], the pure-data
-//!   description of where sprites are drawn and in what coordinate space.
-//! - Collects a world's drawable entities into [`SpriteInstance`] records
-//!   through [`sprite_instances`].
+//! - Defines transforms, cameras, renderable meshes, and directional lights.
+//! - Registers scene components and describes persistable lighting settings.
+//! - Provides physical-pixel viewport bounds for host frontends.
 //!
 //! # Design
 //!
-//! This module contains no GPU code and names no `wgpu` type: it is the data
-//! half of the renderer, and the `sprite` module is the pipeline that consumes
-//! it. Keeping the two halves apart means the `bytemuck` upload record and the
-//! component definitions never have to agree by hand-maintained coincidence -
-//! `sprite.rs` asserts their layouts match at compile time.
+//! Scene components contain plain data with a fixed C layout. Shared identities
+//! let the host and project artifacts address the same ECS columns, while serde
+//! persistence restores scene values across reloads. Stable asset IDs refer to
+//! renderer-owned data; no GPU handles or heap-owning fields enter components.
 //!
-//! These components live here, with the renderer that draws them, rather than
-//! in `pill_engine`: a sprite is a renderer concept, and the ECS core has no
-//! business defining one. Collection reaches into the world through the two
-//! read-only seams `pill_engine` exposes,
-//! [`World::archetypes_iter`] and [`World::component_registry`].
-//!
-//! The components are a deliberately shared ABI: a hot-loaded project and the
-//! host assign different `TypeId`s to the same type, so collection resolves
-//! their columns by stable type name and verified `repr(C)` size instead of by
-//! a host-typed query.
+//! Transforms use a right-handed world with +Y up and cameras looking along local
+//! -Z. Viewports are host presentation state rather than scene components.
 
-// External crates
-use pill_engine::common_components::{register_common_components, Color, Position};
-use pill_engine::component::Component;
-use pill_engine::component_registry::ComponentFieldDescriptor;
-use pill_engine::world::World;
+// External crates and shared engine types
+pub use pill_engine::common_components::{Color, Position};
+use pill_engine::{PillComponent, World};
+use serde::{Deserialize, Serialize};
 
 // =============================================================================
-// Components
+// Scene Components
 // =============================================================================
 
-/// Axis-aligned colored rectangle drawn at an entity's [`Position`].
+/// World-space translation, rotation, and scale for a rendered entity.
 ///
-/// The quad spans `width` by `height` pixels starting at the entity's draw
-/// origin and is filled with `color`.
+/// The renderer composes scale, then rotation, then translation. No parent
+/// hierarchy is evaluated here; projects supply the resulting world transform.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
-pub struct Sprite {
-    /// Quad width in pixels.
-    pub width: f32,
-    /// Quad height in pixels.
-    pub height: f32,
-    /// Fill color of the quad.
-    pub color: Color,
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PillComponent)]
+#[pill(shared, persistable)]
+pub struct TransformComponent {
+    /// World-space position in the scene's chosen distance unit.
+    pub translation: [f32; 3],
+    /// Quaternion in x, y, z, w order.
+    pub rotation: [f32; 4],
+    /// Scale along the local axes; the identity transform uses one on each axis.
+    pub scale: [f32; 3],
 }
-impl Component for Sprite {}
 
-impl Default for Sprite {
+impl Default for TransformComponent {
     fn default() -> Self {
         Self {
-            width: 16.0,
-            height: 16.0,
-            color: Color::WHITE,
+            translation: [0.0; 3],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: [1.0; 3],
         }
     }
 }
 
-// =============================================================================
-// Shared component field layouts (editor inspectability)
-// =============================================================================
-
-// =============================================================================
-// Field layouts (editor inspectability)
-// =============================================================================
-
-/// `Sprite { width, height, color }` with `color` flattened into channels.
-const SPRITE_FIELD_LAYOUT: &[ComponentFieldDescriptor] = &[
-    ComponentFieldDescriptor {
-        name: "width",
-        type_tag: "f32",
-        offset: 0,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-    ComponentFieldDescriptor {
-        name: "height",
-        type_tag: "f32",
-        offset: 4,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-    ComponentFieldDescriptor {
-        name: "color.r",
-        type_tag: "f32",
-        offset: 8,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-    ComponentFieldDescriptor {
-        name: "color.g",
-        type_tag: "f32",
-        offset: 12,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-    ComponentFieldDescriptor {
-        name: "color.b",
-        type_tag: "f32",
-        offset: 16,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-    ComponentFieldDescriptor {
-        name: "color.a",
-        type_tag: "f32",
-        offset: 20,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-];
-
-/// Register [`Position`], [`Color`] and [`Sprite`] with their editor layouts.
+/// Perspective camera paired with a transform.
 ///
-/// The one call a project makes to opt into sprite rendering. Registration is
-/// idempotent, so a hot reload re-running `init` is safe, and it goes through
-/// `register_component_with_layout` so the components arrive field-editable in
-/// the inspector rather than as opaque blobs.
+/// Extraction chooses the valid enabled camera with the highest priority. Equal
+/// priorities use the lowest entity ID so archetype iteration order cannot decide.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PillComponent)]
+#[pill(shared, persistable)]
+pub struct CameraComponent {
+    /// Whether this camera participates in selection.
+    pub enabled: bool,
+    /// Larger values win when several valid cameras are enabled.
+    pub priority: i32,
+    /// Vertical field of view in degrees; extraction accepts values in (0, 179).
+    pub vertical_fov: f32,
+    /// Positive distance from the camera to the near clipping plane.
+    pub near: f32,
+    /// Distance to the far clipping plane; must exceed `near`.
+    pub far: f32,
+}
+
+impl Default for CameraComponent {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            priority: 0,
+            vertical_fov: 60.0,
+            near: 0.1,
+            far: 1000.0,
+        }
+    }
+}
+
+/// Mesh and material selection with per-entity appearance controls.
 ///
-/// [`Position`] and [`Color`] are the engine's, so registering them is
-/// delegated rather than restated: a project that wants them without a
-/// renderer calls
-/// [`register_common_components`](pill_engine::common_components::register_common_components)
-/// directly and links no GPU code at all.
-pub fn register_components(world: &mut World) {
-    register_common_components(world);
-    world.register_component_with_layout::<Sprite>(SPRITE_FIELD_LAYOUT);
+/// Zero asset IDs choose built-in defaults. A loaded material supplies metallic
+/// and roughness factors; its base color is multiplied by the entity tint.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PillComponent)]
+#[pill(shared, persistable)]
+pub struct PbrRenderableComponent {
+    /// Stable IDs; 0 selects the built-in sphere/default material.
+    pub mesh: u64,
+    /// Stable material ID; zero selects the built-in material.
+    pub material: u64,
+    /// Linear RGBA tint multiplied by the loaded material and its albedo texture.
+    pub base_color: [f32; 4],
+    /// Fallback metallic factor when no material is loaded, from zero to one.
+    pub metallic: f32,
+    /// Fallback perceptual roughness when no material is loaded, from zero to one.
+    pub roughness: f32,
+    /// Whether extraction includes this object in the frame packet.
+    pub visible: bool,
+}
+
+impl Default for PbrRenderableComponent {
+    fn default() -> Self {
+        Self {
+            mesh: 0,
+            material: 0,
+            base_color: [1.0; 4],
+            metallic: 0.0,
+            roughness: 0.5,
+            visible: true,
+        }
+    }
+}
+
+/// Directional radiance emitted along the transform's local -Z axis.
+///
+/// The current extraction path uses the first light returned by the ECS query.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PillComponent)]
+#[pill(shared, persistable)]
+pub struct DirectionalLightComponent {
+    /// Linear RGB light color, multiplied by `intensity` during extraction.
+    pub color: [f32; 3],
+    /// Radiance multiplier for the directional light.
+    pub intensity: f32,
+}
+
+impl Default for DirectionalLightComponent {
+    fn default() -> Self {
+        Self {
+            color: [1.0; 3],
+            intensity: 3.0,
+        }
+    }
 }
 
 // =============================================================================
 // Viewport
 // =============================================================================
 
-/// Physical-pixel rectangle within a render target.
-///
-/// Sprite positions are interpreted relative to this rectangle's top-left
-/// corner. The GPU viewport maps their local coordinates into the rectangle,
-/// while a matching scissor prevents drawing outside it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Top-left origin and extent of a scene rectangle in physical surface pixels.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RenderViewport {
-    /// Left edge of the rectangle, in physical pixels.
+    /// Horizontal offset from the left edge of the surface.
     pub x: u32,
-    /// Top edge of the rectangle, in physical pixels.
+    /// Vertical offset from the top edge of the surface.
     pub y: u32,
-    /// Horizontal extent of the rectangle, in physical pixels.
+    /// Horizontal extent in physical pixels.
     pub width: u32,
-    /// Vertical extent of the rectangle, in physical pixels.
+    /// Vertical extent in physical pixels.
     pub height: u32,
 }
 
 impl RenderViewport {
-    /// Construct a physical-pixel viewport rectangle.
-    pub const fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
+    /// Construct a rectangle; use [`Self::clamped_to`] before drawing into a surface.
+    pub fn new(x: u32, y: u32, width: u32, height: u32) -> Self {
         Self {
             x,
             y,
@@ -175,323 +168,84 @@ impl RenderViewport {
         }
     }
 
-    /// Construct a viewport covering an entire render target.
-    pub const fn full(width: u32, height: u32) -> Self {
-        Self::new(0, 0, width, height)
+    /// Cover a whole surface with a rectangle rooted at the top-left corner.
+    pub fn full(width: u32, height: u32) -> Self {
+        Self {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        }
     }
 
-    /// Clamp this rectangle to a render target, returning `None` when empty.
-    pub fn clamped_to(self, target_width: u32, target_height: u32) -> Option<Self> {
-        let x = self.x.min(target_width);
-        let y = self.y.min(target_height);
-        let width = self.width.min(target_width.saturating_sub(x));
-        let height = self.height.min(target_height.saturating_sub(y));
-
-        (width > 0 && height > 0).then_some(Self::new(x, y, width, height))
-    }
-}
-
-/// Logical coordinate space mapped into a physical [`RenderViewport`].
-///
-/// Keeping this separate from the swapchain dimensions lets an embedded project
-/// keep a stable coordinate system while its dock panel is resized. The GPU
-/// viewport performs the final scaling into the panel rectangle.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct VirtualResolution {
-    /// Horizontal extent of the project coordinate space.
-    pub width: f32,
-    /// Vertical extent of the project coordinate space.
-    pub height: f32,
-}
-
-impl VirtualResolution {
-    /// Construct a logical scene resolution.
-    pub const fn new(width: f32, height: f32) -> Self {
-        Self { width, height }
-    }
-
-    /// Return whether both dimensions can safely be used by the projection.
-    pub fn is_valid(self) -> bool {
-        self.width.is_finite() && self.height.is_finite() && self.width > 0.0 && self.height > 0.0
+    /// Clip to the surface bounds, returning `None` when no pixels remain.
+    pub fn clamped_to(self, width: u32, height: u32) -> Option<Self> {
+        let x = self.x.min(width);
+        let y = self.y.min(height);
+        let width = self.width.min(width - x);
+        let height = self.height.min(height - y);
+        (width > 0 && height > 0).then_some(Self {
+            x,
+            y,
+            width,
+            height,
+        })
     }
 }
 
 // =============================================================================
-// Instance data
+// Component Registration
 // =============================================================================
 
-/// One drawable entity, flattened for the renderer.
+/// Register scene layouts and shared identities without installing a system.
 ///
-/// Plain `repr(C)` data with no GPU dependency: the `sprite` module keeps its own
-/// layout-identical `bytemuck` mirror for the actual upload, so this side of
-/// the split needs no `bytemuck` derive of its own.
+/// Projects can call this entry point while the host owns full renderer setup.
+pub fn register_components(world: &mut World) {
+    pill_engine::common_components::register_common_components(world);
+    __pill_register_TransformComponent(world);
+    __pill_register_CameraComponent(world);
+    __pill_register_PbrRenderableComponent(world);
+    __pill_register_DirectionalLightComponent(world);
+}
+
+// =============================================================================
+// Scene Settings
+// =============================================================================
+
+/// Persistable scene lighting controls; GPU state remains with the host.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SpriteInstance {
-    /// Top-left position in pixels.
-    pub position: [f32; 2],
-    /// Width/height in pixels.
-    pub size: [f32; 2],
-    /// RGBA color.
-    pub color: [f32; 4],
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RenderSettings {
+    /// Linear exposure multiplier applied before tonemapping; extraction clamps to zero.
+    pub exposure: f32,
+    /// Background panorama ID; zero uses the automatically discovered environment.
+    pub environment: u64,
+    /// Diffuse irradiance texture ID; zero uses the discovered diffuse IBL map.
+    pub diffuse_ibl: u64,
+    /// Prefiltered reflection texture ID; zero uses the discovered specular IBL map.
+    pub specular_ibl: u64,
+    /// Split-sum BRDF lookup ID; zero uses the discovered lookup texture.
+    pub brdf_lut: u64,
+    /// Whether to draw the environment behind scene geometry.
+    pub background: bool,
 }
 
-// =============================================================================
-// Shared-ABI collection
-// =============================================================================
-
-/// Every drawable entity in `world`, flattened for a renderer.
-///
-/// A hot-loaded Rust project and the host executable can assign different
-/// `TypeId` values to the same renderer type. These components are a
-/// deliberately shared ABI, so columns are resolved by stable type name and
-/// verified C layout instead of by a host-typed ECS query.
-pub fn sprite_instances(world: &World) -> Vec<SpriteInstance> {
-    sprite_instances_named(
-        world,
-        std::any::type_name::<Position>(),
-        std::any::type_name::<Sprite>(),
-    )
-}
-
-/// Type-erased implementation separated from the public renderer names so its
-/// cross-`TypeId` behavior can be covered by an ordinary unit test.
-fn sprite_instances_named(
-    world: &World,
-    position_name: &str,
-    sprite_name: &str,
-) -> Vec<SpriteInstance> {
-    let registry = world.component_registry();
-    let mut instances = Vec::new();
-
-    for archetype in world.archetypes_iter() {
-        // Step 1: Resolve each column among the components actually present in
-        // this archetype by shared type name and size. This also supports
-        // entities retained from older DLL generations whose component IDs
-        // differ from the current module.
-        let position_id = archetype.component_types.iter().copied().find(|id| {
-            registry.get_name(id) == Some(position_name)
-                && registry.get_size(id) == Some(std::mem::size_of::<Position>())
-        });
-        let sprite_id = archetype.component_types.iter().copied().find(|id| {
-            registry.get_name(id) == Some(sprite_name)
-                && registry.get_size(id) == Some(std::mem::size_of::<Sprite>())
-        });
-        let (Some(position_id), Some(sprite_id)) = (position_id, sprite_id) else {
-            continue;
-        };
-
-        // Step 2: Fetch the type-erased column backing each resolved component
-        // so rows can be read without a host-typed query. The columns are keyed
-        // by component id, so a component whose rows were created by another
-        // binary is reached the same way as one of this crate's own.
-        if !position_id.is_native_storage() || !sprite_id.is_native_storage() {
-            continue;
-        }
-        let Some(position_storage) = archetype.component_storages.get(position_id) else {
-            continue;
-        };
-        let Some(sprite_storage) = archetype.component_storages.get(sprite_id) else {
-            continue;
-        };
-
-        // Step 3: Copy each row's layout-validated component data into an
-        // instance record for the GPU.
-        //
-        // SAFETY: Both shared types are `#[repr(C)]` and `Copy`, and their
-        // sizes were verified against this crate's `Position`/`Sprite` above,
-        // so each read from the type-erased trait storage yields a valid value
-        // of the target type even when its native TypeId originated in another
-        // DLL. `row_count` caps the loop at every storage length, keeping the
-        // `get_dyn(row)` accesses in bounds.
-        let row_count = archetype
-            .entity_count()
-            .min(position_storage.len())
-            .min(sprite_storage.len());
-        for row in 0..row_count {
-            // SAFETY: `read_shared_component` dereferences the type-erased
-            // storage pointer; `row_count` is capped at every storage length
-            // and the layout checks above guarantee the value is a valid
-            // `Position` for every row in this loop.
-            let (Some(position_row), Some(sprite_row)) =
-                (position_storage.row_ptr(row), sprite_storage.row_ptr(row))
-            else {
-                continue;
-            };
-            // SAFETY: `row_ptr` returned an in-range row of the validated
-            // shared column, so the bytes are a `Position` by the name and
-            // layout checks above.
-            let position = unsafe { read_shared_component::<Position>(position_row) };
-            // SAFETY: as for the `Position` read directly above, for `Sprite`.
-            let sprite = unsafe { read_shared_component::<Sprite>(sprite_row) };
-            instances.push(SpriteInstance {
-                position: [position.x, position.y],
-                size: [sprite.width, sprite.height],
-                color: [
-                    sprite.color.r,
-                    sprite.color.g,
-                    sprite.color.b,
-                    sprite.color.a,
-                ],
-            });
+impl Default for RenderSettings {
+    fn default() -> Self {
+        Self {
+            exposure: 1.0,
+            environment: 0,
+            diffuse_ibl: 0,
+            specular_ibl: 0,
+            brdf_lut: 0,
+            background: true,
         }
     }
-
-    instances
 }
 
-/// Copy one layout-validated shared component out of type-erased storage.
-///
-/// # Safety
-///
-/// `row` must point to a value with the same `repr(C)` layout and size as `T`.
-/// Callers establish this through the shared component name and size, which is
-/// also why the row arrives as bytes: a shared component is identified by its
-/// layout, so there is no `TypeId` for a typed accessor to check against.
-unsafe fn read_shared_component<T: Copy>(row: *const u8) -> T {
-    let data = row.cast::<T>();
-    // SAFETY: Guaranteed by the caller. `read_unaligned` also avoids relying
-    // on alignment information that is not present in ComponentRegistry.
-    unsafe { data.read_unaligned() }
-}
-
-// =============================================================================
-// Tests
-// =============================================================================
-
-#[cfg(test)]
-mod shared_component_tests {
-    use super::*;
-    use pill_engine::component::ComponentId;
-
-    /// Layout-compatible stand-in with a different TypeId than Position.
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct ForeignPosition {
-        x: f32,
-        y: f32,
-    }
-
-    impl Component for ForeignPosition {}
-
-    /// Layout-compatible stand-in with a different TypeId than Sprite.
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct ForeignSprite {
-        width: f32,
-        height: f32,
-        color: Color,
-    }
-
-    impl Component for ForeignSprite {}
-
-    /// Shared renderer layouts can be read even when their native TypeIds
-    /// originate from a different compilation unit.
-    #[test]
-    fn collects_layout_compatible_components_with_foreign_type_ids() {
-        let mut world = World::new();
-        world.register_component::<ForeignPosition>();
-        world.register_component::<ForeignSprite>();
-        world
-            .create_entity()
-            .with(ForeignPosition { x: 12.0, y: 34.0 })
-            .with(ForeignSprite {
-                width: 56.0,
-                height: 78.0,
-                color: Color::new(0.1, 0.2, 0.3, 0.4),
-            })
-            .build()
-            .unwrap();
-
-        let instances = sprite_instances_named(
-            &world,
-            std::any::type_name::<ForeignPosition>(),
-            std::any::type_name::<ForeignSprite>(),
-        );
-
-        assert_eq!(instances.len(), 1);
-        assert_eq!(instances[0].position, [12.0, 34.0]);
-        assert_eq!(instances[0].size, [56.0, 78.0]);
-        assert_eq!(instances[0].color, [0.1, 0.2, 0.3, 0.4]);
-    }
-
-    /// Projection dimensions must be finite and strictly positive.
-    #[test]
-    fn virtual_resolution_rejects_invalid_projection_dimensions() {
-        assert!(VirtualResolution::new(800.0, 600.0).is_valid());
-        assert!(!VirtualResolution::new(0.0, 600.0).is_valid());
-        assert!(!VirtualResolution::new(800.0, f32::NAN).is_valid());
-        assert!(!VirtualResolution::new(f32::INFINITY, 600.0).is_valid());
-    }
-
-    /// The hand-written layouts mirror the `repr(C)` structs, and
-    /// `register_components` attaches them, so the renderer components are
-    /// field-editable in the inspector without carrying the derive macro.
-    #[test]
-    fn the_sprite_layout_matches_its_struct_and_attaches_on_registration() {
-        // Channel order and byte sizes come straight from the compiler.
-        assert_eq!(std::mem::size_of::<Position>(), 8);
-        assert_eq!(std::mem::size_of::<Color>(), 16);
-        assert_eq!(std::mem::size_of::<Sprite>(), 24);
-
-        let assert_matches = |fields: &[ComponentFieldDescriptor],
-                              expected: &[(&str, usize, usize)]| {
-            assert_eq!(fields.len(), expected.len());
-            for (field, (name, offset, size)) in fields.iter().zip(expected) {
-                assert_eq!(field.name, *name, "descriptor name for {name}");
-                assert_eq!(field.type_tag, "f32", "descriptor tag for {name}");
-                assert_eq!(field.offset, *offset, "descriptor offset for {name}");
-                assert_eq!(field.size, *size, "descriptor size for {name}");
-                assert_eq!(field.align, 4, "descriptor align for {name}");
-                assert_eq!(field.element_count, 0);
-            }
-        };
-
-        // `Sprite.color` is flattened into per-channel scalars at absolute
-        // offsets so the inspector renders it as one colour group.
-        let color_offset = std::mem::offset_of!(Sprite, color);
-        assert_matches(
-            SPRITE_FIELD_LAYOUT,
-            &[
-                ("width", std::mem::offset_of!(Sprite, width), 4),
-                ("height", std::mem::offset_of!(Sprite, height), 4),
-                ("color.r", color_offset + std::mem::offset_of!(Color, r), 4),
-                ("color.g", color_offset + std::mem::offset_of!(Color, g), 4),
-                ("color.b", color_offset + std::mem::offset_of!(Color, b), 4),
-                ("color.a", color_offset + std::mem::offset_of!(Color, a), 4),
-            ],
-        );
-
-        // `register_components` is what makes them editable: it routes through
-        // `register_component_with_layout` rather than the plain path.
-        let mut world = World::new();
-        register_components(&mut world);
-        let position = world
-            .component_field_layout(ComponentId::of::<Position>())
-            .expect("Position registered with a layout");
-        assert_eq!(position.len(), 2);
-        let color = world
-            .component_field_layout(ComponentId::of::<Color>())
-            .expect("Color registered with a layout");
-        assert_eq!(color.len(), 4);
-        let sprite = world
-            .component_field_layout(ComponentId::of::<Sprite>())
-            .expect("Sprite registered with a layout");
-        assert_eq!(sprite.len(), 6);
-    }
-
-    /// Registration is idempotent, because a hot reload re-runs every `init`.
-    #[test]
-    fn register_components_is_idempotent() {
-        let mut world = World::new();
-        register_components(&mut world);
-        register_components(&mut world);
-
-        assert_eq!(
-            world
-                .component_field_layout(ComponentId::of::<Sprite>())
-                .map(<[ComponentFieldDescriptor]>::len),
-            Some(6)
-        );
+impl pill_engine::Resource for RenderSettings {
+    fn shared_name() -> Option<&'static str> {
+        Some("pill_master_renderer::RenderSettings")
     }
 }

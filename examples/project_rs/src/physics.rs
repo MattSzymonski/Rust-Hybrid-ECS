@@ -4,7 +4,7 @@ use crate::settings::*;
 use crate::{PhysicsState, SimulationTime};
 use pill_engine::common_components::Position;
 use pill_engine::*;
-use pill_master_renderer::Sprite;
+use pill_master_renderer::TransformComponent;
 
 impl Default for PhysicsState {
     /// The first ball's spawn state, for callers that need any valid state
@@ -51,7 +51,7 @@ pub fn simulate_ball(state: &mut PhysicsState) {
     }
 }
 
-/// Steps every ball by the frame delta and copies its state into its sprite.
+/// Steps every ball by the frame delta and copies its state into its mesh.
 ///
 /// # Errors
 ///
@@ -59,7 +59,7 @@ pub fn simulate_ball(state: &mut PhysicsState) {
 #[pill_hot]
 pub(crate) fn physics_system(
     mut time: ResMut<SimulationTime>,
-    mut query: Query<(&mut PhysicsState, &mut Position, &mut Sprite)>,
+    mut query: Query<(&mut PhysicsState, &mut Position, &mut TransformComponent)>,
 ) -> Result<(), SystemError> {
     let Some(time) = time.get_mut() else {
         return Err(SystemError::MissingResource {
@@ -68,16 +68,20 @@ pub(crate) fn physics_system(
     };
 
     let delta_seconds = time.delta_seconds;
-    for (mut physics, mut position, mut sprite) in query.iter_mut() {
+    for (mut physics, mut position, mut transform) in query.iter_mut() {
         physics.delta_time = delta_seconds;
         simulate_ball(&mut physics);
 
-        // Physics coordinates describe the centre of the ball; the sprite
+        // Physics coordinates describe the centre of the ball; the mesh
         // renderer expects the top-left corner of the quad.
         position.x = physics.position_x - physics.radius;
         position.y = physics.position_y - physics.radius;
-        sprite.width = physics.radius * 2.0;
-        sprite.height = physics.radius * 2.0;
+        transform.translation = [
+            (physics.position_x - 400.0) / 80.0,
+            (300.0 - physics.position_y) / 80.0,
+            0.0,
+        ];
+        transform.scale = [physics.radius / 80.0; 3];
     }
     Ok(())
 }

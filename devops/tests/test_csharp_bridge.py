@@ -1061,7 +1061,7 @@ def build_host() -> bool:
         # components: the managed manifest marks every type the runtime
         # assembly declares as shared, and a shared component with no native
         # binding is refused at startup. A headless host has no binding for
-        # `TracyLive.Sprite` and dies there, which is what this suite used to
+        # `TracyLive.PbrRenderableComponent` and dies there, which is what this suite used to
         # do before the feature was pinned.
         result = subprocess.run(
             [

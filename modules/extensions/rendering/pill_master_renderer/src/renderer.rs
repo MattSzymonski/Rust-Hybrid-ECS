@@ -5,7 +5,7 @@
 //! - Creates the wgpu instance, surface, adapter, device, and queue.
 //! - Selects an uncapped presentation mode when the platform supports one.
 //! - Reconfigures the surface after frontend resize notifications.
-//! - Acquires, draws, and presents one frame from the current [`Engine`].
+//! - Acquires, draws, and presents one owned ECS frame packet.
 //!
 //! # Design
 //!
@@ -14,12 +14,10 @@
 //! [`Renderer::resize`] and [`Renderer::render`]. No frontend needs a direct
 //! dependency on wgpu or an async executor.
 
-// External crates
-use crate::component::{RenderViewport, VirtualResolution};
-use pill_engine::engine::Engine;
-
 // Current crate
-use crate::sprite::SpriteRenderer;
+use crate::{FrameOutcome, RenderFrame, RenderViewport};
+use crate::graphics::{GpuPassContext, Pass};
+use crate::pbr::PbrPipeline;
 
 // =============================================================================
 // Re-exports
@@ -47,12 +45,25 @@ impl<T> RendererWindow for T where T: wgpu::WindowHandle {}
 // Renderer
 // =============================================================================
 
-/// Engine-owned GPU state associated with one frontend window surface.
+/// Candidate shader pass retained until its asynchronous validation scope resolves.
 ///
-/// Holds every wgpu resource the engine needs to draw one frame — the surface,
-/// device, queue, and sprite renderer — plus the optional viewport and
-/// logical-resolution overrides installed by frontends.
+/// The active pass remains usable while this candidate is pending or rejected.
+struct PendingShaders {
+    /// Complete candidate pass, ready to replace the active pass on success.
+    pipeline: PbrPipeline,
+    /// Backend validation result, polled once per frame without blocking the event loop.
+    validation: std::pin::Pin<Box<dyn std::future::Future<Output = Option<wgpu::Error>>>>,
+}
+
+/// Host-owned GPU state associated with one frontend window surface.
+///
+/// Owns the device, queue, PBR pass, and optional viewport. The frontend retains
+/// its event loop and supplies extracted frame packets through the host contract.
 pub struct Renderer {
+    /// Candidate pass awaiting asynchronous backend validation.
+    pending_shaders: Option<PendingShaders>,
+    /// Hash of the most recently attempted shader sources, including rejected sources.
+    shader_key: u64,
     /// The GPU surface bound to the frontend's window handle.
     surface: wgpu::Surface<'static>,
     /// Logical GPU device used for all rendering commands.
@@ -61,12 +72,14 @@ pub struct Renderer {
     queue: wgpu::Queue,
     /// Surface configuration reapplied after creation, resize, or loss.
     surface_config: wgpu::SurfaceConfiguration,
-    /// Draws the sprite entities into a texture view each frame.
-    sprite_renderer: SpriteRenderer,
+    /// Draws the mesh entities into a texture view each frame.
+    pbr: PbrPipeline,
     /// Physical-pixel crop rectangle, or `None` for full-surface rendering.
     viewport: Option<RenderViewport>,
-    /// Logical scene size filling the viewport, or `None` for one-to-one pixels.
-    virtual_resolution: Option<VirtualResolution>,
+    /// Suppresses surface acquisition while the window has zero extent.
+    minimized: bool,
+    /// Latest uncaptured GPU or device-loss error, reported on the next frame attempt.
+    errors: std::sync::Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl Renderer {
@@ -88,36 +101,79 @@ impl Renderer {
     where
         W: RendererWindow + 'static,
     {
+        pollster::block_on(Self::new_async(window, width, height))
+    }
+
+    /// Async initialization core, independent of the native blocking adapter.
+    pub async fn new_async<W: RendererWindow + 'static>(
+        window: W,
+        width: u32,
+        height: u32,
+    ) -> Result<Self, RendererError> {
         // Step 1: create the wgpu instance and bind it to the frontend window.
         let instance = wgpu::Instance::default();
-        let surface = instance
-            .create_surface(window)
-            .map_err(|error| RendererError::SurfaceCreation { source: error })?;
+        let surface =
+            instance
+                .create_surface(window)
+                .map_err(|error| RendererError::SurfaceCreation {
+                    detail: error.to_string(),
+                })?;
 
         // Step 2: acquire an adapter compatible with the surface.
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
-            force_fallback_adapter: false,
-            compatible_surface: Some(&surface),
-        }))
-        .map_err(|error| RendererError::AdapterRequest { source: error })?;
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::default(),
+                force_fallback_adapter: false,
+                compatible_surface: Some(&surface),
+            })
+            .await
+            .map_err(|error| RendererError::AdapterRequest {
+                detail: error.to_string(),
+            })?;
 
+        let format_features = adapter.get_texture_format_features(wgpu::TextureFormat::Rgba16Float);
+        if !format_features
+            .allowed_usages
+            .contains(wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING)
+            || !format_features
+                .flags
+                .contains(wgpu::TextureFormatFeatureFlags::FILTERABLE)
+        {
+            return Err(RendererError::DeviceCreation {
+                detail: "PBR requires filterable RGBA16Float render targets".into(),
+            });
+        }
         // Step 3: request the device and queue from the adapter.
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-            label: Some("ECS renderer device"),
-            required_features: wgpu::Features::empty(),
-            required_limits:
-                wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
-            memory_hints: wgpu::MemoryHints::default(),
-            ..Default::default()
-        }))
-        .map_err(|error| RendererError::DeviceCreation { source: error })?;
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("ECS renderer device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_webgl2_defaults()
+                    .using_resolution(adapter.limits()),
+                memory_hints: wgpu::MemoryHints::default(),
+                ..Default::default()
+            })
+            .await
+            .map_err(|error| RendererError::DeviceCreation {
+                detail: error.to_string(),
+            })?;
 
+        let errors = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let error_sink = errors.clone();
+        device.on_uncaptured_error(Box::new(move |error| {
+            *error_sink.lock().unwrap() = Some(error.to_string());
+        }));
+        let loss_sink = errors.clone();
+        device.set_device_lost_callback(move |reason, message| {
+            *loss_sink.lock().unwrap() = Some(format!("device lost: {reason:?}: {message}"));
+        });
         // Step 4: derive the surface format, alpha mode, and presentation mode.
         let capabilities = surface.get_capabilities(&adapter);
         let format = capabilities
             .formats
-            .first()
+            .iter()
+            .find(|f| f.is_srgb())
+            .or_else(|| capabilities.formats.first())
             .copied()
             .ok_or(RendererError::NoTextureFormats)?;
         let alpha_mode =
@@ -137,16 +193,19 @@ impl Renderer {
         };
         surface.configure(&device, &surface_config);
 
-        // Step 5: build the sprite renderer and assemble the renderer state.
-        let sprite_renderer = SpriteRenderer::new(&device, format);
+        // Step 5: build the mesh renderer and assemble the renderer state.
+        let pbr = PbrPipeline::new(&device, &queue, format, width.max(1), height.max(1));
         Ok(Self {
+            pending_shaders: None,
+            shader_key: 0,
             surface,
             device,
             queue,
             surface_config,
-            sprite_renderer,
+            pbr,
             viewport: None,
-            virtual_resolution: None,
+            minimized: width == 0 || height == 0,
+            errors,
         })
     }
 
@@ -155,34 +214,19 @@ impl Renderer {
     /// Zero-sized notifications occur while a window is minimized and are
     /// ignored because wgpu surfaces cannot be configured with zero dimensions.
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
+        self.minimized = width == 0 || height == 0;
+        if self.minimized {
             return;
         }
         self.surface_config.width = width;
         self.surface_config.height = height;
+        self.pbr.resize(&self.device, width, height);
         self.configure_surface();
     }
 
     /// Return the physical dimensions of the currently configured surface.
     pub fn surface_size(&self) -> (u32, u32) {
         (self.surface_config.width, self.surface_config.height)
-    }
-
-    /// The logical GPU device, for building resources this renderer will draw.
-    ///
-    /// Exposed so a caller can construct something like
-    /// [`GpuTexture`](crate::texture::GpuTexture) and hand it to the engine.
-    /// A texture must come from the same device that renders it, and this
-    /// renderer owns the only one, so the alternative would be every resource
-    /// type growing a constructor here.
-    pub fn device(&self) -> &wgpu::Device {
-        &self.device
-    }
-
-    /// The command queue, for uploads into resources built from
-    /// [`device`](Self::device).
-    pub fn queue(&self) -> &wgpu::Queue {
-        &self.queue
     }
 
     /// Restrict rendering to a physical-pixel rectangle within the surface.
@@ -194,15 +238,7 @@ impl Renderer {
         self.viewport = viewport;
     }
 
-    /// Select the logical scene size that should fill the physical viewport.
-    ///
-    /// `None` keeps the original one-logical-unit-per-surface-pixel behavior.
-    /// Invalid dimensions are rejected by disabling the override.
-    pub fn set_virtual_resolution(&mut self, resolution: Option<VirtualResolution>) {
-        self.virtual_resolution = resolution.filter(|resolution| resolution.is_valid());
-    }
-
-    /// Draw and present every `(Position, Sprite)` entity in the engine world.
+    /// Draw and present the frame extracted by the ECS rendering system.
     ///
     /// Lost or outdated surfaces are reconfigured and skipped for one frame.
     /// Timeouts are transient and also skip the frame. Fatal allocation and
@@ -214,21 +250,29 @@ impl Renderer {
     /// cannot be acquired due to an out-of-memory condition or an unknown
     /// backend failure. Lost, outdated, and timed-out surfaces are recovered
     /// internally and never produce an error.
-    pub fn render(&mut self, engine: &mut Engine) -> Result<(), RendererError> {
+    pub fn render(&mut self, packet: &RenderFrame) -> Result<FrameOutcome, RendererError> {
+        if let Some(detail) = self.errors.lock().unwrap().take() {
+            return Err(RendererError::SurfaceTextureFailed { detail });
+        }
+        if self.minimized {
+            return Ok(FrameOutcome::Skipped);
+        }
         // Step 1: acquire the next frame texture, recovering transient errors.
         let frame = match self.surface.get_current_texture() {
             Ok(frame) => frame,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 self.configure_surface();
-                return Ok(());
+                return Ok(FrameOutcome::Skipped);
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
+            Err(wgpu::SurfaceError::Timeout) => return Ok(FrameOutcome::Skipped),
             Err(error @ (wgpu::SurfaceError::OutOfMemory | wgpu::SurfaceError::Other)) => {
-                return Err(RendererError::SurfaceTextureFailed { source: error });
+                return Err(RendererError::SurfaceTextureFailed {
+                    detail: error.to_string(),
+                });
             }
         };
 
-        // Step 2: build the texture view and resolve the viewport and projection.
+        // Step 2: build the texture view and clip the host viewport to the surface.
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -240,19 +284,71 @@ impl Renderer {
             .clamped_to(self.surface_config.width, self.surface_config.height)
             .unwrap_or_default();
 
-        let virtual_resolution = resolve_virtual_resolution(self.virtual_resolution, viewport);
-
-        // Step 3: draw the sprite world into the view and present the frame.
-        self.sprite_renderer.render_in_viewport_with_resolution(
-            engine.world_mut(),
-            &self.device,
-            &self.queue,
-            &view,
-            viewport,
-            virtual_resolution,
+        // Step 3: poll shader replacement, submit the extracted scene, and present.
+        self.reload_shaders(packet);
+        self.pbr.draw(
+            GpuPassContext {
+                device: &self.device,
+                queue: &self.queue,
+                output: &view,
+                viewport,
+            },
+            packet,
         );
         frame.present();
-        Ok(())
+        Ok(FrameOutcome::Presented)
+    }
+
+    /// Poll validation without blocking the event loop; only publish a valid pipeline.
+    fn reload_shaders(&mut self, frame: &RenderFrame) {
+        if let Some(pending) = self.pending_shaders.as_mut() {
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            if let std::task::Poll::Ready(error) = pending.validation.as_mut().poll(&mut context) {
+                let mut candidate = self.pending_shaders.take().unwrap();
+                if let Some(error) = error {
+                    eprintln!("[render] retaining previous shaders: {error}");
+                } else {
+                    candidate.pipeline.resize(
+                        &self.device,
+                        self.surface_config.width,
+                        self.surface_config.height,
+                    );
+                    self.pbr = candidate.pipeline;
+                }
+            }
+            return;
+        }
+        let pbr = frame.assets.shaders.get("shaders/pbr.wgsl");
+        let tone = frame.assets.shaders.get("shaders/tonemap.wgsl");
+        let key = if pbr.is_none() && tone.is_none() {
+            0
+        } else {
+            crate::assets::asset_id(&format!(
+                "{}|{}",
+                pbr.map_or("", String::as_str),
+                tone.map_or("", String::as_str)
+            ))
+        };
+        if key == self.shader_key {
+            return;
+        }
+        // Remember failed source versions too: retry only after the source changes,
+        // rather than rebuilding the same invalid pipeline every frame.
+        self.shader_key = key;
+        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let pipeline = PbrPipeline::with_shaders(
+            &self.device,
+            &self.queue,
+            self.surface_config.format,
+            self.surface_config.width,
+            self.surface_config.height,
+            pbr.map_or(include_str!("shaders/pbr.wgsl"), String::as_str),
+            tone.map_or(include_str!("shaders/tonemap.wgsl"), String::as_str),
+        );
+        self.pending_shaders = Some(PendingShaders {
+            pipeline,
+            validation: Box::pin(self.device.pop_error_scope()),
+        });
     }
 
     /// Apply the current surface configuration after creation, resize, or loss.
@@ -264,18 +360,6 @@ impl Renderer {
 // =============================================================================
 // Free Functions
 // =============================================================================
-
-/// Resolve the logical projection without coupling it to surface dimensions.
-fn resolve_virtual_resolution(
-    configured: Option<VirtualResolution>,
-    viewport: RenderViewport,
-) -> VirtualResolution {
-    configured
-        .filter(|resolution| resolution.is_valid())
-        .unwrap_or_else(|| {
-            VirtualResolution::new(viewport.width.max(1) as f32, viewport.height.max(1) as f32)
-        })
-}
 
 /// Select the lowest-latency non-vsync mode supported by the current surface.
 fn select_present_mode(supported: &[wgpu::PresentMode]) -> wgpu::PresentMode {
@@ -308,87 +392,31 @@ fn select_alpha_mode(supported: &[wgpu::CompositeAlphaMode]) -> Option<wgpu::Com
 }
 
 // =============================================================================
-// Tests
+// Host Interface
 // =============================================================================
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Prefer immediate presentation when the surface exposes it.
-    #[test]
-    fn present_mode_prefers_immediate() {
-        let supported = [wgpu::PresentMode::Fifo, wgpu::PresentMode::Immediate];
-        assert_eq!(
-            select_present_mode(&supported),
-            wgpu::PresentMode::Immediate
-        );
+impl crate::PillRenderer for Renderer {
+    fn capabilities(&self) -> crate::api::RenderCapabilities {
+        let limits = self.device.limits();
+        crate::api::RenderCapabilities {
+            max_texture_size: limits.max_texture_dimension_2d,
+            max_buffer_bytes: limits.max_buffer_size,
+            hdr: true,
+        }
     }
-
-    /// Prefer mailbox over the automatic fallback when immediate is absent.
-    #[test]
-    fn present_mode_falls_back_to_mailbox() {
-        let supported = [wgpu::PresentMode::Fifo, wgpu::PresentMode::Mailbox];
-        assert_eq!(select_present_mode(&supported), wgpu::PresentMode::Mailbox);
+    fn metrics(&self) -> crate::api::RenderMetrics {
+        self.pbr.metrics
     }
-
-    /// Request automatic no-vsync selection when no explicit fast mode exists.
-    #[test]
-    fn present_mode_uses_auto_no_vsync_as_last_choice() {
-        assert_eq!(
-            select_present_mode(&[wgpu::PresentMode::Fifo]),
-            wgpu::PresentMode::AutoNoVsync
-        );
+    fn resize(&mut self, w: u32, h: u32) {
+        Renderer::resize(self, w, h);
     }
-
-    /// Transparent UI hosts prefer an explicitly composited alpha mode.
-    #[test]
-    fn alpha_mode_prefers_composited_surface() {
-        let supported = [
-            wgpu::CompositeAlphaMode::Opaque,
-            wgpu::CompositeAlphaMode::PreMultiplied,
-            wgpu::CompositeAlphaMode::PostMultiplied,
-        ];
-        assert_eq!(
-            select_alpha_mode(&supported),
-            Some(wgpu::CompositeAlphaMode::PostMultiplied)
-        );
+    fn set_viewport(&mut self, v: Option<RenderViewport>) {
+        Renderer::set_viewport(self, v);
     }
-
-    /// Platforms without composited modes retain their first supported mode.
-    #[test]
-    fn alpha_mode_falls_back_to_first_supported_mode() {
-        assert_eq!(
-            select_alpha_mode(&[wgpu::CompositeAlphaMode::Opaque]),
-            Some(wgpu::CompositeAlphaMode::Opaque)
-        );
+    fn render(&mut self, f: &RenderFrame) -> Result<FrameOutcome, RendererError> {
+        Renderer::render(self, f)
     }
-
-    /// Embedded viewports cannot extend beyond their native surface.
-    #[test]
-    fn render_viewport_clamps_to_surface_bounds() {
-        assert_eq!(
-            RenderViewport::new(80, 40, 50, 70).clamped_to(100, 90),
-            Some(RenderViewport::new(80, 40, 20, 50))
-        );
-        assert_eq!(
-            RenderViewport::new(100, 0, 20, 20).clamped_to(100, 90),
-            None
-        );
-    }
-
-    /// A configured project coordinate space remains stable as the panel changes.
-    #[test]
-    fn virtual_resolution_is_independent_of_physical_viewport_size() {
-        let configured = VirtualResolution::new(800.0, 600.0);
-
-        assert_eq!(
-            resolve_virtual_resolution(Some(configured), RenderViewport::new(240, 80, 517, 463)),
-            configured
-        );
-        assert_eq!(
-            resolve_virtual_resolution(None, RenderViewport::new(240, 80, 517, 463)),
-            VirtualResolution::new(517.0, 463.0)
-        );
+    fn invalidate_assets(&mut self) {
+        self.pbr.invalidate_assets();
     }
 }

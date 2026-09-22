@@ -36,11 +36,11 @@ use super::commands::{
 };
 use super::components::{
     apply_component_manifest_on_reload, module_native_bindings, register_component_manifest,
-    shared_component_bindings, stable_component_id, BindingStore, Color, ComponentBinding,
-    ComponentBindings, ModuleExposedComponent, Position, Sprite, StableComponentId,
+    shared_component_bindings, stable_component_id, BindingStore, ComponentBinding,
+    ComponentBindings, ModuleExposedComponent, PbrRenderableComponent, Position, StableComponentId,
 };
 use super::managed_buffer::{fetch_managed_buffer, ManagedBufferError};
-// `Color`, `Position` and `Sprite` above are the renderer's components,
+// `Color`, `Position` and `PbrRenderableComponent` above are the renderer's components,
 // re-exported by `components` from `pill_master_renderer`.
 use super::context::ActiveSystemGuard;
 use super::manifest::parse_and_validate_manifest;
@@ -173,16 +173,7 @@ fn setup_test_world(engine: &mut Engine) -> ComponentBindings {
             .world_mut()
             .create_entity()
             .with(Position { x: 0.0, y: 0.0 })
-            .with(Sprite {
-                width: 0.0,
-                height: 0.0,
-                color: Color {
-                    r: 1.0,
-                    g: 0.3,
-                    b: 0.3,
-                    a: 1.0,
-                },
-            })
+            .with(PbrRenderableComponent::default())
             .build()
             .unwrap();
         engine
@@ -386,7 +377,7 @@ fn managed_command_abi_rejects_stale_generations_and_undeclared_commands() {
 fn reflected_managed_commands_access_is_scheduler_exclusive() {
     let mut commands_access = managed_access(&[("Position", 0)]);
     commands_access.set_uses_commands(true);
-    let disjoint_reader = managed_access(&[("Sprite", 0)]);
+    let disjoint_reader = managed_access(&[("PbrRenderableComponent", 0)]);
     let scheduler = scheduler_for([commands_access, disjoint_reader]);
     assert_different_batches(&scheduler, 0, 1);
 }
@@ -467,10 +458,13 @@ fn archetype_chunk_lookup_resolves_components_and_entities() {
         .unwrap();
 
     let position_id = test_stable_id("Position");
-    let sprite_id = test_stable_id("Sprite");
-    let accesses = [native_access("Position", 1), native_access("Sprite", 0)];
+    let renderable_id = test_stable_id("PbrRenderableComponent");
+    let accesses = [
+        native_access("Position", 1),
+        native_access("PbrRenderableComponent", 0),
+    ];
     let mut chunk = empty_chunk();
-    let mut sprite_chunk = empty_chunk();
+    let mut renderable_chunk = empty_chunk();
     let mut entity_chunk = empty_chunk();
     {
         let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &shared);
@@ -504,10 +498,10 @@ fn archetype_chunk_lookup_resolves_components_and_entities() {
             ffi_get_archetype_chunk(
                 chunk.archetype_low,
                 chunk.archetype_high,
-                sprite_id.0 as u64,
-                (sprite_id.0 >> 64) as u64,
+                renderable_id.0 as u64,
+                (renderable_id.0 >> 64) as u64,
                 0,
-                &mut sprite_chunk,
+                &mut renderable_chunk,
             ),
             0
         );
@@ -787,15 +781,15 @@ fn module_native_binding_rejects_live_layout_mismatch() {
     // fails the query arm with the "unknown component" status instead of the
     // debug assertion that aborted debug hosts and vanished in release.
     //
-    // `Sprite` stands in for the module's component here: it is real native
+    // `PbrRenderableComponent` stands in for the module's component here: it is real native
     // storage, which is exactly what the `ModuleNative` arm serves, and its
     // live layout is what the stale binding is compared against.
     let mut bindings = shared_component_bindings(&mut engine);
-    let sprite_stable_id = test_stable_id("Sprite");
+    let renderable_stable_id = test_stable_id("PbrRenderableComponent");
     bindings.insert(
-        sprite_stable_id,
+        renderable_stable_id,
         ComponentBinding::ModuleNative {
-            component_id: ComponentId::of::<Sprite>(),
+            component_id: ComponentId::of::<PbrRenderableComponent>(),
             // Deliberately not the live layout, so the arm has to refuse.
             size: 64,
             align: 4,
@@ -804,25 +798,16 @@ fn module_native_binding_rejects_live_layout_mismatch() {
     engine
         .world_mut()
         .create_entity()
-        .with(Sprite {
-            width: 1.0,
-            height: 1.0,
-            color: Color {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 1.0,
-            },
-        })
+        .with(PbrRenderableComponent::default())
         .build()
         .unwrap();
-    let accesses = [native_access("Sprite", 1)];
+    let accesses = [native_access("PbrRenderableComponent", 1)];
     let mut chunk = empty_chunk();
     let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
     assert_eq!(
         ffi_get_component_chunk(
-            sprite_stable_id.0 as u64,
-            (sprite_stable_id.0 >> 64) as u64,
+            renderable_stable_id.0 as u64,
+            (renderable_stable_id.0 >> 64) as u64,
             1,
             0,
             &mut chunk,
@@ -864,11 +849,12 @@ fn managed_shared_component_schema_mismatch_is_rejected() {
 /// Runs in every build: the components are unconditional now, so the managed
 /// bridge has one binding path rather than one per feature set.
 #[test]
-fn csharp_world_supports_the_sprite_renderer_query() {
+fn csharp_world_supports_the_renderable_renderer_query() {
     let mut engine = Engine::new();
     setup_test_world(&mut engine);
 
-    let mut query = pill_engine::Query::<(&Position, &Sprite)>::new(engine.world_mut());
+    let mut query =
+        pill_engine::Query::<(&Position, &PbrRenderableComponent)>::new(engine.world_mut());
     assert_eq!(query.iter_mut().count(), TEST_WORLD_ENTITY_COUNT);
 }
 
@@ -878,7 +864,7 @@ fn disjoint_managed_writers_share_a_parallel_batch() {
     let scheduler = scheduler_for([
         managed_access(&[("PhysicsState", 1)]),
         managed_access(&[("Position", 1)]),
-        managed_access(&[("Sprite", 1)]),
+        managed_access(&[("PbrRenderableComponent", 1)]),
     ]);
 
     assert_eq!(scheduler.execution_graph().len(), 1);
@@ -913,8 +899,8 @@ fn managed_reader_and_writer_are_scheduled_in_different_batches() {
 #[test]
 fn managed_writers_of_the_same_component_are_scheduled_in_different_batches() {
     let scheduler = scheduler_for([
-        managed_access(&[("Sprite", 1)]),
-        managed_access(&[("Sprite", 1)]),
+        managed_access(&[("PbrRenderableComponent", 1)]),
+        managed_access(&[("PbrRenderableComponent", 1)]),
     ]);
 
     assert_eq!(scheduler.execution_graph().len(), 2);
@@ -928,7 +914,11 @@ fn entity_only_managed_system_does_not_create_a_scheduler_conflict() {
     // access list exported by IQueryDescriptor.
     let scheduler = scheduler_for([
         managed_access(&[]),
-        managed_access(&[("PhysicsState", 1), ("Position", 1), ("Sprite", 1)]),
+        managed_access(&[
+            ("PhysicsState", 1),
+            ("Position", 1),
+            ("PbrRenderableComponent", 1),
+        ]),
     ]);
 
     assert_eq!(scheduler.execution_graph().len(), 1);
@@ -938,12 +928,12 @@ fn entity_only_managed_system_does_not_create_a_scheduler_conflict() {
 /// Verify optional query terms retain their underlying scheduler conflicts.
 #[test]
 fn optional_managed_access_conflicts_when_the_component_may_be_present() {
-    // OptionalWrite<Sprite> exports the same scheduler write as Write<Sprite>;
+    // OptionalWrite<PbrRenderableComponent> exports the same scheduler write as Write<PbrRenderableComponent>;
     // optionality affects matching, never parallel safety.
     let scheduler = scheduler_for([
-        managed_access(&[("PhysicsState", 1), ("Sprite", 0)]),
+        managed_access(&[("PhysicsState", 1), ("PbrRenderableComponent", 0)]),
         managed_access(&[("Position", 1)]),
-        managed_access(&[("Sprite", 1)]),
+        managed_access(&[("PbrRenderableComponent", 1)]),
     ]);
 
     assert_eq!(scheduler.execution_graph().len(), 2);
@@ -1024,9 +1014,12 @@ fn disjoint_managed_writes_mark_the_correct_tick_columns() {
     engine.world_mut().set_system_last_run(baseline);
     engine.world_mut().increment_change_tick();
 
-    let accesses = [native_access("Position", 1), native_access("Sprite", 1)];
+    let accesses = [
+        native_access("Position", 1),
+        native_access("PbrRenderableComponent", 1),
+    ];
     let mut positions = empty_chunk();
-    let mut sprites = empty_chunk();
+    let mut renderables = empty_chunk();
     let mut entities = empty_chunk();
     {
         let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
@@ -1034,15 +1027,18 @@ fn disjoint_managed_writes_mark_the_correct_tick_columns() {
             get_test_chunk("Position", 1, 0, &mut positions),
             ABI_SUCCESS
         );
-        assert_eq!(get_test_chunk("Sprite", 1, 0, &mut sprites), ABI_SUCCESS);
+        assert_eq!(
+            get_test_chunk("PbrRenderableComponent", 1, 0, &mut renderables),
+            ABI_SUCCESS
+        );
         assert_eq!(ffi_get_entity_chunk(0, &mut entities), ABI_SUCCESS);
-        assert_ne!(positions.ticks, sprites.ticks);
+        assert_ne!(positions.ticks, renderables.ticks);
         // SAFETY: both chunks were fetched successfully and rows `3` and `7`
         // fall within their live lengths, so each tick pointer is valid to
         // advance by the requested row.
         unsafe {
             simulate_managed_write(&positions, 3);
-            simulate_managed_write(&sprites, 7);
+            simulate_managed_write(&renderables, 7);
         }
     }
 
@@ -1059,12 +1055,15 @@ fn disjoint_managed_writes_mark_the_correct_tick_columns() {
         .collect();
     assert_eq!(position_hits, vec![entity_at(3)]);
 
-    let mut changed_sprites = pill_engine::Query::<
+    let mut changed_renderables = pill_engine::Query::<
         (pill_engine::Entity,),
-        pill_engine::Changed<Sprite>,
+        pill_engine::Changed<PbrRenderableComponent>,
     >::new(engine.world_mut());
-    let sprite_hits: Vec<_> = changed_sprites.iter_mut().map(|(entity,)| entity).collect();
-    assert_eq!(sprite_hits, vec![entity_at(7)]);
+    let renderable_hits: Vec<_> = changed_renderables
+        .iter_mut()
+        .map(|(entity,)| entity)
+        .collect();
+    assert_eq!(renderable_hits, vec![entity_at(7)]);
 }
 
 /// Verify entity columns are exposed only inside a scheduled managed scope.

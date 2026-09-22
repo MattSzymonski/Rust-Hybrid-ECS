@@ -540,7 +540,7 @@ internal static class Program
                 // The physics step, the three-query spline pass - the same
                 // system shape the Rust project uses - and the systems that
                 // fill the world up to the target counts.
-                Equal(systems.Length, 5, "unexpected project system count");
+                Equal(systems.Length, 6, "unexpected project system count");
                 Assert(systems.Any(system => system.Name == "TracyLive.BallPhysicsSystem.Run"),
                     "ball physics system was not discovered");
                 Assert(systems.Any(system => system.Name == "TracyLive.BallSpawnSystem.Run"),
@@ -557,14 +557,14 @@ internal static class Program
             {
                 var systems = ProjectHost.DiscoverSystems(typeof(BallPhysicsSystem).Assembly);
                 using var json = System.Text.Json.JsonDocument.Parse(
-                    ProjectManifestBuilder.Build(systems));
+                    ProjectManifestBuilder.Build(systems, typeof(BallPhysicsSystem).Assembly));
                 var components = json.RootElement.EnumerateArray().ToArray();
-                // Position, Sprite, PhysicsState, SplineSample + the module Spline mirror.
-                Equal(components.Length, 5, "unexpected manifest component count");
+                // Position, PbrRenderableComponent, PhysicsState, SplineSample + the module Spline mirror.
+                Equal(components.Length, 12, "unexpected manifest component count");
                 var position = components.Single(component =>
                     component.GetProperty("full_name").GetString() == "TracyLive.Position");
-                var sprite = components.Single(component =>
-                    component.GetProperty("full_name").GetString() == "TracyLive.Sprite");
+                var renderable = components.Single(component =>
+                    component.GetProperty("full_name").GetString() == "TracyLive.PbrRenderableComponent");
                 var physics = components.Single(component =>
                     component.GetProperty("full_name").GetString() == "TracyLive.PhysicsState");
                 var sample = components.Single(component =>
@@ -573,8 +573,8 @@ internal static class Program
                     component.GetProperty("full_name").GetString() == "pill_spline.Spline");
                 Assert(position.GetProperty("shared").GetBoolean(),
                     "runtime Position mirror must be shared");
-                Assert(sprite.GetProperty("shared").GetBoolean(),
-                    "runtime Sprite mirror must be shared");
+                Assert(renderable.GetProperty("shared").GetBoolean(),
+                    "runtime PbrRenderableComponent mirror must be shared");
                 Assert(!physics.GetProperty("shared").GetBoolean(),
                     "project-owned PhysicsState must be descriptor-registered");
                 Assert(!sample.GetProperty("shared").GetBoolean(),
@@ -603,27 +603,28 @@ internal static class Program
                     "command-only project component was omitted from the manifest");
             });
 
-            Test("ball physics declares PhysicsState, Position, and Sprite writes", () =>
+            Test("ball physics declares PhysicsState, Position, and TransformComponent writes", () =>
             {
                 var method = typeof(BallPhysicsSystem).GetMethod(nameof(BallPhysicsSystem.Run))
                     ?? throw new InvalidOperationException("BallPhysicsSystem.Run is missing");
                 var system = ProjectHost.CreateSystem(method);
+                var componentAccesses=system.Accesses.Where(access=>access.Kind==0).ToArray();
 
-                Equal(system.Accesses.Length, 3, "unexpected ball access count");
+                Equal(system.Accesses.Count(access => access.Kind == 0), 3, "unexpected ball access count");
                 Assert(system.Accesses.All(access => access.Mode == 1),
                     "ball physics accesses must all be writable");
-                Equal(system.Accesses[0].ComponentKey, Engine.ComponentKey(typeof(PhysicsState)),
+                Equal(componentAccesses[0].ComponentKey, Engine.ComponentKey(typeof(PhysicsState)),
                     "wrong PhysicsState key");
-                Equal(system.Accesses[0].ComponentKeyHigh,
+                Equal(componentAccesses[0].ComponentKeyHigh,
                     Engine.ComponentKeyHigh(typeof(PhysicsState)), "wrong PhysicsState high key");
-                Equal(system.Accesses[1].ComponentKey, Engine.ComponentKey(typeof(Position)),
+                Equal(componentAccesses[1].ComponentKey, Engine.ComponentKey(typeof(Position)),
                     "wrong Position key");
-                Equal(system.Accesses[1].ComponentKeyHigh,
+                Equal(componentAccesses[1].ComponentKeyHigh,
                     Engine.ComponentKeyHigh(typeof(Position)), "wrong Position high key");
-                Equal(system.Accesses[2].ComponentKey, Engine.ComponentKey(typeof(Sprite)),
-                    "wrong Sprite key");
-                Equal(system.Accesses[2].ComponentKeyHigh,
-                    Engine.ComponentKeyHigh(typeof(Sprite)), "wrong Sprite high key");
+                Equal(componentAccesses[2].ComponentKey, Engine.ComponentKey(typeof(TransformComponent)),
+                    "wrong PbrRenderableComponent key");
+                Equal(componentAccesses[2].ComponentKeyHigh,
+                    Engine.ComponentKeyHigh(typeof(TransformComponent)), "wrong PbrRenderableComponent high key");
             });
 
             Test("managed Commands parameter is reflected into system metadata", () =>
@@ -645,15 +646,15 @@ internal static class Program
                 Equal(system.Accesses.Length, 3, "unexpected merged access count");
                 Equal(system.Accesses[0],
                     new ManagedAccess(Engine.ComponentKey(typeof(TestPosition)),
-                        Engine.ComponentKeyHigh(typeof(TestPosition)), 0),
+                        Engine.ComponentKeyHigh(typeof(TestPosition)), 0, 0),
                     "wrong first-query read access");
                 Equal(system.Accesses[1],
                     new ManagedAccess(Engine.ComponentKey(typeof(TestVelocity)),
-                        Engine.ComponentKeyHigh(typeof(TestVelocity)), 1),
+                        Engine.ComponentKeyHigh(typeof(TestVelocity)), 1, 0),
                     "wrong second-query write access");
                 Equal(system.Accesses[2],
                     new ManagedAccess(Engine.ComponentKey(typeof(TestHealth)),
-                        Engine.ComponentKeyHigh(typeof(TestHealth)), 0),
+                        Engine.ComponentKeyHigh(typeof(TestHealth)), 0, 0),
                     "wrong third-query read access");
             });
 
@@ -692,8 +693,8 @@ internal static class Program
                 // what a fresh project build does.
                 ProjectHost.CreateSystem(method).Run();
                 Equal(MockNativeWorld.QueuedCreates, 5, "spawn create count mismatch");
-                Equal(MockNativeWorld.LastCreateComponentCount, 3,
-                    "each ball must contain PhysicsState, Position, and Sprite");
+                Equal(MockNativeWorld.LastCreateComponentCount, 4,
+                    "each ball must contain PhysicsState, Position, and PbrRenderableComponent");
                 Equal(MockNativeWorld.NextEntityId, 5UL, "spawn did not reserve unique entities");
             });
 
@@ -735,9 +736,9 @@ internal static class Program
 
                 Equal(Marshal.SizeOf<Position>(), 8, "Position size mismatch");
                 Equal(Marshal.SizeOf<Color>(), 16, "Color size mismatch");
-                Equal(Marshal.SizeOf<Sprite>(), 24, "Sprite size mismatch");
-                Equal(Marshal.OffsetOf<Sprite>(nameof(Sprite.Color)).ToInt32(), 8,
-                    "Sprite.Color offset mismatch");
+                Equal(Marshal.SizeOf<PbrRenderableComponent>(), 48, "PbrRenderableComponent size mismatch");
+                Equal(Marshal.OffsetOf<PbrRenderableComponent>(nameof(PbrRenderableComponent.R)).ToInt32(), 16,
+                    "PbrRenderableComponent.Color offset mismatch");
             });
 
             Test("padded sequential layouts agree with Marshal", () =>
@@ -867,7 +868,7 @@ internal static class Program
                 var system = ProjectHost.CreateSystem(Method(nameof(TestSystems.SingleWriter)));
                 Equal(system.Accesses.Length, 1, "unexpected access count");
                 Equal(system.Accesses[0],
-                    new ManagedAccess(Engine.ComponentKey(typeof(TestPosition)), Engine.ComponentKeyHigh(typeof(TestPosition)), 1),
+                    new ManagedAccess(Engine.ComponentKey(typeof(TestPosition)), Engine.ComponentKeyHigh(typeof(TestPosition)), 1, 0),
                     "wrong write access");
             });
 
@@ -876,10 +877,10 @@ internal static class Program
                 var system = ProjectHost.CreateSystem(Method(nameof(TestSystems.MixedAccess)));
                 Equal(system.Accesses.Length, 2, "unexpected access count");
                 Equal(system.Accesses[0],
-                    new ManagedAccess(Engine.ComponentKey(typeof(TestPosition)), Engine.ComponentKeyHigh(typeof(TestPosition)), 1),
+                    new ManagedAccess(Engine.ComponentKey(typeof(TestPosition)), Engine.ComponentKeyHigh(typeof(TestPosition)), 1, 0),
                     "wrong writable access");
                 Equal(system.Accesses[1],
-                    new ManagedAccess(Engine.ComponentKey(typeof(TestVelocity)), Engine.ComponentKeyHigh(typeof(TestVelocity)), 0),
+                    new ManagedAccess(Engine.ComponentKey(typeof(TestVelocity)), Engine.ComponentKeyHigh(typeof(TestVelocity)), 0, 0),
                     "wrong read-only access");
             });
 
@@ -902,10 +903,10 @@ internal static class Program
                 var system = ProjectHost.CreateSystem(Method(nameof(TestSystems.OptionalAndEntity)));
                 Equal(system.Accesses.Length, 2, "EntityTerm must not create scheduler access");
                 Equal(system.Accesses[0],
-                    new ManagedAccess(Engine.ComponentKey(typeof(TestPosition)), Engine.ComponentKeyHigh(typeof(TestPosition)), 0),
+                    new ManagedAccess(Engine.ComponentKey(typeof(TestPosition)), Engine.ComponentKeyHigh(typeof(TestPosition)), 0, 0),
                     "wrong required read access");
                 Equal(system.Accesses[1],
-                    new ManagedAccess(Engine.ComponentKey(typeof(TestHealth)), Engine.ComponentKeyHigh(typeof(TestHealth)), 1),
+                    new ManagedAccess(Engine.ComponentKey(typeof(TestHealth)), Engine.ComponentKeyHigh(typeof(TestHealth)), 1, 0),
                     "wrong optional write access");
             });
 
@@ -964,7 +965,7 @@ internal static class Program
                     Equal(system.Accesses[index], new ManagedAccess(
                             Engine.ComponentKey(componentTypes[index]),
                             Engine.ComponentKeyHigh(componentTypes[index]),
-                            modes[index]),
+                            modes[index], 0),
                         $"wrong scheduler access at term {index}");
                 }
             });
@@ -1271,7 +1272,7 @@ internal static class Program
                        Engine.ComponentKey(typeof(Position)),
                     "different current project components produced the same key");
                 Assert(Engine.ComponentKey(typeof(Position)) !=
-                       Engine.ComponentKey(typeof(Sprite)),
+                       Engine.ComponentKey(typeof(PbrRenderableComponent)),
                     "different current project components produced the same key");
             });
 
@@ -1333,7 +1334,7 @@ internal static class Program
 
                 Equal(init((IntPtr)(&api)), 1, "loader init failed");
                 // BallPhysicsSystem, the three-query spline pass, and the spawn systems.
-                Equal(systemCount(), 5u, "unexpected managed system count");
+                Equal(systemCount(), 6u, "unexpected managed system count");
                 Equal(runSystem(1), 1, "healthy system reported failure");
                 Equal(errorLength(1), 0u,
                     "healthy system carries a stale error message");

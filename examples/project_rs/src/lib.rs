@@ -32,10 +32,13 @@ use pill_core::math::Vector3f;
 use pill_engine::*;
 // `Position` is the engine's: it is universal, so a project
 // names them without reaching through whichever renderer happens to draw them.
-// `Sprite` is the renderer's own idea of a thing to draw, so it comes from
+// `PbrRenderableComponent` is the renderer's own idea of a thing to draw, so it comes from
 // there along with the registration call that attaches all three.
 use pill_engine::common_components::Position;
-use pill_master_renderer::{register_components, Sprite};
+use pill_master_renderer::{
+    register_components, CameraComponent, DirectionalLightComponent, PbrRenderableComponent,
+    TransformComponent,
+};
 use pill_spline::Spline;
 use serde::{Deserialize, Serialize};
 
@@ -89,8 +92,8 @@ pub struct PhysicsState {
 
 /// One dot on the project's spline, drawn at the curve parameter `t`.
 ///
-/// The dot carries the usual [`Position`] and [`Sprite`], so it renders like
-/// any other sprite, and `spline_path_system` moves it along the curve as the
+/// The dot carries the usual [`Position`] and [`PbrRenderableComponent`], so it renders like
+/// any other mesh, and `spline_path_system` moves it along the curve as the
 /// balls move. The host serializes this component across hot-reload
 /// generations, so the layout is pinned with `#[repr(C)]`.
 #[repr(C)]
@@ -117,8 +120,58 @@ pub fn init(engine: &mut Engine) -> u32 {
     // The renderer's components are declared by `pill_master_renderer`, not by
     // this crate, so they cannot carry the derive. Registering them through
     // the renderer's own entry point also attaches their editor field layouts,
-    // which is what makes a sprite's size and colour editable in the inspector.
+    // which is what makes a mesh's size and colour editable in the inspector.
     register_components(engine.world_mut());
+    let has_camera = Query::<&CameraComponent>::new(engine.world_mut())
+        .iter_mut()
+        .next()
+        .is_some();
+    if !has_camera {
+        if engine
+            .world_mut()
+            .create_entity()
+            .with(TransformComponent::default())
+            .with(DirectionalLightComponent::default())
+            .build()
+            .is_err()
+        {
+            return 1;
+        }
+        let renderable = PbrRenderableComponent {
+            mesh: pill_master_renderer::assets::asset_id("sample.cooked_mesh"),
+            material: pill_master_renderer::assets::asset_id("sample.material"),
+            ..Default::default()
+        };
+        if engine
+            .world_mut()
+            .create_entity()
+            .with(renderable)
+            .with(TransformComponent {
+                translation: [0.0, 0.0, -1.5],
+                scale: [1.5; 3],
+                ..Default::default()
+            })
+            .build()
+            .is_err()
+        {
+            return 1;
+        }
+    }
+    if !has_camera {
+        if engine
+            .world_mut()
+            .create_entity()
+            .with(CameraComponent::default())
+            .with(TransformComponent {
+                translation: [0.0, 0.0, 9.0],
+                ..Default::default()
+            })
+            .build()
+            .is_err()
+        {
+            return 1;
+        }
+    }
 
     if let Err(message) = audio_scene::initialize(engine) {
         eprintln!("[project] audio initialization failed: {message}");
@@ -197,10 +250,19 @@ pub fn init(engine: &mut Engine) -> u32 {
                 x: physics.position_x - physics.radius,
                 y: physics.position_y - physics.radius,
             })
-            .with(Sprite {
-                width: physics.radius * 2.0,
-                height: physics.radius * 2.0,
-                color: BALL_COLOR,
+            .with(TransformComponent {
+                translation: [
+                    (physics.position_x - 400.0) / 80.0,
+                    (300.0 - physics.position_y) / 80.0,
+                    0.0,
+                ],
+                scale: [physics.radius / 80.0; 3],
+                ..Default::default()
+            })
+            .with(PbrRenderableComponent {
+                base_color: [BALL_COLOR.r, BALL_COLOR.g, BALL_COLOR.b, BALL_COLOR.a],
+                metallic: index as f32 / BALL_COUNT as f32,
+                ..Default::default()
             });
 
         if entity.build().is_err() {
@@ -233,10 +295,23 @@ pub fn init(engine: &mut Engine) -> u32 {
                 x: location.x - SPLINE_SAMPLE_DOT_SIZE * 0.5,
                 y: location.y - SPLINE_SAMPLE_DOT_SIZE * 0.5,
             })
-            .with(Sprite {
-                width: SPLINE_SAMPLE_DOT_SIZE,
-                height: SPLINE_SAMPLE_DOT_SIZE,
-                color: SAMPLE_DOT_COLOR,
+            .with(TransformComponent {
+                translation: [
+                    (location.x - 400.0) / 80.0,
+                    (300.0 - location.y) / 80.0,
+                    0.0,
+                ],
+                scale: [SPLINE_SAMPLE_DOT_SIZE / 160.0; 3],
+                ..Default::default()
+            })
+            .with(PbrRenderableComponent {
+                base_color: [
+                    SAMPLE_DOT_COLOR.r,
+                    SAMPLE_DOT_COLOR.g,
+                    SAMPLE_DOT_COLOR.b,
+                    SAMPLE_DOT_COLOR.a,
+                ],
+                ..Default::default()
             });
 
         if entity.build().is_err() {

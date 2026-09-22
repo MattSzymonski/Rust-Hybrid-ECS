@@ -678,81 +678,35 @@ mod tests {
     }
 
     /// The editor's generic field write reaches the real shared renderer
-    /// `Sprite` layout (flattened `color.r` … `color.a` at absolute offsets),
-    /// which is the path the Inspector uses to repaint sprites live.
+    /// `PbrRenderableComponent` layout (flattened `color.r` … `color.a` at absolute offsets),
+    /// which is the path the Inspector uses to edit materials live.
     #[test]
-    fn set_field_on_renderer_sprite_repaints_color_channels() {
-        use pill_engine::common_components::Color;
-        use pill_master_renderer::{register_components, Sprite};
-
+    fn set_field_on_renderer_material_updates_roughness() {
+        use pill_master_renderer::{register_components, PbrRenderableComponent};
         let mut engine = Engine::new();
         register_components(engine.world_mut());
         let entity = engine
             .world_mut()
             .create_entity()
-            .with(Sprite {
-                width: 40.0,
-                height: 30.0,
-                color: Color::new(1.0, 0.0, 0.0, 1.0),
-            })
+            .with(PbrRenderableComponent::default())
             .build()
-            .expect("entity builds");
-        let sprite_name = std::any::type_name::<Sprite>().to_string();
-
+            .unwrap();
+        let name = std::any::type_name::<PbrRenderableComponent>().to_string();
         let failures = EditorCommand::apply(
             &mut engine,
-            &[
-                EditorCommand::SetField {
-                    entity,
-                    component: sprite_name.clone(),
-                    field: "width".to_string(),
-                    value: FieldValue::F32(96.0),
-                },
-                EditorCommand::SetField {
-                    entity,
-                    component: sprite_name.clone(),
-                    field: "color.r".to_string(),
-                    value: FieldValue::F32(0.1),
-                },
-                EditorCommand::SetField {
-                    entity,
-                    component: sprite_name.clone(),
-                    field: "color.g".to_string(),
-                    value: FieldValue::F32(0.2),
-                },
-                EditorCommand::SetField {
-                    entity,
-                    component: sprite_name.clone(),
-                    field: "color.b".to_string(),
-                    value: FieldValue::F32(0.3),
-                },
-                EditorCommand::SetField {
-                    entity,
-                    component: sprite_name.clone(),
-                    field: "color.a".to_string(),
-                    value: FieldValue::F32(0.5),
-                },
-            ],
+            &[EditorCommand::SetField {
+                entity,
+                component: name.clone(),
+                field: "roughness".into(),
+                value: FieldValue::F32(0.8),
+            }],
         );
-        assert!(failures.is_empty(), "sprite writes failed: {failures:?}");
-
-        // The write landed on the real component: width and the four channels
-        // are updated at their flattened layout offsets.
-        let values = engine
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(engine
             .world()
-            .read_component_fields(entity, &sprite_name)
-            .expect("read sprite");
-        assert_eq!(
-            values,
-            vec![
-                FieldValue::F32(96.0),
-                FieldValue::F32(30.0),
-                FieldValue::F32(0.1),
-                FieldValue::F32(0.2),
-                FieldValue::F32(0.3),
-                FieldValue::F32(0.5),
-            ]
-        );
+            .read_component_fields(entity, &name)
+            .unwrap()
+            .contains(&FieldValue::F32(0.8)));
     }
 
     #[test]

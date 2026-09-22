@@ -30,8 +30,8 @@ public struct PhysicsState
 /// One dot on the project's spline, drawn at the curve parameter `t`.
 /// </summary>
 /// <remarks>
-/// The dot carries the usual <see cref="Position"/> and <see cref="Sprite"/>, so
-/// it renders like any other sprite, and the sample system moves it along the
+/// The dot carries the usual <see cref="Position"/> and <see cref="PbrRenderableComponent"/>, so
+/// it renders like any other mesh, and the sample system moves it along the
 /// curve as the balls move.
 /// </remarks>
 [StructLayout(LayoutKind.Sequential)]

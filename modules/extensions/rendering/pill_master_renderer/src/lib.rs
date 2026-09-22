@@ -1,87 +1,98 @@
-//! The engine's renderer: the sprite components and the wgpu pipeline drawing them.
+//! ECS-driven PBR rendering, with GPU lifetime owned by the host.
 //!
 //! # Responsibilities
 //!
-//! - Defines the renderer's data contract ([`Position`], [`Color`], [`Sprite`],
-//!   [`RenderViewport`], [`VirtualResolution`], [`SpriteInstance`]).
-//! - Creates and drives the window surface, adapter, device and queue
-//!   ([`Renderer`]).
-//! - Owns the sprite render pipeline and its GPU buffers ([`SpriteRenderer`]).
-//! - Declares the rendering failure type ([`RendererError`]).
-//! - Declares [`GpuTexture`], a GPU texture the engine holds as a resource.
+//! - Registers shared scene components, scene settings, and frame extraction.
+//! - Exposes an owned frame packet and the backend-neutral host renderer contract.
+//! - Gates GPU rendering and native asset cooking behind separate features.
 //!
 //! # Design
 //!
-//! A sprite is a renderer concept, so the components that describe one live
-//! here, with the code that draws them, rather than in `pill_engine`. The ECS
-//! core defines storage and scheduling; it does not define what a quad is. A
-//! project that wants sprites depends on this crate and calls
-//! [`component::register_components`].
+//! The project describes a scene through the existing ECS. [`register`] installs
+//! one engine-owned post-update system, which copies that scene after deferred
+//! commands have been applied. The host then submits the packet to [`PillRenderer`].
+//! GPU resources never become components or persistable world resources.
 //!
-//! The crate is split in two halves. [`component`] is pure data: it names no
-//! `wgpu` type and reads the world through the two read-only seams `pill_engine`
-//! exposes, [`World::archetypes_iter`](pill_engine::world::World::archetypes_iter)
-//! and [`World::component_registry`](pill_engine::world::World::component_registry).
-//! [`sprite`] and [`renderer`] are the GPU half. The split is what lets
-//! `sprite.rs` keep its `bytemuck` upload record separate from the component
-//! definitions while asserting at compile time that the two layouts agree.
-//!
-//! It is a plain `rlib` linked by `pill_host` under its `rendering` feature,
-//! not a hot-loadable module: a renderer needs a live window handle, per-frame
-//! `World` access and the frontend's event loop, none of which the one-shot
-//! module ABI provides.
-//!
-//! # Cost note
-//!
-//! This crate carries `wgpu`, and a project links it to name `Sprite`. That
-//! puts wgpu, naga and the `windows` bindings into every project `cdylib` and
-//! every hot patch: measured on a patch of one function, the linker pulls 278
-//! archive members it then discards, about 215 ms of the compile. That is the
-//! accepted price of keeping renderer components out of the ECS core. If patch
-//! latency ever matters more than this layering, the fix is to split
-//! [`component`] into its own dependency-free crate that projects depend on
-//! instead, leaving `wgpu` reachable only from the host.
+//! The contract layer works without the `gpu` feature. Byte-based asset loading
+//! and asynchronous GPU initialization leave room for another platform frontend;
+//! the filesystem cooker remains a native tool behind `asset-cooking`.
 
-// Current crate
+// =============================================================================
+// Scene Contracts and Backend Exports
+// =============================================================================
 
-/// The renderer's data contract: sprite components, viewports, instance data.
+pub mod assets;
 pub mod component;
-
-/// Rendering initialization and presentation failures.
-#[cfg(feature = "gpu")]
+pub mod frame;
+pub use component::*;
+pub use frame::{rendering_system, RenderFrame, RenderInstance};
 pub mod error;
-
-/// Window surface, adapter, device and queue lifecycle.
+#[cfg(feature = "gpu")]
+pub mod pbr;
 #[cfg(feature = "gpu")]
 pub mod renderer;
-
-/// The sprite render pipeline and its GPU buffers.
-#[cfg(feature = "gpu")]
-pub mod sprite;
-
-/// A GPU texture stored in the world as an engine resource.
-#[cfg(feature = "gpu")]
-pub mod texture;
-
-// The renderer's public surface, so callers name `pill_master_renderer::Sprite`
-// rather than reaching through the module that happens to declare it.
-// `Position` and `Color` are the engine's - every renderer and most
-// projects want the same two, so they are defined once in
-// `pill_engine` rather than copied into each pipeline. Re-exported
-// here so a caller that already names them through this crate keeps
-// working, and so `register_components` reads as one contract.
-pub use component::{
-    register_components, sprite_instances, RenderViewport, Sprite, SpriteInstance,
-    VirtualResolution,
-};
-pub use pill_engine::common_components::{Color, Position};
-
-// The GPU half's public surface, absent when the `gpu` feature is off.
-#[cfg(feature = "gpu")]
 pub use error::RendererError;
 #[cfg(feature = "gpu")]
 pub use renderer::{Renderer, RendererWindow};
+
+// =============================================================================
+// Registration
+// =============================================================================
+
+/// Install scene contracts and one engine-owned post-update extraction system.
+///
+/// Repeated calls preserve existing resources and do not add another rendering
+/// system. Engine ownership keeps extraction alive when project systems reload;
+/// the post-update stage also runs while gameplay systems are paused.
+/// Returns zero, matching the extension registration status convention.
+pub fn register(engine: &mut pill_engine::Engine) -> u32 {
+    // Step 1: register identities and persistence without replacing scene settings.
+    register_components(engine.world_mut());
+    engine
+        .world_mut()
+        .register_persistable_resource::<RenderSettings>();
+    if engine.world().get_resource::<RenderSettings>().is_none() {
+        engine
+            .world_mut()
+            .insert_resource(RenderSettings::default());
+    }
+    if engine
+        .world()
+        .get_resource::<assets::RenderAssetRequests>()
+        .is_none()
+    {
+        engine
+            .world_mut()
+            .insert_resource(assets::RenderAssetRequests::default());
+    }
+    if engine.world().get_resource::<RenderFrame>().is_none() {
+        engine.world_mut().insert_resource(RenderFrame::default());
+    }
+    // Step 2: install extraction once, outside the reloadable project owner.
+    if engine.is_system_enabled("rendering").is_none() {
+        engine.begin_module_registration(pill_engine::SystemOwner::ENGINE);
+        engine.register_post_update_system("rendering", rendering_system);
+        engine.end_module_registration();
+    }
+    0
+}
+
+// =============================================================================
+// Feature-Gated Implementations
+// =============================================================================
+
+#[cfg(feature = "asset-cooking")]
+pub mod pill_assets;
+
 #[cfg(feature = "gpu")]
-pub use sprite::SpriteRenderer;
+mod gpu_assets;
+
+pub mod api;
+pub use api::{FrameOutcome, HeadlessRenderer, PillRenderer};
+
 #[cfg(feature = "gpu")]
-pub use texture::GpuTexture;
+pub mod graphics;
+pub mod render_queue;
+
+#[cfg(test)]
+mod validation;

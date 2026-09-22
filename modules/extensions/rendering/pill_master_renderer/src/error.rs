@@ -7,10 +7,8 @@
 //!
 //! # Design
 //!
-//! Lives here rather than in `pill_engine` because every variant wraps a
-//! `wgpu` error type, and `pill_engine` is compiled into every loaded module
-//! and every hot patch - one wgpu type reachable from it would put the whole
-//! graphics stack into all of them.
+//! Backend errors are converted to owned descriptions so the public host
+//! contract compiles without GPU dependencies.
 //!
 //! The `engine::renderer` namespace is deliberately unchanged from when this
 //! enum lived in the engine, so the diagnostic codes users may already have
@@ -26,26 +24,20 @@ use pill_core_macros::engine_error;
 /// Rendering initialization or presentation failures of the wgpu backend.
 #[engine_error(namespace = engine::renderer, runtime = ::pill_core::error)]
 pub enum RendererError {
+    /// Cooked asset preparation or loading failed before a usable frame could be built.
+    #[message("render assets failed: ", value(detail))]
+    Assets { detail: String },
     /// The GPU surface could not be created for the supplied window.
-    #[message("failed to create the GPU surface")]
-    SurfaceCreation {
-        #[source]
-        source: wgpu::CreateSurfaceError,
-    },
+    #[message("failed to create the GPU surface: ", value(detail))]
+    SurfaceCreation { detail: String },
 
     /// No compatible GPU adapter could be found.
-    #[message("failed to find a compatible GPU adapter")]
-    AdapterRequest {
-        #[source]
-        source: wgpu::RequestAdapterError,
-    },
+    #[message("failed to find a compatible GPU adapter: ", value(detail))]
+    AdapterRequest { detail: String },
 
     /// The GPU device could not be created from the adapter.
-    #[message("failed to create the GPU device")]
-    DeviceCreation {
-        #[source]
-        source: wgpu::RequestDeviceError,
-    },
+    #[message("failed to create the GPU device: ", value(detail))]
+    DeviceCreation { detail: String },
 
     /// The surface exposes no texture formats.
     #[message("GPU surface exposes no texture formats")]
@@ -56,11 +48,8 @@ pub enum RendererError {
     NoAlphaModes,
 
     /// The frame texture could not be acquired for a fatal reason.
-    #[message("failed to acquire the GPU surface texture")]
-    SurfaceTextureFailed {
-        #[source]
-        source: wgpu::SurfaceError,
-    },
+    #[message("failed to acquire the GPU surface texture: ", value(detail))]
+    SurfaceTextureFailed { detail: String },
 }
 
 // =============================================================================

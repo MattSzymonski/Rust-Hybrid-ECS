@@ -1,10 +1,11 @@
-//! Keeps the spline and its sample sprites aligned with the balls.
+//! Keeps the spline and its sample meshs aligned with the balls.
 
 use crate::settings::*;
 use crate::{PhysicsState, SplineSample};
 use pill_core::math::Vector3f;
 use pill_engine::common_components::Position;
 use pill_engine::*;
+use pill_master_renderer::TransformComponent;
 use pill_spline::Spline;
 
 /// Rebuilds the spline from the ball centres and walks the sample dots along
@@ -18,7 +19,7 @@ use pill_spline::Spline;
 pub(crate) fn spline_path_system(
     mut balls: Query<&PhysicsState>,
     mut splines: Query<&mut Spline>,
-    mut samples: Query<(&SplineSample, &mut Position)>,
+    mut samples: Query<(&SplineSample, &mut Position, &mut TransformComponent)>,
 ) -> Result<(), SystemError> {
     // Step 1: collect the ball centres in the order the control points take.
     // Iteration walks the ball archetype row by row and the balls are spawned
@@ -42,12 +43,17 @@ pub(crate) fn spline_path_system(
             .copy_from_slice(&control_points[..control_point_count]);
         spline.control_point_count = control_point_count as u32;
 
-        for (sample, mut position) in samples.iter_mut() {
+        for (sample, mut position, mut transform) in samples.iter_mut() {
             let location = spline.get_location_at(sample.t);
-            // Samples are curve points, sprites draw from the top-left corner
+            // Samples are curve points, meshs draw from the top-left corner
             // of their quad, and the dot is centred on the sample.
             position.x = location.x - SPLINE_SAMPLE_DOT_SIZE * 0.5;
             position.y = location.y - SPLINE_SAMPLE_DOT_SIZE * 0.5;
+            transform.translation = [
+                (location.x - 400.0) / 80.0,
+                (300.0 - location.y) / 80.0,
+                0.0,
+            ];
         }
     }
 

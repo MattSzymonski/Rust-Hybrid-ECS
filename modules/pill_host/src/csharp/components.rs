@@ -13,7 +13,7 @@
 //! # Design
 //!
 //! In rendering builds the shared component names ([`Position`], [`Color`],
-//! [`Sprite`]) resolve to the renderer's own components through a conditional
+//! [`PbrRenderableComponent`]) resolve to the renderer's own components through a conditional
 //! re-export; headless builds provide layout-identical local definitions
 //! instead. Every managed component is addressed by a [`StableComponentId`]
 //! hashed from its canonical full name, and [`ComponentBinding`] records
@@ -68,17 +68,17 @@ use super::context::active_scope_token;
 // The components managed physics writes into directly.
 //
 // `Position` and `Color` are the engine's - universal enough that every
-// renderer and most projects want the same two - while `Sprite` lives in
+// renderer and most projects want the same two - while `PbrRenderableComponent` lives in
 // `pill_master_renderer` with the pipeline that draws it. Both imports stay
 // gated because it is the *native binding* that is windowed-only, not the
 // types: a headless host registers no native binding for any of them, and a
-// managed project that declares a `Sprite` mirror still works, falling through
+// managed project that declares a `PbrRenderableComponent` mirror still works, falling through
 // to the managed byte-level binding like any other component the host does not
 // know natively.
 #[cfg(feature = "rendering")]
 pub(super) use pill_engine::common_components::{Color, Position};
 #[cfg(feature = "rendering")]
-pub(super) use pill_master_renderer::Sprite;
+pub(super) use pill_master_renderer::PbrRenderableComponent;
 
 /// Stable 128-bit identity derived from a managed component's canonical name.
 ///
@@ -418,12 +418,13 @@ fn shared_renderer_bindings(engine: &mut Engine, bindings: &mut ComponentBinding
         "TracyLive.Position",
         "TracyLive.Position|8|4|X@0:4:System.Single|Y@4:4:System.Single",
     );
-    register_native_binding::<Sprite>(
-        engine,
-        bindings,
-        "TracyLive.Sprite",
-        "TracyLive.Sprite|24|4|Width@0:4:System.Single|Height@4:4:System.Single|Color@8:16:struct|R@0:4:System.Single|G@4:4:System.Single|B@8:4:System.Single|A@12:4:System.Single",
-    );
+    register_native_binding::<PbrRenderableComponent>(engine, bindings, "TracyLive.PbrRenderableComponent",
+        "TracyLive.PbrRenderableComponent|48|8|Mesh@0:8:System.UInt64|Material@8:8:System.UInt64|R@16:4:System.Single|G@20:4:System.Single|B@24:4:System.Single|A@28:4:System.Single|Metallic@32:4:System.Single|Roughness@36:4:System.Single|Visible@40:1:System.Byte");
+    register_native_binding::<pill_master_renderer::TransformComponent>(engine, bindings,"TracyLive.TransformComponent",
+        "TracyLive.TransformComponent|40|4|X@0:4:System.Single|Y@4:4:System.Single|Z@8:4:System.Single|RotationX@12:4:System.Single|RotationY@16:4:System.Single|RotationZ@20:4:System.Single|RotationW@24:4:System.Single|ScaleX@28:4:System.Single|ScaleY@32:4:System.Single|ScaleZ@36:4:System.Single");
+    register_native_binding::<pill_master_renderer::DirectionalLightComponent>(engine,bindings,"TracyLive.DirectionalLightComponent","TracyLive.DirectionalLightComponent|16|4|R@0:4:System.Single|G@4:4:System.Single|B@8:4:System.Single|Intensity@12:4:System.Single");
+    register_native_binding::<pill_master_renderer::CameraComponent>(engine, bindings,"TracyLive.CameraComponent",
+        "TracyLive.CameraComponent|20|4|Enabled@0:1:System.Byte|Priority@4:4:System.Int32|VerticalFov@8:4:System.Single|Near@12:4:System.Single|Far@16:4:System.Single");
     register_native_binding::<Color>(
         engine,
         bindings,

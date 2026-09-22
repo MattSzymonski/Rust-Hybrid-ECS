@@ -37,7 +37,7 @@
 
   <ItemGroup>
     <!-- Named query-row iteration: `foreach (var row in query.Rows())` with
-         one named accessor per term (`row.Position`, `row.Sprite`, ...). The
+         one named accessor per term (`row.Position`, `row.PbrRenderableComponent`, ...). The
          wrappers must be generated into THIS compilation, so the generator is
          referenced here rather than flowing in with the runtime reference
          (project-referenced analyzers are not transitive). It is a separate
@@ -95,7 +95,7 @@
          this project. A committed copy bootstraps standalone builds. -->
     <Compile Include="../../modules/extensions/*/generated/*.g.cs" />
 
-    <!-- The renderer's components (Position, Sprite, Color). This project
+    <!-- The renderer's components (Position, PbrRenderableComponent, Color). This project
          draws, so it imports them from the renderer that owns them - the
          managed counterpart of the Rust project's `pill_master_renderer`
          dependency. They are hand-written rather than generated because the
