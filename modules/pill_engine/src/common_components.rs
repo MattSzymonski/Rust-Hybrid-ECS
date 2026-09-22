@@ -18,11 +18,8 @@
 //! cost a dependency on wgpu - and copies of both types accumulated in every
 //! other renderer besides.
 //!
-//! [`Sprite`](../../pill_master_renderer/component/struct.Sprite.html) does
-//! *not* live here, and the line is deliberate: a quad with a width, a height
-//! and a fill is a renderer's idea of a thing to draw, and the ECS core has no
-//! business defining one. What is here is what a renderer needs *from* the
-//! world rather than what it draws *into* it.
+//! Renderer-specific mesh, camera and material contracts live in the rendering
+//! extension. These general gameplay data types remain usable without it.
 //!
 //! The types are a deliberately shared ABI. `pill_engine` is an rlib, so every
 //! binary that links it gets its own `TypeId` for these structs; consumers
@@ -72,7 +69,7 @@ pub struct Color {
 impl Component for Color {}
 
 impl Color {
-    /// Opaque white, the default fill color of a sprite.
+    /// Opaque white, the default fill color of a mesh.
     pub const WHITE: Color = Color {
         r: 1.0,
         g: 1.0,
@@ -254,7 +251,7 @@ mod tests {
         );
     }
 
-    /// White is the default, because a sprite with no colour set should be
+    /// White is the default, because a mesh with no colour set should be
     /// visible rather than invisible.
     #[test]
     fn a_default_colour_is_opaque_white() {

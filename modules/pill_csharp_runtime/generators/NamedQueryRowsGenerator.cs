@@ -10,7 +10,7 @@
 //
 //   * a `Rows()` extension on the query, and
 //   * a per-shape iterator and row with one named member per term
-//     (`row.PhysicsState`, `row.Position`, `row.Sprite`, `row.Entity`).
+//     (`row.PhysicsState`, `row.Position`, `row.PbrRenderableComponent`, `row.Entity`).
 //
 // The generated row wraps the runtime's own typed row, so it inherits the
 // same semantics: `Write<T>` terms return `ref T` and stamp the change tick,
@@ -418,7 +418,7 @@ namespace PillIterationGenerators
 
         public string Key { get; }
 
-        /// <summary>Base type name, e.g. `PhysicsStatePositionSpriteQuery`.</summary>
+        /// <summary>Base type name, e.g. `PhysicsStatePositionPbrRenderableComponentQuery`.</summary>
         public string CandidateName { get; }
 
         /// <summary>

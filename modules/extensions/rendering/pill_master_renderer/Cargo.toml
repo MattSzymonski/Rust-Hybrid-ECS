@@ -7,47 +7,39 @@ edition = "2021"
 workspace = true
 
 [lib]
-# A host-linked library under `extensions/`, never a hot-loadable module. A
-# renderer needs a live window handle, per-frame `World` access and the
-# frontend's event loop; the module ABI is a one-shot component registration,
-# so loading this as a DLL would mean inventing a per-frame render ABI for no
-# benefit. Same crate shape as `host_project_project`: plain `rlib`, no
-# `module-abi`, no build script, not listed in any `project_settings.yaml`.
+# Host-linked renderer, never a hot-loaded project module.
 crate-type = ["rlib"]
 
 [dependencies]
+trait_type_map = { path = "../../../../../Trait-Type-Map" }
+half = { version = "2", optional = true }
+anyhow = { version = "1", optional = true }
+glob = { version = "0.3", optional = true }
+png = { version = "0.17", optional = true }
+tobj = { version = "3", optional = true }
+gltf = { version = "1", features = ["import"], optional = true }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+glam = { version = "0.33", features = ["serde"] }
+
 pill_core = { path = "../../../pill_core" }
-# The `#[engine_error]` attribute that declares `RendererError`; it renders
-# through `pill_core::error`, which is why both are needed.
 pill_core_macros = { path = "../../../pill_core_macros" }
 pill_engine = { path = "../../../pill_engine" }
-# `impl_trait_accessible!` for the renderer components, so the ECS can reach
-# them through its type-erased `dyn Component` storage.
-# The GPU half, behind the `gpu` feature. Optional so a project can depend on
-# this crate for `Sprite` alone and keep wgpu out of its dependency graph - see
-# the feature's own note for why that is worth a feature rather than a split.
 wgpu = { version = "26.0.1", optional = true }
 bytemuck = { version = "1", features = ["derive"], optional = true }
 pollster = { version = "0.4", optional = true }
-# Expanded into by `#[engine_error]`, which builds on `thiserror` for the
-# `Error` impl and `miette` for the diagnostic derive.
 thiserror = "2"
 miette = { version = "7", features = ["derive"] }
 
 [features]
-# The wgpu pipeline: the surface, the device, the sprite render pass, and the
-# failure type whose every variant wraps a `wgpu` error. On by default, because
-# anything that links this crate to *draw* wants all of it.
-#
-# A project links this crate only to name `Sprite`, and turns the feature off
-# (`default-features = false`). That matters beyond binary size: cargo folds a
-# dependency's resolved features into the dependent's `-C metadata`, and that
-# hash is part of every symbol name `pill_core.dll` exports. A project that
-# dragged wgpu into its graph therefore linked a different engine dylib than a
-# headless host had mapped, and failed to load with nothing but
-# "The specified procedure could not be found".
-#
-# What is left with the feature off is `component`: `Sprite`, the viewport
-# types, and the collection pass - all plain data that names no `wgpu` type.
+# Contract-only dependencies disable defaults; tooling enables asset-cooking.
 default = ["gpu"]
-gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster"]
+gpu = ["dep:half","dep:wgpu", "dep:bytemuck", "dep:pollster"]
+
+asset-cooking = ["dep:anyhow", "dep:glob", "dep:png", "dep:tobj", "dep:gltf", "dep:bytemuck"]
+
+[[bin]]
+name = "pill-cook"
+path = "src/cook_main.rs"
+required-features = ["asset-cooking"]

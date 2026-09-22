@@ -14,7 +14,7 @@ crate-type = ["cdylib", "rlib"]
 pill_audio = { path = "../../modules/extensions/pill_audio", default-features = false }
 pill_engine = { path = "../../modules/pill_engine" }
 pill_core = { path = "../../modules/pill_core" }
-# The renderer, for `Sprite`: a quad with a width, a height and a fill is the
+# The renderer, for `PbrRenderableComponent`: a quad with a width, a height and a fill is the
 # renderer's own idea of a thing to draw, so it lives with the pipeline that
 # draws it. `Position` and `Color` are universal and come from `pill_engine`
 # instead.

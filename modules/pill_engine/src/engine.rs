@@ -79,6 +79,8 @@ impl SystemOwner {
 }
 
 struct RegisteredSystem {
+    /// Run after deferred commands, including while paused.
+    post_update: bool,
     /// Name used for registration, debugging, and profiling.
     name: String,
     /// Module that registered this system, used to scope a hot reload.
@@ -614,6 +616,7 @@ impl Engine {
 
         // Store system
         self.systems.push(RegisteredSystem {
+            post_update: false,
             name: system_name,
             owner: self.active_owner,
             system: boxed_system,
@@ -625,6 +628,19 @@ impl Engine {
 
         // Rebuild execution graph
         self.scheduler.build_execution_graph();
+    }
+
+    /// Register a post-flush system. Commands emitted here apply next frame.
+    pub fn register_post_update_system<F, Input>(&mut self, name: impl Into<String>, system: F)
+    where
+        F: IntoSystem<Input>,
+        Input: SystemParam,
+    {
+        self.register_system(name, system);
+        self.systems
+            .last_mut()
+            .expect("just registered")
+            .post_update = true;
     }
 
     // -------------------------------------------------------------------------
@@ -706,6 +722,7 @@ impl Engine {
         access.build_component_masks(&self.world.component_registry);
         self.scheduler.register_system(access);
         self.systems.push(RegisteredSystem {
+            post_update: false,
             name: name.into(),
             owner: self.active_owner,
             system: Box::new(system),
@@ -950,7 +967,7 @@ impl Engine {
                 if self.parallel_execution && self.systems.len() > 1 {
                     self.run_systems_parallel();
                 } else {
-                    self.run_systems_sequential();
+                    self.run_systems_sequential(false);
                 }
                 self.single_step_pending = false;
             }
@@ -985,6 +1002,7 @@ impl Engine {
                     .execute_queued_commands(&mut self.world, self.should_exit_on_error);
             }
             crate::profile_secondary_frame_mark!("commands");
+            self.run_systems_sequential(true);
 
             // Step 7: Check for duplicate iterator labels within this frame and
             // emit the per-frame time-series plots and metrics.
@@ -1076,7 +1094,7 @@ impl Engine {
 
     /// Runs systems sequentially, used when parallel execution is disabled or
     /// when only one system is registered.
-    fn run_systems_sequential(&mut self) {
+    fn run_systems_sequential(&mut self, post_update: bool) {
         let _zone = crate::profile_scope!(
             "systems sequential",
             [(
@@ -1086,7 +1104,7 @@ impl Engine {
             )]
         );
         for registered_system in &mut self.systems {
-            if !registered_system.enabled {
+            if !registered_system.enabled || registered_system.post_update != post_update {
                 continue;
             }
             let _tracy_sys = crate::profile_scope!(
@@ -1172,7 +1190,7 @@ impl Engine {
                 // Single system - run directly on main thread, skip rayon
                 let system_index = systems_batch[0];
                 let registered = &mut self.systems[system_index];
-                if !registered.enabled {
+                if !registered.enabled || registered.post_update {
                     continue;
                 }
                 self.world.system_last_run = registered.last_run;
@@ -1262,7 +1280,10 @@ impl Engine {
                 // This is a small fixed-size read that avoids Vec allocation in most cases
                 let enabled_flags: Vec<bool> = systems_batch
                     .iter()
-                    .map(|&system_index| self.systems[system_index].enabled)
+                    .map(|&system_index| {
+                        self.systems[system_index].enabled
+                            && !self.systems[system_index].post_update
+                    })
                     .collect();
 
                 // Pre-compute system names for profiling spans in the parallel closure.
@@ -1586,10 +1607,7 @@ mod tests {
         engine.register_system("owned_by_project", || {});
 
         // Only the module's system is removed by clearing its owner.
-        assert_eq!(
-            engine.clear_systems_owned_by(SystemOwner::extension(3)),
-            1
-        );
+        assert_eq!(engine.clear_systems_owned_by(SystemOwner::extension(3)), 1);
         assert_eq!(engine.is_system_enabled("owned_by_project"), Some(true));
         assert_eq!(engine.is_system_enabled("owned_by_module"), None);
     }
@@ -1600,10 +1618,7 @@ mod tests {
     fn clearing_an_unused_owner_is_a_no_op() {
         let mut engine = Engine::new();
         engine.register_system("project_system", || {});
-        assert_eq!(
-            engine.clear_systems_owned_by(SystemOwner::extension(7)),
-            0
-        );
+        assert_eq!(engine.clear_systems_owned_by(SystemOwner::extension(7)), 0);
         assert_eq!(engine.is_system_enabled("project_system"), Some(true));
     }
 

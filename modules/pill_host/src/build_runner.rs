@@ -134,10 +134,11 @@ fn host_build_identity() -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!(
-        "{HOST_MODULE_FEATURE_SET}\nprofile={}\ntarget={}\nbuild_tree={}\nspawned_env={spawned_environment}",
+        "{HOST_MODULE_FEATURE_SET}\nprofile={}\ntarget={}\nbuild_tree={}\nanchor={:?}\nspawned_env={spawned_environment}",
         crate::config::host_profile_name(),
         crate::config::host_target_triple().unwrap_or("native"),
-        crate::config::MODULE_BUILD_TARGET_DIRECTORY
+        crate::config::MODULE_BUILD_TARGET_DIRECTORY,
+        host_anchor_package()
     )
 }
 

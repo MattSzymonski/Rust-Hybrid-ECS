@@ -37,7 +37,7 @@ use pill_engine::Engine;
 use pill_engine::EngineApi;
 #[cfg(feature = "rendering")]
 use pill_master_renderer::{
-    RenderViewport, Renderer, RendererError, RendererWindow, VirtualResolution,
+    PillRenderer, RenderFrame, RenderViewport, Renderer, RendererError, RendererWindow,
 };
 
 // Current crate
@@ -48,9 +48,9 @@ use crate::config::project_depends_on_crate;
 #[cfg(feature = "hot_reload")]
 use crate::csharp::ModuleExposedComponent;
 #[cfg(feature = "hot_reload")]
-use crate::native_library::cleanup_temporary_files;
-#[cfg(feature = "hot_reload")]
 use crate::extension::{ExtensionSlot, ReloadOutcome};
+#[cfg(feature = "hot_reload")]
+use crate::native_library::cleanup_temporary_files;
 #[cfg(feature = "hot_reload")]
 use crate::project_module::LoadedProject;
 #[cfg(feature = "hot_reload")]
@@ -275,8 +275,8 @@ impl Host {
     /// vector labels owner `i + 1`; owner `0` is the project.
     #[cfg(feature = "hot_reload")]
     pub fn extension_names(&self) -> Vec<String> {
-        self.extensions.
-            iter()
+        self.extensions
+            .iter()
             .map(|slot| slot.name().to_string())
             .collect()
     }
@@ -336,7 +336,11 @@ impl Host {
 #[cfg(feature = "rendering")]
 pub struct RenderingHost {
     host: Host,
-    renderer: Renderer,
+    renderer: Box<dyn PillRenderer>,
+    assets: crate::render_assets::NativeAssets,
+    surface_extent: [u32; 2],
+    viewport: Option<RenderViewport>,
+    presented_scene: bool,
 }
 
 #[cfg(feature = "rendering")]
@@ -356,13 +360,17 @@ impl RenderingHost {
         W: RendererWindow + 'static,
     {
         let renderer = Renderer::new(window, width, height)?;
-        self.renderer = renderer;
+        self.renderer = Box::new(renderer);
+        self.surface_extent = [width, height];
+        self.set_render_viewport(self.viewport);
         Ok(())
     }
 
     /// Forward a physical window resize to the engine renderer.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.renderer.resize(width, height);
+        self.surface_extent = [width, height];
+        self.set_render_viewport(self.viewport);
     }
 
     /// Restrict engine drawing to a physical region of the native surface.
@@ -371,20 +379,41 @@ impl RenderingHost {
     /// corresponding WebView region transparent and keep surrounding UI
     /// panels opaque.
     pub fn set_render_viewport(&mut self, viewport: Option<RenderViewport>) {
+        self.viewport = viewport;
         self.renderer.set_viewport(viewport);
-    }
-
-    /// Map a stable project coordinate space into the current physical viewport.
-    ///
-    /// Pass `None` to make logical renderer units match physical pixels again.
-    pub fn set_render_virtual_resolution(&mut self, resolution: Option<VirtualResolution>) {
-        self.renderer.set_virtual_resolution(resolution);
+        let extent = viewport
+            .and_then(|v| v.clamped_to(self.surface_extent[0], self.surface_extent[1]))
+            .map(|v| [v.width, v.height])
+            .unwrap_or(self.surface_extent);
+        if let Some(frame) = self
+            .host
+            .engine_mut()
+            .world_mut()
+            .get_resource_mut::<RenderFrame>()
+        {
+            frame.extent = extent;
+        }
     }
 
     /// Execute one ECS frame and present its resulting world to the surface.
     pub fn run_one_frame(&mut self) -> Result<Option<FrameReport>, RendererError> {
+        self.assets.update(self.host.engine_mut())?;
         let report = run_one_frame(&mut self.host);
-        self.renderer.render(self.host.engine_mut())?;
+        if let Some(frame) = self.host.engine().world().get_resource::<RenderFrame>() {
+            let outcome = self.renderer.render(frame)?;
+            if !self.presented_scene
+                && matches!(outcome, pill_master_renderer::FrameOutcome::Presented)
+                && self.renderer.metrics().draw_calls > 1
+            {
+                self.presented_scene = true;
+                println!(
+                    "[render] First frame: {outcome:?}; camera={}; instances={}; {:?}",
+                    frame.has_camera,
+                    frame.instances.len(),
+                    self.renderer.metrics()
+                );
+            }
+        }
         Ok(report)
     }
 
@@ -646,8 +675,8 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
     // cascading project reload a module swap would otherwise queue.
     #[cfg(feature = "hot_patch")]
     let module_hot_patch: Vec<Option<crate::hot_patch::HotPatchSession>> = host_config
-        .extensions.
-        iter()
+        .extensions
+        .iter()
         .map(|configuration| {
             crate::hot_patch::HotPatchSession::new(
                 &workspace_root,
@@ -750,7 +779,7 @@ pub fn setup_rendering<W>(
 where
     W: RendererWindow + 'static,
 {
-    let host = setup(project.into())?;
+    let mut host = setup(project.into())?;
     info!(
         target: telemetry_target::RENDERING,
         width,
@@ -758,7 +787,34 @@ where
         "attaching the engine renderer to the window surface"
     );
     let renderer = Renderer::new(window, width, height)?;
-    Ok(RenderingHost { host, renderer })
+    pill_master_renderer::register(host.engine_mut());
+    #[cfg(feature = "hot_reload")]
+    let project_root = host
+        .workspace_root
+        .join(&host.module_config.watch_directory)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    #[cfg(feature = "hot_reload")]
+    let assets =
+        crate::render_assets::NativeAssets::prepare(Some(&project_root), &host.workspace_root)?;
+    #[cfg(not(feature = "hot_reload"))]
+    let assets = crate::render_assets::NativeAssets::prepare(None, std::path::Path::new("."))?;
+    if let Some(frame) = host
+        .engine_mut()
+        .world_mut()
+        .get_resource_mut::<RenderFrame>()
+    {
+        frame.extent = [width, height];
+    }
+    Ok(RenderingHost {
+        host,
+        renderer: Box::new(renderer),
+        assets,
+        surface_extent: [width, height],
+        viewport: None,
+        presented_scene: false,
+    })
 }
 
 /// Complete rendering setup from an already-built [`Host`], attaching the
@@ -774,7 +830,7 @@ where
 /// Returns a [`RendererError`] when surface or renderer creation fails.
 #[cfg(feature = "rendering")]
 pub fn attach_renderer<W>(
-    host: Host,
+    mut host: Host,
     window: W,
     width: u32,
     height: u32,
@@ -789,7 +845,34 @@ where
         "attaching the engine renderer to the window surface"
     );
     let renderer = Renderer::new(window, width, height)?;
-    Ok(RenderingHost { host, renderer })
+    pill_master_renderer::register(host.engine_mut());
+    #[cfg(feature = "hot_reload")]
+    let project_root = host
+        .workspace_root
+        .join(&host.module_config.watch_directory)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    #[cfg(feature = "hot_reload")]
+    let assets =
+        crate::render_assets::NativeAssets::prepare(Some(&project_root), &host.workspace_root)?;
+    #[cfg(not(feature = "hot_reload"))]
+    let assets = crate::render_assets::NativeAssets::prepare(None, std::path::Path::new("."))?;
+    if let Some(frame) = host
+        .engine_mut()
+        .world_mut()
+        .get_resource_mut::<RenderFrame>()
+    {
+        frame.extent = [width, height];
+    }
+    Ok(RenderingHost {
+        host,
+        renderer: Box::new(renderer),
+        assets,
+        surface_extent: [width, height],
+        viewport: None,
+        presented_scene: false,
+    })
 }
 
 /// Process hot reloads, execute one scheduler frame, and update FPS tracking.
@@ -1144,8 +1227,7 @@ fn run_reload_steps(host: &mut Host) {
     if matches!(&module_config.backend, ProjectModuleBackend::CSharp(_)) && any_module_reloaded {
         let mut needs_csharp_reload = false;
         for index in &reloaded_modules {
-            match regenerate_module_csharp_mirror(workspace_root, engine, &extensions[*index])
-            {
+            match regenerate_module_csharp_mirror(workspace_root, engine, &extensions[*index]) {
                 Ok((_exposed, methods, accessors, mirror_changed)) => {
                     // A mirror-content change (fields/value types/method set)
                     // always rebuilds; a module exposing mirrored methods or
@@ -1170,8 +1252,8 @@ fn run_reload_steps(host: &mut Host) {
         // keep the addresses they were loaded with. Container accessors are
         // appended as rows so the managed side resolves them through the same
         // lookup.
-        let mut rows: Vec<crate::csharp::ResolvedMirrorMethod> = extensions.
-            iter()
+        let mut rows: Vec<crate::csharp::ResolvedMirrorMethod> = extensions
+            .iter()
             .flat_map(ExtensionSlot::mirror_methods)
             .collect();
         for slot in extensions.iter() {

@@ -69,7 +69,7 @@ internal static class ProjectConstants
     /// <summary>Edge length of a sample dot, in pixels.</summary>
     internal const float SplineSampleDotSize = 6.0f;
 
-    /// <summary>Fill colour of the ball sprites.</summary>
+    /// <summary>Fill colour of the ball meshes.</summary>
     internal static readonly Color BallColor = new() { R = 1.0f, G = 0.3f, B = 0.3f, A = 1.0f };
 
     /// <summary>Fill colour of the sample dots.</summary>
@@ -134,7 +134,7 @@ internal static class SimulationClock
 // Ball physics
 // =============================================================================
 
-/// <summary>Steps every ball by the frame delta and copies its state into its sprite.</summary>
+/// <summary>Steps every ball by the frame delta and copies its state into its mesh.</summary>
 public static class BallPhysicsSystem
 {
     /// <summary>Advances one ball by its own delta and bounces it off the box.</summary>
@@ -177,7 +177,7 @@ public static class BallPhysicsSystem
     [EcsSystem]
     public static void Run(
         ResMut<SimulationTime> time,
-        Query<Write<PhysicsState>, Write<Position>, Write<Sprite>> query)
+        Query<Write<PhysicsState>, Write<Position>, Write<TransformComponent>> query)
     {
         ref SimulationTime simulation = ref time.Value;
         SimulationClock.Stamp(ref simulation);
@@ -187,17 +187,16 @@ public static class BallPhysicsSystem
         {
             ref var physics = ref row.PhysicsState;
             ref var position = ref row.Position;
-            ref var sprite = ref row.Sprite;
+            ref var transform = ref row.TransformComponent;
 
             physics.DeltaTime = deltaSeconds;
             Simulate(ref physics);
 
-            // Physics coordinates describe the centre of the ball; the sprite
+            // Physics coordinates describe the centre of the ball; the mesh
             // renderer expects the top-left corner of the quad.
             position.X = physics.PositionX - physics.Radius;
             position.Y = physics.PositionY - physics.Radius;
-            sprite.Width = physics.Radius * 2.0f;
-            sprite.Height = physics.Radius * 2.0f;
+            transform = TransformComponent.At((physics.PositionX-400.0f)/80.0f,(300.0f-physics.PositionY)/80.0f,0.0f,physics.Radius/80.0f);
         }
     }
 }
@@ -259,7 +258,7 @@ public static class SplinePathSystem
     public static void Run(
         Query<Read<PhysicsState>> balls,
         Query<Write<Spline>> splines,
-        Query<Write<SplineSample>, Write<Position>> samples)
+        Query<Write<SplineSample>, Write<Position>, Write<TransformComponent>> samples)
     {
         // Step 1: collect the ball centres in the order the control points
         // take. Iteration walks the ball archetype row by row and the balls
@@ -306,9 +305,10 @@ public static class SplinePathSystem
                 float y = spline.GetLocationY(sample.T);
 
                 // Samples are curve points and the dot is centred on them;
-                // sprites draw from the top-left corner of their quad.
+                // meshs draw from the top-left corner of their quad.
                 position.X = x - SplineSampleDotSize * 0.5f;
                 position.Y = y - SplineSampleDotSize * 0.5f;
+                sampleRow.TransformComponent = TransformComponent.At((x-400.0f)/80.0f,(300.0f-y)/80.0f,0.0f,SplineSampleDotSize/160.0f);
             }
         }
     }
@@ -368,12 +368,8 @@ public static class BallSpawnSystem
                     X = ball.PositionX - ball.Radius,
                     Y = ball.PositionY - ball.Radius,
                 })
-                .With(new Sprite
-                {
-                    Width = ball.Radius * 2.0f,
-                    Height = ball.Radius * 2.0f,
-                    Color = BallColor,
-                })
+                .With(TransformComponent.At((ball.PositionX-400.0f)/80.0f,(300.0f-ball.PositionY)/80.0f,0.0f,ball.Radius/80.0f))
+                .With(PbrRenderableComponent.FromColor(BallColor))
                 .Build();
         }
     }
@@ -438,13 +434,19 @@ public static class SplineSampleSpawnSystem
                     X = x - SplineSampleDotSize * 0.5f,
                     Y = y - SplineSampleDotSize * 0.5f,
                 })
-                .With(new Sprite
-                {
-                    Width = SplineSampleDotSize,
-                    Height = SplineSampleDotSize,
-                    Color = SampleDotColor,
-                })
+                .With(TransformComponent.At((x-400.0f)/80.0f,(300.0f-y)/80.0f,0.0f,SplineSampleDotSize/160.0f))
+                .With(PbrRenderableComponent.FromColor(SampleDotColor))
                 .Build();
         }
     }
+}
+
+/// <summary>One camera looking down -Z at the mesh scene.</summary>
+public static class CameraSpawnSystem {
+ [EcsSystem]
+ public static void Run(Query<Read<CameraComponent>> cameras, Commands commands) {
+  foreach (var row in cameras.Rows()) { return; }
+  commands.CreateEntity().With(new DirectionalLightComponent {R=1,G=1,B=1,Intensity=3}).With(TransformComponent.At(0,0,0,1)).Build();
+  commands.CreateEntity().With(new CameraComponent { Enabled=1,VerticalFov=60,Near=0.1f,Far=1000 }).With(TransformComponent.At(0,0,9,1)).Build();
+ }
 }

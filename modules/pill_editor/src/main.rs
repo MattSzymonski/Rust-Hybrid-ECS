@@ -38,7 +38,7 @@ use futures_util::StreamExt;
 use pill_core::error::EngineMessage;
 use pill_host::{
     engine_report, install_engine_report_handler, setup_rendering, FrameReport, HostConfig,
-    HostError, RenderViewport, RenderingError, RenderingHost, VirtualResolution,
+    HostError, RenderViewport, RenderingError, RenderingHost,
 };
 
 use dock_view::DockView;
@@ -57,7 +57,6 @@ const STATS_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 const COMMAND_ERROR_LIMIT: usize = 100;
 
 /// Stable coordinate space used by the bouncing-ball project systems.
-const PROJECT_VIRTUAL_RESOLUTION: VirtualResolution = VirtualResolution::new(800.0, 600.0);
 
 /// Install the shared telemetry stack (terminal, optional file, optional
 /// Tracy) before Dioxus takes over the event loop.
@@ -354,7 +353,6 @@ impl EditorContext {
             size.height,
         )?;
         host.set_render_viewport(Some(RenderViewport::default()));
-        host.set_render_virtual_resolution(Some(PROJECT_VIRTUAL_RESOLUTION));
 
         Ok(Self {
             host: RefCell::new(host),
@@ -405,7 +403,6 @@ impl EditorContext {
         let mut host = self.host.borrow_mut();
         host.retarget_render_window(window, size.width, size.height)
             .map_err(|source| EditorError::Retarget { source })?;
-        host.set_render_virtual_resolution(Some(PROJECT_VIRTUAL_RESOLUTION));
         host.set_render_viewport(Some(RenderViewport::full(size.width, size.height)));
         self.detached_scene_window.set(Some(window_id));
         Ok(())
@@ -429,7 +426,6 @@ impl EditorContext {
         let mut host = self.host.borrow_mut();
         host.retarget_render_window(Arc::clone(&self.window), size.width, size.height)
             .map_err(|source| EditorError::Retarget { source })?;
-        host.set_render_virtual_resolution(Some(PROJECT_VIRTUAL_RESOLUTION));
         host.set_render_viewport(Some(self.main_scene_viewport.get()));
         self.detached_scene_window.set(None);
         Ok(())

@@ -36,7 +36,7 @@ pub const SPLINE_SAMPLE_COUNT: usize = 21;
 /// Edge length of a sample dot, in pixels.
 pub const SPLINE_SAMPLE_DOT_SIZE: f32 = 6.0;
 
-/// Fill colour of the ball sprites.
+/// Fill colour of the ball meshes.
 pub const BALL_COLOR: Color = Color::new(1.0, 0.3, 0.3, 1.0);
 
 /// Fill colour of the sample dots.

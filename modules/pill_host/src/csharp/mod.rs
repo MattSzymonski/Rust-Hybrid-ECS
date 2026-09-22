@@ -26,13 +26,13 @@ mod codegen;
 mod commands;
 /// C# component identities, native bindings, and manifest registration.
 mod components;
-#[cfg(feature = "hot_reload")]
-/// In-process Roslyn compilation of the C# project, replacing MSBuild on reload.
-mod fast_compile;
 /// Thread-local access scope installed around one scheduled C# system.
 mod context;
 /// Low-level .NET hosting bootstrap used by the C# project backend.
 mod csharp_runtime;
+#[cfg(feature = "hot_reload")]
+/// In-process Roslyn compilation of the C# project, replacing MSBuild on reload.
+mod fast_compile;
 /// The two-call protocol every managed payload crosses the boundary through.
 mod managed_buffer;
 /// C# component manifest schema, field validation, and engine type mapping.
@@ -172,7 +172,7 @@ pub(crate) use abi::publish_mirror_methods;
 /// Integration-style unit tests for the native/C# ECS boundary.
 ///
 /// Gated on `rendering` because the fixtures are the renderer's own components
-/// (`Position`, `Sprite`, `Color`): they are the shared-ABI types the managed
+/// (`Position`, `PbrRenderableComponent`, `Color`): they are the shared-ABI types the managed
 /// side mirrors, so they are what these tests must exercise, and they live in
 /// `pill_master_renderer`, which only a windowed host links. `cargo test` on the
 /// editor or any windowed frontend runs them; `--no-default-features` does not.

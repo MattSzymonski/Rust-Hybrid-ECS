@@ -49,6 +49,8 @@ mod hot_patch;
 #[cfg(feature = "hot_patch")]
 pub use hot_patch::PatchGeneration;
 
+/// Lifecycle management for extensions.
+mod extension;
 /// Windowed-frontend and rendering errors, owned by the host because the
 /// host owns the event loop and the renderer.
 #[cfg(feature = "rendering")]
@@ -56,8 +58,6 @@ mod frontend;
 /// Native project-library loading and Windows-safe temporary-copy handling.
 #[cfg(feature = "hot_reload")]
 mod native_library;
-/// Lifecycle management for extensions.
-mod extension;
 /// Lifecycle management for the active native or managed project module.
 mod project_module;
 /// The sequence every reload runs once its replacement image is loaded.
@@ -82,7 +82,7 @@ mod static_link;
 
 // Local host modules and the shared crate-root error surface.
 pub use config::{
-    CSharpModuleConfig, HostConfig, ExtensionConfig, ProjectModuleBackend, ProjectModuleConfig,
+    CSharpModuleConfig, ExtensionConfig, HostConfig, ProjectModuleBackend, ProjectModuleConfig,
 };
 pub use extension::EXTENSION_ABI_VERSION;
 pub use pill_core::error::{
@@ -115,10 +115,11 @@ pub use pill_engine::EngineError;
 #[cfg(feature = "rendering")]
 pub use crate::frontend::{FrontendError, RenderingError};
 #[cfg(feature = "rendering")]
-pub use pill_master_renderer::{
-    RenderViewport, Renderer, RendererError, RendererWindow, VirtualResolution,
-};
+pub use pill_master_renderer::{RenderViewport, Renderer, RendererError, RendererWindow};
 
 // Rendering-only frontend entry points: window and event-loop setup.
 #[cfg(feature = "rendering")]
 pub use runtime::{attach_renderer, setup_rendering, RenderingHost};
+
+#[cfg(feature = "rendering")]
+mod render_assets;

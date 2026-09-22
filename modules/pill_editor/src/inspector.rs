@@ -102,13 +102,13 @@ fn is_scalar_editable(tag: &str) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Colour groups (renderer sprite tint as a colour picker)
+// Colour groups (component tint as a colour picker)
 // ---------------------------------------------------------------------------
 
 /// One RGBA colour group discovered inside a component's scalar fields.
 ///
 /// Either an embedded struct flattened with prefixed names (`color.r` …
-/// `color.a`, exactly how the engine registers `Sprite`) or a bare `r/g/b/a`
+/// `color.a`, exactly how the engine registers a nested colour component) or a bare `r/g/b/a`
 /// set on a component that is itself a colour (`…::Color`). Each channel is an
 /// `f32` in 0.0-1.0 written back through the generic scalar API, one
 /// `SetField` per channel, so nothing here knows the concrete component type.
@@ -211,7 +211,7 @@ fn detect_color_groups(
     let mut consumed = BTreeSet::new();
 
     // Pass 1: prefixed groups such as `color.r` … `color.a`, i.e. an embedded
-    // struct flattened by the engine layout (the `Sprite` case).
+    // struct flattened by the engine layout (a nested colour component).
     let mut by_prefix: BTreeMap<String, BTreeMap<char, (usize, String)>> = BTreeMap::new();
     for (index, field) in fields.iter().enumerate() {
         if field.type_tag != "f32" {
@@ -935,52 +935,7 @@ mod tests {
     use super::*;
     use pill_engine::common_components::Color;
     use pill_engine::Engine;
-    use pill_master_renderer::{register_components, Sprite};
-
-    /// A `Sprite`-carrying entity surfaces width/height as ordinary scalar
-    /// rows plus one colour group whose flattened `color.*` channels are
-    /// consumed by the picker.
-    #[test]
-    fn sprite_fields_produce_one_color_group() {
-        let mut engine = Engine::new();
-        register_components(engine.world_mut());
-        let entity = engine
-            .world_mut()
-            .create_entity()
-            .with(Sprite {
-                width: 64.0,
-                height: 32.0,
-                color: Color::new(1.0, 0.5, 0.25, 1.0),
-            })
-            .build()
-            .expect("entity builds");
-
-        let detail = EditorSnapshot::capture_detail(&engine, entity).expect("detail");
-        let sprite = detail
-            .components
-            .iter()
-            .find(|view| view.type_name.ends_with("::Sprite"))
-            .expect("sprite view present");
-        assert!(sprite.editable, "sprite has a field layout");
-
-        let (groups, consumed) = detect_color_groups(
-            &sprite.type_name,
-            &sprite.fields,
-            &sprite.values,
-            detail.entity,
-            sprite.type_name.clone(),
-        );
-
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].label, "color");
-        assert_eq!(groups[0].r_field, "color.r");
-        assert_eq!(groups[0].a_field.as_deref(), Some("color.a"));
-        assert_eq!(groups[0].hex_value, "#ff8040");
-        // The four colour channels are consumed; width and height stay rows.
-        assert_eq!(consumed.len(), 4);
-        assert!(consumed.contains(&2));
-        assert!(consumed.contains(&5));
-    }
+    use pill_master_renderer::register_components;
 
     /// A component that is itself a colour (`…::Color`) groups its bare
     /// `r/g/b/a` scalars under the "color" label.
