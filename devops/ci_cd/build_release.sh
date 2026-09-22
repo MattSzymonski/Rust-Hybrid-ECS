@@ -7,7 +7,7 @@
 #   `cargo build --release` cannot do.
 #
 #   The obstacle is `-C prefer-dynamic` in `modules/.cargo/config.toml`. It is
-#   there so the host executable and every optional module share one copy of
+#   there so the host executable and every extension share one copy of
 #   `pill_engine`, which is what keeps its statics, thread-locals and tracing
 #   dispatcher single-instance across the DLL boundary. A release binary links
 #   everything into one image and needs none of that - and rustc refuses

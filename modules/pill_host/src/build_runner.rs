@@ -35,7 +35,7 @@ use pill_core::warn;
 
 // Current crate
 use crate::analytics::{self, BuildStatus, ModuleKind};
-use crate::{OptionalModuleConfig, ProjectModuleBackend, ProjectModuleConfig};
+use crate::{ExtensionConfig, ProjectModuleBackend, ProjectModuleConfig};
 
 // =============================================================================
 // Constants
@@ -70,9 +70,9 @@ fn cargo_module_output_subdirectory() -> String {
 }
 
 /// Private directory the host stages the project's loadable artifacts into,
-/// and the default an optional module's configuration also names.
+/// and the default an extension's configuration also names.
 ///
-/// The same protection optional modules have always had, extended to the
+/// The same protection extensions have always had, extended to the
 /// project. Cargo writes `project.dll` to a shared per-crate slot that any
 /// other `cargo build` of the same package overwrites - with a different
 /// feature set, and therefore a differently configured `pill_engine` compiled
@@ -1152,7 +1152,7 @@ fn stop_process_tree(_tree: Option<&BuildProcessTree>, child: &mut Child) {
 
 /// Run one module's build command to completion.
 ///
-/// Shared by the project module and by optional modules so both use the same
+/// Shared by the project module and by extensions so both use the same
 /// process handling, watchdog, cancellation, and failure reporting. Resolving
 /// and validating the produced artifact is left to the caller, because each
 /// module kind names and locates its output differently.
@@ -1407,8 +1407,8 @@ pub(crate) fn build_project_module(
     // naming conventions; managed outputs always use an assembly `.dll`.
     //
     // A native project has two: the slot cargo writes into, and the private
-    // copy the host loads from. They are kept apart for the reason optional
-    // modules already keep them apart - any other `cargo build` of the same
+    // copy the host loads from. They are kept apart for the reason extensions
+    //  already keep them apart - any other `cargo build` of the same
     // package overwrites cargo's slot, and for the project that means a DLL
     // carrying a differently configured `pill_engine`, which access-violates
     // inside `LoadLibrary`. The managed backend has no such collision and
@@ -1650,7 +1650,7 @@ fn stage_engine_dylib(workspace_root: &Path) {
 ///
 /// `rlib` is `None` for a crate that produces none. `require_rlib` says whether
 /// a missing one is an error: the project always produces an rlib and a missing
-/// one means something is wrong, while an optional module declaring only a
+/// one means something is wrong, while an extension declaring only a
 /// `cdylib` legitimately has none and simply leaves the fast path idle.
 ///
 /// Returns the staged paths, in the order a stamp should record them.
@@ -1805,24 +1805,24 @@ fn staged_copy_is_current(source: &Path, staged: &Path) -> bool {
     }
 }
 
-/// Build one optional module and return its expected output artifact.
+/// Build one extension and return its expected output artifact.
 ///
-/// Optional modules are workspace members, so their output always follows the
+/// Extensions are workspace members, so their output always follows the
 /// platform's native-library naming inside the configured output directory.
 ///
 /// # Errors
 ///
 /// Returns an error if the build fails for any of the reasons reported by
 /// [`run_build_command`], or if the built library is missing afterwards.
-pub(crate) fn build_optional_module(
+pub(crate) fn build_extension(
     workspace_root: &Path,
-    config: &OptionalModuleConfig,
+    config: &ExtensionConfig,
     cancel_flag: Option<(&AtomicU64, u64)>,
 ) -> Result<PathBuf, BuildError> {
     info!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
         module = config.name.as_str(),
-        "building optional module"
+        "building extension"
     );
 
     // Cargo writes the freshly compiled cdylib into the shared per-crate
@@ -1886,11 +1886,11 @@ pub(crate) fn build_optional_module(
             info!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 module = config.name.as_str(),
-                "optional module already up to date, skipping build"
+                "extension already up to date, skipping build"
             );
             analytics::record_module_artifact(
                 &config.name,
-                ModuleKind::Optional,
+                ModuleKind::Extension,
                 BuildStatus::Fresh,
                 0.0,
                 workspace_root,
@@ -1900,7 +1900,7 @@ pub(crate) fn build_optional_module(
         }
     }
 
-    // Optional modules carry no per-module environment of their own, but they
+    // Extensions carry no per-module environment of their own, but they
     // need the same profile-driven `RUSTFLAGS` handling the project gets: an
     // optimized build must not inherit `-C prefer-dynamic`.
     run_build_command(
@@ -1955,7 +1955,7 @@ pub(crate) fn build_optional_module(
     }
     analytics::record_module_artifact(
         &config.name,
-        ModuleKind::Optional,
+        ModuleKind::Extension,
         BuildStatus::Built,
         stage_ms,
         workspace_root,

@@ -1,4 +1,4 @@
-//! Optional engine module providing sound playback.
+//! Extension providing sound playback.
 //!
 //! # Responsibilities
 //!

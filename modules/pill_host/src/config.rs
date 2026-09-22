@@ -82,15 +82,15 @@ pub(crate) const CSHARP_COMPILER_ARGUMENTS_TARGETS: &str =
 #[cfg(feature = "hot_reload")]
 const CSHARP_COMPILER_ARGUMENTS_FILE: &str = "pill_compiler_args.rsp";
 
-/// Workspace-relative directory holding every optional module crate.
+/// Workspace-relative directory holding every extension crate.
 ///
 /// The workspace manifest globs this directory, so a module is discovered by
 /// existing rather than by being listed anywhere.
-const OPTIONAL_MODULE_DIRECTORY: &str = "extensions";
+const EXTENSION_DIRECTORY: &str = "extensions";
 
 /// Name prefix of the generated workspace member that builds a native project.
 ///
-/// The member lives under [`OPTIONAL_MODULE_DIRECTORY`], so the existing
+/// The member lives under [`EXTENSION_DIRECTORY`], so the existing
 /// `extensions/*` workspace glob discovers it without any entry in the workspace
 /// manifest; only the package name differs per project.
 const HOST_PROJECT_MEMBER_PREFIX: &str = "host_project_";
@@ -361,7 +361,7 @@ pub(crate) fn module_build_artifact_directory() -> String {
 }
 
 /// Project configuration file name, resolved in the project root. A project
-/// that ships one declares its own optional-module list; the project itself is
+/// that ships one declares its own extension list; the project itself is
 /// selected by `PROJECT_PATH` alone.
 const PROJECT_SETTINGS_FILE: &str = "project_settings.yaml";
 
@@ -476,7 +476,7 @@ pub struct ProjectModuleConfig {
     /// Workspace-relative path to the project's manifest file.
     ///
     /// The host re-reads it at runtime to answer dependency questions, such as
-    /// whether a reloaded optional module is linked by this project.
+    /// whether a reloaded extension is linked by this project.
     pub manifest_path: Option<String>,
 
     /// Directory to watch for source changes, relative to the workspace root.
@@ -495,15 +495,15 @@ pub struct ProjectModuleConfig {
     pub backend: ProjectModuleBackend,
 }
 
-/// Build, watch and load description for one optional engine module.
+/// Build, watch and load description for one extension.
 ///
-/// Optional modules are workspace members of the engine workspace, built as
+/// Extensions are workspace members of the engine workspace, built as
 /// `cdylib` and loaded by the host at runtime. They share the workspace's
 /// lockfile and Cargo configuration, which is what lets them link the engine
 /// dynamically and share one copy of its statics with the host.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
-pub struct OptionalModuleConfig {
+pub struct ExtensionConfig {
     /// Crate directory name, also the log field and temporary-copy prefix.
     pub name: String,
 
@@ -525,10 +525,10 @@ pub struct OptionalModuleConfig {
     pub output_subdirectory: String,
 }
 
-impl OptionalModuleConfig {
+impl ExtensionConfig {
     /// Derive the configuration of a module crate from its directory name.
     ///
-    /// Optional modules live under [`OPTIONAL_MODULE_DIRECTORY`] inside the
+    /// Extensions live under [`EXTENSION_DIRECTORY`] inside the
     /// engine workspace, which a glob in the workspace manifest picks up
     /// automatically, so a new module needs no manifest edit. The directory
     /// name determines everything else: sources in `<directory>/<name>/src`,
@@ -592,7 +592,7 @@ impl OptionalModuleConfig {
         Self {
             name: name.to_string(),
             library_name: name.to_string(),
-            watch_directory: format!("{OPTIONAL_MODULE_DIRECTORY}/{name}/src"),
+            watch_directory: format!("{EXTENSION_DIRECTORY}/{name}/src"),
             build_command,
             output_subdirectory: "target/hot".to_string(),
         }
@@ -617,7 +617,7 @@ impl OptionalModuleConfig {
     }
 }
 
-/// Complete host configuration: the project module plus every optional module
+/// Complete host configuration: the project module plus every extension
 /// the host should build, watch and load.
 ///
 /// Assembled by [`Self::from_environment`] so executable crates stay free of
@@ -636,9 +636,9 @@ pub struct HostConfig {
     /// The project module selected by `PROJECT_PATH`.
     pub project: ProjectModuleConfig,
 
-    /// Optional modules selected by the project's `project_settings.yaml`,
+    /// Extensions selected by the project's `project_settings.yaml`,
     /// loaded before the project.
-    pub optional_modules: Vec<OptionalModuleConfig>,
+    pub extensions: Vec<ExtensionConfig>,
 }
 
 impl HostConfig {
@@ -646,7 +646,7 @@ impl HostConfig {
     /// own settings file.
     ///
     /// `PROJECT_PATH` selects the project; the project's `project_settings.yaml`
-    /// (in the project root) supplies the optional-module list. There is no
+    /// (in the project root) supplies the extension list. There is no
     /// host-level configuration file anymore, so which project runs and which
     /// modules load are both visible at the project itself.
     ///
@@ -662,7 +662,7 @@ impl HostConfig {
         let project = ProjectModuleConfig::from_path(&project_path)?;
 
         // Step 2: Load the project's own settings file. It is the only source
-        // of the optional-module list and of the required `name` /
+        // of the extension list and of the required `name` /
         // `build_binary_name`, so a missing file is a configuration error
         // reported as such, not masked as a missing field.
         let project_root = engine_workspace_root()?.join(&project_path);
@@ -697,20 +697,20 @@ impl HostConfig {
             })?
             .to_string();
 
-        // Step 4: Resolve the optional modules, validating every name before
+        // Step 4: Resolve the extensions, validating every name before
         // it is interpolated into a watch path and a cargo selector. A
         // traversal or duplicate entry, or one with no directory under
         // `extensions/`, is a configuration error here rather than a watch on
         // an arbitrary directory, a malformed `--package`, or a second copy
         // of a module already loading.
-        let optional_root = engine_workspace_root()?.join(OPTIONAL_MODULE_DIRECTORY);
-        let optional_modules =
-            Self::resolve_optional_modules(&project_settings.modules, &optional_root)?;
+        let extensions_root = engine_workspace_root()?.join(EXTENSION_DIRECTORY);
+        let extensions =
+            Self::resolve_extensions(&project_settings.modules, &extensions_root)?;
         Ok(Self {
             name: project_name,
             build_binary_name,
             project,
-            optional_modules,
+            extensions,
         })
     }
 
@@ -725,30 +725,30 @@ impl HostConfig {
     /// repeat is refused before a second copy of the module could load, and
     /// the sibling directory is required before the module is configured at
     /// all.
-    fn resolve_optional_modules(
+    fn resolve_extensions(
         names: &[String],
-        optional_root: &Path,
-    ) -> Result<Vec<OptionalModuleConfig>, ConfigError> {
+        extensions_root: &Path,
+    ) -> Result<Vec<ExtensionConfig>, ConfigError> {
         let mut seen_names: HashSet<&str> = HashSet::new();
         let mut modules = Vec::new();
         for name in names {
             let name = name.trim();
             if !is_valid_module_directory_name(name) {
-                return Err(ConfigError::InvalidOptionalModuleName {
+                return Err(ConfigError::InvalidExtensionName {
                     name: name.to_string(),
                 });
             }
             if !seen_names.insert(name) {
-                return Err(ConfigError::DuplicateOptionalModuleName {
+                return Err(ConfigError::DuplicateExtensionName {
                     name: name.to_string(),
                 });
             }
-            if !optional_root.join(name).is_dir() {
-                return Err(ConfigError::OptionalModuleDirectoryMissing {
+            if !extensions_root.join(name).is_dir() {
+                return Err(ConfigError::ExtensionDirectoryMissing {
                     name: name.to_string(),
                 });
             }
-            let module = OptionalModuleConfig::workspace_member(name);
+            let module = ExtensionConfig::workspace_member(name);
             module.validate()?;
             modules.push(module);
         }
@@ -757,7 +757,7 @@ impl HostConfig {
 }
 
 impl From<ProjectModuleConfig> for HostConfig {
-    /// Run one project with no optional modules.
+    /// Run one project with no extensions.
     ///
     /// Keeps embedders that already build a `ProjectModuleConfig` compiling.
     fn from(project: ProjectModuleConfig) -> Self {
@@ -765,7 +765,7 @@ impl From<ProjectModuleConfig> for HostConfig {
             name: project.name.clone(),
             build_binary_name: project.name.clone(),
             project,
-            optional_modules: Vec::new(),
+            extensions: Vec::new(),
         }
     }
 }
@@ -872,7 +872,7 @@ impl ProjectModuleConfig {
         // Step 2: Materialize a workspace member for the project so it compiles
         // against the engine workspace (one Cargo.lock, one target directory,
         // one crate-metadata set). This is what keeps `pill_spline::Spline` the
-        // same type in the project DLL and in the optional module DLLs. The
+        // same type in the project DLL and in the extension DLLs. The
         // member is generated under `extensions/` and discovered by the existing
         // `extensions/*` glob, so the workspace manifest never names the project.
         materialize_host_project_member(workspace_root, project_path, &package_name)?;
@@ -890,7 +890,7 @@ impl ProjectModuleConfig {
         // Step 4: Build the Cargo command. The project is a workspace member,
         // so the build selects it by package name from the workspace root. It
         // inherits the workspace's `-C prefer-dynamic` rustflags, matching the
-        // optional modules, because a shared crate keeps one metadata identity
+        // extensions, because a shared crate keeps one metadata identity
         // (and therefore one `TypeId`) only when every side is compiled with
         // the same inputs. When the host renders, the project is built with
         // the same feature so both sides share renderer components.
@@ -911,13 +911,13 @@ impl ProjectModuleConfig {
             // stretches) and halves the fixed per-build cargo overhead.
             "--offline".to_string(),
             // Build into the host's own profile, for the same reason the
-            // optional modules do: a profile mismatch across the DLL boundary
+            // extensions do: a profile mismatch across the DLL boundary
             // is a load failure, not a performance difference.
             "--profile".to_string(),
             host_profile_name().to_string(),
         ];
         // Mirror the host's engine feature set into the project build, for the
-        // same reason optional modules do: `pill_engine` is an rlib, so the
+        // same reason extensions do: `pill_engine` is an rlib, so the
         // project links its own copy and must be configured identically.
         //
         // `rendering` used to be mirrored here as well, package-qualified onto
@@ -1009,7 +1009,7 @@ fn required_environment(variable: &'static str) -> Result<String, ConfigError> {
 /// something a launcher owes the engine: the dioxus CLI runs the editor with
 /// its working directory set to `pill_editor/`, which resolved `extensions/`
 /// under the editor crate and made the host refuse to start with
-/// [`ConfigError::OptionalModuleDirectoryMissing`]. `cargo run` from the
+/// [`ConfigError::ExtensionDirectoryMissing`]. `cargo run` from the
 /// workspace root, the test suites and every spawned build agree on this root
 /// instead of on whatever directory the process happens to occupy.
 ///
@@ -1099,7 +1099,7 @@ pub(crate) fn project_depends_on_crate(
     project: &ProjectModuleConfig,
     crate_name: &str,
 ) -> bool {
-    // Only a native Rust project can link an optional module crate; a managed
+    // Only a native Rust project can link an extension crate; a managed
     // project cannot reference it, so it never needs this reload.
     if !matches!(project.backend, ProjectModuleBackend::NativeLibrary { .. }) {
         return false;
@@ -1195,7 +1195,7 @@ fn dependency_sub_table_key(section: &str) -> Option<&str> {
 ///
 /// Unknown keys are refused rather than dropped: `module:` instead of
 /// `modules:` used to parse cleanly into an empty list, so the host started
-/// with no optional modules and no diagnostic - the opposite of what this
+/// with no extensions and no diagnostic - the opposite of what this
 /// parser's contract promises.
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -1210,7 +1210,7 @@ struct ProjectSettingsFile {
     author: Option<String>,
     /// Optional one-line package description.
     description: Option<String>,
-    /// Optional module crate names, in load order. The only source for this
+    /// Extension crate names, in load order. The only source for this
     /// list: there is no environment-variable override, so the file is always
     /// the complete answer to "which modules load".
     modules: Vec<String>,
@@ -1221,7 +1221,7 @@ fn is_valid_build_binary_name(value: &str) -> bool {
     !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// Whether a value is a usable optional-module directory name.
+/// Whether a value is a usable extension directory name.
 ///
 /// The name is a path segment under `extensions/` and a cargo package selector,
 /// so it is checked harder than `build_binary_name`: a leading digit is
@@ -1384,7 +1384,7 @@ fn materialize_host_project_member(
         .find(|(_, absolute)| !Path::new(absolute).exists())
     {
         let member_directory = workspace_root
-            .join(OPTIONAL_MODULE_DIRECTORY)
+            .join(EXTENSION_DIRECTORY)
             .join(format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}"));
         let _ = std::fs::remove_dir_all(&member_directory);
         return Err(ConfigError::ProjectDependencyPathMissing {
@@ -1480,7 +1480,7 @@ fn materialize_host_project_member(
     // host's own up-to-date build check compares modification times and would
     // otherwise see a freshly rewritten manifest as newer than every artifact.
     let member_directory = workspace_root
-        .join(OPTIONAL_MODULE_DIRECTORY)
+        .join(EXTENSION_DIRECTORY)
         .join(format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}"));
     std::fs::create_dir_all(&member_directory).map_err(|source| {
         ConfigError::HostProjectMemberCreationFailed {
@@ -1589,8 +1589,8 @@ fn manifest_entry_name(manifest: &str, key_offset: usize) -> String {
 /// reason to refuse to start; the build that follows either succeeds or reports
 /// the real error itself.
 fn prune_stale_host_project_members(workspace_root: &Path, keep: &Path) {
-    let optional_root = workspace_root.join(OPTIONAL_MODULE_DIRECTORY);
-    let Ok(entries) = std::fs::read_dir(&optional_root) else {
+    let extensions_root = workspace_root.join(EXTENSION_DIRECTORY);
+    let Ok(entries) = std::fs::read_dir(&extensions_root) else {
         return;
     };
     for entry in entries.flatten() {
@@ -1616,7 +1616,7 @@ fn prune_stale_host_project_members(workspace_root: &Path, keep: &Path) {
 mod tests {
     use super::*;
 
-    /// A native project manifest that links the optional module directly.
+    /// A native project manifest that links the extension directly.
     #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
     const DEPENDENT_MANIFEST: &str = r#"
 [package]
@@ -1627,7 +1627,7 @@ pill_engine = { path = "../../modules/pill_engine" }
 pill_spline = { path = "../../modules/extensions/pill_spline" }
 "#;
 
-    /// A native project manifest with no optional-module dependency.
+    /// A native project manifest with no extension dependency.
     #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
     const INDEPENDENT_MANIFEST: &str = r#"
 [package]
@@ -1716,7 +1716,7 @@ serde = { version = "1", features = ["derive"] }
         assert_eq!(settings.modules, vec!["pill_spline", "pill_dummy_math"]);
     }
 
-    /// A missing project settings file selects no optional modules.
+    /// A missing project settings file selects no extensions.
     #[test]
     fn missing_project_settings_file_selects_no_modules() {
         let directory = temp_root().join("project_settings_missing");
@@ -1747,7 +1747,7 @@ serde = { version = "1", features = ["derive"] }
         );
     }
 
-    /// Optional-module names are validated before they become a watch path
+    /// Extension names are validated before they become a watch path
     /// and a cargo selector.
     ///
     /// `workspace_member` interpolates the name into both with no check of
@@ -1757,45 +1757,45 @@ serde = { version = "1", features = ["derive"] }
     /// working directory.
     #[test]
     fn rejects_traversal_and_duplicate_module_names() {
-        let root = temp_root().join("optional_module_names");
+        let root = temp_root().join("extension_names");
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("extensions").join("pill_spline")).unwrap();
-        let optional_root = root.join("extensions");
+        let extensions_root = root.join("extensions");
 
         let traversal =
-            HostConfig::resolve_optional_modules(&[String::from("../pill_spline")], &optional_root);
+            HostConfig::resolve_extensions(&[String::from("../pill_spline")], &extensions_root);
         assert!(
             matches!(
                 &traversal,
-                Err(ConfigError::InvalidOptionalModuleName { .. })
+                Err(ConfigError::InvalidExtensionName { .. })
             ),
             "a traversal entry must be refused: {traversal:?}"
         );
 
-        let duplicate = HostConfig::resolve_optional_modules(
+        let duplicate = HostConfig::resolve_extensions(
             &[String::from("pill_spline"), String::from("pill_spline")],
-            &optional_root,
+            &extensions_root,
         );
         assert!(
             matches!(
                 &duplicate,
-                Err(ConfigError::DuplicateOptionalModuleName { .. })
+                Err(ConfigError::DuplicateExtensionName { .. })
             ),
             "a repeated entry must be refused: {duplicate:?}"
         );
 
         let missing =
-            HostConfig::resolve_optional_modules(&[String::from("pill_absent")], &optional_root);
+            HostConfig::resolve_extensions(&[String::from("pill_absent")], &extensions_root);
         assert!(
             matches!(
                 &missing,
-                Err(ConfigError::OptionalModuleDirectoryMissing { .. })
+                Err(ConfigError::ExtensionDirectoryMissing { .. })
             ),
             "a name without a sibling directory must be refused: {missing:?}"
         );
 
         let resolved =
-            HostConfig::resolve_optional_modules(&[String::from("pill_spline")], &optional_root)
+            HostConfig::resolve_extensions(&[String::from("pill_spline")], &extensions_root)
                 .expect("a real sibling directory resolves");
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "pill_spline");
@@ -1992,7 +1992,7 @@ shared = { version = "1" }
     }
 
     /// A managed project is never triggered, even with a manifest path set,
-    /// because it cannot link a Rust optional-module crate.
+    /// because it cannot link a Rust extension crate.
     #[cfg(feature = "hot_reload")]
     #[test]
     fn managed_project_is_never_triggered() {
@@ -2167,7 +2167,7 @@ mod profile_tests {
 mod host_project_member_validation_tests {
     use super::{
         manifest_entry_name, materialize_host_project_member, HOST_PROJECT_MEMBER_PREFIX,
-        OPTIONAL_MODULE_DIRECTORY,
+        EXTENSION_DIRECTORY,
     };
     use pill_core::error::ConfigError;
 
@@ -2186,7 +2186,7 @@ mod host_project_member_validation_tests {
     fn workspace(test_name: &str, dependency_path: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("pill_member_{test_name}"));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(OPTIONAL_MODULE_DIRECTORY)).unwrap();
+        std::fs::create_dir_all(root.join(EXTENSION_DIRECTORY)).unwrap();
         std::fs::create_dir_all(root.join("project").join("src")).unwrap();
         std::fs::write(
             root.join("project").join("Cargo.toml"),
@@ -2199,7 +2199,7 @@ mod host_project_member_validation_tests {
 
     /// Path of the member `materialize_host_project_member` would generate.
     fn member_directory(root: &std::path::Path) -> std::path::PathBuf {
-        root.join(OPTIONAL_MODULE_DIRECTORY)
+        root.join(EXTENSION_DIRECTORY)
             .join(format!("{HOST_PROJECT_MEMBER_PREFIX}project"))
     }
 
@@ -2274,12 +2274,12 @@ mod host_project_member_validation_tests {
 
 #[cfg(test)]
 mod host_project_member_pruning_tests {
-    use super::{prune_stale_host_project_members, OPTIONAL_MODULE_DIRECTORY};
+    use super::{prune_stale_host_project_members, EXTENSION_DIRECTORY};
 
     /// Creates `extensions/<name>/Cargo.toml` under `root` and returns its
     /// directory, so a test can assert on the directory rather than the file.
     fn seed_member(root: &std::path::Path, name: &str) -> std::path::PathBuf {
-        let directory = root.join(OPTIONAL_MODULE_DIRECTORY).join(name);
+        let directory = root.join(EXTENSION_DIRECTORY).join(name);
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
             directory.join("Cargo.toml"),
@@ -2295,7 +2295,7 @@ name = \"x\"
     fn workspace(test_name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("pill_prune_{test_name}"));
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join(OPTIONAL_MODULE_DIRECTORY)).unwrap();
+        std::fs::create_dir_all(root.join(EXTENSION_DIRECTORY)).unwrap();
         root
     }
 
@@ -2315,7 +2315,7 @@ name = \"x\"
     }
 
     #[test]
-    fn leaves_real_optional_modules_alone() {
+    fn leaves_real_extensions_alone() {
         let root = workspace("real_modules");
         let module = seed_member(&root, "pill_spline");
         let keep = seed_member(&root, "host_project_current");
@@ -2329,7 +2329,7 @@ name = \"x\"
     }
 
     #[test]
-    fn tolerates_a_missing_optional_directory() {
+    fn tolerates_a_missing_extensions_directory() {
         let root = std::env::temp_dir().join("pill_prune_missing");
         let _ = std::fs::remove_dir_all(&root);
 

@@ -15,7 +15,7 @@
 
 The standalone host is a generic launcher. It selects the project from the
 `PROJECT_PATH` environment variable and reads that project's
-`project_settings.yaml` for the optional-module list — there is no host-level
+`project_settings.yaml` for the extension list — there is no host-level
 configuration file. Everything else — backend, name, watch directory, build
 command, and output paths — is inferred from the project's manifest, so no
 project identity is compiled into the host.
@@ -82,7 +82,7 @@ repository root, so both spellings work from either place.
 
 Build output lands under the project's `build/<timestamp>/` directory.
 
-## Optional modules
+## Extensions
 
 Engine extensions are crates inside `modules/extensions/`, built as `cdylib`
 and loaded by the host next to the project. Each is watched, rebuilt and swapped
@@ -94,7 +94,7 @@ to load, in order. An absent or empty list loads none.
 
 - `modules: ["pill_spline"]` in `project_settings.yaml` — load the spline module.
 - `modules: ["pill_spline", "pill_physics"]` — several modules.
-- `modules: []` (or omitting the key) — run with no optional modules.
+- `modules: []` (or omitting the key) — run with no extensions.
 
 ### Adding a module
 

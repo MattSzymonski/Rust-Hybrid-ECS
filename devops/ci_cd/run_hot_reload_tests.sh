@@ -38,7 +38,7 @@
 #        no fast path at all.
 #
 #   Each suite launches the standalone host and drives live source edits
-#   against a real project and an optional module, asserting the host's reload
+#   against a real project and an extension, asserting the host's reload
 #   behaviour from its console output. The suites temporarily modify - and
 #   automatically restore - the projects' project_settings.yaml files,
 #   devops/tests/project/src/lib.rs,

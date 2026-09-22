@@ -76,8 +76,8 @@ HOST_LAUNCH_COMMAND = [
 ]
 
 # The structured logger appends fields with no separator, so the token is
-# `building optional modulemodule="pill_spline"` rather than the spaced form.
-BUILD_STARTED = f'building optional modulemodule="{MODULE_NAME}"'
+# `building extensionmodule="pill_spline"` rather than the spaced form.
+BUILD_STARTED = f'building extensionmodule="{MODULE_NAME}"'
 CANCELLED_TOKEN = "sources changed again during compilation"
 
 # How long after the first save to make the second. Must land inside the build

@@ -16,10 +16,10 @@
 //! # Design
 //!
 //! A process-wide collector is used because the build pipeline spans several
-//! modules (`build_runner`, `native_library`, `optional_module`,
+//! modules (`build_runner`, `native_library`, `extension`,
 //! `project_module`) and no single one owns the whole transaction. Records are
-//! keyed by module name, which is unique across the project and optional
-//! modules. The collector is deliberately best-effort: a missing DLL, a PE
+//! keyed by module name, which is unique across the project and extensions.
+//!  The collector is deliberately best-effort: a missing DLL, a PE
 //! that cannot be parsed, or an absent cargo-timings report degrades the
 //! report to `-` instead of failing the build.
 
@@ -89,8 +89,8 @@ pub(crate) enum BuildStatus {
 /// Which pipeline a module belongs to; used for the report's `kind` column.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModuleKind {
-    /// An optional engine module loaded from its private hot-load copy.
-    Optional,
+    /// An extension loaded from its private hot-load copy.
+    Extension,
     /// The active project module.
     Project,
 }
@@ -98,7 +98,7 @@ pub(crate) enum ModuleKind {
 impl ModuleKind {
     fn label(self) -> &'static str {
         match self {
-            ModuleKind::Optional => "optional",
+            ModuleKind::Extension => "extension",
             ModuleKind::Project => "project",
         }
     }
@@ -295,7 +295,7 @@ pub(crate) fn process_memory(pid: Option<u32>) -> Option<(u64, u64)> {
         // already links. This matters: adding a cargo crate that shares
         // features with `colored` (via `windows-sys`) changes the feature
         // unification of shared crates between the host build and the
-        // optional-module builds, which silently splits the shared
+        // extension builds, which silently splits the shared
         // `pill_core.dll` into two incompatible variants.
         use libloading::{Library, Symbol};
 
@@ -783,9 +783,9 @@ fn find_or_create(collector: &mut Analytics, name: &str, kind: ModuleKind) -> us
 
 /// Record the outcome of one module's build/stage step.
 ///
-/// Called by `build_optional_module` and `build_project_module` from both the
+/// Called by `build_extension` and `build_project_module` from both the
 /// fast-path skip branch and the real-build branch, with the artifact path
-/// being the DLL the host actually loads (the hot copy for optional modules).
+/// being the DLL the host actually loads (the hot copy for extensions).
 /// Also inspects the DLL's PE exports and imports, reads the crate's direct
 /// cargo dependencies, and — after a real build — pulls the per-crate
 /// compile+link time from the newest cargo `--timings` report.
@@ -845,7 +845,7 @@ pub(crate) fn record_build_command(name: &str, elapsed_ms: u64, cargo_peak_bytes
     let mut collector = analytics()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let index = find_or_create(&mut collector, name, ModuleKind::Optional);
+    let index = find_or_create(&mut collector, name, ModuleKind::Extension);
     collector.modules[index].build_wall_ms = elapsed_ms;
     collector.cargo_child_peak_bytes = collector.cargo_child_peak_bytes.max(cargo_peak_bytes);
     if let Some((current, peak)) = process_memory(None) {
@@ -859,7 +859,7 @@ pub(crate) fn record_load(name: &str, load_ms: f64) {
     let mut collector = analytics()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let index = find_or_create(&mut collector, name, ModuleKind::Optional);
+    let index = find_or_create(&mut collector, name, ModuleKind::Extension);
     collector.modules[index].load_ms = load_ms;
 }
 
@@ -868,7 +868,7 @@ pub(crate) fn record_init(name: &str, init_ms: f64) {
     let mut collector = analytics()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let index = find_or_create(&mut collector, name, ModuleKind::Optional);
+    let index = find_or_create(&mut collector, name, ModuleKind::Extension);
     collector.modules[index].init_ms = init_ms;
 }
 
@@ -877,7 +877,7 @@ pub(crate) fn record_migrate(name: &str, migrate_ms: f64) {
     let mut collector = analytics()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let index = find_or_create(&mut collector, name, ModuleKind::Optional);
+    let index = find_or_create(&mut collector, name, ModuleKind::Extension);
     collector.modules[index].migrate_ms = migrate_ms;
 }
 
@@ -886,7 +886,7 @@ pub(crate) fn record_reload(name: &str) {
     let mut collector = analytics()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let index = find_or_create(&mut collector, name, ModuleKind::Optional);
+    let index = find_or_create(&mut collector, name, ModuleKind::Extension);
     let reloads = {
         let module = &mut collector.modules[index];
         module.reloads += 1;
@@ -1106,7 +1106,7 @@ fn format_ms(ms: u64) -> String {
 
 /// Print the full startup analytics report.
 ///
-/// Called once after every module (optional + project) has been built, staged,
+/// Called once after every module (extension + project) has been built, staged,
 /// loaded and initialized. Rows are one per module; the trailing lines break
 /// each module's exports, imports and direct cargo dependencies.
 pub(crate) fn print_startup_report() {

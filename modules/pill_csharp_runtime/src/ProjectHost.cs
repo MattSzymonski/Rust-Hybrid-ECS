@@ -569,7 +569,7 @@ internal sealed class ProjectHost
 
             var oldContext = _context;
             // The new assembly carries its own mirror delegate types (each
-            // collectible context defines them), and an optional module reload
+            // collectible context defines them), and an extension reload
             // may have moved every mirrored method to fresh trampoline
             // addresses, so re-read the host's table and drop the old
             // context's resolved delegates. Done before the swap so the old

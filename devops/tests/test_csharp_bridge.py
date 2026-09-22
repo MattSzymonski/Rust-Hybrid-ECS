@@ -8,8 +8,8 @@ REQUIREMENTS
   - Run from the repository root or anywhere (paths are resolved from __file__)
 
 DESCRIPTION
-    End-to-end suite for the managed (C#) project backend and the optional
-    Rust module -> C# component bridge. Launches the standalone host with
+    End-to-end suite for the managed (C#) project backend and the extension
+     -> C# component bridge. Launches the standalone host with
     `examples/project_cs` and the `pill_spline` module plus a component-less
     dummy module, then verifies from console output and on-disk artifacts:
 

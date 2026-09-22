@@ -1,5 +1,5 @@
 //! Procedural macros that remove the error-prone registration and FFI
-//! boilerplate from optional-module and project crates.
+//! boilerplate from extension and project crates.
 //!
 //! # Responsibilities
 //!
@@ -9,7 +9,7 @@
 //!   `#[pill(persistable)]`) are additionally registered for schema migration,
 //!   and they drive the aggregate project schema fingerprint — no hand-written
 //!   registration list or fingerprint hash to keep in sync.
-//! - [`attribute(PillModule)`] wraps an optional module's `register` function
+//! - [`attribute(PillModule)`] wraps an extension's `register` function
 //!   and generates the `pill_module_*` C-ABI exports (version, name, init) with
 //!   the panic guard and engine-pointer reconstruction that every module
 //!   otherwise hand-writes.
@@ -2042,7 +2042,7 @@ fn hot_patch_resolver_export(
 
 /// Emit the `pill_module_init` entry point every loadable artifact exports.
 ///
-/// One body for both attributes. A project and an optional module are the same
+/// One body for both attributes. A project and an extension are the same
 /// DLL contract: they export the same symbols, are loaded the same way, reload
 /// through the same transaction and retire into the same graveyard. What used
 /// to distinguish them was a symbol prefix, which is a difference in a string
@@ -2130,7 +2130,7 @@ fn module_abi_version_export(gate: &proc_macro2::TokenStream) -> proc_macro2::To
 // #[pill_module]
 // =============================================================================
 
-/// Wraps an optional module's `register` function and generates the
+/// Wraps an extension's `register` function and generates the
 /// `pill_module_*` C-ABI exports.
 ///
 /// The annotated function must have the signature
@@ -2324,7 +2324,7 @@ pub fn pill_module(_attribute: TokenStream, item: TokenStream) -> TokenStream {
 /// registry, so adding a component can never leave the fingerprint stale.
 ///
 /// The entry points are the same ones [`macro@pill_module`] emits, because a
-/// project and an optional module are one DLL contract: the host loads both the
+/// project and an extension are one DLL contract: the host loads both the
 /// same way, reloads both through the same transaction, and used to tell them
 /// apart only by a symbol prefix. What remains project-specific is the schema
 /// fingerprint, which a module has no equivalent of, and the ungated exports -

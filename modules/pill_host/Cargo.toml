@@ -30,7 +30,7 @@ winit = { version = "0.30", optional = true }
 
 [features]
 # On by default: the development posture, where the host watches sources,
-# shells out to cargo, and loads the project and every optional module as a
+# shells out to cargo, and loads the project and every extension as a
 # DLL. Turning it OFF selects the shipping posture - nothing is watched, built
 # or loaded at runtime, and the project is linked into the binary instead.
 default = ["hot_reload"]

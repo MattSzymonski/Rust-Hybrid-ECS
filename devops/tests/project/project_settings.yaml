@@ -1,7 +1,7 @@
 # Test-fixture settings for devops/tests/project.
 #
 # The fixture project is selected by PROJECT_PATH; this file supplies the
-# required project `name` / `build_binary_name` and its optional-module list.
+# required project `name` / `build_binary_name` and its extension list.
 #
 # The five `pill_dummy_*` modules are here, and deliberately not in the example
 # projects. Loading several modules at once is a path worth exercising, but it

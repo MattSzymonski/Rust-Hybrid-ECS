@@ -3,7 +3,7 @@
 //! # Responsibilities
 //!
 //! - Emits `PILL_HOST_PROFILE_DIRECTORY` so the host can build the project and
-//!   its optional modules into the same profile it was compiled into.
+//!   its extensions into the same profile it was compiled into.
 //! - Emits `PILL_HOST_TARGET_TRIPLE` (empty for a native build) so host-spawned
 //!   module builds can pass the same `--target` when a launcher such as the
 //!   dioxus CLI built the host with one. Cargo folds the target into every
@@ -12,8 +12,8 @@
 //!
 //! # Design
 //!
-//! The host shells out to cargo to build the project and every optional
-//! module, and those builds must land in the same profile the host itself was
+//! The host shells out to cargo to build the project and every extension,
+//!  and those builds must land in the same profile the host itself was
 //! built with. A release host that loads debug-profile modules fails at
 //! `LoadLibrary` with "The specified procedure could not be found" (os error
 //! 127), because the two sides resolve different crate-metadata hashes.

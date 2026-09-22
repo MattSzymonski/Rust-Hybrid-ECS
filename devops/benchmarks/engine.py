@@ -65,7 +65,7 @@ KNOWN_BENCH_TARGETS = (
 # is written to any file - both are per-invocation overrides.
 #
 #   1. `modules/.cargo/config.toml` sets `-C prefer-dynamic` so the host and
-#      every optional module share one `pill_core`. Combined with the release
+#      every extension share one `pill_core`. Combined with the release
 #      profile's `lto = "fat"` rustc rejects the build outright:
 #      "linker plugin based LTO is not supported together with
 #      `-C prefer-dynamic` when targeting Windows-like targets". That config

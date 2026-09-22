@@ -59,7 +59,7 @@ pub(crate) use backend::POLL_RELOADED;
 #[cfg(feature = "hot_reload")]
 pub(crate) use fast_compile::FastCompileOutcome;
 
-/// Aggregate of the native components optional modules exposed to managed code.
+/// Aggregate of the native components extensions exposed to managed code.
 pub(crate) use components::{resolve_exposed_component_id, ModuleExposedComponent};
 
 /// One mirrored Rust method resolved to a callable address, shared by the
@@ -157,11 +157,11 @@ pub(crate) fn accessor_rows(accessors: &[ResolvedFieldAccessor]) -> Vec<Resolved
 }
 
 #[cfg(feature = "hot_reload")]
-/// Generate the C# mirror file for optional-module components.
+/// Generate the C# mirror file for extension components.
 pub(crate) use codegen::generate_module_components_csharp;
 
 /// Rebuild the mirror-method table the managed runtime reads, after an
-/// optional module reload changes its trampoline addresses or method set.
+/// extension reload changes its trampoline addresses or method set.
 #[cfg_attr(not(feature = "hot_reload"), allow(unused_imports))]
 pub(crate) use abi::publish_mirror_methods;
 

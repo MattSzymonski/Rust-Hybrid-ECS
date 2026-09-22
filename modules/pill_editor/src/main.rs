@@ -541,7 +541,7 @@ impl EditorContext {
         let errors = std::mem::take(&mut *self.last_command_errors.borrow_mut());
 
         let host = self.host.borrow();
-        let module_names = host.optional_module_names();
+        let module_names = host.extension_names();
         let revision = host.revision();
         let engine = host.engine();
         let mut fresh = EditorSnapshot::capture_list(engine, revision, &module_names, errors);

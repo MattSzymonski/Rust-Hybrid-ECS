@@ -1,10 +1,10 @@
-//! Dummy optional engine module used to pad out module-loading tests.
+//! Dummy extension used to pad out module-loading tests.
 //!
 //! # Responsibilities
 //!
 //! - Defines the [`Stopwatch`] struct with two dummy time-tracking methods.
 //! - Exposes the [`seconds_to_millis`] free function.
-//! - Registers through the optional-module ABI when the host loads it.
+//! - Registers through the extension ABI when the host loads it.
 //!
 //! # Design
 //!

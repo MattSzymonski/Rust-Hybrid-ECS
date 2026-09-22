@@ -12,7 +12,7 @@ DESCRIPTION
     Rust side says so, so a refactor that rewords a log line breaks the suites
     with no compiler error and no unit-test failure.
 
-    That is not hypothetical. Unifying the project and optional-module reload
+    That is not hypothetical. Unifying the project and extension reload
     paths behind one `ReloadTransaction` collapsed three distinct messages:
 
         "hot reload complete"                  also emitted by modules now
@@ -135,7 +135,7 @@ EXTERNALLY_PRODUCED: Dict[str, str] = {
 # Collapsing either pair into a single string would leave the suites unable to
 # tell a project reload from a module reload, so both must stay sourced.
 SUBJECT_DISTINGUISHING_TOKENS: Tuple[Tuple[str, str], ...] = (
-    ("hot reload complete", "optional module hot reload complete"),
+    ("hot reload complete", "extension hot reload complete"),
     ("no longer registered by the project", "no longer registered by this module"),
 )
 
@@ -226,7 +226,7 @@ def check_subject_tokens_stay_distinguishable() -> None:
     Fails if a project token and its module counterpart cannot be told apart.
 
     Both pairs differ only by wording, and one is a substring of the other
-    ("hot reload complete" inside "optional module hot reload complete"). The
+    ("hot reload complete" inside "extension hot reload complete"). The
     requirement is that each still has its own distinct Rust literal.
     """
     rust_sources = read_rust_sources()

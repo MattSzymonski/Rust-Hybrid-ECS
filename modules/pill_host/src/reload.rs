@@ -12,11 +12,11 @@
 //!
 //! # Design
 //!
-//! Optional modules and the project ran this sequence as two separate 250-line
+//! Extensions and the project ran this sequence as two separate 250-line
 //! functions whose differences were almost entirely log wording. They differ in
 //! exactly three ways, and only those three are expressed here:
 //!
-//! 1. An optional module tags its registrations with its [`SystemOwner`], so a
+//! 1. An extension tags its registrations with its [`SystemOwner`], so a
 //!    reload clears only its own systems; the project owns the scheduler
 //!    outright and tags nothing.
 //! 2. Their log wording differs, and not decoratively - the Python suites in
@@ -83,13 +83,13 @@ pub(crate) const MAX_GRAVEYARD_GENERATIONS: usize = 2;
 /// nothing would catch it being reworded.
 const PROJECT_RELOAD_COMPLETE: &str = "hot reload complete";
 
-/// Completion line for an optional-module reload.
-const MODULE_RELOAD_COMPLETE: &str = "optional module hot reload complete";
+/// Completion line for an extension reload.
+const MODULE_RELOAD_COMPLETE: &str = "extension hot reload complete";
 
 /// Forgotten-type warning for a project reload.
 const PROJECT_FORGOTTEN_TYPES: &str = "component type(s) no longer registered by the project; their data stays in the world but is orphaned (the new generation cannot read it)";
 
-/// Forgotten-type warning for an optional-module reload.
+/// Forgotten-type warning for an extension reload.
 const MODULE_FORGOTTEN_TYPES: &str = "component type(s) no longer registered by this module; their data stays in the world but is orphaned (the new generation cannot read it)";
 
 /// Which kind of subject a reload is running for.
@@ -103,9 +103,9 @@ pub(crate) enum ReloadSubjectKind {
     /// The game project: owns the scheduler outright, and is the only subject
     /// whose completion line the migration and auto-reload suites match on.
     Project,
-    /// An optional engine module: contributes systems alongside the project
+    /// An extension: contributes systems alongside the project
     /// and every other module, so its registrations are tagged with its owner.
-    OptionalModule,
+    Extension,
 }
 
 impl ReloadSubjectKind {
@@ -114,14 +114,14 @@ impl ReloadSubjectKind {
     ///
     /// The project owns the scheduler outright and tags nothing.
     fn scopes_registration(&self) -> bool {
-        matches!(self, Self::OptionalModule)
+        matches!(self, Self::Extension)
     }
 
     /// Final log line emitted once the swap succeeds.
     fn completion_message(&self) -> &'static str {
         match self {
             Self::Project => PROJECT_RELOAD_COMPLETE,
-            Self::OptionalModule => MODULE_RELOAD_COMPLETE,
+            Self::Extension => MODULE_RELOAD_COMPLETE,
         }
     }
 
@@ -130,7 +130,7 @@ impl ReloadSubjectKind {
     fn forgotten_types_warning(&self) -> &'static str {
         match self {
             Self::Project => PROJECT_FORGOTTEN_TYPES,
-            Self::OptionalModule => MODULE_FORGOTTEN_TYPES,
+            Self::Extension => MODULE_FORGOTTEN_TYPES,
         }
     }
 }
@@ -247,8 +247,8 @@ impl ReloadTransaction<'_> {
     /// Count consecutive deferred evictions for one subject.
     ///
     /// `defer` increments and returns the new count; clearing resets it to zero
-    /// and returns zero. Keyed by subject because the project and each optional
-    /// module retire independently, and one stuck subject should not mask or be
+    /// and returns zero. Keyed by subject because the project and each extension
+    ///  retire independently, and one stuck subject should not mask or be
     /// masked by another.
     fn deferred_eviction_count(subject: &str, defer: bool) -> u32 {
         use std::collections::HashMap;

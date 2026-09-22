@@ -1,10 +1,10 @@
-//! Optional engine module providing spline paths.
+//! Extension providing spline paths.
 //!
 //! # Responsibilities
 //!
 //! - Defines the [`Spline`] component: an ordered set of control points.
 //! - Samples a position anywhere along that path with [`Spline::get_location_at`].
-//! - Registers the component through the optional-module ABI when loaded.
+//! - Registers the component through the extension ABI when loaded.
 //!
 //! # Design
 //!

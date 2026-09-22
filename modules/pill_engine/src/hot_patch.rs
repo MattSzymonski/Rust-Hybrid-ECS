@@ -1040,8 +1040,8 @@ fn text_hash(text: &str) -> u64 {
 /// [`PillComponentDescriptor`](crate::component_registry::PillComponentDescriptor)
 /// works.
 ///
-/// The registry is **per linked artifact**: the host executable, each optional
-/// module DLL and the project DLL each carry exactly the descriptors their own
+/// The registry is **per linked artifact**: the host executable, each extension
+///  DLL and the project DLL each carry exactly the descriptors their own
 /// sources declared. That is what makes it correct across a reload - a
 /// generation that stops declaring a function simply stops submitting it, and
 /// an evicted DLL takes its descriptors with it.
@@ -1281,7 +1281,7 @@ mod integration_tests {
     fn cleared_systems_stop_being_patchable() {
         use cleared_slots as systems;
         let mut engine = sequential_engine();
-        let owner = SystemOwner::optional_module(0);
+        let owner = SystemOwner::extension(0);
 
         // Distinct functions, so each system gets its own function-path alias
         // and the two do not share a registry entry.

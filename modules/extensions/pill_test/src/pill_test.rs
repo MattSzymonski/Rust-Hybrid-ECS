@@ -1,9 +1,9 @@
-//! Optional engine module used to exercise dynamic module loading.
+//! Extension used to exercise dynamic module loading.
 //!
 //! # Responsibilities
 //!
 //! - Defines the `ModuleTest` component and the `module_test_processor` system.
-//! - Registers both through the optional-module ABI when the host loads it.
+//! - Registers both through the extension ABI when the host loads it.
 //! - Keeps its entities filled to a target count across hot reloads.
 //!
 //! # Design

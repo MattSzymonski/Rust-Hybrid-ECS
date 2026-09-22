@@ -14,7 +14,7 @@
 //! # Design
 //!
 //! The native ABI is a fixed export contract, and there is exactly one of it.
-//! A project and an optional module are the same loadable artifact - same
+//! A project and an extension are the same loadable artifact - same
 //! exports, same loader, same reload transaction, same graveyard - so the
 //! loader has nothing to parameterise:
 //!
@@ -357,7 +357,7 @@ const FIELD_ACCESSOR_COPY_SYMBOL: &[u8] = b"pill_copy_field_accessor_descriptors
 
 /// Required registration entry point of a loadable artifact.
 ///
-/// One name for both kinds. A project and an optional module export the same
+/// One name for both kinds. A project and an extension export the same
 /// symbols, load the same way, reload through the same transaction and retire
 /// into the same graveyard; what used to separate them was a prefix on these
 /// three names, which is a difference in a string rather than in a contract.
@@ -372,7 +372,7 @@ const MODULE_UPDATE_SYMBOL: &[u8] = b"pill_module_update";
 /// Optional ABI revision export, read at load time when present.
 const MODULE_ABI_VERSION_SYMBOL: &[u8] = b"pill_module_abi_version";
 
-/// Owns one loaded native library, either the project or an optional module.
+/// Owns one loaded native library, either the project or an extension.
 ///
 /// Export symbols are resolved once during loading and stored as raw function
 /// pointers. The pointers stay valid for as long as the `library` field keeps

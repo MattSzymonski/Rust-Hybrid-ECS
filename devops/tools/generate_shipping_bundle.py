@@ -6,8 +6,8 @@
 
 # DESCRIPTION: Generates the shipping bundle crate for the static (shipping)
 #   posture of the engine host. The bundle is the single crate `pill_standalone`
-#   links under `static_project`: it declares the project and every optional
-#   module selected by the project's `project_settings.yaml` as ordinary Rust
+#   links under `static_project`: it declares the project and every extension
+#    selected by the project's `project_settings.yaml` as ordinary Rust
 #   dependencies, and exposes the `StaticModule` / `StaticProject` registration
 #   the static-link path initializes.
 #
@@ -77,7 +77,7 @@ BUNDLE_DIRECTORY = Path("build") / BUNDLE_CRATE_NAME
 # File names the generator reads and writes.
 PROJECT_SETTINGS_FILE_NAME = "project_settings.yaml"
 PROJECT_MANIFEST_FILE_NAME = "Cargo.toml"
-OPTIONAL_MODULE_DIRECTORY = Path("modules") / "extensions"
+EXTENSION_DIRECTORY = Path("modules") / "extensions"
 HOST_CRATE_DIRECTORY = Path("modules") / "pill_host"
 
 # Managed (C#) project constants, mirroring `pill_host::config` so a generated
@@ -98,7 +98,7 @@ def repository_root() -> Path:
 
 
 def load_module_list(project_root: Path) -> list:
-    """Loads the optional-module list from the project's settings file.
+    """Loads the extension list from the project's settings file.
 
     Raises FileNotFoundError when the settings file is missing.
     """
@@ -289,7 +289,7 @@ def build_cargo_manifest(
             + " }",
         )
     for module in modules:
-        module_directory = root / OPTIONAL_MODULE_DIRECTORY / module
+        module_directory = root / EXTENSION_DIRECTORY / module
         relative_path = manifest_relative_path(bundle_directory, module_directory)
         lines.append(
             f'{module} = {{ path = "{relative_path}", default-features = false }}'
@@ -316,7 +316,7 @@ def build_library_source(
         "",
         "use pill_host::{StaticModule, StaticProject, StaticProjectBackend};",
         "",
-        "/// Every selected optional module, in `project_settings.yaml` order.",
+        "/// Every selected extension, in `project_settings.yaml` order.",
         # One entry per line regardless of count. rustfmt collapses a
         # single-element array onto one line, so without this the generated
         # file fails `cargo fmt --check` for any project selecting exactly one
@@ -508,11 +508,11 @@ def main() -> int:
     missing_modules = [
         name
         for name in modules
-        if not (root / OPTIONAL_MODULE_DIRECTORY / name).is_dir()
+        if not (root / EXTENSION_DIRECTORY / name).is_dir()
     ]
     if missing_modules:
         print(
-            f"error: modules not found under {OPTIONAL_MODULE_DIRECTORY}: "
+            f"error: modules not found under {EXTENSION_DIRECTORY}: "
             f"{', '.join(missing_modules)}",
             file=sys.stderr,
         )

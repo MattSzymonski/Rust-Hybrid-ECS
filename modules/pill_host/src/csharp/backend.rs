@@ -578,7 +578,7 @@ impl CSharpRuntime {
         mirror_methods: &[ResolvedMirrorMethod],
     ) -> Result<Self, CSharpError> {
         // Step 0: Merge the hardcoded shared renderer bindings with byte-level
-        // bindings for every native component the optional modules exposed, so
+        // bindings for every native component the extensions exposed, so
         // a `project_cs` mirror whose full name matches a module component
         // resolves to the module's native storage.
         let shared_bindings = shared_component_bindings(engine);
@@ -894,7 +894,7 @@ impl CSharpRuntime {
         mirror_methods: &[ResolvedMirrorMethod],
     ) -> Result<Self, CSharpError> {
         // Step 0: merge the shared renderer bindings with byte-level bindings
-        // for every native component the optional modules exposed, exactly as
+        // for every native component the extensions exposed, exactly as
         // the hostfxr path does.
         let shared_bindings = shared_component_bindings(engine);
         let mut bindings = shared_bindings;

@@ -211,7 +211,7 @@ impl CsEngineApi {
 /// Rebuild the mirror-method table the managed runtime copies at startup.
 ///
 /// Called both when the C# backend starts (from [`CsEngineApi::new`]) and when
-/// an optional module reloads, so the C# side always resolves trampoline
+/// an extension reloads, so the C# side always resolves trampoline
 /// addresses from the module generations currently loaded — a hot reload gives
 /// the module a new image (and therefore new addresses), and a reloaded module
 /// may have added or removed mirrored methods.

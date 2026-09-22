@@ -15,8 +15,8 @@ DESCRIPTION:
   `cargo run -p editor` cannot hot-reload at all, because Dioxus 0.7 only
   activates hot reload when the CLI launches the app (it sets the DIOXUS_*
   devserver environment variables and compiles with the `dioxus_hot_reload`
-  cfg). The engine's own module hot reload (examples/project_rs, optional
-  modules) is unaffected and keeps working exactly as under `cargo run`.
+  cfg). The engine's own module hot reload (examples/project_rs, extensions)
+   is unaffected and keeps working exactly as under `cargo run`.
 
   dx needs three machine-specific workarounds on this repository, and this
   script applies all of them for the duration of the session:

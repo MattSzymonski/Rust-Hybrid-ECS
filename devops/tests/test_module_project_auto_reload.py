@@ -7,7 +7,7 @@ REQUIREMENTS
   - Run from workspace root or any path (script resolves paths itself)
 
 DESCRIPTION
-    Verifies the host's dependency-aware reload: when an optional module that
+    Verifies the host's dependency-aware reload: when an extension that
     the project links directly (here `pill_spline`) is edited and hot-reloaded,
     the host must detect the dependency and reload the project as well, so the
     project's embedded copy of the module's code picks up the change.
@@ -51,7 +51,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 
 MODULE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "src" / "lib.rs"
 
-# The host has no environment-variable override for the optional-module list,
+# The host has no environment-variable override for the extension list,
 # so this test drives it the same way a person would: by writing the project's
 # settings file the host actually reads. The real file is backed up and
 # restored around the run so this test never leaves the project's
@@ -66,7 +66,7 @@ modules:
 ORIGINAL_HOST_CONFIG = None
 
 PROBE_PREFIX = "midpoint ("
-MODULE_RELOAD_TOKEN = "optional module reload processed"
+MODULE_RELOAD_TOKEN = "extension reload processed"
 QUEUED_PROJECT_RELOAD_TOKEN = "queuing a project reload"
 PROJECT_RELOAD_TOKEN = "hot reload complete"
 
@@ -194,7 +194,7 @@ def kill_stray_hosts() -> None:
 
 def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
     """Starts the host with the module-project setup and returns process + monitor."""
-    # The optional-module list comes only from the project's settings file
+    # The extension list comes only from the project's settings file
     # (installed by `install_test_project_settings`); `PROJECT_PATH` pins the
     # project explicitly for this test.
     process_environment = os.environ.copy()

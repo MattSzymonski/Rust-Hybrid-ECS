@@ -22,7 +22,7 @@
             // The host resolves `extensions/` relative to the process working
             // directory and expects to be launched from the engine workspace
             // root, which is `modules/`. Launching from anywhere else fails
-            // with "optional module <name> has no directory under extensions/".
+            // with "extension <name> has no directory under extensions/".
             "cwd": "${workspaceFolder}/modules",
             "environment": [
                 {
@@ -32,7 +32,7 @@
                     "value": "../examples/project_rs"
                 }
             ],
-            // Optional modules are built into `target/hot/build`, not
+            // Extensions are built into `target/hot/build`, not
             // `target/debug`, and are loaded from unique temporary copies that
             // carry no PDB beside them. Naming both build outputs lets the
             // debugger find module symbols when the host loads a module at

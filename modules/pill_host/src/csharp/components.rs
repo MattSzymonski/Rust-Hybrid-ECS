@@ -197,7 +197,7 @@ pub(super) enum ComponentBinding {
         /// fields underneath them do not.
         schema_hash: u64,
     },
-    /// A native component registered by an optional Rust module, exposed to
+    /// A native component registered by an extension, exposed to
     /// managed code through the raw byte view of its column.
     ///
     /// The host never names the concrete Rust type; reads and writes go
@@ -432,10 +432,10 @@ fn shared_renderer_bindings(engine: &mut Engine, bindings: &mut ComponentBinding
     );
 }
 
-/// One native component an optional Rust module registered, exposed to managed
+/// One native component an extension registered, exposed to managed
 /// code under a derived C#-facing name.
 ///
-/// The host aggregates these after the optional modules load and hands them to
+/// The host aggregates these after the extensions load and hands them to
 /// the C# backend, which creates a byte-level [`ComponentBinding::ModuleNative`]
 /// for each one so `project_cs` can query and write the module's real storage.
 #[derive(Debug, Clone)]
@@ -482,7 +482,7 @@ pub(crate) fn resolve_exposed_component_id(world: &World, type_name: &str) -> Op
     }
 }
 
-/// Build byte-level bindings for every optional-module component exposed to
+/// Build byte-level bindings for every extension component exposed to
 /// managed code, keyed by the stable identity of its derived C# name.
 ///
 /// The bindings are merged into the shared table before the managed manifest

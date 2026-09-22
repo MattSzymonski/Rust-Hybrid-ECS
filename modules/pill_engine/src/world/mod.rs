@@ -75,7 +75,7 @@ pub use crate::error::{AddComponentError, BuildError, RemoveComponentError, Worl
 
 /// Component-type headroom below which registration warns.
 ///
-/// The 128-type ceiling is shared across a project and every optional module,
+/// The 128-type ceiling is shared across a project and every extension,
 /// so it can be exhausted even with few of "your own" types. Warn while there
 /// is still room to act, so exhaustion is visible before it is fatal.
 const REGISTRATION_HEADROOM_WARNING_THRESHOLD: usize = 16;

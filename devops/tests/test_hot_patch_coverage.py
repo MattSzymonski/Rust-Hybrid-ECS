@@ -22,8 +22,8 @@ DESCRIPTION
     So this test asserts the thing the console tells you and no other test
     checks: that an edit was delivered BY A PATCH, not by a reload.
 
-    Crates are discovered rather than listed - the project and the optional
-    modules come from `examples/project_rs/project_settings.yaml`, so a module
+    Crates are discovered rather than listed - the project and the extensions
+     come from `examples/project_rs/project_settings.yaml`, so a module
     added later is
     covered without touching this file. The function to edit is discovered too:
     the scanner looks for a numeric literal inside a function body, preferring

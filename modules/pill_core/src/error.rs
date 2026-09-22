@@ -485,22 +485,22 @@ pub enum ConfigError {
     )]
     InvalidBuildBinaryName { path: String },
 
-    /// An optional-module name in the settings file is not a usable crate
+    /// An extension name in the settings file is not a usable crate
     /// directory name.
     #[message(
-        "project settings file lists optional module ",
+        "project settings file lists extension ",
         value(name),
         ", which is not a crate directory name (letters, digits, `_`, `-`; must start with a letter)"
     )]
-    InvalidOptionalModuleName { name: String },
+    InvalidExtensionName { name: String },
 
-    /// The settings file lists one optional module twice.
-    #[message("project settings file lists optional module ", value(name), " twice")]
-    DuplicateOptionalModuleName { name: String },
+    /// The settings file lists one extension twice.
+    #[message("project settings file lists extension ", value(name), " twice")]
+    DuplicateExtensionName { name: String },
 
-    /// A configured optional module has no sibling directory to build from.
-    #[message("optional module ", value(name), " has no directory under extensions/")]
-    OptionalModuleDirectoryMissing { name: String },
+    /// A configured extension has no sibling directory to build from.
+    #[message("extension ", value(name), " has no directory under extensions/")]
+    ExtensionDirectoryMissing { name: String },
 }
 
 /// Project-module build execution failures.
@@ -663,8 +663,8 @@ pub enum LibraryError {
 
     /// The library does not export a required entry point.
     ///
-    /// Names the subject as well as the symbol: a project and an optional
-    /// module export the same entry points, so the symbol alone no longer says
+    /// Names the subject as well as the symbol: a project and an extension
+    ///  export the same entry points, so the symbol alone no longer says
     /// which artifact is missing it.
     #[message(
         "native library for ",
@@ -684,7 +684,7 @@ pub enum LibraryError {
     InitializationFailed { status: u32 },
 }
 
-/// Optional-module loading and compatibility failures.
+/// Extension loading and compatibility failures.
 ///
 /// Distinct from [`LibraryError`], which covers the mechanics of mapping a
 /// library: these report a broken contract between the host and a module.
@@ -692,7 +692,7 @@ pub enum LibraryError {
 pub enum ModuleError {
     /// The module was built against a different module ABI revision.
     #[message(
-        "optional module ",
+        "extension ",
         name_style(module),
         " reports ABI version ",
         value(module_version),
@@ -708,18 +708,18 @@ pub enum ModuleError {
 
     /// The module does not export an ABI revision at all.
     #[message(
-        "optional module ",
+        "extension ",
         name_style(module),
         " does not export pill_module_abi_version"
     )]
     #[diagnostic(help(
-        "an optional module must export pill_module_abi_version, pill_module_init and, optionally, pill_module_update"
+        "an extension must export pill_module_abi_version, pill_module_init and, optionally, pill_module_update"
     ))]
     AbiVersionMissing { module: String },
 
     /// The module's registration entry point reported a failed generation.
     #[message(
-        "optional module ",
+        "extension ",
         name_style(module),
         " initialization failed with status ",
         value(status)
@@ -727,7 +727,7 @@ pub enum ModuleError {
     InitializationFailed { module: String, status: u32 },
 
     /// Two configured modules share one name.
-    #[message("optional module name ", name_style(module), " is configured twice")]
+    #[message("extension name ", name_style(module), " is configured twice")]
     DuplicateName { module: String },
 }
 
@@ -984,7 +984,7 @@ pub enum HostError {
     #[transparent]
     Watcher(#[from] WatcherError),
 
-    /// An optional module failed to load or is incompatible.
+    /// An extension failed to load or is incompatible.
     #[transparent]
     Module(#[from] ModuleError),
 

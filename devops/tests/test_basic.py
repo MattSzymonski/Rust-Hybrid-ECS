@@ -389,7 +389,7 @@ def shipping_build(tally: ResultTally) -> None:
 
     First it builds `pill_standalone` with `--no-default-features --features
     static_project`, which turns `hot_reload` off and links the project and its
-    optional modules into the binary. That alone catches the usual breakage - a
+    extensions into the binary. That alone catches the usual breakage - a
     `#[cfg]` that only compiles in one configuration.
 
     Then it searches the binary for strings only the reloading path produces,

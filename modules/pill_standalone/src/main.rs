@@ -58,7 +58,7 @@ compile_error!(
 // Static Project
 // =============================================================================
 
-/// The project and its optional modules, taken from the generated shipping
+/// The project and its extensions, taken from the generated shipping
 /// bundle.
 ///
 /// The bundle is regenerated from the project's `project_settings.yaml` by

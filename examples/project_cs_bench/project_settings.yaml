@@ -1,7 +1,7 @@
 # Project settings for the managed (C#) iteration benchmark project.
 #
 # Deliberately minimal. This project exists to measure one thing - the cost of
-# iterating components from C# - so it declares no optional modules and draws
+# iterating components from C# - so it declares no extensions and draws
 # nothing. Every module it loaded would add native work to a frame whose whole
 # point is to contain only managed iteration, and a renderer would add a GPU
 # present to the same frame.

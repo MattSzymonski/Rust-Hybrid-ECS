@@ -1,10 +1,10 @@
-//! Dummy optional engine module used to pad out module-loading tests.
+//! Dummy extension used to pad out module-loading tests.
 //!
 //! # Responsibilities
 //!
 //! - Defines the [`Greeter`] struct with two dummy text-formatting methods.
 //! - Exposes the [`shout`] free function.
-//! - Registers through the optional-module ABI when the host loads it.
+//! - Registers through the extension ABI when the host loads it.
 //!
 //! # Design
 //!

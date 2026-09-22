@@ -40,7 +40,7 @@ DESCRIPTION
     LAYOUT CONTRACT: the script is hardcoded to the CURRENT module/project
     layout (specific files + edit anchors, see the Layout contract section).
     A prerequisite check runs before anything is built or launched, so a
-    changed layout (e.g. an optional module deleted or renamed) fails with a
+    changed layout (e.g. an extension deleted or renamed) fails with a
     clear per-file diagnostic instead of a mid-run traceback. Update the
     paths/anchors at the top of this file after a layout change.
 
@@ -199,7 +199,7 @@ CSHARP_EDIT = EditHook(
 # The script is deliberately hardcoded to the CURRENT module/project layout:
 # it edits specific constants in specific files to trigger each reload
 # category. `verify_prerequisites` checks every dependency below BEFORE
-# anything is built or launched, so a changed layout (an optional module
+# anything is built or launched, so a changed layout (an extension
 # deleted or renamed, a project moved, a constant renamed) fails with a clear
 # diagnostic instead of a mid-run traceback or a silently empty measurement.
 # The `session` tag scopes each entry to the native / csharp session.
@@ -256,7 +256,7 @@ def verify_prerequisites(run_native: bool, run_csharp: bool) -> bool:
 
     print("\n  [FAIL] The repo layout does not match what this script is hardcoded to.")
     print("  The script triggers each reload by editing a specific constant in a specific")
-    print("  module/project file. If the layout changed (an optional module was deleted or")
+    print("  module/project file. If the layout changed (an extension was deleted or")
     print("  renamed, a project moved, or a constant renamed), update the paths and edit")
     print("  anchors at the top of this file (SPLINE_LIB_RS, PROJECT_RS_LIB_RS,")
     print("  PROJECT_CS_SYSTEMS_CS and the EditHook definitions), or use --native-only /")

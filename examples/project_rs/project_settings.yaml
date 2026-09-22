@@ -4,7 +4,7 @@
 # artifact file base and must contain only letters, digits and underscores.
 # Both are required. The other fields are classic package metadata.
 #
-# `modules` declares which optional engine modules this project uses, in load
+# `modules` declares which extensions this project uses, in load
 # order (the project itself initializes last). The dev host reads this file at
 # startup and the shipping bundle generator reads it at build time, so adding
 # or removing a module is a single edit here.

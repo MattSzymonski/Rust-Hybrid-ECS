@@ -88,9 +88,9 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Auto-generated mirrors of components exposed by optional Rust modules.
+    <!-- Auto-generated mirrors of components exposed by extensions.
          The Rust host writes generated/<module>_Components.g.cs inside each
-         optional module before the project build, deriving every declaration
+         extension before the project build, deriving every declaration
          from the module's real registered layout; nothing is hand-written in
          this project. A committed copy bootstraps standalone builds. -->
     <Compile Include="../../modules/extensions/*/generated/*.g.cs" />

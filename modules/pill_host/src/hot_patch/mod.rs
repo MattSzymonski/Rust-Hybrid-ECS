@@ -422,7 +422,7 @@ impl HotPatchSession {
     ) -> Option<Self> {
         let source_root = workspace_root.join(watch_directory);
         // The crate root is `src/lib.rs` unless the manifest's `[lib] path`
-        // moves it, which optional modules do so their file name is unique
+        // moves it, which extensions do so their file name is unique
         // across the dependency graph. Resolved through the same helper the
         // build script uses, because a root mistaken for a module would prefix
         // every patch name with a segment the inventory does not carry.
@@ -431,7 +431,7 @@ impl HotPatchSession {
             .map(source::crate_root_file)
             .unwrap_or_else(|| source_root.join("lib.rs"));
         // The staged copy, not cargo's per-crate slot. Both the project and
-        // every optional module write their `rlib` to an unhashed path that any
+        // every extension write their `rlib` to an unhashed path that any
         // other build of the same package overwrites, and a patch that linked
         // the wrong one would be compiled against a differently configured
         // engine - giving every type a different `TypeId` than the running

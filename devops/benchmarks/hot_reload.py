@@ -16,7 +16,7 @@ DESCRIPTION
 
     Measured per category (`EditHook` in the harness):
 
-      module_reload   edit `pill_spline` -> "optional module hot reload
+      module_reload   edit `pill_spline` -> "extension hot reload
                       complete" (module-only latency, before the cascade)
       cascade_total   same edit -> "[analytics] reload project" (module plus
                       the queued project reload = full user-visible cost)
@@ -68,8 +68,8 @@ from core.paths import HOT_RELOAD_HARNESS  # noqa: E402
 # frontend can explain a case without duplicating the knowledge.
 CASE_DESCRIPTIONS = {
     "module_reload": (
-        "Edit an optional module constant (pill_spline) until the host logs "
-        "'optional module hot reload complete'. Module-only latency, measured "
+        "Edit an extension constant (pill_spline) until the host logs "
+        "'extension hot reload complete'. Module-only latency, measured "
         "before the queued project reload starts."
     ),
     "cascade_total": (

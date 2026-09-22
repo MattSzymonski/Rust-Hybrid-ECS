@@ -1021,7 +1021,7 @@ fn descriptor_component_ticks_survive_archetype_migration() {
 
 /// The native byte-chunk accessor exposes a native column's rows as raw
 /// bytes with the correct element size, mirroring the descriptor path used
-/// by the C# backend for optional-module components. Descriptor components
+/// by the C# backend for extension components. Descriptor components
 /// are rejected by it.
 #[test]
 fn native_component_chunk_mut_exposes_raw_rows() {
@@ -1078,7 +1078,7 @@ fn native_component_chunk_mut_exposes_raw_rows() {
 }
 
 /// A byte component adder writes raw ABI bytes into a native column, which
-/// is how the C# backend creates or adds optional-module components whose
+/// is how the C# backend creates or adds extension components whose
 /// concrete Rust type the host never names.
 #[test]
 fn byte_component_adder_writes_native_bytes() {

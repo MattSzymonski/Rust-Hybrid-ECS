@@ -102,7 +102,7 @@ CASE_DESCRIPTIONS = {
         "edit-rebuild loop a developer sits through."
     ),
     "startup_cold": (
-        "Launching the standalone host with the project and optional modules "
+        "Launching the standalone host with the project and extensions "
         "not yet built, timed to the 'Entering project loop' token. Includes "
         "the host's own cargo builds of every module."
     ),
@@ -540,7 +540,7 @@ def run(
         cases.append(run_cargo_case("incremental_build", "build", package, log))
 
     if not skip_startup:
-        # The host builds the project and optional modules itself, so this
+        # The host builds the project and extensions itself, so this
         # first launch is the cold one after the clean build above.
         cold = measure_host_startup(
             "startup_cold", COLD_STARTUP_TIMEOUT_SECONDS, log

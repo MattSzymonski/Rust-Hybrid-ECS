@@ -8,7 +8,7 @@ name = "project"
 path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/src/lib.rs"
 # `cdylib` for a hot-reloading build, where the host loads this as a DLL.
 # `rlib` so a shipping build can link the project straight into the binary -
-# a cdylib cannot be a Rust library dependency. Every optional module already
+# a cdylib cannot be a Rust library dependency. Every extension already
 # carries both for the same reason.
 crate-type = ["cdylib", "rlib"]
 
@@ -20,7 +20,7 @@ pill_core = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../m
 # `default-features = false` is a defensive no-op: `module-abi` is opt-in now,
 # so the `pill_module_*` exports stay off in this build either way.
 pill_spline = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/extensions/pill_spline", default-features = false }
-# Dummy optional modules, linked directly purely to exercise their structs and
+# Dummy extensions, linked directly purely to exercise their structs and
 # free functions from the project. `default-features = false` is a defensive
 # no-op (each crate's `module-abi` feature is opt-in), kept so that a future
 # change cannot pull the `#[no_mangle]` `pill_module_*` exports into this one

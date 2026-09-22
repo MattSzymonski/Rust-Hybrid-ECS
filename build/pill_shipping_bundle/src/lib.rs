@@ -4,7 +4,7 @@
 
 use pill_host::{StaticModule, StaticProject, StaticProjectBackend};
 
-/// Every selected optional module, in `project_settings.yaml` order.
+/// Every selected extension, in `project_settings.yaml` order.
 #[rustfmt::skip]
 pub const STATIC_MODULES: &[StaticModule] = &[
     StaticModule {

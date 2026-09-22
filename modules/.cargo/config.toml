@@ -1,5 +1,5 @@
 # Link Rust dependencies dynamically wherever a `dylib` artifact exists, so the
-# host executable and every optional module built from this workspace share one
+# host executable and every extension built from this workspace share one
 # copy of `pill_engine` instead of each embedding a private one. Sharing the
 # engine is what keeps its statics, thread-locals and the tracing dispatcher
 # single-instance across the DLL boundary.

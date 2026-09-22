@@ -88,7 +88,7 @@ pub mod entity;
 /// Typed error system for the ECS engine.
 pub mod error;
 
-/// Constants shared between the host and optional engine modules.
+/// Constants shared between the host and extensions.
 pub mod module_abi;
 
 /// Component persistence and schema migration for hot-reload.

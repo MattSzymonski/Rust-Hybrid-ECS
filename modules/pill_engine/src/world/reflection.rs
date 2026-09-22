@@ -220,7 +220,7 @@ impl World {
     ///
     /// Works for both native (Rust) and descriptor (foreign-language) components.
     /// Used by the C# backend to validate that a managed mirror struct has the
-    /// same ABI layout as the component an optional module registered.
+    /// same ABI layout as the component an extension registered.
     pub fn component_layout(&self, component_id: ComponentId) -> Option<(usize, usize)> {
         match self.storage_factories.get(&component_id) {
             Some(StorageFactory::Native(info)) => Some((info.size, info.align)),

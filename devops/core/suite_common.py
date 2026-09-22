@@ -65,7 +65,7 @@ MODULES_ROOT = WORKSPACE_ROOT / "modules"
 HOST_EXE = MODULES_ROOT / "target" / "debug" / "pill_standalone.exe"
 
 # Known project roots. Each declares its own `project_settings.yaml`, the only
-# source of the optional-module list; the project itself is selected by
+# source of the extension list; the project itself is selected by
 # `PROJECT_PATH` alone (there is no host-level config file anymore).
 NATIVE_PROJECT_ROOT = WORKSPACE_ROOT / "examples" / "project_rs"
 CSHARP_PROJECT_ROOT = WORKSPACE_ROOT / "examples" / "project_cs"
@@ -107,7 +107,7 @@ ANALYTICS_REPORT_TOKEN = "BUILD / LINK / HOT-RELOAD ANALYTICS"
 FAST_PATH_TOKEN = "up to date, skipping build"
 RELOAD_PROJECT_TOKEN = "[analytics] reload project"
 RELOAD_MODULE_TOKEN = "[analytics] reload pill_spline"
-MODULE_RELOAD_COMPLETE_TOKEN = "optional module hot reload complete"
+MODULE_RELOAD_COMPLETE_TOKEN = "extension hot reload complete"
 CASCADE_TOKEN = "queuing a project reload"
 COUNTER_TICK_TOKEN = "counter tick"
 MIGRATION_START_TOKEN = "[persistence] Selective migration starting"

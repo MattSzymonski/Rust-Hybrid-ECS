@@ -202,7 +202,7 @@ suites in `devops/tests/` use.
 
 | Case | Edit | Measured to |
 | --- | --- | --- |
-| `module_reload` | `pill_spline` constant | `optional module hot reload complete` |
+| `module_reload` | `pill_spline` constant | `extension hot reload complete` |
 | `cascade_total` | same edit | the cascaded `[analytics] reload project` |
 | `project_reload` | `examples/project_rs` constant | project reload analytics |
 | `csharp_reload` | `examples/project_cs` probe | `C# hot reload complete` |

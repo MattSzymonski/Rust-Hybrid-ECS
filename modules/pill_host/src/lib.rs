@@ -56,8 +56,8 @@ mod frontend;
 /// Native project-library loading and Windows-safe temporary-copy handling.
 #[cfg(feature = "hot_reload")]
 mod native_library;
-/// Lifecycle management for optional engine modules.
-mod optional_module;
+/// Lifecycle management for extensions.
+mod extension;
 /// Lifecycle management for the active native or managed project module.
 mod project_module;
 /// The sequence every reload runs once its replacement image is loaded.
@@ -82,9 +82,9 @@ mod static_link;
 
 // Local host modules and the shared crate-root error surface.
 pub use config::{
-    CSharpModuleConfig, HostConfig, OptionalModuleConfig, ProjectModuleBackend, ProjectModuleConfig,
+    CSharpModuleConfig, HostConfig, ExtensionConfig, ProjectModuleBackend, ProjectModuleConfig,
 };
-pub use optional_module::OPTIONAL_MODULE_ABI_VERSION;
+pub use extension::EXTENSION_ABI_VERSION;
 pub use pill_core::error::{
     engine_report, install_engine_report_handler, BuildError, CSharpError, ConfigError,
     EngineMessage, EngineReportHandler, HostError, LibraryError, MessageRenderer, ModuleError,

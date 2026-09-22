@@ -462,7 +462,7 @@ public static unsafe class Engine
     /// and drop the resolved delegate cache.
     ///
     /// Called at bind time and again after each managed assembly swap: an
-    /// optional module reload maps the module at a fresh base and may add or
+    /// extension reload maps the module at a fresh base and may add or
     /// remove mirrored methods, so the addresses the generated structs call
     /// must be re-read from the host, and each collectible context defines its
     /// own delegate types.
@@ -761,7 +761,7 @@ public static class MirrorMethods
 
     /// <summary>
     /// Counts host binds. Generated accessors cache trampoline addresses and
-    /// re-resolve whenever this value changes: reloading an optional module
+    /// re-resolve whenever this value changes: reloading an extension
     /// maps it at a fresh base address, so the addresses from the previous
     /// bind dangle from then on.
     /// </summary>

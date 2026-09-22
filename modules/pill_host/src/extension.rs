@@ -1,14 +1,14 @@
-//! Lifecycle management for optional engine modules.
+//! Lifecycle management for extensions.
 //!
 //! # Responsibilities
 //!
-//! - Builds, validates and loads one optional module during startup.
+//! - Builds, validates and loads one extension during startup.
 //! - Reloads a module in isolation when only its sources changed.
 //! - Removes exactly that module's systems across a reload.
 //!
 //! # Design
 //!
-//! Each loaded module owns an [`OptionalModuleSlot`], which holds its
+//! Each loaded module owns an [`ExtensionSlot`], which holds its
 //! configuration, its [`SystemOwner`], the currently mapped library and a
 //! bounded graveyard of retired ones. Reload is transactional in the same way
 //! the project module's is: the replacement is compiled and loaded before any
@@ -43,27 +43,27 @@ use pill_engine::{Engine, EngineApi, SystemOwner};
 #[cfg(feature = "hot_reload")]
 use crate::analytics;
 #[cfg(feature = "hot_reload")]
-use crate::build_runner::build_optional_module;
+use crate::build_runner::build_extension;
 #[cfg(feature = "hot_reload")]
 use crate::native_library::NativeLibrary;
 #[cfg(feature = "hot_reload")]
-use crate::OptionalModuleConfig;
+use crate::ExtensionConfig;
 
 // =============================================================================
 // Constants
 // =============================================================================
 
-/// Optional-module ABI revision this host understands.
+/// Extension ABI revision this host understands.
 ///
 /// A module reporting anything else is rejected before it is handed a pointer
 /// into engine memory, because the two sides then disagree about the contract.
 ///
 /// Read from `pill_engine` so the host and every module (whose ABI export is
 /// generated from the same constant by `#[pill_module]`) can never drift.
-pub use pill_engine::module_abi::MODULE_ABI_VERSION as OPTIONAL_MODULE_ABI_VERSION;
+pub use pill_engine::module_abi::MODULE_ABI_VERSION as EXTENSION_ABI_VERSION;
 
 // =============================================================================
-// OptionalModuleSlot
+// ExtensionSlot
 // =============================================================================
 
 // Everything below loads, versions and replaces a module DLL, none of which a
@@ -71,16 +71,16 @@ pub use pill_engine::module_abi::MODULE_ABI_VERSION as OPTIONAL_MODULE_ABI_VERSI
 // it describes the contract a module crate is compiled against, which is true
 // whether or not this host can load one.
 #[cfg(feature = "hot_reload")]
-pub(crate) use slot::{OptionalModuleSlot, ReloadOutcome};
+pub(crate) use slot::{ExtensionSlot, ReloadOutcome};
 
 #[cfg(feature = "hot_reload")]
 mod slot {
     use super::*;
 
-    /// One loaded optional module and everything needed to reload it.
-    pub(crate) struct OptionalModuleSlot {
+    /// One loaded extension and everything needed to reload it.
+    pub(crate) struct ExtensionSlot {
         /// How this module is built, watched and loaded.
-        config: OptionalModuleConfig,
+        config: ExtensionConfig,
         /// Owner tag applied to every system this module registers.
         owner: SystemOwner,
         /// Currently active library.
@@ -138,8 +138,8 @@ mod slot {
         },
     }
 
-    impl OptionalModuleSlot {
-        /// Build, load and initialize one optional module.
+    impl ExtensionSlot {
+        /// Build, load and initialize one extension.
         ///
         /// # Errors
         ///
@@ -149,12 +149,12 @@ mod slot {
             engine: &mut Engine,
             engine_api: &EngineApi,
             workspace_root: &Path,
-            config: &OptionalModuleConfig,
+            config: &ExtensionConfig,
             owner: SystemOwner,
             source_edit_generation: Arc<AtomicU64>,
         ) -> Result<Self, HostError> {
             // Step 1: Compile the module through the shared command runner.
-            let output_path = build_optional_module(workspace_root, config, None)?;
+            let output_path = build_extension(workspace_root, config, None)?;
 
             // Step 2: Load a uniquely named copy so the next compilation stays free
             // to replace the build output while this generation remains mapped.
@@ -226,7 +226,7 @@ mod slot {
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 module = config.name.as_str(),
                 owner = owner.0,
-                "optional module loaded"
+                "extension loaded"
             );
 
             Ok(Self {
@@ -267,7 +267,7 @@ mod slot {
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 module = self.config.name.as_str(),
                 generation,
-                "optional module reload triggered"
+                "extension reload triggered"
             );
             let outcome = self.reload(engine, engine_api, workspace_root, generation);
 
@@ -373,7 +373,7 @@ mod slot {
             // Step 1: Compile before touching engine state, so a compiler error can
             // never remove the systems of the working generation. A newer save
             // during the build cancels it and the next frame retries.
-            let output_path = match build_optional_module(
+            let output_path = match build_extension(
                 workspace_root,
                 &self.config,
                 Some((&self.source_edit_generation, generation)),
@@ -420,7 +420,7 @@ mod slot {
             // columns, migrate schemas, retire the old image. Their ORDER is
             // load-bearing - see `crate::reload`.
             let transaction = crate::reload::ReloadTransaction {
-                kind: crate::reload::ReloadSubjectKind::OptionalModule,
+                kind: crate::reload::ReloadSubjectKind::Extension,
                 subject: &self.config.name,
                 owner: self.owner,
                 current: &mut self.current,
@@ -440,7 +440,7 @@ mod slot {
         }
     }
 
-    impl Drop for OptionalModuleSlot {
+    impl Drop for ExtensionSlot {
         /// Announce the unload of this module's images, current and retired.
         ///
         /// The fields drop straight after this body, and each one unmaps a
@@ -452,7 +452,7 @@ mod slot {
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 module = %self.config.name,
                 generations = self.old_libraries.len() + 1,
-                "unloading optional module"
+                "unloading extension"
             );
         }
     }
@@ -467,11 +467,11 @@ mod slot {
     /// two sides disagree about what the entry points expect.
     fn check_abi_version(library: &NativeLibrary, module_name: &str) -> Result<(), ModuleError> {
         match library.abi_version() {
-            Some(OPTIONAL_MODULE_ABI_VERSION) => Ok(()),
+            Some(EXTENSION_ABI_VERSION) => Ok(()),
             Some(module_version) => Err(ModuleError::AbiVersionMismatch {
                 module: module_name.to_string(),
                 module_version,
-                host_version: OPTIONAL_MODULE_ABI_VERSION,
+                host_version: EXTENSION_ABI_VERSION,
             }),
             // A module without the export predates the versioned contract and
             // cannot be assumed compatible.

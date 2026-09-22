@@ -2,7 +2,7 @@
 //!
 //! # Responsibilities
 //!
-//! - Describes a project and its optional modules as ordinary Rust functions
+//! - Describes a project and its extensions as ordinary Rust functions
 //!   compiled into the host binary, rather than DLLs discovered at runtime.
 //! - Initializes them in the same order, and under the same owners, that the
 //!   hot-reloading path uses.
@@ -10,7 +10,7 @@
 //! # Design
 //!
 //! Compiled only when the `hot_reload` feature is **off**. With reloading on,
-//! the project and every optional module are separate `cdylib` artifacts the
+//! the project and every extension are separate `cdylib` artifacts the
 //! host builds and loads; with it off there is nothing to build or load, so the
 //! frontend hands the host the entry points directly.
 //!
@@ -51,15 +51,15 @@ use pill_engine::{Engine, SystemOwner};
 use crate::csharp::{CSharpRuntime, ModuleExposedComponent};
 use crate::CSharpModuleConfig;
 
-/// One optional module compiled into the host binary.
+/// One extension compiled into the host binary.
 ///
-/// The counterpart of an `OptionalModuleConfig` in a hot-reloading build: the
+/// The counterpart of an `ExtensionConfig` in a hot-reloading build: the
 /// same module, named the same way, but reached by a direct call instead of
 /// through `pill_module_init` in a loaded DLL.
 #[derive(Clone, Copy)]
 pub struct StaticModule {
     /// Crate name, used for logging and owner attribution exactly as the
-    /// reloading path uses `OptionalModuleConfig::name`.
+    /// reloading path uses `ExtensionConfig::name`.
     pub name: &'static str,
     /// The function `#[pill_module]` was written on.
     ///
@@ -132,7 +132,7 @@ impl StaticProjectBackend {
     }
 }
 
-/// A project and its optional modules, compiled into the host binary.
+/// A project and its extensions, compiled into the host binary.
 ///
 /// Replaces [`HostConfig`](crate::HostConfig) for a shipping build. There is no
 /// project path, no build command and no watch directory, because nothing is
@@ -144,7 +144,7 @@ pub struct StaticProject {
     pub name: &'static str,
     /// How to reach the project itself.
     pub backend: StaticProjectBackend,
-    /// Optional modules, initialized in order **before** the project.
+    /// Extensions, initialized in order **before** the project.
     ///
     /// The order matters for the same reason it does with reloading: the
     /// project may name types a module defines, so the module has to have
@@ -155,7 +155,7 @@ pub struct StaticProject {
 }
 
 impl StaticProject {
-    /// Initialize every optional module, then the project.
+    /// Initialize every extension, then the project.
     ///
     /// Owners are assigned exactly as the reloading path assigns them, so a
     /// statically linked module's systems are attributed to the same owner they
@@ -189,7 +189,7 @@ impl StaticProject {
         for (index, module) in self.modules.iter().enumerate() {
             // The same helper `runtime::setup` uses, so a module gets the
             // same owner whether it is linked in or loaded from a DLL.
-            let owner = SystemOwner::optional_module(index);
+            let owner = SystemOwner::extension(index);
             let registration_sequence = engine.world().component_registration_sequence();
             initialize_one(engine, module.init, Some(owner)).map_err(|status| {
                 ModuleError::InitializationFailed {
@@ -208,7 +208,7 @@ impl StaticProject {
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
                 module = module.name,
                 owner = owner.0,
-                "optional module linked"
+                "extension linked"
             );
         }
 
@@ -297,8 +297,8 @@ fn exposed_components(engine: &Engine, names: &[String]) -> Vec<ModuleExposedCom
 
 /// Run one entry point the way its generated ABI wrapper would.
 ///
-/// `owner` scopes the registrations when present, which is what an optional
-/// module needs and what the project must not have. Returns the non-zero status
+/// `owner` scopes the registrations when present, which is what an extension
+///  needs and what the project must not have. Returns the non-zero status
 /// the entry point reported; the caller names the subject, because only it
 /// knows whether the failure is a module's or the project's.
 fn initialize_one(
@@ -383,7 +383,7 @@ mod tests {
     fn module_owners_match_the_reloading_path() {
         for index in 0..4usize {
             assert_eq!(
-                SystemOwner::optional_module(index).0,
+                SystemOwner::extension(index).0,
                 index as u64 + 1,
                 "owners are 1-based and assigned in load order"
             );

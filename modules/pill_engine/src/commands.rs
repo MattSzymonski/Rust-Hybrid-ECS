@@ -111,8 +111,8 @@ impl<T: Component + Send> ComponentAdder for TypedComponentAdder<T> {
 
 /// Type-erased component adder that writes raw bytes into a native column.
 ///
-/// Used by the C# backend to create or add components that an optional Rust
-/// module registered as native, so the host never names the concrete type.
+/// Used by the C# backend to create or add components that an extension
+///  registered as native, so the host never names the concrete type.
 /// The byte payload must match the component's ABI layout exactly; the
 /// binding validates the size before this adder is queued.
 pub struct ByteComponentAdder {

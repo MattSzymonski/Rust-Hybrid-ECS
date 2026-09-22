@@ -50,7 +50,7 @@ use crate::csharp::ModuleExposedComponent;
 #[cfg(feature = "hot_reload")]
 use crate::native_library::cleanup_temporary_files;
 #[cfg(feature = "hot_reload")]
-use crate::optional_module::{OptionalModuleSlot, ReloadOutcome};
+use crate::extension::{ExtensionSlot, ReloadOutcome};
 #[cfg(feature = "hot_reload")]
 use crate::project_module::LoadedProject;
 #[cfg(feature = "hot_reload")]
@@ -105,9 +105,9 @@ pub struct Host {
     /// hold, its entry point having been called once during setup.
     #[cfg(feature = "hot_reload")]
     loaded_project: LoadedProject,
-    /// Optional modules, each with its own watcher and reload transaction.
+    /// Extensions, each with its own watcher and reload transaction.
     #[cfg(feature = "hot_reload")]
-    optional_modules: Vec<OptionalModuleSlot>,
+    extensions: Vec<ExtensionSlot>,
     /// Counter bumped by the project watcher on every relevant source save.
     ///
     /// One producer (the watcher) and two consumers: `try_project_fast_path`,
@@ -142,8 +142,8 @@ pub struct Host {
     /// existing whole-module reload as the only path.
     #[cfg(feature = "hot_patch")]
     hot_patch: Option<crate::hot_patch::HotPatchSession>,
-    /// Per-function fast path for each optional module, positionally paired
-    /// with `optional_modules`.
+    /// Per-function fast path for each extension, positionally paired
+    /// with `extensions`.
     ///
     /// An entry is `None` when that module annotated nothing, so a module that
     /// has not opted in costs nothing beyond one source scan at startup.
@@ -210,7 +210,7 @@ impl Host {
             hot_patch,
             module_hot_patch,
             loaded_patches,
-            optional_modules,
+            extensions,
             loaded_project,
             engine,
             ..
@@ -225,7 +225,7 @@ impl Host {
             .find(|session| session.knows_function(function))
             .ok_or_else(|| format!("`{function}` has not been patched in this session"))?;
 
-        let targets = patch_targets(loaded_project, optional_modules);
+        let targets = patch_targets(loaded_project, extensions);
         let result = session.rollback(engine, &targets, loaded_patches, function, generation);
         drop(targets);
         if result.is_ok() {
@@ -269,14 +269,14 @@ impl Host {
         );
     }
 
-    /// Names of the loaded optional modules, in `SystemOwner` order.
+    /// Names of the loaded extensions, in `SystemOwner` order.
     ///
-    /// `SystemOwner::optional_module(i)` is `i + 1`, so index `i` of this
+    /// `SystemOwner::extension(i)` is `i + 1`, so index `i` of this
     /// vector labels owner `i + 1`; owner `0` is the project.
     #[cfg(feature = "hot_reload")]
-    pub fn optional_module_names(&self) -> Vec<String> {
-        self.optional_modules
-            .iter()
+    pub fn extension_names(&self) -> Vec<String> {
+        self.extensions.
+            iter()
             .map(|slot| slot.name().to_string())
             .collect()
     }
@@ -409,11 +409,11 @@ impl RenderingHost {
         self.host.revision()
     }
 
-    /// Loaded optional-module names in `SystemOwner` order; see
-    /// [`Host::optional_module_names`].
+    /// Loaded extension names in `SystemOwner` order; see
+    /// [`Host::extension_names`].
     #[cfg(feature = "hot_reload")]
-    pub fn optional_module_names(&self) -> Vec<String> {
-        self.host.optional_module_names()
+    pub fn extension_names(&self) -> Vec<String> {
+        self.host.extension_names()
     }
 }
 
@@ -501,7 +501,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
     let host_config = host_config.into();
     let module_config = host_config.project;
     module_config.validate()?;
-    for module in &host_config.optional_modules {
+    for module in &host_config.extensions {
         module.validate()?;
     }
 
@@ -526,19 +526,19 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
     engine.set_parallel_execution(true);
     let engine_api = EngineApi::new(&mut engine);
 
-    // Step 4: Build, load and watch the optional modules before the project.
+    // Step 4: Build, load and watch the extensions before the project.
     // Modules are infrastructure: loading them first means the project can rely
     // on whatever they register. Each gets its own owner tag and its own
     // generation counter, so later reloads stay isolated from each other.
-    let mut optional_modules = Vec::with_capacity(host_config.optional_modules.len());
-    for (index, module_config) in host_config.optional_modules.iter().enumerate() {
+    let mut extensions = Vec::with_capacity(host_config.extensions.len());
+    for (index, module_config) in host_config.extensions.iter().enumerate() {
         let module_generation = Arc::new(AtomicU64::new(0));
-        let slot = match OptionalModuleSlot::start(
+        let slot = match ExtensionSlot::start(
             &mut engine,
             &engine_api,
             &workspace_root,
             module_config,
-            pill_engine::SystemOwner::optional_module(index),
+            pill_engine::SystemOwner::extension(index),
             Arc::clone(&module_generation),
         ) {
             Ok(slot) => slot,
@@ -552,23 +552,23 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
         ) {
             return Err(fail_setup(engine, error.into()));
         }
-        optional_modules.push(slot);
+        extensions.push(slot);
     }
 
     // Step 5: Build and load the project module, then start its source watcher.
-    // Optional modules load first, so the C# backend can be handed every
+    // Extensions load first, so the C# backend can be handed every
     // native component the modules exposed to managed code: each module's
     // registered type names resolve to its native components, and the
     // C#-facing name is the Rust path with `::` replaced by `.` so a
     // `project_cs` mirror struct reproduces the same stable identity.
     // The generated C# mirror files must exist before the project build
     // compiles `project_cs`, so write them here (managed backend only), one
-    // per optional module that exposes components, derived from each module's
+    // per extension that exposes components, derived from each module's
     // real registered layout. Nothing is hand-written in the project.
     let mut module_exposed_components: Vec<ModuleExposedComponent> = Vec::new();
     let mut all_mirror_methods: Vec<crate::csharp::ResolvedMirrorMethod> = Vec::new();
     if let ProjectModuleBackend::CSharp(_) = &module_config.backend {
-        for slot in &optional_modules {
+        for slot in &extensions {
             // Regenerate the module's C# mirror from its current generation.
             // The returned change flag is ignored at startup (the mirror is
             // always written before the project compiles); the reload path
@@ -640,14 +640,14 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
         &module_config.build_command,
     );
 
-    // The same fast path for each optional module. A module's `#[pill_hot_fn]`
+    // The same fast path for each extension. A module's `#[pill_hot_fn]`
     // functions are compiled into every artifact that links the crate, so this
     // is what lets an edit reach the project's embedded copy without the
     // cascading project reload a module swap would otherwise queue.
     #[cfg(feature = "hot_patch")]
     let module_hot_patch: Vec<Option<crate::hot_patch::HotPatchSession>> = host_config
-        .optional_modules
-        .iter()
+        .extensions.
+        iter()
         .map(|configuration| {
             crate::hot_patch::HotPatchSession::new(
                 &workspace_root,
@@ -665,7 +665,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
         engine,
         engine_api,
         loaded_project,
-        optional_modules,
+        extensions,
         source_edit_generation,
         last_processed_source_edit: 0,
         queued_reload_generation: 0,
@@ -691,12 +691,12 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
 /// Create the engine and initialize a statically linked project.
 ///
 /// The shipping counterpart of the `hot_reload` [`setup`] above. Nothing is
-/// built, watched or loaded: the project and its optional modules were linked
+/// built, watched or loaded: the project and its extensions were linked
 /// into this binary, and the frontend passes their entry points in.
 ///
 /// # Errors
 ///
-/// Returns a typed [`HostError`] when an optional module's or the project's
+/// Returns a typed [`HostError`] when an extension's or the project's
 /// entry point reports a non-zero initialization status. There is no previous
 /// generation to fall back to on this path, so the first failure is fatal.
 #[cfg(not(feature = "hot_reload"))]
@@ -838,7 +838,7 @@ fn arm_patching_thread() {
 #[cfg(all(not(feature = "hot_patch"), feature = "hot_reload"))]
 fn arm_patching_thread() {}
 
-/// Try to deliver every pending optional-module edit by patching, not rebuilding.
+/// Try to deliver every pending extension edit by patching, not rebuilding.
 ///
 /// A module's plain functions are compiled into every artifact that links the
 /// crate, so one patch is offered to all of them at once. That is what makes the
@@ -856,7 +856,7 @@ fn try_module_fast_path(host: &mut Host) {
     let mut any_patch_applied = false;
     {
         let Host {
-            optional_modules,
+            extensions,
             module_hot_patch,
             loaded_patches,
             loaded_project,
@@ -868,19 +868,19 @@ fn try_module_fast_path(host: &mut Host) {
             // Captured before the patch runs: a save that lands while it
             // compiles advances the counter past this value and must stay
             // pending, because nothing has delivered it.
-            let Some(pending) = optional_modules[index].pending_reload_generation() else {
+            let Some(pending) = extensions[index].pending_reload_generation() else {
                 continue;
             };
             let Some(session) = module_hot_patch[index].as_mut() else {
                 continue;
             };
-            let targets = patch_targets(loaded_project, optional_modules);
+            let targets = patch_targets(loaded_project, extensions);
             let outcome = session.try_patch(engine, &targets, loaded_patches);
             // The borrow of the module list ends here, so the slot below can
             // be updated.
             drop(targets);
             if report_patch_outcome(outcome) {
-                optional_modules[index].consume_pending_reload(pending);
+                extensions[index].consume_pending_reload(pending);
                 any_patch_applied = true;
             }
         }
@@ -911,7 +911,7 @@ fn try_project_fast_path(host: &mut Host) {
     // Disjoint field borrows, as the module path does.
     let Host {
         hot_patch,
-        optional_modules,
+        extensions,
         loaded_patches,
         loaded_project,
         engine,
@@ -919,7 +919,7 @@ fn try_project_fast_path(host: &mut Host) {
     } = &mut *host;
     let mut patched = false;
     if let Some(session) = hot_patch {
-        let targets = patch_targets(loaded_project, optional_modules);
+        let targets = patch_targets(loaded_project, extensions);
         let outcome = session.try_patch(engine, &targets, loaded_patches);
         drop(targets);
         patched = report_patch_outcome(outcome);
@@ -983,7 +983,7 @@ type RegeneratedMirror = (
     bool,
 );
 
-/// Compute the C#-exposed bindings for one optional module's current
+/// Compute the C#-exposed bindings for one extension's current
 /// generation and regenerate its `generated/<module>_Components.g.cs` mirror
 /// file from that generation's real registry, value types, and mirrored
 /// methods.
@@ -997,7 +997,7 @@ type RegeneratedMirror = (
 fn regenerate_module_csharp_mirror(
     workspace_root: &Path,
     engine: &mut Engine,
-    slot: &OptionalModuleSlot,
+    slot: &ExtensionSlot,
 ) -> Result<RegeneratedMirror, CSharpError> {
     // Each registered type name resolves to its native component; the
     // C#-facing name is the Rust path with `::` replaced by `.` so a
@@ -1046,7 +1046,7 @@ fn regenerate_module_csharp_mirror(
 /// the no-op twin below compiles the whole sequence out.
 #[cfg(feature = "hot_reload")]
 fn run_reload_steps(host: &mut Host) {
-    // Step 1: Reload any optional module whose sources changed. Each module
+    // Step 1: Reload any extension whose sources changed. Each module
     // owns an independent generation counter and clears only its own systems,
     // so editing one module never rebuilds another and never disturbs the
     // project's systems, entities, or resources.
@@ -1064,14 +1064,14 @@ fn run_reload_steps(host: &mut Host) {
     // requirement rather than a convenience.
     process_rollback_request(host);
 
-    // Step 3: Try the per-function fast path for the optional modules, before
+    // Step 3: Try the per-function fast path for the extensions, before
     // the reload below turns a pending change into a full module rebuild.
     try_module_fast_path(host);
 
     // Destructure so the module list, the engine and the API table are borrowed
     // as disjoint fields rather than through the whole host.
     let Host {
-        optional_modules,
+        extensions,
         engine,
         engine_api,
         workspace_root,
@@ -1083,7 +1083,7 @@ fn run_reload_steps(host: &mut Host) {
     // Which ones, not just whether any: each carries its own patch session, and
     // only the sessions whose sources were rebuilt need a new baseline.
     let mut reloaded_modules: Vec<usize> = Vec::new();
-    for (index, slot) in optional_modules.iter_mut().enumerate() {
+    for (index, slot) in extensions.iter_mut().enumerate() {
         match slot.reload_if_changed(engine, engine_api, workspace_root) {
             ReloadOutcome::Reloaded { generation } => {
                 reloaded_modules.push(index);
@@ -1096,7 +1096,7 @@ fn run_reload_steps(host: &mut Host) {
                     target: telemetry_target::HOT_RELOAD,
                     module = slot.name(),
                     generation,
-                    "optional module reload processed"
+                    "extension reload processed"
                 );
                 // A module the project links directly is compiled into the project
                 // DLL as well as its own DLL, so after the module swaps, the
@@ -1125,7 +1125,7 @@ fn run_reload_steps(host: &mut Host) {
                     target: telemetry_target::HOT_RELOAD,
                     module = slot.name(),
                     generation,
-                    "optional module reload failed; keeping the previous generation and its patch state"
+                    "extension reload failed; keeping the previous generation and its patch state"
                 );
             }
             ReloadOutcome::Unchanged => {}
@@ -1144,7 +1144,7 @@ fn run_reload_steps(host: &mut Host) {
     if matches!(&module_config.backend, ProjectModuleBackend::CSharp(_)) && any_module_reloaded {
         let mut needs_csharp_reload = false;
         for index in &reloaded_modules {
-            match regenerate_module_csharp_mirror(workspace_root, engine, &optional_modules[*index])
+            match regenerate_module_csharp_mirror(workspace_root, engine, &extensions[*index])
             {
                 Ok((_exposed, methods, accessors, mirror_changed)) => {
                     // A mirror-content change (fields/value types/method set)
@@ -1158,7 +1158,7 @@ fn run_reload_steps(host: &mut Host) {
                 Err(error) => {
                     error!(
                         target: telemetry_target::HOT_RELOAD,
-                        module = optional_modules[*index].name(),
+                        module = extensions[*index].name(),
                         error = %error,
                         "failed to regenerate the module's C# mirror after reload"
                     );
@@ -1170,11 +1170,11 @@ fn run_reload_steps(host: &mut Host) {
         // keep the addresses they were loaded with. Container accessors are
         // appended as rows so the managed side resolves them through the same
         // lookup.
-        let mut rows: Vec<crate::csharp::ResolvedMirrorMethod> = optional_modules
-            .iter()
-            .flat_map(OptionalModuleSlot::mirror_methods)
+        let mut rows: Vec<crate::csharp::ResolvedMirrorMethod> = extensions.
+            iter()
+            .flat_map(ExtensionSlot::mirror_methods)
             .collect();
-        for slot in optional_modules.iter() {
+        for slot in extensions.iter() {
             rows.extend(crate::csharp::accessor_rows(&slot.field_accessors()));
         }
         crate::csharp::publish_mirror_methods(&rows);
@@ -1259,8 +1259,8 @@ fn run_reload_steps(host: &mut Host) {
         host.bump_editor_revision();
     }
 
-    // Print the analytics line for every reload completed this frame (optional
-    // modules from Step 0, the project from Step 1), plus one aggregate total.
+    // Print the analytics line for every reload completed this frame (extensions
+    //  from Step 0, the project from Step 1), plus one aggregate total.
     // The events were recorded with their build/stage/load/init/migrate
     // breakdowns already populated, so this is a pure drain-and-print.
     analytics::print_reload_events(reload_started);
@@ -1320,9 +1320,9 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     {
         host.loaded_project.update(&host.engine_api);
 
-        // Optional modules may also export a per-frame hook. Run them after the
+        // Extensions may also export a per-frame hook. Run them after the
         // project so a module observes the world the project's systems produced.
-        for slot in &host.optional_modules {
+        for slot in &host.extensions {
             slot.update(&host.engine_api);
         }
     }
@@ -1507,8 +1507,8 @@ fn print_patch_generations(host: &Host) {
 
 /// Every loaded artifact a plain-function patch must be offered to.
 ///
-/// One entry per currently loaded library: the project and each optional
-/// module. A crate linked into several of them is compiled into each, so each
+/// One entry per currently loaded library: the project and each extension.
+///  A crate linked into several of them is compiled into each, so each
 /// holds an independent redirect slot for the same function and all of them
 /// have to be told about the replacement.
 ///
@@ -1518,13 +1518,13 @@ fn print_patch_generations(host: &Host) {
 #[cfg(feature = "hot_patch")]
 fn patch_targets<'a>(
     loaded_project: &'a LoadedProject,
-    optional_modules: &'a [OptionalModuleSlot],
+    extensions: &'a [ExtensionSlot],
 ) -> Vec<(&'a str, &'a crate::native_library::NativeLibrary)> {
-    let mut targets = Vec::with_capacity(optional_modules.len() + 1);
+    let mut targets = Vec::with_capacity(extensions.len() + 1);
     if let Some(library) = loaded_project.native_library() {
         targets.push(("project", library));
     }
-    for slot in optional_modules {
+    for slot in extensions {
         targets.push((slot.name(), slot.current_library()));
     }
     targets

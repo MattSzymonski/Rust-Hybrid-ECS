@@ -758,7 +758,7 @@ impl World {
     ///
     /// The native twin of [`Self::descriptor_component_chunk_mut`]: returns the
     /// contiguous row buffer of a native (Rust-registered) component as raw
-    /// bytes, so the C# backend can expose components that an optional module
+    /// bytes, so the C# backend can expose components that an extension
     /// registered without naming their concrete Rust type. Only native
     /// components are served; descriptor components must use
     /// [`Self::descriptor_component_chunk_mut`] instead.
@@ -890,7 +890,7 @@ impl World {
     /// Resolve a component ID from its registered type name, without the
     /// persistable-only filter.
     ///
-    /// Used by the C# backend to map an optional module's exposed component
+    /// Used by the C# backend to map an extension's exposed component
     /// name (e.g. `pill_spline::Spline`) to its native [`ComponentId`] so a
     /// byte-level binding can be created without naming the concrete type.
     ///

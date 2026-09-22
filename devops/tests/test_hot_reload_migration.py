@@ -964,7 +964,7 @@ def build_workspace() -> bool:
     try:
         result = subprocess.run(
             # `--package pill_standalone` instead of `--workspace`: building
-            # every optional module together re-enables `module-abi` on crates
+            # every extension together re-enables `module-abi` on crates
             # like `pill_dummy_color` that other modules depend on with it
             # disabled, which collides with their `pill_module_*` exports.
             # `hot_patch` is a default feature now; pin the reload-only posture

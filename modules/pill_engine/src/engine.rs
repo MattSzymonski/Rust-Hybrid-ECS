@@ -66,14 +66,14 @@ impl SystemOwner {
     /// never unloaded, so there is nothing to retire.
     ///
     /// `u64::MAX` so it cannot collide with [`Self::PROJECT`] or any
-    /// [`Self::optional_module`]; reaching it that way would need 2^64 modules.
+    /// [`Self::extension`]; reaching it that way would need 2^64 modules.
     pub const ENGINE: Self = Self(u64::MAX);
 
-    /// Owner of the optional module loaded at `index`.
+    /// Owner of the extension loaded at `index`.
     ///
-    /// Offset by one so that no optional module can collide with
+    /// Offset by one so that no extension can collide with
     /// [`Self::PROJECT`].
-    pub const fn optional_module(index: usize) -> Self {
+    pub const fn extension(index: usize) -> Self {
         Self(index as u64 + 1)
     }
 }
@@ -115,7 +115,7 @@ pub struct SystemSnapshot {
     pub index: usize,
     /// Registration name used for display, profiling, and (ambiguous) lookup.
     pub name: String,
-    /// Module that registered this system: the project or one optional module.
+    /// Module that registered this system: the project or one extension.
     pub owner: SystemOwner,
     /// Whether the system currently participates in frame execution.
     pub enabled: bool,
@@ -733,7 +733,7 @@ impl Engine {
 
     /// Removes only the systems registered by `owner`.
     ///
-    /// Used when hot reloading one optional module: the replacement library's
+    /// Used when hot reloading one extension: the replacement library's
     /// systems are different function pointers, so the retiring generation's
     /// systems must go, while the project and every other module keep running.
     /// Component registrations, entities, and resources are untouched.
@@ -1551,7 +1551,7 @@ mod tests {
             project_counter.fetch_add(1, AtomicOrdering::SeqCst);
         });
 
-        let module_owner = SystemOwner::optional_module(0);
+        let module_owner = SystemOwner::extension(0);
         engine.begin_module_registration(module_owner);
         let module_counter = Arc::clone(&module_runs);
         engine.register_system("module_system", move || {
@@ -1580,14 +1580,14 @@ mod tests {
     #[test]
     fn registration_scope_returns_to_the_project_owner() {
         let mut engine = Engine::new();
-        engine.begin_module_registration(SystemOwner::optional_module(3));
+        engine.begin_module_registration(SystemOwner::extension(3));
         engine.register_system("owned_by_module", || {});
         engine.end_module_registration();
         engine.register_system("owned_by_project", || {});
 
         // Only the module's system is removed by clearing its owner.
         assert_eq!(
-            engine.clear_systems_owned_by(SystemOwner::optional_module(3)),
+            engine.clear_systems_owned_by(SystemOwner::extension(3)),
             1
         );
         assert_eq!(engine.is_system_enabled("owned_by_project"), Some(true));
@@ -1601,7 +1601,7 @@ mod tests {
         let mut engine = Engine::new();
         engine.register_system("project_system", || {});
         assert_eq!(
-            engine.clear_systems_owned_by(SystemOwner::optional_module(7)),
+            engine.clear_systems_owned_by(SystemOwner::extension(7)),
             0
         );
         assert_eq!(engine.is_system_enabled("project_system"), Some(true));
@@ -1621,7 +1621,7 @@ mod tests {
             first_counter.fetch_add(1, AtomicOrdering::SeqCst);
         });
 
-        let middle_owner = SystemOwner::optional_module(1);
+        let middle_owner = SystemOwner::extension(1);
         engine.begin_module_registration(middle_owner);
         engine.register_system("middle", || {});
         engine.end_module_registration();
@@ -1685,7 +1685,7 @@ mod tests {
         // keep those indices meaning what they did.
         engine.set_ecs_diagnostics_interval(None);
         engine.register_system("duplicate", || {});
-        engine.begin_module_registration(SystemOwner::optional_module(0));
+        engine.begin_module_registration(SystemOwner::extension(0));
         engine.register_system("duplicate", || {});
         engine.end_module_registration();
         engine.register_system("project_only", || {});
@@ -1694,7 +1694,7 @@ mod tests {
         assert_eq!(snapshots.len(), 3);
         assert_eq!(snapshots[0].index, 0);
         assert_eq!(snapshots[0].owner, SystemOwner::PROJECT);
-        assert_eq!(snapshots[1].owner, SystemOwner::optional_module(0));
+        assert_eq!(snapshots[1].owner, SystemOwner::extension(0));
         assert!(snapshots.iter().all(|system| system.enabled));
         assert!(snapshots[0].name_is_ambiguous);
         assert!(snapshots[1].name_is_ambiguous);

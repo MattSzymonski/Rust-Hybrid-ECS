@@ -54,7 +54,7 @@ from core.paths import MODULES_ROOT, find_executable  # noqa: E402
 
 CATEGORY = "csharp_iteration"
 
-# The project that does the timing. It declares no optional modules and draws
+# The project that does the timing. It declares no extensions and draws
 # nothing, so a frame contains managed iteration and little else.
 PROJECT_PATH = "../examples/project_cs_bench"
 

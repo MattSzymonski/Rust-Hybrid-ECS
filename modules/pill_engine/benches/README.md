@@ -29,7 +29,7 @@ A bare `cargo bench` currently fails in this workspace, for two independent
 reasons:
 
 1. `modules/.cargo/config.toml` sets `-C prefer-dynamic` so the host and every
-   optional module share one `pill_core`. rustc refuses to combine that with
+   extension share one `pill_core`. rustc refuses to combine that with
    the release profile's `lto = "fat"`:
    `linker plugin based LTO is not supported together with -C prefer-dynamic
    when targeting Windows-like targets`.

@@ -8,7 +8,7 @@ REQUIREMENTS
 
 DESCRIPTION
     End-to-end hot-reload suite that launches the standalone host and drives
-    real source edits against the live project and an optional module, then
+    real source edits against the live project and an extension, then
     asserts the host's behaviour from its console output:
 
       Session A (project = devops/tests/project, module = pill_spline)
@@ -19,7 +19,7 @@ DESCRIPTION
                                      runs selective migration, data survives.
         3. project_forgotten_type  - dropping a component registration emits the
                                      orphaned-data warning on the project path.
-        4. module_hot_reload       - editing an optional module reloads it and
+        4. module_hot_reload       - editing an extension reloads it and
                                      its persistable data survives (existing=1).
         5. module_double_reload    - two consecutive same-config reloads stay
                                      stable: the module re-seeds nothing
@@ -84,7 +84,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 PROJECT_SANDBOX_LIB_RS = WORKSPACE_ROOT / "devops" / "tests" / "project" / "src" / "lib.rs"
 SPLINE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "src" / "lib.rs"
 
-# Session settings: only the optional-module list lives in a file now; the
+# Session settings: only the extension list lives in a file now; the
 # project itself is selected by PROJECT_PATH per session.
 SESSION_A_SETTINGS = """\
 name: "Suite Session A"

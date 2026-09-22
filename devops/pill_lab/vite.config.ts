@@ -23,7 +23,7 @@ const urlPrefix = '/measurements/';
 // The functional test suites live next to this project, under `devops/tests/`.
 const testsDirectory = resolve(__dirname, '../tests');
 // Spawned test scripts run from the repository root so their path resolution
-// (workspace manifests, example projects, optional modules) matches a normal
+// (workspace manifests, example projects, extensions) matches a normal
 // console invocation.
 const repositoryRoot = resolve(__dirname, '../..');
 // The Pill Lab CLI that runs the benchmark categories.

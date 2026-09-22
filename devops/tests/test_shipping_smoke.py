@@ -15,7 +15,7 @@ DESCRIPTION
 
       1. The binary reaches the project loop and reports frames.
       2. It prints the project's own probe line, so the statically linked
-         project and its optional modules really did initialize - a build that
+         project and its extensions really did initialize - a build that
          linked them but never called their entry points would still start.
       3. It never invokes cargo. The reloading host shells out to cargo before
          the first frame; a shipping build must not, and the surest way to know
@@ -72,7 +72,7 @@ FRAME_TOKEN = "FPS |"
 PROJECT_TOKEN = "[project]"
 
 # Proof that the statically linked modules initialized too.
-MODULE_TOKEN = "optional module linked"
+MODULE_TOKEN = "extension linked"
 
 # Anything here means the reload machinery was compiled in after all.
 FORBIDDEN_TOKENS = (
@@ -260,7 +260,7 @@ def run_and_observe(timeout_scale: float) -> int:
     if FRAME_TOKEN not in output:
         failures.append("the binary never reached the project loop")
     if MODULE_TOKEN not in output:
-        failures.append("no optional module was linked and initialized")
+        failures.append("no extension was linked and initialized")
     if PROJECT_TOKEN not in output:
         failures.append("the project's own systems never produced output")
     for token in FORBIDDEN_TOKENS:
@@ -277,7 +277,7 @@ def run_and_observe(timeout_scale: float) -> int:
     frames = output.count(FRAME_TOKEN)
     modules = output.count(MODULE_TOKEN)
     print(f"  [OK] reached the project loop, {frames} frame report(s)")
-    print(f"  [OK] {modules} optional module(s) linked and initialized")
+    print(f"  [OK] {modules} extension(s) linked and initialized")
     print("  [OK] the project's systems produced output")
     print("  [OK] no cargo or rustc child process, and no reload machinery ran")
     print("-" * 70)

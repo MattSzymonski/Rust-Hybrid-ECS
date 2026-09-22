@@ -318,7 +318,7 @@ COLUMN_LINE_PATTERN = re.compile(r"^\W*bit\s+(\d+)\s+(\S+)")
 def install_test_project_settings() -> None:
     """Backs up the example project's settings and installs this suite's own.
 
-    The optional-module list is read only from this file, so the suite writes a
+    The extension list is read only from this file, so the suite writes a
     minimal one loading just `pill_spline`, keeping the scenario independent of
     whatever modules the project happens to list.
     """

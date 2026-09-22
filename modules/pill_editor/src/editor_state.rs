@@ -105,7 +105,7 @@ impl EditorSnapshot {
     pub fn capture_list(
         engine: &Engine,
         revision: u64,
-        optional_module_names: &[String],
+        extension_names: &[String],
         errors: Vec<String>,
     ) -> Self {
         let entities = engine
@@ -129,7 +129,7 @@ impl EditorSnapshot {
             .into_iter()
             .map(|system| SystemSummary {
                 index: system.index,
-                owner_label: owner_label(system.owner, optional_module_names),
+                owner_label: owner_label(system.owner, extension_names),
                 name: system.name,
                 enabled: system.enabled,
                 hot_patchable: system.hot_patchable,
@@ -184,14 +184,14 @@ impl EditorSnapshot {
     }
 }
 
-/// Label a system owner using the host's optional-module names.
+/// Label a system owner using the host's extension names.
 ///
 /// `SystemOwner(0)` is the project, `SystemOwner(n)` labels module `n - 1`;
 /// anything out of range renders as "unknown".
-fn owner_label(owner: SystemOwner, optional_module_names: &[String]) -> String {
+fn owner_label(owner: SystemOwner, extension_names: &[String]) -> String {
     match owner.0 {
         0 => "project".to_string(),
-        index => optional_module_names
+        index => extension_names
             .get(index as usize - 1)
             .cloned()
             .unwrap_or_else(|| "unknown".to_string()),
@@ -868,7 +868,7 @@ mod tests {
         engine.register_system("duplicate", move || {
             counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         });
-        engine.begin_module_registration(SystemOwner::optional_module(0));
+        engine.begin_module_registration(SystemOwner::extension(0));
         engine.register_system("duplicate", || {});
         engine.end_module_registration();
 

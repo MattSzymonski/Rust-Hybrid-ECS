@@ -25,7 +25,7 @@ pill_engine = { path = "../../pill_engine" }
 serde = { version = "1", features = ["derive"] }
 
 [features]
-# `module-abi` is opt-in, not a default (see the other optional modules): the
+# `module-abi` is opt-in, not a default (see the other extensions): the
 # host passes `--features module-abi` when it builds the loadable module, and
 # the feature keeps the `#[no_mangle]` exports out of any build that links
 # this crate statically.

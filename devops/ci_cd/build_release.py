@@ -9,7 +9,7 @@
 #   `cargo build --release` cannot do.
 #
 #   The obstacle is `-C prefer-dynamic` in `modules/.cargo/config.toml`. It is
-#   there so the host executable and every optional module share one copy of
+#   there so the host executable and every extension share one copy of
 #   `pill_engine`, which is what keeps its statics, thread-locals and tracing
 #   dispatcher single-instance across the DLL boundary. A release binary links
 #   everything into one image and needs none of that - and rustc refuses
@@ -574,7 +574,7 @@ def render_tree_lines(root_label: str, branches: list) -> list:
 
 # Crate families for the size report's grouping, matched against cargo bloat's
 # per-crate names. Anything `pill_`-prefixed that is not an engine library is
-# treated as an optional module.
+# treated as an extension.
 ENGINE_LIBRARIES = {
     "pill_engine",
     "pill_core",
@@ -584,8 +584,8 @@ ENGINE_LIBRARIES = {
     "pill_core_macros",
     "pill_hot_scan",
     "pill_editor",
-    # Under `modules/extensions/`, but engine code rather than an optional
-    # module: it is the renderer the host links when built windowed, never
+    # Under `modules/extensions/`, but engine code rather than an extension:
+    #  it is the renderer the host links when built windowed, never
     # something a project loads. Bucketing it with the engine keeps a
     # windowed build's size attributed where the code actually comes from.
     "pill_wgpu_renderer",
@@ -682,7 +682,7 @@ def run_cargo_bloat_json(
 
 
 def group_bloat_crates(crate_items: list) -> list:
-    """Buckets cargo-bloat crates into engine / optional modules / project /
+    """Buckets cargo-bloat crates into engine / extensions / project /
     standard library / third-party groups, each sorted by size descending.
 
     Returns a list of (group_title, [(name, size), ...]) tuples.
@@ -711,7 +711,7 @@ def group_bloat_crates(crate_items: list) -> list:
         buckets[key].sort(key=lambda pair: pair[1], reverse=True)
     return [
         ("engine libraries", buckets["engine"]),
-        ("optional modules", buckets["modules"]),
+        ("extensions", buckets["modules"]),
         ("project", buckets["project"]),
         ("standard library", buckets["std"]),
         ("third-party crates", buckets["third_party"]),
