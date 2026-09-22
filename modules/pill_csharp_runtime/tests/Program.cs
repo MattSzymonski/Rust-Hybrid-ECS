@@ -559,12 +559,12 @@ internal static class Program
                 using var json = System.Text.Json.JsonDocument.Parse(
                     ProjectManifestBuilder.Build(systems, typeof(BallPhysicsSystem).Assembly));
                 var components = json.RootElement.EnumerateArray().ToArray();
-                // Position, PbrRenderableComponent, PhysicsState, SplineSample + the module Spline mirror.
+                // Position, MeshRendererComponent, PhysicsState, SplineSample + the module Spline mirror.
                 Equal(components.Length, 12, "unexpected manifest component count");
                 var position = components.Single(component =>
                     component.GetProperty("full_name").GetString() == "TracyLive.Position");
                 var renderable = components.Single(component =>
-                    component.GetProperty("full_name").GetString() == "TracyLive.PbrRenderableComponent");
+                    component.GetProperty("full_name").GetString() == "TracyLive.MeshRendererComponent");
                 var physics = components.Single(component =>
                     component.GetProperty("full_name").GetString() == "TracyLive.PhysicsState");
                 var sample = components.Single(component =>
@@ -574,7 +574,7 @@ internal static class Program
                 Assert(position.GetProperty("shared").GetBoolean(),
                     "runtime Position mirror must be shared");
                 Assert(renderable.GetProperty("shared").GetBoolean(),
-                    "runtime PbrRenderableComponent mirror must be shared");
+                    "runtime MeshRendererComponent mirror must be shared");
                 Assert(!physics.GetProperty("shared").GetBoolean(),
                     "project-owned PhysicsState must be descriptor-registered");
                 Assert(!sample.GetProperty("shared").GetBoolean(),
@@ -622,9 +622,9 @@ internal static class Program
                 Equal(componentAccesses[1].ComponentKeyHigh,
                     Engine.ComponentKeyHigh(typeof(Position)), "wrong Position high key");
                 Equal(componentAccesses[2].ComponentKey, Engine.ComponentKey(typeof(TransformComponent)),
-                    "wrong PbrRenderableComponent key");
+                    "wrong MeshRendererComponent key");
                 Equal(componentAccesses[2].ComponentKeyHigh,
-                    Engine.ComponentKeyHigh(typeof(TransformComponent)), "wrong PbrRenderableComponent high key");
+                    Engine.ComponentKeyHigh(typeof(TransformComponent)), "wrong MeshRendererComponent high key");
             });
 
             Test("managed Commands parameter is reflected into system metadata", () =>
@@ -694,7 +694,7 @@ internal static class Program
                 ProjectHost.CreateSystem(method).Run();
                 Equal(MockNativeWorld.QueuedCreates, 5, "spawn create count mismatch");
                 Equal(MockNativeWorld.LastCreateComponentCount, 4,
-                    "each ball must contain PhysicsState, Position, and PbrRenderableComponent");
+                    "each ball must contain PhysicsState, Position, and MeshRendererComponent");
                 Equal(MockNativeWorld.NextEntityId, 5UL, "spawn did not reserve unique entities");
             });
 
@@ -736,9 +736,9 @@ internal static class Program
 
                 Equal(Marshal.SizeOf<Position>(), 8, "Position size mismatch");
                 Equal(Marshal.SizeOf<Color>(), 16, "Color size mismatch");
-                Equal(Marshal.SizeOf<PbrRenderableComponent>(), 48, "PbrRenderableComponent size mismatch");
-                Equal(Marshal.OffsetOf<PbrRenderableComponent>(nameof(PbrRenderableComponent.R)).ToInt32(), 16,
-                    "PbrRenderableComponent.Color offset mismatch");
+                Equal(Marshal.SizeOf<MeshRendererComponent>(), 16, "MeshRendererComponent size mismatch");
+                Equal(Marshal.OffsetOf<MeshRendererComponent>(nameof(MeshRendererComponent.Material)).ToInt32(), 8,
+                    "MeshRendererComponent.Material offset mismatch");
             });
 
             Test("padded sequential layouts agree with Marshal", () =>
@@ -1272,7 +1272,7 @@ internal static class Program
                        Engine.ComponentKey(typeof(Position)),
                     "different current project components produced the same key");
                 Assert(Engine.ComponentKey(typeof(Position)) !=
-                       Engine.ComponentKey(typeof(PbrRenderableComponent)),
+                       Engine.ComponentKey(typeof(MeshRendererComponent)),
                     "different current project components produced the same key");
             });
 

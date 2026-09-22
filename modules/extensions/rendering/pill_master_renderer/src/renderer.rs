@@ -1,422 +1,551 @@
-//! Window-surface renderer owned by the host's optional rendering feature.
-//!
-//! # Responsibilities
-//!
-//! - Creates the wgpu instance, surface, adapter, device, and queue.
-//! - Selects an uncapped presentation mode when the platform supports one.
-//! - Reconfigures the surface after frontend resize notifications.
-//! - Acquires, draws, and presents one owned ECS frame packet.
-//!
-//! # Design
-//!
-//! Frontends retain ownership of their event loop and window. They pass a
-//! cloneable window handle into [`Renderer::new`], then interact only through
-//! [`Renderer::resize`] and [`Renderer::render`]. No frontend needs a direct
-//! dependency on wgpu or an async executor.
+#![allow(clippy::too_many_arguments)]
 
-// Current crate
-use crate::{FrameOutcome, RenderFrame, RenderViewport};
-use crate::graphics::{GpuPassContext, Pass};
-use crate::pbr::PbrPipeline;
+use crate::{
+    api::{FrameOutcome, PillRenderer, RenderCapabilities, RenderMetrics},
+    assets::{
+        MaterialParameter, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot, TextureType,
+    },
+    component::RenderViewport,
+    config::MAX_INSTANCE_PER_DRAWCALL_COUNT,
+    drawers::mesh_drawer::MeshDrawer,
+    error::{RendererError, Result},
+    frame::{AssetSnapshot, RenderFrame},
+    render_queue::{compose_render_queue_key, RenderQueueItem},
+    resources::{
+        RendererCamera, RendererMaterial, RendererMesh, RendererResourceStorage, RendererShader,
+        RendererTexture, Vertex,
+    },
+    slot_map::{
+        RendererCameraHandle, RendererMaterialHandle, RendererMeshHandle, RendererShaderHandle,
+        RendererTextureHandle,
+    },
+    Instance,
+};
+use pill_core::{info, PillStyle};
+use std::{collections::HashMap, time::Instant};
 
-// =============================================================================
-// Re-exports
-// =============================================================================
-
-/// Rendering initialization or presentation failure without exposed wgpu types.
-///
-/// The semantic error enum is declared in [`crate::error::RendererError`] and
-/// re-exported here for the pre-existing module path.
-pub use crate::error::RendererError;
-
-// =============================================================================
-// RendererWindow
-// =============================================================================
-
-/// Window-handle capability accepted by the engine renderer.
-///
-/// The blanket implementation lets frontends pass compatible window values
-/// such as `Arc<winit::window::Window>` without importing wgpu themselves.
 pub trait RendererWindow: wgpu::WindowHandle {}
-
 impl<T> RendererWindow for T where T: wgpu::WindowHandle {}
 
-// =============================================================================
-// Renderer
-// =============================================================================
-
-/// Candidate shader pass retained until its asynchronous validation scope resolves.
-///
-/// The active pass remains usable while this candidate is pending or rejected.
-struct PendingShaders {
-    /// Complete candidate pass, ready to replace the active pass on success.
-    pipeline: PbrPipeline,
-    /// Backend validation result, polled once per frame without blocking the event loop.
-    validation: std::pin::Pin<Box<dyn std::future::Future<Output = Option<wgpu::Error>>>>,
-}
-
-/// Host-owned GPU state associated with one frontend window surface.
-///
-/// Owns the device, queue, PBR pass, and optional viewport. The frontend retains
-/// its event loop and supplies extracted frame packets through the host contract.
 pub struct Renderer {
-    /// Candidate pass awaiting asynchronous backend validation.
-    pending_shaders: Option<PendingShaders>,
-    /// Hash of the most recently attempted shader sources, including rejected sources.
-    shader_key: u64,
-    /// The GPU surface bound to the frontend's window handle.
-    surface: wgpu::Surface<'static>,
-    /// Logical GPU device used for all rendering commands.
-    device: wgpu::Device,
-    /// Command queue that submits rendered frames to the device.
-    queue: wgpu::Queue,
-    /// Surface configuration reapplied after creation, resize, or loss.
-    surface_config: wgpu::SurfaceConfiguration,
-    /// Draws the mesh entities into a texture view each frame.
-    pbr: PbrPipeline,
-    /// Physical-pixel crop rectangle, or `None` for full-surface rendering.
+    pub state: State,
+    asset_revision: u64,
+    shader_handles: HashMap<u64, RendererShaderHandle>,
+    material_handles: HashMap<u64, RendererMaterialHandle>,
+    texture_handles: HashMap<u64, RendererTextureHandle>,
+    mesh_handles: HashMap<u64, RendererMeshHandle>,
+    default_shader: RendererShaderHandle,
+    default_material: RendererMaterialHandle,
+    camera: RendererCameraHandle,
     viewport: Option<RenderViewport>,
-    /// Suppresses surface acquisition while the window has zero extent.
     minimized: bool,
-    /// Latest uncaptured GPU or device-loss error, reported on the next frame attempt.
-    errors: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    metrics: RenderMetrics,
 }
 
 impl Renderer {
-    /// Create the GPU surface and all resources needed to draw an engine world.
-    ///
-    /// The supplied handle is retained by wgpu for the surface lifetime. An
-    /// `Arc<winit::window::Window>` satisfies this API without making the engine
-    /// depend on winit.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RendererError::SurfaceCreation`] when the window handle cannot
-    /// be bound to a wgpu surface, [`RendererError::AdapterRequest`] when no
-    /// compatible GPU adapter exists, and [`RendererError::DeviceCreation`]
-    /// when the device cannot be created from the adapter. A surface exposing
-    /// no texture formats or no alpha modes yields
-    /// [`RendererError::NoTextureFormats`] or [`RendererError::NoAlphaModes`].
-    pub fn new<W>(window: W, width: u32, height: u32) -> Result<Self, RendererError>
-    where
-        W: RendererWindow + 'static,
-    {
+    pub fn new<W: RendererWindow + 'static>(window: W, width: u32, height: u32) -> Result<Self> {
         pollster::block_on(Self::new_async(window, width, height))
     }
 
-    /// Async initialization core, independent of the native blocking adapter.
     pub async fn new_async<W: RendererWindow + 'static>(
         window: W,
         width: u32,
         height: u32,
-    ) -> Result<Self, RendererError> {
-        // Step 1: create the wgpu instance and bind it to the frontend window.
-        let instance = wgpu::Instance::default();
+    ) -> Result<Self> {
+        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Initializing {}", "Renderer".module_object_style());
+        let mut state = State::new(window, width, height).await?;
+        let (default_shader, default_material) = install_default_material(&mut state)?;
+        let camera = state
+            .renderer_resource_storage
+            .cameras
+            .insert(RendererCamera::new(
+                &state.device,
+                state.camera_bind_group_layout.clone(),
+            )?);
+        Ok(Self {
+            state,
+            asset_revision: u64::MAX,
+            shader_handles: HashMap::new(),
+            material_handles: HashMap::new(),
+            texture_handles: HashMap::new(),
+            mesh_handles: HashMap::new(),
+            default_shader,
+            default_material,
+            camera,
+            viewport: None,
+            minimized: width == 0 || height == 0,
+            metrics: RenderMetrics::default(),
+        })
+    }
+
+    fn sync_assets(&mut self, assets: &AssetSnapshot) -> Result<()> {
+        if self.asset_revision == assets.revision {
+            return Ok(());
+        }
+        self.state
+            .renderer_resource_storage
+            .clear_assets(&self.state.device, &self.state.queue)?;
+        self.shader_handles.clear();
+        self.material_handles.clear();
+        self.texture_handles.clear();
+        self.mesh_handles.clear();
+        (self.default_shader, self.default_material) = install_default_material(&mut self.state)?;
+
+        for (key, texture) in &assets.textures {
+            let handle =
+                self.state
+                    .renderer_resource_storage
+                    .textures
+                    .insert(RendererTexture::new_texture(
+                        &self.state.device,
+                        &self.state.queue,
+                        Some(&texture.name),
+                        &texture.rgba,
+                        texture.width,
+                        texture.height,
+                        texture.texture_type,
+                    )?);
+            self.texture_handles.insert(*key, handle);
+        }
+        for (key, shader) in &assets.shaders {
+            let value = RendererShader::new(
+                &shader.name,
+                &self.state.device,
+                self.state.color_format,
+                Some(self.state.depth_format),
+                &[
+                    RendererMesh::data_layout_descriptor(),
+                    Instance::data_layout_descriptor(),
+                ],
+                &shader.vertex_wgsl,
+                &shader.fragment_wgsl,
+                &shader.parameter_slots,
+                &shader.texture_slots,
+                &self
+                    .state
+                    .renderer_resource_storage
+                    .engine_parameters
+                    .bind_group_layout,
+                &self.state.camera_bind_group_layout,
+                shader.pass_engine_parameters,
+                shader.pass_camera_parameters,
+            )?;
+            self.shader_handles.insert(
+                *key,
+                self.state.renderer_resource_storage.shaders.insert(value),
+            );
+        }
+        for (key, mesh) in &assets.meshes {
+            let value = RendererMesh::new(&self.state.device, &mesh.name, mesh)?;
+            self.mesh_handles.insert(
+                *key,
+                self.state.renderer_resource_storage.meshes.insert(value),
+            );
+        }
+        for (key, material) in &assets.materials {
+            let shader_key = crate::assets::asset_key(material.shader);
+            let shader = self
+                .shader_handles
+                .get(&shader_key)
+                .copied()
+                .unwrap_or(self.default_shader);
+            let textures = material
+                .textures
+                .iter()
+                .filter_map(|(slot, texture)| {
+                    self.texture_handles
+                        .get(&crate::assets::asset_key(texture.texture))
+                        .copied()
+                        .map(|handle| (slot.clone(), handle))
+                })
+                .collect::<Vec<_>>();
+            let value = RendererMaterial::new(
+                &self.state.device,
+                &self.state.queue,
+                &self.state.renderer_resource_storage,
+                &material.name,
+                shader,
+                &textures,
+                &material.parameters,
+            )?;
+            self.material_handles.insert(
+                *key,
+                self.state.renderer_resource_storage.materials.insert(value),
+            );
+        }
+        self.asset_revision = assets.revision;
+        Ok(())
+    }
+}
+
+impl PillRenderer for Renderer {
+    fn capabilities(&self) -> RenderCapabilities {
+        let limits = self.state.device.limits();
+        RenderCapabilities {
+            max_texture_size: limits.max_texture_dimension_2d,
+            max_buffer_bytes: limits.max_buffer_size,
+            hdr: false,
+        }
+    }
+
+    fn metrics(&self) -> RenderMetrics {
+        self.metrics
+    }
+
+    fn resize(&mut self, width: u32, height: u32) {
+        self.minimized = width == 0 || height == 0;
+        if !self.minimized {
+            self.state
+                .resize(winit::dpi::PhysicalSize::new(width, height));
+        }
+    }
+
+    fn set_viewport(&mut self, viewport: Option<RenderViewport>) {
+        self.viewport = viewport;
+    }
+
+    fn render(&mut self, frame: &RenderFrame) -> Result<FrameOutcome> {
+        if self.minimized || !frame.has_camera {
+            return Ok(FrameOutcome::Skipped);
+        }
+        let prepare = Instant::now();
+        self.sync_assets(&frame.assets)?;
+        let mut render_queue = Vec::with_capacity(frame.instances.len());
+        for (index, instance) in frame.instances.iter().enumerate() {
+            let Some(mesh) = self.mesh_handles.get(&instance.mesh).copied() else {
+                continue;
+            };
+            let material = self
+                .material_handles
+                .get(&instance.material)
+                .copied()
+                .unwrap_or(self.default_material);
+            let shader = self
+                .state
+                .renderer_resource_storage
+                .materials
+                .get(material)
+                .map(|material| material.shader_handle)
+                .unwrap_or(self.default_shader);
+            let order = frame
+                .assets
+                .materials
+                .get(&instance.material)
+                .map(|material| material.rendering_order)
+                .unwrap_or(u8::MAX);
+            render_queue.push(RenderQueueItem {
+                key: compose_render_queue_key(order, shader, material, mesh),
+                entity_index: index as u32,
+            });
+        }
+        render_queue.sort_unstable();
+        self.metrics.prepare_micros = prepare.elapsed().as_micros() as u64;
+        self.metrics.instance_bytes = (render_queue.len() * std::mem::size_of::<Instance>()) as u64;
+        let submitted = Instant::now();
+        self.state
+            .render(self.camera, &render_queue, frame, self.viewport)?;
+        self.metrics.submit_micros = submitted.elapsed().as_micros() as u64;
+        self.metrics.draw_calls = u32::from(!render_queue.is_empty());
+        Ok(FrameOutcome::Presented)
+    }
+
+    fn invalidate_assets(&mut self) {
+        self.asset_revision = u64::MAX;
+    }
+}
+
+fn install_default_material(
+    state: &mut State,
+) -> Result<(RendererShaderHandle, RendererMaterialHandle)> {
+    let parameter_slots = vec![
+        (
+            "tint".to_owned(),
+            ShaderParameterSlot::new(ShaderParameterType::Color),
+        ),
+        (
+            "specularity".to_owned(),
+            ShaderParameterSlot::new(ShaderParameterType::Scalar),
+        ),
+    ];
+    let texture_slots = HashMap::from([
+        (
+            "color".to_owned(),
+            ShaderTextureSlot::new(TextureType::Color, (0, 1)),
+        ),
+        (
+            "normal".to_owned(),
+            ShaderTextureSlot::new(TextureType::Normal, (2, 3)),
+        ),
+    ]);
+    let shader = RendererShader::new(
+        "pill_default_lit",
+        &state.device,
+        state.color_format,
+        Some(state.depth_format),
+        &[
+            RendererMesh::data_layout_descriptor(),
+            Instance::data_layout_descriptor(),
+        ],
+        include_str!("shaders/default_vertex.wgsl"),
+        include_str!("shaders/default_lit_fragment.wgsl"),
+        &parameter_slots,
+        &texture_slots,
+        &state
+            .renderer_resource_storage
+            .engine_parameters
+            .bind_group_layout,
+        &state.camera_bind_group_layout,
+        true,
+        true,
+    )?;
+    let shader = state.renderer_resource_storage.shaders.insert(shader);
+    let parameters = HashMap::from([
+        ("tint".to_owned(), MaterialParameter::Color([1.0; 3])),
+        ("specularity".to_owned(), MaterialParameter::Scalar(0.5)),
+    ]);
+    let material = RendererMaterial::new(
+        &state.device,
+        &state.queue,
+        &state.renderer_resource_storage,
+        "pill_default_lit",
+        shader,
+        &[],
+        &parameters,
+    )?;
+    let material = state.renderer_resource_storage.materials.insert(material);
+    Ok((shader, material))
+}
+
+pub struct State {
+    pub(crate) renderer_resource_storage: RendererResourceStorage,
+    surface: wgpu::Surface<'static>,
+    pub(crate) device: wgpu::Device,
+    pub(crate) queue: wgpu::Queue,
+    surface_configuration: wgpu::SurfaceConfiguration,
+    window_size: winit::dpi::PhysicalSize<u32>,
+    pub(crate) color_format: wgpu::TextureFormat,
+    pub(crate) depth_format: wgpu::TextureFormat,
+    depth_texture: RendererTexture,
+    mesh_drawer: MeshDrawer,
+    pub(crate) camera_bind_group_layout: wgpu::BindGroupLayout,
+}
+
+impl State {
+    async fn new<W: RendererWindow + 'static>(window: W, width: u32, height: u32) -> Result<Self> {
+        let window_size = winit::dpi::PhysicalSize::new(width.max(1), height.max(1));
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            flags: wgpu::InstanceFlags::from_build_config().with_env(),
+            backend_options: wgpu::BackendOptions::default(),
+        });
         let surface =
             instance
                 .create_surface(window)
                 .map_err(|error| RendererError::SurfaceCreation {
                     detail: error.to_string(),
                 })?;
-
-        // Step 2: acquire an adapter compatible with the surface.
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::default(),
-                force_fallback_adapter: false,
                 compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
             })
             .await
             .map_err(|error| RendererError::AdapterRequest {
                 detail: error.to_string(),
             })?;
-
-        let format_features = adapter.get_texture_format_features(wgpu::TextureFormat::Rgba16Float);
-        if !format_features
-            .allowed_usages
-            .contains(wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING)
-            || !format_features
-                .flags
-                .contains(wgpu::TextureFormatFeatureFlags::FILTERABLE)
-        {
-            return Err(RendererError::DeviceCreation {
-                detail: "PBR requires filterable RGBA16Float render targets".into(),
-            });
-        }
-        // Step 3: request the device and queue from the adapter.
+        let info = adapter.get_info();
+        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Using GPU: {} ({:?})", info.name, info.backend);
+        let wanted = wgpu::Features::DEPTH_CLIP_CONTROL;
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
-                label: Some("ECS renderer device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::downlevel_webgl2_defaults()
-                    .using_resolution(adapter.limits()),
+                label: Some("pill renderer device"),
+                required_features: wanted & adapter.features(),
+                required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
                 memory_hints: wgpu::MemoryHints::default(),
-                ..Default::default()
+                trace: wgpu::Trace::default(),
             })
             .await
             .map_err(|error| RendererError::DeviceCreation {
                 detail: error.to_string(),
             })?;
-
-        let errors = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let error_sink = errors.clone();
-        device.on_uncaptured_error(Box::new(move |error| {
-            *error_sink.lock().unwrap() = Some(error.to_string());
-        }));
-        let loss_sink = errors.clone();
-        device.set_device_lost_callback(move |reason, message| {
-            *loss_sink.lock().unwrap() = Some(format!("device lost: {reason:?}: {message}"));
-        });
-        // Step 4: derive the surface format, alpha mode, and presentation mode.
         let capabilities = surface.get_capabilities(&adapter);
-        let format = capabilities
+        let color_format = capabilities
             .formats
             .iter()
-            .find(|f| f.is_srgb())
-            .or_else(|| capabilities.formats.first())
             .copied()
+            .find(wgpu::TextureFormat::is_srgb)
+            .or_else(|| capabilities.formats.first().copied())
             .ok_or(RendererError::NoTextureFormats)?;
-        let alpha_mode =
-            select_alpha_mode(&capabilities.alpha_modes).ok_or(RendererError::NoAlphaModes)?;
-        let present_mode = select_present_mode(&capabilities.present_modes);
-        println!("[render] Present mode: {present_mode:?}");
-
-        let surface_config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: width.max(1),
-            height: height.max(1),
-            present_mode,
-            desired_maximum_frame_latency: 2,
-            alpha_mode,
-            view_formats: vec![],
+        let alpha_mode = capabilities
+            .alpha_modes
+            .first()
+            .copied()
+            .ok_or(RendererError::NoAlphaModes)?;
+        let present_mode = if capabilities
+            .present_modes
+            .contains(&wgpu::PresentMode::Mailbox)
+        {
+            wgpu::PresentMode::Mailbox
+        } else if capabilities
+            .present_modes
+            .contains(&wgpu::PresentMode::Immediate)
+        {
+            wgpu::PresentMode::Immediate
+        } else {
+            wgpu::PresentMode::Fifo
         };
-        surface.configure(&device, &surface_config);
-
-        // Step 5: build the mesh renderer and assemble the renderer state.
-        let pbr = PbrPipeline::new(&device, &queue, format, width.max(1), height.max(1));
+        println!("[render] Present mode: {present_mode:?}");
+        let surface_configuration = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format: color_format,
+            width: window_size.width,
+            height: window_size.height,
+            desired_maximum_frame_latency: 2,
+            present_mode,
+            alpha_mode,
+            view_formats: vec![color_format],
+        };
+        surface.configure(&device, &surface_configuration);
+        let depth_format = wgpu::TextureFormat::Depth32Float;
+        let depth_texture =
+            RendererTexture::new_depth_texture(&device, &surface_configuration, "depth_texture")?;
+        let camera_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("camera_parameters_bind_group_layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+        let renderer_resource_storage = RendererResourceStorage::new(&device, &queue)?;
+        let mesh_drawer = MeshDrawer::new(&device, MAX_INSTANCE_PER_DRAWCALL_COUNT as u32);
         Ok(Self {
-            pending_shaders: None,
-            shader_key: 0,
+            renderer_resource_storage,
             surface,
             device,
             queue,
-            surface_config,
-            pbr,
-            viewport: None,
-            minimized: width == 0 || height == 0,
-            errors,
+            surface_configuration,
+            window_size,
+            color_format,
+            depth_format,
+            depth_texture,
+            mesh_drawer,
+            camera_bind_group_layout,
         })
     }
 
-    /// Reconfigure the presentation surface for a new physical window size.
-    ///
-    /// Zero-sized notifications occur while a window is minimized and are
-    /// ignored because wgpu surfaces cannot be configured with zero dimensions.
-    pub fn resize(&mut self, width: u32, height: u32) {
-        self.minimized = width == 0 || height == 0;
-        if self.minimized {
-            return;
-        }
-        self.surface_config.width = width;
-        self.surface_config.height = height;
-        self.pbr.resize(&self.device, width, height);
-        self.configure_surface();
+    fn resize(&mut self, new_window_size: winit::dpi::PhysicalSize<u32>) {
+        self.window_size = new_window_size;
+        self.surface_configuration.width = new_window_size.width;
+        self.surface_configuration.height = new_window_size.height;
+        self.surface
+            .configure(&self.device, &self.surface_configuration);
+        self.depth_texture = RendererTexture::new_depth_texture(
+            &self.device,
+            &self.surface_configuration,
+            "depth_texture",
+        )
+        .expect("depth texture recreation must succeed");
     }
 
-    /// Return the physical dimensions of the currently configured surface.
-    pub fn surface_size(&self) -> (u32, u32) {
-        (self.surface_config.width, self.surface_config.height)
-    }
-
-    /// Restrict rendering to a physical-pixel rectangle within the surface.
-    ///
-    /// Passing `None` restores full-surface rendering. Frontends embedding the
-    /// surface behind UI should update this rectangle whenever their layout or
-    /// window scale changes.
-    pub fn set_viewport(&mut self, viewport: Option<RenderViewport>) {
-        self.viewport = viewport;
-    }
-
-    /// Draw and present the frame extracted by the ECS rendering system.
-    ///
-    /// Lost or outdated surfaces are reconfigured and skipped for one frame.
-    /// Timeouts are transient and also skip the frame. Fatal allocation and
-    /// generic surface failures are returned to the frontend for reporting.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`RendererError::SurfaceTextureFailed`] when the frame texture
-    /// cannot be acquired due to an out-of-memory condition or an unknown
-    /// backend failure. Lost, outdated, and timed-out surfaces are recovered
-    /// internally and never produce an error.
-    pub fn render(&mut self, packet: &RenderFrame) -> Result<FrameOutcome, RendererError> {
-        if let Some(detail) = self.errors.lock().unwrap().take() {
-            return Err(RendererError::SurfaceTextureFailed { detail });
-        }
-        if self.minimized {
-            return Ok(FrameOutcome::Skipped);
-        }
-        // Step 1: acquire the next frame texture, recovering transient errors.
-        let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                self.configure_surface();
-                return Ok(FrameOutcome::Skipped);
-            }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(FrameOutcome::Skipped),
-            Err(error @ (wgpu::SurfaceError::OutOfMemory | wgpu::SurfaceError::Other)) => {
-                return Err(RendererError::SurfaceTextureFailed {
-                    detail: error.to_string(),
-                });
-            }
-        };
-
-        // Step 2: build the texture view and clip the host viewport to the surface.
-        let view = frame
+    fn render(
+        &mut self,
+        camera_handle: RendererCameraHandle,
+        render_queue: &[RenderQueueItem],
+        frame: &RenderFrame,
+        viewport: Option<RenderViewport>,
+    ) -> Result<()> {
+        let surface_frame = self
+            .surface
+            .get_current_texture()
+            .map_err(|error| match error {
+                wgpu::SurfaceError::Lost => RendererError::SurfaceLost,
+                wgpu::SurfaceError::OutOfMemory => RendererError::SurfaceOutOfMemory,
+                other => RendererError::SurfaceTextureFailed {
+                    detail: other.to_string(),
+                },
+            })?;
+        let view = surface_frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        let viewport = self
-            .viewport
-            .unwrap_or_else(|| {
-                RenderViewport::full(self.surface_config.width, self.surface_config.height)
+        self.renderer_resource_storage
+            .engine_parameters
+            .update(&self.queue, 0.0, [0.0; 3]);
+        let camera = self
+            .renderer_resource_storage
+            .cameras
+            .get_mut(camera_handle)
+            .ok_or(RendererError::RendererResourceNotFound)?;
+        let viewport = viewport
+            .and_then(|value| {
+                value.clamped_to(
+                    self.surface_configuration.width,
+                    self.surface_configuration.height,
+                )
             })
-            .clamped_to(self.surface_config.width, self.surface_config.height)
-            .unwrap_or_default();
-
-        // Step 3: poll shader replacement, submit the extracted scene, and present.
-        self.reload_shaders(packet);
-        self.pbr.draw(
-            GpuPassContext {
-                device: &self.device,
-                queue: &self.queue,
-                output: &view,
-                viewport,
-            },
-            packet,
-        );
-        frame.present();
-        Ok(FrameOutcome::Presented)
-    }
-
-    /// Poll validation without blocking the event loop; only publish a valid pipeline.
-    fn reload_shaders(&mut self, frame: &RenderFrame) {
-        if let Some(pending) = self.pending_shaders.as_mut() {
-            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
-            if let std::task::Poll::Ready(error) = pending.validation.as_mut().poll(&mut context) {
-                let mut candidate = self.pending_shaders.take().unwrap();
-                if let Some(error) = error {
-                    eprintln!("[render] retaining previous shaders: {error}");
-                } else {
-                    candidate.pipeline.resize(
-                        &self.device,
-                        self.surface_config.width,
-                        self.surface_config.height,
-                    );
-                    self.pbr = candidate.pipeline;
-                }
-            }
-            return;
-        }
-        let pbr = frame.assets.shaders.get("shaders/pbr.wgsl");
-        let tone = frame.assets.shaders.get("shaders/tonemap.wgsl");
-        let key = if pbr.is_none() && tone.is_none() {
-            0
-        } else {
-            crate::assets::asset_id(&format!(
-                "{}|{}",
-                pbr.map_or("", String::as_str),
-                tone.map_or("", String::as_str)
-            ))
-        };
-        if key == self.shader_key {
-            return;
-        }
-        // Remember failed source versions too: retry only after the source changes,
-        // rather than rebuilding the same invalid pipeline every frame.
-        self.shader_key = key;
-        self.device.push_error_scope(wgpu::ErrorFilter::Validation);
-        let pipeline = PbrPipeline::with_shaders(
-            &self.device,
+            .unwrap_or_else(|| {
+                RenderViewport::full(
+                    self.surface_configuration.width,
+                    self.surface_configuration.height,
+                )
+            });
+        camera.update(
             &self.queue,
-            self.surface_config.format,
-            self.surface_config.width,
-            self.surface_config.height,
-            pbr.map_or(include_str!("shaders/pbr.wgsl"), String::as_str),
-            tone.map_or(include_str!("shaders/tonemap.wgsl"), String::as_str),
+            &frame.camera,
+            &frame.camera_transform,
+            viewport.width as f32 / viewport.height as f32,
         );
-        self.pending_shaders = Some(PendingShaders {
-            pipeline,
-            validation: Box::pin(self.device.pop_error_scope()),
-        });
-    }
-
-    /// Apply the current surface configuration after creation, resize, or loss.
-    fn configure_surface(&self) {
-        self.surface.configure(&self.device, &self.surface_config);
-    }
-}
-
-// =============================================================================
-// Free Functions
-// =============================================================================
-
-/// Select the lowest-latency non-vsync mode supported by the current surface.
-fn select_present_mode(supported: &[wgpu::PresentMode]) -> wgpu::PresentMode {
-    if supported.contains(&wgpu::PresentMode::Immediate) {
-        wgpu::PresentMode::Immediate
-    } else if supported.contains(&wgpu::PresentMode::Mailbox) {
-        wgpu::PresentMode::Mailbox
-    } else {
-        wgpu::PresentMode::AutoNoVsync
-    }
-}
-
-/// Prefer an alpha-composited surface for transparent UI overlays.
-///
-/// Standalone windows remain opaque at the platform window level, while
-/// Dioxus can opt its window into transparency and reveal this same surface
-/// beneath the webview layer.
-fn select_alpha_mode(supported: &[wgpu::CompositeAlphaMode]) -> Option<wgpu::CompositeAlphaMode> {
-    supported
-        .iter()
-        .copied()
-        .find(|mode| *mode == wgpu::CompositeAlphaMode::PostMultiplied)
-        .or_else(|| {
-            supported
-                .iter()
-                .copied()
-                .find(|mode| *mode == wgpu::CompositeAlphaMode::PreMultiplied)
-        })
-        .or_else(|| supported.first().copied())
-}
-
-// =============================================================================
-// Host Interface
-// =============================================================================
-
-impl crate::PillRenderer for Renderer {
-    fn capabilities(&self) -> crate::api::RenderCapabilities {
-        let limits = self.device.limits();
-        crate::api::RenderCapabilities {
-            max_texture_size: limits.max_texture_dimension_2d,
-            max_buffer_bytes: limits.max_buffer_size,
-            hdr: true,
-        }
-    }
-    fn metrics(&self) -> crate::api::RenderMetrics {
-        self.pbr.metrics
-    }
-    fn resize(&mut self, w: u32, h: u32) {
-        Renderer::resize(self, w, h);
-    }
-    fn set_viewport(&mut self, v: Option<RenderViewport>) {
-        Renderer::set_viewport(self, v);
-    }
-    fn render(&mut self, f: &RenderFrame) -> Result<FrameOutcome, RendererError> {
-        Renderer::render(self, f)
-    }
-    fn invalidate_assets(&mut self) {
-        self.pbr.invalidate_assets();
+        let camera = self
+            .renderer_resource_storage
+            .cameras
+            .get(camera_handle)
+            .ok_or(RendererError::RendererResourceNotFound)?;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("render_encoder"),
+            });
+        let color_attachment = wgpu::RenderPassColorAttachment {
+            view: &view,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color {
+                    r: 0.15,
+                    g: 0.15,
+                    b: 0.15,
+                    a: 1.0,
+                }),
+                store: wgpu::StoreOp::Store,
+            },
+        };
+        let depth_stencil_attachment = wgpu::RenderPassDepthStencilAttachment {
+            view: &self.depth_texture.texture_view,
+            depth_ops: Some(wgpu::Operations {
+                load: wgpu::LoadOp::Clear(1.0),
+                store: wgpu::StoreOp::Store,
+            }),
+            stencil_ops: None,
+        };
+        self.mesh_drawer.record_draw_commands(
+            &self.queue,
+            &mut encoder,
+            &self.renderer_resource_storage,
+            color_attachment,
+            depth_stencil_attachment,
+            camera,
+            render_queue,
+            &frame.instances,
+            viewport,
+        )?;
+        self.queue.submit(std::iter::once(encoder.finish()));
+        surface_frame.present();
+        Ok(())
     }
 }

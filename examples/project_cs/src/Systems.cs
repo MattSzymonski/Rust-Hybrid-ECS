@@ -369,7 +369,7 @@ public static class BallSpawnSystem
                     Y = ball.PositionY - ball.Radius,
                 })
                 .With(TransformComponent.At((ball.PositionX-400.0f)/80.0f,(300.0f-ball.PositionY)/80.0f,0.0f,ball.Radius/80.0f))
-                .With(PbrRenderableComponent.FromColor(BallColor))
+                .With(new MeshRendererComponent())
                 .Build();
         }
     }
@@ -435,7 +435,7 @@ public static class SplineSampleSpawnSystem
                     Y = y - SplineSampleDotSize * 0.5f,
                 })
                 .With(TransformComponent.At((x-400.0f)/80.0f,(300.0f-y)/80.0f,0.0f,SplineSampleDotSize/160.0f))
-                .With(PbrRenderableComponent.FromColor(SampleDotColor))
+                .With(new MeshRendererComponent())
                 .Build();
         }
     }

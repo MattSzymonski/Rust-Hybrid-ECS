@@ -888,18 +888,6 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
-    # Cook native renderer inputs before compiling or packaging the project.
-    render_assets = None
-    if project_root is not None and (project_root / "assets" / "render_source").is_dir():
-        render_assets = project_root / "build" / "render_assets"
-        cook = subprocess.run([
-            "cargo", "run", "--offline", "--quiet", "-p", "pill_master_renderer",
-            "--no-default-features", "--features", "asset-cooking", "--bin", "pill-cook", "--target-dir", "target/asset-cooking",
-            "--", str(project_root / "assets" / "render_source"), str(render_assets),
-        ], cwd=workspace_directory, env=dict(os.environ, RUSTFLAGS=""))
-        if cook.returncode:
-            return cook.returncode
-
     # Where a shipping build's output lands: cargo's target dir under the
     # project's build/build_meta, and dated artifact copies under build/<date>.
     target_directory = None
@@ -1083,21 +1071,6 @@ def main() -> int:
         copied_artifacts = copy_shipping_artifacts(
             target_directory, artifacts_directory, build_binary_name
         )
-        if render_assets is not None:
-            # Manifest paths are relative to this directory; copy only the published generation.
-            manifest = json.loads((render_assets / "manifest.json").read_text(encoding="utf-8"))
-            destination = artifacts_directory / "assets" / "render"
-            destination.mkdir(parents=True, exist_ok=True)
-            for asset in manifest["assets"]:
-                relative = Path(asset["path"])
-                cooked = (render_assets / relative).resolve()
-                if not cooked.is_relative_to(render_assets.resolve()):
-                    raise ValueError(f"cooked asset escapes manifest directory: {relative}")
-                packaged = destination / relative
-                packaged.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(cooked, packaged)
-            shutil.copy2(render_assets / "manifest.json", destination / "manifest.json")
-            copied_artifacts.extend(str(path.relative_to(artifacts_directory)) for path in destination.rglob("*") if path.is_file())
         # The managed side of a `static_csharp` build: the project assembly and
         # the C# runtime it references (or, with --csharp-aot, the single
         # self-contained native library), recorded alongside the shipping

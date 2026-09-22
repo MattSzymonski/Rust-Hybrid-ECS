@@ -32,11 +32,10 @@ use pill_core::math::Vector3f;
 use pill_engine::*;
 // `Position` is the engine's: it is universal, so a project
 // names them without reaching through whichever renderer happens to draw them.
-// `PbrRenderableComponent` is the renderer's own idea of a thing to draw, so it comes from
-// there along with the registration call that attaches all three.
+// `MeshRendererComponent` is the renderer's own idea of a thing to draw.
 use pill_engine::common_components::Position;
 use pill_master_renderer::{
-    register_components, CameraComponent, DirectionalLightComponent, PbrRenderableComponent,
+    CameraComponent, DirectionalLightComponent, Material, Mesh, MeshRendererComponent,
     TransformComponent,
 };
 use pill_spline::Spline;
@@ -92,7 +91,7 @@ pub struct PhysicsState {
 
 /// One dot on the project's spline, drawn at the curve parameter `t`.
 ///
-/// The dot carries the usual [`Position`] and [`PbrRenderableComponent`], so it renders like
+/// The dot carries the usual [`Position`] and [`MeshRendererComponent`], so it renders like
 /// any other mesh, and `spline_path_system` moves it along the curve as the
 /// balls move. The host serializes this component across hot-reload
 /// generations, so the layout is pinned with `#[repr(C)]`.
@@ -117,11 +116,45 @@ pub struct SplineSample {
 /// resolve in the loaded DLL.
 #[pill_project]
 pub fn init(engine: &mut Engine) -> u32 {
-    // The renderer's components are declared by `pill_master_renderer`, not by
-    // this crate, so they cannot carry the derive. Registering them through
-    // the renderer's own entry point also attaches their editor field layouts,
-    // which is what makes a mesh's size and colour editable in the inspector.
-    register_components(engine.world_mut());
+    // Register the renderer from the project artifact so its extraction system
+    // uses the same concrete asset types as this DLL. RenderFrame is a shared
+    // resource, so the host-side GPU backend reads the extracted data through
+    // the engine's stable cross-artifact resource identity.
+    pill_master_renderer::register(engine);
+    let (mesh, scene_material, ball_materials, sample_material) = {
+        let assets = engine
+            .world_mut()
+            .get_resource_mut::<AssetManager>()
+            .expect("Engine always owns an AssetManager");
+        let mesh = assets
+            .handle_by_name::<Mesh>("project.triangle")
+            .unwrap_or_else(|| assets.add_named("project.triangle", Mesh::triangle()));
+        let mut material = |name: &str, color: [f32; 3], specularity: f32| {
+            assets.handle_by_name::<Material>(name).unwrap_or_else(|| {
+                assets.add_named(
+                    name,
+                    Material::builder(name)
+                        .color_parameter("tint", color)
+                        .scalar_parameter("specularity", specularity)
+                        .build(),
+                )
+            })
+        };
+        let scene_material = material("project.scene", [0.8, 0.8, 0.85], 0.5);
+        let ball_materials: [Handle<Material>; BALL_COUNT] = std::array::from_fn(|index| {
+            material(
+                &format!("project.ball.{index}"),
+                [BALL_COLOR.r, BALL_COLOR.g, BALL_COLOR.b],
+                index as f32 / BALL_COUNT as f32,
+            )
+        });
+        let sample_material = material(
+            "project.spline",
+            [SAMPLE_DOT_COLOR.r, SAMPLE_DOT_COLOR.g, SAMPLE_DOT_COLOR.b],
+            0.2,
+        );
+        (mesh, scene_material, ball_materials, sample_material)
+    };
     let has_camera = Query::<&CameraComponent>::new(engine.world_mut())
         .iter_mut()
         .next()
@@ -137,11 +170,10 @@ pub fn init(engine: &mut Engine) -> u32 {
         {
             return 1;
         }
-        let renderable = PbrRenderableComponent {
-            mesh: pill_master_renderer::assets::asset_id("sample.cooked_mesh"),
-            material: pill_master_renderer::assets::asset_id("sample.material"),
-            ..Default::default()
-        };
+        let renderable = MeshRendererComponent::builder()
+            .mesh(&mesh)
+            .material(&scene_material)
+            .build();
         if engine
             .world_mut()
             .create_entity()
@@ -259,11 +291,12 @@ pub fn init(engine: &mut Engine) -> u32 {
                 scale: [physics.radius / 80.0; 3],
                 ..Default::default()
             })
-            .with(PbrRenderableComponent {
-                base_color: [BALL_COLOR.r, BALL_COLOR.g, BALL_COLOR.b, BALL_COLOR.a],
-                metallic: index as f32 / BALL_COUNT as f32,
-                ..Default::default()
-            });
+            .with(
+                MeshRendererComponent::builder()
+                    .mesh(&mesh)
+                    .material(&ball_materials[index])
+                    .build(),
+            );
 
         if entity.build().is_err() {
             // Report the failure and abort the generation: the host keeps the
@@ -304,15 +337,12 @@ pub fn init(engine: &mut Engine) -> u32 {
                 scale: [SPLINE_SAMPLE_DOT_SIZE / 160.0; 3],
                 ..Default::default()
             })
-            .with(PbrRenderableComponent {
-                base_color: [
-                    SAMPLE_DOT_COLOR.r,
-                    SAMPLE_DOT_COLOR.g,
-                    SAMPLE_DOT_COLOR.b,
-                    SAMPLE_DOT_COLOR.a,
-                ],
-                ..Default::default()
-            });
+            .with(
+                MeshRendererComponent::builder()
+                    .mesh(&mesh)
+                    .material(&sample_material)
+                    .build(),
+            );
 
         if entity.build().is_err() {
             error!(

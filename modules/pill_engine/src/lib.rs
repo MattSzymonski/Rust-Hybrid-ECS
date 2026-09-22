@@ -124,14 +124,15 @@ pub mod world;
 
 // Core engine types re-exported for single-import usage.
 pub use api::EngineApi;
-pub use asset::{Asset, AssetGuid, AssetManager, Handle};
+pub use asset::{
+    Asset, AssetGuid, AssetLoadError, AssetLoadResult, AssetLoader, AssetManager, Handle,
+};
 pub use commands::{CommandError, Commands};
 pub use common_components::{
     register_common_components, Color, Position, COLOR_FIELD_LAYOUT, POSITION_FIELD_LAYOUT,
 };
 pub use component::{Component, ComponentId, ComponentTicks, Tick};
 pub use component_field::{ComponentFieldError, FieldValue};
-pub use pill_core::DynamicBuffer;
 pub use engine::{Engine, SystemOwner, SystemSnapshot};
 pub use entity::Entity;
 pub use error::{EngineError, SystemError, SystemFailure};
@@ -140,6 +141,7 @@ pub use hot_patch::{
     PlainSlot,
 };
 pub use persistence::{PersistResourceManifestEntry, ResourceSnapshot};
+pub use pill_core::DynamicBuffer;
 pub use query::{
     Added, BatchStats, Changed, Or, Query, QueryFilter, QueryTarget, Res, ResMut, With, Without,
 };

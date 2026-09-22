@@ -403,7 +403,7 @@ impl RenderingHost {
             let outcome = self.renderer.render(frame)?;
             if !self.presented_scene
                 && matches!(outcome, pill_master_renderer::FrameOutcome::Presented)
-                && self.renderer.metrics().draw_calls > 1
+                && self.renderer.metrics().draw_calls > 0
             {
                 self.presented_scene = true;
                 println!(

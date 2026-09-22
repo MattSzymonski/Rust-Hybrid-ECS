@@ -37,10 +37,10 @@ use super::commands::{
 use super::components::{
     apply_component_manifest_on_reload, module_native_bindings, register_component_manifest,
     shared_component_bindings, stable_component_id, BindingStore, ComponentBinding,
-    ComponentBindings, ModuleExposedComponent, PbrRenderableComponent, Position, StableComponentId,
+    ComponentBindings, MeshRendererComponent, ModuleExposedComponent, Position, StableComponentId,
 };
 use super::managed_buffer::{fetch_managed_buffer, ManagedBufferError};
-// `Color`, `Position` and `PbrRenderableComponent` above are the renderer's components,
+// `Color`, `Position` and `MeshRendererComponent` above are the renderer's components,
 // re-exported by `components` from `pill_master_renderer`.
 use super::context::ActiveSystemGuard;
 use super::manifest::parse_and_validate_manifest;
@@ -173,7 +173,7 @@ fn setup_test_world(engine: &mut Engine) -> ComponentBindings {
             .world_mut()
             .create_entity()
             .with(Position { x: 0.0, y: 0.0 })
-            .with(PbrRenderableComponent::default())
+            .with(MeshRendererComponent::default())
             .build()
             .unwrap();
         engine
@@ -377,7 +377,7 @@ fn managed_command_abi_rejects_stale_generations_and_undeclared_commands() {
 fn reflected_managed_commands_access_is_scheduler_exclusive() {
     let mut commands_access = managed_access(&[("Position", 0)]);
     commands_access.set_uses_commands(true);
-    let disjoint_reader = managed_access(&[("PbrRenderableComponent", 0)]);
+    let disjoint_reader = managed_access(&[("MeshRendererComponent", 0)]);
     let scheduler = scheduler_for([commands_access, disjoint_reader]);
     assert_different_batches(&scheduler, 0, 1);
 }
@@ -458,10 +458,10 @@ fn archetype_chunk_lookup_resolves_components_and_entities() {
         .unwrap();
 
     let position_id = test_stable_id("Position");
-    let renderable_id = test_stable_id("PbrRenderableComponent");
+    let renderable_id = test_stable_id("MeshRendererComponent");
     let accesses = [
         native_access("Position", 1),
-        native_access("PbrRenderableComponent", 0),
+        native_access("MeshRendererComponent", 0),
     ];
     let mut chunk = empty_chunk();
     let mut renderable_chunk = empty_chunk();
@@ -781,15 +781,15 @@ fn module_native_binding_rejects_live_layout_mismatch() {
     // fails the query arm with the "unknown component" status instead of the
     // debug assertion that aborted debug hosts and vanished in release.
     //
-    // `PbrRenderableComponent` stands in for the module's component here: it is real native
+    // `MeshRendererComponent` stands in for the module's component here: it is real native
     // storage, which is exactly what the `ModuleNative` arm serves, and its
     // live layout is what the stale binding is compared against.
     let mut bindings = shared_component_bindings(&mut engine);
-    let renderable_stable_id = test_stable_id("PbrRenderableComponent");
+    let renderable_stable_id = test_stable_id("MeshRendererComponent");
     bindings.insert(
         renderable_stable_id,
         ComponentBinding::ModuleNative {
-            component_id: ComponentId::of::<PbrRenderableComponent>(),
+            component_id: ComponentId::of::<MeshRendererComponent>(),
             // Deliberately not the live layout, so the arm has to refuse.
             size: 64,
             align: 4,
@@ -798,10 +798,10 @@ fn module_native_binding_rejects_live_layout_mismatch() {
     engine
         .world_mut()
         .create_entity()
-        .with(PbrRenderableComponent::default())
+        .with(MeshRendererComponent::default())
         .build()
         .unwrap();
-    let accesses = [native_access("PbrRenderableComponent", 1)];
+    let accesses = [native_access("MeshRendererComponent", 1)];
     let mut chunk = empty_chunk();
     let _guard = ActiveSystemGuard::set(engine.world_mut(), &accesses, &bindings);
     assert_eq!(
@@ -854,7 +854,7 @@ fn csharp_world_supports_the_renderable_renderer_query() {
     setup_test_world(&mut engine);
 
     let mut query =
-        pill_engine::Query::<(&Position, &PbrRenderableComponent)>::new(engine.world_mut());
+        pill_engine::Query::<(&Position, &MeshRendererComponent)>::new(engine.world_mut());
     assert_eq!(query.iter_mut().count(), TEST_WORLD_ENTITY_COUNT);
 }
 
@@ -864,7 +864,7 @@ fn disjoint_managed_writers_share_a_parallel_batch() {
     let scheduler = scheduler_for([
         managed_access(&[("PhysicsState", 1)]),
         managed_access(&[("Position", 1)]),
-        managed_access(&[("PbrRenderableComponent", 1)]),
+        managed_access(&[("MeshRendererComponent", 1)]),
     ]);
 
     assert_eq!(scheduler.execution_graph().len(), 1);
@@ -899,8 +899,8 @@ fn managed_reader_and_writer_are_scheduled_in_different_batches() {
 #[test]
 fn managed_writers_of_the_same_component_are_scheduled_in_different_batches() {
     let scheduler = scheduler_for([
-        managed_access(&[("PbrRenderableComponent", 1)]),
-        managed_access(&[("PbrRenderableComponent", 1)]),
+        managed_access(&[("MeshRendererComponent", 1)]),
+        managed_access(&[("MeshRendererComponent", 1)]),
     ]);
 
     assert_eq!(scheduler.execution_graph().len(), 2);
@@ -917,7 +917,7 @@ fn entity_only_managed_system_does_not_create_a_scheduler_conflict() {
         managed_access(&[
             ("PhysicsState", 1),
             ("Position", 1),
-            ("PbrRenderableComponent", 1),
+            ("MeshRendererComponent", 1),
         ]),
     ]);
 
@@ -928,12 +928,12 @@ fn entity_only_managed_system_does_not_create_a_scheduler_conflict() {
 /// Verify optional query terms retain their underlying scheduler conflicts.
 #[test]
 fn optional_managed_access_conflicts_when_the_component_may_be_present() {
-    // OptionalWrite<PbrRenderableComponent> exports the same scheduler write as Write<PbrRenderableComponent>;
+    // OptionalWrite<MeshRendererComponent> exports the same scheduler write as Write<MeshRendererComponent>;
     // optionality affects matching, never parallel safety.
     let scheduler = scheduler_for([
-        managed_access(&[("PhysicsState", 1), ("PbrRenderableComponent", 0)]),
+        managed_access(&[("PhysicsState", 1), ("MeshRendererComponent", 0)]),
         managed_access(&[("Position", 1)]),
-        managed_access(&[("PbrRenderableComponent", 1)]),
+        managed_access(&[("MeshRendererComponent", 1)]),
     ]);
 
     assert_eq!(scheduler.execution_graph().len(), 2);
@@ -1016,7 +1016,7 @@ fn disjoint_managed_writes_mark_the_correct_tick_columns() {
 
     let accesses = [
         native_access("Position", 1),
-        native_access("PbrRenderableComponent", 1),
+        native_access("MeshRendererComponent", 1),
     ];
     let mut positions = empty_chunk();
     let mut renderables = empty_chunk();
@@ -1028,7 +1028,7 @@ fn disjoint_managed_writes_mark_the_correct_tick_columns() {
             ABI_SUCCESS
         );
         assert_eq!(
-            get_test_chunk("PbrRenderableComponent", 1, 0, &mut renderables),
+            get_test_chunk("MeshRendererComponent", 1, 0, &mut renderables),
             ABI_SUCCESS
         );
         assert_eq!(ffi_get_entity_chunk(0, &mut entities), ABI_SUCCESS);
@@ -1057,7 +1057,7 @@ fn disjoint_managed_writes_mark_the_correct_tick_columns() {
 
     let mut changed_renderables = pill_engine::Query::<
         (pill_engine::Entity,),
-        pill_engine::Changed<PbrRenderableComponent>,
+        pill_engine::Changed<MeshRendererComponent>,
     >::new(engine.world_mut());
     let renderable_hits: Vec<_> = changed_renderables
         .iter_mut()
