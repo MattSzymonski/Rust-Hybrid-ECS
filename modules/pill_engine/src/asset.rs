@@ -220,6 +220,21 @@ impl<T: Asset> Handle<T> {
         _marker: PhantomData,
     };
 
+    /// Reconstructs a handle from a raw index/generation pair.
+    ///
+    /// The same trust model [`Deserialize`](serde::Deserialize) already
+    /// applies: the caller vouches that the pair came from a handle this
+    /// asset manager issued, most often across an FFI boundary that carries
+    /// only the two integers rather than a live handle value.
+    #[inline]
+    pub fn from_raw(index: u32, generation: u32) -> Self {
+        Self {
+            index,
+            generation,
+            _marker: PhantomData,
+        }
+    }
+
     /// Slot index this handle addresses.
     #[inline]
     pub fn index(self) -> u32 {

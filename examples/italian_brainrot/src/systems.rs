@@ -1,10 +1,11 @@
 //! Animation systems used by the scene.
 
 use crate::TagAlphaComponent;
-use pill_engine::{Query, Res, SystemError, Time};
+use pill_engine::{pill_hot, Query, Res, SystemError, Time};
 use pill_master_renderer::TransformComponent;
 
 /// Rotates each tagged model around its local Y axis at 90 degrees per second.
+#[pill_hot]
 pub(crate) fn rotation_system(
     time: Res<Time>,
     mut models: Query<(&mut TransformComponent, &TagAlphaComponent)>,
@@ -20,7 +21,7 @@ pub(crate) fn rotation_system(
         } else {
             glam::Quat::IDENTITY
         };
-        transform.rotation = (step * current).normalize().to_array();
+        transform.rotation = (step * current * 5.0).normalize().to_array();
     }
     Ok(())
 }

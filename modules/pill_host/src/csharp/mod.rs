@@ -17,6 +17,9 @@
 mod abi;
 /// NativeAOT library loader used by the C# project backend's AOT posture.
 mod aot_runtime;
+/// Managed asset loading, bridging `AssetManager` for projects with no
+/// direct Rust asset-construction code of their own.
+mod assets;
 /// High-level C# project startup, discovery, and scheduler registration.
 mod backend;
 #[cfg(feature = "hot_reload")]

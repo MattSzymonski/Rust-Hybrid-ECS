@@ -1,0 +1,24 @@
+# Project settings for the managed C# port of `italian_brainrot`.
+#
+# `name` is the display name (window title); `build_binary_name` is the
+# artifact file base and must contain only letters, digits and underscores.
+# Both are required. The other fields are classic package metadata.
+#
+# `modules` declares which extensions this project uses, in load
+# order (the project itself initializes last). The dev host reads this file at
+# startup and the shipping bundle generator reads it at build time, so adding
+# or removing a module is a single edit here.
+#
+# This project needs none: it loads its own mesh, texture and shaders at
+# startup through the managed asset-loading bridge (`Engine.LoadMeshObj` and
+# friends in `pill_csharp_runtime`), the same way the Rust project's
+# `asset_loading::load` does from Rust.
+
+name: "Italian Brainrot (C#)"
+build_binary_name: "ItalianBrainrotCs"
+version: "0.1.0"
+author: "Matt Szymonski"
+description: "Managed port of the three rotating Chimpanzini Bananini entities."
+
+modules: []
+

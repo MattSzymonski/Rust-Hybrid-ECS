@@ -83,6 +83,90 @@ public unsafe struct EngineApi
     /// <c>5</c> the caller passed no output buffer.
     /// </remarks>
     public delegate* unmanaged[Cdecl]<ulong, ulong, byte, NativeResourceView*, byte> GetResourceView;
+
+    /// <summary>
+    /// Decode a Wavefront OBJ buffer into a mesh, inserted into the active
+    /// invocation's <c>AssetManager</c>. Appended after <see cref="GetResourceView"/>
+    /// for the same reason every earlier addition was: a new slot goes at the
+    /// end, never between existing ones.
+    /// </summary>
+    public delegate* unmanaged[Cdecl]<byte*, uint, byte*, uint, uint*, uint*, byte> AssetLoadMeshObj;
+
+    /// <summary>Decode a PNG buffer into a color texture, inserted the same way.</summary>
+    public delegate* unmanaged[Cdecl]<byte*, uint, byte*, uint, uint*, uint*, byte> AssetLoadTexturePng;
+
+    /// <summary>Build a shader from managed WGSL sources and slot declarations.</summary>
+    public delegate* unmanaged[Cdecl]<
+        byte*, uint,
+        byte*, uint,
+        byte*, uint,
+        NativeShaderParameterSlot*, uint,
+        NativeShaderTextureSlot*, uint,
+        byte, byte,
+        uint*, uint*, byte> AssetLoadShader;
+
+    /// <summary>Build a material from already-loaded handles and per-slot parameters.</summary>
+    public delegate* unmanaged[Cdecl]<
+        byte*, uint,
+        uint, uint,
+        NativeMaterialTexture*, uint,
+        NativeMaterialScalar*, uint,
+        NativeMaterialColor*, uint,
+        byte,
+        uint*, uint*, byte> AssetCreateMaterial;
+}
+
+/// <summary>One parameter slot a managed shader declaration supplies.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct NativeShaderParameterSlot
+{
+    public byte* Name;
+    public uint NameLen;
+    /// <summary><c>0</c> scalar, <c>1</c> bool, <c>2</c> color.</summary>
+    public byte Kind;
+}
+
+/// <summary>
+/// One texture slot a managed shader declaration supplies. The bound texture
+/// is always color-typed.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct NativeShaderTextureSlot
+{
+    public byte* Name;
+    public uint NameLen;
+    public uint TextureBinding;
+    public uint SamplerBinding;
+}
+
+/// <summary>One texture a managed material declaration binds to a shader slot.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct NativeMaterialTexture
+{
+    public byte* Slot;
+    public uint SlotLen;
+    public uint TextureIndex;
+    public uint TextureGeneration;
+}
+
+/// <summary>One scalar parameter a managed material declaration sets.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct NativeMaterialScalar
+{
+    public byte* Name;
+    public uint NameLen;
+    public float Value;
+}
+
+/// <summary>One color parameter a managed material declaration sets.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public unsafe struct NativeMaterialColor
+{
+    public byte* Name;
+    public uint NameLen;
+    public float R;
+    public float G;
+    public float B;
 }
 
 /// <summary>

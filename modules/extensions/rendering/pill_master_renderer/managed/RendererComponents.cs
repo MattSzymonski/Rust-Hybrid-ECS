@@ -35,9 +35,14 @@ public struct Color
 }
 
 [EcsSharedComponent]
+// Four uint fields, not two ulong: the native side is two `Handle<T>` (u32
+// index + u32 generation, align 4 each). A `ulong` field would force the
+// whole struct to the CLR's natural 8-byte alignment, and StructLayout.Pack
+// cannot fix that - the analyzer rejects it (PILL0402) because the manifest
+// generator does not model Pack-adjusted sizes.
 [StructLayout(LayoutKind.Sequential)]
 public struct MeshRendererComponent {
-    public ulong Mesh, Material;
+    public uint MeshIndex, MeshGeneration, MaterialIndex, MaterialGeneration;
 }
 [EcsSharedComponent]
 [StructLayout(LayoutKind.Sequential)]

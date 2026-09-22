@@ -1,0 +1,57 @@
+[package]
+name = "host_project_project"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "project"
+path = "C:/Main/programming/Rust-Hybrid-ECS/modules/../examples/project_rs/src/lib.rs"
+# `cdylib` for a hot-reloading build, where the host loads this as a DLL.
+# `rlib` so a shipping build can link the project straight into the binary -
+# a cdylib cannot be a Rust library dependency. Every optional module already
+# carries both for the same reason.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pill_engine = { path = "C:/Main/programming/Rust-Hybrid-ECS/modules/../examples/project_rs/../../modules/pill_engine" }
+pill_core = { path = "C:/Main/programming/Rust-Hybrid-ECS/modules/../examples/project_rs/../../modules/pill_core" }
+# The renderer, for `Sprite`: a quad with a width, a height and a fill is the
+# renderer's own idea of a thing to draw, so it lives with the pipeline that
+# draws it. `Position` and `Color` are universal and come from `pill_engine`
+# instead.
+#
+# `default-features = false` drops the crate's `gpu` feature, which is what
+# keeps wgpu out of this `cdylib` and out of every hot patch of it. It also
+# keeps this project loadable by a headless host: cargo folds a dependency's
+# resolved features into `-C metadata`, so a project that linked wgpu resolved
+# a different `pill_core.dll` than a host without the renderer had mapped, and
+# failed to load. A windowed host turns the feature back on through its own
+# graph, and both sides unify alike either way.
+pill_master_renderer = { path = "C:/Main/programming/Rust-Hybrid-ECS/modules/../examples/project_rs/../../modules/optional/rendering/pill_master_renderer", default-features = false }
+# Linked directly so the project can name the `Spline` type. See the note in
+# `init` about why this crate must not also be loaded as a module.
+# `default-features = false` is a defensive no-op: `module-abi` is opt-in now,
+# so the `pill_module_*` exports stay off in this build either way.
+# `test-hooks` keeps the module's demo observables - the sampled height
+# offset, the `GetSum` shift - that the hot-reload and bridge suites edit and
+# watch for; a default build of the module computes only the documented math.
+pill_spline = { path = "C:/Main/programming/Rust-Hybrid-ECS/modules/../examples/project_rs/../../modules/optional/pill_spline", default-features = false, features = [
+    "test-hooks",
+] }
+# Dummy optional modules, linked directly purely to exercise their structs and
+# free functions from the project. `default-features = false` is a defensive
+# no-op (each crate's `module-abi` feature is opt-in), kept so that a future
+# change cannot pull the `#[no_mangle]` `pill_module_*` exports into this one
+# `cdylib`, where more than one definition of the same symbol names is a
+# linker error. Each crate is built standalone by the host (which passes
+# `--features module-abi`) for hot-loading via the project's
+# `project_settings.yaml`.
+pill_dummy_math = { path = "C:/Main/programming/Rust-Hybrid-ECS/modules/../examples/project_rs/../../modules/optional/pill_dummy_math", default-features = false }
+pill_dummy_text = { path = "C:/Main/programming/Rust-Hybrid-ECS/modules/../examples/project_rs/../../modules/optional/pill_dummy_text", default-features = false }
+pill_dummy_color = { path = "C:/Main/programming/Rust-Hybrid-ECS/modules/../examples/project_rs/../../modules/optional/pill_dummy_color", default-features = false }
+pill_dummy_timer = { path = "C:/Main/programming/Rust-Hybrid-ECS/modules/../examples/project_rs/../../modules/optional/pill_dummy_timer", default-features = false }
+pill_dummy_random = { path = "C:/Main/programming/Rust-Hybrid-ECS/modules/../examples/project_rs/../../modules/optional/pill_dummy_random", default-features = false }
+serde = { version = "1", features = ["derive"] }
+tracing = "0.1"
+
+[features]

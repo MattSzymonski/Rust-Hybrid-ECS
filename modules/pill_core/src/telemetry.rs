@@ -135,8 +135,8 @@ impl LoggingConfig {
             .with_directive(telemetry_target::HOT_RELOAD, LevelFilter::INFO)
             .with_directive(telemetry_target::INPUT, LevelFilter::INFO)
             .with_directive(telemetry_target::ECS, LevelFilter::INFO)
-            .with_directive(telemetry_target::RENDERING, LevelFilter::DEBUG)
-            .with_directive(telemetry_target::RESOURCES, LevelFilter::INFO)
+            .with_directive(telemetry_target::RENDERING, LevelFilter::OFF)
+            .with_directive(telemetry_target::RESOURCES, LevelFilter::OFF)
             .with_directive("wgpu", LevelFilter::WARN)
             .with_directive("naga", LevelFilter::WARN)
     }

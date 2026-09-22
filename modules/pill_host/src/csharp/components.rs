@@ -422,7 +422,7 @@ fn shared_renderer_bindings(engine: &mut Engine, bindings: &mut ComponentBinding
         engine,
         bindings,
         "TracyLive.MeshRendererComponent",
-        "TracyLive.MeshRendererComponent|16|4|Mesh@0:8:System.UInt64|Material@8:8:System.UInt64",
+        "TracyLive.MeshRendererComponent|16|4|MeshIndex@0:4:System.UInt32|MeshGeneration@4:4:System.UInt32|MaterialIndex@8:4:System.UInt32|MaterialGeneration@12:4:System.UInt32",
     );
     register_native_binding::<pill_master_renderer::TransformComponent>(engine, bindings,"TracyLive.TransformComponent",
         "TracyLive.TransformComponent|40|4|X@0:4:System.Single|Y@4:4:System.Single|Z@8:4:System.Single|RotationX@12:4:System.Single|RotationY@16:4:System.Single|RotationZ@20:4:System.Single|RotationW@24:4:System.Single|ScaleX@28:4:System.Single|ScaleY@32:4:System.Single|ScaleZ@36:4:System.Single");
