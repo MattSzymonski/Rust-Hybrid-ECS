@@ -24,68 +24,37 @@
 //! serializable data.
 
 // Standard library
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 // External crates
 use pill_core::error;
 use pill_core::math::Vector3f;
 use pill_engine::*;
-// `Position` and `Color` are the engine's: they are universal, so a project
+// `Position` is the engine's: it is universal, so a project
 // names them without reaching through whichever renderer happens to draw them.
 // `Sprite` is the renderer's own idea of a thing to draw, so it comes from
 // there along with the registration call that attaches all three.
-use pill_engine::common_components::{Color, Position};
+use pill_engine::common_components::Position;
 use pill_master_renderer::{register_components, Sprite};
 use pill_spline::Spline;
 use serde::{Deserialize, Serialize};
 
-// =============================================================================
-// Constants
-// =============================================================================
+mod audio_scene;
+mod physics;
+// Hot patches compile separately and import the same scene settings.
+pub mod settings;
+mod simulation_time;
+mod spline_path;
+mod spline_probe;
 
-const FIXED_DELTA_TIME: f32 = 1.0 / 60.0;
-const GRAVITY: f32 = 800.0;
-const BOUNCE_VELOCITY_Y: f32 = -800.0;
-const BOUNCE_VELOCITY_X: f32 = 350.0;
-const RESTITUTION: f32 = 0.6;
+// Keep the public hot-patch helper available at its original crate-root path.
+pub use physics::simulate_ball;
 
-/// Upward speed restored when a floor bounce would otherwise decay to rest.
-///
-/// Keeps every ball visibly bouncing for the whole lifetime of the scene
-/// instead of settling on the floor after a few seconds.
-const MINIMUM_BOUNCE_VELOCITY_Y: f32 = 500.0;
-
-const FLOOR_Y: f32 = 580.0;
-const CEILING_Y: f32 = 20.0;
-const LEFT_WALL: f32 = 20.0;
-const RIGHT_WALL: f32 = 780.0;
-
-/// Number of balls in the scene, and with it the number of control points the
-/// spline is driven from.
-///
-/// Must stay at or below `pill_spline::MAX_CONTROL_POINTS`, the length of the
-/// control point array a [`Spline`] stores.
-const BALL_COUNT: usize = 5;
-
-/// Curve parameter between two neighbouring sample dots.
-const SPLINE_SAMPLE_STEP: f32 = 0.05;
-
-/// Number of sample dots: one every [`SPLINE_SAMPLE_STEP`], from `t = 0.0`
-/// through `t = 1.0`, so both endpoints of the curve get a dot of their own.
-const SPLINE_SAMPLE_COUNT: usize = 21;
-
-/// Edge length of a sample dot, in pixels.
-const SPLINE_SAMPLE_DOT_SIZE: f32 = 6.0;
-
-/// Fill colour of the ball sprites.
-const BALL_COLOR: Color = Color::new(1.0, 0.3, 0.3, 1.0);
-
-/// Fill colour of the sample dots.
-const SAMPLE_DOT_COLOR: Color = Color::new(0.25, 0.85, 1.0, 1.0);
-
-// =============================================================================
-// Simulation time
-// =============================================================================
+use physics::{ball_spawn_state, physics_system};
+use settings::*;
+use simulation_time::update_time_system;
+use spline_path::spline_path_system;
+use spline_probe::{spline_probe_system, SplineProbeState};
 
 /// Wall-clock delta between frames, shared by every system that steps on time.
 ///
@@ -99,30 +68,6 @@ pub struct SimulationTime {
 }
 
 impl Resource for SimulationTime {}
-
-/// Stamps the time elapsed since the previous frame into [`SimulationTime`].
-///
-/// # Errors
-///
-/// Returns [`SystemError::MissingResource`] when the resource is absent, which
-/// means the project module and host disagree about initialization.
-fn update_time_system(mut time: ResMut<SimulationTime>) -> Result<(), SystemError> {
-    let now = Instant::now();
-    let Some(mut time) = time.get_mut() else {
-        return Err(SystemError::MissingResource {
-            name: String::from("SimulationTime"),
-        });
-    };
-    // Clamped because a breakpoint or a slow reload can stretch a single frame
-    // far enough to throw a ball straight through a wall.
-    time.delta_seconds = now.duration_since(time.last_frame).as_secs_f32().min(0.1);
-    time.last_frame = now;
-    Ok(())
-}
-
-// =============================================================================
-// Ball physics
-// =============================================================================
 
 /// A rigid ball that bounces inside a fixed box, simulated each frame.
 ///
@@ -142,86 +87,6 @@ pub struct PhysicsState {
     pub active: bool,
 }
 
-impl Default for PhysicsState {
-    /// The first ball's spawn state, for callers that need any valid state
-    /// rather than a particular one.
-    fn default() -> Self {
-        ball_spawn_state(0)
-    }
-}
-
-/// Advances one ball by its own delta and bounces it off the box.
-///
-/// Public so a hot patch of `physics_system` can call it without the patch
-/// having to duplicate the physics constants.
-pub fn simulate_ball(state: &mut PhysicsState) {
-    if !state.active {
-        return;
-    }
-
-    let delta = state.delta_time.clamp(0.0, 0.1);
-    state.velocity_y += GRAVITY * delta;
-    state.position_x += state.velocity_x * delta;
-    state.position_y += state.velocity_y * delta;
-
-    if state.position_y + state.radius >= FLOOR_Y {
-        state.position_y = FLOOR_Y - state.radius;
-        state.velocity_y = -state.velocity_y.abs() * RESTITUTION;
-        // Restitution alone decays each bounce towards rest; restore a
-        // minimum upward speed so balls bounce forever.
-        if state.velocity_y.abs() < MINIMUM_BOUNCE_VELOCITY_Y {
-            state.velocity_y = -MINIMUM_BOUNCE_VELOCITY_Y;
-        }
-    }
-    if state.position_y - state.radius <= CEILING_Y {
-        state.position_y = CEILING_Y + state.radius;
-        state.velocity_y = state.velocity_y.abs() * RESTITUTION;
-    }
-    if state.position_x - state.radius <= LEFT_WALL {
-        state.position_x = LEFT_WALL + state.radius;
-        state.velocity_x = state.velocity_x.abs() * RESTITUTION;
-    }
-    if state.position_x + state.radius >= RIGHT_WALL {
-        state.position_x = RIGHT_WALL - state.radius;
-        state.velocity_x = -state.velocity_x.abs() * RESTITUTION;
-    }
-}
-
-/// Steps every ball by the frame delta and copies its state into its sprite.
-///
-/// # Errors
-///
-/// Returns [`SystemError::MissingResource`] when `SimulationTime` is absent.
-#[pill_hot]
-fn physics_system(
-    mut time: ResMut<SimulationTime>,
-    mut query: Query<(&mut PhysicsState, &mut Position, &mut Sprite)>,
-) -> Result<(), SystemError> {
-    let Some(time) = time.get_mut() else {
-        return Err(SystemError::MissingResource {
-            name: String::from("SimulationTime"),
-        });
-    };
-
-    let delta_seconds = time.delta_seconds;
-    for (mut physics, mut position, mut sprite) in query.iter_mut() {
-        physics.delta_time = delta_seconds;
-        simulate_ball(&mut physics);
-
-        // Physics coordinates describe the centre of the ball; the sprite
-        // renderer expects the top-left corner of the quad.
-        position.x = physics.position_x - physics.radius;
-        position.y = physics.position_y - physics.radius;
-        sprite.width = physics.radius * 2.0;
-        sprite.height = physics.radius * 2.0;
-    }
-    Ok(())
-}
-
-// =============================================================================
-// Spline path
-// =============================================================================
-
 /// One dot on the project's spline, drawn at the curve parameter `t`.
 ///
 /// The dot carries the usual [`Position`] and [`Sprite`], so it renders like
@@ -234,152 +99,6 @@ fn physics_system(
 pub struct SplineSample {
     /// Curve parameter this dot samples, running from 0.0 to 1.0.
     pub t: f32,
-}
-
-/// Rebuilds the spline from the ball centres and walks the sample dots along
-/// the curve that results.
-///
-/// `ball_physics` touches the same components in the same frame, and the
-/// scheduler is free to batch it either side of this system. A centre can
-/// therefore be one frame old by the time it becomes a control point, which is
-/// invisible at 60 Hz and keeps the spline out of the physics step.
-#[pill_hot]
-fn spline_path_system(
-    mut balls: Query<&PhysicsState>,
-    mut splines: Query<&mut Spline>,
-    mut samples: Query<(&SplineSample, &mut Position)>,
-) -> Result<(), SystemError> {
-    // Step 1: collect the ball centres in the order the control points take.
-    // Iteration walks the ball archetype row by row and the balls are spawned
-    // in index order, so the i-th centre seen belongs to the i-th ball.
-    let mut control_points = [Vector3f::ZERO; BALL_COUNT];
-    let mut control_point_count = 0;
-    for physics in balls.iter_mut() {
-        if control_point_count == BALL_COUNT {
-            break;
-        }
-        control_points[control_point_count] =
-            Vector3f::new(physics.position_x, physics.position_y, 0.0);
-        control_point_count += 1;
-    }
-
-    // Step 2: publish the points, then place the dots on the curve they
-    // describe. The spline keeps its own copy of the centres, so the balls
-    // need no relationship to it and stay free to keep moving.
-    for mut spline in splines.iter_mut() {
-        spline.control_points[..control_point_count]
-            .copy_from_slice(&control_points[..control_point_count]);
-        spline.control_point_count = control_point_count as u32;
-
-        for (sample, mut position) in samples.iter_mut() {
-            let location = spline.get_location_at(sample.t);
-            // Samples are curve points, sprites draw from the top-left corner
-            // of their quad, and the dot is centred on the sample.
-            position.x = location.x - SPLINE_SAMPLE_DOT_SIZE * 0.5;
-            position.y = location.y - SPLINE_SAMPLE_DOT_SIZE * 0.5;
-        }
-    }
-
-    Ok(())
-}
-
-// =============================================================================
-// Spline probe
-// =============================================================================
-
-/// Timestamps the last spline probe report so the cadence is wall-clock.
-struct SplineProbeState {
-    last_report: Instant,
-}
-
-impl Resource for SplineProbeState {}
-
-/// How often the probe reports, on the wall clock.
-///
-/// The demo runs uncapped, so a per-frame report would drown the log and a
-/// frame-count interval would make the cadence - and every suite waiting on a
-/// report - depend on the machine's frame rate. Wall-clock time is what a
-/// human reading the log observes, and what the waits can bound.
-const SPLINE_REPORT_INTERVAL: Duration = Duration::from_millis(250);
-
-/// Reports how many splines the project can see, and samples the curve.
-///
-/// The count is what reveals whether a separately loaded copy of `pill_spline`
-/// shares the component type: `Spline` is `#[pill(shared)]`, so the module
-/// DLL's copy and the project's are one column, and this line keeps saying
-/// `1 spline(s)` instead of each artifact seeding a curve of its own.
-///
-/// # Errors
-///
-/// Returns [`SystemError::MissingResource`] when the resource is absent, which
-/// means the project module and host disagree about initialization.
-fn spline_probe_system(
-    mut state: ResMut<SplineProbeState>,
-    mut splines: Query<&mut Spline>,
-) -> Result<(), SystemError> {
-    let Some(mut state) = state.get_mut() else {
-        return Err(SystemError::MissingResource {
-            name: String::from("SplineProbeState"),
-        });
-    };
-    if state.last_report.elapsed() < SPLINE_REPORT_INTERVAL {
-        return Ok(());
-    }
-    state.last_report = Instant::now();
-
-    let mut visible_spline_count = 0;
-    for spline in splines.iter_mut() {
-        visible_spline_count += 1;
-        let _ = spline;
-    }
-
-    // The sampled point comes from a reference spline over the spawn geometry,
-    // not from the live curve: the live control points are the ball centres,
-    // which move every frame, and an integration suite cannot wait for a moving
-    // number. The spawn geometry is fixed, so this value depends only on the
-    // linked module's math - which is what the cascade suites watch change.
-    let mut spawn_points = [Vector3f::ZERO; BALL_COUNT];
-    for (index, point) in spawn_points.iter_mut().enumerate() {
-        let ball = ball_spawn_state(index);
-        *point = Vector3f::new(ball.position_x, ball.position_y, 0.0);
-    }
-    let reference = Spline::from_points(&spawn_points);
-    let midpoint = reference.get_location_at(0.5);
-    let color = reference.get_color_a();
-    // Printed rather than logged through `tracing`: the project links its own
-    // copy of `pill_core`, so its tracing dispatcher has no subscriber and log
-    // lines emitted here never reach the host's telemetry.
-    println!(
-        "[project] 12xxsees {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), colorx {:.2}",
-        midpoint.x, midpoint.y, color
-    );
-
-    Ok(())
-}
-
-// =============================================================================
-// Project module entry points
-// =============================================================================
-
-/// Physics state for the `index`-th ball in the spawn sequence.
-///
-/// Balls line up across the play area with alternating travel direction and a
-/// slightly different launch speed each, so they spread out over the box
-/// instead of crossing it as one block.
-fn ball_spawn_state(index: usize) -> PhysicsState {
-    PhysicsState {
-        delta_time: FIXED_DELTA_TIME,
-        position_x: 90.0 + index as f32 * 150.0,
-        position_y: 120.0,
-        velocity_x: if index.is_multiple_of(2) {
-            BOUNCE_VELOCITY_X
-        } else {
-            -BOUNCE_VELOCITY_X
-        },
-        velocity_y: BOUNCE_VELOCITY_Y - index as f32 * 25.0,
-        radius: 10.0 + (index % 4) as f32 * 2.0,
-        active: true,
-    }
 }
 
 /// Registers resources and systems; component registration happens
@@ -400,6 +119,11 @@ pub fn init(engine: &mut Engine) -> u32 {
     // the renderer's own entry point also attaches their editor field layouts,
     // which is what makes a sprite's size and colour editable in the inspector.
     register_components(engine.world_mut());
+
+    if let Err(message) = audio_scene::initialize(engine) {
+        eprintln!("[project] audio initialization failed: {message}");
+        return 1;
+    }
 
     engine.world_mut().insert_resource(SimulationTime {
         last_frame: Instant::now(),
@@ -526,59 +250,4 @@ pub fn init(engine: &mut Engine) -> u32 {
 
     // Report successful registration so the host keeps this generation.
     0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn ball_bounces_off_floor() {
-        let mut state = ball_spawn_state(0);
-        state.position_y = FLOOR_Y - state.radius;
-        state.velocity_y = 100.0;
-
-        simulate_ball(&mut state);
-
-        assert_eq!(state.position_y, FLOOR_Y - state.radius);
-        assert!(state.velocity_y < 0.0);
-    }
-
-    #[test]
-    fn inactive_ball_does_not_move() {
-        let mut state = ball_spawn_state(0);
-        state.active = false;
-        let before = state;
-
-        simulate_ball(&mut state);
-
-        assert_eq!(state.position_x, before.position_x);
-        assert_eq!(state.position_y, before.position_y);
-        assert_eq!(state.velocity_x, before.velocity_x);
-        assert_eq!(state.velocity_y, before.velocity_y);
-    }
-
-    /// A weak floor bounce is restored so balls never settle on the floor.
-    #[test]
-    fn ball_never_rests_on_the_floor() {
-        let mut state = ball_spawn_state(0);
-        state.position_y = FLOOR_Y - state.radius;
-        state.velocity_y = 5.0;
-
-        simulate_ball(&mut state);
-
-        assert!(state.velocity_y <= -MINIMUM_BOUNCE_VELOCITY_Y);
-    }
-
-    /// The dots only draw the whole curve while the last sample reaches
-    /// `t = 1.0`; a step that does not divide 1.0 leaves the tail unmarked.
-    #[test]
-    fn sample_grid_reaches_both_curve_endpoints() {
-        let sample_parameters: Vec<f32> = (0..SPLINE_SAMPLE_COUNT)
-            .map(|index| index as f32 * SPLINE_SAMPLE_STEP)
-            .collect();
-
-        assert_eq!(sample_parameters.first(), Some(&0.0));
-        assert_eq!(sample_parameters.last(), Some(&1.0));
-    }
 }
