@@ -11,6 +11,7 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+pill_audio = { path = "../../modules/extensions/pill_audio", default-features = false }
 pill_engine = { path = "../../modules/pill_engine" }
 pill_core = { path = "../../modules/pill_core" }
 # The renderer, for `Sprite`: a quad with a width, a height and a fill is the

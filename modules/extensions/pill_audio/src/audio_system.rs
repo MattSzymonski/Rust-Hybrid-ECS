@@ -16,7 +16,8 @@
 //! a sound that ended would hold its sink until the entity was destroyed.
 
 // External crates
-use pill_engine::{AssetManager, Position, Query, Res, ResMut, SystemError};
+use crate::AudioLoadQueue;
+use pill_engine::{AssetManager, Position, Query, ResMut, SystemError};
 
 // Current crate
 use crate::audio_command::AudioCommand;
@@ -52,10 +53,22 @@ use crate::sound_type::SoundType;
 /// case; see [`AudioManager::new`].
 pub fn audio_system(
     mut manager: ResMut<AudioManager>,
-    assets: Res<AssetManager>,
+    mut assets: ResMut<AssetManager>,
+    mut loads: ResMut<AudioLoadQueue>,
     mut listeners: Query<(&AudioListenerComponent, &Position)>,
     mut sources: Query<(&mut AudioSourceComponent, &Position)>,
 ) -> Result<(), SystemError> {
+    let Some(mut assets) = assets.get_mut() else {
+        return Ok(());
+    };
+    if let Some(mut loads) = loads.get_mut() {
+        for (name, bytes) in std::mem::take(&mut loads.sounds) {
+            if assets.get_by_name::<Sound>(&name).is_none() {
+                let sound = Sound::from_bytes(std::path::Path::new(&name), bytes);
+                assets.add_named(name, sound);
+            }
+        }
+    }
     // Step 1: find the active listener. One pair of ears, so the first enabled
     // listener wins and the rest are ignored.
     let mut ears = None;
@@ -72,9 +85,6 @@ pub fn audio_system(
     // Absent on a machine with no audio device; the components still exist and
     // their commands simply go unserviced.
     let Some(mut manager) = manager.get_mut() else {
-        return Ok(());
-    };
-    let Some(assets) = assets.get() else {
         return Ok(());
     };
 

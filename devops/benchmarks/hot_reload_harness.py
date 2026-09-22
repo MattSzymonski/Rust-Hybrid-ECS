@@ -20,7 +20,7 @@ DESCRIPTION
                            reload is followed by a queued project reload.
       * cascade_total    - same edit -> the cascaded project reload line
                            (module + project = the full user-visible cost).
-      * project_reload   - editing `examples/project_rs/src/lib.rs` directly
+      * project_reload   - editing `examples/project_rs/src/settings.rs` directly
                            (project-only, no module cascade).
       * csharp_reload    - editing `examples/project_cs/src/Systems.cs` ->
                            `C# hot reload complete` (dotnet build + collectible
@@ -97,7 +97,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # =============================================================================
 
 SPLINE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "src" / "lib.rs"
-PROJECT_RS_LIB_RS = WORKSPACE_ROOT / "examples" / "project_rs" / "src" / "lib.rs"
+PROJECT_RS_SETTINGS_RS = WORKSPACE_ROOT / "examples" / "project_rs" / "src" / "settings.rs"
 PROJECT_CS_SYSTEMS_CS = WORKSPACE_ROOT / "examples" / "project_cs" / "src" / "Systems.cs"
 
 NATIVE_SETTINGS = """\
@@ -161,7 +161,7 @@ SPLINE_EDIT = EditHook(
 # Direct project edit (project-only reload, no module cascade).
 PROJECT_EDIT = EditHook(
     label="project_reload",
-    path=PROJECT_RS_LIB_RS,
+    path=PROJECT_RS_SETTINGS_RS,
     edit=("BOUNCE_VELOCITY_Y: f32 = -800.0", "BOUNCE_VELOCITY_Y: f32 = -801.0"),
     wait_token="[analytics] reload project ",
     settle_token="[analytics] reload project ",
@@ -207,7 +207,7 @@ CSHARP_EDIT = EditHook(
 
 PREREQUISITE_FILES = [
     ("pill_spline module source", SPLINE_LIB_RS, "native"),
-    ("project_rs source", PROJECT_RS_LIB_RS, "native"),
+    ("project_rs source", PROJECT_RS_SETTINGS_RS, "native"),
     ("project_cs source", PROJECT_CS_SYSTEMS_CS, "csharp"),
     ("project_rs settings", project_settings_yaml(NATIVE_PROJECT_ROOT), "native"),
     ("project_cs settings", project_settings_yaml(CSHARP_PROJECT_ROOT), "csharp"),
@@ -215,7 +215,7 @@ PREREQUISITE_FILES = [
 
 PREREQUISITE_ANCHORS = [
     ("pill_spline constant", SPLINE_LIB_RS, SPLINE_EDIT.edit[0], "native"),
-    ("project_rs constant", PROJECT_RS_LIB_RS, PROJECT_EDIT.edit[0], "native"),
+    ("project_rs constant", PROJECT_RS_SETTINGS_RS, PROJECT_EDIT.edit[0], "native"),
     ("project_cs probe prefix", PROJECT_CS_SYSTEMS_CS, CSHARP_EDIT.edit[0], "csharp"),
 ]
 
@@ -258,7 +258,7 @@ def verify_prerequisites(run_native: bool, run_csharp: bool) -> bool:
     print("  The script triggers each reload by editing a specific constant in a specific")
     print("  module/project file. If the layout changed (an extension was deleted or")
     print("  renamed, a project moved, or a constant renamed), update the paths and edit")
-    print("  anchors at the top of this file (SPLINE_LIB_RS, PROJECT_RS_LIB_RS,")
+    print("  anchors at the top of this file (SPLINE_LIB_RS, PROJECT_RS_SETTINGS_RS,")
     print("  PROJECT_CS_SYSTEMS_CS and the EditHook definitions), or use --native-only /")
     print("  --csharp-only to measure only the session whose layout still matches.")
     print("  Problems found:")
@@ -909,7 +909,7 @@ def main() -> None:
         project_settings_yaml(NATIVE_PROJECT_ROOT),
         project_settings_yaml(CSHARP_PROJECT_ROOT),
         SPLINE_LIB_RS,
-        PROJECT_RS_LIB_RS,
+        PROJECT_RS_SETTINGS_RS,
         PROJECT_CS_SYSTEMS_CS,
     ):
         BACKUP.capture(path)

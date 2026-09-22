@@ -17,3 +17,4 @@ description: "Hot-reloadable bouncing-ball ECS example project."
 
 modules:
   - "pill_spline"
+  - "pill_audio"

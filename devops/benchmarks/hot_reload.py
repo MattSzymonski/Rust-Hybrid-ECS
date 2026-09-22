@@ -207,7 +207,7 @@ def run(
         harness.project_settings_yaml(harness.NATIVE_PROJECT_ROOT),
         harness.project_settings_yaml(harness.CSHARP_PROJECT_ROOT),
         harness.SPLINE_LIB_RS,
-        harness.PROJECT_RS_LIB_RS,
+        harness.PROJECT_RS_SETTINGS_RS,
         harness.PROJECT_CS_SYSTEMS_CS,
     ):
         harness.BACKUP.capture(path)
