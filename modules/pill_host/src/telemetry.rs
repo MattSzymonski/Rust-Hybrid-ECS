@@ -53,7 +53,7 @@ pub fn init_telemetry(
         // Scratch `engine::dev` logs are excluded from the file lane.
         let file_config = LoggingConfig::default_engine()
             .with_directive(DEV_LOG_TARGET, LevelFilter::OFF)
-            .with_directive(telemetry_target::RENDERING, LevelFilter::DEBUG);
+            .with_directive(telemetry_target::RENDERING, LevelFilter::OFF);
         builder = builder.with_file_output(file_config, directory);
     }
 

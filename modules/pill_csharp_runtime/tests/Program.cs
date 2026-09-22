@@ -737,8 +737,8 @@ internal static class Program
                 Equal(Marshal.SizeOf<Position>(), 8, "Position size mismatch");
                 Equal(Marshal.SizeOf<Color>(), 16, "Color size mismatch");
                 Equal(Marshal.SizeOf<MeshRendererComponent>(), 16, "MeshRendererComponent size mismatch");
-                Equal(Marshal.OffsetOf<MeshRendererComponent>(nameof(MeshRendererComponent.Material)).ToInt32(), 8,
-                    "MeshRendererComponent.Material offset mismatch");
+                Equal(Marshal.OffsetOf<MeshRendererComponent>(nameof(MeshRendererComponent.MaterialIndex)).ToInt32(), 8,
+                    "MeshRendererComponent.MaterialIndex offset mismatch");
             });
 
             Test("padded sequential layouts agree with Marshal", () =>

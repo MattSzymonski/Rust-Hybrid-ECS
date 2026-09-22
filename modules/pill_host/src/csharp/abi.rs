@@ -26,6 +26,10 @@ use super::commands::{
     ffi_queue_add_component, ffi_queue_create, ffi_queue_destroy, ffi_queue_remove_component,
     ffi_reserve_entity,
 };
+use super::assets::{
+    NativeMaterialColor, NativeMaterialScalar, NativeMaterialTexture, NativeShaderParameterSlot,
+    NativeShaderTextureSlot,
+};
 use super::queries::{
     ffi_entity_count, ffi_get_archetype_chunk, ffi_get_component_chunk, ffi_get_entity_chunk,
 };
@@ -176,6 +180,45 @@ pub(super) struct CsEngineApi {
     /// purpose: the managed mirror struct reproduces this field order, so a new
     /// slot goes at the end rather than between existing ones.
     get_resource_view: extern "C" fn(u64, u64, u8, *mut ResourceView) -> u8,
+    /// Decode a Wavefront OBJ buffer into a mesh, inserted into the active
+    /// invocation's `AssetManager`. Status `0` succeeded; see
+    /// `assets::ffi_asset_load_mesh_obj` for the rest.
+    asset_load_mesh_obj: extern "C" fn(*const u8, u32, *const u8, u32, *mut u32, *mut u32) -> u8,
+    /// Decode a PNG buffer into a color texture, inserted the same way.
+    asset_load_texture_png: extern "C" fn(*const u8, u32, *const u8, u32, *mut u32, *mut u32) -> u8,
+    /// Build a shader from managed WGSL sources and slot declarations.
+    asset_load_shader: extern "C" fn(
+        *const u8,
+        u32,
+        *const u8,
+        u32,
+        *const u8,
+        u32,
+        *const NativeShaderParameterSlot,
+        u32,
+        *const NativeShaderTextureSlot,
+        u32,
+        u8,
+        u8,
+        *mut u32,
+        *mut u32,
+    ) -> u8,
+    /// Build a material from already-loaded handles and per-slot parameters.
+    asset_create_material: extern "C" fn(
+        *const u8,
+        u32,
+        u32,
+        u32,
+        *const NativeMaterialTexture,
+        u32,
+        *const NativeMaterialScalar,
+        u32,
+        *const NativeMaterialColor,
+        u32,
+        u8,
+        *mut u32,
+        *mut u32,
+    ) -> u8,
 }
 
 impl CsEngineApi {
@@ -204,6 +247,10 @@ impl CsEngineApi {
             current_scope_token: super::context::ffi_current_scope_token,
             mirror_epoch: ffi_mirror_epoch,
             get_resource_view: super::resources::ffi_get_resource_view,
+            asset_load_mesh_obj: super::assets::ffi_asset_load_mesh_obj,
+            asset_load_texture_png: super::assets::ffi_asset_load_texture_png,
+            asset_load_shader: super::assets::ffi_asset_load_shader,
+            asset_create_material: super::assets::ffi_asset_create_material,
         }
     }
 }

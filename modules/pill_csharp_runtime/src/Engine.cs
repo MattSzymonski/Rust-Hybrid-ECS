@@ -664,6 +664,265 @@ public static unsafe class Engine
         }
         return hash;
     }
+
+    // =========================================================================
+    // Asset loading
+    // =========================================================================
+
+    /// <summary>
+    /// Decodes a Wavefront OBJ buffer into a mesh and inserts it into the
+    /// active invocation's <c>AssetManager</c>.
+    /// </summary>
+    /// <remarks>
+    /// Only valid from inside an active invocation - ordinarily an
+    /// <see cref="EcsStartupAttribute"/> method, the managed equivalent of the
+    /// Rust project's own one-time asset loading.
+    /// </remarks>
+    public static AssetHandle LoadMeshObj(string name, ReadOnlySpan<byte> objBytes)
+    {
+        byte[] nameBytes = Encoding.UTF8.GetBytes(name);
+        uint index, generation;
+        byte status;
+        fixed (byte* namePointer = nameBytes)
+        fixed (byte* bytesPointer = objBytes)
+        {
+            status = _api.AssetLoadMeshObj(
+                namePointer, (uint)nameBytes.Length,
+                bytesPointer, (uint)objBytes.Length,
+                &index, &generation);
+        }
+        ValidateAssetStatus(status, $"load mesh \"{name}\"");
+        return new AssetHandle(index, generation);
+    }
+
+    /// <summary>
+    /// Decodes a PNG buffer into a color texture and inserts it into the
+    /// active invocation's <c>AssetManager</c>. Same invocation contract as
+    /// <see cref="LoadMeshObj"/>.
+    /// </summary>
+    public static AssetHandle LoadTexturePng(string name, ReadOnlySpan<byte> pngBytes)
+    {
+        byte[] nameBytes = Encoding.UTF8.GetBytes(name);
+        uint index, generation;
+        byte status;
+        fixed (byte* namePointer = nameBytes)
+        fixed (byte* bytesPointer = pngBytes)
+        {
+            status = _api.AssetLoadTexturePng(
+                namePointer, (uint)nameBytes.Length,
+                bytesPointer, (uint)pngBytes.Length,
+                &index, &generation);
+        }
+        ValidateAssetStatus(status, $"load texture \"{name}\"");
+        return new AssetHandle(index, generation);
+    }
+
+    /// <summary>
+    /// Builds a shader from managed WGSL sources and slot declarations, and
+    /// inserts it into the active invocation's <c>AssetManager</c>. Same
+    /// invocation contract as <see cref="LoadMeshObj"/>.
+    /// </summary>
+    public static AssetHandle LoadShader(
+        string name,
+        string vertexWgsl,
+        string fragmentWgsl,
+        ReadOnlySpan<ShaderParameter> parameters,
+        ReadOnlySpan<ShaderTextureBinding> textures,
+        bool passEngineParameters,
+        bool passCameraParameters)
+    {
+        byte[] nameBytes = Encoding.UTF8.GetBytes(name);
+        byte[] vertexBytes = Encoding.UTF8.GetBytes(vertexWgsl);
+        byte[] fragmentBytes = Encoding.UTF8.GetBytes(fragmentWgsl);
+
+        // Every nested name needs its own pinned buffer alive for the whole
+        // call, so they are collected up front rather than pinned one at a
+        // time inside the loop that fills the native slot arrays.
+        byte[][] parameterNameBytes = new byte[parameters.Length][];
+        for (int i = 0; i < parameters.Length; i++)
+            parameterNameBytes[i] = Encoding.UTF8.GetBytes(parameters[i].Name);
+        byte[][] textureNameBytes = new byte[textures.Length][];
+        for (int i = 0; i < textures.Length; i++)
+            textureNameBytes[i] = Encoding.UTF8.GetBytes(textures[i].Name);
+
+        Span<GCHandle> parameterNamePins = new GCHandle[parameters.Length];
+        Span<GCHandle> textureNamePins = new GCHandle[textures.Length];
+        uint index, generation;
+        byte status;
+        try
+        {
+            var nativeParameters = new NativeShaderParameterSlot[parameters.Length];
+            for (int i = 0; i < parameters.Length; i++)
+            {
+                parameterNamePins[i] = GCHandle.Alloc(parameterNameBytes[i], GCHandleType.Pinned);
+                nativeParameters[i] = new NativeShaderParameterSlot
+                {
+                    Name = (byte*)parameterNamePins[i].AddrOfPinnedObject(),
+                    NameLen = (uint)parameterNameBytes[i].Length,
+                    Kind = (byte)parameters[i].Kind,
+                };
+            }
+
+            var nativeTextures = new NativeShaderTextureSlot[textures.Length];
+            for (int i = 0; i < textures.Length; i++)
+            {
+                textureNamePins[i] = GCHandle.Alloc(textureNameBytes[i], GCHandleType.Pinned);
+                nativeTextures[i] = new NativeShaderTextureSlot
+                {
+                    Name = (byte*)textureNamePins[i].AddrOfPinnedObject(),
+                    NameLen = (uint)textureNameBytes[i].Length,
+                    TextureBinding = textures[i].TextureBinding,
+                    SamplerBinding = textures[i].SamplerBinding,
+                };
+            }
+
+            fixed (byte* namePointer = nameBytes)
+            fixed (byte* vertexPointer = vertexBytes)
+            fixed (byte* fragmentPointer = fragmentBytes)
+            fixed (NativeShaderParameterSlot* parametersPointer = nativeParameters)
+            fixed (NativeShaderTextureSlot* texturesPointer = nativeTextures)
+            {
+                status = _api.AssetLoadShader(
+                    namePointer, (uint)nameBytes.Length,
+                    vertexPointer, (uint)vertexBytes.Length,
+                    fragmentPointer, (uint)fragmentBytes.Length,
+                    parametersPointer, (uint)nativeParameters.Length,
+                    texturesPointer, (uint)nativeTextures.Length,
+                    passEngineParameters ? (byte)1 : (byte)0,
+                    passCameraParameters ? (byte)1 : (byte)0,
+                    &index, &generation);
+            }
+        }
+        finally
+        {
+            foreach (GCHandle pin in parameterNamePins)
+                if (pin.IsAllocated) pin.Free();
+            foreach (GCHandle pin in textureNamePins)
+                if (pin.IsAllocated) pin.Free();
+        }
+        ValidateAssetStatus(status, $"load shader \"{name}\"");
+        return new AssetHandle(index, generation);
+    }
+
+    /// <summary>
+    /// Builds a material from already-loaded handles and per-slot parameters,
+    /// and inserts it into the active invocation's <c>AssetManager</c>. Same
+    /// invocation contract as <see cref="LoadMeshObj"/>.
+    /// </summary>
+    /// <param name="shader">
+    /// The shader to render with, or <see cref="AssetHandle.None"/> to leave
+    /// the renderer's default shader in place.
+    /// </param>
+    public static AssetHandle CreateMaterial(
+        string name,
+        AssetHandle shader,
+        ReadOnlySpan<MaterialTextureBinding> textures,
+        ReadOnlySpan<MaterialScalarParameter> scalars,
+        ReadOnlySpan<MaterialColorParameter> colors,
+        byte renderingOrder = byte.MaxValue)
+    {
+        byte[] nameBytes = Encoding.UTF8.GetBytes(name);
+
+        byte[][] textureSlotBytes = new byte[textures.Length][];
+        for (int i = 0; i < textures.Length; i++)
+            textureSlotBytes[i] = Encoding.UTF8.GetBytes(textures[i].Slot);
+        byte[][] scalarNameBytes = new byte[scalars.Length][];
+        for (int i = 0; i < scalars.Length; i++)
+            scalarNameBytes[i] = Encoding.UTF8.GetBytes(scalars[i].Name);
+        byte[][] colorNameBytes = new byte[colors.Length][];
+        for (int i = 0; i < colors.Length; i++)
+            colorNameBytes[i] = Encoding.UTF8.GetBytes(colors[i].Name);
+
+        Span<GCHandle> texturePins = new GCHandle[textures.Length];
+        Span<GCHandle> scalarPins = new GCHandle[scalars.Length];
+        Span<GCHandle> colorPins = new GCHandle[colors.Length];
+        uint index, generation;
+        byte status;
+        try
+        {
+            var nativeTextures = new NativeMaterialTexture[textures.Length];
+            for (int i = 0; i < textures.Length; i++)
+            {
+                texturePins[i] = GCHandle.Alloc(textureSlotBytes[i], GCHandleType.Pinned);
+                nativeTextures[i] = new NativeMaterialTexture
+                {
+                    Slot = (byte*)texturePins[i].AddrOfPinnedObject(),
+                    SlotLen = (uint)textureSlotBytes[i].Length,
+                    TextureIndex = textures[i].Texture.Index,
+                    TextureGeneration = textures[i].Texture.Generation,
+                };
+            }
+
+            var nativeScalars = new NativeMaterialScalar[scalars.Length];
+            for (int i = 0; i < scalars.Length; i++)
+            {
+                scalarPins[i] = GCHandle.Alloc(scalarNameBytes[i], GCHandleType.Pinned);
+                nativeScalars[i] = new NativeMaterialScalar
+                {
+                    Name = (byte*)scalarPins[i].AddrOfPinnedObject(),
+                    NameLen = (uint)scalarNameBytes[i].Length,
+                    Value = scalars[i].Value,
+                };
+            }
+
+            var nativeColors = new NativeMaterialColor[colors.Length];
+            for (int i = 0; i < colors.Length; i++)
+            {
+                colorPins[i] = GCHandle.Alloc(colorNameBytes[i], GCHandleType.Pinned);
+                nativeColors[i] = new NativeMaterialColor
+                {
+                    Name = (byte*)colorPins[i].AddrOfPinnedObject(),
+                    NameLen = (uint)colorNameBytes[i].Length,
+                    R = colors[i].R,
+                    G = colors[i].G,
+                    B = colors[i].B,
+                };
+            }
+
+            fixed (byte* namePointer = nameBytes)
+            fixed (NativeMaterialTexture* texturesPointer = nativeTextures)
+            fixed (NativeMaterialScalar* scalarsPointer = nativeScalars)
+            fixed (NativeMaterialColor* colorsPointer = nativeColors)
+            {
+                status = _api.AssetCreateMaterial(
+                    namePointer, (uint)nameBytes.Length,
+                    shader.Index, shader.Generation,
+                    texturesPointer, (uint)nativeTextures.Length,
+                    scalarsPointer, (uint)nativeScalars.Length,
+                    colorsPointer, (uint)nativeColors.Length,
+                    renderingOrder,
+                    &index, &generation);
+            }
+        }
+        finally
+        {
+            foreach (GCHandle pin in texturePins)
+                if (pin.IsAllocated) pin.Free();
+            foreach (GCHandle pin in scalarPins)
+                if (pin.IsAllocated) pin.Free();
+            foreach (GCHandle pin in colorPins)
+                if (pin.IsAllocated) pin.Free();
+        }
+        ValidateAssetStatus(status, $"create material \"{name}\"");
+        return new AssetHandle(index, generation);
+    }
+
+    private static void ValidateAssetStatus(byte status, string operation)
+    {
+        if (status == 0)
+            return;
+        string reason = status switch
+        {
+            1 => "no managed invocation is active (asset loading needs an [EcsStartup] method)",
+            2 => "the engine's AssetManager resource is missing",
+            3 => "a supplied string was not valid UTF-8",
+            4 => "the source data failed to decode",
+            5 => "a required buffer was null",
+            6 => "this host build has no renderer, so no asset types exist to load into",
+            _ => $"native status {status}",
+        };
+        throw new InvalidOperationException($"Could not {operation}: {reason}.");
+    }
 }
 
 internal readonly record struct StableComponentId(ulong Low, ulong High);

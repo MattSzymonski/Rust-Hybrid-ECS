@@ -4859,6 +4859,7 @@ dependencies = [
  "pollster",
  "serde",
  "thiserror 2.0.20",
+ "tobj",
  "trait_type_map",
  "wgpu",
  "winit",

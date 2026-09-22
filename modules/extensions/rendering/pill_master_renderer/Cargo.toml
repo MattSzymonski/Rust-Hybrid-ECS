@@ -24,6 +24,7 @@ bytemuck = { version = "1.4", features = ["derive"] }
 wgpu = "25.0.0"
 pollster = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"] }
+tobj = "3"
 
 egui = { version = "0.32.1", optional = true }
 egui-wgpu = { version = "0.32.1", features = ["winit"], optional = true }
