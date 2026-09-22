@@ -28,7 +28,7 @@
 //! ## Reference-counted handles, copy-on-write
 //!
 //! `DynamicBuffer` keeps its elements in a block owned by
-//! [`pill_core::native_buffer`]: memory whose address never changes while the
+//! [`crate::native_buffer`]: memory whose address never changes while the
 //! block is alive, and whose free path is the shared allocation service rather
 //! than whatever code happens to be current. `Clone` *retains* the block - the
 //! clone shares it, address and all - so duplicating a component duplicates
@@ -63,7 +63,7 @@
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 
-use pill_core::native_buffer;
+use crate::native_buffer;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 // =============================================================================

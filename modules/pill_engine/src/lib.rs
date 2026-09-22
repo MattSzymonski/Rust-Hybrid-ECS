@@ -69,9 +69,15 @@ pub mod config;
 /// frames.
 pub mod diagnostics;
 
-/// Engine-owned native dynamic buffer: variable-length component data whose
-/// `(ptr, len, cap)` handle managed code reads straight out of the row.
-pub mod dynamic_buffer;
+/// Engine-owned native dynamic buffer, re-exported from `pill_core`.
+///
+/// The type lives beside the allocation service that owns its blocks, so a
+/// module can name it without depending on the whole ECS. Re-exported here
+/// because a component field is what it is for, and every existing
+/// `pill_engine::DynamicBuffer` import keeps resolving.
+pub mod dynamic_buffer {
+    pub use pill_core::dynamic_buffer::*;
+}
 
 /// System registration, frame execution, and parallel dispatch orchestration.
 pub mod engine;
@@ -118,14 +124,14 @@ pub mod world;
 
 // Core engine types re-exported for single-import usage.
 pub use api::EngineApi;
-pub use asset::{Asset, AssetManager, Handle};
+pub use asset::{Asset, AssetGuid, AssetManager, Handle};
 pub use commands::{CommandError, Commands};
 pub use common_components::{
     register_common_components, Color, Position, COLOR_FIELD_LAYOUT, POSITION_FIELD_LAYOUT,
 };
 pub use component::{Component, ComponentId, ComponentTicks, Tick};
 pub use component_field::{ComponentFieldError, FieldValue};
-pub use dynamic_buffer::DynamicBuffer;
+pub use pill_core::DynamicBuffer;
 pub use engine::{Engine, SystemOwner, SystemSnapshot};
 pub use entity::Entity;
 pub use error::{EngineError, SystemError, SystemFailure};

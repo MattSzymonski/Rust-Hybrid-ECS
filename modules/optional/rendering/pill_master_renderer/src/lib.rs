@@ -8,6 +8,7 @@
 //!   ([`Renderer`]).
 //! - Owns the sprite render pipeline and its GPU buffers ([`SpriteRenderer`]).
 //! - Declares the rendering failure type ([`RendererError`]).
+//! - Declares [`GpuTexture`], a GPU texture the engine holds as a resource.
 //!
 //! # Design
 //!
@@ -58,6 +59,10 @@ pub mod renderer;
 #[cfg(feature = "gpu")]
 pub mod sprite;
 
+/// A GPU texture stored in the world as an engine resource.
+#[cfg(feature = "gpu")]
+pub mod texture;
+
 // The renderer's public surface, so callers name `pill_master_renderer::Sprite`
 // rather than reaching through the module that happens to declare it.
 // `Position` and `Color` are the engine's - every renderer and most
@@ -78,3 +83,5 @@ pub use error::RendererError;
 pub use renderer::{Renderer, RendererWindow};
 #[cfg(feature = "gpu")]
 pub use sprite::SpriteRenderer;
+#[cfg(feature = "gpu")]
+pub use texture::GpuTexture;

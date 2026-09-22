@@ -168,6 +168,23 @@ impl Renderer {
         (self.surface_config.width, self.surface_config.height)
     }
 
+    /// The logical GPU device, for building resources this renderer will draw.
+    ///
+    /// Exposed so a caller can construct something like
+    /// [`GpuTexture`](crate::texture::GpuTexture) and hand it to the engine.
+    /// A texture must come from the same device that renders it, and this
+    /// renderer owns the only one, so the alternative would be every resource
+    /// type growing a constructor here.
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// The command queue, for uploads into resources built from
+    /// [`device`](Self::device).
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
+    }
+
     /// Restrict rendering to a physical-pixel rectangle within the surface.
     ///
     /// Passing `None` restores full-surface rendering. Frontends embedding the

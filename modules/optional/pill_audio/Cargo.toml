@@ -1,0 +1,48 @@
+[package]
+name = "pill_audio"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+[lib]
+# The crate root is named after the crate rather than `lib.rs`. Every crate in
+# the dependency graph has a `src/lib.rs`, and the Windows debugger falls back
+# to matching a breakpoint by file name when the owning module is not mapped -
+# always true for a module the host loads at runtime - so a shared name gives
+# it hundreds of wrong candidates. `pill_hot_scan` reads this key to know
+# which file is the root and emits no module segment for it.
+path = "src/pill_audio.rs"
+# `cdylib` is the artifact the host loads and hot swaps at runtime. `rlib` is
+# kept both for monolithic release builds and so a project can depend on this
+# crate directly to name `AudioSource` in a query.
+crate-type = ["cdylib", "rlib"]
+
+[build-dependencies]
+pill_hot_scan = { path = "../../pill_hot_scan" }
+
+[dependencies]
+pill_core = { path = "../../pill_core" }
+pill_engine = { path = "../../pill_engine" }
+# `impl_trait_accessible!`, which registers `Sound` with the type-erased asset
+# columns. The engine depends on it too, and both must be the same crate for
+# the trait objects to match.
+trait_type_map = { path = "../../../../Trait-Type-Map" }
+serde = { version = "1", features = ["derive"] }
+# The audio backend. Not optional: whether a project has audio at all is
+# decided by whether it loads this module, so a second switch inside the crate
+# would only be a way for the two to disagree. A project that wants no audio
+# stack in its dependency graph leaves the module out.
+rodio = "0.20"
+
+[features]
+default = []
+# `module-abi` is opt-in, not a default: building every member in one cargo
+# invocation (e.g. `cargo build --workspace`) must not turn on the
+# `#[no_mangle]` `pill_module_*` exports for a module's dependency copies.
+# Cargo's feature unification would otherwise leak the default onto those
+# copies and produce duplicate symbols whenever one module links another in
+# the same build. The host passes `--features module-abi` itself when it
+# builds the loadable module.
+module-abi = []

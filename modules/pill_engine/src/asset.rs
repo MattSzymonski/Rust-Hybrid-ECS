@@ -179,6 +179,61 @@ struct AssetColumn {
     /// Reverse of `by_name`, so freeing a slot can drop its name without
     /// scanning the whole map.
     names: HashMap<u32, String>,
+    /// Guid lookup, holding the index exactly as `by_name` does.
+    ///
+    /// A separate map rather than hashing the name at lookup time: a guid may
+    /// be assigned without a name (an asset cooked to an id), and the two
+    /// namespaces must not alias.
+    by_guid: HashMap<AssetGuid, u32>,
+    /// Reverse of `by_guid`, so freeing a slot can drop its guid without
+    /// scanning the whole map.
+    guids: HashMap<u32, AssetGuid>,
+}
+
+// =============================================================================
+// AssetGuid
+// =============================================================================
+
+/// Stable 128-bit identity of one asset.
+///
+/// A name is what a human writes and a scene file carries; a guid is what
+/// survives a rename. Both address the same slot - [`AssetManager`] keeps an
+/// index for each - and an asset may carry either, both, or neither.
+///
+/// [`AssetGuid::from_name`] derives one from a string with the same FNV-1a
+/// construction a shared component identity uses, so a cooking step and the
+/// runtime compute the same value from the same canonical name without
+/// exchanging anything. A guid assigned by a pipeline, from a file or a
+/// database, is passed to [`AssetGuid::new`] instead and is not required to
+/// relate to any name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AssetGuid(u128);
+
+impl AssetGuid {
+    /// Wrap a guid a cooking pipeline or content database already assigned.
+    pub const fn new(value: u128) -> Self {
+        Self(value)
+    }
+
+    /// Derive a guid from a name, reusing the shared-identity hash.
+    ///
+    /// The same function components use for their stable names, so one
+    /// canonical string yields one identity everywhere: in a build step, in
+    /// the host, and in a module compiled separately from either.
+    pub const fn from_name(name: &str) -> Self {
+        Self(crate::component::shared_component_identity(name))
+    }
+
+    /// The raw 128-bit value.
+    pub const fn value(self) -> u128 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for AssetGuid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:032x}", self.0)
+    }
 }
 
 // =============================================================================
@@ -306,6 +361,57 @@ impl AssetManager {
         handle
     }
 
+    /// Store `asset` under `guid` and return a handle to it.
+    ///
+    /// The guid twin of [`Self::add_named`], and it rebinds the same way: a
+    /// guid already in use points at the new asset and leaves the old one
+    /// reachable by its handle. Nothing is unloaded.
+    pub fn add_with_guid<T>(&mut self, guid: AssetGuid, asset: T) -> Handle<T>
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        let handle = self.add(asset);
+        self.bind_guid::<T>(guid, handle.index);
+        handle
+    }
+
+    /// Store `asset` under both a name and a guid.
+    ///
+    /// The usual shape for a cooked asset: the name is what a scene file
+    /// writes, the guid is what survives the name changing.
+    pub fn add_named_with_guid<T>(
+        &mut self,
+        name: impl Into<String>,
+        guid: AssetGuid,
+        asset: T,
+    ) -> Handle<T>
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        let handle = self.add_named(name, asset);
+        self.bind_guid::<T>(guid, handle.index);
+        handle
+    }
+
+    /// Point `guid` at the asset already living in `index`.
+    ///
+    /// Shared by the two guid-assigning entry points. Drops any previous
+    /// reverse entry so `guids` cannot accumulate stale index -> guid pairs
+    /// when a guid is rebound, exactly as `add_named` does for names.
+    fn bind_guid<T>(&mut self, guid: AssetGuid, index: u32)
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        let metadata = self
+            .metadata
+            .get_mut(&TypeId::of::<T>())
+            .expect("add created the column metadata");
+        if let Some(previous_index) = metadata.by_guid.insert(guid, index) {
+            metadata.guids.remove(&previous_index);
+        }
+        metadata.guids.insert(index, guid);
+    }
+
     /// Borrow the asset `handle` refers to, or `None` when it is stale.
     pub fn get<T>(&self, handle: Handle<T>) -> Option<&T>
     where
@@ -352,6 +458,74 @@ impl AssetManager {
         self.get(self.handle_by_name::<T>(name)?)
     }
 
+    /// Resolve a guid to a live handle, or `None` when nothing holds it.
+    pub fn handle_by_guid<T>(&self, guid: AssetGuid) -> Option<Handle<T>>
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        let metadata = self.metadata.get(&TypeId::of::<T>())?;
+        let index = *metadata.by_guid.get(&guid)?;
+        Some(Handle {
+            index,
+            generation: *metadata.generations.get(index as usize)?,
+            _marker: PhantomData,
+        })
+    }
+
+    /// Borrow an asset by guid, or `None` when nothing holds it.
+    pub fn get_by_guid<T>(&self, guid: AssetGuid) -> Option<&T>
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        self.get(self.handle_by_guid::<T>(guid)?)
+    }
+
+    /// Mutably borrow an asset by name, or `None` when nothing holds it.
+    pub fn get_by_name_mut<T>(&mut self, name: &str) -> Option<&mut T>
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        self.get_mut(self.handle_by_name::<T>(name)?)
+    }
+
+    /// Mutably borrow an asset by guid, or `None` when nothing holds it.
+    pub fn get_by_guid_mut<T>(&mut self, guid: AssetGuid) -> Option<&mut T>
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        self.get_mut(self.handle_by_guid::<T>(guid)?)
+    }
+
+    /// The name `handle` was stored under, or `None` when it has none.
+    pub fn name_of<T>(&self, handle: Handle<T>) -> Option<&str>
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        if !self.is_live(handle) {
+            return None;
+        }
+        self.metadata
+            .get(&TypeId::of::<T>())?
+            .names
+            .get(&handle.index)
+            .map(String::as_str)
+    }
+
+    /// The guid `handle` was stored under, or `None` when it has none.
+    pub fn guid_of<T>(&self, handle: Handle<T>) -> Option<AssetGuid>
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        if !self.is_live(handle) {
+            return None;
+        }
+        self.metadata
+            .get(&TypeId::of::<T>())?
+            .guids
+            .get(&handle.index)
+            .copied()
+    }
+
     /// Remove and return the asset `handle` refers to.
     ///
     /// The slot is freed and its generation bumped, so every outstanding handle
@@ -387,6 +561,9 @@ impl AssetManager {
 
         if let Some(name) = metadata.names.remove(&handle.index) {
             metadata.by_name.remove(&name);
+        }
+        if let Some(guid) = metadata.guids.remove(&handle.index) {
+            metadata.by_guid.remove(&guid);
         }
 
         Some(asset)
@@ -518,6 +695,121 @@ mod tests {
     struct Texture(u32);
     impl Asset for Texture {}
     impl_trait_accessible!(dyn Asset; Texture);
+
+    /// A guid resolves to the asset stored under it, and the two namespaces
+    /// are independent: a name lookup does not answer a guid and vice versa.
+    #[test]
+    fn resolves_an_asset_by_guid() {
+        let mut assets = AssetManager::new();
+        let guid = AssetGuid::from_name("textures/grass");
+        let grass = assets.add_with_guid(guid, Texture(7));
+
+        assert_eq!(assets.get_by_guid::<Texture>(guid), Some(&Texture(7)));
+        assert_eq!(assets.handle_by_guid::<Texture>(guid), Some(grass));
+        // Stored with a guid alone, so no name resolves to it.
+        assert_eq!(assets.get_by_name::<Texture>("textures/grass"), None);
+    }
+
+    /// The usual cooked-asset shape: both keys address the same slot.
+    #[test]
+    fn name_and_guid_address_one_asset() {
+        let mut assets = AssetManager::new();
+        let guid = AssetGuid::new(0xdead_beef);
+        let handle = assets.add_named_with_guid("grass", guid, Texture(1));
+
+        assert_eq!(assets.handle_by_name::<Texture>("grass"), Some(handle));
+        assert_eq!(assets.handle_by_guid::<Texture>(guid), Some(handle));
+        assert_eq!(assets.name_of(handle), Some("grass"));
+        assert_eq!(assets.guid_of(handle), Some(guid));
+    }
+
+    /// Freeing a slot must drop its guid entry, or the next asset to land in
+    /// that slot would answer the dead guid - the wrong-asset failure the
+    /// generational handle exists to prevent, reintroduced through the index.
+    #[test]
+    fn removing_an_asset_releases_its_guid() {
+        let mut assets = AssetManager::new();
+        let guid = AssetGuid::from_name("textures/grass");
+        let grass = assets.add_with_guid(guid, Texture(7));
+
+        assets.remove(grass);
+        assert_eq!(assets.get_by_guid::<Texture>(guid), None);
+
+        // The freed slot is reused; the stale guid must not reach the new value.
+        let stone = assets.add(Texture(9));
+        assert_eq!(stone.index(), grass.index());
+        assert_eq!(assets.get_by_guid::<Texture>(guid), None);
+        assert_eq!(assets.guid_of(stone), None);
+    }
+
+    /// Rebinding points the guid at the new asset and leaves the old one
+    /// reachable by handle, matching how `add_named` treats a name.
+    #[test]
+    fn rebinding_a_guid_moves_it_to_the_new_asset() {
+        let mut assets = AssetManager::new();
+        let guid = AssetGuid::new(42);
+        let first = assets.add_with_guid(guid, Texture(1));
+        let second = assets.add_with_guid(guid, Texture(2));
+
+        assert_eq!(assets.get_by_guid::<Texture>(guid), Some(&Texture(2)));
+        assert_eq!(assets.get(first), Some(&Texture(1)));
+        // The displaced asset keeps its slot but no longer claims the guid.
+        assert_eq!(assets.guid_of(first), None);
+        assert_eq!(assets.guid_of(second), Some(guid));
+    }
+
+    /// Guids are per-type, like every other column key: one value does not
+    /// collide across two asset types.
+    #[test]
+    fn guids_do_not_collide_across_types() {
+        let mut assets = AssetManager::new();
+        let guid = AssetGuid::new(1);
+        assets.add_with_guid(guid, Texture(5));
+        assets.add_with_guid(guid, Mesh("rock"));
+
+        assert_eq!(assets.get_by_guid::<Texture>(guid), Some(&Texture(5)));
+        assert_eq!(assets.get_by_guid::<Mesh>(guid), Some(&Mesh("rock")));
+    }
+
+    /// The name hash is a fixed function of the bytes, which is what lets a
+    /// cooking step and the runtime derive one identity from one name.
+    #[test]
+    fn guid_from_name_is_stable_and_distinguishing() {
+        assert_eq!(
+            AssetGuid::from_name("textures/grass"),
+            AssetGuid::from_name("textures/grass")
+        );
+        assert_ne!(
+            AssetGuid::from_name("textures/grass"),
+            AssetGuid::from_name("textures/stone")
+        );
+    }
+
+    /// A stale handle answers nothing, on the guid accessors as on the rest.
+    #[test]
+    fn a_stale_handle_has_no_name_or_guid() {
+        let mut assets = AssetManager::new();
+        let guid = AssetGuid::new(3);
+        let handle = assets.add_named_with_guid("grass", guid, Texture(1));
+        assets.remove(handle);
+
+        assert_eq!(assets.name_of(handle), None);
+        assert_eq!(assets.guid_of(handle), None);
+    }
+
+    /// Mutable lookup by either key reaches the same value.
+    #[test]
+    fn mutable_lookup_by_name_and_guid() {
+        let mut assets = AssetManager::new();
+        let guid = AssetGuid::new(11);
+        let handle = assets.add_named_with_guid("grass", guid, Texture(1));
+
+        assets.get_by_name_mut::<Texture>("grass").unwrap().0 = 2;
+        assert_eq!(assets.get(handle), Some(&Texture(2)));
+
+        assets.get_by_guid_mut::<Texture>(guid).unwrap().0 = 3;
+        assert_eq!(assets.get(handle), Some(&Texture(3)));
+    }
 
     /// The point of the module: one type, many live values.
     #[test]

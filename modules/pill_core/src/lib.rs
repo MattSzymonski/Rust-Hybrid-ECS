@@ -41,8 +41,12 @@
 
 /// Color palettes for debug visualization.
 pub mod color;
+/// Growable runs of plain elements in engine-owned native memory.
+pub mod dynamic_buffer;
 /// Semantic error system shared by every workspace crate.
 pub mod error;
+/// Inline, fixed-capacity strings for plain-data structs.
+pub mod fixed_string;
 /// Math type aliases over `glam` and the direction vocabulary.
 pub mod math;
 /// Metrics recording foundation, gated on the `metrics` feature.
@@ -63,6 +67,10 @@ pub mod utils;
 // Flat Re-exports: tracing, metrics, and tracy-client
 // =============================================================================
 
+/// The engine-owned dynamic buffer, re-exported at the crate root.
+pub use dynamic_buffer::DynamicBuffer;
+/// Inline fixed-capacity strings, re-exported at the crate root.
+pub use fixed_string::{FixedString64, FIXED_STRING_64_CAPACITY};
 /// The `PillStyle` string-styling vocabulary, re-exported at the crate root.
 pub use style::PillStyle;
 /// The `tracing` crate, re-exported so downstream crates import telemetry
