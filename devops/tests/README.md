@@ -65,7 +65,7 @@ The shell wrappers in `devops/ci_cd/` forward every argument through, so
 All suites accept `--timeout-scale S` for slow machines. Every file the suites
 touch (`examples/project_rs/project_settings.yaml`, `devops/tests/project/src/lib.rs`,
 `examples/project_rs/src/lib.rs`, `examples/project_cs/src/Systems.cs`,
-`modules/optional/pill_spline/src/lib.rs`, the generated mirror files) is
+`modules/extensions/pill_spline/src/lib.rs`, the generated mirror files) is
 backed up at startup and restored afterwards.
 
 Suites that drive a host serialize themselves. `ensure_host_lock`
@@ -104,7 +104,7 @@ regression, not a known exception.
 
 ## Generated mirrors (policy)
 
-`modules/optional/<module>/generated/<module>_Components.g.cs` files are **tracked
+`modules/extensions/<module>/generated/<module>_Components.g.cs` files are **tracked
 as a committed bootstrap**. They are build inputs, not artifacts: `examples/project_cs`
 links them (and so do standalone `dotnet build`s), so the C# side must compile without
 a host run. The host regenerates every module's mirror on start and reload, but writes

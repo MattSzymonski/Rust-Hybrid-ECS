@@ -233,7 +233,7 @@ reused, only its numbers.
 
 **Cleaning is explicit and targeted.** The default `--clean-scope packages`
 runs `cargo clean --package <name>` for each workspace member (discovered from
-`cargo metadata`, so a new module under `modules/optional/` is picked up
+`cargo metadata`, so a new module under `modules/extensions/` is picked up
 automatically) and leaves every third-party dependency compiled.
 `--clean-scope workspace` removes the whole target directory and asks for
 confirmation first. `--clean-scope none` skips the clean cases entirely.

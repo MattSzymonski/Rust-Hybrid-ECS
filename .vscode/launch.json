@@ -19,10 +19,10 @@
             "program": "${workspaceFolder}/modules/target/debug/pill_standalone.exe",
             "args": [],
             "stopAtEntry": false,
-            // The host resolves `optional/` relative to the process working
+            // The host resolves `extensions/` relative to the process working
             // directory and expects to be launched from the engine workspace
             // root, which is `modules/`. Launching from anywhere else fails
-            // with "optional module <name> has no directory under optional/".
+            // with "optional module <name> has no directory under extensions/".
             "cwd": "${workspaceFolder}/modules",
             "environment": [
                 {

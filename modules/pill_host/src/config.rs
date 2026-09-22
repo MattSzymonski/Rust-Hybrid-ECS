@@ -86,12 +86,12 @@ const CSHARP_COMPILER_ARGUMENTS_FILE: &str = "pill_compiler_args.rsp";
 ///
 /// The workspace manifest globs this directory, so a module is discovered by
 /// existing rather than by being listed anywhere.
-const OPTIONAL_MODULE_DIRECTORY: &str = "optional";
+const OPTIONAL_MODULE_DIRECTORY: &str = "extensions";
 
 /// Name prefix of the generated workspace member that builds a native project.
 ///
 /// The member lives under [`OPTIONAL_MODULE_DIRECTORY`], so the existing
-/// `optional/*` workspace glob discovers it without any entry in the workspace
+/// `extensions/*` workspace glob discovers it without any entry in the workspace
 /// manifest; only the package name differs per project.
 const HOST_PROJECT_MEMBER_PREFIX: &str = "host_project_";
 
@@ -700,7 +700,7 @@ impl HostConfig {
         // Step 4: Resolve the optional modules, validating every name before
         // it is interpolated into a watch path and a cargo selector. A
         // traversal or duplicate entry, or one with no directory under
-        // `optional/`, is a configuration error here rather than a watch on
+        // `extensions/`, is a configuration error here rather than a watch on
         // an arbitrary directory, a malformed `--package`, or a second copy
         // of a module already loading.
         let optional_root = engine_workspace_root()?.join(OPTIONAL_MODULE_DIRECTORY);
@@ -714,7 +714,7 @@ impl HostConfig {
         })
     }
 
-    /// Resolve the settings file's module names against the `optional/`
+    /// Resolve the settings file's module names against the `extensions/`
     /// directory.
     ///
     /// Split from [`Self::from_environment`] so the validation is testable
@@ -828,7 +828,7 @@ impl ProjectModuleConfig {
         // Step 1: Resolve the directory against the engine workspace root, not
         // the working directory. A launcher that sets its own working
         // directory (`dx serve` runs the editor from `pill_editor/`) would
-        // otherwise resolve the project and the `optional/` directory it lives
+        // otherwise resolve the project and the `extensions/` directory it lives
         // beside to directories that do not exist.
         let workspace_root = engine_workspace_root()?;
         let project_root = workspace_root.join(project_path);
@@ -873,8 +873,8 @@ impl ProjectModuleConfig {
         // against the engine workspace (one Cargo.lock, one target directory,
         // one crate-metadata set). This is what keeps `pill_spline::Spline` the
         // same type in the project DLL and in the optional module DLLs. The
-        // member is generated under `optional/` and discovered by the existing
-        // `optional/*` glob, so the workspace manifest never names the project.
+        // member is generated under `extensions/` and discovered by the existing
+        // `extensions/*` glob, so the workspace manifest never names the project.
         materialize_host_project_member(workspace_root, project_path, &package_name)?;
 
         // Step 3: Derive the source watch directory and build output location.
@@ -1007,7 +1007,7 @@ fn required_environment(variable: &'static str) -> Result<String, ConfigError> {
 /// rather than from the process's working directory. The two coincide only when
 /// the host is started from the workspace root, and that coincidence is not
 /// something a launcher owes the engine: the dioxus CLI runs the editor with
-/// its working directory set to `pill_editor/`, which resolved `optional/`
+/// its working directory set to `pill_editor/`, which resolved `extensions/`
 /// under the editor crate and made the host refuse to start with
 /// [`ConfigError::OptionalModuleDirectoryMissing`]. `cargo run` from the
 /// workspace root, the test suites and every spawned build agree on this root
@@ -1223,7 +1223,7 @@ fn is_valid_build_binary_name(value: &str) -> bool {
 
 /// Whether a value is a usable optional-module directory name.
 ///
-/// The name is a path segment under `optional/` and a cargo package selector,
+/// The name is a path segment under `extensions/` and a cargo package selector,
 /// so it is checked harder than `build_binary_name`: a leading digit is
 /// refused (crate directories start with a letter), `-` is allowed because
 /// real crate directories use it, and every other character - path
@@ -1311,7 +1311,7 @@ fn strip_workspace_tables(manifest: &str) -> String {
 /// Cross-DLL type identity requires the project to compile as a member of the
 /// engine workspace: one Cargo.lock, one target directory, one crate-metadata
 /// set. The project source lives outside the workspace, so this writes a
-/// generated crate under `optional/` — which the existing `optional/*` glob
+/// generated crate under `extensions/` — which the existing `extensions/*` glob
 /// discovers automatically, so no workspace-manifest entry is ever needed.
 ///
 /// The generated `Cargo.toml` is the project's own manifest with every `path`
@@ -1374,7 +1374,7 @@ fn materialize_host_project_member(
     generated_manifest.push_str(&source_manifest[cursor..]);
 
     // Step 1b: Refuse to write a member Cargo cannot load. The generated member
-    // is picked up by the `optional/*` glob, so a single unresolvable path in
+    // is picked up by the `extensions/*` glob, so a single unresolvable path in
     // it stops Cargo loading the workspace at all - which breaks every build,
     // test and lint in the repository, including the build that would replace
     // the member. Report the offending path instead, and clear any member an
@@ -1574,10 +1574,10 @@ fn manifest_entry_name(manifest: &str, key_offset: usize) -> String {
 
 /// Removes host-generated workspace members left behind by earlier runs.
 ///
-/// Every directory under `optional/` whose name carries
+/// Every directory under `extensions/` whose name carries
 /// [`HOST_PROJECT_MEMBER_PREFIX`] was written by this function, so any one that
 /// is not the member being materialized now belongs to a project the host is no
-/// longer pointed at. Leaving it in place is not harmless: the `optional/*`
+/// longer pointed at. Leaving it in place is not harmless: the `extensions/*`
 /// glob still picks it up as a workspace member, and its dependency paths point
 /// into the previous project's directory. Once that directory moves or is
 /// deleted, Cargo fails to load the workspace at all, so every build, test and
@@ -1624,7 +1624,7 @@ name = "project"
 
 [dependencies]
 pill_engine = { path = "../../modules/pill_engine" }
-pill_spline = { path = "../../modules/optional/pill_spline" }
+pill_spline = { path = "../../modules/extensions/pill_spline" }
 "#;
 
     /// A native project manifest with no optional-module dependency.
@@ -1752,15 +1752,15 @@ serde = { version = "1", features = ["derive"] }
     ///
     /// `workspace_member` interpolates the name into both with no check of
     /// its own, so `../pill_spline` used to point the watcher outside
-    /// `optional/` and hand cargo a malformed `--package`. This drives the
+    /// `extensions/` and hand cargo a malformed `--package`. This drives the
     /// resolution `from_environment` runs, so it needs no process-wide
     /// working directory.
     #[test]
     fn rejects_traversal_and_duplicate_module_names() {
         let root = temp_root().join("optional_module_names");
         let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("optional").join("pill_spline")).unwrap();
-        let optional_root = root.join("optional");
+        std::fs::create_dir_all(root.join("extensions").join("pill_spline")).unwrap();
+        let optional_root = root.join("extensions");
 
         let traversal =
             HostConfig::resolve_optional_modules(&[String::from("../pill_spline")], &optional_root);
@@ -1800,7 +1800,7 @@ serde = { version = "1", features = ["derive"] }
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "pill_spline");
         assert_eq!(
-            resolved[0].watch_directory, "optional/pill_spline/src",
+            resolved[0].watch_directory, "extensions/pill_spline/src",
             "the validated name still derives the documented watch path"
         );
 
@@ -1824,7 +1824,7 @@ serde = { version = "1", features = ["derive"] }
     fn renamed_dependency_is_detected() {
         let manifest = r#"
 [dependencies]
-spline_path = { package = "pill_spline", path = "../../modules/optional/pill_spline" }
+spline_path = { package = "pill_spline", path = "../../modules/extensions/pill_spline" }
 "#;
         assert!(manifest_depends_on_crate(manifest, "pill_spline"));
     }
@@ -1836,7 +1836,7 @@ spline_path = { package = "pill_spline", path = "../../modules/optional/pill_spl
     fn quoted_key_rename_is_detected() {
         let manifest = r#"
 [dependencies]
-"spline-path" = { package = "pill_spline", path = "../../modules/optional/pill_spline" }
+"spline-path" = { package = "pill_spline", path = "../../modules/extensions/pill_spline" }
 "#;
         assert!(manifest_depends_on_crate(manifest, "pill_spline"));
     }
@@ -1847,10 +1847,10 @@ spline_path = { package = "pill_spline", path = "../../modules/optional/pill_spl
     fn dev_and_build_dependencies_are_detected() {
         let manifest = r#"
 [dev-dependencies]
-pill_spline = { path = "../../modules/optional/pill_spline" }
+pill_spline = { path = "../../modules/extensions/pill_spline" }
 
 [build-dependencies]
-pill_spline = { path = "../../modules/optional/pill_spline" }
+pill_spline = { path = "../../modules/extensions/pill_spline" }
 "#;
         assert!(manifest_depends_on_crate(manifest, "pill_spline"));
     }
@@ -1861,7 +1861,7 @@ pill_spline = { path = "../../modules/optional/pill_spline" }
     fn target_specific_dependency_is_detected() {
         let manifest = r#"
 [target.'cfg(windows)'.dependencies]
-pill_spline = { path = "../../modules/optional/pill_spline" }
+pill_spline = { path = "../../modules/extensions/pill_spline" }
 "#;
         assert!(manifest_depends_on_crate(manifest, "pill_spline"));
     }
@@ -1872,7 +1872,7 @@ pill_spline = { path = "../../modules/optional/pill_spline" }
     fn sub_table_dependency_is_detected() {
         let manifest = r#"
 [dependencies.pill_spline]
-path = "../../modules/optional/pill_spline"
+path = "../../modules/extensions/pill_spline"
 "#;
         assert!(manifest_depends_on_crate(manifest, "pill_spline"));
     }
@@ -1894,7 +1894,7 @@ path = "../../modules/optional/pill_spline"
     fn workspace_shared_dependency_is_not_a_project_dependency() {
         let manifest = r#"
 [workspace.dependencies]
-pill_spline = { path = "../../modules/optional/pill_spline" }
+pill_spline = { path = "../../modules/extensions/pill_spline" }
 
 [dependencies]
 pill_engine = { path = "../../modules/pill_engine" }
@@ -1925,7 +1925,7 @@ pill_engine = { path = "../../modules/pill_engine" }
     fn shared_prefix_does_not_match() {
         let manifest = r#"
 [dependencies]
-pill_spline_extra = { path = "../../modules/optional/pill_spline_extra" }
+pill_spline_extra = { path = "../../modules/extensions/pill_spline_extra" }
 "#;
         assert!(!manifest_depends_on_crate(manifest, "pill_spline"));
     }
@@ -2181,7 +2181,7 @@ mod host_project_member_validation_tests {
 
     /// Lays out a workspace with a project at `project/` and returns its root.
     ///
-    /// The project directory is a sibling of `optional/`, matching the real
+    /// The project directory is a sibling of `extensions/`, matching the real
     /// layout closely enough that relative paths behave the same way.
     fn workspace(test_name: &str, dependency_path: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!("pill_member_{test_name}"));
@@ -2276,7 +2276,7 @@ mod host_project_member_validation_tests {
 mod host_project_member_pruning_tests {
     use super::{prune_stale_host_project_members, OPTIONAL_MODULE_DIRECTORY};
 
-    /// Creates `optional/<name>/Cargo.toml` under `root` and returns its
+    /// Creates `extensions/<name>/Cargo.toml` under `root` and returns its
     /// directory, so a test can assert on the directory rather than the file.
     fn seed_member(root: &std::path::Path, name: &str) -> std::path::PathBuf {
         let directory = root.join(OPTIONAL_MODULE_DIRECTORY).join(name);
@@ -2333,7 +2333,7 @@ name = \"x\"
         let root = std::env::temp_dir().join("pill_prune_missing");
         let _ = std::fs::remove_dir_all(&root);
 
-        // Must not panic: a workspace with no `optional/` directory yet is
+        // Must not panic: a workspace with no `extensions/` directory yet is
         // valid, and refusing to start over it would be worse than the stale
         // member this function exists to clean up.
         prune_stale_host_project_members(&root, &root.join("nothing"));

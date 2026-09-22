@@ -93,7 +93,7 @@
          optional module before the project build, deriving every declaration
          from the module's real registered layout; nothing is hand-written in
          this project. A committed copy bootstraps standalone builds. -->
-    <Compile Include="../../modules/optional/*/generated/*.g.cs" />
+    <Compile Include="../../modules/extensions/*/generated/*.g.cs" />
 
     <!-- The renderer's components (Position, Sprite, Color). This project
          draws, so it imports them from the renderer that owns them - the
@@ -102,7 +102,7 @@
          host binds them as typed native components that managed physics writes
          into directly, not as the opaque ABI blobs the module generator emits.
          A project that draws nothing simply omits this line. -->
-    <Compile Include="../../modules/optional/rendering/pill_master_renderer/managed/RendererComponents.cs" />
+    <Compile Include="../../modules/extensions/rendering/pill_master_renderer/managed/RendererComponents.cs" />
   </ItemGroup>
 
 </Project>

@@ -77,7 +77,7 @@ BUNDLE_DIRECTORY = Path("build") / BUNDLE_CRATE_NAME
 # File names the generator reads and writes.
 PROJECT_SETTINGS_FILE_NAME = "project_settings.yaml"
 PROJECT_MANIFEST_FILE_NAME = "Cargo.toml"
-OPTIONAL_MODULE_DIRECTORY = Path("modules") / "optional"
+OPTIONAL_MODULE_DIRECTORY = Path("modules") / "extensions"
 HOST_CRATE_DIRECTORY = Path("modules") / "pill_host"
 
 # Managed (C#) project constants, mirroring `pill_host::config` so a generated
@@ -504,7 +504,7 @@ def main() -> int:
         )
         return 1
 
-    # Step 2: validate every selected module exists under modules/optional/.
+    # Step 2: validate every selected module exists under modules/extensions/.
     missing_modules = [
         name
         for name in modules

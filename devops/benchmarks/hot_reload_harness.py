@@ -96,7 +96,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # Session configuration
 # =============================================================================
 
-SPLINE_LIB_RS = MODULES_ROOT / "optional" / "pill_spline" / "src" / "lib.rs"
+SPLINE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "src" / "lib.rs"
 PROJECT_RS_LIB_RS = WORKSPACE_ROOT / "examples" / "project_rs" / "src" / "lib.rs"
 PROJECT_CS_SYSTEMS_CS = WORKSPACE_ROOT / "examples" / "project_cs" / "src" / "Systems.cs"
 

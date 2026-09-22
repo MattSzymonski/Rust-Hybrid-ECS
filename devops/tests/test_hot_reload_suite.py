@@ -82,7 +82,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # =============================================================================
 
 PROJECT_SANDBOX_LIB_RS = WORKSPACE_ROOT / "devops" / "tests" / "project" / "src" / "lib.rs"
-SPLINE_LIB_RS = MODULES_ROOT / "optional" / "pill_spline" / "src" / "lib.rs"
+SPLINE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "src" / "lib.rs"
 
 # Session settings: only the optional-module list lives in a file now; the
 # project itself is selected by PROJECT_PATH per session.

@@ -75,12 +75,12 @@ from core.suite_common import *  # noqa: E402,F401,F403
 
 PROJECT_CS_SYSTEMS_CS = WORKSPACE_ROOT / "examples" / "project_cs" / "src" / "Systems.cs"
 PROJECT_CS_COMPONENTS_CS = WORKSPACE_ROOT / "examples" / "project_cs" / "src" / "Components.cs"
-SPLINE_LIB_RS = MODULES_ROOT / "optional" / "pill_spline" / "src" / "lib.rs"
+SPLINE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "src" / "lib.rs"
 SPLINE_GENERATED_FILE = (
-    MODULES_ROOT / "optional" / "pill_spline" / "generated" / "pill_spline_Components.g.cs"
+    MODULES_ROOT / "extensions" / "pill_spline" / "generated" / "pill_spline_Components.g.cs"
 )
 DUMMY_GENERATED_FILE = (
-    MODULES_ROOT / "optional" / "pill_dummy_color" / "generated"
+    MODULES_ROOT / "extensions" / "pill_dummy_color" / "generated"
     / "pill_dummy_color_Components.g.cs"
 )
 

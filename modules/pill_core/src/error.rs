@@ -387,7 +387,7 @@ pub enum ConfigError {
     /// directory: the two agree only when the host happens to be started from
     /// the workspace root, and a launcher that sets its own working directory
     /// (the dioxus CLI runs the editor from `pill_editor/`) would otherwise
-    /// resolve `optional/` to a directory that does not exist.
+    /// resolve `extensions/` to a directory that does not exist.
     #[message("engine workspace root could not be determined from the host build")]
     EngineWorkspaceRootUndetermined,
 
@@ -499,7 +499,7 @@ pub enum ConfigError {
     DuplicateOptionalModuleName { name: String },
 
     /// A configured optional module has no sibling directory to build from.
-    #[message("optional module ", value(name), " has no directory under optional/")]
+    #[message("optional module ", value(name), " has no directory under extensions/")]
     OptionalModuleDirectoryMissing { name: String },
 }
 

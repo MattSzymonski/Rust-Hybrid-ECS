@@ -19,7 +19,7 @@ pill_core = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../m
 # `init` about why this crate must not also be loaded as a module.
 # `default-features = false` is a defensive no-op: `module-abi` is opt-in now,
 # so the `pill_module_*` exports stay off in this build either way.
-pill_spline = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/optional/pill_spline", default-features = false }
+pill_spline = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/extensions/pill_spline", default-features = false }
 # Dummy optional modules, linked directly purely to exercise their structs and
 # free functions from the project. `default-features = false` is a defensive
 # no-op (each crate's `module-abi` feature is opt-in), kept so that a future
@@ -28,11 +28,11 @@ pill_spline = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../..
 # linker error. Each crate is built standalone by the host (which passes
 # `--features module-abi`) for hot-loading via the project's
 # `project_settings.yaml`.
-pill_dummy_math = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/optional/pill_dummy_math", default-features = false }
-pill_dummy_text = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/optional/pill_dummy_text", default-features = false }
-pill_dummy_color = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/optional/pill_dummy_color", default-features = false }
-pill_dummy_timer = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/optional/pill_dummy_timer", default-features = false }
-pill_dummy_random = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/optional/pill_dummy_random", default-features = false }
+pill_dummy_math = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/extensions/pill_dummy_math", default-features = false }
+pill_dummy_text = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/extensions/pill_dummy_text", default-features = false }
+pill_dummy_color = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/extensions/pill_dummy_color", default-features = false }
+pill_dummy_timer = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/extensions/pill_dummy_timer", default-features = false }
+pill_dummy_random = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../modules/extensions/pill_dummy_random", default-features = false }
 trait_type_map = { path = "d:/Programming/Rust-Hybrid-ECS/examples/project_rs/../../../Trait-Type-Map" }
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"

@@ -84,7 +84,7 @@ Build output lands under the project's `build/<timestamp>/` directory.
 
 ## Optional modules
 
-Optional engine modules are crates inside `modules/optional/`, built as `cdylib`
+Engine extensions are crates inside `modules/extensions/`, built as `cdylib`
 and loaded by the host next to the project. Each is watched, rebuilt and swapped
 on its own, so editing one module reloads only that module and leaves the
 project and every other module running.
@@ -98,10 +98,10 @@ to load, in order. An absent or empty list loads none.
 
 ### Adding a module
 
-The workspace manifest globs `optional/*`, so a module is discovered by
+The workspace manifest globs `extensions/*`, so a module is discovered by
 existing; nothing lists it by name.
 
-1. Create `modules/optional/<name>/` with a `Cargo.toml` declaring
+1. Create `modules/extensions/<name>/` with a `Cargo.toml` declaring
    `crate-type = ["cdylib", "rlib"]` and depending on `pill_engine`.
 2. Export `pill_module_abi_version` and `pill_module_init`, optionally
    `pill_module_update`.
@@ -109,7 +109,7 @@ existing; nothing lists it by name.
 
 Everything else — watch directory, build command, output path — is derived from
 the directory name, so the host needs no changes. See
-`modules/optional/pill_test` for the reference implementation and
+`modules/extensions/pill_test` for the reference implementation and
 `local/documents/modularity_implementation_plan.md` for the design and its
 constraints.
 

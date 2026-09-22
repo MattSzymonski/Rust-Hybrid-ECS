@@ -122,7 +122,7 @@ def workspace_packages(log: Any = print) -> List[str]:
     """Returns the workspace's own package names via `cargo metadata`.
 
     Asking cargo rather than listing names keeps the clean scope correct when
-    a module is added under `modules/optional/`, which the workspace manifest
+    a module is added under `modules/extensions/`, which the workspace manifest
     discovers with a glob.
     """
     command = [

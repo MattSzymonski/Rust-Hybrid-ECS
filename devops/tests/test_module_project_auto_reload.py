@@ -49,7 +49,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # Configuration
 # =============================================================================
 
-MODULE_LIB_RS = MODULES_ROOT / "optional" / "pill_spline" / "src" / "lib.rs"
+MODULE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "src" / "lib.rs"
 
 # The host has no environment-variable override for the optional-module list,
 # so this test drives it the same way a person would: by writing the project's

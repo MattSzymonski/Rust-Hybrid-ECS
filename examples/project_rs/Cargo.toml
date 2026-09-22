@@ -25,7 +25,7 @@ pill_core = { path = "../../modules/pill_core" }
 # a different `pill_core.dll` than a host without the renderer had mapped, and
 # failed to load. A windowed host turns the feature back on through its own
 # graph, and both sides unify alike either way.
-pill_master_renderer = { path = "../../modules/optional/rendering/pill_master_renderer", default-features = false }
+pill_master_renderer = { path = "../../modules/extensions/rendering/pill_master_renderer", default-features = false }
 # Linked directly so the project can name the `Spline` type. See the note in
 # `init` about why this crate must not also be loaded as a module.
 # `default-features = false` is a defensive no-op: `module-abi` is opt-in now,
@@ -33,7 +33,7 @@ pill_master_renderer = { path = "../../modules/optional/rendering/pill_master_re
 # `test-hooks` keeps the module's demo observables - the sampled height
 # offset, the `GetSum` shift - that the hot-reload and bridge suites edit and
 # watch for; a default build of the module computes only the documented math.
-pill_spline = { path = "../../modules/optional/pill_spline", default-features = false, features = [
+pill_spline = { path = "../../modules/extensions/pill_spline", default-features = false, features = [
     "test-hooks",
 ] }
 serde = { version = "1", features = ["derive"] }

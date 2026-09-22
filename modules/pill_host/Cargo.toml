@@ -18,7 +18,7 @@ miette = { version = "7", features = ["derive"] }
 # The wgpu renderer, and the only crate in the workspace that owns wgpu. The
 # host is the only thing that links it: keeping it out of `pill_engine` keeps
 # the graphics stack out of every loaded module and every hot patch.
-pill_master_renderer = { path = "../optional/rendering/pill_master_renderer", optional = true }
+pill_master_renderer = { path = "../extensions/rendering/pill_master_renderer", optional = true }
 libloading = "0.8"
 notify = "6"
 serde = { version = "1", features = ["derive"] }

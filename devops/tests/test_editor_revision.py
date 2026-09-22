@@ -49,7 +49,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # Configuration
 # =============================================================================
 
-MODULE_LIB_RS = MODULES_ROOT / "optional" / "pill_spline" / "src" / "lib.rs"
+MODULE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "src" / "lib.rs"
 
 # The host reads optional modules from the project settings file, so the test
 # backs up and installs its own minimal list, exactly like the auto-reload

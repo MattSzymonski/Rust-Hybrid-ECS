@@ -151,14 +151,14 @@ def discover_crates() -> List[Crate]:
     crates.append(Crate(project_root.name, project_root / "src", "project"))
 
     # `modules:` is a YAML list of quoted crate directory names under
-    # `optional/`, ending at the next top-level key or end of file.
+    # `extensions/`, ending at the next top-level key or end of file.
     config_text = read_source(project_settings_yaml(NATIVE_PROJECT_ROOT))
     modules_block = re.search(
         r"^modules:\s*$(.*?)(?=^\S|\Z)", config_text, re.MULTILINE | re.DOTALL
     )
     if modules_block:
         for name in re.findall(r'^\s*-\s*"([^"]+)"', modules_block.group(1), re.MULTILINE):
-            crates.append(Crate(name, MODULES_ROOT / "optional" / name / "src", "module"))
+            crates.append(Crate(name, MODULES_ROOT / "extensions" / name / "src", "module"))
     return crates
 
 
