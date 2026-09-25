@@ -21,7 +21,7 @@
 //! Balls and spline are tied together by data rather than by an entity
 //! relationship: `spline_path_system` copies the ball centres into the control
 //! point array on every frame, which keeps every component in the scene plain,
-//! serializable data.
+//! serializable data. xx
 
 // Standard library
 use std::time::Instant;

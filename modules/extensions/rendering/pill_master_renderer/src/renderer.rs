@@ -382,21 +382,16 @@ impl State {
             .first()
             .copied()
             .ok_or(RendererError::NoAlphaModes)?;
-        let present_mode = if capabilities
-            .present_modes
-            .contains(&wgpu::PresentMode::Mailbox)
-        {
-            wgpu::PresentMode::Mailbox
-        } else if capabilities
-            .present_modes
-            .contains(&wgpu::PresentMode::Immediate)
-        {
-            wgpu::PresentMode::Immediate
-        } else {
-            wgpu::PresentMode::Fifo
-        };
+        // `Fifo` is the one present mode a surface is required to support, and
+        // a mode listed by `Surface::get_capabilities` is not thereby
+        // creatable: the NVIDIA Vulkan driver on Windows advertises `Mailbox`
+        // and then fails the flip-model swapchain with "Not enough memory
+        // left", which reaches wgpu's uncaptured-error path and aborts the host
+        // before a `RendererError` can be constructed. An uncapped mode stays
+        // an opt-in for a driver that has been verified to create one.
+        let present_mode = wgpu::PresentMode::Fifo;
         println!("[render] Present mode: {present_mode:?}");
-        let surface_configuration = wgpu::SurfaceConfiguration {
+        let mut surface_configuration = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: color_format,
             width: window_size.width,
@@ -406,7 +401,7 @@ impl State {
             alpha_mode,
             view_formats: vec![color_format],
         };
-        surface.configure(&device, &surface_configuration);
+        configure_surface(&surface, &device, &mut surface_configuration)?;
         let depth_format = wgpu::TextureFormat::Depth32Float;
         let depth_texture =
             RendererTexture::new_depth_texture(&device, &surface_configuration, "depth_texture")?;
@@ -548,4 +543,70 @@ impl State {
         surface_frame.present();
         Ok(())
     }
+}
+
+/// Configure the surface, giving up the compositing alpha mode if the driver
+/// refuses it.
+///
+/// `Surface::configure` returns nothing: a refused configuration is reported
+/// through the device's uncaptured-error path, which panics by default and
+/// takes the whole host down before any frontend sees a `RendererError`. A
+/// refusal is realistic because a compositing alpha mode needs a compositing
+/// window, which a capability list does not promise. The requested mode is
+/// therefore tried inside its own error scopes, and `Opaque` - the mode every
+/// surface must support - is the fallback.
+fn configure_surface(
+    surface: &wgpu::Surface<'static>,
+    device: &wgpu::Device,
+    surface_configuration: &mut wgpu::SurfaceConfiguration,
+) -> Result<()> {
+    let requested_alpha_mode = surface_configuration.alpha_mode;
+    let mut alpha_modes = vec![requested_alpha_mode];
+    if requested_alpha_mode != wgpu::CompositeAlphaMode::Opaque {
+        alpha_modes.push(wgpu::CompositeAlphaMode::Opaque);
+    }
+
+    let mut failures = Vec::new();
+    for alpha_mode in alpha_modes {
+        surface_configuration.alpha_mode = alpha_mode;
+
+        // One scope per filter class, so a refusal is captured here rather than
+        // reaching the uncaptured-error handler.
+        device.push_error_scope(wgpu::ErrorFilter::Validation);
+        device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+        device.push_error_scope(wgpu::ErrorFilter::Internal);
+        surface.configure(device, surface_configuration);
+        // Acquiring a frame is what materialises the swapchain: wgpu-core
+        // accepting the configuration does not mean the driver created one, and
+        // the refusal only shows up here.
+        let probe = surface.get_current_texture();
+        let internal = pollster::block_on(device.pop_error_scope());
+        let out_of_memory = pollster::block_on(device.pop_error_scope());
+        let validation = pollster::block_on(device.pop_error_scope());
+
+        let reported = internal
+            .or(out_of_memory)
+            .or(validation)
+            .map(|error| error.to_string());
+        let failure = match probe {
+            Ok(frame) => {
+                // Dropped rather than presented: `render` acquires its own.
+                drop(frame);
+                reported
+            }
+            Err(error) => Some(reported.unwrap_or_else(|| error.to_string())),
+        };
+
+        match failure {
+            None => {
+                println!("[render] Surface configured: {alpha_mode:?}");
+                return Ok(());
+            }
+            Some(failure) => failures.push(format!("{alpha_mode:?} ({failure})")),
+        }
+    }
+
+    Err(RendererError::SurfaceConfigurationRefused {
+        detail: failures.join("; "),
+    })
 }
