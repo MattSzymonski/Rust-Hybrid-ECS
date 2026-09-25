@@ -11,7 +11,6 @@ glam = "0.33"
 pill_engine = { path = "../../modules/pill_engine" }
 pill_master_renderer = { path = "../../modules/extensions/rendering/pill_master_renderer", default-features = false }
 serde = { version = "1", features = ["derive"] }
-tobj = "3"
 trait_type_map = { path = "../../../Trait-Type-Map" }
 
 [features]

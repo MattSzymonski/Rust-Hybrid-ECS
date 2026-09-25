@@ -919,6 +919,7 @@ public static unsafe class Engine
             4 => "the source data failed to decode",
             5 => "a required buffer was null",
             6 => "this host build has no renderer, so no asset types exist to load into",
+            7 => "an asset with that name is already loaded",
             _ => $"native status {status}",
         };
         throw new InvalidOperationException($"Could not {operation}: {reason}.");

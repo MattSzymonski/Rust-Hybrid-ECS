@@ -114,6 +114,23 @@ pub enum AssetLoadError {
 
 pub type AssetLoadResult<T> = Result<T, AssetLoadError>;
 
+/// Refusal to store an asset under a key another asset already answers to.
+///
+/// Kept apart from [`AssetLoadError`]: nothing failed to load, the store simply
+/// would not take a second asset under a name that is already live.
+#[derive(Debug, thiserror::Error)]
+pub enum AssetBindingError {
+    /// The name already addresses a live asset.
+    #[error("an asset named `{name}` already exists")]
+    NameInUse {
+        /// The name that is already taken.
+        name: String,
+    },
+}
+
+/// Result of a binding operation that can hit an occupied name.
+pub type AssetBindingResult<T> = Result<T, AssetBindingError>;
+
 static ASSET_ROOT: OnceLock<RwLock<PathBuf>> = OnceLock::new();
 
 impl AssetLoader {
@@ -329,7 +346,8 @@ struct AssetColumn {
     /// Name lookup for assets added with one.
     ///
     /// Holds the index only: the generation is read from `generations` at
-    /// lookup time, so a name rebound to a new asset resolves to the live one.
+    /// lookup time, so a name that outlived a free cannot resolve to whatever
+    /// refilled the slot.
     by_name: HashMap<String, u32>,
     /// Reverse of `by_name`, so freeing a slot can drop its name without
     /// scanning the whole map.
@@ -411,7 +429,7 @@ impl std::fmt::Display for AssetGuid {
 ///
 /// let mut assets = AssetManager::new();
 /// let rock = assets.add(Mesh("rock"));
-/// let tree = assets.add_named("tree", Mesh("tree"));
+/// let tree = assets.add_named("tree", Mesh("tree")).expect("a fresh name");
 ///
 /// assert_eq!(assets.get(rock), Some(&Mesh("rock")));
 /// assert_eq!(assets.handle_by_name::<Mesh>("tree"), Some(tree));
@@ -503,33 +521,46 @@ impl AssetManager {
     /// Store `asset` under `name` and return a handle to it.
     ///
     /// The name is a lookup key for code that resolves assets by string - a
-    /// scene file naming a mesh, say. Rebinding a name that is already in use
-    /// points it at the new asset and leaves the old one reachable by its
-    /// handle; it does not unload anything.
-    pub fn add_named<T>(&mut self, name: impl Into<String>, asset: T) -> Handle<T>
+    /// scene file naming a mesh, say. A name that already addresses a live
+    /// asset is refused rather than rebound, so a second load of the same key
+    /// is reported instead of quietly adding a copy that nothing looks up.
+    /// Free the name with [`Self::remove`] first when a deliberate replacement
+    /// is wanted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetBindingError::NameInUse`] when `name` already addresses a
+    /// live asset. Nothing is stored and no handle is issued.
+    pub fn add_named<T>(
+        &mut self,
+        name: impl Into<String>,
+        asset: T,
+    ) -> AssetBindingResult<Handle<T>>
     where
         T: Asset + TraitAccessible<dyn Asset>,
     {
+        let name = name.into();
+        // Checked before `add`, so a refused name cannot leave an unreachable
+        // asset behind in the column.
+        if self.handle_by_name::<T>(&name).is_some() {
+            return Err(AssetBindingError::NameInUse { name });
+        }
+
         let handle = self.add(asset);
         let metadata = self
             .metadata
             .get_mut(&TypeId::of::<T>())
             .expect("add created the column metadata");
-        let name = name.into();
-        // Drop any previous reverse entry for this name so `names` cannot
-        // accumulate stale index -> name pairs when a name is rebound.
-        if let Some(previous_index) = metadata.by_name.insert(name.clone(), handle.index) {
-            metadata.names.remove(&previous_index);
-        }
+        metadata.by_name.insert(name.clone(), handle.index);
         metadata.names.insert(handle.index, name);
-        handle
+        Ok(handle)
     }
 
     /// Store `asset` under `guid` and return a handle to it.
     ///
-    /// The guid twin of [`Self::add_named`], and it rebinds the same way: a
-    /// guid already in use points at the new asset and leaves the old one
-    /// reachable by its handle. Nothing is unloaded.
+    /// Unlike [`Self::add_named`], a guid already in use is rebound: it points
+    /// at the new asset and leaves the old one reachable by its handle. Nothing
+    /// is unloaded.
     pub fn add_with_guid<T>(&mut self, guid: AssetGuid, asset: T) -> Handle<T>
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -543,25 +574,30 @@ impl AssetManager {
     ///
     /// The usual shape for a cooked asset: the name is what a scene file
     /// writes, the guid is what survives the name changing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetBindingError::NameInUse`] on the same terms as
+    /// [`Self::add_named`].
     pub fn add_named_with_guid<T>(
         &mut self,
         name: impl Into<String>,
         guid: AssetGuid,
         asset: T,
-    ) -> Handle<T>
+    ) -> AssetBindingResult<Handle<T>>
     where
         T: Asset + TraitAccessible<dyn Asset>,
     {
-        let handle = self.add_named(name, asset);
+        let handle = self.add_named(name, asset)?;
         self.bind_guid::<T>(guid, handle.index);
-        handle
+        Ok(handle)
     }
 
     /// Point `guid` at the asset already living in `index`.
     ///
     /// Shared by the two guid-assigning entry points. Drops any previous
     /// reverse entry so `guids` cannot accumulate stale index -> guid pairs
-    /// when a guid is rebound, exactly as `add_named` does for names.
+    /// when a guid is rebound.
     fn bind_guid<T>(&mut self, guid: AssetGuid, index: u32)
     where
         T: Asset + TraitAccessible<dyn Asset>,
@@ -882,7 +918,9 @@ mod tests {
     fn name_and_guid_address_one_asset() {
         let mut assets = AssetManager::new();
         let guid = AssetGuid::new(0xdead_beef);
-        let handle = assets.add_named_with_guid("grass", guid, Texture(1));
+        let handle = assets
+            .add_named_with_guid("grass", guid, Texture(1))
+            .expect("a fresh name");
 
         assert_eq!(assets.handle_by_name::<Texture>("grass"), Some(handle));
         assert_eq!(assets.handle_by_guid::<Texture>(guid), Some(handle));
@@ -910,7 +948,9 @@ mod tests {
     }
 
     /// Rebinding points the guid at the new asset and leaves the old one
-    /// reachable by handle, matching how `add_named` treats a name.
+    /// reachable by handle. Guids rebind where names refuse, because a guid is
+    /// the identity a cook step pins an asset to rather than a lookup key a
+    /// second load can collide on.
     #[test]
     fn rebinding_a_guid_moves_it_to_the_new_asset() {
         let mut assets = AssetManager::new();
@@ -957,7 +997,9 @@ mod tests {
     fn a_stale_handle_has_no_name_or_guid() {
         let mut assets = AssetManager::new();
         let guid = AssetGuid::new(3);
-        let handle = assets.add_named_with_guid("grass", guid, Texture(1));
+        let handle = assets
+            .add_named_with_guid("grass", guid, Texture(1))
+            .expect("a fresh name");
         assets.remove(handle);
 
         assert_eq!(assets.name_of(handle), None);
@@ -969,7 +1011,9 @@ mod tests {
     fn mutable_lookup_by_name_and_guid() {
         let mut assets = AssetManager::new();
         let guid = AssetGuid::new(11);
-        let handle = assets.add_named_with_guid("grass", guid, Texture(1));
+        let handle = assets
+            .add_named_with_guid("grass", guid, Texture(1))
+            .expect("a fresh name");
 
         assets.get_by_name_mut::<Texture>("grass").unwrap().0 = 2;
         assert_eq!(assets.get(handle), Some(&Texture(2)));
@@ -1094,7 +1138,9 @@ mod tests {
     #[test]
     fn names_resolve_to_live_handles() {
         let mut assets = AssetManager::new();
-        let handle = assets.add_named("rock", Mesh("rock"));
+        let handle = assets
+            .add_named("rock", Mesh("rock"))
+            .expect("a fresh name");
 
         assert_eq!(assets.handle_by_name::<Mesh>("rock"), Some(handle));
         assert_eq!(assets.get_by_name::<Mesh>("rock"), Some(&Mesh("rock")));
@@ -1104,30 +1150,41 @@ mod tests {
         assert_eq!(assets.get_by_name::<Mesh>("rock"), None);
     }
 
-    /// Rebinding a name points it at the new asset and leaves the old one
-    /// reachable by handle - it is a lookup change, not an unload.
+    /// A name that is already bound is refused, and the asset holding it is
+    /// left exactly as it was - the collision is reported, not swallowed.
     #[test]
-    fn rebinding_a_name_leaves_the_previous_asset_alive() {
+    fn a_taken_name_is_refused() {
         let mut assets = AssetManager::new();
-        let original = assets.add_named("mesh", Mesh("first"));
-        let replacement = assets.add_named("mesh", Mesh("second"));
+        let original = assets
+            .add_named("mesh", Mesh("first"))
+            .expect("a fresh name");
 
-        assert_eq!(assets.handle_by_name::<Mesh>("mesh"), Some(replacement));
+        let refused = assets.add_named("mesh", Mesh("second"));
+
+        assert!(matches!(
+            refused,
+            Err(AssetBindingError::NameInUse { ref name }) if name == "mesh"
+        ));
+        assert_eq!(assets.handle_by_name::<Mesh>("mesh"), Some(original));
         assert_eq!(assets.get(original), Some(&Mesh("first")));
-        assert_eq!(assets.len::<Mesh>(), 2);
+        // The refused asset never entered the column, so nothing leaked either.
+        assert_eq!(assets.len::<Mesh>(), 1);
     }
 
-    /// A rebound name must not leave the displaced slot mapped, or removing
-    /// that slot would drop the name the live asset still answers to.
+    /// Freeing a slot frees the name with it, so a later load can take it.
     #[test]
-    fn removing_a_displaced_asset_keeps_the_rebound_name() {
+    fn a_removed_name_can_be_bound_again() {
         let mut assets = AssetManager::new();
-        let original = assets.add_named("mesh", Mesh("first"));
-        let replacement = assets.add_named("mesh", Mesh("second"));
+        let first = assets
+            .add_named("mesh", Mesh("first"))
+            .expect("a fresh name");
+        assets.remove(first);
 
-        assets.remove(original);
+        let second = assets
+            .add_named("mesh", Mesh("second"))
+            .expect("removal freed the name");
 
-        assert_eq!(assets.handle_by_name::<Mesh>("mesh"), Some(replacement));
+        assert_eq!(assets.handle_by_name::<Mesh>("mesh"), Some(second));
         assert_eq!(assets.get_by_name::<Mesh>("mesh"), Some(&Mesh("second")));
     }
 

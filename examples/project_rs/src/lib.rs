@@ -126,18 +126,22 @@ pub fn init(engine: &mut Engine) -> u32 {
             .world_mut()
             .get_resource_mut::<AssetManager>()
             .expect("Engine always owns an AssetManager");
-        let mesh = assets
-            .handle_by_name::<Mesh>("project.triangle")
-            .unwrap_or_else(|| assets.add_named("project.triangle", Mesh::triangle()));
+        let mesh = assets.handle_by_name::<Mesh>("project.triangle").unwrap_or_else(|| {
+            assets
+                .add_named("project.triangle", Mesh::triangle())
+                .expect("the name is free after the lookup missed")
+        });
         let mut material = |name: &str, color: [f32; 3], specularity: f32| {
             assets.handle_by_name::<Material>(name).unwrap_or_else(|| {
-                assets.add_named(
-                    name,
-                    Material::builder(name)
-                        .color_parameter("tint", color)
-                        .scalar_parameter("specularity", specularity)
-                        .build(),
-                )
+                assets
+                    .add_named(
+                        name,
+                        Material::builder(name)
+                            .color_parameter("tint", color)
+                            .scalar_parameter("specularity", specularity)
+                            .build(),
+                    )
+                    .expect("the name is free after the lookup missed")
             })
         };
         let scene_material = material("project.scene", [0.8, 0.8, 0.85], 0.5);

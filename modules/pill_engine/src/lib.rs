@@ -125,7 +125,8 @@ pub mod world;
 // Core engine types re-exported for single-import usage.
 pub use api::EngineApi;
 pub use asset::{
-    Asset, AssetGuid, AssetLoadError, AssetLoadResult, AssetLoader, AssetManager, Handle,
+    Asset, AssetBindingError, AssetBindingResult, AssetGuid, AssetLoadError, AssetLoadResult,
+    AssetLoader, AssetManager, Handle,
 };
 pub use commands::{CommandError, Commands};
 pub use common_components::{
