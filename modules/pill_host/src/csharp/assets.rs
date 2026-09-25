@@ -94,6 +94,9 @@ const STATUS_DECODE_FAILED: u8 = 4;
 const STATUS_NULL_OUTPUT: u8 = 5;
 #[cfg_attr(feature = "rendering", allow(dead_code))]
 const STATUS_RENDERER_UNAVAILABLE: u8 = 6;
+/// The name is already bound to a live asset in the active invocation.
+#[cfg_attr(not(feature = "rendering"), allow(dead_code))]
+const STATUS_NAME_IN_USE: u8 = 7;
 
 /// Reads `len` bytes at `pointer` as owned UTF-8, or an empty string for a
 /// zero-length argument.
@@ -157,8 +160,8 @@ mod rendering_impl {
     use super::{
         read_bytes, read_slice, read_str, NativeMaterialColor, NativeMaterialScalar,
         NativeMaterialTexture, NativeShaderParameterSlot, NativeShaderTextureSlot, NO_HANDLE,
-        STATUS_ASSET_MANAGER_MISSING, STATUS_DECODE_FAILED, STATUS_NO_ACTIVE_SCOPE, STATUS_NULL_OUTPUT,
-        STATUS_OK,
+        STATUS_ASSET_MANAGER_MISSING, STATUS_DECODE_FAILED, STATUS_NAME_IN_USE,
+        STATUS_NO_ACTIVE_SCOPE, STATUS_NULL_OUTPUT, STATUS_OK,
     };
     use crate::csharp::context::with_active_world;
     use pill_engine::{AssetLoader, AssetManager, Handle};
@@ -205,7 +208,9 @@ mod rendering_impl {
         };
         let result = with_assets(|assets| {
             let mesh = Mesh::from_obj_bytes(name.as_str(), &bytes).map_err(|_| STATUS_DECODE_FAILED)?;
-            let handle = assets.add_named(name.as_str(), mesh);
+            let handle = assets
+                .add_named(name.as_str(), mesh)
+                .map_err(|_| STATUS_NAME_IN_USE)?;
             Ok((handle.index(), handle.generation()))
         });
         match result {
@@ -251,7 +256,9 @@ mod rendering_impl {
                 AssetLoader::Bytes(bytes.into_boxed_slice()),
             )
             .map_err(|_| STATUS_DECODE_FAILED)?;
-            let handle = assets.add_named(name.as_str(), texture);
+            let handle = assets
+                .add_named(name.as_str(), texture)
+                .map_err(|_| STATUS_NAME_IN_USE)?;
             Ok((handle.index(), handle.generation()))
         });
         match result {
@@ -358,7 +365,9 @@ mod rendering_impl {
                 pass_engine_parameters != 0,
                 pass_camera_parameters != 0,
             );
-            let handle = assets.add_named(name.as_str(), shader);
+            let handle = assets
+                .add_named(name.as_str(), shader)
+                .map_err(|_| STATUS_NAME_IN_USE)?;
             Ok((handle.index(), handle.generation()))
         });
         match result {
@@ -450,7 +459,9 @@ mod rendering_impl {
         let material = builder.build();
 
         let result = with_assets(|assets| {
-            let handle = assets.add_named(name.as_str(), material);
+            let handle = assets
+                .add_named(name.as_str(), material)
+                .map_err(|_| STATUS_NAME_IN_USE)?;
             Ok((handle.index(), handle.generation()))
         });
         match result {

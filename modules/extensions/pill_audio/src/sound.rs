@@ -50,7 +50,7 @@ pub const SUPPORTED_AUDIO_FORMATS: &[&str] = &["mp3", "wav", "ogg", "flac"];
 /// # use pill_audio::Sound;
 /// # fn demo(assets: &mut pill_engine::AssetManager) -> Result<(), pill_audio::SoundLoadError> {
 /// let sound = Sound::load(std::path::Path::new("assets/footstep.wav"))?;
-/// let handle = assets.add_named("footstep", sound);
+/// let handle = assets.add_named("footstep", sound).expect("a fresh name");
 /// # Ok(())
 /// # }
 /// ```
@@ -237,10 +237,12 @@ mod tests {
     #[test]
     fn sounds_are_stored_as_assets() {
         let mut assets = AssetManager::new();
-        let handle = assets.add_named(
-            "footstep",
-            Sound::from_bytes(std::path::Path::new("a.wav"), vec![7]),
-        );
+        let handle = assets
+            .add_named(
+                "footstep",
+                Sound::from_bytes(std::path::Path::new("a.wav"), vec![7]),
+            )
+            .expect("a fresh name");
 
         assert_eq!(assets.get(handle).map(Sound::bytes), Some(&[7][..]));
         assert_eq!(
@@ -256,10 +258,12 @@ mod tests {
     #[test]
     fn unloading_a_sound_leaves_its_name_unresolvable() {
         let mut assets = AssetManager::new();
-        let handle = assets.add_named(
-            "footstep",
-            Sound::from_bytes(std::path::Path::new("a.wav"), vec![7]),
-        );
+        let handle = assets
+            .add_named(
+                "footstep",
+                Sound::from_bytes(std::path::Path::new("a.wav"), vec![7]),
+            )
+            .expect("a fresh name");
         assets.remove(handle);
 
         assert!(assets.get_by_name::<Sound>("footstep").is_none());

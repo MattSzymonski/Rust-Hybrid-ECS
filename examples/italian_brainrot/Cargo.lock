@@ -942,7 +942,6 @@ dependencies = [
  "pill_engine",
  "pill_master_renderer",
  "serde",
- "tobj",
  "trait_type_map",
 ]
 
@@ -1813,6 +1812,7 @@ dependencies = [
  "pollster",
  "serde",
  "thiserror 2.0.20",
+ "tobj",
  "trait_type_map",
  "wgpu",
  "winit",

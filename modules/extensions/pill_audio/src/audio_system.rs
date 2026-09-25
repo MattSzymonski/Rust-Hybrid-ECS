@@ -65,7 +65,13 @@ pub fn audio_system(
         for (name, bytes) in std::mem::take(&mut loads.sounds) {
             if assets.get_by_name::<Sound>(&name).is_none() {
                 let sound = Sound::from_bytes(std::path::Path::new(&name), bytes);
-                assets.add_named(name, sound);
+                // The guard above rules a clash out, so this only fires if two
+                // queued loads claimed one name; report it rather than drop it.
+                assets
+                    .add_named(name, sound)
+                    .map_err(|error| SystemError::Failure {
+                        message: error.to_string(),
+                    })?;
             }
         }
     }
