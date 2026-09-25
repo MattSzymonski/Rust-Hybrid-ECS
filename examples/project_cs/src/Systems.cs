@@ -47,7 +47,7 @@ internal static class ProjectConstants
     internal const float Gravity = 800.0f;
     internal const float BounceVelocityY = -800.0f;
     internal const float BounceVelocityX = 350.0f;
-    internal const float Restitution = 0.7f;
+    internal const float Restitution = 0.1f;
 
     /// <summary>Upward speed restored when a floor bounce would decay to rest.</summary>
     internal const float MinimumBounceVelocityY = 500.0f;

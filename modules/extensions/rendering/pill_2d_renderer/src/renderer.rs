@@ -102,6 +102,19 @@ impl Renderer {
         }))
         .map_err(|error| RendererError::AdapterRequest { source: error })?;
 
+        // Which adapter and backend won is not visible from the surface
+        // capabilities, and an adapter that cannot present to this window looks
+        // identical to one that can until the first frame fails.
+        let adapter_info = adapter.get_info();
+        println!(
+            "[render] Adapter: {} ({:?}, {:?}) driver={} {}",
+            adapter_info.name,
+            adapter_info.backend,
+            adapter_info.device_type,
+            adapter_info.driver,
+            adapter_info.driver_info
+        );
+
         // Step 3: request the device and queue from the adapter.
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("ECS renderer device"),
@@ -125,7 +138,7 @@ impl Renderer {
         let present_mode = select_present_mode(&capabilities.present_modes);
         println!("[render] Present mode: {present_mode:?}");
 
-        let surface_config = wgpu::SurfaceConfiguration {
+        let mut surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width: width.max(1),
@@ -135,9 +148,75 @@ impl Renderer {
             alpha_mode,
             view_formats: vec![],
         };
-        surface.configure(&device, &surface_config);
 
-        // Step 5: build the sprite renderer and assemble the renderer state.
+        // Step 5: configure the surface, falling back when the driver refuses.
+        //
+        // `Surface::configure` returns nothing: a refused configuration is
+        // reported through the device's uncaptured-error path, which panics by
+        // default and takes the whole host down before any frontend sees a
+        // `RendererError`. A refusal is realistic here because an uncapped
+        // present mode needs a flip-model swapchain and a compositing alpha
+        // mode needs a compositing window, neither of which the surface
+        // capability list guarantees. Each candidate therefore runs inside its
+        // own error scopes, and the first configuration the driver accepts wins.
+        let mut configured = false;
+        for (candidate_present, candidate_alpha) in configure_candidates(present_mode, alpha_mode) {
+            surface_config.present_mode = candidate_present;
+            surface_config.alpha_mode = candidate_alpha;
+
+            // One scope per filter class, so a refusal is captured rather than
+            // reaching the uncaptured-error handler.
+            device.push_error_scope(wgpu::ErrorFilter::Validation);
+            device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
+            device.push_error_scope(wgpu::ErrorFilter::Internal);
+            surface.configure(&device, &surface_config);
+            // Acquiring a frame is what materialises the swapchain, so it is
+            // part of the probe: wgpu-core accepting the configuration does not
+            // mean the swapchain was created, and the refusal only shows up
+            // here. Without a scope around it that refusal is fatal.
+            let probe = surface.get_current_texture();
+            let internal = pollster::block_on(device.pop_error_scope());
+            let out_of_memory = pollster::block_on(device.pop_error_scope());
+            let validation = pollster::block_on(device.pop_error_scope());
+
+            let mut failure = internal
+                .or(out_of_memory)
+                .or(validation)
+                .map(|error| error.to_string());
+            let probed = match probe {
+                Ok(frame) => Some(frame),
+                Err(error) => {
+                    failure.get_or_insert_with(|| error.to_string());
+                    None
+                }
+            };
+
+            match (failure, probed) {
+                (None, Some(frame)) => {
+                    // The probe frame is discarded; the frontend acquires its
+                    // own once the first real frame is drawn.
+                    drop(frame);
+                    println!(
+                        "[render] Surface configured: {candidate_present:?} / {candidate_alpha:?}"
+                    );
+                    configured = true;
+                    break;
+                }
+                (failure, _) => {
+                    eprintln!(
+                        "[render] Rejected {candidate_present:?} / {candidate_alpha:?}: {}",
+                        failure.unwrap_or_else(|| "unknown failure".to_owned())
+                    );
+                }
+            }
+        }
+
+        if !configured {
+            // Every candidate was refused; the backend errors are on stderr above.
+            return Err(RendererError::SurfaceConfigure);
+        }
+
+        // Step 6: build the sprite renderer and assemble the renderer state.
         let sprite_renderer = SpriteRenderer::new(&device, format);
         Ok(Self {
             surface,
@@ -260,15 +339,42 @@ fn resolve_virtual_resolution(
         })
 }
 
-/// Select the lowest-latency non-vsync mode supported by the current surface.
-fn select_present_mode(supported: &[wgpu::PresentMode]) -> wgpu::PresentMode {
-    if supported.contains(&wgpu::PresentMode::Immediate) {
-        wgpu::PresentMode::Immediate
-    } else if supported.contains(&wgpu::PresentMode::Mailbox) {
-        wgpu::PresentMode::Mailbox
-    } else {
-        wgpu::PresentMode::AutoNoVsync
+/// Presentation and alpha combinations to try, most preferred first.
+///
+/// The first candidate is always the pair the selection helpers chose, so a
+/// driver that accepts it behaves exactly as before. The rest give up the two
+/// preferences the surface capability list does not guarantee: a compositing
+/// alpha mode needs a compositing window, and an uncapped present mode needs a
+/// flip-model swapchain. `Fifo` with `Opaque` is the pair every surface is
+/// required to support, so it is the last resort.
+///
+/// Never empty: the caller depends on at least one configuration being tried.
+fn configure_candidates(
+    present_mode: wgpu::PresentMode,
+    alpha_mode: wgpu::CompositeAlphaMode,
+) -> Vec<(wgpu::PresentMode, wgpu::CompositeAlphaMode)> {
+    let mut candidates = vec![(present_mode, alpha_mode)];
+    if alpha_mode != wgpu::CompositeAlphaMode::Opaque {
+        candidates.push((present_mode, wgpu::CompositeAlphaMode::Opaque));
     }
+    if present_mode != wgpu::PresentMode::Fifo {
+        candidates.push((wgpu::PresentMode::Fifo, wgpu::CompositeAlphaMode::Opaque));
+    }
+    candidates
+}
+
+/// Select the presentation mode to configure the surface with.
+///
+/// `Fifo` is the only mode a Vulkan surface is required to support, and a mode
+/// returned by `Surface::get_capabilities` is not thereby creatable: the NVIDIA
+/// Vulkan driver on Windows advertises `Immediate` and then fails the swapchain
+/// with an out-of-memory error, which wgpu reports through the device's
+/// uncaptured-error path and which aborts the host before any `RendererError`
+/// can be constructed. Preferring the guaranteed mode keeps that failure off the
+/// startup path; an uncapped mode stays available as an opt-in for a driver that
+/// has been verified to create one.
+fn select_present_mode(_supported: &[wgpu::PresentMode]) -> wgpu::PresentMode {
+    wgpu::PresentMode::Fifo
 }
 
 /// Prefer an alpha-composited surface for transparent UI overlays.
@@ -298,29 +404,22 @@ fn select_alpha_mode(supported: &[wgpu::CompositeAlphaMode]) -> Option<wgpu::Com
 mod tests {
     use super::*;
 
-    /// Prefer immediate presentation when the surface exposes it.
+    /// The guaranteed mode wins even when the surface advertises an uncapped one.
+    ///
+    /// Advertising is not a promise: the NVIDIA Vulkan driver on Windows lists
+    /// `Immediate` and then fails to create the swapchain for it, so the
+    /// selector must not prefer it.
     #[test]
-    fn present_mode_prefers_immediate() {
-        let supported = [wgpu::PresentMode::Fifo, wgpu::PresentMode::Immediate];
-        assert_eq!(
-            select_present_mode(&supported),
-            wgpu::PresentMode::Immediate
-        );
-    }
-
-    /// Prefer mailbox over the automatic fallback when immediate is absent.
-    #[test]
-    fn present_mode_falls_back_to_mailbox() {
-        let supported = [wgpu::PresentMode::Fifo, wgpu::PresentMode::Mailbox];
-        assert_eq!(select_present_mode(&supported), wgpu::PresentMode::Mailbox);
-    }
-
-    /// Request automatic no-vsync selection when no explicit fast mode exists.
-    #[test]
-    fn present_mode_uses_auto_no_vsync_as_last_choice() {
+    fn present_mode_always_selects_fifo() {
+        let advertised = [
+            wgpu::PresentMode::Immediate,
+            wgpu::PresentMode::Mailbox,
+            wgpu::PresentMode::Fifo,
+        ];
+        assert_eq!(select_present_mode(&advertised), wgpu::PresentMode::Fifo);
         assert_eq!(
             select_present_mode(&[wgpu::PresentMode::Fifo]),
-            wgpu::PresentMode::AutoNoVsync
+            wgpu::PresentMode::Fifo
         );
     }
 
@@ -354,7 +453,7 @@ mod tests {
             RenderViewport::new(80, 40, 50, 70).clamped_to(100, 90),
             Some(RenderViewport::new(80, 40, 20, 50))
         );
-        assert_eq!(
+        assert_eq!(P
             RenderViewport::new(100, 0, 20, 20).clamped_to(100, 90),
             None
         );

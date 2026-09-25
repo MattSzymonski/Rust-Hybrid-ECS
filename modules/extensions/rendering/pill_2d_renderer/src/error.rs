@@ -55,6 +55,16 @@ pub enum RendererError {
     #[message("GPU surface exposes no alpha modes")]
     NoAlphaModes,
 
+    /// No presentation configuration the surface accepted.
+    ///
+    /// `Surface::configure` returns nothing and reports a refusal through the
+    /// device's uncaptured-error path instead, so this variant is reached only
+    /// after every fallback candidate has been refused in turn. The backend
+    /// error itself cannot be carried out of `configure`, so each refusal is
+    /// reported where it happens instead.
+    #[message("failed to configure the GPU surface for presentation")]
+    SurfaceConfigure,
+
     /// The frame texture could not be acquired for a fatal reason.
     #[message("failed to acquire the GPU surface texture")]
     SurfaceTextureFailed {

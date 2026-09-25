@@ -1,17 +1,9 @@
 - Hot-reloading (standalone console, standalone window, editor)
-    - Engine
-    - Project
-    - Renderer
+  - Engine
+  - Project
+  - Renderer
 - Speed of loading (especially editor)
-- Persistance/serialization works
-
-
-
-
-
-
-
-
+- Persistance/serialization works.
 
 The standalone host is a generic launcher. It selects the project from the
 `PROJECT_PATH` environment variable and reads that project's
@@ -27,43 +19,42 @@ Rust project (headless):
 
 Rust project (windowed): the same, with `--features rendering`.
 
-**The host and the project must resolve the same dependency graph.** Cargo
-folds a dependency's resolved features into the dependent's `-C metadata`, and
-that hash is part of every symbol name `pill_core.dll` exports, so a host and a
-project that resolve different graphs link two incompatible engine dylibs and
-the project fails to load. That is why a project depends on
-`pill_master_renderer` with `default-features = false`: `Position` and `Color`
-come from `pill_engine`, `Sprite` needs only the renderer's data half, and wgpu
-stays out of the project's graph so a headless host and a windowed one can both
-load it. Should the two ever diverge anyway, the host names both dylibs rather
-than letting the loader report it as "The specified procedure could not be
+**The host and the project must resolve the same dependency graph.** Cargo  
+folds a dependency's resolved features into the dependent's `-C metadata`, and  
+that hash is part of every symbol name `pill_core.dll` exports, so a host and a  
+project that resolve different graphs link two incompatible engine dylibs and  
+the project fails to load. That is why a project depends on  
+`pill_master_renderer` with `default-features = false`: `Position` and `Color`  
+come from `pill_engine`, `Sprite` needs only the renderer's data half, and wgpu  
+stays out of the project's graph so a headless host and a windowed one can both  
+load it. Should the two ever diverge anyway, the host names both dylibs rather  
+than letting the loader report it as "The specified procedure could not be  
 found".
 
-Live per-function hot patching is on by default in dev builds: a body-only
-edit to a `#[pill_hot]` system is compiled on its own and swapped into the
-running engine at the next frame, instead of a full module reload. Everything
-a patch cannot express (signature or type changes, new components, constants)
-falls back to the normal reload. To run the pure reload path without the patch
-machinery - e.g. when measuring reload performance - build the host with
+Live per-function hot patching is on by default in dev builds: a body-only  
+edit to a `#[pill_hot]` system is compiled on its own and swapped into the  
+running engine at the next frame, instead of a full module reload. Everything  
+a patch cannot express (signature or type changes, new components, constants)  
+falls back to the normal reload. To run the pure reload path without the patch  
+machinery - e.g. when measuring reload performance - build the host with  
 `--no-default-features --features hot_reload` instead.
 
-C# project: point `PROJECT_PATH` at the directory containing the `.csproj`,
+C# project: point `PROJECT_PATH` at the directory containing the `.csproj`,  
 e.g. `../examples/project_cs`.
 
 ## Shipping builds
 
-`devops/ci_cd/build_release.py` builds the shipping host release. It reads the
-project's scripting language from its manifest and picks the matching posture —
-`static_project` for a native Rust project (`Cargo.toml`), `static_csharp` for
+`devops/ci_cd/build_release.py` builds the shipping host release. It reads the  
+project's scripting language from its manifest and picks the matching posture —  
+`static_project` for a native Rust project (`Cargo.toml`), `static_csharp` for  
 a managed C# project (`*.csproj`). A managed C# build has two shipping modes:
 
-- **Framework-dependent (default):** `dotnet build -c Release` produces the
-  project assembly, and the host boots CoreCLR through hostfxr at runtime. The
-  user's machine must have the .NET 8 runtime installed.
-- **NativeAOT self-contained (`--csharp-aot`):** `dotnet publish
-  -p:PublishAot=true` merges the loader, the gameplay code, and a trimmed
-  runtime into one native library; the host loads it directly with no hostfxr,
-  no .NET install, and no JIT.
+- **Framework-dependent (default):** `dotnet build -c Release` produces the  
+project assembly, and the host boots CoreCLR through hostfxr at runtime. The  
+user's machine must have the .NET 8 runtime installed.
+- **NativeAOT self-contained (`--csharp-aot`):** `dotnet publish -p:PublishAot=true` merges the loader, the gameplay code, and a trimmed  
+runtime into one native library; the host loads it directly with no hostfxr,  
+no .NET install, and no JIT.
 
 ```bat
 cd D:\Programming\Rust-Hybrid-ECS
@@ -76,8 +67,8 @@ python devops\ci_cd\build_release.py --features rendering   :: managed (C#), fra
 python devops\ci_cd\build_release.py --csharp-aot           :: managed (C#), NativeAOT self-contained
 ```
 
-`PROJECT_PATH` is resolved against the working directory first (the dev
-convention: from `modules`, `../examples/project_cs`), falling back to the
+`PROJECT_PATH` is resolved against the working directory first (the dev  
+convention: from `modules`, `../examples/project_cs`), falling back to the  
 repository root, so both spellings work from either place.
 
 Build output lands under the project's `build/<timestamp>/` directory.
@@ -89,7 +80,7 @@ and loaded by the host next to the project. Each is watched, rebuilt and swapped
 on its own, so editing one module reloads only that module and leaves the
 project and every other module running.
 
-The `modules` list in the project's `project_settings.yaml` selects which ones
+The `modules` list in the project's `project_settings.yaml` selects which ones  
 to load, in order. An absent or empty list loads none.
 
 - `modules: ["pill_spline"]` in `project_settings.yaml` — load the spline module.
@@ -104,7 +95,7 @@ existing; nothing lists it by name.
 1. Create `modules/extensions/<name>/` with a `Cargo.toml` declaring
    `crate-type = ["cdylib", "rlib"]` and depending on `pill_engine`.
 2. Export `pill_module_abi_version` and `pill_module_init`, optionally
-   `pill_module_update`.
+  `pill_module_update`.
 3. Add `<name>` to the `modules` list in the project's `project_settings.yaml`.
 
 Everything else — watch directory, build command, output path — is derived from
@@ -113,34 +104,29 @@ the directory name, so the host needs no changes. See
 `local/documents/modularity_implementation_plan.md` for the design and its
 constraints.
 
-Modules must live in this directory rather than anywhere on disk: sharing the
-workspace lockfile is what makes a module resolve the same dependency graph as
-the host, which keeps component type identities and the mangled symbols of the
+Modules must live in this directory rather than anywhere on disk: sharing the  
+workspace lockfile is what makes a module resolve the same dependency graph as  
+the host, which keeps component type identities and the mangled symbols of the  
 shared `pill_core` library in agreement.
 
 ### Launching outside Cargo
 
-The engine workspace links `pill_core` dynamically so the host and every loaded
-module share one copy of its telemetry state. That also makes the built
-executable depend on the toolchain's `std-<hash>.dll` at load time. The build
-script in `pill_standalone` (and `pill_editor`) stages that dylib next to the
-executable automatically, so `target\debug\pill_standalone.exe` runs directly
+The engine workspace links `pill_core` dynamically so the host and every loaded  
+module share one copy of its telemetry state. That also makes the built  
+executable depend on the toolchain's `std-<hash>.dll` at load time. The build  
+script in `pill_standalone` (and `pill_editor`) stages that dylib next to the  
+executable automatically, so `target\debug\pill_standalone.exe` runs directly  
 without any `PATH` adjustment:
 
 ```powershell
 .\target\debug\pill_standalone.exe
 ```
 
-If the staged dylib is missing (for example the toolchain was updated and the
+If the staged dylib is missing (for example the toolchain was updated and the  
 binary was not rebuilt), the build script re-copies it on the next `cargo build`.
 
 - `cargo run --package editor` — Run the Rust project in the editor.
-
 - `dotnet build examples/project_cs/project_cs.csproj -c Release --nologo` — Build the C# project and its `csharp_runtime` dependency.
-
 - `dotnet run --project modules/pill_csharp_runtime/tests/csharp_runtime_tests.csproj -c Release` — Run the C# system discovery and scheduler-access tests.
-
 - `cargo test --workspace` — Run all Rust workspace tests.
-
 - `cargo check --workspace` — Type-check the complete Rust workspace without producing release binaries.
-

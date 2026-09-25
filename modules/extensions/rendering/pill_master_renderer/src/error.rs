@@ -20,6 +20,8 @@ pub enum RendererError {
     SurfaceOutOfMemory,
     #[message("failed to acquire the GPU surface texture: ", value(detail))]
     SurfaceTextureFailed { detail: String },
+    #[message("no surface configuration was accepted by the GPU driver: ", value(detail))]
+    SurfaceConfigurationRefused { detail: String },
     #[message("renderer resource was not found")]
     RendererResourceNotFound,
     #[message("renderer operation failed: ", value(detail))]
