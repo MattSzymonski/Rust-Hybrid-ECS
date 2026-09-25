@@ -4,12 +4,25 @@ use wgpu::util::DeviceExt;
 // Layout must match the HLSL `EngineParams` in `include/common.hlsl` (std140):
 //   vec3  fog_color;       // offset 0  (12 bytes)
 //   float fog_density;     // offset 12 (4 bytes)
-//   // total: 16 bytes
+//   vec4  frame_size;      // offset 16; xy = pixels, zw = its reciprocal
+//   vec4  time;            // offset 32; x = seconds, y = delta, z = frame
+//   // total: 48 bytes
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct EngineParametersData {
     pub fog_color: [f32; 3],
     pub fog_density: f32,
+    /// The surface size in pixels, and its reciprocal.
+    ///
+    /// A pass that samples the frame at a texel offset needs this. Reading it
+    /// from here rather than from the pass's own parameters is what keeps a
+    /// resized window from sampling at the size it was when the chain was
+    /// built, and it is why a pass does not have to be handed the frame size by
+    /// the game at all.
+    pub frame_size: [f32; 4],
+    /// x = seconds since the first frame, y = this frame's duration, z = the
+    /// frame's sequence number. w is unused.
+    pub time: [f32; 4],
 }
 
 impl Default for EngineParametersData {
@@ -23,12 +36,28 @@ impl EngineParametersData {
         Self {
             fog_color: [0.0; 3],
             fog_density: 0.0,
+            frame_size: [0.0; 4],
+            time: [0.0; 4],
         }
     }
 
-    pub fn update_data(&mut self, fog_density: f32, fog_color: [f32; 3]) {
+    /// The same values the shaders read, in the order the struct declares them.
+    pub fn update_data(
+        &mut self,
+        fog_density: f32,
+        fog_color: [f32; 3],
+        frame_size: [u32; 2],
+        time: [f32; 4],
+    ) {
         self.fog_density = fog_density;
         self.fog_color = fog_color;
+        self.frame_size = [
+            frame_size[0] as f32,
+            frame_size[1] as f32,
+            1.0 / frame_size[0].max(1) as f32,
+            1.0 / frame_size[1].max(1) as f32,
+        ];
+        self.time = time;
     }
 }
 
@@ -87,8 +116,16 @@ impl EngineParameters {
         Ok(camera)
     }
 
-    pub fn update(&mut self, queue: &wgpu::Queue, fog_density: f32, fog_color: [f32; 3]) {
-        self.parameters_data.update_data(fog_density, fog_color);
+    pub fn update(
+        &mut self,
+        queue: &wgpu::Queue,
+        fog_density: f32,
+        fog_color: [f32; 3],
+        frame_size: [u32; 2],
+        time: [f32; 4],
+    ) {
+        self.parameters_data
+            .update_data(fog_density, fog_color, frame_size, time);
         queue.write_buffer(
             &self.parameters_uniform_buffer,
             0,

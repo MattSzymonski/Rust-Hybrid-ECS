@@ -1,0 +1,5 @@
+# Cooked from the HLSL beside them by `build.rs`, so they are generated rather
+# than tracked: `slangc` rewrites them whenever a source or a header changes.
+# Project shaders elsewhere in the repository are their own to manage, which is
+# why this rule is scoped to this crate instead of being a top-level `*.wgsl`.
+src/shaders/*.wgsl

@@ -26,6 +26,12 @@ pub struct RendererResourceStorage {
     pub(crate) engine_parameters: EngineParameters,
     pub(crate) default_color_texture: RendererTextureHandle,
     pub(crate) default_normal_texture: RendererTextureHandle,
+    /// A sampler for reading depth as a value rather than comparing against it.
+    ///
+    /// The depth buffer carries a comparison sampler for shadow tests, and wgpu
+    /// will not accept that where a layout asks for a plain read - so a pass that
+    /// reconstructs position from depth gets this one.
+    pub(crate) depth_sampler: wgpu::Sampler,
 }
 
 impl RendererResourceStorage {
@@ -53,6 +59,16 @@ impl RendererResourceStorage {
                 0,
                 std::num::NonZeroU32::new(1).unwrap(),
             ),
+            depth_sampler: device.create_sampler(&wgpu::SamplerDescriptor {
+                label: Some("depth_read_sampler"),
+                address_mode_u: wgpu::AddressMode::ClampToEdge,
+                address_mode_v: wgpu::AddressMode::ClampToEdge,
+                address_mode_w: wgpu::AddressMode::ClampToEdge,
+                mag_filter: wgpu::FilterMode::Nearest,
+                min_filter: wgpu::FilterMode::Nearest,
+                mipmap_filter: wgpu::FilterMode::Nearest,
+                ..Default::default()
+            }),
         };
         storage.install_default_textures(device, queue)?;
         Ok(storage)

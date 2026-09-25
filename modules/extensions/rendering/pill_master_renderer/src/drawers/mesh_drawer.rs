@@ -85,6 +85,7 @@ impl DrawingContext {
         &mut self,
         renderer_resource_storage: &RendererResourceStorage,
         shader_handle: RendererShaderHandle,
+        pipeline_override: Option<&wgpu::RenderPipeline>,
         render_pass: &mut wgpu::RenderPass,
         camera: &RendererCamera,
     ) {
@@ -97,7 +98,10 @@ impl DrawingContext {
 
         debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Changing shader to: {}", self.shader_name.name_style());
 
-        render_pass.set_pipeline(&shader.render_pipeline);
+        // A pass that owns a pipeline draws through it: the pass decided the
+        // target's format and its own depth and culling, and the pipeline its
+        // shader was built with cannot know either.
+        render_pass.set_pipeline(pipeline_override.unwrap_or(&shader.render_pipeline));
 
         if shader.pass_engine_parameters {
             render_pass.set_bind_group(
@@ -181,34 +185,75 @@ pub struct MeshDrawer {
     max_instance_batch_size: u32,
     instances: Vec<Instance>,
     instance_buffer: wgpu::Buffer,
+    /// How many instances the buffer has room for.
+    instance_capacity: usize,
+}
+
+/// The region of the instance buffer one batch owns.
+///
+/// Every batch gets its own slice rather than sharing the front of the buffer:
+/// the writes and the draws they feed are recorded into one command buffer, so a
+/// shared region would leave every draw reading whichever batch was written
+/// last. The offset is a whole number of batches, which keeps it four-byte
+/// aligned the way `write_buffer` requires.
+fn batch_region(
+    batch_index: usize,
+    batch_size: usize,
+    instance_count: usize,
+) -> std::ops::Range<u64> {
+    let stride = size_of::<Instance>();
+    let start = (batch_index * batch_size * stride) as u64;
+    start..start + (instance_count * stride) as u64
 }
 
 impl MeshDrawer {
     pub fn new(device: &wgpu::Device, max_instance_batch_size: u32) -> Self {
-        // Create instance buffer
-        let buffer_size = (size_of::<Instance>() * max_instance_batch_size as usize) as u64;
-        let instance_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("instance_buffer"),
-            size: buffer_size,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
+        let capacity = max_instance_batch_size as usize;
+        let instance_buffer = Self::allocate(device, capacity);
 
         MeshDrawer {
             max_instance_batch_size,
             instances: Vec::<Instance>::with_capacity(INITIAL_INSTANCE_VECTOR_CAPACITY),
             instance_buffer,
+            instance_capacity: capacity,
         }
+    }
+
+    fn allocate(device: &wgpu::Device, capacity: usize) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("instance_buffer"),
+            size: (size_of::<Instance>() * capacity) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Make room for a frame's instances, one region per batch.
+    ///
+    /// The capacity grows in whole batches, so a frame that is one instance over
+    /// the limit reallocates once rather than on every frame after it.
+    fn ensure_capacity(&mut self, device: &wgpu::Device, instances: usize) {
+        if instances <= self.instance_capacity {
+            return;
+        }
+
+        let batch_size = self.max_instance_batch_size as usize;
+        let capacity = instances.div_ceil(batch_size) * batch_size;
+        self.instance_buffer = Self::allocate(device, capacity);
+        self.instance_capacity = capacity;
     }
 
     #[allow(clippy::too_many_arguments)]
     pub fn record_draw_commands(
         &mut self,
         // Resources
+        device: &wgpu::Device,
         queue: &wgpu::Queue,
         encoder: &mut wgpu::CommandEncoder,
         renderer_resource_storage: &RendererResourceStorage,
-        color_attachment: wgpu::RenderPassColorAttachment,
+        label: &str,
+        pipeline: Option<&wgpu::RenderPipeline>,
+        color_attachments: &[Option<wgpu::RenderPassColorAttachment>],
         depth_stencil_attachment: wgpu::RenderPassDepthStencilAttachment,
         // Rendring data
         camera: &RendererCamera,
@@ -220,9 +265,9 @@ impl MeshDrawer {
         //let _timestamp_query_start = profiler.write_timestamp(encoder, "xx");
 
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("main pass"),
-            color_attachments: &[Some(color_attachment.clone())],
-            depth_stencil_attachment: Some(depth_stencil_attachment.clone()),
+            label: Some(label),
+            color_attachments,
+            depth_stencil_attachment: Some(depth_stencil_attachment),
             timestamp_writes: None,
             occlusion_query_set: None, // profiler.get_occlusion_query_set(), // immut borrow ends after this stmt
                                        //timestamp_writes: None,
@@ -259,10 +304,10 @@ impl MeshDrawer {
 
         let mut current_drawing_context = DrawingContext::default();
 
-        for (i, instance_batch) in render_queue
-            .chunks(self.max_instance_batch_size as usize)
-            .enumerate()
-        {
+        self.ensure_capacity(device, render_queue.len());
+        let batch_size = self.max_instance_batch_size as usize;
+
+        for (i, instance_batch) in render_queue.chunks(batch_size).enumerate() {
             let batch_size = instance_batch.len();
             current_drawing_context.instance_batch_number = i as u32;
             current_drawing_context.instance_batch_size = batch_size as u32;
@@ -278,13 +323,14 @@ impl MeshDrawer {
                 self.instances.push(Instance::new(transform_component));
             }
 
+            let region = batch_region(i, batch_size, self.instances.len());
             queue.write_buffer(
                 &self.instance_buffer,
-                0,
+                region.start,
                 bytemuck::cast_slice(&self.instances),
-            ); // Update instance buffer
+            ); // Update this batch's region of the instance buffer
 
-            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(..)); // Set instance buffer
+            render_pass.set_vertex_buffer(1, self.instance_buffer.slice(region)); // Set instance buffer
 
             // Reset instance range for each batch
             current_drawing_context.accumulated_instance_range = 0..0;
@@ -319,6 +365,7 @@ impl MeshDrawer {
                     current_drawing_context.change_shader(
                         renderer_resource_storage,
                         renderer_shader_handle,
+                        pipeline,
                         &mut render_pass,
                         camera,
                     );
@@ -364,5 +411,36 @@ impl MeshDrawer {
 
         //queue.submit(std::iter::once(encoder.finish()));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_batch_owns_a_region_of_its_own() {
+        let stride = size_of::<Instance>() as u64;
+
+        let first = batch_region(0, 4, 4);
+        let second = batch_region(1, 4, 4);
+        let last = batch_region(2, 4, 2);
+
+        assert_eq!(first, 0..4 * stride);
+        assert_eq!(second, 4 * stride..8 * stride);
+        assert_eq!(last, 8 * stride..10 * stride);
+        assert!(
+            first.end <= second.start && second.end <= last.start,
+            "two batches sharing a region is the bug this exists to prevent"
+        );
+    }
+
+    #[test]
+    fn a_region_starts_where_the_buffer_can_be_written() {
+        // `write_buffer` refuses an offset that is not a multiple of four, and
+        // an instance is not a power of two in size.
+        for batch in 0..4 {
+            assert_eq!(batch_region(batch, 3, 3).start % 4, 0);
+        }
     }
 }

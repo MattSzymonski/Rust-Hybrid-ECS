@@ -13,4 +13,9 @@ pill_master_renderer = { path = "../../modules/extensions/rendering/pill_master_
 serde = { version = "1", features = ["derive"] }
 trait_type_map = { path = "../../../Trait-Type-Map" }
 
+[build-dependencies]
+# Cooks `res/shaders/*.hlsl` into the WGSL this project loads at runtime, so the
+# HLSL is the source of truth and the WGSL is generated beside it.
+pill_assets = { path = "../../modules/pill_assets" }
+
 [features]

@@ -19,7 +19,10 @@ pub struct RenderCapabilities {
 pub struct RenderMetrics {
     pub prepare_micros: u64,
     pub submit_micros: u64,
+    /// Passes of the chain that recorded at least one draw.
     pub draw_calls: u32,
+    /// Passes the frame ran, whether or not they drew anything.
+    pub passes: u32,
     pub instance_bytes: u64,
 }
 

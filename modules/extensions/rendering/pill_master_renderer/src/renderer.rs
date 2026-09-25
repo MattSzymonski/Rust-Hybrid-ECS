@@ -3,17 +3,22 @@
 use crate::{
     api::{FrameOutcome, PillRenderer, RenderCapabilities, RenderMetrics},
     assets::{
-        MaterialParameter, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot, TextureType,
+        MaterialParameter, PassKind, PassTarget, ShaderParameterSlot, ShaderParameterType,
+        ShaderTextureSlot, TextureType,
     },
     component::RenderViewport,
-    config::MAX_INSTANCE_PER_DRAWCALL_COUNT,
+    config::{
+        CAMERA_PARAMETERS_BIND_GROUP_LAYOUT_INDEX, ENGINE_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
+        MATERIAL_PARAMETERS_BIND_GROUP_LAYOUT_INDEX, MATERIAL_TEXTURES_BIND_GROUP_LAYOUT_INDEX,
+        MAX_INSTANCE_PER_DRAWCALL_COUNT,
+    },
     drawers::mesh_drawer::MeshDrawer,
     error::{RendererError, Result},
-    frame::{AssetSnapshot, RenderFrame},
-    render_queue::{compose_render_queue_key, RenderQueueItem},
+    frame::{AssetSnapshot, RenderFrame, ResolvedPass},
+    render_queue::{compose_render_queue_key, decompose_render_queue_key, RenderQueueItem},
     resources::{
-        RendererCamera, RendererMaterial, RendererMesh, RendererResourceStorage, RendererShader,
-        RendererTexture, Vertex,
+        RendererCamera, RendererMaterial, RendererMesh, RendererPass, RendererResourceStorage,
+        RendererShader, RendererTexture, Vertex,
     },
     slot_map::{
         RendererCameraHandle, RendererMaterialHandle, RendererMeshHandle, RendererShaderHandle,
@@ -22,10 +27,152 @@ use crate::{
     Instance,
 };
 use pill_core::{info, PillStyle};
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
+
+/// Colour every frame starts from, whatever the first pass is.
+const CLEAR_COLOR: wgpu::Color = wgpu::Color {
+    r: 0.15,
+    g: 0.15,
+    b: 0.15,
+    a: 1.0,
+};
+
+/// Format of every offscreen colour target a chain declares.
+///
+/// Half-float rather than the surface's `Unorm`: the values a lit frame
+/// produces run well past 1.0, and a target that cannot hold them clips the
+/// picture before the pass that was going to bring it back into range runs.
+const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
 pub trait RendererWindow: wgpu::WindowHandle {}
 impl<T> RendererWindow for T where T: wgpu::WindowHandle {}
+
+/// Where a pass writes.
+#[derive(Clone, Copy)]
+enum PassOutput<'a> {
+    Surface,
+    Offscreen(&'a str),
+}
+
+/// A pass's GPU object, or the reason there is none.
+enum PassSlot {
+    /// Built and ready to record: a pipeline of its own, for the target it
+    /// writes.
+    Drawable(Box<RendererPass>),
+    /// A geometry pass with no shader of its own. It draws every instance
+    /// through the pipeline each material names, which is the renderer's
+    /// built-in chain and needs nothing built per pass.
+    Unshaded,
+    /// Cannot be recorded, carrying the reason the log reports.
+    Unsupported(String),
+}
+
+/// One pass the renderer will record.
+enum PassPlan<'a> {
+    /// Instances, batched by material, into the pass's targets.
+    Geometry {
+        label: &'a str,
+        items: Vec<RenderQueueItem>,
+        outputs: Vec<PassOutput<'a>>,
+        clear: bool,
+        /// The pass's own pipeline, when it built one. `None` leaves each
+        /// instance to the pipeline its material's shader carries.
+        pass_index: Option<usize>,
+    },
+    /// Three vertices and no vertex buffers, reading what earlier passes wrote.
+    Fullscreen {
+        label: &'a str,
+        pass_index: usize,
+        outputs: Vec<PassOutput<'a>>,
+        clear: bool,
+    },
+}
+
+impl PassPlan<'_> {
+    /// Pass name, used as the wgpu render-pass label and in the chain log.
+    fn label(&self) -> &str {
+        match self {
+            PassPlan::Geometry { label, .. } | PassPlan::Fullscreen { label, .. } => label,
+        }
+    }
+
+    /// Where this pass writes, its own target first.
+    fn outputs(&self) -> &[PassOutput<'_>] {
+        match self {
+            PassPlan::Geometry { outputs, .. } | PassPlan::Fullscreen { outputs, .. } => outputs,
+        }
+    }
+
+    /// Whether this pass opens the targets it writes.
+    fn clears(&self) -> bool {
+        match self {
+            PassPlan::Geometry { clear, .. } | PassPlan::Fullscreen { clear, .. } => *clear,
+        }
+    }
+
+    /// How many draws this pass records: one per instance batch, or the single
+    /// triangle a fullscreen pass is.
+    fn draws(&self) -> usize {
+        match self {
+            PassPlan::Geometry { items, .. } => items.len(),
+            PassPlan::Fullscreen { .. } => 1,
+        }
+    }
+}
+
+/// A signature of everything a chain's GPU objects depend on.
+///
+/// The chain is read every frame but its pipelines are not rebuilt every frame:
+/// this is what decides whether they have to be. The asset revision is part of
+/// it because a pass's parameters live in the asset, so editing one has to
+/// rebuild the bind group that carries it.
+fn chain_signature(chain: &[ResolvedPass], asset_revision: u64) -> String {
+    let mut signature = format!("r{asset_revision}");
+    for pass in chain {
+        signature.push('|');
+        signature.push_str(&pass.name);
+        signature.push_str(match pass.kind {
+            PassKind::Geometry => " geometry",
+            PassKind::Fullscreen => " fullscreen",
+        });
+        match &pass.target {
+            PassTarget::Surface => signature.push_str(" surface"),
+            PassTarget::Offscreen(name) => {
+                signature.push_str(" offscreen:");
+                signature.push_str(name);
+            }
+        }
+        if let Some(shader) = pass.shader {
+            signature.push_str(&format!(" shader:{shader}"));
+        }
+        for extra in &pass.extra_targets {
+            match extra {
+                PassTarget::Surface => signature.push_str(" also:surface"),
+                PassTarget::Offscreen(name) => {
+                    signature.push_str(" also:offscreen:");
+                    signature.push_str(name);
+                }
+            }
+        }
+        signature.push_str(&format!(
+            " scale:{} blend:{} depth_write:{} cull:{:?}",
+            pass.target_scale, pass.blend, pass.depth_write, pass.cull
+        ));
+        for (slot, target) in &pass.inputs {
+            signature.push_str(&format!(" input:{slot}={target}"));
+        }
+        // A pass's textures are part of it for the same reason its parameters
+        // are: the pointer to one lives in the asset, and the bind group that
+        // reads it is built once and then kept.
+        for (slot, texture) in &pass.textures {
+            signature.push_str(&format!(" texture:{slot}={texture}"));
+        }
+    }
+    signature
+}
 
 pub struct Renderer {
     pub state: State,
@@ -39,6 +186,16 @@ pub struct Renderer {
     camera: RendererCameraHandle,
     viewport: Option<RenderViewport>,
     minimized: bool,
+    /// Passes this renderer cannot record yet, remembered so each one is named
+    /// once in the log instead of once per frame.
+    skipped_passes: HashSet<String>,
+    /// The chain last written to the log, so a chain that does not change does
+    /// not write a line per frame.
+    chain_log: Option<String>,
+    /// One entry per pass of the current chain, in the chain's order.
+    passes: Vec<PassSlot>,
+    /// The chain those passes were built from.
+    pipeline_signature: Option<String>,
     metrics: RenderMetrics,
 }
 
@@ -74,6 +231,10 @@ impl Renderer {
             camera,
             viewport: None,
             minimized: width == 0 || height == 0,
+            skipped_passes: HashSet::new(),
+            chain_log: None,
+            passes: Vec::new(),
+            pipeline_signature: None,
             metrics: RenderMetrics::default(),
         })
     }
@@ -197,6 +358,12 @@ impl PillRenderer for Renderer {
         if !self.minimized {
             self.state
                 .resize(winit::dpi::PhysicalSize::new(width, height));
+            // An offscreen target is sized to the surface, so a new surface size
+            // makes every one of them wrong; the chain is rebuilt with them on
+            // the next frame.
+            self.state.offscreen.clear();
+            self.passes.clear();
+            self.pipeline_signature = None;
         }
     }
 
@@ -210,6 +377,7 @@ impl PillRenderer for Renderer {
         }
         let prepare = Instant::now();
         self.sync_assets(&frame.assets)?;
+        self.ensure_pipeline(&frame.passes, &frame.assets)?;
         let mut render_queue = Vec::with_capacity(frame.instances.len());
         for (index, instance) in frame.instances.iter().enumerate() {
             let Some(mesh) = self.mesh_handles.get(&instance.mesh).copied() else {
@@ -241,16 +409,269 @@ impl PillRenderer for Renderer {
         render_queue.sort_unstable();
         self.metrics.prepare_micros = prepare.elapsed().as_micros() as u64;
         self.metrics.instance_bytes = (render_queue.len() * std::mem::size_of::<Instance>()) as u64;
+
+        // Read from the frame every time. A game can swap the pipeline, or
+        // toggle a pass inside one, between any two frames, and a chain cached
+        // here would keep drawing the previous one until something else
+        // happened to invalidate it. An empty chain is a game that asked for
+        // nothing, not a game that asked for the built-in pass: the frame's
+        // writer puts that pass in the chain itself.
+        let plan = self.plan_passes(&frame.passes, &render_queue);
+        self.log_chain(&plan);
+        self.metrics.draw_calls = plan.iter().filter(|entry| entry.draws() > 0).count() as u32;
+        self.metrics.passes = plan.len() as u32;
+
         let submitted = Instant::now();
         self.state
-            .render(self.camera, &render_queue, frame, self.viewport)?;
+            .render(self.camera, &plan, &self.passes, frame, self.viewport)?;
         self.metrics.submit_micros = submitted.elapsed().as_micros() as u64;
-        self.metrics.draw_calls = u32::from(!render_queue.is_empty());
         Ok(FrameOutcome::Presented)
     }
 
     fn invalidate_assets(&mut self) {
         self.asset_revision = u64::MAX;
+    }
+}
+
+impl Renderer {
+    /// Hand each pass the draws it was given.
+    ///
+    /// A geometry pass that names a shader draws the instances shaded by that
+    /// shader and leaves the rest to the other passes; one that names none draws
+    /// every instance, each with the pipeline its own material names, which is
+    /// what the built-in chain is. A fullscreen pass draws nothing but its
+    /// triangle, and reads what earlier passes left in the targets it names.
+    fn plan_passes<'a>(
+        &mut self,
+        chain: &'a [ResolvedPass],
+        render_queue: &[RenderQueueItem],
+    ) -> Vec<PassPlan<'a>> {
+        let mut plan = Vec::with_capacity(chain.len());
+        for (index, pass) in chain.iter().enumerate() {
+            // The pass's own target first, then the ones it writes beside it.
+            let outputs: Vec<PassOutput<'_>> = std::iter::once(&pass.target)
+                .chain(pass.extra_targets.iter())
+                .map(|target| match target {
+                    PassTarget::Surface => PassOutput::Surface,
+                    PassTarget::Offscreen(name) => PassOutput::Offscreen(name.as_str()),
+                })
+                .collect();
+
+            match pass.kind {
+                PassKind::Geometry => {
+                    let reason = match self.passes.get(index) {
+                        Some(PassSlot::Drawable(_)) => None,
+                        Some(PassSlot::Unshaded) => None,
+                        Some(PassSlot::Unsupported(reason)) => Some(reason.clone()),
+                        _ => Some("it has no pipeline".to_owned()),
+                    };
+                    if let Some(reason) = reason {
+                        self.report_skip(&pass.name, &reason);
+                        continue;
+                    }
+
+                    let items = match pass.shader {
+                        // The pass draws the instances shaded by the shader it
+                        // names, when that shader is still loaded. One that no
+                        // longer is draws nothing: falling back to the default
+                        // shader would hand this pass instances another pass
+                        // already took.
+                        Some(key) => match self.shader_handles.get(&key) {
+                            Some(handle) => {
+                                let index = handle.data().index as u8;
+                                render_queue
+                                    .iter()
+                                    .copied()
+                                    .filter(|item| {
+                                        decompose_render_queue_key(item.key).shader_index == index
+                                    })
+                                    .collect()
+                            }
+                            None => Vec::new(),
+                        },
+                        // No shader named: the pass draws every instance, each
+                        // with the pipeline its own material names. This is the
+                        // built-in chain.
+                        None => render_queue.to_vec(),
+                    };
+                    let pass_index = match self.passes.get(index) {
+                        Some(PassSlot::Drawable(_)) => Some(index),
+                        _ => None,
+                    };
+                    plan.push(PassPlan::Geometry {
+                        label: pass.name.as_str(),
+                        items,
+                        outputs,
+                        clear: plan.is_empty(),
+                        pass_index,
+                    });
+                }
+                PassKind::Fullscreen => {
+                    let reason = match self.passes.get(index) {
+                        Some(PassSlot::Drawable(_)) => None,
+                        Some(PassSlot::Unsupported(reason)) => Some(reason.clone()),
+                        _ => Some("it has no fullscreen pipeline".to_owned()),
+                    };
+                    match reason {
+                        None => plan.push(PassPlan::Fullscreen {
+                            label: pass.name.as_str(),
+                            pass_index: index,
+                            outputs,
+                            clear: plan.is_empty(),
+                        }),
+                        Some(reason) => self.report_skip(&pass.name, &reason),
+                    }
+                }
+            }
+        }
+
+        // A chain with nothing recordable in it still has to open the frame's
+        // targets: a swapchain image nobody cleared presents whatever was in it.
+        if plan.is_empty() {
+            plan.push(PassPlan::Geometry {
+                label: "frame.clear",
+                items: Vec::new(),
+                outputs: vec![PassOutput::Surface],
+                clear: true,
+                pass_index: None,
+            });
+        }
+        plan
+    }
+
+    /// Build the GPU objects the chain needs.
+    ///
+    /// One offscreen target per output the chain declares, and one pipeline per
+    /// fullscreen pass. Keyed by a signature of the chain, because this is the
+    /// expensive part of a frame's setup and an unchanged chain needs none of it
+    /// a second time.
+    fn ensure_pipeline(&mut self, chain: &[ResolvedPass], assets: &AssetSnapshot) -> Result<()> {
+        let signature = chain_signature(chain, assets.revision);
+        if self.pipeline_signature.as_deref() == Some(signature.as_str()) {
+            return Ok(());
+        }
+
+        self.state.ensure_offscreen_targets(chain);
+        let passes: Vec<PassSlot> = chain
+            .iter()
+            .map(|pass| self.build_pass(pass, assets))
+            .collect();
+        self.passes = passes;
+        self.pipeline_signature = Some(signature);
+        Ok(())
+    }
+
+    /// A pass's GPU object, or the reason there is none.
+    fn build_pass(&self, pass: &ResolvedPass, assets: &AssetSnapshot) -> PassSlot {
+        // A geometry pass with no shader of its own draws through each
+        // material's pipeline, and that is the only path that needs no object.
+        let Some(shader_key) = pass.shader else {
+            return match pass.kind {
+                PassKind::Geometry => PassSlot::Unshaded,
+                PassKind::Fullscreen => {
+                    PassSlot::Unsupported("it names no shader the renderer loaded".to_owned())
+                }
+            };
+        };
+
+        let Some(shader) = assets.shaders.get(&shader_key) else {
+            return PassSlot::Unsupported("it names no shader the renderer loaded".to_owned());
+        };
+        let Some(renderer_shader) = self
+            .shader_handles
+            .get(&shader_key)
+            .and_then(|handle| self.state.renderer_resource_storage.shaders.get(*handle))
+        else {
+            return PassSlot::Unsupported("its shader has no pipeline".to_owned());
+        };
+        // One format per target the pass writes, in the order the shader's
+        // `SV_TARGET` list names them. A target the pass writes beside its own
+        // is what a geometry pass leaves a normal buffer in.
+        let target_formats: Vec<wgpu::TextureFormat> = std::iter::once(&pass.target)
+            .chain(pass.extra_targets.iter())
+            .map(|target| match target {
+                PassTarget::Surface => self.state.color_format,
+                PassTarget::Offscreen(name) => self
+                    .state
+                    .offscreen
+                    .get(name)
+                    .map(|texture| texture.texture.format())
+                    .unwrap_or(OFFSCREEN_FORMAT),
+            })
+            .collect();
+
+        // The pass's own committed textures, by slot. They resolve to the same
+        // GPU handles a material's textures do, so a pass and a material reach
+        // one texture by one key.
+        let textures: Vec<(String, RendererTextureHandle)> = pass
+            .textures
+            .iter()
+            .filter_map(|(slot, key)| {
+                self.texture_handles
+                    .get(key)
+                    .map(|handle| (slot.clone(), *handle))
+            })
+            .collect();
+
+        let storage = &self.state.renderer_resource_storage;
+        match RendererPass::new(
+            &self.state.device,
+            &self.state.queue,
+            storage,
+            &storage.engine_parameters.bind_group_layout,
+            &self.state.camera_bind_group_layout,
+            pass,
+            shader,
+            renderer_shader,
+            &target_formats,
+            self.state.depth_format,
+            &self.state.offscreen,
+            &self.state.depth_texture,
+            &textures,
+        ) {
+            Ok(value) => PassSlot::Drawable(Box::new(value)),
+            Err(error) => PassSlot::Unsupported(error.to_string()),
+        }
+    }
+
+    /// Name a pass the renderer cannot record, once rather than once per frame.
+    fn report_skip(&mut self, name: &str, reason: &str) {
+        if !self.skipped_passes.insert(name.to_owned()) {
+            return;
+        }
+
+        // Printed, like the renderer's other once-per-change diagnostics: the
+        // log target this would otherwise use is filtered out of the host's log.
+        println!("[render] Pass {name} is not drawn: {reason}");
+    }
+
+    /// Write the chain to the log, once per change.
+    ///
+    /// Each pass is named with the number of draws it was handed, which is the
+    /// one thing that tells a chain doing what the game asked apart from one
+    /// quietly falling back to the built-in pass. A line per frame would bury
+    /// everything else, and an unchanged chain is the normal case.
+    fn log_chain(&mut self, plan: &[PassPlan]) {
+        let mut signature = String::new();
+        for entry in plan {
+            if !signature.is_empty() {
+                signature.push(' ');
+            }
+            signature.push_str(entry.label());
+            signature.push('(');
+            signature.push_str(&entry.draws().to_string());
+            signature.push(')');
+        }
+        if self.chain_log.as_deref() == Some(signature.as_str()) {
+            return;
+        }
+
+        // Printed, like the renderer's other once-per-change diagnostics: the
+        // log target this would otherwise use is filtered out of the host's log,
+        // and this line is what a reader has when the window shows the wrong
+        // thing.
+        println!("[render] Pass chain: {signature}");
+        self.chain_log = Some(signature);
     }
 }
 
@@ -326,6 +747,12 @@ pub struct State {
     pub(crate) color_format: wgpu::TextureFormat,
     pub(crate) depth_format: wgpu::TextureFormat,
     depth_texture: RendererTexture,
+    /// The offscreen colour targets the current chain names, by that name.
+    ///
+    /// Owned here rather than by the passes that write them: two passes name
+    /// the same target - one writes it, the next reads it - and a texture owned
+    /// by either would be a lifetime the chain cannot express.
+    offscreen: HashMap<String, RendererTexture>,
     mesh_drawer: MeshDrawer,
     pub(crate) camera_bind_group_layout: wgpu::BindGroupLayout,
 }
@@ -370,13 +797,19 @@ impl State {
                 detail: error.to_string(),
             })?;
         let capabilities = surface.get_capabilities(&adapter);
-        let color_format = capabilities
-            .formats
-            .iter()
-            .copied()
-            .find(wgpu::TextureFormat::is_srgb)
-            .or_else(|| capabilities.formats.first().copied())
-            .ok_or(RendererError::NoTextureFormats)?;
+        // Preference order taken from the reference: an sRGB target where the
+        // surface offers one, Rgba ahead of Bgra because it needs no channel
+        // swizzle, and finally whatever the surface does advertise rather than
+        // refusing to start.
+        let color_format = [
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            wgpu::TextureFormat::Bgra8Unorm,
+        ]
+        .into_iter()
+        .find(|format| capabilities.formats.contains(format))
+        .or_else(|| capabilities.formats.first().copied())
+        .ok_or(RendererError::NoTextureFormats)?;
         let alpha_mode = capabilities
             .alpha_modes
             .first()
@@ -431,6 +864,7 @@ impl State {
             color_format,
             depth_format,
             depth_texture,
+            offscreen: HashMap::new(),
             mesh_drawer,
             camera_bind_group_layout,
         })
@@ -450,10 +884,47 @@ impl State {
         .expect("depth texture recreation must succeed");
     }
 
+    /// Create a target for every offscreen output the chain declares.
+    ///
+    /// Rebuilt whenever the chain is, and sized to the surface: one that no
+    /// longer matches the window would be sampled at a different scale from the
+    /// pass that wrote it, which shows up as a picture that shrinks with the
+    /// window rather than one that resizes with it.
+    fn ensure_offscreen_targets(&mut self, chain: &[ResolvedPass]) {
+        let width = self.surface_configuration.width;
+        let height = self.surface_configuration.height;
+        let device = &self.device;
+        let targets = &mut self.offscreen;
+        targets.clear();
+
+        for pass in chain {
+            // The pass's own target first, then the ones it writes beside it.
+            // The scale is the first pass's: a target belongs to the chain, and
+            // the pass that names it first is asking on everyone's behalf.
+            let scale = pass.target_scale.max(1);
+            let written = std::iter::once(&pass.target).chain(pass.extra_targets.iter());
+            for target in written {
+                let PassTarget::Offscreen(name) = target else {
+                    continue;
+                };
+                targets.entry(name.clone()).or_insert_with(|| {
+                    RendererTexture::new_render_target(
+                        device,
+                        name,
+                        (width / scale).max(1),
+                        (height / scale).max(1),
+                        OFFSCREEN_FORMAT,
+                    )
+                });
+            }
+        }
+    }
+
     fn render(
         &mut self,
         camera_handle: RendererCameraHandle,
-        render_queue: &[RenderQueueItem],
+        plan: &[PassPlan],
+        passes: &[PassSlot],
         frame: &RenderFrame,
         viewport: Option<RenderViewport>,
     ) -> Result<()> {
@@ -470,9 +941,21 @@ impl State {
         let view = surface_frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-        self.renderer_resource_storage
-            .engine_parameters
-            .update(&self.queue, 0.0, [0.0; 3]);
+        self.renderer_resource_storage.engine_parameters.update(
+            &self.queue,
+            0.0,
+            [0.0; 3],
+            [
+                self.surface_configuration.width,
+                self.surface_configuration.height,
+            ],
+            [
+                frame.seconds,
+                frame.delta_seconds,
+                frame.sequence as f32,
+                0.0,
+            ],
+        );
         let camera = self
             .renderer_resource_storage
             .cameras
@@ -507,41 +990,146 @@ impl State {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("render_encoder"),
             });
-        let color_attachment = wgpu::RenderPassColorAttachment {
-            view: &view,
-            resolve_target: None,
-            ops: wgpu::Operations {
-                load: wgpu::LoadOp::Clear(wgpu::Color {
-                    r: 0.15,
-                    g: 0.15,
-                    b: 0.15,
-                    a: 1.0,
-                }),
-                store: wgpu::StoreOp::Store,
-            },
-        };
-        let depth_stencil_attachment = wgpu::RenderPassDepthStencilAttachment {
-            view: &self.depth_texture.texture_view,
-            depth_ops: Some(wgpu::Operations {
-                load: wgpu::LoadOp::Clear(1.0),
-                store: wgpu::StoreOp::Store,
-            }),
-            stencil_ops: None,
-        };
-        self.mesh_drawer.record_draw_commands(
-            &self.queue,
-            &mut encoder,
-            &self.renderer_resource_storage,
-            color_attachment,
-            depth_stencil_attachment,
-            camera,
-            render_queue,
-            &frame.instances,
-            viewport,
-        )?;
+        // One wgpu render pass per pass of the chain, into the same encoder: the
+        // first clears the targets it writes, the rest add to what is there.
+        for entry in plan {
+            // Every target the pass writes, in the order the shader's
+            // `SV_TARGET` list names them.
+            let mut views = Vec::with_capacity(entry.outputs().len());
+            let mut missing_target = false;
+            for output in entry.outputs() {
+                match output {
+                    PassOutput::Surface => views.push(&view),
+                    // A pass whose target was never created draws nothing rather
+                    // than into the wrong one; the chain log already named the
+                    // pass that could not be built.
+                    PassOutput::Offscreen(name) => match self.offscreen.get(*name) {
+                        Some(texture) => views.push(&texture.texture_view),
+                        None => missing_target = true,
+                    },
+                }
+            }
+            if missing_target {
+                continue;
+            }
+
+            let clear = entry.clears();
+            let color_attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = views
+                .iter()
+                .map(|target| {
+                    Some(wgpu::RenderPassColorAttachment {
+                        view: target,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: color_load(clear),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })
+                })
+                .collect();
+
+            match entry {
+                PassPlan::Geometry {
+                    label,
+                    items,
+                    pass_index,
+                    ..
+                } => {
+                    let depth_stencil_attachment = wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.depth_texture.texture_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: if clear {
+                                wgpu::LoadOp::Clear(1.0)
+                            } else {
+                                wgpu::LoadOp::Load
+                            },
+                            store: wgpu::StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    };
+                    // A pass that built a pipeline draws through it: the
+                    // pipeline holds the targets' formats and the pass's depth
+                    // and culling, none of which an instance may choose.
+                    let pipeline = pass_index.and_then(|index| match passes.get(index) {
+                        Some(PassSlot::Drawable(pass)) => Some(&pass.pipeline),
+                        _ => None,
+                    });
+                    self.mesh_drawer.record_draw_commands(
+                        &self.device,
+                        &self.queue,
+                        &mut encoder,
+                        &self.renderer_resource_storage,
+                        label,
+                        pipeline,
+                        &color_attachments,
+                        depth_stencil_attachment,
+                        camera,
+                        items,
+                        &frame.instances,
+                        viewport,
+                    )?;
+                }
+                PassPlan::Fullscreen {
+                    label, pass_index, ..
+                } => {
+                    let Some(PassSlot::Drawable(pass)) = passes.get(*pass_index) else {
+                        continue;
+                    };
+                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some(label),
+                        color_attachments: &color_attachments,
+                        // No depth: a fullscreen pass overwrites every pixel it
+                        // covers, and the depth left behind describes geometry
+                        // that is not what this triangle is.
+                        depth_stencil_attachment: None,
+                        timestamp_writes: None,
+                        occlusion_query_set: None,
+                    });
+                    render_pass.set_pipeline(&pass.pipeline);
+                    if pass.pass_engine_parameters {
+                        render_pass.set_bind_group(
+                            ENGINE_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
+                            &self.renderer_resource_storage.engine_parameters.bind_group,
+                            &[],
+                        );
+                    }
+                    if pass.pass_camera_parameters {
+                        render_pass.set_bind_group(
+                            CAMERA_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
+                            &camera.bind_group,
+                            &[],
+                        );
+                    }
+                    if let Some(bind_group) = &pass.parameters_bind_group {
+                        render_pass.set_bind_group(
+                            MATERIAL_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
+                            bind_group,
+                            &[],
+                        );
+                    }
+                    if let Some(bind_group) = &pass.textures_bind_group {
+                        render_pass.set_bind_group(
+                            MATERIAL_TEXTURES_BIND_GROUP_LAYOUT_INDEX,
+                            bind_group,
+                            &[],
+                        );
+                    }
+                    render_pass.draw(0..3, 0..1);
+                }
+            }
+        }
         self.queue.submit(std::iter::once(encoder.finish()));
         surface_frame.present();
         Ok(())
+    }
+}
+
+/// The colour a pass opens its target with, or the values already in it.
+fn color_load(clear: bool) -> wgpu::LoadOp<wgpu::Color> {
+    if clear {
+        wgpu::LoadOp::Clear(CLEAR_COLOR)
+    } else {
+        wgpu::LoadOp::Load
     }
 }
 
@@ -609,4 +1197,46 @@ fn configure_surface(
     Err(RendererError::SurfaceConfigurationRefused {
         detail: failures.join("; "),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pass(kind: PassKind, target: PassTarget) -> ResolvedPass {
+        ResolvedPass {
+            name: "p".to_owned(),
+            shader: None,
+            kind,
+            target,
+            extra_targets: Vec::new(),
+            target_scale: 1,
+            blend: false,
+            depth_write: true,
+            cull: crate::assets::CullMode::Back,
+            parameters: HashMap::new(),
+            inputs: HashMap::new(),
+            textures: HashMap::new(),
+            order: 0,
+        }
+    }
+
+    #[test]
+    fn a_chain_signature_covers_everything_the_gpu_objects_depend_on() {
+        let surface = pass(PassKind::Geometry, PassTarget::Surface);
+        let offscreen = pass(PassKind::Geometry, PassTarget::Offscreen("hdr".to_owned()));
+        let mut reading = pass(PassKind::Geometry, PassTarget::Surface);
+        reading.inputs.insert("hdr".to_owned(), "hdr".to_owned());
+
+        let base = chain_signature(std::slice::from_ref(&surface), 1);
+
+        assert_eq!(base, chain_signature(std::slice::from_ref(&surface), 1));
+        assert_ne!(base, chain_signature(std::slice::from_ref(&offscreen), 1));
+        assert_ne!(base, chain_signature(std::slice::from_ref(&reading), 1));
+        assert_ne!(
+            base,
+            chain_signature(std::slice::from_ref(&surface), 2),
+            "a pass's parameters live in the asset, so the asset revision is part of it"
+        );
+    }
 }

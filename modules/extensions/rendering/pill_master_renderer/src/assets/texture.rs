@@ -6,6 +6,15 @@ use pill_engine::{Asset, AssetLoadError, AssetLoadResult, AssetLoader};
 pub enum TextureType {
     Color,
     Normal,
+    /// A depth buffer, sampled by a pass that reconstructs position or measures
+    /// distance.
+    ///
+    /// Not a kind of asset: no file decodes to one, and the renderer refuses a
+    /// texture asset that claims to be one. It exists so a shader can say that a
+    /// slot reads depth, which is what decides the binding wgpu will accept -
+    /// a depth texture cannot be bound where a filterable colour texture is
+    /// expected.
+    Depth,
 }
 
 #[derive(Clone, Debug)]

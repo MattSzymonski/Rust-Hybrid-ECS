@@ -1,6 +1,6 @@
 use crate::{
-    assets::{ShaderParameterSlot, ShaderTextureSlot},
-    error::Result,
+    assets::{ShaderParameterSlot, ShaderTextureSlot, TextureType},
+    error::{RendererError, Result},
 };
 use pill_core::{debug, PillStyle};
 use std::collections::HashMap;
@@ -64,8 +64,10 @@ impl RendererShader {
 
         debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Shader modules created");
 
-        // Create shader modules from WGSL strings — wgpu consumes WGSL natively;
-        // no compile step at runtime, no naga linked into the binary.
+        // Create shader modules from the cooked WGSL. Nothing compiles a shader
+        // at runtime: the authored sources are HLSL in `src/shaders`, the build
+        // script's `slangc` rule produces the WGSL these strings carry, and wgpu
+        // parses that WGSL through naga like any other `ShaderSource::Wgsl`.
         let vertex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("master_vertex_shader"),
             source: wgpu::ShaderSource::Wgsl(vertex_wgsl.into()),
@@ -107,6 +109,20 @@ impl RendererShader {
                 let mut entries = Vec::new();
 
                 for texture_slot in texture_slots.values() {
+                    // A depth slot is bound as depth, with a sampler that does not
+                    // filter: a depth buffer is not a filterable colour texture,
+                    // and wgpu refuses the pipeline that pretends otherwise.
+                    let (sample_type, sampler_type) = match texture_slot.texture_type {
+                        TextureType::Depth => (
+                            wgpu::TextureSampleType::Depth,
+                            wgpu::SamplerBindingType::NonFiltering,
+                        ),
+                        TextureType::Color | TextureType::Normal => (
+                            wgpu::TextureSampleType::Float { filterable: true },
+                            wgpu::SamplerBindingType::Filtering,
+                        ),
+                    };
+
                     // Texture binding
                     entries.push(wgpu::BindGroupLayoutEntry {
                         binding: texture_slot.texture_binding,
@@ -114,7 +130,7 @@ impl RendererShader {
                         ty: wgpu::BindingType::Texture {
                             multisampled: false,
                             view_dimension: wgpu::TextureViewDimension::D2,
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            sample_type,
                         },
                         count: None,
                     });
@@ -123,7 +139,7 @@ impl RendererShader {
                     entries.push(wgpu::BindGroupLayoutEntry {
                         binding: texture_slot.sampler_binding,
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        ty: wgpu::BindingType::Sampler(sampler_type),
                         count: None,
                     });
                 }
@@ -217,7 +233,13 @@ impl RendererShader {
             cache: None,
         };
 
-        let render_pipeline = device.create_render_pipeline(&render_pipeline_descriptor);
+        // Captured rather than left to wgpu's uncaptured-error handler: a shader
+        // the driver refuses is a mistake in the asset, and the pass or material
+        // that named it is what the message should be attached to.
+        let render_pipeline = crate::error::capturing_validation(device, || {
+            device.create_render_pipeline(&render_pipeline_descriptor)
+        })
+        .map_err(|detail| RendererError::Other { detail })?;
 
         let pipeline = Self {
             name: name.to_string(),
