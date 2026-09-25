@@ -182,13 +182,15 @@ impl RendererMaterial {
         Ok(())
     }
 
-    fn calculate_uniform_size(parameter_slots: &[(String, ShaderParameterSlot)]) -> usize {
+    pub(crate) fn calculate_uniform_size(
+        parameter_slots: &[(String, ShaderParameterSlot)],
+    ) -> usize {
         // Calculate total size needed for all parameters
         // Each parameter slot gets 16 bytes (vec4 alignment in WGSL)
         parameter_slots.len() * 16
     }
 
-    fn write_parameters_to_buffer(
+    pub(crate) fn write_parameters_to_buffer(
         queue: &wgpu::Queue,
         buffer: &wgpu::Buffer,
         parameter_slots: &[(String, ShaderParameterSlot)],
@@ -269,6 +271,17 @@ impl RendererMaterial {
                     match slot.texture_type {
                         TextureType::Color => rendering_resource_storage.default_color_texture,
                         TextureType::Normal => rendering_resource_storage.default_normal_texture,
+                        // A material has no depth to give: only the renderer's own
+                        // buffer holds any, and a pass is what reads it. A
+                        // material shader that asks for depth is a mistake worth
+                        // naming rather than a slot quietly filled with white.
+                        TextureType::Depth => {
+                            return Err(RendererError::Other {
+                                detail: format!(
+                                    "material `{name}` declares texture slot `{slot_name}` as depth, which only a pass can read"
+                                ),
+                            });
+                        }
                     }
                 }
             };

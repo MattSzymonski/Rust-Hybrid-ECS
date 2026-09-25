@@ -2,3 +2,8 @@
 target/
 build/
 .vscode/
+
+# Cooked from the HLSL beside them by `build.rs`: `slangc` rewrites these
+# whenever a source or the shared header changes, so they are generated rather
+# than tracked. Scoped to this project, so no other example's shaders are touched.
+res/shaders/*.wgsl

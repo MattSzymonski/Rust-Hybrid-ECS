@@ -19,12 +19,18 @@ impl Instance {
         } else {
             glam::Quat::IDENTITY
         };
-        let (axis, angle) = rotation.to_axis_angle();
-        let rot_radians = axis * angle;
+        // The vertex shader builds `rot_z * rot_y * rot_x` from the three
+        // numbers it is handed, so the CPU has to hand it angles in that
+        // convention. It used to send `axis * angle`, which the shader read as
+        // three Euler angles - a rotation about (x, y, z) that has nothing to
+        // do with the quaternion it came from, and one that lost the winding
+        // past half a turn. `ZYX` is the order the shader's multiplication
+        // spells out, and glam returns the angles in reverse: (z, y, x).
+        let (z, y, x) = rotation.to_euler(glam::EulerRot::ZYX);
         Instance {
             transform: Matrix3f::from_cols(
                 transform_component.translation.into(),
-                rot_radians,
+                glam::Vec3::new(x, y, z),
                 transform_component.scale.into(),
             ),
         }
@@ -100,5 +106,66 @@ impl Vertex for Instance {
                    //     },
             ],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rotation the vertex shader builds from the three numbers it is
+    /// handed, spelled the way the shader spells it: `rot_z * rot_y * rot_x`.
+    fn shader_rotation(angles: glam::Vec3) -> glam::Mat3 {
+        glam::Mat3::from_rotation_z(angles.z)
+            * glam::Mat3::from_rotation_y(angles.y)
+            * glam::Mat3::from_rotation_x(angles.x)
+    }
+
+    fn instance_of(rotation: glam::Quat) -> Instance {
+        Instance::new(&TransformComponent {
+            translation: [0.0; 3],
+            rotation: rotation.to_array(),
+            scale: [1.0; 3],
+        })
+    }
+
+    #[test]
+    fn the_angles_the_shader_is_given_rebuild_the_rotation_they_came_from() {
+        for rotation in [
+            glam::Quat::IDENTITY,
+            glam::Quat::from_rotation_x(0.4),
+            glam::Quat::from_rotation_y(2.0),
+            glam::Quat::from_rotation_z(-1.2),
+            glam::Quat::from_rotation_y(0.7) * glam::Quat::from_rotation_x(0.3),
+            // Past half a turn: the encoding this replaced lost the winding
+            // here, and a spinning model came back rotated the other way.
+            glam::Quat::from_rotation_y(4.5),
+        ] {
+            let instance = instance_of(rotation);
+            let rebuilt = shader_rotation(instance.transform.y_axis);
+            let expected = glam::Mat3::from_quat(rotation);
+
+            let difference = (rebuilt - expected)
+                .to_cols_array()
+                .iter()
+                .fold(0.0f32, |worst, value| worst.max(value.abs()));
+            assert!(
+                difference < 1e-4,
+                "the shader's matrix differs by {difference} for {rotation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_transform_keeps_the_translation_and_scale_it_was_given() {
+        let instance = Instance::new(&TransformComponent {
+            translation: [1.0, 2.0, 3.0],
+            rotation: glam::Quat::IDENTITY.to_array(),
+            scale: [4.0, 5.0, 6.0],
+        });
+
+        assert_eq!(instance.transform.x_axis, glam::Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(instance.transform.z_axis, glam::Vec3::new(4.0, 5.0, 6.0));
+        assert_eq!(instance.transform.y_axis, glam::Vec3::ZERO);
     }
 }

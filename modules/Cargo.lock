@@ -2677,6 +2677,7 @@ name = "host_project_italian_brainrot"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "pill_assets",
  "pill_engine",
  "pill_master_renderer",
  "serde",
@@ -4701,6 +4702,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pill_assets"
+version = "0.1.0"
+
+[[package]]
 name = "pill_audio"
 version = "0.1.0"
 dependencies = [
@@ -4852,6 +4857,7 @@ dependencies = [
  "glam",
  "image",
  "miette",
+ "pill_assets",
  "pill_core",
  "pill_core_macros",
  "pill_engine",

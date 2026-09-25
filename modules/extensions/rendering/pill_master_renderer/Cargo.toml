@@ -23,12 +23,20 @@ winit = "0.30.12"
 bytemuck = { version = "1.4", features = ["derive"] }
 wgpu = "25.0.0"
 pollster = "0.4"
-image = { version = "0.25", default-features = false, features = ["png"] }
+# `jpeg` alongside `png`: the committed helmet asset in `master_renderer_test`
+# ships its PBR maps as JPEG, and re-encoding them to PNG would multiply the
+# committed size for no gain in fidelity.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 tobj = "3"
 
 egui = { version = "0.32.1", optional = true }
 egui-wgpu = { version = "0.32.1", features = ["winit"], optional = true }
 egui-winit = { version = "0.32.1", features = ["clipboard"], optional = true }
+
+[build-dependencies]
+# Turns `src/shaders/*.hlsl` into the WGSL this crate `include_str!`s, so a
+# shader that is not committed is still the one that compiles.
+pill_assets = { path = "../../../pill_assets" }
 
 [features]
 debug_ui = ["dep:egui", "dep:egui-wgpu", "dep:egui-winit"]
