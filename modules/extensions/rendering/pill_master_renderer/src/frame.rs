@@ -271,7 +271,7 @@ mod tests {
     use super::*;
     use crate::{RenderPass, RenderingPipeline, TextureType};
     use pill_engine::AssetManager;
-    use std::collections::HashMap;
+
     #[test]
     fn a_game_with_no_pipeline_runs_the_built_in_pass() {
         let assets = AssetManager::new();
@@ -332,7 +332,7 @@ mod tests {
                     "vertex",
                     "fragment",
                     Vec::new(),
-                    HashMap::new(),
+                    Vec::new(),
                     true,
                     true,
                 ),

@@ -1812,6 +1812,7 @@ dependencies = [
  "bytemuck",
  "glam",
  "image",
+ "indexmap",
  "miette",
  "pill_assets",
  "pill_core",

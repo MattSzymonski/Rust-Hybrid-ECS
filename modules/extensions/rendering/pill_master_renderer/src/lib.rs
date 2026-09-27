@@ -22,7 +22,7 @@ mod timer;
 pub use api::{FrameOutcome, HeadlessRenderer, PillRenderer, RenderCapabilities, RenderMetrics};
 pub use assets::{
     Material, MaterialBuilder, MaterialParameter, Mesh, MeshVertex, PassKind, PassTarget,
-    RenderPass, RenderingPipeline, Shader, ShaderParameterSlot, ShaderParameterType,
+    RenderPass, RenderingPipeline, Shader, ShaderBuilder, ShaderParameterSlot, ShaderParameterType,
     ShaderTextureSlot, Texture, TextureType,
 };
 pub use component::*;

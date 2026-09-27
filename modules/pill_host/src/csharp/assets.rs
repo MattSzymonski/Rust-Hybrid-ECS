@@ -169,7 +169,6 @@ mod rendering_impl {
         Material, Mesh, Shader, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot,
         Texture, TextureType,
     };
-    use std::collections::HashMap;
 
     /// Runs `body` against the active invocation's `AssetManager`, folding the
     /// "no scope"/"no AssetManager" cases into the shared status codes.
@@ -337,23 +336,21 @@ mod rendering_impl {
                 1 => ShaderParameterType::Bool,
                 _ => ShaderParameterType::Color,
             };
-            parameter_slots.push((name, ShaderParameterSlot::new(kind)));
+            parameter_slots.push(ShaderParameterSlot::new(name, kind));
         }
 
-        let mut texture_slots = HashMap::with_capacity(textures.len());
+        let mut texture_slots = Vec::with_capacity(textures.len());
         for texture in textures {
             // SAFETY: same contract as above.
             let name = match unsafe { read_str(texture.name, texture.name_len) } {
                 Ok(value) => value,
                 Err(status) => return status,
             };
-            texture_slots.insert(
+            texture_slots.push(ShaderTextureSlot::new(
                 name,
-                ShaderTextureSlot::new(
-                    TextureType::Color,
-                    (texture.texture_binding, texture.sampler_binding),
-                ),
-            );
+                TextureType::Color,
+                (texture.texture_binding, texture.sampler_binding),
+            ));
         }
 
         let result = with_assets(|assets| {
