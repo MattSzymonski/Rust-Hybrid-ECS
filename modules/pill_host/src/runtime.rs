@@ -1363,7 +1363,10 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
 
     // Step 6: Poll the managed loader for an assembly swap.
     // The managed loader watches the built assembly instead of source files.
-    // Only a reloading build has a managed loader to poll.
+    // Only a reloading build has a managed loader to poll; this is the
+    // fallback half of the deliberate two-mechanism design described on the
+    // C# arm of `project_module::reload` (an in-process compile collapses the
+    // loader's poll interval through `NotifyAssemblyReplaced`).
     #[cfg(feature = "hot_reload")]
     if host.loaded_project.poll_managed_reload(&mut host.engine) {
         // The loader's debounce outlived Step 5, so the swap landed here. The

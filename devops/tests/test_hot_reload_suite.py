@@ -681,44 +681,33 @@ SESSION_B_SCENARIOS = [
 # =============================================================================
 
 
-def verify_fast_path_restart(
+def verify_clean_restart(
     project_root: Path, project_path: str, settings_content: str
 ) -> bool:
-    """Relaunch the host once and verify the up-to-date build fast path.
+    """Relaunch the host once and verify it comes back up cleanly.
 
-    After a session's scenarios every artifact is current, so a clean restart
-    should skip both the module and project builds and report them as
-    "up-to-date skips" in the analytics startup report. A rebuild on restart
-    (for example because cargo state changed between runs) is reported as a
-    WARN rather than a failure; only a crash or a failure to reach the loop is
-    a hard failure.
+    By this point a session's scenarios have reloaded both modules and the
+    project, so the relaunch starts from built artifacts: cargo decides for
+    itself whether anything needs recompiling, and either answer is fine (a
+    cold build state rebuilds everything). Only a crash or a failure to reach
+    the loop is a hard failure; the build count is printed, not asserted.
     """
-    print("\n  [TEST] Fast-path restart (everything up to date)...")
+    print("\n  [TEST] Clean restart (modules already built)...")
     write_project_settings(project_root, settings_content)
     process, monitor = launch_host(project_path)
     try:
         if not monitor.wait_for(STARTUP_TOKEN, STARTUP_TIMEOUT):
-            print("  [FAIL] Fast-path restart did not reach the project loop.")
+            print("  [FAIL] Clean restart did not reach the project loop.")
             print(f"  Output tail:\n{monitor.output_since(0)[-1600:]}")
             return False
         startup_output = monitor.output_since(0)
         if has_crash_signals(startup_output):
-            print("  [FAIL] Crash signals during fast-path restart.")
+            print("  [FAIL] Crash signals during clean restart.")
             print(f"  Output tail:\n{startup_output[-1600:]}")
             return False
-        skip_match = re.search(r"up-to-date skips:\s*(\d+)", startup_output)
-        skip_count = int(skip_match.group(1)) if skip_match else 0
-        if FAST_PATH_TOKEN in startup_output and skip_count >= 1:
-            print(
-                f"  [OK] Fast-path restart: {skip_count} build(s) skipped, "
-                "module and project up to date."
-            )
-            return True
-        # Tolerant: cargo state may have changed between runs.
-        print(
-            f"  [WARN] Fast-path restart did not skip builds "
-            f"(up-to-date skips={skip_count}); non-fatal."
-        )
+        build_match = re.search(r"builds:\s*(\d+)", startup_output)
+        build_count = build_match.group(1) if build_match else "unknown"
+        print(f"  [OK] Clean restart reached the loop (builds={build_count}).")
         return True
     finally:
         terminate_process(process, monitor)
@@ -751,9 +740,9 @@ def run_session(
         print("  [OK] Host started and entered the project loop.")
 
         # Validate startup invariants: the module loaded and the analytics
-        # report printed. The "up to date, skipping build" fast path is NOT a
-        # startup invariant — a cold build state rebuilds everything — so it
-        # is not asserted here.
+        # report printed. Whether cargo recompiled anything is NOT an
+        # invariant — a cold build state rebuilds everything — so it is not
+        # asserted here.
         startup_output = monitor.output_since(0)
         for token in (MODULE_LOADED_TOKEN, ANALYTICS_REPORT_TOKEN):
             if token not in startup_output:
@@ -772,11 +761,11 @@ def run_session(
                 break
 
         if session_passed:
-            # I3: verify the up-to-date build fast path with a clean restart.
+            # I3: verify a clean restart on the same (fully built) project.
             # Stop this host first so the relaunch does not contend for the
-            # shared DLLs, then relaunch with the same (fully built) config.
+            # shared DLLs.
             terminate_process(process, monitor)
-            if not verify_fast_path_restart(project_root, project_path, settings_content):
+            if not verify_clean_restart(project_root, project_path, settings_content):
                 session_passed = False
             print(f"\n  [PASS] Session {name} completed.")
     finally:

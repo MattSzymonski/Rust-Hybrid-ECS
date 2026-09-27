@@ -191,7 +191,7 @@ export interface HotReloadStartup {
   wall_ms: number;
   host_elapsed_ms?: number;
   builds?: number;
-  up_to_date_skips?: number;
+  reloads?: number;
 }
 
 export interface HotReloadSession {
@@ -245,7 +245,7 @@ export interface ColdStartCase {
   cargo_timings?: CargoTimings;
   host_elapsed_ms?: number;
   builds?: number;
-  up_to_date_skips?: number;
+  reloads?: number;
   repetitions?: number;
   min_ms?: number;
   avg_ms?: number;

@@ -410,6 +410,16 @@ pub enum ConfigError {
         source: std::io::Error,
     },
 
+    /// The project manifest is not valid TOML, so no workspace member can be
+    /// generated from it.
+    #[message(
+        "failed to parse project manifest ",
+        name_style(path),
+        ": ",
+        value(details)
+    )]
+    ProjectManifestParseFailed { path: String, details: String },
+
     /// The project manifest does not declare a package name.
     #[message(
         "project manifest ",

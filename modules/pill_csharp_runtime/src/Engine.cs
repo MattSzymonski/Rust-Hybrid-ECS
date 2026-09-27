@@ -502,7 +502,10 @@ public static unsafe class Engine
     /// <remarks>
     /// A component's name is always its full type name; a resource may declare
     /// its own, so the hash is reachable from a string as well as a type. Both
-    /// go through here, so the two can never drift apart.
+    /// go through here, so the two can never drift apart. The two offsets and
+    /// the mixing function are a contract with the host's
+    /// `csharp/components.rs` (`stable_component_id`), which carries the full
+    /// derivation chain.
     /// </remarks>
     internal static StableComponentId StableIdOf(string name) =>
         new StableComponentId(HashName(name, 0xcbf29ce484222325),
@@ -926,6 +929,11 @@ public static unsafe class Engine
     }
 }
 
+/// <summary>
+/// The 128-bit stable identity of one managed component or resource, stored as
+/// the same low/high halves the C ABI carries. The host's
+/// `csharp/components.rs` documents the full derivation chain.
+/// </summary>
 internal readonly record struct StableComponentId(ulong Low, ulong High);
 
 // =============================================================================

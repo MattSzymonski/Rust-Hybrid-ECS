@@ -82,8 +82,30 @@ pub(super) use pill_master_renderer::MeshRendererComponent;
 
 /// Stable 128-bit identity derived from a managed component's canonical name.
 ///
-/// Produced by [`stable_component_id`] from the canonical full name, so the
-/// managed runtime and the host agree on an identity without shared state.
+/// # The derivation chain, in one place
+///
+/// The representations of one managed component type are spelled out here so
+/// they do not have to be traced across three files:
+///
+/// - **Canonical name**: the C# type's full name with dots
+///   (`pill_spline.Spline`). Everything else derives from it.
+/// - **This identity**: [`stable_component_id`] hashes that name with two
+///   FNV-1a passes over different offsets, using the same mixing function as
+///   `pill_engine::component::component_name_hash`; the managed runtime
+///   recomputes the identical value from the identical name in
+///   `Engine.StableIdOf`, which is what lets two separately compiled sides
+///   agree without exchanging anything.
+/// - **The ABI halves**: `component_key` and `component_key_high` carry the
+///   low and high `u64` halves through the C table, because the C ABI has no
+///   128-bit integer; [`Self::from_halves`] restores the value host-side, and
+///   the managed `StableComponentId` record struct stores the same pair.
+/// - **Rust-side names**: a shared component registered from Rust uses `::`
+///   separators, whose hash is a different value - `ModuleExposedComponent`
+///   carries both spellings, and neither is translated into the other.
+///
+/// The engine-side identities (`ComponentId`, `ColumnIdentity`, the registry
+/// and column layout types, the generated mirror) are documented where they
+/// are defined; none of them crosses a binary boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct StableComponentId(
     /// The 128-bit canonical identity value.

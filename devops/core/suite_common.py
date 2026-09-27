@@ -104,7 +104,6 @@ def project_settings_yaml(project_root: Path) -> Path:
 STARTUP_TOKEN = "Entering project loop"
 MODULE_LOADED_TOKEN = "module DLL loaded successfully"
 ANALYTICS_REPORT_TOKEN = "BUILD / LINK / HOT-RELOAD ANALYTICS"
-FAST_PATH_TOKEN = "up to date, skipping build"
 RELOAD_PROJECT_TOKEN = "[analytics] reload project"
 RELOAD_MODULE_TOKEN = "[analytics] reload pill_spline"
 MODULE_RELOAD_COMPLETE_TOKEN = "extension hot reload complete"
@@ -306,11 +305,11 @@ class BackupRegistry:
 
     Why the mtime is captured too: every suite edits module/project sources and
     then restores them, and a plain byte restore leaves each file stamped
-    "now" - newer than the artifacts the host built, so the *next* host start
-    recompiles identical content from scratch (pill_spline alone costs ~8s).
-    Rewinding the modification time in `restore_all` tells the host's up-to-date
-    check that the restored source is older than those artifacts, and the
-    rebuild is skipped.
+    "now" - newer than the artifacts the host built from it, so the *next*
+    host start recompiles identical content from scratch (pill_spline alone
+    costs ~8s). Rewinding the modification time in `restore_all` keeps cargo's
+    mtime-based fingerprint of the restored source agreeing with the artifact
+    it already built, and the rebuild is skipped.
 
     `restore_one` deliberately does NOT rewind: it runs mid-suite while the host
     is watching, and the watcher must see a freshly written file so it reloads
@@ -641,8 +640,16 @@ def launch_process(
 
     Takes the host lock before launching: a process that owns a host owns the
     shared build directories and fixture sources too.
+
+    Automation turns on the host's cargo `--timings` breakdown here, once for
+    every suite. The host keeps `--timings` opt-in because it costs build
+    time on every reload, while the suites assert on and report the per-crate
+    compile times, so they are exactly the callers that should pay for it.
     """
     ensure_host_lock()
+    if environment is not None:
+        environment = dict(environment)
+        environment.setdefault("PILL_CARGO_TIMINGS", "1")
     process = subprocess.Popen(
         list(command),
         cwd=str(cwd),
@@ -709,7 +716,6 @@ __all__ = [
     "STARTUP_TOKEN",
     "MODULE_LOADED_TOKEN",
     "ANALYTICS_REPORT_TOKEN",
-    "FAST_PATH_TOKEN",
     "RELOAD_PROJECT_TOKEN",
     "RELOAD_MODULE_TOKEN",
     "MODULE_RELOAD_COMPLETE_TOKEN",

@@ -28,7 +28,6 @@ mod loaded {
     // Standard library
     use std::path::Path;
     use std::sync::atomic::AtomicU64;
-    use std::time::Instant;
 
     // External crates
     use pill_core::error::{HostError, LibraryError};
@@ -36,7 +35,6 @@ mod loaded {
     use pill_engine::{Engine, EngineApi, SystemOwner};
 
     // Current crate
-    use crate::analytics;
     use crate::build_runner::build_project_module;
     use crate::csharp::CSharpRuntime;
     use crate::native_library::NativeLibrary;
@@ -115,62 +113,29 @@ mod loaded {
                     let library =
                         NativeLibrary::load_copy(&output_path, workspace_root, &config.name)?;
 
-                    // Native modules register their components and systems through
-                    // the stable EngineApi table before the first frame is run.
-                    let init_started = Instant::now();
-                    // Capture the registration sequence before init so the exact set
-                    // of persistable types this generation registered is recorded.
-                    let registration_sequence = engine.world().persist_registration_sequence();
-                    // Taken before init for the same reason, and not read as zero:
-                    // the log accumulates across generations, so `since(0)` would
-                    // record the modules' and the engine's resources as this
-                    // project generation's own claims.
-                    let resource_registration_sequence =
-                        engine.world().resource_registration_sequence();
-                    let status = library.call_init(engine_api);
-                    analytics::record_init(
+                    // Native modules register their components and systems
+                    // through the stable EngineApi table before the first frame
+                    // is run. The capture, init and failure handling are shared
+                    // with the extension path - see `crate::reload`.
+                    let init = crate::reload::initialize_generation(
+                        engine,
+                        engine_api,
                         &config.name,
-                        init_started.elapsed().as_secs_f64() * 1000.0,
+                        None,
+                        SystemOwner::PROJECT,
+                        &library,
                     );
-                    if status != 0 {
-                        // Everything the failed generation owns has to be
-                        // released before its image is unmapped: its systems are
-                        // `Box<dyn System>` trait objects, and its data -
-                        // resources it inserted, columns its entities live in -
-                        // carries drop glue from the same image. Systems first,
-                        // then the world by replacement, both while the image is
-                        // still mapped.
-                        engine.clear_systems_owned_by(pill_engine::SystemOwner::PROJECT);
-                        let abandoned =
-                            std::mem::replace(engine.world_mut(), pill_engine::World::new());
-                        let resources = abandoned.resource_count();
-                        drop(abandoned);
-                        info!(
-                            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                            module = config.name.as_str(),
-                            resources,
-                            "cleared the world before unmapping the generation that failed to initialize"
-                        );
-                        return Err(LibraryError::InitializationFailed { status }.into());
+                    if init.status != 0 {
+                        return Err(LibraryError::InitializationFailed {
+                            status: init.status,
+                        }
+                        .into());
                     }
-                    let registered_type_names = engine
-                        .world()
-                        .persist_type_names_registered_since(registration_sequence);
-                    // What this generation registered, for the same reason the
-                    // type names are kept - and claimed in the world, so one
-                    // subject's retirement cannot take a shared resource out
-                    // from under another.
-                    let registered_resource_ids = engine
-                        .world()
-                        .resource_ids_registered_since(resource_registration_sequence);
-                    engine
-                        .world_mut()
-                        .retain_resource_claims(&registered_resource_ids);
                     Ok(Self::Native {
                         current: library,
                         old_libraries: Vec::new(),
-                        registered_type_names,
-                        registered_resource_ids,
+                        registered_type_names: init.registered_type_names,
+                        registered_resource_ids: init.registered_resource_ids,
                     })
                 }
                 // The managed runtime performs assembly discovery, component
@@ -228,6 +193,27 @@ mod loaded {
                 // managed loader validates the rebuilt assembly's component
                 // manifest and system signatures before swapping; poll_reload
                 // reports the outcome and logs any rejection.
+                //
+                // TWO DELIBERATE MECHANISMS, ONE SWAP. The swap itself always
+                // happens inside the managed loader's `PollReload`; what
+                // differs is when the host asks for it:
+                //
+                // - The `dotnet build` fallback has no completion signal the
+                //   loader can trust - it watches the assembly file, which a
+                //   build may rewrite at any point - so the frame loop polls
+                //   once per frame and the loader's 500 ms interval decides
+                //   when the bytes are settled. That is why
+                //   `poll_managed_reload` exists on the frame path.
+                // - The in-process compiler wrote the file itself through an
+                //   atomic rename and calls `NotifyAssemblyReplaced`, which
+                //   collapses that interval so the swap lands in the same
+                //   frame as the build.
+                //
+                // Neither path may assume the build implies the swap: a
+                // rejection keeps the previous assembly, and a slow swap is
+                // observed by a later frame. `managed_poll_replaced_assembly`
+                // therefore reports what this poll actually landed, and the
+                // caller records bookkeeping only then.
                 Self::CSharp(runtime) => {
                     if !recompile_csharp(runtime, workspace_root, config, cancel_flag) {
                         return false;
@@ -249,7 +235,12 @@ mod loaded {
 
         /// Poll the collectible managed loader after its assembly debounce.
         ///
-        /// Returns whether this poll landed an assembly swap. The debounce can
+        /// Returns whether this poll landed an assembly swap. This is the
+        /// frame path's half of the deliberate two-mechanism design described
+        /// on the C# arm of `reload`: the `dotnet build` fallback has no
+        /// completion signal, so every frame gives the loader a chance to
+        /// observe settled bytes, while the in-process compiler short-circuits
+        /// the interval through `NotifyAssemblyReplaced`. The debounce can
         /// outlive the frame that triggered the build, so a swap - and the
         /// bookkeeping it invalidates - is observed here as often as in
         /// `reload`'s own poll.
@@ -378,40 +369,11 @@ mod loaded {
         config: &ProjectModuleConfig,
         cancel_flag: Option<(&AtomicU64, u64)>,
     ) -> bool {
-        // Step 1: Compile the new module before touching engine state, so a
-        // compiler error can never remove the systems of the working generation.
-        let output_path = match build_project_module(workspace_root, config, cancel_flag) {
-            Ok(path) => path,
-            Err(error) => {
-                error!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                    error = %error,
-                    "build failed; keeping the old project module"
-                );
-                return false;
-            }
-        };
-
-        // Step 2: Load and validate the replacement library transactionally.
-        // Keep `current` untouched until a complete replacement library is ready
-        // to initialize.
-        let new_library = match NativeLibrary::load_copy(&output_path, workspace_root, &config.name)
-        {
-            Ok(library) => library,
-            Err(error) => {
-                error!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                    error = %error,
-                    "failed to load the new library; keeping the old project module"
-                );
-                return false;
-            }
-        };
-
-        // Steps 3 to 6 are identical for every subject and live in one place:
-        // capture metadata, swap systems, drop forgotten types, re-home columns,
-        // migrate schemas, retire the old image. Their ORDER is load-bearing -
-        // see `crate::reload`.
+        // Steps 1 to 3 are shared with the extension path and live in
+        // `crate::reload`: compile before touching engine state, load a private
+        // copy, then swap through the transaction whose step order is
+        // load-bearing. A refused step returns `None`, which for the project
+        // means nothing was replaced.
         let transaction = crate::reload::ReloadTransaction {
             kind: crate::reload::ReloadSubjectKind::Project,
             subject: &config.name,
@@ -421,12 +383,15 @@ mod loaded {
             registered_type_names,
             registered_resource_ids,
         };
-        // The project reports no component names onward; only a module's reach
-        // the C# backend. The commit is the swap: `None` means the new
-        // generation failed to initialize and the previous one was restored,
-        // so the caller is told nothing was replaced.
-        transaction
-            .commit(engine, engine_api, new_library)
-            .is_some()
+        crate::reload::build_load_and_commit(
+            engine,
+            engine_api,
+            workspace_root,
+            |cancel_flag| build_project_module(workspace_root, config, cancel_flag),
+            cancel_flag,
+            crate::reload::LoadValidation::None,
+            transaction,
+        )
+        .is_some()
     }
 }

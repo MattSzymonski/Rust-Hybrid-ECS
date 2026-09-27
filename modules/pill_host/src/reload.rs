@@ -44,9 +44,12 @@
 
 // Standard library
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
 // External crates
+use pill_core::error::BuildError;
 use pill_core::{debug, error, info, warn};
 use pill_engine::{ComponentId, Engine, EngineApi, SystemOwner, World};
 
@@ -133,6 +136,37 @@ impl ReloadSubjectKind {
             Self::Extension => MODULE_FORGOTTEN_TYPES,
         }
     }
+
+    /// Failure line for a build that produced no usable replacement.
+    ///
+    /// Kept per-kind rather than interpolated: the Python suites match the
+    /// project's wording verbatim, and `test_log_contract.py` fails if a
+    /// sourced token stops appearing in Rust.
+    fn build_failed_message(&self) -> &'static str {
+        match self {
+            Self::Project => "build failed; keeping the old project module",
+            Self::Extension => "build failed; keeping the old module generation",
+        }
+    }
+
+    /// Failure line for a replacement that could not be loaded.
+    fn load_failed_message(&self) -> &'static str {
+        match self {
+            Self::Project => "failed to load the new library; keeping the old project module",
+            Self::Extension => "failed to load the new library; keeping the old module generation",
+        }
+    }
+
+    /// Failure line for a replacement the load-time validation refused.
+    fn rejected_message(&self) -> &'static str {
+        match self {
+            // The project is built from this workspace by this host, so its
+            // ABI is guaranteed by construction and this arm is unreachable;
+            // it exists for totality.
+            Self::Project => "rejected the new library; keeping the current generation",
+            Self::Extension => "rejected the new library; keeping the old module generation",
+        }
+    }
 }
 
 /// One subject's state, borrowed for the length of a reload.
@@ -167,6 +201,196 @@ pub(crate) struct ReloadCommit {
     /// persistable. The C# backend needs this to expose a module's native
     /// components; the project has no use for it.
     pub(crate) exposed_component_names: Vec<String>,
+}
+
+/// What one generation's `init` registered, while its image was mapped.
+pub(crate) struct GenerationInit {
+    /// Status the artifact's entry point returned; zero means success.
+    pub(crate) status: u32,
+    /// Persistable component type names this generation registered, for
+    /// forgotten-type detection on the next reload.
+    pub(crate) registered_type_names: Vec<String>,
+    /// Resource ids this generation claimed, so retiring it releases exactly
+    /// those and no other subject's.
+    pub(crate) registered_resource_ids: Vec<pill_engine::ResourceId>,
+    /// Every component type name registered - plain and persistable alike -
+    /// for the C# backend's bindings.
+    pub(crate) component_names: Vec<String>,
+}
+
+/// Capture, initialize and record one native generation.
+///
+/// The shared half of a subject's `start`. The project and an extension run
+/// exactly the same sequence around their entry point: take the registration
+/// sequences first, scope the registration when the subject uses a scope,
+/// invoke the entry point under a timer, then either record what the
+/// generation registered or - on a non-zero status - release everything the
+/// failed image owns while it is still mapped.
+///
+/// `scope` is the owner registrations are tagged with, or `None` for a subject
+/// that owns the scheduler outright. `clearing_owner` names the systems a
+/// failed init removes, which is the subject's own owner either way.
+pub(crate) fn initialize_generation(
+    engine: &mut Engine,
+    engine_api: &EngineApi,
+    subject: &str,
+    scope: Option<SystemOwner>,
+    clearing_owner: SystemOwner,
+    library: &NativeLibrary,
+) -> GenerationInit {
+    // Step 1: Sequences before the call, so `since` compares this generation
+    // against the state just before it ran and not against zero - the log
+    // accumulates across every artifact, and `since(0)` would claim the
+    // engine's own resources for this subject.
+    let persist_sequence = engine.world().persist_registration_sequence();
+    let component_sequence = engine.world().component_registration_sequence();
+    let resource_sequence = engine.world().resource_registration_sequence();
+
+    // Step 2: The entry point, under the subject's registration scope when it
+    // has one.
+    let status = {
+        let started = Instant::now();
+        let status = match scope {
+            Some(owner) => {
+                engine.begin_module_registration(owner);
+                let status = library.call_init(engine_api);
+                engine.end_module_registration();
+                status
+            }
+            None => library.call_init(engine_api),
+        };
+        analytics::record_init(subject, started.elapsed().as_secs_f64() * 1000.0);
+        status
+    };
+
+    if status != 0 {
+        clear_failed_generation(engine, subject, clearing_owner);
+        return GenerationInit {
+            status,
+            registered_type_names: Vec::new(),
+            registered_resource_ids: Vec::new(),
+            component_names: Vec::new(),
+        };
+    }
+
+    // Step 3: What this generation owns, claimed in the world too so one
+    // subject's retirement cannot take a value another subject shares.
+    let registered_resource_ids = engine
+        .world()
+        .resource_ids_registered_since(resource_sequence);
+    engine
+        .world_mut()
+        .retain_resource_claims(&registered_resource_ids);
+    GenerationInit {
+        status,
+        registered_type_names: engine
+            .world()
+            .persist_type_names_registered_since(persist_sequence),
+        registered_resource_ids,
+        component_names: engine
+            .world()
+            .registered_component_names_since(component_sequence),
+    }
+}
+
+/// Release everything one failed generation owns, while its image is mapped.
+///
+/// The failed image's systems are `Box<dyn System>` trait objects, and its
+/// data - resources it inserted, columns its entities live in - carries drop
+/// glue from the same image. Systems first, then the world by replacement: the
+/// replacement's drop is what runs every one of those functions, and both
+/// have to run before the image can be unmapped.
+fn clear_failed_generation(engine: &mut Engine, subject: &str, owner: SystemOwner) {
+    engine.clear_systems_owned_by(owner);
+    let abandoned = std::mem::replace(engine.world_mut(), World::new());
+    let resources = abandoned.resource_count();
+    drop(abandoned);
+    info!(
+        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        module = subject,
+        resources,
+        "cleared the world before unmapping the generation that failed to initialize"
+    );
+}
+
+/// What to verify about a freshly loaded replacement before it is committed.
+pub(crate) enum LoadValidation {
+    /// Nothing: this host built the subject from the workspace it owns, so the
+    /// contract is guaranteed by construction.
+    None,
+    /// The optional module ABI revision export. Extensions are workspace
+    /// members any `cargo build` can refresh, so the revision is checked
+    /// rather than assumed.
+    ModuleAbi,
+}
+
+/// Build, load and commit one native generation, for either subject.
+///
+/// The project and an extension perform the same three steps in the same
+/// order, with the same requirement that a failure anywhere leaves the current
+/// generation running: compile (`build`), load a private copy, then swap
+/// through [`ReloadTransaction`]. Their differences - which build function to
+/// call, whether the ABI check applies, and the exact refusal wording the
+/// Python suites match - are parameters, not a second lifecycle.
+///
+/// Returns the commit when the swap happened, `None` when anything was
+/// refused.
+pub(crate) fn build_load_and_commit(
+    engine: &mut Engine,
+    engine_api: &EngineApi,
+    workspace_root: &Path,
+    build: impl FnOnce(Option<(&AtomicU64, u64)>) -> Result<PathBuf, BuildError>,
+    cancel_flag: Option<(&AtomicU64, u64)>,
+    validation: LoadValidation,
+    transaction: ReloadTransaction<'_>,
+) -> Option<ReloadCommit> {
+    let subject = transaction.subject;
+    let kind = &transaction.kind;
+
+    // Step 1: Compile before touching engine state, so a compiler error can
+    // never remove the systems of the working generation. A newer save during
+    // the build cancels it and the next frame retries.
+    let output_path = match build(cancel_flag) {
+        Ok(path) => path,
+        Err(error) => {
+            error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = subject,
+                error = %error,
+                "{}", kind.build_failed_message()
+            );
+            return None;
+        }
+    };
+
+    // Step 2: Load and validate the replacement transactionally, leaving the
+    // active generation untouched until it is ready to initialize.
+    let new_library = match NativeLibrary::load_copy(&output_path, workspace_root, subject) {
+        Ok(library) => library,
+        Err(error) => {
+            error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = subject,
+                error = %error,
+                "{}", kind.load_failed_message()
+            );
+            return None;
+        }
+    };
+    if let LoadValidation::ModuleAbi = validation {
+        if let Err(error) = new_library.check_module_abi(subject) {
+            error!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = subject,
+                error = %error,
+                "{}", kind.rejected_message()
+            );
+            return None;
+        }
+    }
+
+    // Step 3: The shared transaction, whose own step order is load-bearing.
+    transaction.commit(engine, engine_api, new_library)
 }
 
 impl ReloadTransaction<'_> {

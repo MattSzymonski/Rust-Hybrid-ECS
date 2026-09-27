@@ -207,7 +207,8 @@ mod rendering_impl {
             Err(status) => return status,
         };
         let result = with_assets(|assets| {
-            let mesh = Mesh::from_obj_bytes(name.as_str(), &bytes).map_err(|_| STATUS_DECODE_FAILED)?;
+            let mesh =
+                Mesh::from_obj_bytes(name.as_str(), &bytes).map_err(|_| STATUS_DECODE_FAILED)?;
             let handle = assets
                 .add_named(name.as_str(), mesh)
                 .map_err(|_| STATUS_NAME_IN_USE)?;
@@ -502,7 +503,14 @@ pub(super) extern "C" fn ffi_asset_load_mesh_obj(
     {
         // SAFETY: forwarded from this function's own contract.
         unsafe {
-            rendering_impl::load_mesh_obj(name, name_len, bytes, bytes_len, out_index, out_generation)
+            rendering_impl::load_mesh_obj(
+                name,
+                name_len,
+                bytes,
+                bytes_len,
+                out_index,
+                out_generation,
+            )
         }
     }
     #[cfg(not(feature = "rendering"))]
@@ -530,7 +538,14 @@ pub(super) extern "C" fn ffi_asset_load_texture_png(
     {
         // SAFETY: forwarded from this function's own contract.
         unsafe {
-            rendering_impl::load_texture_png(name, name_len, bytes, bytes_len, out_index, out_generation)
+            rendering_impl::load_texture_png(
+                name,
+                name_len,
+                bytes,
+                bytes_len,
+                out_index,
+                out_generation,
+            )
         }
     }
     #[cfg(not(feature = "rendering"))]

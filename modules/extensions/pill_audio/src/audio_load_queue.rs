@@ -1,4 +1,10 @@
 //! Shared requests for the audio extension to load project-provided sound bytes.
+//!
+//! # Responsibilities
+//!
+//! - Carry encoded sound bytes from a project to the playback DLL that owns
+//!   the sound, so the bytes never cross an asset-identity boundary.
+//! - Coalesce repeated loads of one playback name.
 
 use pill_engine::Resource;
 use std::collections::BTreeMap;

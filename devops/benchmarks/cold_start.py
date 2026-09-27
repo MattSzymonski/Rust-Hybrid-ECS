@@ -14,8 +14,8 @@ DESCRIPTION
       incremental_check /         after only a source-file mtime bump, so
       incremental_build           cargo rebuilds the engine and its dependents
       startup_cold / startup_warm host launch -> "Entering project loop", once
-                                  with modules to rebuild and once on the
-                                  up-to-date fast path
+                                  with modules to rebuild and once with every
+                                  module already built
       engine_init                 the `pill_engine` smoke binary end to end
                                   (process spawn + Engine::new + one print)
 
@@ -107,8 +107,8 @@ CASE_DESCRIPTIONS = {
         "the host's own cargo builds of every module."
     ),
     "startup_warm": (
-        "Relaunching the host with every module already up to date, so the "
-        "host takes its up-to-date fast path instead of building."
+        "Relaunching the host with every module already built, so cargo "
+        "confirms the artifacts are fresh instead of recompiling them."
     ),
     "engine_init": (
         "The pill_engine smoke binary from process spawn to exit: dynamic "
@@ -363,12 +363,12 @@ def measure_host_startup(
         if report_match:
             case["host_elapsed_ms"] = round(float(report_match.group(1)) * 1000.0, 1)
             case["builds"] = int(report_match.group(2))
-            case["up_to_date_skips"] = int(report_match.group(3))
+            case["reloads"] = int(report_match.group(3))
         log(
             f"  [OK]   {name}: {wall_ms / 1000.0:.2f}s"
             + (
                 f" (host {case['host_elapsed_ms'] / 1000.0:.2f}s, "
-                f"builds {case['builds']}, skips {case['up_to_date_skips']})"
+                f"builds {case['builds']}, reloads {case['reloads']})"
                 if "builds" in case
                 else ""
             )
@@ -384,14 +384,14 @@ def _startup_report_pattern():
     The host prints its startup accounting across TWO lines:
 
         elapsed: 9.81s    host RSS: current 21.7MB / peak 25.3MB
-        cargo child peak RSS: 11.5MB    builds: 7    up-to-date skips: 0 ...
+        cargo child peak RSS: 11.5MB    builds: 7    reloads: 0 ...
 
     so `re.DOTALL` is required for `.` to cross the newline between them.
     """
     import re
 
     return re.compile(
-        r"elapsed:\s*([\d.]+)s\b.*?builds:\s*(\d+)\s+up-to-date skips:\s*(\d+)",
+        r"elapsed:\s*([\d.]+)s\b.*?builds:\s*(\d+)\s+reloads:\s*(\d+)",
         re.DOTALL,
     )
 

@@ -22,13 +22,13 @@
 use pill_engine::{ComponentTicks, Entity};
 
 // Current crate
-use super::commands::{
-    ffi_queue_add_component, ffi_queue_create, ffi_queue_destroy, ffi_queue_remove_component,
-    ffi_reserve_entity,
-};
 use super::assets::{
     NativeMaterialColor, NativeMaterialScalar, NativeMaterialTexture, NativeShaderParameterSlot,
     NativeShaderTextureSlot,
+};
+use super::commands::{
+    ffi_queue_add_component, ffi_queue_create, ffi_queue_destroy, ffi_queue_remove_component,
+    ffi_reserve_entity,
 };
 use super::queries::{
     ffi_entity_count, ffi_get_archetype_chunk, ffi_get_component_chunk, ffi_get_entity_chunk,
@@ -296,8 +296,12 @@ pub(crate) fn publish_mirror_methods(mirror_methods: &[ResolvedMirrorMethod]) {
 #[repr(C)]
 pub(super) struct NativeComponentBlob {
     /// Low half of the stable component key identifying the component type.
+    ///
+    /// The key and its derivation chain live on
+    /// [`components::StableComponentId`](super::components::StableComponentId);
+    /// the halves exist because the C ABI has no 128-bit integer.
     pub(super) component_key: u64,
-    /// High half of the stable component key identifying the component type.
+    /// High half of that key, restored into position by `from_halves`.
     pub(super) component_key_high: u64,
     /// Pointer to the managed-pinned component bytes.
     pub(super) data: *const u8,
@@ -369,8 +373,11 @@ pub(super) struct ComponentChunk {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct NativeSystemAccess {
     /// Low half of the component key the access entry refers to.
+    ///
+    /// Same derivation chain as `NativeComponentBlob`'s key: see
+    /// [`components::StableComponentId`](super::components::StableComponentId).
     pub(super) component_key: u64,
-    /// High half of the component key the access entry refers to.
+    /// High half of that key, restored into position by `from_halves`.
     pub(super) component_key_high: u64,
     /// Access mode: `0` is read-only and `1` is read-write.
     pub(super) mode: u8,

@@ -636,9 +636,10 @@ PROBE_RETIREMENT_MARKER_SEED = (
 
 MARKERS_SEEDED_TOKEN = "probe retirement markers seeded"
 # The retirement logs: three rows go with the component, and the unclaimed
-# resource is dropped outright.
-COMPONENT_RETIREMENT_TOKEN = "components=1 entities=3"
-RESOURCE_RETIREMENT_TOKEN = "resources=1 dropped=1"
+# resource is dropped outright. Both lines come from the shared manifest
+# pipeline and carry structured `kind`/`entries`/`touched` fields.
+COMPONENT_RETIREMENT_TOKEN = 'kind="component" entries=1 touched=3'
+RESOURCE_RETIREMENT_TOKEN = 'kind="resource" entries=1 touched=1'
 
 # Renames an [EcsSystem] method of the probe file. Rust builds its execution
 # graph once at startup from these names, so the set has to stay stable until a

@@ -188,11 +188,9 @@ pub(super) extern "C" fn ffi_get_component_chunk(
     chunk_index: u32,
     output: *mut ComponentChunk,
 ) -> u8 {
-    super::context::guard_managed_callback(
-        "ffi_get_component_chunk",
-        5,
-        || ffi_get_component_chunk_guarded(key_low, key_high, mode, chunk_index, output),
-    )
+    super::context::guard_managed_callback("ffi_get_component_chunk", 5, || {
+        ffi_get_component_chunk_guarded(key_low, key_high, mode, chunk_index, output)
+    })
 }
 
 /// Return one component chunk of an archetype the managed enumerator already
@@ -371,11 +369,16 @@ pub(super) extern "C" fn ffi_get_archetype_chunk(
     mode: u8,
     output: *mut ComponentChunk,
 ) -> u8 {
-    super::context::guard_managed_callback(
-        "ffi_get_archetype_chunk",
-        5,
-        || ffi_get_archetype_chunk_guarded(archetype_low, archetype_high, key_low, key_high, mode, output),
-    )
+    super::context::guard_managed_callback("ffi_get_archetype_chunk", 5, || {
+        ffi_get_archetype_chunk_guarded(
+            archetype_low,
+            archetype_high,
+            key_low,
+            key_high,
+            mode,
+            output,
+        )
+    })
 }
 
 /// Return the `chunk_index`th archetype entity column.
@@ -429,11 +432,9 @@ fn ffi_get_entity_chunk_guarded(chunk_index: u32, output: *mut ComponentChunk) -
 /// uses for a call it could not serve - and lets the frame's error path
 /// name the system, rather than killing the host mid-frame.
 pub(super) extern "C" fn ffi_get_entity_chunk(chunk_index: u32, output: *mut ComponentChunk) -> u8 {
-    super::context::guard_managed_callback(
-        "ffi_get_entity_chunk",
-        5,
-        || ffi_get_entity_chunk_guarded(chunk_index, output),
-    )
+    super::context::guard_managed_callback("ffi_get_entity_chunk", 5, || {
+        ffi_get_entity_chunk_guarded(chunk_index, output)
+    })
 }
 
 /// Write the current entity count while a managed system is active.
@@ -467,9 +468,7 @@ fn ffi_entity_count_guarded(output: *mut u32) -> u8 {
 /// uses for a call it could not serve - and lets the frame's error path
 /// name the system, rather than killing the host mid-frame.
 pub(super) extern "C" fn ffi_entity_count(output: *mut u32) -> u8 {
-    super::context::guard_managed_callback(
-        "ffi_entity_count",
-        5,
-        || ffi_entity_count_guarded(output),
-    )
+    super::context::guard_managed_callback("ffi_entity_count", 5, || {
+        ffi_entity_count_guarded(output)
+    })
 }

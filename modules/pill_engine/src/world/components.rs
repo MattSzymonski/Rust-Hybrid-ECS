@@ -1294,47 +1294,6 @@ impl World {
         self.add_descriptor_component(entity, component_id, &vec![0; size])
     }
 
-    /// Remove a runtime-defined component while preserving every other column.
-    ///
-    /// If the entity's last component is removed, the entity is destroyed
-    /// instead of migrated to an empty archetype.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WorldError::EntityNotFound`] if the entity does not exist,
-    /// and [`WorldError::DescriptorComponentMissing`] if the entity does not
-    /// carry the component.
-    pub fn remove_descriptor_component(
-        &mut self,
-        entity: Entity,
-        component_id: ComponentId,
-    ) -> Result<(), WorldError> {
-        let location = *self
-            .entity_locations
-            .get(&entity)
-            .ok_or(WorldError::EntityNotFound)?;
-        let Some(old_archetype) = self.archetypes.get(&location.archetype_id) else {
-            return Err(WorldError::ArchetypeMissing {
-                entity,
-                archetype_id: location.archetype_id,
-            });
-        };
-        if !old_archetype.component_storages.contains(component_id) {
-            return Err(WorldError::DescriptorComponentMissing);
-        }
-        let new_ids: Vec<_> = old_archetype
-            .component_types
-            .iter()
-            .copied()
-            .filter(|id| *id != component_id)
-            .collect();
-        if new_ids.is_empty() {
-            let _ = self.destroy_entity(entity);
-            return Ok(());
-        }
-        self.move_entity_to_archetype(entity, new_ids, |_| Ok(()))
-    }
-
     /// Read-only view of the component registry.
     ///
     /// Exposed for the same reason as [`World::archetypes_iter`]: resolving a

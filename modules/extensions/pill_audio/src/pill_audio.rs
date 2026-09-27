@@ -84,10 +84,10 @@ use pill_engine::*;
 
 /// [`AudioCommand`]: what a source has been asked to do next.
 pub mod audio_command;
-/// Shared project-to-extension sound loading requests.
-pub mod audio_load_queue;
 /// The [`AudioListenerComponent`] component.
 pub mod audio_listener_component;
+/// Shared project-to-extension sound loading requests.
+pub mod audio_load_queue;
 /// The [`AudioManager`] resource: output device and sink pools.
 pub mod audio_manager;
 /// The [`AudioSourceComponent`] component.
@@ -108,8 +108,8 @@ pub mod sound_type;
 // The module that declares a type is an implementation detail; a caller names
 // `pill_audio::AudioSourceComponent` regardless of which file it lives in.
 pub use audio_command::AudioCommand;
-pub use audio_load_queue::AudioLoadQueue;
 pub use audio_listener_component::AudioListenerComponent;
+pub use audio_load_queue::AudioLoadQueue;
 pub use audio_manager::{
     AudioManager, DEFAULT_AMBIENT_SINK_COUNT, DEFAULT_SPATIAL_SINK_COUNT, EAR_SEPARATION,
 };
@@ -134,7 +134,9 @@ pub use sound_type::SoundType;
 #[pill_module]
 pub fn register(engine: &mut Engine) -> u32 {
     if engine.world().get_resource::<AudioLoadQueue>().is_none() {
-        engine.world_mut().insert_resource(AudioLoadQueue::default());
+        engine
+            .world_mut()
+            .insert_resource(AudioLoadQueue::default());
     }
     engine
         .world_mut()

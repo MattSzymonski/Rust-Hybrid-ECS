@@ -19,6 +19,7 @@
 # USAGE: bash devops/ci_cd/run_coding_standards_test.sh [options] [path]
 #
 #   --root <path>   scan a directory instead of the repository root
+#   --exclude <p>   skip a file or directory subtree (repeatable)
 #   --list          print every .rs file that would be checked, then exit
 #   -h, --help      show this help
 #

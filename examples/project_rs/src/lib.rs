@@ -126,11 +126,13 @@ pub fn init(engine: &mut Engine) -> u32 {
             .world_mut()
             .get_resource_mut::<AssetManager>()
             .expect("Engine always owns an AssetManager");
-        let mesh = assets.handle_by_name::<Mesh>("project.triangle").unwrap_or_else(|| {
-            assets
-                .add_named("project.triangle", Mesh::triangle())
-                .expect("the name is free after the lookup missed")
-        });
+        let mesh = assets
+            .handle_by_name::<Mesh>("project.triangle")
+            .unwrap_or_else(|| {
+                assets
+                    .add_named("project.triangle", Mesh::triangle())
+                    .expect("the name is free after the lookup missed")
+            });
         let mut material = |name: &str, color: [f32; 3], specularity: f32| {
             assets.handle_by_name::<Material>(name).unwrap_or_else(|| {
                 assets

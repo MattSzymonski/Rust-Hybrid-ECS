@@ -40,9 +40,7 @@ use pill_core::{info, warn};
 // Current crate
 use super::csharp_runtime::DotnetRuntimeContext;
 use super::managed_buffer::fetch_managed_buffer;
-use crate::config::{
-    CSHARP_COMPILER_ASSEMBLY_NAME, CSHARP_COMPILER_OUTPUT_SUBDIRECTORY,
-};
+use crate::config::{CSHARP_COMPILER_ASSEMBLY_NAME, CSHARP_COMPILER_OUTPUT_SUBDIRECTORY};
 use crate::CSharpModuleConfig;
 
 // =============================================================================
@@ -360,7 +358,9 @@ fn capture_missed_a_source(
     let Ok(watch_root) = std::fs::canonicalize(workspace_root.join(watch_directory)) else {
         // No source directory to compare against: leave the decision to the
         // build, which will report the real problem.
-        return Some(format!("cannot read the source directory {watch_directory}"));
+        return Some(format!(
+            "cannot read the source directory {watch_directory}"
+        ));
     };
     // MSBuild wrote the capture into the project's `obj` directory and resolved
     // relative source paths against the project root, which is its parent.

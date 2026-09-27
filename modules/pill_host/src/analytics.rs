@@ -77,15 +77,6 @@ fn cargo_fingerprint_directory() -> String {
     )
 }
 
-/// Whether a module was rebuilt from scratch or skipped by the up-to-date fast path.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BuildStatus {
-    /// The artifact was already newer than every input; cargo never ran.
-    Fresh,
-    /// Cargo ran and produced a new artifact.
-    Built,
-}
-
 /// Which pipeline a module belongs to; used for the report's `kind` column.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ModuleKind {
@@ -549,7 +540,6 @@ pub(crate) fn read_cargo_deps(workspace_root: &Path, crate_name: &str) -> Vec<St
 struct ModuleAnalytics {
     name: String,
     kind: ModuleKind,
-    status: BuildStatus,
     build_wall_ms: u64,
     /// Sub-second phase timings carry fractional milliseconds so fast
     /// operations (load, init) do not round to zero.
@@ -571,7 +561,6 @@ impl ModuleAnalytics {
         Self {
             name: name.to_string(),
             kind,
-            status: BuildStatus::Built,
             build_wall_ms: 0,
             stage_ms: 0.0,
             load_ms: 0.0,
@@ -729,7 +718,6 @@ struct Analytics {
     host_peak_bytes: u64,
     cargo_child_peak_bytes: u64,
     builds: u64,
-    skips: u64,
     /// Total wall time of the newest cargo `--timings` report, in seconds.
     last_cargo_total_seconds: f64,
     /// Function patches that went live in this process.
@@ -756,7 +744,6 @@ fn analytics() -> &'static Mutex<Analytics> {
             host_peak_bytes: 0,
             cargo_child_peak_bytes: 0,
             builds: 0,
-            skips: 0,
             last_cargo_total_seconds: 0.0,
             patches: 0,
             patch_refusals: 0,
@@ -783,16 +770,15 @@ fn find_or_create(collector: &mut Analytics, name: &str, kind: ModuleKind) -> us
 
 /// Record the outcome of one module's build/stage step.
 ///
-/// Called by `build_extension` and `build_project_module` from both the
-/// fast-path skip branch and the real-build branch, with the artifact path
-/// being the DLL the host actually loads (the hot copy for extensions).
-/// Also inspects the DLL's PE exports and imports, reads the crate's direct
-/// cargo dependencies, and — after a real build — pulls the per-crate
-/// compile+link time from the newest cargo `--timings` report.
+/// Called by `build_extension` and `build_project_module` after the real build
+/// branch, with the artifact path being the DLL the host actually loads (the
+/// hot copy for extensions). Also inspects the DLL's PE exports and imports,
+/// reads the crate's direct cargo dependencies, and — when timing reports are
+/// enabled — pulls the per-crate compile+link time from the newest cargo
+/// `--timings` report.
 pub(crate) fn record_module_artifact(
     name: &str,
     kind: ModuleKind,
-    status: BuildStatus,
     stage_ms: f64,
     workspace_root: &Path,
     artifact_path: &Path,
@@ -803,7 +789,6 @@ pub(crate) fn record_module_artifact(
     let index = find_or_create(&mut collector, name, kind);
     let module = &mut collector.modules[index];
     module.kind = kind;
-    module.status = status;
     module.stage_ms = stage_ms;
     if let Ok(metadata) = std::fs::metadata(artifact_path) {
         module.artifact_bytes = metadata.len();
@@ -814,7 +799,10 @@ pub(crate) fn record_module_artifact(
         module.image_size = inspection.image_size;
     }
     module.cargo_deps = read_cargo_deps(workspace_root, name);
-    if status == BuildStatus::Built {
+    // Only read a timing report when this process's builds were asked to write
+    // one: `--timings` is opt-in, and a leftover HTML from an earlier run must
+    // not be reported as this build's timings.
+    if crate::config::cargo_timings_enabled() {
         if let Some(timing) = parse_latest_cargo_timings(workspace_root) {
             module.cargo_unit_ms = timing.crate_durations_ms.get(name).copied();
             collector.last_cargo_total_seconds = timing.total_seconds;
@@ -829,10 +817,7 @@ pub(crate) fn record_module_artifact(
             }
         }
     }
-    match status {
-        BuildStatus::Built => collector.builds += 1,
-        BuildStatus::Fresh => collector.skips += 1,
-    }
+    collector.builds += 1;
 }
 
 /// Record the wall time and peak memory of one cargo invocation.
@@ -1135,10 +1120,9 @@ pub(crate) fn print_startup_report() {
         format_bytes(collector.host_peak_bytes)
     );
     println!(
-        " cargo child peak RSS: {}    builds: {}    up-to-date skips: {}    reloads: {}",
+        " cargo child peak RSS: {}    builds: {}    reloads: {}",
         format_bytes(collector.cargo_child_peak_bytes),
         collector.builds,
-        collector.skips,
         total_reloads
     );
     if collector.last_cargo_total_seconds > 0.0 {
@@ -1159,13 +1143,12 @@ pub(crate) fn print_startup_report() {
         .unwrap_or(4)
         .max(4);
     let pad = |value: &str| format!("{value:<width$}", width = name_width);
-    let separator = "-".repeat(name_width + 108);
+    let separator = "-".repeat(name_width + 100);
 
     println!(
-        "{}  {:<8}  {:<6}  {:>9}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>7}  {:>7}  {:>9}",
+        "{}  {:<8}  {:>9}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>7}  {:>7}  {:>9}",
         pad("module"),
         "kind",
-        "status",
         "build",
         "stage",
         "load",
@@ -1179,15 +1162,10 @@ pub(crate) fn print_startup_report() {
     println!("{separator}");
 
     for module in &collector.modules {
-        let status = match module.status {
-            BuildStatus::Fresh => "fresh",
-            BuildStatus::Built => "built",
-        };
         println!(
-            "{}  {:<8}  {:<6}  {:>9}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>7}  {:>7}  {:>9}",
+            "{}  {:<8}  {:>9}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>7}  {:>7}  {:>9}",
             pad(&module.name),
             module.kind.label(),
-            status,
             if module.build_wall_ms > 0 {
                 format_ms(module.build_wall_ms)
             } else {

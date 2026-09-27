@@ -24,6 +24,10 @@ notify = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
+# TOML parsing and editing for the generated workspace-member manifest and for
+# reading a project's own Cargo.toml. A real parser replaces the string surgery
+# that used to model tables, renames and arrays by hand.
+toml_edit = "0.22"
 tracing = "0.1"
 metrics = { version = "0.24", optional = true }
 winit = { version = "0.30", optional = true }
