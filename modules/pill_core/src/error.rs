@@ -725,10 +725,6 @@ pub enum ModuleError {
         value(status)
     )]
     InitializationFailed { module: String, status: u32 },
-
-    /// Two configured modules share one name.
-    #[message("extension name ", name_style(module), " is configured twice")]
-    DuplicateName { module: String },
 }
 
 /// Source-watching startup failures.

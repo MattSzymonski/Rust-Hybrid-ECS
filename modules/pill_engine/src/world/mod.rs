@@ -1417,15 +1417,15 @@ impl<T: Component> ComponentInserter for TypedComponentInserter<T> {
 ///
 /// # Example
 ///
-/// ```no_run
+/// ```
 /// # use pill_engine::*;
-/// # use trait_type_map::impl_trait_accessible;
 /// # #[derive(Debug, Clone)] struct Transform { x: f32, y: f32, z: f32 }
 /// # impl Component for Transform {}
 /// # #[derive(Debug, Clone)] struct Velocity { x: f32, y: f32 }
 /// # impl Component for Velocity {}
-/// # impl_trait_accessible!(dyn Component; Transform, Velocity);
 /// # let mut world = World::new();
+/// # world.register_component::<Transform>();
+/// # world.register_component::<Velocity>();
 /// world.create_entity()
 ///     .with(Transform { x: 0.0, y: 0.0, z: 0.0 })
 ///     .with(Velocity { x: 10.0, y: 0.0 })

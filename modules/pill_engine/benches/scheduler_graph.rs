@@ -66,9 +66,7 @@ static DISTINCT_TYPE_IDS: [TypeId; 20] = [
 /// Defines the 20 concrete component structs (`C0`..`C19`) used by the
 /// batch-execution benchmark.
 ///
-/// Each generated struct wraps a single `f32` and implements `Component`; the
-/// `impl_trait_accessible!` invocation registers the set with the
-/// trait-type-map so systems can query them through the engine.
+/// Each generated struct wraps a single `f32` and implements `Component`.
 macro_rules! define_components {
     ($($name:ident),* $(,)?) => {
         $(

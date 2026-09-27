@@ -21,7 +21,10 @@
 //! a declared layout, which is what lets managed code own a resource the host
 //! has never heard of.
 
+use trait_type_map::TraitAccessible;
+
 use super::*;
+use crate::asset::{Asset, AssetManager};
 
 // =============================================================================
 // World - Resource Management
@@ -791,6 +794,42 @@ impl World {
                 }
                 resource.refresh_ops(ops);
             }
+        }
+    }
+
+    /// Declare an asset type the calling generation owns.
+    ///
+    /// The asset twin of [`Self::register_component`]: an asset column's
+    /// per-type table is code from the artifact that filled it, so a
+    /// reloadable owner declares its asset types during registration and
+    /// [`Self::rehome_assets`] points those columns at the generation that is
+    /// still mapped. Using the type ([`AssetManager::add`]) declares it too,
+    /// so this call only matters for a type the generation owns but does not
+    /// touch this run.
+    pub fn register_asset<T>(&mut self)
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        match self.get_resource_mut::<AssetManager>() {
+            Some(assets) => assets.register::<T>(),
+            None => {
+                let mut assets = AssetManager::new();
+                assets.register::<T>();
+                self.insert_resource(assets);
+            }
+        }
+    }
+
+    /// Re-home every asset column's per-type function table.
+    ///
+    /// The third member of the re-homing family, called by the reload
+    /// transaction beside [`Self::rehome_native_columns`] and
+    /// [`Self::rehome_resources`] and for the same reason: the asset store
+    /// outlives every reload, so a column whose table still belongs to a
+    /// retiring image has to be re-pointed while that image is mapped.
+    pub fn rehome_assets(&mut self) {
+        if let Some(assets) = self.get_resource_mut::<AssetManager>() {
+            assets.rehome();
         }
     }
 

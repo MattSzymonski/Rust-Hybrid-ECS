@@ -111,14 +111,12 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// # use pill_engine::*;
-    /// # use trait_type_map::impl_trait_accessible;
     /// # #[derive(Debug, Clone)] struct Position { x: f32, y: f32 }
     /// # impl Component for Position {}
     /// # #[derive(Debug, Clone)] struct Velocity { x: f32, y: f32 }
     /// # impl Component for Velocity {}
-    /// # impl_trait_accessible!(dyn Component; Position, Velocity);
     /// # let mut world = World::new();
     /// # world.register_component::<Position>();
     /// # world.register_component::<Velocity>();
@@ -366,12 +364,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// # use pill_engine::*;
-    /// # use trait_type_map::impl_trait_accessible;
     /// # #[derive(Debug, Clone)] struct Position { x: f32, y: f32 }
     /// # impl Component for Position {}
-    /// # impl_trait_accessible!(dyn Component; Position);
     /// # let mut world = World::new();
     /// # world.register_component::<Position>();
     /// # world.create_entity().with(Position { x: 1.0, y: 2.0 }).build().unwrap();
@@ -413,12 +409,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// # use pill_engine::*;
-    /// # use trait_type_map::impl_trait_accessible;
     /// # #[derive(Debug, Clone)] struct Position { x: f32, y: f32 }
     /// # impl Component for Position {}
-    /// # impl_trait_accessible!(dyn Component; Position);
     /// # let mut world = World::new();
     /// # world.register_component::<Position>();
     /// # world.create_entity().with(Position { x: 1.0, y: 2.0 }).build().unwrap();
@@ -461,12 +455,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// # use pill_engine::*;
-    /// # use trait_type_map::impl_trait_accessible;
     /// # #[derive(Debug, Clone)] struct Position { x: f32, y: f32 }
     /// # impl Component for Position {}
-    /// # impl_trait_accessible!(dyn Component; Position);
     /// # let mut world = World::new();
     /// # world.register_component::<Position>();
     /// let mut query = Query::<&Position>::new(&mut world);
@@ -500,12 +492,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// # use pill_engine::*;
-    /// # use trait_type_map::impl_trait_accessible;
     /// # #[derive(Debug, Clone)] struct Position { x: f32, y: f32 }
     /// # impl Component for Position {}
-    /// # impl_trait_accessible!(dyn Component; Position);
     /// # let mut world = World::new();
     /// # world.register_component::<Position>();
     /// # world.create_entity().with(Position { x: 1.0, y: 2.0 }).build().unwrap();
@@ -537,12 +527,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
     ///
     /// # Examples
     ///
-    /// ```no_run
+    /// ```
     /// # use pill_engine::*;
-    /// # use trait_type_map::impl_trait_accessible;
     /// # #[derive(Debug, Clone)] struct Position { x: f32, y: f32 }
     /// # impl Component for Position {}
-    /// # impl_trait_accessible!(dyn Component; Position);
     /// # let mut world = World::new();
     /// # world.register_component::<Position>();
     /// # world.create_entity().with(Position { x: 1.0, y: 2.0 }).build().unwrap();

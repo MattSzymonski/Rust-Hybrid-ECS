@@ -533,6 +533,7 @@ dependencies = [
  "miette",
  "notify",
  "pill_core_macros",
+ "serde",
  "serde_json",
  "thiserror",
  "tracing",

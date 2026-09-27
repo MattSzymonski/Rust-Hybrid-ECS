@@ -35,6 +35,16 @@ pub use resources::RenderingManager;
 
 pub fn register(engine: &mut pill_engine::Engine) -> u32 {
     register_components(engine.world_mut());
+    // Declare the asset types this renderer owns. A project artifact calls this
+    // on every generation, and asset columns outlive the reload, so the
+    // declaration is what re-points their per-type tables at the generation
+    // still mapped.
+    engine.world_mut().register_asset::<Mesh>();
+    engine.world_mut().register_asset::<Texture>();
+    engine.world_mut().register_asset::<Shader>();
+    engine.world_mut().register_asset::<Material>();
+    engine.world_mut().register_asset::<RenderPass>();
+    engine.world_mut().register_asset::<RenderingPipeline>();
     if engine.world().get_resource::<RenderFrame>().is_none() {
         engine.world_mut().insert_resource(RenderFrame::default());
     }

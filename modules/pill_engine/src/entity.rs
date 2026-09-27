@@ -26,15 +26,15 @@ use std::fmt;
 /// Entities are 16 bytes, [`Copy`], and cheap to pass by value. The
 /// generation counter disambiguates recycled IDs:
 ///
-/// ```no_run
+/// ```
 /// # use pill_engine::*;
-/// # use trait_type_map::impl_trait_accessible;
 /// # #[derive(Debug, Clone)] struct Health(f32);
 /// # impl Component for Health {}
 /// # #[derive(Debug, Clone)] struct Damage(f32);
 /// # impl Component for Damage {}
-/// # impl_trait_accessible!(dyn Component; Health, Damage);
 /// # let mut world = World::new();
+/// # world.register_component::<Health>();
+/// # world.register_component::<Damage>();
 /// let enemy = world.create_entity().with(Health(100.0)).build().unwrap();
 /// world.destroy_entity(enemy);
 ///
