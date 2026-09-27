@@ -11,6 +11,6 @@ glam = "0.33"
 pill_engine = { path = "../../modules/pill_engine" }
 pill_master_renderer = { path = "../../modules/extensions/rendering/pill_master_renderer", default-features = false }
 serde = { version = "1", features = ["derive"] }
-trait_type_map = { path = "../../modules/trait_type_map" }
+trait_type_map = { git = "https://github.com/MattSzymonski/Trait-Type-Map", rev = "25343a9eac856445b0fa8266df5b000326d1574b" }
 
 [features]

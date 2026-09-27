@@ -2,8 +2,8 @@
 
 The test infrastructure for the hot-reload / persistence architecture. This is
 the **regression net** that must stay green while the audit's simplification
-opportunities (`docs/data_audit.md`, critical review in
-`docs/data_audit_review.md`) are implemented. Every fix lands behind
+opportunities (`local/docs/data_audit.md`, critical review in
+`local/docs/data_audit_review.md`) are implemented. Every fix lands behind
 these tests.
 
 This directory holds **pass/fail tests only**, and every suite in it runs

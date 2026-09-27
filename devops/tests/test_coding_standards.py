@@ -96,11 +96,6 @@ EXCLUDED_DIRECTORY_NAMES = {
     # run agree, which is the disagreement that made `run_all.py` red while the
     # documented gate was green.
     "local",
-    # Vendored third-party source: `modules/trait_type_map` is an unmodified
-    # copy of the Trait-Type-Map crate (see its `VENDORED.md`). Its style is
-    # upstream's, and the copy is meant to stay byte-for-byte identical, so
-    # the Pill comment and layout rules do not apply to it.
-    "trait_type_map",
 }
 
 # =============================================================================
