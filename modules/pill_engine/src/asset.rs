@@ -21,11 +21,13 @@
 //! an asset writer still runs beside a system touching only components. No
 //! scheduler change was needed to add this.
 //!
-//! Storage mirrors how components are held - a type-erased column per type in a
+//! Storage mirrors how components are held - an erased column per type in a
 //! `TraitTypeMap` - minus archetypes, which exist to group *entities* by their
-//! component set and have no meaning for an asset. The family is
-//! [`VecOptionFamily`] rather than `VecFamily` because unloading must free one
-//! slot without moving the others: every live handle keeps its index.
+//! component set and have no meaning for an asset. The column is the same
+//! `ErasedVecStorage` the component side uses, so its per-type behaviour is a
+//! replaceable data table rather than a trait-object vtable: a handle keeps its
+//! slot index across an unload, and a column can be re-pointed at whichever
+//! generation is still mapped (see [`AssetManager::rehome`]).
 //!
 //! # Handles are generational
 //!
@@ -43,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 // External crates
-use trait_type_map::{TraitAccessible, TraitTypeMap, VecOptionFamily};
+use trait_type_map::{ErasedVecStorageOps, TraitAccessible, TraitTypeMap, VecFamily};
 
 // Current crate
 use crate::resource::Resource;
@@ -112,6 +114,7 @@ pub enum AssetLoadError {
     Decode { label: String, detail: String },
 }
 
+/// Result of loading an asset's bytes from wherever its [`AssetLoader`] points.
 pub type AssetLoadResult<T> = Result<T, AssetLoadError>;
 
 /// Refusal to store an asset under a key another asset already answers to.
@@ -336,13 +339,22 @@ impl<T: Asset> std::fmt::Debug for Handle<T> {
 /// map stores type-erased columns and cannot carry per-type metadata of its own.
 #[derive(Default)]
 struct AssetColumn {
-    /// Generation of each slot, parallel to the column's slots by index.
+    /// Generation of each slot, one entry per slot that has ever existed.
     ///
     /// Starts at 0 for a fresh slot and increments on every free, so a handle
     /// issued before the free never matches after it.
     generations: Vec<u32>,
     /// Slots freed by `remove`, refilled before the column grows.
     free_slots: Vec<u32>,
+    /// Row the live slot at this index occupies in the packed column.
+    ///
+    /// Rows are packed, so removing one swaps the last row into the hole. This
+    /// map and `row_slots` are what keep the *slot* index stable through that
+    /// swap, and the slot index is what a handle addresses. An entry for a free
+    /// slot holds whatever the last occupant left.
+    slot_rows: Vec<u32>,
+    /// Slot owning each row; the reverse of `slot_rows`.
+    row_slots: Vec<u32>,
     /// Name lookup for assets added with one.
     ///
     /// Holds the index only: the generation is read from `generations` at
@@ -413,6 +425,24 @@ impl std::fmt::Display for AssetGuid {
 // AssetManager
 // =============================================================================
 
+/// Rebuild one asset type's function table from the calling generation's code.
+///
+/// The address of this function is what [`AssetManager::register`] records per
+/// type. Calling it from a freshly loaded generation re-points that type's
+/// column at that generation, which is what keeps the column usable after the
+/// generation that filled it is evicted from the reload graveyard.
+fn refresh_column_ops<T>(columns: &mut TraitTypeMap<dyn Asset, VecFamily>)
+where
+    T: Asset + TraitAccessible<dyn Asset>,
+{
+    if let Some(column) = columns.get_trait_storage_mut(TypeId::of::<T>()) {
+        column.refresh_ops(ErasedVecStorageOps::of::<T>());
+    }
+}
+
+/// How to refresh one asset type's column; see [`refresh_column_ops`].
+type AssetOpsRefresher = fn(&mut TraitTypeMap<dyn Asset, VecFamily>);
+
 /// Stores many assets per type, each addressed by a [`Handle`].
 ///
 /// Inserted into a world like any other resource, and reached through
@@ -436,31 +466,16 @@ impl std::fmt::Display for AssetGuid {
 /// ```
 #[derive(Default)]
 pub struct AssetManager {
-    /// One type-erased column per asset type, holding the values themselves.
-    columns: TraitTypeMap<dyn Asset, VecOptionFamily>,
+    /// One erased column per asset type, holding the values themselves.
+    columns: TraitTypeMap<dyn Asset, VecFamily>,
     /// Slot bookkeeping for each column, keyed by the same type.
     metadata: HashMap<TypeId, AssetColumn>,
+    /// How to rebuild each registered type's table from the generation that
+    /// last registered it; see [`Self::rehome`].
+    ops_refreshers: HashMap<TypeId, AssetOpsRefresher>,
     /// Changes whenever stored asset data may have changed.
     revision: u64,
 }
-
-// SAFETY: Every value the map holds is an `Asset`, and `Asset` requires
-// `Send + Sync`, so each stored asset is genuinely safe to move and share
-// across threads. What is not `Send + Sync` is the erased
-// `Box<dyn TraitVecOptionStorage<dyn Asset>>` the map stores its columns in:
-// that trait object carries no auto-trait bounds, so the compiler cannot see
-// the guarantee the `Asset` bound already enforces at every insertion point.
-// `add` is the only way a value enters a column and it requires `T: Asset`, so
-// no non-`Send` or non-`Sync` value can be reached through this type.
-//
-// Aliasing is handled separately by the scheduler: `AssetManager` is a
-// resource, so concurrent access is serialised by the existing
-// `Res` / `ResMut` conflict analysis exactly as for any other resource.
-unsafe impl Send for AssetManager {}
-// SAFETY: As for `Send` directly above - shared access reaches only `Asset`
-// values, which are `Sync` by the trait bound, and the scheduler serialises a
-// writer against every other accessor.
-unsafe impl Sync for AssetManager {}
 
 impl Resource for AssetManager {}
 
@@ -468,7 +483,9 @@ impl AssetManager {
     /// Create an empty manager holding no asset types.
     ///
     /// Types register themselves on first use, so nothing needs declaring up
-    /// front - a project that loads no meshes carries no mesh column.
+    /// front - a project that loads no meshes carries no mesh column. Declaring
+    /// a type with [`Self::register`] is for types whose owning artifact
+    /// reloads; see that method for why it matters there.
     pub fn new() -> Self {
         Self::default()
     }
@@ -495,19 +512,22 @@ impl AssetManager {
             .get_mut(&TypeId::of::<T>())
             .expect("column metadata is created alongside the column");
 
-        // Refill a freed slot when one exists; otherwise append and give the
-        // new slot generation 0.
+        // Refill a freed slot when one exists; otherwise append one and give it
+        // generation 0. The value always lands in a fresh row, so a refilled
+        // slot never inherits the row its previous occupant occupied.
         let index = match metadata.free_slots.pop() {
-            Some(index) => {
-                storage.data[index as usize] = Some(asset);
-                index
-            }
+            Some(index) => index,
             None => {
-                let index = storage.push(asset) as u32;
+                let index = metadata.slot_rows.len() as u32;
+                metadata.slot_rows.push(0);
                 metadata.generations.push(0);
                 index
             }
         };
+        let row = storage.len() as u32;
+        storage.push(asset);
+        metadata.slot_rows[index as usize] = row;
+        metadata.row_slots.push(index);
 
         self.revision = self.revision.wrapping_add(1);
 
@@ -620,7 +640,8 @@ impl AssetManager {
         if !self.is_live(handle) {
             return None;
         }
-        self.columns.get_storage::<T>().get(handle.index as usize)
+        let row = self.slot_row::<T>(handle.index)?;
+        Some(self.columns.get_storage::<T>().get::<T>(row as usize))
     }
 
     /// Mutably borrow the asset `handle` refers to, or `None` when it is stale.
@@ -632,9 +653,12 @@ impl AssetManager {
             return None;
         }
         self.revision = self.revision.wrapping_add(1);
-        self.columns
-            .get_storage_mut::<T>()
-            .get_mut(handle.index as usize)
+        let row = self.slot_row::<T>(handle.index)?;
+        Some(
+            self.columns
+                .get_storage_mut::<T>()
+                .get_mut::<T>(row as usize),
+        )
     }
 
     /// Resolve a name to a live handle, or `None` when nothing holds it.
@@ -741,15 +765,32 @@ impl AssetManager {
             return None;
         }
 
-        let asset = self
-            .columns
-            .get_storage_mut::<T>()
-            .take(handle.index as usize)?;
+        let type_id = TypeId::of::<T>();
+        let row = self
+            .metadata
+            .get(&type_id)
+            .expect("a live handle implies existing metadata")
+            .slot_rows[handle.index as usize];
+
+        let storage = self.columns.get_storage_mut::<T>();
+        let asset = storage.swap_remove::<T>(row as usize);
+        // A packed column moves its last row into the hole; that row's slot
+        // takes over the vacated index below, so handles follow the slot and
+        // not the row.
+        let moved_row = (row as usize) < storage.len();
 
         let metadata = self
             .metadata
-            .get_mut(&TypeId::of::<T>())
+            .get_mut(&type_id)
             .expect("a live handle implies existing metadata");
+
+        // The popped entry is the slot of the row that moved in, or the removed
+        // slot's own when the last row went - which needs no fix-up either way.
+        let last_slot = metadata.row_slots.pop().expect("a live slot owns a row");
+        if moved_row {
+            metadata.slot_rows[last_slot as usize] = row;
+            metadata.row_slots[row as usize] = last_slot;
+        }
 
         // Bump the generation so this handle, and every copy of it, stops
         // resolving. Saturating rather than wrapping: at u32::MAX the slot is
@@ -777,12 +818,7 @@ impl AssetManager {
     where
         T: Asset + TraitAccessible<dyn Asset>,
     {
-        self.is_live(handle)
-            && self
-                .columns
-                .get_storage::<T>()
-                .get(handle.index as usize)
-                .is_some()
+        self.is_live(handle) && self.slot_row::<T>(handle.index).is_some()
     }
 
     /// Number of live assets of type `T`.
@@ -793,7 +829,7 @@ impl AssetManager {
         if !self.metadata.contains_key(&TypeId::of::<T>()) {
             return 0;
         }
-        self.columns.get_storage::<T>().iter().count()
+        self.columns.get_storage::<T>().len()
     }
 
     /// Whether no asset of type `T` is stored.
@@ -806,18 +842,18 @@ impl AssetManager {
 
     /// Iterate every live asset of type `T`.
     ///
-    /// Order is slot order, which is insertion order until the first removal
+    /// Order is row order, which is insertion order until the first removal
     /// and arbitrary afterwards; callers needing a stable order must impose
     /// one themselves.
     pub fn iter<T>(&self) -> impl Iterator<Item = &T>
     where
         T: Asset + TraitAccessible<dyn Asset>,
     {
-        // `Option` is iterable, so an unregistered type yields nothing rather
-        // than needing the column to exist.
+        // An unregistered type yields nothing rather than needing the column
+        // to exist.
         self.metadata
             .contains_key(&TypeId::of::<T>())
-            .then(|| self.columns.get_storage::<T>().iter())
+            .then(|| self.columns.get_storage::<T>().iter::<T>())
             .into_iter()
             .flatten()
     }
@@ -832,19 +868,20 @@ impl AssetManager {
             .map(|metadata| {
                 self.columns
                     .get_storage::<T>()
-                    .data
-                    .iter()
+                    .iter::<T>()
                     .enumerate()
-                    .filter_map(move |(index, slot)| {
-                        let asset = slot.as_ref()?;
-                        Some((
+                    .map(move |(row, asset)| {
+                        // Rows are packed; the handle names the slot the row
+                        // lives in, which is the index that survives a swap.
+                        let slot = metadata.row_slots[row];
+                        (
                             Handle {
-                                index: index as u32,
-                                generation: metadata.generations[index],
+                                index: slot,
+                                generation: metadata.generations[slot as usize],
                                 _marker: PhantomData,
                             },
                             asset,
-                        ))
+                        )
                     })
             })
             .into_iter()
@@ -862,21 +899,64 @@ impl AssetManager {
             .is_some_and(|generation| *generation == handle.generation)
     }
 
-    /// Create the column and metadata for `T` if this is its first use.
+    /// Row the live slot at `index` occupies, or `None` when nothing lives there.
     ///
-    /// Registration is implicit rather than an explicit call a caller could
-    /// forget: `register_type_storage` panics on a second registration, so the
-    /// check belongs here where it can be made idempotent.
+    /// The reverse lookup is what proves occupancy: a freed slot's stale row
+    /// entry answers to a different slot (or to no row), so even a handle that
+    /// guessed a freed slot's generation cannot reach another asset's row.
+    fn slot_row<T: Asset>(&self, index: u32) -> Option<u32> {
+        let metadata = self.metadata.get(&TypeId::of::<T>())?;
+        let row = *metadata.slot_rows.get(index as usize)?;
+        (metadata.row_slots.get(row as usize) == Some(&index)).then_some(row)
+    }
+
+    /// Declare `T` as an asset type and re-point its column at this generation.
+    ///
+    /// Creating the column is implicit in using the type - every `add` lands
+    /// here first - but a *declaration* also matters across a reload: the
+    /// column's per-type table is code from the artifact that filled it, so a
+    /// generation that owns an asset type should declare it in registration
+    /// even when it will not add an instance this run. Declaring twice is
+    /// harmless; the second call only refreshes the table.
+    ///
+    /// `register_type_storage` panics on a second registration, so the
+    /// existence check belongs here where it can be made idempotent.
+    pub fn register<T>(&mut self)
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        let type_id = TypeId::of::<T>();
+        self.ops_refreshers.insert(type_id, refresh_column_ops::<T>);
+        if self.metadata.contains_key(&type_id) {
+            self.columns
+                .get_storage_mut::<T>()
+                .refresh_ops(ErasedVecStorageOps::of::<T>());
+            return;
+        }
+        self.columns.register_type_storage::<T>();
+        self.metadata.insert(type_id, AssetColumn::default());
+    }
+
+    /// Re-point every registered asset column at its newest function table.
+    ///
+    /// The reload transaction calls this beside the component and resource
+    /// re-homing passes, after the arriving generation registered and before
+    /// any retiring image can be evicted: a column keeps working only while its
+    /// table points at code that is still mapped. A type the arriving
+    /// generation neither declared nor used keeps the table it has - there is
+    /// nothing newer to point it at.
+    pub fn rehome(&mut self) {
+        for refresher in self.ops_refreshers.values() {
+            refresher(&mut self.columns);
+        }
+    }
+
+    /// Create the column and metadata for `T` if this is its first use.
     fn ensure_column<T>(&mut self)
     where
         T: Asset + TraitAccessible<dyn Asset>,
     {
-        if self.metadata.contains_key(&TypeId::of::<T>()) {
-            return;
-        }
-        self.columns.register_type_storage::<T>();
-        self.metadata
-            .insert(TypeId::of::<T>(), AssetColumn::default());
+        self.register::<T>();
     }
 }
 
@@ -1218,6 +1298,89 @@ mod tests {
         }
     }
 
+    /// The packed column swaps rows on removal; a handle follows its slot, not
+    /// the row that used to hold its value.
+    #[test]
+    fn removing_the_middle_asset_keeps_the_others_addressable() {
+        let mut assets = AssetManager::new();
+        let a = assets.add(Mesh("a"));
+        let b = assets.add(Mesh("b"));
+        let c = assets.add(Mesh("c"));
+
+        assert_eq!(assets.remove(b), Some(Mesh("b")));
+        assert_eq!(assets.get(a), Some(&Mesh("a")));
+        assert_eq!(assets.get(c), Some(&Mesh("c")));
+
+        let d = assets.add(Mesh("d"));
+        assert_eq!(d.index(), b.index(), "the freed slot is refilled");
+        assert_eq!(assets.get(a), Some(&Mesh("a")));
+        assert_eq!(assets.get(c), Some(&Mesh("c")));
+        assert_eq!(assets.get(d), Some(&Mesh("d")));
+        assert_eq!(assets.len::<Mesh>(), 3);
+    }
+
+    /// Declaring a type re-points its column without disturbing its contents.
+    #[test]
+    fn declaring_a_type_twice_keeps_its_assets() {
+        let mut assets = AssetManager::new();
+        let handle = assets
+            .add_named("rock", Mesh("rock"))
+            .expect("a fresh name");
+
+        assets.register::<Mesh>();
+
+        assert_eq!(assets.get(handle), Some(&Mesh("rock")));
+        assert_eq!(assets.handle_by_name::<Mesh>("rock"), Some(handle));
+        assert_eq!(assets.len::<Mesh>(), 1);
+    }
+
+    /// The re-home pass swaps every column's table; values, handles and names
+    /// must survive it untouched.
+    #[test]
+    fn rehoming_leaves_assets_and_handles_intact() {
+        let mut assets = AssetManager::new();
+        let shared = assets.add(Mesh("shared"));
+        let doomed = assets.add(Mesh("doomed"));
+        assets.remove(doomed);
+        let named = assets
+            .add_named("tree", Mesh("tree"))
+            .expect("a fresh name");
+
+        assets.rehome();
+
+        assert_eq!(assets.get(shared), Some(&Mesh("shared")));
+        assert_eq!(assets.get(named), Some(&Mesh("tree")));
+        assert_eq!(assets.handle_by_name::<Mesh>("tree"), Some(named));
+        let mut names: Vec<&str> = assets.iter::<Mesh>().map(|mesh| mesh.0).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["shared", "tree"]);
+    }
+
+    /// The column still drops its values through its function table after the
+    /// table has been swapped - the property the whole design exists to keep.
+    #[test]
+    fn dropping_the_manager_drops_its_assets() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct DropProbe(Arc<AtomicUsize>);
+        impl Drop for DropProbe {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        impl Asset for DropProbe {}
+        impl_trait_accessible!(dyn Asset; DropProbe);
+
+        let drops = Arc::new(AtomicUsize::new(0));
+        {
+            let mut assets = AssetManager::new();
+            assets.add(DropProbe(Arc::clone(&drops)));
+            assets.rehome();
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
     /// Handles are inert values: copyable, comparable, and hashable, so they
     /// can sit inside components and map keys.
     #[test]
@@ -1249,6 +1412,29 @@ mod tests {
             .get_resource::<AssetManager>()
             .expect("manager was inserted");
         assert_eq!(stored.get(handle), Some(&Mesh("rock")));
+    }
+
+    /// The world-side API the reload transaction uses: declaring a type
+    /// creates the manager on first use, and the re-home pass runs through it.
+    #[test]
+    fn world_registers_and_rehomes_asset_types() {
+        use crate::world::World;
+
+        let mut world = World::new();
+        world.register_asset::<Mesh>();
+        let handle = world
+            .get_resource_mut::<AssetManager>()
+            .expect("register_asset creates the manager")
+            .add(Mesh("rock"));
+
+        world.rehome_assets();
+
+        assert_eq!(
+            world
+                .get_resource::<AssetManager>()
+                .and_then(|assets| assets.get(handle)),
+            Some(&Mesh("rock"))
+        );
     }
 
     #[test]

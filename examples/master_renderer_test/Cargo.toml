@@ -11,7 +11,7 @@ glam = "0.33"
 pill_engine = { path = "../../modules/pill_engine" }
 pill_master_renderer = { path = "../../modules/extensions/rendering/pill_master_renderer", default-features = false }
 serde = { version = "1", features = ["derive"] }
-trait_type_map = { path = "../../../Trait-Type-Map" }
+trait_type_map = { path = "../../modules/trait_type_map" }
 
 [build-dependencies]
 # Cooks `res/shaders/*.hlsl` into the WGSL this project loads at runtime, so the

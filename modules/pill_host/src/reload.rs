@@ -450,6 +450,12 @@ impl ReloadTransaction<'_> {
             // init) or dropped just above, so no table still points into the
             // failing image.
             engine.world_mut().rehome_resources();
+            // Asset columns follow the same rule: the rollback init re-declares
+            // the asset types its generation owns, so their tables point back
+            // at the image that stays mapped. A type only the failed generation
+            // declared has no owner to re-claim it - the asset store keeps no
+            // per-subject claims yet - so it keeps that generation's table.
+            engine.world_mut().rehome_assets();
             // Retire the failed image instead of unmapping it. The purge above
             // is designed to leave nothing pointing into it, but "designed to"
             // is not a proof: an image that is parked costs a `FreeLibrary`
@@ -564,6 +570,13 @@ impl ReloadTransaction<'_> {
         // image would be evicted while a live resource still pointed its
         // destructor into it.
         engine.world_mut().rehome_resources();
+
+        // Step 4d: And for asset columns. The asset store outlives the reload
+        // too, and a column's per-type table - drop, upcast, take - is code
+        // from whichever artifact declared or first used the type. Re-pointing
+        // it here keeps the store usable after that artifact's image leaves
+        // the graveyard.
+        engine.world_mut().rehome_assets();
 
         // Step 5: Migrate persistable schemas that changed across the swap.
         // Types are matched by stable name rather than runtime ComponentId,

@@ -13,7 +13,7 @@ crate-type = ["rlib"]
 pill_core = { path = "../../../pill_core" }
 pill_core_macros = { path = "../../../pill_core_macros" }
 pill_engine = { path = "../../../pill_engine" }
-trait_type_map = { path = "../../../../../Trait-Type-Map" }
+trait_type_map = { path = "../../../trait_type_map" }
 
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
@@ -26,7 +26,10 @@ pollster = "0.4"
 # `jpeg` alongside `png`: the committed helmet asset in `master_renderer_test`
 # ships its PBR maps as JPEG, and re-encoding them to PNG would multiply the
 # committed size for no gain in fidelity.
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+] }
 tobj = "3"
 
 egui = { version = "0.32.1", optional = true }

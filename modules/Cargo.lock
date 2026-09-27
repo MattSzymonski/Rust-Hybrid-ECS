@@ -2673,15 +2673,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dfa686283ad6dd069f105e5ab091b04c62850d3e4cf5d67debad1933f55023df"
 
 [[package]]
-name = "host_project_italian_brainrot"
+name = "host_project_project"
 version = "0.1.0"
 dependencies = [
- "glam",
- "pill_assets",
+ "pill_audio",
+ "pill_core",
  "pill_engine",
  "pill_master_renderer",
+ "pill_spline",
  "serde",
- "trait_type_map",
+ "tracing",
 ]
 
 [[package]]

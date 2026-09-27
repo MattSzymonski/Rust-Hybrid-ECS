@@ -142,6 +142,10 @@ pub fn register(engine: &mut Engine) -> u32 {
     engine
         .world_mut()
         .register_component::<AudioSourceComponent>();
+    // Declare the asset type this module stores. Sounds outlive a reload of
+    // this DLL - the world's asset store does - so the column's per-type table
+    // has to be re-pointed at the generation still mapped.
+    engine.world_mut().register_asset::<Sound>();
 
     // Only build the device once. Registration runs again on every reload, and
     // replacing a live manager would cut off whatever is playing.
