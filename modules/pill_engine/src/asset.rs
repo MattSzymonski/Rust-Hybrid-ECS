@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 // External crates
-use trait_type_map::{ErasedVecStorageOps, TraitAccessible, TraitTypeMap, VecFamily};
+use trait_type_map::{ErasedVecFamily, ErasedVecStorageOps, TraitAccessible, TraitTypeMap};
 
 // Current crate
 use crate::resource::Resource;
@@ -431,7 +431,7 @@ impl std::fmt::Display for AssetGuid {
 /// type. Calling it from a freshly loaded generation re-points that type's
 /// column at that generation, which is what keeps the column usable after the
 /// generation that filled it is evicted from the reload graveyard.
-fn refresh_column_ops<T>(columns: &mut TraitTypeMap<dyn Asset, VecFamily>)
+fn refresh_column_ops<T>(columns: &mut TraitTypeMap<dyn Asset, ErasedVecFamily>)
 where
     T: Asset + TraitAccessible<dyn Asset>,
 {
@@ -441,7 +441,7 @@ where
 }
 
 /// How to refresh one asset type's column; see [`refresh_column_ops`].
-type AssetOpsRefresher = fn(&mut TraitTypeMap<dyn Asset, VecFamily>);
+type AssetOpsRefresher = fn(&mut TraitTypeMap<dyn Asset, ErasedVecFamily>);
 
 /// Stores many assets per type, each addressed by a [`Handle`].
 ///
@@ -467,7 +467,7 @@ type AssetOpsRefresher = fn(&mut TraitTypeMap<dyn Asset, VecFamily>);
 #[derive(Default)]
 pub struct AssetManager {
     /// One erased column per asset type, holding the values themselves.
-    columns: TraitTypeMap<dyn Asset, VecFamily>,
+    columns: TraitTypeMap<dyn Asset, ErasedVecFamily>,
     /// Slot bookkeeping for each column, keyed by the same type.
     metadata: HashMap<TypeId, AssetColumn>,
     /// How to rebuild each registered type's table from the generation that

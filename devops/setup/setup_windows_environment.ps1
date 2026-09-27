@@ -23,7 +23,8 @@ if (-not (Test-Path "$env:USERPROFILE\.cargo\bin\cargo.exe")) {
     Write-Host "Installing Rust (rustup)..."
     winget install --id Rustlang.Rustup -e --source winget --accept-package-agreements --accept-source-agreements
     Update-SessionPath
-} else {
+}
+else {
     Write-Host "Rust toolchain already installed."
 }
 
@@ -35,22 +36,7 @@ winget install --id Microsoft.VisualStudio.2022.BuildTools -e --source winget `
     --accept-package-agreements --accept-source-agreements `
     --override "--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.Windows11SDK.22621 --includeRecommended"
 
-# 3. Sibling dependency: pill_engine depends on a path dependency,
-#    ../../../Trait-Type-Map relative to modules/, i.e. a sibling checkout next
-#    to this repository's parent directory.
-$repoRoot = $PSScriptRoot
-$siblingDir = Split-Path $repoRoot -Parent
-$traitTypeMapDir = Join-Path $siblingDir "Trait-Type-Map"
-if (-not (Test-Path $traitTypeMapDir)) {
-    Write-Host "Cloning sibling dependency Trait-Type-Map..."
-    Push-Location $siblingDir
-    git clone https://github.com/MattSzymonski/Trait-Type-Map.git
-    Pop-Location
-} else {
-    Write-Host "Trait-Type-Map already present at $traitTypeMapDir."
-}
-
-# 4. Windows Smart App Control (SAC) blocks LoadLibrary of the DLLs this
+# 3. Windows Smart App Control (SAC) blocks LoadLibrary of the DLLs this
 #    workspace compiles on the fly for hot-reloaded modules/projects
 #    ("An Application Control policy has blocked this file", os error 4551).
 #    SAC can only be turned off through the Windows Security UI while it is
@@ -61,13 +47,16 @@ $sacState = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\CI\P
 if ($sacState -ne 0) {
     Write-Warning "Windows Smart App Control is still ON. Go to Settings > Privacy & security > Windows Security > App & browser control > Smart App Control settings and turn it Off, then re-run this script."
     Write-Warning "(If the Off option is greyed out, SAC is fully enforced and can only be disabled by reinstalling Windows.)"
-} else {
+}
+else {
     Write-Host "Smart App Control is off."
 }
 
-# 5. Populate the offline cargo registry cache (the --offline run needs every
-#    dependency already downloaded once).
+# 4. Populate the offline cargo registry cache (the --offline run needs every
+#    dependency already downloaded once; this also fetches the pinned
+#    `trait_type_map` git dependency).
 Update-SessionPath
+$repoRoot = $PSScriptRoot
 Push-Location (Join-Path $repoRoot "modules")
 Write-Host "Fetching cargo dependencies (online, one-time)..."
 & "$env:USERPROFILE\.cargo\bin\cargo.exe" fetch

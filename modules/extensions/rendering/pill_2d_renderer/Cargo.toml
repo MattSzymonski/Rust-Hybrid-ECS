@@ -11,8 +11,9 @@ workspace = true
 # renderer needs a live window handle, per-frame `World` access and the
 # frontend's event loop; the module ABI is a one-shot component registration,
 # so loading this as a DLL would mean inventing a per-frame render ABI for no
-# benefit. Same crate shape as `host_project_project`: plain `rlib`, no
-# `module-abi`, no build script, not listed in any `project_settings.yaml`.
+# benefit. Same crate shape as a generated host project member
+# (`host_project_<name>`): plain `rlib`, no `module-abi`, no build script, not
+# listed in any `project_settings.yaml`.
 crate-type = ["rlib"]
 
 [dependencies]

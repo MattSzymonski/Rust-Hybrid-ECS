@@ -9,10 +9,6 @@ members = [
     "pill_host",
     "pill_hot_scan",
     "pill_standalone",
-    # Vendored third-party crate (upstream and revision in its `VENDORED.md`).
-    # Several members and the example projects depend on it by path, so it has
-    # to travel with the repository rather than sit beside it.
-    "trait_type_map",
     # Every crate under `extensions/` is an extension, discovered by
     # this glob so adding one is just creating a directory. The glob is scoped
     # to that directory rather than the workspace root because every path it
