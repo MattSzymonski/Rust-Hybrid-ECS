@@ -2,17 +2,17 @@ use crate::{
     assets::{ShaderParameterSlot, ShaderTextureSlot, TextureType},
     error::{RendererError, Result},
 };
+use indexmap::IndexMap;
 use pill_core::{debug, PillStyle};
-use std::collections::HashMap;
 
 pub struct RendererShader {
     pub name: String,
     pub render_pipeline: wgpu::RenderPipeline,
 
-    pub parameter_slots: Vec<(String, ShaderParameterSlot)>,
+    pub parameter_slots: IndexMap<String, ShaderParameterSlot>,
     pub parameters_bind_group_layout: Option<wgpu::BindGroupLayout>,
 
-    pub texture_slots: HashMap<String, ShaderTextureSlot>,
+    pub texture_slots: IndexMap<String, ShaderTextureSlot>,
     pub textures_bind_group_layout: Option<wgpu::BindGroupLayout>,
 
     pub pass_engine_parameters: bool,
@@ -29,8 +29,8 @@ impl RendererShader {
         vertex_layouts: &[wgpu::VertexBufferLayout],
         vertex_wgsl: &str,
         fragment_wgsl: &str,
-        parameter_slots: &[(String, ShaderParameterSlot)],
-        texture_slots: &HashMap<String, ShaderTextureSlot>,
+        parameter_slots: &IndexMap<String, ShaderParameterSlot>,
+        texture_slots: &IndexMap<String, ShaderTextureSlot>,
         engine_bind_group_layout: &wgpu::BindGroupLayout,
         camera_bind_group_layout: &wgpu::BindGroupLayout,
         pass_engine_parameters: bool,
@@ -244,7 +244,7 @@ impl RendererShader {
         let pipeline = Self {
             name: name.to_string(),
             render_pipeline,
-            parameter_slots: parameter_slots.to_vec(),
+            parameter_slots: parameter_slots.clone(),
             textures_bind_group_layout,
             texture_slots: texture_slots.clone(),
             parameters_bind_group_layout,

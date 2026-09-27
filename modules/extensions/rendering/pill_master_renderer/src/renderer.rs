@@ -3,8 +3,8 @@
 use crate::{
     api::{FrameOutcome, PillRenderer, RenderCapabilities, RenderMetrics},
     assets::{
-        MaterialParameter, PassKind, PassTarget, ShaderParameterSlot, ShaderParameterType,
-        ShaderTextureSlot, TextureType,
+        parameter_slots_by_name, texture_slots_by_name, MaterialParameter, PassKind, PassTarget,
+        ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot, TextureType,
     },
     component::RenderViewport,
     config::{
@@ -678,25 +678,13 @@ impl Renderer {
 fn install_default_material(
     state: &mut State,
 ) -> Result<(RendererShaderHandle, RendererMaterialHandle)> {
-    let parameter_slots = vec![
-        (
-            "tint".to_owned(),
-            ShaderParameterSlot::new(ShaderParameterType::Color),
-        ),
-        (
-            "specularity".to_owned(),
-            ShaderParameterSlot::new(ShaderParameterType::Scalar),
-        ),
-    ];
-    let texture_slots = HashMap::from([
-        (
-            "color".to_owned(),
-            ShaderTextureSlot::new(TextureType::Color, (0, 1)),
-        ),
-        (
-            "normal".to_owned(),
-            ShaderTextureSlot::new(TextureType::Normal, (2, 3)),
-        ),
+    let parameter_slots = parameter_slots_by_name([
+        ShaderParameterSlot::new("tint", ShaderParameterType::Color),
+        ShaderParameterSlot::new("specularity", ShaderParameterType::Scalar),
+    ]);
+    let texture_slots = texture_slots_by_name([
+        ShaderTextureSlot::new("color", TextureType::Color, (0, 1)),
+        ShaderTextureSlot::new("normal", TextureType::Normal, (2, 3)),
     ]);
     let shader = RendererShader::new(
         "pill_default_lit",

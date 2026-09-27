@@ -5,7 +5,7 @@ use pill_master_renderer::{
     AssetLoader, Material, Mesh, Shader, ShaderParameterSlot, ShaderParameterType,
     ShaderTextureSlot, Texture, TextureType,
 };
-use std::{collections::HashMap, path::PathBuf};
+use std::path::PathBuf;
 
 #[derive(Clone, Copy)]
 pub(crate) struct SceneAssets {
@@ -44,39 +44,39 @@ pub(crate) fn load(world: &mut World) -> Result<SceneAssets, Box<dyn std::error:
     )?;
     let unlit_shader = assets.add_named(
         "italian_brainrot.shader.unlit",
-        Shader::new(
-            "italian_brainrot_unlit",
-            AssetLoader::Path("shaders/default_vertex.wgsl".into()),
-            AssetLoader::Path("shaders/unlit_fragment.wgsl".into()),
-            vec![(
-                "tint".to_owned(),
-                ShaderParameterSlot::new(ShaderParameterType::Color),
-            )],
-            HashMap::from([(
-                "color".to_owned(),
-                ShaderTextureSlot::new(TextureType::Color, (0, 1)),
-            )]),
-            true,
-            true,
-        )?,
+        Shader::new("italian_brainrot_unlit")
+            .with_vertex_source(AssetLoader::Path("shaders/default_vertex.wgsl".into()))
+            .with_fragment_source(AssetLoader::Path("shaders/unlit_fragment.wgsl".into()))
+            .with_parameter_slots(vec![ShaderParameterSlot::new(
+                "tint",
+                ShaderParameterType::Color,
+            )])
+            .with_texture_slots(vec![ShaderTextureSlot::new(
+                "color",
+                TextureType::Color,
+                (0, 1),
+            )])
+            .with_engine_parameters(true)
+            .with_camera_parameters(true)
+            .build()?,
     )?;
     let cartoon_shader = assets.add_named(
         "italian_brainrot.shader.cartoon",
-        Shader::new(
-            "cartoon",
-            AssetLoader::Path("shaders/default_vertex.wgsl".into()),
-            AssetLoader::Path("shaders/cartoon_fragment.wgsl".into()),
-            vec![(
-                "posterize_level".to_owned(),
-                ShaderParameterSlot::new(ShaderParameterType::Scalar),
-            )],
-            HashMap::from([(
-                "color".to_owned(),
-                ShaderTextureSlot::new(TextureType::Color, (0, 1)),
-            )]),
-            true,
-            true,
-        )?,
+        Shader::new("cartoon")
+            .with_vertex_source(AssetLoader::Path("shaders/default_vertex.wgsl".into()))
+            .with_fragment_source(AssetLoader::Path("shaders/cartoon_fragment.wgsl".into()))
+            .with_parameter_slots(vec![ShaderParameterSlot::new(
+                "posterize_level",
+                ShaderParameterType::Scalar,
+            )])
+            .with_texture_slots(vec![ShaderTextureSlot::new(
+                "color",
+                TextureType::Color,
+                (0, 1),
+            )])
+            .with_engine_parameters(true)
+            .with_camera_parameters(true)
+            .build()?,
     )?;
 
     // An invalid shader handle selects the renderer's built-in lit shader.

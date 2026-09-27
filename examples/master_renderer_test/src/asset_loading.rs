@@ -11,7 +11,7 @@ use pill_master_renderer::{
     RenderingPipeline, Shader, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot,
     Texture, TextureType,
 };
-use std::{collections::HashMap, path::PathBuf};
+use std::path::PathBuf;
 
 /// Asset names, so a reload that runs this twice is refused by the manager with
 /// the offending name rather than quietly adding the helmet a second time.
@@ -43,84 +43,6 @@ pub(crate) struct SceneAssets {
     pub mesh: Handle<Mesh>,
     pub material: Handle<Material>,
     pub pipeline: Handle<RenderingPipeline>,
-}
-
-/// The texture slots `pbr_fragment.hlsl` declares, with the binding pairs it
-/// declares them at: base colour, normal, metallic-roughness, emissive.
-fn pbr_texture_slots() -> HashMap<String, ShaderTextureSlot> {
-    HashMap::from([
-        (
-            "base_color".to_owned(),
-            ShaderTextureSlot::new(TextureType::Color, (0, 1)),
-        ),
-        (
-            "normal".to_owned(),
-            ShaderTextureSlot::new(TextureType::Normal, (2, 3)),
-        ),
-        (
-            "metallic_roughness".to_owned(),
-            ShaderTextureSlot::new(TextureType::Color, (4, 5)),
-        ),
-        (
-            "emissive".to_owned(),
-            ShaderTextureSlot::new(TextureType::Color, (6, 7)),
-        ),
-    ])
-}
-
-/// The uniform slots `pbr_fragment.hlsl` declares, in slot order: the two
-/// `Color` slots carry a tint, the two `Scalar` slots a factor.
-fn pbr_parameter_slots() -> Vec<(String, ShaderParameterSlot)> {
-    vec![
-        (
-            "pbr_base".to_owned(),
-            ShaderParameterSlot::new(ShaderParameterType::Color),
-        ),
-        (
-            "pbr_roughness".to_owned(),
-            ShaderParameterSlot::new(ShaderParameterType::Scalar),
-        ),
-        (
-            "pbr_metallic".to_owned(),
-            ShaderParameterSlot::new(ShaderParameterType::Scalar),
-        ),
-        (
-            "pbr_emissive".to_owned(),
-            ShaderParameterSlot::new(ShaderParameterType::Color),
-        ),
-    ]
-}
-
-/// The uniform slots `tonemap_fragment.hlsl` declares, in slot order. `b` and
-/// `c` are not tuned by hand - see [`lottes_bc`] - but they are still slots,
-/// because the shader has no other way to be told them.
-fn tonemap_parameter_slots() -> Vec<(String, ShaderParameterSlot)> {
-    ["contrast", "shoulder", "b", "c"]
-        .into_iter()
-        .map(|slot| {
-            (
-                slot.to_owned(),
-                ShaderParameterSlot::new(ShaderParameterType::Scalar),
-            )
-        })
-        .collect()
-}
-
-/// One `Color` slot under the given name. Post passes group their numbers into
-/// slots this way because that is how the engine packs them.
-fn color_parameter(slot: &str) -> (String, ShaderParameterSlot) {
-    (
-        slot.to_owned(),
-        ShaderParameterSlot::new(ShaderParameterType::Color),
-    )
-}
-
-/// The single frame `bloom_prefilter_fragment.hlsl` reads.
-fn single_input_slots(slot: &str) -> HashMap<String, ShaderTextureSlot> {
-    HashMap::from([(
-        slot.to_owned(),
-        ShaderTextureSlot::new(TextureType::Color, (0, 1)),
-    )])
 }
 
 /// The curve shape and the two constants Lottes' tonemap is defined by.
@@ -166,17 +88,6 @@ fn grain_texture() -> Texture {
     Texture::from_rgba("helmet.grain", TextureType::Color, rgba, SIZE, SIZE)
 }
 
-/// Decode one committed texture under `name`.
-fn load_texture(
-    assets: &mut AssetManager,
-    name: &str,
-    file: &str,
-    texture_type: TextureType,
-) -> Result<Handle<Texture>, Box<dyn std::error::Error>> {
-    let texture = Texture::new(name, texture_type, AssetLoader::Path(file.into()))?;
-    Ok(assets.add_named(name, texture)?)
-}
-
 /// Decodes the helmet and everything the frame draws it with.
 ///
 /// # Errors
@@ -190,46 +101,57 @@ pub(crate) fn load(world: &mut World) -> Result<SceneAssets, Box<dyn std::error:
         .ok_or_else(|| "the engine AssetManager resource is missing".to_owned())?;
 
     let obj = AssetLoader::Path("models/helmet.obj".into()).load()?;
-    let mesh = assets.add_named(HELMET_MESH, Mesh::from_obj_bytes("helmet", &obj)?)?;
+    let mesh = Mesh::from_obj_bytes("helmet", &obj)?;
+    let mesh = assets.add_named(HELMET_MESH, mesh)?;
 
-    let base_color = load_texture(
-        assets,
+    let base_color = Texture::new(
         "helmet.base_color",
-        "textures/helmet_basecolor.jpg",
         TextureType::Color,
+        AssetLoader::Path("textures/helmet_basecolor.jpg".into()),
     )?;
-    let normal = load_texture(
-        assets,
+    let base_color = assets.add_named("helmet.base_color", base_color)?;
+    let normal = Texture::new(
         "helmet.normal",
-        "textures/helmet_normal.jpg",
         TextureType::Normal,
+        AssetLoader::Path("textures/helmet_normal.jpg".into()),
     )?;
-    let metallic_roughness = load_texture(
-        assets,
+    let normal = assets.add_named("helmet.normal", normal)?;
+    let metallic_roughness = Texture::new(
         "helmet.metallic_roughness",
-        "textures/helmet_metallic_roughness.jpg",
         TextureType::Color,
+        AssetLoader::Path("textures/helmet_metallic_roughness.jpg".into()),
     )?;
-    let emissive = load_texture(
-        assets,
+    let metallic_roughness = assets.add_named("helmet.metallic_roughness", metallic_roughness)?;
+    let emissive = Texture::new(
         "helmet.emissive",
-        "textures/helmet_emissive.jpg",
         TextureType::Color,
+        AssetLoader::Path("textures/helmet_emissive.jpg".into()),
     )?;
+    let emissive = assets.add_named("helmet.emissive", emissive)?;
 
     // Both stages are cooked from HLSL by this project's `build.rs`.
-    let shader = Shader::new(
-        "helmet_pbr",
-        AssetLoader::Path("shaders/default_vertex.wgsl".into()),
-        AssetLoader::Path("shaders/pbr_fragment.wgsl".into()),
-        pbr_parameter_slots(),
-        pbr_texture_slots(),
-        true,
-        true,
-    )?;
+    let shader = Shader::new("helmet_pbr")
+        .with_vertex_source(AssetLoader::Path("shaders/default_vertex.wgsl".into()))
+        .with_fragment_source(AssetLoader::Path("shaders/pbr_fragment.wgsl".into()))
+        .with_parameter_slots(vec![
+            ShaderParameterSlot::new("pbr_base", ShaderParameterType::Color),
+            ShaderParameterSlot::new("pbr_roughness", ShaderParameterType::Scalar),
+            ShaderParameterSlot::new("pbr_metallic", ShaderParameterType::Scalar),
+            ShaderParameterSlot::new("pbr_emissive", ShaderParameterType::Color),
+        ])
+        .with_texture_slots(vec![
+            ShaderTextureSlot::new("base_color", TextureType::Color, (0, 1)),
+            ShaderTextureSlot::new("normal", TextureType::Normal, (2, 3)),
+            ShaderTextureSlot::new("metallic_roughness", TextureType::Color, (4, 5)),
+            ShaderTextureSlot::new("emissive", TextureType::Color, (6, 7)),
+        ])
+        .with_engine_parameters(true)
+        .with_camera_parameters(true)
+        .build()?;
     let shader = assets.add_named(HELMET_SHADER, shader)?;
 
-    let grain = assets.add_named(GRAIN_TEXTURE, grain_texture())?;
+    let grain = grain_texture();
+    let grain = assets.add_named(GRAIN_TEXTURE, grain)?;
 
     // The maps carry most of the look; the factors are neutral, so what the
     // helmet shows is its own albedo, roughness and metalness.
@@ -258,15 +180,23 @@ pub(crate) fn load(world: &mut World) -> Result<SceneAssets, Box<dyn std::error:
         .with_order(0);
     let helmet = assets.add_named(HELMET_PASS, helmet)?;
 
-    let bloom = Shader::new(
-        "helmet_bloom",
-        AssetLoader::Path("shaders/fullscreen_vertex.wgsl".into()),
-        AssetLoader::Path("shaders/bloom_prefilter_fragment.wgsl".into()),
-        vec![color_parameter("threshold")],
-        single_input_slots("hdr"),
-        true,
-        true,
-    )?;
+    let bloom = Shader::new("helmet_bloom")
+        .with_vertex_source(AssetLoader::Path("shaders/fullscreen_vertex.wgsl".into()))
+        .with_fragment_source(AssetLoader::Path(
+            "shaders/bloom_prefilter_fragment.wgsl".into(),
+        ))
+        .with_parameter_slots(vec![ShaderParameterSlot::new(
+            "threshold",
+            ShaderParameterType::Color,
+        )])
+        .with_texture_slots(vec![ShaderTextureSlot::new(
+            "hdr",
+            TextureType::Color,
+            (0, 1),
+        )])
+        .with_engine_parameters(true)
+        .with_camera_parameters(true)
+        .build()?;
     let bloom = assets.add_named(BLOOM_SHADER, bloom)?;
     let bloom_pass = RenderPass::new("helmet.bloom")
         .with_shader(bloom)
@@ -280,24 +210,22 @@ pub(crate) fn load(world: &mut World) -> Result<SceneAssets, Box<dyn std::error:
         .with_order(1);
     let bloom_pass = assets.add_named(BLOOM_PASS, bloom_pass)?;
 
-    let composite = Shader::new(
-        "helmet_bloom_composite",
-        AssetLoader::Path("shaders/fullscreen_vertex.wgsl".into()),
-        AssetLoader::Path("shaders/bloom_composite_fragment.wgsl".into()),
-        vec![color_parameter("bloom")],
-        HashMap::from([
-            (
-                "hdr".to_owned(),
-                ShaderTextureSlot::new(TextureType::Color, (0, 1)),
-            ),
-            (
-                "bloom".to_owned(),
-                ShaderTextureSlot::new(TextureType::Color, (2, 3)),
-            ),
-        ]),
-        true,
-        true,
-    )?;
+    let composite = Shader::new("helmet_bloom_composite")
+        .with_vertex_source(AssetLoader::Path("shaders/fullscreen_vertex.wgsl".into()))
+        .with_fragment_source(AssetLoader::Path(
+            "shaders/bloom_composite_fragment.wgsl".into(),
+        ))
+        .with_parameter_slots(vec![ShaderParameterSlot::new(
+            "bloom",
+            ShaderParameterType::Color,
+        )])
+        .with_texture_slots(vec![
+            ShaderTextureSlot::new("hdr", TextureType::Color, (0, 1)),
+            ShaderTextureSlot::new("bloom", TextureType::Color, (2, 3)),
+        ])
+        .with_engine_parameters(true)
+        .with_camera_parameters(true)
+        .build()?;
     let composite = assets.add_named(COMPOSITE_SHADER, composite)?;
     let composite_pass = RenderPass::new("helmet.bloom_composite")
         .with_shader(composite)
@@ -312,15 +240,23 @@ pub(crate) fn load(world: &mut World) -> Result<SceneAssets, Box<dyn std::error:
     let contrast = 1.6;
     let shoulder = 0.977;
     let (b, c) = lottes_bc(contrast, shoulder, 8.0, 0.18, 0.267);
-    let tonemap = Shader::new(
-        "helmet_tonemap",
-        AssetLoader::Path("shaders/fullscreen_vertex.wgsl".into()),
-        AssetLoader::Path("shaders/tonemap_fragment.wgsl".into()),
-        tonemap_parameter_slots(),
-        single_input_slots("hdr"),
-        true,
-        true,
-    )?;
+    let tonemap = Shader::new("helmet_tonemap")
+        .with_vertex_source(AssetLoader::Path("shaders/fullscreen_vertex.wgsl".into()))
+        .with_fragment_source(AssetLoader::Path("shaders/tonemap_fragment.wgsl".into()))
+        .with_parameter_slots(vec![
+            ShaderParameterSlot::new("contrast", ShaderParameterType::Scalar),
+            ShaderParameterSlot::new("shoulder", ShaderParameterType::Scalar),
+            ShaderParameterSlot::new("b", ShaderParameterType::Scalar),
+            ShaderParameterSlot::new("c", ShaderParameterType::Scalar),
+        ])
+        .with_texture_slots(vec![ShaderTextureSlot::new(
+            "hdr",
+            TextureType::Color,
+            (0, 1),
+        )])
+        .with_engine_parameters(true)
+        .with_camera_parameters(true)
+        .build()?;
     let tonemap = assets.add_named(TONEMAP_SHADER, tonemap)?;
     let tonemap_pass = RenderPass::new("helmet.tonemap")
         .with_shader(tonemap)
@@ -334,29 +270,22 @@ pub(crate) fn load(world: &mut World) -> Result<SceneAssets, Box<dyn std::error:
         .with_order(3);
     let tonemap_pass = assets.add_named(TONEMAP_PASS, tonemap_pass)?;
 
-    let lens = Shader::new(
-        "helmet_lens",
-        AssetLoader::Path("shaders/fullscreen_vertex.wgsl".into()),
-        AssetLoader::Path("shaders/lens_fragment.wgsl".into()),
-        vec![
-            color_parameter("shape"),
-            color_parameter("gamma"),
-            color_parameter("grade"),
-            color_parameter("grain"),
-        ],
-        HashMap::from([
-            (
-                "source".to_owned(),
-                ShaderTextureSlot::new(TextureType::Color, (0, 1)),
-            ),
-            (
-                "grain".to_owned(),
-                ShaderTextureSlot::new(TextureType::Color, (2, 3)),
-            ),
-        ]),
-        true,
-        true,
-    )?;
+    let lens = Shader::new("helmet_lens")
+        .with_vertex_source(AssetLoader::Path("shaders/fullscreen_vertex.wgsl".into()))
+        .with_fragment_source(AssetLoader::Path("shaders/lens_fragment.wgsl".into()))
+        .with_parameter_slots(vec![
+            ShaderParameterSlot::new("shape", ShaderParameterType::Color),
+            ShaderParameterSlot::new("gamma", ShaderParameterType::Color),
+            ShaderParameterSlot::new("grade", ShaderParameterType::Color),
+            ShaderParameterSlot::new("grain", ShaderParameterType::Color),
+        ])
+        .with_texture_slots(vec![
+            ShaderTextureSlot::new("source", TextureType::Color, (0, 1)),
+            ShaderTextureSlot::new("grain", TextureType::Color, (2, 3)),
+        ])
+        .with_engine_parameters(true)
+        .with_camera_parameters(true)
+        .build()?;
     let lens = assets.add_named(LENS_SHADER, lens)?;
     let lens_pass = RenderPass::new("helmet.lens")
         .with_shader(lens)
@@ -371,15 +300,13 @@ pub(crate) fn load(world: &mut World) -> Result<SceneAssets, Box<dyn std::error:
         .with_order(4);
     let lens_pass = assets.add_named(LENS_PASS, lens_pass)?;
 
-    let pipeline = assets.add_named(
-        HELMET_PIPELINE,
-        RenderingPipeline::new()
-            .with_pass(helmet)
-            .with_pass(bloom_pass)
-            .with_pass(composite_pass)
-            .with_pass(tonemap_pass)
-            .with_pass(lens_pass),
-    )?;
+    let pipeline = RenderingPipeline::new()
+        .with_pass(helmet)
+        .with_pass(bloom_pass)
+        .with_pass(composite_pass)
+        .with_pass(tonemap_pass)
+        .with_pass(lens_pass);
+    let pipeline = assets.add_named(HELMET_PIPELINE, pipeline)?;
 
     Ok(SceneAssets {
         mesh,

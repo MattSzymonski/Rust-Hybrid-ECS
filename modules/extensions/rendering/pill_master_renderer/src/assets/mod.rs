@@ -11,7 +11,10 @@ pub use material::{Material, MaterialBuilder, MaterialParameter, MaterialTexture
 pub use mesh::{Mesh, MeshVertex};
 pub use render_pass::{CullMode, PassKind, PassTarget, RenderPass};
 pub use rendering_pipeline::RenderingPipeline;
-pub use shader::{Shader, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot};
+pub(crate) use shader::{parameter_slots_by_name, texture_slots_by_name};
+pub use shader::{
+    Shader, ShaderBuilder, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot,
+};
 pub use texture::{Texture, TextureType};
 
 use pill_engine::{Asset, Handle};

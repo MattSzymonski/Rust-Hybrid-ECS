@@ -9,6 +9,7 @@ use crate::{
 };
 
 use crate::resources::RendererResourceStorage;
+use indexmap::IndexMap;
 use pill_core::{debug, PillStyle};
 use std::collections::HashMap;
 
@@ -183,7 +184,7 @@ impl RendererMaterial {
     }
 
     pub(crate) fn calculate_uniform_size(
-        parameter_slots: &[(String, ShaderParameterSlot)],
+        parameter_slots: &IndexMap<String, ShaderParameterSlot>,
     ) -> usize {
         // Calculate total size needed for all parameters
         // Each parameter slot gets 16 bytes (vec4 alignment in WGSL)
@@ -193,7 +194,7 @@ impl RendererMaterial {
     pub(crate) fn write_parameters_to_buffer(
         queue: &wgpu::Queue,
         buffer: &wgpu::Buffer,
-        parameter_slots: &[(String, ShaderParameterSlot)],
+        parameter_slots: &IndexMap<String, ShaderParameterSlot>,
         parameters: &HashMap<String, MaterialParameter>,
     ) -> Result<()> {
         // Create a temporary buffer to hold all parameter data
@@ -250,7 +251,7 @@ impl RendererMaterial {
         rendering_resource_storage: &RendererResourceStorage,
         texture_bind_group_layout: &wgpu::BindGroupLayout,
         name: &str,
-        texture_slots: &HashMap<String, ShaderTextureSlot>,
+        texture_slots: &IndexMap<String, ShaderTextureSlot>,
         textures: &[(String, RendererTextureHandle)],
     ) -> Result<wgpu::BindGroup> {
         let mut entries = Vec::new();
