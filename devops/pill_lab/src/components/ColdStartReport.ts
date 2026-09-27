@@ -253,8 +253,8 @@ function renderCaseCard(
   if (coldCase.builds !== undefined) {
     addFact('Modules built', String(coldCase.builds));
   }
-  if (coldCase.up_to_date_skips !== undefined) {
-    addFact('Up-to-date skips', String(coldCase.up_to_date_skips));
+  if (coldCase.reloads !== undefined) {
+    addFact('Reloads', String(coldCase.reloads));
   }
   const timings = coldCase.cargo_timings;
   if (timings) {

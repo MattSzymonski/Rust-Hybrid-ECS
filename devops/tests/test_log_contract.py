@@ -75,6 +75,9 @@ EXTERNALLY_PRODUCED: Dict[str, str] = {
     "[project]": "Printed by the example project in examples/project_rs, which "
     "is outside the `modules/` tree this test scans.",
     "warning CS": "Emitted by the C# compiler.",
+    "[csharp_bench] done":
+        "Printed by the C# benchmark scene in examples/project_cs_bench, "
+        "whose source is C# rather than Rust.",
     "[csharp_runtime] reloaded project_cs.dll":
         "Emitted by the .NET bridge, whose source is C# rather than Rust.",
     "[csharp_runtime] reload failed:":
@@ -99,14 +102,12 @@ EXTERNALLY_PRODUCED: Dict[str, str] = {
     "awaiting the host's verdict":
         "Emitted by the .NET bridge (ProjectHost.cs), whose source is C# "
         "rather than Rust.",
-    "components=1 entities=3":
-        "Composed at runtime: `components` and `entities` are structured "
-        "fields on the retirement line in csharp/components.rs, and their "
-        "values are counts.",
-    "resources=1 dropped=1":
-        "Composed at runtime: `resources` and `dropped` are structured fields "
-        "on the resource-retirement line in csharp/components.rs, and their "
-        "values are counts.",
+    'kind="component" entries=1 touched=3':
+        "Composed at runtime: the retirement line's structured fields carry "
+        "`kind`, `entries` and `touched`, and their values are counts.",
+    'kind="resource" entries=1 touched=1':
+        "Composed at runtime: the retirement line's structured fields carry "
+        "`kind`, `entries` and `touched`, and their values are counts.",
     "existing=1":
         "Composed at runtime: `existing` is a structured field on "
         "pill_spline's registration line, and its value is a count.",

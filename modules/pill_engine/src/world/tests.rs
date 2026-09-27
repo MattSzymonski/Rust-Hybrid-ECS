@@ -108,7 +108,7 @@ fn descriptor_components_coexist_and_survive_archetype_migration() {
     );
     assert_eq!(world.descriptor_component_bytes(entity, c).unwrap(), [0; 8]);
 
-    world.remove_descriptor_component(entity, b).unwrap();
+    world.remove_component_by_id(entity, b).unwrap();
     assert_eq!(
         world.descriptor_component_bytes(entity, a).unwrap(),
         10_u32.to_ne_bytes()
@@ -1008,7 +1008,7 @@ fn descriptor_component_ticks_survive_archetype_migration() {
     assert_eq!(added_after_add.changed, addition_tick);
 
     world.increment_change_tick();
-    world.remove_descriptor_component(entity, removed).unwrap();
+    world.remove_component_by_id(entity, removed).unwrap();
 
     let retained_after_remove = ticks_for(&world, entity, retained);
     let added_after_remove = ticks_for(&world, entity, added);

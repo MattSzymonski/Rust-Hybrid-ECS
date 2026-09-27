@@ -170,6 +170,16 @@ internal sealed class ProjectHost
     /// <summary>The version awaiting a verdict, if any.</summary>
     private PendingReload? _pending;
 
+    /// <summary>Interval between assembly mtime checks on the ordinary path.</summary>
+    /// <remarks>
+    /// Part of a deliberate two-mechanism design shared with the Rust host.
+    /// The interval exists only so the loader can tell settled bytes from a
+    /// half-written assembly: a `dotnet build` offers no completion signal it
+    /// can trust. When the host compiles in-process it knows the file is
+    /// complete and calls <see cref="RequestImmediatePoll"/>, which skips the
+    /// wait. This interval is not the reload trigger - the trigger is always
+    /// a <see cref="PollReload"/> call.
+    /// </remarks>
     private static readonly TimeSpan PollInterval = TimeSpan.FromMilliseconds(500);
     private readonly string _assemblyPath;
     private ProjectContext? _context;

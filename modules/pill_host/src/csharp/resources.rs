@@ -744,11 +744,9 @@ pub(super) extern "C" fn ffi_get_resource_view(
     mode: u8,
     output: *mut ResourceView,
 ) -> u8 {
-    super::context::guard_managed_callback(
-        "ffi_get_resource_view",
-        5,
-        || ffi_get_resource_view_guarded(stable_id_low, stable_id_high, mode, output),
-    )
+    super::context::guard_managed_callback("ffi_get_resource_view", 5, || {
+        ffi_get_resource_view_guarded(stable_id_low, stable_id_high, mode, output)
+    })
 }
 
 /// Write one resource's live bytes into the caller's view.

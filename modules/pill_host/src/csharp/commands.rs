@@ -102,11 +102,9 @@ fn ffi_reserve_entity_guarded(output: *mut Entity) -> u8 {
 /// uses for a call it could not serve - and lets the frame's error path
 /// name the system, rather than killing the host mid-frame.
 pub(super) extern "C" fn ffi_reserve_entity(output: *mut Entity) -> u8 {
-    super::context::guard_managed_callback(
-        "ffi_reserve_entity",
-        6,
-        || ffi_reserve_entity_guarded(output),
-    )
+    super::context::guard_managed_callback("ffi_reserve_entity", 6, || {
+        ffi_reserve_entity_guarded(output)
+    })
 }
 
 /// Validate and copy a component blob into the representation understood by
@@ -239,11 +237,9 @@ pub(super) extern "C" fn ffi_queue_create(
     blobs: *const NativeComponentBlob,
     count: u32,
 ) -> u8 {
-    super::context::guard_managed_callback(
-        "ffi_queue_create",
-        6,
-        || ffi_queue_create_guarded(entity, blobs, count),
-    )
+    super::context::guard_managed_callback("ffi_queue_create", 6, || {
+        ffi_queue_create_guarded(entity, blobs, count)
+    })
 }
 
 /// Queue destruction only for a currently live generation.
@@ -275,11 +271,9 @@ fn ffi_queue_destroy_guarded(entity: *const Entity) -> u8 {
 /// uses for a call it could not serve - and lets the frame's error path
 /// name the system, rather than killing the host mid-frame.
 pub(super) extern "C" fn ffi_queue_destroy(entity: *const Entity) -> u8 {
-    super::context::guard_managed_callback(
-        "ffi_queue_destroy",
-        6,
-        || ffi_queue_destroy_guarded(entity),
-    )
+    super::context::guard_managed_callback("ffi_queue_destroy", 6, || {
+        ffi_queue_destroy_guarded(entity)
+    })
 }
 
 /// Queue a component addition selected by stable managed identity.
@@ -336,19 +330,13 @@ pub(super) extern "C" fn ffi_queue_add_component(
     data: *const u8,
     size: u32,
 ) -> u8 {
-    super::context::guard_managed_callback(
-        "ffi_queue_add_component",
-        6,
-        || ffi_queue_add_component_guarded(entity, key_low, key_high, data, size),
-    )
+    super::context::guard_managed_callback("ffi_queue_add_component", 6, || {
+        ffi_queue_add_component_guarded(entity, key_low, key_high, data, size)
+    })
 }
 
 /// Queue component removal without requiring a concrete Rust type.
-fn ffi_queue_remove_component_guarded(
-    entity: *const Entity,
-    key_low: u64,
-    key_high: u64,
-) -> u8 {
+fn ffi_queue_remove_component_guarded(entity: *const Entity, key_low: u64, key_high: u64) -> u8 {
     if entity.is_null() {
         return 6;
     }
@@ -385,9 +373,7 @@ pub(super) extern "C" fn ffi_queue_remove_component(
     key_low: u64,
     key_high: u64,
 ) -> u8 {
-    super::context::guard_managed_callback(
-        "ffi_queue_remove_component",
-        6,
-        || ffi_queue_remove_component_guarded(entity, key_low, key_high),
-    )
+    super::context::guard_managed_callback("ffi_queue_remove_component", 6, || {
+        ffi_queue_remove_component_guarded(entity, key_low, key_high)
+    })
 }

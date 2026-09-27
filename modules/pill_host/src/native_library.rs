@@ -45,7 +45,7 @@ use std::time::{Duration, Instant, SystemTime};
 #[cfg(windows)]
 use libloading::os::windows as windows_loader;
 use libloading::{Library, Symbol};
-use pill_core::error::LibraryError;
+use pill_core::error::{LibraryError, ModuleError};
 use pill_core::{debug, info};
 use pill_engine::component_registry::{
     PillFieldAccessorDescriptor, PillMethodDescriptor, PillValueTypeDescriptor,
@@ -1018,6 +1018,36 @@ impl NativeLibrary {
         // `api` is borrowed immutably for the whole call and outlives it
         // because the host creates the engine API before loading the module.
         unsafe { (self.module_init)(api as *const EngineApi) }
+    }
+
+    /// Reject an artifact built against a different revision of the module ABI.
+    ///
+    /// Every loadable artifact exports the same optional
+    /// `pill_module_abi_version`, and the host checks it before anything calls
+    /// into the artifact: a contract mismatch means the two sides disagree
+    /// about what the entry points expect, and the failure mode of proceeding
+    /// is a call through a signature one side never agreed to. An artifact
+    /// with no revision export at all predates the versioned contract and
+    /// cannot be assumed compatible.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ModuleError::AbiVersionMismatch`] when the artifact reports a
+    /// different revision, and [`ModuleError::AbiVersionMissing`] when it has
+    /// no revision export.
+    pub(crate) fn check_module_abi(&self, module_name: &str) -> Result<(), ModuleError> {
+        let host_version = pill_engine::module_abi::MODULE_ABI_VERSION;
+        match self.abi_version() {
+            Some(module_version) if module_version == host_version => Ok(()),
+            Some(module_version) => Err(ModuleError::AbiVersionMismatch {
+                module: module_name.to_string(),
+                module_version,
+                host_version,
+            }),
+            None => Err(ModuleError::AbiVersionMissing {
+                module: module_name.to_string(),
+            }),
+        }
     }
 
     /// Call the optional native per-frame update entry point, when exported.

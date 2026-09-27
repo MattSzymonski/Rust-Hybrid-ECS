@@ -26,8 +26,9 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-// Current crate
+// External crates
 use pill_core::error::ConfigError;
+use toml_edit::{value, DocumentMut, Item, Table, Value};
 
 // =============================================================================
 // Constants
@@ -36,6 +37,16 @@ use pill_core::error::ConfigError;
 /// The only variable the host reads: the project directory to run, relative
 /// to the workspace root (for example `../examples/project_rs`).
 const PROJECT_PATH_ENVIRONMENT_VARIABLE: &str = "PROJECT_PATH";
+
+/// Opt-in variable that adds cargo's `--timings` report to every host-driven
+/// build.
+///
+/// Off by default: the report makes cargo write a timing HTML file and adds a
+/// per-build overhead, and only the analytics collector reads it - which a
+/// developer is not usually watching. Set the variable (to any value) when
+/// per-crate build times are wanted; the collector then reads the report this
+/// process's builds produce.
+const CARGO_TIMINGS_ENVIRONMENT_VARIABLE: &str = "PILL_CARGO_TIMINGS";
 
 /// Assembly name of the bundled `csharp_runtime` collectible loader.
 const CSHARP_RUNTIME_ASSEMBLY_NAME: &str = "csharp_runtime";
@@ -63,10 +74,6 @@ pub(crate) const CSHARP_COMPILER_ASSEMBLY_NAME: &str = "pill_csharp_compiler";
 #[cfg(feature = "hot_reload")]
 pub(crate) const CSHARP_COMPILER_OUTPUT_SUBDIRECTORY: &str =
     "pill_csharp_compiler/bin/Release/net8.0";
-
-/// Workspace-relative source directory of the in-process C# compiler.
-#[cfg(feature = "hot_reload")]
-pub(crate) const CSHARP_COMPILER_WATCH_DIRECTORY: &str = "pill_csharp_compiler/src";
 
 /// Workspace-relative MSBuild file that captures a project's compiler command
 /// line, injected into a managed project's build.
@@ -545,9 +552,6 @@ impl ExtensionConfig {
             "build".to_string(),
             "--package".to_string(),
             name.to_string(),
-            // Emit a cargo timing report so the analytics collector can show
-            // per-crate compile+link wall time for every host-driven build.
-            "--timings".to_string(),
             // Never touch the registry: every dependency is already cached in
             // the workspace. Skipping the index avoids the ~/.cargo package
             // cache lock (which rust-analyzer's cargo check can hold for long
@@ -560,6 +564,9 @@ impl ExtensionConfig {
             "--profile".to_string(),
             host_profile_name().to_string(),
         ];
+        if cargo_timings_enabled() {
+            build_command.push("--timings".to_string());
+        }
         // Enable the module's C-ABI exports explicitly. The feature is opt-in
         // (not a default) so that building every member in one cargo
         // invocation never leaks the `#[no_mangle]` `pill_module_*` exports
@@ -704,8 +711,7 @@ impl HostConfig {
         // an arbitrary directory, a malformed `--package`, or a second copy
         // of a module already loading.
         let extensions_root = engine_workspace_root()?.join(EXTENSION_DIRECTORY);
-        let extensions =
-            Self::resolve_extensions(&project_settings.modules, &extensions_root)?;
+        let extensions = Self::resolve_extensions(&project_settings.modules, &extensions_root)?;
         Ok(Self {
             name: project_name,
             build_binary_name,
@@ -902,9 +908,6 @@ impl ProjectModuleConfig {
             // from: the two are distinct packages so a shipping binary can link
             // the project directly without colliding with this one.
             format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}"),
-            // Emit a cargo timing report so the analytics collector can show
-            // per-crate compile+link wall time for every host-driven build.
-            "--timings".to_string(),
             // Never touch the registry: every dependency is already cached in
             // the workspace. Skipping the index avoids the ~/.cargo package
             // cache lock (which rust-analyzer's cargo check can hold for long
@@ -916,6 +919,9 @@ impl ProjectModuleConfig {
             "--profile".to_string(),
             host_profile_name().to_string(),
         ];
+        if cargo_timings_enabled() {
+            build_command.push("--timings".to_string());
+        }
         // Mirror the host's engine feature set into the project build, for the
         // same reason extensions do: `pill_engine` is an rlib, so the
         // project links its own copy and must be configured identically.
@@ -1000,6 +1006,14 @@ fn required_environment(variable: &'static str) -> Result<String, ConfigError> {
     env::var(variable).map_err(|_| ConfigError::MissingEnvironmentVariable { variable })
 }
 
+/// Whether host-driven cargo builds should emit a timing report.
+///
+/// Read by both the build-command builders below and the analytics collector,
+/// so the flag cannot be set on one side and silently unread on the other.
+pub(crate) fn cargo_timings_enabled() -> bool {
+    std::env::var_os(CARGO_TIMINGS_ENVIRONMENT_VARIABLE).is_some()
+}
+
 /// Directory holding the engine workspace: the base every stored relative path
 /// is resolved against.
 ///
@@ -1051,40 +1065,20 @@ fn find_csproj_manifest(project_root: &Path) -> Result<PathBuf, ConfigError> {
     })
 }
 
-/// Extract a quoted string value from one section of a TOML manifest.
+/// Read a string value out of one section of a TOML manifest.
 ///
-/// Scans for the top-level `[section]` header, then reads `key = "value"`
-/// lines inside it until a nested section starts. Used only for the handful
-/// of fields the host infers from a `Cargo.toml`, so the host stays free of
-/// a full TOML dependency.
+/// Used only for the handful of fields the host infers from a `Cargo.toml`
+/// (the package name and the library name), so a manifest that does not parse
+/// answers `None` here like a missing key; the same manifest is parsed again,
+/// with the error reported, when the workspace member is written.
 fn manifest_string_value(manifest: &str, section: &str, key: &str) -> Option<String> {
-    let section_header = format!("[{section}]");
-    let mut in_section = false;
-    for raw_line in manifest.lines() {
-        let line = raw_line.trim();
-        // Any bracketed header selects the section and ends the previous one.
-        if line.starts_with('[') {
-            in_section = line == section_header;
-            continue;
-        }
-        if !in_section || line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((left, right)) = line.split_once('=') else {
-            continue;
-        };
-        if left.trim() != key {
-            continue;
-        }
-        // Accept `key = "value"` with an optional trailing comment.
-        let value = right.trim();
-        if let Some(inner) = value.strip_prefix('"') {
-            if let Some(end) = inner.find('"') {
-                return Some(inner[..end].to_string());
-            }
-        }
-    }
-    None
+    let document = manifest.parse::<DocumentMut>().ok()?;
+    document
+        .get(section)?
+        .as_table()?
+        .get(key)?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Whether the project manifest declares a direct dependency on `crate_name`.
@@ -1113,78 +1107,72 @@ pub(crate) fn project_depends_on_crate(
     manifest_depends_on_crate(&manifest, crate_name)
 }
 
-/// Scan a `Cargo.toml` for a dependency entry naming `crate_name`.
+/// Dependency tables whose entries link code into the build.
 ///
-/// Accepts both a direct entry (`pill_spline = { ... }`) and a renamed one
-/// (`my_spline = { package = "pill_spline", ... }`). Only dependency sections
-/// contribute code to the built library: `[dependencies]`, the dev and build
-#[cfg(feature = "hot_reload")]
-/// variants, and target-specific tables that end in `.dependencies`.
-fn manifest_depends_on_crate(manifest: &str, crate_name: &str) -> bool {
-    let mut in_dependency_section = false;
-    for raw_line in manifest.lines() {
-        let line = raw_line.trim();
+/// The workspace-wide `[workspace.dependencies]` table is deliberately absent:
+/// it is shared infrastructure rather than a dependency of this project.
+const LINKING_DEPENDENCY_TABLES: [&str; 3] =
+    ["dependencies", "dev-dependencies", "build-dependencies"];
 
-        // Any bracketed header selects a section and ends the previous one.
-        if line.starts_with('[') {
-            let section = line.trim_start_matches('[').trim_end_matches(']').trim();
-            // A sub-table like `[dependencies.foo]` declares the dependency
-            // `foo` itself; match its key directly and leave its body unscanned.
-            if let Some(dependency_key) = dependency_sub_table_key(section) {
-                if dependency_key == crate_name {
-                    return true;
+/// Whether a `Cargo.toml` declares a dependency on `crate_name`.
+///
+/// Reads the document rather than scanning lines: a dependency may be an
+/// inline table, a sub-table, renamed through `package = "..."`, or declared
+/// under a target-specific table, and each of those shapes needed its own
+/// special case in the line scanner this replaced.
+#[cfg(feature = "hot_reload")]
+fn manifest_depends_on_crate(manifest: &str, crate_name: &str) -> bool {
+    let Ok(document) = manifest.parse::<DocumentMut>() else {
+        return false;
+    };
+    linking_dependency_tables(&document)
+        .iter()
+        .any(|table| declares_dependency(table, crate_name))
+}
+
+/// Every dependency table in `document`: the three linking tables at the top
+/// level, and the same three under each `[target.<cfg>]` table.
+#[cfg(feature = "hot_reload")]
+fn linking_dependency_tables(document: &DocumentMut) -> Vec<&Table> {
+    let mut tables = Vec::new();
+    for section in LINKING_DEPENDENCY_TABLES {
+        if let Some(table) = document.get(section).and_then(Item::as_table) {
+            tables.push(table);
+        }
+    }
+    if let Some(targets) = document.get("target").and_then(Item::as_table) {
+        for (_, target) in targets.iter() {
+            let Some(target_table) = target.as_table() else {
+                continue;
+            };
+            for section in LINKING_DEPENDENCY_TABLES {
+                if let Some(table) = target_table.get(section).and_then(Item::as_table) {
+                    tables.push(table);
                 }
             }
-            in_dependency_section = is_dependency_section(section);
-            continue;
         }
+    }
+    tables
+}
 
-        if !in_dependency_section || line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        // Dependency keys may be quoted when renamed to a non-identifier.
-        let key = key.trim().trim_matches('"');
+/// Whether one dependency table declares `crate_name`, directly or as the
+/// `package` of a renamed entry.
+#[cfg(feature = "hot_reload")]
+fn declares_dependency(table: &Table, crate_name: &str) -> bool {
+    table.iter().any(|(key, item)| {
         if key == crate_name {
             return true;
         }
-        // A renamed dependency keeps the real crate name in `package`.
-        if value.contains(&format!("package = \"{crate_name}\"")) {
-            return true;
-        }
-    }
-    false
-}
-
-/// Whether `section` is one of the dependency tables that contributes linked
-/// code: the plain `[dependencies]` family or a target-specific table ending
-/// in `.dependencies`. The workspace-wide `[workspace.dependencies]` table is
-/// shared infrastructure rather than a dependency of this project, so it is
-#[cfg(feature = "hot_reload")]
-/// excluded.
-fn is_dependency_section(section: &str) -> bool {
-    matches!(
-        section,
-        "dependencies" | "dev-dependencies" | "build-dependencies"
-    ) || (section.ends_with(".dependencies") && !section.starts_with("workspace."))
-}
-
-/// The crate name a dependency sub-table declares, for sections shaped like
-/// `[dependencies.<name>]`, `[dev-dependencies.<name>]`, or
-/// `[build-dependencies.<name>]`. Returns `None` for any other section or for
-#[cfg(feature = "hot_reload")]
-/// a sub-table nested deeper than one level.
-fn dependency_sub_table_key(section: &str) -> Option<&str> {
-    for prefix in ["dependencies.", "dev-dependencies.", "build-dependencies."] {
-        if let Some(rest) = section.strip_prefix(prefix) {
-            if !rest.contains('.') {
-                return Some(rest);
+        match item {
+            Item::Value(Value::InlineTable(inline)) => {
+                inline.get("package").and_then(Value::as_str) == Some(crate_name)
             }
+            Item::Table(sub_table) => {
+                sub_table.get("package").and_then(Item::as_str) == Some(crate_name)
+            }
+            _ => false,
         }
-    }
-    None
+    })
 }
 
 /// Values declared by the project's own `project_settings.yaml`.
@@ -1271,41 +1259,6 @@ fn read_project_settings_file(
     })
 }
 
-/// Remove the project's own `[workspace]` (and `[workspace.*]`) tables from a
-/// generated member manifest.
-///
-/// A standalone project declares itself a workspace root; a member of the
-/// engine workspace cannot be one too, so every `[workspace...]` header —
-/// including `[workspace.dependencies]` — is dropped before the member is
-/// written. The header scan is line-oriented so table names inside string
-/// values are never touched.
-fn strip_workspace_tables(manifest: &str) -> String {
-    let mut result = String::with_capacity(manifest.len());
-    let mut cursor = 0usize;
-    loop {
-        // Find the next `[workspace...]` header at the start of a line.
-        let relative = if manifest[cursor..].starts_with("[workspace") {
-            Some(0)
-        } else {
-            manifest[cursor..]
-                .find("\n[workspace")
-                .map(|offset| offset + 1)
-        };
-        let Some(header) = relative else { break };
-        let header = cursor + header;
-        // The whole table runs from its header to the next bracketed header
-        // (or the end of the manifest); drop it wholesale.
-        let table_end = manifest[header..]
-            .find("\n[")
-            .map(|offset| header + offset)
-            .unwrap_or(manifest.len());
-        result.push_str(&manifest[cursor..header]);
-        cursor = table_end;
-    }
-    result.push_str(&manifest[cursor..]);
-    result
-}
-
 /// Materialize a temporary workspace member for the native project.
 ///
 /// Cross-DLL type identity requires the project to compile as a member of the
@@ -1333,47 +1286,61 @@ fn materialize_host_project_member(
     package_name: &str,
 ) -> Result<(), ConfigError> {
     let project_root = workspace_root.join(project_path);
-    let source_manifest =
-        std::fs::read_to_string(project_root.join("Cargo.toml")).map_err(|source| {
-            ConfigError::ProjectManifestReadFailed {
-                path: project_root.join("Cargo.toml").display().to_string(),
-                source,
-            }
-        })?;
+    let manifest_path = project_root.join("Cargo.toml");
+    let source_manifest = std::fs::read_to_string(&manifest_path).map_err(|source| {
+        ConfigError::ProjectManifestReadFailed {
+            path: manifest_path.display().to_string(),
+            source,
+        }
+    })?;
+    let mut document: DocumentMut =
+        source_manifest
+            .parse()
+            .map_err(
+                |source: toml_edit::TomlError| ConfigError::ProjectManifestParseFailed {
+                    path: manifest_path.display().to_string(),
+                    details: source.to_string(),
+                },
+            )?;
 
-    // Step 1: Resolve every `path = "..."` value against the real project
-    // directory so the generated manifest works from any location. Forward
-    // slashes keep the TOML strings valid on Windows.
-    let mut generated_manifest = String::with_capacity(source_manifest.len() + 512);
-    let mut cursor = 0usize;
-    let mut rewritten_paths: Vec<(String, String)> = Vec::new();
-    while let Some(relative_start) = source_manifest[cursor..].find("path = \"") {
-        let key_offset = cursor + relative_start;
-        let value_start = key_offset + "path = \"".len();
-        let Some(relative_end) = source_manifest[value_start..].find('"') else {
-            break;
-        };
-        let relative_end = value_start + relative_end;
-        let relative = &source_manifest[value_start..relative_end];
-        let absolute = if Path::new(relative).is_absolute() {
-            relative.to_string()
-        } else {
-            project_root
-                .join(relative)
-                .to_string_lossy()
-                .replace('\\', "/")
-        };
-        rewritten_paths.push((
-            manifest_entry_name(&source_manifest, key_offset),
-            absolute.clone(),
-        ));
-        generated_manifest.push_str(&source_manifest[cursor..value_start]);
-        generated_manifest.push_str(&absolute);
-        cursor = relative_end;
+    // Step 1: Drop the project's own `[workspace]` tables. A standalone project
+    // declares itself a workspace root; as a member of the engine workspace
+    // that table would make Cargo report "multiple workspace roots found in the
+    // same workspace" and fail every rebuild. Removing the top-level table
+    // takes `[workspace.dependencies]` and every other nested workspace table
+    // with it.
+    document.remove("workspace");
+
+    // Step 2: Give the generated member its own package name.
+    //
+    // It used to keep the project's, which made two packages in one workspace
+    // claim the same name: this member, and the project crate itself for any
+    // build that links the project directly. Cargo rejects that outright
+    // ("package collision in the lockfile"), and a statically linked shipping
+    // binary has to link the project directly - that is the whole point of it.
+    //
+    // The `[lib] name` set below keeps the built artifact called `project.dll`,
+    // so nothing downstream of the build changes; only the package cargo
+    // selects does. The build command is generated from the same prefix, so
+    // the two cannot drift.
+    let member_package_name = format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}");
+    if let Some(package) = document.get_mut("package").and_then(Item::as_table_mut) {
+        package.insert("name", value(member_package_name.as_str()));
     }
-    generated_manifest.push_str(&source_manifest[cursor..]);
 
-    // Step 1b: Refuse to write a member Cargo cannot load. The generated member
+    // Step 3: Resolve every `path` dependency against the real project
+    // directory so the generated manifest works from any location. Forward
+    // slashes keep the values valid TOML strings on Windows.
+    let mut rewritten_paths: Vec<(String, String)> = Vec::new();
+    for_each_dependency_table_mut(document.as_table_mut(), &mut |table| {
+        for (dependency, item) in table.iter_mut() {
+            if let Some(absolute) = resolve_dependency_path(project_root.as_path(), item) {
+                rewritten_paths.push((dependency.get().to_string(), absolute));
+            }
+        }
+    });
+
+    // Step 3a: Refuse to write a member Cargo cannot load. The generated member
     // is picked up by the `extensions/*` glob, so a single unresolvable path in
     // it stops Cargo loading the workspace at all - which breaks every build,
     // test and lint in the repository, including the build that would replace
@@ -1388,97 +1355,53 @@ fn materialize_host_project_member(
             .join(format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}"));
         let _ = std::fs::remove_dir_all(&member_directory);
         return Err(ConfigError::ProjectDependencyPathMissing {
-            manifest_path: project_root.join("Cargo.toml").display().to_string(),
+            manifest_path: manifest_path.display().to_string(),
             dependency,
             resolved_path,
         });
     }
 
-    // Step 2: Drop the project's own `[workspace]` tables. A standalone
-    // project declares itself a workspace root; as a member of the engine
-    // workspace that table would make Cargo report "multiple workspace roots
-    // found in the same workspace" and fail every rebuild.
-    #[allow(unused_mut)]
-    let mut generated_manifest = strip_workspace_tables(&generated_manifest);
-
-    // Step 2b: Give the generated member its own package name.
-    //
-    // It used to keep the project's, which made two packages in one workspace
-    // claim the same name: this member, and the project crate itself for any
-    // build that links the project directly. Cargo rejects that outright
-    // ("package collision in the lockfile"), and a statically linked shipping
-    // binary has to link the project directly - that is the whole point of it.
-    //
-    // The `[lib] name` set below keeps the built artifact called `project.dll`,
-    // so nothing downstream of the build changes; only the package cargo
-    // selects does. The build command is generated from the same prefix, so
-    // the two cannot drift.
-    let member_package_name = format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}");
-    generated_manifest = rewrite_package_name(&generated_manifest, &member_package_name);
-
-    // Step 3: Point the generated member's library at the real source file so
+    // Step 3b: Point the generated member's library at the real source file so
     // the project compiles from its actual location, and pin the library name
-    // so the artifact keeps the name the host looks for.
+    // so the artifact keeps the name the host looks for. A manifest without a
+    // `[lib]` section is left alone: Cargo's defaults then apply exactly as
+    // they did for the project itself.
     let lib_source = project_root.join("src").join("lib.rs");
-    if lib_source.is_file() {
-        let absolute_lib_path = lib_source.to_string_lossy().replace('\\', "/");
-        if let Some(lib_header) = generated_manifest.find("[lib]") {
-            // The `[lib]` section ends at the next bracketed header.
-            let section_end = generated_manifest[lib_header..]
-                .find("\n[")
-                .map(|offset| lib_header + offset)
-                .unwrap_or(generated_manifest.len());
-            let header_line_end = generated_manifest[lib_header..]
-                .find('\n')
-                .map(|offset| lib_header + offset)
-                .unwrap_or(section_end);
-            if !generated_manifest[lib_header..section_end].contains("path =") {
-                generated_manifest.insert_str(
-                    header_line_end,
-                    &format!("\npath = \"{absolute_lib_path}\""),
-                );
+    if let Some(lib) = document.get_mut("lib").and_then(Item::as_table_mut) {
+        if lib_source.is_file() && lib.get("path").is_none() {
+            lib.insert("path", value(render_manifest_path(&lib_source)));
+        }
+        if lib.get("name").is_none() {
+            lib.insert("name", value(package_name));
+        }
+        // Step 3c: Add an `rlib` artifact when the host can hot patch.
+        //
+        // A generated patch does `use <project>::*` so it gets the SAME types
+        // the running world holds - identical layout and identical `TypeId` -
+        // and that needs the crate as an rlib. It is added here rather than in
+        // the project's own manifest because it costs a measured ~109 ms on
+        // every project rebuild (1241 ms vs 1132 ms, best of three), which no
+        // one should pay for a development feature they have not enabled. A
+        // `[lib]` without a `crate-type` list already defaults to `rlib`.
+        #[cfg(feature = "hot_patch")]
+        if let Some(crate_types) = lib.get_mut("crate-type").and_then(Item::as_array_mut) {
+            if !crate_types
+                .iter()
+                .any(|entry| entry.as_str() == Some("rlib"))
+            {
+                crate_types.push("rlib");
             }
         }
     }
 
-    // Step 3a: Name the library after the project, not after this member.
-    //
-    // Without this the artifact would follow the renamed package and land as
-    // `host_project_project.dll`, which is not what the host looks for.
-    if let Some(lib_header) = generated_manifest.find("[lib]") {
-        let section_end = generated_manifest[lib_header..]
-            .find("\n[")
-            .map(|offset| lib_header + offset)
-            .unwrap_or(generated_manifest.len());
-        if !generated_manifest[lib_header..section_end].contains("name =") {
-            let header_line_end = generated_manifest[lib_header..]
-                .find('\n')
-                .map(|offset| lib_header + offset)
-                .unwrap_or(section_end);
-            generated_manifest.insert_str(header_line_end, &format!("\nname = \"{package_name}\""));
-        }
-    }
-
-    // Step 3b: Add an `rlib` artifact when the host can hot patch.
-    //
-    // A generated patch does `use <project>::*` so it gets the SAME types the
-    // running world holds - identical layout and identical `TypeId` - and that
-    // needs the crate as an rlib. It is added here rather than in the project's
-    // own manifest because it costs a measured ~109 ms on every project rebuild
-    // (1241 ms vs 1132 ms, best of three), which no one should pay for a
-    // development feature they have not enabled.
-    #[cfg(feature = "hot_patch")]
-    {
-        generated_manifest = add_rlib_crate_type(&generated_manifest);
-    }
+    let generated_manifest = document.to_string();
 
     // Step 4: Write the generated member, replacing any previous generation.
     //
     // When the generated content is unchanged the existing file is left
-    // untouched so its modification time survives. Cargo fingerprints the
-    // manifest by content, so this is not required for correctness, but the
-    // host's own up-to-date build check compares modification times and would
-    // otherwise see a freshly rewritten manifest as newer than every artifact.
+    // untouched. Cargo fingerprints the manifest by content, so a rewrite
+    // would rebuild nothing, but skipping it also keeps the file's
+    // modification time stable for anything else watching the tree.
     let member_directory = workspace_root
         .join(EXTENSION_DIRECTORY)
         .join(format!("{HOST_PROJECT_MEMBER_PREFIX}{package_name}"));
@@ -1505,71 +1428,77 @@ fn materialize_host_project_member(
     Ok(())
 }
 
-/// Replace the `name` of a manifest's `[package]` section.
+/// Rewrite one dependency entry's `path` to an absolute location, returning
+/// the resolved path.
 ///
-/// Only the `[package]` table is touched: a `name` under `[lib]` or inside a
-/// dependency entry means something else entirely, and rewriting one of those
-/// would silently retarget the build.
-///
-/// Returns the manifest unchanged when it declares no `[package]` name, which
-/// cannot happen for a project the host accepted - [`ProjectModuleConfig`]
-/// rejects that earlier with `ProjectPackageNameMissing` - but is handled here
-/// rather than assumed.
-fn rewrite_package_name(manifest: &str, package_name: &str) -> String {
-    let Some(section) = manifest.find("[package]") else {
-        return manifest.to_string();
-    };
-    let section_end = manifest[section..]
-        .find("\n[")
-        .map(|offset| section + offset)
-        .unwrap_or(manifest.len());
-    let Some(name_offset) = manifest[section..section_end]
-        .find("name")
-        .map(|offset| section + offset)
-    else {
-        return manifest.to_string();
-    };
-    let line_end = manifest[name_offset..]
-        .find('\n')
-        .map(|offset| name_offset + offset)
-        .unwrap_or(manifest.len());
-
-    let mut rewritten = String::with_capacity(manifest.len() + package_name.len());
-    rewritten.push_str(&manifest[..name_offset]);
-    rewritten.push_str(&format!("name = \"{package_name}\""));
-    rewritten.push_str(&manifest[line_end..]);
-    rewritten
+/// Handles both shapes a dependency takes in a `Cargo.toml`: an inline table
+/// and its own sub-table. An entry with no `path` - a registry dependency -
+/// is left alone and answers `None`.
+fn resolve_dependency_path(project_root: &Path, item: &mut Item) -> Option<String> {
+    match item {
+        Item::Value(Value::InlineTable(inline)) => {
+            let relative = inline.get("path").and_then(Value::as_str)?;
+            let absolute = absolute_manifest_path(project_root, relative);
+            inline.insert("path", Value::from(absolute.as_str()));
+            Some(absolute)
+        }
+        Item::Table(sub_table) => {
+            let relative = sub_table.get("path").and_then(Item::as_str)?;
+            let absolute = absolute_manifest_path(project_root, relative);
+            sub_table.insert("path", value(absolute.as_str()));
+            Some(absolute)
+        }
+        _ => None,
+    }
 }
 
-/// Names the manifest entry that owns the `path = "..."` at `key_offset`.
-///
-/// Used only to make an error message actionable: it reports which dependency
-/// (or which section, for a `[lib]` path) has an unresolvable path, rather than
-/// leaving the reader to work that out from the resolved path alone. Falls back
-/// to the enclosing section header when the line carries no key of its own, and
-/// to `"unknown"` when neither can be determined.
-fn manifest_entry_name(manifest: &str, key_offset: usize) -> String {
-    let line_start = manifest[..key_offset]
-        .rfind('\n')
-        .map_or(0, |index| index + 1);
+/// Resolve one manifest `path` value against the project root, leaving an
+/// already-absolute path as it is.
+fn absolute_manifest_path(project_root: &Path, path: &str) -> String {
+    if Path::new(path).is_absolute() {
+        path.to_string()
+    } else {
+        render_manifest_path(&project_root.join(path))
+    }
+}
 
-    // `pill_engine = { path = "..." }` names the dependency on the same line.
-    if let Some(name) = manifest[line_start..key_offset].split('=').next() {
-        let name = name.trim().trim_start_matches('[');
-        if !name.is_empty() {
-            return name.to_string();
+/// Render a path for a TOML string: lossy text with forward slashes.
+fn render_manifest_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Visit every dependency table a generated member must carry: the three
+/// linking tables at the top level, and the same three under each
+/// `[target.<cfg>]` table.
+fn for_each_dependency_table_mut(root: &mut Table, visit: &mut impl FnMut(&mut Table)) {
+    for (section, item) in root.iter_mut() {
+        match section.get() {
+            "target" => {
+                let Some(targets) = item.as_table_mut() else {
+                    continue;
+                };
+                for (_, target) in targets.iter_mut() {
+                    let Some(target_table) = target.as_table_mut() else {
+                        continue;
+                    };
+                    for (section, item) in target_table.iter_mut() {
+                        if !LINKING_DEPENDENCY_TABLES.contains(&section.get()) {
+                            continue;
+                        }
+                        if let Some(table) = item.as_table_mut() {
+                            visit(table);
+                        }
+                    }
+                }
+            }
+            name if LINKING_DEPENDENCY_TABLES.contains(&name) => {
+                if let Some(table) = item.as_table_mut() {
+                    visit(table);
+                }
+            }
+            _ => {}
         }
     }
-
-    // A bare `path = "..."` belongs to whatever section it sits under.
-    manifest[..key_offset]
-        .rfind('[')
-        .and_then(|open| {
-            manifest[open..]
-                .find(']')
-                .map(|close| &manifest[open..=open + close])
-        })
-        .map_or_else(|| "unknown".to_string(), str::to_string)
 }
 
 /// Removes host-generated workspace members left behind by earlier runs.
@@ -1765,10 +1694,7 @@ serde = { version = "1", features = ["derive"] }
         let traversal =
             HostConfig::resolve_extensions(&[String::from("../pill_spline")], &extensions_root);
         assert!(
-            matches!(
-                &traversal,
-                Err(ConfigError::InvalidExtensionName { .. })
-            ),
+            matches!(&traversal, Err(ConfigError::InvalidExtensionName { .. })),
             "a traversal entry must be refused: {traversal:?}"
         );
 
@@ -1777,20 +1703,14 @@ serde = { version = "1", features = ["derive"] }
             &extensions_root,
         );
         assert!(
-            matches!(
-                &duplicate,
-                Err(ConfigError::DuplicateExtensionName { .. })
-            ),
+            matches!(&duplicate, Err(ConfigError::DuplicateExtensionName { .. })),
             "a repeated entry must be refused: {duplicate:?}"
         );
 
         let missing =
             HostConfig::resolve_extensions(&[String::from("pill_absent")], &extensions_root);
         assert!(
-            matches!(
-                &missing,
-                Err(ConfigError::ExtensionDirectoryMissing { .. })
-            ),
+            matches!(&missing, Err(ConfigError::ExtensionDirectoryMissing { .. })),
             "a name without a sibling directory must be refused: {missing:?}"
         );
 
@@ -1934,35 +1854,6 @@ pill_spline_extra = { path = "../../modules/extensions/pill_spline_extra" }
     // project_depends_on_crate
     // =========================================================================
 
-    /// A project manifest with its own workspace tables, like `tests/project`.
-    const WORKSPACE_MANIFEST: &str = r#"
-[package]
-name = "project"
-edition = "2021"
-
-[dependencies]
-pill_engine = { path = "../../modules/pill_engine" }
-serde = { version = "1", features = ["derive"] }
-
-[workspace.dependencies]
-shared = { version = "1" }
-
-[workspace]
-"#;
-
-    /// The `[workspace]` and `[workspace.dependencies]` tables are dropped so
-    /// the generated member is not mistaken for a nested workspace root.
-    #[test]
-    fn strips_workspace_tables_from_project_manifest() {
-        let stripped = strip_workspace_tables(WORKSPACE_MANIFEST);
-        assert!(
-            !stripped.contains("[workspace"),
-            "workspace table still present"
-        );
-        assert!(stripped.contains("[package]"), "package table was dropped");
-        assert!(stripped.contains("serde ="), "dependency was dropped");
-    }
-
     /// The project manifest is read from disk and a direct dependency found.
     #[cfg(feature = "hot_reload")]
     #[test]
@@ -2030,49 +1921,6 @@ shared = { version = "1" }
             "pill_spline"
         ));
     }
-}
-
-/// Ensure the generated member's `[lib]` section builds an `rlib` as well.
-///
-/// A hot patch links the project crate to name its types, which requires an
-/// rlib. Only called when the host was built with `hot_patch`, so a project
-/// that never gets patched keeps building one artifact.
-///
-/// Rewrites an existing `crate-type` list in place and leaves a manifest that
-/// already asks for `rlib` untouched, so the transform is idempotent.
-#[cfg(feature = "hot_patch")]
-fn add_rlib_crate_type(manifest: &str) -> String {
-    let Some(lib_header) = manifest.find("[lib]") else {
-        return manifest.to_string();
-    };
-    // The `[lib]` section ends at the next bracketed header.
-    let section_end = manifest[lib_header..]
-        .find("\n[")
-        .map(|offset| lib_header + offset)
-        .unwrap_or(manifest.len());
-    let section = &manifest[lib_header..section_end];
-
-    let Some(key_offset) = section.find("crate-type") else {
-        // No crate-type at all: the default is `rlib` already.
-        return manifest.to_string();
-    };
-    let Some(open) = section[key_offset..].find('[').map(|o| key_offset + o) else {
-        return manifest.to_string();
-    };
-    let Some(close) = section[open..].find(']').map(|o| open + o) else {
-        return manifest.to_string();
-    };
-
-    let list = &section[open + 1..close];
-    if list.contains("rlib") {
-        return manifest.to_string();
-    }
-
-    let mut rewritten = String::with_capacity(manifest.len() + 8);
-    rewritten.push_str(&manifest[..lib_header + close]);
-    rewritten.push_str(", \"rlib\"");
-    rewritten.push_str(&manifest[lib_header + close..]);
-    rewritten
 }
 
 #[cfg(test)]
@@ -2165,10 +2013,7 @@ mod profile_tests {
 
 #[cfg(test)]
 mod host_project_member_validation_tests {
-    use super::{
-        manifest_entry_name, materialize_host_project_member, HOST_PROJECT_MEMBER_PREFIX,
-        EXTENSION_DIRECTORY,
-    };
+    use super::{materialize_host_project_member, EXTENSION_DIRECTORY, HOST_PROJECT_MEMBER_PREFIX};
     use pill_core::error::ConfigError;
 
     /// A project manifest whose one path dependency is filled in per test, so
@@ -2258,17 +2103,48 @@ mod host_project_member_validation_tests {
     }
 
     #[test]
-    fn names_the_dependency_that_owns_a_path() {
-        let manifest = manifest_with_dependency("../x");
-        let offset = manifest.find("path = \"").unwrap();
-        assert_eq!(manifest_entry_name(&manifest, offset), "pill_engine");
+    fn drops_the_projects_workspace_tables() {
+        let root = workspace("workspace_tables", "../real_dependency");
+        std::fs::create_dir_all(root.join("real_dependency")).unwrap();
+        // A standalone project declares itself a workspace root; the generated
+        // member must not carry those tables, or Cargo reports multiple
+        // workspace roots.
+        let manifest = format!(
+            "{}\n[workspace.dependencies]\nshared = {{ version = \"1\" }}\n\n[workspace]\n",
+            manifest_with_dependency("../real_dependency")
+        );
+        std::fs::write(root.join("project").join("Cargo.toml"), manifest).unwrap();
+
+        materialize_host_project_member(&root, "project", "project").unwrap();
+
+        let generated =
+            std::fs::read_to_string(member_directory(&root).join("Cargo.toml")).unwrap();
+        assert!(
+            !generated.contains("[workspace"),
+            "workspace tables must be dropped: {generated}"
+        );
+        assert!(
+            generated.contains(&format!("name = \"{HOST_PROJECT_MEMBER_PREFIX}project\"")),
+            "the member carries its own package name: {generated}"
+        );
     }
 
     #[test]
-    fn falls_back_to_the_section_for_a_bare_path() {
-        let manifest = "[lib]\npath = \"src/lib.rs\"\n";
-        let offset = manifest.find("path = \"").unwrap();
-        assert_eq!(manifest_entry_name(manifest, offset), "[lib]");
+    fn reports_a_manifest_that_is_not_valid_toml() {
+        let root = workspace("invalid_toml", "../real_dependency");
+        std::fs::write(
+            root.join("project").join("Cargo.toml"),
+            "this is not = = toml",
+        )
+        .unwrap();
+
+        let error = materialize_host_project_member(&root, "project", "project")
+            .expect_err("a manifest that does not parse must be reported");
+
+        assert!(
+            matches!(error, ConfigError::ProjectManifestParseFailed { .. }),
+            "expected ProjectManifestParseFailed, got {error:?}"
+        );
     }
 }
 
@@ -2342,37 +2218,35 @@ name = \"x\"
 
 #[cfg(all(test, feature = "hot_patch"))]
 mod hot_patch_manifest_tests {
-    use super::add_rlib_crate_type;
+    use super::{materialize_host_project_member, EXTENSION_DIRECTORY, HOST_PROJECT_MEMBER_PREFIX};
 
+    /// A hot-patching host needs the generated member to build an `rlib` too,
+    /// or a patch has nothing to link the project's types from.
     #[test]
-    fn adds_rlib_to_an_existing_crate_type_list() {
-        let manifest =
-            "[package]\nname = \"project\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\n";
-        let rewritten = add_rlib_crate_type(manifest);
-        assert!(rewritten.contains("crate-type = [\"cdylib\", \"rlib\"]"));
-        assert!(rewritten.contains("[dependencies]"));
-    }
+    fn generated_member_builds_an_rlib_for_hot_patching() {
+        let root = std::env::temp_dir().join("pill_member_hot_patch_rlib");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(EXTENSION_DIRECTORY)).unwrap();
+        std::fs::create_dir_all(root.join("project").join("src")).unwrap();
+        std::fs::write(
+            root.join("project").join("Cargo.toml"),
+            "[package]\nname = \"project\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("project").join("src").join("lib.rs"), "").unwrap();
 
-    #[test]
-    fn is_idempotent() {
-        let manifest = "[lib]\ncrate-type = [\"cdylib\", \"rlib\"]\n";
-        assert_eq!(add_rlib_crate_type(manifest), manifest);
-        assert_eq!(
-            add_rlib_crate_type(&add_rlib_crate_type(manifest)),
-            manifest
+        materialize_host_project_member(&root, "project", "project").unwrap();
+
+        let generated = std::fs::read_to_string(
+            root.join(EXTENSION_DIRECTORY)
+                .join(format!("{HOST_PROJECT_MEMBER_PREFIX}project"))
+                .join("Cargo.toml"),
+        )
+        .unwrap();
+        assert!(generated.contains("cdylib"), "{generated}");
+        assert!(
+            generated.contains("rlib"),
+            "the member must build an rlib when hot patching: {generated}"
         );
-    }
-
-    #[test]
-    fn leaves_a_manifest_without_crate_type_alone() {
-        // No `crate-type` means the default, which already includes `rlib`.
-        let manifest = "[lib]\npath = \"src/lib.rs\"\n";
-        assert_eq!(add_rlib_crate_type(manifest), manifest);
-    }
-
-    #[test]
-    fn leaves_a_manifest_without_a_lib_section_alone() {
-        let manifest = "[package]\nname = \"project\"\n";
-        assert_eq!(add_rlib_crate_type(manifest), manifest);
     }
 }

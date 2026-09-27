@@ -193,7 +193,7 @@ function renderStartupSection(
       { text: 'Wall time', class: 'numeric' },
       { text: 'Host elapsed', class: 'numeric' },
       { text: 'Builds', class: 'numeric' },
-      { text: 'Up-to-date skips', class: 'numeric' },
+      { text: 'Reloads', class: 'numeric' },
       { text: 'Δ Baseline', class: 'numeric' },
     ]),
   );
@@ -211,7 +211,7 @@ function renderStartupSection(
         { text: formatMilliseconds(startup.host_elapsed_ms), class: 'numeric' },
         { text: startup.builds !== undefined ? String(startup.builds) : '-', class: 'numeric' },
         {
-          text: startup.up_to_date_skips !== undefined ? String(startup.up_to_date_skips) : '-',
+          text: startup.reloads !== undefined ? String(startup.reloads) : '-',
           class: 'numeric',
         },
         {

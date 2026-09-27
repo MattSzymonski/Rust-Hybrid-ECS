@@ -28,20 +28,16 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "hot_reload")]
 use std::sync::Arc;
-#[cfg(feature = "hot_reload")]
-use std::time::Instant;
 
 // External crates
 #[cfg(feature = "hot_reload")]
 use pill_core::error::{HostError, ModuleError};
 #[cfg(feature = "hot_reload")]
-use pill_core::{error, info};
+use pill_core::info;
 #[cfg(feature = "hot_reload")]
 use pill_engine::{Engine, EngineApi, SystemOwner};
 
 // Current crate
-#[cfg(feature = "hot_reload")]
-use crate::analytics;
 #[cfg(feature = "hot_reload")]
 use crate::build_runner::build_extension;
 #[cfg(feature = "hot_reload")]
@@ -161,66 +157,27 @@ mod slot {
             let library = NativeLibrary::load_copy(&output_path, workspace_root, &config.name)?;
 
             // Step 3: Check the contract before handing the module anything.
-            check_abi_version(&library, &config.name)?;
+            library.check_module_abi(&config.name)?;
 
-            // Step 4: Register the module's components and systems under its own
-            // owner, so a later reload can remove exactly these systems.
-            let init_started = Instant::now();
-            // Capture the registration sequence before init so the exact set of
-            // persistable types this generation registered can be recorded.
-            let registration_sequence = engine.world().persist_registration_sequence();
-            let component_registration_sequence = engine.world().component_registration_sequence();
-            // And again for resources. It has to be the sequence taken here, not
-            // zero: the registration log accumulates across every generation and
-            // every other artifact, so `since(0)` would record the engine's own
-            // `Time` and `AssetManager` as this module's claims, and the reload
-            // comparison below would then hand them to `drop_resources`.
-            let resource_registration_sequence = engine.world().resource_registration_sequence();
-            engine.begin_module_registration(owner);
-            let status = library.call_init(engine_api);
-            engine.end_module_registration();
-            analytics::record_init(&config.name, init_started.elapsed().as_secs_f64() * 1000.0);
-            if status != 0 {
-                // Everything the failed generation owns has to be released
-                // before its image is unmapped: its systems are `Box<dyn
-                // System>` trait objects, and its data - the resources it
-                // inserted, the columns its entities live in - carries drop glue
-                // from the same image. Systems first, then the world by
-                // replacement, both while the image is still mapped.
-                engine.clear_systems_owned_by(owner);
-                let abandoned = std::mem::replace(engine.world_mut(), pill_engine::World::new());
-                let resources = abandoned.resource_count();
-                drop(abandoned);
-                info!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                    module = config.name.as_str(),
-                    resources,
-                    "cleared the world before unmapping the generation that failed to initialize"
-                );
+            // Step 4: Register the module's components and systems under its
+            // own owner, so a later reload can remove exactly these systems.
+            // The capture, init and failure handling are shared with the
+            // project path - see `crate::reload`.
+            let init = crate::reload::initialize_generation(
+                engine,
+                engine_api,
+                &config.name,
+                Some(owner),
+                owner,
+                &library,
+            );
+            if init.status != 0 {
                 return Err(ModuleError::InitializationFailed {
                     module: config.name.clone(),
-                    status,
+                    status: init.status,
                 }
                 .into());
             }
-            // What this generation's `init` registered; kept so the next
-            // reload can tell which types the new one stopped owning. The
-            // claim is recorded in the world too, so retiring it from this
-            // subject alone will not destroy a value another subject shares.
-            let registered_resource_ids = engine
-                .world()
-                .resource_ids_registered_since(resource_registration_sequence);
-            engine
-                .world_mut()
-                .retain_resource_claims(&registered_resource_ids);
-            let registered_type_names = engine
-                .world()
-                .persist_type_names_registered_since(registration_sequence);
-            // The general registration log covers plain and persistable types, so
-            // every component this generation registered is exposed to C#.
-            let exposed_component_names = engine
-                .world()
-                .registered_component_names_since(component_registration_sequence);
 
             info!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
@@ -236,9 +193,9 @@ mod slot {
                 old_libraries: Vec::new(),
                 source_edit_generation,
                 last_processed_source_edit: 0,
-                registered_type_names,
-                registered_resource_ids,
-                exposed_component_names,
+                registered_type_names: init.registered_type_names,
+                registered_resource_ids: init.registered_resource_ids,
+                exposed_component_names: init.component_names,
             })
         }
 
@@ -370,55 +327,11 @@ mod slot {
             workspace_root: &Path,
             generation: u64,
         ) -> ReloadOutcome {
-            // Step 1: Compile before touching engine state, so a compiler error can
-            // never remove the systems of the working generation. A newer save
-            // during the build cancels it and the next frame retries.
-            let output_path = match build_extension(
-                workspace_root,
-                &self.config,
-                Some((&self.source_edit_generation, generation)),
-            ) {
-                Ok(path) => path,
-                Err(error) => {
-                    error!(
-                        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                        module = self.config.name.as_str(),
-                        error = %error,
-                        "build failed; keeping the old module generation"
-                    );
-                    return ReloadOutcome::Failed { generation };
-                }
-            };
-
-            // Step 2: Load and validate the replacement transactionally, leaving
-            // the active generation untouched until it is ready to initialize.
-            let new_library =
-                match NativeLibrary::load_copy(&output_path, workspace_root, &self.config.name) {
-                    Ok(library) => library,
-                    Err(error) => {
-                        error!(
-                            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                            module = self.config.name.as_str(),
-                            error = %error,
-                            "failed to load the new library; keeping the old module generation"
-                        );
-                        return ReloadOutcome::Failed { generation };
-                    }
-                };
-            if let Err(error) = check_abi_version(&new_library, &self.config.name) {
-                error!(
-                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                    module = self.config.name.as_str(),
-                    error = %error,
-                    "rejected the new library; keeping the old module generation"
-                );
-                return ReloadOutcome::Failed { generation };
-            }
-
-            // Steps 3 to 6 are identical for every subject and live in one place:
-            // capture metadata, swap systems, drop forgotten types, re-home
-            // columns, migrate schemas, retire the old image. Their ORDER is
-            // load-bearing - see `crate::reload`.
+            // Steps 1 to 3 are shared with the project path and live in
+            // `crate::reload`: compile before touching engine state (a newer
+            // save during the build cancels it and the next frame retries),
+            // load a private copy, verify the ABI, then swap through the
+            // transaction whose step order is load-bearing.
             let transaction = crate::reload::ReloadTransaction {
                 kind: crate::reload::ReloadSubjectKind::Extension,
                 subject: &self.config.name,
@@ -428,9 +341,16 @@ mod slot {
                 registered_type_names: &mut self.registered_type_names,
                 registered_resource_ids: &mut self.registered_resource_ids,
             };
-            let Some(commit) = transaction.commit(engine, engine_api, new_library) else {
-                // The new generation failed to initialize and the previous one
-                // was restored; nothing swapped.
+            let Some(commit) = crate::reload::build_load_and_commit(
+                engine,
+                engine_api,
+                workspace_root,
+                |cancel_flag| build_extension(workspace_root, &self.config, cancel_flag),
+                Some((&self.source_edit_generation, generation)),
+                crate::reload::LoadValidation::ModuleAbi,
+                transaction,
+            ) else {
+                // A refused step left the previous generation running.
                 return ReloadOutcome::Failed { generation };
             };
             // Refresh the C#-exposed component set to the new generation's
@@ -454,30 +374,6 @@ mod slot {
                 generations = self.old_libraries.len() + 1,
                 "unloading extension"
             );
-        }
-    }
-
-    // =============================================================================
-    // Free Functions
-    // =============================================================================
-
-    /// Reject a module built against a different revision of the module ABI.
-    ///
-    /// Checked before the module is called, because a contract mismatch means the
-    /// two sides disagree about what the entry points expect.
-    fn check_abi_version(library: &NativeLibrary, module_name: &str) -> Result<(), ModuleError> {
-        match library.abi_version() {
-            Some(EXTENSION_ABI_VERSION) => Ok(()),
-            Some(module_version) => Err(ModuleError::AbiVersionMismatch {
-                module: module_name.to_string(),
-                module_version,
-                host_version: EXTENSION_ABI_VERSION,
-            }),
-            // A module without the export predates the versioned contract and
-            // cannot be assumed compatible.
-            None => Err(ModuleError::AbiVersionMissing {
-                module: module_name.to_string(),
-            }),
         }
     }
 }

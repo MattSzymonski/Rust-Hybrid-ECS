@@ -13,7 +13,7 @@ DESCRIPTION
 
       * startup          - launch -> "Entering project loop" wall time, plus
                            the host's own analytics (`elapsed:`, `builds:`,
-                           `up-to-date skips:`).
+                           `reloads:`).
       * module_reload    - editing `pill_spline` -> the module's reload
                            analytics line. Includes the cascade: because the
                            project statically embeds the modules, the module
@@ -309,11 +309,11 @@ PROVABLE_ROUTES = frozenset({"engine-slot", "artifact-slot"})
 CRATES_LINE_RE = re.compile(r"crates rebuilt by cargo: (.*)")
 # The host's startup report spans TWO lines:
 #   elapsed: 9.81s    host RSS: current 21.7MB / peak 25.3MB
-#   cargo child peak RSS: 11.5MB    builds: 7    up-to-date skips: 0    reloads: 0
+#   cargo child peak RSS: 11.5MB    builds: 7    reloads: 0
 # `re.DOTALL` is therefore required - without it `.` stops at the newline and
 # the pattern can never match, silently dropping the startup breakdown.
 STARTUP_REPORT_RE = re.compile(
-    r"elapsed:\s*([\d.]+)s\b.*?builds:\s*(\d+)\s+up-to-date skips:\s*(\d+)",
+    r"elapsed:\s*([\d.]+)s\b.*?builds:\s*(\d+)\s+reloads:\s*(\d+)",
     re.DOTALL,
 )
 
@@ -564,7 +564,7 @@ def measure_startup(monitor: OutputMonitor) -> Optional[Dict[str, float]]:
     if match:
         report["host_elapsed_ms"] = float(match.group(1)) * 1000.0
         report["builds"] = float(match.group(2))
-        report["up_to_date_skips"] = float(match.group(3))
+        report["reloads"] = float(match.group(3))
     return report
 
 
@@ -658,7 +658,7 @@ def run_session(
             f"  [OK] Startup: wall={startup['wall_ms']:.0f}ms"
             + (
                 f" host_elapsed={startup['host_elapsed_ms']:.0f}ms"
-                f" builds={startup['builds']:.0f} skips={startup['up_to_date_skips']:.0f}"
+                f" builds={startup['builds']:.0f} reloads={startup['reloads']:.0f}"
                 if "host_elapsed_ms" in startup
                 else ""
             )
@@ -971,7 +971,7 @@ def main() -> None:
                 f"  {name:<34}wall={report['wall_ms']:.0f}ms"
                 + (
                     f" host={report['host_elapsed_ms']:.0f}ms"
-                    f" builds={report['builds']:.0f} skips={report['up_to_date_skips']:.0f}"
+                    f" builds={report['builds']:.0f} reloads={report['reloads']:.0f}"
                     if "host_elapsed_ms" in report
                     else ""
                 )

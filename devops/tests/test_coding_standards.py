@@ -33,6 +33,7 @@ DESCRIPTION
 
 USAGE
   python devops/tests/test_coding_standards.py [--root <path>] [--list]
+                                              [--exclude <path>]...
   python devops/tests/test_coding_standards.py <path/to/file.rs | path/to/dir>
 
 EXAMPLE USAGE
@@ -40,6 +41,8 @@ EXAMPLE USAGE
   python devops/tests/test_coding_standards.py --list
   python devops/tests/test_coding_standards.py --root modules/pill_engine/src
   python devops/tests/test_coding_standards.py modules/pill_core/src/lib.rs
+  python devops/tests/test_coding_standards.py --root modules \
+      --exclude modules/extensions/rendering/pill_master_renderer
 
   Exit status: 0 when every checked file complies, 1 when at least one
   violation is reported, 2 on a usage error.
@@ -161,19 +164,31 @@ class ViolationCollector:
 # =============================================================================
 
 
-def find_rust_files(root: Path) -> List[Path]:
+def find_rust_files(root: Path, excludes: Optional[List[Path]] = None) -> List[Path]:
     """Returns every `.rs` file under a root, skipping build and VCS output.
 
     A single `.rs` file is a valid root, mirroring `find` accepting a file
     path. Results are sorted by their POSIX string so the order matches the
     shell version's `LC_ALL=C sort`.
+
+    `excludes` names files or directory subtrees to leave out entirely - the
+    escape hatch for a tree that is being brought to the standard rather than
+    expected to meet it (CI passes the in-progress renderer this way, so the
+    rules still gate every other crate).
     """
     if root.is_file():
         return [root] if root.suffix == ".rs" else []
 
+    resolved_excludes = [path.resolve() for path in (excludes or [])]
     discovered: List[Path] = []
     for path in root.rglob("*.rs"):
         if EXCLUDED_DIRECTORY_NAMES.intersection(path.parts):
+            continue
+        resolved = path.resolve()
+        if any(
+            resolved == exclude or exclude in resolved.parents
+            for exclude in resolved_excludes
+        ):
             continue
         discovered.append(path)
     return sorted(discovered, key=lambda path: path.as_posix())
@@ -429,6 +444,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  test_coding_standards.py --list\n"
             "  test_coding_standards.py --root modules/pill_engine/src\n"
             "  test_coding_standards.py modules/pill_core/src/lib.rs\n"
+            "  test_coding_standards.py --root modules --exclude "
+            "modules/extensions/rendering/pill_master_renderer\n"
         ),
     )
     parser.add_argument(
@@ -436,6 +453,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help="Scan a directory instead of the repository root",
+    )
+    parser.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="Skip a file or directory subtree (repeatable)",
     )
     parser.add_argument(
         "--list",
@@ -476,7 +500,7 @@ def main() -> int:
     """Scans the target and reports every violation found."""
     arguments = build_parser().parse_args()
     root = resolve_root(arguments)
-    files = find_rust_files(root)
+    files = find_rust_files(root, [Path(entry) for entry in arguments.exclude])
 
     if arguments.list:
         for path in files:

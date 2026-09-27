@@ -31,7 +31,7 @@ DESCRIPTION
 
     Host startup is measured per session as well (launch -> "Entering project
     loop"), including the host's self-reported elapsed time, build count and
-    up-to-date skip count.
+    reload count.
 
 USAGE
   python devops/benchmarks/hot_reload.py [--iterations N] [--no-warmup]
@@ -342,7 +342,7 @@ def _startup_to_json(startup: Optional[Dict[str, float]]) -> Optional[Dict[str, 
     if "host_elapsed_ms" in startup:
         entry["host_elapsed_ms"] = round(startup["host_elapsed_ms"], 2)
         entry["builds"] = int(startup["builds"])
-        entry["up_to_date_skips"] = int(startup["up_to_date_skips"])
+        entry["reloads"] = int(startup["reloads"])
     return entry
 
 
