@@ -9,29 +9,50 @@
 
 #include "include/common.hlsl"
 
-struct MaterialParams {
+struct MaterialParams
+{
     float posterize_level;
 };
-[[vk::binding(0, 2)]] ConstantBuffer<MaterialParams> material;
+
+[[vk::binding(0, 2)]]
+ConstantBuffer<MaterialParams> material;
 
 // Texture slot "color": texture_binding = 0, sampler_binding = 1 (group 3).
-[[vk::binding(0, 3)]] Texture2D    color_texture;
-[[vk::binding(1, 3)]] SamplerState color_sampler;
+[[vk::binding(0, 3)]]
+Texture2D color_texture;
+
+[[vk::binding(1, 3)]]
+SamplerState color_sampler;
+
+struct PixelInput
+{
+    [[vk::location(0)]] float3 vertex_position       : TEXCOORD0;
+    [[vk::location(1)]] float2 vertex_texture_coords : TEXCOORD1;
+    [[vk::location(2)]] float3 TBN_tangent           : TEXCOORD2;
+    [[vk::location(3)]] float3 TBN_bitangent         : TEXCOORD3;
+    [[vk::location(4)]] float3 TBN_normal            : TEXCOORD4;
+    [[vk::location(5)]] float3 world_position        : TEXCOORD5;
+};
+
+struct PixelOutput
+{
+    [[vk::location(0)]] float4 output : SV_TARGET0;
+};
 
 [shader("fragment")]
-float4 fs_main(
-    [[vk::location(0)]] float3 in_vertex_position       : TEXCOORD0,
-    [[vk::location(1)]] float2 in_vertex_texture_coords : TEXCOORD1,
-    [[vk::location(2)]] float3 in_TBN_tangent           : TEXCOORD2,
-    [[vk::location(3)]] float3 in_TBN_bitangent         : TEXCOORD3,
-    [[vk::location(4)]] float3 in_TBN_normal            : TEXCOORD4,
-    [[vk::location(5)]] float3 in_world_position        : TEXCOORD5
-) : SV_TARGET {
-    float4 object_color = color_texture.Sample(color_sampler, in_vertex_texture_coords);
+PixelOutput fs_main(PixelInput input)
+{
+    PixelOutput result;
+
+    float4 object_color = color_texture.Sample(
+        color_sampler,
+        input.vertex_texture_coords
+    );
 
     // Posterize per channel: floor(rgb * levels) / levels.
     float levels = max(material.posterize_level, 1.0);
     float3 posterized = floor(object_color.xyz * levels) / levels;
 
-    return float4(posterized, 1.0);
+    result.output = float4(posterized, 1.0);
+    return result;
 }

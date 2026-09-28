@@ -18,7 +18,40 @@ use crate::{walk_files, CookError, Rule};
 /// vertex stage entered at `vs_main`, `*_fragment.hlsl` a fragment stage entered
 /// at `fs_main`. Any other name fails instead of guessing, so adding a stage is
 /// a decision made here rather than something inferred from a typo.
-pub struct HlslToWgsl;
+///
+/// Sources `#include` an `include/` beside them, which costs nothing to set up
+/// and needs no configuration. [`HlslToWgsl::with_include`] adds directories for
+/// a header that several trees share: without it the header has to be copied
+/// into each `include/`, and copies drift.
+pub struct HlslToWgsl {
+    /// Directories handed to `slangc -I`, searched after the source's own
+    /// directory and `include/`.
+    include_dirs: Vec<PathBuf>,
+}
+
+impl HlslToWgsl {
+    /// The rule with no include path: sources resolve against their own tree.
+    pub fn new() -> Self {
+        Self {
+            include_dirs: Vec::new(),
+        }
+    }
+
+    /// Also search `directory` for the headers the sources `#include`.
+    ///
+    /// Repeatable; directories are searched in the order given.
+    #[must_use]
+    pub fn with_include(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.include_dirs.push(directory.into());
+        self
+    }
+}
+
+impl Default for HlslToWgsl {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl Rule for HlslToWgsl {
     fn name(&self) -> &'static str {
@@ -36,25 +69,32 @@ impl Rule for HlslToWgsl {
     }
 
     fn extra_inputs(&self, input: &Path) -> Result<Vec<PathBuf>, CookError> {
-        // The sources `#include` this directory while the rule's glob matches
-        // only top-level `shaders/*.hlsl`; a header edit must make every
-        // output stale, not merely re-run the build script.
-        let Some(parent) = input.parent() else {
-            return Ok(Vec::new());
-        };
-        walk_files(&parent.join("include"))
+        // Everything the sources `#include` is an input, whether it sits in the
+        // tree's own `include/` or in one shared with other trees. None of it
+        // matches the rule's glob, so without this a header edit would leave
+        // every output looking fresh.
+        let mut headers = Vec::new();
+        if let Some(parent) = input.parent() {
+            headers.extend(walk_files(&parent.join("include"))?);
+        }
+        for directory in &self.include_dirs {
+            headers.extend(walk_files(directory)?);
+        }
+        Ok(headers)
     }
 
     fn build(&self, input: &Path, output: &Path) -> Result<(), CookError> {
         let (entry, stage) = stage_for(input)?;
-        let cooked = Command::new("slangc")
+        let mut slangc = Command::new("slangc");
+        slangc
             .arg(input)
-            .args(["-target", "wgsl", "-entry", entry, "-stage", stage])
-            // `-O0 -g` keep the intermediate variable names, so the emitted WGSL
-            // still reads like the HLSL it came from.
-            .args(["-O0", "-g", "-o"])
-            .arg(output)
-            .output();
+            .args(["-target", "wgsl", "-entry", entry, "-stage", stage]);
+        for directory in &self.include_dirs {
+            slangc.arg("-I").arg(directory);
+        }
+        // `-O0 -g` keep the intermediate variable names, so the emitted WGSL
+        // still reads like the HLSL it came from.
+        let cooked = slangc.args(["-O0", "-g", "-o"]).arg(output).output();
 
         let cooked = match cooked {
             Ok(cooked) => cooked,
@@ -124,13 +164,22 @@ mod tests {
 
     #[test]
     fn the_output_sits_beside_the_source() {
-        let rule = HlslToWgsl;
+        let rule = HlslToWgsl::new();
 
         assert_eq!(
             rule.output_for(Path::new("shaders/default_vertex.hlsl")),
             PathBuf::from("shaders/default_vertex.wgsl")
         );
         assert_eq!(rule.input_glob(), "shaders/*.hlsl");
+    }
+
+    #[test]
+    fn an_include_path_is_searched_after_the_trees_own() {
+        let shared = Path::new("../common_shaders");
+        let configured = HlslToWgsl::new().with_include(shared);
+
+        assert_eq!(configured.include_dirs, vec![PathBuf::from(shared)]);
+        assert!(HlslToWgsl::new().include_dirs.is_empty());
     }
 
     #[test]

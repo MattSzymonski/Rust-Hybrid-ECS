@@ -6,17 +6,32 @@
 
 #include "include/common.hlsl"
 
-struct VS_OUT {
+struct VertexInput
+{
+    [[vk::location(0)]] float3 vertex_position       : POSITION;
+    [[vk::location(1)]] float2 vertex_texture_coords : TEXCOORD0;
+    [[vk::location(2)]] float3 vertex_normal         : NORMAL;
+    [[vk::location(3)]] float3 vertex_tangent        : TANGENT;
+    [[vk::location(4)]] float3 vertex_bitangent      : BINORMAL;
+    [[vk::location(5)]] float3 transform_position    : TEXCOORD1;
+    [[vk::location(6)]] float3 transform_rotation    : TEXCOORD2;
+    [[vk::location(7)]] float3 transform_scale       : TEXCOORD3;
+};
+
+struct VertexOutput
+{
     [[vk::location(0)]] float3 vertex_position       : TEXCOORD0;
     [[vk::location(1)]] float2 vertex_texture_coords : TEXCOORD1;
     [[vk::location(2)]] float3 TBN_tangent           : TEXCOORD2;
     [[vk::location(3)]] float3 TBN_bitangent         : TEXCOORD3;
     [[vk::location(4)]] float3 TBN_normal            : TEXCOORD4;
     [[vk::location(5)]] float3 world_position        : TEXCOORD5;
-                        float4 sv_position           : SV_POSITION;
+
+    float4 sv_position : SV_POSITION;
 };
 
-float3x3 inverse_mat3(float3x3 m) {
+float3x3 inverse_mat3(float3x3 m)
+{
     float m00 = m[0][0]; float m01 = m[0][1]; float m02 = m[0][2];
     float m10 = m[1][0]; float m11 = m[1][1]; float m12 = m[1][2];
     float m20 = m[2][0]; float m21 = m[2][1]; float m22 = m[2][2];
@@ -25,7 +40,8 @@ float3x3 inverse_mat3(float3x3 m) {
               - m01 * (m10 * m22 - m12 * m20)
               + m02 * (m10 * m21 - m11 * m20);
 
-    if (abs(det) < 1e-6) {
+    if (abs(det) < 1e-6)
+    {
         // Fallback to identity if non-invertible.
         return float3x3(1, 0, 0,
                         0, 1, 0,
@@ -47,7 +63,8 @@ float3x3 inverse_mat3(float3x3 m) {
     return inv;
 }
 
-float4x4 compute_model_matrix(float3 position, float3 rotation, float3 scale) {
+float4x4 compute_model_matrix(float3 position, float3 rotation, float3 scale)
+{
     float4x4 scale_matrix = float4x4(
         scale.x, 0,       0,       0,
         0,       scale.y, 0,       0,
@@ -96,38 +113,35 @@ float4x4 compute_model_matrix(float3 position, float3 rotation, float3 scale) {
 }
 
 [shader("vertex")]
-VS_OUT vs_main(
-    [[vk::location(0)]] float3 in_vertex_position       : POSITION,
-    [[vk::location(1)]] float2 in_vertex_texture_coords : TEXCOORD0,
-    [[vk::location(2)]] float3 in_vertex_normal         : NORMAL,
-    [[vk::location(3)]] float3 in_vertex_tangent        : TANGENT,
-    [[vk::location(4)]] float3 in_vertex_bitangent      : BINORMAL,
-    [[vk::location(5)]] float3 transform_position       : TEXCOORD1,
-    [[vk::location(6)]] float3 transform_rotation       : TEXCOORD2,
-    [[vk::location(7)]] float3 transform_scale          : TEXCOORD3
-) {
-    float4x4 model_matrix = compute_model_matrix(transform_position, transform_rotation, transform_scale);
+VertexOutput vs_main(VertexInput input)
+{
+    float4x4 model_matrix = compute_model_matrix(
+        input.transform_position,
+        input.transform_rotation,
+        input.transform_scale
+    );
 
     float3x3 model3x3 = (float3x3)model_matrix;
     float3x3 normal_matrix = transpose(inverse_mat3(model3x3));
 
-    float3 tangent   = normalize(mul(normal_matrix, in_vertex_tangent));
-    float3 bitangent = normalize(mul(normal_matrix, in_vertex_bitangent));
-    float3 normal    = normalize(mul(normal_matrix, in_vertex_normal));
+    float3 tangent = normalize(mul(normal_matrix, input.vertex_tangent));
+    float3 bitangent = normalize(mul(normal_matrix, input.vertex_bitangent));
+    float3 normal = normalize(mul(normal_matrix, input.vertex_normal));
 
     // Transpose so tangent/bitangent/normal become rows. The fragment shader
     // reads each row as a separate location and reconstructs the matrix.
     float3x3 TBN_matrix = transpose(float3x3(tangent, bitangent, normal));
 
-    float4 model_space = mul(model_matrix, float4(in_vertex_position, 1.0));
+    float4 model_space = mul(model_matrix, float4(input.vertex_position, 1.0));
 
-    VS_OUT o;
-    o.TBN_tangent           = TBN_matrix[0];
-    o.TBN_bitangent         = TBN_matrix[1];
-    o.TBN_normal            = TBN_matrix[2];
-    o.vertex_position       = mul(TBN_matrix, model_space.xyz);
-    o.world_position        = model_space.xyz;
-    o.vertex_texture_coords = in_vertex_texture_coords;
-    o.sv_position           = mul(camera.camera_view_projection, model_space);
-    return o;
+    VertexOutput output;
+    output.TBN_tangent = TBN_matrix[0];
+    output.TBN_bitangent = TBN_matrix[1];
+    output.TBN_normal = TBN_matrix[2];
+    output.vertex_position = mul(TBN_matrix, model_space.xyz);
+    output.world_position = model_space.xyz;
+    output.vertex_texture_coords = input.vertex_texture_coords;
+    output.sv_position = mul(camera.camera_view_projection, model_space);
+
+    return output;
 }

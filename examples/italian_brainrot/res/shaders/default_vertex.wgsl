@@ -64,7 +64,7 @@ fn inverse_mat3_0( m_0 : mat3x3<f32>) -> mat3x3<f32>
     return inv_0;
 }
 
-struct VS_OUT_0
+struct VertexOutput_0
 {
     @location(0) vertex_position_0 : vec3<f32>,
     @location(1) vertex_texture_coords_0 : vec2<f32>,
@@ -77,39 +77,52 @@ struct VS_OUT_0
 
 struct vertexInput_0
 {
-    @location(0) in_vertex_position_0 : vec3<f32>,
-    @location(4) in_vertex_texture_coords_0 : vec2<f32>,
-    @location(5) in_vertex_normal_0 : vec3<f32>,
-    @location(6) in_vertex_tangent_0 : vec3<f32>,
-    @location(7) in_vertex_bitangent_0 : vec3<f32>,
+    @location(0) vertex_position_1 : vec3<f32>,
+    @location(4) vertex_texture_coords_1 : vec2<f32>,
+    @location(5) vertex_normal_0 : vec3<f32>,
+    @location(6) vertex_tangent_0 : vec3<f32>,
+    @location(7) vertex_bitangent_0 : vec3<f32>,
     @location(1) transform_position_0 : vec3<f32>,
     @location(2) transform_rotation_0 : vec3<f32>,
     @location(3) transform_scale_0 : vec3<f32>,
 };
 
-@vertex
-fn vs_main( _S17 : vertexInput_0) -> VS_OUT_0
+struct VertexInput_0
 {
+     vertex_position_2 : vec3<f32>,
+     vertex_texture_coords_2 : vec2<f32>,
+     vertex_normal_1 : vec3<f32>,
+     vertex_tangent_1 : vec3<f32>,
+     vertex_bitangent_1 : vec3<f32>,
+     transform_position_1 : vec3<f32>,
+     transform_rotation_1 : vec3<f32>,
+     transform_scale_1 : vec3<f32>,
+};
+
+@vertex
+fn vs_main( _S17 : vertexInput_0) -> VertexOutput_0
+{
+    var _S18 : VertexInput_0 = VertexInput_0( _S17.vertex_position_1, _S17.vertex_texture_coords_1, _S17.vertex_normal_0, _S17.vertex_tangent_0, _S17.vertex_bitangent_0, _S17.transform_position_0, _S17.transform_rotation_0, _S17.transform_scale_0 );
     var model_matrix_0 : mat4x4<f32> = compute_model_matrix_0(_S17.transform_position_0, _S17.transform_rotation_0, _S17.transform_scale_0);
-    var _S18 : mat3x3<f32> = mat3x3<f32>(model_matrix_0[i32(0)].xyz, model_matrix_0[i32(1)].xyz, model_matrix_0[i32(2)].xyz);
-    var _S19 : mat3x3<f32> = inverse_mat3_0(_S18);
-    var normal_matrix_0 : mat3x3<f32> = transpose(_S19);
-    var tangent_0 : vec3<f32> = normalize((((_S17.in_vertex_tangent_0) * (normal_matrix_0))));
-    var bitangent_0 : vec3<f32> = normalize((((_S17.in_vertex_bitangent_0) * (normal_matrix_0))));
-    var normal_0 : vec3<f32> = normalize((((_S17.in_vertex_normal_0) * (normal_matrix_0))));
+    var _S19 : mat3x3<f32> = mat3x3<f32>(model_matrix_0[i32(0)].xyz, model_matrix_0[i32(1)].xyz, model_matrix_0[i32(2)].xyz);
+    var _S20 : mat3x3<f32> = inverse_mat3_0(_S19);
+    var normal_matrix_0 : mat3x3<f32> = transpose(_S20);
+    var tangent_0 : vec3<f32> = normalize((((_S17.vertex_tangent_0) * (normal_matrix_0))));
+    var bitangent_0 : vec3<f32> = normalize((((_S17.vertex_bitangent_0) * (normal_matrix_0))));
+    var normal_0 : vec3<f32> = normalize((((_S17.vertex_normal_0) * (normal_matrix_0))));
     var TBN_matrix_0 : mat3x3<f32> = transpose(mat3x3<f32>(tangent_0, bitangent_0, normal_0));
-    var model_space_0 : vec4<f32> = (((vec4<f32>(_S17.in_vertex_position_0, 1.0f)) * (model_matrix_0)));
-    var o_0 : VS_OUT_0;
-    o_0.TBN_tangent_0 = TBN_matrix_0[i32(0)];
-    o_0.TBN_bitangent_0 = TBN_matrix_0[i32(1)];
-    o_0.TBN_normal_0 = TBN_matrix_0[i32(2)];
-    var _S20 : vec3<f32> = model_space_0.xyz;
-    var _S21 : vec3<f32> = (((_S20) * (TBN_matrix_0)));
-    o_0.vertex_position_0 = _S21;
-    o_0.world_position_0 = _S20;
-    o_0.vertex_texture_coords_0 = _S17.in_vertex_texture_coords_0;
-    var _S22 : vec4<f32> = (((model_space_0) * (mat4x4<f32>(camera_0.camera_view_projection_0.data_0[i32(0)][i32(0)], camera_0.camera_view_projection_0.data_0[i32(1)][i32(0)], camera_0.camera_view_projection_0.data_0[i32(2)][i32(0)], camera_0.camera_view_projection_0.data_0[i32(3)][i32(0)], camera_0.camera_view_projection_0.data_0[i32(0)][i32(1)], camera_0.camera_view_projection_0.data_0[i32(1)][i32(1)], camera_0.camera_view_projection_0.data_0[i32(2)][i32(1)], camera_0.camera_view_projection_0.data_0[i32(3)][i32(1)], camera_0.camera_view_projection_0.data_0[i32(0)][i32(2)], camera_0.camera_view_projection_0.data_0[i32(1)][i32(2)], camera_0.camera_view_projection_0.data_0[i32(2)][i32(2)], camera_0.camera_view_projection_0.data_0[i32(3)][i32(2)], camera_0.camera_view_projection_0.data_0[i32(0)][i32(3)], camera_0.camera_view_projection_0.data_0[i32(1)][i32(3)], camera_0.camera_view_projection_0.data_0[i32(2)][i32(3)], camera_0.camera_view_projection_0.data_0[i32(3)][i32(3)]))));
-    o_0.sv_position_0 = _S22;
-    return o_0;
+    var model_space_0 : vec4<f32> = (((vec4<f32>(_S17.vertex_position_1, 1.0f)) * (model_matrix_0)));
+    var output_0 : VertexOutput_0;
+    output_0.TBN_tangent_0 = TBN_matrix_0[i32(0)];
+    output_0.TBN_bitangent_0 = TBN_matrix_0[i32(1)];
+    output_0.TBN_normal_0 = TBN_matrix_0[i32(2)];
+    var _S21 : vec3<f32> = model_space_0.xyz;
+    var _S22 : vec3<f32> = (((_S21) * (TBN_matrix_0)));
+    output_0.vertex_position_0 = _S22;
+    output_0.world_position_0 = _S21;
+    output_0.vertex_texture_coords_0 = _S17.vertex_texture_coords_1;
+    var _S23 : vec4<f32> = (((model_space_0) * (mat4x4<f32>(camera_0.camera_view_projection_0.data_0[i32(0)][i32(0)], camera_0.camera_view_projection_0.data_0[i32(1)][i32(0)], camera_0.camera_view_projection_0.data_0[i32(2)][i32(0)], camera_0.camera_view_projection_0.data_0[i32(3)][i32(0)], camera_0.camera_view_projection_0.data_0[i32(0)][i32(1)], camera_0.camera_view_projection_0.data_0[i32(1)][i32(1)], camera_0.camera_view_projection_0.data_0[i32(2)][i32(1)], camera_0.camera_view_projection_0.data_0[i32(3)][i32(1)], camera_0.camera_view_projection_0.data_0[i32(0)][i32(2)], camera_0.camera_view_projection_0.data_0[i32(1)][i32(2)], camera_0.camera_view_projection_0.data_0[i32(2)][i32(2)], camera_0.camera_view_projection_0.data_0[i32(3)][i32(2)], camera_0.camera_view_projection_0.data_0[i32(0)][i32(3)], camera_0.camera_view_projection_0.data_0[i32(1)][i32(3)], camera_0.camera_view_projection_0.data_0[i32(2)][i32(3)], camera_0.camera_view_projection_0.data_0[i32(3)][i32(3)]))));
+    output_0.sv_position_0 = _S23;
+    return output_0;
 }
 

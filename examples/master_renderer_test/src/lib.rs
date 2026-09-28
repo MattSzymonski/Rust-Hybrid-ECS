@@ -1,21 +1,22 @@
-//! Draws the committed DamagedHelmet with a PBR material, through the pass and
-//! pipeline assets the project builds.
+//! Draws the committed DamagedHelmet with a PBR material, through the pipeline
+//! the renderer installs for itself.
 //!
 //! # Responsibilities
 //!
-//! - Register the renderer and load the helmet, its PBR maps, shader and
-//!   material, plus the pass and pipeline that describe the frame.
-//! - Hand that pipeline to the renderer's `RenderingManager`.
+//! - Register the renderer, which installs its own PBR chain as the frame to
+//!   run, and load the helmet: its mesh, its four PBR maps, and the material
+//!   built from them through that chain's shader.
 //! - Create the scene: a camera and one spinning helmet.
 //!
 //! # Design
 //!
-//! The frame is described as data. `asset_loading::load` builds a `RenderPass`
-//! and a `RenderingPipeline` and stores them as assets like any other, and
-//! `RenderingManager::set_pipeline` is the single call that tells the renderer
-//! which one to run. Nothing in this project reaches into the renderer to
-//! describe a pass in code, which is what would make adding a second pass a
-//! change to this file rather than to a renderer struct.
+//! The frame belongs to the renderer, not to this project. `register` installs
+//! the PBR chain - geometry into a half-float target, bloom, tonemap, lens - and
+//! points the renderer's manager at it, so what is left here is content and
+//! scene. Swapping the frame is one `RenderingManager::set_pipeline` call with
+//! another pipeline asset, not a change to this file; and the helmet only has to
+//! be drawable by whatever chain is running, which is why its material is built
+//! through the chain's shader rather than one of its own.
 
 use pill_engine::{pill_project, Engine, PillComponent};
 use serde::{Deserialize, Serialize};
@@ -30,10 +31,11 @@ mod systems;
 #[pill(shared = "master_renderer_test::TagHelmet", persistable)]
 pub struct TagHelmet;
 
-/// Registers the renderer, loads the helmet, hands the renderer its pipeline,
-/// and creates the scene.
+/// Registers the renderer, loads the helmet, and creates the scene.
 #[pill_project]
 pub fn init(engine: &mut Engine) -> u32 {
+    // Installs the renderer's own PBR chain and points the renderer at it, so
+    // this project has no frame of its own to hand over.
     pill_master_renderer::register(engine);
     __pill_register_TagHelmet(engine.world_mut());
 
@@ -44,16 +46,6 @@ pub fn init(engine: &mut Engine) -> u32 {
             return 1;
         }
     };
-
-    // The one call that connects the project's frame to the renderer.
-    let Some(manager) = engine
-        .world_mut()
-        .get_resource_mut::<pill_master_renderer::RenderingManager>()
-    else {
-        eprintln!("[master_renderer_test] the renderer's RenderingManager is missing");
-        return 1;
-    };
-    manager.set_pipeline(assets.pipeline);
 
     if let Err(error) = scene::create(engine.world_mut(), assets) {
         eprintln!("[master_renderer_test] scene creation failed: {error}");

@@ -24,5 +24,5 @@ use crate::Rule;
 /// the cooked WGSL, so a build that skipped the cook would have no shader at all
 /// rather than a stale one.
 pub fn default_rules() -> Vec<Box<dyn Rule>> {
-    vec![Box::new(HlslToWgsl)]
+    vec![Box::new(HlslToWgsl::new())]
 }
