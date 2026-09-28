@@ -34,7 +34,7 @@
 //! one has no `include/` beside it.
 
 // External crates
-use pill_engine::{AssetBindingResult, AssetManager, Handle};
+use pill_engine::{AssetLoadResult, AssetManager, Handle};
 
 // Current crate
 use crate::assets::{
@@ -73,41 +73,29 @@ const TONEMAP_PASS: &str = "pill.pbr.pass.tonemap";
 /// Asset name of the lens pass.
 const LENS_PASS: &str = "pill.pbr.pass.lens";
 
-/// The passes installing the post-processing half produced, in the order the
-/// frame runs them.
-pub struct PostProcessing {
-    /// What is brighter than the threshold, written at half the surface size.
-    pub bloom: Handle<RenderPass>,
-    /// The bloom added back over the lit image.
-    pub composite: Handle<RenderPass>,
-    /// The range brought down to what a display can show.
-    pub tonemap: Handle<RenderPass>,
-    /// Grain, grade and vignette, onto the swapchain.
-    pub lens: Handle<RenderPass>,
-}
-
-/// Install the four post-processing passes, and return their handles.
+/// Install the four post-processing passes.
+///
+/// Returns the passes in the order the frame runs them. The grain tile the last
+/// one samples is not returned: the lens pass already binds it, and a second
+/// hand-out of that handle would be a copy free to disagree with the pass.
 ///
 /// Idempotent: a store that already holds them gets the same handles back rather
 /// than a second copy, so this is safe to call once per generation.
 ///
 /// # Errors
 ///
-/// Returns the engine's asset error when a name this owns is already taken by an
-/// asset of a different type.
-pub fn install(assets: &mut AssetManager) -> AssetBindingResult<PostProcessing> {
+/// Returns an error when a name this owns is already taken by an asset of a
+/// different type, or when one of the shaders fails to build.
+pub fn install(
+    assets: &mut AssetManager,
+) -> Result<Vec<Handle<RenderPass>>, Box<dyn std::error::Error>> {
     if let (Some(bloom), Some(composite), Some(tonemap), Some(lens)) = (
         assets.handle_by_name::<RenderPass>(BLOOM_PASS),
         assets.handle_by_name::<RenderPass>(COMPOSITE_PASS),
         assets.handle_by_name::<RenderPass>(TONEMAP_PASS),
         assets.handle_by_name::<RenderPass>(LENS_PASS),
     ) {
-        return Ok(PostProcessing {
-            bloom,
-            composite,
-            tonemap,
-            lens,
-        });
+        return Ok(vec![bloom, composite, tonemap, lens]);
     }
 
     // The grain tile the lens pass samples, generated rather than shipped: the
@@ -123,7 +111,7 @@ pub fn install(assets: &mut AssetManager) -> AssetBindingResult<PostProcessing> 
             ShaderParameterType::Color,
         )],
         [ShaderTextureSlot::new("hdr", TextureType::Color, (0, 1))],
-    );
+    )?;
     let prefilter = assets.add_named(PREFILTER_SHADER, prefilter)?;
     let bloom = RenderPass::new("pill.pbr.bloom")
         .with_shader(prefilter)
@@ -145,7 +133,7 @@ pub fn install(assets: &mut AssetManager) -> AssetBindingResult<PostProcessing> 
             ShaderTextureSlot::new("hdr", TextureType::Color, (0, 1)),
             ShaderTextureSlot::new("bloom", TextureType::Color, (2, 3)),
         ],
-    );
+    )?;
     let composite = assets.add_named(COMPOSITE_SHADER, composite)?;
     let composite_pass = RenderPass::new("pill.pbr.bloom_composite")
         .with_shader(composite)
@@ -173,7 +161,7 @@ pub fn install(assets: &mut AssetManager) -> AssetBindingResult<PostProcessing> 
             ShaderParameterSlot::new("c", ShaderParameterType::Scalar),
         ],
         [ShaderTextureSlot::new("hdr", TextureType::Color, (0, 1))],
-    );
+    )?;
     let tonemap = assets.add_named(TONEMAP_SHADER, tonemap)?;
     let tonemap_pass = RenderPass::new("pill.pbr.tonemap")
         .with_shader(tonemap)
@@ -201,7 +189,7 @@ pub fn install(assets: &mut AssetManager) -> AssetBindingResult<PostProcessing> 
             ShaderTextureSlot::new("source", TextureType::Color, (0, 1)),
             ShaderTextureSlot::new("grain", TextureType::Color, (2, 3)),
         ],
-    );
+    )?;
     let lens = assets.add_named(LENS_SHADER, lens)?;
     let lens_pass = RenderPass::new("pill.pbr.lens")
         .with_shader(lens)
@@ -216,31 +204,28 @@ pub fn install(assets: &mut AssetManager) -> AssetBindingResult<PostProcessing> 
         .with_order(4);
     let lens_pass = assets.add_named(LENS_PASS, lens_pass)?;
 
-    Ok(PostProcessing {
-        bloom,
-        composite: composite_pass,
-        tonemap: tonemap_pass,
-        lens: lens_pass,
-    })
+    Ok(vec![bloom, composite_pass, tonemap_pass, lens_pass])
 }
 
 /// A fullscreen shader: this module's fullscreen vertex stage, the given
 /// fragment stage, and the engine's and the camera's groups.
+///
+/// # Errors
+///
+/// Returns the engine's load error when the stages cannot be built.
 fn fullscreen_shader(
     name: &str,
     fragment: &str,
     parameters: impl IntoIterator<Item = ShaderParameterSlot>,
     textures: impl IntoIterator<Item = ShaderTextureSlot>,
-) -> Shader {
-    Shader::from_wgsl(
-        name,
-        include_str!("shaders/fullscreen_vertex.wgsl"),
-        fragment,
-        parameters,
-        textures,
-        true,
-        true,
-    )
+) -> AssetLoadResult<Shader> {
+    Shader::new(name)
+        .with_wgsl(include_str!("shaders/fullscreen_vertex.wgsl"), fragment)
+        .with_parameter_slots(parameters)
+        .with_texture_slots(textures)
+        .with_engine_parameters(true)
+        .with_camera_parameters(true)
+        .build()
 }
 
 /// The curve shape and the two constants Lottes' tonemap is defined by.

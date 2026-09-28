@@ -36,7 +36,7 @@
 //! live somewhere the renderer has never heard of.
 
 // External crates
-use pill_engine::{AssetBindingResult, AssetManager, Handle};
+use pill_engine::{AssetManager, Handle};
 
 // Current crate
 use crate::{
@@ -62,28 +62,31 @@ pub const PASS_NAME: &str = "pill.simple.pass";
 ///
 /// # Errors
 ///
-/// Returns the engine's asset error when a name this owns is already taken by
-/// an asset of a different type.
-pub fn install(assets: &mut AssetManager) -> AssetBindingResult<Handle<RenderingPipeline>> {
+/// Returns an error when a name this owns is already taken by an asset of a
+/// different type, or when the shader's stages fail to build.
+pub fn install(
+    assets: &mut AssetManager,
+) -> Result<Handle<RenderingPipeline>, Box<dyn std::error::Error>> {
     if let Some(pipeline) = assets.handle_by_name::<RenderingPipeline>(PIPELINE_NAME) {
         return Ok(pipeline);
     }
 
-    let shader = Shader::from_wgsl(
-        "pill_simple",
-        include_str!("../common_shaders/default_vertex.wgsl"),
-        include_str!("shaders/default_lit_fragment.wgsl"),
-        [
+    let shader = Shader::new("pill_simple")
+        .with_wgsl(
+            include_str!("../common_shaders/default_vertex.wgsl"),
+            include_str!("shaders/default_lit_fragment.wgsl"),
+        )
+        .with_parameter_slots(vec![
             ShaderParameterSlot::new("tint", ShaderParameterType::Color),
             ShaderParameterSlot::new("specularity", ShaderParameterType::Scalar),
-        ],
-        [
+        ])
+        .with_texture_slots(vec![
             ShaderTextureSlot::new("color", TextureType::Color, (0, 1)),
             ShaderTextureSlot::new("normal", TextureType::Normal, (2, 3)),
-        ],
-        true,
-        true,
-    );
+        ])
+        .with_engine_parameters(true)
+        .with_camera_parameters(true)
+        .build()?;
     let shader = assets.add_named(SHADER_NAME, shader)?;
 
     let pass = RenderPass::new("pill.simple.opaque")
@@ -92,5 +95,7 @@ pub fn install(assets: &mut AssetManager) -> AssetBindingResult<Handle<Rendering
         .with_target(PassTarget::Surface);
     let pass = assets.add_named(PASS_NAME, pass)?;
 
-    assets.add_named(PIPELINE_NAME, RenderingPipeline::new().with_pass(pass))
+    let pipeline = assets.add_named(PIPELINE_NAME, RenderingPipeline::new().with_pass(pass))?;
+
+    Ok(pipeline)
 }

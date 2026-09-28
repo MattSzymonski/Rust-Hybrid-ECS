@@ -354,15 +354,14 @@ mod rendering_impl {
         }
 
         let result = with_assets(|assets| {
-            let shader = Shader::from_wgsl(
-                name.as_str(),
-                vertex_wgsl,
-                fragment_wgsl,
-                parameter_slots,
-                texture_slots,
-                pass_engine_parameters != 0,
-                pass_camera_parameters != 0,
-            );
+            let shader = Shader::new(name.as_str())
+                .with_wgsl(vertex_wgsl, fragment_wgsl)
+                .with_parameter_slots(parameter_slots)
+                .with_texture_slots(texture_slots)
+                .with_engine_parameters(pass_engine_parameters != 0)
+                .with_camera_parameters(pass_camera_parameters != 0)
+                .build()
+                .map_err(|_| STATUS_DECODE_FAILED)?;
             let handle = assets
                 .add_named(name.as_str(), shader)
                 .map_err(|_| STATUS_NAME_IN_USE)?;
