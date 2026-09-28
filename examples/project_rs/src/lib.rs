@@ -34,7 +34,7 @@ use pill_engine::*;
 // names them without reaching through whichever renderer happens to draw them.
 // `MeshRendererComponent` is the renderer's own idea of a thing to draw.
 use pill_engine::common_components::Position;
-use pill_master_renderer::{
+use pill_renderer_api::{
     CameraComponent, DirectionalLightComponent, Material, Mesh, MeshRendererComponent,
     TransformComponent,
 };
@@ -120,7 +120,7 @@ pub fn init(engine: &mut Engine) -> u32 {
     // uses the same concrete asset types as this DLL. RenderFrame is a shared
     // resource, so the host-side GPU backend reads the extracted data through
     // the engine's stable cross-artifact resource identity.
-    pill_master_renderer::register(engine);
+    pill_renderer_api::register(engine);
     let (mesh, scene_material, ball_materials, sample_material) = {
         let assets = engine
             .world_mut()

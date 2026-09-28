@@ -64,6 +64,8 @@ mod project_module;
 #[cfg(feature = "hot_reload")]
 mod reload;
 
+/// The renderer's plain data, registered in every posture before anything loads.
+mod renderer_data;
 /// Complete standalone application runner owned by the host crate.
 mod runner;
 /// Engine ownership and frontend-facing frame orchestration.

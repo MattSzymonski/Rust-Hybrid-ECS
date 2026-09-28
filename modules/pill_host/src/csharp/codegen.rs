@@ -33,6 +33,7 @@ use pill_engine::component_registry::{ComponentFieldDescriptor, PillValueTypeDes
 
 // Current crate
 use super::components::ModuleExposedComponent;
+use super::mirror_naming::{is_opaque_container_tag, snake_to_pascal, split_array_tag};
 use super::{ResolvedFieldAccessor, ResolvedMirrorMethod};
 
 // =============================================================================
@@ -82,8 +83,35 @@ pub(crate) fn generate_module_components_csharp(
     methods: &[ResolvedMirrorMethod],
     accessors: &[ResolvedFieldAccessor],
 ) -> Result<bool, String> {
-    let module_root = workspace_root.join("extensions").join(module_name);
-    let generated_dir = module_root.join("generated");
+    generate_components_csharp(
+        &workspace_root.join("extensions").join(module_name),
+        module_name,
+        exposed,
+        value_types,
+        methods,
+        accessors,
+    )
+}
+
+/// Generate `generated/<module_name>_Components.g.cs` inside `crate_root`.
+///
+/// The engine of [`generate_module_components_csharp`], for a crate that is not
+/// an extension: the host's own renderer data (`pill_renderer_api`) exposes its
+/// components exactly as an extension does, but lives beside `pill_engine`
+/// rather than under `extensions/`.
+///
+/// # Errors
+///
+/// As [`generate_module_components_csharp`].
+pub(crate) fn generate_components_csharp(
+    crate_root: &Path,
+    module_name: &str,
+    exposed: &[ModuleExposedComponent],
+    value_types: &[PillValueTypeDescriptor],
+    methods: &[ResolvedMirrorMethod],
+    accessors: &[ResolvedFieldAccessor],
+) -> Result<bool, String> {
+    let generated_dir = crate_root.join("generated");
     let output_path = generated_dir.join(format!("{module_name}_Components.g.cs"));
 
     // A module that exposes no components needs no mirror file. Remove a stale
@@ -122,6 +150,12 @@ pub(crate) fn generate_module_components_csharp(
     // qualified path and pushed in dependency order, so concatenating them in
     // order always compiles. Emitted once per file, before the components.
     let mut nested_definitions: Vec<EmittedStruct> = Vec::new();
+    // The namespace each nested definition is emitted in, index for index: the
+    // namespace of the first component that referenced it. A file can span
+    // namespaces (the renderer data mirrors `pill_engine` and renderer types
+    // together), so "the first component's namespace" would strand a type
+    // away from the only component that uses it.
+    let mut nested_namespaces: Vec<String> = Vec::new();
     let mut component_blocks: Vec<(String, String)> = Vec::new();
 
     for component in exposed {
@@ -153,6 +187,7 @@ pub(crate) fn generate_module_components_csharp(
                 &rust_type_name,
             )?
         };
+        nested_namespaces.resize(nested_definitions.len(), namespace.to_string());
         component_blocks.push((namespace.to_string(), body));
     }
 
@@ -195,20 +230,39 @@ pub(crate) fn generate_module_components_csharp(
         });
     }
 
-    // Nested value types live in the same namespace as the components that
-    // reference them, so C# refers to `pill_spline.Vector3f` etc.
-    for nested in &nested_definitions {
-        let namespace = component_blocks
-            .first()
-            .map(|(namespace, _)| namespace.clone())
-            .unwrap_or_else(|| format!("pill_{module_name}"));
+    // Nested value types live in the namespace of the component that first
+    // referenced them, so C# refers to `pill_spline.Vector3f` etc. A value type
+    // no component references goes to the first component's namespace.
+    let default_namespace = component_blocks
+        .first()
+        .map(|(namespace, _)| namespace.clone())
+        .unwrap_or_else(|| format!("pill_{module_name}"));
+    nested_namespaces.resize(nested_definitions.len(), default_namespace);
+    for (nested, namespace) in nested_definitions.iter().zip(&nested_namespaces) {
         content.push_str(&format!(
             "namespace {namespace} {{\n\n{}\n\n}}\n\n",
             nested.definition
         ));
     }
-    for (namespace, body) in component_blocks {
-        content.push_str(&format!("namespace {namespace} {{\n\n{body}\n\n}}\n\n"));
+    // A component in another namespace sees those types through `using`, so a
+    // field typed with one compiles wherever it was declared.
+    let mut nested_namespace_set: Vec<&String> = nested_namespaces.iter().collect();
+    nested_namespace_set.sort();
+    nested_namespace_set.dedup();
+    for (namespace, body) in &component_blocks {
+        let usings: String = nested_namespace_set
+            .iter()
+            .filter(|nested| **nested != namespace)
+            .map(|nested| format!("using {nested};\n"))
+            .collect();
+        let usings = if usings.is_empty() {
+            usings
+        } else {
+            format!("{usings}\n")
+        };
+        content.push_str(&format!(
+            "namespace {namespace} {{\n\n{usings}{body}\n\n}}\n\n"
+        ));
     }
 
     // Write only when the file is missing or its content differs from what
@@ -244,7 +298,7 @@ fn emit_blob_component(name: &str, size: usize, align: usize) -> Result<String, 
         .ok_or_else(|| format!("unsupported alignment {align} for exposed component {name}"))?;
     Ok(format!(
         "[StructLayout(LayoutKind.Sequential, Size = {size})]\n\
-         public struct {name}\n\
+         public partial struct {name}\n\
          {{\n\
          \x20\x20\x20\x20/// {size}-byte, {align}-byte-aligned ABI mirror of a component\n\
          \x20\x20\x20\x20/// registered by this extension.\n\
@@ -460,7 +514,7 @@ fn emit_typed_struct(
     // when trailing padding exists; `Raw` keeps the live-bytes escape hatch.
     let mut body = String::new();
     body.push_str(&format!(
-        "[StructLayout(LayoutKind.Explicit, Size = {size})]\npublic struct {name}\n{{\n"
+        "[StructLayout(LayoutKind.Explicit, Size = {size})]\npublic partial struct {name}\n{{\n"
     ));
     for (declaration, offset, _) in &resolved {
         body.push_str(&format!("    [FieldOffset({offset})] {declaration};\n"));
@@ -565,7 +619,7 @@ fn emit_opaque_struct(name: &str, size: usize, align: usize) -> Result<String, S
         .ok_or_else(|| format!("unsupported alignment {align} for nested value type `{name}`"))?;
     Ok(format!(
         "[StructLayout(LayoutKind.Sequential, Size = {size})]\n\
-         public struct {name}\n\
+         public partial struct {name}\n\
          {{\n\
          \x20\x20\x20\x20private readonly {align_primitive} _alignmentPad;\n\
          \n\
@@ -1351,26 +1405,11 @@ fn resolve_span_element_type(
     ))
 }
 
-/// Whether a tag names a Rust-owned container field, which carries no C# field
-/// of its own: its pointer must never be exposed to managed code, so elements
-/// are reached through the generated accessor members instead.
-fn is_opaque_container_tag(tag: &str) -> bool {
-    tag.starts_with("vec:") || tag == "string"
-}
-
 /// Whether a tag names any heap-owning field, which the accessor member
 /// emitter handles - Rust-owned containers and engine-owned native buffers
 /// alike.
 fn is_heap_field_tag(tag: &str) -> bool {
     is_opaque_container_tag(tag) || tag.starts_with("dynbuf:")
-}
-
-/// Split an `array:<inner>` tag into its base tag and whether it is an array.
-fn split_array_tag(tag: &str) -> Result<(&str, bool), String> {
-    match tag.strip_prefix("array:") {
-        Some(inner) => Ok((inner, true)),
-        None => Ok((tag, false)),
-    }
 }
 
 /// Map a primitive type tag to its C# type, byte size, and alignment.
@@ -1401,23 +1440,6 @@ fn cs_primitive(tag: &str) -> Option<(&'static str, usize, usize)> {
         )),
         _ => None,
     }
-}
-
-/// Convert a snake_case Rust identifier to the PascalCase used in C# mirrors.
-fn snake_to_pascal(name: &str) -> String {
-    let mut result = String::with_capacity(name.len());
-    let mut capitalize_next = true;
-    for character in name.chars() {
-        if character == '_' {
-            capitalize_next = true;
-        } else if capitalize_next {
-            result.extend(character.to_uppercase());
-            capitalize_next = false;
-        } else {
-            result.push(character);
-        }
-    }
-    result
 }
 
 /// Convert a snake_case Rust identifier to the camelCase used for private
@@ -1627,7 +1649,7 @@ mod tests {
 
         let content = read_generated(&workspace, "pill_spline");
         assert!(content.contains("namespace pill_spline {"));
-        assert!(content.contains("public struct Spline"));
+        assert!(content.contains("public partial struct Spline"));
         assert!(content.contains("Size = 196"));
         assert!(content.contains("private readonly uint _alignmentPad;"));
         assert!(content.contains("public readonly Span<byte> Raw =>"));
@@ -1649,9 +1671,9 @@ mod tests {
         let content = read_generated(&workspace, "pill_spline");
         assert!(content.contains("namespace pill_spline {"));
         assert!(content.contains("namespace tracy_nav {"));
-        assert!(content.contains("public struct Spline"));
-        assert!(content.contains("public struct Path"));
-        assert!(content.contains("public struct Segment"));
+        assert!(content.contains("public partial struct Spline"));
+        assert!(content.contains("public partial struct Path"));
+        assert!(content.contains("public partial struct Segment"));
         assert!(content.contains("Size = 196"));
         assert!(content.contains("Size = 12"));
         assert!(content.contains("Size = 16"));
@@ -1785,10 +1807,10 @@ mod tests {
         let content = read_generated(&workspace, "pill_spline");
         // The nested struct is emitted once, before the component.
         let nested_index = content
-            .find("public struct Vector2f")
+            .find("public partial struct Vector2f")
             .expect("nested struct");
         let component_index = content
-            .find("public struct Path")
+            .find("public partial struct Path")
             .expect("component struct");
         assert!(
             nested_index < component_index,
@@ -1799,6 +1821,47 @@ mod tests {
         assert!(content.contains("[FieldOffset(0)] public Vector2f Start;"));
         assert!(content.contains("[FieldOffset(8)] public Vector2f End;"));
         assert!(content.contains("[FieldOffset(20)] public uint Kind;"));
+    }
+
+    /// A file spanning two namespaces puts a nested type beside the component
+    /// that uses it, not beside whichever component came first, and lets the
+    /// other namespace see it through `using`. The renderer data's mirror is
+    /// such a file: `pill_engine` components first, then renderer components
+    /// holding asset handles.
+    #[test]
+    fn a_nested_type_lives_in_the_namespace_of_its_first_user() {
+        let workspace = temp_workspace("namespaces", "pill_spline");
+        let first = exposed_typed(
+            "pill_engine.common_components.Position",
+            8,
+            4,
+            vec![field("x", "f32", 0, 4, 4), field("y", "f32", 4, 4, 4)],
+        );
+        let second = exposed_typed(
+            "pill_master_renderer.component.Path",
+            16,
+            4,
+            vec![
+                field("start", "struct:pill_core::math::Vector2f", 0, 8, 4),
+                field("end", "struct:pill_core::math::Vector2f", 8, 8, 4),
+            ],
+        );
+        let value_types = [PillValueTypeDescriptor {
+            type_name: "pill_core::math::Vector2f",
+            size: 8,
+            align: 4,
+            fields: VECTOR2F_FIELDS,
+        }];
+        call_codegen(&workspace, "pill_spline", &[first, second], &value_types).unwrap();
+
+        let content = read_generated(&workspace, "pill_spline");
+        assert!(content.contains(
+            "namespace pill_master_renderer.component {\n\n[StructLayout(LayoutKind.Explicit, Size = 8)]\npublic partial struct Vector2f"
+        ));
+        assert!(content.contains(
+            "namespace pill_engine.common_components {\n\nusing pill_master_renderer.component;\n"
+        ));
+        assert!(!content.contains("namespace pill_master_renderer.component {\n\nusing"));
     }
 
     /// A `struct:` field with no `PillMirror` descriptor (a foreign type, an
@@ -1816,7 +1879,7 @@ mod tests {
         call_codegen(&workspace, "pill_spline", &[component], &[]).unwrap();
 
         let content = read_generated(&workspace, "pill_spline");
-        assert!(content.contains("public struct Vec3"));
+        assert!(content.contains("public partial struct Vec3"));
         assert!(content.contains("Size = 12"));
         assert!(content.contains("[FieldOffset(0)] public Vec3 Foreign;"));
     }
@@ -1912,10 +1975,10 @@ mod tests {
         call_codegen(&workspace, "pill_spline", &[component], &value_types).unwrap();
 
         let content = read_generated(&workspace, "pill_spline");
-        assert!(content.contains("public struct OmoMO"));
+        assert!(content.contains("public partial struct OmoMO"));
         assert!(content.contains("[FieldOffset(0)] public ulong X;"));
         assert!(content.contains("[FieldOffset(8)] public ulong Y;"));
-        assert!(content.contains("public struct Spline"));
+        assert!(content.contains("public partial struct Spline"));
     }
 
     /// Overlapping sibling fields (a malformed descriptor) are rejected before
@@ -2748,10 +2811,10 @@ mod tests {
         assert!(content.contains("public Span<Vector2f> NodesMut"));
         assert!(content.contains("[FieldOffset(0)] private readonly ulong _alignmentPad;"));
         let nested_index = content
-            .find("public struct Vector2f")
+            .find("public partial struct Vector2f")
             .expect("nested struct");
         let component_index = content
-            .find("public struct Path")
+            .find("public partial struct Path")
             .expect("component struct");
         assert!(nested_index < component_index);
     }

@@ -44,7 +44,21 @@ use crate::{
         PassKind, PassTarget, RenderPass, RenderingPipeline, Shader, ShaderParameterSlot,
         ShaderParameterType, ShaderTextureSlot, TextureType,
     },
+    config::{ShaderSourceRecord, DEFAULT_VERTEX},
 };
+
+config_shader_file!(
+    /// The pass's fragment stage, cooked from `default_lit_fragment.hlsl`; also
+    /// the renderer's built-in fallback shader.
+    pub DEFAULT_LIT_FRAGMENT, "simple_pipeline/shaders/default_lit_fragment.wgsl"
+);
+
+/// The shader assets [`install`] creates, and the files each is built from.
+pub const SHADER_SOURCES: &[ShaderSourceRecord] = &[ShaderSourceRecord {
+    shader_asset_name: SHADER_NAME,
+    vertex: DEFAULT_VERTEX,
+    fragment: DEFAULT_LIT_FRAGMENT,
+}];
 
 /// Asset name the installed pipeline is stored under.
 pub const PIPELINE_NAME: &str = "pill.simple.pipeline";
@@ -73,8 +87,8 @@ pub fn install(
 
     let shader = Shader::new("pill_simple")
         .with_wgsl(
-            include_str!("../common_shaders/default_vertex.wgsl"),
-            include_str!("shaders/default_lit_fragment.wgsl"),
+            DEFAULT_VERTEX.embedded_source,
+            DEFAULT_LIT_FRAGMENT.embedded_source,
         )
         .with_parameter_slots(vec![
             ShaderParameterSlot::new("tint", ShaderParameterType::Color),

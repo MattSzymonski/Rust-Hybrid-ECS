@@ -97,9 +97,7 @@ impl ActiveSystemGuard {
     ///
     /// Production systems use [`Self::set_with_commands`] because the scheduler
     /// always supplies a queue even when the managed signature omits Commands.
-    /// Only the windowed test build has a native component to bind, so the
-    /// headless posture never compiles the tests that reach this.
-    #[cfg(all(test, feature = "rendering"))]
+    #[cfg(test)]
     pub(super) fn set(
         world: &mut World,
         access: &[NativeSystemAccess],

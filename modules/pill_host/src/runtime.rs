@@ -340,6 +340,10 @@ pub struct RenderingHost {
     assets: crate::render_assets::NativeAssets,
     viewport: Option<RenderViewport>,
     presented_scene: bool,
+    /// Re-cooks edited renderer shaders and updates their assets; `None` when
+    /// the watch could not start, which only costs the reload.
+    #[cfg(feature = "hot_reload")]
+    shader_reloader: Option<pill_master_renderer::ShaderReloader>,
 }
 
 #[cfg(feature = "rendering")]
@@ -382,6 +386,19 @@ impl RenderingHost {
 
     /// Execute one ECS frame and present its resulting world to the surface.
     pub fn run_one_frame(&mut self) -> Result<Option<FrameReport>, RendererError> {
+        // An edited renderer shader becomes an asset edit here, before the
+        // frame, so this frame's sync already rebuilds it.
+        #[cfg(feature = "hot_reload")]
+        if let Some(reloader) = &mut self.shader_reloader {
+            if let Some(assets) = self
+                .host
+                .engine_mut()
+                .world_mut()
+                .get_resource_mut::<pill_engine::AssetManager>()
+            {
+                reloader.poll(assets);
+            }
+        }
         self.assets.update(self.host.engine_mut())?;
         let report = run_one_frame(&mut self.host);
         // The renderer reads both resources straight out of the world - the
@@ -549,6 +566,11 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
     engine.set_parallel_execution(true);
     let engine_api = EngineApi::new(&mut engine);
 
+    // The renderer's plain data, before anything that may use it: extensions
+    // and the project find its components registered, and the C# bridge binds
+    // them natively, whether or not this host ever attaches a renderer.
+    let renderer_component_names = crate::renderer_data::register_renderer_data(&mut engine);
+
     // Step 4: Build, load and watch the extensions before the project.
     // Modules are infrastructure: loading them first means the project can rely
     // on whatever they register. Each gets its own owner tag and its own
@@ -591,6 +613,12 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
     let mut module_exposed_components: Vec<ModuleExposedComponent> = Vec::new();
     let mut all_mirror_methods: Vec<crate::csharp::ResolvedMirrorMethod> = Vec::new();
     if let ProjectModuleBackend::CSharp(_) = &module_config.backend {
+        // The renderer data first: it registered before every extension.
+        module_exposed_components.extend(crate::renderer_data::expose_renderer_data_to_csharp(
+            &workspace_root,
+            &engine,
+            &renderer_component_names,
+        )?);
         for slot in &extensions {
             // Regenerate the module's C# mirror from its current generation.
             // The returned change flag is ignored at startup (the mirror is
@@ -800,7 +828,27 @@ where
         assets,
         viewport: None,
         presented_scene: false,
+        #[cfg(feature = "hot_reload")]
+        shader_reloader: start_shader_reloader(),
     })
+}
+
+/// Start watching the renderer's shader sources, or log why it could not.
+///
+/// A watch that fails to start costs only the shader reload, never the host,
+/// so the failure is reported and the host runs without it.
+#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+fn start_shader_reloader() -> Option<pill_master_renderer::ShaderReloader> {
+    match pill_master_renderer::ShaderReloader::new() {
+        Ok(reloader) => Some(reloader),
+        Err(error) => {
+            warn!(
+                target: telemetry_target::HOT_RELOAD,
+                "renderer shader reload is off: the source watch failed: {error}"
+            );
+            None
+        }
+    }
 }
 
 /// Complete rendering setup from an already-built [`Host`], attaching the
@@ -850,6 +898,8 @@ where
         assets,
         viewport: None,
         presented_scene: false,
+        #[cfg(feature = "hot_reload")]
+        shader_reloader: start_shader_reloader(),
     })
 }
 
@@ -1060,31 +1110,12 @@ fn regenerate_module_csharp_mirror(
     engine: &mut Engine,
     slot: &ExtensionSlot,
 ) -> Result<RegeneratedMirror, CSharpError> {
-    // Each registered type name resolves to its native component; the
-    // C#-facing name is the Rust path with `::` replaced by `.` so a
-    // `project_cs` mirror struct reproduces the same stable identity.
-    let exposed: Vec<ModuleExposedComponent> = slot
-        .exposed_component_names()
-        .iter()
-        .filter_map(|type_name| {
-            let component_id =
-                crate::csharp::resolve_exposed_component_id(engine.world(), type_name)?;
-            let (size, align) = engine.world().component_layout(component_id)?;
-            // The derive registers the compile-time field layout with the
-            // world; components without one keep the ABI blob.
-            let fields = engine
-                .world()
-                .component_field_layout(component_id)
-                .unwrap_or(&[]);
-            Some(ModuleExposedComponent {
-                csharp_name: type_name.replace("::", "."),
-                component_id,
-                size,
-                align,
-                fields: fields.to_vec(),
-            })
-        })
-        .collect();
+    // Each registered type name resolves to its native component, under the
+    // C#-facing name a generated mirror struct is declared with.
+    let exposed = crate::csharp::exposed_components_from_names(
+        engine.world(),
+        slot.exposed_component_names(),
+    );
     let methods = slot.mirror_methods();
     let accessors = slot.field_accessors();
     let changed = crate::csharp::generate_module_components_csharp(

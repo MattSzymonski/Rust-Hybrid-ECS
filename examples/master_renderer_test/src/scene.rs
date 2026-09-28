@@ -2,7 +2,7 @@
 
 use crate::{asset_loading::SceneAssets, TagHelmet};
 use pill_engine::{Query, World};
-use pill_master_renderer::{CameraComponent, MeshRendererComponent, TransformComponent};
+use pill_renderer_api::{CameraComponent, MeshRendererComponent, TransformComponent};
 
 /// Adds the camera if the world has none, then the helmet if it has none.
 ///

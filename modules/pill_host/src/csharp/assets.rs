@@ -16,16 +16,10 @@
 //! time, before the parallel scheduler starts), so none of the
 //! access-declaration bookkeeping components and resources need applies here.
 //!
-//! Gated behind the `rendering` feature because the asset types these
-//! functions build (`Mesh`, `Texture`, `Shader`, `Material`) belong to
-//! `pill_master_renderer`, which only a windowed host links. A headless host
-//! still exposes the same four ABI slots - the managed struct layout must not
-//! depend on host build flags - they just always report "unavailable".
-
-// The shared argument structs, status codes and byte-reading helpers below
-// are only exercised by `rendering_impl`, which does not exist in a headless
-// build; the headless stubs only need the status constant they return.
-#![cfg_attr(not(feature = "rendering"), allow(dead_code))]
+//! The asset types these functions build (`Mesh`, `Texture`, `Shader`,
+//! `Material`) are `pill_renderer_api`'s plain data, which the host links in
+//! every posture, so a headless host builds them exactly as a windowed one
+//! does; only drawing them needs the renderer.
 
 // =============================================================================
 // Shared native argument shapes
@@ -92,10 +86,11 @@ const STATUS_ASSET_MANAGER_MISSING: u8 = 2;
 const STATUS_INVALID_UTF8: u8 = 3;
 const STATUS_DECODE_FAILED: u8 = 4;
 const STATUS_NULL_OUTPUT: u8 = 5;
-#[cfg_attr(feature = "rendering", allow(dead_code))]
+/// Reserved: the asset types were once windowed-only and a headless host
+/// reported this. Kept so the managed side's status table stays aligned.
+#[allow(dead_code)]
 const STATUS_RENDERER_UNAVAILABLE: u8 = 6;
 /// The name is already bound to a live asset in the active invocation.
-#[cfg_attr(not(feature = "rendering"), allow(dead_code))]
 const STATUS_NAME_IN_USE: u8 = 7;
 
 /// Reads `len` bytes at `pointer` as owned UTF-8, or an empty string for a
@@ -155,7 +150,6 @@ unsafe fn read_slice<'a, T>(pointer: *const T, len: u32) -> Result<&'a [T], u8> 
     Ok(unsafe { std::slice::from_raw_parts(pointer, len as usize) })
 }
 
-#[cfg(feature = "rendering")]
 mod rendering_impl {
     use super::{
         read_bytes, read_slice, read_str, NativeMaterialColor, NativeMaterialScalar,
@@ -165,7 +159,7 @@ mod rendering_impl {
     };
     use crate::csharp::context::with_active_world;
     use pill_engine::{AssetLoader, AssetManager, Handle};
-    use pill_master_renderer::{
+    use pill_renderer_api::{
         Material, Mesh, Shader, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot,
         Texture, TextureType,
     };
@@ -495,24 +489,9 @@ pub(super) extern "C" fn ffi_asset_load_mesh_obj(
     out_index: *mut u32,
     out_generation: *mut u32,
 ) -> u8 {
-    #[cfg(feature = "rendering")]
-    {
-        // SAFETY: forwarded from this function's own contract.
-        unsafe {
-            rendering_impl::load_mesh_obj(
-                name,
-                name_len,
-                bytes,
-                bytes_len,
-                out_index,
-                out_generation,
-            )
-        }
-    }
-    #[cfg(not(feature = "rendering"))]
-    {
-        let _ = (name, name_len, bytes, bytes_len, out_index, out_generation);
-        STATUS_RENDERER_UNAVAILABLE
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        rendering_impl::load_mesh_obj(name, name_len, bytes, bytes_len, out_index, out_generation)
     }
 }
 
@@ -530,24 +509,16 @@ pub(super) extern "C" fn ffi_asset_load_texture_png(
     out_index: *mut u32,
     out_generation: *mut u32,
 ) -> u8 {
-    #[cfg(feature = "rendering")]
-    {
-        // SAFETY: forwarded from this function's own contract.
-        unsafe {
-            rendering_impl::load_texture_png(
-                name,
-                name_len,
-                bytes,
-                bytes_len,
-                out_index,
-                out_generation,
-            )
-        }
-    }
-    #[cfg(not(feature = "rendering"))]
-    {
-        let _ = (name, name_len, bytes, bytes_len, out_index, out_generation);
-        STATUS_RENDERER_UNAVAILABLE
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        rendering_impl::load_texture_png(
+            name,
+            name_len,
+            bytes,
+            bytes_len,
+            out_index,
+            out_generation,
+        )
     }
 }
 
@@ -578,31 +549,9 @@ pub(super) extern "C" fn ffi_asset_load_shader(
     out_index: *mut u32,
     out_generation: *mut u32,
 ) -> u8 {
-    #[cfg(feature = "rendering")]
-    {
-        // SAFETY: forwarded from this function's own contract.
-        unsafe {
-            rendering_impl::load_shader(
-                name,
-                name_len,
-                vertex,
-                vertex_len,
-                fragment,
-                fragment_len,
-                parameters,
-                parameters_len,
-                textures,
-                textures_len,
-                pass_engine_parameters,
-                pass_camera_parameters,
-                out_index,
-                out_generation,
-            )
-        }
-    }
-    #[cfg(not(feature = "rendering"))]
-    {
-        let _ = (
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        rendering_impl::load_shader(
             name,
             name_len,
             vertex,
@@ -617,8 +566,7 @@ pub(super) extern "C" fn ffi_asset_load_shader(
             pass_camera_parameters,
             out_index,
             out_generation,
-        );
-        STATUS_RENDERER_UNAVAILABLE
+        )
     }
 }
 
@@ -648,30 +596,9 @@ pub(super) extern "C" fn ffi_asset_create_material(
     out_index: *mut u32,
     out_generation: *mut u32,
 ) -> u8 {
-    #[cfg(feature = "rendering")]
-    {
-        // SAFETY: forwarded from this function's own contract.
-        unsafe {
-            rendering_impl::create_material(
-                name,
-                name_len,
-                shader_index,
-                shader_generation,
-                textures,
-                textures_len,
-                scalars,
-                scalars_len,
-                colors,
-                colors_len,
-                rendering_order,
-                out_index,
-                out_generation,
-            )
-        }
-    }
-    #[cfg(not(feature = "rendering"))]
-    {
-        let _ = (
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        rendering_impl::create_material(
             name,
             name_len,
             shader_index,
@@ -685,7 +612,6 @@ pub(super) extern "C" fn ffi_asset_create_material(
             rendering_order,
             out_index,
             out_generation,
-        );
-        STATUS_RENDERER_UNAVAILABLE
+        )
     }
 }

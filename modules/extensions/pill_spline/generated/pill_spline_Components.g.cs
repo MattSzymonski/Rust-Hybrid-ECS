@@ -13,7 +13,7 @@ using System.Runtime.InteropServices;
 namespace pill_spline {
 
 [StructLayout(LayoutKind.Explicit, Size = 12)]
-public struct Vector3f
+public partial struct Vector3f
 {
     [FieldOffset(0)] public float X;
     [FieldOffset(4)] public float Y;
@@ -29,7 +29,7 @@ public struct Vector3f
 namespace pill_spline {
 
 [StructLayout(LayoutKind.Explicit, Size = 16)]
-public struct OmoMO
+public partial struct OmoMO
 {
     [FieldOffset(0)] public ulong X;
     [FieldOffset(8)] public ulong Y;
@@ -104,7 +104,7 @@ public struct OmoMO
 namespace pill_spline {
 
 [StructLayout(LayoutKind.Explicit, Size = 200)]
-public struct Spline
+public partial struct Spline
 {
     [FieldOffset(0)] public Vector3f ControlPoints0;
     [FieldOffset(12)] public Vector3f ControlPoints1;

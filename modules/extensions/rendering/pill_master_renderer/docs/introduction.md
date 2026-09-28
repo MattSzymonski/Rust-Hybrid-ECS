@@ -193,10 +193,10 @@ ECS exists.
 | `drawers/mesh_drawer.rs` | batching and draw recording                                                          | 510     |
 | `render_queue.rs`        | the packed `u64` sort key                                                            | 160     |
 | `instance.rs`            | one instance's transform, in the shader's layout                                     | 210     |
-| `config/`                | bind-group indices, batch size, and the shipped pipelines, each with its shaders (`simple_pipeline/`, `pbr_pipeline/`, `post_processing/`) | 672 |
+| `config/`                | bind-group indices, batch size, and the shipped pipelines, each with its shaders (`common_shaders/`, `simple_pipeline/`, `pbr_pipeline/`, `post_processing/`) | 672 |
 | `error.rs`               | `RendererError`, `capturing_validation`                                              | 140     |
 | `profiler.rs`            | GPU timing queries                                                                   | 670     |
-| `build.rs`               | cooks `*.hlsl` → `*.wgsl` before the crate compiles                                  | 71      |
+| `build.rs`               | cooks `*.hlsl` → `*.wgsl` before the crate compiles                                  | 94      |
 
 `managed/RendererComponents.cs` is the generated C# mirror of the components, so  
 a C# project binds the same field layouts.
@@ -439,9 +439,11 @@ Nothing here names a windowing crate: the surface is built from a
 ### `ScriptableRenderingPipeline` — the chain as GPU objects
 
 `src/pipeline.rs`. The game's chain is an *asset*: a `RenderingPipeline` holding  
-`RenderPass` handles, written through `RenderingManager` and resolved once per  
-frame into `ResolvedPass` values. This is the other side of that declaration —  
-what the chain becomes once the device has seen it.
+`RenderPass` handles — the order and nothing else, because a pass already carries  
+the shader it draws with and the values it reads. It is written through  
+`RenderingManager` and resolved once per frame into `ResolvedPass` values. This  
+is the other side of that declaration — what the chain becomes once the device  
+has seen it.
 
 | Field             | What it is                                                                  |
 | ----------------- | --------------------------------------------------------------------------- |
@@ -476,11 +478,12 @@ one as easily as a project hands the renderer one:
 | `config/post_processing/` | the four fullscreen passes that end the frame                                            |
 
 `pbr_pipeline`'s `mod.rs` is what composes the two halves into one pipeline asset,  
-and every module here keeps its shaders in a `shaders/` beside itself — the built-in  
-lit pair under `config/simple_pipeline/`, the geometry fragment stage under  
+and every module here keeps its shaders in a `shaders/` beside itself — the lit  
+fragment stage under `config/simple_pipeline/`, the geometry fragment stage under  
 `config/pbr_pipeline/`, the four fullscreen stages under `config/post_processing/`.  
 The cooker's rule matches one level and does not walk, so each of those directories  
-is a root of its own (see [The shaders](#the-shaders)).
+is a root of its own (see [The shaders](#the-shaders)). The vertex stage the lit  
+passes share is not one pipeline's, so it sits in `config/common_shaders/`.
 
 `pbr_pipeline` is the default. `register` installs it and points  
 `RenderingManager` at it, so a project that declares no frame still draws one; a  
@@ -874,22 +877,24 @@ longer be trusted.
 
 ### The shaders
 
-Each pipeline carries its own `shaders/`, so `build.rs` runs the `pill_assets`  
-pipeline over three roots. The rule matches `<root>/shaders/*.hlsl` — one level,  
-not a search — so every `shaders` directory takes a call of its own:
+Four directories hold stage sources, so `build.rs` runs the `pill_assets`  
+pipeline over four roots. The rule matches one level below the directory it is  
+given — `<root>/shaders/*.hlsl`, or `*.hlsl` where the root is itself the  
+shaders directory — never a search, so each tree takes a call of its own:
 
-| Root                              | What it holds                                                     |
-| --------------------------------- | ----------------------------------------------------------------- |
-| `src/config/simple_pipeline/`     | the built-in lit vertex/fragment pair                              |
-| `src/config/pbr_pipeline/`        | the geometry fragment stage                                        |
-| `src/config/post_processing/`     | the fullscreen vertex stage and the four fragment stages           |
+| Root                              | What it holds                                        |
+| --------------------------------- | ---------------------------------------------------- |
+| `src/config/common_shaders/`      | the vertex stage every lit pass starts from          |
+| `src/config/simple_pipeline/`     | the built-in lit fragment stage                      |
+| `src/config/pbr_pipeline/`        | the geometry fragment stage                          |
+| `src/config/post_processing/`     | the fullscreen vertex stage and the four fragment stages |
 
 Nothing compiles a shader at runtime — wgpu parses the cooked WGSL through naga  
 like any other `ShaderSource::Wgsl`.
 
-The lit pair has three readers, which is why it is not private to the pipeline  
-that ships it: `simple_pipeline` names it, the renderer's fallback material is  
-built from the same WGSL, and the PBR geometry pass reuses its vertex stage —  
+The lit pair has three readers, which is why its vertex stage is not private to  
+the pipeline that names it: `simple_pipeline` and the renderer's fallback material  
+are built from the same pair, and the PBR geometry pass reuses the vertex stage —  
 every lit pass in the crate starts from the same instance layout.
 
 The six chain sources were adopted from the project that first defined the chain,  
@@ -898,11 +903,13 @@ cannot load its shaders from somebody else's `res/`, so they are cooked in and
 embedded instead. They split along the seam the passes already have — one  
 fragment stage for the lit pass, five stages for the four fullscreen ones.
 
-Three of the eight sources `#include` `config/common_shaders/common.hlsl`, which  
-is not in a `shaders/` tree at all — the rule is handed that directory as an  
-include path, and `slangc -I` resolves it. One copy, however many trees read it.  
-The name matters: `common_shaders` is not `shaders`, so no rule's glob reaches a  
-`.hlsl` there, and `build.rs` reports the directory's files to cargo itself.
+`config/common_shaders/` is the one flat tree: it is not any pipeline's, and a  
+shared directory holding a couple of stages does not need a `shaders/` level to  
+keep them apart. Its header is not beside them for the same reason a header never  
+sits in a matched directory — the rule refuses a name that declares no stage  
+rather than skipping it. So `common.hlsl` is in `common_shaders/include/`, the one  
+directory beside the sources no glob reaches, and `slangc -I` is handed it so  
+`#include "common.hlsl"` resolves from every tree.
 
 The built-in pair is a working example of the conventions:
 

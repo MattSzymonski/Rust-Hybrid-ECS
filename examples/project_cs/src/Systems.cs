@@ -28,7 +28,12 @@
 //    itself.
 
 using System.Diagnostics;
+using System.Numerics;
 using System.Runtime.InteropServices;
+
+// The renderer's components, generated from their Rust registration.
+using pill_engine.common_components;
+using pill_master_renderer.component;
 
 using static TracyLive.ProjectConstants;
 using Spline = pill_spline.Spline;
@@ -448,7 +453,7 @@ public static class CameraSpawnSystem
     public static void Run(Query<Read<CameraComponent>> cameras, Commands commands)
     {
         foreach (var row in cameras.Rows()) { return; }
-        commands.CreateEntity().With(new DirectionalLightComponent { R = 1, G = 1, B = 1, Intensity = 3 }).With(TransformComponent.At(0, 0, 0, 1)).Build();
-        commands.CreateEntity().With(new CameraComponent { Enabled = 1, VerticalFov = 60, Near = 0.1f, Far = 1000 }).With(TransformComponent.At(0, 0, 9, 1)).Build();
+        commands.CreateEntity().With(DirectionalLightComponent.From(Vector3.One, 3)).With(TransformComponent.At(0, 0, 0, 1)).Build();
+        commands.CreateEntity().With(CameraComponent.Perspective(60, 0.1f, 1000)).With(TransformComponent.At(0, 0, 9, 1)).Build();
     }
 }

@@ -42,6 +42,8 @@ mod managed_buffer;
 mod manifest;
 /// The one apply pipeline every manifest kind runs through.
 mod manifest_apply;
+/// The rules that name a generated mirror's fields, for generation and binding checks.
+mod mirror_naming;
 /// Native callbacks used by C# query enumerators.
 mod queries;
 /// Managed resource registration and the callback that serves resource bytes.
@@ -62,8 +64,12 @@ pub(crate) use backend::POLL_RELOADED;
 #[cfg(feature = "hot_reload")]
 pub(crate) use fast_compile::FastCompileOutcome;
 
-/// Aggregate of the native components extensions exposed to managed code.
-pub(crate) use components::{resolve_exposed_component_id, ModuleExposedComponent};
+/// Resolve registered component names into the layouts managed code binds.
+pub(crate) use components::exposed_components_from_names;
+/// Aggregate of the native components exposed to managed code; named only by
+/// the reloading path, which collects them per extension.
+#[cfg(feature = "hot_reload")]
+pub(crate) use components::ModuleExposedComponent;
 
 /// One mirrored Rust method resolved to a callable address, shared by the
 /// host's module loader and the C# backend. Defined here (not in the
@@ -161,7 +167,7 @@ pub(crate) fn accessor_rows(accessors: &[ResolvedFieldAccessor]) -> Vec<Resolved
 
 #[cfg(feature = "hot_reload")]
 /// Generate the C# mirror file for extension components.
-pub(crate) use codegen::generate_module_components_csharp;
+pub(crate) use codegen::{generate_components_csharp, generate_module_components_csharp};
 
 /// Rebuild the mirror-method table the managed runtime reads, after an
 /// extension reload changes its trampoline addresses or method set.
@@ -174,10 +180,9 @@ pub(crate) use abi::publish_mirror_methods;
 
 /// Integration-style unit tests for the native/C# ECS boundary.
 ///
-/// Gated on `rendering` because the fixtures are the renderer's own components
-/// (`Position`, `MeshRendererComponent`, `Color`): they are the shared-ABI types the managed
-/// side mirrors, so they are what these tests must exercise, and they live in
-/// `pill_master_renderer`, which only a windowed host links. `cargo test` on the
-/// editor or any windowed frontend runs them; `--no-default-features` does not.
-#[cfg(all(test, feature = "rendering"))]
+/// The fixtures are the shared-ABI components the managed side mirrors
+/// (`Position`, `MeshRendererComponent`, `Color`). They come from `pill_engine`
+/// and `pill_renderer_api`, which the host links in every posture, so these run
+/// in every build, headless included.
+#[cfg(test)]
 mod tests;

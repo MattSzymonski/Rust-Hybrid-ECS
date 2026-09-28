@@ -48,7 +48,7 @@ use pill_core::info;
 use pill_engine::{Engine, SystemOwner};
 
 // Current crate
-use crate::csharp::{CSharpRuntime, ModuleExposedComponent};
+use crate::csharp::CSharpRuntime;
 use crate::CSharpModuleConfig;
 
 /// One extension compiled into the host binary.
@@ -183,8 +183,16 @@ impl StaticProject {
         // A managed project is handed byte-level bindings for every native
         // component the modules registered, so the names have to be collected
         // as each module initializes rather than reconstructed afterwards.
-        let mut exposed_names: Vec<String> = Vec::new();
         let wants_bindings = self.backend.loads_managed_code();
+        // The renderer's plain data first, exactly as the reloading path does:
+        // modules and the project find it registered in both postures, and a
+        // managed project binds its components like any module's.
+        let renderer_component_names = crate::renderer_data::register_renderer_data(engine);
+        let mut exposed_names: Vec<String> = if wants_bindings {
+            renderer_component_names
+        } else {
+            Vec::new()
+        };
 
         for (index, module) in self.modules.iter().enumerate() {
             // The same helper `runtime::setup` uses, so a module gets the
@@ -228,7 +236,8 @@ impl StaticProject {
             // which nothing per-frame is needed - managed gameplay is entirely
             // scheduler systems.
             StaticProjectBackend::CSharp { config, root } => {
-                let exposed = exposed_components(engine, &exposed_names);
+                let exposed =
+                    crate::csharp::exposed_components_from_names(engine.world(), &exposed_names);
                 // Mirrored methods are resolved from a dynamically loaded
                 // module's exports; the static path has no module handle, so
                 // the C# method table stays empty (calling one throws at
@@ -241,7 +250,8 @@ impl StaticProject {
             // and register the generated systems exactly as the hostfxr path
             // does. The runtime is embedded and trimmed, so nothing else ships.
             StaticProjectBackend::CSharpAot { config, root } => {
-                let exposed = exposed_components(engine, &exposed_names);
+                let exposed =
+                    crate::csharp::exposed_components_from_names(engine.world(), &exposed_names);
                 Some(CSharpRuntime::start_aot(
                     engine,
                     root,
@@ -261,38 +271,6 @@ impl StaticProject {
         );
         Ok(runtime)
     }
-}
-
-/// Resolve registered component names into the layout bindings C# needs.
-///
-/// A name that no longer resolves is skipped rather than reported: the managed
-/// side binds by name, so an unresolvable one simply has no binding, exactly as
-/// the reloading path treats it.
-fn exposed_components(engine: &Engine, names: &[String]) -> Vec<ModuleExposedComponent> {
-    names
-        .iter()
-        .filter_map(|type_name| {
-            let component_id =
-                crate::csharp::resolve_exposed_component_id(engine.world(), type_name)?;
-            let (size, align) = engine.world().component_layout(component_id)?;
-            // Field layouts only drive the dev codegen; shipping mirrors are
-            // committed, so this stays informational here.
-            let fields = engine
-                .world()
-                .component_field_layout(component_id)
-                .unwrap_or(&[]);
-            Some(ModuleExposedComponent {
-                // The C#-facing name is the Rust path with `::` replaced by
-                // `.`, so a `project_cs` mirror struct reproduces the same
-                // stable identity. Must match `runtime::setup` exactly.
-                csharp_name: type_name.replace("::", "."),
-                component_id,
-                size,
-                align,
-                fields: fields.to_vec(),
-            })
-        })
-        .collect()
 }
 
 /// Run one entry point the way its generated ABI wrapper would.
@@ -475,7 +453,10 @@ mod tests {
         let mut engine = Engine::new();
         // An unregistered name resolves to nothing and is skipped rather than
         // reported, so this also pins the filtering behaviour.
-        let bindings = exposed_components(&engine, &["pill_spline::Spline".to_string()]);
+        let bindings = crate::csharp::exposed_components_from_names(
+            engine.world(),
+            &["pill_spline::Spline".to_string()],
+        );
         assert!(
             bindings.is_empty(),
             "a name the world does not know must be skipped, not guessed at"

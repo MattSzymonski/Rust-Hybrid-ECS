@@ -48,7 +48,8 @@ pub(super) const MAX_COMPONENTS_PER_CREATE: u32 = 1024;
 /// binding's decode function; the descriptor variant carries a stable component
 /// identity plus raw bytes for late binding by the queue.
 enum DecodedCommandComponent {
-    /// A concrete Rust component decoded through its native binding.
+    /// A native Rust component, added through the type-erased byte adder its
+    /// column accepts.
     Native(Box<dyn ComponentAdder>),
     /// A type-erased byte payload for a descriptor-registered component.
     Descriptor(ComponentId, Vec<u8>),
@@ -123,16 +124,6 @@ fn decode_command_component(
         return Err("component data pointer is null".into());
     }
     match binding {
-        ComponentBinding::Native {
-            size: expected,
-            decode,
-            ..
-        } => {
-            if size != expected {
-                return Err("native component blob has the wrong size".into());
-            }
-            decode(data, size).map(DecodedCommandComponent::Native)
-        }
         ComponentBinding::Managed {
             component_id,
             size: expected,

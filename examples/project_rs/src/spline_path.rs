@@ -5,7 +5,7 @@ use crate::{PhysicsState, SplineSample};
 use pill_core::math::Vector3f;
 use pill_engine::common_components::Position;
 use pill_engine::*;
-use pill_master_renderer::TransformComponent;
+use pill_renderer_api::TransformComponent;
 use pill_spline::Spline;
 
 /// Rebuilds the spline from the ball centres and walks the sample dots along
