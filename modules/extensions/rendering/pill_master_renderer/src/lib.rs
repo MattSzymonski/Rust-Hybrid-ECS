@@ -62,9 +62,6 @@ pub mod render_queue;
 /// The wgpu renderer: device and surface lifecycle, pipelines and submission.
 pub mod renderer;
 
-/// The GPU resource handles the renderer's slot maps are keyed by.
-mod resource_handles;
-
 /// One module per cached GPU resource, re-exported flat for the renderer.
 pub mod resources;
 

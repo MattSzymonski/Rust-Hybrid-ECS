@@ -45,8 +45,7 @@ use crate::{
     frame::ResolvedPass,
     render_queue::{decompose_render_queue_key, RenderQueueItem},
     renderer::{State, OFFSCREEN_FORMAT},
-    resource_handles::{RendererShaderHandle, RendererTextureHandle},
-    resources::RendererPass,
+    resources::{RendererPass, RendererShaderHandle, RendererTextureHandle},
 };
 
 /// Where a pass writes.

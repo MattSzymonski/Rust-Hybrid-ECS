@@ -33,6 +33,10 @@ use crate::{
     error::{RendererError, Result},
 };
 
+// --- Handle ---
+
+pill_core::define_slot_key!(RendererShaderHandle);
+
 /// One shader's GPU pipeline and the layout of the groups its draws bind.
 ///
 /// Built during asset sync from the shader asset, beside every other GPU

@@ -24,10 +24,9 @@ use crate::{
     assets::{CullMode, PassKind, Shader},
     error::{capturing_validation, ErrorContext, RendererError, Result},
     frame::ResolvedPass,
-    resource_handles::RendererTextureHandle,
     resources::{
         RendererMaterial, RendererMesh, RendererResourceStorage, RendererShader, RendererTexture,
-        Vertex,
+        RendererTextureHandle, Vertex,
     },
     Instance,
 };

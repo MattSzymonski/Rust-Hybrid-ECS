@@ -37,10 +37,12 @@ use crate::{
         MaterialParameter, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot, TextureType,
     },
     error::{capturing_validation, RendererError, Result},
-    resource_handles::{RendererShaderHandle, RendererTextureHandle},
+    resources::{RendererResourceStorage, RendererShaderHandle, RendererTextureHandle},
 };
 
-use crate::resources::RendererResourceStorage;
+// --- Handle ---
+
+pill_core::define_slot_key!(RendererMaterialHandle);
 
 // --- Material ---
 

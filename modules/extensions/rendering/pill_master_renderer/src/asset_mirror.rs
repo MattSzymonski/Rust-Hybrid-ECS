@@ -43,12 +43,12 @@ use crate::{
     frame::RenderFrame,
     pipeline::ChainContext,
     render_queue::{compose_render_queue_key, RenderQueueItem},
-    renderer::State,
     error::Result,
-    resource_handles::{
-        RendererMaterialHandle, RendererMeshHandle, RendererShaderHandle, RendererTextureHandle,
+    renderer::State,
+    resources::{
+        RendererMaterial, RendererMaterialHandle, RendererMesh, RendererMeshHandle, RendererShader,
+        RendererShaderHandle, RendererTexture, RendererTextureHandle, Vertex,
     },
-    resources::{RendererMaterial, RendererMesh, RendererShader, RendererTexture, Vertex},
     Instance,
 };
 

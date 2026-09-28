@@ -29,6 +29,10 @@ use crate::{
     error::{RendererError, Result},
 };
 
+// --- Handle ---
+
+pill_core::define_slot_key!(RendererMeshHandle);
+
 // --- Vertex ---
 
 /// A type whose values can sit in one vertex buffer: its memory layout, as
