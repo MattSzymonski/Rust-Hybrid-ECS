@@ -7,12 +7,18 @@
 //
 // Edit here - `pill_assets` regenerates the .wgsl.
 
-struct VOut {
+// No input struct: the only stage input is SV_VertexID, and wrapping a system
+// value in a struct would invent an interface that does not exist.
+struct VertexOutput
+{
     float4 position : SV_Position;
-    float2 uv       : TEXCOORD0;
+
+    [[vk::location(0)]] float2 texture_coords : TEXCOORD0;
 };
 
-VOut vs_main(uint vertex_index : SV_VertexID) {
+[shader("vertex")]
+VertexOutput vs_main(uint vertex_index : SV_VertexID)
+{
     // Oversized on purpose: the triangle covers the target without touching its
     // edges, so no interpolation runs off the end of the visible area.
     float2 corner[3] = {
@@ -23,9 +29,13 @@ VOut vs_main(uint vertex_index : SV_VertexID) {
 
     float2 position = corner[vertex_index];
 
-    VOut output;
+    VertexOutput output;
     output.position = float4(position, 0.0, 1.0);
     // v flips because clip space counts up and a texture counts down.
-    output.uv = float2(position.x * 0.5 + 0.5, -position.y * 0.5 + 0.5);
+    output.texture_coords = float2(
+        position.x * 0.5 + 0.5,
+        -position.y * 0.5 + 0.5
+    );
+
     return output;
 }

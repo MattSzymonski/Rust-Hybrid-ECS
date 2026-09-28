@@ -1,4 +1,5 @@
-//! Layout facts every pipeline the renderer builds shares.
+//! Layout facts every pipeline the renderer builds shares, and the two frames
+//! the renderer ships with.
 //!
 //! # Responsibilities
 //!
@@ -6,6 +7,27 @@
 //!   engine's shaders declare and the drawers bind against.
 //! - Size the instance batch the mesh drawer accumulates and uploads in one
 //!   command.
+//! - Hold the pipelines the renderer defines itself - [`simple_pipeline`], and
+//!   [`pbr_pipeline`] with its [`post_processing`] half - so a project can run a
+//!   frame without declaring one, each with its shaders in a `shaders/` folder
+//!   beside it.
+//!
+//! # Design
+//!
+//! Every pipeline here is an ordinary `RenderingPipeline` asset. Nothing about
+//! them is special to the renderer beyond the fact that it installs one, and
+//! each `install` is idempotent - it returns what the store already holds rather
+//! than adding a second copy - which is what lets the renderer's own
+//! registration call one of them on every generation.
+//!
+//! [`pbr_pipeline`] is the default: [`register`](crate::register) installs it and
+//! points [`RenderingManager`](crate::RenderingManager) at it. A project that
+//! wants a different frame calls `set_pipeline` after registering, and one that
+//! wants the renderer's own fallback chain clears the manager instead.
+
+pub mod pbr_pipeline;
+pub mod post_processing;
+pub mod simple_pipeline;
 
 /// Instances one draw command covers.
 ///

@@ -203,6 +203,17 @@ impl Pipeline {
         }
     }
 
+    /// A pipeline over `root` holding `rules` instead of [`default_rules`].
+    ///
+    /// For a caller that has to configure a rule - the shader rule's include
+    /// path, say - rather than take the always-on set as it comes.
+    pub fn with_rules(root: impl Into<PathBuf>, rules: Vec<Box<dyn Rule>>) -> Self {
+        Self {
+            root: root.into(),
+            rules,
+        }
+    }
+
     /// Add the optional rules `manifest` names, resolved through `resolve`.
     ///
     /// The manifest is plain text: one rule name per line, with `#` comments and

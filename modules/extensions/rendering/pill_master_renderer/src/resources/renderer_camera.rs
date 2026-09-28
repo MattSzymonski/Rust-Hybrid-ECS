@@ -43,8 +43,8 @@ pill_core::define_slot_key!(RendererCameraHandle);
 /// `CameraParams` constant buffer.
 ///
 /// The two sides are one layout written twice: a field changed here has to be
-/// changed in `shaders/include/common.hlsl` as well, or the shader reads the
-/// next value from wherever the padding lands.
+/// changed in `config/common_shaders/common.hlsl` as well, or the shader reads
+/// the next value from wherever the padding lands.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct CameraParametersData {

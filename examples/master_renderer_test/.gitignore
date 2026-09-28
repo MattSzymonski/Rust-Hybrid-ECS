@@ -7,3 +7,7 @@ build/
 # whenever a source or the shared header changes, so they are generated rather
 # than tracked. Scoped to this project, so no other example's shaders are touched.
 res/shaders/*.wgsl
+
+# ...except `unlit_fragment.wgsl`, which is hand-written: there is no
+# `unlit_fragment.hlsl` beside it, so nothing would regenerate it.
+!res/shaders/unlit_fragment.wgsl

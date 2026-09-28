@@ -133,9 +133,10 @@ impl RendererShader {
         }
 
         // Create shader modules from the cooked WGSL. Nothing compiles a shader
-        // at runtime: the authored sources are HLSL in `src/shaders`, the build
-        // script's `slangc` rule produces the WGSL these strings carry, and wgpu
-        // parses that WGSL through naga like any other `ShaderSource::Wgsl`.
+        // at runtime: the authored sources are HLSL next to the pipeline that
+        // draws through them, the build script's `slangc` rule produces the WGSL
+        // these strings carry, and wgpu parses that WGSL through naga like any
+        // other `ShaderSource::Wgsl`.
         let vertex_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("master_vertex_shader"),
             source: wgpu::ShaderSource::Wgsl(vertex_wgsl.into()),

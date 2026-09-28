@@ -4,6 +4,31 @@
 /modules/target
 /examples/**/target/**
 
+# Cooked shader output.
+#
+# Where a `build.rs` runs the `pill_assets` pipeline over a `shaders/` directory,
+# the `*.wgsl` beside each `*.hlsl` are build products: a tracked copy is stale
+# the moment its source is edited, and the diff it leaves is noise on every
+# shader change.
+#
+# The rule is blanket because the cooked output is read two different ways - the
+# renderer embeds its WGSL through `include_str!`, while a project example loads
+# it from `res/` by path - so the directories holding it are not in one place.
+#
+# The exceptions are files nothing generates. `italian_brainrot` and
+# `italian_brainrot_cs` have no build script and no cooker: their `.wgsl` are
+# committed, loaded from `res/` as they are, and copied out of whichever project
+# cooks them last. Ignoring them would let a shader edit fall out of the
+# repository with nothing to regenerate it.
+*.wgsl
+!examples/italian_brainrot/res/shaders/*.wgsl
+!examples/italian_brainrot_cs/res/shaders/*.wgsl
+
+# Hand-written WGSL, with no `.hlsl` beside it to cook. `master_renderer_test`
+# carries its own rule for its cooked output, and the matching exception for
+# this file lives there - a negation here cannot reach past a deeper one.
+!examples/master_renderer_test/res/shaders/unlit_fragment.wgsl
+
 # Hot-reload runtime temp copies
 modules/pill_standalone_temp/
 

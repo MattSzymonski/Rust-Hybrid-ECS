@@ -5,14 +5,20 @@
 // mirrored on both sides.
 
 // `EngineParametersData` carries the fog pair and nothing else, in that order.
-struct EngineParams {
+struct EngineParams
+{
     float3 fog_color;
     float  fog_density;
 };
-[[vk::binding(0, 0)]] ConstantBuffer<EngineParams> engine;
 
-struct CameraParams {
+[[vk::binding(0, 0)]]
+ConstantBuffer<EngineParams> engine;
+
+struct CameraParams
+{
     float3                camera_position;
     column_major float4x4 camera_view_projection;
 };
-[[vk::binding(0, 1)]] ConstantBuffer<CameraParams> camera;
+
+[[vk::binding(0, 1)]]
+ConstantBuffer<CameraParams> camera;

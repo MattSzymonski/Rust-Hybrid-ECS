@@ -509,6 +509,11 @@ impl RenderingResourcesManager {
 /// The material is what a mesh whose material never built draws with, and the
 /// shader is what a material that names none draws with, so the two are built
 /// together and kept as one pair.
+///
+/// The lit WGSL is the simple pipeline's (`config/simple_pipeline/shaders`),
+/// not a copy of it: the shipped pipeline names the same shader with the same
+/// declared slots, so a material written for this fallback draws there without
+/// being rebuilt.
 fn install_default_material(
     state: &mut State,
 ) -> Result<(RendererShaderHandle, RendererMaterialHandle)> {
@@ -535,8 +540,8 @@ fn install_default_material(
             RendererMesh::data_layout_descriptor(),
             Instance::data_layout_descriptor(),
         ],
-        include_str!("shaders/default_vertex.wgsl"),
-        include_str!("shaders/default_lit_fragment.wgsl"),
+        include_str!("config/simple_pipeline/shaders/default_vertex.wgsl"),
+        include_str!("config/simple_pipeline/shaders/default_lit_fragment.wgsl"),
         &parameter_slots,
         &texture_slots,
         &state
