@@ -128,9 +128,10 @@ pub trait Rule {
 
     /// Glob, relative to the pipeline root, selecting this rule's inputs.
     ///
-    /// Only the `directory/*.extension` shape is supported; that is all the
-    /// rules use, and a general glob engine would be a dependency every build
-    /// script pays for.
+    /// The shape is `directory/*.extension`, or `*.extension` alone for a root
+    /// whose inputs sit directly under it. Nothing more general is supported:
+    /// that is all the rules use, and a real glob engine would be a dependency
+    /// every build script pays for.
     fn input_glob(&self) -> &'static str;
 
     /// The output `input` produces. Its timestamp decides staleness.
@@ -361,9 +362,13 @@ fn expand(root: &Path, pattern: &str) -> Result<Vec<PathBuf>, CookError> {
     let unsupported = || CookError::BadGlob {
         pattern: pattern.to_owned(),
     };
-    let (directory, file_pattern) = pattern.rsplit_once('/').ok_or_else(unsupported)?;
+    let (directory, file_pattern) = match pattern.rsplit_once('/') {
+        Some((directory, file_pattern)) => (root.join(directory), file_pattern),
+        // No directory part: the inputs sit directly under the root, which is
+        // how a tree that is itself the shaders directory is cooked.
+        None => (root.to_owned(), pattern),
+    };
     let (prefix, suffix) = file_pattern.split_once('*').ok_or_else(unsupported)?;
-    let directory = root.join(directory);
 
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
@@ -470,6 +475,24 @@ mod tests {
             .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, ["a.hlsl", "b.hlsl"]);
+    }
+
+    #[test]
+    fn a_pattern_without_a_directory_matches_the_root_itself() {
+        let root = scratch("flat");
+        fs::create_dir_all(root.join("include")).expect("include");
+        fs::write(root.join("a.hlsl"), b"").expect("a");
+        fs::write(root.join("include/header.hlsl"), b"").expect("header");
+
+        let matched = expand(&root, "*.hlsl").expect("expansion");
+
+        let names: Vec<_> = matched
+            .iter()
+            .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        // The nested header is not a match: the pattern is one level deep even
+        // when that level is the root.
+        assert_eq!(names, ["a.hlsl"]);
     }
 
     #[test]

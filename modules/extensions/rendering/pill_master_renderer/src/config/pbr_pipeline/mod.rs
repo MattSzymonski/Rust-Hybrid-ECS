@@ -28,9 +28,8 @@
 //! so installing the chain reads no files: the fragment stage from `shaders/`
 //! beside this file, which `#include`s the crate's shared header, and the
 //! post-processing stages from `../post_processing/shaders/`. The vertex stage is
-//! the one the simple pipeline ships -
-//! `../simple_pipeline/shaders/default_vertex.wgsl` - because every lit pass in
-//! the crate starts from the same instance layout.
+//! the shared one - `../common_shaders/default_vertex.wgsl` - because every lit
+//! pass in the crate starts from the same instance layout.
 
 // External crates
 use pill_engine::{AssetBindingResult, AssetManager, Handle};
@@ -112,7 +111,7 @@ pub fn install(assets: &mut AssetManager) -> AssetBindingResult<PbrPipeline> {
     // every shader in the engine may bind.
     let pbr = Shader::from_wgsl(
         "pill_pbr",
-        include_str!("../simple_pipeline/shaders/default_vertex.wgsl"),
+        include_str!("../common_shaders/default_vertex.wgsl"),
         include_str!("shaders/pbr_fragment.wgsl"),
         [
             ShaderParameterSlot::new("pbr_base", ShaderParameterType::Color),

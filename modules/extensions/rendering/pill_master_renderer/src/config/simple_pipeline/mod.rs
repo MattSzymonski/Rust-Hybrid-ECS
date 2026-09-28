@@ -19,17 +19,17 @@
 //!
 //! # Where the shaders are
 //!
-//! In `shaders/` beside this file: the lit vertex/fragment pair. That directory
-//! is a shader cooker root of its own, because the rule matches
-//! `<root>/shaders/*.hlsl` one level down and does not walk to a nested one.
-//! Both sources `#include` `config/common_shaders/common.hlsl`, the one header
-//! three of the crate's stages share.
+//! In `shaders/` beside this file, the lit fragment stage. The vertex stage it
+//! pairs with lives in `config/common_shaders/`, because it is not this
+//! pipeline's alone: the renderer's fallback material is built from the same
+//! pair - a material written for the fallback draws here without being rebuilt -
+//! and the PBR geometry pass reuses the vertex stage, since every lit pass in
+//! the crate starts from the same instance layout. Three readers, one copy of
+//! the vertex stage.
 //!
-//! The pair is not this pipeline's alone. The renderer's fallback material is
-//! built from the same WGSL - a material written for the fallback draws here
-//! without being rebuilt - and the PBR geometry pass reuses the vertex stage,
-//! since every lit pass in the crate starts from the same instance layout. One
-//! copy, three readers.
+//! Each of those directories is a shader cooker root of its own: the rule
+//! matches `<root>/shaders/*.hlsl` one level down and does not walk to a nested
+//! one.
 //!
 //! Nothing here reads a file at runtime: the WGSL is cooked into the crate at
 //! build time and embedded, so the pipeline installs for a project whose assets
@@ -71,7 +71,7 @@ pub fn install(assets: &mut AssetManager) -> AssetBindingResult<Handle<Rendering
 
     let shader = Shader::from_wgsl(
         "pill_simple",
-        include_str!("shaders/default_vertex.wgsl"),
+        include_str!("../common_shaders/default_vertex.wgsl"),
         include_str!("shaders/default_lit_fragment.wgsl"),
         [
             ShaderParameterSlot::new("tint", ShaderParameterType::Color),
