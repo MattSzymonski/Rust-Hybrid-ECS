@@ -26,9 +26,6 @@
 /// The renderer contract a frontend drives, plus a headless stub.
 pub mod api;
 
-/// The GPU objects behind the asset store, kept level with it one type at a time.
-mod asset_mirror;
-
 /// The drawable assets - meshes, textures, shaders, materials, passes - and their builders.
 pub mod assets;
 
@@ -61,6 +58,9 @@ pub mod render_queue;
 
 /// The wgpu renderer: device and surface lifecycle, pipelines and submission.
 pub mod renderer;
+
+/// The GPU objects behind the asset store, kept level with it one type at a time.
+mod rendering_resources_manager;
 
 /// One module per cached GPU resource, re-exported flat for the renderer.
 pub mod resources;
