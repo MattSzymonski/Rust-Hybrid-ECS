@@ -11,6 +11,9 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using TracyLive;
 using TracyLive.Loader;
+// The renderer's components, generated from their Rust registration.
+using pill_engine.common_components;
+using pill_master_renderer.component;
 
 namespace TracyLive.Tests;
 
@@ -560,21 +563,27 @@ internal static class Program
                     ProjectManifestBuilder.Build(systems, typeof(BallPhysicsSystem).Assembly));
                 var components = json.RootElement.EnumerateArray().ToArray();
                 // Position, MeshRendererComponent, PhysicsState, SplineSample + the module Spline mirror.
-                Equal(components.Length, 12, "unexpected manifest component count");
+                // 13 rather than 12 since the renderer's mirrors are generated: the
+                // generated `Handle` value type is a blittable project struct too,
+                // described like the value types a module's generated mirror carries.
+                Equal(components.Length, 13, "unexpected manifest component count");
                 var position = components.Single(component =>
-                    component.GetProperty("full_name").GetString() == "TracyLive.Position");
+                    component.GetProperty("full_name").GetString() == "pill_engine.common_components.Position");
                 var renderable = components.Single(component =>
-                    component.GetProperty("full_name").GetString() == "TracyLive.MeshRendererComponent");
+                    component.GetProperty("full_name").GetString() == "pill_master_renderer.component.MeshRendererComponent");
                 var physics = components.Single(component =>
                     component.GetProperty("full_name").GetString() == "TracyLive.PhysicsState");
                 var sample = components.Single(component =>
                     component.GetProperty("full_name").GetString() == "TracyLive.SplineSample");
                 var spline = components.Single(component =>
                     component.GetProperty("full_name").GetString() == "pill_spline.Spline");
-                Assert(position.GetProperty("shared").GetBoolean(),
-                    "runtime Position mirror must be shared");
-                Assert(renderable.GetProperty("shared").GetBoolean(),
-                    "runtime MeshRendererComponent mirror must be shared");
+                // Generated mirrors bind by their generated identity, exactly as
+                // an extension's do; the shared-schema path is for hand-written
+                // `[EcsSharedComponent]` mirrors, which the renderer no longer has.
+                Assert(!position.GetProperty("shared").GetBoolean(),
+                    "generated Position mirror must bind by identity, not as a shared schema");
+                Assert(!renderable.GetProperty("shared").GetBoolean(),
+                    "generated MeshRendererComponent mirror must bind by identity, not as a shared schema");
                 Assert(!physics.GetProperty("shared").GetBoolean(),
                     "project-owned PhysicsState must be descriptor-registered");
                 Assert(!sample.GetProperty("shared").GetBoolean(),
@@ -737,8 +746,8 @@ internal static class Program
                 Equal(Marshal.SizeOf<Position>(), 8, "Position size mismatch");
                 Equal(Marshal.SizeOf<Color>(), 16, "Color size mismatch");
                 Equal(Marshal.SizeOf<MeshRendererComponent>(), 16, "MeshRendererComponent size mismatch");
-                Equal(Marshal.OffsetOf<MeshRendererComponent>(nameof(MeshRendererComponent.MaterialIndex)).ToInt32(), 8,
-                    "MeshRendererComponent.MaterialIndex offset mismatch");
+                Equal(Marshal.OffsetOf<MeshRendererComponent>(nameof(MeshRendererComponent.Material)).ToInt32(), 8,
+                    "MeshRendererComponent.Material offset mismatch");
             });
 
             Test("padded sequential layouts agree with Marshal", () =>

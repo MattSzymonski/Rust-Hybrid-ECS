@@ -2,7 +2,7 @@
 
 use crate::TagHelmet;
 use pill_engine::{pill_hot, Query, Res, SystemError, Time};
-use pill_master_renderer::TransformComponent;
+use pill_renderer_api::TransformComponent;
 
 /// One full turn every eight seconds, applied per frame so the speed does not
 /// depend on the frame rate.

@@ -3,7 +3,9 @@
 //! # Responsibilities
 //!
 //! - Discover each rule's inputs by glob, relative to a pipeline root.
-//! - Rebuild an output only when it is missing or older than its input.
+//! - Rebuild an output only when it is missing or older than its input, and
+//!   stamp an output the rule left untouched with its newest input's time, so
+//!   an unchanged rewrite still counts as fresh.
 //! - Report what was discovered, rebuilt and skipped, and how long each rebuilt
 //!   output took.
 //!
@@ -299,9 +301,10 @@ impl Pipeline {
                 if !execute {
                     continue;
                 }
+                let extra_inputs = rule.extra_inputs(&input)?;
                 let mut stale = is_stale(&input, &output)?;
-                for extra_input in rule.extra_inputs(&input)? {
-                    if is_stale(&extra_input, &output)? {
+                for extra_input in &extra_inputs {
+                    if is_stale(extra_input, &output)? {
                         stale = true;
                         break;
                     }
@@ -312,6 +315,7 @@ impl Pipeline {
                 }
                 let started = Instant::now();
                 rule.build(&input, &output)?;
+                stamp_output(&output, std::iter::once(&input).chain(&extra_inputs))?;
                 stats.cook_times.push((output.clone(), started.elapsed()));
                 stats.rebuilt.push(output);
             }
@@ -397,6 +401,62 @@ fn expand(root: &Path, pattern: &str) -> Result<Vec<PathBuf>, CookError> {
     }
     matched.sort();
     Ok(matched)
+}
+
+/// Mark `output` as cooked against `inputs`, whether or not the rule rewrote it.
+///
+/// A tool may leave an output untouched when what it would write is identical;
+/// `slangc` does exactly that. After an edit that changes nothing in the
+/// output, such as a comment in a shared header, the output would then stay
+/// older than the header forever and be re-cooked on every run.
+///
+/// The stamp is the newest input's own timestamp, and only ever moves the
+/// output forward to it - the rule `make` uses. Stamping with the clock instead
+/// would be wrong: file times are coarser than `SystemTime::now()`, so an input
+/// saved a moment after the cook can carry an *earlier* time than a clock
+/// stamp, and that edit would never be cooked.
+///
+/// An output the rule did not produce at all is left for the next run to find
+/// missing, rather than reported here: the rule already said it succeeded.
+fn stamp_output<'a>(
+    output: &Path,
+    inputs: impl IntoIterator<Item = &'a PathBuf>,
+) -> Result<(), CookError> {
+    let modified = |path: &Path| {
+        fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .map_err(|source| CookError::Io {
+                path: path.to_owned(),
+                source,
+            })
+    };
+    let output_modified = match fs::metadata(output).and_then(|meta| meta.modified()) {
+        Ok(time) => time,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(source) => {
+            return Err(CookError::Io {
+                path: output.to_owned(),
+                source,
+            })
+        }
+    };
+    let mut newest_input = None;
+    for input in inputs {
+        let time = modified(input)?;
+        newest_input =
+            Some(newest_input.map_or(time, |newest: std::time::SystemTime| newest.max(time)));
+    }
+    let Some(newest_input) = newest_input.filter(|newest| *newest > output_modified) else {
+        return Ok(());
+    };
+    fs::File::options()
+        .write(true)
+        .open(output)
+        .and_then(|file| file.set_modified(newest_input))
+        .map_err(|source| CookError::Io {
+            path: output.to_owned(),
+            source,
+        })
 }
 
 /// Whether `output` is missing or older than `input`.
@@ -526,6 +586,66 @@ mod tests {
         assert!(second.rebuilt.is_empty());
         assert_eq!(second.skipped.len(), 1);
         assert_eq!(second.discovered, first.discovered);
+    }
+
+    /// A rule whose tool leaves an identical output untouched must not leave it
+    /// stale: the next run has to skip it rather than cook it again.
+    #[test]
+    fn an_output_the_rule_left_untouched_is_fresh_afterwards() {
+        /// Cooks `shaders/*.in`, writing the output only when it is missing.
+        struct WritesOnlyWhenMissing;
+
+        impl Rule for WritesOnlyWhenMissing {
+            fn name(&self) -> &'static str {
+                "writes_only_when_missing"
+            }
+
+            fn input_glob(&self) -> &'static str {
+                "shaders/*.in"
+            }
+
+            fn output_for(&self, input: &Path) -> PathBuf {
+                input.with_extension("out")
+            }
+
+            fn build(&self, _input: &Path, output: &Path) -> Result<(), CookError> {
+                if !output.exists() {
+                    fs::write(output, b"cooked").map_err(|source| CookError::Io {
+                        path: output.to_owned(),
+                        source,
+                    })?;
+                }
+                Ok(())
+            }
+        }
+
+        let root = scratch("untouched");
+        fs::create_dir_all(root.join("shaders")).expect("shaders");
+        let input = root.join("shaders/triangle.in");
+        fs::write(&input, b"source").expect("input");
+        let pipeline = Pipeline {
+            root: root.clone(),
+            rules: vec![Box::new(WritesOnlyWhenMissing)],
+        };
+        pipeline.run().expect("first run");
+
+        // Age the output past the input, as an edit to the input would; the
+        // rule will see an existing output and not rewrite it.
+        let output = input.with_extension("out");
+        let earlier = std::time::SystemTime::now() - Duration::from_secs(60);
+        fs::File::options()
+            .write(true)
+            .open(&output)
+            .and_then(|file| file.set_modified(earlier))
+            .expect("age the output");
+        let second = pipeline.run().expect("second run");
+        assert_eq!(second.rebuilt.len(), 1);
+
+        // Without the stamp the output would still be older than the input and
+        // this run would cook it again.
+        let third = pipeline.run().expect("third run");
+        assert!(third.rebuilt.is_empty());
+        assert_eq!(third.skipped.len(), 1);
     }
 
     /// A rule can declare inputs its glob does not match - the shader rule's

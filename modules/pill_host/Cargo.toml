@@ -15,6 +15,11 @@ pill_core = { path = "../pill_core" }
 pill_core_macros = { path = "../pill_core_macros" }
 thiserror = "2"
 miette = { version = "7", features = ["derive"] }
+# The renderer's plain data - components, assets, default pipelines, the frame
+# and the backend trait - with no wgpu. Linked in every posture: a headless host
+# registers it so projects that declare cameras, meshes and lights load
+# unchanged, and the C# bridge binds those types natively in both postures.
+pill_renderer_api = { path = "../pill_renderer_api" }
 # The wgpu renderer, and the only crate in the workspace that owns wgpu. The
 # host is the only thing that links it: keeping it out of `pill_engine` keeps
 # the graphics stack out of every loaded module and every hot patch.
@@ -38,7 +43,9 @@ winit = { version = "0.30", optional = true }
 # DLL. Turning it OFF selects the shipping posture - nothing is watched, built
 # or loaded at runtime, and the project is linked into the binary instead.
 default = ["hot_reload"]
-hot_reload = []
+# Reload edited code without a restart. In a windowed build this also turns on
+# the renderer's development shader reload (weak: headless never links it).
+hot_reload = ["pill_master_renderer?/shader-hot-reload"]
 # A windowed host: the winit event loop plus the wgpu renderer. Nothing is
 # forwarded to `pill_engine` or `pill_core` any more - neither has a
 # `rendering` feature, which is what lets a module and a hot patch link the

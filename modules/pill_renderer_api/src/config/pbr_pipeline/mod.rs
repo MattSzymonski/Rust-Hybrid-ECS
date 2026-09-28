@@ -39,7 +39,20 @@ use crate::{
         ShaderParameterType, ShaderTextureSlot, TextureType,
     },
     config::post_processing::{self, HDR_TARGET},
+    config::{ShaderSourceRecord, DEFAULT_VERTEX},
 };
+
+config_shader_file!(
+    /// The geometry pass's fragment stage, cooked from `pbr_fragment.hlsl`.
+    PBR_FRAGMENT, "pbr_pipeline/shaders/pbr_fragment.wgsl"
+);
+
+/// The shader assets [`install`] creates, and the files each is built from.
+pub const SHADER_SOURCES: &[ShaderSourceRecord] = &[ShaderSourceRecord {
+    shader_asset_name: SHADER_NAME,
+    vertex: DEFAULT_VERTEX,
+    fragment: PBR_FRAGMENT,
+}];
 
 /// Asset name the installed chain is stored under.
 pub const PIPELINE_NAME: &str = "pill.pbr.pipeline";
@@ -67,7 +80,9 @@ const OPAQUE_PASS: &str = "pill.pbr.pass.opaque";
 ///
 /// Returns an error when a name this owns is already taken by an asset of a
 /// different type, or when one of the chain's shaders fails to build.
-pub fn install(assets: &mut AssetManager) -> Result<Handle<RenderingPipeline>, Box<dyn std::error::Error>> {
+pub fn install(
+    assets: &mut AssetManager,
+) -> Result<Handle<RenderingPipeline>, Box<dyn std::error::Error>> {
     if let Some(pipeline) = assets.handle_by_name::<RenderingPipeline>(PIPELINE_NAME) {
         return Ok(pipeline);
     }
@@ -76,10 +91,7 @@ pub fn install(assets: &mut AssetManager) -> Result<Handle<RenderingPipeline>, B
     // with the four maps it reads declared under their slots and the two groups
     // every shader in the engine may bind.
     let pbr = Shader::new("pill_pbr")
-        .with_wgsl(
-            include_str!("../common_shaders/default_vertex.wgsl"),
-            include_str!("shaders/pbr_fragment.wgsl"),
-        )
+        .with_wgsl(DEFAULT_VERTEX.embedded_source, PBR_FRAGMENT.embedded_source)
         .with_parameter_slots(vec![
             ShaderParameterSlot::new("pbr_base", ShaderParameterType::Color),
             ShaderParameterSlot::new("pbr_roughness", ShaderParameterType::Scalar),
@@ -150,7 +162,11 @@ mod tests {
             .expect("the lit pass");
         let pipeline = assets.get(pbr).expect("the pipeline it just added");
 
-        assert_eq!(pipeline.passes.len(), 5, "one lit pass and four post passes");
+        assert_eq!(
+            pipeline.passes.len(),
+            5,
+            "one lit pass and four post passes"
+        );
         assert_eq!(pipeline.passes[0], opaque, "the lit pass comes first");
     }
 }

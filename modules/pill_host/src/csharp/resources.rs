@@ -190,10 +190,8 @@ fn publish_resource_bindings(bindings: ResourceBindings) {
 /// not one per archetype - which is right in a host and wrong under `cargo
 /// test`, where every test shares one process and cargo runs them on parallel
 /// threads. Tests that touch it take a shared lock and start by calling this;
-/// see `RESOURCE_TABLE_LOCK` in the test module, which is gated on `rendering`
-/// for the same reason the rest of that module is - its fixtures are the
-/// renderer's components.
-#[cfg(all(test, feature = "rendering"))]
+/// see `RESOURCE_TABLE_LOCK` in the test module.
+#[cfg(test)]
 pub(super) fn reset_resource_bindings_for_test() {
     publish_resource_bindings(ResourceBindings::new());
 }

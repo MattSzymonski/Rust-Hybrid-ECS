@@ -1,14 +1,14 @@
 //! Loads the committed helmet: its mesh, its four PBR maps, and the material
 //! the renderer draws it with.
 //!
-//! The frame is not this project's to declare. `pill_master_renderer` installs
-//! its own PBR chain - a lit pass into a half-float target, bloom, tonemap, and a
+//! The frame is not this project's to declare. `pill_renderer_api` installs
+//! the PBR chain - a lit pass into a half-float target, bloom, tonemap, and a
 //! lens pass onto the surface - and points the renderer at it when the module
 //! registers. This file supplies only the geometry and the maps that feed that
 //! chain, and builds the material through the shader the chain draws with.
 
 use pill_engine::{AssetManager, Handle, World};
-use pill_master_renderer::{
+use pill_renderer_api::{
     config::pbr_pipeline, AssetLoader, Material, Mesh, Shader, Texture, TextureType,
 };
 use std::path::PathBuf;

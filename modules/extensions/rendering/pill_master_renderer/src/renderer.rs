@@ -27,10 +27,7 @@
 #![allow(clippy::too_many_arguments)]
 
 // Standard library
-use std::{
-    collections::HashMap,
-    time::Instant,
-};
+use std::{collections::HashMap, time::Instant};
 
 // External crates
 use pill_core::{info, PillStyle};
@@ -180,19 +177,27 @@ impl PillRenderer for Renderer {
         self.viewport = viewport;
     }
 
-    fn render(&mut self, frame: &RenderFrame, assets_manager: &AssetManager) -> Result<FrameOutcome> {
+    fn render(
+        &mut self,
+        frame: &RenderFrame,
+        assets_manager: &AssetManager,
+    ) -> Result<FrameOutcome> {
         if self.minimized || !frame.has_camera {
             return Ok(FrameOutcome::Skipped);
         }
         let prepare = Instant::now();
-        self.rendering_resources_manager.sync(assets_manager, &mut self.state);
+        self.rendering_resources_manager
+            .sync(assets_manager, &mut self.state);
         self.pipeline.ensure(
             &frame.passes,
             assets_manager,
             frame.chain_generation,
-            self.rendering_resources_manager.chain_context(&mut self.state),
+            self.rendering_resources_manager
+                .chain_context(&mut self.state),
         );
-        let render_queue = self.rendering_resources_manager.build_queue(frame, &self.state);
+        let render_queue = self
+            .rendering_resources_manager
+            .build_queue(frame, &self.state);
         self.metrics.prepare_micros = prepare.elapsed().as_micros() as u64;
         self.metrics.instance_bytes = (render_queue.len() * std::mem::size_of::<Instance>()) as u64;
 
@@ -202,9 +207,11 @@ impl PillRenderer for Renderer {
         // An empty chain is a game that asked for nothing, not a game that
         // asked for the built-in pass: the frame's writer puts that pass in the
         // chain itself.
-        let plan = self
-            .pipeline
-            .plan(&frame.passes, &render_queue, self.rendering_resources_manager.shader_handles());
+        let plan = self.pipeline.plan(
+            &frame.passes,
+            &render_queue,
+            self.rendering_resources_manager.shader_handles(),
+        );
         self.pipeline.log(&plan);
         self.metrics.draw_calls = plan.iter().filter(|entry| entry.draws() > 0).count() as u32;
         self.metrics.passes = plan.len() as u32;

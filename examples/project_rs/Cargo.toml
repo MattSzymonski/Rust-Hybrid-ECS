@@ -14,9 +14,9 @@ crate-type = ["cdylib", "rlib"]
 pill_audio = { path = "../../modules/extensions/pill_audio", default-features = false }
 pill_engine = { path = "../../modules/pill_engine" }
 pill_core = { path = "../../modules/pill_core" }
-# Renderer asset and component types are created by the project; the host owns
-# the renderer instance and its window surface.
-pill_master_renderer = { path = "../../modules/extensions/rendering/pill_master_renderer", default-features = false }
+# The renderer's data only - components, assets, pipelines. The GPU renderer is
+# the host's; a project that linked it would carry wgpu in its own DLL.
+pill_renderer_api = { path = "../../modules/pill_renderer_api" }
 # Linked directly so the project can name the `Spline` type. See the note in
 # `init` about why this crate must not also be loaded as a module.
 # `default-features = false` is a defensive no-op: `module-abi` is opt-in now,

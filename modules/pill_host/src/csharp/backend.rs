@@ -36,8 +36,8 @@ use super::aot_runtime::AotRuntimeContext;
 #[cfg_attr(not(feature = "hot_reload"), allow(unused_imports))]
 use super::components::apply_component_manifest_on_reload;
 use super::components::{
-    module_native_bindings, register_component_manifest, shared_component_bindings, BindingStore,
-    ComponentBindings, ModuleExposedComponent, StableComponentId,
+    module_native_bindings, register_component_manifest, BindingStore, ComponentBindings,
+    ModuleExposedComponent, StableComponentId,
 };
 use super::context::ActiveSystemGuard;
 use super::csharp_runtime::DotnetRuntimeContext;
@@ -897,13 +897,11 @@ impl CSharpRuntime {
         mirror_methods: &[ResolvedMirrorMethod],
         fast_compiler: RuntimeFastCompiler,
     ) -> Result<Self, CSharpError> {
-        // Step 0: Merge the hardcoded shared renderer bindings with byte-level
-        // bindings for every native component the extensions exposed, so
-        // a `project_cs` mirror whose full name matches a module component
-        // resolves to the module's native storage.
-        let shared_bindings = shared_component_bindings(engine);
-        let mut bindings = shared_bindings;
-        bindings.extend(module_native_bindings(engine, module_exposed));
+        // Step 0: Byte-level bindings for every native component exposed to
+        // managed code - the renderer data's and each extension's - so a
+        // generated mirror whose full name matches resolves to the native
+        // storage. No component type is bound by hand.
+        let bindings = module_native_bindings(engine, module_exposed);
 
         // Step 2: Initialize the runtime bridge and register the component
         // manifest copied from the managed assembly.

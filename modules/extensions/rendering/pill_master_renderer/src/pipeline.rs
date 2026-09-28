@@ -246,7 +246,12 @@ impl ScriptableRenderingPipeline {
         let mut defined_targets: HashSet<String> = HashSet::new();
         let mut passes: Vec<PassSlot> = Vec::with_capacity(chain.len());
         for pass in chain {
-            passes.push(build_pass(pass, &shaders_by_key, &defined_targets, &context));
+            passes.push(build_pass(
+                pass,
+                &shaders_by_key,
+                &defined_targets,
+                &context,
+            ));
             for target in std::iter::once(&pass.target).chain(pass.extra_targets.iter()) {
                 if let PassTarget::Offscreen(name) = target {
                     defined_targets.insert(name.clone());

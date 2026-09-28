@@ -100,7 +100,7 @@ impl ShaderTextureSlot {
 /// values pack into the uniform buffer. A name declared twice keeps its first
 /// declaration and reports the later one: collapsing the pair silently would
 /// leave the packed layout disagreeing with the shader's own declarations.
-pub(crate) fn parameter_slots_by_name(
+pub fn parameter_slots_by_name(
     shader_name: &str,
     slots: impl IntoIterator<Item = ShaderParameterSlot>,
 ) -> IndexMap<String, ShaderParameterSlot> {
@@ -120,7 +120,7 @@ pub(crate) fn parameter_slots_by_name(
 }
 
 /// [`parameter_slots_by_name`], for texture slots.
-pub(crate) fn texture_slots_by_name(
+pub fn texture_slots_by_name(
     shader_name: &str,
     slots: impl IntoIterator<Item = ShaderTextureSlot>,
 ) -> IndexMap<String, ShaderTextureSlot> {
@@ -180,7 +180,6 @@ impl Shader {
             pass_camera_parameters: false,
         }
     }
-
 }
 
 /// A [`Shader`] under construction, started by [`Shader::new`].

@@ -80,7 +80,6 @@ fn ffi_get_component_chunk_guarded(
     // Step 2: Resolve the component binding and write the requested chunk
     // into the managed caller's output buffer.
     let status = with_active_context(|world, bindings| match bindings.get(&stable_id).copied() {
-        Some(ComponentBinding::Native { get_chunk, .. }) => get_chunk(world, chunk_index, output),
         Some(ComponentBinding::Managed { component_id, .. }) => {
             // The stride comes from the live column, never from the binding's
             // copy of the layout: `data` points into that column, and only the
@@ -271,10 +270,6 @@ fn ffi_get_archetype_chunk_guarded(
     // Step 4: Resolve the binding and write the column from that one
     // archetype; the remaining chunks of the world are never touched.
     let status = with_active_context(|world, bindings| match bindings.get(&stable_id).copied() {
-        Some(ComponentBinding::Native {
-            get_chunk_in_archetype,
-            ..
-        }) => get_chunk_in_archetype(world, archetype_id, output),
         Some(ComponentBinding::Managed { component_id, .. }) => {
             // As in the index-based callback: the stride is the live column's,
             // so a drifted binding cannot mislead managed row arithmetic.

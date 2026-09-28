@@ -7,6 +7,7 @@ members = [
     "pill_core",
     "pill_core_macros",
     "pill_host",
+    "pill_renderer_api",
     "pill_hot_scan",
     "pill_standalone",
     # Every crate under `extensions/` is an extension, discovered by

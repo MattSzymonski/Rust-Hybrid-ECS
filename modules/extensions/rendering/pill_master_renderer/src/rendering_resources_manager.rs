@@ -40,10 +40,10 @@ use crate::{
         Mesh, Shader, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot, Texture,
         TextureType,
     },
+    error::Result,
     frame::RenderFrame,
     pipeline::ChainContext,
     render_queue::{compose_render_queue_key, RenderQueueItem},
-    error::Result,
     renderer::State,
     resources::{
         RendererMaterial, RendererMaterialHandle, RendererMesh, RendererMeshHandle, RendererShader,
@@ -541,8 +541,8 @@ fn install_default_material(
             RendererMesh::data_layout_descriptor(),
             Instance::data_layout_descriptor(),
         ],
-        include_str!("config/common_shaders/default_vertex.wgsl"),
-        include_str!("config/simple_pipeline/shaders/default_lit_fragment.wgsl"),
+        crate::config::DEFAULT_VERTEX.embedded_source,
+        crate::config::simple_pipeline::DEFAULT_LIT_FRAGMENT.embedded_source,
         &parameter_slots,
         &texture_slots,
         &state

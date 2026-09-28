@@ -12,10 +12,11 @@
 //!
 //! # Design
 //!
-//! In rendering builds the shared component names ([`Position`], [`Color`],
-//! [`MeshRendererComponent`]) resolve to the renderer's own components through a conditional
-//! re-export; headless builds provide layout-identical local definitions
-//! instead. Every managed component is addressed by a [`StableComponentId`]
+//! The shared component names ([`Position`], [`Color`],
+//! [`MeshRendererComponent`] and the renderer's other components) resolve to
+//! the Rust types in `pill_engine` and `pill_renderer_api`, which the host
+//! links in every posture, so a headless host binds them exactly as a windowed
+//! one does. Every managed component is addressed by a [`StableComponentId`]
 //! hashed from its canonical full name, and [`ComponentBinding`] records
 //! whether storage is backed by a concrete Rust type or by a managed layout of
 //! raw bytes.
@@ -34,15 +35,8 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use pill_core::error::{CSharpError, EngineMessage};
 use pill_core::info;
 use pill_core::telemetry::telemetry_target;
-use pill_engine::archetype::{ArchetypeId, Blittability, FieldPlan, LayoutField};
-// The native binding path is windowed-only (its components come from the
-// renderer), so these three are unused in a headless build.
-#[cfg(feature = "rendering")]
-use pill_engine::commands::boxed_component_adder;
-use pill_engine::commands::ComponentAdder;
+use pill_engine::archetype::{Blittability, FieldPlan, LayoutField};
 use pill_engine::component_registry::ComponentFieldDescriptor;
-#[cfg(feature = "rendering")]
-use pill_engine::Component;
 use pill_engine::{ComponentId, Engine, World};
 
 // Current crate
@@ -55,30 +49,10 @@ use super::manifest_apply::{
 };
 
 // Current crate
-use super::abi::ComponentChunk;
-// Only the native chunk binders stamp a scope token, and those are
-// windowed-only, so a headless build never reaches this.
-#[cfg(feature = "rendering")]
-use super::context::active_scope_token;
 
 // =============================================================================
 // Types + Impls
 // =============================================================================
-
-// The components managed physics writes into directly.
-//
-// `Position` and `Color` are the engine's - universal enough that every
-// renderer and most projects want the same two - while `MeshRendererComponent` lives in
-// `pill_master_renderer` with the pipeline that draws it. Both imports stay
-// gated because it is the *native binding* that is windowed-only, not the
-// types: a headless host registers no native binding for any of them, and a
-// managed project that declares a `MeshRendererComponent` mirror still works, falling through
-// to the managed byte-level binding like any other component the host does not
-// know natively.
-#[cfg(feature = "rendering")]
-pub(super) use pill_engine::common_components::{Color, Position};
-#[cfg(feature = "rendering")]
-pub(super) use pill_master_renderer::MeshRendererComponent;
 
 /// Stable 128-bit identity derived from a managed component's canonical name.
 ///
@@ -165,44 +139,14 @@ impl BindingStore {
     }
 }
 
-/// Copies one archetype column into an ABI `ComponentChunk` for managed code.
-type NativeChunkGetter = fn(&mut World, u32, *mut ComponentChunk) -> u8;
-
-/// Copies one component column of an already-known archetype into an ABI chunk.
-type NativeArchetypeChunkGetter = fn(&mut World, ArchetypeId, *mut ComponentChunk) -> u8;
-
-/// Decodes one managed component blob into a deferred command adder.
-type NativeBlobDecoder = fn(*const u8, usize) -> Result<Box<dyn ComponentAdder>, String>;
-
 /// Resolves a stable managed identity to native or type-erased ECS storage.
 ///
-/// Native bindings carry typed callbacks for chunk access and blob decoding;
-/// managed bindings keep only the layout facts needed for raw byte storage.
+/// Every binding is type-erased: managed storage keeps the layout facts raw
+/// bytes need, and a Rust component - an extension's or the renderer data's -
+/// is served through its native column's byte view. The bridge names no Rust
+/// component type.
 #[derive(Clone, Copy)]
 pub(super) enum ComponentBinding {
-    /// A concrete Rust component with chunk access and a typed decoder.
-    ///
-    /// Constructed only by [`register_native_binding`], which is itself
-    /// windowed-only: the sole native components this host binds are the
-    /// renderer's. A headless build still *matches* on the variant, so it stays
-    /// in the enum rather than being compiled out with the constructor.
-    #[cfg_attr(not(feature = "rendering"), allow(dead_code))]
-    Native {
-        /// Engine ID of the registered Rust component type.
-        component_id: ComponentId,
-        /// Copies the matching archetype column into an ABI chunk.
-        get_chunk: NativeChunkGetter,
-        /// Copies one column of an already-known archetype into an ABI chunk.
-        get_chunk_in_archetype: NativeArchetypeChunkGetter,
-        /// Size of the Rust type in bytes.
-        size: usize,
-        /// Alignment of the Rust type in bytes.
-        align: usize,
-        /// Hash of the managed schema the native type must match.
-        schema_hash: u64,
-        /// Decodes one managed blob into a deferred command adder.
-        decode: NativeBlobDecoder,
-    },
     /// A managed layout stored as raw bytes.
     Managed {
         /// Engine ID of the managed component type.
@@ -233,6 +177,10 @@ pub(super) enum ComponentBinding {
         size: usize,
         /// Alignment of the native layout in bytes.
         align: usize,
+        /// Hash of the public fields the generated mirror declares, when the
+        /// component's field layout is known; a managed mirror must declare
+        /// exactly these. `None` checks size and alignment only.
+        field_signature: Option<u64>,
     },
 }
 
@@ -241,9 +189,9 @@ impl ComponentBinding {
     /// by a concrete Rust type or a managed layout.
     pub(super) fn component_id(self) -> ComponentId {
         match self {
-            Self::Native { component_id, .. }
-            | Self::Managed { component_id, .. }
-            | Self::ModuleNative { component_id, .. } => component_id,
+            Self::Managed { component_id, .. } | Self::ModuleNative { component_id, .. } => {
+                component_id
+            }
         }
     }
 }
@@ -274,191 +222,6 @@ pub(super) const fn stable_component_id(name: &str) -> StableComponentId {
     )
 }
 
-/// Return the `chunk_index`th archetype column containing native component T.
-///
-/// Windowed builds only, with the rest of the native binding path: no other
-/// build has a native component to bind.
-#[cfg(feature = "rendering")]
-fn get_component_chunk<T: Component>(
-    world: &mut World,
-    chunk_index: u32,
-    output: *mut ComponentChunk,
-) -> u8 {
-    let change_tick = world.change_tick().get();
-    let scope_token = active_scope_token();
-    let Some((archetype, slice, ticks)) =
-        world.component_chunk_with_ticks_mut::<T>(chunk_index as usize)
-    else {
-        return 0;
-    };
-    let bits = archetype.0;
-    // SAFETY: `output` was checked by the FFI entry point and the slice stays
-    // alive for the duration of the active scheduled system invocation. The
-    // managed side must stay within `len * element_size` and must not retain
-    // the returned pointers beyond that invocation. The u32 length ceiling
-    // is documented on `ComponentChunk`.
-    unsafe {
-        output.write(ComponentChunk {
-            archetype_low: bits as u64,
-            archetype_high: (bits >> 64) as u64,
-            data: slice.as_mut_ptr().cast(),
-            entities: std::ptr::null(),
-            len: slice.len() as u32,
-            element_size: std::mem::size_of::<T>() as u32,
-            ticks: ticks.as_mut_ptr(),
-            change_tick,
-            scope_token,
-        });
-    }
-    1
-}
-
-/// Return one archetype column containing native component T.
-///
-/// The archetype-scoped twin of [`get_component_chunk`]: managed enumerators
-/// that already hold a driver chunk's archetype identity use this to resolve
-/// the remaining query terms directly, with no chunk-index scan.
-#[cfg(feature = "rendering")]
-fn get_component_chunk_in_archetype<T: Component>(
-    world: &mut World,
-    archetype_id: ArchetypeId,
-    output: *mut ComponentChunk,
-) -> u8 {
-    let change_tick = world.change_tick().get();
-    let scope_token = active_scope_token();
-    let Some((archetype, slice, ticks)) =
-        world.component_chunk_with_ticks_mut_in_archetype::<T>(archetype_id)
-    else {
-        return 0;
-    };
-    let bits = archetype.0;
-    // SAFETY: `output` was checked by the FFI entry point and the slice stays
-    // alive for the duration of the active scheduled system invocation. The
-    // managed side must stay within `len * element_size` and must not retain
-    // the returned pointers beyond that invocation. The u32 length ceiling
-    // is documented on `ComponentChunk`.
-    unsafe {
-        output.write(ComponentChunk {
-            archetype_low: bits as u64,
-            archetype_high: (bits >> 64) as u64,
-            data: slice.as_mut_ptr().cast(),
-            entities: std::ptr::null(),
-            len: slice.len() as u32,
-            element_size: std::mem::size_of::<T>() as u32,
-            ticks: ticks.as_mut_ptr(),
-            change_tick,
-            scope_token,
-        });
-    }
-    1
-}
-
-/// Copy one managed component blob into a concrete Rust component adder.
-///
-/// The decoder is stored in a native binding so deferred commands can recover
-/// the correct Rust type without a hardcoded component match at the call site.
-///
-/// # Errors
-///
-/// Returns an error when `data` is null or `size` does not match the exact
-/// ABI layout of `T`.
-#[cfg(feature = "rendering")]
-fn decode_native_component<T>(
-    data: *const u8,
-    size: usize,
-) -> Result<Box<dyn ComponentAdder>, String>
-where
-    T: Component + Copy + Send,
-{
-    if data.is_null() || size != std::mem::size_of::<T>() {
-        return Err("native component blob does not match its ABI layout".into());
-    }
-    // SAFETY: the binding validated the exact type size and the caller keeps
-    // the managed pinned buffer alive for the duration of this call.
-    // `read_unaligned` permits buffers with no stronger alignment guarantee.
-    let component = unsafe { std::ptr::read_unaligned(data.cast::<T>()) };
-    Ok(boxed_component_adder(component))
-}
-
-/// Register one engine-owned component and bind its managed name and schema to
-/// the callbacks required by queries and deferred commands.
-#[cfg(feature = "rendering")]
-fn register_native_binding<T>(
-    engine: &mut Engine,
-    bindings: &mut ComponentBindings,
-    managed_name: &str,
-    managed_schema: &str,
-) where
-    T: Component + Copy + Send,
-{
-    engine.world_mut().register_component::<T>();
-    bindings.insert(
-        stable_component_id(managed_name),
-        ComponentBinding::Native {
-            component_id: ComponentId::of::<T>(),
-            get_chunk: get_component_chunk::<T>,
-            get_chunk_in_archetype: get_component_chunk_in_archetype::<T>,
-            size: std::mem::size_of::<T>(),
-            align: std::mem::align_of::<T>(),
-            schema_hash: component_hash(managed_schema, 0xcbf29ce484222325),
-            decode: decode_native_component::<T>,
-        },
-    );
-}
-
-/// Register native shared components and create their managed lookup table.
-///
-/// The schema strings encode the canonical managed layouts; a mismatch with
-/// the runtime's own reflection is rejected during manifest registration.
-pub(super) fn shared_component_bindings(engine: &mut Engine) -> ComponentBindings {
-    // Only a windowed host links `pill_master_renderer`, so a headless build has
-    // nothing to bind and the table comes back empty. Spelled as two blocks
-    // rather than one guarded call so neither configuration carries an unused
-    // `mut` or an unused parameter.
-    #[cfg(feature = "rendering")]
-    {
-        let mut bindings = HashMap::new();
-        shared_renderer_bindings(engine, &mut bindings);
-        bindings
-    }
-    #[cfg(not(feature = "rendering"))]
-    {
-        let _ = engine;
-        HashMap::new()
-    }
-}
-
-/// Bind the renderer's components to their canonical managed mirrors.
-///
-/// Windowed builds only - the types live in `pill_master_renderer`, which only a
-/// windowed host links.
-#[cfg(feature = "rendering")]
-fn shared_renderer_bindings(engine: &mut Engine, bindings: &mut ComponentBindings) {
-    register_native_binding::<Position>(
-        engine,
-        bindings,
-        "TracyLive.Position",
-        "TracyLive.Position|8|4|X@0:4:System.Single|Y@4:4:System.Single",
-    );
-    register_native_binding::<MeshRendererComponent>(
-        engine,
-        bindings,
-        "TracyLive.MeshRendererComponent",
-        "TracyLive.MeshRendererComponent|16|4|MeshIndex@0:4:System.UInt32|MeshGeneration@4:4:System.UInt32|MaterialIndex@8:4:System.UInt32|MaterialGeneration@12:4:System.UInt32",
-    );
-    register_native_binding::<pill_master_renderer::TransformComponent>(engine, bindings,"TracyLive.TransformComponent",
-        "TracyLive.TransformComponent|40|4|X@0:4:System.Single|Y@4:4:System.Single|Z@8:4:System.Single|RotationX@12:4:System.Single|RotationY@16:4:System.Single|RotationZ@20:4:System.Single|RotationW@24:4:System.Single|ScaleX@28:4:System.Single|ScaleY@32:4:System.Single|ScaleZ@36:4:System.Single");
-    register_native_binding::<pill_master_renderer::DirectionalLightComponent>(engine,bindings,"TracyLive.DirectionalLightComponent","TracyLive.DirectionalLightComponent|16|4|R@0:4:System.Single|G@4:4:System.Single|B@8:4:System.Single|Intensity@12:4:System.Single");
-    register_native_binding::<pill_master_renderer::CameraComponent>(engine, bindings,"TracyLive.CameraComponent",
-        "TracyLive.CameraComponent|20|4|Enabled@0:1:System.Byte|Priority@4:4:System.Int32|VerticalFov@8:4:System.Single|Near@12:4:System.Single|Far@16:4:System.Single");
-    register_native_binding::<Color>(
-        engine,
-        bindings,
-        "TracyLive.Color",
-        "TracyLive.Color|16|4|R@0:4:System.Single|G@4:4:System.Single|B@8:4:System.Single|A@12:4:System.Single",
-    );
-}
-
 /// One native component an extension registered, exposed to managed
 /// code under a derived C#-facing name.
 ///
@@ -486,6 +249,34 @@ pub(crate) struct ModuleExposedComponent {
     pub(crate) fields: Vec<ComponentFieldDescriptor>,
 }
 
+/// Resolve registered component names into the layouts C# binds against.
+///
+/// The C#-facing name is the Rust path with `::` replaced by `.`, so a mirror
+/// struct generated under that full name reproduces the same stable identity.
+/// A name that no longer resolves is skipped: the managed side binds by name,
+/// so an unresolvable one simply has no binding. The field layout comes from
+/// the derive's registration; a component without one keeps the opaque blob.
+pub(crate) fn exposed_components_from_names(
+    world: &World,
+    names: &[String],
+) -> Vec<ModuleExposedComponent> {
+    names
+        .iter()
+        .filter_map(|type_name| {
+            let component_id = resolve_exposed_component_id(world, type_name)?;
+            let (size, align) = world.component_layout(component_id)?;
+            let fields = world.component_field_layout(component_id).unwrap_or(&[]);
+            Some(ModuleExposedComponent {
+                csharp_name: type_name.replace("::", "."),
+                component_id,
+                size,
+                align,
+                fields: fields.to_vec(),
+            })
+        })
+        .collect()
+}
+
 /// Resolve one exposed component name to its engine [`ComponentId`], reporting
 /// an ambiguous name instead of binding managed code to a guessed column.
 ///
@@ -494,7 +285,7 @@ pub(crate) struct ModuleExposedComponent {
 /// two registrations is not: managed code would be bound to whichever column
 /// won an arbitrary tiebreak, and every read and write through that binding
 /// would silently address the wrong rows. That case is logged and left unbound.
-pub(crate) fn resolve_exposed_component_id(world: &World, type_name: &str) -> Option<ComponentId> {
+pub(super) fn resolve_exposed_component_id(world: &World, type_name: &str) -> Option<ComponentId> {
     match world.resolve_component_id_by_name_any(type_name) {
         Ok(component_id) => component_id,
         Err(error) => {
@@ -528,6 +319,8 @@ pub(super) fn module_native_bindings(
                 component_id: component.component_id,
                 size: component.size,
                 align: component.align,
+                field_signature: super::mirror_naming::generated_field_signature(&component.fields)
+                    .map(|signature| component_hash(&signature, 0xcbf29ce484222325)),
             },
         );
     }
@@ -664,6 +457,25 @@ pub(super) fn register_component_manifest(
     Ok(bindings)
 }
 
+/// Hash of the public fields a managed mirror declares, in the form
+/// [`generated_field_signature`](super::mirror_naming::generated_field_signature)
+/// produces for the native side.
+///
+/// The generated alignment pad is private and not a field the generator
+/// declares for data, so it is left out.
+fn managed_field_signature(component: &ManagedComponentManifest) -> u64 {
+    let declared = component
+        .fields
+        .iter()
+        .filter(|field| field.name != "_alignmentPad")
+        .map(|field| (field.offset, field.name.clone(), field.size))
+        .collect();
+    component_hash(
+        &super::mirror_naming::field_signature_text(declared),
+        0xcbf29ce484222325,
+    )
+}
+
 /// Check one manifest entry against the binding the host already holds.
 ///
 /// The startup and reload paths share this so they cannot disagree about what
@@ -674,26 +486,33 @@ pub(super) fn check_binding_against_manifest(
     component: &ManagedComponentManifest,
 ) -> Result<(), CSharpError> {
     let (size, align, expected_schema) = match binding {
-        ComponentBinding::Native {
-            size,
-            align,
-            schema_hash,
-            ..
-        } => (size, align, Some(schema_hash)),
         ComponentBinding::Managed {
             size,
             align,
             schema_hash,
             ..
         } => (size, align, Some(schema_hash)),
-        ComponentBinding::ModuleNative { size, align, .. } => {
-            // No schema hash to compare: the managed manifest's hash is an FNV
-            // over a C#-only schema text (managed type names, nested-struct
-            // recursion) that the engine's flat field descriptors cannot
-            // reproduce, so a hash invented here would refuse healthy mirrors.
-            // The mirror is regenerated from the module's own descriptors on
-            // every reload, and `module_native_bindings` validates the binding
-            // against the live column before it is handed out.
+        ComponentBinding::ModuleNative {
+            size,
+            align,
+            field_signature,
+            ..
+        } => {
+            // The managed manifest's own schema hash is an FNV over a C#-only
+            // text (managed type names, nested-struct recursion) the engine's
+            // flat descriptors cannot reproduce. What both sides can state is
+            // the public field list - name, offset, size - which the mirror
+            // generator derives from the native descriptors; comparing that
+            // refuses a mirror of the right size whose fields disagree.
+            if let Some(expected) = field_signature {
+                if managed_field_signature(component) != expected {
+                    return Err(format!(
+                        "managed mirror {} does not match the native component field schema",
+                        component.full_name
+                    )
+                    .into());
+                }
+            }
             (size, align, None)
         }
     };

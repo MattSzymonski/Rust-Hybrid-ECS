@@ -22,6 +22,9 @@
 
 using System.Numerics;
 
+// The renderer's components, generated from their Rust registration.
+using pill_master_renderer.component;
+
 namespace TracyLive;
 
 // =============================================================================
@@ -161,8 +164,8 @@ public static class SceneStartup
             []);
 
         commands.CreateEntity()
-            .With(new CameraComponent { Enabled = 1, Priority = 0, VerticalFov = 60.0f, Near = 0.1f, Far = 1000.0f })
-            .With(new TransformComponent { Z = 5.0f, RotationW = 1.0f, ScaleX = 1.0f, ScaleY = 1.0f, ScaleZ = 1.0f })
+            .With(CameraComponent.Perspective(60.0f, 0.1f, 1000.0f))
+            .With(TransformComponent.At(0.0f, 0.0f, 5.0f, 1.0f))
             .Build();
 
         AssetHandle[] materials = [lit, unlit, cartoon];
@@ -171,23 +174,10 @@ public static class SceneStartup
             var (x, y, z) = ProjectConstants.ModelPositions[i];
             AssetHandle material = materials[i];
             commands.CreateEntity()
-                .With(new TransformComponent
-                {
-                    X = x,
-                    Y = y,
-                    Z = z,
-                    RotationW = 1.0f,
-                    ScaleX = 1.0f,
-                    ScaleY = 1.0f,
-                    ScaleZ = 1.0f,
-                })
-                .With(new MeshRendererComponent
-                {
-                    MeshIndex = mesh.Index,
-                    MeshGeneration = mesh.Generation,
-                    MaterialIndex = material.Index,
-                    MaterialGeneration = material.Generation,
-                })
+                .With(TransformComponent.At(x, y, z, 1.0f))
+                .With(MeshRendererComponent.From(
+                    Handle.From(mesh.Index, mesh.Generation),
+                    Handle.From(material.Index, material.Generation)))
                 .With(new TagAlpha())
                 .Build();
         }
@@ -216,13 +206,9 @@ public static class RotationSystem
         foreach (var row in models.Rows())
         {
             ref var transform = ref row.TransformComponent;
-            var current = new Quaternion(transform.RotationX, transform.RotationY, transform.RotationZ, transform.RotationW);
+            var current = transform.Rotation;
             current = current.LengthSquared() > 1.0e-8f ? Quaternion.Normalize(current) : Quaternion.Identity;
-            var next = Quaternion.Normalize(step * current);
-            transform.RotationX = next.X;
-            transform.RotationY = next.Y;
-            transform.RotationZ = next.Z;
-            transform.RotationW = next.W;
+            transform.Rotation = Quaternion.Normalize(step * current);
         }
     }
 }

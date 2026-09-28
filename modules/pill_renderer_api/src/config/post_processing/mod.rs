@@ -41,6 +41,7 @@ use crate::assets::{
     MaterialParameter, PassKind, PassTarget, RenderPass, Shader, ShaderParameterSlot,
     ShaderParameterType, ShaderTextureSlot, Texture, TextureType,
 };
+use crate::config::{ConfigShaderFile, ShaderSourceRecord};
 
 /// Name of the target the frame's geometry pass writes, and the first pass here
 /// reads.
@@ -63,6 +64,51 @@ const COMPOSITE_SHADER: &str = "pill.pbr.shader.bloom.composite";
 const TONEMAP_SHADER: &str = "pill.pbr.shader.tonemap";
 /// Asset name of the lens pass's shader.
 const LENS_SHADER: &str = "pill.pbr.shader.lens";
+
+config_shader_file!(
+    /// The fullscreen vertex stage every pass here draws through.
+    FULLSCREEN_VERTEX, "post_processing/shaders/fullscreen_vertex.wgsl"
+);
+config_shader_file!(
+    /// The bloom prefilter's fragment stage.
+    PREFILTER_FRAGMENT, "post_processing/shaders/bloom_prefilter_fragment.wgsl"
+);
+config_shader_file!(
+    /// The bloom composite's fragment stage.
+    COMPOSITE_FRAGMENT, "post_processing/shaders/bloom_composite_fragment.wgsl"
+);
+config_shader_file!(
+    /// The tonemap's fragment stage.
+    TONEMAP_FRAGMENT, "post_processing/shaders/tonemap_fragment.wgsl"
+);
+config_shader_file!(
+    /// The lens pass's fragment stage.
+    LENS_FRAGMENT, "post_processing/shaders/lens_fragment.wgsl"
+);
+
+/// The shader assets [`install`] creates, and the files each is built from.
+pub const SHADER_SOURCES: &[ShaderSourceRecord] = &[
+    ShaderSourceRecord {
+        shader_asset_name: PREFILTER_SHADER,
+        vertex: FULLSCREEN_VERTEX,
+        fragment: PREFILTER_FRAGMENT,
+    },
+    ShaderSourceRecord {
+        shader_asset_name: COMPOSITE_SHADER,
+        vertex: FULLSCREEN_VERTEX,
+        fragment: COMPOSITE_FRAGMENT,
+    },
+    ShaderSourceRecord {
+        shader_asset_name: TONEMAP_SHADER,
+        vertex: FULLSCREEN_VERTEX,
+        fragment: TONEMAP_FRAGMENT,
+    },
+    ShaderSourceRecord {
+        shader_asset_name: LENS_SHADER,
+        vertex: FULLSCREEN_VERTEX,
+        fragment: LENS_FRAGMENT,
+    },
+];
 
 /// Asset name of the bloom prefilter pass.
 const BLOOM_PASS: &str = "pill.pbr.pass.bloom";
@@ -105,7 +151,7 @@ pub fn install(
 
     let prefilter = fullscreen_shader(
         "pill_pbr_bloom_prefilter",
-        include_str!("shaders/bloom_prefilter_fragment.wgsl"),
+        PREFILTER_FRAGMENT,
         [ShaderParameterSlot::new(
             "threshold",
             ShaderParameterType::Color,
@@ -127,8 +173,11 @@ pub fn install(
 
     let composite = fullscreen_shader(
         "pill_pbr_bloom_composite",
-        include_str!("shaders/bloom_composite_fragment.wgsl"),
-        [ShaderParameterSlot::new("bloom", ShaderParameterType::Color)],
+        COMPOSITE_FRAGMENT,
+        [ShaderParameterSlot::new(
+            "bloom",
+            ShaderParameterType::Color,
+        )],
         [
             ShaderTextureSlot::new("hdr", TextureType::Color, (0, 1)),
             ShaderTextureSlot::new("bloom", TextureType::Color, (2, 3)),
@@ -153,7 +202,7 @@ pub fn install(
     let (b, c) = lottes_bc(contrast, shoulder, 8.0, 0.18, 0.267);
     let tonemap = fullscreen_shader(
         "pill_pbr_tonemap",
-        include_str!("shaders/tonemap_fragment.wgsl"),
+        TONEMAP_FRAGMENT,
         [
             ShaderParameterSlot::new("contrast", ShaderParameterType::Scalar),
             ShaderParameterSlot::new("shoulder", ShaderParameterType::Scalar),
@@ -178,7 +227,7 @@ pub fn install(
     // The last stage writes the swapchain, so the chain ends where it has to.
     let lens = fullscreen_shader(
         "pill_pbr_lens",
-        include_str!("shaders/lens_fragment.wgsl"),
+        LENS_FRAGMENT,
         [
             ShaderParameterSlot::new("shape", ShaderParameterType::Color),
             ShaderParameterSlot::new("gamma", ShaderParameterType::Color),
@@ -215,12 +264,12 @@ pub fn install(
 /// Returns the engine's load error when the stages cannot be built.
 fn fullscreen_shader(
     name: &str,
-    fragment: &str,
+    fragment: ConfigShaderFile,
     parameters: impl IntoIterator<Item = ShaderParameterSlot>,
     textures: impl IntoIterator<Item = ShaderTextureSlot>,
 ) -> AssetLoadResult<Shader> {
     Shader::new(name)
-        .with_wgsl(include_str!("shaders/fullscreen_vertex.wgsl"), fragment)
+        .with_wgsl(FULLSCREEN_VERTEX.embedded_source, fragment.embedded_source)
         .with_parameter_slots(parameters)
         .with_texture_slots(textures)
         .with_engine_parameters(true)
@@ -280,7 +329,10 @@ mod tests {
     fn the_solved_curve_constants_are_positive_and_are_the_reference_values() {
         let (b, c) = lottes_bc(1.6, 0.977, 8.0, 0.18, 0.267);
 
-        assert!(b > 0.0 && c > 0.0, "the curve needs both constants positive");
+        assert!(
+            b > 0.0 && c > 0.0,
+            "the curve needs both constants positive"
+        );
         // The reference's own values for these art parameters, to three places:
         // a change here means the solve moved, not that rounding did.
         assert!((b - 1.073).abs() < 0.002, "b came out {b}");

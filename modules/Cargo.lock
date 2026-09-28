@@ -1700,7 +1700,7 @@ dependencies = [
  "pill_engine",
  "pill_host",
  "pill_hot_scan",
- "pill_master_renderer",
+ "pill_renderer_api",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -2545,7 +2545,7 @@ dependencies = [
  "glam",
  "pill_assets",
  "pill_engine",
- "pill_master_renderer",
+ "pill_renderer_api",
  "serde",
  "trait_type_map",
 ]
@@ -4679,6 +4679,7 @@ dependencies = [
  "pill_engine",
  "pill_hot_scan",
  "pill_master_renderer",
+ "pill_renderer_api",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -4698,20 +4699,38 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "glam",
+ "indexmap",
+ "miette",
+ "pill_core",
+ "pill_core_macros",
+ "pill_engine",
+ "pill_renderer_api",
+ "pollster",
+ "serde",
+ "thiserror 2.0.20",
+ "trait_type_map",
+ "wgpu",
+ "winit",
+]
+
+[[package]]
+name = "pill_renderer_api"
+version = "0.1.0"
+dependencies = [
+ "bytemuck",
+ "glam",
  "image",
  "indexmap",
  "miette",
+ "notify",
  "pill_assets",
  "pill_core",
  "pill_core_macros",
  "pill_engine",
- "pollster",
  "serde",
  "thiserror 2.0.20",
  "tobj",
  "trait_type_map",
- "wgpu",
- "winit",
 ]
 
 [[package]]
@@ -5016,7 +5035,7 @@ dependencies = [
  "pill_audio",
  "pill_core",
  "pill_engine",
- "pill_master_renderer",
+ "pill_renderer_api",
  "pill_spline",
  "serde",
  "tracing",

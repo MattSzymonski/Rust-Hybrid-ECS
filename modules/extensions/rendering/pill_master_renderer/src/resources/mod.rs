@@ -18,7 +18,6 @@ mod renderer_pass;
 mod renderer_resource_storage;
 mod renderer_shader;
 mod renderer_texture;
-mod rendering_manager;
 
 // --- Use ---
 
@@ -48,4 +47,4 @@ pub use renderer_resource_storage::RendererResourceStorage;
 
 pub use renderer_pass::RendererPass;
 
-pub use rendering_manager::RenderingManager;
+pub use pill_renderer_api::RenderingManager;

@@ -682,7 +682,7 @@ mod tests {
     /// which is the path the Inspector uses to edit materials live.
     #[test]
     fn set_field_on_renderer_light_updates_intensity() {
-        use pill_master_renderer::{register_components, DirectionalLightComponent};
+        use pill_renderer_api::{register_components, DirectionalLightComponent};
         let mut engine = Engine::new();
         register_components(engine.world_mut());
         let entity = engine

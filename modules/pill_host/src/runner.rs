@@ -56,8 +56,8 @@ use crate::FrameReport;
 #[cfg(feature = "rendering")]
 struct WindowedApplication {
     project: crate::ProjectSource,
-    window: Option<Arc<Window>>,
     host: Option<crate::RenderingHost>,
+    window: Option<Arc<Window>>,
     /// Whether the hidden startup window has been revealed after its first frame.
     window_shown: bool,
     /// Failure recorded during `resumed`; surfaced after the loop exits.

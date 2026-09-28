@@ -35,19 +35,21 @@ use super::commands::{
     ffi_reserve_entity,
 };
 use super::components::{
-    apply_component_manifest_on_reload, module_native_bindings, register_component_manifest,
-    shared_component_bindings, stable_component_id, BindingStore, ComponentBinding,
-    ComponentBindings, MeshRendererComponent, ModuleExposedComponent, Position, StableComponentId,
+    apply_component_manifest_on_reload, exposed_components_from_names, module_native_bindings,
+    register_component_manifest, stable_component_id, BindingStore, ComponentBinding,
+    ComponentBindings, ModuleExposedComponent, StableComponentId,
 };
 use super::managed_buffer::{fetch_managed_buffer, ManagedBufferError};
-// `Color`, `Position` and `MeshRendererComponent` above are the renderer's components,
-// re-exported by `components` from `pill_master_renderer`.
+// The shared-ABI fixtures: the engine's `Position` and the renderer data's
+// `MeshRendererComponent`, bound the way a managed project gets them.
 use super::context::ActiveSystemGuard;
 use super::manifest::parse_and_validate_manifest;
 use super::queries::{
     ffi_entity_count, ffi_get_archetype_chunk, ffi_get_component_chunk, ffi_get_entity_chunk,
 };
 use super::resources::resource_target;
+use pill_engine::common_components::Position;
+use pill_renderer_api::MeshRendererComponent;
 
 // =============================================================================
 // Constants
@@ -76,9 +78,35 @@ const TEST_WORLD_ENTITY_COUNT: usize = 100;
 // Test Helpers
 // =============================================================================
 
-/// Return the stable ID used by a component in the shared `TracyLive` namespace.
+/// The managed full name a test component is declared under.
+///
+/// The two shared-ABI fixtures take the names their generated mirrors carry -
+/// the Rust registration name with `::` as `.` - and every other test
+/// component lives in the project's `TracyLive` namespace.
+fn test_full_name(name: &str) -> String {
+    match name {
+        "Position" => "pill_engine.common_components.Position".to_owned(),
+        "MeshRendererComponent" => {
+            "pill_master_renderer.component.MeshRendererComponent".to_owned()
+        }
+        other => format!("TracyLive.{other}"),
+    }
+}
+
+/// Return the stable ID of a test component, under [`test_full_name`].
 fn test_stable_id(name: &str) -> StableComponentId {
-    stable_component_id(&format!("TracyLive.{name}"))
+    stable_component_id(&test_full_name(name))
+}
+
+/// The bindings a managed project gets for the renderer's plain data.
+///
+/// Exactly the production path: the host registers `pill_renderer_api`, and
+/// the components that registration added are exposed like an extension's,
+/// as type-erased native bindings. Nothing here names a component type.
+fn shared_component_bindings(engine: &mut Engine) -> ComponentBindings {
+    let names = crate::renderer_data::register_renderer_data(engine);
+    let exposed = exposed_components_from_names(engine.world(), &names);
+    module_native_bindings(engine, &exposed)
 }
 
 /// The witness these tests hand to `register_component_descriptor`.
@@ -245,7 +273,7 @@ fn managed_command_abi_runs_mixed_lifecycle_through_the_native_queue() {
             schema_hash: 2,
         },
     );
-    let position_key = stable_component_id("TracyLive.Position");
+    let position_key = test_stable_id("Position");
     let position = Position { x: 9.0, y: 12.0 };
     let descriptor_a_value = 41_u32;
     let mut created = None;
@@ -793,6 +821,7 @@ fn module_native_binding_rejects_live_layout_mismatch() {
             // Deliberately not the live layout, so the arm has to refuse.
             size: 64,
             align: 4,
+            field_signature: None,
         },
     );
     engine
@@ -822,11 +851,11 @@ fn module_native_binding_rejects_live_layout_mismatch() {
 fn managed_shared_component_schema_mismatch_is_rejected() {
     let mut engine = Engine::new();
     let shared = shared_component_bindings(&mut engine);
-    let stable_id = stable_component_id("TracyLive.Position");
+    let stable_id = test_stable_id("Position");
     let manifest = serde_json::json!([{
         "stable_id_low": stable_id.0 as u64,
         "stable_id_high": (stable_id.0 >> 64) as u64,
-        "full_name": "TracyLive.Position",
+        "full_name": test_full_name("Position"),
         "size": 8,
         "alignment": 4,
         "schema_hash": 0,
@@ -2175,6 +2204,7 @@ fn the_apply_refuses_what_it_cannot_migrate() {
             component_id: module_id,
             size: 8,
             align: 4,
+            field_signature: None,
         },
     );
     let store = BindingStore::new(bindings);
