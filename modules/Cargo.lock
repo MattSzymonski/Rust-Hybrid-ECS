@@ -1701,11 +1701,13 @@ dependencies = [
  "pill_host",
  "pill_hot_scan",
  "pill_master_renderer",
+ "raw-window-handle 0.6.2",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "x11-dl",
 ]
 
 [[package]]

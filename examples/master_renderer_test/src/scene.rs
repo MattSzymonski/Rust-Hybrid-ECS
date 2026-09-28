@@ -22,7 +22,7 @@ pub(crate) fn create(world: &mut World, assets: SceneAssets) -> Result<(), Strin
             .create_entity()
             .with(CameraComponent::default())
             .with(TransformComponent {
-                translation: [0.0, 0.0, 2.5],
+                translation: [0.0, 0.0, 5.5],
                 ..Default::default()
             })
             .build()

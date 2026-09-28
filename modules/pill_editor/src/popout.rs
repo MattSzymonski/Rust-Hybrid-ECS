@@ -82,13 +82,13 @@ pub(crate) fn open_panel_window(
         WindowBuilder::new()
             .with_title(format!("{} - ECS Editor", panel.title()))
             .with_inner_size(LogicalSize::new(720.0, 520.0))
-            .with_transparent(panel == PanelKind::Scene),
+            .with_transparent(panel == PanelKind::Scene && crate::SCENE_NEEDS_TRANSPARENT_WINDOW),
     );
 
     if panel == PanelKind::Scene {
         // The renderer remains owned by the same host; only its native surface
         // is replaced. The ECS world and hot-loaded project are not recreated.
-        config = config
+        config = crate::embedded_scene_config(config)
             .with_on_window(move |window, _| {
                 if let Err(error) = editor.attach_detached_scene(window) {
                     eprintln!("[editor] Could not attach detached Scene renderer: {error}");

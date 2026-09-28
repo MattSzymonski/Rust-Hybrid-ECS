@@ -51,6 +51,24 @@ fn pick_color_format(formats: &[wgpu::TextureFormat]) -> Option<wgpu::TextureFor
     .or_else(|| formats.first().copied())
 }
 
+/// The alpha mode to ask a new surface for.
+///
+/// A compositing mode first, because the editor paints its panels over the same
+/// window the scene viewport lives in: that needs the swapchain image to carry
+/// alpha, and a window created transparent can be given one. The renderer's own
+/// shaders write opaque pixels, so a window that has nothing to show through
+/// stays opaque either way, and [`configure`] falls back to `Opaque` by itself
+/// when the compositor refuses.
+fn pick_alpha_mode(modes: &[wgpu::CompositeAlphaMode]) -> Option<wgpu::CompositeAlphaMode> {
+    [
+        wgpu::CompositeAlphaMode::PreMultiplied,
+        wgpu::CompositeAlphaMode::PostMultiplied,
+    ]
+    .into_iter()
+    .find(|mode| modes.contains(mode))
+    .or_else(|| modes.first().copied())
+}
+
 /// The alpha modes to try, in order: the requested one, then `Opaque`.
 ///
 /// A compositing alpha mode needs a compositing window, which a capability list
@@ -139,11 +157,8 @@ impl Surface {
         let capabilities = surface.get_capabilities(&adapter);
         let color_format =
             pick_color_format(&capabilities.formats).ok_or(RendererError::NoTextureFormats)?;
-        let alpha_mode = capabilities
-            .alpha_modes
-            .first()
-            .copied()
-            .ok_or(RendererError::NoAlphaModes)?;
+        let alpha_mode =
+            pick_alpha_mode(&capabilities.alpha_modes).ok_or(RendererError::NoAlphaModes)?;
         // `Fifo` is the one present mode a surface is required to support, and
         // a mode listed by `Surface::get_capabilities` is not thereby
         // creatable: the NVIDIA Vulkan driver on Windows advertises `Mailbox`
@@ -183,6 +198,20 @@ impl Surface {
     /// The configured size, in physical pixels.
     pub fn size(&self) -> (u32, u32) {
         (self.configuration.width, self.configuration.height)
+    }
+
+    /// Whether the swapchain image's alpha reaches the compositor.
+    ///
+    /// This is what decides whether a transparent pixel means "leave this pixel
+    /// to whatever else paints this window" or is simply opaque black: only a
+    /// compositing mode carries alpha out of the image. [`configure`] records
+    /// the mode the surface actually accepted, so an `Opaque` fallback is
+    /// visible here rather than assumed away.
+    pub fn composites(&self) -> bool {
+        matches!(
+            self.configuration.alpha_mode,
+            wgpu::CompositeAlphaMode::PreMultiplied | wgpu::CompositeAlphaMode::PostMultiplied
+        )
     }
 
     /// The whole configuration, for resources sized alongside the surface.
@@ -350,6 +379,36 @@ mod tests {
             "the first advertised format beats refusing to start"
         );
         assert_eq!(pick_color_format(&[]), None, "no formats is an error");
+    }
+
+    #[test]
+    fn a_compositing_alpha_mode_is_preferred_where_the_surface_offers_one() {
+        assert_eq!(
+            pick_alpha_mode(&[
+                wgpu::CompositeAlphaMode::Opaque,
+                wgpu::CompositeAlphaMode::Auto,
+                wgpu::CompositeAlphaMode::PreMultiplied,
+            ]),
+            Some(wgpu::CompositeAlphaMode::PreMultiplied),
+            "the scene shares its window with the editor's panels, so the image has to carry alpha"
+        );
+        assert_eq!(
+            pick_alpha_mode(&[
+                wgpu::CompositeAlphaMode::Auto,
+                wgpu::CompositeAlphaMode::PostMultiplied,
+            ]),
+            Some(wgpu::CompositeAlphaMode::PostMultiplied),
+            "the other compositing mode is taken when it is the only one on offer"
+        );
+        assert_eq!(
+            pick_alpha_mode(&[wgpu::CompositeAlphaMode::Opaque]),
+            Some(wgpu::CompositeAlphaMode::Opaque)
+        );
+        assert_eq!(
+            pick_alpha_mode(&[]),
+            None,
+            "no alpha modes advertised is an error, not a mode"
+        );
     }
 
     #[test]
