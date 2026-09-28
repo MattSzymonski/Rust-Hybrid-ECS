@@ -141,6 +141,21 @@ pub trait Rule {
         Vec::new()
     }
 
+    /// Inputs besides `input` the rule's build reads, if any.
+    ///
+    /// Used for staleness only: an output is stale when any of these is newer
+    /// than it. The shader rule's `#include` headers are the reason this
+    /// exists - a build script can report them to cargo, but without this the
+    /// per-file check would see the output as fresh and silently serve a
+    /// stale cook.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CookError::Io`] when the extra inputs cannot be listed.
+    fn extra_inputs(&self, _input: &Path) -> Result<Vec<PathBuf>, CookError> {
+        Ok(Vec::new())
+    }
+
     /// Turn `input` into `output`, called only while `output` is stale.
     ///
     /// # Errors
@@ -272,7 +287,14 @@ impl Pipeline {
                 if !execute {
                     continue;
                 }
-                if !is_stale(&input, &output)? {
+                let mut stale = is_stale(&input, &output)?;
+                for extra_input in rule.extra_inputs(&input)? {
+                    if is_stale(&extra_input, &output)? {
+                        stale = true;
+                        break;
+                    }
+                }
+                if !stale {
                     stats.skipped.push(output);
                     continue;
                 }
@@ -470,6 +492,65 @@ mod tests {
         assert!(second.rebuilt.is_empty());
         assert_eq!(second.skipped.len(), 1);
         assert_eq!(second.discovered, first.discovered);
+    }
+
+    /// A rule can declare inputs its glob does not match - the shader rule's
+    /// `#include` headers - and a newer one has to make the output stale.
+    #[test]
+    fn a_newer_extra_input_rebuilds_the_output() {
+        /// Cooks `shaders/*.in`, re-cooked when `include/` changes.
+        struct WithIncludes;
+
+        impl Rule for WithIncludes {
+            fn name(&self) -> &'static str {
+                "with_includes"
+            }
+
+            fn input_glob(&self) -> &'static str {
+                "shaders/*.in"
+            }
+
+            fn output_for(&self, input: &Path) -> PathBuf {
+                input.with_extension("out")
+            }
+
+            fn extra_inputs(&self, input: &Path) -> Result<Vec<PathBuf>, CookError> {
+                let parent = input.parent().expect("matched inputs live in a directory");
+                walk_files(&parent.join("include"))
+            }
+
+            fn build(&self, input: &Path, output: &Path) -> Result<(), CookError> {
+                fs::copy(input, output).map_err(|source| CookError::Io {
+                    path: output.to_owned(),
+                    source,
+                })?;
+                Ok(())
+            }
+        }
+
+        let root = scratch("extra_inputs");
+        fs::create_dir_all(root.join("shaders/include")).expect("shaders");
+        fs::write(root.join("shaders/triangle.in"), b"source").expect("input");
+        let header = root.join("shaders/include/common.h");
+        fs::write(&header, b"header").expect("header");
+        let pipeline = Pipeline {
+            root: root.clone(),
+            rules: vec![Box::new(WithIncludes)],
+        };
+
+        let first = pipeline.run().expect("first run");
+        assert_eq!(first.rebuilt.len(), 1);
+
+        // Nothing moved: the matched input is untouched, so the output stays.
+        let second = pipeline.run().expect("second run");
+        assert!(second.rebuilt.is_empty());
+        assert_eq!(second.skipped.len(), 1);
+
+        // The header the rule reads is newer than the output, so the next run
+        // re-cooks even though the matched input never moved.
+        fs::write(&header, b"header v2").expect("header edit");
+        let third = pipeline.run().expect("third run");
+        assert_eq!(third.rebuilt.len(), 1);
     }
 
     #[test]

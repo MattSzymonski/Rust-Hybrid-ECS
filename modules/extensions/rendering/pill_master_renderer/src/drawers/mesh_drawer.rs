@@ -1,5 +1,32 @@
+//! Batching and draw recording for the master renderer's mesh path.
+//!
+//! # Responsibilities
+//!
+//! - Track the shader, material, and mesh the bound GPU resources belong to,
+//!   flushing the accumulated instances when any of them changes
+//!   ([`DrawingContext`]).
+//! - Own the instance buffer, keep it large enough for a frame's batches, and
+//!   give each batch its own region of it ([`MeshDrawer`]).
+//! - Open the frame's render pass and record every draw the sorted queue
+//!   implies inside it ([`MeshDrawer::record_draw_commands`]).
+//!
+//! # Design
+//!
+//! The queue arrives sorted by its packed key - draw order first, then shader,
+//! material, and mesh - so items that agree on all three state handles are
+//! drawn as one instanced call, and draws are recorded only where the state
+//! changes or a batch ends. The instance data itself lives in one growable
+//! buffer: the staging vector and the buffer are reused frame after frame, and
+//! each batch writes its own region because every `write_buffer` of a frame
+//! lands before the command buffer runs.
+
+// Standard library
 use std::{num::NonZeroU32, ops::Range};
 
+// External crates
+use pill_core::{debug, PillStyle};
+
+// Current crate
 use crate::error::Result;
 use crate::{
     component::RenderViewport,
@@ -14,11 +41,15 @@ use crate::{
     slot_map::{RendererMaterialHandle, RendererMeshHandle, RendererShaderHandle},
     Instance,
 };
-use pill_core::{debug, PillStyle};
 
+/// Accumulated draw state for the run of instances being recorded.
+///
+/// Holds the shader, material, and mesh the bound GPU resources belong to,
+/// plus the instance range accumulated since the last recorded draw. Starting
+/// empty through `Default` makes the first item count as a change, so its
+/// resources are bound before anything is drawn.
 #[derive(Debug, Clone, Default)]
 pub struct DrawingContext {
-    rendering_order: u8,
     shader_handle: Option<RendererShaderHandle>,
     shader_name: String,
     material_handle: Option<RendererMaterialHandle>,
@@ -30,29 +61,37 @@ pub struct DrawingContext {
     accumulated_instance_range: Range<u32>,
     accumulated_instance_count: u32,
 
-    rendering_context_change_number: u32,
-
     instance_batch_number: u32,
     instance_batch_size: u32,
 }
 
 impl DrawingContext {
+    /// Emits the telemetry line describing the draw just recorded.
+    ///
+    /// Reports the batch number, the instance range, and the shader, material,
+    /// and mesh names, which is what makes a mis-batched frame traceable from
+    /// the log alone.
     pub fn log(&self) {
         debug!(
             target: pill_core::telemetry::telemetry_target::RENDERING,
-            "Draw {} instance(s) {}->{}/{} command recorded [Batch: {}, Rendering order: {}, Shader: {}, Material: {}, Mesh: {}]",
+            "Draw {} instance(s) {}->{}/{} command recorded [Batch: {}, Shader: {}, Material: {}, Mesh: {}]",
             self.accumulated_instance_count,
             self.accumulated_instance_range.start,
             self.accumulated_instance_range.end - 1,
             self.instance_batch_size,
             self.instance_batch_number,
-            self.rendering_order,
             self.shader_name.name_style(),
             self.material_name.name_style(),
             self.mesh_name.name_style()
         );
     }
 
+    /// Records the instances accumulated since the last draw as one indexed
+    /// draw, if there are any, then empties the range.
+    ///
+    /// It runs wherever the accumulated instances stop sharing the bound
+    /// state: before a shader, material, or mesh switch, and at the end of a
+    /// batch.
     pub fn record_draw_accumulated_instances(&mut self, render_pass: &mut wgpu::RenderPass) {
         if self.accumulated_instance_count > 0 {
             render_pass.draw_indexed(
@@ -67,6 +106,11 @@ impl DrawingContext {
         }
     }
 
+    /// Adds the instance most recently prepared to the range the next draw
+    /// covers.
+    ///
+    /// One call per queue item, so the range grows instance by instance until
+    /// a state change or the end of the batch records it.
     pub fn accumulate_instance(&mut self) {
         self.accumulated_instance_range =
             self.accumulated_instance_range.start..self.accumulated_instance_range.end + 1;
@@ -74,13 +118,11 @@ impl DrawingContext {
             self.accumulated_instance_range.end - self.accumulated_instance_range.start;
     }
 
-    pub fn change_rendering_order(&mut self, new_order: u8) {
-        self.rendering_order = new_order;
-
-        self.rendering_context_change_number += 1;
-        debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Rendering order changed to: {}", self.rendering_order);
-    }
-
+    /// Binds the pipeline and bind groups the given shader draws through.
+    ///
+    /// The shader's own pipeline is used unless the pass supplies an override,
+    /// and the engine and camera bind groups are set only when the shader
+    /// declares that it reads them.
     pub fn change_shader(
         &mut self,
         renderer_resource_storage: &RendererResourceStorage,
@@ -121,10 +163,15 @@ impl DrawingContext {
             debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Camera parameters bound");
         }
 
-        self.rendering_context_change_number += 1;
         debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Renderer pipeline shader changed to: {}", self.shader_name.name_style());
     }
 
+    /// Binds the parameter and texture bind groups the given material draws
+    /// through.
+    ///
+    /// Either group may be absent, because a material without parameters or
+    /// without textures declares none for it; a missing group leaves whatever
+    /// was bound before it in place.
     pub fn change_material(
         &mut self,
         renderer_resource_storage: &RendererResourceStorage,
@@ -158,10 +205,13 @@ impl DrawingContext {
             debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Material textures bound");
         }
 
-        self.rendering_context_change_number += 1;
         debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Renderer pipeline material changed to: {}", self.material_name.name_style());
     }
 
+    /// Binds the vertex and index buffers of the given mesh.
+    ///
+    /// The mesh's index count is stored alongside the binding, because the
+    /// draw calls read it from the context, not from the mesh.
     pub fn change_mesh(
         &mut self,
         renderer_resource_storage: &RendererResourceStorage,
@@ -176,11 +226,15 @@ impl DrawingContext {
         render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
         render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
 
-        self.rendering_context_change_number += 1;
         debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Renderer pipeline mesh changed to: {}", self.mesh_name.name_style());
     }
 }
 
+/// Owns the instance buffer and records a frame's mesh draws through it.
+///
+/// One drawer lives for the renderer's lifetime: the staging vector and the
+/// buffer are reused every frame, and grow only when a frame brings more
+/// instances than the buffer holds.
 pub struct MeshDrawer {
     max_instance_batch_size: u32,
     instances: Vec<Instance>,
@@ -194,19 +248,26 @@ pub struct MeshDrawer {
 /// Every batch gets its own slice rather than sharing the front of the buffer:
 /// the writes and the draws they feed are recorded into one command buffer, so a
 /// shared region would leave every draw reading whichever batch was written
-/// last. The offset is a whole number of batches, which keeps it four-byte
-/// aligned the way `write_buffer` requires.
+/// last. `max_batch_size` - never the trailing chunk's own length - is what
+/// puts each region at a whole-batch offset, which also keeps it four-byte
+/// aligned the way `write_buffer` requires; `instance_count` is how many
+/// instances that batch actually holds.
 fn batch_region(
     batch_index: usize,
-    batch_size: usize,
+    max_batch_size: usize,
     instance_count: usize,
 ) -> std::ops::Range<u64> {
     let stride = size_of::<Instance>();
-    let start = (batch_index * batch_size * stride) as u64;
+    let start = (batch_index * max_batch_size * stride) as u64;
     start..start + (instance_count * stride) as u64
 }
 
 impl MeshDrawer {
+    /// Creates a drawer whose instance buffer has room for one full batch.
+    ///
+    /// `max_instance_batch_size` is both the batch chunk size and the initial
+    /// buffer capacity, so a frame no larger than one batch needs no
+    /// reallocation; larger frames grow the buffer in whole batches.
     pub fn new(device: &wgpu::Device, max_instance_batch_size: u32) -> Self {
         let capacity = max_instance_batch_size as usize;
         let instance_buffer = Self::allocate(device, capacity);
@@ -243,6 +304,20 @@ impl MeshDrawer {
         self.instance_capacity = capacity;
     }
 
+    /// Opens a render pass on `encoder` and records every draw the sorted
+    /// queue implies, then drops the pass before returning.
+    ///
+    /// Uploads and draws run in batches of `max_instance_batch_size`, each
+    /// batch through its own region of the instance buffer, so one buffer
+    /// write covers at most one batch's instances. Drawn state carries across
+    /// batch boundaries: a shader, material, or mesh shared by two adjacent
+    /// batches is not rebound just because the batch ended.
+    ///
+    /// # Errors
+    ///
+    /// Never returns an error: every step is a wgpu call that reports nothing
+    /// to check, and `Ok(())` is the only value produced. The `Result` keeps
+    /// the call site uniform with the frame path's other fallible steps.
     #[allow(clippy::too_many_arguments)]
     pub fn record_draw_commands(
         &mut self,
@@ -255,28 +330,18 @@ impl MeshDrawer {
         pipeline: Option<&wgpu::RenderPipeline>,
         color_attachments: &[Option<wgpu::RenderPassColorAttachment>],
         depth_stencil_attachment: wgpu::RenderPassDepthStencilAttachment,
-        // Rendring data
+        // Rendering data
         camera: &RendererCamera,
         render_queue: &[RenderQueueItem],
         instances: &[RenderInstance],
         viewport: RenderViewport,
-        // profiler: &mut Profiler,
     ) -> Result<()> {
-        //let _timestamp_query_start = profiler.write_timestamp(encoder, "xx");
-
         let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some(label),
             color_attachments,
             depth_stencil_attachment: Some(depth_stencil_attachment),
             timestamp_writes: None,
-            occlusion_query_set: None, // profiler.get_occlusion_query_set(), // immut borrow ends after this stmt
-                                       //timestamp_writes: None,
-                                       // occlusion_query_set: profiler.get_occlusion_query_set(), // immut borrow ends after this stmt
-                                       // timestamp_writes: Some(wgpu::RenderPassTimestampWrites {
-                                       //     query_set: profiler.get_timestamp_query_set().unwrap(),
-                                       //     beginning_of_pass_write_index: Some(0),
-                                       //     end_of_pass_write_index: Some(1),
-                                       // }),
+            occlusion_query_set: None,
         });
 
         render_pass.set_viewport(
@@ -289,28 +354,18 @@ impl MeshDrawer {
         );
         render_pass.set_scissor_rect(viewport.x, viewport.y, viewport.width, viewport.height);
 
-        // let _pipeline_statistics_query_start = profiler.begin_pipeline_statistics_query(&mut render_pass);
-        //let _occlusion_query_start = profiler.begin_occlusion_query(&mut render_pass);
-
-        // let mut current_rendering_order: u8 = 0;
-
-        // let mut current_shader_handle: Option<RendererShaderHandle> = None;
-        // let mut current_shader_name = "";
-        // let mut current_material_handle: Option<RendererMaterialHandle> = None;
-        // let mut current_material_name = "";
-        // let mut current_mesh_handle: Option<RendererMeshHandle> = None;
-        // let mut current_mesh_name = "";
-        // let mut current_mesh_index_count: u32 = 0; // Number of indices in the current mesh
-
         let mut current_drawing_context = DrawingContext::default();
 
         self.ensure_capacity(device, render_queue.len());
         let batch_size = self.max_instance_batch_size as usize;
 
         for (i, instance_batch) in render_queue.chunks(batch_size).enumerate() {
-            let batch_size = instance_batch.len();
+            // The chunk's own length, kept apart from `batch_size`: regions are
+            // laid out in whole batches, and letting this shadow the configured
+            // size made a partial trailing batch overwrite an earlier one.
+            let instance_count = instance_batch.len();
             current_drawing_context.instance_batch_number = i as u32;
-            current_drawing_context.instance_batch_size = batch_size as u32;
+            current_drawing_context.instance_batch_size = instance_count as u32;
 
             // Prepare instance data and load it to buffer
             self.instances.clear();
@@ -323,7 +378,7 @@ impl MeshDrawer {
                 self.instances.push(Instance::new(transform_component));
             }
 
-            let region = batch_region(i, batch_size, self.instances.len());
+            let region = batch_region(i, batch_size, instance_count);
             queue.write_buffer(
                 &self.instance_buffer,
                 region.start,
@@ -352,12 +407,6 @@ impl MeshDrawer {
                     render_queue_key_fields.mesh_index.into(),
                     NonZeroU32::new(render_queue_key_fields.mesh_version.into()).unwrap(),
                 );
-
-                // Check for rendering order change
-                if current_drawing_context.rendering_order > render_queue_key_fields.order {
-                    current_drawing_context.record_draw_accumulated_instances(&mut render_pass);
-                    current_drawing_context.change_rendering_order(render_queue_key_fields.order);
-                }
 
                 // Check for shader change
                 if current_drawing_context.shader_handle != Some(renderer_shader_handle) {
@@ -395,21 +444,16 @@ impl MeshDrawer {
                 current_drawing_context.accumulate_instance();
 
                 // If last in batch, draw accumulated instances
-                if j == batch_size - 1 {
+                if j == instance_count - 1 {
                     current_drawing_context.record_draw_accumulated_instances(&mut render_pass);
                 }
             }
         }
 
-        // Drop render_pass before finishing encoder
-        //let _occlusion_query_end = profiler.end_occlusion_query(&mut render_pass);
-        //let _pipeline_statistics_query_end = profiler.end_pipeline_statistics_query(&mut render_pass);
-
+        // Drop render_pass before returning: the borrow of the encoder has to
+        // end here, and the caller finishes the encoder.
         drop(render_pass);
 
-        // let _timestamp_query_end = profiler.write_timestamp(encoder, "xx12");
-
-        //queue.submit(std::iter::once(encoder.finish()));
         Ok(())
     }
 }
@@ -442,5 +486,21 @@ mod tests {
         for batch in 0..4 {
             assert_eq!(batch_region(batch, 3, 3).start % 4, 0);
         }
+    }
+
+    /// The call site hands the function the configured batch size, not the
+    /// chunk's: a partial trailing batch must start at its own whole-batch
+    /// boundary, or it overwrites the batch before it.
+    #[test]
+    fn a_partial_batch_starts_on_a_whole_batch_boundary() {
+        let stride = size_of::<Instance>() as u64;
+
+        let full = batch_region(0, 4, 4);
+        let partial = batch_region(1, 4, 1);
+        assert_eq!(partial, 4 * stride..5 * stride);
+        assert!(
+            full.end <= partial.start,
+            "the partial batch overlapped the full one"
+        );
     }
 }

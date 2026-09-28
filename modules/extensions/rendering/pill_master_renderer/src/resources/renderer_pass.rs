@@ -18,7 +18,7 @@
 //! wrote. That is the shape every post-processing step takes, and it is the
 //! reason a pass can carry its own parameters and inputs at all.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     assets::{CullMode, PassKind, Shader},
@@ -64,6 +64,7 @@ impl RendererPass {
         targets: &HashMap<String, RendererTexture>,
         depth: &RendererTexture,
         textures: &[(String, RendererTextureHandle)],
+        defined_targets: &HashSet<String>,
     ) -> Result<Self> {
         let vertex_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("pass_vertex_shader"),
@@ -244,11 +245,26 @@ impl RendererPass {
                     Some(target) => {
                         // Depth is not an offscreen colour target, but a pass
                         // names it the same way: as something an earlier pass
-                        // left behind. It gets the renderer's read sampler,
-                        // because the buffer's own is a comparison one.
+                        // left behind. It reads through the depth buffer's own
+                        // sampler, which is a plain read sampler rather than a
+                        // comparison one.
                         let (view, sampler) = if target == DEPTH_INPUT {
-                            (&depth.texture_view, &storage.depth_sampler)
+                            (&depth.texture_view, &depth.sampler)
                         } else {
+                            // The target map holds every offscreen target the
+                            // chain declares, so the map alone cannot tell an
+                            // earlier pass's output from this pass's own or a
+                            // later pass's: `defined_targets` is the chain
+                            // walked so far, and reading outside it would bind
+                            // an uninitialised texture.
+                            if !defined_targets.contains(target.as_str()) {
+                                return Err(RendererError::Other {
+                                    detail: format!(
+                                        "pass {} reads `{target}`, which no earlier pass writes",
+                                        pass.name
+                                    ),
+                                });
+                            }
                             let texture = targets.get(target).context(format!(
                                 "pass {} reads `{target}`, which no earlier pass writes",
                                 pass.name
@@ -307,6 +323,25 @@ impl RendererPass {
                     binding: slot.sampler_binding,
                     resource: wgpu::BindingResource::Sampler(sampler),
                 });
+            }
+            // A name the shader has no slot for is a typo or a leftover from an
+            // edited shader; saying so is the difference between a pass that is
+            // missing a texture and one whose author believes it bound it.
+            for slot_name in pass.inputs.keys() {
+                if !renderer_shader.texture_slots.contains_key(slot_name) {
+                    println!(
+                        "[render] Pass {} names input `{slot_name}`, which its shader has no slot for",
+                        pass.name
+                    );
+                }
+            }
+            for (slot_name, _key) in textures {
+                if !renderer_shader.texture_slots.contains_key(slot_name) {
+                    println!(
+                        "[render] Pass {} binds texture `{slot_name}`, which its shader has no slot for",
+                        pass.name
+                    );
+                }
             }
             let layout = renderer_shader
                 .textures_bind_group_layout

@@ -1,5 +1,11 @@
 //! Declaring a foreign type's layout with `pill_value_type!`.
 //!
+//! # Responsibilities
+//!
+//! - Exercise the macro on a path spelled across segments, and on two
+//!   declarations whose paths share a trailing segment.
+//! - Pin the generated item naming that lets the two coexist.
+//!
 //! The macro walks the fields through a synthetic struct and takes every
 //! offset from the compiler, so a path spelled across segments has to work the
 //! same as an imported name - and two declarations whose paths share a

@@ -338,7 +338,6 @@ pub struct RenderingHost {
     host: Host,
     renderer: Box<dyn PillRenderer>,
     assets: crate::render_assets::NativeAssets,
-    surface_extent: [u32; 2],
     viewport: Option<RenderViewport>,
     presented_scene: bool,
 }
@@ -361,7 +360,6 @@ impl RenderingHost {
     {
         let renderer = Renderer::new(window, width, height)?;
         self.renderer = Box::new(renderer);
-        self.surface_extent = [width, height];
         self.set_render_viewport(self.viewport);
         Ok(())
     }
@@ -369,7 +367,6 @@ impl RenderingHost {
     /// Forward a physical window resize to the engine renderer.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.renderer.resize(width, height);
-        self.surface_extent = [width, height];
         self.set_render_viewport(self.viewport);
     }
 
@@ -381,18 +378,6 @@ impl RenderingHost {
     pub fn set_render_viewport(&mut self, viewport: Option<RenderViewport>) {
         self.viewport = viewport;
         self.renderer.set_viewport(viewport);
-        let extent = viewport
-            .and_then(|v| v.clamped_to(self.surface_extent[0], self.surface_extent[1]))
-            .map(|v| [v.width, v.height])
-            .unwrap_or(self.surface_extent);
-        if let Some(frame) = self
-            .host
-            .engine_mut()
-            .world_mut()
-            .get_resource_mut::<RenderFrame>()
-        {
-            frame.extent = extent;
-        }
     }
 
     /// Execute one ECS frame and present its resulting world to the surface.
@@ -800,18 +785,10 @@ where
         crate::render_assets::NativeAssets::prepare(Some(&project_root), &host.workspace_root)?;
     #[cfg(not(feature = "hot_reload"))]
     let assets = crate::render_assets::NativeAssets::prepare(None, std::path::Path::new("."))?;
-    if let Some(frame) = host
-        .engine_mut()
-        .world_mut()
-        .get_resource_mut::<RenderFrame>()
-    {
-        frame.extent = [width, height];
-    }
     Ok(RenderingHost {
         host,
         renderer: Box::new(renderer),
         assets,
-        surface_extent: [width, height],
         viewport: None,
         presented_scene: false,
     })
@@ -858,18 +835,10 @@ where
         crate::render_assets::NativeAssets::prepare(Some(&project_root), &host.workspace_root)?;
     #[cfg(not(feature = "hot_reload"))]
     let assets = crate::render_assets::NativeAssets::prepare(None, std::path::Path::new("."))?;
-    if let Some(frame) = host
-        .engine_mut()
-        .world_mut()
-        .get_resource_mut::<RenderFrame>()
-    {
-        frame.extent = [width, height];
-    }
     Ok(RenderingHost {
         host,
         renderer: Box::new(renderer),
         assets,
-        surface_extent: [width, height],
         viewport: None,
         presented_scene: false,
     })

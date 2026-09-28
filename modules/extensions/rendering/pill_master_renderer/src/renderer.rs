@@ -1,5 +1,43 @@
+//! The master renderer: draws a frame's resolved chain and instances, over the
+//! device, surface, and frame state [`State`] owns.
+//!
+//! # Responsibilities
+//!
+//! - Keep the GPU caches level with each frame's asset snapshot, one asset
+//!   type at a time, rebuilding only what moved ([`Renderer`] and its
+//!   per-type sync helpers).
+//! - Decide when the chain's pipelines, bind groups, and offscreen targets
+//!   have to be rebuilt, from two signatures compared against the frame's
+//!   chain generation, resource epoch, and surface size.
+//! - Plan each pass - which draws it takes, which pass opens each target -
+//!   and name a pass that cannot be recorded once, rather than once per
+//!   frame (`PassPlan`).
+//! - Submit the frame through [`State`]: one command encoder, one wgpu render
+//!   pass per planned pass, then the present.
+//!
+//! # Design
+//!
+//! The chain is read every frame but its GPU objects are not rebuilt every
+//! frame: an unchanged frame costs one tuple comparison, and the signature
+//! strings are only built once the chain generation, the resource epoch, or
+//! the surface size moved. Creation failures are reported and skipped rather
+//! than fatal - a shader, texture, or target that would not build is named in
+//! the log while the rest of the revision still reaches the GPU.
+
 #![allow(clippy::too_many_arguments)]
 
+// Standard library
+use std::{
+    borrow::Cow,
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
+
+// External crates
+use pill_core::{info, PillStyle};
+use pill_engine::Handle;
+
+// Current crate
 use crate::{
     api::{FrameOutcome, PillRenderer, RenderCapabilities, RenderMetrics},
     assets::{
@@ -9,11 +47,11 @@ use crate::{
     component::RenderViewport,
     config::{
         CAMERA_PARAMETERS_BIND_GROUP_LAYOUT_INDEX, ENGINE_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
-        MATERIAL_PARAMETERS_BIND_GROUP_LAYOUT_INDEX, MATERIAL_TEXTURES_BIND_GROUP_LAYOUT_INDEX,
-        MAX_INSTANCE_PER_DRAWCALL_COUNT,
+        INSTANCE_BATCH_SIZE, MATERIAL_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
+        MATERIAL_TEXTURES_BIND_GROUP_LAYOUT_INDEX,
     },
     drawers::mesh_drawer::MeshDrawer,
-    error::{RendererError, Result},
+    error::{capturing_validation, RendererError, Result},
     frame::{AssetSnapshot, RenderFrame, ResolvedPass},
     render_queue::{compose_render_queue_key, decompose_render_queue_key, RenderQueueItem},
     resources::{
@@ -25,11 +63,6 @@ use crate::{
         RendererTextureHandle,
     },
     Instance,
-};
-use pill_core::{info, PillStyle};
-use std::{
-    collections::{HashMap, HashSet},
-    time::Instant,
 };
 
 /// Colour every frame starts from, whatever the first pass is.
@@ -47,6 +80,10 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
 /// picture before the pass that was going to bring it back into range runs.
 const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
 
+/// A window the renderer can build its surface from.
+///
+/// Blanket-implemented for every wgpu window handle, so a frontend hands the
+/// renderer its own window type without naming wgpu's.
 pub trait RendererWindow: wgpu::WindowHandle {}
 impl<T> RendererWindow for T where T: wgpu::WindowHandle {}
 
@@ -73,9 +110,12 @@ enum PassSlot {
 /// One pass the renderer will record.
 enum PassPlan<'a> {
     /// Instances, batched by material, into the pass's targets.
+    ///
+    /// Borrowed when the pass takes the whole queue, which is the built-in
+    /// chain's shape; only a shader-filtered pass pays for a collection.
     Geometry {
         label: &'a str,
-        items: Vec<RenderQueueItem>,
+        items: Cow<'a, [RenderQueueItem]>,
         outputs: Vec<PassOutput<'a>>,
         clear: bool,
         /// The pass's own pipeline, when it built one. `None` leaves each
@@ -126,11 +166,13 @@ impl PassPlan<'_> {
 /// A signature of everything a chain's GPU objects depend on.
 ///
 /// The chain is read every frame but its pipelines are not rebuilt every frame:
-/// this is what decides whether they have to be. The asset revision is part of
-/// it because a pass's parameters live in the asset, so editing one has to
-/// rebuild the bind group that carries it.
-fn chain_signature(chain: &[ResolvedPass], asset_revision: u64) -> String {
-    let mut signature = format!("r{asset_revision}");
+/// this is what decides whether they have to be. It covers the chain's content,
+/// including pass parameters and the textures a pass names - both iterated in
+/// slot order so a `HashMap`'s arbitrary order cannot make an unchanged chain
+/// look new - plus the resource epoch, which moves whenever a shader or texture
+/// the bind groups reference was recreated.
+fn chain_signature(chain: &[ResolvedPass], resource_epoch: u64) -> String {
+    let mut signature = format!("e{resource_epoch}");
     for pass in chain {
         signature.push('|');
         signature.push_str(&pass.name);
@@ -161,22 +203,72 @@ fn chain_signature(chain: &[ResolvedPass], asset_revision: u64) -> String {
             " scale:{} blend:{} depth_write:{} cull:{:?}",
             pass.target_scale, pass.blend, pass.depth_write, pass.cull
         ));
-        for (slot, target) in &pass.inputs {
+        let mut inputs: Vec<_> = pass.inputs.iter().collect();
+        inputs.sort();
+        for (slot, target) in inputs {
             signature.push_str(&format!(" input:{slot}={target}"));
         }
         // A pass's textures are part of it for the same reason its parameters
-        // are: the pointer to one lives in the asset, and the bind group that
-        // reads it is built once and then kept.
-        for (slot, texture) in &pass.textures {
+        // are: the handle the bind group reads is resolved here, and it is
+        // built once and then kept.
+        let mut textures: Vec<_> = pass.textures.iter().collect();
+        textures.sort();
+        for (slot, texture) in textures {
             signature.push_str(&format!(" texture:{slot}={texture}"));
+        }
+        // Serialized, not hashed: a pass's parameters live in a uniform buffer
+        // the bind group keeps, so this is what makes editing one rebuild it.
+        let mut parameters: Vec<_> = pass.parameters.iter().collect();
+        parameters.sort_by_key(|(name, _)| name.as_str());
+        for (name, parameter) in parameters {
+            signature.push_str(&format!(" param:{name}={parameter:?}"));
         }
     }
     signature
 }
 
+/// A signature of the offscreen targets a chain needs: every target name, the
+/// scale of the pass that names it, and the surface size it is built at.
+///
+/// Kept apart from the pipeline signature on purpose: editing an asset moves
+/// the pipeline signature (a pass's parameters are part of it) but changes none
+/// of this, so the offscreen textures survive an asset edit.
+fn offscreen_signature(chain: &[ResolvedPass], width: u32, height: u32) -> String {
+    let mut signature = format!("{width}x{height}");
+    for pass in chain {
+        let scale = pass.target_scale.max(1);
+        for target in std::iter::once(&pass.target).chain(pass.extra_targets.iter()) {
+            if let PassTarget::Offscreen(name) = target {
+                signature.push('|');
+                signature.push_str(name);
+                signature.push_str(&format!("@{scale}"));
+            }
+        }
+    }
+    signature
+}
+
+/// The master renderer: the asset caches, the chain's GPU objects, and the
+/// frame submission behind the [`PillRenderer`] contract.
+///
+/// One renderer owns one window's surface and everything drawn to it. The
+/// per-asset maps are its frame-to-GPU diff: each sync compares an asset's
+/// content version against the version the object behind its key was built
+/// from, and rebuilds only what moved.
 pub struct Renderer {
+    /// The wgpu device, surface, and frame state this renderer drives.
     pub state: State,
-    asset_revision: u64,
+    /// The snapshot revision the GPU caches are level with, or `None` after an
+    /// explicit invalidation; the sync runs when it does not match the frame's.
+    assets_synced_revision: Option<u64>,
+    /// Content version of every asset the GPU object behind a key was built
+    /// from, one map per asset type. A key whose version moved - or that is not
+    /// recorded here at all - is rebuilt; a key whose version matches keeps its
+    /// object.
+    shader_versions: HashMap<u64, u64>,
+    material_versions: HashMap<u64, u64>,
+    texture_versions: HashMap<u64, u64>,
+    mesh_versions: HashMap<u64, u64>,
     shader_handles: HashMap<u64, RendererShaderHandle>,
     material_handles: HashMap<u64, RendererMaterialHandle>,
     texture_handles: HashMap<u64, RendererTextureHandle>,
@@ -196,14 +288,38 @@ pub struct Renderer {
     passes: Vec<PassSlot>,
     /// The chain those passes were built from.
     pipeline_signature: Option<String>,
+    /// What `pipeline_signature` was last checked against: the frame's chain
+    /// generation, the resource epoch and the surface size. One tuple compare
+    /// per frame - no strings built - until the frame's chain or the GPU
+    /// objects behind it actually move.
+    pipeline_inputs: Option<(u64, u64, u32, u32)>,
+    /// The offscreen layout the current targets were built for.
+    offscreen_key: Option<String>,
+    /// Bumped whenever a shader or texture GPU object is created, recreated,
+    /// or dropped: pass bind groups reference those objects by handle, so a
+    /// change to one is what invalidates them.
+    resource_epoch: u64,
     metrics: RenderMetrics,
 }
 
 impl Renderer {
+    /// Creates the renderer synchronously, blocking on [`Renderer::new_async`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the errors of [`Renderer::new_async`], which does the work.
     pub fn new<W: RendererWindow + 'static>(window: W, width: u32, height: u32) -> Result<Self> {
         pollster::block_on(Self::new_async(window, width, height))
     }
 
+    /// Creates the renderer: device and surface, the default material, and the
+    /// camera.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`RendererError`] when a creation step fails: surface or
+    /// adapter acquisition, device creation, surface configuration, the depth
+    /// buffer, the resource storage, the default material, or the camera.
     pub async fn new_async<W: RendererWindow + 'static>(
         window: W,
         width: u32,
@@ -221,7 +337,11 @@ impl Renderer {
             )?);
         Ok(Self {
             state,
-            asset_revision: u64::MAX,
+            assets_synced_revision: None,
+            shader_versions: HashMap::new(),
+            material_versions: HashMap::new(),
+            texture_versions: HashMap::new(),
+            mesh_versions: HashMap::new(),
             shader_handles: HashMap::new(),
             material_handles: HashMap::new(),
             texture_handles: HashMap::new(),
@@ -235,40 +355,156 @@ impl Renderer {
             chain_log: None,
             passes: Vec::new(),
             pipeline_signature: None,
+            pipeline_inputs: None,
+            offscreen_key: None,
+            resource_epoch: 0,
             metrics: RenderMetrics::default(),
         })
     }
 
-    fn sync_assets(&mut self, assets: &AssetSnapshot) -> Result<()> {
-        if self.asset_revision == assets.revision {
-            return Ok(());
+    /// Bring the GPU caches level with the snapshot, per asset.
+    ///
+    /// The snapshot's revision gates the pass, and its per-asset content
+    /// versions decide what inside it moved: one edited texture is re-uploaded
+    /// while its neighbours keep their GPU objects, and a removed asset frees
+    /// its slot. Creation failures are reported and skipped rather than
+    /// aborting the pass, so one bad asset neither holds the rest of the
+    /// revision hostage nor is retried every frame.
+    fn sync_assets(&mut self, assets: &AssetSnapshot) {
+        if self.assets_synced_revision == Some(assets.revision) {
+            return;
         }
-        self.state
-            .renderer_resource_storage
-            .clear_assets(&self.state.device, &self.state.queue)?;
-        self.shader_handles.clear();
-        self.material_handles.clear();
-        self.texture_handles.clear();
-        self.mesh_handles.clear();
-        (self.default_shader, self.default_material) = install_default_material(&mut self.state)?;
+        self.assets_synced_revision = Some(assets.revision);
+
+        // Textures and shaders first: materials bind them by handle. The epoch
+        // moves only when one of these two layers did, because those are the
+        // objects a pass's bind groups keep - and the materials built against
+        // them are invalidated by key, because their own content version alone
+        // would not ask for a rebuild.
+        let mut changed: HashSet<u64> = HashSet::new();
+        let mut epoch_moved = self.sync_textures(assets, &mut changed);
+        epoch_moved |= self.sync_shaders(assets, &mut changed);
+        self.sync_meshes(assets);
+        if !changed.is_empty() {
+            self.invalidate_dependent_materials(assets, &changed);
+        }
+        self.sync_materials(assets);
+        if epoch_moved {
+            self.resource_epoch = self.resource_epoch.wrapping_add(1);
+        }
+    }
+
+    /// Forget every built material that reads an asset just recreated.
+    ///
+    /// A material's bind groups are built against the layouts and views its
+    /// shader and textures had at the time; when one of those is rebuilt or
+    /// removed, the groups go stale while the material's own content version
+    /// stands still. Dropping the version record is what makes `sync_materials`
+    /// rebuild it in the same pass, against the new object.
+    fn invalidate_dependent_materials(&mut self, assets: &AssetSnapshot, changed: &HashSet<u64>) {
+        for (material_key, material) in &assets.materials {
+            let shader_changed = changed.contains(&crate::assets::asset_key(material.shader));
+            let texture_changed = material
+                .textures
+                .values()
+                .any(|texture| changed.contains(&crate::assets::asset_key(texture.texture)));
+            if shader_changed || texture_changed {
+                self.material_versions.remove(material_key);
+            }
+        }
+    }
+
+    /// Drop and rebuild the textures whose asset changed.
+    ///
+    /// Returns whether any texture object was created, recreated, or dropped.
+    /// Keys whose object moved are added to `changed`, so the materials built
+    /// against them can be rebuilt too.
+    fn sync_textures(&mut self, assets: &AssetSnapshot, changed: &mut HashSet<u64>) -> bool {
+        let mut epoch_moved = false;
+        let removed: Vec<u64> = self
+            .texture_handles
+            .keys()
+            .filter(|key| !assets.textures.contains_key(key))
+            .copied()
+            .collect();
+        for key in removed {
+            if let Some(handle) = self.texture_handles.remove(&key) {
+                self.state.renderer_resource_storage.textures.remove(handle);
+                self.texture_versions.remove(&key);
+                changed.insert(key);
+                epoch_moved = true;
+            }
+        }
 
         for (key, texture) in &assets.textures {
-            let handle =
-                self.state
-                    .renderer_resource_storage
-                    .textures
-                    .insert(RendererTexture::new_texture(
-                        &self.state.device,
-                        &self.state.queue,
-                        Some(&texture.name),
-                        &texture.rgba,
-                        texture.width,
-                        texture.height,
-                        texture.texture_type,
-                    )?);
-            self.texture_handles.insert(*key, handle);
+            let version = assets.versions.textures.get(key).copied().unwrap_or(0);
+            if self.texture_versions.get(key) == Some(&version) {
+                continue;
+            }
+            // Recorded before the rebuild: even a failed creation dropped the
+            // texture the old materials were built against.
+            changed.insert(*key);
+            if let Some(old) = self.texture_handles.remove(key) {
+                self.state.renderer_resource_storage.textures.remove(old);
+            }
+            match RendererTexture::new_texture(
+                &self.state.device,
+                &self.state.queue,
+                Some(&texture.name),
+                &texture.rgba,
+                texture.width,
+                texture.height,
+                texture.texture_type,
+            ) {
+                Ok(value) => {
+                    let handle = self.state.renderer_resource_storage.textures.insert(value);
+                    self.texture_handles.insert(*key, handle);
+                    self.texture_versions.insert(*key, version);
+                    epoch_moved = true;
+                }
+                // Left unrecorded, so a later revision tries again - and named,
+                // so the log says which asset is not on the GPU.
+                Err(error) => pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    "texture `{}` is not uploaded: {error}",
+                    texture.name
+                ),
+            }
         }
+        epoch_moved
+    }
+
+    /// Drop and rebuild the shaders whose asset changed.
+    ///
+    /// Returns whether any shader object was created, recreated, or dropped.
+    /// Keys whose object moved are added to `changed`, so the materials built
+    /// against them can be rebuilt too.
+    fn sync_shaders(&mut self, assets: &AssetSnapshot, changed: &mut HashSet<u64>) -> bool {
+        let mut epoch_moved = false;
+        let removed: Vec<u64> = self
+            .shader_handles
+            .keys()
+            .filter(|key| !assets.shaders.contains_key(key))
+            .copied()
+            .collect();
+        for key in removed {
+            if let Some(handle) = self.shader_handles.remove(&key) {
+                self.state.renderer_resource_storage.shaders.remove(handle);
+                self.shader_versions.remove(&key);
+                changed.insert(key);
+                epoch_moved = true;
+            }
+        }
+
         for (key, shader) in &assets.shaders {
+            let version = assets.versions.shaders.get(key).copied().unwrap_or(0);
+            if self.shader_versions.get(key) == Some(&version) {
+                continue;
+            }
+            changed.insert(*key);
+            if let Some(old) = self.shader_handles.remove(key) {
+                self.state.renderer_resource_storage.shaders.remove(old);
+            }
             let value = RendererShader::new(
                 &shader.name,
                 &self.state.device,
@@ -290,26 +526,106 @@ impl Renderer {
                 &self.state.camera_bind_group_layout,
                 shader.pass_engine_parameters,
                 shader.pass_camera_parameters,
-            )?;
-            self.shader_handles.insert(
-                *key,
-                self.state.renderer_resource_storage.shaders.insert(value),
             );
+            match value {
+                Ok(value) => {
+                    let handle = self.state.renderer_resource_storage.shaders.insert(value);
+                    self.shader_handles.insert(*key, handle);
+                    self.shader_versions.insert(*key, version);
+                    epoch_moved = true;
+                }
+                Err(error) => pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    "shader `{}` is not compiled: {error}",
+                    shader.name
+                ),
+            }
         }
+        epoch_moved
+    }
+
+    /// Drop and rebuild the meshes whose asset changed.
+    ///
+    /// No epoch is needed for meshes: the draw path resolves a mesh handle per
+    /// frame, so a rebuilt one is picked up without invalidating any pipeline.
+    fn sync_meshes(&mut self, assets: &AssetSnapshot) {
+        let removed: Vec<u64> = self
+            .mesh_handles
+            .keys()
+            .filter(|key| !assets.meshes.contains_key(key))
+            .copied()
+            .collect();
+        for key in removed {
+            if let Some(handle) = self.mesh_handles.remove(&key) {
+                self.state.renderer_resource_storage.meshes.remove(handle);
+                self.mesh_versions.remove(&key);
+            }
+        }
+
         for (key, mesh) in &assets.meshes {
-            let value = RendererMesh::new(&self.state.device, &mesh.name, mesh)?;
-            self.mesh_handles.insert(
-                *key,
-                self.state.renderer_resource_storage.meshes.insert(value),
-            );
+            let version = assets.versions.meshes.get(key).copied().unwrap_or(0);
+            if self.mesh_versions.get(key) == Some(&version) {
+                continue;
+            }
+            if let Some(old) = self.mesh_handles.remove(key) {
+                self.state.renderer_resource_storage.meshes.remove(old);
+            }
+            match RendererMesh::new(&self.state.device, &mesh.name, mesh) {
+                Ok(value) => {
+                    let handle = self.state.renderer_resource_storage.meshes.insert(value);
+                    self.mesh_handles.insert(*key, handle);
+                    self.mesh_versions.insert(*key, version);
+                }
+                Err(error) => pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    "mesh `{}` is not on the GPU: {error}",
+                    mesh.name
+                ),
+            }
         }
+    }
+
+    /// Drop and rebuild the materials whose asset changed.
+    fn sync_materials(&mut self, assets: &AssetSnapshot) {
+        let removed: Vec<u64> = self
+            .material_handles
+            .keys()
+            .filter(|key| !assets.materials.contains_key(key))
+            .copied()
+            .collect();
+        for key in removed {
+            if let Some(handle) = self.material_handles.remove(&key) {
+                self.state
+                    .renderer_resource_storage
+                    .materials
+                    .remove(handle);
+                self.material_versions.remove(&key);
+            }
+        }
+
         for (key, material) in &assets.materials {
+            let version = assets.versions.materials.get(key).copied().unwrap_or(0);
+            if self.material_versions.get(key) == Some(&version) {
+                continue;
+            }
+            if let Some(old) = self.material_handles.remove(key) {
+                self.state.renderer_resource_storage.materials.remove(old);
+            }
             let shader_key = crate::assets::asset_key(material.shader);
-            let shader = self
-                .shader_handles
-                .get(&shader_key)
-                .copied()
-                .unwrap_or(self.default_shader);
+            let shader = if material.shader == Handle::INVALID {
+                // A material built without a shader is documented to draw with
+                // the renderer's own; that is a choice, not a fault.
+                self.default_shader
+            } else if let Some(handle) = self.shader_handles.get(&shader_key) {
+                *handle
+            } else {
+                pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    "material `{}` names a shader that is not loaded; drawing with the default shader",
+                    material.name
+                );
+                self.default_shader
+            };
             let textures = material
                 .textures
                 .iter()
@@ -320,7 +636,7 @@ impl Renderer {
                         .map(|handle| (slot.clone(), handle))
                 })
                 .collect::<Vec<_>>();
-            let value = RendererMaterial::new(
+            match RendererMaterial::new(
                 &self.state.device,
                 &self.state.queue,
                 &self.state.renderer_resource_storage,
@@ -328,14 +644,19 @@ impl Renderer {
                 shader,
                 &textures,
                 &material.parameters,
-            )?;
-            self.material_handles.insert(
-                *key,
-                self.state.renderer_resource_storage.materials.insert(value),
-            );
+            ) {
+                Ok(value) => {
+                    let handle = self.state.renderer_resource_storage.materials.insert(value);
+                    self.material_handles.insert(*key, handle);
+                    self.material_versions.insert(*key, version);
+                }
+                Err(error) => pill_core::warn!(
+                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    "material `{}` has no pipeline: {error}",
+                    material.name
+                ),
+            }
         }
-        self.asset_revision = assets.revision;
-        Ok(())
     }
 }
 
@@ -355,16 +676,28 @@ impl PillRenderer for Renderer {
 
     fn resize(&mut self, width: u32, height: u32) {
         self.minimized = width == 0 || height == 0;
-        if !self.minimized {
-            self.state
-                .resize(winit::dpi::PhysicalSize::new(width, height));
-            // An offscreen target is sized to the surface, so a new surface size
-            // makes every one of them wrong; the chain is rebuilt with them on
-            // the next frame.
-            self.state.offscreen.clear();
-            self.passes.clear();
-            self.pipeline_signature = None;
+        if self.minimized {
+            return;
         }
+        if let Err(error) = self
+            .state
+            .resize(winit::dpi::PhysicalSize::new(width, height))
+        {
+            // Warned instead of panicking: a size the driver will not take is
+            // not worth killing a running game over, and the next resize event
+            // tries again.
+            pill_core::warn!(
+                target: pill_core::telemetry::telemetry_target::RENDERING,
+                "surface resize to {width}x{height} failed: {error}"
+            );
+            return;
+        }
+        // An offscreen target is sized to the surface, so a new surface size
+        // makes every one of them wrong; the chain is rebuilt with them on
+        // the next frame.
+        self.state.offscreen.clear();
+        self.passes.clear();
+        self.pipeline_signature = None;
     }
 
     fn set_viewport(&mut self, viewport: Option<RenderViewport>) {
@@ -376,8 +709,8 @@ impl PillRenderer for Renderer {
             return Ok(FrameOutcome::Skipped);
         }
         let prepare = Instant::now();
-        self.sync_assets(&frame.assets)?;
-        self.ensure_pipeline(&frame.passes, &frame.assets)?;
+        self.sync_assets(&frame.assets);
+        self.ensure_pipeline(&frame.passes, &frame.assets, frame.chain_generation)?;
         let mut render_queue = Vec::with_capacity(frame.instances.len());
         for (index, instance) in frame.instances.iter().enumerate() {
             let Some(mesh) = self.mesh_handles.get(&instance.mesh).copied() else {
@@ -410,12 +743,12 @@ impl PillRenderer for Renderer {
         self.metrics.prepare_micros = prepare.elapsed().as_micros() as u64;
         self.metrics.instance_bytes = (render_queue.len() * std::mem::size_of::<Instance>()) as u64;
 
-        // Read from the frame every time. A game can swap the pipeline, or
-        // toggle a pass inside one, between any two frames, and a chain cached
-        // here would keep drawing the previous one until something else
-        // happened to invalidate it. An empty chain is a game that asked for
-        // nothing, not a game that asked for the built-in pass: the frame's
-        // writer puts that pass in the chain itself.
+        // The frame's chain generation is what makes reading it every frame
+        // cheap: the frame resolves the chain only when it changes, and
+        // `ensure_pipeline` restarts only when the generation it built from
+        // moves. An empty chain is a game that asked for nothing, not a game
+        // that asked for the built-in pass: the frame's writer puts that pass
+        // in the chain itself.
         let plan = self.plan_passes(&frame.passes, &render_queue);
         self.log_chain(&plan);
         self.metrics.draw_calls = plan.iter().filter(|entry| entry.draws() > 0).count() as u32;
@@ -429,7 +762,16 @@ impl PillRenderer for Renderer {
     }
 
     fn invalidate_assets(&mut self) {
-        self.asset_revision = u64::MAX;
+        // Forget the versions so the next sync rebuilds every GPU object from
+        // the snapshot, let that sync through the revision gate, and drop the
+        // pipeline inputs so the rebuild reaches the bind groups that reference
+        // the old objects.
+        self.assets_synced_revision = None;
+        self.texture_versions.clear();
+        self.shader_versions.clear();
+        self.mesh_versions.clear();
+        self.material_versions.clear();
+        self.pipeline_inputs = None;
     }
 }
 
@@ -444,7 +786,7 @@ impl Renderer {
     fn plan_passes<'a>(
         &mut self,
         chain: &'a [ResolvedPass],
-        render_queue: &[RenderQueueItem],
+        render_queue: &'a [RenderQueueItem],
     ) -> Vec<PassPlan<'a>> {
         let mut plan = Vec::with_capacity(chain.len());
         for (index, pass) in chain.iter().enumerate() {
@@ -470,7 +812,7 @@ impl Renderer {
                         continue;
                     }
 
-                    let items = match pass.shader {
+                    let items: Cow<'a, [RenderQueueItem]> = match pass.shader {
                         // The pass draws the instances shaded by the shader it
                         // names, when that shader is still loaded. One that no
                         // longer is draws nothing: falling back to the default
@@ -479,20 +821,24 @@ impl Renderer {
                         Some(key) => match self.shader_handles.get(&key) {
                             Some(handle) => {
                                 let index = handle.data().index as u8;
-                                render_queue
-                                    .iter()
-                                    .copied()
-                                    .filter(|item| {
-                                        decompose_render_queue_key(item.key).shader_index == index
-                                    })
-                                    .collect()
+                                Cow::Owned(
+                                    render_queue
+                                        .iter()
+                                        .copied()
+                                        .filter(|item| {
+                                            decompose_render_queue_key(item.key).shader_index
+                                                == index
+                                        })
+                                        .collect::<Vec<_>>(),
+                                )
                             }
-                            None => Vec::new(),
+                            None => Cow::Borrowed(&[] as &[RenderQueueItem]),
                         },
                         // No shader named: the pass draws every instance, each
                         // with the pipeline its own material names. This is the
-                        // built-in chain.
-                        None => render_queue.to_vec(),
+                        // built-in chain, and it borrows the queue rather than
+                        // copying it.
+                        None => Cow::Borrowed(render_queue),
                     };
                     let pass_index = match self.passes.get(index) {
                         Some(PassSlot::Drawable(_)) => Some(index),
@@ -530,7 +876,7 @@ impl Renderer {
         if plan.is_empty() {
             plan.push(PassPlan::Geometry {
                 label: "frame.clear",
-                items: Vec::new(),
+                items: Cow::default(),
                 outputs: vec![PassOutput::Surface],
                 clear: true,
                 pass_index: None,
@@ -539,30 +885,71 @@ impl Renderer {
         plan
     }
 
-    /// Build the GPU objects the chain needs.
+    /// Build the GPU objects the chain needs, when something they depend on
+    /// moved.
     ///
-    /// One offscreen target per output the chain declares, and one pipeline per
-    /// fullscreen pass. Keyed by a signature of the chain, because this is the
-    /// expensive part of a frame's setup and an unchanged chain needs none of it
-    /// a second time.
-    fn ensure_pipeline(&mut self, chain: &[ResolvedPass], assets: &AssetSnapshot) -> Result<()> {
-        let signature = chain_signature(chain, assets.revision);
-        if self.pipeline_signature.as_deref() == Some(signature.as_str()) {
+    /// Two keys decide. The offscreen layout - every target and scale the chain
+    /// declares, at the surface size - decides the render target textures;
+    /// everything else (the chain's serialized content and the resource epoch)
+    /// decides the pass pipelines and their bind groups. An unchanged frame
+    /// costs one tuple comparison: signature strings are only built when the
+    /// chain generation, the resource epoch or the surface size moved.
+    fn ensure_pipeline(
+        &mut self,
+        chain: &[ResolvedPass],
+        assets: &AssetSnapshot,
+        chain_generation: u64,
+    ) -> Result<()> {
+        let width = self.state.surface_configuration.width;
+        let height = self.state.surface_configuration.height;
+        let inputs = (chain_generation, self.resource_epoch, width, height);
+        if self.pipeline_inputs == Some(inputs) {
             return Ok(());
         }
 
-        self.state.ensure_offscreen_targets(chain);
-        let passes: Vec<PassSlot> = chain
-            .iter()
-            .map(|pass| self.build_pass(pass, assets))
-            .collect();
+        let offscreen_key = offscreen_signature(chain, width, height);
+        let targets_changed = self.offscreen_key.as_deref() != Some(offscreen_key.as_str());
+        let signature = chain_signature(chain, self.resource_epoch);
+        if !targets_changed && self.pipeline_signature.as_deref() == Some(signature.as_str()) {
+            self.pipeline_inputs = Some(inputs);
+            return Ok(());
+        }
+
+        if targets_changed {
+            self.state.ensure_offscreen_targets(chain);
+            self.offscreen_key = Some(offscreen_key);
+        }
+
+        // Passes are built in chain order and may only read targets an earlier
+        // pass declares: the set grows as the chain is walked, so a pass that
+        // reads its own output, or a later pass's, is refused instead of
+        // binding whatever the map happens to hold.
+        let mut defined_targets: HashSet<String> = HashSet::new();
+        let mut passes: Vec<PassSlot> = Vec::with_capacity(chain.len());
+        for pass in chain {
+            passes.push(self.build_pass(pass, assets, &defined_targets));
+            for target in std::iter::once(&pass.target).chain(pass.extra_targets.iter()) {
+                if let PassTarget::Offscreen(name) = target {
+                    defined_targets.insert(name.clone());
+                }
+            }
+        }
         self.passes = passes;
         self.pipeline_signature = Some(signature);
+        self.pipeline_inputs = Some(inputs);
         Ok(())
     }
 
     /// A pass's GPU object, or the reason there is none.
-    fn build_pass(&self, pass: &ResolvedPass, assets: &AssetSnapshot) -> PassSlot {
+    ///
+    /// `defined_targets` is what earlier passes of the chain declared so far;
+    /// the pass may only read those.
+    fn build_pass(
+        &self,
+        pass: &ResolvedPass,
+        assets: &AssetSnapshot,
+        defined_targets: &HashSet<String>,
+    ) -> PassSlot {
         // A geometry pass with no shader of its own draws through each
         // material's pipeline, and that is the only path that needs no object.
         let Some(shader_key) = pass.shader else {
@@ -602,16 +989,19 @@ impl Renderer {
 
         // The pass's own committed textures, by slot. They resolve to the same
         // GPU handles a material's textures do, so a pass and a material reach
-        // one texture by one key.
-        let textures: Vec<(String, RendererTextureHandle)> = pass
-            .textures
-            .iter()
-            .filter_map(|(slot, key)| {
-                self.texture_handles
-                    .get(key)
-                    .map(|handle| (slot.clone(), *handle))
-            })
-            .collect();
+        // one texture by one key. A slot whose texture is not loaded falls
+        // through to the binder's default, which the log names rather than
+        // leaving a pass quietly showing the wrong map.
+        let mut textures: Vec<(String, RendererTextureHandle)> = Vec::new();
+        for (slot, key) in &pass.textures {
+            match self.texture_handles.get(key) {
+                Some(handle) => textures.push((slot.clone(), *handle)),
+                None => println!(
+                    "[render] Pass {} binds texture `{slot}`, which is not loaded; the shader's default is used",
+                    pass.name
+                ),
+            }
+        }
 
         let storage = &self.state.renderer_resource_storage;
         match RendererPass::new(
@@ -628,6 +1018,7 @@ impl Renderer {
             &self.state.offscreen,
             &self.state.depth_texture,
             &textures,
+            defined_targets,
         ) {
             Ok(value) => PassSlot::Drawable(Box::new(value)),
             Err(error) => PassSlot::Unsupported(error.to_string()),
@@ -678,14 +1069,20 @@ impl Renderer {
 fn install_default_material(
     state: &mut State,
 ) -> Result<(RendererShaderHandle, RendererMaterialHandle)> {
-    let parameter_slots = parameter_slots_by_name([
-        ShaderParameterSlot::new("tint", ShaderParameterType::Color),
-        ShaderParameterSlot::new("specularity", ShaderParameterType::Scalar),
-    ]);
-    let texture_slots = texture_slots_by_name([
-        ShaderTextureSlot::new("color", TextureType::Color, (0, 1)),
-        ShaderTextureSlot::new("normal", TextureType::Normal, (2, 3)),
-    ]);
+    let parameter_slots = parameter_slots_by_name(
+        "pill_default_lit",
+        [
+            ShaderParameterSlot::new("tint", ShaderParameterType::Color),
+            ShaderParameterSlot::new("specularity", ShaderParameterType::Scalar),
+        ],
+    );
+    let texture_slots = texture_slots_by_name(
+        "pill_default_lit",
+        [
+            ShaderTextureSlot::new("color", TextureType::Color, (0, 1)),
+            ShaderTextureSlot::new("normal", TextureType::Normal, (2, 3)),
+        ],
+    );
     let shader = RendererShader::new(
         "pill_default_lit",
         &state.device,
@@ -725,14 +1122,26 @@ fn install_default_material(
     Ok((shader, material))
 }
 
+/// The wgpu objects behind a [`Renderer`]: device, surface, and frame state.
+///
+/// Owns the surface and its configuration, the device and queue, the depth
+/// texture, and the offscreen colour targets the current chain declares. Kept
+/// beside [`Renderer`] rather than inside it so the surface lifecycle - new,
+/// resize, reconfigure - has a home independent of the asset caches.
 pub struct State {
+    /// The per-type cache of every GPU resource - shaders, textures, meshes,
+    /// materials - and the engine parameters table.
     pub(crate) renderer_resource_storage: RendererResourceStorage,
     surface: wgpu::Surface<'static>,
+    /// The device every GPU object in this module is created from.
     pub(crate) device: wgpu::Device,
+    /// The queue every upload and frame submission goes through.
     pub(crate) queue: wgpu::Queue,
     surface_configuration: wgpu::SurfaceConfiguration,
-    window_size: winit::dpi::PhysicalSize<u32>,
+    /// The surface's colour format, chosen once and declared by every pipeline
+    /// that renders to it.
     pub(crate) color_format: wgpu::TextureFormat,
+    /// Format of the depth buffer shared by the geometry passes.
     pub(crate) depth_format: wgpu::TextureFormat,
     depth_texture: RendererTexture,
     /// The offscreen colour targets the current chain names, by that name.
@@ -742,6 +1151,7 @@ pub struct State {
     /// by either would be a lifetime the chain cannot express.
     offscreen: HashMap<String, RendererTexture>,
     mesh_drawer: MeshDrawer,
+    /// Layout every camera bind group is built from.
     pub(crate) camera_bind_group_layout: wgpu::BindGroupLayout,
 }
 
@@ -826,7 +1236,10 @@ impl State {
         let depth_format = wgpu::TextureFormat::Depth32Float;
         let depth_texture =
             RendererTexture::new_depth_texture(&device, &surface_configuration, "depth_texture")?;
-        let camera_bind_group_layout =
+        // Scoped like every other creation: a refused layout would otherwise
+        // reach the uncaptured-error handler and take the host down before a
+        // `RendererError` exists to explain it.
+        let camera_bind_group_layout = capturing_validation(&device, || {
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("camera_parameters_bind_group_layout"),
                 entries: &[wgpu::BindGroupLayoutEntry {
@@ -839,16 +1252,19 @@ impl State {
                     },
                     count: None,
                 }],
-            });
+            })
+        })
+        .map_err(|detail| RendererError::Other {
+            detail: format!("camera bind group layout: {detail}"),
+        })?;
         let renderer_resource_storage = RendererResourceStorage::new(&device, &queue)?;
-        let mesh_drawer = MeshDrawer::new(&device, MAX_INSTANCE_PER_DRAWCALL_COUNT as u32);
+        let mesh_drawer = MeshDrawer::new(&device, INSTANCE_BATCH_SIZE as u32);
         Ok(Self {
             renderer_resource_storage,
             surface,
             device,
             queue,
             surface_configuration,
-            window_size,
             color_format,
             depth_format,
             depth_texture,
@@ -858,18 +1274,36 @@ impl State {
         })
     }
 
-    fn resize(&mut self, new_window_size: winit::dpi::PhysicalSize<u32>) {
-        self.window_size = new_window_size;
-        self.surface_configuration.width = new_window_size.width;
-        self.surface_configuration.height = new_window_size.height;
-        self.surface
-            .configure(&self.device, &self.surface_configuration);
-        self.depth_texture = RendererTexture::new_depth_texture(
+    /// Resize the surface and rebuild the depth buffer that matches it.
+    ///
+    /// The new size is applied through `configure_surface` - scoped, with its
+    /// `Opaque` fallback - and only committed once the surface accepted it, so
+    /// a refusal leaves the old, consistent surface and depth pair in place
+    /// instead of a configuration that disagrees with the swapchain. What used
+    /// to be an `expect` here killed the host on a resize it could not honour.
+    fn resize(&mut self, new_window_size: winit::dpi::PhysicalSize<u32>) -> Result<()> {
+        let mut surface_configuration = self.surface_configuration.clone();
+        surface_configuration.width = new_window_size.width;
+        surface_configuration.height = new_window_size.height;
+        configure_surface(&self.surface, &self.device, &mut surface_configuration)?;
+        let depth_texture = RendererTexture::new_depth_texture(
             &self.device,
-            &self.surface_configuration,
+            &surface_configuration,
             "depth_texture",
-        )
-        .expect("depth texture recreation must succeed");
+        )?;
+        self.surface_configuration = surface_configuration;
+        self.depth_texture = depth_texture;
+        Ok(())
+    }
+
+    /// Reconfigure the surface from its current settings.
+    ///
+    /// The recovery path for a lost or outdated swapchain: the configuration
+    /// is still what the window wants, only the platform-side surface needs
+    /// recreating - and without this the renderer stays dead until a resize
+    /// event happens to arrive.
+    fn reconfigure_surface(&mut self) -> Result<()> {
+        configure_surface(&self.surface, &self.device, &mut self.surface_configuration)
     }
 
     /// Create a target for every offscreen output the chain declares.
@@ -895,15 +1329,29 @@ impl State {
                 let PassTarget::Offscreen(name) = target else {
                     continue;
                 };
-                targets.entry(name.clone()).or_insert_with(|| {
-                    RendererTexture::new_render_target(
-                        device,
-                        name,
-                        (width / scale).max(1),
-                        (height / scale).max(1),
-                        OFFSCREEN_FORMAT,
-                    )
-                });
+                if targets.contains_key(name) {
+                    continue;
+                }
+                match RendererTexture::new_render_target(
+                    device,
+                    name,
+                    (width / scale).max(1),
+                    (height / scale).max(1),
+                    OFFSCREEN_FORMAT,
+                ) {
+                    Ok(target) => {
+                        targets.insert(name.clone(), target);
+                    }
+                    // Reported instead of fatal: the passes that read it each
+                    // say they are not drawn, which is the same outcome their
+                    // own failure path would produce.
+                    Err(error) => {
+                        pill_core::warn!(
+                            target: pill_core::telemetry::telemetry_target::RENDERING,
+                            "offscreen target `{name}` was not created: {error}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -916,16 +1364,32 @@ impl State {
         frame: &RenderFrame,
         viewport: Option<RenderViewport>,
     ) -> Result<()> {
-        let surface_frame = self
-            .surface
-            .get_current_texture()
-            .map_err(|error| match error {
-                wgpu::SurfaceError::Lost => RendererError::SurfaceLost,
-                wgpu::SurfaceError::OutOfMemory => RendererError::SurfaceOutOfMemory,
-                other => RendererError::SurfaceTextureFailed {
+        let surface_frame = match self.surface.get_current_texture() {
+            Ok(surface_frame) => surface_frame,
+            // A lost or outdated swapchain is recovered by reconfiguring and
+            // retrying once; reporting it and returning left the renderer dead
+            // until some later resize event happened to arrive.
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                self.reconfigure_surface()?;
+                self.surface
+                    .get_current_texture()
+                    .map_err(|error| match error {
+                        wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
+                            RendererError::SurfaceLost
+                        }
+                        wgpu::SurfaceError::OutOfMemory => RendererError::SurfaceOutOfMemory,
+                        other => RendererError::SurfaceTextureFailed {
+                            detail: other.to_string(),
+                        },
+                    })?
+            }
+            Err(wgpu::SurfaceError::OutOfMemory) => return Err(RendererError::SurfaceOutOfMemory),
+            Err(other) => {
+                return Err(RendererError::SurfaceTextureFailed {
                     detail: other.to_string(),
-                },
-            })?;
+                })
+            }
+        };
         let view = surface_frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1106,7 +1570,15 @@ impl State {
                 }
             }
         }
-        self.queue.submit(std::iter::once(encoder.finish()));
+        // The last creation-class failure a frame can hit: wgpu validates a
+        // command buffer when it is submitted, and a validation failure would
+        // otherwise reach the uncaptured-error handler as a panic.
+        capturing_validation(&self.device, || {
+            self.queue.submit(std::iter::once(encoder.finish()));
+        })
+        .map_err(|detail| RendererError::Other {
+            detail: format!("frame submission: {detail}"),
+        })?;
         surface_frame.present();
         Ok(())
     }

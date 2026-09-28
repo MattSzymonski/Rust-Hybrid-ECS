@@ -1,22 +1,28 @@
-use std::{cell::Cell, num::NonZeroU32};
-use wgpu::{ 
-    core::device::queue, 
-    Adapter, 
-    Buffer, 
-    BufferDescriptor, 
-    BufferUsages, 
-    CommandEncoder, 
-    Device, 
-    Features, 
-    Maintain, 
-    PipelineStatisticsTypes, 
-    QuerySet, 
-    QuerySetDescriptor, 
-    QueryType, 
-    Queue
+//! GPU-side profiling: timestamps, occlusion queries and pipeline statistics.
+//!
+//! # Responsibilities
+//!
+//! - Own the query sets, the resolve buffers and the readbacks that turn them
+//!   into numbers, for a renderer built on wgpu.
+//!
+//! # Design
+//!
+//! Query sets are allocated once with a per-frame cap; each frame resolves into
+//! one slot of a three-deep ring, and the blocking readers take the slot one
+//! frame back, so a readback never waits on the frame being recorded. Every
+//! capability is optional: a device without the timestamp or pipeline
+//! statistics features simply gets `None` where a query set would be.
+
+// Standard library
+use std::cell::Cell;
+
+// External crates
+use wgpu::{
+    Adapter, Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Features,
+    PipelineStatisticsTypes, PollType, QuerySet, QuerySetDescriptor, QueryType, Queue,
 };
 
-/* 
+/*
 This module provides GPU-side profiling capabilities using wgpu.
 
 - Timestamp queries:
@@ -38,25 +44,25 @@ This module provides GPU-side profiling capabilities using wgpu.
 
 - Pipeline statistics:
   Collects various pipeline statistics like:
-  - VERTEX_SHADER_INVOCATIONS — how many times the vertex shader ran (accounts for the vertex cache with indexed draws). 
-  - CLIPPER_INVOCATIONS — number of times the clipper stage was invoked (equals triangles output by the vertex stage). 
-  - CLIPPER_PRIMITIVES_OUT — primitives that survived clipping (triangles that actually proceed to rasterization). 
-  - FRAGMENT_SHADER_INVOCATIONS — how many fragments executed the fragment shader (per-sample with MSAA; GPUs often execute in 2×2 quads for derivatives). 
-  - COMPUTE_SHADER_INVOCATIONS — total compute shader invocations (dispatch count × workgroup size). 
+  - VERTEX_SHADER_INVOCATIONS - how many times the vertex shader ran (accounts for the vertex cache with indexed draws).
+  - CLIPPER_INVOCATIONS - number of times the clipper stage was invoked (equals triangles output by the vertex stage).
+  - CLIPPER_PRIMITIVES_OUT - primitives that survived clipping (triangles that actually proceed to rasterization).
+  - FRAGMENT_SHADER_INVOCATIONS - how many fragments executed the fragment shader (per-sample with MSAA; GPUs often execute in 2×2 quads for derivatives).
+  - COMPUTE_SHADER_INVOCATIONS - total compute shader invocations (dispatch count × workgroup size).
   Result: Vector of u64 values, one per statistic type requested.
   Not available on the web (needs PIPELINE_STATISTICS_QUERY feature)
 */
 
 /// How many frames we pipeline readbacks to avoid stalls.
-/// You can set this to 2–4 depending on your swapchain latency.
+/// You can set this to 2-4 depending on your swapchain latency.
 const FRAMES_IN_FLIGHT: usize = 3;
 
-/// GPU-side profiling using wgpu
+/// GPU-side profiling using wgpu query sets.
+///
+/// Owns one query set per category (timestamps, occlusion, pipeline
+/// statistics) plus a three-slot ring of resolve buffers per category, so a
+/// readback can map the previous frame while the current one still records.
 pub struct Profiler {
-    // Capabilities
-    has_timestamps: bool,
-    has_pipeline_stats: bool,
-
     // Query sets (optional if feature unsupported)
     timestamp_query_set: Option<QuerySet>,
     timestamp_query_names: Vec<String>, // To store names associated with each timestamp
@@ -92,17 +98,27 @@ pub struct Profiler {
 }
 
 impl Profiler {
+    /// Creates a profiler against `device`, `queue` and `adapter`.
+    ///
+    /// The three `max_*` arguments are per-frame caps: a recording past its
+    /// cap is refused with a printed notice rather than overwriting an
+    /// earlier query of the same kind. Query sets are only created for the
+    /// capabilities the adapter exposes, so on a device without timestamp or
+    /// pipeline statistics support the matching readers always answer `None`.
     pub fn new(
-        device: &Device, 
+        device: &Device,
         queue: &Queue,
-        adapter: &Adapter, 
+        adapter: &Adapter,
         max_timestamp_queries: u32, // Number of timestamp writes planned to record per frame (start/end of sections)
         max_occlusion_queries: u32, // Number of occlusion queries per frame
         max_pipeline_statistics_queries: u32, // Number of pipeline statistics queries per frame
         pipeline_statistics_types: PipelineStatisticsTypes, // Type of pipeline statistics to collect
     ) -> Self {
         let features = adapter.features();
-        let has_timestamps = features.contains(Features::TIMESTAMP_QUERY);
+        // `write_timestamp` on an encoder is what this profiler calls, so the
+        // inside-encoders bit is required, not just the query feature.
+        let has_timestamps = features
+            .contains(Features::TIMESTAMP_QUERY | Features::TIMESTAMP_QUERY_INSIDE_ENCODERS);
         let has_pipeline_statistics = features.contains(Features::PIPELINE_STATISTICS_QUERY);
 
         // Timestamp query set
@@ -128,21 +144,26 @@ impl Profiler {
         };
 
         // Pipeline statistics query set
-        let pipeline_statistics_query_set = if has_pipeline_statistics && !pipeline_statistics_types.is_empty() {
-            Some(device.create_query_set(&QuerySetDescriptor {
-                label: Some("gpu_profiler.pipeline_statistics_query_set"),
-                ty: QueryType::PipelineStatistics(pipeline_statistics_types),
-                count: max_pipeline_statistics_queries,
-            }))
-        } else {
-            None
-        };
+        let pipeline_statistics_query_set =
+            if has_pipeline_statistics && !pipeline_statistics_types.is_empty() {
+                Some(device.create_query_set(&QuerySetDescriptor {
+                    label: Some("gpu_profiler.pipeline_statistics_query_set"),
+                    ty: QueryType::PipelineStatistics(pipeline_statistics_types),
+                    count: max_pipeline_statistics_queries,
+                }))
+            } else {
+                None
+            };
 
         // Bytes per query result entry
         let timestamp_queries_result_bytes = std::mem::size_of::<u64>() as u64;
         let occlusion_queries_result_bytes = std::mem::size_of::<u64>() as u64;
         let pipeline_statistics_fields = pipeline_statistics_types.bits().count_ones() as u64;
-        let pipeline_statistics_queries_result_bytes = if pipeline_statistics_fields == 0 { 0 } else { pipeline_statistics_fields * std::mem::size_of::<u64>() as u64 };
+        let pipeline_statistics_queries_result_bytes = if pipeline_statistics_fields == 0 {
+            0
+        } else {
+            pipeline_statistics_fields * std::mem::size_of::<u64>() as u64
+        };
 
         // Resolve buffers ring (created lazily on first use)
         let timestamp_buffers = (0..FRAMES_IN_FLIGHT).map(|_| None).collect();
@@ -150,12 +171,13 @@ impl Profiler {
         let pipeline_buffers = (0..FRAMES_IN_FLIGHT).map(|_| None).collect();
 
         // Timestamp period
-        let timestamp_period_ns = if has_timestamps { queue.get_timestamp_period() } else { 0.0 };
+        let timestamp_period_ns = if has_timestamps {
+            queue.get_timestamp_period()
+        } else {
+            0.0
+        };
 
         Self {
-            has_timestamps,
-            has_pipeline_stats: has_pipeline_statistics,
-
             timestamp_query_set,
             timestamp_query_names: Vec::new(),
             occlusion_query_set,
@@ -164,7 +186,7 @@ impl Profiler {
 
             max_timestamp_queries,
             max_occlusion_queries,
-            max_pipeline_statistics_queries: max_occlusion_queries.max(1), // we bound ps queries with the same cap for simplicity
+            max_pipeline_statistics_queries: max_pipeline_statistics_queries.max(1),
 
             current_timestamp_query: Cell::new(0),
             current_occlusion_query: Cell::new(0),
@@ -199,6 +221,12 @@ impl Profiler {
 
     // --- Timestamps ---
 
+    /// Returns the timestamp query set, or `None` when the adapter exposes no
+    /// timestamp support or the cap was zero.
+    ///
+    /// For callers that want to write timestamps themselves; prefer
+    /// [`Self::write_timestamp`], which keeps the index and name bookkeeping
+    /// the summaries rely on.
     pub fn get_timestamp_query_set(&self) -> Option<&QuerySet> {
         self.timestamp_query_set.as_ref()
     }
@@ -227,30 +255,52 @@ impl Profiler {
     }
 
     /// Resolve all timestamps recorded so far this frame into the ring buffer
-    pub fn resolve_timestamp_queries(&mut self, device: &wgpu::Device, encoder: &mut wgpu::CommandEncoder) {
+    pub fn resolve_timestamp_queries(
+        &mut self,
+        device: &wgpu::Device,
+        encoder: &mut wgpu::CommandEncoder,
+    ) {
         if let Some(query_set) = &self.timestamp_query_set {
             let count = self.current_timestamp_query.get();
-            if count == 0 { return; }
+            if count == 0 {
+                return;
+            }
             let byte_len = self.timestamp_queries_result_bytes * count as u64;
 
             let index = self.frame_index;
-            let slot = &mut self.timestamp_buffers[index]; 
-            let buffer = ensure_buffer_slot(device, slot, byte_len, "gpu_profiler.timestamp_queries.resolve");
+            let slot = &mut self.timestamp_buffers[index];
+            let buffer = ensure_buffer_slot(
+                device,
+                slot,
+                byte_len,
+                "gpu_profiler.timestamp_queries.resolve",
+            );
 
             encoder.resolve_query_set(query_set, 0..count, buffer, 0);
         }
     }
 
-    /// Blocking readback of all timestamps for the frame that was resolved into the previous ring slot
-    /// Returns the raw u64 ticks and also a helper to convert ticks to ms
+    /// Blocking readback of all timestamps for the frame that was resolved into the previous ring slot.
+    /// Returns the raw u64 ticks, or `None` when nothing was resolved into that slot;
+    /// convert them to milliseconds with [`Self::timestamp_ticks_to_ms`].
     pub fn read_timestamp_queries_blocking(&self, device: &Device) -> Option<Vec<u64>> {
         let index = (self.frame_index + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT;
         let buffer = self.timestamp_buffers[index].as_ref()?;
         let slice = buffer.slice(..);
 
-        // Map and wait
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(Maintain::Wait);
+        // Map and wait. The callback's result is checked because
+        // `get_mapped_range` aborts on an unmapped range: a failed map has to
+        // come back as "no numbers", not as a panic.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        if device.poll(PollType::Wait).is_err() {
+            return None;
+        }
+        if receiver.recv().ok()?.is_err() {
+            return None;
+        }
         let data = slice.get_mapped_range();
         let values: Vec<u64> = bytemuck::cast_slice(&data).to_vec();
 
@@ -264,21 +314,28 @@ impl Profiler {
         (delta_ticks as f32 * self.timestamp_period_ns) / 1_000_000.0
     }
 
+    /// Prints one line per resolved region with its GPU time in milliseconds.
+    ///
+    /// `ticks` are the raw values as read back, written in pairs - start and
+    /// end around each region - so a slice with fewer than two entries prints
+    /// a notice instead. Regions are labelled from the names gathered by
+    /// [`Self::write_timestamp`] when the counts line up; otherwise they fall
+    /// back to `Section N` placeholders.
     pub fn summarize_timestamp_queries(&self, ticks: &[u64]) {
         if ticks.len() < 2 {
             println!("[GPU] no timestamp sections recorded");
             return;
         }
-        let want = ticks.len() - 1;
-        let use_default = self.timestamp_query_names.len() != want;
+        // Written in pairs - before and after each region - so the sections are
+        // the pairs, and a pair's first name is the region's own.
+        let use_default = self.timestamp_query_names.len() != ticks.len();
 
-        for (i, window) in ticks.windows(2).enumerate() {
-            let delta_ticks = window[1] - window[0];
-            let ms = self.timestamp_ticks_to_ms(delta_ticks);
+        for (index, pair) in ticks.chunks_exact(2).enumerate() {
+            let ms = self.timestamp_ticks_to_ms(pair[1] - pair[0]);
             let label = if use_default {
-                format!("Section {}", i)
+                format!("Section {index}")
             } else {
-                self.timestamp_query_names[i].to_string()
+                self.timestamp_query_names[index * 2].clone()
             };
             println!("[GPU] {:<24}: {:6.3} ms", label, ms);
         }
@@ -309,6 +366,10 @@ impl Profiler {
         }
     }
 
+    /// Ends the occlusion query most recently begun in `render_pass`.
+    ///
+    /// Pairs with [`Self::begin_occlusion_query`]; the sample counts become
+    /// readable once the frame's queries are resolved and read back.
     pub fn end_occlusion_query(&self, render_pass: &mut wgpu::RenderPass<'_>) {
         render_pass.end_occlusion_query();
     }
@@ -317,25 +378,46 @@ impl Profiler {
     pub fn resolve_occlusion_queries(&mut self, device: &Device, encoder: &mut CommandEncoder) {
         if let Some(query_set) = &self.occlusion_query_set {
             let count = self.current_occlusion_query.get();
-            if count == 0 { return; }
+            if count == 0 {
+                return;
+            }
             let byte_len = self.occlusion_queries_result_bytes * count as u64;
 
             let index = self.frame_index;
             let slot = &mut self.occlusion_buffers[index];
-            let buffer = ensure_buffer_slot(device, slot, byte_len, "gpu_profiler.occlusion_queries.resolve");
+            let buffer = ensure_buffer_slot(
+                device,
+                slot,
+                byte_len,
+                "gpu_profiler.occlusion_queries.resolve",
+            );
 
             encoder.resolve_query_set(query_set, 0..count, buffer, 0);
         }
     }
 
+    /// Blocking readback of the occlusion sample counts resolved for the
+    /// previous frame, one `u64` per query.
+    ///
+    /// Returns `None` while nothing has been resolved into that ring slot -
+    /// no occlusion query has been begun and resolved yet. A count of 0 means
+    /// the query's region drew no visible fragments.
     pub fn read_occlusion_queries_blocking(&self, device: &Device) -> Option<Vec<u64>> {
         let index = (self.frame_index + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT;
         let buffer = self.occlusion_buffers[index].as_ref()?;
         let slice = buffer.slice(..);
 
-        // Map and wait
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(Maintain::Wait);
+        // Map and wait; see the timestamp reader for why the result is checked.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        if device.poll(PollType::Wait).is_err() {
+            return None;
+        }
+        if receiver.recv().ok()?.is_err() {
+            return None;
+        }
         let data = slice.get_mapped_range();
         let values: Vec<u64> = bytemuck::cast_slice(&data).to_vec();
 
@@ -344,6 +426,11 @@ impl Profiler {
         Some(values)
     }
 
+    /// Prints each occlusion query's sample count, tagged visible or
+    /// occluded, followed by a visible/total line.
+    ///
+    /// An empty slice means the blocking reader had nothing to hand over and
+    /// prints a "no occlusion queries recorded" notice instead.
     pub fn summarize_occlusion_queries(&self, samples: &[u64]) {
         if samples.is_empty() {
             println!("[GPU] no occlusion queries recorded");
@@ -352,8 +439,19 @@ impl Profiler {
         let mut visible = 0usize;
         for (i, &sample) in samples.iter().enumerate() {
             let is_visible = sample > 0;
-            if is_visible { visible += 1; }
-            println!("[GPU] occlusion[{:02}] = {:>12}  {}", i, sample, if is_visible { "(visible)" } else { "(occluded)" });
+            if is_visible {
+                visible += 1;
+            }
+            println!(
+                "[GPU] occlusion[{:02}] = {:>12}  {}",
+                i,
+                sample,
+                if is_visible {
+                    "(visible)"
+                } else {
+                    "(occluded)"
+                }
+            );
         }
         println!("[GPU] occlusion visible: {}/{}", visible, samples.len());
     }
@@ -368,10 +466,14 @@ impl Profiler {
     }
 
     /// Begin a pipeline statistics query in the pass; returns query index
-    pub fn begin_pipeline_statistics_query(&self, render_pass: &mut wgpu::RenderPass<'_>) -> Option<u32> {
+    pub fn begin_pipeline_statistics_query(
+        &self,
+        render_pass: &mut wgpu::RenderPass<'_>,
+    ) -> Option<u32> {
         if let Some(query_set) = &self.pipeline_statistics_query_set {
             // Check if there is space for another pipeline statistics query
-            if self.current_pipeline_statistics_query.get() >= self.max_pipeline_statistics_queries {
+            if self.current_pipeline_statistics_query.get() >= self.max_pipeline_statistics_queries
+            {
                 println!("Profiler: Max pipeline statistics queries reached for this frame");
                 return None;
             }
@@ -385,9 +487,12 @@ impl Profiler {
         }
     }
 
+    /// Prints the requested pipeline statistics counters grouped per query.
+    ///
+    /// `raw` is the flat readback: one `u64` per requested statistic per
+    /// query, in the order of the mask the profiler was built with. An empty
+    /// slice or an empty mask prints a notice instead.
     pub fn summarize_pipeline_statistics_queries(&self, raw: &[u64]) {
-        use wgpu::PipelineStatisticsTypes as PST;
-
         let mask = self.pipeline_statistics_types;
         if raw.is_empty() || mask.is_empty() {
             println!("[GPU] no pipeline statistics recorded");
@@ -395,12 +500,41 @@ impl Profiler {
         }
 
         let mut layout: Vec<(&'static str, wgpu::PipelineStatisticsTypes)> = Vec::new();
-        let push = |v: &mut Vec<_>, name, flag, mask: wgpu::PipelineStatisticsTypes| { if mask.contains(flag) { v.push((name, flag)); } };
-        push(&mut layout, "VS invocations",          wgpu::PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS,    mask);
-        push(&mut layout, "Clipper invocations",     wgpu::PipelineStatisticsTypes::CLIPPER_INVOCATIONS,          mask);
-        push(&mut layout, "Clipper primitives out",  wgpu::PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT,       mask);
-        push(&mut layout, "FS invocations",          wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS,  mask);
-        push(&mut layout, "CS invocations",          wgpu::PipelineStatisticsTypes::COMPUTE_SHADER_INVOCATIONS,   mask);
+        let push = |v: &mut Vec<_>, name, flag, mask: wgpu::PipelineStatisticsTypes| {
+            if mask.contains(flag) {
+                v.push((name, flag));
+            }
+        };
+        push(
+            &mut layout,
+            "VS invocations",
+            wgpu::PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS,
+            mask,
+        );
+        push(
+            &mut layout,
+            "Clipper invocations",
+            wgpu::PipelineStatisticsTypes::CLIPPER_INVOCATIONS,
+            mask,
+        );
+        push(
+            &mut layout,
+            "Clipper primitives out",
+            wgpu::PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT,
+            mask,
+        );
+        push(
+            &mut layout,
+            "FS invocations",
+            wgpu::PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS,
+            mask,
+        );
+        push(
+            &mut layout,
+            "CS invocations",
+            wgpu::PipelineStatisticsTypes::COMPUTE_SHADER_INVOCATIONS,
+            mask,
+        );
 
         let stride = layout.len();
         if stride == 0 {
@@ -409,7 +543,9 @@ impl Profiler {
         }
 
         for (query, chunk) in raw.chunks(stride).enumerate() {
-            if chunk.len() < stride { break; }
+            if chunk.len() < stride {
+                break;
+            }
             println!("[GPU] pipeline stats query {}:", query);
             for ((name, _flag), &value) in layout.iter().zip(chunk.iter()) {
                 println!("       {:>24}: {}", name, value);
@@ -417,32 +553,68 @@ impl Profiler {
         }
     }
 
+    /// Ends the pipeline statistics query most recently begun in
+    /// `render_pass`.
+    ///
+    /// Pairs with [`Self::begin_pipeline_statistics_query`]; the counters
+    /// become readable once the frame's queries are resolved.
     pub fn end_pipeline_statistics_query(&self, render_pass: &mut wgpu::RenderPass<'_>) {
         render_pass.end_pipeline_statistics_query();
     }
 
-    pub fn resolve_pipeline_statistics_queries(&mut self, device: &Device, encoder: &mut CommandEncoder) {
+    /// Resolves the pipeline statistics recorded this frame into the current
+    /// ring slot.
+    ///
+    /// A no-op when the feature is unsupported or no query was begun this
+    /// frame, so a frame with nothing to resolve leaves its ring slot at
+    /// whatever the previous resolve put there.
+    pub fn resolve_pipeline_statistics_queries(
+        &mut self,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+    ) {
         if let Some(query_set) = &self.pipeline_statistics_query_set {
             let count = self.current_pipeline_statistics_query.get();
-            if count == 0 { return; }
+            if count == 0 {
+                return;
+            }
             let byte_len = self.pipeline_statistics_queries_result_bytes * count as u64;
 
             let index = self.frame_index;
             let slot = &mut self.pipeline_buffers[index];
-            let buffer = ensure_buffer_slot(device, slot, byte_len, "gpu_profiler.pipeline_statistics_queries.resolve");
+            let buffer = ensure_buffer_slot(
+                device,
+                slot,
+                byte_len,
+                "gpu_profiler.pipeline_statistics_queries.resolve",
+            );
 
             encoder.resolve_query_set(query_set, 0..count, buffer, 0);
         }
     }
 
+    /// Blocking readback of the raw statistic counters resolved for the
+    /// previous frame.
+    ///
+    /// Returns `None` when the feature is unsupported or no query has been
+    /// resolved yet. The values are the flat layout
+    /// [`Self::summarize_pipeline_statistics_queries`] expects.
     pub fn read_pipeline_statistics_queries_blocking(&self, device: &Device) -> Option<Vec<u64>> {
         let index = (self.frame_index + FRAMES_IN_FLIGHT - 1) % FRAMES_IN_FLIGHT;
         let buffer = self.pipeline_buffers[index].as_ref()?;
         let slice = buffer.slice(..);
 
-        // Map and wait
-        slice.map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(Maintain::Wait);
+        // Map and wait; see the timestamp reader for why the result is checked.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        if device.poll(PollType::Wait).is_err() {
+            return None;
+        }
+        if receiver.recv().ok()?.is_err() {
+            return None;
+        }
         let data = slice.get_mapped_range();
         let values: Vec<u64> = bytemuck::cast_slice(&data).to_vec();
 
@@ -453,6 +625,11 @@ impl Profiler {
 
     // --- Misc ---
 
+    /// Reads back and prints all three profiling categories in one call.
+    ///
+    /// Each reader blocks on the GPU in turn, so this is a debugging aid
+    /// rather than something to run every frame. Categories with nothing
+    /// resolved are skipped entirely - their readers answer `None`.
     pub fn summarize_all_blocking(&self, device: &wgpu::Device) {
         if let Some(timestamp_queries) = self.read_timestamp_queries_blocking(device) {
             self.summarize_timestamp_queries(&timestamp_queries);
@@ -460,12 +637,20 @@ impl Profiler {
         if let Some(occlusion_queries) = self.read_occlusion_queries_blocking(device) {
             self.summarize_occlusion_queries(&occlusion_queries);
         }
-        if let Some(pipeline_statistics_queries) = self.read_pipeline_statistics_queries_blocking(device) {
+        if let Some(pipeline_statistics_queries) =
+            self.read_pipeline_statistics_queries_blocking(device)
+        {
             self.summarize_pipeline_statistics_queries(&pipeline_statistics_queries);
         }
     }
 }
 
+/// Returns the ring slot's buffer, creating or replacing it when it cannot
+/// already hold `size` bytes.
+///
+/// A slot only ever grows: once a frame with many queries has asked for a
+/// large buffer, later smaller frames reuse that allocation instead of
+/// shrinking it.
 #[inline]
 fn ensure_buffer_slot<'a>(
     device: &wgpu::Device,
@@ -478,15 +663,9 @@ fn ensure_buffer_slot<'a>(
         *slot = Some(device.create_buffer(&BufferDescriptor {
             label: Some(label),
             size,
-            usage: BufferUsages::COPY_SRC | wgpu::BufferUsages::MAP_READ  | BufferUsages::QUERY_RESOLVE,
+            usage: BufferUsages::COPY_SRC | BufferUsages::MAP_READ | BufferUsages::QUERY_RESOLVE,
             mapped_at_creation: false,
         }));
-        // *slot = Some(device.create_buffer(&wgpu::BufferDescriptor {
-        //     label: Some(label),
-        //     size,
-        //     usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::QUERY_RESOLVE,
-        //     mapped_at_creation: false,
-        // }));
     }
     slot.as_ref().unwrap()
 }

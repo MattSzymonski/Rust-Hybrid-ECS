@@ -1,4 +1,26 @@
 //! Game-facing renderer assets stored in the world's `AssetManager`.
+//!
+//! # Responsibilities
+//!
+//! - Own the asset types a project draws from - [`Mesh`], [`Texture`],
+//!   [`Shader`], [`Material`], [`RenderPass`], [`RenderingPipeline`] -
+//!   re-exported flat so a game names them without the submodule they sit in.
+//! - Carry each type's builder and binding declarations: [`MaterialBuilder`],
+//!   [`ShaderBuilder`], the parameter and texture slot types, and the
+//!   `pub(crate)` helpers that key slot lists by the names they carry.
+//! - Register every type behind `dyn Asset`, so the world's `AssetManager`
+//!   stores them many per type like any other asset.
+//! - Provide [`asset_key`], packing a handle's index and generation into the
+//!   `u64` the renderer's caches key on.
+//!
+//! # Design
+//!
+//! Each type here is data plus declaration: a game builds it, the
+//! `AssetManager` owns it, and the renderer reads it while resolving a frame,
+//! with the GPU side - caches, pipelines, bind groups - living under
+//! [`crate::resources`] and [`crate::renderer`]. [`asset_key`] packs a
+//! handle's generation above its index, so one `u64` tells a cache which
+//! asset and which version of it a resource was built for.
 
 mod material;
 mod mesh;

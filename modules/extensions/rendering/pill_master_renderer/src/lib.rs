@@ -1,24 +1,71 @@
-//! Pill renderer transferred from the original `pill_renderer` crate.
+//! The wgpu renderer: drawable assets, render components, and the GPU machinery
+//! that turns them into frames.
 //!
-//! The GPU resource, shader, material, mesh, camera, drawer, and surface code
-//! remains in the original module structure. The added asset and frame modules
-//! adapt that backend to this repository's `AssetManager` and ECS scheduler.
+//! # Responsibilities
+//!
+//! - Defines the assets a project draws from ([`Mesh`], [`Texture`], [`Shader`],
+//!   [`Material`], [`RenderPass`], [`RenderingPipeline`]) and the [`component`]
+//!   types that place them in the world.
+//! - Owns the GPU half: device and surface lifecycle ([`Renderer`]), the
+//!   [`resources`] caches, the [`drawers`], and the [`render_queue`] keys that
+//!   order a frame's draws.
+//! - Installs the renderer on an engine through [`register`], and resolves each
+//!   frame's render input in [`frame`].
+//!
+//! # Design
+//!
+//! Transferred from the original `pill_renderer` crate. The GPU resource,
+//! shader, material, mesh, camera, drawer, and surface code remains in the
+//! original module structure; the added [`assets`] and [`frame`] modules adapt
+//! that backend to this repository's `AssetManager` and ECS scheduler.
+//!
+//! The host links this crate directly under its `rendering` feature rather
+//! than loading it as a hot-reloadable module, because a renderer is built
+//! around a live window surface and driven from the frontend's frame loop.
 
+/// The renderer contract a frontend drives, plus a headless stub.
 pub mod api;
-pub mod assets;
-pub mod component;
-pub mod config;
-pub mod drawers;
-pub mod error;
-pub mod frame;
-pub mod instance;
-pub mod render_queue;
-pub mod renderer;
-pub mod resources;
-mod slot_map;
-#[cfg(feature = "debug_ui")]
-mod timer;
 
+/// The drawable assets - meshes, textures, shaders, materials, passes - and their builders.
+pub mod assets;
+
+/// The world-side draw components - transform, camera, mesh renderer, light - and [`register_components`].
+pub mod component;
+
+/// Bind group indices and the instance batch size every pipeline is built around.
+pub mod config;
+
+/// The mesh drawer: batches queued entities and records the instanced draws.
+pub mod drawers;
+
+/// Renderer failures, the `Result` alias, and the wgpu validation capture.
+pub mod error;
+
+/// Asset snapshots, render instances, resolved passes, and the system that builds them.
+pub mod frame;
+
+/// The per-instance transform the drawer uploads for the vertex shader.
+pub mod instance;
+
+/// The query sets and readbacks behind GPU profiling measurements.
+pub mod profiler;
+
+/// Queue items and the packed key fields that order a frame's draws.
+pub mod render_queue;
+
+/// The wgpu renderer: device and surface lifecycle, pipelines and submission.
+pub mod renderer;
+
+/// One module per cached GPU resource, re-exported flat for the renderer.
+pub mod resources;
+
+/// The generational arena backing the renderer's resource handles.
+mod slot_map;
+
+// External crates
+pub use pill_engine::AssetLoader;
+
+// Current crate
 pub use api::{FrameOutcome, HeadlessRenderer, PillRenderer, RenderCapabilities, RenderMetrics};
 pub use assets::{
     Material, MaterialBuilder, MaterialParameter, Mesh, MeshVertex, PassKind, PassTarget,
@@ -29,10 +76,19 @@ pub use component::*;
 pub use error::RendererError;
 pub use frame::{rendering_system, AssetSnapshot, RenderFrame, RenderInstance, ResolvedPass};
 pub use instance::Instance;
-pub use pill_engine::AssetLoader;
 pub use renderer::{Renderer, RendererWindow};
 pub use resources::RenderingManager;
 
+/// Registers the renderer's components, assets, resources and system with an
+/// engine, and returns zero.
+///
+/// The host calls this once it has attached a [`Renderer`] to a window.
+/// Components go in through [`register_components`]; the six asset types are
+/// declared so their per-type tables are re-pointed at the generation still
+/// mapped; the [`RenderFrame`] and [`RenderingManager`] resources are only
+/// filled in when missing, and the post-update `rendering` system is only
+/// registered once - every step checks what is already there, so a repeated
+/// call changes nothing.
 pub fn register(engine: &mut pill_engine::Engine) -> u32 {
     register_components(engine.world_mut());
     // Declare the asset types this renderer owns. A project artifact calls this
