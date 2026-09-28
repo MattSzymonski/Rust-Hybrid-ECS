@@ -30,7 +30,7 @@ pub mod api;
 pub mod assets;
 
 /// The world-side draw components - transform, camera, mesh renderer, light - and [`register_components`].
-pub mod component;
+pub mod components;
 
 /// Bind group indices and the instance batch size every pipeline is built around.
 pub mod config;
@@ -56,11 +56,11 @@ pub mod render_queue;
 /// The wgpu renderer: device and surface lifecycle, pipelines and submission.
 pub mod renderer;
 
+/// The GPU resource handles the renderer's slot maps are keyed by.
+mod resource_handles;
+
 /// One module per cached GPU resource, re-exported flat for the renderer.
 pub mod resources;
-
-/// The generational arena backing the renderer's resource handles.
-mod slot_map;
 
 // External crates
 pub use pill_engine::AssetLoader;
@@ -72,7 +72,7 @@ pub use assets::{
     RenderPass, RenderingPipeline, Shader, ShaderBuilder, ShaderParameterSlot, ShaderParameterType,
     ShaderTextureSlot, Texture, TextureType,
 };
-pub use component::*;
+pub use components::*;
 pub use error::RendererError;
 pub use frame::{rendering_system, AssetSnapshot, RenderFrame, RenderInstance, ResolvedPass};
 pub use instance::Instance;

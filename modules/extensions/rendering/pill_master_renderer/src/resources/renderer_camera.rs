@@ -29,7 +29,7 @@ use wgpu::util::DeviceExt;
 
 // Current crate
 use crate::{
-    component::{CameraComponent, TransformComponent},
+    components::{CameraComponent, TransformComponent},
     error::Result,
 };
 

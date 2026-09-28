@@ -44,7 +44,7 @@ use crate::{
         parameter_slots_by_name, texture_slots_by_name, MaterialParameter, PassKind, PassTarget,
         ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot, TextureType,
     },
-    component::RenderViewport,
+    components::RenderViewport,
     config::{
         CAMERA_PARAMETERS_BIND_GROUP_LAYOUT_INDEX, ENGINE_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
         INSTANCE_BATCH_SIZE, MATERIAL_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
@@ -54,13 +54,13 @@ use crate::{
     error::{capturing_validation, RendererError, Result},
     frame::{AssetSnapshot, RenderFrame, ResolvedPass},
     render_queue::{compose_render_queue_key, decompose_render_queue_key, RenderQueueItem},
+    resource_handles::{
+        RendererCameraHandle, RendererMaterialHandle, RendererMeshHandle, RendererShaderHandle,
+        RendererTextureHandle,
+    },
     resources::{
         RendererCamera, RendererMaterial, RendererMesh, RendererPass, RendererResourceStorage,
         RendererShader, RendererTexture, Vertex,
-    },
-    slot_map::{
-        RendererCameraHandle, RendererMaterialHandle, RendererMeshHandle, RendererShaderHandle,
-        RendererTextureHandle,
     },
     Instance,
 };
