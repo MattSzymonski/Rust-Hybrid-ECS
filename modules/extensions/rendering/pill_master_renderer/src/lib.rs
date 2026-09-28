@@ -26,6 +26,9 @@
 /// The renderer contract a frontend drives, plus a headless stub.
 pub mod api;
 
+/// The GPU objects behind the asset store, kept level with it one type at a time.
+mod asset_mirror;
+
 /// The drawable assets - meshes, textures, shaders, materials, passes - and their builders.
 pub mod assets;
 
@@ -46,6 +49,9 @@ pub mod frame;
 
 /// The per-instance transform the drawer uploads for the vertex shader.
 pub mod instance;
+
+/// The frame's chain as GPU objects: a pass pipeline each, and the plan a frame is recorded from.
+mod pipeline;
 
 /// The query sets and readbacks behind GPU profiling measurements.
 pub mod profiler;
