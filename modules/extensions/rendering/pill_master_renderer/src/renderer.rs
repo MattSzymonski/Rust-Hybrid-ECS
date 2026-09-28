@@ -32,6 +32,7 @@ use std::{collections::HashMap, time::Instant};
 // External crates
 use pill_core::{info, PillStyle};
 use pill_engine::AssetManager;
+use pill_renderer_api::RawWindowData;
 
 // Current crate
 use crate::{
@@ -49,7 +50,7 @@ use crate::{
     pipeline::{PassOutput, PassPlan, PassSlot, ScriptableRenderingPipeline},
     rendering_resources_manager::RenderingResourcesManager,
     resources::{RendererCamera, RendererCameraHandle, RendererResourceStorage, RendererTexture},
-    surface::{RendererWindow, Surface},
+    surface::Surface,
     Instance,
 };
 
@@ -95,8 +96,14 @@ impl Renderer {
     /// # Errors
     ///
     /// Returns the errors of [`Renderer::new_async`], which does the work.
-    pub fn new<W: RendererWindow + 'static>(window: W, width: u32, height: u32) -> Result<Self> {
-        pollster::block_on(Self::new_async(window, width, height))
+    ///
+    /// # Safety
+    ///
+    /// As [`Renderer::new_async`]: `window` must name a live window that
+    /// outlives the renderer.
+    pub unsafe fn new(window: RawWindowData, width: u32, height: u32) -> Result<Self> {
+        // SAFETY: forwarded from this function's own contract.
+        pollster::block_on(unsafe { Self::new_async(window, width, height) })
     }
 
     /// Creates the renderer: device and surface, the default material, and the
@@ -107,13 +114,17 @@ impl Renderer {
     /// Returns a [`RendererError`] when a creation step fails: surface or
     /// adapter acquisition, device creation, surface configuration, the depth
     /// buffer, the resource storage, the default material, or the camera.
-    pub async fn new_async<W: RendererWindow + 'static>(
-        window: W,
-        width: u32,
-        height: u32,
-    ) -> Result<Self> {
+    ///
+    /// # Safety
+    ///
+    /// `window` must name a live window, and that window must outlive the
+    /// renderer: the surface is built on its raw handles and nothing here keeps
+    /// it alive. A frontend holds the window for as long as it holds the
+    /// renderer, and drops the renderer first.
+    pub async unsafe fn new_async(window: RawWindowData, width: u32, height: u32) -> Result<Self> {
         info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Initializing {}", "Renderer".module_object_style());
-        let mut state = State::new(window, width, height).await?;
+        // SAFETY: forwarded from this function's own contract.
+        let mut state = unsafe { State::new(window, width, height) }.await?;
         let rendering_resources_manager = RenderingResourcesManager::new(&mut state)?;
         let camera = state
             .renderer_resource_storage
@@ -153,10 +164,7 @@ impl PillRenderer for Renderer {
         if self.minimized {
             return;
         }
-        if let Err(error) = self
-            .state
-            .resize(winit::dpi::PhysicalSize::new(width, height))
-        {
+        if let Err(error) = self.state.resize(width, height) {
             // Warned instead of panicking: a size the driver will not take is
             // not worth killing a running game over, and the next resize event
             // tries again.
@@ -271,8 +279,12 @@ pub struct State {
 }
 
 impl State {
-    async fn new<W: RendererWindow + 'static>(window: W, width: u32, height: u32) -> Result<Self> {
-        let (surface, device, queue) = Surface::create(window, width, height).await?;
+    /// # Safety
+    ///
+    /// As [`Surface::create`]: `window` must outlive the state.
+    async unsafe fn new(window: RawWindowData, width: u32, height: u32) -> Result<Self> {
+        // SAFETY: forwarded from this function's own contract.
+        let (surface, device, queue) = unsafe { Surface::create(window, width, height) }.await?;
         let depth_format = wgpu::TextureFormat::Depth32Float;
         let depth_texture =
             RendererTexture::new_depth_texture(&device, surface.configuration(), "depth_texture")?;
@@ -318,9 +330,8 @@ impl State {
     /// leaves the old, consistent surface and depth pair in place instead of a
     /// configuration that disagrees with the swapchain. What used to be an
     /// `expect` here killed the host on a resize it could not honour.
-    fn resize(&mut self, new_window_size: winit::dpi::PhysicalSize<u32>) -> Result<()> {
-        self.surface
-            .resize(&self.device, new_window_size.width, new_window_size.height)?;
+    fn resize(&mut self, width: u32, height: u32) -> Result<()> {
+        self.surface.resize(&self.device, width, height)?;
         self.depth_texture = RendererTexture::new_depth_texture(
             &self.device,
             self.surface.configuration(),

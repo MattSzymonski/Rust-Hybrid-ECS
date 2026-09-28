@@ -20,20 +20,19 @@
 //! for the surface does not quietly become the device's owner.
 //!
 //! Nothing here names a windowing crate: the surface is built from a
-//! [`RendererWindow`], and the sizes that reach it are plain pixels.
+//! [`RawWindowData`] - the window's platform handles as plain data - and the
+//! sizes that reach it are plain pixels. That is what lets a frontend on any
+//! windowing crate (winit in the standalone host, tao in the editor) attach
+//! this renderer, and what keeps a windowing crate out of this one.
 
 // External crates
 use pill_core::info;
 
+// External crates
+use pill_renderer_api::RawWindowData;
+
 // Current crate
 use crate::error::{RendererError, Result};
-
-/// A window the renderer can build its surface from.
-///
-/// Blanket-implemented for every wgpu window handle, so a frontend hands the
-/// renderer its own window type without naming wgpu's.
-pub trait RendererWindow: wgpu::WindowHandle {}
-impl<T> RendererWindow for T where T: wgpu::WindowHandle {}
 
 /// The colour format every pipeline rendering to this surface declares.
 ///
@@ -91,8 +90,13 @@ impl Surface {
     /// adapter acquisition, device creation, a surface advertising no texture
     /// format or alpha mode, or a configuration every candidate was refused
     /// for.
-    pub async fn create<W: RendererWindow + 'static>(
-        window: W,
+    ///
+    /// # Safety
+    ///
+    /// `window` must name a live window, and that window must outlive the
+    /// returned surface: nothing here keeps it alive.
+    pub async unsafe fn create(
+        window: RawWindowData,
         width: u32,
         height: u32,
     ) -> Result<(Self, wgpu::Device, wgpu::Queue)> {
@@ -105,12 +109,18 @@ impl Surface {
             flags: wgpu::InstanceFlags::from_build_config().with_env(),
             backend_options: wgpu::BackendOptions::default(),
         });
-        let surface =
-            instance
-                .create_surface(window)
-                .map_err(|error| RendererError::SurfaceCreation {
-                    detail: error.to_string(),
-                })?;
+        let (raw_window_handle, raw_display_handle) = window.to_raw()?;
+        // SAFETY: the handles name a live window that outlives the surface,
+        // which is this function's own contract with its caller.
+        let surface = unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle,
+                raw_window_handle,
+            })
+        }
+        .map_err(|error| RendererError::SurfaceCreation {
+            detail: error.to_string(),
+        })?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::default(),
