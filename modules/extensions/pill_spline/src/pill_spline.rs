@@ -132,56 +132,22 @@ impl Default for Spline {
     }
 }
 
-/// Compile-time layout of the vector type the control points are stored in.
-///
-/// `Vector3f` is `glam::Vec3`, a foreign type that cannot carry
-/// `#[derive(PillMirror)]`; without this declaration the managed mirror falls
-/// back to an opaque byte blob and C# has to write points by offset. The name
-/// is the path the field is written with (`array:struct:Vector3f`), so
-/// managed code gets typed `X`/`Y`/`Z` members instead. glam guarantees
-/// `#[repr(C)]` with `x`, `y`, `z` in order, and the asserts below turn that
-/// guarantee into a build failure if it ever changes.
-static VECTOR3F_MIRROR_FIELDS: &[pill_engine::component_registry::ComponentFieldDescriptor] = &[
-    pill_engine::component_registry::ComponentFieldDescriptor {
-        name: "x",
-        type_tag: "f32",
-        offset: 0,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-    pill_engine::component_registry::ComponentFieldDescriptor {
-        name: "y",
-        type_tag: "f32",
-        offset: 4,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-    pill_engine::component_registry::ComponentFieldDescriptor {
-        name: "z",
-        type_tag: "f32",
-        offset: 8,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-];
-
-pill_engine::submit! {
-    pill_engine::component_registry::PillValueTypeDescriptor {
-        type_name: "Vector3f",
-        size: 12,
-        align: 4,
-        fields: VECTOR3F_MIRROR_FIELDS,
+// Compile-time layout of the vector type the control points are stored in.
+//
+// `Vector3f` is `glam::Vec3`, a foreign type that cannot carry
+// `#[derive(PillMirror)]`; without this declaration the managed mirror falls
+// back to an opaque byte blob and C# has to write points by offset. The name
+// is the path the field is written with (`array:struct:Vector3f`), so managed
+// code gets typed `X`/`Y`/`Z` members instead. glam guarantees `#[repr(C)]`
+// with `x`, `y`, `z` in order; the macro takes the offsets from the compiler
+// and fails the build if the declared fields stop covering the type.
+pill_engine::pill_value_type! {
+    Vector3f {
+        x: f32,
+        y: f32,
+        z: f32,
     }
 }
-
-const _: () = assert!(core::mem::size_of::<Vector3f>() == 12);
-const _: () = assert!(core::mem::align_of::<Vector3f>() == 4);
-const _: () = assert!(core::mem::offset_of!(Vector3f, x) == 0);
-const _: () = assert!(core::mem::offset_of!(Vector3f, y) == 4);
-const _: () = assert!(core::mem::offset_of!(Vector3f, z) == 8);
 
 /// A mirrored value type used by the interop suites: two coordinates, and a
 /// handful of mirrored methods that prove the trampoline surface changes
@@ -787,5 +753,24 @@ mod tests {
             "(&Spline,)-> f64",
         );
         assert!(result.is_err(), "a changed signature must be refused");
+    }
+
+    /// The declaration reaches this artifact's registry, which is what the
+    /// managed mirror codegen reads out of a loaded module.
+    #[test]
+    fn the_vector3f_declaration_reaches_the_registry() {
+        let descriptor = pill_engine::component_registry::value_type_descriptors()
+            .into_iter()
+            .find(|descriptor| descriptor.type_name == "Vector3f")
+            .expect("the Vector3f declaration must be in this artifact's registry");
+
+        assert_eq!(descriptor.size, core::mem::size_of::<Vector3f>());
+        assert_eq!(descriptor.align, core::mem::align_of::<Vector3f>());
+        let fields: Vec<(&str, &str, usize)> = descriptor
+            .fields
+            .iter()
+            .map(|field| (field.name, field.type_tag, field.offset))
+            .collect();
+        assert_eq!(fields, [("x", "f32", 0), ("y", "f32", 4), ("z", "f32", 8)]);
     }
 }

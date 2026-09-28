@@ -25,6 +25,13 @@
 //! vocabulary one-to-one. `struct:` fields (and anything else the engine
 //! cannot interpret) are surfaced as [`FieldValue::Opaque`] on read and are
 //! never writable, so an inspector can show them instead of hiding them.
+//!
+//! A nested `struct:` field whose type has a known layout is expanded before it
+//! ever reaches here: the world flattens it into dotted leaf rows when the
+//! component is registered ([`World::register_component_with_layout`]), using
+//! the layouts registered before it, so a nested colour or vector arrives as
+//! the scalars it is made of. The `struct:` tag survives to the decode path
+//! only when no layout was resolvable.
 
 // Standard library
 use std::mem::size_of;
@@ -607,6 +614,173 @@ impl World {
 }
 
 // =============================================================================
+// Nested field expansion
+// =============================================================================
+
+impl World {
+    /// Record a component's editor field layout, expanding nested struct
+    /// fields into dotted leaf rows.
+    ///
+    /// A `struct:<path>` field whose type has a known layout - another
+    /// component registered with one, or a `#[derive(PillMirror)]` value type -
+    /// becomes one row per leaf, named `<field>.<leaf>` with the offsets
+    /// composed, so the editor's generic field API reads and writes a nested
+    /// colour or vector channel by channel. Resolution sees the layouts
+    /// registered so far, so the nested type registers first.
+    ///
+    /// The common case - nothing to expand - keeps borrowing the caller's
+    /// `'static` slice; only an actual expansion copies into an owned layout.
+    pub(crate) fn record_component_field_layout(
+        &mut self,
+        component_id: ComponentId,
+        fields: &'static [ComponentFieldDescriptor],
+    ) {
+        let layout = match self.expanded_field_layout(fields) {
+            Some(expanded) => crate::world::ComponentFieldLayout::from_owned(expanded),
+            None => crate::world::ComponentFieldLayout::from_static(fields),
+        };
+        self.component_field_layouts.insert(component_id, layout);
+    }
+
+    /// Expand `struct:` fields into dotted leaf rows where their type's layout
+    /// is known; `None` when every field already stands on its own.
+    fn expanded_field_layout(
+        &self,
+        fields: &[ComponentFieldDescriptor],
+    ) -> Option<Vec<ComponentFieldDescriptor>> {
+        let mut expanded = Vec::new();
+        let mut changed = false;
+        self.expand_fields_into(fields, "", 0, &mut expanded, &mut changed);
+        changed.then_some(expanded)
+    }
+
+    /// Flatten one level of `fields` into `out`, recursing into every
+    /// `struct:` field whose path resolves to a known layout.
+    ///
+    /// `prefix` is the dotted path of the struct being flattened ("" at the
+    /// top level) and `base_offset` is where that struct starts in the
+    /// component row. A struct cannot contain itself without a heap
+    /// indirection, and heap fields are not `struct:`-tagged, so the recursion
+    /// terminates.
+    fn expand_fields_into(
+        &self,
+        fields: &[ComponentFieldDescriptor],
+        prefix: &str,
+        base_offset: usize,
+        out: &mut Vec<ComponentFieldDescriptor>,
+        changed: &mut bool,
+    ) {
+        for field in fields {
+            let nested = field
+                .type_tag
+                .strip_prefix("struct:")
+                .and_then(|path| self.resolve_nested_layout(path));
+            if let Some(nested) = nested {
+                *changed = true;
+                let name = if prefix.is_empty() {
+                    field.name.to_string()
+                } else {
+                    format!("{prefix}.{}", field.name)
+                };
+                self.expand_fields_into(&nested, &name, base_offset + field.offset, out, changed);
+            } else {
+                let name = if prefix.is_empty() {
+                    field.name
+                } else {
+                    intern_nested_field_name(format!("{prefix}.{}", field.name))
+                };
+                out.push(ComponentFieldDescriptor {
+                    name,
+                    type_tag: field.type_tag,
+                    offset: base_offset + field.offset,
+                    size: field.size,
+                    align: field.align,
+                    element_count: field.element_count,
+                });
+            }
+        }
+    }
+
+    /// The field layout a `struct:<path>` tag names, if one is known.
+    ///
+    /// The tag is the path as written at the field site, which is usually an
+    /// imported short name (`Color`), so an exact match is tried first and a
+    /// unique `::<path>` suffix match second. Candidates are the world's
+    /// registered component layouts and the artifact's `#[derive(PillMirror)]`
+    /// value types. An ambiguous suffix resolves to `None` - an opaque field
+    /// is readable, a wrong one is not.
+    fn resolve_nested_layout(&self, path: &str) -> Option<Vec<ComponentFieldDescriptor>> {
+        let suffix = format!("::{path}");
+
+        // Registered components, exact match then unique suffix match.
+        let mut component_hit = None;
+        let mut component_suffix_matches = 0usize;
+        for (component_id, layout) in &self.component_field_layouts {
+            let Some(name) = self.component_registry.get_name(component_id) else {
+                continue;
+            };
+            if name == path {
+                return Some(layout.fields().to_vec());
+            }
+            if name.ends_with(&suffix) {
+                component_suffix_matches += 1;
+                if component_suffix_matches == 1 {
+                    component_hit = Some(layout.fields().to_vec());
+                }
+            }
+        }
+        if component_suffix_matches == 1 {
+            return component_hit;
+        }
+
+        // Artifact value types, exact match then unique suffix match.
+        let mut value_hit = None;
+        let mut value_suffix_matches = 0usize;
+        for descriptor in crate::component_registry::value_type_descriptors() {
+            if descriptor.type_name == path {
+                return Some(descriptor.fields.to_vec());
+            }
+            if descriptor.type_name.ends_with(&suffix) {
+                value_suffix_matches += 1;
+                if value_suffix_matches == 1 {
+                    value_hit = Some(descriptor.fields.to_vec());
+                }
+            }
+        }
+        if value_suffix_matches == 1 {
+            return value_hit;
+        }
+
+        None
+    }
+}
+
+/// Intern a synthesized nested field name ("color.r", "inner.a.b") into
+/// `&'static str`.
+///
+/// Descriptors store names as `&'static str` and expansion builds them at
+/// registration, so each distinct dotted name is leaked once and reused for
+/// the process lifetime. The set is bounded by the distinct field paths a
+/// process ever registers, so a hot reload re-registering the same components
+/// does not grow it.
+fn intern_nested_field_name(name: String) -> &'static str {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static NESTED_FIELD_NAMES: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let names = NESTED_FIELD_NAMES.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut names = names
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(&existing) = names.get(name.as_str()) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(name.into_boxed_str());
+    names.insert(leaked);
+    leaked
+}
+
+// =============================================================================
 // Writes
 // =============================================================================
 
@@ -1081,6 +1255,34 @@ mod tests {
     }
     impl Component for OtherComponent {}
 
+    /// Inner half of the nested-layout components below.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct NestedInner {
+        a: f32,
+        b: f32,
+    }
+    impl Component for NestedInner {}
+
+    /// A value type whose layout reaches components through the mirror
+    /// inventory rather than through a component registration of its own.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy, crate::PillMirror)]
+    struct ProbeVector {
+        x: f32,
+        y: f32,
+    }
+
+    /// Carries one nested component field and one nested value-type field.
+    #[repr(C)]
+    #[derive(Debug, Clone, Copy)]
+    struct NestedOuter {
+        lead: f32,
+        inner: NestedInner,
+        probe: ProbeVector,
+    }
+    impl Component for NestedOuter {}
+
     // A hand-rolled registration mirroring what #[derive(PillComponent)] emits.
     static SAMPLE_FIELDS: &[ComponentFieldDescriptor] = &[
         ComponentFieldDescriptor {
@@ -1132,6 +1334,133 @@ mod tests {
             a_bool: true,
             an_array: [1, 2, 3],
         }
+    }
+
+    static NESTED_INNER_FIELDS: &[ComponentFieldDescriptor] = &[
+        ComponentFieldDescriptor {
+            name: "a",
+            type_tag: "f32",
+            offset: 0,
+            size: 4,
+            align: 4,
+            element_count: 0,
+        },
+        ComponentFieldDescriptor {
+            name: "b",
+            type_tag: "f32",
+            offset: 4,
+            size: 4,
+            align: 4,
+            element_count: 0,
+        },
+    ];
+
+    static NESTED_OUTER_FIELDS: &[ComponentFieldDescriptor] = &[
+        ComponentFieldDescriptor {
+            name: "lead",
+            type_tag: "f32",
+            offset: 0,
+            size: 4,
+            align: 4,
+            element_count: 0,
+        },
+        ComponentFieldDescriptor {
+            name: "inner",
+            type_tag: "struct:NestedInner",
+            offset: 4,
+            size: 8,
+            align: 4,
+            element_count: 0,
+        },
+        ComponentFieldDescriptor {
+            name: "probe",
+            type_tag: "struct:ProbeVector",
+            offset: 12,
+            size: 8,
+            align: 4,
+            element_count: 0,
+        },
+    ];
+
+    fn nested_world() -> World {
+        let mut world = World::new();
+        world.register_component_with_layout::<NestedInner>(NESTED_INNER_FIELDS);
+        world.register_component_with_layout::<NestedOuter>(NESTED_OUTER_FIELDS);
+        world
+    }
+
+    /// Nested `struct:` fields expand into dotted leaf rows at registration,
+    /// and the leaves read and write like any scalar field.
+    #[test]
+    fn nested_fields_expand_into_editable_rows() {
+        let mut world = nested_world();
+
+        let layout = world
+            .component_field_layout(ComponentId::of::<NestedOuter>())
+            .expect("NestedOuter registered with a layout");
+        let names: Vec<&str> = layout.iter().map(|field| field.name).collect();
+        assert_eq!(names, ["lead", "inner.a", "inner.b", "probe.x", "probe.y"]);
+        assert_eq!(layout[1].offset, 4, "composed offsets for inner.a");
+        assert_eq!(layout[2].offset, 8, "composed offsets for inner.b");
+        assert_eq!(layout[3].offset, 12, "composed offsets for probe.x");
+
+        let entity = world
+            .create_entity()
+            .with(NestedOuter {
+                lead: 1.0,
+                inner: NestedInner { a: 2.0, b: 3.0 },
+                probe: ProbeVector { x: 4.0, y: 5.0 },
+            })
+            .build()
+            .expect("entity builds");
+
+        let name = "pill_engine::component_field::tests::NestedOuter";
+        assert_eq!(
+            world.read_component_field(entity, name, "inner.b").unwrap(),
+            FieldValue::F32(3.0)
+        );
+        assert_eq!(
+            world.read_component_field(entity, name, "probe.y").unwrap(),
+            FieldValue::F32(5.0)
+        );
+
+        world
+            .write_component_field(entity, name, "inner.b", FieldValue::F32(9.0))
+            .expect("the expanded leaf is writable");
+        assert_eq!(
+            world.read_component_field(entity, name, "inner.b").unwrap(),
+            FieldValue::F32(9.0)
+        );
+    }
+
+    /// A `struct:` field whose type has no known layout stays one opaque row
+    /// instead of being guessed at.
+    #[test]
+    fn unresolvable_struct_fields_stay_opaque() {
+        static FIELDS: &[ComponentFieldDescriptor] = &[ComponentFieldDescriptor {
+            name: "mystery",
+            type_tag: "struct:NoSuchTypeExists",
+            offset: 0,
+            size: 4,
+            align: 4,
+            element_count: 0,
+        }];
+
+        #[repr(C)]
+        #[derive(Debug, Clone, Copy)]
+        struct OpaqueHolder {
+            mystery: u32,
+        }
+        impl Component for OpaqueHolder {}
+
+        let mut world = World::new();
+        world.register_component_with_layout::<OpaqueHolder>(FIELDS);
+        let layout = world
+            .component_field_layout(ComponentId::of::<OpaqueHolder>())
+            .expect("OpaqueHolder registered with a layout");
+        assert_eq!(layout.len(), 1);
+        assert_eq!(layout[0].name, "mystery");
+        assert_eq!(layout[0].type_tag, "struct:NoSuchTypeExists");
     }
 
     #[test]

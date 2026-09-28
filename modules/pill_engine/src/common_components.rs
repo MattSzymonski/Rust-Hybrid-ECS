@@ -29,8 +29,10 @@
 
 // Current crate
 use crate::component::Component;
-use crate::component_registry::ComponentFieldDescriptor;
 use crate::world::World;
+
+// Derive macro for the field layout (the layout half of `PillComponent`).
+use pill_engine_macros::PillLayout;
 
 // =============================================================================
 // Components
@@ -41,7 +43,7 @@ use crate::world::World;
 /// Resolved across binaries by stable type name rather than by Rust `TypeId`,
 /// so a hot-loaded project and the host agree on one column.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PillLayout)]
 pub struct Position {
     /// Horizontal pixel coordinate of the draw origin.
     pub x: f32,
@@ -55,7 +57,7 @@ impl Component for Position {}
 /// `#[repr(C)]` with normalized float channels so the byte layout is shared
 /// with the C# runtime as part of the component ABI.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, PillLayout)]
 pub struct Color {
     /// Red channel.
     pub r: f32,
@@ -90,86 +92,26 @@ impl Default for Color {
 }
 
 // =============================================================================
-// Shared component field layouts (editor inspectability)
+// Registration
 // =============================================================================
-
-/// Hand-written `repr(C)` offsets mirroring [`Position`], for the editor's
-/// generic field API.
-///
-/// These types are part of a shared ABI and cannot carry
-/// `#[derive(PillComponent)]` - the derive lives in `pill_engine_macros` and
-/// expects to own the type - so without these layouts the editor would show
-/// them with no fields at all. [`register_common_components`] attaches them.
-///
-/// Public because a renderer that flattens a `Color` into a larger component
-/// builds its own layout from these offsets rather than restating them.
-pub const POSITION_FIELD_LAYOUT: &[ComponentFieldDescriptor] = &[
-    ComponentFieldDescriptor {
-        name: "x",
-        type_tag: "f32",
-        offset: 0,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-    ComponentFieldDescriptor {
-        name: "y",
-        type_tag: "f32",
-        offset: 4,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-];
-
-/// `Color` is itself a component; register its channels like the derive would.
-pub const COLOR_FIELD_LAYOUT: &[ComponentFieldDescriptor] = &[
-    ComponentFieldDescriptor {
-        name: "r",
-        type_tag: "f32",
-        offset: 0,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-    ComponentFieldDescriptor {
-        name: "g",
-        type_tag: "f32",
-        offset: 4,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-    ComponentFieldDescriptor {
-        name: "b",
-        type_tag: "f32",
-        offset: 8,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-    ComponentFieldDescriptor {
-        name: "a",
-        type_tag: "f32",
-        offset: 12,
-        size: 4,
-        align: 4,
-        element_count: 0,
-    },
-];
 
 /// Register [`Position`] and [`Color`] with their editor layouts.
 ///
 /// Idempotent, so a hot reload re-running `init` is safe, and it goes through
 /// `register_component_with_layout` so the components arrive field-editable in
-/// the inspector rather than as opaque blobs.
+/// the inspector rather than as opaque blobs. The layouts come from
+/// `#[derive(PillLayout)]` on each struct: generated descriptors instead of
+/// hand-written offsets. These types are a shared ABI every binary links, so
+/// they must not carry `#[derive(PillComponent)]` - that derive also submits
+/// an inventory registration, which would put both columns in every world that
+/// merely links the engine.
 ///
 /// A renderer calls this from its own registration entry point and then adds
 /// whatever it draws with; a project that only wants a position and a colour
 /// can call it directly and link no renderer at all.
 pub fn register_common_components(world: &mut World) {
-    world.register_component_with_layout::<Position>(POSITION_FIELD_LAYOUT);
-    world.register_component_with_layout::<Color>(COLOR_FIELD_LAYOUT);
+    world.register_component_with_layout::<Position>(Position::FIELD_LAYOUT);
+    world.register_component_with_layout::<Color>(Color::FIELD_LAYOUT);
 }
 
 // =============================================================================
@@ -182,39 +124,37 @@ mod tests {
 
     /// The declared layouts describe the structs they claim to.
     ///
-    /// Hand-written offsets are the price of a shared `repr(C)` ABI the derive
-    /// cannot own, so the one thing that can go wrong with them - drifting
-    /// from the struct - is checked here rather than discovered in an
-    /// inspector showing the wrong bytes.
+    /// The generated layouts cover each struct byte-for-byte, with the tags
+    /// and alignment the inspector relies on.
     #[test]
     fn the_field_layouts_match_their_structs() {
         assert_eq!(
-            POSITION_FIELD_LAYOUT.len(),
+            Position::FIELD_LAYOUT.len(),
             2,
             "a position has two coordinates"
         );
         assert_eq!(
             std::mem::size_of::<Position>(),
-            POSITION_FIELD_LAYOUT
+            Position::FIELD_LAYOUT
                 .iter()
                 .map(|field| field.size)
                 .sum::<usize>(),
             "the layout covers every byte of Position"
         );
 
-        assert_eq!(COLOR_FIELD_LAYOUT.len(), 4, "a colour has four channels");
+        assert_eq!(Color::FIELD_LAYOUT.len(), 4, "a colour has four channels");
         assert_eq!(
             std::mem::size_of::<Color>(),
-            COLOR_FIELD_LAYOUT
+            Color::FIELD_LAYOUT
                 .iter()
                 .map(|field| field.size)
                 .sum::<usize>(),
             "the layout covers every byte of Color"
         );
 
-        for (index, field) in POSITION_FIELD_LAYOUT
+        for (index, field) in Position::FIELD_LAYOUT
             .iter()
-            .chain(COLOR_FIELD_LAYOUT)
+            .chain(Color::FIELD_LAYOUT)
             .enumerate()
         {
             assert_eq!(field.type_tag, "f32", "field {index} is a float channel");
