@@ -53,11 +53,19 @@ use crate::FrameReport;
 /// Owns the configured project, the native window, and the rendering host, and
 /// defers window-creation and host-setup failures until the loop exits so
 /// they can be surfaced through [`run`]'s error path.
+///
+/// The field order is load-bearing. Fields drop in declaration order, and
+/// `host` is therefore declared before `window` so the window outlives every
+/// GPU object. wgpu terminates the EGL display from whichever handle is
+/// dropped last, not from the surface; if the window went first, that teardown
+/// would run after winit had already destroyed the window's Wayland objects,
+/// and Mesa's `eglTerminate` walks those freed proxies and faults. Holding the
+/// app's own `Arc` until the host is gone keeps them valid throughout.
 #[cfg(feature = "rendering")]
 struct WindowedApplication {
     project: crate::ProjectSource,
-    window: Option<Arc<Window>>,
     host: Option<crate::RenderingHost>,
+    window: Option<Arc<Window>>,
     /// Whether the hidden startup window has been revealed after its first frame.
     window_shown: bool,
     /// Failure recorded during `resumed`; surfaced after the loop exits.
