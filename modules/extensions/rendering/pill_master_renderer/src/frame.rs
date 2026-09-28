@@ -2,125 +2,40 @@
 //!
 //! # Responsibilities
 //!
-//! - Snapshot the assets a frame may draw from, carrying a content version
-//!   per asset so the renderer's uploads can diff what changed
-//!   ([`AssetSnapshot`], [`AssetVersions`]).
-//! - Collect the frame itself once per update: the chosen camera, every
-//!   drawable the world offers, and the clock the shaders read
-//!   ([`RenderFrame`], [`rendering_system`]).
+//! - Collect the frame once per update: the chosen camera, every drawable the
+//!   world offers, and the clock the shaders read ([`RenderFrame`],
+//!   [`rendering_system`]).
 //! - Resolve the game's pipeline into plain passes, dropping disabled and
 //!   stale entries and calling out a chain whose surface pass breaks the
 //!   contract ([`ResolvedPass`]).
 //!
 //! # Design
 //!
-//! The renderer only ever sees a [`RenderFrame`] and never the world, so the
-//! frame crosses the ECS boundary as plain owned values: asset keys instead of
-//! handles, the camera copied out rather than borrowed. The snapshot and the
-//! resolved chain are each keyed by what they came from - the asset revision,
-//! and the pipeline handle beside it - so a frame whose sources did not move
-//! reuses the last one instead of building it again.
+//! The renderer only ever sees a [`RenderFrame`]; the assets it draws from it
+//! reads straight out of the world's `AssetManager`, borrowed for the call.
+//! What crosses here is the part that has to be *decided* rather than read: the
+//! camera choosing among several, the pipeline resolving into plain passes, the
+//! drawables resolving into instances that carry their own sort key. Assets are
+//! left where they live, so a frame never copies the asset store.
+//!
+//! The frame crosses the artifact boundary - a project's copy of this crate
+//! fills it, the host's renderer reads it - so what it carries is plain data:
+//! asset keys instead of handles, the camera copied out rather than borrowed.
 
 // Standard library
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
+use std::collections::HashMap;
 
 // External crates
-use pill_engine::{Entity, Handle, Query, Res, ResMut, Resource, SystemError};
+use pill_engine::{
+    AssetManager, Entity, Handle, Query, Res, ResMut, Resource, SystemError,
+};
 
 // Current crate
 use crate::{
-    assets::{
-        asset_key, CullMode, Material, MaterialParameter, Mesh, PassKind, PassTarget, Shader,
-        Texture,
-    },
+    assets::{asset_key, CullMode, MaterialParameter, PassKind, PassTarget},
     components::{CameraComponent, MeshRendererComponent, TransformComponent},
     resources::RenderingManager,
 };
-
-/// Per-asset content versions, keyed like the snapshot's own maps.
-///
-/// A consumer that mirrors assets (the renderer's GPU uploads) diffs these
-/// against the versions it last uploaded, so an edited asset rebuilds its
-/// resource while an untouched neighbour keeps the one it has.
-#[derive(Clone, Debug, Default)]
-pub struct AssetVersions {
-    /// Content version of each mesh, by asset key.
-    pub meshes: BTreeMap<u64, u64>,
-    /// Content version of each material, by asset key.
-    pub materials: BTreeMap<u64, u64>,
-    /// Content version of each texture, by asset key.
-    pub textures: BTreeMap<u64, u64>,
-    /// Content version of each shader, by asset key.
-    pub shaders: BTreeMap<u64, u64>,
-}
-
-/// One revision of the asset store, cloned out for the renderer to read.
-///
-/// Taken when the manager's revision moves and reused until it moves again;
-/// the renderer diffs it against the snapshot it last uploaded from, so only
-/// an asset whose version changed rebuilds its GPU resource.
-#[derive(Clone, Debug, Default)]
-pub struct AssetSnapshot {
-    /// Revision of the store this snapshot was taken from.
-    pub revision: u64,
-    /// Committed meshes, by asset key.
-    pub meshes: BTreeMap<u64, Mesh>,
-    /// Committed materials, by asset key.
-    pub materials: BTreeMap<u64, Material>,
-    /// Committed textures, by asset key.
-    pub textures: BTreeMap<u64, Texture>,
-    /// Committed shaders, by asset key.
-    pub shaders: BTreeMap<u64, Shader>,
-    /// Content version of each asset above, by the same keys.
-    pub versions: AssetVersions,
-}
-
-impl AssetSnapshot {
-    /// Takes one snapshot of everything the manager holds, carrying each
-    /// entry's content version into [`AssetVersions`].
-    fn from_manager(assets: &pill_engine::AssetManager) -> Self {
-        let mut snapshot = Self {
-            revision: assets.revision(),
-            ..Self::default()
-        };
-        for (handle, value) in assets.iter_handles::<Mesh>() {
-            let key = asset_key(handle);
-            snapshot.meshes.insert(key, value.clone());
-            snapshot
-                .versions
-                .meshes
-                .insert(key, assets.content_version(handle).unwrap_or(0));
-        }
-        for (handle, value) in assets.iter_handles::<Material>() {
-            let key = asset_key(handle);
-            snapshot.materials.insert(key, value.clone());
-            snapshot
-                .versions
-                .materials
-                .insert(key, assets.content_version(handle).unwrap_or(0));
-        }
-        for (handle, value) in assets.iter_handles::<Texture>() {
-            let key = asset_key(handle);
-            snapshot.textures.insert(key, value.clone());
-            snapshot
-                .versions
-                .textures
-                .insert(key, assets.content_version(handle).unwrap_or(0));
-        }
-        for (handle, value) in assets.iter_handles::<Shader>() {
-            let key = asset_key(handle);
-            snapshot.shaders.insert(key, value.clone());
-            snapshot
-                .versions
-                .shaders
-                .insert(key, assets.content_version(handle).unwrap_or(0));
-        }
-        snapshot
-    }
-}
 
 /// One drawable the frame collected: where it stands and what it draws with.
 ///
@@ -135,6 +50,9 @@ pub struct RenderInstance {
     pub mesh: u64,
     /// Asset key of the material to draw it with.
     pub material: u64,
+    /// The material's rendering order, resolved here so the renderer can sort
+    /// draws without going back to the material asset for each one.
+    pub rendering_order: u8,
 }
 
 /// One pass of the chain the renderer runs, with every handle resolved.
@@ -198,17 +116,16 @@ impl ResolvedPass {
     }
 }
 
-/// One frame's renderer input: assets, instances, the pass chain, the camera,
-/// and the clock, extracted from the world and handed to the renderer.
+/// One frame's renderer input: the instances, the pass chain, the camera, and
+/// the clock, extracted from the world and handed to the renderer.
 ///
-/// The renderer never reads the world; it reads this. Everything crosses as
-/// plain owned values, so the asset snapshot and the resolved chain are
-/// replaced only when what they were derived from moved.
+/// Everything here crosses as plain owned values, because the frame is what a
+/// project's copy of this crate hands the host's renderer: asset keys instead
+/// of handles, the camera copied out rather than borrowed. The assets behind
+/// those keys are read from the world's `AssetManager` at render time, so the
+/// frame stays small however large the project's assets are.
 #[derive(Clone, Debug)]
 pub struct RenderFrame {
-    /// Every asset the frame may draw from, behind the `Arc` until the next
-    /// revision replaces the snapshot.
-    pub assets: Arc<AssetSnapshot>,
     /// Every drawable the world offered this update, in traversal order.
     pub instances: Vec<RenderInstance>,
     /// The chain to run this frame, as resolved from the pipeline the game set
@@ -247,7 +164,6 @@ pub struct RenderFrame {
 impl Default for RenderFrame {
     fn default() -> Self {
         Self {
-            assets: Arc::default(),
             instances: Vec::new(),
             passes: Vec::new(),
             chain_source: None,
@@ -380,14 +296,14 @@ fn pick_camera(
 /// Fills the frame from the current world, once per update.
 ///
 /// Registered as the post-update `rendering` system, so gameplay has already
-/// written the components it reads. The asset snapshot and the resolved chain
-/// are refreshed only when what they were derived from moved - the asset
-/// revision and the pipeline's key - so most frames reuse the last one's work.
-/// A world with no frame resource, no assets, or no enabled camera is not an
-/// error: the frame simply carries less, and the renderer clears or skips it.
+/// written the components it reads. The resolved chain is refreshed only when
+/// what it was derived from moved - the asset revision and the pipeline's key -
+/// so most frames reuse the last one's work. A world with no frame resource, no
+/// assets, or no enabled camera is not an error: the frame simply carries less,
+/// and the renderer clears or skips it.
 pub fn rendering_system(
     mut frame: ResMut<RenderFrame>,
-    assets: Res<pill_engine::AssetManager>,
+    assets: Res<AssetManager>,
     manager: Res<RenderingManager>,
     time: Res<pill_engine::Time>,
     mut cameras: Query<(Entity, &TransformComponent, &CameraComponent)>,
@@ -400,17 +316,13 @@ pub fn rendering_system(
         return Ok(());
     };
 
-    if frame.assets.revision != assets.revision() {
-        frame.assets = Arc::new(AssetSnapshot::from_manager(assets));
-    }
-
     // The manager is re-read every frame - a game can set a pipeline, or toggle
     // a pass inside one, at any point between two frames - but the chain itself
     // is resolved again only when the pipeline handle or the revision moved.
     // Resolution clones every pass's strings and maps, and the renderer uses
     // the generation it produces to recognise the chain it already built from.
     let chain_source = (
-        frame.assets.revision,
+        assets.revision(),
         manager
             .get()
             .and_then(|manager| manager.pipeline())
@@ -445,16 +357,23 @@ pub fn rendering_system(
     }
 
     for (transform, renderer) in objects.iter_mut() {
-        // Handles with nothing behind them are dropped here; the draw order is
-        // the renderer's to impose when it composes the queue, so what is left
-        // stays in traversal order.
-        if assets.contains(renderer.mesh) && assets.contains(renderer.material) {
-            frame.instances.push(RenderInstance {
-                transform: *transform,
-                mesh: asset_key(renderer.mesh),
-                material: asset_key(renderer.material),
-            });
+        // Handles with nothing behind them are dropped here, so a dangling
+        // handle draws nothing instead of failing the frame. The material is
+        // read rather than merely checked because the draw order it carries
+        // rides along with the instance; the renderer imposes that order when
+        // it composes the queue, so what is left here stays in traversal order.
+        let Some(material) = assets.get(renderer.material) else {
+            continue;
+        };
+        if !assets.contains(renderer.mesh) {
+            continue;
         }
+        frame.instances.push(RenderInstance {
+            transform: *transform,
+            mesh: asset_key(renderer.mesh),
+            material: asset_key(renderer.material),
+            rendering_order: material.rendering_order,
+        });
     }
     Ok(())
 }
@@ -462,7 +381,9 @@ pub fn rendering_system(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{RenderPass, RenderingPipeline, TextureType};
+    // `Shader` and `Texture` are here to build the fixture assets the chain
+    // tests need, not by anything in the module itself.
+    use crate::{RenderPass, RenderingPipeline, Shader, Texture, TextureType};
     use pill_engine::AssetManager;
 
     #[test]
