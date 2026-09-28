@@ -64,6 +64,9 @@ mod project_module;
 #[cfg(feature = "hot_reload")]
 mod reload;
 
+/// Attaching a renderer to a frontend's window, through its handles as data.
+#[cfg(feature = "rendering")]
+mod render_window;
 /// The renderer's plain data, registered in every posture before anything loads.
 mod renderer_data;
 /// Complete standalone application runner owned by the host crate.
@@ -117,7 +120,9 @@ pub use pill_engine::EngineError;
 #[cfg(feature = "rendering")]
 pub use crate::frontend::{FrontendError, RenderingError};
 #[cfg(feature = "rendering")]
-pub use pill_master_renderer::{RenderViewport, Renderer, RendererError, RendererWindow};
+pub use pill_master_renderer::{RenderViewport, RendererError};
+#[cfg(feature = "rendering")]
+pub use render_window::RendererWindow;
 
 // Rendering-only frontend entry points: window and event-loop setup.
 #[cfg(feature = "rendering")]

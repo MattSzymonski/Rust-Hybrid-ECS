@@ -45,6 +45,9 @@ pub mod error;
 /// The frame a renderer draws: instances, resolved passes, camera and clock.
 pub mod frame;
 
+/// A window's platform handles as plain data, for attaching a renderer to it.
+pub mod raw_window;
+
 /// The resource a game sets its pipeline in.
 mod rendering_manager;
 
@@ -66,6 +69,7 @@ pub use assets::{
 pub use components::*;
 pub use error::RendererError;
 pub use frame::{RenderFrame, RenderInstance, ResolvedPass};
+pub use raw_window::{RawWindowData, RawWindowKind};
 pub use rendering_manager::RenderingManager;
 #[cfg(feature = "shader-hot-reload")]
 pub use shader_reload::{ShaderReloadReport, ShaderReloader};

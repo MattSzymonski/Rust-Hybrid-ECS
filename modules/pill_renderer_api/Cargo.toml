@@ -36,6 +36,9 @@ image = { version = "0.25", default-features = false, features = [
     "png",
 ] }
 tobj = "3"
+# Window handles as plain data (`RawWindowData`): the standard the windowing
+# crates (winit, tao) and wgpu share, with no windowing crate behind it.
+raw-window-handle = "0.6"
 # Development shader reload only (`shader-hot-reload`): the cooker the build
 # script runs, and a watcher on the shader sources.
 pill_assets = { path = "../pill_assets", optional = true }

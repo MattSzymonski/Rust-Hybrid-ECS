@@ -36,9 +36,11 @@ use pill_engine::Engine;
 #[cfg(feature = "hot_reload")]
 use pill_engine::EngineApi;
 #[cfg(feature = "rendering")]
-use pill_master_renderer::{
-    PillRenderer, RenderFrame, RenderViewport, Renderer, RendererError, RendererWindow,
-};
+use pill_master_renderer::{PillRenderer, RenderFrame, RenderViewport, RendererError};
+
+// Current crate (rendering)
+#[cfg(feature = "rendering")]
+use crate::render_window::{attach_window, AttachedWindow, RendererWindow};
 
 // Current crate
 #[cfg(feature = "hot_reload")]
@@ -336,7 +338,11 @@ impl Host {
 #[cfg(feature = "rendering")]
 pub struct RenderingHost {
     host: Host,
+    /// Declared before `window` so it drops first: the renderer's surface is
+    /// built on the window's raw handles and must not outlive it.
     renderer: Box<dyn PillRenderer>,
+    /// The frontend window the renderer draws on, kept alive for it.
+    window: AttachedWindow,
     assets: crate::render_assets::NativeAssets,
     viewport: Option<RenderViewport>,
     presented_scene: bool,
@@ -362,8 +368,11 @@ impl RenderingHost {
     where
         W: RendererWindow + 'static,
     {
-        let renderer = Renderer::new(window, width, height)?;
-        self.renderer = Box::new(renderer);
+        let (renderer, window) = attach_window(window, width, height)?;
+        // Renderer first, then window: the old renderer drops while its window
+        // is still alive, and only then is that window released.
+        self.renderer = renderer;
+        self.window = window;
         self.set_render_viewport(self.viewport);
         Ok(())
     }
@@ -808,7 +817,7 @@ where
         height,
         "attaching the engine renderer to the window surface"
     );
-    let renderer = Renderer::new(window, width, height)?;
+    let (renderer, window) = attach_window(window, width, height)?;
     pill_master_renderer::register(host.engine_mut());
     #[cfg(feature = "hot_reload")]
     let project_root = host
@@ -824,7 +833,8 @@ where
     let assets = crate::render_assets::NativeAssets::prepare(None, std::path::Path::new("."))?;
     Ok(RenderingHost {
         host,
-        renderer: Box::new(renderer),
+        renderer,
+        window,
         assets,
         viewport: None,
         presented_scene: false,
@@ -878,7 +888,7 @@ where
         height,
         "attaching the engine renderer to the window surface"
     );
-    let renderer = Renderer::new(window, width, height)?;
+    let (renderer, window) = attach_window(window, width, height)?;
     pill_master_renderer::register(host.engine_mut());
     #[cfg(feature = "hot_reload")]
     let project_root = host
@@ -894,7 +904,8 @@ where
     let assets = crate::render_assets::NativeAssets::prepare(None, std::path::Path::new("."))?;
     Ok(RenderingHost {
         host,
-        renderer: Box::new(renderer),
+        renderer,
+        window,
         assets,
         viewport: None,
         presented_scene: false,

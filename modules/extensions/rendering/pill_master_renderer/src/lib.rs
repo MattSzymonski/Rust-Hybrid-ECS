@@ -81,7 +81,6 @@ pub use frame::{rendering_system, RenderFrame, RenderInstance, ResolvedPass};
 pub use instance::Instance;
 pub use renderer::Renderer;
 pub use resources::RenderingManager;
-pub use surface::RendererWindow;
 
 /// Registers the renderer's data and its `rendering` system with an engine,
 /// and returns zero.

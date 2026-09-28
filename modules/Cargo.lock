@@ -4710,7 +4710,6 @@ dependencies = [
  "thiserror 2.0.20",
  "trait_type_map",
  "wgpu",
- "winit",
 ]
 
 [[package]]
@@ -4727,6 +4726,7 @@ dependencies = [
  "pill_core",
  "pill_core_macros",
  "pill_engine",
+ "raw-window-handle 0.6.2",
  "serde",
  "thiserror 2.0.20",
  "tobj",
