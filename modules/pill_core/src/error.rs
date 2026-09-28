@@ -380,6 +380,22 @@ pub enum ConfigError {
     #[message("required environment variable ", value(variable), " is not set")]
     MissingEnvironmentVariable { variable: &'static str },
 
+    /// A configuration environment variable holds a value the host does not
+    /// accept.
+    #[message(
+        "environment variable ",
+        value(variable),
+        " is set to ",
+        value(value),
+        "; expected ",
+        value(expected)
+    )]
+    InvalidEnvironmentVariable {
+        variable: &'static str,
+        value: String,
+        expected: &'static str,
+    },
+
     /// The directory the engine workspace lives in could not be determined.
     ///
     /// Every stored path is relative to that directory, and it is derived from

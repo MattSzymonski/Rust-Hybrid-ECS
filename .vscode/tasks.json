@@ -52,6 +52,47 @@
                 "$rustc"
             ],
             "group": "build"
+        },
+        {
+            // Start the windowed host on the C# example with everything the
+            // managed debugger needs, and hand control back once the runtime is
+            // waiting for it. Used as the `preLaunchTask` of the C# attach
+            // configuration in launch.json.
+            //
+            // - `PILL_CSHARP_CONFIGURATION=Debug`: build the project and the
+            //   runtime unoptimized, so locals survive into the IL.
+            // - `PILL_WAIT_FOR_MANAGED_DEBUGGER=1`: block in the runtime's
+            //   `Init` (up to two minutes) until a managed debugger attaches,
+            //   so breakpoints in startup code bind.
+            //
+            // The host keeps running after the debug session ends; close its
+            // window or kill the task to stop it.
+            "label": "run standalone (C# project, waiting for managed debugger)",
+            "type": "process",
+            "command": "${workspaceFolder}/modules/target/debug/pill_standalone.exe",
+            "dependsOn": "build standalone (debug)",
+            "isBackground": true,
+            "options": {
+                "cwd": "${workspaceFolder}/modules",
+                "env": {
+                    "PROJECT_PATH": "../examples/project_cs",
+                    "PILL_CSHARP_CONFIGURATION": "Debug",
+                    "PILL_WAIT_FOR_MANAGED_DEBUGGER": "1"
+                }
+            },
+            // A background task is "ready" when its end pattern prints; the
+            // pattern that would report problems never matches.
+            "problemMatcher": {
+                "owner": "pill-host",
+                "pattern": {
+                    "regexp": "^__pill_host_reports_no_problems__$"
+                },
+                "background": {
+                    "activeBegins": true,
+                    "beginsPattern": "ECS host starting",
+                    "endsPattern": "waiting up to .* for a managed debugger"
+                }
+            }
         }
     ]
 }

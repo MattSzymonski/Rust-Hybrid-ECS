@@ -456,9 +456,11 @@ internal static class ProjectCompiler
         {
             Directory.CreateDirectory(directory);
         }
-        ReplaceFile(outputAssemblyPath, assemblyStream.ToArray());
+        // Symbols first: the assembly's rename is what the loader reacts to, so
+        // the pdb has to be in place before it or the reload reads the previous
+        // build's symbols, refuses them by ID and runs without breakpoints.
         // Symbols are best effort: a locked or otherwise unwritable pdb costs
-        // line numbers in stack traces, which is not worth failing a reload for.
+        // line numbers and debugging, which is not worth failing a reload for.
         try
         {
             ReplaceFile(symbolsPath, symbolsStream.ToArray());
@@ -469,6 +471,7 @@ internal static class ProjectCompiler
         catch (UnauthorizedAccessException)
         {
         }
+        ReplaceFile(outputAssemblyPath, assemblyStream.ToArray());
         return new CompileOutcome(CompileStatus.Compiled, "");
     }
 

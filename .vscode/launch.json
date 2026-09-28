@@ -73,6 +73,33 @@
             "console": "integratedTerminal"
         },
         {
+            // Managed (C#) debugging of the C# example project.
+            //
+            // The host boots the .NET runtime itself, so there is nothing for
+            // the managed debugger to launch: the pre-launch task starts the
+            // host with a Debug C# build and the runtime waiting in `Init`, and
+            // this configuration attaches to it by process name.
+            //
+            // Requires the C# extension (ms-dotnettools.csharp). Rust code is
+            // not debuggable from this session; use a `cppvsdbg`
+            // configuration above for that, or Visual Studio's mixed mode to
+            // step across the boundary in one session.
+            "name": "Debug C# project (managed attach)",
+            "type": "coreclr",
+            "request": "attach",
+            "processName": "pill_standalone.exe",
+            "preLaunchTask": "run standalone (C# project, waiting for managed debugger)"
+        },
+        {
+            // Attach the managed debugger to a host that is already running,
+            // picked from a list. Breakpoints only bind in code the host loaded
+            // with symbols - start it with `PILL_CSHARP_CONFIGURATION=Debug`.
+            "name": "Attach C# to running host (pick process)",
+            "type": "coreclr",
+            "request": "attach",
+            "processId": "${command:pickProcess}"
+        },
+        {
             // Alternative adapter: CodeLLDB (vadimcn.vscode-lldb). Kept for
             // GNU-toolchain builds; on windows-msvc prefer cppvsdbg above,
             // whose PDB support is stronger.

@@ -151,6 +151,7 @@ public static unsafe class LoaderInterop
         {
             Engine.Bind(api);
             InstallThreadFailureHandlers();
+            WaitForManagedDebuggerIfRequested();
             var dir = Environment.GetEnvironmentVariable("ECS_CSHARP_PROJECT_DIR")
                 ?? AppContext.BaseDirectory;
             var assembly = Environment.GetEnvironmentVariable("ECS_CSHARP_PROJECT_ASSEMBLY")
@@ -164,6 +165,41 @@ public static unsafe class LoaderInterop
             Console.Error.WriteLine($"[csharp_runtime] Init failed: {e}");
             return 0;
         }
+    }
+
+    /// <summary>Opt-in variable that makes <see cref="Init"/> wait for a managed debugger.</summary>
+    private const string WaitForManagedDebuggerVariable = "PILL_WAIT_FOR_MANAGED_DEBUGGER";
+
+    /// <summary>Longest <see cref="Init"/> waits before continuing without a debugger.</summary>
+    private static readonly TimeSpan ManagedDebuggerWaitLimit = TimeSpan.FromMinutes(2);
+
+    /// <summary>
+    /// Block until a managed debugger attaches, when the opt-in variable is set.
+    /// </summary>
+    /// <remarks>
+    /// The host boots the runtime itself, so a managed debugger can only attach
+    /// to a process that is already running - by which point the gameplay
+    /// assembly is loaded and its startups have run. Waiting here, before the
+    /// first load, is what lets breakpoints in startup code bind. The wait is
+    /// bounded so a forgotten variable costs two minutes, not a hung host.
+    /// </remarks>
+    private static void WaitForManagedDebuggerIfRequested()
+    {
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable(WaitForManagedDebuggerVariable))
+            || System.Diagnostics.Debugger.IsAttached)
+            return;
+
+        Console.Error.WriteLine(
+            $"[csharp_runtime] {WaitForManagedDebuggerVariable} is set; waiting up to " +
+            $"{ManagedDebuggerWaitLimit.TotalSeconds:0} s for a managed debugger to attach " +
+            $"to process {Environment.ProcessId}");
+        var waited = System.Diagnostics.Stopwatch.StartNew();
+        while (!System.Diagnostics.Debugger.IsAttached && waited.Elapsed < ManagedDebuggerWaitLimit)
+            Thread.Sleep(100);
+
+        Console.Error.WriteLine(System.Diagnostics.Debugger.IsAttached
+            ? "[csharp_runtime] managed debugger attached; continuing"
+            : "[csharp_runtime] no managed debugger attached; continuing without one");
     }
 
     /// <summary>Whether the process-wide failure handlers are installed.</summary>
