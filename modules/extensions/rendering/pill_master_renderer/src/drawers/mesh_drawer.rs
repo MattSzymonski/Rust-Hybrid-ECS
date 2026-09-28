@@ -29,7 +29,7 @@ use pill_core::{debug, PillStyle};
 // Current crate
 use crate::error::Result;
 use crate::{
-    component::RenderViewport,
+    components::RenderViewport,
     config::{
         CAMERA_PARAMETERS_BIND_GROUP_LAYOUT_INDEX, ENGINE_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
         INITIAL_INSTANCE_VECTOR_CAPACITY, MATERIAL_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
@@ -37,8 +37,8 @@ use crate::{
     },
     frame::RenderInstance,
     render_queue::{decompose_render_queue_key, RenderQueueItem},
+    resource_handles::{RendererMaterialHandle, RendererMeshHandle, RendererShaderHandle},
     resources::{RendererCamera, RendererResourceStorage, RendererShader},
-    slot_map::{RendererMaterialHandle, RendererMeshHandle, RendererShaderHandle},
     Instance,
 };
 

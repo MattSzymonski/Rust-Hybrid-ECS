@@ -23,7 +23,7 @@
 use pill_core::math::Matrix3f;
 
 // Current crate
-use crate::component::TransformComponent;
+use crate::components::TransformComponent;
 use crate::resources::Vertex;
 
 // --- Instance ---

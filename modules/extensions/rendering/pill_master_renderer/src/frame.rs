@@ -36,7 +36,7 @@ use crate::{
         asset_key, CullMode, Material, MaterialParameter, Mesh, PassKind, PassTarget, Shader,
         Texture,
     },
-    component::{CameraComponent, MeshRendererComponent, TransformComponent},
+    components::{CameraComponent, MeshRendererComponent, TransformComponent},
     resources::RenderingManager,
 };
 

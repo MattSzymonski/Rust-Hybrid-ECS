@@ -37,7 +37,7 @@ use crate::{
         MaterialParameter, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot, TextureType,
     },
     error::{capturing_validation, RendererError, Result},
-    slot_map::{RendererShaderHandle, RendererTextureHandle},
+    resource_handles::{RendererShaderHandle, RendererTextureHandle},
 };
 
 use crate::resources::RendererResourceStorage;

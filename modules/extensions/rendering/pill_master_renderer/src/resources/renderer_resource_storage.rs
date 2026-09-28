@@ -14,6 +14,9 @@
 //! handles kept, so a slot that binds nothing falls back to the same white or
 //! flat-normal texture.
 
+// External crates
+use pill_core::slot_map::SlotMap;
+
 // Current crate
 use crate::resources::{
     EngineParameters, RendererCamera, RendererMaterial, RendererMesh, RendererShader,
@@ -22,9 +25,9 @@ use crate::resources::{
 
 use crate::{
     error::Result,
-    slot_map::{
+    resource_handles::{
         RendererCameraHandle, RendererMaterialHandle, RendererMeshHandle, RendererShaderHandle,
-        RendererTextureHandle, SlotMap,
+        RendererTextureHandle,
     },
 };
 

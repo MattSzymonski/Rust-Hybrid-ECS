@@ -1,6 +1,6 @@
 // Managed mirrors of the renderer's components.
 //
-// These mirror the `#[repr(C)]` Rust definitions in `../src/component.rs` in
+// These mirror the `#[repr(C)]` Rust definitions in `../src/components/` in
 // layout: field order, sizes and alignment, which is what shared memory needs.
 // Field names need not match - the host binds fields by the schema strings in
 // `pill_host::csharp::components` and validates each struct's size against the

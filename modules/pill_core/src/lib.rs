@@ -56,6 +56,8 @@ pub mod metrics;
 pub mod native_buffer;
 /// Tracy profiling API with feature gating and no-op fallbacks.
 pub mod profiling;
+/// Generational slot arena for values addressed by stable handles.
+pub mod slot_map;
 /// `PillStyle` string-styling vocabulary for terminal output.
 pub mod style;
 /// Telemetry foundation: static targets, formatter, and subscriber builder.
