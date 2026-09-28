@@ -16,7 +16,10 @@
 //! receives an [`EngineApi`] carrying a pointer to the host's engine and calls
 //! the typed API through it. There is no language-neutral plugin table - see
 //! [`api`] for why one was removed rather than completed.
-
+// The derive macros expand to `::pill_engine::...` paths, so the crate itself
+// needs its name in scope to use its own derives - `Position` and `Color`
+// derive `PillLayout` here rather than carrying hand-written offsets.
+extern crate self as pill_engine;
 // ===== Constants =====
 
 /// Tracy profiled allocator that tracks allocations in Tracy's memory view.
@@ -129,9 +132,7 @@ pub use asset::{
     AssetLoader, AssetManager, Handle,
 };
 pub use commands::{CommandError, Commands};
-pub use common_components::{
-    register_common_components, Color, Position, COLOR_FIELD_LAYOUT, POSITION_FIELD_LAYOUT,
-};
+pub use common_components::{register_common_components, Color, Position};
 pub use component::{Component, ComponentId, ComponentTicks, Tick};
 pub use component_field::{ComponentFieldError, FieldValue};
 pub use engine::{Engine, SystemOwner, SystemSnapshot};
@@ -162,7 +163,7 @@ pub use tracing;
 pub use inventory::submit;
 pub use pill_engine_macros::{
     pill_hot, pill_hot_fn, pill_hot_resolver, pill_mirror_impl, pill_mirror_method, pill_module,
-    pill_project, PillComponent, PillMirror,
+    pill_project, pill_value_type, PillComponent, PillLayout, PillMirror,
 };
 
 // World container and its entity-builder and error types.

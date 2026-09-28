@@ -470,6 +470,10 @@ pub struct World {
     /// manifest (owned). Consumed by the C# mirror codegen and the editor's
     /// generic inspector. Re-registered by each reloaded generation; a
     /// descriptor manifest replaces rather than accumulates.
+    ///
+    /// A native layout is recorded with its nested `struct:` fields expanded
+    /// into dotted leaf rows (`World::record_component_field_layout`), so a
+    /// nested colour or vector is editable channel by channel.
     pub(crate) component_field_layouts: HashMap<ComponentId, ComponentFieldLayout>,
     /// First component-registration failure of the current init pass, if any.
     ///

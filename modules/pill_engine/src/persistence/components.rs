@@ -295,10 +295,7 @@ impl World {
         T: Component + Serialize + DeserializeOwned + Default + 'static,
     {
         self.register_persistable_component_inner::<T>(fields);
-        self.component_field_layouts.insert(
-            ComponentId::of::<T>(),
-            crate::world::ComponentFieldLayout::from_static(fields),
-        );
+        self.record_component_field_layout(ComponentId::of::<T>(), fields);
     }
 }
 

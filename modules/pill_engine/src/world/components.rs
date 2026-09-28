@@ -264,6 +264,9 @@ impl World {
     /// the C# mirror codegen can emit a typed struct. Components registered
     /// without field metadata (hand-registered, descriptor, or unit types) keep
     /// the opaque ABI-blob mirror.
+    ///
+    /// Nested `struct:` fields are expanded into dotted leaf rows as the layout
+    /// is recorded for the editor; see `record_component_field_layout`.
     pub fn register_component_with_layout<T>(
         &mut self,
         fields: &'static [crate::component_registry::ComponentFieldDescriptor],
@@ -271,10 +274,7 @@ impl World {
         T: Component,
     {
         self.register_component_inner::<T>(fields);
-        self.component_field_layouts.insert(
-            ComponentId::of::<T>(),
-            ComponentFieldLayout::from_static(fields),
-        );
+        self.record_component_field_layout(ComponentId::of::<T>(), fields);
     }
 
     /// Record a runtime-described layout for a descriptor component.

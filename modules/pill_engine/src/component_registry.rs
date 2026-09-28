@@ -77,6 +77,20 @@ pub struct ComponentFieldDescriptor {
     pub element_count: usize,
 }
 
+/// The compile-time field layout of a type, as the derive macros emit it.
+///
+/// Implemented by `#[derive(PillLayout)]`, `#[derive(PillComponent)]` and
+/// `#[derive(PillMirror)]`; lets a layout reach
+/// [`World::register_component_with_layout`] without restating the
+/// descriptors. The shorthand for the same list is the type's inherent
+/// `FIELD_LAYOUT` const.
+///
+/// [`World::register_component_with_layout`]: crate::World::register_component_with_layout
+pub trait ComponentLayout {
+    /// The declared field list, in declaration order.
+    const FIELDS: &'static [ComponentFieldDescriptor];
+}
+
 /// A plain value type (not a component) declared with `#[derive(PillMirror)]`.
 ///
 /// Submitted into the same per-artifact inventory as [`PillComponentDescriptor`]
