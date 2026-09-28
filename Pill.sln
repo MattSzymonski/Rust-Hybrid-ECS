@@ -1,0 +1,88 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "modules", "modules", "{9ADE95BE-33B7-40AE-A7A6-671B4062A270}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "csharp_runtime", "modules\pill_csharp_runtime\csharp_runtime.csproj", "{659498B0-5CBD-47BB-91B1-7617593023C8}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "pill_csharp_runtime", "pill_csharp_runtime", "{8C59BCA7-B70E-40BD-9CB4-0472ADAC7FB8}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PillScriptAnalyzers", "modules\pill_csharp_runtime\analyzers\PillScriptAnalyzers.csproj", "{93C87AA7-9EA3-47FB-A916-40F8B826CAEB}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PillIterationGenerators", "modules\pill_csharp_runtime\generators\PillIterationGenerators.csproj", "{1567E62E-7FD9-4A87-8A18-7F51D10B107E}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PillCSharpRuntimeMacros", "modules\pill_csharp_runtime\macros\PillCSharpRuntimeMacros.csproj", "{CE54F974-4709-46E8-90AD-9F8912D437DA}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "csharp_runtime_tests", "modules\pill_csharp_runtime\tests\csharp_runtime_tests.csproj", "{FBE4CB7C-60F0-4FED-8A64-5FE8E8A7920B}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "pill_csharp_compiler", "modules\pill_csharp_compiler\pill_csharp_compiler.csproj", "{893C5969-4D9F-4518-95F8-707EE4D388FA}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "examples", "examples", "{20323623-E7F0-4A9E-BEBB-8C23D1F00C96}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "project_cs", "examples\project_cs\project_cs.csproj", "{C0B237FD-ED61-421C-B01B-06787C7C5B41}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "italian_brainrot_cs", "examples\italian_brainrot_cs\italian_brainrot_cs.csproj", "{188E0DEC-8CD2-4AF2-9F2F-7B2E0B424613}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "project_cs_bench", "examples\project_cs_bench\project_cs_bench.csproj", "{A811F2E7-7C8A-4BA7-AD0F-8FA09430F826}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{659498B0-5CBD-47BB-91B1-7617593023C8}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{659498B0-5CBD-47BB-91B1-7617593023C8}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{659498B0-5CBD-47BB-91B1-7617593023C8}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{659498B0-5CBD-47BB-91B1-7617593023C8}.Release|Any CPU.Build.0 = Release|Any CPU
+		{93C87AA7-9EA3-47FB-A916-40F8B826CAEB}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{93C87AA7-9EA3-47FB-A916-40F8B826CAEB}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{93C87AA7-9EA3-47FB-A916-40F8B826CAEB}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{93C87AA7-9EA3-47FB-A916-40F8B826CAEB}.Release|Any CPU.Build.0 = Release|Any CPU
+		{1567E62E-7FD9-4A87-8A18-7F51D10B107E}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{1567E62E-7FD9-4A87-8A18-7F51D10B107E}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{1567E62E-7FD9-4A87-8A18-7F51D10B107E}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{1567E62E-7FD9-4A87-8A18-7F51D10B107E}.Release|Any CPU.Build.0 = Release|Any CPU
+		{CE54F974-4709-46E8-90AD-9F8912D437DA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{CE54F974-4709-46E8-90AD-9F8912D437DA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{CE54F974-4709-46E8-90AD-9F8912D437DA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{CE54F974-4709-46E8-90AD-9F8912D437DA}.Release|Any CPU.Build.0 = Release|Any CPU
+		{FBE4CB7C-60F0-4FED-8A64-5FE8E8A7920B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{FBE4CB7C-60F0-4FED-8A64-5FE8E8A7920B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{FBE4CB7C-60F0-4FED-8A64-5FE8E8A7920B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{FBE4CB7C-60F0-4FED-8A64-5FE8E8A7920B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{893C5969-4D9F-4518-95F8-707EE4D388FA}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{893C5969-4D9F-4518-95F8-707EE4D388FA}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{893C5969-4D9F-4518-95F8-707EE4D388FA}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{893C5969-4D9F-4518-95F8-707EE4D388FA}.Release|Any CPU.Build.0 = Release|Any CPU
+		{C0B237FD-ED61-421C-B01B-06787C7C5B41}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{C0B237FD-ED61-421C-B01B-06787C7C5B41}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{C0B237FD-ED61-421C-B01B-06787C7C5B41}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{C0B237FD-ED61-421C-B01B-06787C7C5B41}.Release|Any CPU.Build.0 = Release|Any CPU
+		{188E0DEC-8CD2-4AF2-9F2F-7B2E0B424613}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{188E0DEC-8CD2-4AF2-9F2F-7B2E0B424613}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{188E0DEC-8CD2-4AF2-9F2F-7B2E0B424613}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{188E0DEC-8CD2-4AF2-9F2F-7B2E0B424613}.Release|Any CPU.Build.0 = Release|Any CPU
+		{A811F2E7-7C8A-4BA7-AD0F-8FA09430F826}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{A811F2E7-7C8A-4BA7-AD0F-8FA09430F826}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{A811F2E7-7C8A-4BA7-AD0F-8FA09430F826}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{A811F2E7-7C8A-4BA7-AD0F-8FA09430F826}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{659498B0-5CBD-47BB-91B1-7617593023C8} = {9ADE95BE-33B7-40AE-A7A6-671B4062A270}
+		{8C59BCA7-B70E-40BD-9CB4-0472ADAC7FB8} = {9ADE95BE-33B7-40AE-A7A6-671B4062A270}
+		{93C87AA7-9EA3-47FB-A916-40F8B826CAEB} = {8C59BCA7-B70E-40BD-9CB4-0472ADAC7FB8}
+		{1567E62E-7FD9-4A87-8A18-7F51D10B107E} = {8C59BCA7-B70E-40BD-9CB4-0472ADAC7FB8}
+		{CE54F974-4709-46E8-90AD-9F8912D437DA} = {8C59BCA7-B70E-40BD-9CB4-0472ADAC7FB8}
+		{FBE4CB7C-60F0-4FED-8A64-5FE8E8A7920B} = {8C59BCA7-B70E-40BD-9CB4-0472ADAC7FB8}
+		{893C5969-4D9F-4518-95F8-707EE4D388FA} = {9ADE95BE-33B7-40AE-A7A6-671B4062A270}
+		{C0B237FD-ED61-421C-B01B-06787C7C5B41} = {20323623-E7F0-4A9E-BEBB-8C23D1F00C96}
+		{188E0DEC-8CD2-4AF2-9F2F-7B2E0B424613} = {20323623-E7F0-4A9E-BEBB-8C23D1F00C96}
+		{A811F2E7-7C8A-4BA7-AD0F-8FA09430F826} = {20323623-E7F0-4A9E-BEBB-8C23D1F00C96}
+	EndGlobalSection
+EndGlobal

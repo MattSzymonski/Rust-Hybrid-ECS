@@ -8,12 +8,16 @@
 //
 // Design:
 // - Every project version lives in a collectible AssemblyLoadContext and is read
-//   from bytes so the compiler can replace the source DLL on Windows.
+//   from bytes so the compiler can replace the source DLL on Windows. Its
+//   portable PDB is read the same way and handed to the context, which is what
+//   gives a managed debugger symbols without either file being held open.
 // - Rust builds its execution graph once. A reload may replace method bodies,
 //   but names and access signatures must remain stable until host restart.
 
 using System.Linq.Expressions;
 using System.Reflection;
+using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
 using System.Runtime.CompilerServices;
 using System.Runtime.Loader;
 using System.Threading;
@@ -542,12 +546,17 @@ internal sealed class ProjectHost
     private PollStatus Load(bool isReload)
     {
         var bytes = ReadAllBytesWithRetry(_assemblyPath);
+        var symbols = ReadMatchingSymbols(_assemblyPath, bytes);
         var context = new ProjectContext();
         try
         {
+            // Symbols go in with the image: an assembly loaded from a stream
+            // has no path, so this is the only way a managed debugger can bind
+            // breakpoints in it.
             Assembly assembly;
             using (var stream = new MemoryStream(bytes))
-                assembly = context.LoadFromStream(stream);
+            using (var symbolStream = symbols is null ? null : new MemoryStream(symbols))
+                assembly = context.LoadFromStream(stream, symbolStream);
 
             var systems = DiscoverSystems(assembly);
             var startups = DiscoverStartups(assembly);
@@ -948,6 +957,61 @@ internal sealed class ProjectHost
     // =========================================================================
     // File Loading
     // =========================================================================
+
+    /// <summary>
+    /// Read the portable PDB beside an assembly, if it was built with these bytes.
+    /// </summary>
+    /// <remarks>
+    /// The PDB and the DLL are separate files written one after the other, so a
+    /// reload can see the new assembly next to the previous build's symbols.
+    /// Symbols whose ID differs from the one the image records are refused
+    /// rather than attached to code they do not describe. Null means "load
+    /// without symbols", which costs only debugging, so no failure here may
+    /// fail the load.
+    /// </remarks>
+    private static byte[]? ReadMatchingSymbols(string assemblyPath, byte[] assemblyBytes)
+    {
+        string symbolsPath = Path.ChangeExtension(assemblyPath, ".pdb");
+        if (!File.Exists(symbolsPath))
+            return null;
+        try
+        {
+            byte[] symbols = ReadAllBytesWithRetry(symbolsPath);
+
+            // The image records the ID of the PDB it was built with in its
+            // CodeView debug directory entry: a GUID plus the entry's stamp.
+            using var peReader = new PEReader(new MemoryStream(assemblyBytes));
+            DebugDirectoryEntry? codeView = null;
+            foreach (DebugDirectoryEntry entry in peReader.ReadDebugDirectory())
+            {
+                if (entry.Type == DebugDirectoryEntryType.CodeView)
+                {
+                    codeView = entry;
+                    break;
+                }
+            }
+            if (codeView is not DebugDirectoryEntry recorded)
+                return null;
+            Guid expectedGuid = peReader.ReadCodeViewDebugDirectoryData(recorded).Guid;
+
+            // A portable PDB carries the same pair as its 20-byte ID.
+            using var symbolsProvider =
+                MetadataReaderProvider.FromPortablePdbStream(new MemoryStream(symbols));
+            var header = symbolsProvider.GetMetadataReader().DebugMetadataHeader;
+            if (header is null)
+                return null;
+            var actual = new BlobContentId(header.Id);
+            return actual.Guid == expectedGuid && actual.Stamp == recorded.Stamp
+                ? symbols
+                : null;
+        }
+        catch (Exception failure) when (failure is IOException
+            or UnauthorizedAccessException
+            or BadImageFormatException)
+        {
+            return null;
+        }
+    }
 
     /// <summary>Read a just-built DLL, retrying transient compiler file locks.</summary>
     private static byte[] ReadAllBytesWithRetry(string path)

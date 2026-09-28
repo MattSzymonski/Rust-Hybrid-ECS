@@ -51,11 +51,25 @@ const CARGO_TIMINGS_ENVIRONMENT_VARIABLE: &str = "PILL_CARGO_TIMINGS";
 /// Assembly name of the bundled `csharp_runtime` collectible loader.
 const CSHARP_RUNTIME_ASSEMBLY_NAME: &str = "csharp_runtime";
 
-/// Workspace-root-relative output directory of the bundled C# runtime.
-const CSHARP_RUNTIME_OUTPUT_SUBDIRECTORY: &str = "pill_csharp_runtime/bin/Release/net8.0";
+/// Workspace-root-relative directory of the bundled C# runtime project; its
+/// output lands under `bin/<configuration>/<framework>` inside it.
+const CSHARP_RUNTIME_PROJECT_SUBDIRECTORY: &str = "pill_csharp_runtime";
 
 /// Default target framework used for the managed project output path.
 const CSHARP_TARGET_FRAMEWORK: &str = "net8.0";
+
+/// Opt-in variable selecting the MSBuild configuration of the managed project
+/// build: `Release` (the default) or `Debug`.
+///
+/// `Debug` exists for the managed debugger. A `Release` build is optimized by
+/// Roslyn itself, so locals are gone from the IL and no JIT setting brings
+/// them back. The runtime is a `ProjectReference` of every gameplay project,
+/// so it is built in the same configuration and its output path follows.
+const CSHARP_CONFIGURATION_ENVIRONMENT_VARIABLE: &str = "PILL_CSHARP_CONFIGURATION";
+
+/// Managed build configurations [`CSHARP_CONFIGURATION_ENVIRONMENT_VARIABLE`]
+/// accepts, spelled as MSBuild names its output directories.
+const CSHARP_CONFIGURATIONS: [&str; 2] = ["Release", "Debug"];
 
 /// Workspace-relative manifest of the in-process C# compiler.
 ///
@@ -443,8 +457,8 @@ impl CSharpModuleConfig {
     ///
     /// The project's build writes it into the project's own `obj` directory, so
     /// it is derived from the output directory rather than stored: that
-    /// directory is `<project>/bin/Release/<framework>` by construction, and its
-    /// fourth ancestor is the project root.
+    /// directory is `<project>/bin/<configuration>/<framework>` by
+    /// construction, and its fourth ancestor is the project root.
     ///
     /// Returns `None` when the output directory has no such shape, which is the
     /// shipping posture - a bundle keeps the assembly flat beside the
@@ -967,15 +981,21 @@ impl ProjectModuleConfig {
             .to_string();
 
         // Step 2: Derive the source watch directory, build command, and output.
+        // The runtime and the project share one configuration because the
+        // project build is what builds the runtime, as its project reference.
+        let configuration = csharp_build_configuration()?;
         let watch_directory = format!("{project_path}/src");
         let project_output_subdirectory =
-            format!("{project_path}/bin/Release/{CSHARP_TARGET_FRAMEWORK}");
+            format!("{project_path}/bin/{configuration}/{CSHARP_TARGET_FRAMEWORK}");
+        let runtime_output_subdirectory = format!(
+            "{CSHARP_RUNTIME_PROJECT_SUBDIRECTORY}/bin/{configuration}/{CSHARP_TARGET_FRAMEWORK}"
+        );
         let build_command = vec![
             "dotnet".to_string(),
             "build".to_string(),
             format!("{project_path}/{project_assembly_name}.csproj"),
             "-c".to_string(),
-            "Release".to_string(),
+            configuration.to_string(),
             "--nologo".to_string(),
         ];
 
@@ -988,7 +1008,7 @@ impl ProjectModuleConfig {
             build_environment: Vec::new(),
             backend: ProjectModuleBackend::CSharp(CSharpModuleConfig {
                 runtime_assembly_name: CSHARP_RUNTIME_ASSEMBLY_NAME.to_string(),
-                runtime_output_subdirectory: CSHARP_RUNTIME_OUTPUT_SUBDIRECTORY.to_string(),
+                runtime_output_subdirectory,
                 project_assembly_name,
                 project_output_subdirectory,
             }),
@@ -1012,6 +1032,31 @@ fn required_environment(variable: &'static str) -> Result<String, ConfigError> {
 /// so the flag cannot be set on one side and silently unread on the other.
 pub(crate) fn cargo_timings_enabled() -> bool {
     std::env::var_os(CARGO_TIMINGS_ENVIRONMENT_VARIABLE).is_some()
+}
+
+/// MSBuild configuration the managed project is built in, from
+/// [`CSHARP_CONFIGURATION_ENVIRONMENT_VARIABLE`]; `Release` when it is unset.
+///
+/// Matched without regard to case but returned in MSBuild's own spelling,
+/// because the result also names the output directory the host loads from.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::InvalidEnvironmentVariable`] for any other value,
+/// rather than falling back: a mistyped `Debug` silently building `Release`
+/// would leave the debugger showing optimized-away locals with no hint why.
+fn csharp_build_configuration() -> Result<&'static str, ConfigError> {
+    let Ok(requested) = env::var(CSHARP_CONFIGURATION_ENVIRONMENT_VARIABLE) else {
+        return Ok(CSHARP_CONFIGURATIONS[0]);
+    };
+    CSHARP_CONFIGURATIONS
+        .into_iter()
+        .find(|configuration| configuration.eq_ignore_ascii_case(requested.trim()))
+        .ok_or(ConfigError::InvalidEnvironmentVariable {
+            variable: CSHARP_CONFIGURATION_ENVIRONMENT_VARIABLE,
+            value: requested,
+            expected: "Release or Debug",
+        })
 }
 
 /// Directory holding the engine workspace: the base every stored relative path
