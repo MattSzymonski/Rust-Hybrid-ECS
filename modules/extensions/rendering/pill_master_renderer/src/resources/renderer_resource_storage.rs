@@ -18,16 +18,12 @@
 use pill_core::slot_map::SlotMap;
 
 // Current crate
-use crate::resources::{
-    EngineParameters, RendererCamera, RendererMaterial, RendererMesh, RendererShader,
-    RendererTexture,
-};
-
 use crate::{
     error::Result,
-    resource_handles::{
-        RendererCameraHandle, RendererMaterialHandle, RendererMeshHandle, RendererShaderHandle,
-        RendererTextureHandle,
+    resources::{
+        EngineParameters, RendererCamera, RendererCameraHandle, RendererMaterial,
+        RendererMaterialHandle, RendererMesh, RendererMeshHandle, RendererShader,
+        RendererShaderHandle, RendererTexture, RendererTextureHandle,
     },
 };
 

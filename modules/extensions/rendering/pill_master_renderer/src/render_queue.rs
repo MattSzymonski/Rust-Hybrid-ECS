@@ -26,7 +26,7 @@
 //! in a byte; beyond it the key aliases.
 
 // Current crate
-use crate::resource_handles::{RendererMaterialHandle, RendererMeshHandle, RendererShaderHandle};
+use crate::resources::{RendererMaterialHandle, RendererMeshHandle, RendererShaderHandle};
 
 /// One queued draw: a packed state key plus the instance it draws.
 ///

@@ -51,8 +51,7 @@ use crate::{
     error::{capturing_validation, RendererError, Result},
     frame::{RenderFrame, ResolvedPass},
     pipeline::{PassOutput, PassPlan, PassSlot, ScriptableRenderingPipeline},
-    resource_handles::RendererCameraHandle,
-    resources::{RendererCamera, RendererResourceStorage, RendererTexture},
+    resources::{RendererCamera, RendererCameraHandle, RendererResourceStorage, RendererTexture},
     surface::{RendererWindow, Surface},
     Instance,
 };

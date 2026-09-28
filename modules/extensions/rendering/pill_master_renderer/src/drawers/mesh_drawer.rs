@@ -37,8 +37,10 @@ use crate::{
     },
     frame::RenderInstance,
     render_queue::{decompose_render_queue_key, RenderQueueItem},
-    resource_handles::{RendererMaterialHandle, RendererMeshHandle, RendererShaderHandle},
-    resources::{RendererCamera, RendererResourceStorage, RendererShader},
+    resources::{
+        RendererCamera, RendererMaterialHandle, RendererMeshHandle, RendererResourceStorage,
+        RendererShader, RendererShaderHandle,
+    },
     Instance,
 };
 

@@ -33,6 +33,10 @@ use crate::{
     error::Result,
 };
 
+// --- Handle ---
+
+pill_core::define_slot_key!(RendererCameraHandle);
+
 // --- Camera Uniform ---
 
 /// The camera values the shaders read, in the layout of the HLSL

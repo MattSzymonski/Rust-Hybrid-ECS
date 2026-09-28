@@ -24,6 +24,10 @@ use crate::{
     error::{capturing_validation, Result},
 };
 
+// --- Handle ---
+
+pill_core::define_slot_key!(RendererTextureHandle);
+
 // --- Texture ---
 
 /// A texture together with the view and sampler that make it usable.
