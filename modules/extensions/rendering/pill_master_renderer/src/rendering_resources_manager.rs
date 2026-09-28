@@ -53,7 +53,7 @@ use crate::{
 };
 
 /// The GPU objects behind the asset store, and what they were built from.
-pub(crate) struct AssetMirror {
+pub(crate) struct RenderingResourcesManager {
     /// The store revision these caches are level with, or `None` after an
     /// explicit invalidation; the sync runs when it does not match the store's.
     synced_revision: Option<u64>,
@@ -76,9 +76,18 @@ pub(crate) struct AssetMirror {
     /// dropped: pass bind groups reference those objects by handle, so a change
     /// to one is what invalidates them.
     resource_epoch: u64,
+    /// Scratch: every key the store still holds for the column being walked.
+    ///
+    /// One set serves all four columns, because the walks run in sequence and
+    /// each clears it first.
+    live: HashSet<u64>,
+    /// Scratch: the keys whose object this sync rebuilt. Read once, by
+    /// `invalidate_dependent_materials`, and meaningless outside the sync that
+    /// filled it.
+    changed: HashSet<u64>,
 }
 
-impl AssetMirror {
+impl RenderingResourcesManager {
     /// Nothing mirrored yet, plus the two objects the fallbacks need.
     ///
     /// # Errors
@@ -102,6 +111,8 @@ impl AssetMirror {
             default_shader,
             default_material,
             resource_epoch: 0,
+            live: HashSet::new(),
+            changed: HashSet::new(),
         })
     }
 
@@ -113,6 +124,10 @@ impl AssetMirror {
     /// Creation failures are reported and skipped rather than aborting the pass,
     /// so one bad asset neither holds the rest of the revision hostage nor is
     /// retried every frame.
+    ///
+    /// The scratch sets it walks with are reused across calls rather than
+    /// allocated per column: this runs whenever the store moved, which for a
+    /// game that edits assets is every frame.
     pub(crate) fn sync(&mut self, assets: &AssetManager, state: &mut State) {
         if self.synced_revision == Some(assets.revision()) {
             return;
@@ -124,12 +139,12 @@ impl AssetMirror {
         // objects a pass's bind groups keep - and the materials built against
         // them are invalidated by key, because their own content version alone
         // would not ask for a rebuild.
-        let mut changed: HashSet<u64> = HashSet::new();
-        let mut epoch_moved = self.sync_textures(assets, state, &mut changed);
-        epoch_moved |= self.sync_shaders(assets, state, &mut changed);
+        self.changed.clear();
+        let mut epoch_moved = self.sync_textures(assets, state);
+        epoch_moved |= self.sync_shaders(assets, state);
         self.sync_meshes(assets, state);
-        if !changed.is_empty() {
-            self.invalidate_dependent_materials(assets, &changed);
+        if !self.changed.is_empty() {
+            self.invalidate_dependent_materials(assets);
         }
         self.sync_materials(assets, state);
         if epoch_moved {
@@ -210,13 +225,13 @@ impl AssetMirror {
     /// removed, the groups go stale while the material's own content version
     /// stands still. Dropping the version record is what makes `sync_materials`
     /// rebuild it in the same pass, against the new object.
-    fn invalidate_dependent_materials(&mut self, assets: &AssetManager, changed: &HashSet<u64>) {
+    fn invalidate_dependent_materials(&mut self, assets: &AssetManager) {
         for (handle, material) in assets.iter_handles::<Material>() {
-            let shader_changed = changed.contains(&asset_key(material.shader));
+            let shader_changed = self.changed.contains(&asset_key(material.shader));
             let texture_changed = material
                 .textures
                 .values()
-                .any(|texture| changed.contains(&asset_key(texture.texture)));
+                .any(|texture| self.changed.contains(&asset_key(texture.texture)));
             if shader_changed || texture_changed {
                 self.material_versions.remove(&asset_key(handle));
             }
@@ -228,29 +243,24 @@ impl AssetMirror {
     /// Returns whether any texture object was created, recreated, or dropped.
     /// Keys whose object moved are added to `changed`, so the materials built
     /// against them can be rebuilt too.
-    fn sync_textures(
-        &mut self,
-        assets: &AssetManager,
-        state: &mut State,
-        changed: &mut HashSet<u64>,
-    ) -> bool {
+    fn sync_textures(&mut self, assets: &AssetManager, state: &mut State) -> bool {
         let mut epoch_moved = false;
         // Every key the store still holds, collected while the rebuild pass
-        // walks it. The mirror caches by key and the manager looks up by handle,
+        // walks it. The mirror caches by key and `AssetManager` looks up by handle,
         // so walking the store is the only way back from a cached key to whether
         // the asset behind it is still live.
-        let mut live: HashSet<u64> = HashSet::with_capacity(self.texture_handles.len());
+        self.live.clear();
 
         for (handle, texture) in assets.iter_handles::<Texture>() {
             let key = asset_key(handle);
-            live.insert(key);
+            self.live.insert(key);
             let version = assets.content_version(handle).unwrap_or(0);
             if self.texture_versions.get(&key) == Some(&version) {
                 continue;
             }
             // Recorded before the rebuild: even a failed creation dropped the
             // texture the old materials were built against.
-            changed.insert(key);
+            self.changed.insert(key);
             if let Some(old) = self.texture_handles.remove(&key) {
                 state.renderer_resource_storage.textures.remove(old);
             }
@@ -284,14 +294,14 @@ impl AssetMirror {
         let removed: Vec<u64> = self
             .texture_handles
             .keys()
-            .filter(|key| !live.contains(key))
+            .filter(|key| !self.live.contains(key))
             .copied()
             .collect();
         for key in removed {
             if let Some(gpu) = self.texture_handles.remove(&key) {
                 state.renderer_resource_storage.textures.remove(gpu);
                 self.texture_versions.remove(&key);
-                changed.insert(key);
+                self.changed.insert(key);
                 epoch_moved = true;
             }
         }
@@ -303,25 +313,20 @@ impl AssetMirror {
     /// Returns whether any shader object was created, recreated, or dropped.
     /// Keys whose object moved are added to `changed`, so the materials built
     /// against them can be rebuilt too.
-    fn sync_shaders(
-        &mut self,
-        assets: &AssetManager,
-        state: &mut State,
-        changed: &mut HashSet<u64>,
-    ) -> bool {
+    fn sync_shaders(&mut self, assets: &AssetManager, state: &mut State) -> bool {
         let mut epoch_moved = false;
         // See `sync_textures`: walking the store is what says which cached keys
         // are still live.
-        let mut live: HashSet<u64> = HashSet::with_capacity(self.shader_handles.len());
+        self.live.clear();
 
         for (handle, shader) in assets.iter_handles::<Shader>() {
             let key = asset_key(handle);
-            live.insert(key);
+            self.live.insert(key);
             let version = assets.content_version(handle).unwrap_or(0);
             if self.shader_versions.get(&key) == Some(&version) {
                 continue;
             }
-            changed.insert(key);
+            self.changed.insert(key);
             if let Some(old) = self.shader_handles.remove(&key) {
                 state.renderer_resource_storage.shaders.remove(old);
             }
@@ -364,14 +369,14 @@ impl AssetMirror {
         let removed: Vec<u64> = self
             .shader_handles
             .keys()
-            .filter(|key| !live.contains(key))
+            .filter(|key| !self.live.contains(key))
             .copied()
             .collect();
         for key in removed {
             if let Some(gpu) = self.shader_handles.remove(&key) {
                 state.renderer_resource_storage.shaders.remove(gpu);
                 self.shader_versions.remove(&key);
-                changed.insert(key);
+                self.changed.insert(key);
                 epoch_moved = true;
             }
         }
@@ -383,11 +388,11 @@ impl AssetMirror {
     /// No epoch is needed for meshes: the draw path resolves a mesh handle per
     /// frame, so a rebuilt one is picked up without invalidating any pipeline.
     fn sync_meshes(&mut self, assets: &AssetManager, state: &mut State) {
-        let mut live: HashSet<u64> = HashSet::with_capacity(self.mesh_handles.len());
+        self.live.clear();
 
         for (handle, mesh) in assets.iter_handles::<Mesh>() {
             let key = asset_key(handle);
-            live.insert(key);
+            self.live.insert(key);
             let version = assets.content_version(handle).unwrap_or(0);
             if self.mesh_versions.get(&key) == Some(&version) {
                 continue;
@@ -412,7 +417,7 @@ impl AssetMirror {
         let removed: Vec<u64> = self
             .mesh_handles
             .keys()
-            .filter(|key| !live.contains(key))
+            .filter(|key| !self.live.contains(key))
             .copied()
             .collect();
         for key in removed {
@@ -425,11 +430,11 @@ impl AssetMirror {
 
     /// Drop and rebuild the materials whose asset changed.
     fn sync_materials(&mut self, assets: &AssetManager, state: &mut State) {
-        let mut live: HashSet<u64> = HashSet::with_capacity(self.material_handles.len());
+        self.live.clear();
 
         for (handle, material) in assets.iter_handles::<Material>() {
             let key = asset_key(handle);
-            live.insert(key);
+            self.live.insert(key);
             let version = assets.content_version(handle).unwrap_or(0);
             if self.material_versions.get(&key) == Some(&version) {
                 continue;
@@ -487,7 +492,7 @@ impl AssetMirror {
         let removed: Vec<u64> = self
             .material_handles
             .keys()
-            .filter(|key| !live.contains(key))
+            .filter(|key| !self.live.contains(key))
             .copied()
             .collect();
         for key in removed {

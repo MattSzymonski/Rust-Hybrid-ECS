@@ -39,7 +39,6 @@ use pill_engine::AssetManager;
 // Current crate
 use crate::{
     api::{FrameOutcome, PillRenderer, RenderCapabilities, RenderMetrics},
-    asset_mirror::AssetMirror,
     assets::PassTarget,
     components::RenderViewport,
     config::{
@@ -51,6 +50,7 @@ use crate::{
     error::{capturing_validation, RendererError, Result},
     frame::{RenderFrame, ResolvedPass},
     pipeline::{PassOutput, PassPlan, PassSlot, ScriptableRenderingPipeline},
+    rendering_resources_manager::RenderingResourcesManager,
     resources::{RendererCamera, RendererCameraHandle, RendererResourceStorage, RendererTexture},
     surface::{RendererWindow, Surface},
     Instance,
@@ -75,14 +75,14 @@ pub(crate) const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rg
 /// behind the [`PillRenderer`] contract.
 ///
 /// One renderer owns one window's surface and everything drawn to it: the GPU
-/// state, the asset mirror that keeps the store level with the GPU, and the
+/// state, the resources manager that keeps the store level with the GPU, and the
 /// chain that turns a frame into passes.
 pub struct Renderer {
     /// The wgpu device, surface, and frame state this renderer drives.
     pub state: State,
     /// The GPU object behind every live asset, and the version it was built
     /// from: the frame-to-GPU diff, one asset type at a time.
-    assets: AssetMirror,
+    rendering_resources_manager: RenderingResourcesManager,
     camera: RendererCameraHandle,
     viewport: Option<RenderViewport>,
     minimized: bool,
@@ -117,7 +117,7 @@ impl Renderer {
     ) -> Result<Self> {
         info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Initializing {}", "Renderer".module_object_style());
         let mut state = State::new(window, width, height).await?;
-        let assets = AssetMirror::new(&mut state)?;
+        let rendering_resources_manager = RenderingResourcesManager::new(&mut state)?;
         let camera = state
             .renderer_resource_storage
             .cameras
@@ -127,7 +127,7 @@ impl Renderer {
             )?);
         Ok(Self {
             state,
-            assets,
+            rendering_resources_manager,
             camera,
             viewport: None,
             minimized: width == 0 || height == 0,
@@ -180,19 +180,19 @@ impl PillRenderer for Renderer {
         self.viewport = viewport;
     }
 
-    fn render(&mut self, frame: &RenderFrame, assets: &AssetManager) -> Result<FrameOutcome> {
+    fn render(&mut self, frame: &RenderFrame, assets_manager: &AssetManager) -> Result<FrameOutcome> {
         if self.minimized || !frame.has_camera {
             return Ok(FrameOutcome::Skipped);
         }
         let prepare = Instant::now();
-        self.assets.sync(assets, &mut self.state);
+        self.rendering_resources_manager.sync(assets_manager, &mut self.state);
         self.pipeline.ensure(
             &frame.passes,
-            assets,
+            assets_manager,
             frame.chain_generation,
-            self.assets.chain_context(&mut self.state),
+            self.rendering_resources_manager.chain_context(&mut self.state),
         );
-        let render_queue = self.assets.build_queue(frame, &self.state);
+        let render_queue = self.rendering_resources_manager.build_queue(frame, &self.state);
         self.metrics.prepare_micros = prepare.elapsed().as_micros() as u64;
         self.metrics.instance_bytes = (render_queue.len() * std::mem::size_of::<Instance>()) as u64;
 
@@ -204,7 +204,7 @@ impl PillRenderer for Renderer {
         // chain itself.
         let plan = self
             .pipeline
-            .plan(&frame.passes, &render_queue, self.assets.shader_handles());
+            .plan(&frame.passes, &render_queue, self.rendering_resources_manager.shader_handles());
         self.pipeline.log(&plan);
         self.metrics.draw_calls = plan.iter().filter(|entry| entry.draws() > 0).count() as u32;
         self.metrics.passes = plan.len() as u32;
@@ -225,7 +225,7 @@ impl PillRenderer for Renderer {
         // Forget which versions the GPU objects were built from, so the next
         // sync rebuilds them all, and drop the pass objects so the rebuild
         // reaches the bind groups that reference the old ones.
-        self.assets.invalidate();
+        self.rendering_resources_manager.invalidate();
         self.pipeline.invalidate();
     }
 }
