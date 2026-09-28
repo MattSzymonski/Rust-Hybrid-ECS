@@ -4,7 +4,7 @@
 //! # Responsibilities
 //!
 //! - Defines the assets a project draws from ([`Mesh`], [`Texture`], [`Shader`],
-//!   [`Material`], [`RenderPass`], [`RenderingPipeline`]) and the [`component`]
+//!   [`Material`], [`RenderPass`], [`RenderingPipeline`]) and the [`components`]
 //!   types that place them in the world.
 //! - Owns the GPU half: device and surface lifecycle ([`Renderer`]), the
 //!   [`resources`] caches, the [`drawers`], and the [`render_queue`] keys that
@@ -41,7 +41,7 @@ pub mod drawers;
 /// Renderer failures, the `Result` alias, and the wgpu validation capture.
 pub mod error;
 
-/// Asset snapshots, render instances, resolved passes, and the system that builds them.
+/// Render instances, resolved passes, and the system that builds a frame from the world.
 pub mod frame;
 
 /// The per-instance transform the drawer uploads for the vertex shader.
@@ -74,7 +74,7 @@ pub use assets::{
 };
 pub use components::*;
 pub use error::RendererError;
-pub use frame::{rendering_system, AssetSnapshot, RenderFrame, RenderInstance, ResolvedPass};
+pub use frame::{rendering_system, RenderFrame, RenderInstance, ResolvedPass};
 pub use instance::Instance;
 pub use renderer::{Renderer, RendererWindow};
 pub use resources::RenderingManager;

@@ -3,7 +3,7 @@
 //!
 //! # Responsibilities
 //!
-//! - Keep the GPU caches level with each frame's asset snapshot, one asset
+//! - Keep the GPU caches level with each frame's asset store, one asset
 //!   type at a time, rebuilding only what moved ([`Renderer`] and its
 //!   per-type sync helpers).
 //! - Decide when the chain's pipelines, bind groups, and offscreen targets
@@ -35,14 +35,15 @@ use std::{
 
 // External crates
 use pill_core::{info, PillStyle};
-use pill_engine::Handle;
+use pill_engine::{AssetManager, Handle};
 
 // Current crate
 use crate::{
     api::{FrameOutcome, PillRenderer, RenderCapabilities, RenderMetrics},
     assets::{
-        parameter_slots_by_name, texture_slots_by_name, MaterialParameter, PassKind, PassTarget,
-        ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot, TextureType,
+        asset_key, parameter_slots_by_name, texture_slots_by_name, Material, MaterialParameter,
+        Mesh, PassKind, PassTarget, Shader, ShaderParameterSlot, ShaderParameterType,
+        ShaderTextureSlot, Texture, TextureType,
     },
     components::RenderViewport,
     config::{
@@ -52,7 +53,7 @@ use crate::{
     },
     drawers::mesh_drawer::MeshDrawer,
     error::{capturing_validation, RendererError, Result},
-    frame::{AssetSnapshot, RenderFrame, ResolvedPass},
+    frame::{RenderFrame, ResolvedPass},
     render_queue::{compose_render_queue_key, decompose_render_queue_key, RenderQueueItem},
     resource_handles::{
         RendererCameraHandle, RendererMaterialHandle, RendererMeshHandle, RendererShaderHandle,
@@ -258,8 +259,8 @@ fn offscreen_signature(chain: &[ResolvedPass], width: u32, height: u32) -> Strin
 pub struct Renderer {
     /// The wgpu device, surface, and frame state this renderer drives.
     pub state: State,
-    /// The snapshot revision the GPU caches are level with, or `None` after an
-    /// explicit invalidation; the sync runs when it does not match the frame's.
+    /// The store revision the GPU caches are level with, or `None` after an
+    /// explicit invalidation; the sync runs when it does not match the store's.
     assets_synced_revision: Option<u64>,
     /// Content version of every asset the GPU object behind a key was built
     /// from, one map per asset type. A key whose version moved - or that is not
@@ -362,19 +363,19 @@ impl Renderer {
         })
     }
 
-    /// Bring the GPU caches level with the snapshot, per asset.
+    /// Bring the GPU caches level with the asset store, per asset.
     ///
-    /// The snapshot's revision gates the pass, and its per-asset content
+    /// The manager's revision gates the pass, and its per-asset content
     /// versions decide what inside it moved: one edited texture is re-uploaded
     /// while its neighbours keep their GPU objects, and a removed asset frees
     /// its slot. Creation failures are reported and skipped rather than
     /// aborting the pass, so one bad asset neither holds the rest of the
     /// revision hostage nor is retried every frame.
-    fn sync_assets(&mut self, assets: &AssetSnapshot) {
-        if self.assets_synced_revision == Some(assets.revision) {
+    fn sync_assets(&mut self, assets: &AssetManager) {
+        if self.assets_synced_revision == Some(assets.revision()) {
             return;
         }
-        self.assets_synced_revision = Some(assets.revision);
+        self.assets_synced_revision = Some(assets.revision());
 
         // Textures and shaders first: materials bind them by handle. The epoch
         // moves only when one of these two layers did, because those are the
@@ -401,15 +402,15 @@ impl Renderer {
     /// removed, the groups go stale while the material's own content version
     /// stands still. Dropping the version record is what makes `sync_materials`
     /// rebuild it in the same pass, against the new object.
-    fn invalidate_dependent_materials(&mut self, assets: &AssetSnapshot, changed: &HashSet<u64>) {
-        for (material_key, material) in &assets.materials {
-            let shader_changed = changed.contains(&crate::assets::asset_key(material.shader));
+    fn invalidate_dependent_materials(&mut self, assets: &AssetManager, changed: &HashSet<u64>) {
+        for (handle, material) in assets.iter_handles::<Material>() {
+            let shader_changed = changed.contains(&asset_key(material.shader));
             let texture_changed = material
                 .textures
                 .values()
-                .any(|texture| changed.contains(&crate::assets::asset_key(texture.texture)));
+                .any(|texture| changed.contains(&asset_key(texture.texture)));
             if shader_changed || texture_changed {
-                self.material_versions.remove(material_key);
+                self.material_versions.remove(&asset_key(handle));
             }
         }
     }
@@ -419,32 +420,25 @@ impl Renderer {
     /// Returns whether any texture object was created, recreated, or dropped.
     /// Keys whose object moved are added to `changed`, so the materials built
     /// against them can be rebuilt too.
-    fn sync_textures(&mut self, assets: &AssetSnapshot, changed: &mut HashSet<u64>) -> bool {
+    fn sync_textures(&mut self, assets: &AssetManager, changed: &mut HashSet<u64>) -> bool {
         let mut epoch_moved = false;
-        let removed: Vec<u64> = self
-            .texture_handles
-            .keys()
-            .filter(|key| !assets.textures.contains_key(key))
-            .copied()
-            .collect();
-        for key in removed {
-            if let Some(handle) = self.texture_handles.remove(&key) {
-                self.state.renderer_resource_storage.textures.remove(handle);
-                self.texture_versions.remove(&key);
-                changed.insert(key);
-                epoch_moved = true;
-            }
-        }
+        // Every key the store still holds, collected while the rebuild pass
+        // walks it. The renderer caches by key and the manager looks up by
+        // handle, so walking the store is the only way back from a cached key
+        // to whether the asset behind it is still live.
+        let mut live: HashSet<u64> = HashSet::with_capacity(self.texture_handles.len());
 
-        for (key, texture) in &assets.textures {
-            let version = assets.versions.textures.get(key).copied().unwrap_or(0);
-            if self.texture_versions.get(key) == Some(&version) {
+        for (handle, texture) in assets.iter_handles::<Texture>() {
+            let key = asset_key(handle);
+            live.insert(key);
+            let version = assets.content_version(handle).unwrap_or(0);
+            if self.texture_versions.get(&key) == Some(&version) {
                 continue;
             }
             // Recorded before the rebuild: even a failed creation dropped the
             // texture the old materials were built against.
-            changed.insert(*key);
-            if let Some(old) = self.texture_handles.remove(key) {
+            changed.insert(key);
+            if let Some(old) = self.texture_handles.remove(&key) {
                 self.state.renderer_resource_storage.textures.remove(old);
             }
             match RendererTexture::new_texture(
@@ -457,9 +451,9 @@ impl Renderer {
                 texture.texture_type,
             ) {
                 Ok(value) => {
-                    let handle = self.state.renderer_resource_storage.textures.insert(value);
-                    self.texture_handles.insert(*key, handle);
-                    self.texture_versions.insert(*key, version);
+                    let gpu = self.state.renderer_resource_storage.textures.insert(value);
+                    self.texture_handles.insert(key, gpu);
+                    self.texture_versions.insert(key, version);
                     epoch_moved = true;
                 }
                 // Left unrecorded, so a later revision tries again - and named,
@@ -471,6 +465,23 @@ impl Renderer {
                 ),
             }
         }
+
+        // A cached key the store no longer holds: its asset was removed, so its
+        // object goes with it.
+        let removed: Vec<u64> = self
+            .texture_handles
+            .keys()
+            .filter(|key| !live.contains(key))
+            .copied()
+            .collect();
+        for key in removed {
+            if let Some(gpu) = self.texture_handles.remove(&key) {
+                self.state.renderer_resource_storage.textures.remove(gpu);
+                self.texture_versions.remove(&key);
+                changed.insert(key);
+                epoch_moved = true;
+            }
+        }
         epoch_moved
     }
 
@@ -479,30 +490,21 @@ impl Renderer {
     /// Returns whether any shader object was created, recreated, or dropped.
     /// Keys whose object moved are added to `changed`, so the materials built
     /// against them can be rebuilt too.
-    fn sync_shaders(&mut self, assets: &AssetSnapshot, changed: &mut HashSet<u64>) -> bool {
+    fn sync_shaders(&mut self, assets: &AssetManager, changed: &mut HashSet<u64>) -> bool {
         let mut epoch_moved = false;
-        let removed: Vec<u64> = self
-            .shader_handles
-            .keys()
-            .filter(|key| !assets.shaders.contains_key(key))
-            .copied()
-            .collect();
-        for key in removed {
-            if let Some(handle) = self.shader_handles.remove(&key) {
-                self.state.renderer_resource_storage.shaders.remove(handle);
-                self.shader_versions.remove(&key);
-                changed.insert(key);
-                epoch_moved = true;
-            }
-        }
+        // See `sync_textures`: walking the store is what says which cached keys
+        // are still live.
+        let mut live: HashSet<u64> = HashSet::with_capacity(self.shader_handles.len());
 
-        for (key, shader) in &assets.shaders {
-            let version = assets.versions.shaders.get(key).copied().unwrap_or(0);
-            if self.shader_versions.get(key) == Some(&version) {
+        for (handle, shader) in assets.iter_handles::<Shader>() {
+            let key = asset_key(handle);
+            live.insert(key);
+            let version = assets.content_version(handle).unwrap_or(0);
+            if self.shader_versions.get(&key) == Some(&version) {
                 continue;
             }
-            changed.insert(*key);
-            if let Some(old) = self.shader_handles.remove(key) {
+            changed.insert(key);
+            if let Some(old) = self.shader_handles.remove(&key) {
                 self.state.renderer_resource_storage.shaders.remove(old);
             }
             let value = RendererShader::new(
@@ -529,9 +531,9 @@ impl Renderer {
             );
             match value {
                 Ok(value) => {
-                    let handle = self.state.renderer_resource_storage.shaders.insert(value);
-                    self.shader_handles.insert(*key, handle);
-                    self.shader_versions.insert(*key, version);
+                    let gpu = self.state.renderer_resource_storage.shaders.insert(value);
+                    self.shader_handles.insert(key, gpu);
+                    self.shader_versions.insert(key, version);
                     epoch_moved = true;
                 }
                 Err(error) => pill_core::warn!(
@@ -541,6 +543,21 @@ impl Renderer {
                 ),
             }
         }
+
+        let removed: Vec<u64> = self
+            .shader_handles
+            .keys()
+            .filter(|key| !live.contains(key))
+            .copied()
+            .collect();
+        for key in removed {
+            if let Some(gpu) = self.shader_handles.remove(&key) {
+                self.state.renderer_resource_storage.shaders.remove(gpu);
+                self.shader_versions.remove(&key);
+                changed.insert(key);
+                epoch_moved = true;
+            }
+        }
         epoch_moved
     }
 
@@ -548,33 +565,24 @@ impl Renderer {
     ///
     /// No epoch is needed for meshes: the draw path resolves a mesh handle per
     /// frame, so a rebuilt one is picked up without invalidating any pipeline.
-    fn sync_meshes(&mut self, assets: &AssetSnapshot) {
-        let removed: Vec<u64> = self
-            .mesh_handles
-            .keys()
-            .filter(|key| !assets.meshes.contains_key(key))
-            .copied()
-            .collect();
-        for key in removed {
-            if let Some(handle) = self.mesh_handles.remove(&key) {
-                self.state.renderer_resource_storage.meshes.remove(handle);
-                self.mesh_versions.remove(&key);
-            }
-        }
+    fn sync_meshes(&mut self, assets: &AssetManager) {
+        let mut live: HashSet<u64> = HashSet::with_capacity(self.mesh_handles.len());
 
-        for (key, mesh) in &assets.meshes {
-            let version = assets.versions.meshes.get(key).copied().unwrap_or(0);
-            if self.mesh_versions.get(key) == Some(&version) {
+        for (handle, mesh) in assets.iter_handles::<Mesh>() {
+            let key = asset_key(handle);
+            live.insert(key);
+            let version = assets.content_version(handle).unwrap_or(0);
+            if self.mesh_versions.get(&key) == Some(&version) {
                 continue;
             }
-            if let Some(old) = self.mesh_handles.remove(key) {
+            if let Some(old) = self.mesh_handles.remove(&key) {
                 self.state.renderer_resource_storage.meshes.remove(old);
             }
             match RendererMesh::new(&self.state.device, &mesh.name, mesh) {
                 Ok(value) => {
-                    let handle = self.state.renderer_resource_storage.meshes.insert(value);
-                    self.mesh_handles.insert(*key, handle);
-                    self.mesh_versions.insert(*key, version);
+                    let gpu = self.state.renderer_resource_storage.meshes.insert(value);
+                    self.mesh_handles.insert(key, gpu);
+                    self.mesh_versions.insert(key, version);
                 }
                 Err(error) => pill_core::warn!(
                     target: pill_core::telemetry::telemetry_target::RENDERING,
@@ -583,41 +591,42 @@ impl Renderer {
                 ),
             }
         }
-    }
 
-    /// Drop and rebuild the materials whose asset changed.
-    fn sync_materials(&mut self, assets: &AssetSnapshot) {
         let removed: Vec<u64> = self
-            .material_handles
+            .mesh_handles
             .keys()
-            .filter(|key| !assets.materials.contains_key(key))
+            .filter(|key| !live.contains(key))
             .copied()
             .collect();
         for key in removed {
-            if let Some(handle) = self.material_handles.remove(&key) {
-                self.state
-                    .renderer_resource_storage
-                    .materials
-                    .remove(handle);
-                self.material_versions.remove(&key);
+            if let Some(gpu) = self.mesh_handles.remove(&key) {
+                self.state.renderer_resource_storage.meshes.remove(gpu);
+                self.mesh_versions.remove(&key);
             }
         }
+    }
 
-        for (key, material) in &assets.materials {
-            let version = assets.versions.materials.get(key).copied().unwrap_or(0);
-            if self.material_versions.get(key) == Some(&version) {
+    /// Drop and rebuild the materials whose asset changed.
+    fn sync_materials(&mut self, assets: &AssetManager) {
+        let mut live: HashSet<u64> = HashSet::with_capacity(self.material_handles.len());
+
+        for (handle, material) in assets.iter_handles::<Material>() {
+            let key = asset_key(handle);
+            live.insert(key);
+            let version = assets.content_version(handle).unwrap_or(0);
+            if self.material_versions.get(&key) == Some(&version) {
                 continue;
             }
-            if let Some(old) = self.material_handles.remove(key) {
+            if let Some(old) = self.material_handles.remove(&key) {
                 self.state.renderer_resource_storage.materials.remove(old);
             }
-            let shader_key = crate::assets::asset_key(material.shader);
+            let shader_key = asset_key(material.shader);
             let shader = if material.shader == Handle::INVALID {
                 // A material built without a shader is documented to draw with
                 // the renderer's own; that is a choice, not a fault.
                 self.default_shader
-            } else if let Some(handle) = self.shader_handles.get(&shader_key) {
-                *handle
+            } else if let Some(gpu) = self.shader_handles.get(&shader_key) {
+                *gpu
             } else {
                 pill_core::warn!(
                     target: pill_core::telemetry::telemetry_target::RENDERING,
@@ -631,9 +640,9 @@ impl Renderer {
                 .iter()
                 .filter_map(|(slot, texture)| {
                     self.texture_handles
-                        .get(&crate::assets::asset_key(texture.texture))
+                        .get(&asset_key(texture.texture))
                         .copied()
-                        .map(|handle| (slot.clone(), handle))
+                        .map(|gpu| (slot.clone(), gpu))
                 })
                 .collect::<Vec<_>>();
             match RendererMaterial::new(
@@ -646,15 +655,31 @@ impl Renderer {
                 &material.parameters,
             ) {
                 Ok(value) => {
-                    let handle = self.state.renderer_resource_storage.materials.insert(value);
-                    self.material_handles.insert(*key, handle);
-                    self.material_versions.insert(*key, version);
+                    let gpu = self.state.renderer_resource_storage.materials.insert(value);
+                    self.material_handles.insert(key, gpu);
+                    self.material_versions.insert(key, version);
                 }
                 Err(error) => pill_core::warn!(
                     target: pill_core::telemetry::telemetry_target::RENDERING,
                     "material `{}` has no pipeline: {error}",
                     material.name
                 ),
+            }
+        }
+
+        let removed: Vec<u64> = self
+            .material_handles
+            .keys()
+            .filter(|key| !live.contains(key))
+            .copied()
+            .collect();
+        for key in removed {
+            if let Some(gpu) = self.material_handles.remove(&key) {
+                self.state
+                    .renderer_resource_storage
+                    .materials
+                    .remove(gpu);
+                self.material_versions.remove(&key);
             }
         }
     }
@@ -704,13 +729,13 @@ impl PillRenderer for Renderer {
         self.viewport = viewport;
     }
 
-    fn render(&mut self, frame: &RenderFrame) -> Result<FrameOutcome> {
+    fn render(&mut self, frame: &RenderFrame, assets: &AssetManager) -> Result<FrameOutcome> {
         if self.minimized || !frame.has_camera {
             return Ok(FrameOutcome::Skipped);
         }
         let prepare = Instant::now();
-        self.sync_assets(&frame.assets);
-        self.ensure_pipeline(&frame.passes, &frame.assets, frame.chain_generation)?;
+        self.sync_assets(assets);
+        self.ensure_pipeline(&frame.passes, assets, frame.chain_generation)?;
         let mut render_queue = Vec::with_capacity(frame.instances.len());
         for (index, instance) in frame.instances.iter().enumerate() {
             let Some(mesh) = self.mesh_handles.get(&instance.mesh).copied() else {
@@ -728,14 +753,8 @@ impl PillRenderer for Renderer {
                 .get(material)
                 .map(|material| material.shader_handle)
                 .unwrap_or(self.default_shader);
-            let order = frame
-                .assets
-                .materials
-                .get(&instance.material)
-                .map(|material| material.rendering_order)
-                .unwrap_or(u8::MAX);
             render_queue.push(RenderQueueItem {
-                key: compose_render_queue_key(order, shader, material, mesh),
+                key: compose_render_queue_key(instance.rendering_order, shader, material, mesh),
                 entity_index: index as u32,
             });
         }
@@ -763,7 +782,7 @@ impl PillRenderer for Renderer {
 
     fn invalidate_assets(&mut self) {
         // Forget the versions so the next sync rebuilds every GPU object from
-        // the snapshot, let that sync through the revision gate, and drop the
+        // the store, let that sync through the revision gate, and drop the
         // pipeline inputs so the rebuild reaches the bind groups that reference
         // the old objects.
         self.assets_synced_revision = None;
@@ -897,7 +916,7 @@ impl Renderer {
     fn ensure_pipeline(
         &mut self,
         chain: &[ResolvedPass],
-        assets: &AssetSnapshot,
+        assets: &AssetManager,
         chain_generation: u64,
     ) -> Result<()> {
         let width = self.state.surface_configuration.width;
@@ -920,6 +939,16 @@ impl Renderer {
             self.offscreen_key = Some(offscreen_key);
         }
 
+        // A pass builds its own pipeline from the shader's sources, and the
+        // chain names that shader by key while the manager looks assets up by
+        // handle. One walk of the shader column builds the way from one to the
+        // other - here rather than once per pass, and only when the chain is
+        // actually rebuilt.
+        let shaders_by_key: HashMap<u64, &Shader> = assets
+            .iter_handles::<Shader>()
+            .map(|(handle, shader)| (asset_key(handle), shader))
+            .collect();
+
         // Passes are built in chain order and may only read targets an earlier
         // pass declares: the set grows as the chain is walked, so a pass that
         // reads its own output, or a later pass's, is refused instead of
@@ -927,7 +956,7 @@ impl Renderer {
         let mut defined_targets: HashSet<String> = HashSet::new();
         let mut passes: Vec<PassSlot> = Vec::with_capacity(chain.len());
         for pass in chain {
-            passes.push(self.build_pass(pass, assets, &defined_targets));
+            passes.push(self.build_pass(pass, &shaders_by_key, &defined_targets));
             for target in std::iter::once(&pass.target).chain(pass.extra_targets.iter()) {
                 if let PassTarget::Offscreen(name) = target {
                     defined_targets.insert(name.clone());
@@ -947,7 +976,7 @@ impl Renderer {
     fn build_pass(
         &self,
         pass: &ResolvedPass,
-        assets: &AssetSnapshot,
+        shaders_by_key: &HashMap<u64, &Shader>,
         defined_targets: &HashSet<String>,
     ) -> PassSlot {
         // A geometry pass with no shader of its own draws through each
@@ -961,7 +990,7 @@ impl Renderer {
             };
         };
 
-        let Some(shader) = assets.shaders.get(&shader_key) else {
+        let Some(shader) = shaders_by_key.get(&shader_key).copied() else {
             return PassSlot::Unsupported("it names no shader the renderer loaded".to_owned());
         };
         let Some(renderer_shader) = self

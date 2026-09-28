@@ -384,8 +384,17 @@ impl RenderingHost {
     pub fn run_one_frame(&mut self) -> Result<Option<FrameReport>, RendererError> {
         self.assets.update(self.host.engine_mut())?;
         let report = run_one_frame(&mut self.host);
-        if let Some(frame) = self.host.engine().world().get_resource::<RenderFrame>() {
-            let outcome = self.renderer.render(frame)?;
+        // The renderer reads both resources straight out of the world - the
+        // frame the `rendering` system filled in, and the store the assets live
+        // in - rather than being handed a copy of the assets. Both borrows last
+        // the call, which is what stops the store changing under a frame that
+        // is already being drawn.
+        let world = self.host.engine().world();
+        if let (Some(frame), Some(assets)) = (
+            world.get_resource::<RenderFrame>(),
+            world.get_resource::<pill_engine::AssetManager>(),
+        ) {
+            let outcome = self.renderer.render(frame, assets)?;
             if !self.presented_scene
                 && matches!(outcome, pill_master_renderer::FrameOutcome::Presented)
                 && self.renderer.metrics().draw_calls > 0

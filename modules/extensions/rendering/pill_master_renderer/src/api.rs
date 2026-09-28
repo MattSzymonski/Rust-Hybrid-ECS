@@ -14,10 +14,13 @@
 //!
 //! The host stores its renderer as a `Box<dyn PillRenderer>`, so this module
 //! keeps to the values that cross that boundary - [`RenderFrame`],
-//! [`RenderViewport`], and [`RendererError`] - and stays free of wgpu types.
-//! A windowed build implements the trait on its wgpu `Renderer`; a headless
-//! build holds [`HeadlessRenderer`] instead, and the frame loop cannot tell
-//! the difference.
+//! [`AssetManager`], [`RenderViewport`], and [`RendererError`] - and stays free
+//! of wgpu types. A windowed build implements the trait on its wgpu `Renderer`;
+//! a headless build holds [`HeadlessRenderer`] instead, and the frame loop
+//! cannot tell the difference.
+
+// External crates
+use pill_engine::AssetManager;
 
 // Current crate
 use crate::{RenderFrame, RenderViewport, RendererError};
@@ -105,11 +108,16 @@ pub trait PillRenderer {
     /// keep drawing out of the UI regions they overlay.
     fn set_viewport(&mut self, viewport: Option<RenderViewport>);
 
-    /// Draws one resolved frame and presents it.
+    /// Draws one resolved frame from `assets` and presents it.
     ///
     /// Returns [`FrameOutcome::Skipped`] when there is nothing to present - a
     /// minimized surface or a frame without a camera - which is a normal
     /// outcome, not an error.
+    ///
+    /// The store is read rather than copied into the frame: the renderer diffs
+    /// it against what it last uploaded, so only the assets that moved are
+    /// rebuilt, and a frame never carries a duplicate of the project's asset
+    /// data. The borrow lasts the call, so nothing can change under it.
     ///
     /// # Errors
     ///
@@ -117,10 +125,13 @@ pub trait PillRenderer {
     /// out-of-memory surface, a camera handle with no camera behind it, or a
     /// command buffer wgpu refuses at submission. An asset that will not build
     /// is not an error - it is reported per pass and skipped.
-    fn render(&mut self, frame: &RenderFrame) -> Result<FrameOutcome, RendererError>;
+    fn render(
+        &mut self,
+        frame: &RenderFrame,
+        assets: &AssetManager,
+    ) -> Result<FrameOutcome, RendererError>;
 
-    /// Forces the next frame to rebuild every GPU object from its asset
-    /// snapshot.
+    /// Forces the next frame to rebuild every GPU object from the asset store.
     ///
     /// The renderer normally rebuilds only what changed, tracked by content
     /// versions; this clears that bookkeeping for callers that know the asset
@@ -139,7 +150,7 @@ pub struct HeadlessRenderer;
 impl PillRenderer for HeadlessRenderer {
     fn resize(&mut self, _: u32, _: u32) {}
     fn set_viewport(&mut self, _: Option<RenderViewport>) {}
-    fn render(&mut self, _: &RenderFrame) -> Result<FrameOutcome, RendererError> {
+    fn render(&mut self, _: &RenderFrame, _: &AssetManager) -> Result<FrameOutcome, RendererError> {
         Ok(FrameOutcome::Skipped)
     }
     fn invalidate_assets(&mut self) {}

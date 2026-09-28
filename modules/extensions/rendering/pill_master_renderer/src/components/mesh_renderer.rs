@@ -52,7 +52,7 @@ impl MeshRendererComponentBuilder {
 
 /// What an entity draws: a mesh paired with the material that shades it.
 ///
-/// The extraction system snapshots every entity carrying this and emits one
+/// The extraction system collects every entity carrying this and emits one
 /// instance per surviving pair, skipping any whose handles no longer resolve
 /// in the asset manager, so a dangling handle draws nothing instead of failing
 /// the frame. The shared name is pinned explicitly instead of being derived

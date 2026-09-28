@@ -1987,6 +1987,7 @@ dependencies = [
  "bytemuck",
  "glam",
  "image",
+ "indexmap",
  "miette",
  "pill_assets",
  "pill_core",
@@ -2953,6 +2954,7 @@ dependencies = [
 [[package]]
 name = "trait_type_map"
 version = "1.0.0"
+source = "git+https://github.com/MattSzymonski/Trait-Type-Map?rev=25343a9eac856445b0fa8266df5b000326d1574b#25343a9eac856445b0fa8266df5b000326d1574b"
 dependencies = [
  "ahash",
  "dyn-clone",
