@@ -145,8 +145,8 @@ pub fn register(engine: &mut pill_engine::Engine) -> u32 {
 ///
 /// A failure is warned and not returned: a renderer that could not install its
 /// own default pipeline still runs, through its built-in chain, and the log
-/// says what went wrong. The only way in here is a name clash with an asset the
-/// project already owns.
+/// says what went wrong. Two things get in here: a name clash with an asset the
+/// project already owns, and a shader of ours that will not build.
 fn install_default_pipeline(world: &mut World) {
     let installed = match world.get_resource_mut::<AssetManager>() {
         Some(assets) => config::pbr_pipeline::install(assets),
@@ -155,9 +155,9 @@ fn install_default_pipeline(world: &mut World) {
     };
 
     match installed {
-        Ok(pbr) => {
+        Ok(pipeline) => {
             if let Some(manager) = world.get_resource_mut::<RenderingManager>() {
-                manager.set_pipeline(pbr.pipeline);
+                manager.set_pipeline(pipeline);
             }
         }
         Err(error) => pill_core::warn!(

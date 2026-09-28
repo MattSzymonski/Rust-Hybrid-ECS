@@ -12,6 +12,12 @@
 //! resolving target names, creating the pipelines the GPU runs - happens in the
 //! renderer when the game hands this asset over through `RenderingManager`,
 //! because that is the side that owns the device.
+//!
+//! Nothing else belongs here. A pass already carries the shader it draws with
+//! and the values it reads, so a pipeline that also listed its shaders and
+//! textures would be saying the same thing twice - and would go stale the moment
+//! a pass was edited. What an installer put in the store is the store's
+//! business: `AssetManager::handle_by_name` is the index for it.
 
 use pill_engine::{Asset, Handle};
 

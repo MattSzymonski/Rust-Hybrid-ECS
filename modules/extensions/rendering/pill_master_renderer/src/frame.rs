@@ -441,15 +441,12 @@ mod tests {
         let shader = assets
             .add_named(
                 "pbr",
-                Shader::from_wgsl(
-                    "pbr",
-                    "vertex",
-                    "fragment",
-                    Vec::new(),
-                    Vec::new(),
-                    true,
-                    true,
-                ),
+                Shader::new("pbr")
+                    .with_wgsl("vertex", "fragment")
+                    .with_engine_parameters(true)
+                    .with_camera_parameters(true)
+                    .build()
+                    .expect("the stages are in memory"),
             )
             .expect("a free name");
         let pass = assets

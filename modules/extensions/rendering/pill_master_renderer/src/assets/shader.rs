@@ -7,10 +7,11 @@
 //! - Keep those slots in declaration order: that order is the order their
 //!   values pack into the uniform buffer, and reordering them would leave the
 //!   packed layout disagreeing with the shader's own declarations.
-//! - Offer both ways in: [`Shader::new`] reads the stages from files when the
-//!   shader is built, and [`Shader::from_wgsl`] takes sources already in
-//!   memory, which is how the host bridge builds shaders from what a C#
-//!   project handed it.
+//! - Offer both ways in: [`ShaderBuilder::with_vertex_source`] reads the stages
+//!   from files when the shader is built, and [`ShaderBuilder::with_wgsl`] takes
+//!   sources already in memory, which is how a chain embedding its own stages
+//!   and the host bridge building them from what a C# project handed it both
+//!   work.
 //!
 //! # Design
 //!
@@ -180,30 +181,6 @@ impl Shader {
         }
     }
 
-    /// Build a shader from WGSL already in memory, for callers whose sources
-    /// are not committed files - the host bridge builds them from what a C#
-    /// project handed it.
-    #[allow(clippy::too_many_arguments)]
-    pub fn from_wgsl(
-        name: impl Into<String>,
-        vertex_wgsl: impl Into<String>,
-        fragment_wgsl: impl Into<String>,
-        parameter_slots: impl IntoIterator<Item = ShaderParameterSlot>,
-        texture_slots: impl IntoIterator<Item = ShaderTextureSlot>,
-        pass_engine_parameters: bool,
-        pass_camera_parameters: bool,
-    ) -> Self {
-        let name = name.into();
-        Self {
-            parameter_slots: parameter_slots_by_name(&name, parameter_slots),
-            texture_slots: texture_slots_by_name(&name, texture_slots),
-            name,
-            vertex_wgsl: vertex_wgsl.into(),
-            fragment_wgsl: fragment_wgsl.into(),
-            pass_engine_parameters,
-            pass_camera_parameters,
-        }
-    }
 }
 
 /// A [`Shader`] under construction, started by [`Shader::new`].
@@ -238,6 +215,18 @@ impl ShaderBuilder {
     /// The WGSL fragment stage, read from this source when the shader is built.
     pub fn with_fragment_source(mut self, source: AssetLoader) -> Self {
         self.fragment_source = Some(source);
+        self
+    }
+
+    /// The two WGSL stages, already in hand.
+    ///
+    /// For sources that are not files: `include_str!` gives a `&'static str`,
+    /// and the host bridge has whatever a C# project handed it. Nothing is
+    /// resolved or read, so [`Self::build`] has the stages already - where
+    /// [`Self::with_vertex_source`] has a path that may turn out not to exist.
+    pub fn with_wgsl(mut self, vertex: impl Into<String>, fragment: impl Into<String>) -> Self {
+        self.vertex_source = Some(AssetLoader::Bytes(vertex.into().into_bytes().into()));
+        self.fragment_source = Some(AssetLoader::Bytes(fragment.into().into_bytes().into()));
         self
     }
 

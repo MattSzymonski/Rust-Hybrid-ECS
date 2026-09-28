@@ -9,8 +9,7 @@
 
 use pill_engine::{AssetManager, Handle, World};
 use pill_master_renderer::{
-    config::pbr_pipeline::{self, PbrMaps},
-    AssetLoader, Material, Mesh, Texture, TextureType,
+    config::pbr_pipeline, AssetLoader, Material, Mesh, Shader, Texture, TextureType,
 };
 use std::path::PathBuf;
 
@@ -71,23 +70,28 @@ pub(crate) fn load(world: &mut World) -> Result<SceneAssets, Box<dyn std::error:
     )?;
     let emissive = assets.add_named(EMISSIVE, emissive)?;
 
-    // The material is built through the chain's own shader. `install` is
-    // idempotent, so this is the shader the module already put in the store
-    // rather than a second copy, and the slots named here are the ones the
-    // shipped PBR shader declares - which is what makes the helmet's material
-    // drawable by the chain's geometry pass, and not by some other one.
-    let pbr = pbr_pipeline::install(assets)?;
-    let material = pbr_pipeline::material(
-        assets,
-        HELMET_MATERIAL,
-        &pbr,
-        PbrMaps {
-            base_color,
-            normal,
-            metallic_roughness,
-            emissive,
-        },
-    )?;
+    // The material is built through the chain's own shader, which the chain
+    // stores under a published name. `install` is idempotent, so this is the
+    // shader the module already put in the store rather than a second copy, and
+    // the slots named here are the ones the shipped PBR shader declares - which
+    // is what makes the helmet's material drawable by the chain's geometry pass,
+    // and not by some other one.
+    pbr_pipeline::install(assets)?;
+    let shader = assets
+        .handle_by_name::<Shader>(pbr_pipeline::SHADER_NAME)
+        .ok_or_else(|| "the PBR chain installed without its shader".to_owned())?;
+    let material = Material::builder(HELMET_MATERIAL)
+        .shader(&shader)
+        .texture("base_color", &base_color)
+        .texture("normal", &normal)
+        .texture("metallic_roughness", &metallic_roughness)
+        .texture("emissive", &emissive)
+        .color_parameter("pbr_base", [1.0, 1.0, 1.0])
+        .scalar_parameter("pbr_roughness", 1.0)
+        .scalar_parameter("pbr_metallic", 1.0)
+        .color_parameter("pbr_emissive", [1.0, 1.0, 1.0])
+        .build();
+    let material = assets.add_named(HELMET_MATERIAL, material)?;
 
     Ok(SceneAssets { mesh, material })
 }
