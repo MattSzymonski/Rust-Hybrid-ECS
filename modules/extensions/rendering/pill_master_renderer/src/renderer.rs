@@ -63,6 +63,7 @@ use crate::{
         RendererCamera, RendererMaterial, RendererMesh, RendererPass, RendererResourceStorage,
         RendererShader, RendererTexture, Vertex,
     },
+    surface::{RendererWindow, Surface},
     Instance,
 };
 
@@ -80,13 +81,6 @@ const CLEAR_COLOR: wgpu::Color = wgpu::Color {
 /// produces run well past 1.0, and a target that cannot hold them clips the
 /// picture before the pass that was going to bring it back into range runs.
 const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba16Float;
-
-/// A window the renderer can build its surface from.
-///
-/// Blanket-implemented for every wgpu window handle, so a frontend hands the
-/// renderer its own window type without naming wgpu's.
-pub trait RendererWindow: wgpu::WindowHandle {}
-impl<T> RendererWindow for T where T: wgpu::WindowHandle {}
 
 /// Where a pass writes.
 #[derive(Clone, Copy)]
@@ -510,7 +504,7 @@ impl Renderer {
             let value = RendererShader::new(
                 &shader.name,
                 &self.state.device,
-                self.state.color_format,
+                self.state.surface.format(),
                 Some(self.state.depth_format),
                 &[
                     RendererMesh::data_layout_descriptor(),
@@ -919,8 +913,7 @@ impl Renderer {
         assets: &AssetManager,
         chain_generation: u64,
     ) -> Result<()> {
-        let width = self.state.surface_configuration.width;
-        let height = self.state.surface_configuration.height;
+        let (width, height) = self.state.surface.size();
         let inputs = (chain_generation, self.resource_epoch, width, height);
         if self.pipeline_inputs == Some(inputs) {
             return Ok(());
@@ -1006,7 +999,7 @@ impl Renderer {
         let target_formats: Vec<wgpu::TextureFormat> = std::iter::once(&pass.target)
             .chain(pass.extra_targets.iter())
             .map(|target| match target {
-                PassTarget::Surface => self.state.color_format,
+                PassTarget::Surface => self.state.surface.format(),
                 PassTarget::Offscreen(name) => self
                     .state
                     .offscreen
@@ -1115,7 +1108,7 @@ fn install_default_material(
     let shader = RendererShader::new(
         "pill_default_lit",
         &state.device,
-        state.color_format,
+        state.surface.format(),
         Some(state.depth_format),
         &[
             RendererMesh::data_layout_descriptor(),
@@ -1153,23 +1146,21 @@ fn install_default_material(
 
 /// The wgpu objects behind a [`Renderer`]: device, surface, and frame state.
 ///
-/// Owns the surface and its configuration, the device and queue, the depth
+/// Owns the device and queue, the [`Surface`] built from them, the depth
 /// texture, and the offscreen colour targets the current chain declares. Kept
-/// beside [`Renderer`] rather than inside it so the surface lifecycle - new,
-/// resize, reconfigure - has a home independent of the asset caches.
+/// beside [`Renderer`] rather than inside it so the GPU lifetime - new, resize,
+/// reconfigure - has a home independent of the asset caches.
 pub struct State {
     /// The per-type cache of every GPU resource - shaders, textures, meshes,
     /// materials - and the engine parameters table.
     pub(crate) renderer_resource_storage: RendererResourceStorage,
-    surface: wgpu::Surface<'static>,
+    /// The window's swapchain, and the colour format every pipeline that
+    /// renders to it declares.
+    pub(crate) surface: Surface,
     /// The device every GPU object in this module is created from.
     pub(crate) device: wgpu::Device,
     /// The queue every upload and frame submission goes through.
     pub(crate) queue: wgpu::Queue,
-    surface_configuration: wgpu::SurfaceConfiguration,
-    /// The surface's colour format, chosen once and declared by every pipeline
-    /// that renders to it.
-    pub(crate) color_format: wgpu::TextureFormat,
     /// Format of the depth buffer shared by the geometry passes.
     pub(crate) depth_format: wgpu::TextureFormat,
     depth_texture: RendererTexture,
@@ -1186,85 +1177,10 @@ pub struct State {
 
 impl State {
     async fn new<W: RendererWindow + 'static>(window: W, width: u32, height: u32) -> Result<Self> {
-        let window_size = winit::dpi::PhysicalSize::new(width.max(1), height.max(1));
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            flags: wgpu::InstanceFlags::from_build_config().with_env(),
-            backend_options: wgpu::BackendOptions::default(),
-        });
-        let surface =
-            instance
-                .create_surface(window)
-                .map_err(|error| RendererError::SurfaceCreation {
-                    detail: error.to_string(),
-                })?;
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::default(),
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .map_err(|error| RendererError::AdapterRequest {
-                detail: error.to_string(),
-            })?;
-        let info = adapter.get_info();
-        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Using GPU: {} ({:?})", info.name, info.backend);
-        let wanted = wgpu::Features::DEPTH_CLIP_CONTROL;
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("pill renderer device"),
-                required_features: wanted & adapter.features(),
-                required_limits: wgpu::Limits::default().using_resolution(adapter.limits()),
-                memory_hints: wgpu::MemoryHints::default(),
-                trace: wgpu::Trace::default(),
-            })
-            .await
-            .map_err(|error| RendererError::DeviceCreation {
-                detail: error.to_string(),
-            })?;
-        let capabilities = surface.get_capabilities(&adapter);
-        // Preference order taken from the reference: an sRGB target where the
-        // surface offers one, Rgba ahead of Bgra because it needs no channel
-        // swizzle, and finally whatever the surface does advertise rather than
-        // refusing to start.
-        let color_format = [
-            wgpu::TextureFormat::Rgba8UnormSrgb,
-            wgpu::TextureFormat::Bgra8UnormSrgb,
-            wgpu::TextureFormat::Bgra8Unorm,
-        ]
-        .into_iter()
-        .find(|format| capabilities.formats.contains(format))
-        .or_else(|| capabilities.formats.first().copied())
-        .ok_or(RendererError::NoTextureFormats)?;
-        let alpha_mode = capabilities
-            .alpha_modes
-            .first()
-            .copied()
-            .ok_or(RendererError::NoAlphaModes)?;
-        // `Fifo` is the one present mode a surface is required to support, and
-        // a mode listed by `Surface::get_capabilities` is not thereby
-        // creatable: the NVIDIA Vulkan driver on Windows advertises `Mailbox`
-        // and then fails the flip-model swapchain with "Not enough memory
-        // left", which reaches wgpu's uncaptured-error path and aborts the host
-        // before a `RendererError` can be constructed. An uncapped mode stays
-        // an opt-in for a driver that has been verified to create one.
-        let present_mode = wgpu::PresentMode::Fifo;
-        println!("[render] Present mode: {present_mode:?}");
-        let mut surface_configuration = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: color_format,
-            width: window_size.width,
-            height: window_size.height,
-            desired_maximum_frame_latency: 2,
-            present_mode,
-            alpha_mode,
-            view_formats: vec![color_format],
-        };
-        configure_surface(&surface, &device, &mut surface_configuration)?;
+        let (surface, device, queue) = Surface::create(window, width, height).await?;
         let depth_format = wgpu::TextureFormat::Depth32Float;
         let depth_texture =
-            RendererTexture::new_depth_texture(&device, &surface_configuration, "depth_texture")?;
+            RendererTexture::new_depth_texture(&device, surface.configuration(), "depth_texture")?;
         // Scoped like every other creation: a refused layout would otherwise
         // reach the uncaptured-error handler and take the host down before a
         // `RendererError` exists to explain it.
@@ -1293,8 +1209,6 @@ impl State {
             surface,
             device,
             queue,
-            surface_configuration,
-            color_format,
             depth_format,
             depth_texture,
             offscreen: HashMap::new(),
@@ -1305,34 +1219,19 @@ impl State {
 
     /// Resize the surface and rebuild the depth buffer that matches it.
     ///
-    /// The new size is applied through `configure_surface` - scoped, with its
-    /// `Opaque` fallback - and only committed once the surface accepted it, so
-    /// a refusal leaves the old, consistent surface and depth pair in place
-    /// instead of a configuration that disagrees with the swapchain. What used
-    /// to be an `expect` here killed the host on a resize it could not honour.
+    /// Only committed once the surface accepted the new size, so a refusal
+    /// leaves the old, consistent surface and depth pair in place instead of a
+    /// configuration that disagrees with the swapchain. What used to be an
+    /// `expect` here killed the host on a resize it could not honour.
     fn resize(&mut self, new_window_size: winit::dpi::PhysicalSize<u32>) -> Result<()> {
-        let mut surface_configuration = self.surface_configuration.clone();
-        surface_configuration.width = new_window_size.width;
-        surface_configuration.height = new_window_size.height;
-        configure_surface(&self.surface, &self.device, &mut surface_configuration)?;
-        let depth_texture = RendererTexture::new_depth_texture(
+        self.surface
+            .resize(&self.device, new_window_size.width, new_window_size.height)?;
+        self.depth_texture = RendererTexture::new_depth_texture(
             &self.device,
-            &surface_configuration,
+            self.surface.configuration(),
             "depth_texture",
         )?;
-        self.surface_configuration = surface_configuration;
-        self.depth_texture = depth_texture;
         Ok(())
-    }
-
-    /// Reconfigure the surface from its current settings.
-    ///
-    /// The recovery path for a lost or outdated swapchain: the configuration
-    /// is still what the window wants, only the platform-side surface needs
-    /// recreating - and without this the renderer stays dead until a resize
-    /// event happens to arrive.
-    fn reconfigure_surface(&mut self) -> Result<()> {
-        configure_surface(&self.surface, &self.device, &mut self.surface_configuration)
     }
 
     /// Create a target for every offscreen output the chain declares.
@@ -1342,8 +1241,7 @@ impl State {
     /// pass that wrote it, which shows up as a picture that shrinks with the
     /// window rather than one that resizes with it.
     fn ensure_offscreen_targets(&mut self, chain: &[ResolvedPass]) {
-        let width = self.surface_configuration.width;
-        let height = self.surface_configuration.height;
+        let (width, height) = self.surface.size();
         let device = &self.device;
         let targets = &mut self.offscreen;
         targets.clear();
@@ -1393,32 +1291,10 @@ impl State {
         frame: &RenderFrame,
         viewport: Option<RenderViewport>,
     ) -> Result<()> {
-        let surface_frame = match self.surface.get_current_texture() {
-            Ok(surface_frame) => surface_frame,
-            // A lost or outdated swapchain is recovered by reconfiguring and
-            // retrying once; reporting it and returning left the renderer dead
-            // until some later resize event happened to arrive.
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
-                self.reconfigure_surface()?;
-                self.surface
-                    .get_current_texture()
-                    .map_err(|error| match error {
-                        wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated => {
-                            RendererError::SurfaceLost
-                        }
-                        wgpu::SurfaceError::OutOfMemory => RendererError::SurfaceOutOfMemory,
-                        other => RendererError::SurfaceTextureFailed {
-                            detail: other.to_string(),
-                        },
-                    })?
-            }
-            Err(wgpu::SurfaceError::OutOfMemory) => return Err(RendererError::SurfaceOutOfMemory),
-            Err(other) => {
-                return Err(RendererError::SurfaceTextureFailed {
-                    detail: other.to_string(),
-                })
-            }
-        };
+        // Both borrows are of separate fields, so the surface can reconfigure
+        // itself against the device that created it.
+        let surface_frame = self.surface.acquire(&self.device)?;
+        let (width, height) = self.surface.size();
         let view = surface_frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -1426,10 +1302,7 @@ impl State {
             &self.queue,
             0.0,
             [0.0; 3],
-            [
-                self.surface_configuration.width,
-                self.surface_configuration.height,
-            ],
+            [width, height],
             [
                 frame.seconds,
                 frame.delta_seconds,
@@ -1443,18 +1316,8 @@ impl State {
             .get_mut(camera_handle)
             .ok_or(RendererError::RendererResourceNotFound)?;
         let viewport = viewport
-            .and_then(|value| {
-                value.clamped_to(
-                    self.surface_configuration.width,
-                    self.surface_configuration.height,
-                )
-            })
-            .unwrap_or_else(|| {
-                RenderViewport::full(
-                    self.surface_configuration.width,
-                    self.surface_configuration.height,
-                )
-            });
+            .and_then(|value| value.clamped_to(width, height))
+            .unwrap_or_else(|| RenderViewport::full(width, height));
         camera.update(
             &self.queue,
             &frame.camera,
@@ -1620,72 +1483,6 @@ fn color_load(clear: bool) -> wgpu::LoadOp<wgpu::Color> {
     } else {
         wgpu::LoadOp::Load
     }
-}
-
-/// Configure the surface, giving up the compositing alpha mode if the driver
-/// refuses it.
-///
-/// `Surface::configure` returns nothing: a refused configuration is reported
-/// through the device's uncaptured-error path, which panics by default and
-/// takes the whole host down before any frontend sees a `RendererError`. A
-/// refusal is realistic because a compositing alpha mode needs a compositing
-/// window, which a capability list does not promise. The requested mode is
-/// therefore tried inside its own error scopes, and `Opaque` - the mode every
-/// surface must support - is the fallback.
-fn configure_surface(
-    surface: &wgpu::Surface<'static>,
-    device: &wgpu::Device,
-    surface_configuration: &mut wgpu::SurfaceConfiguration,
-) -> Result<()> {
-    let requested_alpha_mode = surface_configuration.alpha_mode;
-    let mut alpha_modes = vec![requested_alpha_mode];
-    if requested_alpha_mode != wgpu::CompositeAlphaMode::Opaque {
-        alpha_modes.push(wgpu::CompositeAlphaMode::Opaque);
-    }
-
-    let mut failures = Vec::new();
-    for alpha_mode in alpha_modes {
-        surface_configuration.alpha_mode = alpha_mode;
-
-        // One scope per filter class, so a refusal is captured here rather than
-        // reaching the uncaptured-error handler.
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
-        device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        device.push_error_scope(wgpu::ErrorFilter::Internal);
-        surface.configure(device, surface_configuration);
-        // Acquiring a frame is what materialises the swapchain: wgpu-core
-        // accepting the configuration does not mean the driver created one, and
-        // the refusal only shows up here.
-        let probe = surface.get_current_texture();
-        let internal = pollster::block_on(device.pop_error_scope());
-        let out_of_memory = pollster::block_on(device.pop_error_scope());
-        let validation = pollster::block_on(device.pop_error_scope());
-
-        let reported = internal
-            .or(out_of_memory)
-            .or(validation)
-            .map(|error| error.to_string());
-        let failure = match probe {
-            Ok(frame) => {
-                // Dropped rather than presented: `render` acquires its own.
-                drop(frame);
-                reported
-            }
-            Err(error) => Some(reported.unwrap_or_else(|| error.to_string())),
-        };
-
-        match failure {
-            None => {
-                println!("[render] Surface configured: {alpha_mode:?}");
-                return Ok(());
-            }
-            Some(failure) => failures.push(format!("{alpha_mode:?} ({failure})")),
-        }
-    }
-
-    Err(RendererError::SurfaceConfigurationRefused {
-        detail: failures.join("; "),
-    })
 }
 
 #[cfg(test)]

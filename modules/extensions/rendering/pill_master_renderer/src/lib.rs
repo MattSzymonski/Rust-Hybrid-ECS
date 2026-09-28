@@ -62,6 +62,9 @@ mod resource_handles;
 /// One module per cached GPU resource, re-exported flat for the renderer.
 pub mod resources;
 
+/// The window surface, its swapchain, and the lifecycle that keeps them live.
+mod surface;
+
 // External crates
 pub use pill_engine::AssetLoader;
 
@@ -76,8 +79,9 @@ pub use components::*;
 pub use error::RendererError;
 pub use frame::{rendering_system, RenderFrame, RenderInstance, ResolvedPass};
 pub use instance::Instance;
-pub use renderer::{Renderer, RendererWindow};
+pub use renderer::Renderer;
 pub use resources::RenderingManager;
+pub use surface::RendererWindow;
 
 /// Registers the renderer's components, assets, resources and system with an
 /// engine, and returns zero.
