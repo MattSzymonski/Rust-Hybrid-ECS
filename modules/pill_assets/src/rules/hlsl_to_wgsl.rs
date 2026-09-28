@@ -23,16 +23,39 @@ use crate::{walk_files, CookError, Rule};
 /// and needs no configuration. [`HlslToWgsl::with_include`] adds directories for
 /// a header that several trees share: without it the header has to be copied
 /// into each `include/`, and copies drift.
+///
+/// Two layouts read from the root: [`HlslToWgsl::new`] takes a `shaders/`
+/// directory below it, which leaves room for an `include/` of headers that are
+/// not stages, while [`HlslToWgsl::flat`] takes the sources at the top of the
+/// root itself. A header cannot live in the second layout's top level - the
+/// glob would match it and no stage could be inferred - so it belongs in
+/// `include/` either way.
 pub struct HlslToWgsl {
+    /// Glob, relative to the root, selecting the sources.
+    glob: &'static str,
     /// Directories handed to `slangc -I`, searched after the source's own
     /// directory and `include/`.
     include_dirs: Vec<PathBuf>,
 }
 
 impl HlslToWgsl {
-    /// The rule with no include path: sources resolve against their own tree.
+    /// The rule for a root with a `shaders/` directory: no include path, so
+    /// sources resolve against their own tree.
     pub fn new() -> Self {
         Self {
+            glob: "shaders/*.hlsl",
+            include_dirs: Vec::new(),
+        }
+    }
+
+    /// The rule for a root that is itself the shaders directory.
+    ///
+    /// For a tree whose sources have no `shaders/` level to sit in - a shared
+    /// one holding a handful of stages, say, where the extra directory earns
+    /// nothing.
+    pub fn flat() -> Self {
+        Self {
+            glob: "*.hlsl",
             include_dirs: Vec::new(),
         }
     }
@@ -59,9 +82,9 @@ impl Rule for HlslToWgsl {
     }
 
     fn input_glob(&self) -> &'static str {
-        // Top level only: `shaders/include/*.hlsl` are headers the sources
-        // `#include`, and a build script reports those as inputs itself.
-        "shaders/*.hlsl"
+        // A `shaders/` level, or the root itself for a flat tree. Headers are
+        // never matched: they live in `include/`, beside it.
+        self.glob
     }
 
     fn output_for(&self, input: &Path) -> PathBuf {
@@ -171,6 +194,12 @@ mod tests {
             PathBuf::from("shaders/default_vertex.wgsl")
         );
         assert_eq!(rule.input_glob(), "shaders/*.hlsl");
+    }
+
+    #[test]
+    fn a_flat_tree_takes_its_sources_from_the_root() {
+        assert_eq!(HlslToWgsl::new().input_glob(), "shaders/*.hlsl");
+        assert_eq!(HlslToWgsl::flat().input_glob(), "*.hlsl");
     }
 
     #[test]
