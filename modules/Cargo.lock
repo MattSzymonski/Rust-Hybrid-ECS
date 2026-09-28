@@ -2543,6 +2543,7 @@ name = "host_project_italian_brainrot"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "pill_assets",
  "pill_engine",
  "pill_master_renderer",
  "serde",

@@ -11,10 +11,16 @@
 struct MaterialParams
 {
     // Art-side shape, then the two constants `lottes_bc` resolves them to.
-    float contrast;
-    float shoulder;
-    float b;
-    float c;
+    //
+    // One `float4` per slot, the engine's packing: every parameter is written
+    // as its own 16-byte slot, so a scalar lives at `.x` and its slot's other
+    // three components are padding. Four plain `float`s would pack them at
+    // offsets 0, 4, 8 and 12 instead - inside the first slot and its padding -
+    // and the curve would read three zeros and divide by a zero denominator.
+    float4 contrast;
+    float4 shoulder;
+    float4 b;
+    float4 c;
 };
 
 [[vk::binding(0, 2)]]
@@ -55,10 +61,10 @@ PixelOutput fs_main(PixelInput input)
 
     float3 hdr = hdr_texture.Sample(hdr_sampler, input.texture_coords).rgb;
 
-    float contrast = material.contrast;
-    float shoulder = material.shoulder;
-    float b = material.b;
-    float c = material.c;
+    float contrast = material.contrast.x;
+    float shoulder = material.shoulder.x;
+    float b = material.b.x;
+    float c = material.c.x;
 
     // Per channel, not per pixel: the three curves are independent, and a pixel
     // that misses one channel still has to keep the other two.
