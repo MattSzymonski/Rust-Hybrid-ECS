@@ -1,25 +1,72 @@
 //! Mesh assets and their interleaved vertex representation.
+//!
+//! # Responsibilities
+//!
+//! - Carry the geometry the renderer uploads: vertices interleaved in the
+//!   order the pipeline's vertex step reads them, plus a 32-bit index list.
+//! - Build meshes three ways: from buffers the game already holds, from the
+//!   built-in triangle used as a stand-in, and by decoding a Wavefront OBJ
+//!   buffer handed over by the managed asset bridge.
+//! - Derive tangent space after an OBJ decode. A file carries positions, UVs
+//!   and normals, so the tangents and bitangents the shaders read are
+//!   accumulated from the mesh's triangles and normalized here.
+//!
+//! # Design
+//!
+//! [`MeshVertex`] is `repr(C)` and `Pod`, so a mesh's vertices upload as a
+//! plain byte slice, and that same field order is the attribute layout the
+//! renderer declares to wgpu. A mesh is an [`Asset`], so the renderer
+//! re-uploads its buffers when the asset's version moves rather than
+//! expecting a game to mutate renderer state mid frame.
 
-use pill_engine::Asset;
+// External crates
+use pill_engine::{Asset, AssetLoadError};
 
+/// One vertex, in the layout the vertex buffer step reads it.
+///
+/// `repr(C)` and `Pod` are what let a run of these upload to the GPU as raw
+/// bytes, and the field order is the attribute layout the renderer declares
+/// to wgpu, so the two have to agree.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct MeshVertex {
+    /// Object-space position.
     pub position: [f32; 3],
+    /// Texture coordinates for the shader's UV input. The OBJ decoder flips
+    /// V, because a file counts it upward from the bottom edge.
     pub texture_coordinates: [f32; 2],
+    /// Object-space normal. A decoded vertex the file gives no normal for
+    /// falls back to +Y.
     pub normal: [f32; 3],
+    /// Tangent along the U direction, one axis of the TBN frame the shaders
+    /// use for normal mapping.
     pub tangent: [f32; 3],
+    /// Bitangent along the V direction, the frame's third axis. The OBJ
+    /// decode starts both at zero and fills them from the triangles.
     pub bitangent: [f32; 3],
 }
 
+/// One drawable piece of geometry: interleaved vertices plus a 32-bit index
+/// list.
+///
+/// The renderer builds a GPU copy once and rebuilds it when the asset's
+/// version moves, so a game edits the mesh it holds and lets the renderer
+/// notice rather than touching buffers itself.
 #[derive(Clone, Debug)]
 pub struct Mesh {
+    /// Label used in logs, profiling, and error messages.
     pub name: String,
+    /// Vertices, interleaved as [`MeshVertex`] lays them out.
     pub vertices: Vec<MeshVertex>,
+    /// Indices into [`Self::vertices`], one triangle per three entries.
     pub indices: Vec<u32>,
 }
 
 impl Mesh {
+    /// Builds a mesh from finished vertex and index buffers.
+    ///
+    /// The buffers are stored as given: nothing checks the indices against
+    /// the vertex list, so the caller supplies a pair that already agrees.
     pub fn from_data(
         name: impl Into<String>,
         vertices: Vec<MeshVertex>,
@@ -32,6 +79,12 @@ impl Mesh {
         }
     }
 
+    /// The built-in stand-in mesh: one triangle in the XY plane, half a unit
+    /// quad, facing +Z with its UVs and tangent space filled in.
+    ///
+    /// A project with no geometry of its own can register this and draw it
+    /// through the same material and pipeline path as any loaded mesh, which
+    /// keeps a fresh scene renderable before its assets exist.
     pub fn triangle() -> Self {
         let vertex = |position, texture_coordinates| MeshVertex {
             position,
@@ -58,7 +111,16 @@ impl Mesh {
     /// so it hands the host raw file bytes and gets a mesh back. This is the
     /// same decode `italian_brainrot`'s Rust project used to do for itself
     /// before that project moved to the shared bridge.
-    pub fn from_obj_bytes(name: impl Into<String>, bytes: &[u8]) -> Result<Self, String> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetLoadError::Decode`] when the buffer is not a readable
+    /// OBJ, or when it holds no triangles - the two ways a mesh the renderer
+    /// would otherwise upload empty comes back named instead. Both carry the
+    /// mesh's name, so the failure points at the asset rather than at the
+    /// bytes.
+    pub fn from_obj_bytes(name: impl Into<String>, bytes: &[u8]) -> Result<Self, AssetLoadError> {
+        let name = name.into();
         let mut source = std::io::Cursor::new(bytes);
         let options = tobj::LoadOptions {
             triangulate: true,
@@ -68,7 +130,10 @@ impl Mesh {
         let (models, _) = tobj::load_obj_buf(&mut source, &options, |_| {
             Ok((Vec::new(), Default::default()))
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| AssetLoadError::Decode {
+            label: name.clone(),
+            detail: error.to_string(),
+        })?;
 
         let mut vertices = Vec::new();
         let mut indices = Vec::new();
@@ -111,7 +176,10 @@ impl Mesh {
 
         calculate_tangent_space(&mut vertices, &indices);
         if vertices.is_empty() || indices.is_empty() {
-            return Err("the OBJ buffer contained no triangles".to_owned());
+            return Err(AssetLoadError::Decode {
+                label: name,
+                detail: "the OBJ buffer contained no triangles".to_owned(),
+            });
         }
         Ok(Self::from_data(name, vertices, indices))
     }
@@ -155,6 +223,8 @@ fn calculate_tangent_space(vertices: &mut [MeshVertex], indices: &[u32]) {
     }
 }
 
+/// Returns the normalized vector, or the fallback axis when the vector is
+/// non-finite or too short to normalize.
 fn normalized_or(value: glam::Vec3, fallback: glam::Vec3) -> glam::Vec3 {
     if value.is_finite() && value.length_squared() > 1.0e-8 {
         value.normalize()

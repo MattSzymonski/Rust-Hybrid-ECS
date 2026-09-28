@@ -344,6 +344,15 @@ struct AssetColumn {
     /// Starts at 0 for a fresh slot and increments on every free, so a handle
     /// issued before the free never matches after it.
     generations: Vec<u32>,
+    /// Content version of each slot, one entry per slot that has ever existed.
+    ///
+    /// Bumped whenever the stored value is mutably borrowed, so a consumer
+    /// that mirrors assets - the renderer's GPU uploads - can tell an edited
+    /// asset from an untouched one instead of rebuilding everything when any
+    /// asset changes. A freed slot keeps its last entry; the handle that
+    /// refills it carries a new generation, so a version only ever compares
+    /// within one handle.
+    content_versions: Vec<u64>,
     /// Slots freed by `remove`, refilled before the column grows.
     free_slots: Vec<u32>,
     /// Row the live slot at this index occupies in the packed column.
@@ -495,6 +504,25 @@ impl AssetManager {
         self.revision
     }
 
+    /// Content version of the slot `handle` names, or `None` when stale.
+    ///
+    /// Bumped whenever the value is mutably borrowed, so a consumer that
+    /// mirrors assets can rebuild the one asset that changed instead of every
+    /// asset. Meaningful only within one handle: a refilled slot is addressed
+    /// by a new generation, whose version starts fresh.
+    pub fn content_version<T>(&self, handle: Handle<T>) -> Option<u64>
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        if !self.is_live(handle) {
+            return None;
+        }
+        self.metadata
+            .get(&TypeId::of::<T>())
+            .and_then(|metadata| metadata.content_versions.get(handle.index as usize))
+            .copied()
+    }
+
     /// Store `asset` and return a handle to it.
     ///
     /// Reuses a slot freed by [`Self::remove`] when one is available, so a
@@ -521,6 +549,7 @@ impl AssetManager {
                 let index = metadata.slot_rows.len() as u32;
                 metadata.slot_rows.push(0);
                 metadata.generations.push(0);
+                metadata.content_versions.push(0);
                 index
             }
         };
@@ -653,6 +682,15 @@ impl AssetManager {
             return None;
         }
         self.revision = self.revision.wrapping_add(1);
+        // One counter per slot, not per column: it is what tells a mirrored
+        // consumer which single asset moved, and borrowing one value must not
+        // look like a change to every asset.
+        let version = &mut self
+            .metadata
+            .get_mut(&TypeId::of::<T>())
+            .expect("a live handle implies existing metadata")
+            .content_versions[handle.index as usize];
+        *version = version.wrapping_add(1);
         let row = self.slot_row::<T>(handle.index)?;
         Some(
             self.columns
@@ -1166,6 +1204,35 @@ mod tests {
 
         assets.remove(handle);
         assert_ne!(assets.revision(), after_mutation);
+    }
+
+    /// The per-slot content counter is what lets a GPU uploader rebuild one
+    /// edited asset instead of every asset: only a mutable borrow moves it.
+    #[test]
+    fn content_version_moves_only_on_a_mutable_borrow() {
+        let mut assets = AssetManager::new();
+        let handle = assets.add(Texture(1));
+
+        let created = assets.content_version(handle).expect("live handle");
+        assert_eq!(
+            assets.content_version(handle),
+            Some(created),
+            "reading leaves the version alone"
+        );
+
+        assets.get_mut(handle).expect("live handle").0 = 2;
+        assert_eq!(
+            assets.content_version(handle),
+            Some(created + 1),
+            "editing moves it"
+        );
+
+        assets.remove(handle);
+        assert_eq!(
+            assets.content_version(handle),
+            None,
+            "a stale handle answers nothing"
+        );
     }
 
     /// Removing yields the asset and invalidates the handle.

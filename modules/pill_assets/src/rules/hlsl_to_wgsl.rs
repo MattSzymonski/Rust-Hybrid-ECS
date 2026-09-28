@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::{CookError, Rule};
+use crate::{walk_files, CookError, Rule};
 
 /// Compiles `shaders/*.hlsl` to WGSL beside the source.
 ///
@@ -33,6 +33,16 @@ impl Rule for HlslToWgsl {
 
     fn output_for(&self, input: &Path) -> PathBuf {
         input.with_extension("wgsl")
+    }
+
+    fn extra_inputs(&self, input: &Path) -> Result<Vec<PathBuf>, CookError> {
+        // The sources `#include` this directory while the rule's glob matches
+        // only top-level `shaders/*.hlsl`; a header edit must make every
+        // output stale, not merely re-run the build script.
+        let Some(parent) = input.parent() else {
+            return Ok(Vec::new());
+        };
+        walk_files(&parent.join("include"))
     }
 
     fn build(&self, input: &Path, output: &Path) -> Result<(), CookError> {

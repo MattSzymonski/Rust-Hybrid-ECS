@@ -1,25 +1,91 @@
+//! The GPU pipeline a shader asset becomes, and the layouts its draws bind.
+//!
+//! # Responsibilities
+//!
+//! - Build the render pipeline and group layouts from a shader's cooked WGSL,
+//!   capturing wgpu validation so a shader the driver refuses is reported
+//!   against the asset that named it instead of taking the host down
+//!   ([`RendererShader::new`]).
+//! - Create the parameters group layout (set 2) and the textures group layout
+//!   (set 3), each absent when the shader declares none of that kind, and pad
+//!   the pipeline layout so every shader keeps the engine's fixed groups.
+//! - Carry the flags that say whether the shader reads the engine's or the
+//!   camera's uniforms, so a drawer binds those groups only when they are
+//!   read.
+//!
+//! # Design
+//!
+//! Built during asset sync, when a shader asset is loaded or its version
+//! changes, not per frame. The four group slots are fixed by the engine's
+//! convention - engine parameters at 0, camera at 1, a material's or pass's
+//! parameters at 2, its textures at 3 - and an empty layout keeps a slot the
+//! shader does not declare, so every pipeline has the same shape the drawers
+//! bind against. The WGSL the modules are created from is cooked at build
+//! time; nothing compiles a shader at runtime.
+
+// External crates
+use indexmap::IndexMap;
+use pill_core::{debug, PillStyle};
+
+// Current crate
 use crate::{
     assets::{ShaderParameterSlot, ShaderTextureSlot, TextureType},
     error::{RendererError, Result},
 };
-use indexmap::IndexMap;
-use pill_core::{debug, PillStyle};
 
+/// One shader's GPU pipeline and the layout of the groups its draws bind.
+///
+/// Built during asset sync from the shader asset, beside every other GPU
+/// resource. The pipeline is what a draw switches to; the layouts are what a
+/// material or pass built against this shader binds its parameters and
+/// textures through.
 pub struct RendererShader {
+    /// Label used in logs and error messages, taken from the shader asset.
     pub name: String,
+    /// Pipeline a draw using this shader binds.
+    ///
+    /// A pass that owns its pipeline can still draw through its own instead,
+    /// because only the pass knows the target's format and its depth and
+    /// culling.
     pub render_pipeline: wgpu::RenderPipeline,
 
+    /// The uniforms the shader declares, by name, in declaration order.
     pub parameter_slots: IndexMap<String, ShaderParameterSlot>,
+    /// Layout of the parameters group (set 2), or `None` when the shader
+    /// declares no parameters.
     pub parameters_bind_group_layout: Option<wgpu::BindGroupLayout>,
 
+    /// The textures the shader declares, by name, each with its bindings.
     pub texture_slots: IndexMap<String, ShaderTextureSlot>,
+    /// Layout of the textures group (set 3), or `None` when the shader
+    /// declares no textures.
     pub textures_bind_group_layout: Option<wgpu::BindGroupLayout>,
 
+    /// Whether the shader reads the engine's parameters, in which case a
+    /// drawer binds that group before the draw.
     pub pass_engine_parameters: bool,
+    /// Whether the shader reads the camera's parameters, in which case a
+    /// drawer binds that group before the draw.
     pub pass_camera_parameters: bool,
 }
 
 impl RendererShader {
+    /// Builds a shader's render pipeline and group layouts from its cooked
+    /// WGSL.
+    ///
+    /// The vertex and fragment modules are created from the WGSL the build
+    /// cooked from the authored HLSL, and the pipeline is built for the given
+    /// color and depth formats. The parameters and textures layouts exist only
+    /// when the shader declares slots of that kind; the pipeline layout pads a
+    /// missing one with an empty layout, so the shader keeps the engine's
+    /// fixed group convention either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RendererError::Other`] when the pipeline fails wgpu
+    /// validation - a mistake in the shader asset. Validation is scoped so
+    /// the refusal is reported against the shader instead of panicking
+    /// through wgpu's uncaptured-error handler.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         name: &str,
@@ -62,8 +128,6 @@ impl RendererShader {
             debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", shader_info);
         }
 
-        debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Shader modules created");
-
         // Create shader modules from the cooked WGSL. Nothing compiles a shader
         // at runtime: the authored sources are HLSL in `src/shaders`, the build
         // script's `slangc` rule produces the WGSL these strings carry, and wgpu
@@ -77,11 +141,13 @@ impl RendererShader {
             source: wgpu::ShaderSource::Wgsl(fragment_wgsl.into()),
         });
 
+        debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Shader modules created");
+
         let parameters_bind_group_layout = {
             if !parameter_slots.is_empty() {
                 let bind_group_layout_entry = wgpu::BindGroupLayoutEntry {
                     binding: 0, // (set = 2, binding = 0)
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -103,7 +169,7 @@ impl RendererShader {
 
         debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Parameters bind group layout created");
 
-        // Create bind group layout entries for textures - Bind group slot 1
+        // Create bind group layout entries for textures - Bind group slot 3
         let textures_bind_group_layout = {
             if !texture_slots.is_empty() {
                 let mut entries = Vec::new();
@@ -126,7 +192,7 @@ impl RendererShader {
                     // Texture binding
                     entries.push(wgpu::BindGroupLayoutEntry {
                         binding: texture_slot.texture_binding,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             multisampled: false,
                             view_dimension: wgpu::TextureViewDimension::D2,
@@ -138,7 +204,7 @@ impl RendererShader {
                     // Sampler binding
                     entries.push(wgpu::BindGroupLayoutEntry {
                         binding: texture_slot.sampler_binding,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                         ty: wgpu::BindingType::Sampler(sampler_type),
                         count: None,
                     });
@@ -157,23 +223,26 @@ impl RendererShader {
 
         debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Textures bind group layout created");
 
-        // Create pipeline layout
+        // Create pipeline layout. The four group slots are fixed by the
+        // engine's convention - engine parameters at 0, camera at 1, a
+        // material's or pass's parameters at 2, its textures at 3 - and an
+        // empty layout keeps a slot the shader does not declare, so every
+        // pipeline has the same shape the drawers bind against. The pass path
+        // pads its layout the same way.
         let pipeline_layout = {
-            // Collect bind group layouts only if they exist
-            let mut bind_group_layouts = Vec::new();
+            let empty_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("shader_empty_bind_group_layout"),
+                entries: &[],
+            });
 
-            if pass_engine_parameters {
-                bind_group_layouts.push(engine_bind_group_layout);
-            }
-            if pass_camera_parameters {
-                bind_group_layouts.push(camera_bind_group_layout);
-            }
-            if let Some(ref layout) = parameters_bind_group_layout {
-                bind_group_layouts.push(layout);
-            }
-            if let Some(ref layout) = textures_bind_group_layout {
-                bind_group_layouts.push(layout);
-            }
+            let bind_group_layouts = [
+                engine_bind_group_layout,
+                camera_bind_group_layout,
+                parameters_bind_group_layout
+                    .as_ref()
+                    .unwrap_or(&empty_layout),
+                textures_bind_group_layout.as_ref().unwrap_or(&empty_layout),
+            ];
 
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some(&format!("{}_pipeline_layout", name)),
@@ -182,7 +251,7 @@ impl RendererShader {
             })
         };
 
-        // Create color target states that specifies what what color outputs wgpu should set up
+        // Create color target states that specify what color outputs wgpu should set up
         let color_target_states = &[Some(wgpu::ColorTargetState {
             format: color_format,
             blend: Some(wgpu::BlendState {

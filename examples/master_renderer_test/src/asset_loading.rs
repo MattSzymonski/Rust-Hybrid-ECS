@@ -86,6 +86,7 @@ fn grain_texture() -> Texture {
     }
 
     Texture::from_rgba("helmet.grain", TextureType::Color, rgba, SIZE, SIZE)
+        .expect("the tile is SIZE x SIZE RGBA")
 }
 
 /// Decodes the helmet and everything the frame draws it with.

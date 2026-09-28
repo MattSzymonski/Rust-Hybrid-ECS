@@ -1,10 +1,40 @@
 //! Texture assets and their color interpretation.
+//!
+//! # Responsibilities
+//!
+//! - Carry the pixels the renderer uploads: RGBA bytes, their dimensions, and
+//!   the name the asset is known by.
+//! - Say how those pixels are meant to be read ([`TextureType`]): as colour,
+//!   as a normal map, or as depth that only a shader declares.
+//! - Build textures two ways, by decoding an image file ([`Texture::new`])
+//!   and from a buffer the caller already holds ([`Texture::from_rgba`]).
+//!
+//! # Design
+//!
+//! A texture here is plain data with no GPU state: the renderer keeps the
+//! texture, view and sampler beside it and rebuilds them when the asset's
+//! version moves. The [`TextureType`] travels with the pixels for the same
+//! reason the pixels travel at all - the bytes alone do not say how to read
+//! them, so the type decides the format the renderer uploads as and how a
+//! shader may sample the result.
 
+// External crates
 use pill_engine::{Asset, AssetLoadError, AssetLoadResult, AssetLoader};
 
+/// How a texture's pixels are meant to be read.
+///
+/// The type travels with the pixels because the bytes alone do not say how to
+/// interpret them: it decides the format the pixels upload as and the binding
+/// a shader receives for a texture slot, which is what keeps colour, normal
+/// and depth data from being read the wrong way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextureType {
+    /// A colour image: albedo, UI, or any texture sampled for its values.
+    /// Uploaded as sRGB, so the hardware converts it to linear light before a
+    /// shader reads it.
     Color,
+    /// A normal map, whose bytes are directions rather than colours.
+    /// Uploaded as linear data, so they reach a shader exactly as stored.
     Normal,
     /// A depth buffer, sampled by a pass that reconstructs position or measures
     /// distance.
@@ -17,16 +47,40 @@ pub enum TextureType {
     Depth,
 }
 
+/// Decoded image data under a name, ready for the renderer to upload.
+///
+/// Plain data rather than a GPU resource: the renderer holds the matching
+/// texture, view and sampler, and re-uploads them when the asset's version
+/// moves, so a game edits the texture it holds instead of GPU state.
 #[derive(Clone, Debug)]
 pub struct Texture {
+    /// Label used in logs, profiling and error messages.
     pub name: String,
+    /// Pixels in RGBA order, four bytes per texel. The constructors check the
+    /// length against the dimensions before a texture exists.
     pub rgba: Vec<u8>,
+    /// Width in texels.
     pub width: u32,
+    /// Height in texels.
     pub height: u32,
+    /// How a shader should read the pixels.
     pub texture_type: TextureType,
 }
 
 impl Texture {
+    /// Builds a texture by decoding an image file.
+    ///
+    /// The loader supplies the bytes and the texture keeps its name, so a
+    /// decode failure is reported against the asset being loaded rather than
+    /// an anonymous buffer. Whatever format the file carries, the pixels are
+    /// converted to RGBA8 before they are stored.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the loader reports when the file is missing or
+    /// unreadable, [`AssetLoadError::Decode`] when the bytes are not a
+    /// decodable image, and (through [`Self::from_rgba`]) a decode error when
+    /// the image's dimensions do not match its pixel buffer.
     pub fn new(
         name: impl Into<String>,
         texture_type: TextureType,
@@ -40,29 +94,47 @@ impl Texture {
         })?;
         let image = image.to_rgba8();
         let (width, height) = image.dimensions();
-        Ok(Self::from_rgba(
-            name,
-            texture_type,
-            image.into_raw(),
-            width,
-            height,
-        ))
+        Self::from_rgba(name, texture_type, image.into_raw(), width, height)
     }
 
+    /// Wraps an RGBA byte buffer as a texture, checked against the declared
+    /// dimensions.
+    ///
+    /// This is the constructor for pixels that were made rather than loaded -
+    /// a procedural image, a single-colour stand-in - where no file exists to
+    /// decode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AssetLoadError::Decode`] when the buffer's length is not
+    /// `width * height * 4`. The GPU upload checks the same thing later, but it
+    /// can only report the mismatch as an upload failure; catching it here
+    /// names the texture while its own numbers are still at hand.
     pub fn from_rgba(
         name: impl Into<String>,
         texture_type: TextureType,
         rgba: Vec<u8>,
         width: u32,
         height: u32,
-    ) -> Self {
-        Self {
-            name: name.into(),
+    ) -> AssetLoadResult<Self> {
+        let name = name.into();
+        let expected_bytes = width as usize * height as usize * 4;
+        if rgba.len() != expected_bytes {
+            return Err(AssetLoadError::Decode {
+                label: name,
+                detail: format!(
+                    "declares {width}x{height} but carries {} bytes of RGBA data (expected {expected_bytes})",
+                    rgba.len()
+                ),
+            });
+        }
+        Ok(Self {
+            name,
             rgba,
             width,
             height,
             texture_type,
-        }
+        })
     }
 }
 

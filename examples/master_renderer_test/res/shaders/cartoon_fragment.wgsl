@@ -1,29 +1,36 @@
-struct MaterialParameters {
-    posterize_level: f32,
+@binding(0) @group(3) var color_texture : texture_2d<f32>;
+
+@binding(1) @group(3) var color_sampler : sampler;
+
+struct MaterialParams
+{
+    @align(16) posterize_level : f32,
 };
 
-@group(2) @binding(0)
-var<uniform> material: MaterialParameters;
+@binding(0) @group(2) var<uniform> material : MaterialParams
 
-@group(3) @binding(0)
-var color_texture: texture_2d<f32>;
+struct PixelInput
+{
+    @location(0) in_vertex_position : vec3<f32>,
+    @location(1) in_vertex_texture_coords : vec2<f32>,
+    @location(2) in_TBN_tangent : vec3<f32>,
+    @location(3) in_TBN_bitangent : vec3<f32>,
+    @location(4) in_TBN_normal : vec3<f32>,
+    @location(5) in_world_position : vec3<f32>,
+};
 
-@group(3) @binding(1)
-var color_sampler: sampler;
-
-struct FragmentInput {
-    @location(0) vertex_position: vec3<f32>,
-    @location(1) texture_coordinates: vec2<f32>,
-    @location(2) tbn_tangent: vec3<f32>,
-    @location(3) tbn_bitangent: vec3<f32>,
-    @location(4) tbn_normal: vec3<f32>,
-    @location(5) world_position: vec3<f32>,
+struct PixelOutput
+{
+    @location(0) output : vec4<f32>,
 };
 
 @fragment
-fn fs_main(input: FragmentInput) -> @location(0) vec4<f32> {
-    let color = textureSample(color_texture, color_sampler, input.texture_coordinates);
-    let levels = max(material.posterize_level, 1.0);
-    let posterized = floor(color.rgb * levels) / levels;
-    return vec4<f32>(posterized, color.a);
+fn fs_main(input : PixelInput) -> PixelOutput
+{
+    var color : vec4<f32> = (textureSample((color_texture), (color_sampler), (input.in_vertex_texture_coords)));
+    var levels : f32 = max(material.posterize_level, 1.0f);
+    var posterized : vec3<f32> = floor(color.rgb * levels) / levels;
+    var output : PixelOutput = PixelOutput(posterized, 1.0f);
+    return output;
 }
+

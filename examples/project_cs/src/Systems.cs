@@ -196,7 +196,7 @@ public static class BallPhysicsSystem
             // renderer expects the top-left corner of the quad.
             position.X = physics.PositionX - physics.Radius;
             position.Y = physics.PositionY - physics.Radius;
-            transform = TransformComponent.At((physics.PositionX-400.0f)/80.0f,(300.0f-physics.PositionY)/80.0f,0.0f,physics.Radius/80.0f);
+            transform = TransformComponent.At((physics.PositionX - 400.0f) / 80.0f, (300.0f - physics.PositionY) / 80.0f, 0.0f, physics.Radius / 80.0f);
         }
     }
 }
@@ -308,7 +308,7 @@ public static class SplinePathSystem
                 // meshs draw from the top-left corner of their quad.
                 position.X = x - SplineSampleDotSize * 0.5f;
                 position.Y = y - SplineSampleDotSize * 0.5f;
-                sampleRow.TransformComponent = TransformComponent.At((x-400.0f)/80.0f,(300.0f-y)/80.0f,0.0f,SplineSampleDotSize/160.0f);
+                sampleRow.TransformComponent = TransformComponent.At((x - 400.0f) / 80.0f, (300.0f - y) / 80.0f, 0.0f, SplineSampleDotSize / 160.0f);
             }
         }
     }
@@ -368,8 +368,8 @@ public static class BallSpawnSystem
                     X = ball.PositionX - ball.Radius,
                     Y = ball.PositionY - ball.Radius,
                 })
-                .With(TransformComponent.At((ball.PositionX-400.0f)/80.0f,(300.0f-ball.PositionY)/80.0f,0.0f,ball.Radius/80.0f))
-                .With(new MeshRendererComponent())
+                .With(TransformComponent.At((ball.PositionX - 400.0f) / 80.0f, (300.0f - ball.PositionY) / 80.0f, 0.0f, ball.Radius / 80.0f))
+                .With(MeshRendererComponent.None)
                 .Build();
         }
     }
@@ -434,19 +434,21 @@ public static class SplineSampleSpawnSystem
                     X = x - SplineSampleDotSize * 0.5f,
                     Y = y - SplineSampleDotSize * 0.5f,
                 })
-                .With(TransformComponent.At((x-400.0f)/80.0f,(300.0f-y)/80.0f,0.0f,SplineSampleDotSize/160.0f))
-                .With(new MeshRendererComponent())
+                .With(TransformComponent.At((x - 400.0f) / 80.0f, (300.0f - y) / 80.0f, 0.0f, SplineSampleDotSize / 160.0f))
+                .With(MeshRendererComponent.None)
                 .Build();
         }
     }
 }
 
 /// <summary>One camera looking down -Z at the mesh scene.</summary>
-public static class CameraSpawnSystem {
- [EcsSystem]
- public static void Run(Query<Read<CameraComponent>> cameras, Commands commands) {
-  foreach (var row in cameras.Rows()) { return; }
-  commands.CreateEntity().With(new DirectionalLightComponent {R=1,G=1,B=1,Intensity=3}).With(TransformComponent.At(0,0,0,1)).Build();
-  commands.CreateEntity().With(new CameraComponent { Enabled=1,VerticalFov=60,Near=0.1f,Far=1000 }).With(TransformComponent.At(0,0,9,1)).Build();
- }
+public static class CameraSpawnSystem
+{
+    [EcsSystem]
+    public static void Run(Query<Read<CameraComponent>> cameras, Commands commands)
+    {
+        foreach (var row in cameras.Rows()) { return; }
+        commands.CreateEntity().With(new DirectionalLightComponent { R = 1, G = 1, B = 1, Intensity = 3 }).With(TransformComponent.At(0, 0, 0, 1)).Build();
+        commands.CreateEntity().With(new CameraComponent { Enabled = 1, VerticalFov = 60, Near = 0.1f, Far = 1000 }).With(TransformComponent.At(0, 0, 9, 1)).Build();
+    }
 }

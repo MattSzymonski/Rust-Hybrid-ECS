@@ -1,30 +1,66 @@
 //! Public renderer failures at the host boundary.
+//!
+//! # Responsibilities
+//!
+//! - Declare [`RendererError`], the failures the renderer reports while it is
+//!   built and while frames are presented.
+//! - Provide the [`Result`] alias and [`ErrorContext`], so a call site can
+//!   attach a description of what it was doing to any failure beneath it.
+//! - Capture wgpu's uncaptured validation errors, which panic by default, and
+//!   turn them into messages a caller can report (`capturing_validation`).
+//!
+//! # Design
+//!
+//! The variants carry plain strings rather than `wgpu` error values: a host
+//! that links this crate under its `rendering` feature reports renderer
+//! failures without naming a graphics type. The `engine::renderer` namespace
+//! is shared with the sibling renderer backends, so a diagnostic code keeps
+//! its meaning whichever one a build links.
 
+// External crates
 use pill_core_macros::engine_error;
 
+/// Failures the renderer reports to its host.
+///
+/// Covers the startup path - surface, adapter, device - and frame
+/// acquisition, so the host handles one enum instead of the wgpu error types
+/// behind it.
 #[engine_error(namespace = engine::renderer, runtime = ::pill_core::error)]
 pub enum RendererError {
+    /// The GPU surface could not be created for the supplied window.
     #[message("failed to create the GPU surface: ", value(detail))]
     SurfaceCreation { detail: String },
+    /// No compatible GPU adapter was found for the surface.
     #[message("failed to find a compatible GPU adapter: ", value(detail))]
     AdapterRequest { detail: String },
+    /// The GPU device could not be created from the adapter.
     #[message("failed to create the GPU device: ", value(detail))]
     DeviceCreation { detail: String },
+    /// The surface advertises no texture formats to render into.
     #[message("GPU surface exposes no texture formats")]
     NoTextureFormats,
+    /// The surface advertises no alpha modes to present with.
     #[message("GPU surface exposes no alpha modes")]
     NoAlphaModes,
+    /// The surface stayed lost or outdated even after one reconfiguration.
     #[message("GPU surface was lost")]
     SurfaceLost,
+    /// The surface ran out of memory while providing a frame.
     #[message("GPU surface is out of memory")]
     SurfaceOutOfMemory,
+    /// Acquiring the surface texture failed for a reason other than loss or
+    /// out-of-memory, such as a timeout.
     #[message("failed to acquire the GPU surface texture: ", value(detail))]
     SurfaceTextureFailed { detail: String },
+    /// Every candidate surface configuration was refused by the driver, with
+    /// each refusal collected into `detail`.
     #[message(
         "no surface configuration was accepted by the GPU driver: ",
         value(detail)
     )]
     SurfaceConfigurationRefused { detail: String },
+    /// A resource the call referenced - a camera, a shader - is not in
+    /// storage.
     #[message("renderer resource was not found")]
     RendererResourceNotFound,
     /// An operation the caller described in its own words: the pass that reads a
@@ -37,9 +73,19 @@ pub enum RendererError {
     Other { detail: String },
 }
 
+/// The renderer's result alias: [`RendererError`] on the failure side.
 pub type Result<T> = std::result::Result<T, RendererError>;
 
+/// Turns any lower-level failure into a [`RendererError::Other`] carrying a
+/// description of what the caller was doing.
+///
+/// Implemented for every `Result<T, E>` whose error implements `Display`, and
+/// for `Option<T>`, so a call site can name its own operation - loading this
+/// texture, building this pass - instead of the enum growing a variant per
+/// operation.
 pub trait ErrorContext<T> {
+    /// Returns the value, or [`RendererError::Other`] holding `message` and,
+    /// for a `Result`, the original error's text.
     fn context(self, message: impl Into<String>) -> Result<T>;
 }
 
@@ -60,8 +106,8 @@ impl<T> ErrorContext<T> for Option<T> {
     }
 }
 
-/// Run a block of GPU work with wgpu's errors captured rather than delivered to
-/// its uncaptured-error handler.
+/// Runs a block of GPU work with wgpu's errors captured rather than delivered
+/// to its uncaptured-error handler.
 ///
 /// wgpu reports a refused pipeline, bind group or texture through that handler,
 /// which panics by default and takes the host down with it. There is no return
@@ -70,6 +116,12 @@ impl<T> ErrorContext<T> for Option<T> {
 /// them into a message the caller can attach to whatever asked for the work -
 /// the pass, the shader, the material - which is the difference between "the
 /// host died" and "this pass is not drawn, and here is why".
+///
+/// # Errors
+///
+/// Returns the captured validation error if the block provoked one, otherwise
+/// the captured out-of-memory error; when neither was reported, the block's
+/// value is returned as `Ok`.
 pub(crate) fn capturing_validation<T>(
     device: &wgpu::Device,
     make: impl FnOnce() -> T,
