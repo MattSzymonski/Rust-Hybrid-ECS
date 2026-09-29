@@ -78,12 +78,17 @@ pub(crate) fn open_panel_window(
         popouts,
     };
     let dom = VirtualDom::new_with_props(DetachedPanelWindow, props);
-    let mut config = Config::new().with_disable_context_menu(true).with_window(
-        WindowBuilder::new()
-            .with_title(format!("{} - ECS Editor", panel.title()))
-            .with_inner_size(LogicalSize::new(720.0, 520.0))
-            .with_transparent(panel == PanelKind::Scene && crate::SCENE_NEEDS_TRANSPARENT_WINDOW),
-    );
+    let builder = WindowBuilder::new()
+        .with_title(format!("{} - ECS Editor", panel.title()))
+        .with_inner_size(LogicalSize::new(720.0, 520.0));
+    let builder = if panel == PanelKind::Scene {
+        crate::scene_window_builder(builder)
+    } else {
+        builder
+    };
+    let mut config = Config::new()
+        .with_disable_context_menu(true)
+        .with_window(builder);
 
     if panel == PanelKind::Scene {
         // The renderer remains owned by the same host; only its native surface
