@@ -2,7 +2,7 @@
 //! the project's `project_settings.yaml` by
 //! `devops/tools/generate_shipping_bundle.py`.
 
-use pill_host::{StaticModule, StaticProject, StaticProjectBackend};
+use pill_host::{StaticModule, StaticProject, StaticProjectBackend, StaticRenderer};
 
 /// Every selected extension, in `project_settings.yaml` order.
 #[rustfmt::skip]
@@ -10,6 +10,10 @@ pub const STATIC_MODULES: &[StaticModule] = &[
     StaticModule {
         name: "pill_spline",
         init: pill_spline::register,
+    },
+    StaticModule {
+        name: "pill_audio",
+        init: pill_audio::register,
     },
 ];
 
@@ -20,11 +24,17 @@ pub fn project_backend() -> StaticProjectBackend {
     }
 }
 
+/// The renderer this binary links, or `None` for a headless build.
+pub fn static_renderer() -> Option<StaticRenderer> {
+    None
+}
+
 /// The complete shipping project: modules first, then the project.
 pub fn static_project() -> StaticProject {
     StaticProject {
         name: "Bouncing Balls",
         backend: project_backend(),
         modules: STATIC_MODULES,
+        renderer: static_renderer(),
     }
 }

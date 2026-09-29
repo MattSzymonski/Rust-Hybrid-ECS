@@ -4737,6 +4737,7 @@ dependencies = [
 name = "pill_shipping_bundle"
 version = "0.0.0"
 dependencies = [
+ "pill_audio",
  "pill_host",
  "pill_spline",
  "project",

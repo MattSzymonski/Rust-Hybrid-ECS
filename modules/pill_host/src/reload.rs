@@ -173,6 +173,23 @@ impl ReloadSubjectKind {
 ///
 /// Built fresh per reload rather than stored: it borrows the caller's library
 /// slot and graveyard mutably, and only for the transaction.
+/// Whether a subject's retired generations are ever unmapped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GraveyardPolicy {
+    /// Keep at most [`MAX_GRAVEYARD_GENERATIONS`] retired images mapped and
+    /// evict the oldest past that, once no column still needs its tables.
+    Bounded,
+    /// Never unmap a retired image.
+    ///
+    /// For a subject whose images leave pointers behind that nothing here can
+    /// track or release. The renderer module is one: wgpu, the graphics driver
+    /// and the `tracing` callsite registry in the shared `pill_core.dll` all
+    /// keep state that points into the image that created it, and a renderer
+    /// whose oldest generation was evicted hung the host's frame loop. The cost
+    /// is one mapped image per reload, which a development session can afford.
+    KeepAll,
+}
+
 pub(crate) struct ReloadTransaction<'a> {
     /// Name used in every log line and analytics record.
     pub(crate) subject: &'a str,
@@ -193,6 +210,8 @@ pub(crate) struct ReloadTransaction<'a> {
     /// the subject has stopped owning can be dropped while the image holding
     /// its drop function is still mapped.
     pub(crate) registered_resource_ids: &'a mut Vec<pill_engine::ResourceId>,
+    /// Whether retired generations may be unmapped.
+    pub(crate) graveyard_policy: GraveyardPolicy,
 }
 
 /// What a committed reload registered, for the caller to record.
@@ -237,6 +256,7 @@ pub(crate) fn initialize_generation(
     scope: Option<SystemOwner>,
     clearing_owner: SystemOwner,
     library: &NativeLibrary,
+    first_load_failure: FirstLoadFailure,
 ) -> GenerationInit {
     // Step 1: Sequences before the call, so `since` compares this generation
     // against the state just before it ran and not against zero - the log
@@ -264,7 +284,20 @@ pub(crate) fn initialize_generation(
     };
 
     if status != 0 {
-        clear_failed_generation(engine, subject, clearing_owner);
+        match first_load_failure {
+            FirstLoadFailure::ClearWorld => {
+                clear_failed_generation(engine, subject, clearing_owner)
+            }
+            FirstLoadFailure::ClearSystemsOnly => {
+                let removed = engine.clear_systems_owned_by(clearing_owner);
+                info!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    module = subject,
+                    removed_systems = removed,
+                    "cleared the failed generation's systems and kept the world"
+                );
+            }
+        }
         return GenerationInit {
             status,
             registered_type_names: Vec::new(),
@@ -291,6 +324,25 @@ pub(crate) fn initialize_generation(
             .world()
             .registered_component_names_since(component_sequence),
     }
+}
+
+/// What a failed first load of an artifact costs the world.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FirstLoadFailure {
+    /// Replace the whole world ([`clear_failed_generation`]). The only sound
+    /// answer for an artifact that may own data: its columns and resources
+    /// carry drop glue from the image about to be unmapped.
+    ClearWorld,
+    /// Clear only the artifact's systems and keep the world.
+    ///
+    /// Sound only together with two promises the caller keeps: the artifact
+    /// registers no data (the renderer module's components, assets and
+    /// resources are `pill_renderer_api`'s, registered by the host), and the
+    /// failed image is never unmapped, so anything it did touch still points
+    /// at mapped code. The renderer module first loads when the window opens,
+    /// after the project has filled the world, which is why wiping the world
+    /// there would cost the scene.
+    ClearSystemsOnly,
 }
 
 /// Release everything one failed generation owns, while its image is mapped.
@@ -333,8 +385,15 @@ pub(crate) enum LoadValidation {
 /// call, whether the ABI check applies, and the exact refusal wording the
 /// Python suites match - are parameters, not a second lifecycle.
 ///
+/// `before_commit` runs once the replacement has built, loaded and passed
+/// validation, immediately before the swap - and not at all when an earlier
+/// step refused it. It is where a subject releases state that must be dropped
+/// while the retiring image is still mapped and that the transaction itself
+/// does not know about: the renderer module detaches its GPU backend there.
+///
 /// Returns the commit when the swap happened, `None` when anything was
 /// refused.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_load_and_commit(
     engine: &mut Engine,
     engine_api: &EngineApi,
@@ -342,6 +401,7 @@ pub(crate) fn build_load_and_commit(
     build: impl FnOnce(Option<(&AtomicU64, u64)>) -> Result<PathBuf, BuildError>,
     cancel_flag: Option<(&AtomicU64, u64)>,
     validation: LoadValidation,
+    before_commit: &mut dyn FnMut(),
     transaction: ReloadTransaction<'_>,
 ) -> Option<ReloadCommit> {
     let subject = transaction.subject;
@@ -390,6 +450,7 @@ pub(crate) fn build_load_and_commit(
     }
 
     // Step 3: The shared transaction, whose own step order is load-bearing.
+    before_commit();
     transaction.commit(engine, engine_api, new_library)
 }
 
@@ -424,6 +485,15 @@ impl ReloadTransaction<'_> {
     /// rather than risking a call into freed memory.
     fn retire_library(&mut self, library: NativeLibrary, world: &World) {
         self.old_libraries.push(library);
+        if self.graveyard_policy == GraveyardPolicy::KeepAll {
+            debug!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                subject = self.subject,
+                generations = self.old_libraries.len(),
+                "keeping every retired generation mapped"
+            );
+            return;
+        }
         if self.old_libraries.len() > MAX_GRAVEYARD_GENERATIONS {
             let orphaned = world.columns_without_factory();
             if orphaned != 0 {

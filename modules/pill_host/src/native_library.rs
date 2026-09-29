@@ -1050,6 +1050,27 @@ impl NativeLibrary {
         }
     }
 
+    /// Resolve an export only one kind of caller knows about, or `None` when
+    /// the library does not export it.
+    ///
+    /// The loader caches the exports every artifact may have; an export that
+    /// belongs to one module's own contract - the renderer's attach and detach
+    /// entry points - is looked up here, once, by the caller that knows its
+    /// signature, rather than widening this type for every such module.
+    ///
+    /// # Safety
+    ///
+    /// `T` must be the export's exact function-pointer type. The pointer is
+    /// valid only while this library stays mapped.
+    #[cfg(feature = "rendering")]
+    pub(crate) unsafe fn resolve_export<T: Copy>(&self, name: &[u8]) -> Option<T> {
+        let library = self.library.as_ref()?;
+        // SAFETY: the caller states `T` is the export's type; the returned
+        // copy of the pointer is valid while `library` keeps the image mapped,
+        // which the caller's contract bounds its use to.
+        unsafe { library.get::<T>(name) }.ok().map(|symbol| *symbol)
+    }
+
     /// Call the optional native per-frame update entry point, when exported.
     ///
     /// Artifacts that omit `pill_module_update` run entirely through their registered

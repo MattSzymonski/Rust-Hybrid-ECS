@@ -69,6 +69,9 @@ mod reload;
 mod render_window;
 /// The renderer's plain data, registered in every posture before anything loads.
 mod renderer_data;
+/// The GPU renderer as a loaded module: starting it and driving its backend.
+#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+mod renderer_module;
 /// Complete standalone application runner owned by the host crate.
 mod runner;
 /// Engine ownership and frontend-facing frame orchestration.
@@ -99,7 +102,7 @@ pub use pill_core::error::{
 /// The project and modules a shipping build links in, in place of a
 /// [`HostConfig`]: with `hot_reload` off nothing is built, watched or loaded.
 #[cfg(not(feature = "hot_reload"))]
-pub use static_link::{StaticModule, StaticProject, StaticProjectBackend};
+pub use static_link::{StaticModule, StaticProject, StaticProjectBackend, StaticRenderer};
 // Standalone runner, frame orchestration, and telemetry bootstrap.
 pub use runner::run;
 pub use runtime::{run_one_frame, setup, FrameReport, Host, ProjectSource};
@@ -120,7 +123,7 @@ pub use pill_engine::EngineError;
 #[cfg(feature = "rendering")]
 pub use crate::frontend::{FrontendError, RenderingError};
 #[cfg(feature = "rendering")]
-pub use pill_master_renderer::{RenderViewport, RendererError};
+pub use pill_renderer_api::{RenderViewport, RendererError};
 #[cfg(feature = "rendering")]
 pub use render_window::RendererWindow;
 

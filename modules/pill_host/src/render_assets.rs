@@ -7,7 +7,7 @@
 //!   ignores them.
 //! - Hold the native-assets handle the host stores beside the engine.
 
-use pill_master_renderer::RendererError;
+use pill_renderer_api::RendererError;
 use std::path::Path;
 
 /// Handle for native renderer assets owned by the host.

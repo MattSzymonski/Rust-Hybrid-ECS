@@ -20,10 +20,15 @@ miette = { version = "7", features = ["derive"] }
 # registers it so projects that declare cameras, meshes and lights load
 # unchanged, and the C# bridge binds those types natively in both postures.
 pill_renderer_api = { path = "../pill_renderer_api" }
-# The wgpu renderer, and the only crate in the workspace that owns wgpu. The
-# host is the only thing that links it: keeping it out of `pill_engine` keeps
-# the graphics stack out of every loaded module and every hot patch.
-pill_master_renderer = { path = "../extensions/rendering/pill_master_renderer", optional = true }
+# Dependency GRAPH only - never named in code, and renamed so any use stands
+# out. Every module and project build is resolved together with the running
+# host (see `build_runner::apply_cargo_host_overrides`), and cargo folds each
+# dependency's resolution into `pill_core.dll`'s symbol names. The renderer
+# module's build includes wgpu; if the host's did not, the two would link
+# different `pill_core.dll`s and the renderer module could not load. Declaring
+# the renderer here puts wgpu's graph into the host's resolution without
+# linking any of it: rlibs link as archives, and nothing references this one.
+renderer_dependency_graph = { package = "pill_master_renderer", path = "../extensions/pill_master_renderer", optional = true }
 libloading = "0.8"
 notify = "6"
 serde = { version = "1", features = ["derive"] }
@@ -43,14 +48,15 @@ winit = { version = "0.30", optional = true }
 # DLL. Turning it OFF selects the shipping posture - nothing is watched, built
 # or loaded at runtime, and the project is linked into the binary instead.
 default = ["hot_reload"]
-# Reload edited code without a restart. In a windowed build this also turns on
-# the renderer's development shader reload (weak: headless never links it).
-hot_reload = ["pill_master_renderer?/shader-hot-reload"]
-# A windowed host: the winit event loop plus the wgpu renderer. Nothing is
-# forwarded to `pill_engine` or `pill_core` any more - neither has a
-# `rendering` feature, which is what lets a module and a hot patch link the
-# same engine the host does without any of the graphics stack.
-rendering = ["dep:winit", "dep:pill_master_renderer"]
+# Reload edited code without a restart. Also compiles the renderer data's
+# development shader reload, which only a windowed host ever starts.
+hot_reload = ["pill_renderer_api/shader-hot-reload"]
+# A windowed host: the winit event loop, and the renderer module it loads and
+# attaches to the window. The host itself links no renderer and no wgpu: the
+# graphics stack exists only inside that module. Nothing is forwarded to
+# `pill_engine` or `pill_core` - neither has a `rendering` feature, which is
+# what lets a module and a hot patch link the same engine the host does.
+rendering = ["dep:winit", "dep:renderer_dependency_graph"]
 # Enable Tracy profiling: engine profiling zones plus the Tracy tracing layer.
 profiling = ["pill_engine/profiling", "pill_core/tracy"]
 # Investigative fine-grained profiling zones.

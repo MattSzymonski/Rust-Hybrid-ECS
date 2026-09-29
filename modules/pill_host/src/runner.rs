@@ -125,7 +125,7 @@ impl ApplicationHandler for WindowedApplication {
             }
             Err(error) => {
                 report_failure("renderer attachment", &error);
-                self.setup_error = Some(error.into());
+                self.setup_error = Some(error);
                 event_loop.exit();
             }
         }

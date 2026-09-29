@@ -100,6 +100,8 @@ mod slot {
         /// registered, exposed to the C# backend so `project_cs` can use the
         /// module's native components through byte-level bindings.
         exposed_component_names: Vec<String>,
+        /// Whether this module's retired generations may be unmapped.
+        graveyard_policy: crate::reload::GraveyardPolicy,
     }
 
     /// What a module reload attempt did.
@@ -148,6 +150,7 @@ mod slot {
             config: &ExtensionConfig,
             owner: SystemOwner,
             source_edit_generation: Arc<AtomicU64>,
+            first_load_failure: crate::reload::FirstLoadFailure,
         ) -> Result<Self, HostError> {
             // Step 1: Compile the module through the shared command runner.
             let output_path = build_extension(workspace_root, config, None)?;
@@ -163,6 +166,19 @@ mod slot {
             // own owner, so a later reload can remove exactly these systems.
             // The capture, init and failure handling are shared with the
             // project path - see `crate::reload`.
+            // Under `ClearSystemsOnly` the module may register no data of its
+            // own, so what already exists is noted first: re-registering a
+            // shared component the host registered - which `#[pill_module]`'s
+            // generated `init` does for every derived component it links - is
+            // not new data, and must not count against it.
+            let registered_before = (first_load_failure
+                == crate::reload::FirstLoadFailure::ClearSystemsOnly)
+                .then(|| {
+                    (
+                        engine.world().registered_component_names_since(0),
+                        engine.world().resource_ids_registered_since(0),
+                    )
+                });
             let init = crate::reload::initialize_generation(
                 engine,
                 engine_api,
@@ -170,13 +186,54 @@ mod slot {
                 Some(owner),
                 owner,
                 &library,
+                first_load_failure,
             );
-            if init.status != 0 {
-                return Err(ModuleError::InitializationFailed {
-                    module: config.name.clone(),
-                    status: init.status,
+            // Under `ClearSystemsOnly` a refused image stays mapped for good:
+            // that is half of what makes keeping the world sound (see
+            // `FirstLoadFailure`). It leaks one image and its staged copy,
+            // which the next host startup cleans up.
+            let refuse = |library: NativeLibrary, error: HostError| {
+                if first_load_failure == crate::reload::FirstLoadFailure::ClearSystemsOnly {
+                    std::mem::forget(library);
                 }
-                .into());
+                Err(error)
+            };
+            if init.status != 0 {
+                return refuse(
+                    library,
+                    ModuleError::InitializationFailed {
+                        module: config.name.clone(),
+                        status: init.status,
+                    }
+                    .into(),
+                );
+            }
+            // The other half: a module that may keep the world on failure
+            // must own no data, so one that registered data nobody had
+            // registered before it is refused.
+            if let Some((components_before, resources_before)) = &registered_before {
+                let new_components = init
+                    .component_names
+                    .iter()
+                    .filter(|name| !components_before.contains(name))
+                    .count();
+                let new_resources = init
+                    .registered_resource_ids
+                    .iter()
+                    .filter(|id| !resources_before.contains(id))
+                    .count();
+                if new_components != 0 || new_resources != 0 {
+                    engine.clear_systems_owned_by(owner);
+                    return refuse(
+                        library,
+                        ModuleError::RegisteredForbiddenData {
+                            module: config.name.clone(),
+                            components: new_components,
+                            resources: new_resources,
+                        }
+                        .into(),
+                    );
+                }
             }
 
             info!(
@@ -196,7 +253,17 @@ mod slot {
                 registered_type_names: init.registered_type_names,
                 registered_resource_ids: init.registered_resource_ids,
                 exposed_component_names: init.component_names,
+                graveyard_policy: crate::reload::GraveyardPolicy::Bounded,
             })
+        }
+
+        /// Never unmap this module's retired generations.
+        ///
+        /// For a module whose images leave state behind that the reload
+        /// transaction cannot track: see [`crate::reload::GraveyardPolicy::KeepAll`].
+        #[cfg(feature = "rendering")]
+        pub(crate) fn keep_every_generation(&mut self) {
+            self.graveyard_policy = crate::reload::GraveyardPolicy::KeepAll;
         }
 
         /// Reload this module when its watcher signalled a source change.
@@ -215,6 +282,24 @@ mod slot {
             engine_api: &EngineApi,
             workspace_root: &Path,
         ) -> ReloadOutcome {
+            self.reload_if_changed_with(engine, engine_api, workspace_root, &mut || {})
+        }
+
+        /// [`Self::reload_if_changed`], running `before_commit` once the
+        /// replacement has built, loaded and passed the ABI check, immediately
+        /// before it is swapped in - and not at all when an earlier step
+        /// refused it.
+        ///
+        /// For a module whose caller holds state built on the current image
+        /// that has to be released while that image is still mapped: the
+        /// renderer module's GPU backend.
+        pub(crate) fn reload_if_changed_with(
+            &mut self,
+            engine: &mut Engine,
+            engine_api: &EngineApi,
+            workspace_root: &Path,
+            before_commit: &mut dyn FnMut(),
+        ) -> ReloadOutcome {
             let generation = self.source_edit_generation.load(Ordering::Acquire);
             if generation == self.last_processed_source_edit {
                 return ReloadOutcome::Unchanged;
@@ -226,7 +311,13 @@ mod slot {
                 generation,
                 "extension reload triggered"
             );
-            let outcome = self.reload(engine, engine_api, workspace_root, generation);
+            let outcome = self.reload(
+                engine,
+                engine_api,
+                workspace_root,
+                generation,
+                before_commit,
+            );
 
             // The generation observed BEFORE the reload, deliberately, not a fresh
             // read. A save during the build advances the counter past this value,
@@ -274,13 +365,14 @@ mod slot {
         /// save that lands while the patch is compiling advances the counter past
         /// it, and that save has not been delivered by anything. Recording it as
         /// handled would strand the edit on disk.
-        #[cfg(feature = "hot_patch")]
+        #[cfg(any(feature = "hot_patch", feature = "rendering"))]
         pub(crate) fn consume_pending_reload(&mut self, generation: u64) {
             self.last_processed_source_edit = generation;
         }
 
-        /// The module's currently loaded library, as a patch target.
-        #[cfg(feature = "hot_patch")]
+        /// The module's currently loaded library: a patch target, and where the
+        /// renderer module's attach and detach exports are resolved.
+        #[cfg(any(feature = "hot_patch", feature = "rendering"))]
         pub(crate) fn current_library(&self) -> &NativeLibrary {
             &self.current
         }
@@ -326,6 +418,7 @@ mod slot {
             engine_api: &EngineApi,
             workspace_root: &Path,
             generation: u64,
+            before_commit: &mut dyn FnMut(),
         ) -> ReloadOutcome {
             // Steps 1 to 3 are shared with the project path and live in
             // `crate::reload`: compile before touching engine state (a newer
@@ -340,6 +433,7 @@ mod slot {
                 old_libraries: &mut self.old_libraries,
                 registered_type_names: &mut self.registered_type_names,
                 registered_resource_ids: &mut self.registered_resource_ids,
+                graveyard_policy: self.graveyard_policy,
             };
             let Some(commit) = crate::reload::build_load_and_commit(
                 engine,
@@ -348,6 +442,7 @@ mod slot {
                 |cancel_flag| build_extension(workspace_root, &self.config, cancel_flag),
                 Some((&self.source_edit_generation, generation)),
                 crate::reload::LoadValidation::ModuleAbi,
+                before_commit,
                 transaction,
             ) else {
                 // A refused step left the previous generation running.

@@ -42,7 +42,7 @@ EXAMPLE USAGE
   python devops/tests/test_coding_standards.py --root modules/pill_engine/src
   python devops/tests/test_coding_standards.py modules/pill_core/src/lib.rs
   python devops/tests/test_coding_standards.py --root modules \
-      --exclude modules/extensions/rendering/pill_master_renderer
+      --exclude modules/extensions/pill_master_renderer
 
   Exit status: 0 when every checked file complies, 1 when at least one
   violation is reported, 2 on a usage error.
@@ -440,7 +440,7 @@ def build_parser() -> argparse.ArgumentParser:
             "  test_coding_standards.py --root modules/pill_engine/src\n"
             "  test_coding_standards.py modules/pill_core/src/lib.rs\n"
             "  test_coding_standards.py --root modules --exclude "
-            "modules/extensions/rendering/pill_master_renderer\n"
+            "modules/extensions/pill_master_renderer\n"
         ),
     )
     parser.add_argument(
