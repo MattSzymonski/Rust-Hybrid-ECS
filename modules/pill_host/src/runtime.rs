@@ -340,6 +340,7 @@ pub struct RenderingHost {
     assets: crate::render_assets::NativeAssets,
     viewport: Option<RenderViewport>,
     presented_scene: bool,
+    presented_last_frame: bool,
 }
 
 #[cfg(feature = "rendering")]
@@ -382,6 +383,7 @@ impl RenderingHost {
 
     /// Execute one ECS frame and present its resulting world to the surface.
     pub fn run_one_frame(&mut self) -> Result<Option<FrameReport>, RendererError> {
+        self.presented_last_frame = false;
         self.assets.update(self.host.engine_mut())?;
         let report = run_one_frame(&mut self.host);
         // The renderer reads both resources straight out of the world - the
@@ -395,6 +397,8 @@ impl RenderingHost {
             world.get_resource::<pill_engine::AssetManager>(),
         ) {
             let outcome = self.renderer.render(frame, assets)?;
+            self.presented_last_frame =
+                matches!(outcome, pill_master_renderer::FrameOutcome::Presented);
             if !self.presented_scene
                 && matches!(outcome, pill_master_renderer::FrameOutcome::Presented)
                 && self.renderer.metrics().draw_calls > 0
@@ -409,6 +413,15 @@ impl RenderingHost {
             }
         }
         Ok(report)
+    }
+
+    /// Whether the last [`Self::run_one_frame`] presented an image to the
+    /// surface, as opposed to skipping it (minimised, no camera) or failing.
+    ///
+    /// Frontends that pace presentation themselves need this: a skipped frame
+    /// commits nothing to the surface, so nothing the compositor could answer.
+    pub fn presented_last_frame(&self) -> bool {
+        self.presented_last_frame
     }
 
     /// Read live frame statistics for UI overlays without affecting the
@@ -800,6 +813,7 @@ where
         assets,
         viewport: None,
         presented_scene: false,
+        presented_last_frame: false,
     })
 }
 
@@ -850,6 +864,7 @@ where
         assets,
         viewport: None,
         presented_scene: false,
+        presented_last_frame: false,
     })
 }
 

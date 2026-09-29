@@ -1694,6 +1694,7 @@ version = "0.1.0"
 dependencies = [
  "dioxus",
  "futures-util",
+ "gtk",
  "miette",
  "pill_core",
  "pill_core_macros",
@@ -1707,6 +1708,8 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "wayland-backend",
+ "wayland-client",
  "x11-dl",
 ]
 
