@@ -151,11 +151,13 @@ pub struct StaticRenderer {
 }
 
 /// `attach(window, width, height)`: a renderer backend built on `window`.
-pub type StaticRendererAttachFn = unsafe fn(
-    pill_renderer_api::RawWindowData,
-    u32,
-    u32,
-) -> Result<Box<dyn pill_renderer_api::PillRenderer>, pill_renderer_api::RendererError>;
+pub type StaticRendererAttachFn =
+    unsafe fn(
+        pill_renderer_api::RawWindowData,
+        u32,
+        u32,
+    )
+        -> Result<Box<dyn pill_renderer_api::PillRenderer>, pill_renderer_api::RendererError>;
 
 /// A project and its extensions, compiled into the host binary.
 ///

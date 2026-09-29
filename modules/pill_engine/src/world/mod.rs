@@ -409,9 +409,18 @@ pub struct World {
     /// from two threads at once. Their resource ids are disjoint - the
     /// scheduler guarantees that - but a `HashSet` is not safe to mutate
     /// concurrently whatever the keys are.
+    ///
+    /// A `std` mutex, never `parking_lot`: this `World` is shared by the host
+    /// and every loaded artifact, and each of them links its own copy of
+    /// `pill_engine` - and with it its own `parking_lot`, whose table of
+    /// parked threads is per copy. A thread that parked in one copy's table
+    /// was never found by an unlock running another copy's code, so two
+    /// systems from different artifacts contending here deadlocked the frame.
+    /// `std` is one shared library in this build, and on Windows its mutex
+    /// waits on the lock's own address, so a wakeup reaches the waiter
+    /// whichever artifact unlocks.
     #[cfg(debug_assertions)]
-    pub(crate) debug_resource_write_locks:
-        parking_lot::Mutex<std::collections::HashSet<ResourceId>>,
+    pub(crate) debug_resource_write_locks: std::sync::Mutex<std::collections::HashSet<ResourceId>>,
 
     /// Number of deferred commands executed in the current frame.
     /// Set by `CommandQueue::execute_queued_commands`, read by the Engine for Tracy plots.
@@ -509,7 +518,7 @@ impl World {
             system_last_run: 0,
             archetype_generation: 0,
             #[cfg(debug_assertions)]
-            debug_resource_write_locks: parking_lot::Mutex::new(std::collections::HashSet::new()),
+            debug_resource_write_locks: std::sync::Mutex::new(std::collections::HashSet::new()),
             commands_executed_this_frame: 0,
             iterator_timings: std::sync::Arc::new(std::sync::Mutex::new(IteratorTimings::new())),
             persist_serializers: HashMap::new(),

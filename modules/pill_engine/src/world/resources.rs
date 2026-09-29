@@ -981,7 +981,7 @@ impl World {
     /// `&mut World`, so this must be callable through a shared reference.
     #[cfg(debug_assertions)]
     pub(crate) fn debug_acquire_resource_lock(&self, id: ResourceId) {
-        let newly_inserted = self.debug_resource_write_locks.lock().insert(id);
+        let newly_inserted = self.debug_resource_write_locks().insert(id);
         debug_assert!(
             newly_inserted,
             "Resource {id:?} is already mutably borrowed by another live \
@@ -993,11 +993,23 @@ impl World {
     /// [`Self::debug_acquire_resource_lock`].
     #[cfg(debug_assertions)]
     pub(crate) fn debug_release_resource_lock(&self, id: ResourceId) {
-        self.debug_resource_write_locks.lock().remove(&id);
+        self.debug_resource_write_locks().remove(&id);
     }
 
     #[cfg(debug_assertions)]
     pub(crate) fn debug_clear_resource_locks(&mut self) {
-        self.debug_resource_write_locks.lock().clear();
+        self.debug_resource_write_locks().clear();
+    }
+
+    /// The debug write-lock set, taken even when a panicking holder poisoned
+    /// it: the set is bookkeeping for an assertion, and a poisoned one is
+    /// still the best record there is.
+    #[cfg(debug_assertions)]
+    fn debug_resource_write_locks(
+        &self,
+    ) -> std::sync::MutexGuard<'_, std::collections::HashSet<ResourceId>> {
+        self.debug_resource_write_locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
