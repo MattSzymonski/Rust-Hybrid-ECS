@@ -7,3 +7,4 @@ edition = "2021"
 pill_host = { path = "../../modules/pill_host", default-features = false }
 project = { path = "../../examples/project_rs" }
 pill_spline = { path = "../../modules/extensions/pill_spline", default-features = false }
+pill_audio = { path = "../../modules/extensions/pill_audio", default-features = false }

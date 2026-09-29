@@ -145,6 +145,23 @@ impl Renderer {
     }
 }
 
+impl Drop for Renderer {
+    /// Wait for the GPU to finish before the renderer's objects are released.
+    ///
+    /// A renderer is dropped when its module reloads, while the host keeps
+    /// running: work still in flight would otherwise reference buffers and
+    /// pipelines that are being destroyed, and the surface would be released
+    /// under a frame the driver has not presented yet.
+    fn drop(&mut self) {
+        if let Err(error) = self.state.device.poll(wgpu::PollType::Wait) {
+            pill_core::warn!(
+                target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                "the GPU did not go idle before the renderer was released: {error}"
+            );
+        }
+    }
+}
+
 impl PillRenderer for Renderer {
     fn capabilities(&self) -> RenderCapabilities {
         let limits = self.state.device.limits();

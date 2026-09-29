@@ -132,6 +132,31 @@ impl StaticProjectBackend {
     }
 }
 
+/// The renderer a windowed shipping build links, as the two functions the host
+/// needs from it.
+///
+/// Function pointers rather than a dependency: the host names no renderer type
+/// in any posture. The shipping bundle - the one crate that depends on the
+/// renderer - fills this in.
+#[derive(Clone, Copy)]
+pub struct StaticRenderer {
+    /// The renderer's registration (`pill_master_renderer::register`), which
+    /// adds the `rendering` system.
+    pub init: fn(&mut Engine) -> u32,
+    /// Builds a backend on a window (`pill_master_renderer::attach`).
+    ///
+    /// Unsafe for the renderer's own reason: the window must outlive the
+    /// backend, which the host guarantees by dropping the backend first.
+    pub attach: StaticRendererAttachFn,
+}
+
+/// `attach(window, width, height)`: a renderer backend built on `window`.
+pub type StaticRendererAttachFn = unsafe fn(
+    pill_renderer_api::RawWindowData,
+    u32,
+    u32,
+) -> Result<Box<dyn pill_renderer_api::PillRenderer>, pill_renderer_api::RendererError>;
+
 /// A project and its extensions, compiled into the host binary.
 ///
 /// Replaces [`HostConfig`](crate::HostConfig) for a shipping build. There is no
@@ -152,6 +177,26 @@ pub struct StaticProject {
     /// module's components registered before its assembly loads, so the
     /// bindings it is handed can resolve them.
     pub modules: &'static [StaticModule],
+    /// The renderer this binary links, when it was built to draw.
+    ///
+    /// `None` for a headless shipping build, which links no renderer at all.
+    pub renderer: Option<StaticRenderer>,
+}
+
+/// Register the statically linked renderer's `rendering` system under `owner`,
+/// exactly as its module entry point would.
+///
+/// # Errors
+///
+/// Returns the renderer's non-zero status, or `u32::MAX` for a registration
+/// error it left in the world.
+#[cfg(feature = "rendering")]
+pub(crate) fn initialize_static_renderer(
+    engine: &mut Engine,
+    renderer: StaticRenderer,
+    owner: SystemOwner,
+) -> Result<(), u32> {
+    initialize_one(engine, renderer.init, Some(owner))
 }
 
 impl StaticProject {
@@ -394,6 +439,7 @@ mod tests {
                 init: project_module_init,
             },
             modules: MODULES,
+            renderer: None,
         };
         project.initialize(&mut engine).expect("both succeed");
 
@@ -420,6 +466,7 @@ mod tests {
             name: "project",
             backend: StaticProjectBackend::Native { init: no_op },
             modules: MODULES,
+            renderer: None,
         };
         let Err(error) = project.initialize(&mut engine) else {
             panic!("a non-zero module status must be reported");
@@ -440,6 +487,7 @@ mod tests {
             name: "project",
             backend: StaticProjectBackend::Native { init: no_op },
             modules: &[],
+            renderer: None,
         };
         let runtime = project.initialize(&mut engine).expect("it succeeds");
         assert!(runtime.is_none());

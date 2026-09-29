@@ -64,7 +64,12 @@ pub mod resources;
 /// The window surface, its swapchain, and the lifecycle that keeps them live.
 mod surface;
 
+/// The C ABI a host drives this renderer through when it loads it as a module.
+#[cfg(feature = "module-abi")]
+mod module_entry;
+
 // External crates
+use pill_engine::{pill_module, Engine};
 pub use pill_renderer_api::components::*;
 pub use pill_renderer_api::{
     register_components, AssetLoader, FrameOutcome, HeadlessRenderer, Material, MaterialBuilder,
@@ -82,21 +87,47 @@ pub use instance::Instance;
 pub use renderer::Renderer;
 pub use resources::RenderingManager;
 
-/// Registers the renderer's data and its `rendering` system with an engine,
-/// and returns zero.
+/// The module's entry point: registers the post-update `rendering` system
+/// that fills the frame, once, and returns zero.
 ///
-/// The data - components, asset types, resources and the default pipeline -
-/// is [`pill_renderer_api::register`]'s; this adds the post-update `rendering`
-/// system that fills the frame, once. Every step checks what is already there,
-/// so a repeated call changes nothing.
-pub fn register(engine: &mut pill_engine::Engine) -> u32 {
-    pill_renderer_api::register(engine);
+/// Registers no data. The host registers `pill_renderer_api` - components,
+/// asset types, resources, the default pipeline - before anything loads, in
+/// every posture; registering it again from here would re-point the asset
+/// types' tables at this image, the one that reloads most often.
+///
+/// The system is registered under whatever scope the caller opened: a host
+/// loading this module scopes it to the module's own owner, so a reload clears
+/// exactly this system and the next generation registers its own. With
+/// `module-abi` on, `#[pill_module]` also exports this as `pill_module_init`.
+#[pill_module]
+pub fn register(engine: &mut Engine) -> u32 {
     if engine.is_system_enabled("rendering").is_none() {
-        engine.begin_module_registration(pill_engine::SystemOwner::ENGINE);
         engine.register_post_update_system("rendering", rendering_system);
-        engine.end_module_registration();
     }
     0
+}
+
+/// Build a renderer backend on a window, for a host that links this crate
+/// statically - the shipping posture, which has no module to load.
+///
+/// The loaded-module path reaches the same renderer through the
+/// `pill_renderer_attach` export instead.
+///
+/// # Errors
+///
+/// Returns a [`RendererError`] when surface, adapter or device creation fails.
+///
+/// # Safety
+///
+/// `window` must name a live window that outlives the returned renderer.
+pub unsafe fn attach(
+    window: pill_renderer_api::RawWindowData,
+    width: u32,
+    height: u32,
+) -> Result<Box<dyn PillRenderer>, RendererError> {
+    // SAFETY: forwarded from this function's own contract.
+    let renderer = unsafe { Renderer::new(window, width, height) }?;
+    Ok(Box::new(renderer))
 }
 
 #[cfg(test)]

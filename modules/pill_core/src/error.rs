@@ -751,6 +751,29 @@ pub enum ModuleError {
         value(status)
     )]
     InitializationFailed { module: String, status: u32 },
+
+    /// A module whose failures clear only its systems registered data.
+    ///
+    /// Clearing only systems on a failed load is sound because such a module
+    /// owns no data: its components and resources are registered by someone
+    /// else. One that registers its own is refused rather than trusted.
+    #[message(
+        "extension ",
+        name_style(module),
+        " registered ",
+        value(components),
+        " component type(s) and ",
+        value(resources),
+        " resource type(s), but may register no data"
+    )]
+    #[diagnostic(help(
+        "register the data in pill_renderer_api, which the host registers before any module loads"
+    ))]
+    RegisteredForbiddenData {
+        module: String,
+        components: usize,
+        resources: usize,
+    },
 }
 
 /// Source-watching startup failures.

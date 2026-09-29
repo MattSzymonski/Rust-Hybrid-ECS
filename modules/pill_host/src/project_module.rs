@@ -124,6 +124,7 @@ mod loaded {
                         None,
                         SystemOwner::PROJECT,
                         &library,
+                        crate::reload::FirstLoadFailure::ClearWorld,
                     );
                     if init.status != 0 {
                         return Err(LibraryError::InitializationFailed {
@@ -382,6 +383,7 @@ mod loaded {
             old_libraries,
             registered_type_names,
             registered_resource_ids,
+            graveyard_policy: crate::reload::GraveyardPolicy::Bounded,
         };
         crate::reload::build_load_and_commit(
             engine,
@@ -390,6 +392,7 @@ mod loaded {
             |cancel_flag| build_project_module(workspace_root, config, cancel_flag),
             cancel_flag,
             crate::reload::LoadValidation::None,
+            &mut || {},
             transaction,
         )
         .is_some()

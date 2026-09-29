@@ -36,7 +36,7 @@ use pill_engine::Engine;
 #[cfg(feature = "hot_reload")]
 use pill_engine::EngineApi;
 #[cfg(feature = "rendering")]
-use pill_master_renderer::{PillRenderer, RenderFrame, RenderViewport, RendererError};
+use pill_renderer_api::{PillRenderer, RenderFrame, RenderViewport, RendererError};
 
 // Current crate (rendering)
 #[cfg(feature = "rendering")]
@@ -87,6 +87,10 @@ pub struct Host {
     // Boxed before EngineApi is created so its raw engine pointer remains
     // stable even if Host is moved by a caller.
     engine: Box<Engine>,
+    /// The renderer a windowed shipping build links, with the owner its
+    /// `rendering` system registers under; `None` when the bundle links none.
+    #[cfg(all(feature = "rendering", not(feature = "hot_reload")))]
+    static_renderer: Option<(crate::static_link::StaticRenderer, pill_engine::SystemOwner)>,
     /// The C-callable table a loaded artifact is handed at every entry point.
     ///
     /// A pure function-pointer table with no side effects, so a statically
@@ -343,13 +347,25 @@ pub struct RenderingHost {
     renderer: Box<dyn PillRenderer>,
     /// The frontend window the renderer draws on, kept alive for it.
     window: AttachedWindow,
+    /// The renderer module the backend lives in. Declared after `renderer`
+    /// so the backend is detached while the module is still mapped.
+    #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+    renderer_module: RendererModule,
+    /// The window's handles as data, kept to attach a reloaded renderer
+    /// module to the same window.
+    #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+    window_data: pill_renderer_api::RawWindowData,
+    /// The surface size last handed to the renderer, which a reattached one
+    /// starts from.
+    #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
+    surface_size: (u32, u32),
     assets: crate::render_assets::NativeAssets,
     viewport: Option<RenderViewport>,
     presented_scene: bool,
     /// Re-cooks edited renderer shaders and updates their assets; `None` when
     /// the watch could not start, which only costs the reload.
     #[cfg(feature = "hot_reload")]
-    shader_reloader: Option<pill_master_renderer::ShaderReloader>,
+    shader_reloader: Option<pill_renderer_api::ShaderReloader>,
 }
 
 #[cfg(feature = "rendering")]
@@ -368,19 +384,95 @@ impl RenderingHost {
     where
         W: RendererWindow + 'static,
     {
-        let (renderer, window) = attach_window(window, width, height)?;
+        let (renderer, window, window_data) = attach_window(window, |window_data| {
+            attach_backend(&self.renderer_module, window_data, width, height)
+        })?;
         // Renderer first, then window: the old renderer drops while its window
         // is still alive, and only then is that window released.
         self.renderer = renderer;
         self.window = window;
+        self.window_data = window_data;
+        self.surface_size = (width, height);
         self.set_render_viewport(self.viewport);
         Ok(())
     }
 
     /// Forward a physical window resize to the engine renderer.
     pub fn resize(&mut self, width: u32, height: u32) {
+        self.surface_size = (width, height);
         self.renderer.resize(width, height);
         self.set_render_viewport(self.viewport);
+    }
+
+    /// Reload the renderer module when its sources changed, and keep the
+    /// window drawn by whichever generation is current afterwards.
+    ///
+    /// The backend is built on the current module image, so it is detached in
+    /// the reload's `before_commit` hook - after the replacement has built and
+    /// loaded, and before the swap retires the old image - while that image is
+    /// still mapped. Until the attach below, the host draws nothing. After the
+    /// commit, the slot's current library is the new generation, or the old
+    /// one when the new `init` failed and the transaction rolled back; both
+    /// are attached the same way. A build or load that failed never reaches
+    /// the hook, and the backend is left as it was.
+    ///
+    /// A backend that fails to attach leaves the window undrawn and is
+    /// retried on the next source change; the reason is logged.
+    #[cfg(feature = "hot_reload")]
+    fn reload_renderer_if_changed(&mut self) {
+        let RenderingHost {
+            host,
+            renderer,
+            renderer_module,
+            window_data,
+            surface_size,
+            viewport,
+            ..
+        } = self;
+        let mut detached = false;
+        let outcome = renderer_module.reload_if_changed(
+            &mut host.engine,
+            &host.engine_api,
+            &host.workspace_root,
+            &mut || {
+                // Dropping the module's backend runs its detach export inside
+                // the image that is about to retire, while it is still mapped.
+                *renderer = Box::new(pill_renderer_api::HeadlessRenderer);
+                detached = true;
+            },
+        );
+        // A generation that loaded for the first time - after a startup load
+        // that failed - has nothing attached yet, exactly like a detached one.
+        let loaded = outcome == crate::renderer_module::RendererModuleChange::Loaded;
+        if !detached && !loaded {
+            return;
+        }
+        let (width, height) = *surface_size;
+        match attach_backend(renderer_module, *window_data, width, height) {
+            Ok(attached) => {
+                *renderer = attached;
+                renderer.set_viewport(*viewport);
+                // Counted, not assumed: a generation whose system escaped its
+                // owner would leave a second `rendering` system behind.
+                let rendering_systems = host
+                    .engine
+                    .system_snapshots()
+                    .iter()
+                    .filter(|system| system.name == "rendering")
+                    .count();
+                info!(
+                    target: telemetry_target::HOT_RELOAD,
+                    outcome = ?outcome,
+                    rendering_systems,
+                    "renderer reattached to the window"
+                );
+            }
+            Err(error) => warn!(
+                target: telemetry_target::HOT_RELOAD,
+                outcome = ?outcome,
+                "renderer reloaded but could not reattach; the window stays undrawn until the next renderer edit: {error}"
+            ),
+        }
     }
 
     /// Restrict engine drawing to a physical region of the native surface.
@@ -395,6 +487,10 @@ impl RenderingHost {
 
     /// Execute one ECS frame and present its resulting world to the surface.
     pub fn run_one_frame(&mut self) -> Result<Option<FrameReport>, RendererError> {
+        // A renderer module whose sources changed is swapped first, so this
+        // frame is drawn by the generation that is current.
+        #[cfg(feature = "hot_reload")]
+        self.reload_renderer_if_changed();
         // An edited renderer shader becomes an asset edit here, before the
         // frame, so this frame's sync already rebuilds it.
         #[cfg(feature = "hot_reload")]
@@ -422,7 +518,7 @@ impl RenderingHost {
         ) {
             let outcome = self.renderer.render(frame, assets)?;
             if !self.presented_scene
-                && matches!(outcome, pill_master_renderer::FrameOutcome::Presented)
+                && matches!(outcome, pill_renderer_api::FrameOutcome::Presented)
                 && self.renderer.metrics().draw_calls > 0
             {
                 self.presented_scene = true;
@@ -594,6 +690,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
             module_config,
             pill_engine::SystemOwner::extension(index),
             Arc::clone(&module_generation),
+            crate::reload::FirstLoadFailure::ClearWorld,
         ) {
             Ok(slot) => slot,
             Err(error) => return Err(fail_setup(engine, error)),
@@ -775,9 +872,20 @@ pub fn setup(project: StaticProject) -> Result<Host, HostError> {
     // Step 2: Register every module, then the project, in the order and under
     // the owners the reloading path would have used.
     let managed_runtime = project.initialize(&mut engine)?;
+    // The renderer is registered when a window attaches it, like the loaded
+    // module; it takes the next owner after the modules, as that module does.
+    #[cfg(feature = "rendering")]
+    let static_renderer = project.renderer.map(|renderer| {
+        (
+            renderer,
+            pill_engine::SystemOwner::extension(project.modules.len()),
+        )
+    });
 
     Ok(Host {
         engine,
+        #[cfg(feature = "rendering")]
+        static_renderer,
         _managed_runtime: managed_runtime,
         last_frame_error: None,
         last_error_report: Instant::now(),
@@ -817,8 +925,8 @@ where
         height,
         "attaching the engine renderer to the window surface"
     );
-    let (renderer, window) = attach_window(window, width, height)?;
-    pill_master_renderer::register(host.engine_mut());
+    let (renderer_module, renderer, window, window_data) =
+        attach_renderer_module(&mut host, window, width, height)?;
     #[cfg(feature = "hot_reload")]
     let project_root = host
         .workspace_root
@@ -830,11 +938,14 @@ where
     let assets =
         crate::render_assets::NativeAssets::prepare(Some(&project_root), &host.workspace_root)?;
     #[cfg(not(feature = "hot_reload"))]
-    let assets = crate::render_assets::NativeAssets::prepare(None, std::path::Path::new("."))?;
+    let assets = crate::render_assets::NativeAssets::prepare(None)?;
     Ok(RenderingHost {
         host,
         renderer,
         window,
+        renderer_module,
+        window_data,
+        surface_size: (width, height),
         assets,
         viewport: None,
         presented_scene: false,
@@ -843,13 +954,139 @@ where
     })
 }
 
+/// The renderer module a windowed host loads: the extension slot it lives in.
+///
+/// The shipping posture loads no DLL; until it links the renderer statically
+/// (slice 2.8 of the renderer hot-reload plan) it has no renderer module.
+#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+type RendererModule = crate::renderer_module::RendererModule;
+/// The shipping posture's renderer: the bundle's statically linked one, with
+/// the owner its system registers under, or `None` when it links none.
+#[cfg(all(feature = "rendering", not(feature = "hot_reload")))]
+type RendererModule = Option<(crate::static_link::StaticRenderer, pill_engine::SystemOwner)>;
+
+/// Load the renderer module and attach it to `window`.
+///
+/// The module takes the next extension owner, so its `rendering` system is
+/// cleared and re-registered with it rather than living forever under the
+/// engine's owner.
+///
+/// # Errors
+///
+/// Returns a [`HostError`] when the module cannot be built, loaded or
+/// initialized, and a [`RendererError`] when attaching it to the window fails.
+#[cfg(feature = "rendering")]
+fn attach_renderer_module<W: RendererWindow>(
+    host: &mut Host,
+    window: W,
+    width: u32,
+    height: u32,
+) -> Result<
+    (
+        RendererModule,
+        Box<dyn PillRenderer>,
+        AttachedWindow,
+        pill_renderer_api::RawWindowData,
+    ),
+    crate::frontend::RenderingError,
+> {
+    #[cfg(feature = "hot_reload")]
+    {
+        let renderer_module = crate::renderer_module::RendererModule::start(
+            &mut host.engine,
+            &host.engine_api,
+            &host.workspace_root,
+            pill_engine::SystemOwner::extension(host.extensions.len()),
+        )?;
+        // A renderer that did not load, or loaded but could not attach, leaves
+        // the window blank rather than ending the host: the scene keeps
+        // running, and the next renderer edit loads and attaches again.
+        let (renderer, window, window_data) = attach_window(window, |window_data| {
+            if renderer_module.slot().is_none() {
+                // Already logged by the failed load.
+                return Ok(Box::new(pill_renderer_api::HeadlessRenderer));
+            }
+            Ok(attach_backend(&renderer_module, window_data, width, height).unwrap_or_else(
+                |failure| {
+                    error!(
+                        target: telemetry_target::HOT_RELOAD,
+                        "the renderer could not attach to the window; it stays blank until the next renderer edit: {failure}"
+                    );
+                    Box::new(pill_renderer_api::HeadlessRenderer)
+                },
+            ))
+        })?;
+        Ok((renderer_module, renderer, window, window_data))
+    }
+    // The shipping posture links the renderer statically: register its system
+    // the way its module entry point would, then attach through the bundle's
+    // function pointer. A build without one reports that from `attach_backend`.
+    #[cfg(not(feature = "hot_reload"))]
+    {
+        let renderer_module = host.static_renderer;
+        if let Some((renderer, owner)) = renderer_module {
+            crate::static_link::initialize_static_renderer(&mut host.engine, renderer, owner)
+                .map_err(|status| RendererError::Other {
+                    detail: format!("the renderer failed to initialize with status {status}"),
+                })?;
+        }
+        let (renderer, window, window_data) = attach_window(window, |window_data| {
+            attach_backend(&renderer_module, window_data, width, height)
+        })?;
+        Ok((renderer_module, renderer, window, window_data))
+    }
+}
+
+/// Build a backend on `window_data` from the loaded renderer module.
+///
+/// # Errors
+///
+/// Returns a [`RendererError`] when the module cannot attach, or - in the
+/// shipping posture - because no renderer is linked yet.
+#[cfg(feature = "rendering")]
+fn attach_backend(
+    renderer_module: &RendererModule,
+    window_data: pill_renderer_api::RawWindowData,
+    width: u32,
+    height: u32,
+) -> Result<Box<dyn PillRenderer>, RendererError> {
+    #[cfg(feature = "hot_reload")]
+    {
+        // SAFETY: every caller stores the backend in a `RenderingHost`, whose
+        // `renderer` field is declared before both `window` and
+        // `renderer_module`: the backend drops while the window is alive and
+        // the module is mapped.
+        unsafe {
+            crate::renderer_module::attach_module_renderer(
+                renderer_module,
+                window_data,
+                width,
+                height,
+            )
+        }
+    }
+    #[cfg(not(feature = "hot_reload"))]
+    {
+        let Some((renderer, _)) = renderer_module else {
+            return Err(RendererError::Other {
+                detail:
+                    "this shipping build links no renderer; build it with `--features rendering`"
+                        .to_owned(),
+            });
+        };
+        // SAFETY: as in the reloading posture - the backend is stored in a
+        // `RenderingHost`, whose `renderer` field drops before `window`.
+        unsafe { (renderer.attach)(window_data, width, height) }
+    }
+}
+
 /// Start watching the renderer's shader sources, or log why it could not.
 ///
 /// A watch that fails to start costs only the shader reload, never the host,
 /// so the failure is reported and the host runs without it.
 #[cfg(all(feature = "rendering", feature = "hot_reload"))]
-fn start_shader_reloader() -> Option<pill_master_renderer::ShaderReloader> {
-    match pill_master_renderer::ShaderReloader::new() {
+fn start_shader_reloader() -> Option<pill_renderer_api::ShaderReloader> {
+    match pill_renderer_api::ShaderReloader::new() {
         Ok(reloader) => Some(reloader),
         Err(error) => {
             warn!(
@@ -871,14 +1108,16 @@ fn start_shader_reloader() -> Option<pill_master_renderer::ShaderReloader> {
 ///
 /// # Errors
 ///
-/// Returns a [`RendererError`] when surface or renderer creation fails.
+/// Returns the composed [`RenderingError`](crate::frontend::RenderingError):
+/// a [`HostError`] when the renderer module cannot be built, loaded or
+/// initialized, or a [`RendererError`] when attaching it to the window fails.
 #[cfg(feature = "rendering")]
 pub fn attach_renderer<W>(
     mut host: Host,
     window: W,
     width: u32,
     height: u32,
-) -> Result<RenderingHost, RendererError>
+) -> Result<RenderingHost, crate::frontend::RenderingError>
 where
     W: RendererWindow + 'static,
 {
@@ -888,8 +1127,8 @@ where
         height,
         "attaching the engine renderer to the window surface"
     );
-    let (renderer, window) = attach_window(window, width, height)?;
-    pill_master_renderer::register(host.engine_mut());
+    let (renderer_module, renderer, window, window_data) =
+        attach_renderer_module(&mut host, window, width, height)?;
     #[cfg(feature = "hot_reload")]
     let project_root = host
         .workspace_root
@@ -901,11 +1140,14 @@ where
     let assets =
         crate::render_assets::NativeAssets::prepare(Some(&project_root), &host.workspace_root)?;
     #[cfg(not(feature = "hot_reload"))]
-    let assets = crate::render_assets::NativeAssets::prepare(None, std::path::Path::new("."))?;
+    let assets = crate::render_assets::NativeAssets::prepare(None)?;
     Ok(RenderingHost {
         host,
         renderer,
         window,
+        renderer_module,
+        window_data,
+        surface_size: (width, height),
         assets,
         viewport: None,
         presented_scene: false,
