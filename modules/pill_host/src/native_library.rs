@@ -165,7 +165,25 @@ fn stage_module_engine_dylib(workspace_root: &Path, directory: &Path) {
     if std::fs::create_dir_all(directory).is_err() {
         return;
     }
-    let _ = std::fs::copy(source, directory.join("pill_core.dll"));
+    let _ = std::fs::copy(&source, directory.join("pill_core.dll"));
+
+    // Cargo stages the engine DLL in `target/hot`, but keeps its PDB in the
+    // private module artifact directory alongside the other host-spawned
+    // outputs. Keep the engine's symbols beside the co-located DLL too.
+    let direct_symbol = source.with_extension("pdb");
+    let artifact_symbol = workspace_root
+        .join(crate::config::module_build_artifact_directory())
+        .join("pill_core.pdb");
+    let symbol_source = if direct_symbol.is_file() {
+        direct_symbol
+    } else {
+        artifact_symbol
+    };
+    if symbol_source.is_file() {
+        let symbol_target = directory.join("pill_core.pdb");
+        let _ = std::fs::hard_link(&symbol_source, &symbol_target)
+            .or_else(|_| std::fs::copy(symbol_source, symbol_target).map(|_| ()));
+    }
 }
 
 /// Locate the engine dylib the module build produced: the staged hot-load copy
@@ -530,7 +548,19 @@ impl NativeLibrary {
         // Best effort by design. A build carrying no debug info has no PDB,
         // and a link that cannot be made costs symbols rather than the module,
         // so nothing here may fail the load.
-        let symbol_source = build_output.with_extension("pdb");
+        let direct_symbol_source = build_output.with_extension("pdb");
+        let artifact_symbol_source = workspace_root
+            .join(crate::config::module_build_artifact_directory())
+            .join(
+                direct_symbol_source
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new("module.pdb")),
+            );
+        let symbol_source = if direct_symbol_source.is_file() {
+            direct_symbol_source
+        } else {
+            artifact_symbol_source
+        };
         if let Some(symbol_name) = symbol_source.file_name() {
             if symbol_source.is_file() {
                 // The image names the PDB by bare file name, so the copy has to
