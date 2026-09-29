@@ -20,6 +20,7 @@
 
 // External crates
 use pill_engine::{ComponentTicks, Entity};
+use std::cell::RefCell;
 
 // Current crate
 use super::assets::{
@@ -34,6 +35,62 @@ use super::queries::{
     ffi_entity_count, ffi_get_archetype_chunk, ffi_get_component_chunk, ffi_get_entity_chunk,
 };
 use super::ResolvedMirrorMethod;
+
+thread_local! {
+    /// C# profiling zones are entered and exited on the same scheduler thread.
+    /// Keeping the guards thread-local avoids sending a non-Send Tracy guard
+    /// across threads and also makes an accidentally missing end harmless when
+    /// the managed invocation returns.
+    static CSHARP_ZONES: RefCell<Vec<(u64, pill_core::profiling::TracyZone)>> =
+        const { RefCell::new(Vec::new()) };
+}
+static NEXT_CSHARP_ZONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn ffi_bytes(ptr: *const u8, len: u32) -> Vec<u8> {
+    if ptr.is_null() || len == 0 {
+        return Vec::new();
+    }
+    // The managed side pins both buffers for the complete callback. A null
+    // pointer is treated as an empty string so diagnostics never cross the ABI.
+    unsafe { std::slice::from_raw_parts(ptr, len as usize).to_vec() }
+}
+
+extern "C" fn ffi_csharp_log(
+    level: u8,
+    target: *const u8,
+    target_len: u32,
+    message: *const u8,
+    message_len: u32,
+) {
+    let target_bytes = ffi_bytes(target, target_len);
+    let message_bytes = ffi_bytes(message, message_len);
+    let target = String::from_utf8_lossy(&target_bytes).into_owned();
+    let message = String::from_utf8_lossy(&message_bytes).into_owned();
+    match level {
+        0 => tracing::trace!(target: "csharp", target = %target, message = %message),
+        1 => tracing::debug!(target: "csharp", target = %target, message = %message),
+        2 => tracing::info!(target: "csharp", target = %target, message = %message),
+        3 => tracing::warn!(target: "csharp", target = %target, message = %message),
+        _ => tracing::error!(target: "csharp", target = %target, message = %message),
+    }
+}
+
+extern "C" fn ffi_csharp_zone_begin(name: *const u8, name_len: u32) -> u64 {
+    let name = String::from_utf8_lossy(&ffi_bytes(name, name_len)).into_owned();
+    let token = NEXT_CSHARP_ZONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let zone = pill_core::profiling::TracyZone::new_dynamic(&name, "csharp", "managed", 0);
+    CSHARP_ZONES.with(|zones| zones.borrow_mut().push((token, zone)));
+    token
+}
+
+extern "C" fn ffi_csharp_zone_end(token: u64) {
+    CSHARP_ZONES.with(|zones| {
+        let mut zones = zones.borrow_mut();
+        if let Some(index) = zones.iter().position(|(candidate, _)| *candidate == token) {
+            drop(zones.remove(index));
+        }
+    });
+}
 
 // =============================================================================
 // Types
@@ -219,6 +276,11 @@ pub(super) struct CsEngineApi {
         *mut u32,
         *mut u32,
     ) -> u8,
+    /// Emit a managed log event through the shared tracing subscriber.
+    csharp_log: extern "C" fn(u8, *const u8, u32, *const u8, u32),
+    /// Begin and end a dynamic managed Tracy zone.
+    csharp_zone_begin: extern "C" fn(*const u8, u32) -> u64,
+    csharp_zone_end: extern "C" fn(u64),
 }
 
 impl CsEngineApi {
@@ -251,6 +313,9 @@ impl CsEngineApi {
             asset_load_texture_png: super::assets::ffi_asset_load_texture_png,
             asset_load_shader: super::assets::ffi_asset_load_shader,
             asset_create_material: super::assets::ffi_asset_create_material,
+            csharp_log: ffi_csharp_log,
+            csharp_zone_begin: ffi_csharp_zone_begin,
+            csharp_zone_end: ffi_csharp_zone_end,
         }
     }
 }
