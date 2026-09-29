@@ -1,16 +1,133 @@
-# Prepares a fresh Windows machine to build and run this workspace with:
-#   cargo run --package pill_standalone --features rendering --offline
+# REQUIREMENTS:
+#   Windows 10/11 with Windows PowerShell 5.1 or newer, run from an ordinary
+#   (non-admin) session. The installers this script starts request elevation
+#   through UAC themselves when required.
+
+# DESCRIPTION:
+#   Prepares a fresh Windows machine to build and run this workspace with:
+#       cargo run --package pill_standalone --features rendering --offline
 #
-# Run this script from an ordinary (non-admin) PowerShell. It only requests
-# elevation implicitly through winget's own installers, which prompt for UAC
-# themselves when required.
+#   It is the Windows counterpart of setup_linux_environment.sh and performs
+#   the same jobs, mapped onto this platform:
+#
+#   1. Rust toolchain (rustup), through winget or rustup's own installer when
+#      an enterprise policy blocks winget.
+#   2. MSVC build tools and the Windows SDK. The workspace links with rust-lld,
+#      but rust-lld still needs the MSVC and Windows SDK import libraries; only
+#      link.exe is replaced.
+#   3. Smart App Control, which blocks LoadLibrary of the DLLs the host
+#      compiles at runtime for hot reload (os error 4551).
+#   4. An optional VS Code debugging setup: the editor, the .NET 8 SDK and the
+#      extensions the launch profiles depend on.
+#   5. The offline cargo registry cache, so `cargo build --offline` never waits
+#      on the registry during a reload.
+#
+#   Every step is idempotent: already-installed tools are detected and skipped,
+#   so the script can be rerun after fixing whatever failed.
+
+# USAGE: powershell -ExecutionPolicy Bypass -File devops\setup\setup_windows_environment.ps1
+#          (no arguments)   Run every step; prompts once about the optional
+#                           VS Code debugging setup.
+
+# EXAMPLE USAGE:
+#   cd devops\setup
+#   powershell ./setup_windows_environment.ps1
+
+# --- SCRIPT ---
 
 $ErrorActionPreference = "Stop"
+
+# Invoke-WebRequest draws a progress bar on Windows PowerShell 5.1, which makes
+# large downloads several times slower, so turn it off.
+$ProgressPreference = "SilentlyContinue"
+
+# Shared state for the [n/5] step marker printed by Write-Step and for the
+# failure report in the top-level catch block.
+$script:StepNumber = 0
+$script:TotalSteps = 5
+$script:CurrentStepTitle = 'startup'
+$script:CodeExtensionCache = $null
+
+# Prints a green "==> message" status line, matching the rest of devops/.
+function Write-Info {
+    param([Parameter(Mandatory = $true)][string] $Message)
+
+    Write-Host "==> $Message" -ForegroundColor Green
+}
+
+# Prints an empty line and the "==> [n/5] Title" step marker, and remembers the
+# step title so a later failure can be reported against it.
+function Write-Step {
+    param([Parameter(Mandatory = $true)][string] $Title)
+
+    $script:StepNumber++
+    $script:CurrentStepTitle = $Title
+    Write-Host ""
+    Write-Info "[$($script:StepNumber)/$($script:TotalSteps)] $Title"
+}
+
+# Prints an indented progress line under the current step.
+function Write-Detail {
+    param([Parameter(Mandatory = $true)][string] $Message)
+
+    Write-Host "    $Message"
+}
+
+# Prints an indented "[ok] ..." line for a completed check or installation.
+function Write-Success {
+    param([Parameter(Mandatory = $true)][string] $Message)
+
+    Write-Host "    [ok] $Message" -ForegroundColor Green
+}
+
+# Prints an indented "[warn] ..." line for a non-fatal problem the user still
+# has to handle, for example a missing cdb.exe or Smart App Control being on.
+function Write-Caution {
+    param([Parameter(Mandatory = $true)][string] $Message)
+
+    Write-Host "    [warn] $Message" -ForegroundColor Yellow
+}
 
 function Update-SessionPath {
     $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $env:PATH = "$machinePath;$userPath"
+}
+
+# Walks up from the script folder until it finds the directory whose modules
+# folder holds Cargo.toml. This keeps the script working no matter which
+# directory it is launched from, for example devops\setup.
+function Find-RepositoryRoot {
+    $candidate = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).ProviderPath }
+    while (-not [string]::IsNullOrEmpty($candidate)) {
+        if (Test-Path -LiteralPath (Join-Path $candidate 'modules\Cargo.toml')) {
+            return $candidate
+        }
+        $parent = Split-Path -Parent $candidate
+        if ($parent -eq $candidate) {
+            break
+        }
+        $candidate = $parent
+    }
+    throw "Could not find the repository root above '$PSScriptRoot': no parent folder contains modules\Cargo.toml. Keep devops\setup inside the repository and rerun the script."
+}
+
+# Adds a directory to the current session PATH and persists it in the user PATH,
+# skipping entries that are already there. Used for tool locations the
+# installers do not always register themselves, such as .NET global tools.
+function Add-UserPathEntry {
+    param([Parameter(Mandatory = $true)][string] $Directory)
+
+    $sessionEntries = @($env:PATH -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($sessionEntries -notcontains $Directory) {
+        $env:PATH = "$Directory;$env:PATH"
+    }
+
+    $userEntries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($userEntries -notcontains $Directory) {
+        [Environment]::SetEnvironmentVariable('Path', (@($Directory) + $userEntries) -join ';', 'User')
+        Write-Detail "Added $Directory to the user PATH for future terminals."
+    }
 }
 
 function Test-WingetPackage {
@@ -30,7 +147,7 @@ function Install-WingetPackage {
     )
 
     if (Test-WingetPackage -Id $Id) {
-        Write-Host "$Id is already installed."
+        Write-Success "$Id is already installed."
         return
     }
 
@@ -38,7 +155,7 @@ function Install-WingetPackage {
         throw "Cannot install $Id because Windows Package Manager is disabled by Group Policy. Install it manually or ask your administrator to enable App Installer/Windows Package Manager, then rerun this script."
     }
 
-    Write-Host "Installing $Id..."
+    Write-Detail "Installing $Id..."
     $arguments = @(
         'install', '--id', $Id, '--exact', '--source', 'winget',
         '--accept-package-agreements', '--accept-source-agreements'
@@ -51,6 +168,7 @@ function Install-WingetPackage {
         throw "winget failed to install $Id with exit code $LASTEXITCODE."
     }
     Update-SessionPath
+    Write-Success "$Id installed."
 }
 
 function Test-CodeExtension {
@@ -59,23 +177,28 @@ function Test-CodeExtension {
     if (-not (Get-Command code -ErrorAction SilentlyContinue)) {
         return $false
     }
-    $installed = @(code --list-extensions 2>$null)
-    return ($installed -contains $Id)
+    # Query the installed extensions once per run; the list costs about a
+    # second per invocation and is checked for seven extensions.
+    if ($null -eq $script:CodeExtensionCache) {
+        $script:CodeExtensionCache = @(code --list-extensions 2>$null)
+    }
+    return ($script:CodeExtensionCache -contains $Id)
 }
 
 function Install-CodeExtension {
     param([Parameter(Mandatory = $true)][string] $Id)
 
     if (Test-CodeExtension -Id $Id) {
-        Write-Host "VS Code extension $Id is already installed."
+        Write-Success "VS Code extension $Id is already installed."
         return
     }
 
-    Write-Host "Installing VS Code extension $Id..."
+    Write-Detail "Installing VS Code extension $Id..."
     & code --install-extension $Id
     if ($LASTEXITCODE -ne 0) {
         throw "VS Code failed to install extension $Id with exit code $LASTEXITCODE."
     }
+    $script:CodeExtensionCache += $Id
 }
 
 function Test-VisualStudioCppBuildTools {
@@ -100,22 +223,22 @@ function Test-Cdb {
 }
 
 function Install-VisualStudioCppBuildTools {
-    if (Test-VisualStudioCppBuildTools) {
-        Write-Host 'Visual Studio C++ Build Tools and a C++ workload are already installed.'
-        return
-    }
-
     $installer = Join-Path ([IO.Path]::GetTempPath()) 'vs_buildtools.exe'
-    Write-Host 'Downloading the official Visual Studio Build Tools installer...'
+    Write-Detail 'Downloading the official Visual Studio Build Tools installer...'
     Invoke-WebRequest -Uri 'https://aka.ms/vs/17/release/vs_buildtools.exe' -OutFile $installer
     try {
-        Write-Host 'Installing Visual Studio C++ Build Tools and Windows SDK...'
+        Write-Detail 'Installing the C++ workload and the Windows 11 SDK (this can take a while)...'
         & $installer --wait --quiet `
             --add Microsoft.VisualStudio.Workload.VCTools `
             --add Microsoft.VisualStudio.Component.Windows11SDK.22621 `
             --includeRecommended
-        if ($LASTEXITCODE -ne 0) {
-            throw "Visual Studio Build Tools installer failed with exit code $LASTEXITCODE."
+        $installerExitCode = $LASTEXITCODE
+        if ($installerExitCode -eq 3010) {
+            # 3010 means the install succeeded but a reboot is still pending.
+            Write-Caution 'The Build Tools installer reports that a reboot is required to finish.'
+        }
+        elseif ($installerExitCode -ne 0) {
+            throw "Visual Studio Build Tools installer failed with exit code $installerExitCode."
         }
     }
     finally {
@@ -132,25 +255,32 @@ function Test-DotNet8Sdk {
 }
 
 function Install-VsCodeAndDotNetFallbacks {
-    if (-not (Get-Command code -ErrorAction SilentlyContinue)) {
+    if (Get-Command code -ErrorAction SilentlyContinue) {
+        Write-Success 'Visual Studio Code is already installed.'
+    }
+    else {
         $codeInstaller = Join-Path ([IO.Path]::GetTempPath()) 'VSCodeUserSetup.exe'
-        Write-Host 'Downloading the official VS Code installer because Winget installation is unavailable...'
+        Write-Detail 'Downloading the official VS Code installer because Winget installation is unavailable...'
         Invoke-WebRequest -Uri 'https://update.code.visualstudio.com/latest/win32-x64-user/stable' -OutFile $codeInstaller
         try {
-            Start-Process -FilePath $codeInstaller -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+            $codeProcess = Start-Process -FilePath $codeInstaller -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+            if ($codeProcess.ExitCode -ne 0) {
+                throw "VS Code installer failed with exit code $($codeProcess.ExitCode)."
+            }
         }
         finally {
             Remove-Item -LiteralPath $codeInstaller -Force -ErrorAction SilentlyContinue
         }
         Update-SessionPath
-    }
-    else {
-        Write-Host 'Visual Studio Code is already installed.'
+        Write-Success 'Visual Studio Code installed.'
     }
 
-    if (-not (Test-DotNet8Sdk)) {
+    if (Test-DotNet8Sdk) {
+        Write-Success '.NET 8 SDK is already installed.'
+    }
+    else {
         $dotnetInstaller = Join-Path ([IO.Path]::GetTempPath()) 'dotnet-install.ps1'
-        Write-Host 'Downloading the official .NET SDK installer because Winget installation is unavailable...'
+        Write-Detail 'Downloading the official .NET SDK installer because Winget installation is unavailable...'
         Invoke-WebRequest -Uri 'https://dot.net/v1/dotnet-install.ps1' -OutFile $dotnetInstaller
         try {
             & $dotnetInstaller -Channel 8.0 -InstallDir (Join-Path $env:USERPROFILE '.dotnet')
@@ -161,10 +291,8 @@ function Install-VsCodeAndDotNetFallbacks {
         finally {
             Remove-Item -LiteralPath $dotnetInstaller -Force -ErrorAction SilentlyContinue
         }
-        $env:PATH = "$(Join-Path $env:USERPROFILE '.dotnet');$env:PATH"
-    }
-    else {
-        Write-Host '.NET 8 SDK is already installed.'
+        Add-UserPathEntry -Directory (Join-Path $env:USERPROFILE '.dotnet')
+        Write-Success '.NET 8 SDK installed.'
     }
 }
 
@@ -182,142 +310,208 @@ function Read-YesNo {
     return $answer.Trim().ToLowerInvariant() -in @('y', 'yes')
 }
 
-$script:WingetEnabled = $false
-if (Get-Command winget -ErrorAction SilentlyContinue) {
-    & winget --version 2>$null | Out-Null
-    $script:WingetEnabled = ($LASTEXITCODE -eq 0)
-}
+try {
+    # --- Preflight ---------------------------------------------------------
+    Write-Host 'Pill workspace environment setup (Windows)'
+    $repoRoot = Find-RepositoryRoot
+    Write-Info "repository root: $repoRoot"
 
-if (-not $script:WingetEnabled) {
-    Write-Warning "Windows Package Manager is unavailable or disabled by Group Policy. Winget-based installations will be skipped."
-    Write-Warning "Rust has a direct installer fallback; Visual Studio Build Tools and optional VS Code setup require manual installation when Winget is blocked."
-}
-
-# 1. Rust toolchain (rustup installs the stable-x86_64-pc-windows-msvc toolchain by default).
-$cargoPath = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
-if (Test-Path -LiteralPath $cargoPath) {
-    Write-Host "Rust toolchain already installed."
-}
-elseif ($script:WingetEnabled) {
-    Install-WingetPackage -Id 'Rustlang.Rustup'
-}
-else {
-    # Rustup's official installer is the fallback when an enterprise policy
-    # disables Winget. It does not require administrator rights.
-    $rustupInstaller = Join-Path ([IO.Path]::GetTempPath()) 'rustup-init.exe'
-    Write-Host 'Downloading the official Rust installer because Winget is disabled...'
-    Invoke-WebRequest -Uri 'https://win.rustup.rs/x86_64' -OutFile $rustupInstaller
-    try {
-        & $rustupInstaller -y --default-toolchain stable-x86_64-pc-windows-msvc
-        if ($LASTEXITCODE -ne 0) {
-            throw "rustup failed with exit code $LASTEXITCODE."
-        }
+    # Winget is used when available; enterprise policies sometimes block its
+    # install operation while it still answers --version, which the per-step
+    # fallbacks below handle.
+    $script:WingetEnabled = $false
+    if (Get-Command winget -ErrorAction SilentlyContinue) {
+        & winget --version 2>$null | Out-Null
+        $script:WingetEnabled = ($LASTEXITCODE -eq 0)
     }
-    finally {
-        Remove-Item -LiteralPath $rustupInstaller -Force -ErrorAction SilentlyContinue
-    }
-    Update-SessionPath
-}
-
-# 2. MSVC build tools + Windows SDK (needed to link, even though the workspace
-#    uses rust-lld as the linker - rust-lld still needs the MSVC/Windows SDK
-#    import libraries, only replaces link.exe).
-if (Test-VisualStudioCppBuildTools) {
-    Write-Host 'Visual Studio C++ Build Tools and a C++ workload are already installed.'
-}
-else {
-    # Use the official bootstrapper directly. It works even when an enterprise
-    # policy permits querying Winget but blocks its install operation.
-    Install-VisualStudioCppBuildTools
-}
-
-# CDB is distributed by the separate Windows SDK installer, not necessarily by
-# the Visual Studio Build Tools installer. It is needed only by the manual
-# stack-sampling check, so report the prerequisite without stopping setup.
-if (Test-Cdb) {
-    Write-Host 'Windows debugging tools (cdb.exe) are already installed.'
-}
-else {
-    Write-Warning 'cdb.exe is not installed. Download the Windows SDK from https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/ and select only Debugging Tools for Windows. This is required for stack_sample.ps1.'
-}
-
-# 3. Windows Smart App Control (SAC) blocks LoadLibrary of the DLLs this
-#    workspace compiles on the fly for hot-reloaded modules/projects
-#    ("An Application Control policy has blocked this file", os error 4551).
-#    SAC can only be turned off through the Windows Security UI while it is
-#    still in evaluation mode; it cannot be scripted (the registry key is
-#    protected even from an elevated process), and once fully enforced it can
-#    only be turned back off by reinstalling Windows.
-$sacState = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy" -Name "VerifiedAndReputablePolicyState" -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState
-if ($sacState -ne 0) {
-    Write-Warning "Windows Smart App Control is still ON. Go to Settings > Privacy & security > Windows Security > App & browser control > Smart App Control settings and turn it Off, then re-run this script."
-    Write-Warning "(If the Off option is greyed out, SAC is fully enforced and can only be disabled by reinstalling Windows.)"
-}
-else {
-    Write-Host "Smart App Control is off."
-}
-
-# 4. Optional VS Code debugging setup.
-$installVsCodeDebugging = Read-YesNo -Prompt 'Install the VS Code debugging setup and required tools?' -Default $true
-if ($installVsCodeDebugging) {
-    # VS Code's cppvsdbg provider is required by the native launch profiles;
-    # coreclr is supplied by the C# extension. CodeLLDB supports the alternate
-    # launch profile and the remaining extensions support editing/inspection.
     if ($script:WingetEnabled) {
-        try {
-            Install-WingetPackage -Id 'Microsoft.VisualStudioCode'
-            Install-WingetPackage -Id 'Microsoft.DotNet.SDK.8'
-        }
-        catch {
-            Write-Warning "Winget installation was blocked: $($_.Exception.Message)"
-            Install-VsCodeAndDotNetFallbacks
-        }
+        Write-Detail 'Windows Package Manager (winget) is available.'
     }
     else {
-        Install-VsCodeAndDotNetFallbacks
+        Write-Caution 'Windows Package Manager is unavailable or disabled by Group Policy; direct installer fallbacks will be used instead.'
     }
 
-    $debugExtensions = @(
-        'rust-lang.rust-analyzer',
-        'ms-vscode.cpptools',
-        'ms-dotnettools.csharp',
-        'ms-dotnettools.csdevkit',
-        'ms-vscode.hexeditor',
-        'tamasfe.even-better-toml',
-        'vadimcn.vscode-lldb'
-    )
-    foreach ($extensionId in $debugExtensions) {
-        Install-CodeExtension -Id $extensionId
+    # --- 1. Rust toolchain --------------------------------------------------
+    # Rustup installs the stable-x86_64-pc-windows-msvc toolchain by default.
+    Write-Step 'Rust toolchain'
+    $cargoExecutable = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
+    if (Test-Path -LiteralPath $cargoExecutable) {
+        Write-Success 'Rust is already installed.'
     }
-
-    if (-not (Get-Command dotnet-trace -ErrorAction SilentlyContinue)) {
-        Write-Host 'Installing dotnet-trace...'
-        & dotnet tool install --global dotnet-trace
-        if ($LASTEXITCODE -ne 0) {
-            throw "dotnet-trace installation failed with exit code $LASTEXITCODE."
-        }
+    elseif ($script:WingetEnabled) {
+        Install-WingetPackage -Id 'Rustlang.Rustup'
         Update-SessionPath
     }
     else {
-        Write-Host 'dotnet-trace is already installed.'
+        # Rustup's official installer is the fallback when an enterprise policy
+        # disables Winget. It does not require administrator rights.
+        $rustupInstaller = Join-Path ([IO.Path]::GetTempPath()) 'rustup-init.exe'
+        Write-Detail 'Downloading the official Rust installer because Winget is blocked...'
+        Invoke-WebRequest -Uri 'https://win.rustup.rs/x86_64' -OutFile $rustupInstaller
+        try {
+            & $rustupInstaller -y --default-toolchain stable-x86_64-pc-windows-msvc
+            if ($LASTEXITCODE -ne 0) {
+                throw "rustup failed with exit code $LASTEXITCODE."
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $rustupInstaller -Force -ErrorAction SilentlyContinue
+        }
+        Update-SessionPath
+        Write-Success 'Rust toolchain installed.'
     }
-}
-else {
-    Write-Host 'Skipping VS Code debugging setup.'
-}
 
-# 5. Populate the offline cargo registry cache (the --offline run needs every
-#    dependency already downloaded once; this also fetches the pinned
-#    `trait_type_map` git dependency).
-Update-SessionPath
-$repoRoot = $PSScriptRoot
-Push-Location (Join-Path $repoRoot "modules")
-Write-Host "Fetching cargo dependencies (online, one-time)..."
-& "$env:USERPROFILE\.cargo\bin\cargo.exe" fetch
-Pop-Location
+    # Fail here with a readable message instead of failing in the cargo fetch
+    # step with a bare "cargo not found".
+    if (-not (Test-Path -LiteralPath $cargoExecutable)) {
+        $cargoCommand = Get-Command cargo.exe -ErrorAction SilentlyContinue
+        if ($cargoCommand) {
+            $cargoExecutable = $cargoCommand.Source
+        }
+        else {
+            throw "cargo.exe was not found at '$cargoExecutable' and is not on the PATH. Install Rust from https://rustup.rs and rerun this script."
+        }
+    }
 
-Write-Host ""
-Write-Host "Setup complete. Run the project with:"
-Write-Host '  $env:PROJECT_PATH = "../examples/project_rs"'
-Write-Host "  cd modules"
-Write-Host "  cargo run --package pill_standalone --features rendering --offline"
+    # --- 2. MSVC build tools + Windows SDK ----------------------------------
+    # Needed to link even though the workspace uses rust-lld as the linker:
+    # rust-lld still needs the MSVC and Windows SDK import libraries.
+    Write-Step 'Visual Studio C++ Build Tools and Windows SDK'
+    if (Test-VisualStudioCppBuildTools) {
+        Write-Success 'C++ workload is already installed.'
+    }
+    else {
+        # Use the official bootstrapper directly. It works even when an
+        # enterprise policy permits querying Winget but blocks its install
+        # operation.
+        Install-VisualStudioCppBuildTools
+        Write-Success 'Visual Studio C++ Build Tools and Windows SDK installed.'
+    }
+
+    # cdb.exe is distributed by the separate Windows SDK installer, not
+    # necessarily by the Visual Studio Build Tools installer. It is needed only
+    # by the manual stack-sampling check, so report it without stopping setup.
+    if (Test-Cdb) {
+        Write-Success 'Windows debugging tools (cdb.exe) are already installed.'
+    }
+    else {
+        Write-Caution 'cdb.exe is not installed. Download the Windows SDK from https://developer.microsoft.com/en-us/windows/downloads/windows-sdk/ and select only Debugging Tools for Windows. This is required for stack_sample.ps1.'
+    }
+
+    # --- 3. Smart App Control -----------------------------------------------
+    # SAC blocks LoadLibrary of the DLLs this workspace compiles on the fly for
+    # hot-reloaded modules and projects ("An Application Control policy has
+    # blocked this file", os error 4551). It can only be turned off through the
+    # Windows Security UI while it is still in evaluation mode: it cannot be
+    # scripted (the registry key is protected even from an elevated process),
+    # and once fully enforced it can only be turned back off by reinstalling
+    # Windows.
+    Write-Step 'Windows Smart App Control'
+    $sacState = (Get-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\CI\Policy" -Name "VerifiedAndReputablePolicyState" -ErrorAction SilentlyContinue).VerifiedAndReputablePolicyState
+    if ($sacState -ne 0) {
+        Write-Caution 'Smart App Control is still ON. Go to Settings > Privacy & security > Windows Security > App & browser control > Smart App Control settings and turn it Off, then rerun this script.'
+        Write-Caution 'If the Off option is greyed out, SAC is fully enforced and can only be disabled by reinstalling Windows.'
+    }
+    else {
+        Write-Success 'Smart App Control is off.'
+    }
+
+    # --- 4. Optional VS Code debugging setup --------------------------------
+    Write-Step 'VS Code debugging setup (optional)'
+    $installVsCodeDebugging = Read-YesNo -Prompt 'Install the VS Code debugging setup and required tools?' -Default $true
+    if (-not $installVsCodeDebugging) {
+        Write-Detail 'Skipping the VS Code debugging setup.'
+    }
+    else {
+        # VS Code's cppvsdbg provider is required by the native launch profiles;
+        # coreclr is supplied by the C# extension. CodeLLDB supports the
+        # alternate launch profile and the remaining extensions support
+        # editing and inspection.
+        if ($script:WingetEnabled) {
+            try {
+                Install-WingetPackage -Id 'Microsoft.VisualStudioCode'
+                Install-WingetPackage -Id 'Microsoft.DotNet.SDK.8'
+            }
+            catch {
+                Write-Caution "Winget installation was blocked: $($_.Exception.Message)"
+                Install-VsCodeAndDotNetFallbacks
+            }
+        }
+        else {
+            Install-VsCodeAndDotNetFallbacks
+        }
+
+        $debugExtensions = @(
+            'rust-lang.rust-analyzer',
+            'ms-vscode.cpptools',
+            'ms-dotnettools.csharp',
+            'ms-dotnettools.csdevkit',
+            'ms-vscode.hexeditor',
+            'tamasfe.even-better-toml',
+            'vadimcn.vscode-lldb'
+        )
+        if (-not (Get-Command code -ErrorAction SilentlyContinue)) {
+            Write-Caution 'The VS Code "code" command is not on PATH, so extensions cannot be installed automatically. Open VS Code once and run "Shell Command: Install code command in PATH" from the Command Palette, then rerun this script.'
+        }
+        else {
+            foreach ($extensionId in $debugExtensions) {
+                Install-CodeExtension -Id $extensionId
+            }
+        }
+
+        # "dotnet tool install" fails when the tool already exists, so check
+        # the global tool list instead of retrying the install.
+        $dotnetToolsDirectory = Join-Path $env:USERPROFILE '.dotnet\tools'
+        $globalTools = @(dotnet tool list --global 2>$null)
+        if ($globalTools -match 'dotnet-trace') {
+            Write-Success 'dotnet-trace is already installed.'
+        }
+        else {
+            Write-Detail 'Installing dotnet-trace...'
+            & dotnet tool install --global dotnet-trace
+            if ($LASTEXITCODE -ne 0) {
+                throw "dotnet-trace installation failed with exit code $LASTEXITCODE."
+            }
+            Write-Success 'dotnet-trace installed.'
+        }
+
+        # The dotnet CLI does not always update PATH itself, so persist the
+        # tools directory for future terminals.
+        Add-UserPathEntry -Directory $dotnetToolsDirectory
+    }
+
+    # --- 5. Offline cargo registry -------------------------------------------
+    # The --offline run needs every dependency downloaded once; this also
+    # fetches the pinned `trait_type_map` git dependency.
+    Write-Step 'Cargo dependency cache'
+    $modulesDirectory = Join-Path $repoRoot 'modules'
+    Update-SessionPath
+    Push-Location -LiteralPath $modulesDirectory
+    try {
+        Write-Detail 'Fetching crate and git dependencies (online, one-time)...'
+        & $cargoExecutable fetch
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo fetch failed with exit code $LASTEXITCODE."
+        }
+        Write-Success 'Cargo dependency cache populated.'
+    }
+    finally {
+        Pop-Location
+    }
+
+    Write-Host ""
+    Write-Host "Setup complete!" -ForegroundColor Green
+}
+catch {
+    Write-Host ""
+    if ($script:StepNumber -gt 0) {
+        Write-Host "[error] Setup failed in step $($script:StepNumber)/$($script:TotalSteps) ($($script:CurrentStepTitle)):" -ForegroundColor Red
+    }
+    else {
+        Write-Host "[error] Setup failed during the startup checks:" -ForegroundColor Red
+    }
+    Write-Host "  $($_.Exception.Message) (script line $($_.InvocationInfo.ScriptLineNumber))" -ForegroundColor Red
+    Write-Host ""
+    Write-Host 'Fix the problem above, then rerun this script; finished steps are detected and skipped.'
+    exit 1
+}
