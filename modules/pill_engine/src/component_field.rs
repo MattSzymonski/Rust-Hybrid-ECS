@@ -440,6 +440,19 @@ fn decode_field(bytes: &[u8], descriptor: &ComponentFieldDescriptor) -> FieldVal
     FieldValue::Array(elements)
 }
 
+/// Format a copied component row for native debugger helpers.
+///
+/// This accepts a byte slice rather than a component type, so it works for
+/// Rust, renderer, and managed descriptor columns alike when paired with the
+/// registered field layout.
+pub fn format_component_debug(fields: &[ComponentFieldDescriptor], bytes: &[u8]) -> String {
+    fields
+        .iter()
+        .map(|field| format!("{}={:?}", field.name, decode_field(bytes, field)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Decode one tag-sized value: a scalar when the tag is scalar, otherwise an
 /// opaque byte copy of `size` bytes.
 ///
