@@ -382,6 +382,33 @@ public static unsafe class Engine
         return _api.GetResourceView(id.Low, id.High, mode, output);
     }
 
+    internal static void Log(byte level, string target, string message)
+    {
+        if (_api.CSharpLog == null)
+            return;
+        byte[] targetBytes = Encoding.UTF8.GetBytes(target);
+        byte[] messageBytes = Encoding.UTF8.GetBytes(message);
+        fixed (byte* targetPointer = targetBytes)
+        fixed (byte* messagePointer = messageBytes)
+            _api.CSharpLog(level, targetPointer, (uint)targetBytes.Length,
+                messagePointer, (uint)messageBytes.Length);
+    }
+
+    internal static ulong BeginZone(string name)
+    {
+        if (_api.CSharpZoneBegin == null)
+            return 0;
+        byte[] bytes = Encoding.UTF8.GetBytes(name);
+        fixed (byte* pointer = bytes)
+            return _api.CSharpZoneBegin(pointer, (uint)bytes.Length);
+    }
+
+    internal static void EndZone(ulong token)
+    {
+        if (token != 0 && _api.CSharpZoneEnd != null)
+            _api.CSharpZoneEnd(token);
+    }
+
     /// <summary>
     /// Reject a resource view that was issued to an earlier managed invocation.
     /// </summary>

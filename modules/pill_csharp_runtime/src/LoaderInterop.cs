@@ -104,9 +104,10 @@ public static unsafe class LoaderInterop
     /// resources, which added both a slot (<c>GetResourceView</c>) and a field
     /// to an exchanged struct (<c>NativeSystemAccess.Kind</c>) - a stale
     /// runtime would leave that field unwritten and every resource access
-    /// would be resolved against the component table.
+    /// would be resolved against the component table. Bumped to 11 by the
+    /// managed logging and profiling callbacks appended to the API table.
     /// </summary>
-    public const uint InteropContractVersion = 10;
+    public const uint InteropContractVersion = 11;
 
     /// <summary>Return the unmanaged ABI contract version for host validation.</summary>
 #if !PILL_AOT

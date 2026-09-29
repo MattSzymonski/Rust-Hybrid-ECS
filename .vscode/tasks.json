@@ -22,9 +22,6 @@
             "options": {
                 "cwd": "${workspaceFolder}/modules"
             },
-            "problemMatcher": [
-                "$rustc"
-            ],
             "group": "build"
         },
         {
@@ -48,9 +45,6 @@
             "options": {
                 "cwd": "${workspaceFolder}/modules"
             },
-            "problemMatcher": [
-                "$rustc"
-            ],
             "group": "build"
         },
         {
@@ -88,7 +82,7 @@
                     "regexp": "^__pill_host_reports_no_problems__$"
                 },
                 "background": {
-                    "activeBegins": true,
+                    "activeOnStart": true,
                     "beginsPattern": "ECS host starting",
                     "endsPattern": "waiting up to .* for a managed debugger"
                 }

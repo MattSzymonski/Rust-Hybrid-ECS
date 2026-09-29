@@ -114,6 +114,15 @@ public unsafe struct EngineApi
         NativeMaterialColor*, uint,
         byte,
         uint*, uint*, byte> AssetCreateMaterial;
+
+    /// <summary>Emit a managed event through the native tracing subscriber.</summary>
+    public delegate* unmanaged[Cdecl]<byte, byte*, uint, byte*, uint, void> CSharpLog;
+
+    /// <summary>Begin a dynamic managed profiling zone and return its token.</summary>
+    public delegate* unmanaged[Cdecl]<byte*, uint, ulong> CSharpZoneBegin;
+
+    /// <summary>End a dynamic managed profiling zone.</summary>
+    public delegate* unmanaged[Cdecl]<ulong, void> CSharpZoneEnd;
 }
 
 /// <summary>One parameter slot a managed shader declaration supplies.</summary>
