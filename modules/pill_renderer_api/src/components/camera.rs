@@ -11,6 +11,10 @@
 //! its fields live and the host carries them across reload generations. The
 //! shared name is pinned rather than derived from the module path; see
 //! [`crate::components`].
+//!
+//! **Renderer contract.** [`crate::frame::RenderFrame`] embeds the camera it
+//! renders through, so this component stays in `pill_renderer_api` for every
+//! renderer, unlike the renderer-specific components beside it.
 
 // External crates
 use pill_engine::{PillComponent, World};

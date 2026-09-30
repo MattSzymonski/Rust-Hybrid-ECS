@@ -41,8 +41,8 @@ use pill_engine::AssetManager;
 
 // Current crate
 use crate::{
-    assets::{asset_key, PassKind, PassTarget, Shader},
-    frame::ResolvedPass,
+    assets::{asset_key, Shader},
+    frame::{PassKind, PassTarget, ResolvedPass},
     render_queue::{decompose_render_queue_key, RenderQueueItem},
     renderer::{State, OFFSCREEN_FORMAT},
     resources::{RendererPass, RendererShaderHandle, RendererTextureHandle},
@@ -620,7 +620,7 @@ mod tests {
             target_scale: 1,
             blend: false,
             depth_write: true,
-            cull: crate::assets::CullMode::Back,
+            cull: crate::frame::CullMode::Back,
             parameters: HashMap::new(),
             inputs: HashMap::new(),
             textures: HashMap::new(),

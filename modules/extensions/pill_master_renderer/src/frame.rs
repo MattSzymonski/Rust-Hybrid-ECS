@@ -18,12 +18,14 @@
 //! resolving into instances that carry their own sort key.
 
 // External crates
-use pill_engine::{AssetManager, Entity, Handle, Query, Res, ResMut, SystemError};
-pub use pill_renderer_api::frame::{RenderFrame, RenderInstance, ResolvedPass};
+use pill_engine::{AssetManager, Component, Entity, Handle, Query, Res, ResMut, SystemError};
+pub use pill_renderer_api::frame::{
+    CullMode, PassKind, PassTarget, RenderFrame, RenderInstance, ResolvedPass,
+};
 
 // Current crate
 use crate::{
-    assets::{asset_key, PassTarget},
+    assets::asset_key,
     components::{CameraComponent, MeshRendererComponent, TransformComponent},
     resources::RenderingManager,
 };
@@ -137,6 +139,24 @@ fn pick_camera(
     selected.map(|(_, camera, transform)| (camera, transform))
 }
 
+/// Shared names of the components [`rendering_system`] reads, for
+/// [`RenderCapabilities::consumed_components`](crate::api::RenderCapabilities::consumed_components).
+///
+/// Derived from the types the system queries rather than written out, so a
+/// renamed component can't leave a stale string behind. Keep it in step with
+/// the system's parameters.
+pub(crate) fn consumed_component_names() -> Vec<String> {
+    [
+        TransformComponent::shared_name(),
+        CameraComponent::shared_name(),
+        MeshRendererComponent::shared_name(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::to_owned)
+    .collect()
+}
+
 /// Fills the frame from the current world, once per update.
 ///
 /// Registered as the post-update `rendering` system, so gameplay has already
@@ -224,6 +244,20 @@ pub fn rendering_system(
 
 #[cfg(test)]
 mod tests {
+    /// The renderer reports exactly the three components its system queries,
+    /// by their pinned shared names.
+    #[test]
+    fn the_consumed_components_are_the_queried_ones() {
+        assert_eq!(
+            super::consumed_component_names(),
+            [
+                "pill_master_renderer::component::TransformComponent",
+                "pill_master_renderer::component::CameraComponent",
+                "pill_master_renderer::component::MeshRendererComponent",
+            ]
+        );
+    }
+
     use super::*;
     // `PassKind`, `Shader` and `Texture` are here to build the fixture assets the chain
     // tests need, not by anything in the module itself.

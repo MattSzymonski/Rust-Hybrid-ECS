@@ -6,6 +6,8 @@
 //! - Define [`RenderFrame`], the per-update renderer input, and the two values
 //!   it carries: [`RenderInstance`] for each drawable and [`ResolvedPass`] for
 //!   each pass of the chain.
+//! - Define the vocabulary a resolved pass is written in: [`PassKind`],
+//!   [`PassTarget`], [`CullMode`] and [`MaterialParameter`].
 //!
 //! # Design
 //!
@@ -15,18 +17,77 @@
 //! keys instead of handles, the camera copied out rather than borrowed. The
 //! assets behind those keys are read from the world's `AssetManager` at render
 //! time, so the frame never copies the asset store.
+//!
+//! **This module is renderer contract.** `PillRenderer::render` takes a
+//! [`RenderFrame`], so everything the frame names must be available to every
+//! renderer and to the host, whichever renderer's data crate a project uses.
+//! It therefore depends on nothing in `assets/`, `config/` or the rendering
+//! manager: the pass and parameter types it needs are defined here, and the
+//! asset types that use them import them from here. The camera is contract for
+//! the same reason; the transform is the engine's.
 
 // Standard library
 use std::collections::HashMap;
 
 // External crates
+use pill_engine::common_components::TransformComponent;
 use pill_engine::Resource;
 
 // Current crate
-use crate::{
-    assets::{CullMode, MaterialParameter, PassKind, PassTarget},
-    components::{CameraComponent, TransformComponent},
-};
+use crate::components::CameraComponent;
+
+/// What a pass draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum PassKind {
+    /// Draws the scene's meshes, one instance batch per material.
+    #[default]
+    Geometry,
+    /// Draws one fullscreen triangle: the shape post-processing passes take.
+    Fullscreen,
+}
+
+/// Where a pass reads from and writes to.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+pub enum PassTarget {
+    /// The swapchain image. A pass writing here reads nothing and ends the
+    /// frame, so a pipeline has at most one such pass and it runs last.
+    #[default]
+    Surface,
+    /// An offscreen colour target, named so later passes can sample it.
+    ///
+    /// The renderer owns these: a name that no earlier pass declares is an
+    /// error when the pipeline is built, not a silently blank frame.
+    Offscreen(String),
+}
+
+/// Which faces a pass drops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum CullMode {
+    /// Back faces: the default for solid geometry.
+    #[default]
+    Back,
+    /// Front faces, for looking at the inside of a shape.
+    Front,
+    /// Nothing: a fullscreen triangle has no outside worth dropping, and
+    /// two-sided geometry has no inside.
+    None,
+}
+
+/// One named value a shader reads.
+///
+/// Parameters are keyed by the slot name the shader declares, and the packer
+/// walks the shader's slots rather than the map, so a name the shader never
+/// declares is ignored instead of shifting anything after it. Each value pads
+/// out to one 16-byte uniform slot.
+#[derive(Clone, Debug)]
+pub enum MaterialParameter {
+    /// One `f32`, in the first four bytes of the slot.
+    Scalar(f32),
+    /// A boolean, packed as a `u32` of 0 or 1.
+    Bool(bool),
+    /// An RGB colour: three `f32`s with the rest of the slot as padding.
+    Color([f32; 3]),
+}
 
 /// One drawable the frame collected: where it stands and what it draws with.
 ///
@@ -120,8 +181,9 @@ pub struct RenderFrame {
     /// Every drawable the world offered this update, in traversal order.
     pub instances: Vec<RenderInstance>,
     /// The chain to run this frame, as resolved from the pipeline the game set
-    /// in [`RenderingManager`](crate::RenderingManager). Empty asks for a cleared frame and nothing
-    /// else, which is what a pipeline with every pass disabled means.
+    /// in the renderer's pipeline-selection resource. Empty asks for a cleared
+    /// frame and nothing else, which is what a pipeline with every pass disabled
+    /// means.
     pub passes: Vec<ResolvedPass>,
     /// What the current `passes` were resolved from: the asset revision and the
     /// pipeline's asset key, when the manager holds one.

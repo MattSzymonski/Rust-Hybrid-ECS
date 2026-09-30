@@ -21,44 +21,9 @@ use std::collections::HashMap;
 
 use pill_engine::{Asset, Handle};
 
-use crate::{MaterialParameter, Shader, Texture};
-
-/// What a pass draws.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum PassKind {
-    /// Draws the scene's meshes, one instance batch per material.
-    #[default]
-    Geometry,
-    /// Draws one fullscreen triangle: the shape post-processing passes take.
-    Fullscreen,
-}
-
-/// Where a pass reads from and writes to.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
-pub enum PassTarget {
-    /// The swapchain image. A pass writing here reads nothing and ends the
-    /// frame, so a pipeline has at most one such pass and it runs last.
-    #[default]
-    Surface,
-    /// An offscreen colour target, named so later passes can sample it.
-    ///
-    /// The renderer owns these: a name that no earlier pass declares is an
-    /// error when the pipeline is built, not a silently blank frame.
-    Offscreen(String),
-}
-
-/// Which faces a pass drops.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum CullMode {
-    /// Back faces: the default for solid geometry.
-    #[default]
-    Back,
-    /// Front faces, for looking at the inside of a shape.
-    Front,
-    /// Nothing: a fullscreen triangle has no outside worth dropping, and
-    /// two-sided geometry has no inside.
-    None,
-}
+// The pass vocabulary is part of the frame contract, so it lives there.
+use crate::frame::{CullMode, MaterialParameter, PassKind, PassTarget};
+use crate::{Shader, Texture};
 
 /// One pass in a [`RenderingPipeline`](crate::RenderingPipeline).
 #[derive(Clone, Debug)]
