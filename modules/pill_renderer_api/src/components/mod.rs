@@ -4,7 +4,6 @@
 //!
 //! - Declare [`CameraComponent`], which [`crate::frame::RenderFrame`] embeds,
 //!   and [`RenderViewport`], the rectangle a frontend points a renderer at.
-//! - Re-export the engine's [`TransformComponent`], which the frame carries too.
 //! - Register the contract's components through
 //!   [`register_contract_components`], field layout included.
 //!
@@ -23,9 +22,6 @@ mod camera;
 mod viewport;
 
 pub use camera::CameraComponent;
-// The engine's (moved there in stage 1 of the renderer data split); re-exported
-// until the API is shrunk (stage 10).
-pub use pill_engine::common_components::TransformComponent;
 pub use viewport::RenderViewport;
 
 // External crates
@@ -43,6 +39,7 @@ pub fn register_contract_components(world: &mut World) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pill_engine::common_components::TransformComponent;
     use pill_engine::{Component, ComponentId};
 
     /// The contract's components arrive field-described, under their pinned

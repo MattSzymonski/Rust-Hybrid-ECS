@@ -389,6 +389,10 @@ pub struct RenderingHost {
     /// shaders or the watch could not start.
     #[cfg(feature = "hot_reload")]
     shader_watcher: Option<crate::shader_watcher::ShaderWatcher>,
+    /// Set whenever a renderer backend attaches; the next frame then reports
+    /// the render data the renderer ignores, once per renderer generation.
+    #[cfg(feature = "hot_reload")]
+    unsupported_data_check_pending: bool,
 }
 
 /// Why a windowed host stopped rendering; see [`RenderingHost`]'s `paused`.
@@ -527,6 +531,7 @@ impl RenderingHost {
             window_data,
             surface_size,
             viewport,
+            unsupported_data_check_pending,
             ..
         } = self;
         let mut detached = false;
@@ -565,6 +570,8 @@ impl RenderingHost {
             Ok(attached) => {
                 *renderer = attached;
                 renderer.set_viewport(*viewport);
+                // A new renderer generation: what it ignores is reported anew.
+                *unsupported_data_check_pending = true;
                 // Counted, not assumed: a generation whose system escaped its
                 // owner would leave a second `rendering` system behind.
                 let rendering_systems = host
@@ -723,6 +730,41 @@ impl RenderingHost {
         }
     }
 
+    /// Warn once about each render component the attached renderer ignores.
+    ///
+    /// The candidates are the shared components the renderer's data crate
+    /// registered and at least one entity carries. Shared, because render data
+    /// has to be to reach the renderer module at all - its own copy of a type
+    /// only finds the world's column through the shared identity - while the
+    /// plain components the data crate registers along the way (the engine's
+    /// `Position` and `Color`) are not render data. A candidate missing from the
+    /// renderer's `RenderCapabilities::consumed_components` draws nothing, and
+    /// a project should hear so rather than wonder why its fog volume or light
+    /// has no effect.
+    #[cfg(feature = "hot_reload")]
+    fn report_unsupported_render_data(&self, data_extension: Option<&str>) {
+        let Some(slot) = data_extension
+            .and_then(|data| self.host.extensions.iter().find(|slot| slot.name() == data))
+        else {
+            return;
+        };
+        let consumed = self.renderer.capabilities().consumed_components;
+        let ignored = unsupported_render_components(
+            self.host.engine().world(),
+            slot.exposed_component_names(),
+            &consumed,
+        );
+        for (component, entities) in ignored {
+            warn!(
+                target: telemetry_target::RENDERING,
+                component = component.as_str(),
+                entities,
+                renderer = self.host.renderer.as_deref().unwrap_or_default(),
+                "entities carry a render component the active renderer does not draw; it has no effect on the picture"
+            );
+        }
+    }
+
     /// Restrict engine drawing to a physical region of the native surface.
     ///
     /// Use `None` for full-window rendering. Embedded frontends can leave the
@@ -785,6 +827,14 @@ impl RenderingHost {
         #[cfg(feature = "hot_reload")]
         if self.paused.is_some() {
             return Ok(report);
+        }
+        // After the frame's systems, so entities a startup system spawns are
+        // counted too; while paused the check waits for the renderer that
+        // resumes drawing.
+        #[cfg(feature = "hot_reload")]
+        if self.unsupported_data_check_pending {
+            self.unsupported_data_check_pending = false;
+            self.report_unsupported_render_data(data_extension.as_deref());
         }
         // The renderer reads both resources straight out of the world - the
         // frame the `rendering` system filled in, and the store the assets live
@@ -1233,7 +1283,41 @@ where
         paused: None,
         #[cfg(feature = "hot_reload")]
         shader_watcher,
+        #[cfg(feature = "hot_reload")]
+        unsupported_data_check_pending: true,
     })
+}
+
+/// The shared components among `registered` that at least one entity in
+/// `world` carries and `consumed` does not name, each with its entity count,
+/// sorted by name and listed once.
+///
+/// See [`RenderingHost::report_unsupported_render_data`] for why only shared
+/// components are candidates.
+#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+fn unsupported_render_components(
+    world: &pill_engine::World,
+    registered: &[String],
+    consumed: &[String],
+) -> Vec<(String, usize)> {
+    let mut names: Vec<&String> = registered.iter().collect();
+    names.sort();
+    names.dedup();
+    names
+        .into_iter()
+        .filter(|name| !consumed.contains(name))
+        .filter_map(|name| {
+            let component = world
+                .resolve_component_id_by_name_any(name)
+                .ok()
+                .flatten()?;
+            if !matches!(component, pill_engine::ComponentId::Shared(_)) {
+                return None;
+            }
+            let entities = world.live_row_count(component);
+            (entities > 0).then(|| (name.clone(), entities))
+        })
+        .collect()
 }
 
 /// The renderer data crate's development shader reload export; see
@@ -1473,6 +1557,8 @@ where
         paused: None,
         #[cfg(feature = "hot_reload")]
         shader_watcher,
+        #[cfg(feature = "hot_reload")]
+        unsupported_data_check_pending: true,
     })
 }
 
@@ -2465,6 +2551,54 @@ mod tests {
     use super::*;
 
     const PAUSED: Option<PauseReason> = Some(PauseReason::StaleRendererAfterDataLayoutChange);
+
+    /// A world holding one entity with each of the engine's common components
+    /// (the shared transform, the plain position), and the names they are
+    /// registered under.
+    fn world_with_common_components() -> (pill_engine::World, String, String) {
+        let mut world = pill_engine::World::new();
+        pill_engine::register_common_components(&mut world);
+        world
+            .create_entity()
+            .with(pill_engine::TransformComponent::default())
+            .with(pill_engine::Position::default())
+            .build()
+            .expect("registered components");
+        let transform = pill_engine::common_components::TRANSFORM_SHARED_NAME.to_owned();
+        let position =
+            pill_engine::component::ComponentRegistry::registered_name::<pill_engine::Position>();
+        (world, transform, position)
+    }
+
+    /// A shared component with entities that the renderer does not consume is
+    /// reported once, with its entity count; a plain one never is.
+    #[test]
+    fn an_ignored_shared_component_is_reported_once() {
+        let (world, transform, position) = world_with_common_components();
+        let registered = vec![transform.clone(), position, transform.clone()];
+
+        assert_eq!(
+            unsupported_render_components(&world, &registered, &[]),
+            vec![(transform, 1)]
+        );
+    }
+
+    /// A consumed component, or one no entity carries, is not reported.
+    #[test]
+    fn consumed_or_unused_components_are_not_reported() {
+        let (world, transform, _) = world_with_common_components();
+
+        assert!(unsupported_render_components(
+            &world,
+            std::slice::from_ref(&transform),
+            std::slice::from_ref(&transform)
+        )
+        .is_empty());
+        let mut empty = pill_engine::World::new();
+        pill_engine::register_common_components(&mut empty);
+        let transform = pill_engine::common_components::TRANSFORM_SHARED_NAME.to_owned();
+        assert!(unsupported_render_components(&empty, &[transform], &[]).is_empty());
+    }
 
     /// A data layout change pauses rendering unless a renderer rebuilt against
     /// it attached in the same boundary.

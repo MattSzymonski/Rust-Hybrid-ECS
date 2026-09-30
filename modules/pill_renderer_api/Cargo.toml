@@ -10,35 +10,21 @@ workspace = true
 # camera and viewport, and window handles as data. Linked by the host in every
 # posture, by every renderer and (through a renderer's data crate) by projects,
 # so it must never depend on wgpu or winit. Renderer-specific data lives in each
-# renderer's data crate (`extensions/pill_master_renderer_data`). Some
-# dependencies below served that data before it moved; stage 10 of the renderer
-# data split removes them.
+# renderer's data crate (`extensions/pill_master_renderer_data`), and the
+# dependencies are limited to what the contract itself needs (rule 3 of the
+# renderer data split).
 [lib]
 crate-type = ["rlib"]
 
 [dependencies]
 pill_core = { path = "../pill_core" }
+# `#[engine_error]`, which expands to the `thiserror` and `miette` derives below.
 pill_core_macros = { path = "../pill_core_macros" }
 pill_engine = { path = "../pill_engine" }
-trait_type_map = { git = "https://github.com/MattSzymonski/Trait-Type-Map", rev = "25343a9eac856445b0fa8266df5b000326d1574b" }
 
 serde = { version = "1", features = ["derive"] }
-# `#[engine_error]` expands to `thiserror` and `miette` derives.
 thiserror = "2"
 miette = { version = "7", features = ["derive"] }
-glam = { version = "0.33", features = ["serde", "bytemuck"] }
-bytemuck = { version = "1.4", features = ["derive"] }
-# The shaders' slot tables: name-keyed like a map, with the declaration order
-# the uniform buffer packs in. `indexmap` is `ordermap`'s current name.
-indexmap = "2"
-# `jpeg` alongside `png`: the committed helmet asset in `master_renderer_test`
-# ships its PBR maps as JPEG, and re-encoding them to PNG would multiply the
-# committed size for no gain in fidelity.
-image = { version = "0.25", default-features = false, features = [
-    "jpeg",
-    "png",
-] }
-tobj = "3"
 # Window handles as plain data (`RawWindowData`): the standard the windowing
 # crates (winit, tao) and wgpu share, with no windowing crate behind it.
 raw-window-handle = "0.6"
