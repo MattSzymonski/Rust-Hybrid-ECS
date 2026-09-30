@@ -28,6 +28,7 @@ standalone from a console. Performance measurement lives in
 | `test_patch_bookkeeping.py` | The order between a project reload and the patch records it invalidates. A reload that **fails** (build error, load refusal, rolled-back init) keeps the current image, and with it every live patch installed in it - so the bookkeeping may only be dropped once the image actually changed. Patches a project system, breaks the project build, and then rolls the patch back through the failed reload: the rollback must succeed because the patch is still installed. Before the fix it refused with "has not been patched in this session", because the failed attempt had already cleared the records. |
 | `test_basic.py` | The CI fast checks: `cargo fmt --check` and `cargo clippy -D warnings` over the workspace, **`cargo test --workspace` in both feature configurations** (default and `hot_patch` - the feature is additive, so the default run never compiles the live-patching code and left 62 tests outside every lane until this was added), plus launcher-driven native/WASM builds, the WASM size budget, a dev-server smoke test and the native performance benchmark. The three launcher-driven checks SKIP in this repository (no PillLauncher project layout); fmt, clippy and the tests run for real. |
 | `test_coding_standards.py` | Pill comment & layout lint over every `.rs` file: `//!` module header with a `# Responsibilities` section, `// SAFETY:` above unsafe blocks, `///` docs on public items, ordered import-group headers, and `mod tests` as the last top-level section. Ported from `run_coding_standards_test.sh`, which now just invokes it. Exit 0 clean / 1 violations / 2 usage error. String-literal lookalikes are ignored: the host's codegen carries a C# keyword table that lists `unsafe`, and a quoted token is data rather than a declaration. |
+| `test_renderer_boundaries.py` | The renderer data split's dependency rules, read from the Cargo manifests: only a GPU module (`extensions/<renderer>`, found by its `<renderer>_data` sibling) depends on `wgpu`; `pill_renderer_api` depends only on the contract's crates; `pill_host`/`pill_standalone` reach a renderer crate only through a graph-only `*_dependency_graph` dependency their non-test code never names; no project and no data crate depends on a GPU module. `--self-test` proves each rule fails on a generated broken tree. Exit 0 clean / 1 violations / 2 unreadable manifest. |
 | `test_examples.py` | Builds every example under `examples/` in release and reports artifact sizes. Examples are discovered by convention (a `Cargo.toml` or a `*.csproj`), so adding one needs no edit. Ported from `run_examples_tests.sh`, which now just invokes it. |
 | `run_all.py` | Not a test either: the batch entry point. Runs every suite above in the documented order, streams each suite's own output, and ends with a PASS/FAIL summary and a non-zero exit when anything failed. `--list` prints the order, `--only NAME ...` picks suites, `--keep-going` runs the rest after a failure. |
 | `devops/core/suite_common.py` | Not a test, and not in this directory. Single source of truth for paths, log tokens, timeouts, the color `print` wrapper, the `OutputMonitor` (rolling buffer + counter-tick tail), atomic source editing, and host process helpers. Shared by every suite (audit opportunity 5.14) **and** by the hot-reload harness and cold-start startup timing in `devops/benchmarks/`, which is why it lives in `devops/core/`; it also owns the machine-global host lock (`ensure_host_lock`) that serializes host-driving suites. A reworded host log token must keep both sides working. |
@@ -75,7 +76,7 @@ another suite holds it, and is released by process exit - so two host-driving
 suites started at once queue instead of each one's stale-host cleanup killing
 the other's host, which is how a migration scenario once read as flaky. The
 host-free suites (`test_harness_parsing.py`, `test_coding_standards.py`,
-`test_log_contract.py`) do not take the lock and stay safe to run beside
+`test_renderer_boundaries.py`, `test_log_contract.py`) do not take the lock and stay safe to run beside
 anything.
 
 ## Gate matrix
@@ -96,6 +97,7 @@ a row in the same commit that moves it.
 | Clippy | `cargo clippy` for `pill_engine`, `pill_core`, `pill_host` in each posture | clean in every posture |
 | Formatting | `cargo fmt --check` | clean |
 | Comment & layout lint | `python devops/tests/test_coding_standards.py --root modules` | 0 violations |
+| Renderer boundaries | `python devops/tests/test_renderer_boundaries.py` (and `--self-test`) | every rule holds |
 | End-to-end suites | `python devops/tests/run_all.py` | all pass; the suites serialize themselves |
 
 Measured on 2026-09-17, after plan items 2.14 (zero-sized components) and 2.15

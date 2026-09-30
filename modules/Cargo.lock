@@ -4739,10 +4739,6 @@ dependencies = [
 name = "pill_renderer_api"
 version = "0.1.0"
 dependencies = [
- "bytemuck",
- "glam",
- "image",
- "indexmap",
  "miette",
  "pill_core",
  "pill_core_macros",
@@ -4750,8 +4746,6 @@ dependencies = [
  "raw-window-handle 0.6.2",
  "serde",
  "thiserror 2.0.20",
- "tobj",
- "trait_type_map",
 ]
 
 [[package]]

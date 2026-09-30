@@ -64,6 +64,7 @@ SUITES_DIR = WORKSPACE_ROOT / "devops" / "tests"
 SUITE_ORDER: Sequence[str] = (
     "test_harness_parsing.py",
     "test_coding_standards.py",
+    "test_renderer_boundaries.py",
     "test_log_contract.py",
     "test_csharp_analyzer.py",
     "test_hot_reload_suite.py",
