@@ -39,5 +39,3 @@ default = []
 # `pill_renderer_detach`). Opt-in, like every module's: the host's module build
 # turns it on, and a crate linking this as an rlib never exports the symbols.
 module-abi = []
-# Forwarded to the data crate, which owns the shaders and their reload.
-shader-hot-reload = ["pill_master_renderer_data/shader-hot-reload"]

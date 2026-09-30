@@ -6,5 +6,6 @@ edition = "2021"
 [dependencies]
 pill_host = { path = "../../modules/pill_host", default-features = false }
 project = { path = "../../examples/project_rs" }
+pill_master_renderer_data = { path = "../../modules/extensions/pill_master_renderer_data", default-features = false }
 pill_spline = { path = "../../modules/extensions/pill_spline", default-features = false }
 pill_audio = { path = "../../modules/extensions/pill_audio", default-features = false }

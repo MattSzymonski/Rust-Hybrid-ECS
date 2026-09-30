@@ -25,8 +25,9 @@
 //! builds on; the types a game needs from it are re-exported here.
 //!
 //! The shaders live at the crate root (`shaders/`), not under `src/`, so a
-//! shader edit is not a Rust source edit. The development shader reload
-//! ([`shader_reload`], behind `shader-hot-reload`) applies them at runtime.
+//! shader edit is not a Rust source edit. In development the host watches and
+//! re-cooks them, and hands each result to [`shader_hot_reload`]'s export,
+//! compiled only into a loaded module (`module-abi`).
 
 /// The drawable assets - meshes, textures, shaders, materials, passes - and their builders.
 pub mod assets;
@@ -34,15 +35,18 @@ pub mod assets;
 /// The world-side draw components and [`register_components`].
 pub mod components;
 
+/// The C# bridge's asset functions, offered to the host by name.
+pub mod csharp_assets;
+
 /// Bind group indices, the instance batch size, and the pipelines the renderer ships.
 pub mod config;
 
 /// The resource a game sets its pipeline in.
 mod rendering_manager;
 
-/// Development shader reload: watches the HLSL sources and updates the shader assets built from them.
-#[cfg(feature = "shader-hot-reload")]
-pub mod shader_reload;
+/// Development shader reload: puts WGSL the host re-cooked into the shader assets built from it.
+#[cfg(any(test, feature = "module-abi"))]
+pub mod shader_hot_reload;
 
 // External crates
 pub use pill_engine::AssetLoader;
@@ -59,8 +63,6 @@ pub use assets::{
 };
 pub use components::*;
 pub use rendering_manager::RenderingManager;
-#[cfg(feature = "shader-hot-reload")]
-pub use shader_reload::{ShaderReloadReport, ShaderReloader};
 
 /// Registers the renderer's components, asset types and resources with an
 /// engine, and installs its default pipeline; returns zero.

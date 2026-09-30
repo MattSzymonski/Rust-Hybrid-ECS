@@ -23,10 +23,6 @@ use pill_engine::{ComponentTicks, Entity};
 use std::cell::RefCell;
 
 // Current crate
-use super::assets::{
-    NativeMaterialColor, NativeMaterialScalar, NativeMaterialTexture, NativeShaderParameterSlot,
-    NativeShaderTextureSlot,
-};
 use super::commands::{
     ffi_queue_add_component, ffi_queue_create, ffi_queue_destroy, ffi_queue_remove_component,
     ffi_reserve_entity,
@@ -243,7 +239,10 @@ pub(super) struct CsEngineApi {
     asset_load_mesh_obj: extern "C" fn(*const u8, u32, *const u8, u32, *mut u32, *mut u32) -> u8,
     /// Decode a PNG buffer into a color texture, inserted the same way.
     asset_load_texture_png: extern "C" fn(*const u8, u32, *const u8, u32, *mut u32, *mut u32) -> u8,
-    /// Build a shader from managed WGSL sources and slot declarations.
+    /// Build a shader from managed WGSL sources and slot declarations. The slot
+    /// arrays cross as opaque pointers: their element layout is shared by the
+    /// managed side and the renderer data crate, which builds the asset
+    /// (`pill_master_renderer_data::csharp_assets`), not by the host.
     asset_load_shader: extern "C" fn(
         *const u8,
         u32,
@@ -251,9 +250,9 @@ pub(super) struct CsEngineApi {
         u32,
         *const u8,
         u32,
-        *const NativeShaderParameterSlot,
+        *const std::ffi::c_void,
         u32,
-        *const NativeShaderTextureSlot,
+        *const std::ffi::c_void,
         u32,
         u8,
         u8,
@@ -266,11 +265,11 @@ pub(super) struct CsEngineApi {
         u32,
         u32,
         u32,
-        *const NativeMaterialTexture,
+        *const std::ffi::c_void,
         u32,
-        *const NativeMaterialScalar,
+        *const std::ffi::c_void,
         u32,
-        *const NativeMaterialColor,
+        *const std::ffi::c_void,
         u32,
         u8,
         *mut u32,

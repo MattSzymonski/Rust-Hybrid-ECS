@@ -43,21 +43,16 @@ image = { version = "0.25", default-features = false, features = [
     "png",
 ] }
 tobj = "3"
-# Development shader reload only (`shader-hot-reload`): the cooker the build
-# script runs, and a watcher on the shader sources.
-pill_assets = { path = "../../pill_assets", optional = true }
-notify = { version = "6", optional = true }
 
 [features]
 default = []
 # The `pill_module_*` C-ABI exports. Opt-in like every module's: the host's
 # module build turns it on, and a crate linking this as an rlib never exports
 # the symbols (two copies in one binary would collide at link time).
+# Also compiles the development shader reload export
+# (`pill_render_data_shader_changed`): only a loaded module has a host watching
+# its shaders, so a shipping build never carries it.
 module-abi = []
-# Watch `shaders/` for HLSL edits at runtime, re-cook them and update the
-# shader assets built from them. A development convenience: the host enables it
-# with `hot_reload`, and a shipping build never compiles it.
-shader-hot-reload = ["dep:pill_assets", "dep:notify"]
 
 [build-dependencies]
 # Turns `shaders/**/*.hlsl` into the WGSL this crate embeds, so a shader that

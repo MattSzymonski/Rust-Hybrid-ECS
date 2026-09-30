@@ -554,7 +554,7 @@ fn install_default_material(
         true,
     )?;
     let shader = state.renderer_resource_storage.shaders.insert(shader);
-    let parameters = HashMap::from([
+    let parameters = std::collections::BTreeMap::from([
         ("tint".to_owned(), MaterialParameter::Color([1.0; 3])),
         ("specularity".to_owned(), MaterialParameter::Scalar(0.5)),
     ]);

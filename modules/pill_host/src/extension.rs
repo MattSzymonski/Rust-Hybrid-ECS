@@ -93,6 +93,9 @@ mod slot {
         /// Persistable component type names the last `init` registered, used to
         /// detect types the next generation forgets to re-register.
         registered_type_names: Vec<String>,
+        /// The schema hash of each of those types as the last `init` declared
+        /// it, to find the ones another module's reload has re-laid out since.
+        registered_schemas: Vec<(String, u64)>,
         /// Resource ids the last `init` registered, so a type this module stops
         /// owning can be dropped while its image is still mapped.
         registered_resource_ids: Vec<pill_engine::ResourceId>,
@@ -251,6 +254,7 @@ mod slot {
                 source_edit_generation,
                 last_processed_source_edit: 0,
                 registered_type_names: init.registered_type_names,
+                registered_schemas: init.registered_schemas,
                 registered_resource_ids: init.registered_resource_ids,
                 exposed_component_names: init.component_names,
                 graveyard_policy: crate::reload::GraveyardPolicy::Bounded,
@@ -342,6 +346,15 @@ mod slot {
             &self.config.name
         }
 
+        /// The module's crate directory, relative to the workspace root: the
+        /// parent of the source directory its watcher watches.
+        #[cfg(feature = "rendering")]
+        pub(crate) fn crate_directory(&self) -> &Path {
+            Path::new(&self.config.watch_directory)
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+        }
+
         /// The generation this module's watcher has signalled but nothing has acted
         /// on yet, if any.
         ///
@@ -349,7 +362,7 @@ mod slot {
         /// [`Self::reload_if_changed`] turns it into a full rebuild. The value is
         /// returned rather than just a flag so the caller can hand the exact
         /// generation it acted on back to [`Self::consume_pending_reload`].
-        #[cfg(feature = "hot_patch")]
+        #[cfg(any(feature = "hot_patch", feature = "rendering"))]
         pub(crate) fn pending_reload_generation(&self) -> Option<u64> {
             let generation = self.source_edit_generation.load(Ordering::Acquire);
             (generation != self.last_processed_source_edit).then_some(generation)
@@ -375,6 +388,34 @@ mod slot {
         #[cfg(any(feature = "hot_patch", feature = "rendering"))]
         pub(crate) fn current_library(&self) -> &NativeLibrary {
             &self.current
+        }
+
+        /// The address of the current generation's export named `name`, if it
+        /// has one; how the C# bridge finds the functions a module offers by
+        /// name (the renderer data crate's asset functions).
+        ///
+        /// Valid while this generation stays current: callers republish after
+        /// every reload rather than keep an address across one.
+        pub(crate) fn export_address(
+            &self,
+            name: &str,
+        ) -> Option<pill_engine::component_registry::ExportAddress> {
+            // SAFETY: the symbol is read as a plain address and never called
+            // here; whoever calls it states its signature.
+            let address = unsafe { self.current.resolve_export::<*const ()>(name.as_bytes()) }?;
+            Some(pill_engine::component_registry::ExportAddress(address))
+        }
+
+        /// The persistable components this module registered whose layout
+        /// another module's reload has replaced since; empty while it is
+        /// current. See [`crate::reload::stale_components`].
+        pub(crate) fn stale_components(&self, world: &pill_engine::World) -> Vec<String> {
+            crate::reload::stale_components(world, &self.registered_schemas)
+        }
+
+        /// The owner tag this module's systems are registered under.
+        pub(crate) fn owner(&self) -> SystemOwner {
+            self.owner
         }
 
         /// Every component type name the current generation registered, exposed
@@ -432,6 +473,7 @@ mod slot {
                 current: &mut self.current,
                 old_libraries: &mut self.old_libraries,
                 registered_type_names: &mut self.registered_type_names,
+                registered_schemas: &mut self.registered_schemas,
                 registered_resource_ids: &mut self.registered_resource_ids,
                 graveyard_policy: self.graveyard_policy,
             };

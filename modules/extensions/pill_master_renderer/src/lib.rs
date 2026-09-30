@@ -73,8 +73,6 @@ mod module_entry;
 // External crates
 use pill_engine::{pill_module, Engine};
 pub use pill_master_renderer_data::components::*;
-#[cfg(feature = "shader-hot-reload")]
-pub use pill_master_renderer_data::{shader_reload, ShaderReloadReport, ShaderReloader};
 pub use pill_master_renderer_data::{
     AssetLoader, Material, MaterialBuilder, MaterialParameter, Mesh, MeshVertex, PassKind,
     PassTarget, RenderPass, RenderingPipeline, Shader, ShaderBuilder, ShaderParameterSlot,

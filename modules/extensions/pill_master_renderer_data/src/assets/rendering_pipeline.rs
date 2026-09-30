@@ -49,7 +49,15 @@ impl RenderingPipeline {
     }
 }
 
-impl Asset for RenderingPipeline {}
+// Shared across binaries: the data module, the GPU module and every project
+// compile their own copy of this crate, each with its own `TypeId`. The pinned
+// name makes them one asset column (see `Asset::shared_name`); keep it
+// verbatim when moving the type.
+impl Asset for RenderingPipeline {
+    fn shared_name() -> Option<&'static str> {
+        Some("pill_master_renderer::assets::RenderingPipeline")
+    }
+}
 
 #[cfg(test)]
 mod tests {

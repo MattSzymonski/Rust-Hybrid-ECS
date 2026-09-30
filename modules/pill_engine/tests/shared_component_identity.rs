@@ -849,3 +849,120 @@ fn one_type_compiled_twice_is_not_a_name_conflict() {
         "two copies of one type must still bind"
     );
 }
+
+/// One persistable shared component in two layouts: the one now in force and
+/// the one a stale binary was built against. Same size, fields swapped.
+pub mod relaid_current {
+    /// The layout the reloaded subject declares.
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    #[repr(C)]
+    pub struct Relaid {
+        pub first: u32,
+        pub second: u32,
+    }
+    impl pill_engine::component::Component for Relaid {
+        fn shared_name() -> Option<&'static str> {
+            Some("audit::Relaid")
+        }
+    }
+}
+
+/// The previous layout of [`relaid_current::Relaid`].
+pub mod relaid_previous {
+    /// The layout a binary built before the edit declares.
+    #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+    #[repr(C)]
+    pub struct Relaid {
+        pub second: u32,
+        pub first: u32,
+    }
+    impl pill_engine::component::Component for Relaid {
+        fn shared_name() -> Option<&'static str> {
+            Some("audit::Relaid")
+        }
+    }
+}
+
+/// A two-field `u32` layout, with the field names in declaration order.
+const fn relaid_fields(
+    leading: &'static str,
+    trailing: &'static str,
+) -> [pill_engine::component_registry::ComponentFieldDescriptor; 2] {
+    [
+        pill_engine::component_registry::ComponentFieldDescriptor {
+            name: leading,
+            type_tag: "u32",
+            offset: 0,
+            size: 4,
+            align: 4,
+            element_count: 0,
+        },
+        pill_engine::component_registry::ComponentFieldDescriptor {
+            name: trailing,
+            type_tag: "u32",
+            offset: 4,
+            size: 4,
+            align: 4,
+            element_count: 0,
+        },
+    ]
+}
+
+static RELAID_CURRENT_FIELDS: [pill_engine::component_registry::ComponentFieldDescriptor; 2] =
+    relaid_fields("first", "second");
+static RELAID_PREVIOUS_FIELDS: [pill_engine::component_registry::ComponentFieldDescriptor; 2] =
+    relaid_fields("second", "first");
+
+/// A reload of a subject that was current for a shared component may re-lay
+/// it out; a subject already stale for it (a failed rebuild's rollback) may
+/// not take it back, and without the host's announcement the old layout is a
+/// mismatch as before.
+#[test]
+fn only_a_current_subject_may_re_lay_out_a_shared_component() {
+    const NAME: &str = "audit::Relaid";
+    let mut world = World::new();
+    world.register_persistable_component_with_layout::<relaid_previous::Relaid>(
+        &RELAID_PREVIOUS_FIELDS,
+    );
+    assert!(world.take_registration_error().is_none());
+    let previous_hash = world.persist_schema_hash(NAME).expect("registered");
+
+    // The reload of a subject current for the component: the new layout wins.
+    world.supersede_persist_registrations(&[NAME.to_owned()]);
+    world.register_persistable_component_with_layout::<relaid_current::Relaid>(
+        &RELAID_CURRENT_FIELDS,
+    );
+    world.clear_superseded_persist_registrations();
+    assert!(
+        world.take_registration_error().is_none(),
+        "a superseding registration re-lays the component out"
+    );
+    let current_hash = world.persist_schema_hash(NAME).expect("registered");
+    assert_ne!(current_hash, previous_hash, "the new layout is recorded");
+
+    // The rollback of a subject stale for it: skipped, the layout is kept.
+    world.supersede_persist_registrations(&[NAME.to_owned()]);
+    world.mark_stale_superseded_persist_registrations(&[NAME.to_owned()]);
+    world.register_persistable_component_with_layout::<relaid_previous::Relaid>(
+        &RELAID_PREVIOUS_FIELDS,
+    );
+    world.clear_superseded_persist_registrations();
+    assert!(
+        world.take_registration_error().is_none(),
+        "a stale subject's registration is skipped, not failed"
+    );
+    assert_eq!(
+        world.persist_schema_hash(NAME),
+        Some(current_hash),
+        "a stale subject cannot take the layout back"
+    );
+
+    // Unannounced, the old layout is the mismatch it always was.
+    world.register_persistable_component_with_layout::<relaid_previous::Relaid>(
+        &RELAID_PREVIOUS_FIELDS,
+    );
+    assert!(matches!(
+        world.take_registration_error(),
+        Some(pill_engine::error::WorldError::SharedComponentLayoutMismatch { .. })
+    ));
+}

@@ -4,9 +4,14 @@
 
 use pill_host::{StaticModule, StaticProject, StaticProjectBackend, StaticRenderer};
 
-/// Every selected extension, in `project_settings.yaml` order.
+/// Every selected extension: the renderer's data crate first, then
+/// `project_settings.yaml` order.
 #[rustfmt::skip]
 pub const STATIC_MODULES: &[StaticModule] = &[
+    StaticModule {
+        name: "pill_master_renderer_data",
+        init: pill_master_renderer_data::register,
+    },
     StaticModule {
         name: "pill_spline",
         init: pill_spline::register,

@@ -89,6 +89,7 @@ SPLINE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "src" / "pill_spli
 SESSION_A_SETTINGS = """\
 name: "Suite Session A"
 build_binary_name: "SuiteSessionA"
+renderer: "none"
 modules:
   - "pill_spline"
 """

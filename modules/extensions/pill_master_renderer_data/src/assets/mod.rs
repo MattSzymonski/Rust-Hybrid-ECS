@@ -58,3 +58,34 @@ trait_type_map::impl_trait_accessible!(
 pub fn asset_key<T: Asset>(handle: Handle<T>) -> u64 {
     (u64::from(handle.generation()) << 32) | u64::from(handle.index())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The asset types' shared names are an identity contract: they are what
+    /// lets the data module, the GPU module and a project reach one column per
+    /// type, so the exact strings are asserted here.
+    #[test]
+    fn the_asset_types_keep_their_pinned_shared_names() {
+        let names = [
+            Mesh::shared_name(),
+            Texture::shared_name(),
+            Shader::shared_name(),
+            Material::shared_name(),
+            RenderPass::shared_name(),
+            RenderingPipeline::shared_name(),
+        ];
+        assert_eq!(
+            names,
+            [
+                Some("pill_master_renderer::assets::Mesh"),
+                Some("pill_master_renderer::assets::Texture"),
+                Some("pill_master_renderer::assets::Shader"),
+                Some("pill_master_renderer::assets::Material"),
+                Some("pill_master_renderer::assets::RenderPass"),
+                Some("pill_master_renderer::assets::RenderingPipeline"),
+            ]
+        );
+    }
+}

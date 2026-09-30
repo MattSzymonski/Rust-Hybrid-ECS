@@ -67,8 +67,6 @@ mod reload;
 /// Attaching a renderer to a frontend's window, through its handles as data.
 #[cfg(feature = "rendering")]
 mod render_window;
-/// The renderer's plain data, registered in every posture before anything loads.
-mod renderer_data;
 /// The GPU renderer as a loaded module: starting it and driving its backend.
 #[cfg(all(feature = "rendering", feature = "hot_reload"))]
 mod renderer_module;
@@ -81,6 +79,9 @@ mod telemetry;
 /// Source-tree watching and reload signalling for the main thread.
 #[cfg(feature = "hot_reload")]
 mod watcher;
+
+#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+mod shader_watcher;
 
 /// Statically linked project and module registration, for shipping builds.
 #[cfg(not(feature = "hot_reload"))]

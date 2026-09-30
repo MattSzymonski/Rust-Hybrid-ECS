@@ -84,6 +84,11 @@ pub struct Host {
     workspace_root: PathBuf,
     #[cfg(feature = "hot_reload")]
     module_config: ProjectModuleConfig,
+    /// The renderer GPU module a windowed build loads, from the project's
+    /// `renderer:` setting; `None` when it selects no renderer. Its data crate
+    /// is already among `extensions`.
+    #[cfg(all(feature = "hot_reload", feature = "rendering"))]
+    renderer: Option<String>,
     // Boxed before EngineApi is created so its raw engine pointer remains
     // stable even if Host is moved by a caller.
     engine: Box<Engine>,
@@ -141,6 +146,14 @@ pub struct Host {
     /// The `queued_reload_generation` value the frame loop last rebuilt for.
     #[cfg(feature = "hot_reload")]
     last_processed_queued_reload: u64,
+    /// Owners whose systems this host suspended because their binary was built
+    /// against a shared component layout another reload has replaced.
+    ///
+    /// Kept so only these are resumed when they are rebuilt: an owner some
+    /// other mechanism suspended (the renderer's pause) is not this code's to
+    /// turn back on.
+    #[cfg(feature = "hot_reload")]
+    stale_suspended_owners: Vec<pill_engine::SystemOwner>,
     /// Per-function fast path, when the project opted in with `#[pill_hot]`.
     ///
     /// `None` when the feature is off, when no function is annotated, or when
@@ -362,10 +375,97 @@ pub struct RenderingHost {
     assets: crate::render_assets::NativeAssets,
     viewport: Option<RenderViewport>,
     presented_scene: bool,
-    /// Re-cooks edited renderer shaders and updates their assets; `None` when
-    /// the watch could not start, which only costs the reload.
+    /// Why rendering is paused, or `None` while it runs.
+    ///
+    /// Set when the renderer's data crate reloaded with a different component
+    /// layout and no renderer built against the new layout could take over:
+    /// the live renderer's `rendering` system and `render` would read the new
+    /// rows through the old field offsets. While paused, the renderer's owner
+    /// is disabled and `render` is skipped; the window keeps its last frame.
     #[cfg(feature = "hot_reload")]
-    shader_reloader: Option<pill_master_renderer_data::ShaderReloader>,
+    paused: Option<PauseReason>,
+    /// Watches the renderer data crate's `shaders/` and queues what it
+    /// re-cooks; `None` without a renderer, or when its data crate has no
+    /// shaders or the watch could not start.
+    #[cfg(feature = "hot_reload")]
+    shader_watcher: Option<crate::shader_watcher::ShaderWatcher>,
+}
+
+/// Why a windowed host stopped rendering; see [`RenderingHost`]'s `paused`.
+#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PauseReason {
+    /// The renderer's data crate reloaded with a different component layout,
+    /// and the renderer rebuilt against it failed to build, initialize or
+    /// attach.
+    StaleRendererAfterDataLayoutChange,
+}
+
+/// What a renderer step did, for the pause decision.
+#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RendererStep {
+    /// Nothing reloaded; whatever was attached stays.
+    Unchanged,
+    /// A generation loaded or reloaded and is attached to the window.
+    Attached,
+    /// A reload or first load was attempted and did not end with a new
+    /// generation attached (build, `init` or attach failed; a rollback may
+    /// have re-attached the previous generation).
+    Failed,
+}
+
+/// Whether rendering should be paused after one frame boundary.
+///
+/// `paused` is the state before it; `data_layout_changed` says whether the
+/// renderer's data crate reloaded this boundary with a different component
+/// layout; `step` is what the renderer step did. A renderer that attached
+/// successfully always resumes; a layout change without one pauses; anything
+/// else keeps the current state.
+#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+fn pause_after_boundary(
+    paused: Option<PauseReason>,
+    data_layout_changed: bool,
+    step: RendererStep,
+) -> Option<PauseReason> {
+    match step {
+        RendererStep::Attached => None,
+        RendererStep::Failed | RendererStep::Unchanged if data_layout_changed => {
+            Some(PauseReason::StaleRendererAfterDataLayoutChange)
+        }
+        RendererStep::Failed | RendererStep::Unchanged => paused,
+    }
+}
+
+/// The structural hash of every component the named extension registered,
+/// by component name, or empty when no such extension is loaded.
+///
+/// Taken before and after a reload of the renderer's data crate, to tell a
+/// layout change (the renderer must not read the rows until it is rebuilt)
+/// from a body-only one (it may).
+#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+fn component_schemas_of(host: &Host, extension: &str) -> Vec<(String, Option<u64>)> {
+    let Some(slot) = host.extensions.iter().find(|slot| slot.name() == extension) else {
+        return Vec::new();
+    };
+    let world = host.engine.world();
+    let mut schemas: Vec<(String, Option<u64>)> = slot
+        .exposed_component_names()
+        .iter()
+        .map(|name| {
+            let schema = world
+                .resolve_component_id_by_name_any(name)
+                .ok()
+                .flatten()
+                .and_then(|component| world.component_field_layout(component))
+                .filter(|fields| !fields.is_empty())
+                .map(pill_engine::component::component_schema_hash);
+            (name.clone(), schema)
+        })
+        .collect();
+    schemas.sort();
+    schemas.dedup();
+    schemas
 }
 
 #[cfg(feature = "rendering")]
@@ -419,7 +519,7 @@ impl RenderingHost {
     /// A backend that fails to attach leaves the window undrawn and is
     /// retried on the next source change; the reason is logged.
     #[cfg(feature = "hot_reload")]
-    fn reload_renderer_if_changed(&mut self) {
+    fn reload_renderer_if_changed(&mut self) -> RendererStep {
         let RenderingHost {
             host,
             renderer,
@@ -445,8 +545,21 @@ impl RenderingHost {
         // that failed - has nothing attached yet, exactly like a detached one.
         let loaded = outcome == crate::renderer_module::RendererModuleChange::Loaded;
         if !detached && !loaded {
-            return;
+            // A reload that failed before its commit (build or load) left the
+            // backend attached; one that did not run changed nothing.
+            return match outcome {
+                crate::renderer_module::RendererModuleChange::Reloaded(ReloadOutcome::Failed {
+                    ..
+                }) => RendererStep::Failed,
+                _ => RendererStep::Unchanged,
+            };
         }
+        // After the commit: a rolled-back reload re-attaches the previous
+        // generation, which is not a renderer built for new data.
+        let rolled_back = matches!(
+            outcome,
+            crate::renderer_module::RendererModuleChange::Reloaded(ReloadOutcome::Failed { .. })
+        );
         let (width, height) = *surface_size;
         match attach_backend(renderer_module, *window_data, width, height) {
             Ok(attached) => {
@@ -466,12 +579,147 @@ impl RenderingHost {
                     rendering_systems,
                     "renderer reattached to the window"
                 );
+                if rolled_back {
+                    RendererStep::Failed
+                } else {
+                    RendererStep::Attached
+                }
             }
-            Err(error) => warn!(
+            Err(error) => {
+                warn!(
+                    target: telemetry_target::HOT_RELOAD,
+                    outcome = ?outcome,
+                    "renderer reloaded but could not reattach; the window stays undrawn until the next renderer edit: {error}"
+                );
+                RendererStep::Failed
+            }
+        }
+    }
+
+    /// The renderer step of one frame boundary, run between the host's reload
+    /// phase and its frame phase: reload the renderer when its own sources
+    /// changed, or when its data crate just reloaded, and pause or resume
+    /// rendering accordingly.
+    ///
+    /// Module builds are synchronous, so a data reload and the renderer rebuild
+    /// it requests complete in the same boundary: in the normal case no frame
+    /// runs between the two swaps and nothing pauses. The pause covers the
+    /// rest: a layout change whose renderer could not be rebuilt, initialized
+    /// or attached.
+    #[cfg(feature = "hot_reload")]
+    fn renderer_step(
+        &mut self,
+        data_extension: Option<&str>,
+        reloaded_extensions: &[String],
+        schemas_before: Option<Vec<(String, Option<u64>)>>,
+    ) {
+        // Step 1: A reloaded data crate means the renderer's compiled-in copy
+        // of it is stale: rebuild the renderer against the new source.
+        let data_reloaded =
+            data_extension.is_some_and(|data| reloaded_extensions.iter().any(|name| name == data));
+        let data_layout_changed = match (data_reloaded, data_extension, schemas_before) {
+            (true, Some(data), Some(before)) => component_schemas_of(&self.host, data) != before,
+            _ => false,
+        };
+        if data_reloaded {
+            info!(
                 target: telemetry_target::HOT_RELOAD,
-                outcome = ?outcome,
-                "renderer reloaded but could not reattach; the window stays undrawn until the next renderer edit: {error}"
-            ),
+                layout_changed = data_layout_changed,
+                "the renderer's data crate reloaded; rebuilding the renderer against it"
+            );
+            self.renderer_module.request_rebuild();
+        }
+
+        // Step 2: The renderer reload itself, from its own edit or the request.
+        let step = self.reload_renderer_if_changed();
+
+        // Step 3: Pause or resume.
+        let owner = self.renderer_module.owner();
+        let next = pause_after_boundary(self.paused, data_layout_changed, step);
+        if next != self.paused {
+            let enabled = next.is_none();
+            self.host
+                .engine
+                .set_systems_enabled_for_owner(owner, enabled);
+            match next {
+                Some(reason) => warn!(
+                    target: telemetry_target::HOT_RELOAD,
+                    reason = ?reason,
+                    "rendering paused: the renderer is not built against the current data layout; the window keeps its last frame until a renderer edit builds and loads"
+                ),
+                None => info!(
+                    target: telemetry_target::HOT_RELOAD,
+                    "rendering resumed: the renderer is built against the current data layout"
+                ),
+            }
+            self.paused = next;
+        } else if next.is_some() {
+            // Still paused: a generation that registered during the pause
+            // starts disabled already (the owner stays disabled).
+            self.host.engine.set_systems_enabled_for_owner(owner, false);
+        }
+    }
+
+    /// Hand every shader the watcher re-cooked to the renderer data crate's
+    /// `pill_render_data_shader_changed`, which puts the WGSL into the shader
+    /// assets built from it.
+    ///
+    /// The export is resolved again on every delivery, from the data module
+    /// generation current at this frame boundary, so a shader edit made while
+    /// the data crate was rebuilding lands in the generation that replaced it.
+    /// A data crate that does not export it (built without `module-abi`)
+    /// leaves the edits undelivered, with a warning.
+    #[cfg(feature = "hot_reload")]
+    fn deliver_shader_changes(&mut self, data_extension: Option<&str>) {
+        let Some(watcher) = &self.shader_watcher else {
+            return;
+        };
+        let cooked = watcher.drain();
+        if cooked.is_empty() {
+            return;
+        }
+        let Host {
+            extensions, engine, ..
+        } = &mut self.host;
+        let Some(slot) =
+            data_extension.and_then(|data| extensions.iter().find(|slot| slot.name() == data))
+        else {
+            return;
+        };
+        let Some(address) = slot.export_address(SHADER_CHANGED_EXPORT) else {
+            warn!(
+                target: telemetry_target::HOT_RELOAD,
+                module = slot.name(),
+                export = SHADER_CHANGED_EXPORT,
+                "the renderer data module does not export the shader reload function; shader edits are not applied"
+            );
+            return;
+        };
+        // SAFETY: the data crate exports this name with exactly
+        // `ShaderChangedFunction`'s signature, and a function pointer and a data
+        // pointer have the same size on every target this engine builds for.
+        let shader_changed =
+            unsafe { std::mem::transmute_copy::<*const (), ShaderChangedFunction>(&address.0) };
+        let world: *mut pill_engine::World = engine.world_mut();
+        for shader in cooked {
+            // SAFETY: `world` is the live engine world, used by nothing else for
+            // the call, and both buffers are the owned strings' bytes.
+            let changed = unsafe {
+                shader_changed(
+                    world,
+                    shader.relative_path.as_ptr(),
+                    shader.relative_path.len(),
+                    shader.wgsl.as_ptr(),
+                    shader.wgsl.len(),
+                )
+            };
+            if changed == SHADER_CHANGE_REFUSED {
+                warn!(
+                    target: telemetry_target::HOT_RELOAD,
+                    path = shader.relative_path.as_str(),
+                    "the renderer data module refused a re-cooked shader"
+                );
+            }
         }
     }
 
@@ -487,25 +735,57 @@ impl RenderingHost {
 
     /// Execute one ECS frame and present its resulting world to the surface.
     pub fn run_one_frame(&mut self) -> Result<Option<FrameReport>, RendererError> {
-        // A renderer module whose sources changed is swapped first, so this
-        // frame is drawn by the generation that is current.
+        #[cfg(feature = "metrics")]
+        let frame_start = Instant::now();
+
+        // Step 1: The data crate's schemas before any reload, when it has an
+        // edit pending: compared after the reload phase to tell a layout change
+        // from a body-only one.
         #[cfg(feature = "hot_reload")]
-        self.reload_renderer_if_changed();
-        // An edited renderer shader becomes an asset edit here, before the
-        // frame, so this frame's sync already rebuilds it.
+        let data_extension = self
+            .host
+            .renderer
+            .as_deref()
+            .map(|renderer| format!("{renderer}_data"));
         #[cfg(feature = "hot_reload")]
-        if let Some(reloader) = &mut self.shader_reloader {
-            if let Some(assets) = self
+        let schemas_before = data_extension.as_deref().and_then(|data| {
+            let pending = self
                 .host
-                .engine_mut()
-                .world_mut()
-                .get_resource_mut::<pill_engine::AssetManager>()
-            {
-                reloader.poll(assets);
-            }
-        }
+                .extensions
+                .iter()
+                .any(|slot| slot.name() == data && slot.pending_reload_generation().is_some());
+            pending.then(|| component_schemas_of(&self.host, data))
+        });
+
+        // Step 2: Extension and project reloads, then the renderer step, all
+        // before any system runs: the renderer this frame draws with is built
+        // against the data this frame holds, or rendering is paused.
+        #[cfg_attr(not(feature = "hot_reload"), allow(unused_variables))]
+        let reloaded_extensions = run_reload_phase(&mut self.host);
+        #[cfg(feature = "hot_reload")]
+        self.renderer_step(
+            data_extension.as_deref(),
+            &reloaded_extensions,
+            schemas_before,
+        );
+        // Re-cooked shaders go to the data generation that is current now,
+        // after every swap of this boundary.
+        #[cfg(feature = "hot_reload")]
+        self.deliver_shader_changes(data_extension.as_deref());
+
+        // Step 3: Asset sync, then the frame's systems.
         self.assets.update(self.host.engine_mut())?;
-        let report = run_one_frame(&mut self.host);
+        let report = run_frame_phase(
+            &mut self.host,
+            #[cfg(feature = "metrics")]
+            frame_start,
+        );
+
+        // Step 4: While paused the live renderer must not read the world.
+        #[cfg(feature = "hot_reload")]
+        if self.paused.is_some() {
+            return Ok(report);
+        }
         // The renderer reads both resources straight out of the world - the
         // frame the `rendering` system filled in, and the store the assets live
         // in - rather than being handed a copy of the assets. Both borrows last
@@ -671,14 +951,12 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
     engine.set_parallel_execution(true);
     let engine_api = EngineApi::new(&mut engine);
 
-    // The renderer's plain data, before anything that may use it: extensions
-    // and the project find its components registered, and the C# bridge binds
-    // them natively, whether or not this host ever attaches a renderer.
-    let renderer_component_names = crate::renderer_data::register_renderer_data(&mut engine);
-
     // Step 4: Build, load and watch the extensions before the project.
     // Modules are infrastructure: loading them first means the project can rely
-    // on whatever they register. Each gets its own owner tag and its own
+    // on whatever they register. The renderer's data crate, when the project
+    // selects a renderer, is the first of them (see `HostConfig::renderer`), so
+    // extensions and the project find its components registered and the C#
+    // bridge binds them like any extension's, headless included. Each gets its own owner tag and its own
     // generation counter, so later reloads stay isolated from each other.
     let mut extensions = Vec::with_capacity(host_config.extensions.len());
     for (index, module_config) in host_config.extensions.iter().enumerate() {
@@ -705,6 +983,9 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
         }
         extensions.push(slot);
     }
+    // The renderer data crate's asset functions, for the C# bridge: resolved
+    // from whichever loaded module offers them, before any managed code runs.
+    publish_asset_exports(&extensions);
 
     // Step 5: Build and load the project module, then start its source watcher.
     // Extensions load first, so the C# backend can be handed every
@@ -719,12 +1000,6 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
     let mut module_exposed_components: Vec<ModuleExposedComponent> = Vec::new();
     let mut all_mirror_methods: Vec<crate::csharp::ResolvedMirrorMethod> = Vec::new();
     if let ProjectModuleBackend::CSharp(_) = &module_config.backend {
-        // The renderer data first: it registered before every extension.
-        module_exposed_components.extend(crate::renderer_data::expose_renderer_data_to_csharp(
-            &workspace_root,
-            &engine,
-            &renderer_component_names,
-        )?);
         for slot in &extensions {
             // Regenerate the module's C# mirror from its current generation.
             // The returned change flag is ignored at startup (the mirror is
@@ -819,6 +1094,8 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
     let host = Host {
         workspace_root,
         module_config,
+        #[cfg(feature = "rendering")]
+        renderer: host_config.renderer.clone(),
         engine,
         engine_api,
         loaded_project,
@@ -827,6 +1104,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<Host, HostError> {
         last_processed_source_edit: 0,
         queued_reload_generation: 0,
         last_processed_queued_reload: 0,
+        stale_suspended_owners: Vec::new(),
         #[cfg(feature = "hot_patch")]
         hot_patch,
         #[cfg(feature = "hot_patch")]
@@ -939,6 +1217,8 @@ where
         crate::render_assets::NativeAssets::prepare(Some(&project_root), &host.workspace_root)?;
     #[cfg(not(feature = "hot_reload"))]
     let assets = crate::render_assets::NativeAssets::prepare(None)?;
+    #[cfg(feature = "hot_reload")]
+    let shader_watcher = start_shader_watcher(&host);
     Ok(RenderingHost {
         host,
         renderer,
@@ -950,8 +1230,61 @@ where
         viewport: None,
         presented_scene: false,
         #[cfg(feature = "hot_reload")]
-        shader_reloader: start_shader_reloader(),
+        paused: None,
+        #[cfg(feature = "hot_reload")]
+        shader_watcher,
     })
+}
+
+/// The renderer data crate's development shader reload export; see
+/// `pill_master_renderer_data::shader_hot_reload`.
+#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+const SHADER_CHANGED_EXPORT: &str = "pill_render_data_shader_changed";
+
+/// What that export returns when it could not look at the assets at all.
+#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+const SHADER_CHANGE_REFUSED: u32 = u32::MAX;
+
+/// Signature of [`SHADER_CHANGED_EXPORT`]: the world, the re-cooked file's
+/// path relative to `shaders/`, and its WGSL; returns how many shader assets
+/// changed.
+#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+type ShaderChangedFunction = unsafe extern "C" fn(
+    world: *mut pill_engine::World,
+    path: *const u8,
+    path_len: usize,
+    wgsl: *const u8,
+    wgsl_len: usize,
+) -> u32;
+
+/// Start watching the renderer data crate's shaders, when the host has a
+/// renderer and its data crate has a `shaders/` directory.
+///
+/// A watch that cannot start is reported and leaves the host without shader
+/// reload; nothing else depends on it.
+#[cfg(all(feature = "rendering", feature = "hot_reload"))]
+fn start_shader_watcher(host: &Host) -> Option<crate::shader_watcher::ShaderWatcher> {
+    let data = format!(
+        "{}{}",
+        host.renderer.as_deref()?,
+        crate::config::RENDERER_DATA_SUFFIX
+    );
+    let slot = host.extensions.iter().find(|slot| slot.name() == data)?;
+    let shaders_directory = host
+        .workspace_root
+        .join(slot.crate_directory())
+        .join("shaders");
+    match crate::shader_watcher::ShaderWatcher::spawn(&data, shaders_directory) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            warn!(
+                target: telemetry_target::HOT_RELOAD,
+                module = data.as_str(),
+                "shader reload is off: the shader watcher could not start: {error}"
+            );
+            None
+        }
+    }
 }
 
 /// The renderer module a windowed host loads: the extension slot it lives in.
@@ -993,6 +1326,7 @@ fn attach_renderer_module<W: RendererWindow>(
     #[cfg(feature = "hot_reload")]
     {
         let renderer_module = crate::renderer_module::RendererModule::start(
+            host.renderer.as_deref(),
             &mut host.engine,
             &host.engine_api,
             &host.workspace_root,
@@ -1080,24 +1414,6 @@ fn attach_backend(
     }
 }
 
-/// Start watching the renderer's shader sources, or log why it could not.
-///
-/// A watch that fails to start costs only the shader reload, never the host,
-/// so the failure is reported and the host runs without it.
-#[cfg(all(feature = "rendering", feature = "hot_reload"))]
-fn start_shader_reloader() -> Option<pill_master_renderer_data::ShaderReloader> {
-    match pill_master_renderer_data::ShaderReloader::new() {
-        Ok(reloader) => Some(reloader),
-        Err(error) => {
-            warn!(
-                target: telemetry_target::HOT_RELOAD,
-                "renderer shader reload is off: the source watch failed: {error}"
-            );
-            None
-        }
-    }
-}
-
 /// Complete rendering setup from an already-built [`Host`], attaching the
 /// engine renderer to a supplied native window.
 ///
@@ -1141,6 +1457,8 @@ where
         crate::render_assets::NativeAssets::prepare(Some(&project_root), &host.workspace_root)?;
     #[cfg(not(feature = "hot_reload"))]
     let assets = crate::render_assets::NativeAssets::prepare(None)?;
+    #[cfg(feature = "hot_reload")]
+    let shader_watcher = start_shader_watcher(&host);
     Ok(RenderingHost {
         host,
         renderer,
@@ -1152,14 +1470,32 @@ where
         viewport: None,
         presented_scene: false,
         #[cfg(feature = "hot_reload")]
-        shader_reloader: start_shader_reloader(),
+        paused: None,
+        #[cfg(feature = "hot_reload")]
+        shader_watcher,
     })
 }
 
-/// Process hot reloads, execute one scheduler frame, and update FPS tracking.
+/// Publish the C# asset functions the loaded extensions offer (the renderer
+/// data crate's), taking the last module that offers each name.
 ///
-/// Returns a report roughly every three seconds for a frontend to print or
-/// display; all other frames return `None`.
+/// A project with no renderer data crate publishes none, and its C# asset
+/// calls report that no renderer data provides them.
+#[cfg(feature = "hot_reload")]
+fn publish_asset_exports(extensions: &[ExtensionSlot]) {
+    let found = crate::csharp::publish_asset_exports(|name| {
+        extensions
+            .iter()
+            .rev()
+            .find_map(|slot| slot.export_address(name))
+    });
+    info!(
+        target: telemetry_target::HOT_RELOAD,
+        found,
+        "C# asset functions published from the loaded extensions"
+    );
+}
+
 /// Drop every recorded prologue address, because an image was just replaced.
 ///
 /// A prologue patch overwrote bytes inside a loaded artifact. When that artifact
@@ -1390,7 +1726,7 @@ fn regenerate_module_csharp_mirror(
 /// build configurations. Without `hot_reload` there is nothing to reload, and
 /// the no-op twin below compiles the whole sequence out.
 #[cfg(feature = "hot_reload")]
-fn run_reload_steps(host: &mut Host) {
+fn run_reload_steps(host: &mut Host) -> Vec<String> {
     // Step 1: Reload any extension whose sources changed. Each module
     // owns an independent generation counter and clears only its own systems,
     // so editing one module never rebuilds another and never disturbs the
@@ -1475,6 +1811,20 @@ fn run_reload_steps(host: &mut Host) {
             }
             ReloadOutcome::Unchanged => {}
         }
+    }
+
+    // Which extensions reloaded, by name, for the caller: a windowed host
+    // rebuilds its renderer when the renderer's data crate is among them.
+    let reloaded_extensions: Vec<String> = reloaded_modules
+        .iter()
+        .map(|&index| extensions[index].name().to_owned())
+        .collect();
+
+    // Step 3a: A reloaded module may be the one offering the C# asset
+    // functions; its previous generation's addresses must not be used again,
+    // and managed code (a queued C# reload re-runs startups) may call them next.
+    if any_module_reloaded {
+        publish_asset_exports(extensions);
     }
 
     // Step 3b: A reloaded module may have changed the C# mirror surface
@@ -1603,25 +1953,108 @@ fn run_reload_steps(host: &mut Host) {
         host.bump_editor_revision();
     }
 
+    // Step 6: A reload above may have re-laid out a shared component other
+    // subjects registered too. Those still run code built against the old
+    // layout, so their systems stay suspended until a rebuild catches them up;
+    // the project normally does in Step 5 of this same boundary.
+    suspend_stale_subjects(host);
+
     // Print the analytics line for every reload completed this frame (extensions
     //  from Step 0, the project from Step 1), plus one aggregate total.
     // The events were recorded with their build/stage/load/init/migrate
     // breakdowns already populated, so this is a pure drain-and-print.
     analytics::print_reload_events(reload_started);
+    reloaded_extensions
 }
 
 /// See the `hot_reload` version above; a statically linked build reloads
 /// nothing, so there is no work and no analytics to drain.
 #[cfg(not(feature = "hot_reload"))]
-fn run_reload_steps(_host: &mut Host) {}
+fn run_reload_steps(_host: &mut Host) -> Vec<String> {
+    Vec::new()
+}
 
+/// Suspend the systems of every subject built against a shared component
+/// layout a reload has since replaced, and resume the ones rebuilt since.
+///
+/// A stale subject's queries are already refused by the declared schema check,
+/// but its systems can reach the type in other ways, such as spawning a value,
+/// which would write rows in the old layout. Suspending the owner stops all of
+/// it until the subject is rebuilt against the layout now registered.
+#[cfg(feature = "hot_reload")]
+fn suspend_stale_subjects(host: &mut Host) {
+    // Step 1: Every native subject that registers data, with what is stale in
+    // it. The renderer module is not among them: it holds no slot here, and a
+    // renderer built against a replaced layout is covered by its own pause.
+    let world = host.engine.world();
+    let mut subjects: Vec<(String, pill_engine::SystemOwner, Vec<String>)> = host
+        .extensions
+        .iter()
+        .map(|slot| {
+            (
+                slot.name().to_owned(),
+                slot.owner(),
+                slot.stale_components(world),
+            )
+        })
+        .collect();
+    subjects.push((
+        host.module_config.name.clone(),
+        pill_engine::SystemOwner::PROJECT,
+        host.loaded_project.stale_components(world),
+    ));
+
+    // Step 2: Act only on transitions, so each is logged once.
+    for (subject, owner, stale) in subjects {
+        let suspended = host.stale_suspended_owners.contains(&owner);
+        if !stale.is_empty() && !suspended {
+            host.engine.set_systems_enabled_for_owner(owner, false);
+            host.stale_suspended_owners.push(owner);
+            error!(
+                target: telemetry_target::HOT_RELOAD,
+                subject = subject.as_str(),
+                components = ?stale,
+                "systems suspended: this binary was built against a previous layout of these shared components; they resume once it is rebuilt"
+            );
+        } else if stale.is_empty() && suspended {
+            host.engine.set_systems_enabled_for_owner(owner, true);
+            host.stale_suspended_owners.retain(|other| *other != owner);
+            info!(
+                target: telemetry_target::HOT_RELOAD,
+                subject = subject.as_str(),
+                "systems resumed: rebuilt against the current shared component layouts"
+            );
+        }
+    }
+}
+
+/// Process hot reloads, execute one scheduler frame, and update FPS tracking.
+///
+/// Returns a report roughly every three seconds for a frontend to print or
+/// display; all other frames return `None`. The two phases back to back: a
+/// windowed host runs them itself, with its renderer step between them (see
+/// [`RenderingHost::run_one_frame`]).
 pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
     #[cfg(feature = "metrics")]
     let frame_start = Instant::now();
+    run_reload_phase(host);
+    run_frame_phase(
+        host,
+        #[cfg(feature = "metrics")]
+        frame_start,
+    )
+}
 
+/// Everything reloading does at a frame boundary, before any system runs:
+/// extension and project reloads, patches, and the managed loader's swap.
+///
+/// Returns the names of the extensions that reloaded. Separate from
+/// [`run_frame_phase`] so a windowed host can reload its renderer between the
+/// two - after the data it draws reloaded, before any system reads it.
+pub(crate) fn run_reload_phase(host: &mut Host) -> Vec<String> {
     // Steps 1 to 5: everything reloading does, in one call so this loop is
     // identical whether or not the machinery is compiled in.
-    run_reload_steps(host);
+    let reloaded_extensions = run_reload_steps(host);
 
     // Step 6: Poll the managed loader for an assembly swap.
     // The managed loader watches the built assembly instead of source files.
@@ -1635,7 +2068,15 @@ pub fn run_one_frame(host: &mut Host) -> Option<FrameReport> {
         // records go stale for the same reason and are cleared the same way.
         forget_prologue_records(host);
     }
+    reloaded_extensions
+}
 
+/// One scheduler frame and its reporting: systems, deferred commands, the
+/// native update hooks, and the FPS report.
+pub(crate) fn run_frame_phase(
+    host: &mut Host,
+    #[cfg(feature = "metrics")] frame_start: Instant,
+) -> Option<FrameReport> {
     // Step 7: Execute one scheduler frame and report its failures.
     if let Err(errors) = host.engine.process_frame() {
         // Deferred command failures arrive as a batch; flatten them into one
@@ -2017,4 +2458,64 @@ fn print_startup_configuration(workspace_root: &Path, module_config: &ProjectMod
         watch_directory = module_config.watch_directory.as_str(),
         "ECS host starting"
     );
+}
+
+#[cfg(all(test, feature = "rendering", feature = "hot_reload"))]
+mod tests {
+    use super::*;
+
+    const PAUSED: Option<PauseReason> = Some(PauseReason::StaleRendererAfterDataLayoutChange);
+
+    /// A data layout change pauses rendering unless a renderer rebuilt against
+    /// it attached in the same boundary.
+    #[test]
+    fn a_layout_change_pauses_unless_the_rebuilt_renderer_attached() {
+        assert_eq!(
+            pause_after_boundary(None, true, RendererStep::Attached),
+            None
+        );
+        assert_eq!(
+            pause_after_boundary(None, true, RendererStep::Failed),
+            PAUSED
+        );
+        assert_eq!(
+            pause_after_boundary(None, true, RendererStep::Unchanged),
+            PAUSED
+        );
+    }
+
+    /// A body-only data change, or none, never pauses: the renderer's layout
+    /// still matches, even when its rebuild failed.
+    #[test]
+    fn without_a_layout_change_nothing_pauses() {
+        assert_eq!(
+            pause_after_boundary(None, false, RendererStep::Failed),
+            None
+        );
+        assert_eq!(
+            pause_after_boundary(None, false, RendererStep::Unchanged),
+            None
+        );
+        assert_eq!(
+            pause_after_boundary(None, false, RendererStep::Attached),
+            None
+        );
+    }
+
+    /// A pause lasts until a renderer attaches, and only that ends it.
+    #[test]
+    fn a_pause_ends_only_when_a_renderer_attaches() {
+        assert_eq!(
+            pause_after_boundary(PAUSED, false, RendererStep::Unchanged),
+            PAUSED
+        );
+        assert_eq!(
+            pause_after_boundary(PAUSED, false, RendererStep::Failed),
+            PAUSED
+        );
+        assert_eq!(
+            pause_after_boundary(PAUSED, false, RendererStep::Attached),
+            None
+        );
+    }
 }

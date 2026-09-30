@@ -79,10 +79,15 @@ PROJECT_SETTINGS_FILE_NAME = "project_settings.yaml"
 PROJECT_MANIFEST_FILE_NAME = "Cargo.toml"
 EXTENSION_DIRECTORY = Path("modules") / "extensions"
 HOST_CRATE_DIRECTORY = Path("modules") / "pill_host"
-# The GPU renderer. A windowed shipping build links it statically - there is no
-# module to load - and hands the host its entry points as `StaticRenderer`.
-RENDERER_CRATE_NAME = "pill_master_renderer"
-RENDERER_CRATE_DIRECTORY = Path("modules") / "extensions" / RENDERER_CRATE_NAME
+# The renderer, chosen by the project's `renderer:` setting exactly as the host
+# chooses it (`pill_host::config`): absent means the master renderer, `none`
+# means no renderer. Its data crate, `<renderer>_data`, is linked as the first
+# static module in every shipping build, headless included; a windowed build
+# also links the GPU crate `<renderer>` and hands the host its entry points as
+# `StaticRenderer`.
+DEFAULT_RENDERER = "pill_master_renderer"
+NO_RENDERER = "none"
+RENDERER_DATA_SUFFIX = "_data"
 # The requested feature that makes a shipping build windowed.
 RENDERING_FEATURE = "rendering"
 
@@ -117,6 +122,26 @@ def load_module_list(project_root: Path) -> list:
         data = yaml.safe_load(handle) or {}
     modules = data.get("modules") or []
     return [str(name) for name in modules]
+
+
+def load_renderer(project_root: Path):
+    """Returns the renderer the project selects, or None for `renderer: none`.
+
+    Reads the settings file's `renderer:` key; absent means DEFAULT_RENDERER.
+    """
+    settings_path = project_root / PROJECT_SETTINGS_FILE_NAME
+    with settings_path.open(encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    name = str(data.get("renderer") or DEFAULT_RENDERER).strip()
+    return None if name == NO_RENDERER else name
+
+
+def modules_with_renderer_data(renderer, modules: list) -> list:
+    """Puts the renderer's data crate first in the module list, once."""
+    if renderer is None:
+        return list(modules)
+    data = renderer + RENDERER_DATA_SUFFIX
+    return [data] + [name for name in modules if name.strip() != data]
 
 
 def load_project_name(project_root: Path) -> str:
@@ -259,9 +284,12 @@ def build_cargo_manifest(
     project_features: set,
     root: Path,
     managed: bool = False,
-    renderer: bool = False,
+    renderer=None,
 ) -> str:
-    """Builds the generated bundle's Cargo.toml text."""
+    """Builds the generated bundle's Cargo.toml text.
+
+    `renderer` is the GPU crate a windowed build links, or None.
+    """
     lines = [
         "[package]",
         f'name = "{BUNDLE_CRATE_NAME}"',
@@ -308,9 +336,11 @@ def build_cargo_manifest(
         # The renderer, linked statically: the bundle is the only crate that
         # depends on it for real, and hands the host its two entry points.
         # `module-abi` stays off - nothing loads this binary as a module.
-        renderer_path = manifest_relative_path(bundle_directory, root / RENDERER_CRATE_DIRECTORY)
+        renderer_path = manifest_relative_path(
+            bundle_directory, root / EXTENSION_DIRECTORY / renderer
+        )
         lines.append(
-            f'{RENDERER_CRATE_NAME} = {{ path = "{renderer_path}", default-features = false }}'
+            f'{renderer} = {{ path = "{renderer_path}", default-features = false }}'
         )
     return "\n".join(lines) + "\n"
 
@@ -325,9 +355,12 @@ def build_library_source(
     workspace_root: Path,
     aot: bool = False,
     rid: str = "win-x64",
-    renderer: bool = False,
+    renderer=None,
 ) -> str:
-    """Builds the generated bundle's src/lib.rs text."""
+    """Builds the generated bundle's src/lib.rs text.
+
+    `renderer` is the GPU crate a windowed build links, or None.
+    """
     lines = [
         "//! Generated shipping bundle - do not edit. Regenerated from",
         "//! the project's `project_settings.yaml` by",
@@ -335,7 +368,8 @@ def build_library_source(
         "",
         "use pill_host::{StaticModule, StaticProject, StaticProjectBackend, StaticRenderer};",
         "",
-        "/// Every selected extension, in `project_settings.yaml` order.",
+        "/// Every selected extension: the renderer's data crate first, then",
+        "/// `project_settings.yaml` order.",
         # One entry per line regardless of count. rustfmt collapses a
         # single-element array onto one line, so without this the generated
         # file fails `cargo fmt --check` for any project selecting exactly one
@@ -410,8 +444,8 @@ def build_library_source(
     if renderer:
         lines += [
             "    Some(StaticRenderer {",
-            f"        init: {RENDERER_CRATE_NAME}::register,",
-            f"        attach: {RENDERER_CRATE_NAME}::attach,",
+            f"        init: {renderer}::register,",
+            f"        attach: {renderer}::attach,",
             "    })",
         ]
     else:
@@ -521,7 +555,8 @@ def main() -> int:
     # the .csproj file stem.
     try:
         kind = project_kind(project_root)
-        modules = load_module_list(project_root)
+        renderer_name = load_renderer(project_root)
+        modules = modules_with_renderer_data(renderer_name, load_module_list(project_root))
         project_name = load_project_name(project_root)
         build_binary_name = load_build_binary_name(project_root)
         if kind == "managed":
@@ -539,10 +574,15 @@ def main() -> int:
         )
         return 1
 
-    # Step 2: validate every selected module exists under modules/extensions/.
+    # Step 2: validate every selected module exists under modules/extensions/,
+    # the renderer's data crate included, and the GPU crate a windowed build
+    # links.
+    linked_renderer = (
+        renderer_name if renderer_name and RENDERING_FEATURE in requested_features else None
+    )
     missing_modules = [
         name
-        for name in modules
+        for name in modules + ([linked_renderer] if linked_renderer else [])
         if not (root / EXTENSION_DIRECTORY / name).is_dir()
     ]
     if missing_modules:
@@ -582,7 +622,7 @@ def main() -> int:
         project_features,
         root,
         managed=(kind == "managed"),
-        renderer=RENDERING_FEATURE in requested_features,
+        renderer=linked_renderer,
     )
     library_source = build_library_source(
         package_name,
@@ -594,7 +634,7 @@ def main() -> int:
         root / WORKSPACE_DIRECTORY,
         aot=aot and kind == "managed",
         rid=rid,
-        renderer=RENDERING_FEATURE in requested_features,
+        renderer=linked_renderer,
     )
     wrote_manifest = write_if_changed(
         bundle_directory / PROJECT_MANIFEST_FILE_NAME, cargo_manifest

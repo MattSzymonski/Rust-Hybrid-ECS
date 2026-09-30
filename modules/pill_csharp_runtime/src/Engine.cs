@@ -948,7 +948,7 @@ public static unsafe class Engine
             3 => "a supplied string was not valid UTF-8",
             4 => "the source data failed to decode",
             5 => "a required buffer was null",
-            6 => "this host build has no renderer, so no asset types exist to load into",
+            6 => "no renderer data crate provides the asset functions in this build",
             7 => "an asset with that name is already loaded",
             _ => $"native status {status}",
         };

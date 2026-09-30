@@ -4674,6 +4674,7 @@ dependencies = [
  "metrics",
  "miette",
  "notify",
+ "pill_assets",
  "pill_core",
  "pill_core_macros",
  "pill_engine",
@@ -4723,7 +4724,6 @@ dependencies = [
  "image",
  "indexmap",
  "miette",
- "notify",
  "pill_assets",
  "pill_core",
  "pill_core_macros",
@@ -4760,6 +4760,7 @@ version = "0.0.0"
 dependencies = [
  "pill_audio",
  "pill_host",
+ "pill_master_renderer_data",
  "pill_spline",
  "project",
 ]

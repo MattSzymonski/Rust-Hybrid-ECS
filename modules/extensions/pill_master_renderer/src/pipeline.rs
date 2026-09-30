@@ -621,9 +621,9 @@ mod tests {
             blend: false,
             depth_write: true,
             cull: crate::frame::CullMode::Back,
-            parameters: HashMap::new(),
-            inputs: HashMap::new(),
-            textures: HashMap::new(),
+            parameters: std::collections::BTreeMap::new(),
+            inputs: std::collections::BTreeMap::new(),
+            textures: std::collections::BTreeMap::new(),
             order: 0,
         }
     }

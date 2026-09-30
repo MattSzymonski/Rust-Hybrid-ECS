@@ -17,7 +17,7 @@
 //! and the renderer can drive any pass through the code path it already has for
 //! drawing with a material.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use pill_engine::{Asset, Handle};
 
@@ -26,6 +26,12 @@ use crate::{Shader, Texture};
 use pill_renderer_api::frame::{CullMode, MaterialParameter, PassKind, PassTarget};
 
 /// One pass in a [`RenderingPipeline`](crate::RenderingPipeline).
+///
+/// Its maps are `BTreeMap`s, never `HashMap`s. An empty `HashMap` does not
+/// allocate: it points at a static inside the binary that created it. This
+/// value lives in the world and outlives that binary - a project or module
+/// that built it is reloaded and its retired image eventually unmapped - and
+/// reading such a map afterwards faults. A `BTreeMap` holds no such pointer.
 #[derive(Clone, Debug)]
 pub struct RenderPass {
     /// Label used in logs, profiling and error messages.
@@ -35,7 +41,7 @@ pub struct RenderPass {
     pub shader: Handle<Shader>,
     /// Uniform parameters, packed exactly as a material packs its own: one
     /// 16-byte slot each, in the order the shader declares them.
-    pub parameters: HashMap<String, MaterialParameter>,
+    pub parameters: BTreeMap<String, MaterialParameter>,
     /// Textures bound to the slots the shader declares, by slot name. A slot
     /// the shader declares and neither this map nor [`Self::inputs`] fills falls
     /// back to the renderer's default texture for its type.
@@ -43,14 +49,14 @@ pub struct RenderPass {
     /// A slot named in both takes the input: that is the frame an earlier pass
     /// of the same chain produced, and the more specific thing to have asked
     /// for.
-    pub textures: HashMap<String, Handle<Texture>>,
+    pub textures: BTreeMap<String, Handle<Texture>>,
     /// Offscreen targets the pass samples, by the texture slot they bind to.
     ///
     /// Separate from [`Self::textures`] because a target is not an asset: it
     /// lives for one frame, is named by whichever pass writes it, and has no
     /// handle to hold. A name no earlier pass writes fails when the chain is
     /// built, naming the pass and the target rather than showing a flat frame.
-    pub inputs: HashMap<String, String>,
+    pub inputs: BTreeMap<String, String>,
     /// What the pass draws.
     pub kind: PassKind,
     /// Where the pass reads and writes.
@@ -89,9 +95,9 @@ impl RenderPass {
         Self {
             name: name.into(),
             shader: Handle::INVALID,
-            parameters: HashMap::new(),
-            textures: HashMap::new(),
-            inputs: HashMap::new(),
+            parameters: BTreeMap::new(),
+            textures: BTreeMap::new(),
+            inputs: BTreeMap::new(),
             kind: PassKind::Geometry,
             target: PassTarget::Surface,
             extra_targets: Vec::new(),
@@ -183,7 +189,15 @@ impl RenderPass {
     }
 }
 
-impl Asset for RenderPass {}
+// Shared across binaries: the data module, the GPU module and every project
+// compile their own copy of this crate, each with its own `TypeId`. The pinned
+// name makes them one asset column (see `Asset::shared_name`); keep it
+// verbatim when moving the type.
+impl Asset for RenderPass {
+    fn shared_name() -> Option<&'static str> {
+        Some("pill_master_renderer::assets::RenderPass")
+    }
+}
 
 #[cfg(test)]
 mod tests {

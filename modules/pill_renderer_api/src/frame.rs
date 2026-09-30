@@ -27,7 +27,7 @@
 //! the same reason; the transform is the engine's.
 
 // Standard library
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 // External crates
 use pill_engine::common_components::TransformComponent;
@@ -114,6 +114,12 @@ pub struct RenderInstance {
 /// plain values: `shader` is the asset key the renderer finds its GPU shader
 /// by, and `None` leaves the choice to the instances, each drawing with the
 /// shader its own material names.
+///
+/// Its maps are `BTreeMap`s, never `HashMap`s. An empty `HashMap` does not
+/// allocate: it points at a static inside the binary that created it. This
+/// value lives in the world and outlives that binary - a project or module
+/// that built it is reloaded and its retired image eventually unmapped - and
+/// reading such a map afterwards faults. A `BTreeMap` holds no such pointer.
 #[derive(Clone, Debug)]
 pub struct ResolvedPass {
     /// Label used in logs, profiling and error messages.
@@ -134,12 +140,12 @@ pub struct ResolvedPass {
     /// Which faces the pass drops.
     pub cull: CullMode,
     /// Uniform parameters, packed exactly as a material packs its own.
-    pub parameters: HashMap<String, MaterialParameter>,
+    pub parameters: BTreeMap<String, MaterialParameter>,
     /// Offscreen targets the pass samples, by the texture slot they bind to.
-    pub inputs: HashMap<String, String>,
+    pub inputs: BTreeMap<String, String>,
     /// Committed textures the pass samples, by the texture slot they bind to,
     /// as the asset keys `shader` is a key for.
-    pub textures: HashMap<String, u64>,
+    pub textures: BTreeMap<String, u64>,
     /// Ordering key: lower runs first. Equal orders keep the pipeline's order.
     pub order: u8,
 }
@@ -160,9 +166,9 @@ impl ResolvedPass {
             blend: false,
             depth_write: true,
             cull: CullMode::Back,
-            parameters: HashMap::new(),
-            inputs: HashMap::new(),
-            textures: HashMap::new(),
+            parameters: BTreeMap::new(),
+            inputs: BTreeMap::new(),
+            textures: BTreeMap::new(),
             order: 0,
         }
     }

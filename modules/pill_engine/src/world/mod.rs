@@ -450,6 +450,11 @@ pub struct World {
     /// about to run, so a reloaded generation may replace its predecessor's
     /// persist entries instead of being refused as a concurrent peer.
     pub(crate) superseded_persist_names: std::collections::HashSet<String>,
+    /// The subset of those names whose predecessor was already stale: built
+    /// against a layout another subject has since replaced. A registration of
+    /// one of them in a layout other than the registered one is skipped
+    /// instead of re-laying the component out again.
+    pub(crate) stale_superseded_persist_names: std::collections::HashSet<String>,
 
     /// Per-resource serialize fn for snapshotting, keyed by the live id.
     ///
@@ -531,6 +536,7 @@ impl World {
             persist_registration_sequence: 0,
             persist_registration_log: Vec::new(),
             superseded_persist_names: std::collections::HashSet::new(),
+            stale_superseded_persist_names: std::collections::HashSet::new(),
             persist_resource_serializers: HashMap::new(),
             persist_resource_restorers: HashMap::new(),
             persist_resource_names: HashMap::new(),
