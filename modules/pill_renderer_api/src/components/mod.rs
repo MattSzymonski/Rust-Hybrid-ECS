@@ -2,9 +2,11 @@
 //!
 //! # Responsibilities
 //!
-//! - Gather the scene's renderer components, one per submodule: transform,
-//!   camera, mesh renderer and directional light, plus the viewport rectangle
-//!   a frame is drawn through.
+//! - Gather the scene's renderer components, one per submodule: camera, mesh
+//!   renderer and directional light, plus the viewport rectangle a frame is
+//!   drawn through. The transform is the engine's
+//!   ([`pill_engine::common_components::TransformComponent`]), re-exported here
+//!   for now.
 //! - Keep them shared and persistable, so the managed mirror binds the same
 //!   values and the host carries them across reload generations.
 //! - Register them with the world through [`register_components`], field
@@ -12,7 +14,7 @@
 //!
 //! # Design
 //!
-//! The four component structs are `#[repr(C)]`, `Serialize` and
+//! The three component structs are `#[repr(C)]`, `Serialize` and
 //! `Deserialize`, because they are the renderer's public scene contract:
 //! projects set them, the managed mirror binds their fields, and the host
 //! serialises them when a project reloads. [`RenderViewport`] is a plain value
@@ -30,13 +32,14 @@
 mod camera;
 mod directional_light;
 mod mesh_renderer;
-mod transform;
 mod viewport;
 
 pub use camera::CameraComponent;
 pub use directional_light::DirectionalLightComponent;
 pub use mesh_renderer::{MeshRendererComponent, MeshRendererComponentBuilder};
-pub use transform::TransformComponent;
+// Moved into the engine (renderer data split, stage 1). Re-exported so every
+// user keeps compiling until the API is shrunk (stage 10), which removes it.
+pub use pill_engine::common_components::TransformComponent;
 pub use viewport::RenderViewport;
 
 // External crates
@@ -44,14 +47,13 @@ use pill_engine::World;
 
 /// Registers every renderer component with the world, field layouts included.
 ///
-/// The engine's common components are registered first, then the four declared
-/// in this module's children, through the `__pill_register_*` functions the
-/// `PillComponent` derives generate. Those registrations are what give the
+/// The engine's common components (the transform among them) are registered
+/// first, then the three declared in this module's children, through the
+/// `__pill_register_*` functions the `PillComponent` derives generate. Those registrations are what give the
 /// managed codegen and the editor each field's name and offset; without one a
 /// component is an opaque blob to both.
 pub fn register_components(world: &mut World) {
     pill_engine::common_components::register_common_components(world);
-    transform::register(world);
     camera::register(world);
     mesh_renderer::register(world);
     directional_light::register(world);
