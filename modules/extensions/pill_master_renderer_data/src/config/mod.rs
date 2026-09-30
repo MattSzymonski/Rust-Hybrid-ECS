@@ -28,7 +28,7 @@
 //! wants a different frame calls `set_pipeline` after registering, and one that
 //! wants the renderer's own fallback chain clears the manager instead.
 
-/// Declares a [`ConfigShaderFile`] constant for a cooked file under `src/config/`.
+/// Declares a [`ConfigShaderFile`] constant for a cooked file under `shaders/`.
 ///
 /// One literal feeds both halves: `include_str!` embeds the file at build time,
 /// and the same path lets a runtime reload find it again. Written as a macro
@@ -38,7 +38,7 @@ macro_rules! config_shader_file {
         $(#[$attribute])*
         $visibility const $name: $crate::config::ConfigShaderFile = $crate::config::ConfigShaderFile {
             relative_path: $path,
-            embedded_source: include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/config/", $path)),
+            embedded_source: include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/shaders/", $path)),
         };
     };
 }
@@ -57,7 +57,8 @@ pub mod simple_pipeline;
 /// A cooked WGSL file the renderer's own pipelines are built from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConfigShaderFile {
-    /// Path relative to `src/config/`, e.g. `pbr_pipeline/shaders/pbr_fragment.wgsl`.
+    /// Path relative to the crate's `shaders/`, e.g.
+    /// `pbr_pipeline/shaders/pbr_fragment.wgsl`.
     pub relative_path: &'static str,
     /// The file's text as `include_str!` embedded it when the crate was built.
     pub embedded_source: &'static str,
@@ -142,7 +143,7 @@ mod tests {
     /// behind an `include_str!` of some other file.
     #[test]
     fn every_declared_file_is_the_file_it_names() {
-        let config_directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/config");
+        let config_directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders");
         for record in all_shader_sources() {
             for file in [record.vertex, record.fragment] {
                 let on_disk = std::fs::read_to_string(config_directory.join(file.relative_path))

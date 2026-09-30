@@ -1,0 +1,65 @@
+[package]
+name = "pill_master_renderer_data"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+# The master renderer's data: what a game says to this renderer. Components,
+# assets, the pipelines and their shaders, pipeline selection, and the C# mirror
+# of it all. Never links wgpu: projects, the host and headless builds link this,
+# and only the GPU module (`pill_master_renderer`) links the graphics stack.
+[lib]
+# Named after the crate rather than `lib.rs`, like every extension, so the
+# debugger's file-name fallback has one candidate.
+path = "src/pill_master_renderer_data.rs"
+# `cdylib` for the host to load as an extension (from stage 6 of the renderer
+# data split); `rlib` for the GPU module, projects and shipping builds.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pill_core = { path = "../../pill_core" }
+pill_core_macros = { path = "../../pill_core_macros" }
+pill_engine = { path = "../../pill_engine" }
+# The renderer contract: the frame vocabulary the assets are written in
+# (pass kinds and targets, material parameters) and the camera.
+pill_renderer_api = { path = "../../pill_renderer_api" }
+trait_type_map = { git = "https://github.com/MattSzymonski/Trait-Type-Map", rev = "25343a9eac856445b0fa8266df5b000326d1574b" }
+
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+miette = { version = "7", features = ["derive"] }
+glam = { version = "0.33", features = ["serde", "bytemuck"] }
+bytemuck = { version = "1.4", features = ["derive"] }
+# The shaders' slot tables: name-keyed like a map, with the declaration order
+# the uniform buffer packs in. `indexmap` is `ordermap`'s current name.
+indexmap = "2"
+# `jpeg` alongside `png`: the committed helmet asset in `master_renderer_test`
+# ships its PBR maps as JPEG, and re-encoding them to PNG would multiply the
+# committed size for no gain in fidelity.
+image = { version = "0.25", default-features = false, features = [
+    "jpeg",
+    "png",
+] }
+tobj = "3"
+# Development shader reload only (`shader-hot-reload`): the cooker the build
+# script runs, and a watcher on the shader sources.
+pill_assets = { path = "../../pill_assets", optional = true }
+notify = { version = "6", optional = true }
+
+[features]
+default = []
+# The `pill_module_*` C-ABI exports. Opt-in like every module's: the host's
+# module build turns it on, and a crate linking this as an rlib never exports
+# the symbols (two copies in one binary would collide at link time).
+module-abi = []
+# Watch `shaders/` for HLSL edits at runtime, re-cook them and update the
+# shader assets built from them. A development convenience: the host enables it
+# with `hot_reload`, and a shipping build never compiles it.
+shader-hot-reload = ["dep:pill_assets", "dep:notify"]
+
+[build-dependencies]
+# Turns `shaders/**/*.hlsl` into the WGSL this crate embeds, so a shader that
+# is not committed is still the one that compiles.
+pill_assets = { path = "../../pill_assets" }

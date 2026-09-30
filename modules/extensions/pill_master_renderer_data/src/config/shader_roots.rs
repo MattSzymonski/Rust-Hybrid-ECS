@@ -2,7 +2,7 @@
 //!
 //! # Responsibilities
 //!
-//! - Name the four HLSL source trees under `src/config/` and the shared header
+//! - Name the four HLSL source trees under `shaders/` and the shared header
 //!   directory they all include from.
 //! - Cook every tree with the [`pill_assets`] shader rule in one call
 //!   ([`cook_config_shaders`]), and list the directories an edit can land in
@@ -45,10 +45,10 @@ use std::path::{Path, PathBuf};
 // External crates
 use pill_assets::{walk_files, CookError, HlslToWgsl, Pipeline, Rule};
 
-/// Directory under `src/config/` holding the headers every tree includes.
+/// Directory under `shaders/` holding the headers every tree includes.
 const SHARED_INCLUDE_DIRECTORY: &str = "common_shaders/include";
 
-/// Each source tree under `src/config/`, and whether its root is itself the
+/// Each source tree under `shaders/`, and whether its root is itself the
 /// shaders directory (`true`) or holds one named `shaders/` (`false`).
 const SHADER_ROOTS: [(&str, bool); 4] = [
     ("common_shaders", true),
@@ -84,7 +84,7 @@ pub fn shader_source_directories(config_directory: &Path) -> Vec<PathBuf> {
     directories
 }
 
-/// Cook every stale shader under `config_directory` (the crate's `src/config/`).
+/// Cook every stale shader under `config_directory` (the crate's `shaders/`).
 ///
 /// # Errors
 ///

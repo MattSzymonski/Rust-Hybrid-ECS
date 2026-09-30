@@ -23,7 +23,7 @@ use pill_engine::{Asset, Handle};
 
 use super::{Shader, Texture};
 // Part of the frame contract (a resolved pass carries parameters too).
-use crate::frame::MaterialParameter;
+use pill_renderer_api::frame::MaterialParameter;
 
 /// A texture handle bound to one of a material's slots.
 ///

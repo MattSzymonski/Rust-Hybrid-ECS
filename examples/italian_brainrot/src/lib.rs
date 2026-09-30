@@ -20,7 +20,7 @@ pub struct TagAlphaComponent;
 /// Registers the renderer, loads the bundled assets, and creates the scene.
 #[pill_project]
 pub fn init(engine: &mut Engine) -> u32 {
-    pill_renderer_api::register(engine);
+    pill_master_renderer_data::register(engine);
     __pill_register_TagAlphaComponent(engine.world_mut());
 
     let assets = match asset_loading::load(engine.world_mut()) {
@@ -44,7 +44,7 @@ pub fn init(engine: &mut Engine) -> u32 {
 mod tests {
     use super::*;
     use pill_engine::Query;
-    use pill_renderer_api::{CameraComponent, MeshRendererComponent};
+    use pill_master_renderer_data::{CameraComponent, MeshRendererComponent};
 
     #[test]
     fn initialization_creates_the_original_three_model_scene() {

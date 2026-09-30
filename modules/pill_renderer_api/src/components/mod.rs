@@ -1,62 +1,43 @@
-//! ECS contracts consumed by the transferred renderer.
+//! The scene components that are part of the renderer contract.
 //!
 //! # Responsibilities
 //!
-//! - Gather the scene's renderer components, one per submodule: camera, mesh
-//!   renderer and directional light, plus the viewport rectangle a frame is
-//!   drawn through. The transform is the engine's
-//!   ([`pill_engine::common_components::TransformComponent`]), re-exported here
-//!   for now.
-//! - Keep them shared and persistable, so the managed mirror binds the same
-//!   values and the host carries them across reload generations.
-//! - Register them with the world through [`register_components`], field
-//!   layout included, for the managed codegen and the editor.
+//! - Declare [`CameraComponent`], which [`crate::frame::RenderFrame`] embeds,
+//!   and [`RenderViewport`], the rectangle a frontend points a renderer at.
+//! - Re-export the engine's [`TransformComponent`], which the frame carries too.
+//! - Register the contract's components through
+//!   [`register_contract_components`], field layout included.
 //!
 //! # Design
 //!
-//! The three component structs are `#[repr(C)]`, `Serialize` and
-//! `Deserialize`, because they are the renderer's public scene contract:
-//! projects set them, the managed mirror binds their fields, and the host
-//! serialises them when a project reloads. [`RenderViewport`] is a plain value
-//! the renderer owns, so it carries no ECS derives; it lives here because this
-//! module is where the renderer's scene-facing types are gathered.
+//! Only what every renderer must understand lives here. A renderer's own
+//! components - the master renderer's mesh renderer and directional light, for
+//! instance - live in that renderer's data crate, which registers these first
+//! and its own after.
 //!
-//! **Every component pins its shared name.** The `PillComponent` derive would
-//! otherwise build that name from `module_path!()`, which makes the identity
-//! follow the file layout rather than the type: a component moved to another
-//! module registers as a *different* component, and the columns a live world
-//! already holds for it are orphaned on the next reload. The pinned strings are
-//! the names these types carried when they shared a single `component.rs`, kept
-//! verbatim through the split into this folder and not to be re-derived.
+//! **The camera pins its shared name.** The `PillComponent` derive would
+//! otherwise build it from `module_path!()`, so moving the type would register
+//! a *different* component and orphan every column a live world holds for it.
 
 mod camera;
-mod directional_light;
-mod mesh_renderer;
 mod viewport;
 
 pub use camera::CameraComponent;
-pub use directional_light::DirectionalLightComponent;
-pub use mesh_renderer::{MeshRendererComponent, MeshRendererComponentBuilder};
-// Moved into the engine (renderer data split, stage 1). Re-exported so every
-// user keeps compiling until the API is shrunk (stage 10), which removes it.
+// The engine's (moved there in stage 1 of the renderer data split); re-exported
+// until the API is shrunk (stage 10).
 pub use pill_engine::common_components::TransformComponent;
 pub use viewport::RenderViewport;
 
 // External crates
 use pill_engine::World;
 
-/// Registers every renderer component with the world, field layouts included.
+/// Registers the contract's components with the world, field layouts included:
+/// the engine's common components (the transform among them) and the camera.
 ///
-/// The engine's common components (the transform among them) are registered
-/// first, then the three declared in this module's children, through the
-/// `__pill_register_*` functions the `PillComponent` derives generate. Those registrations are what give the
-/// managed codegen and the editor each field's name and offset; without one a
-/// component is an opaque blob to both.
-pub fn register_components(world: &mut World) {
+/// A renderer's data crate calls this before registering its own components.
+pub fn register_contract_components(world: &mut World) {
     pill_engine::common_components::register_common_components(world);
     camera::register(world);
-    mesh_renderer::register(world);
-    directional_light::register(world);
 }
 
 #[cfg(test)]
@@ -64,107 +45,24 @@ mod tests {
     use super::*;
     use pill_engine::{Component, ComponentId};
 
-    /// Registration records the field layouts the managed codegen and the
-    /// editor read. Without them a component is an opaque blob to both, which
-    /// is a silent failure everywhere except here.
+    /// The contract's components arrive field-described, under their pinned
+    /// shared names.
     #[test]
-    fn registering_the_components_records_their_field_layouts() {
+    fn the_contract_components_register_with_their_layouts() {
         let mut world = World::new();
-        register_components(&mut world);
+        register_contract_components(&mut world);
 
-        let layouts = [
-            (
-                "TransformComponent",
-                ComponentId::of::<TransformComponent>(),
-            ),
-            ("CameraComponent", ComponentId::of::<CameraComponent>()),
-            (
-                "MeshRendererComponent",
-                ComponentId::of::<MeshRendererComponent>(),
-            ),
-            (
-                "DirectionalLightComponent",
-                ComponentId::of::<DirectionalLightComponent>(),
-            ),
-        ];
-        for (name, component) in layouts {
-            let fields = world
-                .component_field_layout(component)
-                .unwrap_or_else(|| panic!("{name} has no field layout after registration"));
-            assert!(!fields.is_empty(), "{name} has an empty field layout");
-        }
-
-        // One row per declared field, in declaration order, which is what the
-        // managed mirror is generated from - an empty or blob-like layout would
-        // leave it with nothing to bind by name.
-        let count = |component| {
+        let fields = |component| {
             world
                 .component_field_layout(component)
                 .map(<[_]>::len)
                 .unwrap_or(0)
         };
-        assert_eq!(count(ComponentId::of::<TransformComponent>()), 3);
-        assert_eq!(count(ComponentId::of::<CameraComponent>()), 5);
-        assert_eq!(count(ComponentId::of::<MeshRendererComponent>()), 2);
-        assert_eq!(count(ComponentId::of::<DirectionalLightComponent>()), 2);
-    }
-
-    /// The layout each type declares for the stale-reader check is exactly the
-    /// one its registration records. If they disagreed, every query on the
-    /// component would be refused as stale.
-    #[test]
-    fn declared_layouts_match_the_registered_ones() {
-        let mut world = World::new();
-        register_components(&mut world);
-        // The registry hashes the registered descriptors the same way.
-        let registered = |component: ComponentId| {
-            world
-                .component_field_layout(component)
-                .filter(|fields| !fields.is_empty())
-                .map(pill_engine::component::component_schema_hash)
-        };
-
-        assert_eq!(
-            TransformComponent::declared_schema_hash(),
-            registered(ComponentId::of::<TransformComponent>())
-        );
-        assert_eq!(
-            CameraComponent::declared_schema_hash(),
-            registered(ComponentId::of::<CameraComponent>())
-        );
-        assert_eq!(
-            MeshRendererComponent::declared_schema_hash(),
-            registered(ComponentId::of::<MeshRendererComponent>())
-        );
-        assert_eq!(
-            DirectionalLightComponent::declared_schema_hash(),
-            registered(ComponentId::of::<DirectionalLightComponent>())
-        );
-        assert!(TransformComponent::declared_schema_hash().is_some());
-    }
-
-    /// The pinned shared names are an identity contract, not decoration: they
-    /// are what makes the same component recognisable in the host, in a loaded
-    /// module, and in a world that outlived the generation which registered it.
-    /// Re-deriving one from `module_path!()` would silently orphan live data, so
-    /// the exact strings are asserted here.
-    #[test]
-    fn the_components_keep_the_shared_names_they_were_pinned_to() {
-        assert_eq!(
-            TransformComponent::shared_name(),
-            Some("pill_master_renderer::component::TransformComponent")
-        );
+        assert_eq!(fields(ComponentId::of::<TransformComponent>()), 3);
+        assert_eq!(fields(ComponentId::of::<CameraComponent>()), 5);
         assert_eq!(
             CameraComponent::shared_name(),
             Some("pill_master_renderer::component::CameraComponent")
-        );
-        assert_eq!(
-            MeshRendererComponent::shared_name(),
-            Some("pill_master_renderer::component::MeshRendererComponent")
-        );
-        assert_eq!(
-            DirectionalLightComponent::shared_name(),
-            Some("pill_master_renderer::component::DirectionalLightComponent")
         );
     }
 }

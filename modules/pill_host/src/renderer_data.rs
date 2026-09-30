@@ -1,8 +1,12 @@
-//! The renderer's plain data, registered by the host in every posture.
+//! The master renderer's data, registered by the host in every posture.
+//!
+//! Interim (renderer data split, stages 4-5): stage 6 makes the data crate an
+//! extension the host loads, and removes this module.
 //!
 //! # Responsibilities
 //!
-//! - Register `pill_renderer_api`'s components, asset types, resources and
+//! - Register the master renderer's data crate (`pill_master_renderer_data`):
+//!   its components, asset types, resources and
 //!   default pipeline with the engine before any extension, project or C#
 //!   runtime loads, and report which component types that registered.
 //! - Expose those components to a managed project exactly as an extension's
@@ -40,28 +44,28 @@ use crate::csharp::ModuleExposedComponent;
 /// Workspace-relative directory of the renderer data crate; its generated C#
 /// mirror lands in `generated/` inside it.
 #[cfg(feature = "hot_reload")]
-const RENDERER_DATA_DIRECTORY: &str = "pill_renderer_api";
+const RENDERER_DATA_DIRECTORY: &str = "extensions/pill_master_renderer_data";
 
 /// Name the generated mirror file is derived from.
 #[cfg(feature = "hot_reload")]
-const RENDERER_DATA_CRATE_NAME: &str = "pill_renderer_api";
+const RENDERER_DATA_CRATE_NAME: &str = "pill_master_renderer_data";
 
 /// Register the renderer's plain data with `engine`, and return the names of
 /// the component types that registration added.
 ///
-/// Idempotent, like [`pill_renderer_api::register`] itself: a project that
+/// Idempotent, like [`pill_master_renderer_data::register`] itself: a project that
 /// registers the same data again during its own `init` changes nothing. The
 /// names are what a managed project is handed bindings for; a second call
 /// registers nothing new and returns none.
 pub(crate) fn register_renderer_data(engine: &mut Engine) -> Vec<String> {
     let sequence = engine.world().component_registration_sequence();
-    pill_renderer_api::register(engine);
+    pill_master_renderer_data::register(engine);
     engine.world().registered_component_names_since(sequence)
 }
 
 /// Write the renderer data's C# mirror and return the components to bind.
 ///
-/// The mirror goes to `pill_renderer_api/generated/`, which managed projects
+/// The mirror goes to `extensions/pill_master_renderer_data/generated/`, which managed projects
 /// that draw compile in. Like an extension's, it is written only when its
 /// content changed, so a committed copy stays clean.
 ///

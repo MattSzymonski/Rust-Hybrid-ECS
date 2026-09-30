@@ -2,7 +2,7 @@
 
 use crate::{asset_loading::SceneAssets, TagAlphaComponent};
 use pill_engine::{Query, World};
-use pill_renderer_api::{CameraComponent, MeshRendererComponent, TransformComponent};
+use pill_master_renderer_data::{CameraComponent, MeshRendererComponent, TransformComponent};
 
 pub(crate) fn create(world: &mut World, assets: SceneAssets) -> Result<(), String> {
     if Query::<&CameraComponent>::new(world)

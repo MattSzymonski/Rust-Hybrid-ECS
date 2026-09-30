@@ -2,7 +2,7 @@
 
 use crate::TagAlphaComponent;
 use pill_engine::{pill_hot, Query, Res, SystemError, Time};
-use pill_renderer_api::TransformComponent;
+use pill_master_renderer_data::TransformComponent;
 
 /// Rotates each tagged model around its local Y axis at 90 degrees per second.
 #[pill_hot]

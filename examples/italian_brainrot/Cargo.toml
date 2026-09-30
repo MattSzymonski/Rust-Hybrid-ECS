@@ -9,9 +9,11 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 glam = "0.33"
 pill_engine = { path = "../../modules/pill_engine" }
-# The renderer's data only - components, assets, pipelines. The GPU renderer is
-# the host's; a project that linked it would carry wgpu in its own DLL.
-pill_renderer_api = { path = "../../modules/pill_renderer_api" }
+# The master renderer's data only - components, assets, pipelines. The GPU
+# renderer is the host's; a project that linked it would carry wgpu in its own
+# DLL. `default-features = false`, as for every extension, keeps its module
+# exports out of this project's DLL.
+pill_master_renderer_data = { path = "../../modules/extensions/pill_master_renderer_data", default-features = false }
 serde = { version = "1", features = ["derive"] }
 trait_type_map = { git = "https://github.com/MattSzymonski/Trait-Type-Map", rev = "25343a9eac856445b0fa8266df5b000326d1574b" }
 

@@ -32,9 +32,9 @@ mod texture;
 pub use material::{Material, MaterialBuilder, MaterialTexture};
 pub use mesh::{Mesh, MeshVertex};
 pub use render_pass::RenderPass;
-// Defined by the frame contract; re-exported here so `assets::` paths keep
-// working until the assets move to the renderer's data crate (stage 4).
-pub use crate::frame::{CullMode, MaterialParameter, PassKind, PassTarget};
+// Defined by the renderer contract (`pill_renderer_api::frame`), which a
+// resolved pass is written in too; re-exported so `assets::` paths keep working.
+pub use pill_renderer_api::frame::{CullMode, MaterialParameter, PassKind, PassTarget};
 pub use rendering_pipeline::RenderingPipeline;
 pub use shader::{parameter_slots_by_name, texture_slots_by_name};
 pub use shader::{

@@ -26,9 +26,12 @@ wgpu = "25.0.0"
 pollster = "0.4"
 # The GPU caches key their slot tables the way the shader assets do.
 indexmap = "2"
-# The renderer's data half: components, assets, pipelines, the frame and the
-# backend trait. Everything wgpu-free lives there.
+# The renderer contract: the backend trait this crate implements, the frame it
+# draws, and the window it attaches to.
 pill_renderer_api = { path = "../../pill_renderer_api" }
+# This renderer's data crate: its components, assets, pipelines and shaders.
+# Everything wgpu-free that is specific to the master renderer lives there.
+pill_master_renderer_data = { path = "../pill_master_renderer_data" }
 
 [features]
 default = []
@@ -37,4 +40,4 @@ default = []
 # turns it on, and a crate linking this as an rlib never exports the symbols.
 module-abi = []
 # Forwarded to the data crate, which owns the shaders and their reload.
-shader-hot-reload = ["pill_renderer_api/shader-hot-reload"]
+shader-hot-reload = ["pill_master_renderer_data/shader-hot-reload"]

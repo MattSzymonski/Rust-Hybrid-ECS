@@ -31,7 +31,7 @@ pill_hot_scan = { path = "../pill_hot_scan" }
 # production code never touches this crate.
 # Inspector tests use the real renderer component field layouts, which are
 # plain data: no GPU renderer is needed to test them.
-pill_renderer_api = { path = "../pill_renderer_api" }
+pill_master_renderer_data = { path = "../extensions/pill_master_renderer_data" }
 
 [features]
 # Match a normal `cargo run` of pill_standalone: per-function hot patching is

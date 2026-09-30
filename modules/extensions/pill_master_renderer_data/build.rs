@@ -2,7 +2,7 @@
 //!
 //! # Responsibilities
 //!
-//! - Cook every HLSL tree under `src/config/` to the WGSL the crate embeds,
+//! - Cook every HLSL tree under `shaders/` to the WGSL the crate embeds,
 //!   through the same routine the development shader reload runs.
 //! - Report every source directory, header and discovered input to cargo so
 //!   that a source edit rebuilds.
@@ -11,7 +11,8 @@
 //!
 //! Cargo runs build scripts before the crate's own compilation, so the cooked
 //! files are on disk by the time `include_str!` looks for them. The roots and
-//! the cooking itself live in `src/config/shader_roots.rs`, compiled here as a
+//! the cooking itself live in `src/config/shader_roots.rs` (Rust, so it stays
+//! under `src/`), compiled here as a
 //! `#[path]` module, so a runtime cook and this one cannot disagree about which
 //! files exist; see that file for the tree layout.
 //!
@@ -31,15 +32,13 @@ use std::path::PathBuf;
 mod shader_roots;
 
 fn main() {
-    let config_directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("src")
-        .join("config");
+    // The shader trees live at the crate root rather than under `src/`, so a
+    // shader edit is not a Rust source edit: a module watcher on `src/` never
+    // rebuilds the crate for one.
+    let config_directory = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("shaders");
 
     println!("cargo:rerun-if-changed=build.rs");
-    println!(
-        "cargo:rerun-if-changed={}",
-        config_directory.join("shader_roots.rs").display()
-    );
+    println!("cargo:rerun-if-changed=src/config/shader_roots.rs");
 
     let report = shader_roots::cook_config_shaders(&config_directory)
         .unwrap_or_else(|error| panic!("shader cooking failed: {error}"));

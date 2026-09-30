@@ -53,7 +53,7 @@ const SETTLE_DURATION: Duration = Duration::from_millis(150);
 
 /// Watches the renderer's shader sources and applies edits to the asset store.
 pub struct ShaderReloader {
-    /// The crate's `src/config/`, the root every [`ShaderSourceRecord`] path is
+    /// The crate's `shaders/`, the root every [`ShaderSourceRecord`] path is
     /// relative to.
     config_directory: PathBuf,
     /// Held only to keep the watch alive; dropping it stops the events.
@@ -81,11 +81,7 @@ impl ShaderReloader {
     /// Returns the watcher's error when it cannot be created or a directory
     /// cannot be registered.
     pub fn new() -> notify::Result<Self> {
-        Self::watching(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("src")
-                .join("config"),
-        )
+        Self::watching(Path::new(env!("CARGO_MANIFEST_DIR")).join("shaders"))
     }
 
     /// Watch the shader sources under `config_directory`.

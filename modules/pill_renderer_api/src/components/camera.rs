@@ -67,8 +67,8 @@ impl Default for CameraComponent {
 /// Registers [`CameraComponent`] with the world, field layout included.
 ///
 /// The derive generates `__pill_register_CameraComponent` as a private item of
-/// this module, so [`crate::components::register_components`] reaches it
-/// through here rather than by path.
+/// this module, so [`crate::components::register_contract_components`] reaches
+/// it through here rather than by path.
 pub(crate) fn register(world: &mut World) {
     __pill_register_CameraComponent(world);
 }

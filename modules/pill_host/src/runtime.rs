@@ -365,7 +365,7 @@ pub struct RenderingHost {
     /// Re-cooks edited renderer shaders and updates their assets; `None` when
     /// the watch could not start, which only costs the reload.
     #[cfg(feature = "hot_reload")]
-    shader_reloader: Option<pill_renderer_api::ShaderReloader>,
+    shader_reloader: Option<pill_master_renderer_data::ShaderReloader>,
 }
 
 #[cfg(feature = "rendering")]
@@ -1085,8 +1085,8 @@ fn attach_backend(
 /// A watch that fails to start costs only the shader reload, never the host,
 /// so the failure is reported and the host runs without it.
 #[cfg(all(feature = "rendering", feature = "hot_reload"))]
-fn start_shader_reloader() -> Option<pill_renderer_api::ShaderReloader> {
-    match pill_renderer_api::ShaderReloader::new() {
+fn start_shader_reloader() -> Option<pill_master_renderer_data::ShaderReloader> {
+    match pill_master_renderer_data::ShaderReloader::new() {
         Ok(reloader) => Some(reloader),
         Err(error) => {
             warn!(
