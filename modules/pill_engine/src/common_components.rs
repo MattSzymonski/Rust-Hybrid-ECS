@@ -142,6 +142,13 @@ impl Component for TransformComponent {
         const IDENTITY: u128 = crate::component::shared_component_identity(TRANSFORM_SHARED_NAME);
         Some(IDENTITY)
     }
+
+    fn declared_schema_hash() -> Option<u64> {
+        // What the derive would emit: the hash of the layout registration uses.
+        Some(crate::component::component_schema_hash(
+            TransformComponent::FIELD_LAYOUT,
+        ))
+    }
 }
 
 impl Default for TransformComponent {

@@ -52,6 +52,18 @@ pub trait QueryTarget {
     /// Returns `(reads, writes)` as vectors of `ComponentId`.
     fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>);
 
+    /// The shared components this target reads or writes, each with the
+    /// schema hash this binary's type declares for it.
+    ///
+    /// [`crate::Query::new`] compares these with the registry so a binary built
+    /// against an older layout of a shared component can't read the current
+    /// rows through stale field offsets. Components that aren't shared, or
+    /// whose type declares no layout, are left out: `TypeId` or size and
+    /// alignment already cover them. Defaults to none.
+    fn declared_shared_schemas() -> Vec<(ComponentId, u64)> {
+        Vec::new()
+    }
+
     /// Initialize state for fetching from an archetype (caches storage pointers).
     ///
     /// `this_run` is the current world tick used by mutable fetches to populate
@@ -114,6 +126,10 @@ impl<T: Component> QueryTarget for &T {
 
     fn component_ids() -> Vec<ComponentId> {
         vec![ComponentId::of::<T>()]
+    }
+
+    fn declared_shared_schemas() -> Vec<(ComponentId, u64)> {
+        declared_shared_schema::<T>().into_iter().collect()
     }
 
     fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>) {
@@ -189,6 +205,10 @@ impl<T: Component> QueryTarget for &mut T {
         vec![ComponentId::of::<T>()]
     }
 
+    fn declared_shared_schemas() -> Vec<(ComponentId, u64)> {
+        declared_shared_schema::<T>().into_iter().collect()
+    }
+
     fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>) {
         (Vec::new(), vec![ComponentId::of::<T>()])
     }
@@ -243,6 +263,12 @@ macro_rules! impl_query_target_tuple {
                 let mut ids = Vec::with_capacity(crate::config::QueryConfig::DEFAULT_TUPLE_COMPONENT_IDS_CAPACITY);
                 $(ids.extend($T::component_ids());)*
                 ids
+            }
+
+            fn declared_shared_schemas() -> Vec<(ComponentId, u64)> {
+                let mut schemas = Vec::new();
+                $(schemas.extend($T::declared_shared_schemas());)*
+                schemas
             }
 
             fn report_component_access() -> (Vec<ComponentId>, Vec<ComponentId>) {
@@ -303,6 +329,14 @@ impl_query_target_tuple!(A, B, C, D, E);
 // =============================================================================
 // Free Functions
 // =============================================================================
+
+/// `T`'s component id and the schema hash `T` declares, when `T` is a shared
+/// component that declares a layout; the unit of
+/// [`QueryTarget::declared_shared_schemas`].
+fn declared_shared_schema<T: Component>() -> Option<(ComponentId, u64)> {
+    T::shared_name()?;
+    Some((ComponentId::of::<T>(), T::declared_schema_hash()?))
+}
 
 /// Returns the first [`ComponentId`] a target both reads and writes, or writes
 /// twice - the aliasing that produces overlapping `&`/`&mut` borrows of one

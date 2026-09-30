@@ -82,6 +82,14 @@ pub struct Query<'w, Q: QueryTarget, F: QueryFilter = ()> {
     /// component matched archetypes that cannot serve it, and iteration then
     /// panicked inside the column lookup.
     unresolved_target: Option<ComponentId>,
+    /// A shared component this query's binary declares with a different field
+    /// layout than the one registered now (see
+    /// [`World::find_stale_shared_reader`]).
+    ///
+    /// Reading it would apply the old field offsets to the new rows, so the
+    /// query matches nothing, exactly like an unresolved target. The world logs
+    /// the refusal once.
+    stale_shared_component: Option<ComponentId>,
     /// Whether every filter pair carried an unresolved id on its include
     /// side. No archetype can satisfy such a pair, so when all of them are
     /// like that the query matches nothing - `With<T>` for an unregistered
@@ -161,6 +169,16 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         };
         let (filter_pairs, filters_unsatisfiable) = Self::build_filter_mask_pairs(world);
 
+        // Step 2b: Refuse a stale reader of a shared component: the binary
+        // running this query was built against a field layout the registry no
+        // longer holds. Checked once here per query, not per row.
+        let declared_shared = Q::declared_shared_schemas();
+        let stale_shared_component = if declared_shared.is_empty() {
+            None
+        } else {
+            world.find_stale_shared_reader(&declared_shared, std::any::type_name::<Q>())
+        };
+
         // Step 3: Sum the sizes of every fetched component type, clamped to
         // a minimum of 8 bytes. `default_entities_per_slice` divides by this
         // value, so the clamp both avoids division by zero and keeps the
@@ -178,12 +196,21 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
             target_mask,
             filter_pairs,
             unresolved_target,
+            stale_shared_component,
             filters_unsatisfiable,
             total_components_size,
             cached_matches: Vec::new(),
             cached_generation: 0,
             _phantom: std::marker::PhantomData,
         }
+    }
+
+    /// The shared component this query refused because its binary declares a
+    /// different field layout than the registered one, if any.
+    ///
+    /// A refused query matches nothing; this says why.
+    pub fn stale_shared_component(&self) -> Option<ComponentId> {
+        self.stale_shared_component
     }
 
     /// Builds the component mask for the query target from the world's
@@ -310,7 +337,10 @@ impl<'w, Q: QueryTarget, F: QueryFilter> Query<'w, Q, F> {
         // Step 0: An unresolved target or an unsatisfiable filter means the
         // answer is the empty set no matter what the world holds; returning
         // here also keeps a stale cache from ever being refreshed into it.
-        if self.unresolved_target.is_some() || self.filters_unsatisfiable {
+        if self.unresolved_target.is_some()
+            || self.stale_shared_component.is_some()
+            || self.filters_unsatisfiable
+        {
             return &[];
         }
 

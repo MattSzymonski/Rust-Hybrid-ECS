@@ -28,6 +28,57 @@ use super::*;
 // =============================================================================
 
 impl World {
+    /// The first shared component in `declared` whose registered layout differs
+    /// from the layout the reading binary's type declares, if any.
+    ///
+    /// `declared` pairs each shared component a query targets with the schema
+    /// hash its type declares ([`crate::QueryTarget::declared_shared_schemas`]).
+    /// A component whose registration carries no hash is not compared: there is
+    /// no evidence either way, and size and alignment still guard the column.
+    /// Each mismatch is logged once per (component, declared hash), since the
+    /// query that hits it is typically rebuilt every frame.
+    pub(crate) fn find_stale_shared_reader(
+        &mut self,
+        declared: &[(ComponentId, u64)],
+        query_type: &str,
+    ) -> Option<ComponentId> {
+        for &(component_id, declared_hash) in declared {
+            let Some(registered_hash) = self
+                .component_registry
+                .get_layout(&component_id)
+                .and_then(|layout| layout.schema_hash)
+            else {
+                continue;
+            };
+            if registered_hash == declared_hash {
+                continue;
+            }
+            // Log the first sighting only; the refusal itself happens every time.
+            if !self
+                .reported_schema_mismatches
+                .contains(&(component_id, declared_hash))
+            {
+                self.reported_schema_mismatches
+                    .push((component_id, declared_hash));
+                let component = self
+                    .component_registry
+                    .get_name(&component_id)
+                    .unwrap_or("<unnamed>")
+                    .to_owned();
+                error!(
+                    target: pill_core::telemetry::telemetry_target::ECS,
+                    component = %component,
+                    query = query_type,
+                    declared_hash = format!("{declared_hash:#018x}"),
+                    registered_hash = format!("{registered_hash:#018x}"),
+                    "query refused: its binary was built against a different layout of this                      shared component than the one registered now; it matches nothing until                      that binary is rebuilt"
+                );
+            }
+            return Some(component_id);
+        }
+        None
+    }
+
     /// Reserve capacity for at least `additional` instances of component `T`
     /// in every archetype that currently contains `T`.
     ///

@@ -216,6 +216,16 @@ pub fn derive_pill_component(input: TokenStream) -> TokenStream {
     let expanded = quote! {
         impl ::pill_engine::Component for #ident {
             #shared_name_impl
+
+            fn declared_schema_hash() -> ::core::option::Option<u64> {
+                // The same descriptors registration hashes, so a type agrees
+                // with its own registration by construction. An empty layout
+                // declares nothing, matching `ComponentLayout::of`.
+                let fields: &[::pill_engine::component_registry::ComponentFieldDescriptor] =
+                    #layout_reference;
+                (!fields.is_empty())
+                    .then(|| ::pill_engine::component::component_schema_hash(fields))
+            }
         }
         #declared_layout
 

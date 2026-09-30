@@ -109,6 +109,28 @@ pub trait Component: Send + 'static {
     {
         Self::shared_name().map(shared_component_identity)
     }
+
+    /// The structural hash of the field layout *this binary's* type declares,
+    /// or `None` when it declares none.
+    ///
+    /// Compared with the registry's hash for the component when a query binds
+    /// a shared component (see [`crate::Query::new`]). For a shared component,
+    /// size and alignment are the only check the column itself can make, and
+    /// they can't tell `{x: f32, y: f32}` from `{y: f32, x: f32}`. A binary
+    /// still running code built against an older layout - a module whose data
+    /// crate was reloaded under it - would otherwise read the new rows through
+    /// the old field offsets.
+    ///
+    /// `#[derive(PillComponent)]` overrides it from the type's field
+    /// descriptors, the same ones registration hashes. A hand-written impl
+    /// overrides it with `component_schema_hash(Self::FIELD_LAYOUT)`; leaving
+    /// the default keeps the size-and-alignment check only.
+    fn declared_schema_hash() -> Option<u64>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 // =============================================================================
