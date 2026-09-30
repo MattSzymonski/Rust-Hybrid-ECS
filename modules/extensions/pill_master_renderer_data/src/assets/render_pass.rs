@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use pill_engine::{Asset, Handle};
 
 // The pass vocabulary is part of the frame contract, so it lives there.
-use crate::frame::{CullMode, MaterialParameter, PassKind, PassTarget};
 use crate::{Shader, Texture};
+use pill_renderer_api::frame::{CullMode, MaterialParameter, PassKind, PassTarget};
 
 /// One pass in a [`RenderingPipeline`](crate::RenderingPipeline).
 #[derive(Clone, Debug)]

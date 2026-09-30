@@ -935,7 +935,7 @@ mod tests {
     use super::*;
     use pill_engine::common_components::Color;
     use pill_engine::Engine;
-    use pill_renderer_api::register_components;
+    use pill_master_renderer_data::register_components;
 
     /// A component that is itself a colour (`…::Color`) groups its bare
     /// `r/g/b/a` scalars under the "color" label.

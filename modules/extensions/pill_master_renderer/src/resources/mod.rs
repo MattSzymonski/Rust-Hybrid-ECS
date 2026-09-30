@@ -47,4 +47,4 @@ pub use renderer_resource_storage::RendererResourceStorage;
 
 pub use renderer_pass::RendererPass;
 
-pub use pill_renderer_api::RenderingManager;
+pub use pill_master_renderer_data::RenderingManager;

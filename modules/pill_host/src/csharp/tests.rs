@@ -49,7 +49,7 @@ use super::queries::{
 };
 use super::resources::resource_target;
 use pill_engine::common_components::Position;
-use pill_renderer_api::MeshRendererComponent;
+use pill_master_renderer_data::MeshRendererComponent;
 
 // =============================================================================
 // Constants

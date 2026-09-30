@@ -1,7 +1,7 @@
 //! Decodes the bundled OBJ and PNG into the current renderer asset types.
 
 use pill_engine::{AssetManager, Handle, World};
-use pill_renderer_api::{
+use pill_master_renderer_data::{
     AssetLoader, Material, Mesh, Shader, ShaderParameterSlot, ShaderParameterType,
     ShaderTextureSlot, Texture, TextureType,
 };

@@ -159,7 +159,7 @@ mod rendering_impl {
     };
     use crate::csharp::context::with_active_world;
     use pill_engine::{AssetLoader, AssetManager, Handle};
-    use pill_renderer_api::{
+    use pill_master_renderer_data::{
         Material, Mesh, Shader, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot,
         Texture, TextureType,
     };

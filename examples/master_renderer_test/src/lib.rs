@@ -36,7 +36,7 @@ pub struct TagHelmet;
 pub fn init(engine: &mut Engine) -> u32 {
     // Installs the renderer's own PBR chain and points the renderer at it, so
     // this project has no frame of its own to hand over.
-    pill_renderer_api::register(engine);
+    pill_master_renderer_data::register(engine);
     __pill_register_TagHelmet(engine.world_mut());
 
     let assets = match asset_loading::load(engine.world_mut()) {
@@ -60,7 +60,7 @@ pub fn init(engine: &mut Engine) -> u32 {
 mod tests {
     use super::*;
     use pill_engine::Query;
-    use pill_renderer_api::{
+    use pill_master_renderer_data::{
         AssetLoader, CameraComponent, Mesh, MeshRendererComponent, Texture, TextureType,
     };
 

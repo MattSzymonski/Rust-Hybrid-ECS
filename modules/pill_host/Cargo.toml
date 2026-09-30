@@ -15,11 +15,15 @@ pill_core = { path = "../pill_core" }
 pill_core_macros = { path = "../pill_core_macros" }
 thiserror = "2"
 miette = { version = "7", features = ["derive"] }
-# The renderer's plain data - components, assets, default pipelines, the frame
-# and the backend trait - with no wgpu. Linked in every posture: a headless host
-# registers it so projects that declare cameras, meshes and lights load
-# unchanged, and the C# bridge binds those types natively in both postures.
+# The renderer contract - the backend trait, the frame, the camera, window
+# handles as data - with no wgpu. Linked in every posture.
 pill_renderer_api = { path = "../pill_renderer_api" }
+# INTERIM (renderer data split, stages 4-5): the master renderer's data -
+# components, assets, pipelines - still linked and registered by the host, so a
+# headless host loads projects that declare cameras, meshes and lights, and the
+# C# bridge binds those types. Stage 6 turns it into an extension the host loads
+# and removes this dependency.
+pill_master_renderer_data = { path = "../extensions/pill_master_renderer_data" }
 # Dependency GRAPH only - never named in code, and renamed so any use stands
 # out. Every module and project build is resolved together with the running
 # host (see `build_runner::apply_cargo_host_overrides`), and cargo folds each
@@ -50,7 +54,7 @@ winit = { version = "0.30", optional = true }
 default = ["hot_reload"]
 # Reload edited code without a restart. Also compiles the renderer data's
 # development shader reload, which only a windowed host ever starts.
-hot_reload = ["pill_renderer_api/shader-hot-reload"]
+hot_reload = ["pill_master_renderer_data/shader-hot-reload"]
 # A windowed host: the winit event loop, and the renderer module it loads and
 # attaches to the window. The host itself links no renderer and no wgpu: the
 # graphics stack exists only inside that module. Nothing is forwarded to

@@ -6,10 +6,13 @@ edition = "2021"
 [lints]
 workspace = true
 
-# The renderer's plain data: components, assets, the default pipelines and
-# their WGSL, the frame the renderer draws, and the backend trait. Linked by the
-# host in every posture and by projects, so it must never depend on wgpu or
-# winit - that is what keeps the graphics stack in exactly one loadable module.
+# The renderer contract: the backend trait, the frame and its vocabulary, the
+# camera and viewport, and window handles as data. Linked by the host in every
+# posture, by every renderer and (through a renderer's data crate) by projects,
+# so it must never depend on wgpu or winit. Renderer-specific data lives in each
+# renderer's data crate (`extensions/pill_master_renderer_data`). Some
+# dependencies below served that data before it moved; stage 10 of the renderer
+# data split removes them.
 [lib]
 crate-type = ["rlib"]
 
@@ -39,19 +42,3 @@ tobj = "3"
 # Window handles as plain data (`RawWindowData`): the standard the windowing
 # crates (winit, tao) and wgpu share, with no windowing crate behind it.
 raw-window-handle = "0.6"
-# Development shader reload only (`shader-hot-reload`): the cooker the build
-# script runs, and a watcher on the shader sources.
-pill_assets = { path = "../pill_assets", optional = true }
-notify = { version = "6", optional = true }
-
-[features]
-default = []
-# Watch `src/config/` for HLSL edits at runtime, re-cook them and update the
-# shader assets built from them. A development convenience: the host enables it
-# with `hot_reload`, and a shipping build never compiles it.
-shader-hot-reload = ["dep:pill_assets", "dep:notify"]
-
-[build-dependencies]
-# Turns `src/config/**/*.hlsl` into the WGSL this crate embeds, so a shader
-# that is not committed is still the one that compiles.
-pill_assets = { path = "../pill_assets" }

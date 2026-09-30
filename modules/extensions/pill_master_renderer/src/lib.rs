@@ -26,10 +26,12 @@
 //! making it a reloadable module is the remaining work of
 //! `local/docs/plans/renderer_hot_reload.md`.
 
-// The data half lives in `pill_renderer_api`, which carries no wgpu; its
-// modules are re-exported so this crate's own paths (`crate::assets`,
+// The contract lives in `pill_renderer_api` and this renderer's data in
+// `pill_master_renderer_data`; neither carries wgpu. Their modules are
+// re-exported so this crate's own paths (`crate::api`, `crate::assets`,
 // `crate::components`, `crate::config`) keep resolving.
-pub use pill_renderer_api::{api, assets, components, config};
+pub use pill_master_renderer_data::{assets, components, config};
+pub use pill_renderer_api::api;
 
 /// The mesh drawer: batches queued entities and records the instanced draws.
 pub mod drawers;
@@ -70,15 +72,17 @@ mod module_entry;
 
 // External crates
 use pill_engine::{pill_module, Engine};
-pub use pill_renderer_api::components::*;
-pub use pill_renderer_api::{
-    register_components, AssetLoader, FrameOutcome, HeadlessRenderer, Material, MaterialBuilder,
-    MaterialParameter, Mesh, MeshVertex, PassKind, PassTarget, PillRenderer, RenderCapabilities,
-    RenderMetrics, RenderPass, RenderingPipeline, Shader, ShaderBuilder, ShaderParameterSlot,
+pub use pill_master_renderer_data::components::*;
+#[cfg(feature = "shader-hot-reload")]
+pub use pill_master_renderer_data::{shader_reload, ShaderReloadReport, ShaderReloader};
+pub use pill_master_renderer_data::{
+    AssetLoader, Material, MaterialBuilder, MaterialParameter, Mesh, MeshVertex, PassKind,
+    PassTarget, RenderPass, RenderingPipeline, Shader, ShaderBuilder, ShaderParameterSlot,
     ShaderParameterType, ShaderTextureSlot, Texture, TextureType,
 };
-#[cfg(feature = "shader-hot-reload")]
-pub use pill_renderer_api::{shader_reload, ShaderReloadReport, ShaderReloader};
+pub use pill_renderer_api::{
+    FrameOutcome, HeadlessRenderer, PillRenderer, RenderCapabilities, RenderMetrics,
+};
 
 // Current crate
 pub use error::RendererError;
