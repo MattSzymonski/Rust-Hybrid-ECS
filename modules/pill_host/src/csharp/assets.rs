@@ -1,472 +1,197 @@
-//! Managed asset loading: bridges `AssetManager` for C# projects that cannot
-//! construct engine asset types directly.
+//! Managed asset loading: the C# entry points, forwarded to the renderer data
+//! crate's asset functions.
 //!
 //! # Responsibilities
 //!
-//! - Decode a mesh, texture or shader from raw bytes a managed caller
-//!   supplies and insert it into the active invocation's `AssetManager`.
-//! - Build a material from already-loaded handles and per-slot parameters.
+//! - Publish the four asset entry points the managed runtime calls (load a
+//!   mesh, texture or shader; create a material) in `CsEngineApi`.
+//! - Find the renderer data crate's function for each by name and call it with
+//!   the active managed invocation's world.
+//! - Report a missing invocation or a missing function with the status codes
+//!   the managed side already knows.
 //!
 //! # Design
 //!
-//! Every function below runs only inside an active managed invocation -
-//! ordinarily an `[EcsStartup]` method - reusing the same thread-local world
-//! access [`with_active_world`] already gives queries and resources. Asset
-//! mutation during startup is inherently exclusive (startups run one at a
-//! time, before the parallel scheduler starts), so none of the
-//! access-declaration bookkeeping components and resources need applies here.
+//! The asset types these calls build (`Mesh`, `Texture`, `Shader`, `Material`)
+//! belong to the renderer's data crate (`pill_master_renderer_data`), and so do
+//! the functions that build them, in its `csharp_assets` module. The host names
+//! no renderer data type: it only owns the managed invocation's world, which
+//! the data crate's functions take as their first argument, and passes every
+//! other argument through untouched - the argument structs included, as opaque
+//! pointers whose layout only the managed side and the data crate share.
 //!
-//! The asset types these functions build (`Mesh`, `Texture`, `Shader`,
-//! `Material`) are `pill_renderer_api`'s plain data, which the host links in
-//! every posture, so a headless host builds them exactly as a windowed one
-//! does; only drawing them needs the renderer.
+//! Each function is found by its export name, the contract between the host
+//! and the data crate:
+//!
+//! - **Development**: the data crate is a loaded extension. After every
+//!   extension load and reload, the host resolves the names from the loaded
+//!   DLLs and publishes them here ([`publish_asset_exports`]). It never falls
+//!   back to its own image: a copy of the data crate linked there would build
+//!   assets with that copy's type identities, not the module's.
+//! - **Shipping**: the data crate is linked into the executable, which finds
+//!   the descriptors it submits
+//!   ([`pill_engine::component_registry::find_export`]).
+//!
+//! Every function runs only inside an active managed invocation - ordinarily an
+//! `[EcsStartup]` method - reusing the thread-local world access
+//! [`with_active_world`] already gives queries and resources. Startups run one
+//! at a time, before the parallel scheduler starts, so the world is used
+//! exclusively for the call.
 
-// =============================================================================
-// Shared native argument shapes
-// =============================================================================
+// Standard library
+use std::ffi::c_void;
 
-/// One parameter slot a managed shader declaration supplies.
-#[repr(C)]
-pub(super) struct NativeShaderParameterSlot {
-    pub(super) name: *const u8,
-    pub(super) name_len: u32,
-    /// `0` scalar, `1` bool, `2` color.
-    pub(super) kind: u8,
-}
+// External crates
+use pill_engine::component_registry::ExportAddress;
+use pill_engine::World;
 
-/// One texture slot a managed shader declaration supplies.
-///
-/// The bound texture is always color-typed: nothing using this bridge yet
-/// needs a normal map slot.
-#[repr(C)]
-pub(super) struct NativeShaderTextureSlot {
-    pub(super) name: *const u8,
-    pub(super) name_len: u32,
-    pub(super) texture_binding: u32,
-    pub(super) sampler_binding: u32,
-}
+// Current crate
+use crate::csharp::context::with_active_world;
 
-/// One texture a managed material declaration binds to a shader slot.
-#[repr(C)]
-pub(super) struct NativeMaterialTexture {
-    pub(super) slot: *const u8,
-    pub(super) slot_len: u32,
-    pub(super) texture_index: u32,
-    pub(super) texture_generation: u32,
-}
-
-/// One scalar parameter a managed material declaration sets.
-#[repr(C)]
-pub(super) struct NativeMaterialScalar {
-    pub(super) name: *const u8,
-    pub(super) name_len: u32,
-    pub(super) value: f32,
-}
-
-/// One color parameter a managed material declaration sets.
-#[repr(C)]
-pub(super) struct NativeMaterialColor {
-    pub(super) name: *const u8,
-    pub(super) name_len: u32,
-    pub(super) r: f32,
-    pub(super) g: f32,
-    pub(super) b: f32,
-}
-
-/// Handle part meaning "absent" - no shader override, no bound texture.
-pub(super) const NO_HANDLE: u32 = u32::MAX;
-
-// Status codes shared by every function in this module. `0` is always
-// success; the rest are deliberately distinct from `resources.rs`'s codes
-// because these calls are not the resource-access path and must never be
-// confused with it in a log.
-const STATUS_OK: u8 = 0;
+// Status codes the host reports itself; the data crate's functions report the
+// rest. The managed side's table (`Engine.ValidateAssetStatus`) knows them all.
+/// No managed invocation is active.
 const STATUS_NO_ACTIVE_SCOPE: u8 = 1;
-const STATUS_ASSET_MANAGER_MISSING: u8 = 2;
-const STATUS_INVALID_UTF8: u8 = 3;
-const STATUS_DECODE_FAILED: u8 = 4;
-const STATUS_NULL_OUTPUT: u8 = 5;
-/// Reserved: the asset types were once windowed-only and a headless host
-/// reported this. Kept so the managed side's status table stays aligned.
-#[allow(dead_code)]
+/// No renderer data crate provides the asset functions.
 const STATUS_RENDERER_UNAVAILABLE: u8 = 6;
-/// The name is already bound to a live asset in the active invocation.
-const STATUS_NAME_IN_USE: u8 = 7;
 
-/// Reads `len` bytes at `pointer` as owned UTF-8, or an empty string for a
-/// zero-length argument.
+/// The export names the four entry points forward to, in the renderer data
+/// crate (`pill_master_renderer_data::csharp_assets`).
+#[cfg(feature = "hot_reload")]
+pub(crate) const ASSET_EXPORT_NAMES: [&str; 4] = [
+    "pill_render_data_load_mesh_obj",
+    "pill_render_data_load_texture_png",
+    "pill_render_data_load_shader",
+    "pill_render_data_create_material",
+];
+
+/// The asset functions the loaded modules offer, by export name.
+///
+/// Replaced wholesale after every extension load and reload, so it never names
+/// an image the reload retired.
+#[cfg(feature = "hot_reload")]
+static LOADED_ASSET_EXPORTS: std::sync::RwLock<Vec<(&'static str, ExportAddress)>> =
+    std::sync::RwLock::new(Vec::new());
+
+/// Publish the asset functions `lookup` finds among the loaded modules, and
+/// return how many of [`ASSET_EXPORT_NAMES`] it found.
+///
+/// Call it after every extension load or reload, before any managed code can
+/// run: the addresses of a reloaded module's previous generation must not be
+/// used again.
+#[cfg(feature = "hot_reload")]
+pub(crate) fn publish_asset_exports(lookup: impl Fn(&str) -> Option<ExportAddress>) -> usize {
+    let found: Vec<(&'static str, ExportAddress)> = ASSET_EXPORT_NAMES
+        .iter()
+        .filter_map(|name| lookup(name).map(|address| (*name, address)))
+        .collect();
+    let count = found.len();
+    match LOADED_ASSET_EXPORTS.write() {
+        Ok(mut table) => *table = found,
+        Err(poisoned) => *poisoned.into_inner() = found,
+    }
+    count
+}
+
+/// The address of the asset function exported as `name`, for this build.
+fn export_address(name: &str) -> Option<ExportAddress> {
+    // Development: only what the loaded modules published.
+    #[cfg(feature = "hot_reload")]
+    {
+        let table = match LOADED_ASSET_EXPORTS.read() {
+            Ok(table) => table,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        table
+            .iter()
+            .find(|(export, _)| *export == name)
+            .map(|(_, address)| *address)
+    }
+    // Shipping: the descriptors linked into this executable.
+    #[cfg(not(feature = "hot_reload"))]
+    {
+        pill_engine::component_registry::find_export(name)
+    }
+}
+
+/// The data crate's mesh loader: world, name, bytes, handle outputs.
+type LoadMeshObj =
+    unsafe extern "C" fn(*mut World, *const u8, u32, *const u8, u32, *mut u32, *mut u32) -> u8;
+/// The data crate's texture loader, shaped like [`LoadMeshObj`].
+type LoadTexturePng = LoadMeshObj;
+/// The data crate's shader builder: world, name, both stages' WGSL, the slot
+/// arrays, the two parameter flags, handle outputs.
+type LoadShader = unsafe extern "C" fn(
+    *mut World,
+    *const u8,
+    u32,
+    *const u8,
+    u32,
+    *const u8,
+    u32,
+    *const c_void,
+    u32,
+    *const c_void,
+    u32,
+    u8,
+    u8,
+    *mut u32,
+    *mut u32,
+) -> u8;
+/// The data crate's material builder: world, name, shader handle, the
+/// texture/scalar/color arrays, rendering order, handle outputs.
+type CreateMaterial = unsafe extern "C" fn(
+    *mut World,
+    *const u8,
+    u32,
+    u32,
+    u32,
+    *const c_void,
+    u32,
+    *const c_void,
+    u32,
+    *const c_void,
+    u32,
+    u8,
+    *mut u32,
+    *mut u32,
+) -> u8;
+
+/// The data crate's function named `name`, as the function pointer type `F`.
 ///
 /// # Safety
 ///
-/// `pointer` must reference `len` valid, readable bytes for the call's
-/// duration, unless `len` is zero.
-unsafe fn read_str(pointer: *const u8, len: u32) -> Result<String, u8> {
-    if len == 0 {
-        return Ok(String::new());
-    }
-    if pointer.is_null() {
-        return Err(STATUS_NULL_OUTPUT);
-    }
-    // SAFETY: caller contract.
-    let slice = unsafe { std::slice::from_raw_parts(pointer, len as usize) };
-    std::str::from_utf8(slice)
-        .map(str::to_owned)
-        .map_err(|_| STATUS_INVALID_UTF8)
+/// `F` must be the exact signature of the function exported under `name`.
+unsafe fn resolve<F: Copy>(name: &str) -> Option<F> {
+    let address = export_address(name)?;
+    debug_assert_eq!(
+        std::mem::size_of::<F>(),
+        std::mem::size_of::<*const ()>(),
+        "an export resolves to a plain function pointer"
+    );
+    // SAFETY: `address` was made from the function exported as `name`, and the
+    // caller guarantees `F` is that function's type; a function pointer and a
+    // data pointer have the same size on every target this engine builds for.
+    Some(unsafe { std::mem::transmute_copy::<*const (), F>(&address.0) })
 }
 
-/// Reads `len` bytes at `pointer` into an owned buffer, or an empty one for a
-/// zero-length argument.
+/// Calls the data crate's function `name` with the active invocation's world,
+/// through `call`.
+///
+/// Reports [`STATUS_RENDERER_UNAVAILABLE`] when no linked data crate offers the
+/// function and [`STATUS_NO_ACTIVE_SCOPE`] outside a managed invocation.
 ///
 /// # Safety
 ///
-/// `pointer` must reference `len` valid, readable bytes for the call's
-/// duration, unless `len` is zero.
-unsafe fn read_bytes(pointer: *const u8, len: u32) -> Result<Vec<u8>, u8> {
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-    if pointer.is_null() {
-        return Err(STATUS_NULL_OUTPUT);
-    }
-    // SAFETY: caller contract.
-    Ok(unsafe { std::slice::from_raw_parts(pointer, len as usize) }.to_vec())
-}
-
-/// Reads `len` elements of `T` at `pointer`, or an empty slice for a
-/// zero-length argument.
-///
-/// # Safety
-///
-/// `pointer` must reference `len` valid, readable, properly aligned `T`
-/// values for the call's duration, unless `len` is zero.
-unsafe fn read_slice<'a, T>(pointer: *const T, len: u32) -> Result<&'a [T], u8> {
-    if len == 0 {
-        return Ok(&[]);
-    }
-    if pointer.is_null() {
-        return Err(STATUS_NULL_OUTPUT);
-    }
-    // SAFETY: caller contract.
-    Ok(unsafe { std::slice::from_raw_parts(pointer, len as usize) })
-}
-
-mod rendering_impl {
-    use super::{
-        read_bytes, read_slice, read_str, NativeMaterialColor, NativeMaterialScalar,
-        NativeMaterialTexture, NativeShaderParameterSlot, NativeShaderTextureSlot, NO_HANDLE,
-        STATUS_ASSET_MANAGER_MISSING, STATUS_DECODE_FAILED, STATUS_NAME_IN_USE,
-        STATUS_NO_ACTIVE_SCOPE, STATUS_NULL_OUTPUT, STATUS_OK,
+/// `F` must be the exact signature of the function exported under `name`, and
+/// `call` must uphold that function's own contract for every argument but the
+/// world.
+unsafe fn forward<F: Copy>(name: &str, call: impl FnOnce(F, *mut World) -> u8) -> u8 {
+    // SAFETY: forwarded from this function's own contract.
+    let Some(function) = (unsafe { resolve::<F>(name) }) else {
+        return STATUS_RENDERER_UNAVAILABLE;
     };
-    use crate::csharp::context::with_active_world;
-    use pill_engine::{AssetLoader, AssetManager, Handle};
-    use pill_master_renderer_data::{
-        Material, Mesh, Shader, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot,
-        Texture, TextureType,
-    };
-
-    /// Runs `body` against the active invocation's `AssetManager`, folding the
-    /// "no scope"/"no AssetManager" cases into the shared status codes.
-    fn with_assets<R>(body: impl FnOnce(&mut AssetManager) -> Result<R, u8>) -> Result<R, u8> {
-        with_active_world(|world| {
-            let Some(assets) = world.get_resource_mut::<AssetManager>() else {
-                return Err(STATUS_ASSET_MANAGER_MISSING);
-            };
-            body(assets)
-        })
-        .unwrap_or(Err(STATUS_NO_ACTIVE_SCOPE))
-    }
-
-    /// # Safety
-    /// See [`super::ffi_asset_load_mesh_obj`]; this is its rendering-enabled body.
-    pub(super) unsafe fn load_mesh_obj(
-        name: *const u8,
-        name_len: u32,
-        bytes: *const u8,
-        bytes_len: u32,
-        out_index: *mut u32,
-        out_generation: *mut u32,
-    ) -> u8 {
-        if out_index.is_null() || out_generation.is_null() {
-            return STATUS_NULL_OUTPUT;
-        }
-        // SAFETY: forwarded from the caller's contract.
-        let name = match unsafe { read_str(name, name_len) } {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
-        // SAFETY: forwarded from the caller's contract.
-        let bytes = match unsafe { read_bytes(bytes, bytes_len) } {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
-        let result = with_assets(|assets| {
-            let mesh =
-                Mesh::from_obj_bytes(name.as_str(), &bytes).map_err(|_| STATUS_DECODE_FAILED)?;
-            let handle = assets
-                .add_named(name.as_str(), mesh)
-                .map_err(|_| STATUS_NAME_IN_USE)?;
-            Ok((handle.index(), handle.generation()))
-        });
-        match result {
-            Ok((index, generation)) => {
-                // SAFETY: both pointers were checked non-null above.
-                unsafe {
-                    *out_index = index;
-                    *out_generation = generation;
-                }
-                STATUS_OK
-            }
-            Err(status) => status,
-        }
-    }
-
-    /// # Safety
-    /// See [`super::ffi_asset_load_texture_png`]; this is its rendering-enabled body.
-    pub(super) unsafe fn load_texture_png(
-        name: *const u8,
-        name_len: u32,
-        bytes: *const u8,
-        bytes_len: u32,
-        out_index: *mut u32,
-        out_generation: *mut u32,
-    ) -> u8 {
-        if out_index.is_null() || out_generation.is_null() {
-            return STATUS_NULL_OUTPUT;
-        }
-        // SAFETY: forwarded from the caller's contract.
-        let name = match unsafe { read_str(name, name_len) } {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
-        // SAFETY: forwarded from the caller's contract.
-        let bytes = match unsafe { read_bytes(bytes, bytes_len) } {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
-        let result = with_assets(|assets| {
-            let texture = Texture::new(
-                name.as_str(),
-                TextureType::Color,
-                AssetLoader::Bytes(bytes.into_boxed_slice()),
-            )
-            .map_err(|_| STATUS_DECODE_FAILED)?;
-            let handle = assets
-                .add_named(name.as_str(), texture)
-                .map_err(|_| STATUS_NAME_IN_USE)?;
-            Ok((handle.index(), handle.generation()))
-        });
-        match result {
-            Ok((index, generation)) => {
-                // SAFETY: both pointers were checked non-null above.
-                unsafe {
-                    *out_index = index;
-                    *out_generation = generation;
-                }
-                STATUS_OK
-            }
-            Err(status) => status,
-        }
-    }
-
-    /// # Safety
-    /// See [`super::ffi_asset_load_shader`]; this is its rendering-enabled body.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) unsafe fn load_shader(
-        name: *const u8,
-        name_len: u32,
-        vertex: *const u8,
-        vertex_len: u32,
-        fragment: *const u8,
-        fragment_len: u32,
-        parameters: *const NativeShaderParameterSlot,
-        parameters_len: u32,
-        textures: *const NativeShaderTextureSlot,
-        textures_len: u32,
-        pass_engine_parameters: u8,
-        pass_camera_parameters: u8,
-        out_index: *mut u32,
-        out_generation: *mut u32,
-    ) -> u8 {
-        if out_index.is_null() || out_generation.is_null() {
-            return STATUS_NULL_OUTPUT;
-        }
-        // SAFETY: every read below forwards the caller's pointer/length contract.
-        let (name, vertex_wgsl, fragment_wgsl) = unsafe {
-            let name = match read_str(name, name_len) {
-                Ok(value) => value,
-                Err(status) => return status,
-            };
-            let vertex_wgsl = match read_str(vertex, vertex_len) {
-                Ok(value) => value,
-                Err(status) => return status,
-            };
-            let fragment_wgsl = match read_str(fragment, fragment_len) {
-                Ok(value) => value,
-                Err(status) => return status,
-            };
-            (name, vertex_wgsl, fragment_wgsl)
-        };
-        // SAFETY: forwarded from the caller's contract.
-        let parameters = match unsafe { read_slice(parameters, parameters_len) } {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
-        // SAFETY: forwarded from the caller's contract.
-        let textures = match unsafe { read_slice(textures, textures_len) } {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
-
-        let mut parameter_slots = Vec::with_capacity(parameters.len());
-        for parameter in parameters {
-            // SAFETY: `parameter.name`/`name_len` came from the same caller
-            // contract as every other string in this call.
-            let name = match unsafe { read_str(parameter.name, parameter.name_len) } {
-                Ok(value) => value,
-                Err(status) => return status,
-            };
-            let kind = match parameter.kind {
-                0 => ShaderParameterType::Scalar,
-                1 => ShaderParameterType::Bool,
-                _ => ShaderParameterType::Color,
-            };
-            parameter_slots.push(ShaderParameterSlot::new(name, kind));
-        }
-
-        let mut texture_slots = Vec::with_capacity(textures.len());
-        for texture in textures {
-            // SAFETY: same contract as above.
-            let name = match unsafe { read_str(texture.name, texture.name_len) } {
-                Ok(value) => value,
-                Err(status) => return status,
-            };
-            texture_slots.push(ShaderTextureSlot::new(
-                name,
-                TextureType::Color,
-                (texture.texture_binding, texture.sampler_binding),
-            ));
-        }
-
-        let result = with_assets(|assets| {
-            let shader = Shader::new(name.as_str())
-                .with_wgsl(vertex_wgsl, fragment_wgsl)
-                .with_parameter_slots(parameter_slots)
-                .with_texture_slots(texture_slots)
-                .with_engine_parameters(pass_engine_parameters != 0)
-                .with_camera_parameters(pass_camera_parameters != 0)
-                .build()
-                .map_err(|_| STATUS_DECODE_FAILED)?;
-            let handle = assets
-                .add_named(name.as_str(), shader)
-                .map_err(|_| STATUS_NAME_IN_USE)?;
-            Ok((handle.index(), handle.generation()))
-        });
-        match result {
-            Ok((index, generation)) => {
-                // SAFETY: both pointers were checked non-null above.
-                unsafe {
-                    *out_index = index;
-                    *out_generation = generation;
-                }
-                STATUS_OK
-            }
-            Err(status) => status,
-        }
-    }
-
-    /// # Safety
-    /// See [`super::ffi_asset_create_material`]; this is its rendering-enabled body.
-    #[allow(clippy::too_many_arguments)]
-    pub(super) unsafe fn create_material(
-        name: *const u8,
-        name_len: u32,
-        shader_index: u32,
-        shader_generation: u32,
-        textures: *const NativeMaterialTexture,
-        textures_len: u32,
-        scalars: *const NativeMaterialScalar,
-        scalars_len: u32,
-        colors: *const NativeMaterialColor,
-        colors_len: u32,
-        rendering_order: u8,
-        out_index: *mut u32,
-        out_generation: *mut u32,
-    ) -> u8 {
-        if out_index.is_null() || out_generation.is_null() {
-            return STATUS_NULL_OUTPUT;
-        }
-        // SAFETY: forwarded from the caller's contract.
-        let name = match unsafe { read_str(name, name_len) } {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
-        // SAFETY: forwarded from the caller's contract.
-        let textures = match unsafe { read_slice(textures, textures_len) } {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
-        // SAFETY: forwarded from the caller's contract.
-        let scalars = match unsafe { read_slice(scalars, scalars_len) } {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
-        // SAFETY: forwarded from the caller's contract.
-        let colors = match unsafe { read_slice(colors, colors_len) } {
-            Ok(value) => value,
-            Err(status) => return status,
-        };
-
-        let mut builder = Material::builder(name.as_str()).rendering_order(rendering_order);
-        if shader_index != NO_HANDLE || shader_generation != NO_HANDLE {
-            builder = builder.shader(&Handle::from_raw(shader_index, shader_generation));
-        }
-        for texture in textures {
-            // SAFETY: same contract as every other string in this call.
-            let slot = match unsafe { read_str(texture.slot, texture.slot_len) } {
-                Ok(value) => value,
-                Err(status) => return status,
-            };
-            builder = builder.texture(
-                slot,
-                &Handle::from_raw(texture.texture_index, texture.texture_generation),
-            );
-        }
-        for scalar in scalars {
-            // SAFETY: same contract as above.
-            let name = match unsafe { read_str(scalar.name, scalar.name_len) } {
-                Ok(value) => value,
-                Err(status) => return status,
-            };
-            builder = builder.scalar_parameter(name, scalar.value);
-        }
-        for color in colors {
-            // SAFETY: same contract as above.
-            let name = match unsafe { read_str(color.name, color.name_len) } {
-                Ok(value) => value,
-                Err(status) => return status,
-            };
-            builder = builder.color_parameter(name, [color.r, color.g, color.b]);
-        }
-        let material = builder.build();
-
-        let result = with_assets(|assets| {
-            let handle = assets
-                .add_named(name.as_str(), material)
-                .map_err(|_| STATUS_NAME_IN_USE)?;
-            Ok((handle.index(), handle.generation()))
-        });
-        match result {
-            Ok((index, generation)) => {
-                // SAFETY: both pointers were checked non-null above.
-                unsafe {
-                    *out_index = index;
-                    *out_generation = generation;
-                }
-                STATUS_OK
-            }
-            Err(status) => status,
-        }
-    }
+    with_active_world(|world| call(function, world as *mut World)).unwrap_or(STATUS_NO_ACTIVE_SCOPE)
 }
 
 // =============================================================================
@@ -489,9 +214,20 @@ pub(super) extern "C" fn ffi_asset_load_mesh_obj(
     out_index: *mut u32,
     out_generation: *mut u32,
 ) -> u8 {
-    // SAFETY: forwarded from this function's own contract.
+    // SAFETY: `LoadMeshObj` is the export's signature, and every argument but
+    // the world comes from this function's own contract unchanged.
     unsafe {
-        rendering_impl::load_mesh_obj(name, name_len, bytes, bytes_len, out_index, out_generation)
+        forward::<LoadMeshObj>("pill_render_data_load_mesh_obj", |function, world| {
+            function(
+                world,
+                name,
+                name_len,
+                bytes,
+                bytes_len,
+                out_index,
+                out_generation,
+            )
+        })
     }
 }
 
@@ -509,21 +245,27 @@ pub(super) extern "C" fn ffi_asset_load_texture_png(
     out_index: *mut u32,
     out_generation: *mut u32,
 ) -> u8 {
-    // SAFETY: forwarded from this function's own contract.
+    // SAFETY: as in `ffi_asset_load_mesh_obj`, for `LoadTexturePng`.
     unsafe {
-        rendering_impl::load_texture_png(
-            name,
-            name_len,
-            bytes,
-            bytes_len,
-            out_index,
-            out_generation,
-        )
+        forward::<LoadTexturePng>("pill_render_data_load_texture_png", |function, world| {
+            function(
+                world,
+                name,
+                name_len,
+                bytes,
+                bytes_len,
+                out_index,
+                out_generation,
+            )
+        })
     }
 }
 
 /// Builds a shader from managed WGSL sources and slot declarations, and
 /// inserts it into the active invocation's `AssetManager`.
+///
+/// `parameters` and `textures` point at arrays whose element layout the
+/// managed side and the data crate share; the host passes them through.
 ///
 /// # Safety
 ///
@@ -540,40 +282,43 @@ pub(super) extern "C" fn ffi_asset_load_shader(
     vertex_len: u32,
     fragment: *const u8,
     fragment_len: u32,
-    parameters: *const NativeShaderParameterSlot,
+    parameters: *const c_void,
     parameters_len: u32,
-    textures: *const NativeShaderTextureSlot,
+    textures: *const c_void,
     textures_len: u32,
     pass_engine_parameters: u8,
     pass_camera_parameters: u8,
     out_index: *mut u32,
     out_generation: *mut u32,
 ) -> u8 {
-    // SAFETY: forwarded from this function's own contract.
+    // SAFETY: as in `ffi_asset_load_mesh_obj`, for `LoadShader`.
     unsafe {
-        rendering_impl::load_shader(
-            name,
-            name_len,
-            vertex,
-            vertex_len,
-            fragment,
-            fragment_len,
-            parameters,
-            parameters_len,
-            textures,
-            textures_len,
-            pass_engine_parameters,
-            pass_camera_parameters,
-            out_index,
-            out_generation,
-        )
+        forward::<LoadShader>("pill_render_data_load_shader", |function, world| {
+            function(
+                world,
+                name,
+                name_len,
+                vertex,
+                vertex_len,
+                fragment,
+                fragment_len,
+                parameters,
+                parameters_len,
+                textures,
+                textures_len,
+                pass_engine_parameters,
+                pass_camera_parameters,
+                out_index,
+                out_generation,
+            )
+        })
     }
 }
 
 /// Builds a material from already-loaded handles and per-slot parameters, and
 /// inserts it into the active invocation's `AssetManager`.
 ///
-/// `shader_index`/`shader_generation` may both be [`NO_HANDLE`] to leave the
+/// `shader_index`/`shader_generation` may both be `u32::MAX` to leave the
 /// renderer's default shader in place.
 ///
 /// # Safety
@@ -586,32 +331,35 @@ pub(super) extern "C" fn ffi_asset_create_material(
     name_len: u32,
     shader_index: u32,
     shader_generation: u32,
-    textures: *const NativeMaterialTexture,
+    textures: *const c_void,
     textures_len: u32,
-    scalars: *const NativeMaterialScalar,
+    scalars: *const c_void,
     scalars_len: u32,
-    colors: *const NativeMaterialColor,
+    colors: *const c_void,
     colors_len: u32,
     rendering_order: u8,
     out_index: *mut u32,
     out_generation: *mut u32,
 ) -> u8 {
-    // SAFETY: forwarded from this function's own contract.
+    // SAFETY: as in `ffi_asset_load_mesh_obj`, for `CreateMaterial`.
     unsafe {
-        rendering_impl::create_material(
-            name,
-            name_len,
-            shader_index,
-            shader_generation,
-            textures,
-            textures_len,
-            scalars,
-            scalars_len,
-            colors,
-            colors_len,
-            rendering_order,
-            out_index,
-            out_generation,
-        )
+        forward::<CreateMaterial>("pill_render_data_create_material", |function, world| {
+            function(
+                world,
+                name,
+                name_len,
+                shader_index,
+                shader_generation,
+                textures,
+                textures_len,
+                scalars,
+                scalars_len,
+                colors,
+                colors_len,
+                rendering_order,
+                out_index,
+                out_generation,
+            )
+        })
     }
 }

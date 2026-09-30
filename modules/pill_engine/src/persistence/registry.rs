@@ -98,6 +98,15 @@ impl World {
         }
     }
 
+    /// The schema hash currently recorded for one persistable component name.
+    ///
+    /// The host keeps the hash each subject registered and compares it with
+    /// this one, so a subject built against a layout another subject has since
+    /// replaced is found without asking the stale binary anything.
+    pub fn persist_schema_hash(&self, type_name: &str) -> Option<u64> {
+        self.persist_schema_hashes.get(type_name).copied()
+    }
+
     /// Return current persistable component manifest.
     pub fn persist_type_manifest(&self) -> Vec<PersistTypeManifestEntry> {
         let mut entries: Vec<PersistTypeManifestEntry> = self

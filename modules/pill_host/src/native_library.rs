@@ -1092,7 +1092,6 @@ impl NativeLibrary {
     ///
     /// `T` must be the export's exact function-pointer type. The pointer is
     /// valid only while this library stays mapped.
-    #[cfg(feature = "rendering")]
     pub(crate) unsafe fn resolve_export<T: Copy>(&self, name: &[u8]) -> Option<T> {
         let library = self.library.as_ref()?;
         // SAFETY: the caller states `T` is the export's type; the returned

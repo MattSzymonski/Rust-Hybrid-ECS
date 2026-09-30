@@ -112,6 +112,29 @@ impl World {
         // collision guard below, so the layout guard remembers it first.
         let superseding = self.superseded_persist_names.contains(&type_name);
 
+        // Step 0: A subject whose previous generation was already stale for
+        // this name - the rollback of a module built against a layout another
+        // reload has replaced, typically - may not re-lay the component out
+        // back. Its registration in the old layout is skipped whole: the
+        // registered layout, the persist entries and the column stay with the
+        // subjects that are current, and this binary stays stale (its queries
+        // are refused and the host keeps its systems suspended) until it is
+        // rebuilt.
+        if self.stale_superseded_persist_names.contains(&type_name) {
+            let incoming_hash = calculate_schema_hash::<T>(fields);
+            if let Some(registered_hash) = self.persist_schema_hashes.get(&type_name).copied() {
+                if registered_hash != incoming_hash {
+                    self.superseded_persist_names.remove(&type_name);
+                    warn!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        type_name = %type_name,
+                        "kept the registered layout: this binary was built against a previous layout of the component and stays stale until it is rebuilt"
+                    );
+                    return;
+                }
+            }
+        }
+
         // Step 1: Refuse a name collision before the registration happens.
         // This guard used to run *after* `register_component_inner`, which its
         // `return` then left half-applied: a fresh bit, a name entry, a
@@ -193,7 +216,9 @@ impl World {
         // Step 2: Perform the standard component registration (bit index,
         // storage factory), carrying the field layout so the registry
         // can check a repeat registration against the first one.
-        self.register_component_inner::<T>(fields);
+        // A superseding registration may re-lay out a shared component; the
+        // reload migrates its rows once `init` returns.
+        self.register_component_inner_superseding::<T>(fields, superseding);
 
         // Step 3: Purge stale persist entries left over from previous
         // registrations of the same type name.  This handles the case where
@@ -273,9 +298,25 @@ impl World {
             .extend(type_names.iter().cloned());
     }
 
-    /// Drop the marks left by [`Self::supersede_persist_registrations`].
+    /// Announce which of the superseded names the retiring generation was
+    /// already stale for: it was built against a layout of a shared component
+    /// that another subject's reload has replaced since.
+    ///
+    /// Only a subject that was current for a component may re-lay it out. A
+    /// stale one registering the old layout again - the rollback of a module
+    /// whose rebuild failed - would otherwise take the component back to a
+    /// layout every current subject has left, so that registration is skipped
+    /// and the registered layout is kept.
+    pub fn mark_stale_superseded_persist_registrations(&mut self, type_names: &[String]) {
+        self.stale_superseded_persist_names
+            .extend(type_names.iter().cloned());
+    }
+
+    /// Drop the marks left by [`Self::supersede_persist_registrations`] and
+    /// [`Self::mark_stale_superseded_persist_registrations`].
     pub fn clear_superseded_persist_registrations(&mut self) {
         self.superseded_persist_names.clear();
+        self.stale_superseded_persist_names.clear();
     }
 
     /// Register a persistable component together with its compile-time field

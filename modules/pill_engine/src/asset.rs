@@ -45,7 +45,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{OnceLock, RwLock};
 
 // External crates
-use trait_type_map::{ErasedVecFamily, ErasedVecStorageOps, TraitAccessible, TraitTypeMap};
+use trait_type_map::{
+    ErasedVecFamily, ErasedVecStorage, ErasedVecStorageInfo, ErasedVecStorageOps, TraitAccessible,
+    TraitTypeMap,
+};
 
 // Current crate
 use crate::resource::Resource;
@@ -77,7 +80,40 @@ use crate::resource::Resource;
 /// impl Asset for Mesh {}
 /// impl_trait_accessible!(dyn Asset; Mesh);
 /// ```
-pub trait Asset: Send + Sync + 'static {}
+pub trait Asset: Send + Sync + 'static {
+    /// A stable name that identifies this asset type across binaries, or
+    /// `None` to be identified by its `TypeId` alone.
+    ///
+    /// The asset counterpart of [`Component::shared_name`](crate::Component::shared_name).
+    /// Every binary that compiles its own copy of the defining crate - with
+    /// different cargo features, say, as a module and the crates that link it
+    /// do - gets a different `TypeId` for the same type, so a `TypeId`-keyed
+    /// store would hand each binary its own empty column. A shared name makes
+    /// them one column: the store keys it by the name's identity, and checks
+    /// each binary's type against the column by layout.
+    ///
+    /// Pin a literal rather than deriving it from the module path, so moving
+    /// the type does not change its identity. Every copy must be compiled from
+    /// the same source; the column checks size and alignment, as it does for
+    /// shared components.
+    fn shared_name() -> Option<&'static str>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    /// The stable identity [`Self::shared_name`] hashes to, or `None`.
+    ///
+    /// The same hash shared components use. Override it only with that
+    /// function of `Self::shared_name()`.
+    fn shared_identity() -> Option<u128>
+    where
+        Self: Sized,
+    {
+        Self::shared_name().map(crate::component::shared_component_identity)
+    }
+}
 
 // =============================================================================
 // AssetLoader
@@ -339,6 +375,9 @@ impl<T: Asset> std::fmt::Debug for Handle<T> {
 /// map stores type-erased columns and cannot carry per-type metadata of its own.
 #[derive(Default)]
 struct AssetColumn {
+    /// Size and alignment of the column's element type, as the first
+    /// registration declared it; what a later shared registrant must match.
+    element_layout: (usize, usize),
     /// Generation of each slot, one entry per slot that has ever existed.
     ///
     /// Starts at 0 for a fresh slot and increments on every free, so a handle
@@ -440,17 +479,18 @@ impl std::fmt::Display for AssetGuid {
 /// type. Calling it from a freshly loaded generation re-points that type's
 /// column at that generation, which is what keeps the column usable after the
 /// generation that filled it is evicted from the reload graveyard.
-fn refresh_column_ops<T>(columns: &mut TraitTypeMap<dyn Asset, ErasedVecFamily>)
+fn refresh_column_ops<T>(columns: &mut TraitTypeMap<dyn Asset, ErasedVecFamily>, key: TypeId)
 where
     T: Asset + TraitAccessible<dyn Asset>,
 {
-    if let Some(column) = columns.get_trait_storage_mut(TypeId::of::<T>()) {
+    if let Some(column) = columns.get_trait_storage_mut(key) {
         column.refresh_ops(ErasedVecStorageOps::of::<T>());
     }
 }
 
-/// How to refresh one asset type's column; see [`refresh_column_ops`].
-type AssetOpsRefresher = fn(&mut TraitTypeMap<dyn Asset, ErasedVecFamily>);
+/// How to refresh one asset type's column, given its storage key; see
+/// [`refresh_column_ops`].
+type AssetOpsRefresher = fn(&mut TraitTypeMap<dyn Asset, ErasedVecFamily>, TypeId);
 
 /// Stores many assets per type, each addressed by a [`Handle`].
 ///
@@ -477,8 +517,18 @@ type AssetOpsRefresher = fn(&mut TraitTypeMap<dyn Asset, ErasedVecFamily>);
 pub struct AssetManager {
     /// One erased column per asset type, holding the values themselves.
     columns: TraitTypeMap<dyn Asset, ErasedVecFamily>,
-    /// Slot bookkeeping for each column, keyed by the same type.
+    /// Slot bookkeeping for each column, keyed by the same storage key.
+    ///
+    /// A storage key is a type's own `TypeId`, except for a shared asset type
+    /// (see [`Asset::shared_name`]), whose key is the `TypeId` of the first
+    /// binary that registered it; see [`Self::shared_keys`].
     metadata: HashMap<TypeId, AssetColumn>,
+    /// The storage key of each shared asset type, by its shared identity.
+    ///
+    /// Recorded by the first registration and never replaced, so every binary's
+    /// copy of the type reaches the one column. A `TypeId` is only a value
+    /// here: it stays a valid key after the binary it came from is unloaded.
+    shared_keys: HashMap<u128, TypeId>,
     /// How to rebuild each registered type's table from the generation that
     /// last registered it; see [`Self::rehome`].
     ops_refreshers: HashMap<TypeId, AssetOpsRefresher>,
@@ -489,6 +539,47 @@ pub struct AssetManager {
 impl Resource for AssetManager {}
 
 impl AssetManager {
+    /// The storage key `T`'s column is kept under, or `None` when `T` is a
+    /// shared type no binary has registered yet.
+    #[inline]
+    fn key_of<T: Asset>(&self) -> Option<TypeId> {
+        match T::shared_identity() {
+            Some(identity) => self.shared_keys.get(&identity).copied(),
+            None => Some(TypeId::of::<T>()),
+        }
+    }
+
+    /// `T`'s column bookkeeping, or `None` when `T` has no column.
+    #[inline]
+    fn metadata_of<T: Asset>(&self) -> Option<&AssetColumn> {
+        self.metadata.get(&self.key_of::<T>()?)
+    }
+
+    /// `T`'s column bookkeeping, mutably, or `None` when `T` has no column.
+    #[inline]
+    fn metadata_of_mut<T: Asset>(&mut self) -> Option<&mut AssetColumn> {
+        let key = self.key_of::<T>()?;
+        self.metadata.get_mut(&key)
+    }
+
+    /// `T`'s column. Panics when `T` has none: callers check first.
+    #[inline]
+    fn column<T: Asset>(&self) -> &ErasedVecStorage<dyn Asset> {
+        let key = self.key_of::<T>().expect("the asset type is registered");
+        self.columns
+            .get_trait_storage(key)
+            .expect("the asset type's column exists")
+    }
+
+    /// `T`'s column, mutably. Panics when `T` has none: callers check first.
+    #[inline]
+    fn column_mut<T: Asset>(&mut self) -> &mut ErasedVecStorage<dyn Asset> {
+        let key = self.key_of::<T>().expect("the asset type is registered");
+        self.columns
+            .get_trait_storage_mut(key)
+            .expect("the asset type's column exists")
+    }
+
     /// Create an empty manager holding no asset types.
     ///
     /// Types register themselves on first use, so nothing needs declaring up
@@ -517,8 +608,7 @@ impl AssetManager {
         if !self.is_live(handle) {
             return None;
         }
-        self.metadata
-            .get(&TypeId::of::<T>())
+        self.metadata_of::<T>()
             .and_then(|metadata| metadata.content_versions.get(handle.index as usize))
             .copied()
     }
@@ -534,10 +624,16 @@ impl AssetManager {
     {
         self.ensure_column::<T>();
 
-        let storage = self.columns.get_storage_mut::<T>();
+        let key = self
+            .key_of::<T>()
+            .expect("ensure_column registered the type");
+        let storage = self
+            .columns
+            .get_trait_storage_mut(key)
+            .expect("the column is created alongside its metadata");
         let metadata = self
             .metadata
-            .get_mut(&TypeId::of::<T>())
+            .get_mut(&key)
             .expect("column metadata is created alongside the column");
 
         // Refill a freed slot when one exists; otherwise append one and give it
@@ -597,8 +693,7 @@ impl AssetManager {
 
         let handle = self.add(asset);
         let metadata = self
-            .metadata
-            .get_mut(&TypeId::of::<T>())
+            .metadata_of_mut::<T>()
             .expect("add created the column metadata");
         metadata.by_name.insert(name.clone(), handle.index);
         metadata.names.insert(handle.index, name);
@@ -652,8 +747,7 @@ impl AssetManager {
         T: Asset + TraitAccessible<dyn Asset>,
     {
         let metadata = self
-            .metadata
-            .get_mut(&TypeId::of::<T>())
+            .metadata_of_mut::<T>()
             .expect("add created the column metadata");
         if let Some(previous_index) = metadata.by_guid.insert(guid, index) {
             metadata.guids.remove(&previous_index);
@@ -670,7 +764,7 @@ impl AssetManager {
             return None;
         }
         let row = self.slot_row::<T>(handle.index)?;
-        Some(self.columns.get_storage::<T>().get::<T>(row as usize))
+        Some(self.column::<T>().get::<T>(row as usize))
     }
 
     /// Mutably borrow the asset `handle` refers to, or `None` when it is stale.
@@ -686,17 +780,12 @@ impl AssetManager {
         // consumer which single asset moved, and borrowing one value must not
         // look like a change to every asset.
         let version = &mut self
-            .metadata
-            .get_mut(&TypeId::of::<T>())
+            .metadata_of_mut::<T>()
             .expect("a live handle implies existing metadata")
             .content_versions[handle.index as usize];
         *version = version.wrapping_add(1);
         let row = self.slot_row::<T>(handle.index)?;
-        Some(
-            self.columns
-                .get_storage_mut::<T>()
-                .get_mut::<T>(row as usize),
-        )
+        Some(self.column_mut::<T>().get_mut::<T>(row as usize))
     }
 
     /// Resolve a name to a live handle, or `None` when nothing holds it.
@@ -704,7 +793,7 @@ impl AssetManager {
     where
         T: Asset + TraitAccessible<dyn Asset>,
     {
-        let metadata = self.metadata.get(&TypeId::of::<T>())?;
+        let metadata = self.metadata_of::<T>()?;
         let index = *metadata.by_name.get(name)?;
         Some(Handle {
             index,
@@ -726,7 +815,7 @@ impl AssetManager {
     where
         T: Asset + TraitAccessible<dyn Asset>,
     {
-        let metadata = self.metadata.get(&TypeId::of::<T>())?;
+        let metadata = self.metadata_of::<T>()?;
         let index = *metadata.by_guid.get(&guid)?;
         Some(Handle {
             index,
@@ -767,8 +856,7 @@ impl AssetManager {
         if !self.is_live(handle) {
             return None;
         }
-        self.metadata
-            .get(&TypeId::of::<T>())?
+        self.metadata_of::<T>()?
             .names
             .get(&handle.index)
             .map(String::as_str)
@@ -782,11 +870,7 @@ impl AssetManager {
         if !self.is_live(handle) {
             return None;
         }
-        self.metadata
-            .get(&TypeId::of::<T>())?
-            .guids
-            .get(&handle.index)
-            .copied()
+        self.metadata_of::<T>()?.guids.get(&handle.index).copied()
     }
 
     /// Remove and return the asset `handle` refers to.
@@ -803,14 +887,19 @@ impl AssetManager {
             return None;
         }
 
-        let type_id = TypeId::of::<T>();
+        let type_id = self
+            .key_of::<T>()
+            .expect("a live handle implies a registered type");
         let row = self
             .metadata
             .get(&type_id)
             .expect("a live handle implies existing metadata")
             .slot_rows[handle.index as usize];
 
-        let storage = self.columns.get_storage_mut::<T>();
+        let storage = self
+            .columns
+            .get_trait_storage_mut(type_id)
+            .expect("a live handle implies an existing column");
         let asset = storage.swap_remove::<T>(row as usize);
         // A packed column moves its last row into the hole; that row's slot
         // takes over the vacated index below, so handles follow the slot and
@@ -864,10 +953,10 @@ impl AssetManager {
     where
         T: Asset + TraitAccessible<dyn Asset>,
     {
-        if !self.metadata.contains_key(&TypeId::of::<T>()) {
+        if self.metadata_of::<T>().is_none() {
             return 0;
         }
-        self.columns.get_storage::<T>().len()
+        self.column::<T>().len()
     }
 
     /// Whether no asset of type `T` is stored.
@@ -889,9 +978,9 @@ impl AssetManager {
     {
         // An unregistered type yields nothing rather than needing the column
         // to exist.
-        self.metadata
-            .contains_key(&TypeId::of::<T>())
-            .then(|| self.columns.get_storage::<T>().iter::<T>())
+        self.metadata_of::<T>()
+            .is_some()
+            .then(|| self.column::<T>().iter::<T>())
             .into_iter()
             .flatten()
     }
@@ -901,11 +990,10 @@ impl AssetManager {
     where
         T: Asset + TraitAccessible<dyn Asset>,
     {
-        let metadata = self.metadata.get(&TypeId::of::<T>());
+        let metadata = self.metadata_of::<T>();
         metadata
             .map(|metadata| {
-                self.columns
-                    .get_storage::<T>()
+                self.column::<T>()
                     .iter::<T>()
                     .enumerate()
                     .map(move |(row, asset)| {
@@ -931,8 +1019,7 @@ impl AssetManager {
     /// The single place a handle is validated, so every accessor agrees on what
     /// "stale" means.
     fn is_live<T: Asset>(&self, handle: Handle<T>) -> bool {
-        self.metadata
-            .get(&TypeId::of::<T>())
+        self.metadata_of::<T>()
             .and_then(|metadata| metadata.generations.get(handle.index as usize))
             .is_some_and(|generation| *generation == handle.generation)
     }
@@ -943,7 +1030,7 @@ impl AssetManager {
     /// entry answers to a different slot (or to no row), so even a handle that
     /// guessed a freed slot's generation cannot reach another asset's row.
     fn slot_row<T: Asset>(&self, index: u32) -> Option<u32> {
-        let metadata = self.metadata.get(&TypeId::of::<T>())?;
+        let metadata = self.metadata_of::<T>()?;
         let row = *metadata.slot_rows.get(index as usize)?;
         (metadata.row_slots.get(row as usize) == Some(&index)).then_some(row)
     }
@@ -959,20 +1046,52 @@ impl AssetManager {
     ///
     /// `register_type_storage` panics on a second registration, so the
     /// existence check belongs here where it can be made idempotent.
+    ///
+    /// A shared asset type ([`Asset::shared_name`]) is keyed by the `TypeId`
+    /// of the first binary that registers it, and its column is built to check
+    /// element types by layout: every binary's copy of the type then reaches
+    /// that one column. A later registrant's copy must match its size and
+    /// alignment; one that does not is refused with a panic here, before it can
+    /// read a row.
     pub fn register<T>(&mut self)
     where
         T: Asset + TraitAccessible<dyn Asset>,
     {
-        let type_id = TypeId::of::<T>();
-        self.ops_refreshers.insert(type_id, refresh_column_ops::<T>);
-        if self.metadata.contains_key(&type_id) {
-            self.columns
-                .get_storage_mut::<T>()
-                .refresh_ops(ErasedVecStorageOps::of::<T>());
+        let key = match T::shared_identity() {
+            Some(identity) => *self
+                .shared_keys
+                .entry(identity)
+                .or_insert_with(TypeId::of::<T>),
+            None => TypeId::of::<T>(),
+        };
+        if let Some(metadata) = self.metadata.get(&key) {
+            // Checked here, where a mismatch is a registration problem with
+            // one clear cause, rather than at the first read of a row.
+            assert!(
+                metadata.element_layout == (std::mem::size_of::<T>(), std::mem::align_of::<T>()),
+                "asset type {} does not match the layout of the shared column it is registered to",
+                std::any::type_name::<T>()
+            );
+            self.ops_refreshers.insert(key, refresh_column_ops::<T>);
+            if let Some(column) = self.columns.get_trait_storage_mut(key) {
+                column.refresh_ops(ErasedVecStorageOps::of::<T>());
+            }
             return;
         }
-        self.columns.register_type_storage::<T>();
-        self.metadata.insert(type_id, AssetColumn::default());
+        self.ops_refreshers.insert(key, refresh_column_ops::<T>);
+        if T::shared_identity().is_some() {
+            self.columns
+                .insert_erased(ErasedVecStorage::new(ErasedVecStorageInfo::of_shared::<T>()));
+        } else {
+            self.columns.register_type_storage::<T>();
+        }
+        self.metadata.insert(
+            key,
+            AssetColumn {
+                element_layout: (std::mem::size_of::<T>(), std::mem::align_of::<T>()),
+                ..AssetColumn::default()
+            },
+        );
     }
 
     /// Re-point every registered asset column at its newest function table.
@@ -984,8 +1103,8 @@ impl AssetManager {
     /// generation neither declared nor used keeps the table it has - there is
     /// nothing newer to point it at.
     pub fn rehome(&mut self) {
-        for refresher in self.ops_refreshers.values() {
-            refresher(&mut self.columns);
+        for (key, refresher) in &self.ops_refreshers {
+            refresher(&mut self.columns, *key);
         }
     }
 
@@ -1016,6 +1135,122 @@ mod tests {
     struct Texture(u32);
     impl Asset for Texture {}
     impl_trait_accessible!(dyn Asset; Texture);
+
+    /// The shared name the two copies below register under, standing in for
+    /// one asset type compiled into two binaries (two distinct `TypeId`s).
+    const SHARED_MESH: &str = "asset_tests::SharedMesh";
+
+    /// One binary's copy of the shared asset type.
+    #[derive(Debug, PartialEq)]
+    struct WriterMesh {
+        vertices: Vec<u32>,
+    }
+    impl Asset for WriterMesh {
+        fn shared_name() -> Option<&'static str> {
+            Some(SHARED_MESH)
+        }
+    }
+    impl_trait_accessible!(dyn Asset; WriterMesh);
+
+    /// Another binary's copy of the same type.
+    #[derive(Debug, PartialEq)]
+    struct ReaderMesh {
+        vertices: Vec<u32>,
+    }
+    impl Asset for ReaderMesh {
+        fn shared_name() -> Option<&'static str> {
+            Some(SHARED_MESH)
+        }
+    }
+    impl_trait_accessible!(dyn Asset; ReaderMesh);
+
+    /// A type claiming the same shared name with a different layout.
+    #[derive(Debug, PartialEq)]
+    struct MismatchedMesh(u8);
+    impl Asset for MismatchedMesh {
+        fn shared_name() -> Option<&'static str> {
+            Some(SHARED_MESH)
+        }
+    }
+    impl_trait_accessible!(dyn Asset; MismatchedMesh);
+
+    /// Two copies of one shared asset type reach one column: what one stores,
+    /// the other finds by handle, name and iteration, and can add to and
+    /// remove from.
+    #[test]
+    fn copies_of_a_shared_asset_type_share_one_column() {
+        let mut assets = AssetManager::new();
+        let written = assets
+            .add_named(
+                "cube",
+                WriterMesh {
+                    vertices: vec![1, 2, 3],
+                },
+            )
+            .expect("a fresh name");
+
+        let as_reader = Handle::<ReaderMesh>::from_raw(written.index(), written.generation());
+        assert_eq!(
+            assets.get(as_reader).map(|mesh| mesh.vertices.clone()),
+            Some(vec![1, 2, 3])
+        );
+        assert_eq!(assets.handle_by_name::<ReaderMesh>("cube"), Some(as_reader));
+        assert_eq!(assets.len::<ReaderMesh>(), 1);
+
+        let added = assets.add(ReaderMesh { vertices: vec![4] });
+        assert_eq!(assets.len::<WriterMesh>(), 2);
+        assert_eq!(
+            assets
+                .iter::<WriterMesh>()
+                .map(|mesh| mesh.vertices.len())
+                .sum::<usize>(),
+            4
+        );
+
+        assert_eq!(
+            assets.remove(added).map(|mesh| mesh.vertices),
+            Some(vec![4])
+        );
+        assert_eq!(assets.len::<WriterMesh>(), 1);
+    }
+
+    /// A reader that looks before any copy registered sees nothing, rather
+    /// than a column of its own.
+    #[test]
+    fn a_shared_type_nobody_registered_has_no_assets() {
+        let assets = AssetManager::new();
+        assert_eq!(assets.len::<ReaderMesh>(), 0);
+        assert_eq!(assets.handle_by_name::<ReaderMesh>("cube"), None);
+    }
+
+    /// Registering a second copy re-points the column's function table and
+    /// keeps its rows, as a reloaded module's registration does.
+    #[test]
+    fn a_later_copy_registers_onto_the_existing_column() {
+        let mut assets = AssetManager::new();
+        assets.add(WriterMesh { vertices: vec![7] });
+        assets.register::<ReaderMesh>();
+        assets.rehome();
+        assert_eq!(assets.len::<ReaderMesh>(), 1);
+    }
+
+    /// A copy whose layout differs is refused when it registers.
+    #[test]
+    #[should_panic(expected = "does not match the layout of the shared column")]
+    fn a_shared_type_with_a_different_layout_is_refused() {
+        let mut assets = AssetManager::new();
+        assets.add(WriterMesh { vertices: vec![1] });
+        assets.register::<MismatchedMesh>();
+    }
+
+    /// Unshared types keep their own columns even when they look alike.
+    #[test]
+    fn unshared_types_keep_separate_columns() {
+        let mut assets = AssetManager::new();
+        assets.add(Mesh("rock"));
+        assert_eq!(assets.len::<Mesh>(), 1);
+        assert_eq!(assets.len::<Texture>(), 0);
+    }
 
     /// A guid resolves to the asset stored under it, and the two namespaces
     /// are independent: a name lookup does not answer a guid and vice versa.

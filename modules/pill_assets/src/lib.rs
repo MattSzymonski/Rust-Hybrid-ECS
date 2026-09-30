@@ -49,6 +49,12 @@ pub mod rules;
 
 pub use rules::{default_rules, HlslToWgsl};
 
+/// A crate's whole `shaders/` directory, cooked by convention: the routine a
+/// build script and the development shader watcher share.
+pub mod shader_tree;
+
+pub use shader_tree::{cook_shader_tree, shader_tree_layout, ShaderTreeLayout, ShaderTreeReport};
+
 // =============================================================================
 // Errors
 // =============================================================================

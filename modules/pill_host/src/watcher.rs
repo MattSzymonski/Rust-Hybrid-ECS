@@ -54,7 +54,7 @@ const DEFAULT_DEBOUNCE_MILLISECONDS: u64 = 60;
 const DEBOUNCE_OVERRIDE_VARIABLE: &str = "PILL_WATCH_DEBOUNCE_MS";
 
 /// How long to coalesce a burst of file events, resolved once per process.
-fn debounce_duration() -> Duration {
+pub(crate) fn debounce_duration() -> Duration {
     static RESOLVED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
     *RESOLVED.get_or_init(|| {
         let milliseconds = std::env::var(DEBOUNCE_OVERRIDE_VARIABLE)
@@ -87,7 +87,7 @@ const REPORTED_PATH_LIMIT: usize = 5;
 /// surface as a remove/create pair or a name modification depending on the
 /// platform, so they are covered by the same three kinds. Access and
 /// metadata-only events are ignored.
-fn is_relevant_event(kind: &EventKind) -> bool {
+pub(crate) fn is_relevant_event(kind: &EventKind) -> bool {
     matches!(
         kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)

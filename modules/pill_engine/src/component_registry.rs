@@ -201,9 +201,53 @@ pub struct PillMethodDescriptor {
     pub arg_names: &'static [&'static str],
 }
 
+/// A named C-ABI function an artifact offers to the host, found by name.
+///
+/// Submitted with `pill_engine::submit!` beside the function, so a host that
+/// links the artifact statically - a shipping build, or a host that links a
+/// data crate directly - finds it through [`find_export`] with no symbol table
+/// to search. A loaded module offers the same function as a `#[no_mangle]`
+/// export under the same name, which the host resolves from the DLL instead.
+///
+/// Keep the shape minimal (name and address): every such function carries its
+/// own signature, which the host states where it calls it.
+#[derive(Clone, Copy, Debug)]
+pub struct PillExportDescriptor {
+    /// The function's export name, e.g. `pill_render_data_load_mesh_obj`.
+    pub name: &'static str,
+    /// The function's address.
+    pub address: ExportAddress,
+}
+
+/// The address of an exported function, as data.
+///
+/// A newtype so descriptors can live in a `static` inventory: a raw function
+/// pointer is neither `Send` nor `Sync` on its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExportAddress(pub *const ());
+
+// SAFETY: the address names immutable code in the image that submitted it; it
+// is only ever read and turned back into the function pointer it was made from.
+unsafe impl Send for ExportAddress {}
+// SAFETY: as above - nothing is written through it.
+unsafe impl Sync for ExportAddress {}
+
 inventory::collect!(PillComponentDescriptor);
 inventory::collect!(PillValueTypeDescriptor);
 inventory::collect!(PillMethodDescriptor);
+inventory::collect!(PillExportDescriptor);
+
+/// The address of the export named `name` among those linked into the calling
+/// artifact, if one was submitted.
+///
+/// Sees only this artifact's own inventory: a function in a separately loaded
+/// module is not found here, and is resolved from that module's DLL instead.
+pub fn find_export(name: &str) -> Option<ExportAddress> {
+    inventory::iter::<PillExportDescriptor>
+        .into_iter()
+        .find(|descriptor| descriptor.name == name)
+        .map(|descriptor| descriptor.address)
+}
 inventory::collect!(PillFieldAccessorDescriptor);
 
 /// Every value type this artifact declares with `#[derive(PillMirror)]`,

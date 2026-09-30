@@ -45,13 +45,7 @@ macro_rules! config_shader_file {
 
 pub mod pbr_pipeline;
 pub mod post_processing;
-/// The shader trees and the routine that cooks them, shared with `build.rs`.
-///
-/// `build.rs` reads the inputs this reports and the reload reads the rebuilt
-/// outputs, so each compilation leaves part of it unread.
-#[cfg(feature = "shader-hot-reload")]
-#[allow(dead_code)]
-pub(crate) mod shader_roots;
+/// The built-in lit pipeline, the fallback a project can opt into.
 pub mod simple_pipeline;
 
 /// A cooked WGSL file the renderer's own pipelines are built from.

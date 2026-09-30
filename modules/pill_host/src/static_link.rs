@@ -231,15 +231,11 @@ impl StaticProject {
         // component the modules registered, so the names have to be collected
         // as each module initializes rather than reconstructed afterwards.
         let wants_bindings = self.backend.loads_managed_code();
-        // The renderer's plain data first, exactly as the reloading path does:
-        // modules and the project find it registered in both postures, and a
-        // managed project binds its components like any module's.
-        let renderer_component_names = crate::renderer_data::register_renderer_data(engine);
-        let mut exposed_names: Vec<String> = if wants_bindings {
-            renderer_component_names
-        } else {
-            Vec::new()
-        };
+        // The renderer's data crate is the first module, as in the reloading
+        // posture (the bundle generator puts it there), so modules and the
+        // project find its components registered and a managed project binds
+        // them like any module's.
+        let mut exposed_names: Vec<String> = Vec::new();
 
         for (index, module) in self.modules.iter().enumerate() {
             // The same helper `runtime::setup` uses, so a module gets the

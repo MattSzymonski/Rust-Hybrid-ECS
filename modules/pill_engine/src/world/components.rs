@@ -188,6 +188,20 @@ impl World {
     ) where
         T: Component,
     {
+        self.register_component_inner_superseding::<T>(fields, false);
+    }
+
+    /// [`Self::register_component_inner`] for a registration the host
+    /// announced as replacing the previous generation of the same subject,
+    /// which may re-lay out a shared component (see
+    /// [`crate::component::ComponentRegistry::register_with_layout_superseding`]).
+    pub(crate) fn register_component_inner_superseding<T>(
+        &mut self,
+        fields: &'static [crate::component_registry::ComponentFieldDescriptor],
+        superseding: bool,
+    ) where
+        T: Component,
+    {
         let _zone = crate::profile_scope!(
             "register component",
             [(
@@ -204,7 +218,8 @@ impl World {
         // normal here because a hot reload re-runs every `init`.
         let bit = match self
             .component_registry
-            .register_bit_with_layout::<T>(fields)
+            .register_with_layout_superseding::<T>(fields, superseding)
+            .map(crate::component::Registration::bit)
         {
             Ok(bit) => bit,
             Err(error) => {

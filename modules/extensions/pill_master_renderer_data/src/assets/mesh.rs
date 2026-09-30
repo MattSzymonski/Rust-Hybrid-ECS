@@ -233,7 +233,15 @@ fn normalized_or(value: glam::Vec3, fallback: glam::Vec3) -> glam::Vec3 {
     }
 }
 
-impl Asset for Mesh {}
+// Shared across binaries: the data module, the GPU module and every project
+// compile their own copy of this crate, each with its own `TypeId`. The pinned
+// name makes them one asset column (see `Asset::shared_name`); keep it
+// verbatim when moving the type.
+impl Asset for Mesh {
+    fn shared_name() -> Option<&'static str> {
+        Some("pill_master_renderer::assets::Mesh")
+    }
+}
 
 #[cfg(test)]
 mod tests {

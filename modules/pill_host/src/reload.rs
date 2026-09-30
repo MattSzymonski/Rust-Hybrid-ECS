@@ -204,6 +204,9 @@ pub(crate) struct ReloadTransaction<'a> {
     pub(crate) old_libraries: &'a mut Vec<NativeLibrary>,
     /// Persistable type names the previous `init` registered.
     pub(crate) registered_type_names: &'a mut Vec<String>,
+    /// The schema hash of each persistable type the previous `init`
+    /// registered, as that generation declared it; see [`stale_components`].
+    pub(crate) registered_schemas: &'a mut Vec<(String, u64)>,
     /// Resource ids the previous generation of this subject registered.
     ///
     /// Compared against what the new generation registers, so a resource type
@@ -229,6 +232,8 @@ pub(crate) struct GenerationInit {
     /// Persistable component type names this generation registered, for
     /// forgotten-type detection on the next reload.
     pub(crate) registered_type_names: Vec<String>,
+    /// The schema hash of each of those types as this generation declared it.
+    pub(crate) registered_schemas: Vec<(String, u64)>,
     /// Resource ids this generation claimed, so retiring it releases exactly
     /// those and no other subject's.
     pub(crate) registered_resource_ids: Vec<pill_engine::ResourceId>,
@@ -301,6 +306,7 @@ pub(crate) fn initialize_generation(
         return GenerationInit {
             status,
             registered_type_names: Vec::new(),
+            registered_schemas: Vec::new(),
             registered_resource_ids: Vec::new(),
             component_names: Vec::new(),
         };
@@ -314,16 +320,58 @@ pub(crate) fn initialize_generation(
     engine
         .world_mut()
         .retain_resource_claims(&registered_resource_ids);
+    let registered_type_names = engine
+        .world()
+        .persist_type_names_registered_since(persist_sequence);
     GenerationInit {
         status,
-        registered_type_names: engine
-            .world()
-            .persist_type_names_registered_since(persist_sequence),
+        registered_schemas: registered_schemas(engine.world(), &registered_type_names),
+        registered_type_names,
         registered_resource_ids,
         component_names: engine
             .world()
             .registered_component_names_since(component_sequence),
     }
+}
+
+/// The schema hash recorded now for each of `type_names`, captured right
+/// after the `init` that registered them, while they are still the hashes
+/// that generation declared.
+fn registered_schemas(world: &World, type_names: &[String]) -> Vec<(String, u64)> {
+    // A generation can register one type twice (the component inventory and
+    // an explicit `register` call both do), which the log records twice.
+    let mut schemas: Vec<(String, u64)> = Vec::new();
+    for name in type_names {
+        if schemas.iter().any(|(known, _)| known == name) {
+            continue;
+        }
+        if let Some(hash) = world.persist_schema_hash(name) {
+            schemas.push((name.clone(), hash));
+        }
+    }
+    schemas
+}
+
+/// The persistable components a subject registered whose layout has been
+/// replaced since, by another subject's reload.
+///
+/// A shared component is registered by every binary that links it, and a
+/// reload of one of them may re-lay it out (the registry accepts the new
+/// layout from a superseding registration, and the reload migrates the rows).
+/// Every other binary that registered it is still built against the old
+/// layout: its queries are refused by the declared schema check, and whatever
+/// else its systems do with the type, such as spawning a value, would write
+/// rows in the old layout. An empty result means the subject is current.
+pub(crate) fn stale_components(world: &World, registered_schemas: &[(String, u64)]) -> Vec<String> {
+    registered_schemas
+        .iter()
+        .filter(|(name, declared)| {
+            world
+                .persist_schema_hash(name)
+                .is_some_and(|current| current != *declared)
+        })
+        .map(|(name, _)| name.clone())
+        .collect()
 }
 
 /// What a failed first load of an artifact costs the world.
@@ -608,6 +656,15 @@ impl ReloadTransaction<'_> {
         // schema, and the retiring serializer would misread it while a
         // same-layout column is rebuilt.
         let pre_swap_entities = engine.world().capture_live_entities();
+        // Shared components registered before this transaction. Several
+        // subjects hold one shared id, so a failed generation re-registering
+        // one did not create it, and the rollback below must not drop it.
+        let shared_ids_before: HashSet<ComponentId> = engine
+            .world()
+            .registered_component_ids_since(0)
+            .into_iter()
+            .filter(|id| matches!(id, ComponentId::Shared(_)))
+            .collect();
         // Step 5: announce the retiring generation's persistable names. A
         // rebuilt image has a fresh `TypeId` for every type name it declares,
         // which at the registration site looks exactly like another binary
@@ -616,9 +673,17 @@ impl ReloadTransaction<'_> {
         // is replacing, so a reload that does not say so fails its own init and
         // rolls back.
         let retiring_type_names = self.registered_type_names.clone();
+        // Which of them the retiring generation was already stale for: only a
+        // subject current for a shared component may re-lay it out, so a stale
+        // one's registrations in the old layout are skipped (see
+        // `stale_components`). Captured once, before either init runs.
+        let retiring_stale_names = stale_components(engine.world(), self.registered_schemas);
         engine
             .world_mut()
             .supersede_persist_registrations(&retiring_type_names);
+        engine
+            .world_mut()
+            .mark_stale_superseded_persist_registrations(&retiring_stale_names);
         self.begin_registration(engine);
         let status = new_library.call_init(engine_api);
         self.end_registration(engine);
@@ -663,6 +728,9 @@ impl ReloadTransaction<'_> {
             engine
                 .world_mut()
                 .supersede_persist_registrations(&retiring_type_names);
+            engine
+                .world_mut()
+                .mark_stale_superseded_persist_registrations(&retiring_stale_names);
             self.begin_registration(engine);
             let rollback_status = self.current.call_init(engine_api);
             self.end_registration(engine);
@@ -687,9 +755,18 @@ impl ReloadTransaction<'_> {
             let rollback_ids = engine
                 .world()
                 .registered_component_ids_since(rollback_sequence);
+            // A shared id that existed before this transaction is not the
+            // failed generation's to drop, even when the rollback skipped it
+            // (a stale subject keeps the registered layout; see
+            // `stale_components`): dropping it would take the rows and the
+            // registration of every subject that shares it. Its storage
+            // factory and persist entries may now point into the failed
+            // image, which was built against the registered layout; that
+            // image stays mapped in the graveyard, and the next registration
+            // of the component by a current subject re-points them.
             let stranded: Vec<ComponentId> = failed_ids
                 .into_iter()
-                .filter(|id| !rollback_ids.contains(id))
+                .filter(|id| !rollback_ids.contains(id) && !shared_ids_before.contains(id))
                 .collect();
             if !stranded.is_empty() {
                 warn!(
@@ -807,6 +884,7 @@ impl ReloadTransaction<'_> {
                 );
             }
         }
+        *self.registered_schemas = registered_schemas(engine.world(), &newly_registered);
         *self.registered_type_names = newly_registered;
 
         // The resource twin of the block above. A resource holds a drop
@@ -988,5 +1066,37 @@ impl ReloadTransaction<'_> {
         Some(ReloadCommit {
             exposed_component_names: all_registered,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // External crates
+    use pill_engine::World;
+
+    // Current crate
+    use super::{registered_schemas, stale_components};
+
+    /// A subject is stale exactly while the hash it registered differs from
+    /// the one recorded now, and a name the world no longer records is not
+    /// reported.
+    #[test]
+    fn a_subject_is_stale_only_while_its_registered_layout_is_replaced() {
+        let mut world = World::new();
+        pill_engine::register_common_components(&mut world);
+        let name = pill_engine::common_components::TRANSFORM_SHARED_NAME.to_owned();
+
+        let current = registered_schemas(&world, std::slice::from_ref(&name));
+        assert_eq!(current.len(), 1, "the registered hash is captured");
+        assert!(stale_components(&world, &current).is_empty());
+
+        let built_against_previous = vec![(name.clone(), current[0].1 ^ 1)];
+        assert_eq!(
+            stale_components(&world, &built_against_previous),
+            vec![name]
+        );
+
+        let forgotten = vec![("no::such::Component".to_owned(), 7)];
+        assert!(stale_components(&world, &forgotten).is_empty());
     }
 }

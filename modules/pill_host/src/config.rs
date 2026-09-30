@@ -386,6 +386,16 @@ pub(crate) fn module_build_artifact_directory() -> String {
 /// selected by `PROJECT_PATH` alone.
 const PROJECT_SETTINGS_FILE: &str = "project_settings.yaml";
 
+/// The renderer a project draws with when its settings name none.
+const DEFAULT_RENDERER: &str = "pill_master_renderer";
+
+/// The `renderer:` value that selects no renderer at all: neither its data
+/// crate nor its GPU module loads.
+const NO_RENDERER: &str = "none";
+
+/// Suffix of a renderer's data crate: renderer `X`'s data is `X_data`.
+pub(crate) const RENDERER_DATA_SUFFIX: &str = "_data";
+
 // =============================================================================
 // Types
 // =============================================================================
@@ -658,8 +668,17 @@ pub struct HostConfig {
     pub project: ProjectModuleConfig,
 
     /// Extensions selected by the project's `project_settings.yaml`,
-    /// loaded before the project.
+    /// loaded before the project. When a renderer is selected, its data crate
+    /// (`<renderer>_data`) comes first, whatever the settings list.
     pub extensions: Vec<ExtensionConfig>,
+
+    /// The renderer's GPU module, from the settings' `renderer:` key
+    /// (`pill_master_renderer` when absent); `None` for `renderer: none`.
+    ///
+    /// Only a windowed host loads it. Its data crate is among
+    /// [`Self::extensions`] in every build, headless included, so a project's
+    /// render components exist whether or not anything draws them.
+    pub renderer: Option<String>,
 }
 
 impl HostConfig {
@@ -725,13 +744,63 @@ impl HostConfig {
         // an arbitrary directory, a malformed `--package`, or a second copy
         // of a module already loading.
         let extensions_root = engine_workspace_root()?.join(EXTENSION_DIRECTORY);
-        let extensions = Self::resolve_extensions(&project_settings.modules, &extensions_root)?;
+        let renderer =
+            Self::resolve_renderer(project_settings.renderer.as_deref(), &extensions_root)?;
+        let module_names =
+            Self::module_names_with_renderer_data(renderer.as_deref(), &project_settings.modules);
+        let extensions = Self::resolve_extensions(&module_names, &extensions_root)?;
         Ok(Self {
             name: project_name,
             build_binary_name,
             project,
             extensions,
+            renderer,
         })
+    }
+
+    /// Resolve the settings' `renderer:` value to a renderer name.
+    ///
+    /// Absent means [`DEFAULT_RENDERER`]; [`NO_RENDERER`] means none. A named
+    /// renderer must have both of its crates under `extensions/`: the GPU
+    /// module `<renderer>` and the data crate `<renderer>_data`. A missing one
+    /// is a configuration error here rather than a failed build later.
+    fn resolve_renderer(
+        setting: Option<&str>,
+        extensions_root: &Path,
+    ) -> Result<Option<String>, ConfigError> {
+        let name = setting.map(str::trim).unwrap_or(DEFAULT_RENDERER);
+        if name == NO_RENDERER {
+            return Ok(None);
+        }
+        if !is_valid_module_directory_name(name) {
+            return Err(ConfigError::InvalidExtensionName {
+                name: name.to_string(),
+            });
+        }
+        let data = format!("{name}{RENDERER_DATA_SUFFIX}");
+        for directory in [name, data.as_str()] {
+            if !extensions_root.join(directory).is_dir() {
+                return Err(ConfigError::ExtensionDirectoryMissing {
+                    name: directory.to_string(),
+                });
+            }
+        }
+        Ok(Some(name.to_string()))
+    }
+
+    /// The module load order: the renderer's data crate first, when a renderer
+    /// is selected, then the settings' own list without it.
+    ///
+    /// First because extensions and the project may use its components. A
+    /// project that also lists the data crate gets it once, not twice.
+    fn module_names_with_renderer_data(renderer: Option<&str>, modules: &[String]) -> Vec<String> {
+        let Some(renderer) = renderer else {
+            return modules.to_vec();
+        };
+        let data = format!("{renderer}{RENDERER_DATA_SUFFIX}");
+        std::iter::once(data.clone())
+            .chain(modules.iter().filter(|name| name.trim() != data).cloned())
+            .collect()
     }
 
     /// Resolve the settings file's module names against the `extensions/`
@@ -786,6 +855,7 @@ impl From<ProjectModuleConfig> for HostConfig {
             build_binary_name: project.name.clone(),
             project,
             extensions: Vec::new(),
+            renderer: None,
         }
     }
 }
@@ -1245,8 +1315,13 @@ struct ProjectSettingsFile {
     description: Option<String>,
     /// Extension crate names, in load order. The only source for this
     /// list: there is no environment-variable override, so the file is always
-    /// the complete answer to "which modules load".
+    /// the complete answer to "which modules load" - apart from the selected
+    /// renderer's data crate, which loads first by convention.
     modules: Vec<String>,
+    /// The renderer the project draws with: the name of its GPU module under
+    /// `extensions/` (`pill_master_renderer` when absent), or `none`. Its data
+    /// crate, `<renderer>_data`, loads in every build.
+    renderer: Option<String>,
 }
 
 /// Whether a value is a safe artifact file base: letters, digits, underscores.
@@ -1697,6 +1772,72 @@ serde = { version = "1", features = ["derive"] }
         let _ = std::fs::remove_dir_all(&directory);
         std::fs::create_dir_all(&directory).unwrap();
         assert!(read_project_settings_file(&directory).unwrap().is_none());
+    }
+
+    /// An `extensions/` directory holding the named crate directories.
+    fn extensions_root_with(name: &str, crates: &[&str]) -> PathBuf {
+        let root = temp_root().join(name);
+        let _ = std::fs::remove_dir_all(&root);
+        for crate_name in crates {
+            std::fs::create_dir_all(root.join(crate_name)).unwrap();
+        }
+        root
+    }
+
+    /// No `renderer:` key selects the master renderer, whose two crates must
+    /// both exist.
+    #[test]
+    fn an_absent_renderer_key_selects_the_master_renderer() {
+        let root = extensions_root_with(
+            "renderer_default",
+            &["pill_master_renderer", "pill_master_renderer_data"],
+        );
+        assert_eq!(
+            HostConfig::resolve_renderer(None, &root)
+                .unwrap()
+                .as_deref(),
+            Some("pill_master_renderer")
+        );
+    }
+
+    /// `renderer: none` selects no renderer, and needs no renderer crates.
+    #[test]
+    fn renderer_none_selects_no_renderer() {
+        let root = extensions_root_with("renderer_none", &[]);
+        assert_eq!(
+            HostConfig::resolve_renderer(Some("none"), &root).unwrap(),
+            None
+        );
+    }
+
+    /// A renderer whose data crate is missing is refused, naming that crate.
+    #[test]
+    fn a_renderer_without_its_data_crate_is_refused() {
+        let root = extensions_root_with("renderer_no_data", &["other_renderer"]);
+        let error = HostConfig::resolve_renderer(Some("other_renderer"), &root).unwrap_err();
+        assert!(
+            matches!(&error, ConfigError::ExtensionDirectoryMissing { name } if name == "other_renderer_data"),
+            "{error:?}"
+        );
+    }
+
+    /// The renderer's data crate loads first, and once even when the settings
+    /// list it too; without a renderer the list is unchanged.
+    #[test]
+    fn the_renderer_data_crate_loads_first_and_once() {
+        let listed = vec![
+            "pill_spline".to_string(),
+            "pill_master_renderer_data".to_string(),
+            "pill_audio".to_string(),
+        ];
+        assert_eq!(
+            HostConfig::module_names_with_renderer_data(Some("pill_master_renderer"), &listed),
+            ["pill_master_renderer_data", "pill_spline", "pill_audio"]
+        );
+        assert_eq!(
+            HostConfig::module_names_with_renderer_data(None, &listed),
+            listed
+        );
     }
 
     /// A misspelled key is an error rather than a silently different module

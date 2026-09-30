@@ -260,8 +260,15 @@ pub(crate) fn exposed_components_from_names(
     world: &World,
     names: &[String],
 ) -> Vec<ModuleExposedComponent> {
+    // A module may register one component more than once - registration is
+    // idempotent, and the renderer data crate registers its components both
+    // explicitly and through its module entry point - so a name can repeat in
+    // the registration log. Expose each once, in first-registration order: a
+    // repeated name would emit its C# mirror struct twice.
+    let mut seen = std::collections::HashSet::new();
     names
         .iter()
+        .filter(|type_name| seen.insert(type_name.as_str()))
         .filter_map(|type_name| {
             let component_id = resolve_exposed_component_id(world, type_name)?;
             let (size, align) = world.component_layout(component_id)?;

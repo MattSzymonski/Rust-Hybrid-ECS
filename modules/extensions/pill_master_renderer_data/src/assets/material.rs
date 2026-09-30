@@ -17,7 +17,7 @@
 //! a material and a pass through one code path, and a material's
 //! `rendering_order` decides where it sorts within the pass that draws it.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use pill_engine::{Asset, Handle};
 
@@ -42,6 +42,12 @@ pub struct MaterialTexture {
 /// A material is an asset, so the renderer rebuilds its bind groups when the
 /// asset's version moves rather than expecting a game to mutate renderer state
 /// mid frame. [`MaterialBuilder`] is the supported way to make one.
+///
+/// Its maps are `BTreeMap`s, never `HashMap`s. An empty `HashMap` does not
+/// allocate: it points at a static inside the binary that created it. This
+/// value lives in the world and outlives that binary - a project or module
+/// that built it is reloaded and its retired image eventually unmapped - and
+/// reading such a map afterwards faults. A `BTreeMap` holds no such pointer.
 #[derive(Clone, Debug)]
 pub struct Material {
     /// Label used in logs, profiling and error messages.
@@ -56,11 +62,11 @@ pub struct Material {
     /// twice has one entry rather than a vector the binder reads only its first
     /// match out of. A declared slot the material leaves unbound falls back to
     /// the renderer's default texture for that slot's type.
-    pub textures: HashMap<String, MaterialTexture>,
+    pub textures: BTreeMap<String, MaterialTexture>,
     /// Uniform parameters, packed one 16-byte slot each, in the order the
     /// shader declares them. A declared slot the material leaves unset packs
     /// as zero.
-    pub parameters: HashMap<String, MaterialParameter>,
+    pub parameters: BTreeMap<String, MaterialParameter>,
     /// Sort key for materials inside the pass that draws them.
     ///
     /// The queue's composed key stores this byte inverted and sorts the key
@@ -90,8 +96,8 @@ impl Material {
             material: Self {
                 name: name.into(),
                 shader: Handle::INVALID,
-                textures: HashMap::new(),
-                parameters: HashMap::new(),
+                textures: BTreeMap::new(),
+                parameters: BTreeMap::new(),
                 rendering_order: u8::MAX,
             },
         }
@@ -155,4 +161,12 @@ impl MaterialBuilder {
     }
 }
 
-impl Asset for Material {}
+// Shared across binaries: the data module, the GPU module and every project
+// compile their own copy of this crate, each with its own `TypeId`. The pinned
+// name makes them one asset column (see `Asset::shared_name`); keep it
+// verbatim when moving the type.
+impl Asset for Material {
+    fn shared_name() -> Option<&'static str> {
+        Some("pill_master_renderer::assets::Material")
+    }
+}

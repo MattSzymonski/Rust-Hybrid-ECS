@@ -19,6 +19,10 @@
 name: "Fixture Project"
 build_binary_name: "FixtureProject"
 
+# The fixture draws nothing and declares no render components, so it selects
+# no renderer: its data crate would only add a build to every cold start.
+renderer: "none"
+
 modules:
   - "pill_spline"
   - "pill_dummy_math"

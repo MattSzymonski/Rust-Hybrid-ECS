@@ -167,12 +167,15 @@ pub(crate) fn accessor_rows(accessors: &[ResolvedFieldAccessor]) -> Vec<Resolved
 
 #[cfg(feature = "hot_reload")]
 /// Generate the C# mirror file for extension components.
-pub(crate) use codegen::{generate_components_csharp, generate_module_components_csharp};
+pub(crate) use codegen::generate_module_components_csharp;
 
 /// Rebuild the mirror-method table the managed runtime reads, after an
 /// extension reload changes its trampoline addresses or method set.
 #[cfg_attr(not(feature = "hot_reload"), allow(unused_imports))]
 pub(crate) use abi::publish_mirror_methods;
+/// Publish the renderer data crate's asset functions from the loaded modules.
+#[cfg(feature = "hot_reload")]
+pub(crate) use assets::publish_asset_exports;
 
 // =============================================================================
 // Tests

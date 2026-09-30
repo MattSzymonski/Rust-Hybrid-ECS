@@ -25,7 +25,7 @@
 //! exactly as long as the group that reads it.
 
 // Standard library
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 // External crates
 use indexmap::IndexMap;
@@ -98,7 +98,7 @@ impl RendererMaterial {
         name: &str,
         shader_handle: RendererShaderHandle,
         textures: &[(String, RendererTextureHandle)],
-        parameters: &HashMap<String, MaterialParameter>,
+        parameters: &BTreeMap<String, MaterialParameter>,
     ) -> Result<Self> {
         debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Creating material {}", name.name_style());
 
@@ -217,7 +217,7 @@ impl RendererMaterial {
         queue: &wgpu::Queue,
         buffer: &wgpu::Buffer,
         parameter_slots: &IndexMap<String, ShaderParameterSlot>,
-        parameters: &HashMap<String, MaterialParameter>,
+        parameters: &BTreeMap<String, MaterialParameter>,
     ) -> Result<()> {
         // Stage every slot in one vector so the GPU buffer is written once.
         let mut data = Vec::new();

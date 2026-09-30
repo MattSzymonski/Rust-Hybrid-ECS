@@ -18,12 +18,17 @@ miette = { version = "7", features = ["derive"] }
 # The renderer contract - the backend trait, the frame, the camera, window
 # handles as data - with no wgpu. Linked in every posture.
 pill_renderer_api = { path = "../pill_renderer_api" }
-# INTERIM (renderer data split, stages 4-5): the master renderer's data -
-# components, assets, pipelines - still linked and registered by the host, so a
-# headless host loads projects that declare cameras, meshes and lights, and the
-# C# bridge binds those types. Stage 6 turns it into an extension the host loads
-# and removes this dependency.
-pill_master_renderer_data = { path = "../extensions/pill_master_renderer_data" }
+# Dependency GRAPH only - never named in code, and renamed so any use stands
+# out; the same reason as `renderer_dependency_graph` below, for headless
+# builds too. The master renderer's data crate is an extension the host loads
+# (first, in every posture), and its module build is resolved together with the
+# host. Its dependencies turn on features in crates `pill_core` shares (glam's
+# `bytemuck`, for one), and cargo folds those into `pill_core.dll`'s symbol
+# names: without this entry a headless host would resolve a different
+# `pill_core.dll` than the data module and could not load it. Nothing
+# references it, so nothing of it is linked into the host. (The C# bridge
+# tests are the one exception: they alias it to bind real renderer components.)
+renderer_data_dependency_graph = { package = "pill_master_renderer_data", path = "../extensions/pill_master_renderer_data" }
 # Dependency GRAPH only - never named in code, and renamed so any use stands
 # out. Every module and project build is resolved together with the running
 # host (see `build_runner::apply_cargo_host_overrides`), and cargo folds each
@@ -34,7 +39,11 @@ pill_master_renderer_data = { path = "../extensions/pill_master_renderer_data" }
 # linking any of it: rlibs link as archives, and nothing references this one.
 renderer_dependency_graph = { package = "pill_master_renderer", path = "../extensions/pill_master_renderer", optional = true }
 libloading = "0.8"
-notify = "6"
+# Development only (`hot_reload`): the source and shader watchers, and the
+# cooker the shader watcher runs - the one the renderer data crate's build
+# script runs, so a runtime cook matches the build's.
+notify = { version = "6", optional = true }
+pill_assets = { path = "../pill_assets", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -52,9 +61,9 @@ winit = { version = "0.30", optional = true }
 # DLL. Turning it OFF selects the shipping posture - nothing is watched, built
 # or loaded at runtime, and the project is linked into the binary instead.
 default = ["hot_reload"]
-# Reload edited code without a restart. Also compiles the renderer data's
-# development shader reload, which only a windowed host ever starts.
-hot_reload = ["pill_master_renderer_data/shader-hot-reload"]
+# Reload edited code without a restart, and in a windowed host, edited shaders
+# of the renderer's data crate without a rebuild.
+hot_reload = ["dep:notify", "dep:pill_assets"]
 # A windowed host: the winit event loop, and the renderer module it loads and
 # attaches to the window. The host itself links no renderer and no wgpu: the
 # graphics stack exists only inside that module. Nothing is forwarded to

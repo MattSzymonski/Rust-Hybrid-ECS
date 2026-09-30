@@ -54,9 +54,6 @@ use crate::config::ExtensionConfig;
 use crate::extension::{ExtensionSlot, ReloadOutcome};
 use crate::reload::FirstLoadFailure;
 
-/// Directory, package and library name of the renderer module.
-const RENDERER_MODULE_NAME: &str = "pill_master_renderer";
-
 /// Export that builds a backend on a window.
 const ATTACH_SYMBOL: &[u8] = b"pill_renderer_attach";
 
@@ -74,8 +71,10 @@ type DetachFn = unsafe extern "C" fn(*mut c_void);
 pub(crate) struct RendererModule {
     /// The loaded module, or `None` while no generation has loaded yet.
     slot: Option<ExtensionSlot>,
-    /// Build, watch and output configuration derived from the module's name.
-    config: ExtensionConfig,
+    /// Build, watch and output configuration derived from the module's name
+    /// (the project's `renderer:` setting); `None` when the project selects no
+    /// renderer, which leaves the module permanently unloaded.
+    config: Option<ExtensionConfig>,
     /// Bumped by the watcher on every save under the module's `src/`.
     source_edit_generation: Arc<AtomicU64>,
     /// The source-edit generation the last failed first load was tried at,
@@ -111,12 +110,28 @@ impl RendererModule {
     /// Returns a [`HostError`] only when the configuration is invalid or the
     /// sources cannot be watched - the two things a later edit cannot fix.
     pub(crate) fn start(
+        name: Option<&str>,
         engine: &mut Engine,
         engine_api: &EngineApi,
         workspace_root: &Path,
         owner: SystemOwner,
     ) -> Result<Self, HostError> {
-        let config = ExtensionConfig::workspace_member(RENDERER_MODULE_NAME);
+        // No renderer selected: nothing to watch or load. With no watcher the
+        // edit counter never moves, so `reload_if_changed` never retries.
+        let Some(name) = name else {
+            info!(
+                target: telemetry_target::HOT_RELOAD,
+                "the project selects no renderer; the window stays blank"
+            );
+            return Ok(Self {
+                slot: None,
+                config: None,
+                source_edit_generation: Arc::new(AtomicU64::new(0)),
+                last_failed_generation: 0,
+                owner,
+            });
+        };
+        let config = ExtensionConfig::workspace_member(name);
         config.validate()?;
         // The watcher first: it is what retries a first load that fails below.
         let source_edit_generation = Arc::new(AtomicU64::new(0));
@@ -128,7 +143,7 @@ impl RendererModule {
         )?;
         let mut module = Self {
             slot: None,
-            config,
+            config: Some(config),
             source_edit_generation,
             last_failed_generation: 0,
             owner,
@@ -140,6 +155,23 @@ impl RendererModule {
     /// The loaded module, if a generation has loaded.
     pub(crate) fn slot(&self) -> Option<&ExtensionSlot> {
         self.slot.as_ref()
+    }
+
+    /// Owner every generation's systems are registered under.
+    pub(crate) fn owner(&self) -> SystemOwner {
+        self.owner
+    }
+
+    /// Ask for a rebuild and reload on the next [`Self::reload_if_changed`], as
+    /// a save under the module's sources would.
+    ///
+    /// Used when the renderer's data crate reloaded: the renderer compiles that
+    /// crate into its own image, so it must be rebuilt against the new source
+    /// before it may read the data again. A no-op when no renderer is selected.
+    pub(crate) fn request_rebuild(&self) {
+        if self.config.is_some() {
+            self.source_edit_generation.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     /// Reload the module when its sources changed, or retry a first load that
@@ -183,11 +215,15 @@ impl RendererModule {
         workspace_root: &Path,
         generation: u64,
     ) -> bool {
+        let Some(config) = &self.config else {
+            return false;
+        };
+        let module_name = config.name.clone();
         match ExtensionSlot::start(
             engine,
             engine_api,
             workspace_root,
-            &self.config,
+            config,
             self.owner,
             Arc::clone(&self.source_edit_generation),
             FirstLoadFailure::ClearSystemsOnly,
@@ -203,7 +239,7 @@ impl RendererModule {
                 self.slot = Some(slot);
                 info!(
                     target: telemetry_target::HOT_RELOAD,
-                    module = RENDERER_MODULE_NAME,
+                    module = module_name.as_str(),
                     "renderer module loaded"
                 );
                 true
@@ -212,7 +248,7 @@ impl RendererModule {
                 self.last_failed_generation = generation;
                 error!(
                     target: telemetry_target::HOT_RELOAD,
-                    module = RENDERER_MODULE_NAME,
+                    module = module_name.as_str(),
                     "the renderer module did not load; the window stays blank until the next renderer edit: {failure}"
                 );
                 false

@@ -49,7 +49,11 @@ use super::queries::{
 };
 use super::resources::resource_target;
 use pill_engine::common_components::Position;
-use pill_master_renderer_data::MeshRendererComponent;
+// The host depends on the renderer data crate for its dependency graph only
+// (see `pill_host/Cargo.toml`); these tests are the one place that names it,
+// to bind the real renderer components and call its asset functions.
+use renderer_data_dependency_graph as pill_master_renderer_data;
+use renderer_data_dependency_graph::MeshRendererComponent;
 
 // =============================================================================
 // Constants
@@ -98,13 +102,16 @@ fn test_stable_id(name: &str) -> StableComponentId {
     stable_component_id(&test_full_name(name))
 }
 
-/// The bindings a managed project gets for the renderer's plain data.
+/// The bindings a managed project gets for the renderer's data.
 ///
-/// Exactly the production path: the host registers `pill_renderer_api`, and
-/// the components that registration added are exposed like an extension's,
-/// as type-erased native bindings. Nothing here names a component type.
+/// The production path's shape: the renderer data crate registers (it is the
+/// first extension a host loads), and the components that registration added
+/// are exposed like any extension's, as type-erased native bindings. Nothing
+/// here names a component type.
 fn shared_component_bindings(engine: &mut Engine) -> ComponentBindings {
-    let names = crate::renderer_data::register_renderer_data(engine);
+    let sequence = engine.world().component_registration_sequence();
+    pill_master_renderer_data::register(engine);
+    let names = engine.world().registered_component_names_since(sequence);
     let exposed = exposed_components_from_names(engine.world(), &names);
     module_native_bindings(engine, &exposed)
 }
@@ -2719,4 +2726,116 @@ fn a_managed_resource_publishes_its_field_layout() {
         .expect("the reload republished the layout");
     assert_eq!(fields.len(), 3, "the arriving shape is what is served");
     assert_eq!(fields[0].name, "b", "and it is the arriving order");
+}
+
+// =============================================================================
+// Asset functions (renderer data crate, found by name)
+// =============================================================================
+
+/// The export names the C# asset entry points forward to.
+const ASSET_EXPORTS: [&str; 4] = [
+    "pill_render_data_load_mesh_obj",
+    "pill_render_data_load_texture_png",
+    "pill_render_data_load_shader",
+    "pill_render_data_create_material",
+];
+
+/// A binary that links the renderer data crate finds every asset function the
+/// C# bridge forwards to by its export name (the shipping path).
+#[test]
+fn the_renderer_data_asset_functions_are_found_by_name() {
+    for name in ASSET_EXPORTS {
+        assert!(
+            pill_engine::component_registry::find_export(name).is_some(),
+            "{name} is not offered by any linked crate"
+        );
+    }
+}
+
+/// Outside a managed invocation the call reports "no active scope" (1), not
+/// "no asset functions" (6): the function was found, only the world is missing.
+#[test]
+fn an_asset_call_outside_an_invocation_reports_no_active_scope() {
+    // As the host does after loading the extensions (same full set as every
+    // other test publishes, so parallel tests cannot disturb each other).
+    #[cfg(feature = "hot_reload")]
+    crate::csharp::publish_asset_exports(pill_engine::component_registry::find_export);
+    let name = "outside";
+    let (mut index, mut generation) = (0u32, 0u32);
+    let status = super::assets::ffi_asset_load_mesh_obj(
+        name.as_ptr(),
+        name.len() as u32,
+        std::ptr::null(),
+        0,
+        &mut index,
+        &mut generation,
+    );
+    assert_eq!(status, 1);
+}
+
+/// Inside an invocation, a mesh decoded from OBJ bytes by the renderer data
+/// crate lands in the world's asset store under its name.
+#[test]
+fn a_mesh_loads_through_the_forwarded_call() {
+    let mut engine = Engine::new();
+    pill_master_renderer_data::register(&mut engine);
+    // What the host does after loading the extensions; this test binary links
+    // the data crate, so its own descriptors stand in for the loaded module.
+    #[cfg(feature = "hot_reload")]
+    crate::csharp::publish_asset_exports(pill_engine::component_registry::find_export);
+    let bindings = ComponentBindings::default();
+    let name = "forwarded_triangle";
+    let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";
+    let (mut index, mut generation) = (u32::MAX, u32::MAX);
+    {
+        let _guard = ActiveSystemGuard::set(engine.world_mut(), &[], &bindings);
+        let status = super::assets::ffi_asset_load_mesh_obj(
+            name.as_ptr(),
+            name.len() as u32,
+            obj.as_ptr(),
+            obj.len() as u32,
+            &mut index,
+            &mut generation,
+        );
+        assert_eq!(status, 0, "the forwarded load succeeds");
+    }
+
+    let assets = engine
+        .world()
+        .get_resource::<pill_engine::AssetManager>()
+        .expect("the engine inserts the store");
+    let handle = assets
+        .handle_by_name::<pill_master_renderer_data::Mesh>(name)
+        .expect("the mesh is stored under its name");
+    assert_eq!((handle.index(), handle.generation()), (index, generation));
+}
+
+/// A module that registers a component twice - explicitly and through its
+/// entry point, as the renderer data crate does - exposes it once, so its C#
+/// mirror struct is emitted once.
+#[test]
+fn a_component_registered_twice_is_exposed_once() {
+    let mut engine = Engine::new();
+    let sequence = engine.world().component_registration_sequence();
+    pill_master_renderer_data::register(&mut engine);
+    pill_master_renderer_data::register(&mut engine);
+    let names = engine.world().registered_component_names_since(sequence);
+
+    let exposed = exposed_components_from_names(engine.world(), &names);
+    let mut csharp_names: Vec<&str> = exposed
+        .iter()
+        .map(|component| component.csharp_name.as_str())
+        .collect();
+    let exposed_count = csharp_names.len();
+    csharp_names.sort_unstable();
+    csharp_names.dedup();
+    assert_eq!(
+        csharp_names.len(),
+        exposed_count,
+        "no component is exposed twice"
+    );
+    assert!(
+        names.len() > exposed_count,
+        "the log itself does repeat names"
+    );
 }

@@ -63,6 +63,10 @@ mod loaded {
             /// Persistable component type names the last `pill_module_init` registered,
             /// used to detect types the next generation forgets to re-register.
             registered_type_names: Vec<String>,
+            /// The schema hash of each of those types as the last
+            /// `pill_module_init` declared it, to find the ones a module
+            /// reload has re-laid out since.
+            registered_schemas: Vec<(String, u64)>,
             /// Resource ids the last `pill_module_init` registered, so a type the
             /// project stops owning can be dropped while its image is mapped.
             registered_resource_ids: Vec<pill_engine::ResourceId>,
@@ -81,6 +85,19 @@ mod loaded {
             match self {
                 Self::Native { current, .. } => Some(current),
                 Self::CSharp(_) => None,
+            }
+        }
+
+        /// The persistable components the native project registered whose
+        /// layout a module reload has replaced since; empty while it is
+        /// current, and always empty for the C# backend, which registers its
+        /// own descriptor components. See [`crate::reload::stale_components`].
+        pub(crate) fn stale_components(&self, world: &pill_engine::World) -> Vec<String> {
+            match self {
+                Self::Native {
+                    registered_schemas, ..
+                } => crate::reload::stale_components(world, registered_schemas),
+                Self::CSharp(_) => Vec::new(),
             }
         }
 
@@ -136,6 +153,7 @@ mod loaded {
                         current: library,
                         old_libraries: Vec::new(),
                         registered_type_names: init.registered_type_names,
+                        registered_schemas: init.registered_schemas,
                         registered_resource_ids: init.registered_resource_ids,
                     })
                 }
@@ -178,11 +196,13 @@ mod loaded {
                     current,
                     old_libraries,
                     registered_type_names,
+                    registered_schemas,
                     registered_resource_ids,
                 } => reload_native(
                     current,
                     old_libraries,
                     registered_type_names,
+                    registered_schemas,
                     registered_resource_ids,
                     engine,
                     engine_api,
@@ -353,8 +373,8 @@ mod loaded {
 
     /// Reload one native generation and migrate components whose persisted schema
     /// changed across the module boundary.
-    // Eight parameters, and they are eight distinct collaborators rather than
-    // fields of an implicit struct: the three pieces of generation state this
+    // Ten parameters, and they are ten distinct collaborators rather than
+    // fields of an implicit struct: the five pieces of generation state this
     // mutates, the engine and its API table, where to build, what to build, and the
     // cancellation signal. Grouping them would name a type that exists only to
     // satisfy the lint, and would hide which of them this function mutates.
@@ -363,6 +383,7 @@ mod loaded {
         current: &mut NativeLibrary,
         old_libraries: &mut Vec<NativeLibrary>,
         registered_type_names: &mut Vec<String>,
+        registered_schemas: &mut Vec<(String, u64)>,
         registered_resource_ids: &mut Vec<pill_engine::ResourceId>,
         engine: &mut Engine,
         engine_api: &EngineApi,
@@ -382,6 +403,7 @@ mod loaded {
             current,
             old_libraries,
             registered_type_names,
+            registered_schemas,
             registered_resource_ids,
             graveyard_policy: crate::reload::GraveyardPolicy::Bounded,
         };

@@ -26,6 +26,56 @@ public partial struct Handle
 
 }
 
+namespace pill_master_renderer.component {
+
+[StructLayout(LayoutKind.Explicit, Size = 20)]
+public partial struct CameraComponent
+{
+    [FieldOffset(0)] public byte Enabled;
+    [FieldOffset(4)] public int Priority;
+    [FieldOffset(8)] public float VerticalFov;
+    [FieldOffset(12)] public float Near;
+    [FieldOffset(16)] public float Far;
+    /// Live ABI bytes of this component row (safe code).
+    public readonly Span<byte> Raw =>
+        MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
+}
+
+
+}
+
+namespace pill_master_renderer.component {
+
+[StructLayout(LayoutKind.Explicit, Size = 16)]
+public partial struct MeshRendererComponent
+{
+    [FieldOffset(0)] public Handle Mesh;
+    [FieldOffset(8)] public Handle Material;
+    /// Live ABI bytes of this component row (safe code).
+    public readonly Span<byte> Raw =>
+        MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
+}
+
+
+}
+
+namespace pill_master_renderer.component {
+
+[StructLayout(LayoutKind.Explicit, Size = 16)]
+public partial struct DirectionalLightComponent
+{
+    [FieldOffset(0)] public float Color0;
+    [FieldOffset(4)] public float Color1;
+    [FieldOffset(8)] public float Color2;
+    [FieldOffset(12)] public float Intensity;
+    /// Live ABI bytes of this component row (safe code).
+    public readonly Span<byte> Raw =>
+        MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
+}
+
+
+}
+
 namespace pill_engine.common_components {
 
 using pill_master_renderer.component;
@@ -77,56 +127,6 @@ public partial struct TransformComponent
     [FieldOffset(28)] public float Scale0;
     [FieldOffset(32)] public float Scale1;
     [FieldOffset(36)] public float Scale2;
-    /// Live ABI bytes of this component row (safe code).
-    public readonly Span<byte> Raw =>
-        MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
-}
-
-
-}
-
-namespace pill_master_renderer.component {
-
-[StructLayout(LayoutKind.Explicit, Size = 20)]
-public partial struct CameraComponent
-{
-    [FieldOffset(0)] public byte Enabled;
-    [FieldOffset(4)] public int Priority;
-    [FieldOffset(8)] public float VerticalFov;
-    [FieldOffset(12)] public float Near;
-    [FieldOffset(16)] public float Far;
-    /// Live ABI bytes of this component row (safe code).
-    public readonly Span<byte> Raw =>
-        MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
-}
-
-
-}
-
-namespace pill_master_renderer.component {
-
-[StructLayout(LayoutKind.Explicit, Size = 16)]
-public partial struct MeshRendererComponent
-{
-    [FieldOffset(0)] public Handle Mesh;
-    [FieldOffset(8)] public Handle Material;
-    /// Live ABI bytes of this component row (safe code).
-    public readonly Span<byte> Raw =>
-        MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));
-}
-
-
-}
-
-namespace pill_master_renderer.component {
-
-[StructLayout(LayoutKind.Explicit, Size = 16)]
-public partial struct DirectionalLightComponent
-{
-    [FieldOffset(0)] public float Color0;
-    [FieldOffset(4)] public float Color1;
-    [FieldOffset(8)] public float Color2;
-    [FieldOffset(12)] public float Intensity;
     /// Live ABI bytes of this component row (safe code).
     public readonly Span<byte> Raw =>
         MemoryMarshal.AsBytes(MemoryMarshal.CreateSpan(ref Unsafe.AsRef(in this), 1));

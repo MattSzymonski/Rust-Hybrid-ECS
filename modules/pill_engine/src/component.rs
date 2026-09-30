@@ -683,6 +683,29 @@ impl ComponentRegistry {
         &mut self,
         fields: &[ComponentFieldDescriptor],
     ) -> Result<Registration, WorldError> {
+        self.register_with_layout_superseding::<T>(fields, false)
+    }
+
+    /// [`Self::register_with_layout`] for a registration that replaces the
+    /// previous generation of the same subject.
+    ///
+    /// With `supersedes` set, a shared component whose layout differs from the
+    /// recorded one is re-laid out instead of refused: the host announced that
+    /// this registration comes from a reload of a subject that registered the
+    /// component before, and the reload migrates the component's rows to the
+    /// new layout. Every other binary still built against the old layout is
+    /// then stale; its queries are refused by the declared schema check and
+    /// the host suspends its systems until it is rebuilt.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::register_with_layout`], except that a layout disagreement is
+    /// not an error when `supersedes` is set.
+    pub fn register_with_layout_superseding<T: Component>(
+        &mut self,
+        fields: &[ComponentFieldDescriptor],
+        supersedes: bool,
+    ) -> Result<Registration, WorldError> {
         // Step 1: Return the existing bit index when the type is already
         // registered, after checking that both registrations describe the
         // same memory shape.
@@ -740,6 +763,22 @@ impl ComponentRegistry {
                 // first one already owns. Both will read and write the same
                 // rows through their own `T`, so a layout disagreement is a
                 // misread waiting to happen and must stop the registration.
+                // A reload of a subject that registered this component before
+                // is the one case where the new layout wins: the host migrates
+                // the rows after `init`, and the binaries still built against
+                // the old layout are refused by the declared schema check.
+                (Some(recorded), Some(shared_name))
+                    if supersedes && !recorded.is_compatible_with(&layout) =>
+                {
+                    warn!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
+                        shared_name,
+                        type_name = std::any::type_name::<T>(),
+                        previous_size = recorded.size,
+                        incoming_size = layout.size,
+                        "shared component re-laid out by a reloading generation; binaries built against the previous layout are stale until they are rebuilt"
+                    );
+                }
                 (Some(recorded), Some(shared_name)) if !recorded.is_compatible_with(&layout) => {
                     return Err(WorldError::SharedComponentLayoutMismatch {
                         shared_name: shared_name.to_string(),
@@ -1138,7 +1177,8 @@ mod tests {
 
     /// A layout-less re-registration must not disarm the shared-layout check:
     /// the recorded schema hash survives it, so a later declaration with the
-    /// same size but a different field shape is still refused.
+    /// same size but a different field shape is still refused - unless the
+    /// declaration supersedes the previous generation, which re-lays it out.
     #[test]
     fn schema_hash_survives_layout_less_reregistration() {
         // Two copies of one shared type, as two binaries compile them: same
@@ -1215,6 +1255,28 @@ mod tests {
             .expect_err("the hash recorded by the first declaration must survive");
         assert!(matches!(
             error,
+            WorldError::SharedComponentLayoutMismatch { .. }
+        ));
+
+        // A reload of the subject that registered the component may re-lay it
+        // out: the new layout is recorded, so the old one is what becomes a
+        // mismatch from then on.
+        let relaid = registry
+            .register_with_layout_superseding::<second_copy::SharedProbe>(FIELDS_B, true)
+            .expect("a superseding registration re-lays out the component");
+        assert!(!relaid.is_new(), "the component keeps its bit");
+        assert_eq!(
+            registry
+                .get_layout(&ComponentId::of::<first_copy::SharedProbe>())
+                .and_then(|layout| layout.schema_hash),
+            Some(component_schema_hash(FIELDS_B)),
+            "the new layout is the recorded one"
+        );
+        let stale = registry
+            .register_with_layout::<first_copy::SharedProbe>(FIELDS_A)
+            .expect_err("a binary built against the old layout is now the stale one");
+        assert!(matches!(
+            stale,
             WorldError::SharedComponentLayoutMismatch { .. }
         ));
     }
