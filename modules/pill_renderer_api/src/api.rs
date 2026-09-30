@@ -38,12 +38,18 @@ pub enum FrameOutcome {
     Skipped,
 }
 
-/// Limits of the device the renderer draws on.
+/// What the renderer can do: the limits of its device and the scene data it
+/// draws.
 ///
 /// Exposes what the device can accept, so callers that size transient
 /// resources - render targets, uploads - do not have to assume desktop
 /// maxima. A renderer with no GPU behind it reports the zero defaults.
-#[derive(Debug, Clone, Copy, Default)]
+///
+/// Not `Copy`: `consumed_components` is an owned list. It is owned rather than
+/// `&'static` on purpose - a renderer loaded as a module builds it inside its
+/// own image, and a static slice would point into that image after a reload
+/// unmaps it.
+#[derive(Debug, Clone, Default)]
 pub struct RenderCapabilities {
     /// Largest supported 2D texture dimension, in texels.
     pub max_texture_size: u32,
@@ -52,6 +58,13 @@ pub struct RenderCapabilities {
     /// Whether the surface presents high-dynamic-range output. No backend
     /// reports `true` yet.
     pub hdr: bool,
+    /// Shared names of the components this renderer reads to build a frame.
+    ///
+    /// Lets the host warn when a project uses render data the active renderer
+    /// ignores (for example a component another renderer's data crate
+    /// declares). Empty for a renderer that reads nothing, like the headless
+    /// stub.
+    pub consumed_components: Vec<String>,
 }
 
 /// Frame statistics from the most recent [`PillRenderer::render`] call.

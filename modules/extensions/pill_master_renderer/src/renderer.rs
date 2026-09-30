@@ -37,7 +37,6 @@ use pill_renderer_api::RawWindowData;
 // Current crate
 use crate::{
     api::{FrameOutcome, PillRenderer, RenderCapabilities, RenderMetrics},
-    assets::PassTarget,
     components::RenderViewport,
     config::{
         CAMERA_PARAMETERS_BIND_GROUP_LAYOUT_INDEX, ENGINE_PARAMETERS_BIND_GROUP_LAYOUT_INDEX,
@@ -46,7 +45,7 @@ use crate::{
     },
     drawers::mesh_drawer::MeshDrawer,
     error::{capturing_validation, RendererError, Result},
-    frame::{RenderFrame, ResolvedPass},
+    frame::{PassTarget, RenderFrame, ResolvedPass},
     pipeline::{PassOutput, PassPlan, PassSlot, ScriptableRenderingPipeline},
     rendering_resources_manager::RenderingResourcesManager,
     resources::{RendererCamera, RendererCameraHandle, RendererResourceStorage, RendererTexture},
@@ -169,6 +168,7 @@ impl PillRenderer for Renderer {
             max_texture_size: limits.max_texture_dimension_2d,
             max_buffer_bytes: limits.max_buffer_size,
             hdr: false,
+            consumed_components: crate::frame::consumed_component_names(),
         }
     }
 

@@ -22,22 +22,8 @@ use std::collections::HashMap;
 use pill_engine::{Asset, Handle};
 
 use super::{Shader, Texture};
-
-/// One named value a shader reads.
-///
-/// Parameters are keyed by the slot name the shader declares, and the packer
-/// walks the shader's slots rather than the map, so a name the shader never
-/// declares is ignored instead of shifting anything after it. Each value pads
-/// out to one 16-byte uniform slot.
-#[derive(Clone, Debug)]
-pub enum MaterialParameter {
-    /// One `f32`, in the first four bytes of the slot.
-    Scalar(f32),
-    /// A boolean, packed as a `u32` of 0 or 1.
-    Bool(bool),
-    /// An RGB colour: three `f32`s with the rest of the slot as padding.
-    Color([f32; 3]),
-}
+// Part of the frame contract (a resolved pass carries parameters too).
+use crate::frame::MaterialParameter;
 
 /// A texture handle bound to one of a material's slots.
 ///

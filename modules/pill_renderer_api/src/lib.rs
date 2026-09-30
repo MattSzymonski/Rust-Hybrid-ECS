@@ -62,13 +62,15 @@ use pill_engine::{AssetManager, World};
 // Current crate
 pub use api::{FrameOutcome, HeadlessRenderer, PillRenderer, RenderCapabilities, RenderMetrics};
 pub use assets::{
-    Material, MaterialBuilder, MaterialParameter, Mesh, MeshVertex, PassKind, PassTarget,
-    RenderPass, RenderingPipeline, Shader, ShaderBuilder, ShaderParameterSlot, ShaderParameterType,
-    ShaderTextureSlot, Texture, TextureType,
+    Material, MaterialBuilder, Mesh, MeshVertex, RenderPass, RenderingPipeline, Shader,
+    ShaderBuilder, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot, Texture,
+    TextureType,
 };
 pub use components::*;
 pub use error::RendererError;
-pub use frame::{RenderFrame, RenderInstance, ResolvedPass};
+pub use frame::{
+    CullMode, MaterialParameter, PassKind, PassTarget, RenderFrame, RenderInstance, ResolvedPass,
+};
 pub use raw_window::{RawWindowData, RawWindowKind};
 pub use rendering_manager::RenderingManager;
 #[cfg(feature = "shader-hot-reload")]

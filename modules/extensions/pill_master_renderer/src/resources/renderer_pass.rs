@@ -21,9 +21,9 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    assets::{CullMode, PassKind, Shader},
+    assets::Shader,
     error::{capturing_validation, ErrorContext, RendererError, Result},
-    frame::ResolvedPass,
+    frame::{CullMode, PassKind, ResolvedPass},
     resources::{
         RendererMaterial, RendererMesh, RendererResourceStorage, RendererShader, RendererTexture,
         RendererTextureHandle, Vertex,
