@@ -466,6 +466,9 @@ pub struct World {
     /// Per-name schema hash for persistable resources, so a reload can tell a
     /// reshaped resource from an unchanged one.
     pub(crate) persist_resource_schema_hashes: HashMap<String, u64>,
+    /// Stale shared-component readers already reported, as (component,
+    /// declared hash), so a query rebuilt every frame logs its refusal once.
+    pub(crate) reported_schema_mismatches: Vec<(ComponentId, u64)>,
     /// Monotonic counter bumped on every component registration (plain or
     /// persistable), letting the host enumerate which types one module's
     /// `init` registered at all — the distinction between a type that was
@@ -532,6 +535,7 @@ impl World {
             persist_resource_restorers: HashMap::new(),
             persist_resource_names: HashMap::new(),
             persist_resource_schema_hashes: HashMap::new(),
+            reported_schema_mismatches: Vec::new(),
             component_registration_sequence: 0,
             component_registration_log: Vec::new(),
             component_field_layouts: HashMap::new(),

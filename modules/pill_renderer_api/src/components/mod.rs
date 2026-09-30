@@ -109,6 +109,40 @@ mod tests {
         assert_eq!(count(ComponentId::of::<DirectionalLightComponent>()), 2);
     }
 
+    /// The layout each type declares for the stale-reader check is exactly the
+    /// one its registration records. If they disagreed, every query on the
+    /// component would be refused as stale.
+    #[test]
+    fn declared_layouts_match_the_registered_ones() {
+        let mut world = World::new();
+        register_components(&mut world);
+        // The registry hashes the registered descriptors the same way.
+        let registered = |component: ComponentId| {
+            world
+                .component_field_layout(component)
+                .filter(|fields| !fields.is_empty())
+                .map(pill_engine::component::component_schema_hash)
+        };
+
+        assert_eq!(
+            TransformComponent::declared_schema_hash(),
+            registered(ComponentId::of::<TransformComponent>())
+        );
+        assert_eq!(
+            CameraComponent::declared_schema_hash(),
+            registered(ComponentId::of::<CameraComponent>())
+        );
+        assert_eq!(
+            MeshRendererComponent::declared_schema_hash(),
+            registered(ComponentId::of::<MeshRendererComponent>())
+        );
+        assert_eq!(
+            DirectionalLightComponent::declared_schema_hash(),
+            registered(ComponentId::of::<DirectionalLightComponent>())
+        );
+        assert!(TransformComponent::declared_schema_hash().is_some());
+    }
+
     /// The pinned shared names are an identity contract, not decoration: they
     /// are what makes the same component recognisable in the host, in a loaded
     /// module, and in a world that outlived the generation which registered it.

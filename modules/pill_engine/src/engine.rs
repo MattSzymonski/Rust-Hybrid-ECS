@@ -199,6 +199,14 @@ pub struct Engine {
     /// [`Engine::end_module_registration`], so modules register systems exactly
     /// as before and still end up correctly attributed.
     active_owner: SystemOwner,
+    /// Owners whose systems are suspended by
+    /// [`Engine::set_systems_enabled_for_owner`].
+    ///
+    /// Kept as a set of owners rather than only as the systems' flags, so a
+    /// system registered *while* its owner is suspended starts disabled: a new
+    /// module generation initializing during a suspension must not run early.
+    /// A `Vec` because only a handful of owners ever exist.
+    disabled_owners: Vec<SystemOwner>,
     /// Dispatch slots for hot-patchable systems, keyed by registration name.
     ///
     /// Deliberately NOT behind `#[cfg(feature = "hot_patch")]`. Gating the field
@@ -281,6 +289,7 @@ impl Engine {
             trace_frame_wait: true,
             last_archetype_generation: 0,
             active_owner: SystemOwner::PROJECT,
+            disabled_owners: Vec::new(),
             hot_patch_registry: crate::hot_patch::HotPatchRegistry::new(),
         };
 
@@ -620,7 +629,8 @@ impl Engine {
             name: system_name,
             owner: self.active_owner,
             system: boxed_system,
-            enabled: true,
+            // Starts suspended when its owner is (see `disabled_owners`).
+            enabled: !self.disabled_owners.contains(&self.active_owner),
             last_run: 0,
             average_duration: 0,
             last_duration: 0,
@@ -726,7 +736,8 @@ impl Engine {
             name: name.into(),
             owner: self.active_owner,
             system: Box::new(system),
-            enabled: true,
+            // Starts suspended when its owner is (see `disabled_owners`).
+            enabled: !self.disabled_owners.contains(&self.active_owner),
             last_run: 0,
             average_duration: 0,
             last_duration: 0,
@@ -746,6 +757,48 @@ impl Engine {
     /// Returns registration attribution to [`SystemOwner::PROJECT`].
     pub fn end_module_registration(&mut self) {
         self.active_owner = SystemOwner::PROJECT;
+    }
+
+    /// Suspends or resumes every system registered by `owner`.
+    ///
+    /// Disabling also covers systems `owner` registers later, until it is
+    /// enabled again: a module generation that initializes during a suspension
+    /// registers its systems disabled. The suspension outlives
+    /// [`Self::clear_systems_owned_by`], which removes systems but not the
+    /// owner's state. Enabling turns every system of `owner` back on, including
+    /// any disabled individually with [`Self::set_system_enabled`] meanwhile.
+    ///
+    /// The execution graph is rebuilt before the next frame, as for a single
+    /// system's toggle. Returns the number of systems `owner` currently has.
+    pub fn set_systems_enabled_for_owner(&mut self, owner: SystemOwner, enabled: bool) -> usize {
+        // Step 1: Record the owner's state for systems registered later.
+        if enabled {
+            self.disabled_owners.retain(|disabled| *disabled != owner);
+        } else if !self.disabled_owners.contains(&owner) {
+            self.disabled_owners.push(owner);
+        }
+
+        // Step 2: Apply it to the systems registered so far, marking the graph
+        // dirty once if anything changed.
+        let mut owned = 0;
+        for system in self
+            .systems
+            .iter_mut()
+            .filter(|system| system.owner == owner)
+        {
+            owned += 1;
+            if system.enabled != enabled {
+                system.enabled = enabled;
+                self.graph_dirty = true;
+            }
+        }
+        owned
+    }
+
+    /// Whether systems of `owner` are allowed to run, i.e. it isn't suspended
+    /// by [`Self::set_systems_enabled_for_owner`].
+    pub fn is_owner_enabled(&self, owner: SystemOwner) -> bool {
+        !self.disabled_owners.contains(&owner)
     }
 
     /// Removes only the systems registered by `owner`.
@@ -1594,6 +1647,115 @@ mod tests {
         assert_eq!(engine.clear_systems_owned_by(SystemOwner::PROJECT), 1);
         engine.process_frame().unwrap();
         assert_eq!(project_runs.load(AtomicOrdering::SeqCst), 2);
+    }
+
+    /// Registers one counting system under `owner` and returns its counter.
+    fn register_counting_system(
+        engine: &mut Engine,
+        owner: SystemOwner,
+        name: &str,
+    ) -> Arc<AtomicUsize> {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&runs);
+        engine.begin_module_registration(owner);
+        engine.register_system(name.to_owned(), move || {
+            counter.fetch_add(1, AtomicOrdering::SeqCst);
+        });
+        engine.end_module_registration();
+        runs
+    }
+
+    /// Suspending an owner stops its systems and only its systems, in both the
+    /// sequential and the parallel scheduler, and resuming restores them.
+    #[test]
+    fn suspending_an_owner_stops_only_its_systems() {
+        for parallel in [false, true] {
+            let mut engine = Engine::new();
+            engine.set_parallel_execution(parallel);
+            let module_owner = SystemOwner::extension(2);
+            let project_runs =
+                register_counting_system(&mut engine, SystemOwner::PROJECT, "project");
+            let first_runs = register_counting_system(&mut engine, module_owner, "module_first");
+            let second_runs = register_counting_system(&mut engine, module_owner, "module_second");
+
+            assert_eq!(engine.set_systems_enabled_for_owner(module_owner, false), 2);
+            assert!(!engine.is_owner_enabled(module_owner));
+            engine.process_frame().unwrap();
+            assert_eq!(
+                project_runs.load(AtomicOrdering::SeqCst),
+                1,
+                "parallel={parallel}"
+            );
+            assert_eq!(
+                first_runs.load(AtomicOrdering::SeqCst),
+                0,
+                "parallel={parallel}"
+            );
+            assert_eq!(
+                second_runs.load(AtomicOrdering::SeqCst),
+                0,
+                "parallel={parallel}"
+            );
+
+            assert_eq!(engine.set_systems_enabled_for_owner(module_owner, true), 2);
+            assert!(engine.is_owner_enabled(module_owner));
+            engine.process_frame().unwrap();
+            assert_eq!(
+                project_runs.load(AtomicOrdering::SeqCst),
+                2,
+                "parallel={parallel}"
+            );
+            assert_eq!(
+                first_runs.load(AtomicOrdering::SeqCst),
+                1,
+                "parallel={parallel}"
+            );
+            assert_eq!(
+                second_runs.load(AtomicOrdering::SeqCst),
+                1,
+                "parallel={parallel}"
+            );
+        }
+    }
+
+    /// A system registered while its owner is suspended starts disabled, so a
+    /// module generation that initializes during a suspension does not run
+    /// early; resuming the owner starts it.
+    #[test]
+    fn systems_registered_during_a_suspension_start_disabled() {
+        let mut engine = Engine::new();
+        let module_owner = SystemOwner::extension(0);
+        assert_eq!(engine.set_systems_enabled_for_owner(module_owner, false), 0);
+
+        let runs = register_counting_system(&mut engine, module_owner, "late");
+        assert_eq!(engine.is_system_enabled("late"), Some(false));
+        engine.process_frame().unwrap();
+        assert_eq!(runs.load(AtomicOrdering::SeqCst), 0);
+
+        engine.set_systems_enabled_for_owner(module_owner, true);
+        engine.process_frame().unwrap();
+        assert_eq!(runs.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    /// Clearing a suspended owner's systems still works, and the suspension
+    /// survives it: the replacement generation's systems start disabled.
+    #[test]
+    fn a_suspension_survives_clearing_the_owners_systems() {
+        let mut engine = Engine::new();
+        let module_owner = SystemOwner::extension(1);
+        register_counting_system(&mut engine, module_owner, "old_generation");
+        engine.set_systems_enabled_for_owner(module_owner, false);
+
+        assert_eq!(engine.clear_systems_owned_by(module_owner), 1);
+        assert!(!engine.is_owner_enabled(module_owner));
+
+        let runs = register_counting_system(&mut engine, module_owner, "new_generation");
+        engine.process_frame().unwrap();
+        assert_eq!(runs.load(AtomicOrdering::SeqCst), 0);
+
+        engine.set_systems_enabled_for_owner(module_owner, true);
+        engine.process_frame().unwrap();
+        assert_eq!(runs.load(AtomicOrdering::SeqCst), 1);
     }
 
     /// Registration outside a module scope is attributed to the project, and

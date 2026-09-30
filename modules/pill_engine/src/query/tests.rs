@@ -1448,3 +1448,121 @@ fn test_filter_changed_empty_after_no_mutation() {
     let mut q = Query::<(Entity,), Changed<Position>>::new(&mut world);
     assert_eq!(q.iter_mut().count(), 0);
 }
+
+// =============================================================================
+// Stale shared readers
+// =============================================================================
+
+/// The shared name the three point types below all register under, as the
+/// same component compiled into different binaries would.
+const SHARED_POINT: &str = "query_tests::SharedPoint";
+
+/// The layout the registry holds: `x`, then `y`.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, pill_engine_macros::PillLayout)]
+struct CurrentPoint {
+    x: f32,
+    y: f32,
+}
+impl Component for CurrentPoint {
+    fn shared_name() -> Option<&'static str> {
+        Some(SHARED_POINT)
+    }
+    fn declared_schema_hash() -> Option<u64> {
+        Some(crate::component::component_schema_hash(Self::FIELD_LAYOUT))
+    }
+}
+
+/// A reader built against an older layout of the same component: same size and
+/// alignment, fields swapped - what size and alignment alone cannot catch.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default, pill_engine_macros::PillLayout)]
+struct StalePoint {
+    y: f32,
+    x: f32,
+}
+impl Component for StalePoint {
+    fn shared_name() -> Option<&'static str> {
+        Some(SHARED_POINT)
+    }
+    fn declared_schema_hash() -> Option<u64> {
+        Some(crate::component::component_schema_hash(Self::FIELD_LAYOUT))
+    }
+}
+
+/// A reader that declares no layout, so only size and alignment are checked.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+struct UndeclaredPoint {
+    x: f32,
+    y: f32,
+}
+impl Component for UndeclaredPoint {
+    fn shared_name() -> Option<&'static str> {
+        Some(SHARED_POINT)
+    }
+}
+
+/// A world holding one entity of the shared point, registered with
+/// [`CurrentPoint`]'s layout.
+fn world_with_a_current_point() -> World {
+    let mut world = World::new();
+    world.register_component_with_layout::<CurrentPoint>(CurrentPoint::FIELD_LAYOUT);
+    world
+        .create_entity()
+        .with(CurrentPoint { x: 1.0, y: 2.0 })
+        .build()
+        .unwrap();
+    world
+}
+
+/// A query whose type declares a different layout of a shared component than
+/// the registered one is refused and matches nothing, alone, mutable, or inside
+/// a tuple; the current layout's query still sees the row.
+#[test]
+fn a_stale_shared_reader_is_refused() {
+    let mut world = world_with_a_current_point();
+    let point = ComponentId::of::<CurrentPoint>();
+    assert_eq!(
+        ComponentId::of::<StalePoint>(),
+        point,
+        "one shared name, one component"
+    );
+
+    let mut stale = Query::<&StalePoint>::new(&mut world);
+    assert_eq!(stale.stale_shared_component(), Some(point));
+    assert_eq!(stale.iter_mut().count(), 0);
+
+    let mut stale_mutable = Query::<&mut StalePoint>::new(&mut world);
+    assert_eq!(stale_mutable.stale_shared_component(), Some(point));
+    assert_eq!(stale_mutable.iter_mut().count(), 0);
+
+    let mut stale_in_tuple = Query::<(Entity, &StalePoint)>::new(&mut world);
+    assert_eq!(stale_in_tuple.stale_shared_component(), Some(point));
+    assert_eq!(stale_in_tuple.entity_count(), 0);
+
+    let mut current = Query::<&CurrentPoint>::new(&mut world);
+    assert_eq!(current.stale_shared_component(), None);
+    let values: Vec<(f32, f32)> = current.iter_mut().map(|point| (point.x, point.y)).collect();
+    assert_eq!(values, [(1.0, 2.0)]);
+}
+
+/// A reader declaring no layout keeps today's size-and-alignment check, so it
+/// still matches.
+#[test]
+fn a_reader_without_a_declared_layout_falls_back_to_size_and_alignment() {
+    let mut world = world_with_a_current_point();
+    let mut query = Query::<&UndeclaredPoint>::new(&mut world);
+    assert_eq!(query.stale_shared_component(), None);
+    assert_eq!(query.iter_mut().count(), 1);
+}
+
+/// A refused query is rebuilt every frame; the refusal is recorded once.
+#[test]
+fn a_stale_reader_is_reported_once() {
+    let mut world = world_with_a_current_point();
+    for _ in 0..3 {
+        let _ = Query::<&StalePoint>::new(&mut world);
+    }
+    assert_eq!(world.reported_schema_mismatches.len(), 1);
+}
