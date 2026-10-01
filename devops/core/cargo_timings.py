@@ -12,7 +12,7 @@ DESCRIPTION
 
     Only the structured data is extracted - Pill Lab renders it with its own
     UI rather than embedding Cargo's HTML. This mirrors the parser the engine
-    host already uses (`modules/pill_host/src/analytics.rs`), so the two agree
+    host already uses (`modules/hosting/pill_host/src/analytics.rs`), so the two agree
     on what a "crate build time" means.
 
     Note that `--timings=json` is still nightly-only, which is why the stable

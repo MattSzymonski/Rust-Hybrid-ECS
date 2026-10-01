@@ -18,7 +18,7 @@
          $(PillRoslynVersion) in the PackageReference.
 
   EXAMPLE USAGE:
-    <Import Project="../Roslyn.props" />
+    <Import Project="../../Roslyn.props" />
     <ItemGroup>
       <PackageReference Include="Microsoft.CodeAnalysis.CSharp"
                         Version="$(PillRoslynVersion)" />

@@ -43,7 +43,7 @@
          (project-referenced analyzers are not transitive). It is a separate
          project from the AOT registry generator, which stays opt-in with the
          AOT posture so an ordinary build does not install that registry. -->
-    <ProjectReference Include="../../modules/pill_csharp_runtime/generators/PillIterationGenerators.csproj"
+    <ProjectReference Include="../../modules/csharp/pill_csharp_runtime/generators/PillIterationGenerators.csproj"
                       OutputItemType="Analyzer"
                       ReferenceOutputAssembly="false" />
 
@@ -52,7 +52,7 @@
          parallel batch races on, or a static event that roots the retiring load
          context are all things the runtime either refuses a run later or cannot
          detect at all. Reporting them here makes them build errors instead. -->
-    <ProjectReference Include="../../modules/pill_csharp_runtime/analyzers/PillScriptAnalyzers.csproj"
+    <ProjectReference Include="../../modules/csharp/pill_csharp_runtime/analyzers/PillScriptAnalyzers.csproj"
                       OutputItemType="Analyzer"
                       ReferenceOutputAssembly="false" />
   </ItemGroup>
@@ -60,7 +60,7 @@
   <ItemGroup>
     <!-- For Engine.cs's safe generic query facade. Project-specific component
          structs live in this reloadable project. -->
-    <ProjectReference Include="../../modules/pill_csharp_runtime/csharp_runtime.csproj" />
+    <ProjectReference Include="../../modules/csharp/pill_csharp_runtime/csharp_runtime.csproj" />
   </ItemGroup>
 
   <!-- NativeAOT shipping posture. ProjectHost cannot load or reflect over the
@@ -76,7 +76,7 @@
        AOT-compiled. Ordinary JIT builds never set EnablePillAot and pay
        nothing. The RuntimeIdentifier is supplied by the release script. -->
   <ItemGroup Condition="'$(EnablePillAot)' == 'true'">
-    <ProjectReference Include="../../modules/pill_csharp_runtime/macros/PillCSharpRuntimeMacros.csproj"
+    <ProjectReference Include="../../modules/csharp/pill_csharp_runtime/macros/PillCSharpRuntimeMacros.csproj"
                       OutputItemType="Analyzer"
                       ReferenceOutputAssembly="false" />
   </ItemGroup>

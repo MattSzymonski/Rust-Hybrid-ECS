@@ -121,6 +121,10 @@ pub mod hot_patch;
 /// Advanced system parameter infrastructure with automatic parameter resolution.
 pub mod system;
 
+/// Keyboard, mouse and gamepad state maintained by the engine and read through
+/// `Res<Input>`.
+pub mod input;
+
 /// Frame timing maintained by the engine and read through `Res<Time>`.
 pub mod time;
 
@@ -144,6 +148,10 @@ pub use error::{EngineError, SystemError, SystemFailure};
 pub use hot_patch::{
     HotPatchError, HotPatchRegistry, HotSlot, PillHotFunctionDescriptor, PillHotSlotDescriptor,
     PlainSlot,
+};
+pub use input::{
+    ButtonState, GamepadAxis, GamepadButton, Input, InputEvent, KeyCode, MouseButton, PlayerId,
+    RumbleRequest, ScrollDelta,
 };
 pub use persistence::{PersistResourceManifestEntry, ResourceSnapshot};
 pub use pill_core::DynamicBuffer;

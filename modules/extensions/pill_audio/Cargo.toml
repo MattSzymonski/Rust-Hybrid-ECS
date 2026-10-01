@@ -20,7 +20,7 @@ path = "src/pill_audio.rs"
 crate-type = ["cdylib", "rlib"]
 
 [build-dependencies]
-pill_hot_scan = { path = "../../pill_hot_scan" }
+pill_hot_scan = { path = "../../hosting/pill_hot_scan" }
 
 [dependencies]
 pill_core = { path = "../../pill_core" }

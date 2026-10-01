@@ -25,6 +25,9 @@ DESCRIPTION
       5. With Pillow installed: at least one capture of the canvas, taken once
          per second, shows a lit scene rather than an empty frame. The scene
          rotates, so not every moment shows it.
+      6. Input reaches the game: a key press (sent without a click, so the
+         canvas must hold focus from the start), a wheel turn and a mouse
+         button, each logged by the project's control systems.
 
     The shipping bundle the build regenerates is restored afterwards, so the
     tree is left as it was found.
@@ -78,6 +81,27 @@ BUNDLE_DIRECTORY = REPOSITORY_ROOT / "build" / "pill_shipping_bundle"
 PACK_TOKEN = "mounted the embedded asset pack"
 FIRST_FRAME_TOKEN = "[render] First frame: Presented; camera=true"
 FRAME_TOKEN = "frame statistics"
+
+# Input sent through the DevTools protocol once the first frame is up, and what
+# the project logs when its systems see it (`examples/master_renderer_test/
+# src/controls.rs`). The key goes first and without a click, so it also checks
+# that the canvas holds keyboard focus from the start. The wheel scrolls down,
+# moving the camera back: closer would put it inside the helmet, and the
+# picture check would see an empty frame.
+INPUT_DELAY_SECONDS = 1.0
+INPUT_EVENTS = (
+    ("Input.dispatchKeyEvent", {"type": "keyDown", "code": "KeyW", "key": "w", "windowsVirtualKeyCode": 87}),
+    ("Input.dispatchKeyEvent", {"type": "keyUp", "code": "KeyW", "key": "w", "windowsVirtualKeyCode": 87}),
+    ("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": 640, "y": 360}),
+    ("Input.dispatchMouseEvent", {"type": "mouseWheel", "x": 640, "y": 360, "deltaX": 0, "deltaY": 240}),
+    ("Input.dispatchMouseEvent", {"type": "mousePressed", "x": 640, "y": 360, "button": "left", "clickCount": 1}),
+    ("Input.dispatchMouseEvent", {"type": "mouseReleased", "x": 640, "y": 360, "button": "left", "clickCount": 1}),
+)
+INPUT_TOKENS = (
+    ("key pressed: KeyW", "a key press did not reach the game"),
+    ("scrolled; camera distance", "the mouse wheel did not reach the game"),
+    ("mouse button pressed: Left", "a mouse button did not reach the game"),
+)
 
 # A blurred capture whose brightness varies this much shows a scene; an empty
 # frame is the clear colour under the lens grain, which blurs flat.
@@ -282,15 +306,21 @@ def observe_page(browser: str, url: str, seconds: float) -> tuple:
             devtools.send("Page.addScriptToEvaluateOnNewDocument", {"source": INJECTED_SCRIPT})
             devtools.send("Page.navigate", {"url": url})
 
-            # Collect events, and once a second ask for a capture of the page.
+            # Collect events, once a second ask for a capture of the page, and
+            # send the input shortly after the first frame.
             devtools.connection.settimeout(0.5)
             end = time.monotonic() + seconds
             next_capture = time.monotonic() + 1
             capture_requests = set()
+            input_due = None
             while time.monotonic() < end:
                 if time.monotonic() >= next_capture:
                     capture_requests.add(devtools.send("Page.captureScreenshot", {"format": "png"}))
                     next_capture += 1
+                if input_due is not None and time.monotonic() >= input_due:
+                    for method, params in INPUT_EVENTS:
+                        devtools.send(method, params)
+                    input_due = float("inf")
                 try:
                     message = devtools.receive()
                 except (socket.timeout, TimeoutError):
@@ -307,6 +337,8 @@ def observe_page(browser: str, url: str, seconds: float) -> tuple:
                         for argument in message["params"]["args"]
                     )
                     console_lines.append(text)
+                    if input_due is None and FIRST_FRAME_TOKEN in text:
+                        input_due = time.monotonic() + INPUT_DELAY_SECONDS
                     if level == "error":
                         problems.append(f"console error: {text[:300]}")
                 elif method == "Runtime.exceptionThrown":
@@ -367,6 +399,7 @@ def run_smoke_test(timeout_scale: float, seconds: float) -> int:
         (PACK_TOKEN, "the embedded asset pack was not mounted"),
         (FIRST_FRAME_TOKEN, "no first frame was presented with a camera"),
         (FRAME_TOKEN, "frames did not keep running"),
+        *INPUT_TOKENS,
     ):
         if token not in console:
             failures.append(meaning)
@@ -382,6 +415,7 @@ def run_smoke_test(timeout_scale: float, seconds: float) -> int:
     print("  [OK] the embedded asset pack was mounted")
     print("  [OK] the first frame was presented with a camera")
     print(f"  [OK] frames kept running ({console.count(FRAME_TOKEN)} statistics report(s))")
+    print("  [OK] keyboard, wheel and mouse button input reached the game")
     print("  [OK] no engine error, WebGPU error or page exception")
     if variations:
         print(f"  [OK] a lit scene was drawn (largest variation {max(variations):.1f})")

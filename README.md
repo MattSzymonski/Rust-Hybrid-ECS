@@ -149,6 +149,6 @@ binary was not rebuilt), the build script re-copies it on the next `cargo build`
 
 - `cargo run --package editor` — Run the Rust project in the editor.
 - `dotnet build examples/project_cs/project_cs.csproj -c Release --nologo` — Build the C# project and its `csharp_runtime` dependency.
-- `dotnet run --project modules/pill_csharp_runtime/tests/csharp_runtime_tests.csproj -c Release` — Run the C# system discovery and scheduler-access tests.
+- `dotnet run --project modules/csharp/pill_csharp_runtime/tests/csharp_runtime_tests.csproj -c Release` — Run the C# system discovery and scheduler-access tests.
 - `cargo test --workspace` — Run all Rust workspace tests.
 - `cargo check --workspace` — Type-check the complete Rust workspace without producing release binaries.
