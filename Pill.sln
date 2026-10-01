@@ -5,19 +5,19 @@ VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "modules", "modules", "{9ADE95BE-33B7-40AE-A7A6-671B4062A270}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "csharp_runtime", "modules\pill_csharp_runtime\csharp_runtime.csproj", "{659498B0-5CBD-47BB-91B1-7617593023C8}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "csharp_runtime", "modules\csharp\pill_csharp_runtime\csharp_runtime.csproj", "{659498B0-5CBD-47BB-91B1-7617593023C8}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "pill_csharp_runtime", "pill_csharp_runtime", "{8C59BCA7-B70E-40BD-9CB4-0472ADAC7FB8}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PillScriptAnalyzers", "modules\pill_csharp_runtime\analyzers\PillScriptAnalyzers.csproj", "{93C87AA7-9EA3-47FB-A916-40F8B826CAEB}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PillScriptAnalyzers", "modules\csharp\pill_csharp_runtime\analyzers\PillScriptAnalyzers.csproj", "{93C87AA7-9EA3-47FB-A916-40F8B826CAEB}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PillIterationGenerators", "modules\pill_csharp_runtime\generators\PillIterationGenerators.csproj", "{1567E62E-7FD9-4A87-8A18-7F51D10B107E}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PillIterationGenerators", "modules\csharp\pill_csharp_runtime\generators\PillIterationGenerators.csproj", "{1567E62E-7FD9-4A87-8A18-7F51D10B107E}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PillCSharpRuntimeMacros", "modules\pill_csharp_runtime\macros\PillCSharpRuntimeMacros.csproj", "{CE54F974-4709-46E8-90AD-9F8912D437DA}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "PillCSharpRuntimeMacros", "modules\csharp\pill_csharp_runtime\macros\PillCSharpRuntimeMacros.csproj", "{CE54F974-4709-46E8-90AD-9F8912D437DA}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "csharp_runtime_tests", "modules\pill_csharp_runtime\tests\csharp_runtime_tests.csproj", "{FBE4CB7C-60F0-4FED-8A64-5FE8E8A7920B}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "csharp_runtime_tests", "modules\csharp\pill_csharp_runtime\tests\csharp_runtime_tests.csproj", "{FBE4CB7C-60F0-4FED-8A64-5FE8E8A7920B}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "pill_csharp_compiler", "modules\pill_csharp_compiler\pill_csharp_compiler.csproj", "{893C5969-4D9F-4518-95F8-707EE4D388FA}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "pill_csharp_compiler", "modules\csharp\pill_csharp_compiler\pill_csharp_compiler.csproj", "{893C5969-4D9F-4518-95F8-707EE4D388FA}"
 EndProject
 Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "examples", "examples", "{20323623-E7F0-4A9E-BEBB-8C23D1F00C96}"
 EndProject

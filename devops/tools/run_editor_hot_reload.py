@@ -3,7 +3,7 @@
 REQUIREMENTS:
   - Windows (the editor's development loop targets Windows/MSVC).
   - Python 3.10 or newer.
-  - Rust toolchain with the `editor` crate under modules/pill_editor.
+  - Rust toolchain with the `editor` crate under modules/frontents/pill_editor.
   - `dx` (dioxus-cli) version 0.7.10 matching dioxus 0.7.10; install with
     `cargo install dioxus-cli --version 0.7.10 --locked`.
 
@@ -67,7 +67,7 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-EDITOR_DIRECTORY = REPO_ROOT / "modules" / "pill_editor"
+EDITOR_DIRECTORY = REPO_ROOT / "modules" / "frontents" / "pill_editor"
 DEFAULT_PROJECT = REPO_ROOT / "examples" / "project_rs"
 DX_BUILD_DIRECTORY = (
     REPO_ROOT

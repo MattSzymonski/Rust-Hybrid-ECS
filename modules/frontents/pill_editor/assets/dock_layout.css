@@ -1,0 +1,491 @@
+:root {
+    --dock-bg: rgb(64, 64, 64);
+    --dock-bg-raised: rgb(74, 74, 74);
+    --dock-border: rgb(38, 38, 38);
+    --dock-text: rgb(232, 232, 232);
+    --dock-muted: rgb(175, 175, 175);
+    --dock-accent: rgb(74, 144, 226);
+    --dock-tab-strip-height: 30px;
+    --dock-splitter-size: 5px;
+    --dock-checker: linear-gradient(45deg, rgba(255, 255, 255, 0.055) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.055) 75%), linear-gradient(45deg, rgba(255, 255, 255, 0.055) 25%, transparent 25%, transparent 75%, rgba(255, 255, 255, 0.055) 75%);
+}
+
+html,
+body {
+    margin: 0;
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    background: transparent !important;
+    color: var(--dock-text);
+    font-family: Inter, "Segoe UI", sans-serif;
+    user-select: none;
+}
+
+.dock-root {
+    position: fixed;
+    inset: 0;
+    overflow: hidden;
+    background: transparent;
+}
+
+.dock-checker {
+    background-color: var(--dock-bg);
+    background-image: var(--dock-checker);
+    background-size: 16px 16px;
+    background-position: 0 0, 8px 8px;
+}
+
+.dock-tabset {
+    position: absolute;
+    box-sizing: border-box;
+    border: 1px solid var(--dock-border);
+    pointer-events: none;
+    z-index: 3;
+}
+
+.dock-tab-strip {
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 0;
+    height: var(--dock-tab-strip-height);
+    display: flex;
+    align-items: stretch;
+    overflow: hidden;
+    pointer-events: auto;
+    border-bottom: 1px solid var(--dock-border);
+    background: var(--dock-bg-raised);
+}
+
+.dock-tab {
+    height: 100%;
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 10px;
+    box-sizing: border-box;
+    border: 0;
+    border-right: 1px solid var(--dock-border);
+    border-bottom: 2px solid transparent;
+    background: rgb(56, 56, 56);
+    color: var(--dock-muted);
+    cursor: default;
+    font: inherit;
+    font-size: 12px;
+    white-space: nowrap;
+}
+
+.dock-tab:hover {
+    background: rgb(68, 68, 68);
+    color: var(--dock-text);
+}
+
+.dock-tab[aria-selected="true"] {
+    color: white;
+    background: var(--dock-bg);
+    border-bottom-color: var(--dock-accent);
+}
+
+.dock-tab:focus-visible,
+.dock-undock:focus-visible,
+.dock-close:focus-visible,
+.dock-splitter:focus-visible {
+    outline: 2px solid var(--dock-accent);
+    outline-offset: -2px;
+}
+
+.dock-undock,
+.dock-close {
+    width: 16px;
+    height: 16px;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    line-height: 14px;
+    cursor: pointer;
+}
+
+.dock-undock:hover,
+.dock-close:hover {
+    color: white;
+}
+
+.dock-panel-host {
+    position: absolute;
+    box-sizing: border-box;
+    overflow: hidden;
+    z-index: 1;
+}
+
+.dock-panel-scene {
+    background: transparent;
+}
+
+/* Covers the Scene viewport and takes its keyboard, pointer and wheel input
+   for the game. Transparent, so the engine's surface behind it shows. */
+.dock-scene-input {
+    position: absolute;
+    inset: 0;
+    outline: none;
+    touch-action: none;
+}
+
+.dock-viewport-fps {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    z-index: 2;
+    padding: 5px 8px;
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    border-radius: 4px;
+    background: rgba(20, 20, 20, 0.72);
+    color: white;
+    font-family: Consolas, monospace;
+    font-size: 12px;
+    line-height: 1;
+    pointer-events: none;
+}
+
+.dock-panel-placeholder {
+    width: 100%;
+    height: 100%;
+    box-sizing: border-box;
+    padding: 12px;
+    color: var(--dock-muted);
+    font-size: 12px;
+}
+
+.dock-panel-title {
+    margin-bottom: 10px;
+    color: var(--dock-text);
+    font-size: 13px;
+    font-weight: 600;
+}
+
+.dock-splitter {
+    position: absolute;
+    z-index: 5;
+    border: 0;
+    padding: 0;
+    background: rgb(44, 44, 44);
+}
+
+.dock-splitter:hover {
+    background: var(--dock-accent);
+}
+
+.dock-splitter-horizontal {
+    cursor: col-resize;
+}
+
+.dock-splitter-vertical {
+    cursor: row-resize;
+}
+
+.dock-statistics {
+    margin: 12px;
+    width: max-content;
+    padding: 10px 14px;
+    border-radius: 6px;
+    background: rgba(20, 20, 20, 0.72);
+    color: white;
+    font-family: Consolas, monospace;
+    font-size: 12px;
+}
+
+.dock-drop-preview {
+    position: absolute;
+    z-index: 20;
+    box-sizing: border-box;
+    border: 2px solid rgba(92, 168, 255, 0.95);
+    background: rgba(74, 144, 226, 0.28);
+    pointer-events: none;
+}
+
+.dock-layout-tools {
+    position: fixed;
+    right: 8px;
+    bottom: 8px;
+    z-index: 30;
+    display: flex;
+    gap: 6px;
+    padding: 6px;
+    border: 1px solid var(--dock-border);
+    border-radius: 5px;
+    background: rgba(42, 42, 42, 0.92);
+}
+
+.dock-tool-button {
+    padding: 4px 8px;
+    border: 1px solid rgb(92, 92, 92);
+    border-radius: 3px;
+    background: rgb(66, 66, 66);
+    color: var(--dock-text);
+    font: inherit;
+    font-size: 11px;
+}
+
+.dock-tool-button:hover {
+    background: rgb(82, 82, 82);
+}
+
+.dock-context-menu {
+    position: fixed;
+    z-index: 100;
+    min-width: 150px;
+    box-sizing: border-box;
+    padding: 4px;
+    border: 1px solid rgb(34, 34, 34);
+    border-radius: 4px;
+    background: rgb(52, 52, 52);
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.42);
+}
+
+.dock-context-menu-item {
+    display: block;
+    width: 100%;
+    padding: 6px 10px;
+    border: 0;
+    border-radius: 2px;
+    background: transparent;
+    color: var(--dock-text);
+    font: inherit;
+    font-size: 12px;
+    text-align: left;
+}
+
+.dock-context-menu-item:hover,
+.dock-context-menu-item:focus-visible {
+    outline: none;
+    background: var(--dock-accent);
+    color: white;
+}
+
+.dock-detached-root {
+    position: fixed;
+    inset: 0;
+    overflow: hidden;
+}
+
+.dock-detached-panel {
+    position: absolute;
+    inset: 0;
+}
+
+/* ------------------------------------------------------------------ *
+ * Editor data panels (Hierarchy / Inspector / Systems / Console).
+ * Rendered inside .dock-panel-host, which is already a positioned
+ * box; these classes only style the document flow within it.
+ * ------------------------------------------------------------------ */
+
+.editor-panel {
+    position: absolute;
+    inset: 0;
+    overflow: auto;
+    padding: 6px 8px;
+    box-sizing: border-box;
+    color: var(--dock-text);
+    font-size: 12px;
+}
+
+.editor-panel-toolbar {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    margin-bottom: 6px;
+}
+
+.editor-panel-toolbar button,
+.editor-icon-button {
+    border: 1px solid rgb(70, 70, 70);
+    border-radius: 3px;
+    background: rgb(48, 48, 48);
+    color: var(--dock-text);
+    font: inherit;
+    font-size: 11px;
+    padding: 2px 8px;
+    cursor: pointer;
+}
+
+.editor-panel-toolbar button:hover,
+.editor-icon-button:hover {
+    background: var(--dock-accent);
+    color: white;
+}
+
+.editor-icon-button {
+    margin-left: auto;
+}
+
+.editor-panel-title,
+.editor-component-head {
+    font-weight: 600;
+    color: var(--dock-text);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.editor-panel-note {
+    font-size: 11px;
+    opacity: 0.75;
+    margin-bottom: 6px;
+}
+
+.editor-placeholder {
+    opacity: 0.6;
+    font-style: italic;
+    padding: 4px 0;
+}
+
+.editor-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.editor-list-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 3px 4px;
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+.editor-list-row:hover {
+    background: rgba(255, 255, 255, 0.07);
+}
+
+.editor-row-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.editor-row-subtitle {
+    font-size: 11px;
+    opacity: 0.7;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.editor-tag {
+    font-size: 10px;
+    padding: 1px 5px;
+    border-radius: 8px;
+    background: rgb(40, 62, 40);
+    color: rgb(150, 220, 150);
+}
+
+.editor-tag.editor-warn {
+    background: rgb(64, 54, 30);
+    color: rgb(230, 200, 120);
+}
+
+.editor-component {
+    margin: 6px 0;
+    padding: 4px 0;
+    border-top: 1px solid rgb(58, 58, 58);
+}
+
+.editor-field {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 2px 0;
+}
+
+.editor-field-name {
+    flex: 1 1 auto;
+    min-width: 90px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.editor-number {
+    flex: 0 0 120px;
+    border: 1px solid rgb(70, 70, 70);
+    border-radius: 3px;
+    background: rgb(28, 28, 28);
+    color: var(--dock-text);
+    padding: 2px 6px;
+    font: inherit;
+    font-size: 12px;
+    text-align: right;
+}
+
+.editor-checkbox {
+    width: 14px;
+    height: 14px;
+    accent-color: var(--dock-accent);
+}
+
+.editor-field-value {
+    flex: 0 1 auto;
+    opacity: 0.85;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Colour picker row: swatch block, native colour input, and alpha box. */
+.editor-color {
+    gap: 8px;
+}
+
+.editor-color-swatch {
+    flex: 0 0 22px;
+    width: 22px;
+    height: 22px;
+    border: 1px solid rgb(70, 70, 70);
+    border-radius: 3px;
+}
+
+.editor-color-input {
+    flex: 0 0 120px;
+    width: 46px;
+    height: 22px;
+    border: 1px solid rgb(70, 70, 70);
+    border-radius: 3px;
+    background: rgb(28, 28, 28);
+    padding: 0;
+}
+
+.editor-color-alpha {
+    flex: 0 0 56px;
+}
+
+.editor-select {
+    width: 100%;
+    margin-bottom: 4px;
+    border: 1px solid rgb(70, 70, 70);
+    border-radius: 3px;
+    background: rgb(28, 28, 28);
+    color: var(--dock-text);
+    font: inherit;
+    font-size: 12px;
+    padding: 2px 4px;
+}
+
+.editor-context-menu {
+    position: fixed;
+    z-index: 200;
+    background: rgb(52, 52, 52);
+    border: 1px solid rgb(34, 34, 34);
+    border-radius: 4px;
+    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.42);
+    padding: 4px;
+}
+
+.editor-hierarchy .editor-list-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0;
+}

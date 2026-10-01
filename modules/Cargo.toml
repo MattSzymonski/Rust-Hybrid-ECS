@@ -1,18 +1,23 @@
 [workspace]
 members = [
     "pill_assets",
-    "pill_editor",
     "pill_engine",
     "pill_engine_macros",
     "pill_core",
     "pill_core_macros",
-    "pill_csharp_bridge",
-    "pill_host",
-    "pill_renderer_api",
-    "pill_runtime",
-    "pill_hot_scan",
-    "pill_standalone",
-    "pill_web",
+    # The C# half of the engine: the bridge crate, plus the managed runtime and
+    # compiler that live beside it. This one is named explicitly rather than
+    # globbed, because `csharp/` is not all crates - the other two are MSBuild
+    # projects with no manifest for cargo to read.
+    "csharp/pill_csharp_bridge",
+    # Hosting and running a project: the runtime, the development host, the
+    # source scanner the host patches through, and the renderer contract. All
+    # four are crates, so this is the same scoping rule as the globs below.
+    "hosting/*",
+    # The frontends - `pill_standalone`, `pill_web`, `pill_editor` and the
+    # `pill_input` glue they share - live one level down, discovered the same
+    # way the extensions are: every path the glob matches must be a crate.
+    "frontents/*",
     # Every crate under `extensions/` is an extension, discovered by
     # this glob so adding one is just creating a directory. The glob is scoped
     # to that directory rather than the workspace root because every path it

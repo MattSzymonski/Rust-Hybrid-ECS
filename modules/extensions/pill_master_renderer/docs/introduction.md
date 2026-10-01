@@ -80,7 +80,7 @@ Three facts about that position:
 compile into a DLL the host swaps out while running. This one doesn't: it is  
 built around a live window surface and is driven from the host's own frame  
 loop. The host links it directly under its `rendering` feature  
-(`modules/pill_host/Cargo.toml` → `rendering = ["dep:winit", "dep:pill_master_renderer"]`).
+(`modules/hosting/pill_host/Cargo.toml` → `rendering = ["dep:winit", "dep:pill_master_renderer"]`).
 - **Projects never see wgpu.** A project depends on this crate with  
 `default-features = false` and touches only its data half — components and  
 assets. wgpu stays in the host's dependency graph, which is what lets a  

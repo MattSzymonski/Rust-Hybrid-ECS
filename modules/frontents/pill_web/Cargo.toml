@@ -1,0 +1,24 @@
+[package]
+name = "pill_web"
+version = "0.1.0"
+edition = "2021"
+
+[lints]
+workspace = true
+
+# The browser frontend: runs a statically linked project in a page's canvas.
+# Every dependency is wasm-only, so on native targets this crate compiles to
+# nothing and the workspace's native builds are unaffected.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+pill_core = { path = "../../pill_core" }
+# What runs the game: the engine, the linked project and the renderer attached
+# to the canvas.
+pill_runtime = { path = "../../hosting/pill_runtime", features = ["rendering"] }
+# The canvas window and the browser's event loop.
+winit = "0.30"
+# The canvas's keyboard and mouse events as engine input events.
+pill_input = { path = "../pill_input", features = ["winit"] }
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["console", "Document", "Element", "HtmlCanvasElement", "HtmlElement", "Window"] }
+# Panic messages in the browser console instead of `unreachable`.
+console_error_panic_hook = "0.1"

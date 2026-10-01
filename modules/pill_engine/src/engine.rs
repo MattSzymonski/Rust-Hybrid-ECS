@@ -268,11 +268,12 @@ impl Engine {
         crate::config::print_parallel_config();
 
         // Engine-owned resources, present before any project or module runs so
-        // nothing has to check whether they exist. Both are advanced or owned
+        // nothing has to check whether they exist. All are advanced or owned
         // by the engine itself rather than by a registered system, so a hot
         // reload - which retires systems by owner - cannot take them away.
         let mut world = World::new();
         world.insert_resource(crate::time::Time::new());
+        world.insert_resource(crate::input::Input::new());
         world.insert_resource(crate::asset::AssetManager::new());
 
         let engine = Self {
@@ -555,6 +556,27 @@ impl Engine {
     /// Returns a mutable reference to the world.
     pub fn world_mut(&mut self) -> &mut World {
         &mut self.world
+    }
+
+    // -------------------------------------------------------------------------
+    // Input
+    // -------------------------------------------------------------------------
+
+    /// Queue an input event from the frontend; it takes effect at the start of
+    /// the next frame. See [`crate::input`].
+    pub fn push_input_event(&mut self, event: crate::input::InputEvent) {
+        if let Some(input) = self.world.get_resource_mut::<crate::input::Input>() {
+            input.push_event(event);
+        }
+    }
+
+    /// Take the rumble requests systems queued, for the frontend that owns the
+    /// gamepads to play.
+    pub fn take_rumble_requests(&mut self) -> Vec<crate::input::RumbleRequest> {
+        self.world
+            .get_resource_mut::<crate::input::Input>()
+            .map(crate::input::Input::take_rumble_requests)
+            .unwrap_or_default()
     }
 
     // -------------------------------------------------------------------------
@@ -976,6 +998,13 @@ impl Engine {
             // every single frame tells a reader nothing.
             if let Some(time) = self.world.get_resource_mut::<crate::time::Time>() {
                 time.advance();
+            }
+
+            // Apply the input the frontend queued since the last frame, for
+            // the same reason and in the same way as the clock: every system
+            // in this frame sees the same keys, buttons and motion.
+            if let Some(input) = self.world.get_resource_mut::<crate::input::Input>() {
+                input.begin_frame();
             }
 
             // Debug-only: clear the resource write-lock tracker so that the

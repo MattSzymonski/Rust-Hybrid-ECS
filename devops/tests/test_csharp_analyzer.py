@@ -8,7 +8,7 @@ REQUIREMENTS
 
 DESCRIPTION
     Regression suite for the PILLxxxx compile-time rules in
-    `modules/pill_csharp_runtime/analyzers`. Those rules are the only guard
+    `modules/csharp/pill_csharp_runtime/analyzers`. Those rules are the only guard
     that catches several scripting hazards before they reach a running host -
     an await that escapes its frame, a static a parallel batch races on, a
     static event that roots the retiring load context - so a rule that quietly

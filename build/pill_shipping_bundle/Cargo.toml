@@ -5,7 +5,7 @@ edition = "2021"
 build = false
 
 [dependencies]
-pill_runtime = { path = "../../modules/pill_runtime" }
+pill_runtime = { path = "../../modules/hosting/pill_runtime" }
 project = { path = "../../examples/project_rs" }
 pill_master_renderer_data = { path = "../../modules/extensions/pill_master_renderer_data", default-features = false }
 pill_spline = { path = "../../modules/extensions/pill_spline", default-features = false }

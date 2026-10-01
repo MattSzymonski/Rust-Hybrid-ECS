@@ -96,8 +96,8 @@ EXTENSION_DIRECTORY = Path("modules") / "extensions"
 # The crates a bundle names: the runtime always (the static-link types), and the
 # C# bridge for a managed project (its external project backend). Never the
 # development host - a shipping build does not compile it at all.
-RUNTIME_CRATE_DIRECTORY = Path("modules") / "pill_runtime"
-CSHARP_BRIDGE_CRATE_DIRECTORY = Path("modules") / "pill_csharp_bridge"
+RUNTIME_CRATE_DIRECTORY = Path("modules") / "hosting" / "pill_runtime"
+CSHARP_BRIDGE_CRATE_DIRECTORY = Path("modules") / "csharp" / "pill_csharp_bridge"
 # The renderer, chosen by the project's `renderer:` setting exactly as the host
 # chooses it (`pill_host::config`): absent means the master renderer, `none`
 # means no renderer. Its data crate, `<renderer>_data`, is linked as the first
@@ -119,7 +119,7 @@ BUILD_SCRIPT_FILE_NAME = "build.rs"
 # canvas its page provides (`devops/tools/web/index.html`).
 WEB_APP_CRATE_NAME = "pill_web_app"
 WEB_APP_DIRECTORY = Path("build") / WEB_APP_CRATE_NAME
-WEB_CRATE_DIRECTORY = Path("modules") / "pill_web"
+WEB_CRATE_DIRECTORY = Path("modules") / "frontents" / "pill_web"
 WEB_CANVAS_ID = "pill-canvas"
 
 # Managed (C#) project constants, mirroring `pill_host::config` so a generated
@@ -127,7 +127,7 @@ WEB_CANVAS_ID = "pill-canvas"
 # host derives the same four values in `csharp_from_manifest`; a shipping build
 # has no project path to read, so the generator states them instead.
 CSHARP_RUNTIME_ASSEMBLY_NAME = "csharp_runtime"
-CSHARP_RUNTIME_OUTPUT_SUBDIRECTORY = "pill_csharp_runtime/bin/Release/net8.0"
+CSHARP_RUNTIME_OUTPUT_SUBDIRECTORY = "csharp/pill_csharp_runtime/bin/Release/net8.0"
 CSHARP_TARGET_FRAMEWORK = "net8.0"
 # The engine workspace root, against which the managed config's output
 # subdirectories are resolved (the workspace manifest globs `modules/*`).

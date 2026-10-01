@@ -374,7 +374,7 @@ def copy_managed_artifacts(
             copied.append(source_name)
     # The C# runtime the project references, from the same dotnet build; it
     # lives in the engine workspace, not under the project.
-    runtime_output = workspace_root / "pill_csharp_runtime" / "bin" / "Release" / "net8.0"
+    runtime_output = workspace_root / "csharp" / "pill_csharp_runtime" / "bin" / "Release" / "net8.0"
     for source_name in ("csharp_runtime.dll", "csharp_runtime.runtimeconfig.json"):
         source = runtime_output / source_name
         if source.is_file():

@@ -350,8 +350,8 @@ if [[ -n "${artifacts_directory}" ]]; then
         for source in \
             "${project_root}/bin/Release/net8.0/${managed_assembly_name}.dll" \
             "${project_root}/bin/Release/net8.0/${managed_assembly_name}.pdb" \
-            "${workspace_directory}/pill_csharp_runtime/bin/Release/net8.0/csharp_runtime.dll" \
-            "${workspace_directory}/pill_csharp_runtime/bin/Release/net8.0/csharp_runtime.runtimeconfig.json"; do
+            "${workspace_directory}/csharp/pill_csharp_runtime/bin/Release/net8.0/csharp_runtime.dll" \
+            "${workspace_directory}/csharp/pill_csharp_runtime/bin/Release/net8.0/csharp_runtime.runtimeconfig.json"; do
             if [[ -f "${source}" ]]; then
                 cp -f "${source}" "${artifacts_directory}/"
                 echo "  artifact: $(basename "${source}")"

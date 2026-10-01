@@ -7,6 +7,8 @@
 //!   run, and load the helmet: its mesh, its four PBR maps, and the material
 //!   built from them through that chain's shader.
 //! - Create the scene: a camera and one spinning helmet.
+//! - Let the player turn the helmet and move the camera with the mouse,
+//!   keyboard or a gamepad (`controls`).
 //!
 //! # Design
 //!
@@ -22,6 +24,7 @@ use pill_engine::{pill_project, Engine, PillComponent};
 use serde::{Deserialize, Serialize};
 
 mod asset_loading;
+mod controls;
 mod scene;
 mod systems;
 
@@ -53,6 +56,9 @@ pub fn init(engine: &mut Engine) -> u32 {
     }
 
     engine.register_system("helmet_rotation", systems::rotation_system);
+    engine.register_system("helmet_control", controls::helmet_control_system);
+    engine.register_system("camera_zoom", controls::camera_zoom_system);
+    engine.register_system("gamepad_rumble", controls::rumble_system);
     0
 }
 
@@ -78,6 +84,32 @@ mod tests {
             .count();
         assert_eq!(model_count, 1);
         assert_eq!(camera_count, 1);
+    }
+
+    /// Input a frontend queues reaches this frame's systems: two wheel lines
+    /// up bring the camera two zoom steps closer.
+    #[test]
+    fn scrolling_moves_the_camera_in_the_same_frame() {
+        use pill_engine::{InputEvent, ScrollDelta};
+        use pill_master_renderer_data::TransformComponent;
+
+        let mut engine = Engine::new();
+        assert_eq!(init(&mut engine), 0);
+        let camera_distance = |engine: &mut Engine| {
+            Query::<(&TransformComponent, &CameraComponent)>::new(engine.world_mut())
+                .iter_mut()
+                .map(|(transform, _)| transform.translation[2])
+                .next()
+                .expect("one camera")
+        };
+        let before = camera_distance(&mut engine);
+
+        engine.push_input_event(InputEvent::MouseWheel {
+            delta: ScrollDelta::Lines(glam::Vec2::new(0.0, 2.0)),
+        });
+        engine.process_frame().expect("frame runs");
+
+        assert_eq!(camera_distance(&mut engine), before - 0.5);
     }
 
     /// The committed helmet decodes: the OBJ into the mesh the converter
