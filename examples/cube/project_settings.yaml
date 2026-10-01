@@ -1,0 +1,16 @@
+# Project settings for the cube example: one spinning cube, ported from the
+# previous engine's `examples/cube`. Built mainly for the browser:
+#   python devops/tools/build_web.py examples/cube
+#
+# `name` is the display name (window title); `build_binary_name` is the
+# artifact file base and must contain only letters, digits and underscores.
+# `modules` lists the extensions the project uses; the cube needs none beyond
+# the renderer, which the host and the web build add on their own.
+
+name: "Cube"
+build_binary_name: "Cube"
+version: "0.1.0"
+author: "Matt Szymonski"
+description: "One spinning cube through the simple lit pipeline."
+
+modules: []
