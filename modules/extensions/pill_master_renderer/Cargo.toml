@@ -23,7 +23,6 @@ miette = { version = "7", features = ["derive"] }
 glam = { version = "0.33", features = ["serde", "bytemuck"] }
 bytemuck = { version = "1.4", features = ["derive"] }
 wgpu = "25.0.0"
-pollster = "0.4"
 # The GPU caches key their slot tables the way the shader assets do.
 indexmap = "2"
 # The renderer contract: the backend trait this crate implements, the frame it
@@ -38,4 +37,11 @@ default = []
 # The C ABI exports (`pill_module_init`, `pill_renderer_attach`,
 # `pill_renderer_detach`). Opt-in, like every module's: the host's module build
 # turns it on, and a crate linking this as an rlib never exports the symbols.
-module-abi = []
+module-abi = ["validation-capture"]
+# Block on wgpu's error scopes during a frame, so a pipeline, bind group or
+# texture the device refuses - an edited shader, most often - is reported and
+# skipped instead of reaching the device's error handler. A development
+# capability: only a native build can block, and a loaded module is always a
+# development build, so `module-abi` turns it on. Without it the handler logs
+# the error.
+validation-capture = []

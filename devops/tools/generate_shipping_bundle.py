@@ -6,7 +6,7 @@
 
 # DESCRIPTION: Generates the shipping bundle crate for the static (shipping)
 #   posture of the engine host. The bundle is the single crate `pill_standalone`
-#   links under `static_project`: it declares the project and every extension
+#   links under `shipping`: it declares the project and every extension
 #    selected by the project's `project_settings.yaml` as ordinary Rust
 #   dependencies, and exposes the `StaticModule` / `StaticProject` registration
 #   the static-link path initializes.
@@ -14,11 +14,11 @@
 #   The project's scripting language is read from its manifest: a `Cargo.toml`
 #   is a native Rust project, a `*.csproj` is a managed C# project. A managed
 #   project has no cargo dependency to declare; its `project_backend()` instead
-#   returns the `StaticProjectBackend::CSharp` configuration, resolving the
-#   assemblies `dotnet build` produced against the engine workspace root. With
-#   `--csharp-aot` the backend becomes `StaticProjectBackend::CSharpAot` and the
+#   returns an external backend, the C# bridge's `CSharpBackend::coreclr`,
+#   resolving the assemblies `dotnet build` produced against the engine
+#   workspace root. With `--csharp-aot` it is `CSharpBackend::native_aot` and the
 #   project subdirectory points at the `dotnet publish` NativeAOT output, which
-#   the host loads directly (no hostfxr, no installed .NET).
+#   the runtime loads directly (no hostfxr, no installed .NET).
 #
 #   Cargo resolves dependencies before build scripts run, so a `build.rs`
 #   cannot pull modules in from a YAML file; this generator runs before cargo
@@ -26,7 +26,19 @@
 #   under `<repository_root>/build/pill_shipping_bundle/`. The location is
 #   project-agnostic (cargo needs a static path, and only one shipping binary
 #   is built at a time), so `pill_standalone`'s manifest never names a specific
-#   project. The host links it by path (like the project itself), so no
+#   project.
+#
+#   A project with a `res` directory also gets a `build.rs` in the bundle: it
+#   packs that directory with `pill_assets::write_asset_pack` at build time, and
+#   the bundle embeds the pack as `StaticProject::asset_pack`, which the
+#   runtime mounts in the engine's asset store. A shipped game then reads its
+#   assets from its own binary, wherever it runs.
+#
+#   With `--web` it also writes the web app crate, `build/pill_web_app`: a
+#   `cdylib` whose `#[wasm_bindgen(start)]` shim runs the bundle's project
+#   through `pill_web` on the page's canvas. It has a `[workspace]` of its own,
+#   so the engine workspace's native feature choices and `.cargo` settings stay
+#   out of the wasm build. `devops/tools/build_web.py` builds it. The host links it by path (like the project itself), so no
 #   workspace edit is needed; the folder is gitignored, and regeneration is
 #   content-based: unchanged output is not rewritten, so a stable tree shows
 #   no diff.
@@ -39,13 +51,15 @@
 #                            release build forwards its requested features,
 #                            so e.g. `--feature rendering` makes the static
 #                            build link the project's renderer components.
-#          --csharp-aot      emit the NativeAOT backend (`CSharpAot`) instead
+#          --csharp-aot      emit the NativeAOT backend (`native_aot`) instead
 #                            of the hostfxr one, for a managed project whose
 #                            assembly was published with `dotnet publish
 #                            -p:PublishAot=true`.
 #          --rid <rid>       runtime identifier for the NativeAOT publish
 #                            output path (default win-x64; only meaningful
 #                            with --csharp-aot).
+#          --web             also write the web app crate for a browser build
+#                            (implies `--feature rendering`; Rust projects only).
 #          [project_path]    workspace-relative path to the project directory
 #                            (e.g. examples/project_rs). When omitted, the
 #                            PROJECT_PATH environment variable is used - the
@@ -55,6 +69,7 @@
 #   python devops/tools/generate_shipping_bundle.py examples/project_rs
 #   python devops/tools/generate_shipping_bundle.py --feature rendering examples/project_rs
 #   python devops/tools/generate_shipping_bundle.py examples/project_cs
+#   python devops/tools/generate_shipping_bundle.py --web examples/master_renderer_test
 #   set PROJECT_PATH=examples/project_rs
 #   python devops/tools/generate_shipping_bundle.py
 
@@ -78,7 +93,11 @@ BUNDLE_DIRECTORY = Path("build") / BUNDLE_CRATE_NAME
 PROJECT_SETTINGS_FILE_NAME = "project_settings.yaml"
 PROJECT_MANIFEST_FILE_NAME = "Cargo.toml"
 EXTENSION_DIRECTORY = Path("modules") / "extensions"
-HOST_CRATE_DIRECTORY = Path("modules") / "pill_host"
+# The crates a bundle names: the runtime always (the static-link types), and the
+# C# bridge for a managed project (its external project backend). Never the
+# development host - a shipping build does not compile it at all.
+RUNTIME_CRATE_DIRECTORY = Path("modules") / "pill_runtime"
+CSHARP_BRIDGE_CRATE_DIRECTORY = Path("modules") / "pill_csharp_bridge"
 # The renderer, chosen by the project's `renderer:` setting exactly as the host
 # chooses it (`pill_host::config`): absent means the master renderer, `none`
 # means no renderer. Its data crate, `<renderer>_data`, is linked as the first
@@ -90,6 +109,18 @@ NO_RENDERER = "none"
 RENDERER_DATA_SUFFIX = "_data"
 # The requested feature that makes a shipping build windowed.
 RENDERING_FEATURE = "rendering"
+# The project's asset directory, packed into the binary when it exists, and the
+# crate whose build-time writer packs it.
+ASSETS_DIRECTORY_NAME = "res"
+ASSETS_CRATE_DIRECTORY = Path("modules") / "pill_assets"
+ASSET_PACK_FILE_NAME = "assets.pillpack"
+BUILD_SCRIPT_FILE_NAME = "build.rs"
+# The web app crate `--web` writes, the frontend it runs on, and the id of the
+# canvas its page provides (`devops/tools/web/index.html`).
+WEB_APP_CRATE_NAME = "pill_web_app"
+WEB_APP_DIRECTORY = Path("build") / WEB_APP_CRATE_NAME
+WEB_CRATE_DIRECTORY = Path("modules") / "pill_web"
+WEB_CANVAS_ID = "pill-canvas"
 
 # Managed (C#) project constants, mirroring `pill_host::config` so a generated
 # bundle resolves assemblies exactly where `dotnet build` produced them. The
@@ -285,25 +316,34 @@ def build_cargo_manifest(
     root: Path,
     managed: bool = False,
     renderer=None,
+    packs_assets: bool = False,
 ) -> str:
     """Builds the generated bundle's Cargo.toml text.
 
     `renderer` is the GPU crate a windowed build links, or None.
+    `packs_assets` adds the asset packer the bundle's build script runs.
     """
     lines = [
         "[package]",
         f'name = "{BUNDLE_CRATE_NAME}"',
         'version = "0.0.0"',
         'edition = "2021"',
+        # Without assets there is no build script. Saying so explicitly makes
+        # cargo ignore a `build.rs` left behind by an earlier project's bundle
+        # (it is gitignored, so restoring the stub does not remove it).
+        *([] if packs_assets else ["build = false"]),
         "",
         "[dependencies]",
-        # The host, so the table can name StaticModule / StaticProjectBackend.
-        # default-features = false keeps hot_reload off, because those types
-        # exist only in the static posture.
-        "pill_host = { path = "
-        f'"{manifest_relative_path(bundle_directory, root / HOST_CRATE_DIRECTORY)}", '
-        'default-features = false }',
+        # The runtime, so the table can name StaticModule / StaticProjectBackend.
+        "pill_runtime = { path = "
+        f'"{manifest_relative_path(bundle_directory, root / RUNTIME_CRATE_DIRECTORY)}" }}',
     ]
+    if managed:
+        # The C# bridge, whose backend starts the managed project.
+        lines.append(
+            "pill_csharp_bridge = { path = "
+            f'"{manifest_relative_path(bundle_directory, root / CSHARP_BRIDGE_CRATE_DIRECTORY)}" }}'
+        )
     if not managed:
         # The native project itself, so `project::init` is nameable. Any
         # requested feature the project actually declares is enabled so the
@@ -342,6 +382,43 @@ def build_cargo_manifest(
         lines.append(
             f'{renderer} = {{ path = "{renderer_path}", default-features = false }}'
         )
+    if packs_assets:
+        # The build script packs the project's `res` directory with it.
+        assets_path = manifest_relative_path(bundle_directory, root / ASSETS_CRATE_DIRECTORY)
+        lines += ["", "[build-dependencies]", f'pill_assets = {{ path = "{assets_path}" }}']
+    return "\n".join(lines) + "\n"
+
+
+def build_build_script(bundle_directory: Path, assets_directory: Path) -> str:
+    """Builds the bundle's build.rs, which packs `assets_directory` into OUT_DIR.
+
+    The directory is named relative to the bundle, like every dependency path,
+    so the generated file does not change with the checkout's location.
+    """
+    relative_assets = manifest_relative_path(bundle_directory, assets_directory)
+    lines = [
+        "//! Generated shipping bundle build script - do not edit. Regenerated by",
+        "//! `devops/tools/generate_shipping_bundle.py`.",
+        "//!",
+        "//! # Responsibilities",
+        "//!",
+        "//! - Pack the project's `res` directory into `OUT_DIR`, where `src/lib.rs`",
+        "//!   embeds it as the project's asset pack.",
+        "",
+        "fn main() {",
+        "    let manifest_directory = std::path::PathBuf::from(env!(\"CARGO_MANIFEST_DIR\"));",
+        f'    let source = manifest_directory.join("{relative_assets}");',
+        "    let output = std::path::PathBuf::from(std::env::var(\"OUT_DIR\").expect(\"cargo sets OUT_DIR\"))",
+        f'        .join("{ASSET_PACK_FILE_NAME}");',
+        "    let packed = pill_assets::write_asset_pack(&source, &output)",
+        "        .unwrap_or_else(|error| panic!(\"cannot pack {}: {error}\", source.display()));",
+        "    // The directory itself too, so an added or removed file repacks.",
+        "    println!(\"cargo:rerun-if-changed={}\", source.display());",
+        "    for file in packed {",
+        "        println!(\"cargo:rerun-if-changed={}\", file.display());",
+        "    }",
+        "}",
+    ]
     return "\n".join(lines) + "\n"
 
 
@@ -356,17 +433,19 @@ def build_library_source(
     aot: bool = False,
     rid: str = "win-x64",
     renderer=None,
+    packs_assets: bool = False,
 ) -> str:
     """Builds the generated bundle's src/lib.rs text.
 
     `renderer` is the GPU crate a windowed build links, or None.
+    `packs_assets` embeds the asset pack the build script wrote.
     """
     lines = [
         "//! Generated shipping bundle - do not edit. Regenerated from",
         "//! the project's `project_settings.yaml` by",
         "//! `devops/tools/generate_shipping_bundle.py`.",
         "",
-        "use pill_host::{StaticModule, StaticProject, StaticProjectBackend, StaticRenderer};",
+        "use pill_runtime::{StaticModule, StaticProject, StaticProjectBackend, StaticRenderer};",
         "",
         "/// Every selected extension: the renderer's data crate first, then",
         "/// `project_settings.yaml` order.",
@@ -401,33 +480,28 @@ def build_library_source(
             project_subdirectory = (
                 f"../{project_path}/bin/Release/{CSHARP_TARGET_FRAMEWORK}/{rid}/publish"
             )
-            lines += [
-                "pub fn project_backend() -> StaticProjectBackend {",
-                "    StaticProjectBackend::CSharpAot {",
-                "        config: pill_host::CSharpModuleConfig::new(",
-                f'            "{CSHARP_RUNTIME_ASSEMBLY_NAME}",',
-                f'            "{CSHARP_RUNTIME_OUTPUT_SUBDIRECTORY}",',
-                f'            "{package_name}",',
-                f'            "{project_subdirectory}",',
-                "        ),",
-                f'        root: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("{workspace_relative_path}"),',
-                "    }",
-                "}",
-            ]
+            constructor = "native_aot"
         else:
-            lines += [
-                "pub fn project_backend() -> StaticProjectBackend {",
-                "    StaticProjectBackend::CSharp {",
-                "        config: pill_host::CSharpModuleConfig::new(",
-                f'            "{CSHARP_RUNTIME_ASSEMBLY_NAME}",',
-                f'            "{CSHARP_RUNTIME_OUTPUT_SUBDIRECTORY}",',
-                f'            "{package_name}",',
-                f'            "../{project_path}/bin/Release/{CSHARP_TARGET_FRAMEWORK}",',
-                "        ),",
-                f'        root: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("{workspace_relative_path}"),',
-                "    }",
-                "}",
-            ]
+            project_subdirectory = f"../{project_path}/bin/Release/{CSHARP_TARGET_FRAMEWORK}"
+            constructor = "coreclr"
+        # The runtime names no C# type: the bridge's backend is handed over as
+        # an external project backend, which the runtime starts after the
+        # extensions and keeps alive beside the engine.
+        lines += [
+            "pub fn project_backend() -> StaticProjectBackend {",
+            "    StaticProjectBackend::External(std::sync::Arc::new(",
+            f"        pill_csharp_bridge::CSharpBackend::{constructor}(",
+            "            pill_csharp_bridge::CSharpModuleConfig::new(",
+            f'                "{CSHARP_RUNTIME_ASSEMBLY_NAME}",',
+            f'                "{CSHARP_RUNTIME_OUTPUT_SUBDIRECTORY}",',
+            f'                "{package_name}",',
+            f'                "{project_subdirectory}",',
+            "            ),",
+            f'            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("{workspace_relative_path}"),',
+            "        ),",
+            "    ))",
+            "}",
+        ]
     else:
         lines += [
             "pub fn project_backend() -> StaticProjectBackend {",
@@ -462,7 +536,64 @@ def build_library_source(
         "        backend: project_backend(),",
         "        modules: STATIC_MODULES,",
         "        renderer: static_renderer(),",
+        (
+            f'        asset_pack: Some(include_bytes!(concat!(env!("OUT_DIR"), "/{ASSET_PACK_FILE_NAME}"))),'
+            if packs_assets
+            else "        asset_pack: None,"
+        ),
         "    }",
+        "}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def build_web_app_manifest(web_app_directory: Path, root: Path) -> str:
+    """Builds the web app crate's Cargo.toml text.
+
+    The empty `[workspace]` makes the crate its own workspace root: the wasm
+    build resolves features for this crate alone, and cargo does not look for
+    an enclosing workspace.
+    """
+    web_path = manifest_relative_path(web_app_directory, root / WEB_CRATE_DIRECTORY)
+    bundle_path = manifest_relative_path(web_app_directory, root / BUNDLE_DIRECTORY)
+    lines = [
+        "[package]",
+        f'name = "{WEB_APP_CRATE_NAME}"',
+        'version = "0.0.0"',
+        'edition = "2021"',
+        "",
+        "[lib]",
+        'crate-type = ["cdylib"]',
+        "",
+        "[dependencies]",
+        f'pill_web = {{ path = "{web_path}" }}',
+        f'{BUNDLE_CRATE_NAME} = {{ path = "{bundle_path}" }}',
+        'wasm-bindgen = "0.2"',
+        "",
+        "# Its own workspace: nothing of the engine workspace's native builds takes",
+        "# part in this one.",
+        "[workspace]",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def build_web_app_source() -> str:
+    """Builds the web app crate's src/lib.rs: the browser entry point."""
+    lines = [
+        "//! Generated web app - do not edit. Regenerated by",
+        "//! `devops/tools/generate_shipping_bundle.py --web`.",
+        "//!",
+        "//! # Responsibilities",
+        "//!",
+        "//! - Run the shipping bundle's project in the page's canvas when the",
+        "//!   browser has instantiated this module.",
+        "",
+        "use wasm_bindgen::prelude::wasm_bindgen;",
+        "",
+        "/// The entry point the browser calls once the module is instantiated.",
+        "#[wasm_bindgen(start)]",
+        "pub fn start() {",
+        f'    pill_web::run({BUNDLE_CRATE_NAME}::static_project(), "{WEB_CANVAS_ID}");',
         "}",
     ]
     return "\n".join(lines) + "\n"
@@ -485,10 +616,11 @@ def main() -> int:
     resolution the host uses at startup.
     """
     # Parse `--feature <name>` (repeatable), `--csharp-aot`, `--rid <rid>`,
-    # and the optional project path.
+    # `--web`, and the optional project path.
     arguments = sys.argv[1:]
     requested_features = []
     aot = False
+    web = False
     rid = "win-x64"
     positional = []
     index = 0
@@ -504,6 +636,10 @@ def main() -> int:
             requested_features.append(argument[len("--feature=") :])
         elif argument == "--csharp-aot":
             aot = True
+        elif argument == "--web":
+            # A browser build always draws: it links the renderer.
+            web = True
+            requested_features.append(RENDERING_FEATURE)
         elif argument == "--rid":
             index += 1
             if index >= len(arguments):
@@ -566,6 +702,13 @@ def main() -> int:
     except (FileNotFoundError, ValueError, yaml.YAMLError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
+    if web and kind == "managed":
+        print(
+            "error: --web supports Rust projects only; a C# project cannot run in "
+            f"a browser yet, and {project_path} is a managed (`.csproj`) project",
+            file=sys.stderr,
+        )
+        return 1
     if aot and kind != "managed":
         print(
             "error: --csharp-aot requires a managed (`.csproj`) project; "
@@ -614,6 +757,9 @@ def main() -> int:
     # binary-name record land in the shared `<repo>/build/` scratch location,
     # not under the project, so `pill_standalone`'s manifest path stays static.
     bundle_directory = root / BUNDLE_DIRECTORY
+    # A project with a `res` directory ships it packed inside the binary.
+    assets_directory = project_root / ASSETS_DIRECTORY_NAME
+    packs_assets = assets_directory.is_dir()
     cargo_manifest = build_cargo_manifest(
         bundle_directory,
         project_root,
@@ -623,6 +769,7 @@ def main() -> int:
         root,
         managed=(kind == "managed"),
         renderer=linked_renderer,
+        packs_assets=packs_assets,
     )
     library_source = build_library_source(
         package_name,
@@ -635,16 +782,40 @@ def main() -> int:
         aot=aot and kind == "managed",
         rid=rid,
         renderer=linked_renderer,
+        packs_assets=packs_assets,
     )
     wrote_manifest = write_if_changed(
         bundle_directory / PROJECT_MANIFEST_FILE_NAME, cargo_manifest
     )
     wrote_source = write_if_changed(bundle_directory / "src" / "lib.rs", library_source)
+    # The build script exists only while there is a `res` to pack; a stale one
+    # from the previous project would pack the wrong directory.
+    build_script_path = bundle_directory / BUILD_SCRIPT_FILE_NAME
+    if packs_assets:
+        wrote_source |= write_if_changed(
+            build_script_path, build_build_script(bundle_directory, assets_directory)
+        )
+    elif build_script_path.is_file():
+        build_script_path.unlink()
+        wrote_source = True
     project_name_path = root / "build" / "build_meta" / "build_binary_name.txt"
     wrote_name = write_if_changed(project_name_path, build_binary_name + "\n")
 
     print(f"shipping bundle: {os.path.relpath(bundle_directory, root)}")
     print("  regenerated (changed)" if wrote_manifest or wrote_source else "  unchanged")
+
+    # Step 5: the web app crate, for a browser build.
+    if web:
+        web_app_directory = root / WEB_APP_DIRECTORY
+        wrote_web = write_if_changed(
+            web_app_directory / PROJECT_MANIFEST_FILE_NAME,
+            build_web_app_manifest(web_app_directory, root),
+        )
+        wrote_web |= write_if_changed(
+            web_app_directory / "src" / "lib.rs", build_web_app_source()
+        )
+        print(f"web app: {os.path.relpath(web_app_directory, root)}")
+        print("  regenerated (changed)" if wrote_web else "  unchanged")
     print(f"build binary name: {build_binary_name}")
     return 0
 

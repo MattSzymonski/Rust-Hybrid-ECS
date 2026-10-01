@@ -6,10 +6,13 @@ members = [
     "pill_engine_macros",
     "pill_core",
     "pill_core_macros",
+    "pill_csharp_bridge",
     "pill_host",
     "pill_renderer_api",
+    "pill_runtime",
     "pill_hot_scan",
     "pill_standalone",
+    "pill_web",
     # Every crate under `extensions/` is an extension, discovered by
     # this glob so adding one is just creating a directory. The glob is scoped
     # to that directory rather than the workspace root because every path it

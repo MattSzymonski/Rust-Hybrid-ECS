@@ -5,7 +5,8 @@
 //! - Define [`RendererWindow`], the bound a frontend's window type meets: any
 //!   window that hands out `raw-window-handle` 0.6 handles (winit, tao).
 //! - Attach a renderer to such a window from its handles as plain data
-//!   ([`attach_window`]), and keep the window alive beside it.
+//!   ([`attach_window`], or [`attach_window_async`] for a renderer built by a
+//!   future), and keep the window alive beside it.
 //!
 //! # Design
 //!
@@ -17,6 +18,7 @@
 
 // Standard library
 use std::any::Any;
+use std::future::Future;
 
 // External crates
 use pill_renderer_api::raw_window::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -55,5 +57,25 @@ pub(crate) fn attach_window<W: RendererWindow>(
 ) -> Result<(Box<dyn PillRenderer>, AttachedWindow, RawWindowData), RendererError> {
     let window_data = RawWindowData::from_window(&window)?;
     let renderer = attach(window_data)?;
+    Ok((renderer, Box::new(window), window_data))
+}
+
+/// [`attach_window`] with a renderer that is built asynchronously: `attach`
+/// returns the future that builds it, and the window is kept across the wait.
+///
+/// # Errors
+///
+/// Returns a [`RendererError`] when the window cannot give its handles or the
+/// future `attach` returns fails.
+pub(crate) async fn attach_window_async<W, F>(
+    window: W,
+    attach: impl FnOnce(RawWindowData) -> F,
+) -> Result<(Box<dyn PillRenderer>, AttachedWindow, RawWindowData), RendererError>
+where
+    W: RendererWindow,
+    F: Future<Output = Result<Box<dyn PillRenderer>, RendererError>>,
+{
+    let window_data = RawWindowData::from_window(&window)?;
+    let renderer = attach(window_data).await?;
     Ok((renderer, Box::new(window), window_data))
 }

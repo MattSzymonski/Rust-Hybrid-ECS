@@ -49,7 +49,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # Configuration
 # =============================================================================
 
-MODULE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "src" / "lib.rs"
+MODULE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "src" / "pill_spline.rs"
 
 # The host has no environment-variable override for the extension list,
 # so this test drives it the same way a person would: by writing the project's
@@ -213,7 +213,7 @@ def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
             "pill_standalone",
             "--no-default-features",
             "--features",
-            "hot_reload,rendering",
+            "dev,rendering",
         ],
         MODULES_ROOT,
         process_environment,
@@ -241,7 +241,7 @@ def build_workspace() -> bool:
                 "pill_standalone",
                 "--no-default-features",
                 "--features",
-                "hot_reload,rendering",
+                "dev,rendering",
             ],
             cwd=str(MODULES_ROOT),
             capture_output=True,
@@ -294,7 +294,7 @@ def run_suite(expected_midpoint: str) -> bool:
 
         baseline_x, baseline_y = last_probe_midpoint(monitor.output_since(0))
 
-        print("  [TEST] Editing pill_spline/src/lib.rs...")
+        print("  [TEST] Editing pill_spline/src/pill_spline.rs...")
         old_line, new_line, offset_delta = plan_value_edit(ORIGINAL_CONTENT)
         atomic_write(ORIGINAL_CONTENT.replace(old_line, new_line, 1))
         print("  [OK] Module source edited.")

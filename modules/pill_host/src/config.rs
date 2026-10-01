@@ -28,6 +28,7 @@ use std::sync::OnceLock;
 
 // External crates
 use pill_core::error::ConfigError;
+use pill_csharp_bridge::CSharpModuleConfig;
 use toml_edit::{value, DocumentMut, Item, Table, Value};
 
 // =============================================================================
@@ -101,7 +102,7 @@ pub(crate) const CSHARP_COMPILER_ARGUMENTS_TARGETS: &str =
 /// them: MSBuild derives the directory from the project it is building, and the
 /// host derives the same path from the project's output directory.
 #[cfg(feature = "hot_reload")]
-const CSHARP_COMPILER_ARGUMENTS_FILE: &str = "pill_compiler_args.rsp";
+pub(crate) const CSHARP_COMPILER_ARGUMENTS_FILE: &str = "pill_compiler_args.rsp";
 
 /// Workspace-relative directory holding every extension crate.
 ///
@@ -417,75 +418,6 @@ pub enum ProjectModuleBackend {
     },
     /// A managed project assembly loaded through the stable `csharp_runtime` host.
     CSharp(CSharpModuleConfig),
-}
-
-/// Output locations and assembly names used by the managed project backend.
-///
-/// The runtime assembly hosts the collectible loader; the project assembly is
-/// loaded by the runtime, so both assemblies and their output directories are
-/// needed to start the managed module.
-#[non_exhaustive]
-#[derive(Debug, Clone)]
-pub struct CSharpModuleConfig {
-    /// Name of the runtime assembly that hosts the collectible loader.
-    pub runtime_assembly_name: String,
-    /// Output subdirectory for the runtime assembly, relative to the workspace root.
-    pub runtime_output_subdirectory: String,
-    /// Name of the project assembly loaded by the runtime.
-    pub project_assembly_name: String,
-    /// Output subdirectory for the project assembly, relative to the workspace root.
-    pub project_output_subdirectory: String,
-}
-
-impl CSharpModuleConfig {
-    /// Describe a managed project by its assembly names and output directories.
-    ///
-    /// A reloading build gets this from
-    /// [`ProjectModuleConfig::from_environment`], which reads the project's
-    /// `.csproj`. A shipping build has no project path to read, so its frontend
-    /// states the same four values directly - which is also why this type needs
-    /// a constructor at all: it is `#[non_exhaustive]`, so it cannot be built
-    /// with a struct expression from another crate.
-    ///
-    /// The two subdirectories are relative to the root the caller supplies with
-    /// them, not to any fixed location.
-    pub fn new(
-        runtime_assembly_name: impl Into<String>,
-        runtime_output_subdirectory: impl Into<String>,
-        project_assembly_name: impl Into<String>,
-        project_output_subdirectory: impl Into<String>,
-    ) -> Self {
-        Self {
-            runtime_assembly_name: runtime_assembly_name.into(),
-            runtime_output_subdirectory: runtime_output_subdirectory.into(),
-            project_assembly_name: project_assembly_name.into(),
-            project_output_subdirectory: project_output_subdirectory.into(),
-        }
-    }
-
-    /// Workspace-relative path of this project's captured compiler command line.
-    ///
-    /// The project's build writes it into the project's own `obj` directory, so
-    /// it is derived from the output directory rather than stored: that
-    /// directory is `<project>/bin/<configuration>/<framework>` by
-    /// construction, and its fourth ancestor is the project root.
-    ///
-    /// Returns `None` when the output directory has no such shape, which is the
-    /// shipping posture - a bundle keeps the assembly flat beside the
-    /// executable. That posture never hot reloads, so it never needs a capture.
-    #[cfg(feature = "hot_reload")]
-    pub(crate) fn compiler_arguments_file(&self) -> Option<PathBuf> {
-        let output_directory = Path::new(&self.project_output_subdirectory);
-        let project_root = output_directory.ancestors().nth(3)?;
-        if project_root.as_os_str().is_empty() {
-            return None;
-        }
-        Some(
-            project_root
-                .join("obj")
-                .join(CSHARP_COMPILER_ARGUMENTS_FILE),
-        )
-    }
 }
 
 /// Configuration for a hot-reloadable project module.
@@ -1076,12 +1008,12 @@ impl ProjectModuleConfig {
             build_command,
             // The managed build never invokes rustc, so it needs no overrides.
             build_environment: Vec::new(),
-            backend: ProjectModuleBackend::CSharp(CSharpModuleConfig {
-                runtime_assembly_name: CSHARP_RUNTIME_ASSEMBLY_NAME.to_string(),
+            backend: ProjectModuleBackend::CSharp(CSharpModuleConfig::new(
+                CSHARP_RUNTIME_ASSEMBLY_NAME,
                 runtime_output_subdirectory,
                 project_assembly_name,
                 project_output_subdirectory,
-            }),
+            )),
         })
     }
 }
@@ -1712,12 +1644,12 @@ serde = { version = "1", features = ["derive"] }
             watch_directory: "project_cs/src".to_string(),
             build_command: vec!["dotnet".to_string(), "build".to_string()],
             build_environment: Vec::new(),
-            backend: ProjectModuleBackend::CSharp(CSharpModuleConfig {
-                runtime_assembly_name: "csharp_runtime".to_string(),
-                runtime_output_subdirectory: "pill_csharp_runtime/bin/Release/net8.0".to_string(),
-                project_assembly_name: "project_cs".to_string(),
-                project_output_subdirectory: "project_cs/bin/Release/net8.0".to_string(),
-            }),
+            backend: ProjectModuleBackend::CSharp(CSharpModuleConfig::new(
+                "csharp_runtime",
+                "pill_csharp_runtime/bin/Release/net8.0",
+                "project_cs",
+                "project_cs/bin/Release/net8.0",
+            )),
         }
     }
 

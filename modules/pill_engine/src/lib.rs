@@ -50,6 +50,9 @@ pub mod archetype;
 /// `Res` / `ResMut` parameters.
 pub mod asset;
 
+/// Where asset paths resolve: mounted packs and the filesystem.
+pub mod asset_store;
+
 /// Deferred command queue for structural ECS mutations.
 pub mod commands;
 

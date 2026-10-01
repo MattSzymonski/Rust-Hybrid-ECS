@@ -1,21 +1,22 @@
-//! Shared project-module host for every engine frontend.
+//! The development host every engine frontend runs a project through.
 //!
 //! # Responsibilities
 //!
-//! - Creates and owns the [`pill_engine::Engine`] instance.
-//! - Builds and loads native or C# project modules.
-//! - Watches project sources and coordinates safe hot reloads.
-//! - Exposes [`setup`] and [`run_one_frame`] to embedding frontends.
-//! - Owns the standalone headless or windowed application runner.
+//! - Builds and loads native or C# project modules and the extensions.
+//! - Watches project sources and coordinates safe hot reloads, around the
+//!   frames the wrapped [`pill_runtime::Runtime`] runs.
+//! - Exposes [`setup`], [`run_one_frame`] and, windowed, [`setup_rendering`] /
+//!   [`attach_renderer`] to frontends, which own their event loops and drive
+//!   the host through [`FrameDriver`].
 //!
 //! # Design
 //!
-//! The crate has no `main` function, but it owns the complete standalone run loop.
-//! With `rendering` enabled that includes the window, event loop, and engine renderer.
-//! Embedding frontends such as `editor` can instead provide their own window and
-//! event loop through [`setup_rendering`].
-//! Configuration is externalized in [`ProjectModuleConfig`],
-//! keeping backend selection out of executable crates.
+//! Configuration is externalized in [`ProjectModuleConfig`], keeping backend
+//! selection out of executable crates. Running the game - the engine, the
+//! frame, the statically linked project, the renderer's window - is
+//! `pill_runtime`'s, which a shipping build links without this crate; the
+//! host exists only with `hot_reload`, and without it this crate is little
+//! more than its configuration types.
 
 // ===== Module Declarations =====
 
@@ -33,28 +34,24 @@ mod config;
 /// ANSI console helpers for the hot-reload log (colors, VT enabling).
 #[cfg(feature = "hot_reload")]
 mod console;
-/// Scheduler-aware C# backend for the native project host.
+/// C# development tooling over `pill_csharp_bridge`: mirror generation and the
+/// in-process compiler, plus the bridge items the host names.
 ///
-/// Compiled in both postures. A managed assembly is loaded by the .NET runtime
-/// either way - there is no static equivalent - so a shipping build differs
-/// only in what it does not do: no `dotnet build`, no generated C# mirrors, and
-/// no watching the assembly for replacement.
+/// A shipped C# project needs none of it: it starts through the bridge's
+/// `CSharpBackend`, which the runtime runs.
+#[cfg(feature = "hot_reload")]
 mod csharp;
 /// Per-function hot patching: classify, generate, compile and activate a patch.
 #[cfg(feature = "hot_patch")]
 mod hot_patch;
 
 /// One entry in a patched function's history, as returned by
-/// [`Host::patch_generations`](runtime::Host::patch_generations).
+/// [`DevHost::patch_generations`](runtime::DevHost::patch_generations).
 #[cfg(feature = "hot_patch")]
 pub use hot_patch::PatchGeneration;
 
 /// Lifecycle management for extensions.
 mod extension;
-/// Windowed-frontend and rendering errors, owned by the host because the
-/// host owns the event loop and the renderer.
-#[cfg(feature = "rendering")]
-mod frontend;
 /// Native project-library loading and Windows-safe temporary-copy handling.
 #[cfg(feature = "hot_reload")]
 mod native_library;
@@ -64,18 +61,12 @@ mod project_module;
 #[cfg(feature = "hot_reload")]
 mod reload;
 
-/// Attaching a renderer to a frontend's window, through its handles as data.
-#[cfg(feature = "rendering")]
-mod render_window;
 /// The GPU renderer as a loaded module: starting it and driving its backend.
 #[cfg(all(feature = "rendering", feature = "hot_reload"))]
 mod renderer_module;
-/// Complete standalone application runner owned by the host crate.
-mod runner;
-/// Engine ownership and frontend-facing frame orchestration.
+/// The development host: reloads around the runtime's frames.
+#[cfg(feature = "hot_reload")]
 mod runtime;
-/// Application telemetry bootstrap for every host frontend.
-mod telemetry;
 /// Source-tree watching and reload signalling for the main thread.
 #[cfg(feature = "hot_reload")]
 mod watcher;
@@ -83,16 +74,10 @@ mod watcher;
 #[cfg(all(feature = "rendering", feature = "hot_reload"))]
 mod shader_watcher;
 
-/// Statically linked project and module registration, for shipping builds.
-#[cfg(not(feature = "hot_reload"))]
-mod static_link;
-
 // ===== Re-exports =====
 
 // Local host modules and the shared crate-root error surface.
-pub use config::{
-    CSharpModuleConfig, ExtensionConfig, HostConfig, ProjectModuleBackend, ProjectModuleConfig,
-};
+pub use config::{ExtensionConfig, HostConfig, ProjectModuleBackend, ProjectModuleConfig};
 pub use extension::EXTENSION_ABI_VERSION;
 pub use pill_core::error::{
     engine_report, install_engine_report_handler, BuildError, CSharpError, ConfigError,
@@ -100,37 +85,29 @@ pub use pill_core::error::{
     PlainMessageRenderer, SemanticRole, StyledDiagnosticProxy, TerminalMessageRenderer,
     WatcherError,
 };
-/// The project and modules a shipping build links in, in place of a
-/// [`HostConfig`]: with `hot_reload` off nothing is built, watched or loaded.
-#[cfg(not(feature = "hot_reload"))]
-pub use static_link::{StaticModule, StaticProject, StaticProjectBackend, StaticRenderer};
-// Standalone runner, frame orchestration, and telemetry bootstrap.
-pub use runner::run;
-pub use runtime::{run_one_frame, setup, FrameReport, Host, ProjectSource};
-pub use telemetry::init_telemetry;
+/// Where a managed project's assemblies are, as [`ProjectModuleBackend`]
+/// names them; defined by the C# bridge.
+pub use pill_csharp_bridge::CSharpModuleConfig;
+// The frame driver frontends run the host through, and what a frame reports.
+pub use pill_runtime::{FrameDriver, FrameReport};
+
+// The development host.
+#[cfg(feature = "hot_reload")]
+pub use runtime::{run_one_frame, setup, DevHost};
 
 // `EngineError` has no rendering variants, so it is available to headless
 // frontends too.
 pub use pill_engine::EngineError;
 
-// Rendering-only: the renderer itself, its data contract, and the errors the
-// windowed path composes. Re-exported so frontends never name
-// `pill_master_renderer` directly and stay free of a wgpu dependency of their
-// own.
-//
-// The viewport types moved here with the rest of the renderer. They are plain
-// data, but they describe where a renderer draws, so a headless build has
-// nothing to point them at - and only the windowed path ever named them.
-#[cfg(feature = "rendering")]
-pub use crate::frontend::{FrontendError, RenderingError};
+// Rendering-only: the renderer contract's data and errors, re-exported so
+// frontends never name a renderer crate and stay free of a wgpu dependency of
+// their own. The viewport describes where a renderer draws, so a headless build
+// has nothing to point it at.
 #[cfg(feature = "rendering")]
 pub use pill_renderer_api::{RenderViewport, RendererError};
 #[cfg(feature = "rendering")]
-pub use render_window::RendererWindow;
+pub use pill_runtime::{RendererWindow, RenderingError};
 
-// Rendering-only frontend entry points: window and event-loop setup.
-#[cfg(feature = "rendering")]
+// Rendering-only entry points: attaching the renderer to a frontend's window.
+#[cfg(all(feature = "rendering", feature = "hot_reload"))]
 pub use runtime::{attach_renderer, setup_rendering, RenderingHost};
-
-#[cfg(feature = "rendering")]
-mod render_assets;

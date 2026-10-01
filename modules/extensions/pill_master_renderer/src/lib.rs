@@ -109,15 +109,16 @@ pub fn register(engine: &mut Engine) -> u32 {
     0
 }
 
-/// Build a renderer backend on a window, for a host that links this crate
-/// statically - the shipping posture, which has no module to load.
+/// Start building a renderer backend on a window, for a host that links this
+/// crate statically - the shipping posture, which has no module to load.
 ///
-/// The loaded-module path reaches the same renderer through the
-/// `pill_renderer_attach` export instead.
+/// A future, because creating the device is asynchronous: a native frontend
+/// blocks on it once, a web frontend awaits it. The loaded-module path reaches
+/// the same renderer through the blocking `pill_renderer_attach` export
+/// instead.
 ///
-/// # Errors
-///
-/// Returns a [`RendererError`] when surface, adapter or device creation fails.
+/// The future fails with a [`RendererError`] when surface, adapter or device
+/// creation fails.
 ///
 /// # Safety
 ///
@@ -126,10 +127,13 @@ pub unsafe fn attach(
     window: pill_renderer_api::RawWindowData,
     width: u32,
     height: u32,
-) -> Result<Box<dyn PillRenderer>, RendererError> {
-    // SAFETY: forwarded from this function's own contract.
-    let renderer = unsafe { Renderer::new(window, width, height) }?;
-    Ok(Box::new(renderer))
+) -> pill_renderer_api::AttachFuture {
+    Box::pin(async move {
+        // SAFETY: forwarded from this function's own contract, which covers
+        // the future as much as the renderer it resolves to.
+        let renderer = unsafe { Renderer::new_async(window, width, height) }.await?;
+        Ok(Box::new(renderer) as Box<dyn PillRenderer>)
+    })
 }
 
 #[cfg(test)]

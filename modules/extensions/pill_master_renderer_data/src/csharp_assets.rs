@@ -15,9 +15,10 @@
 //!
 //! # Design
 //!
-//! The functions moved here from the host (`pill_host/src/csharp/assets.rs`),
-//! because the asset types they build belong to this renderer's data crate and
-//! the host names no renderer data type. The host keeps the C# entry points:
+//! The functions moved here from the C# backend (now
+//! `pill_csharp_bridge/src/assets.rs`), because the asset types they build
+//! belong to this renderer's data crate and the backend names no renderer data
+//! type. The backend keeps the C# entry points:
 //! it owns the managed invocation's world, resolves the function by name, and
 //! forwards the call with that world as the first argument. The managed API,
 //! the argument shapes and the status codes are unchanged.

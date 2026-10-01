@@ -27,9 +27,9 @@
 //! the GUI stops listening after an abrupt disconnect.
 
 // Standard library
-use std::time::Instant;
 
 // External crates
+use pill_core::platform::Instant;
 use pill_engine::*;
 
 // =============================================================================

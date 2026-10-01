@@ -314,8 +314,21 @@ public static unsafe class Engine
     private static uint _mirrorEpoch;
 
     /// <summary>Bind the native function table for all subsequent queries.</summary>
+    /// <exception cref="InvalidOperationException">
+    /// The table was built for a different interop contract than this runtime.
+    /// </exception>
     internal static void Bind(EngineApi* api)
     {
+        // Check the header before copying: every slot after it is only
+        // meaningful if both sides agree on the contract that laid them out.
+        if (api->AbiVersion != Loader.LoaderInterop.InteropContractVersion
+            || api->TableSize != (uint)sizeof(EngineApi))
+        {
+            throw new InvalidOperationException(
+                $"the host's engine API table (contract {api->AbiVersion}, {api->TableSize} bytes) " +
+                $"does not match this runtime (contract {Loader.LoaderInterop.InteropContractVersion}, " +
+                $"{sizeof(EngineApi)} bytes); rebuild csharp_runtime and the host from the same checkout");
+        }
         _api = *api;
         ReloadMirrorMethods();
     }

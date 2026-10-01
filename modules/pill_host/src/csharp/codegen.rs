@@ -31,10 +31,10 @@ use std::path::Path;
 // External crates
 use pill_engine::component_registry::{ComponentFieldDescriptor, PillValueTypeDescriptor};
 
-// Current crate
-use super::components::ModuleExposedComponent;
-use super::mirror_naming::{is_opaque_container_tag, snake_to_pascal, split_array_tag};
-use super::{ResolvedFieldAccessor, ResolvedMirrorMethod};
+use pill_csharp_bridge::{
+    is_opaque_container_tag, snake_to_pascal, split_array_tag, ModuleExposedComponent,
+    ResolvedFieldAccessor, ResolvedMirrorMethod,
+};
 
 // =============================================================================
 // Free Functions

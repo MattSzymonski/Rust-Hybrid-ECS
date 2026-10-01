@@ -3,9 +3,10 @@
 use crate::physics::ball_spawn_state;
 use crate::settings::BALL_COUNT;
 use pill_core::math::Vector3f;
+use pill_core::platform::Instant;
 use pill_engine::*;
 use pill_spline::Spline;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Timestamps the last spline probe report so the cadence is wall-clock.
 pub(crate) struct SplineProbeState {

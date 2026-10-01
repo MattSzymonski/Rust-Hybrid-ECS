@@ -391,7 +391,7 @@ where
         let iterator_timings = std::sync::Arc::clone(&self.iterator_timings);
 
         // Step 3: dispatch to tracked or untracked parallel execution.
-        let started = std::time::Instant::now();
+        let started = pill_core::platform::Instant::now();
         let result = if self.tracked {
             ParForEachResult::Tracked(self.execute_tracked(f, hint_ns))
         } else {

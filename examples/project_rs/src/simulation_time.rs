@@ -1,8 +1,8 @@
 //! Updates the shared frame delta.
 
 use crate::SimulationTime;
+use pill_core::platform::Instant;
 use pill_engine::*;
-use std::time::Instant;
 
 /// Stamps the time elapsed since the previous frame into [`SimulationTime`].
 ///

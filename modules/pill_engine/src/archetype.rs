@@ -124,7 +124,7 @@ pub struct Blittability {
 impl Blittability {
     /// The witness a manifest-driven registration carries.
     ///
-    /// `pill_host::csharp::components` calls this only after its
+    /// `pill_csharp_bridge::components` calls this only after its
     /// `BLITTABLE_FIELD_TYPES` check rejected every field type that is not a
     /// blittable value type, so holding one of these means the fields were
     /// vetted. The name records where the check ran.

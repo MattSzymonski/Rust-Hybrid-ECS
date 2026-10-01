@@ -343,8 +343,13 @@ fn decode_scalar(bytes: &[u8], offset: usize, tag: &str) -> Option<FieldValue> {
         "u32" => FieldValue::U32(u32::from_ne_bytes(read::<4>(bytes, offset)?)),
         "u64" => FieldValue::U64(u64::from_ne_bytes(read::<8>(bytes, offset)?)),
         "bool" => FieldValue::Bool(bytes.get(offset).copied()? != 0),
-        "usize" => FieldValue::Usize(usize::from_ne_bytes(read::<8>(bytes, offset)?)),
-        "isize" => FieldValue::Isize(isize::from_ne_bytes(read::<8>(bytes, offset)?)),
+        // Pointer-sized: 4 bytes on wasm32, 8 on 64-bit targets.
+        "usize" => FieldValue::Usize(usize::from_ne_bytes(read::<{ size_of::<usize>() }>(
+            bytes, offset,
+        )?)),
+        "isize" => FieldValue::Isize(isize::from_ne_bytes(read::<{ size_of::<isize>() }>(
+            bytes, offset,
+        )?)),
         _ => return None,
     })
 }

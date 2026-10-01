@@ -13,7 +13,7 @@
 //! are reloaded transactionally by [`reload_native`]: the previous DLL stays
 //! mapped in a bounded graveyard while changed persist schemas migrate, so
 //! engine-owned pointers into retired code remain valid. Managed backends
-//! delegate assembly discovery and validation to [`CSharpRuntime`], which
+//! delegate assembly discovery and validation to the C# bridge's runtime, which
 //! reports success or rejection through `poll_reload`.
 
 // The whole module is the loaded-project lifecycle: build, load, initialize,
@@ -36,7 +36,7 @@ mod loaded {
 
     // Current crate
     use crate::build_runner::build_project_module;
-    use crate::csharp::CSharpRuntime;
+    use crate::csharp::CSharpProject;
     use crate::native_library::NativeLibrary;
     use crate::{ProjectModuleBackend, ProjectModuleConfig};
 
@@ -71,8 +71,9 @@ mod loaded {
             /// project stops owning can be dropped while its image is mapped.
             registered_resource_ids: Vec<pill_engine::ResourceId>,
         },
-        /// A collectible managed runtime hosting the C# project assembly.
-        CSharp(CSharpRuntime),
+        /// A collectible managed runtime hosting the C# project assembly,
+        /// with the in-process compiler that rebuilds it.
+        CSharp(CSharpProject),
     }
 
     impl LoadedProject {
@@ -159,7 +160,7 @@ mod loaded {
                 }
                 // The managed runtime performs assembly discovery, component
                 // registration, startup commands, and system registration itself.
-                ProjectModuleBackend::CSharp(config) => Ok(Self::CSharp(CSharpRuntime::start(
+                ProjectModuleBackend::CSharp(config) => Ok(Self::CSharp(CSharpProject::start(
                     engine,
                     workspace_root,
                     config,
@@ -297,7 +298,7 @@ mod loaded {
     /// that matters - reaches the caller as a plain `Err` that both call sites
     /// used to discard. A project left with no systems and nothing on the
     /// console is the worst outcome available here, so it is logged loudly.
-    fn managed_poll_replaced_assembly(runtime: &mut CSharpRuntime, engine: &mut Engine) -> bool {
+    fn managed_poll_replaced_assembly(runtime: &mut CSharpProject, engine: &mut Engine) -> bool {
         match runtime.poll_reload(engine) {
             Ok(status) => status == crate::csharp::POLL_RELOADED,
             Err(error) => {
@@ -323,7 +324,7 @@ mod loaded {
     /// that every reload used to run. That build also refreshes the capture,
     /// which is what makes the reload after it fast again.
     fn recompile_csharp(
-        runtime: &CSharpRuntime,
+        runtime: &CSharpProject,
         workspace_root: &Path,
         config: &ProjectModuleConfig,
         cancel_flag: Option<(&AtomicU64, u64)>,

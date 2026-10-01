@@ -49,7 +49,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # Configuration
 # =============================================================================
 
-MODULE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "src" / "lib.rs"
+MODULE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "src" / "pill_spline.rs"
 
 # The host reads extensions from the project settings file, so the test
 # backs up and installs its own minimal list, exactly like the auto-reload
@@ -191,7 +191,7 @@ def launch_standalone() -> Tuple[subprocess.Popen, OutputMonitor]:
             # fails to load with "The specified procedure could not be found"
             # (os error 127), the same reason the cascade suite pins it.
             "--features",
-            "hot_reload,rendering",
+            "dev,rendering",
         ],
         MODULES_ROOT,
         process_environment,
@@ -218,7 +218,7 @@ def build_workspace() -> bool:
                 # Matches the launch below; see the note there for why the
                 # project needs a rendering host.
                 "--features",
-                "hot_reload,rendering",
+                "dev,rendering",
             ],
             cwd=str(MODULES_ROOT),
             capture_output=True,

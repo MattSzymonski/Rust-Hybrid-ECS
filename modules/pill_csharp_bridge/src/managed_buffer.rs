@@ -44,7 +44,7 @@ use pill_core::error::CSharpError;
 /// the managed side again.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ManagedBufferError {
+pub enum ManagedBufferError {
     /// The managed side reported a length outside `1..=limit`.
     LengthOutOfRange {
         /// The length it reported.
@@ -86,7 +86,7 @@ pub(super) enum ManagedBufferError {
 /// Nothing is allocated in the first case, and the partially filled buffer is
 /// discarded in the last.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
-pub(super) fn fetch_managed_buffer(
+pub fn fetch_managed_buffer(
     length: impl FnOnce() -> u32,
     copy: impl FnOnce(*mut u8, u32) -> u8,
     limit: u32,

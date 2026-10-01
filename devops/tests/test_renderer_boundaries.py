@@ -18,7 +18,8 @@ DESCRIPTION
                          crates: pill_core, pill_core_macros, pill_engine,
                          serde, thiserror, miette, raw-window-handle; and has no
                          build dependencies.
-      3. host          - `pill_host` and `pill_standalone` name no data crate
+      3. host          - `pill_runtime`, `pill_csharp_bridge`, `pill_host` and
+                         `pill_standalone` name no data crate
                          or GPU module in code. A dependency on one is allowed
                          only as a graph-only dependency (a key ending in
                          `_dependency_graph`, which keeps the host's resolved
@@ -65,7 +66,7 @@ API_ALLOWED_DEPENDENCIES = {
 }
 
 # Crates that must not name renderer data or GPU code (rule 3).
-HOST_CRATES = ("pill_host", "pill_standalone")
+HOST_CRATES = ("pill_runtime", "pill_csharp_bridge", "pill_host", "pill_standalone")
 
 # Suffix that marks a data crate, and one that marks a graph-only dependency.
 DATA_SUFFIX = "_data"

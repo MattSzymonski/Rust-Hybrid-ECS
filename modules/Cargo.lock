@@ -730,6 +730,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "const-serialize"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1701,6 +1711,7 @@ dependencies = [
  "pill_host",
  "pill_hot_scan",
  "pill_master_renderer_data",
+ "pill_runtime",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -2185,9 +2196,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "899def5c37c4fd7b2664648c28120ecec138e4d395b459e5ca34f9cce2dd77fd"
 dependencies = [
  "cfg-if",
+ "js-sys",
  "libc",
  "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -3254,7 +3267,7 @@ dependencies = [
  "bitflags 2.13.1",
  "libc",
  "plain",
- "redox_syscall 0.9.1",
+ "redox_syscall 0.9.4",
 ]
 
 [[package]]
@@ -4575,6 +4588,7 @@ dependencies = [
  "miette",
  "notify",
  "pill_core_macros",
+ "pollster",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -4584,6 +4598,10 @@ dependencies = [
  "tracing-subscriber",
  "tracing-tracy",
  "tracy-client",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "web-time",
 ]
 
 [[package]]
@@ -4593,6 +4611,20 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "pill_csharp_bridge"
+version = "0.1.0"
+dependencies = [
+ "libloading 0.8.9",
+ "pill_core",
+ "pill_engine",
+ "pill_master_renderer_data",
+ "pill_runtime",
+ "serde",
+ "serde_json",
+ "tracing",
 ]
 
 [[package]]
@@ -4641,6 +4673,7 @@ name = "pill_engine"
 version = "0.1.0"
 dependencies = [
  "criterion",
+ "getrandom 0.3.4",
  "inventory",
  "metrics",
  "miette",
@@ -4671,24 +4704,21 @@ name = "pill_host"
 version = "0.1.0"
 dependencies = [
  "libloading 0.8.9",
- "metrics",
- "miette",
  "notify",
  "pill_assets",
  "pill_core",
- "pill_core_macros",
+ "pill_csharp_bridge",
  "pill_engine",
  "pill_hot_scan",
  "pill_master_renderer",
  "pill_master_renderer_data",
  "pill_renderer_api",
+ "pill_runtime",
  "serde",
  "serde_json",
  "serde_yaml",
- "thiserror 2.0.20",
  "toml_edit 0.22.27",
  "tracing",
- "winit",
 ]
 
 [[package]]
@@ -4708,7 +4738,6 @@ dependencies = [
  "pill_engine",
  "pill_master_renderer_data",
  "pill_renderer_api",
- "pollster",
  "serde",
  "thiserror 2.0.20",
  "trait_type_map",
@@ -4749,12 +4778,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pill_runtime"
+version = "0.1.0"
+dependencies = [
+ "metrics",
+ "miette",
+ "pill_core",
+ "pill_core_macros",
+ "pill_engine",
+ "pill_renderer_api",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "pill_shipping_bundle"
 version = "0.0.0"
 dependencies = [
  "pill_audio",
- "pill_host",
  "pill_master_renderer_data",
+ "pill_runtime",
  "pill_spline",
  "project",
 ]
@@ -4776,10 +4819,14 @@ version = "0.1.0"
 dependencies = [
  "miette",
  "pill_core",
+ "pill_core_macros",
  "pill_host",
  "pill_hot_scan",
+ "pill_runtime",
  "pill_shipping_bundle",
+ "thiserror 2.0.20",
  "tracing",
+ "winit",
 ]
 
 [[package]]
@@ -4789,6 +4836,18 @@ dependencies = [
  "pill_core",
  "pill_engine",
  "serde",
+]
+
+[[package]]
+name = "pill_web"
+version = "0.1.0"
+dependencies = [
+ "console_error_panic_hook",
+ "pill_core",
+ "pill_runtime",
+ "wasm-bindgen",
+ "web-sys",
+ "winit",
 ]
 
 [[package]]
@@ -5374,9 +5433,9 @@ dependencies = [
 
 [[package]]
 name = "redox_syscall"
-version = "0.9.1"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07507be7b4a5f9f26eeb41eeaebb1f5a7ff29dfb29739facc21d35bf8b11c21e"
+checksum = "737970939a87c6fa31e7acad13307bccbb017a073b695b6089a2c484f929e20e"
 dependencies = [
  "bitflags 2.13.1",
 ]
@@ -7079,9 +7138,9 @@ dependencies = [
 
 [[package]]
 name = "wayland-backend"
-version = "0.3.16"
+version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "016ccf01d1c58b6f8999612813e17c9b2390f7d70671428869913310f83f54b8"
+checksum = "38a91b4eaddff87b1cd1074985e3713da4af2c49742d1b356b2c01670a67a078"
 dependencies = [
  "cc",
  "downcast-rs",

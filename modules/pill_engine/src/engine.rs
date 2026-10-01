@@ -20,9 +20,10 @@
 // Standard library
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // External crates
+use pill_core::platform::Instant;
 use pill_core::warn;
 use rayon::prelude::*;
 

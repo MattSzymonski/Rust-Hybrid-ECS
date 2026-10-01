@@ -30,17 +30,19 @@
 // Standard library
 use std::ffi::CString;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
 
 // External crates
 use pill_core::error::CSharpError;
+use pill_core::platform::Instant;
 use pill_core::telemetry::telemetry_target::HOT_RELOAD;
 use pill_core::{info, warn};
+use pill_csharp_bridge::{fetch_managed_buffer, DotnetRuntimeContext};
 
 // Current crate
-use super::csharp_runtime::DotnetRuntimeContext;
-use super::managed_buffer::fetch_managed_buffer;
-use crate::config::{CSHARP_COMPILER_ASSEMBLY_NAME, CSHARP_COMPILER_OUTPUT_SUBDIRECTORY};
+use crate::config::{
+    CSHARP_COMPILER_ARGUMENTS_FILE, CSHARP_COMPILER_ASSEMBLY_NAME,
+    CSHARP_COMPILER_OUTPUT_SUBDIRECTORY,
+};
 use crate::CSharpModuleConfig;
 
 // =============================================================================
@@ -146,7 +148,7 @@ impl FastCompiler {
         // Step 1: Resolve the two paths this compiler works between. A shipping
         // layout has no project `obj` directory and reports no capture path,
         // which is also the posture that never reloads.
-        let response_file = workspace_root.join(config.compiler_arguments_file()?);
+        let response_file = workspace_root.join(compiler_arguments_file(config)?);
         let output_assembly = workspace_root
             .join(&config.project_output_subdirectory)
             .join(format!("{}.dll", config.project_assembly_name));
@@ -335,6 +337,29 @@ impl FastCompiler {
 // =============================================================================
 // Free Functions
 // =============================================================================
+
+/// Workspace-relative path of `config`'s captured compiler command line.
+///
+/// The project's build writes it into the project's own `obj` directory, so
+/// it is derived from the output directory rather than stored: that
+/// directory is `<project>/bin/<configuration>/<framework>` by
+/// construction, and its fourth ancestor is the project root.
+///
+/// Returns `None` when the output directory has no such shape, which is the
+/// shipping posture - a bundle keeps the assembly flat beside the
+/// executable. That posture never hot reloads, so it never needs a capture.
+fn compiler_arguments_file(config: &CSharpModuleConfig) -> Option<PathBuf> {
+    let output_directory = Path::new(&config.project_output_subdirectory);
+    let project_root = output_directory.ancestors().nth(3)?;
+    if project_root.as_os_str().is_empty() {
+        return None;
+    }
+    Some(
+        project_root
+            .join("obj")
+            .join(CSHARP_COMPILER_ARGUMENTS_FILE),
+    )
+}
 
 /// Encode a path as NUL-terminated UTF-8 for the managed entry points.
 ///

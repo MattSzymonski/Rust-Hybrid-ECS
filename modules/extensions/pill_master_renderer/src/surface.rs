@@ -32,7 +32,7 @@ use pill_core::info;
 use pill_renderer_api::RawWindowData;
 
 // Current crate
-use crate::error::{RendererError, Result};
+use crate::error::{captured, captured_now, CapturedErrors, RendererError, Result};
 
 /// The colour format every pipeline rendering to this surface declares.
 ///
@@ -64,7 +64,8 @@ fn alpha_mode_candidates(requested: wgpu::CompositeAlphaMode) -> Vec<wgpu::Compo
     modes
 }
 
-/// The window's swapchain, its configuration, and the format it was chosen for.
+/// The window's swapchain, its configuration, and the format pipelines draw
+/// to it in.
 ///
 /// Built once by [`Surface::create`] and reconfigured in place for the rest of
 /// the renderer's life. The device it was configured against is passed in
@@ -73,6 +74,8 @@ fn alpha_mode_candidates(requested: wgpu::CompositeAlphaMode) -> Vec<wgpu::Compo
 pub struct Surface {
     surface: wgpu::Surface<'static>,
     configuration: wgpu::SurfaceConfiguration,
+    /// The sRGB format of the views drawn into, which may differ from the
+    /// configured format only by its sRGB-ness; see [`Surface::create`].
     format: wgpu::TextureFormat,
 }
 
@@ -146,9 +149,16 @@ impl Surface {
             .map_err(|error| RendererError::DeviceCreation {
                 detail: error.to_string(),
             })?;
+        crate::error::report_uncaptured_errors(&device);
         let capabilities = surface.get_capabilities(&adapter);
         let color_format =
             pick_color_format(&capabilities.formats).ok_or(RendererError::NoTextureFormats)?;
+        // Pipelines draw through an sRGB view, so the hardware encodes the
+        // linear colours they write. A surface that offers no sRGB format - a
+        // WebGPU canvas never does - is configured in its plain format with
+        // the sRGB variant allowed as a view format; drawing into the plain
+        // format directly would put linear values on screen, far too dark.
+        let render_format = color_format.add_srgb_suffix();
         let alpha_mode = capabilities
             .alpha_modes
             .first()
@@ -171,21 +181,22 @@ impl Surface {
             desired_maximum_frame_latency: 2,
             present_mode,
             alpha_mode,
-            view_formats: vec![color_format],
+            view_formats: vec![render_format],
         };
-        configure(&surface, &device, &mut configuration)?;
+        configure_first(&surface, &device, &mut configuration).await?;
         Ok((
             Self {
                 surface,
                 configuration,
-                format: color_format,
+                format: render_format,
             },
             device,
             queue,
         ))
     }
 
-    /// The colour format every pipeline rendering to this surface declares.
+    /// The colour format every pipeline rendering to this surface declares,
+    /// and the format of the view each frame is drawn through: always sRGB.
     pub fn format(&self) -> wgpu::TextureFormat {
         self.format
     }
@@ -202,9 +213,9 @@ impl Surface {
 
     /// Reconfigure for a new size.
     ///
-    /// The new size is applied through [`configure`] - scoped, with its
-    /// `Opaque` fallback - and only committed once the surface accepted it, so
-    /// a refusal leaves the old, consistent configuration in place instead of
+    /// The new size is applied through [`configure`] - with its `Opaque`
+    /// fallback - and only committed once the surface accepted it, so a
+    /// refusal leaves the old, consistent configuration in place instead of
     /// one that disagrees with the swapchain.
     ///
     /// # Errors
@@ -265,8 +276,8 @@ impl Surface {
     }
 }
 
-/// Configure the surface, giving up the compositing alpha mode if the driver
-/// refuses it.
+/// Configure the surface for the first time, giving up the compositing alpha
+/// mode if the driver refuses it.
 ///
 /// `Surface::configure` returns nothing: a refused configuration is reported
 /// through the device's uncaptured-error path, which panics by default and
@@ -274,45 +285,21 @@ impl Surface {
 /// refusal is realistic because a compositing alpha mode needs a compositing
 /// window, which a capability list does not promise. The requested mode is
 /// therefore tried inside its own error scopes, and `Opaque` - the mode every
-/// surface must support - is the fallback.
-fn configure(
+/// surface must support - is the fallback. The scopes are awaited: the
+/// renderer is being built asynchronously, so every target can wait for them.
+async fn configure_first(
     surface: &wgpu::Surface<'static>,
     device: &wgpu::Device,
     surface_configuration: &mut wgpu::SurfaceConfiguration,
 ) -> Result<()> {
-    let requested_alpha_mode = surface_configuration.alpha_mode;
     let mut failures = Vec::new();
-    for alpha_mode in alpha_mode_candidates(requested_alpha_mode) {
+    for alpha_mode in alpha_mode_candidates(surface_configuration.alpha_mode) {
         surface_configuration.alpha_mode = alpha_mode;
-
-        // One scope per filter class, so a refusal is captured here rather than
-        // reaching the uncaptured-error handler.
-        device.push_error_scope(wgpu::ErrorFilter::Validation);
-        device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
-        device.push_error_scope(wgpu::ErrorFilter::Internal);
-        surface.configure(device, surface_configuration);
-        // Acquiring a frame is what materialises the swapchain: wgpu-core
-        // accepting the configuration does not mean the driver created one, and
-        // the refusal only shows up here.
-        let probe = surface.get_current_texture();
-        let internal = pollster::block_on(device.pop_error_scope());
-        let out_of_memory = pollster::block_on(device.pop_error_scope());
-        let validation = pollster::block_on(device.pop_error_scope());
-
-        let reported = internal
-            .or(out_of_memory)
-            .or(validation)
-            .map(|error| error.to_string());
-        let failure = match probe {
-            Ok(frame) => {
-                // Dropped rather than presented: the frame loop acquires its own.
-                drop(frame);
-                reported
-            }
-            Err(error) => Some(reported.unwrap_or_else(|| error.to_string())),
-        };
-
-        match failure {
+        let (probe, errors) = captured(device, || {
+            apply_and_probe(surface, device, surface_configuration)
+        })
+        .await;
+        match attempt_failure(probe, errors) {
             None => {
                 println!("[render] Surface configured: {alpha_mode:?}");
                 return Ok(());
@@ -320,10 +307,73 @@ fn configure(
             Some(failure) => failures.push(format!("{alpha_mode:?} ({failure})")),
         }
     }
-
     Err(RendererError::SurfaceConfigurationRefused {
         detail: failures.join("; "),
     })
+}
+
+/// Reconfigure the surface during a frame (resize, a lost swapchain), with the
+/// same `Opaque` fallback as [`configure_first`].
+///
+/// A frame cannot await, so the error scopes are blocked on only where the
+/// build can capture (`validation-capture`, development). Elsewhere a refusal
+/// reaches the device's error handler, which logs it, and the frame probe
+/// still reports it here - the alpha mode reused is the one the first
+/// configuration proved, so this is the rare path.
+fn configure(
+    surface: &wgpu::Surface<'static>,
+    device: &wgpu::Device,
+    surface_configuration: &mut wgpu::SurfaceConfiguration,
+) -> Result<()> {
+    let mut failures = Vec::new();
+    for alpha_mode in alpha_mode_candidates(surface_configuration.alpha_mode) {
+        surface_configuration.alpha_mode = alpha_mode;
+        let (probe, errors) = captured_now(device, || {
+            apply_and_probe(surface, device, surface_configuration)
+        });
+        match attempt_failure(probe, errors) {
+            None => return Ok(()),
+            Some(failure) => failures.push(format!("{alpha_mode:?} ({failure})")),
+        }
+    }
+    Err(RendererError::SurfaceConfigurationRefused {
+        detail: failures.join("; "),
+    })
+}
+
+/// Configure the surface and acquire a frame from it.
+///
+/// Acquiring a frame is what materialises the swapchain: wgpu-core accepting
+/// the configuration does not mean the driver created one, and the refusal
+/// only shows up here.
+fn apply_and_probe(
+    surface: &wgpu::Surface<'static>,
+    device: &wgpu::Device,
+    surface_configuration: &wgpu::SurfaceConfiguration,
+) -> std::result::Result<wgpu::SurfaceTexture, wgpu::SurfaceError> {
+    surface.configure(device, surface_configuration);
+    surface.get_current_texture()
+}
+
+/// Why one configuration attempt failed, or `None` when it succeeded: a
+/// captured error first, else the probe's own failure.
+fn attempt_failure(
+    probe: std::result::Result<wgpu::SurfaceTexture, wgpu::SurfaceError>,
+    errors: CapturedErrors,
+) -> Option<String> {
+    let reported = errors
+        .internal
+        .or(errors.out_of_memory)
+        .or(errors.validation)
+        .map(|error| error.to_string());
+    match probe {
+        Ok(frame) => {
+            // Dropped rather than presented: the frame loop acquires its own.
+            drop(frame);
+            reported
+        }
+        Err(error) => Some(reported.unwrap_or_else(|| error.to_string())),
+    }
 }
 
 #[cfg(test)]

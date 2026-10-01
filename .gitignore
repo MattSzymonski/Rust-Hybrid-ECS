@@ -53,7 +53,7 @@ modules/extensions/host_project_*/
 # dependency. Cargo resolves every manifest in the workspace BEFORE it
 # evaluates features, so a missing directory here breaks resolution for the
 # whole workspace - including plain debug builds that never enable
-# `static_project`, and including `cargo run -p editor`. `optional = true`
+# `shipping`, and including `cargo run -p editor`. `optional = true`
 # means "do not compile it", not "do not look for it".
 #
 # The committed stub is deliberately project-agnostic. A shipping build

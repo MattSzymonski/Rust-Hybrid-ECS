@@ -42,7 +42,9 @@ pub mod frame;
 pub mod raw_window;
 
 // Current crate
-pub use api::{FrameOutcome, HeadlessRenderer, PillRenderer, RenderCapabilities, RenderMetrics};
+pub use api::{
+    AttachFuture, FrameOutcome, HeadlessRenderer, PillRenderer, RenderCapabilities, RenderMetrics,
+};
 pub use components::*;
 pub use error::RendererError;
 pub use frame::{
