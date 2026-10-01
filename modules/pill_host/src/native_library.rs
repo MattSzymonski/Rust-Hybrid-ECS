@@ -39,13 +39,14 @@
 // Standard library
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
 // External crates
 #[cfg(windows)]
 use libloading::os::windows as windows_loader;
 use libloading::{Library, Symbol};
 use pill_core::error::{LibraryError, ModuleError};
+use pill_core::platform::Instant;
 use pill_core::{debug, info};
 use pill_engine::component_registry::{
     PillFieldAccessorDescriptor, PillMethodDescriptor, PillValueTypeDescriptor,

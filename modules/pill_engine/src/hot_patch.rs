@@ -662,6 +662,7 @@ pub fn declare_patching_thread() {
 /// # Errors
 ///
 /// Returns the message to refuse with. Undeclared means unrestricted.
+#[cfg(all(windows, target_arch = "x86_64"))]
 fn check_patching_thread() -> Result<(), String> {
     let declared = PATCHING_THREAD.load(Ordering::Acquire);
     if declared == 0 || declared == current_thread_token() {
@@ -682,6 +683,7 @@ fn check_patching_thread() -> Result<(), String> {
 /// base image - measured at +7.4 GB during the original research - so the
 /// relative form would need a trampoline on essentially every patch anyway.
 /// Twelve bytes is more of the function to overwrite, which is the trade.
+#[cfg(all(windows, target_arch = "x86_64"))]
 const ABSOLUTE_JUMP_LENGTH: usize = 12;
 
 /// Read/write/execute page protection.

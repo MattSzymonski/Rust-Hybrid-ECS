@@ -7,6 +7,8 @@
 //! - Report each frame's result and cost through [`FrameOutcome`],
 //!   [`RenderCapabilities`], and [`RenderMetrics`], so frontends can display
 //!   statistics without knowing which backend produced them.
+//! - Name the future a renderer is built through ([`AttachFuture`]), so a
+//!   frontend can await it where it cannot block - in a browser.
 //! - Provide [`HeadlessRenderer`], the stub that keeps builds and tests
 //!   without a GPU surface on the same call path as the wgpu backend.
 //!
@@ -18,6 +20,10 @@
 //! of wgpu types. A windowed build implements the trait on its wgpu `Renderer`;
 //! a headless build holds [`HeadlessRenderer`] instead, and the frame loop
 //! cannot tell the difference.
+
+// Standard library
+use std::future::Future;
+use std::pin::Pin;
 
 // External crates
 use pill_engine::AssetManager;
@@ -86,6 +92,15 @@ pub struct RenderMetrics {
     /// Instance bytes the frame's draw queue carried.
     pub instance_bytes: u64,
 }
+
+/// A renderer being built on a window: what a statically linked renderer's
+/// attach returns.
+///
+/// A future because creating a GPU device is asynchronous, and a browser only
+/// finishes it once control returns to its event loop: a native frontend
+/// blocks on it once, a web frontend awaits it. Not `Send` - a web GPU handle
+/// stays on the thread that made it.
+pub type AttachFuture = Pin<Box<dyn Future<Output = Result<Box<dyn PillRenderer>, RendererError>>>>;
 
 /// The renderer contract a frontend drives once per frame.
 ///

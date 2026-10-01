@@ -12,9 +12,10 @@
 //! value round-trips through the engine's generic field API.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use dioxus::prelude::*;
+use pill_core::platform::Instant;
 use pill_engine::component_registry::ComponentFieldDescriptor;
 use pill_engine::{Entity, FieldValue};
 

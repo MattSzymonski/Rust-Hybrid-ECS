@@ -25,7 +25,10 @@
 //! line wants without re-deriving it at each call site.
 
 // Standard library
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+// External crates
+use pill_core::platform::Instant;
 
 // Current crate
 use crate::resource::Resource;

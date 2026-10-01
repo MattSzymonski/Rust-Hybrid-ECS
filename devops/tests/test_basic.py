@@ -388,8 +388,8 @@ def shipping_build(tally: ResultTally) -> None:
     things the net cannot.
 
     First it builds `pill_standalone` with `--no-default-features --features
-    static_project`, which turns `hot_reload` off and links the project and its
-    extensions into the binary. That alone catches the usual breakage - a
+    shipping`, which leaves the development host out entirely and links the
+    project and its extensions into the binary. That alone catches the usual breakage - a
     `#[cfg]` that only compiles in one configuration.
 
     Then it searches the binary for strings only the reloading path produces,
@@ -419,7 +419,7 @@ def shipping_build(tally: ResultTally) -> None:
         tally.report_fail("shipping build", failure_excerpt(generated))
         return
 
-    print("Building pill_standalone --no-default-features --features static_project")
+    print("Building pill_standalone --no-default-features --features shipping")
     completed = run_command(
         [
             find_executable("cargo"),
@@ -429,7 +429,7 @@ def shipping_build(tally: ResultTally) -> None:
             "pill_standalone",
             "--no-default-features",
             "--features",
-            "static_project",
+            "shipping",
             "--manifest-path",
             str(WORKSPACE_MANIFEST),
         ],

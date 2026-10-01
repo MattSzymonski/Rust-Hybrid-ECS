@@ -229,24 +229,24 @@ pub(super) const fn stable_component_id(name: &str) -> StableComponentId {
 /// the C# backend, which creates a byte-level [`ComponentBinding::ModuleNative`]
 /// for each one so `project_cs` can query and write the module's real storage.
 #[derive(Debug, Clone)]
-pub(crate) struct ModuleExposedComponent {
+pub struct ModuleExposedComponent {
     /// C#-facing name derived from the registered Rust type name
     /// (`pill_spline::Spline` -> `pill_spline.Spline`). Managed code declares
     /// its mirror struct under exactly this full name so the stable 128-bit
     /// identity matches.
-    pub(crate) csharp_name: String,
+    pub csharp_name: String,
     /// Engine ID of the module-registered native component.
-    pub(crate) component_id: ComponentId,
+    pub component_id: ComponentId,
     /// Size in bytes of the native layout.
-    pub(crate) size: usize,
+    pub size: usize,
     /// Alignment in bytes of the native layout.
-    pub(crate) align: usize,
+    pub align: usize,
     /// Compile-time field layout registered with the component, when the
     /// component was declared with `#[derive(PillComponent)]`. Empty for
     /// hand-registered or managed components, which keep the opaque ABI-blob
     /// mirror.
     #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
-    pub(crate) fields: Vec<ComponentFieldDescriptor>,
+    pub fields: Vec<ComponentFieldDescriptor>,
 }
 
 /// Resolve registered component names into the layouts C# binds against.
@@ -256,7 +256,7 @@ pub(crate) struct ModuleExposedComponent {
 /// A name that no longer resolves is skipped: the managed side binds by name,
 /// so an unresolvable one simply has no binding. The field layout comes from
 /// the derive's registration; a component without one keeps the opaque blob.
-pub(crate) fn exposed_components_from_names(
+pub fn exposed_components_from_names(
     world: &World,
     names: &[String],
 ) -> Vec<ModuleExposedComponent> {

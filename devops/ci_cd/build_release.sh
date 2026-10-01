@@ -27,9 +27,9 @@
 
 # USAGE: devops/ci_cd/build_release.sh [cargo arguments...]
 #          (no arguments)      Build the shipping host release (project from
-#                              PROJECT_PATH, bundle regenerated; static_project
-#                              for a native project, static_csharp for a
-#                              managed C# project)
+#                              PROJECT_PATH, bundle regenerated, feature
+#                              `shipping`; a C# project also gets its
+#                              assemblies built and copied)
 #          --profile <name>   Build a different release profile
 #                             (release-fast, release-with-debug)
 #          --project <path>   Project directory (workspace-relative) whose
@@ -39,7 +39,7 @@
 #
 #   A release build of the host is always the shipping posture: release
 #   building `pill_standalone` requires `--no-default-features --features
-#   static_project` (or `static_csharp`), and the script refuses any other
+#   shipping`, and the script refuses any other
 #   way - as does `pill_standalone`'s build script, for direct cargo builds.
 #   A managed (C#) project is additionally built with `dotnet build -c
 #   Release` before the host, and its assemblies are copied alongside the
@@ -131,15 +131,11 @@ if [[ -n "${project_path}" ]]; then
 fi
 
 # A plain invocation defaults to the shipping host: pill_standalone built with
-# `--no-default-features --features static_project` for a native project and
-# `static_csharp` for a managed one.
+# `--no-default-features --features shipping`, native and managed projects
+# alike (the generated bundle carries the backend).
 host_default=()
 if ! package_scoping_present "$@"; then
-    if [[ ${managed_project} -eq 1 ]]; then
-        host_default=(--package pill_standalone --no-default-features --features static_csharp)
-    else
-        host_default=(--package pill_standalone --no-default-features --features static_project)
-    fi
+    host_default=(--package pill_standalone --no-default-features --features shipping)
 fi
 set -- "${host_default[@]}" "$@"
 
@@ -165,7 +161,7 @@ fi
 
 # A release build of the host is always the shipping posture: hot reload is a
 # development tool and must not ship. Refuse any invocation that would compile
-# `pill_standalone` without `static_project`/`static_csharp`. `pill_standalone`'s
+# `pill_standalone` without `shipping`. `pill_standalone`'s
 # build script enforces the same rule for direct cargo builds; this fails first
 # with the same guidance.
 
@@ -247,15 +243,15 @@ flag_selected() {
 }
 
 if host_will_build "$@"; then
-    if features_selected "static_project,static_csharp" "$@"; then
-        # The shipping postures link the project in; the default `hot_reload`
+    if features_selected "shipping" "$@"; then
+        # The shipping posture links the project in; the default `dev`
         # feature would otherwise stay on, so it must be turned off.
         if ! flag_selected "--no-default-features" "$@"; then
-            echo "error: the shipping postures (\`static_project\` / \`static_csharp\`) need \`--no-default-features\`, otherwise the default \`hot_reload\` feature stays on and the binary ships reloading code." >&2
+            echo "error: the shipping posture (\`shipping\`) needs \`--no-default-features\`, otherwise the default \`dev\` feature stays on and the binary ships the development host." >&2
             exit 1
         fi
-        if features_selected "hot_reload,hot_patch" "$@"; then
-            echo "error: a shipping build cannot combine \`static_project\`/\`static_csharp\` with \`hot_reload\`/\`hot_patch\`." >&2
+        if features_selected "dev,hot_patch" "$@"; then
+            echo "error: a shipping build cannot combine \`shipping\` with \`dev\`/\`hot_patch\`." >&2
             exit 1
         fi
         # Regenerate the shipping bundle from the project's settings file so
@@ -286,7 +282,7 @@ if host_will_build "$@"; then
         fi
     else
         echo "error: a release build of pill_standalone is always the shipping posture - hot reload is a development tool and must not ship." >&2
-        echo "  build it as: devops/ci_cd/build_release.sh --package pill_standalone --no-default-features --features static_project (native) or static_csharp (managed)" >&2
+        echo "  build it as: devops/ci_cd/build_release.sh --package pill_standalone --no-default-features --features shipping" >&2
         echo "  or scope the build away from the host (e.g. -p pill_engine or --exclude pill_standalone)." >&2
         exit 1
     fi
@@ -347,7 +343,7 @@ if [[ -n "${artifacts_directory}" ]]; then
             echo "  artifact: $(basename "${sidecar}")"
         fi
     done
-    # The managed side of a `static_csharp` build: the project assembly and the
+    # The managed side of a C# shipping build: the project assembly and the
     # C# runtime it references, recorded alongside the shipping binary.
     if [[ ${managed_project} -eq 1 && -n "${managed_manifest:-}" ]]; then
         managed_assembly_name="$(basename "${managed_manifest}" .csproj)"

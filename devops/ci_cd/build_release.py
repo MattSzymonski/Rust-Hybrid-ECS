@@ -28,19 +28,21 @@
 #   the script defaults to the shipping host: the project comes from
 #   `PROJECT_PATH` (or `--project`), the shipping bundle is regenerated from
 #   its `project_settings.yaml`, and `pill_standalone` is built with
-#   `--no-default-features --features static_project`. Hot reload is a
-#   development tool and must not ship, so there is no other way to
+#   `--no-default-features --features shipping`, which runs the project
+#   through `pill_runtime` and does not compile the development host. Hot
+#   reload is a development tool and must not ship, so there is no other way to
 #   release-build the host.
 #
 #   A project whose scripting language is C# (a `*.csproj` in its root, like
-#   `examples/project_cs`) is built with `static_csharp` instead: the bundle
+#   `examples/project_cs`) ships the same way, and more: the bundle
 #   generator emits the managed backend, `dotnet build -c Release` produces the
 #   project assembly (and the C# runtime it references) before cargo runs, and
 #   the managed sidecars are copied alongside the shipping binary. Pass
 #   `--csharp-aot` to switch that posture to NativeAOT: `dotnet publish
 #   -p:PublishAot=true` merges the loader, gameplay code and a trimmed runtime
 #   into one self-contained native library (no .NET install, no JIT), the
-#   bundle emits `CSharpAot`, and the host loads the library directly.
+#   bundle emits the bridge's NativeAOT backend, and the runtime loads the
+#   library directly.
 #
 #   Build output lands with the project: cargo's target directory is redirected
 #   to `<project_root>/build/build_meta/pill_build_data`, and the finished
@@ -54,9 +56,9 @@
 
 # USAGE: devops/ci_cd/build_release.py [cargo arguments...]
 #          (no arguments)      Build the shipping host release (project from
-#                              PROJECT_PATH, bundle regenerated; static_project
-#                              for a native project, static_csharp for a
-#                              managed C# project)
+#                              PROJECT_PATH, bundle regenerated, feature
+#                              `shipping`; a C# project also gets its
+#                              assemblies built and copied)
 #          --project <path>    Project directory (workspace-relative) whose
 #                              project_settings.yaml drives the shipping bundle
 #                              (defaults to PROJECT_PATH)
@@ -123,6 +125,10 @@ REMOVE_MISC_ARTIFACTS = True
 # File extensions a shipped bundle never needs at runtime (see the constant
 # above). Matched case-insensitively against the copied artifact names.
 MISC_ARTIFACT_SUFFIXES = (".pdb", ".exp", ".lib")
+
+# The `pill_standalone` feature that selects the shipping posture: the runtime
+# and the generated bundle, and no development host.
+SHIPPING_FEATURE = "shipping"
 
 
 def collect_requested_features(arguments: list) -> set:
@@ -230,20 +236,19 @@ def explicitly_targets_host(arguments: list) -> bool:
     return False
 
 
-def shipping_posture_feature(project_root) -> str:
-    """The static feature matching the project's scripting language.
+def project_is_managed(project_root) -> bool:
+    """Whether the project's scripting language is C#.
 
-    A project whose root contains a `.csproj` is managed and ships as
-    `static_csharp`; anything else (no project at all, or a `Cargo.toml`)
-    ships as `static_project`.
+    A project whose root contains a `.csproj` is managed; anything else (no
+    project at all, or a `Cargo.toml`) is native. Both ship with the same
+    `shipping` feature - the generated bundle carries the backend - but a
+    managed one also needs its assemblies built and copied.
     """
-    if (
+    return (
         project_root is not None
         and project_root.is_dir()
         and any(project_root.glob("*.csproj"))
-    ):
-        return "static_csharp"
-    return "static_project"
+    )
 
 
 def dotnet_rid() -> str:
@@ -276,11 +281,10 @@ def resolve_project_root(repository_root: Path, project_path: str) -> Path:
 def apply_shipping_host_default(arguments: list, project_root) -> list:
     """Forces the shipping posture for the host.
 
-    With no package scoping the script defaults to the shipping host build,
-    choosing the static feature from the project's scripting language; an
+    With no package scoping the script defaults to the shipping host build; an
     explicit `-p pill_standalone` is forced to the shipping posture too, so a
-    release build of the host can never carry `hot_reload`. Other packages keep
-    their arguments as given.
+    release build of the host can never carry the development host. Other
+    packages keep their arguments as given.
     """
     if not package_selection_present(arguments):
         return [
@@ -288,15 +292,15 @@ def apply_shipping_host_default(arguments: list, project_root) -> list:
             "pill_standalone",
             "--no-default-features",
             "--features",
-            shipping_posture_feature(project_root),
+            SHIPPING_FEATURE,
         ] + arguments
     if explicitly_targets_host(arguments):
         injected = []
         if "--no-default-features" not in arguments:
             injected.append("--no-default-features")
         requested = collect_requested_features(arguments)
-        if not requested & {"static_project", "static_csharp"}:
-            injected += ["--features", shipping_posture_feature(project_root)]
+        if SHIPPING_FEATURE not in requested:
+            injected += ["--features", SHIPPING_FEATURE]
         if injected:
             return injected + arguments
     return arguments
@@ -341,7 +345,7 @@ def copy_managed_artifacts(
 ) -> list:
     """Copies the managed project and runtime assemblies into the artifact dir.
 
-    A `static_csharp` host loads these by the workspace paths the bundle baked
+    A managed shipping host loads these by the workspace paths the bundle baked
     in at compile time, so the copies document what shipped rather than being
     what the binary loads; the artifact folder stays a complete record either
     way. With `aot=True` the managed side is one self-contained native library
@@ -579,6 +583,8 @@ ENGINE_LIBRARIES = {
     "pill_engine",
     "pill_core",
     "pill_host",
+    "pill_runtime",
+    "pill_csharp_bridge",
     "pill_standalone",
     "pill_engine_macros",
     "pill_core_macros",
@@ -868,8 +874,8 @@ def main() -> int:
     if not project_path:
         project_path = os.environ.get("PROJECT_PATH", "")
 
-    # The project root, resolved up front so the shipping default below can
-    # pick the static feature matching the project's scripting language.
+    # The project root, resolved up front: its manifest says whether the
+    # project is managed, which adds the dotnet steps below.
     project_root = (
         resolve_project_root(repository_root, project_path) if project_path else None
     )
@@ -880,11 +886,12 @@ def main() -> int:
 
     # Step 5: validate the effective feature set before any build work starts.
     requested_features = collect_requested_features(arguments)
-    shipping_posture = requested_features & {"static_project", "static_csharp"}
-    if aot and shipping_posture != {"static_csharp"}:
+    shipping = SHIPPING_FEATURE in requested_features
+    managed = shipping and project_is_managed(project_root)
+    if aot and not managed:
         print(
-            "error: --csharp-aot requires a managed C# project (static_csharp "
-            "posture); point PROJECT_PATH at a directory with a .csproj",
+            "error: --csharp-aot requires a managed C# project shipping build; "
+            "point PROJECT_PATH at a directory with a .csproj",
             file=sys.stderr,
         )
         return 1
@@ -893,19 +900,19 @@ def main() -> int:
     target_directory = None
     artifacts_directory = None
     build_binary_name = ""
-    if shipping_posture:
+    if shipping:
         if "--no-default-features" not in arguments:
             print(
-                "error: the shipping postures (`static_project` / `static_csharp`) "
-                "need `--no-default-features`, otherwise the default `hot_reload` "
-                "feature stays on and the binary ships reloading code.",
+                "error: the shipping posture (`shipping`) needs "
+                "`--no-default-features`, otherwise the default `dev` feature "
+                "stays on and the binary ships the development host.",
                 file=sys.stderr,
             )
             return 1
-        if requested_features & {"hot_reload", "hot_patch"}:
+        if requested_features & {"dev", "hot_patch"}:
             print(
-                "error: a shipping build cannot combine "
-                f"{sorted(shipping_posture)} with `hot_reload`/`hot_patch`.",
+                "error: a shipping build cannot combine `shipping` with "
+                "`dev`/`hot_patch`.",
                 file=sys.stderr,
             )
             return 1
@@ -961,11 +968,11 @@ def main() -> int:
 
     # Step 5b: a managed shipping build needs the project assembly (and the C#
     # runtime it references) produced before the host is linked - the
-    # `static_csharp` backend loads prebuilt assemblies, it never compiles. The
+    # managed backend loads prebuilt assemblies, it never compiles. The
     # bundle declared the modules in Rust, so this dotnet build is the whole
     # managed side of the shipping binary. The output directories are derived
     # from the manifest exactly as the generated bundle's CSharp config does.
-    if shipping_posture == {"static_csharp"}:
+    if managed:
         managed_manifests = sorted(project_root.glob("*.csproj"))
         if not managed_manifests:
             print(
@@ -1025,10 +1032,10 @@ def main() -> int:
 
     # Step 6: refuse a release build of the host that escaped the shipping
     # default (e.g. `--workspace` without the posture).
-    if host_will_build(arguments) and not shipping_posture:
+    if host_will_build(arguments) and not shipping:
         print(
             "error: a release build of `pill_standalone` is always the shipping "
-            "posture - `hot_reload` is a development tool and must not ship. "
+            "posture - the development host is a development tool and must not ship. "
             "Scope the build away from the host (e.g. `-p pill_engine` or "
             "`--exclude pill_standalone`).",
             file=sys.stderr,
@@ -1071,11 +1078,11 @@ def main() -> int:
         copied_artifacts = copy_shipping_artifacts(
             target_directory, artifacts_directory, build_binary_name
         )
-        # The managed side of a `static_csharp` build: the project assembly and
+        # The managed side of a C# shipping build: the project assembly and
         # the C# runtime it references (or, with --csharp-aot, the single
         # self-contained native library), recorded alongside the shipping
         # binary.
-        if shipping_posture == {"static_csharp"}:
+        if managed:
             managed_assembly_name = managed_manifests[0].stem
             copied_artifacts += copy_managed_artifacts(
                 project_root,

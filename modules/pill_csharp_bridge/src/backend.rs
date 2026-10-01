@@ -41,8 +41,6 @@ use super::components::{
 };
 use super::context::ActiveSystemGuard;
 use super::csharp_runtime::DotnetRuntimeContext;
-#[cfg(feature = "hot_reload")]
-use super::fast_compile::{FastCompileOutcome, FastCompiler};
 use super::managed_buffer::{fetch_managed_buffer, manifest_fetch_error};
 // Only the reload path distinguishes the failure kinds; a shipping build maps
 // them all through `manifest_fetch_error` and never names them.
@@ -63,13 +61,13 @@ pub(super) const MAX_COMPONENT_MANIFEST_BYTES: u32 = 16 * 1024 * 1024;
 
 #[cfg(feature = "hot_reload")]
 /// Poll returned without a reload: nothing was due or the file is unchanged.
-pub(crate) const POLL_NO_CHANGE: u8 = 0;
+pub const POLL_NO_CHANGE: u8 = 0;
 #[cfg(feature = "hot_reload")]
 /// Poll swapped in a behavior-compatible assembly.
-pub(crate) const POLL_RELOADED: u8 = 1;
+pub const POLL_RELOADED: u8 = 1;
 #[cfg(feature = "hot_reload")]
 /// Poll rejected the new assembly; the old version stays loaded.
-pub(crate) const POLL_REJECTED: u8 = 2;
+pub const POLL_REJECTED: u8 = 2;
 #[cfg(feature = "hot_reload")]
 /// A behaviour-compatible assembly is loaded and waiting on the host's verdict
 /// about its component manifest.
@@ -77,7 +75,7 @@ pub(crate) const POLL_REJECTED: u8 = 2;
 /// The managed loader cannot decide it: whether a manifest change can be
 /// applied depends on what each component is bound to natively, and only the
 /// host holds those bindings. It answers within the same poll.
-pub(crate) const POLL_MANIFEST_PENDING: u8 = 3;
+pub const POLL_MANIFEST_PENDING: u8 = 3;
 
 /// Maximum UTF-8 byte length accepted for a managed system name.
 const MAX_SYSTEM_NAME_BYTES: u32 = 1024;
@@ -108,13 +106,14 @@ pub(super) const MAX_ACCESSES_PER_SYSTEM: u32 = 1024;
 /// different version. Bumped to 10 by `NotifyAssemblyReplaced`, which the
 /// in-process compile path calls to collapse the loader's poll interval.
 /// Bumped to 11 by the managed logging and profiling callbacks appended to
-/// `CsEngineApi`.
+/// `CsEngineApi`. Bumped to 12 by the version and size header that opens
+/// `CsEngineApi`, which the managed side checks before copying the table.
 ///
 /// Collapsing the four length/copy export pairs into one pair keyed by a
 /// payload-kind number would save six exports here and six resolutions
 /// across the two export constructors. It was proposed and declined: see
 /// the design note in `LoaderInterop.cs` for why the named exports are kept.
-const INTEROP_CONTRACT_VERSION: u32 = 11;
+pub const INTEROP_CONTRACT_VERSION: u32 = 12;
 
 // =============================================================================
 // Types + Impls
@@ -221,7 +220,7 @@ pub(crate) enum ManagedRuntimeContext {
 // polling and reflection exports, resolved at startup either way, and read
 // only by `poll_reload` and `verify_systems_unchanged`.
 #[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
-pub(crate) struct CSharpRuntime {
+pub struct CSharpRuntime {
     /// Unmanaged export polling the collectible loader for a rebuilt assembly.
     poll_reload: PollReloadFn,
     /// Byte length of the manifest a parked version carries.
@@ -285,20 +284,13 @@ pub(crate) struct CSharpRuntime {
     bindings: Arc<BindingStore>,
     /// Clears the loader's poll interval after an in-process compile.
     ///
-    /// Only useful together with the compiler above: the certainty it reports is
-    /// exactly the certainty an in-process compile produces. `None` in the AOT
-    /// posture, which never reloads - and which would otherwise oblige every
-    /// shipped project to re-export a symbol it can never call, since NativeAOT
-    /// exports only from the root assembly.
+    /// Only useful together with `pill_host`'s in-process compiler: the
+    /// certainty it reports is exactly the certainty an in-process compile
+    /// produces. `None` in the AOT posture, which never reloads - and which
+    /// would otherwise oblige every shipped project to re-export a symbol it
+    /// can never call, since NativeAOT exports only from the root assembly.
     #[cfg(feature = "hot_reload")]
     notify_assembly_replaced: Option<NotifyAssemblyReplacedFn>,
-    /// The in-process Roslyn compiler, when one could be loaded.
-    ///
-    /// `None` leaves every reload on the ordinary `dotnet build` path, which is
-    /// the AOT posture's permanent state and the reloading posture's fallback
-    /// when the compiler cannot be built or loaded.
-    #[cfg(feature = "hot_reload")]
-    fast_compiler: Option<FastCompiler>,
     /// Keeps the hosted .NET runtime alive for the host's lifetime.
     _runtime: ManagedRuntimeContext,
     /// Keeps the native API table alive so registered closures stay valid.
@@ -561,17 +553,6 @@ fn shipped_or_baked(workspace_root: &Path, baked_relative_dir: &str, file_name: 
     workspace_root.join(baked_relative_dir).join(file_name)
 }
 
-/// The in-process compiler a reloading build may have loaded.
-///
-/// An alias rather than a `cfg` on `start_with`'s parameter list: the
-/// shipping posture has no compiler to pass and no field to store it in,
-/// and the alias keeps that difference out of every call site.
-#[cfg(feature = "hot_reload")]
-type RuntimeFastCompiler = Option<FastCompiler>;
-/// A shipping build has no compiler to hold.
-#[cfg(not(feature = "hot_reload"))]
-type RuntimeFastCompiler = ();
-
 /// Every managed export the host calls, resolved once per posture.
 ///
 /// The postures differ only in how a function pointer is obtained - a
@@ -812,18 +793,26 @@ impl CSharpRuntime {
     /// Start .NET, load `csharp_runtime`, discover managed systems, and register
     /// each system with its reflected read/write access declaration.
     ///
+    /// `on_runtime_booted` sees the .NET runtime once it is up and before the
+    /// project starts. Development tooling loads its own assemblies into it
+    /// there: `pill_host` starts its in-process compiler's warmup, about 1.6
+    /// seconds of JIT and metadata reading, so it overlaps component
+    /// registration, the startup methods and system registration instead of
+    /// landing on the developer's first edit. A shipping build passes a no-op.
+    ///
     /// # Errors
     ///
     /// Returns an error if the runtime cannot start, a managed export is
     /// missing, runtime initialization fails, the component manifest cannot be
     /// copied or registered, a startup method fails, or a reflected access
     /// references an unregistered component.
-    pub(crate) fn start(
+    pub fn start(
         engine: &mut Engine,
         workspace_root: &Path,
         config: &CSharpModuleConfig,
         module_exposed: &[ModuleExposedComponent],
         mirror_methods: &[ResolvedMirrorMethod],
+        on_runtime_booted: &mut dyn FnMut(&DotnetRuntimeContext),
     ) -> Result<Self, CSharpError> {
         // Step 1: Resolve assembly paths, start .NET, and load managed exports.
         // A shipped bundle keeps the runtime sidecars and the project assembly
@@ -858,14 +847,7 @@ impl CSharpRuntime {
         std::env::set_var("ECS_CSHARP_PROJECT_ASSEMBLY", project_assembly_name);
 
         let runtime = DotnetRuntimeContext::new(&runtime_config)?;
-        // Started here rather than at the end of startup so its background
-        // warmup - about 1.6 seconds of JIT and metadata reading - overlaps
-        // component registration, the startup methods and system registration
-        // instead of landing on the developer's first edit.
-        #[cfg(feature = "hot_reload")]
-        let fast_compiler = FastCompiler::try_new(&runtime, workspace_root, config);
-        #[cfg(not(feature = "hot_reload"))]
-        let fast_compiler = RuntimeFastCompiler::default();
+        on_runtime_booted(&runtime);
         let type_name = format!(
             "TracyLive.Loader.LoaderInterop, {}",
             config.runtime_assembly_name
@@ -878,7 +860,6 @@ impl CSharpRuntime {
             exports,
             module_exposed,
             mirror_methods,
-            fast_compiler,
         )
     }
 
@@ -890,14 +871,12 @@ impl CSharpRuntime {
     /// registers it with the scheduler. Everything here has one copy, so the
     /// `unsafe` access-registration closure and the startup rollback guarantee
     /// cannot drift between the hostfxr and NativeAOT paths.
-    #[cfg_attr(not(feature = "hot_reload"), allow(unused_variables))]
     fn start_with(
         engine: &mut Engine,
         runtime: ManagedRuntimeContext,
         exports: ManagedExports,
         module_exposed: &[ModuleExposedComponent],
         mirror_methods: &[ResolvedMirrorMethod],
-        fast_compiler: RuntimeFastCompiler,
     ) -> Result<Self, CSharpError> {
         // Step 0: Byte-level bindings for every native component exposed to
         // managed code - the renderer data's and each extension's - so a
@@ -1011,38 +990,23 @@ impl CSharpRuntime {
             manifest_applied_without_assembly: false,
             #[cfg(feature = "hot_reload")]
             notify_assembly_replaced: exports.notify_assembly_replaced,
-            #[cfg(feature = "hot_reload")]
-            fast_compiler,
             _runtime: runtime,
             _api: api,
         })
     }
 
-    /// Recompile the project in-process, when a compiler could be loaded.
+    /// Tell the loader a complete project assembly is already on disk.
     ///
-    /// `None` means there is no fast path at all and the caller must build
-    /// normally; a [`FastCompileOutcome::Unavailable`] means the fast path
-    /// exists but cannot answer this particular reload.
+    /// The loader samples the assembly's timestamp on an interval because it
+    /// cannot otherwise tell a finished build from a half-copied one. An
+    /// in-process compile writes the file itself, through an atomic rename,
+    /// so its caller uses this to let the next poll skip that wait entirely.
+    /// Does nothing in the AOT posture, which never reloads.
     #[cfg(feature = "hot_reload")]
-    pub(crate) fn fast_compile(
-        &self,
-        workspace_root: &Path,
-        watch_directory: &str,
-    ) -> Option<FastCompileOutcome> {
-        let outcome = self
-            .fast_compiler
-            .as_ref()?
-            .compile(workspace_root, watch_directory);
-        // The loader samples the assembly's timestamp on an interval because it
-        // cannot otherwise tell a finished build from a half-copied one. This
-        // compile wrote the file itself, through an atomic rename, so the next
-        // poll can skip that wait entirely.
-        if matches!(outcome, FastCompileOutcome::Compiled { .. }) {
-            if let Some(notify) = self.notify_assembly_replaced {
-                notify();
-            }
+    pub fn notify_assembly_replaced(&self) {
+        if let Some(notify) = self.notify_assembly_replaced {
+            notify();
         }
-        Some(outcome)
     }
 
     /// Start a NativeAOT-published library, resolve the loader exports by
@@ -1060,8 +1024,7 @@ impl CSharpRuntime {
     /// the ABI contract mismatches, initialization fails, the component
     /// manifest cannot be registered, a startup method fails, or a reflected
     /// access references an unregistered component.
-    #[cfg_attr(feature = "hot_reload", allow(dead_code))]
-    pub(crate) fn start_aot(
+    pub fn start_aot(
         engine: &mut Engine,
         workspace_root: &Path,
         config: &CSharpModuleConfig,
@@ -1086,8 +1049,6 @@ impl CSharpRuntime {
             exports,
             module_exposed,
             mirror_methods,
-            // A NativeAOT bundle ships no compiler and never reloads.
-            RuntimeFastCompiler::default(),
         )
     }
 
@@ -1104,7 +1065,7 @@ impl CSharpRuntime {
     /// host cannot interpret is a failure to report, not a change that never
     /// happened. The currently loaded assembly is kept either way.
     #[cfg(feature = "hot_reload")]
-    pub(crate) fn poll_reload(&mut self, engine: &mut Engine) -> Result<u8, CSharpError> {
+    pub fn poll_reload(&mut self, engine: &mut Engine) -> Result<u8, CSharpError> {
         // A world that took a manifest whose assembly never loaded cannot be
         // reconciled by another poll: the mismatch is already in the world's
         // layouts. Stay stopped rather than swapping a second assembly on top.

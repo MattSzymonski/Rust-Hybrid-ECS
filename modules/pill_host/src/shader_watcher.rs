@@ -37,11 +37,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver};
-use std::time::Instant;
 
 // External crates
 use notify::{Config, Event, RecommendedWatcher, RecursiveMode, Watcher};
 use pill_core::error::WatcherError;
+use pill_core::platform::Instant;
 use pill_core::{error, info, warn};
 
 // Current crate

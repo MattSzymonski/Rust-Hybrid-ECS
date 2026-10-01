@@ -6,6 +6,8 @@
 //! - Keep the `PillStyle` string-styling vocabulary for terminal output.
 //! - Own the telemetry foundation: static targets, developer log macros,
 //!   the terminal formatter, and the subscriber builder.
+//! - Own the platform layer ([`platform`]): the clock, log output and
+//!   futures, the only code that differs between native and the web.
 //! - Own the Tracy profiling API (`profile_scope!` and friends) with its
 //!   feature gating and no-op fallbacks.
 //! - Re-export the `tracing`, `metrics`, and profiling macros so users import
@@ -54,6 +56,8 @@ pub mod math;
 pub mod metrics;
 /// Engine-owned native buffer allocation, shared by every loaded artifact.
 pub mod native_buffer;
+/// The platform layer: clock, log output and futures on native and the web.
+pub mod platform;
 /// Tracy profiling API with feature gating and no-op fallbacks.
 pub mod profiling;
 /// Generational slot arena for values addressed by stable handles.

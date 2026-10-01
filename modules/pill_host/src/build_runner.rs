@@ -23,13 +23,14 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 // External crates
 #[cfg(feature = "hot_patch")]
 use pill_core::debug;
 use pill_core::error::BuildError;
 use pill_core::info;
+use pill_core::platform::Instant;
 use pill_core::warn;
 
 // Current crate

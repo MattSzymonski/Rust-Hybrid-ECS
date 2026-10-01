@@ -27,12 +27,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::UNIX_EPOCH;
 
 // Crate-internal
 use crate::console;
 
 // External crates
+use pill_core::platform::Instant;
 use serde_json::Value;
 
 // =============================================================================
@@ -1252,7 +1253,7 @@ pub(crate) fn print_startup_report() {
 /// first build), so the total spans the whole cascade - the edited module
 /// plus the queued project reload - rather than one transaction. Returns the
 /// number of reload events printed.
-pub(crate) fn print_reload_events(reload_started: std::time::Instant) -> usize {
+pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
     let events = drain_reload_events();
     let count = events.len();
     if count == 0 {

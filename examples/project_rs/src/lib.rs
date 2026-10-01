@@ -24,11 +24,11 @@
 //! serializable data. xx
 
 // Standard library
-use std::time::Instant;
 
 // External crates
 use pill_core::error;
 use pill_core::math::Vector3f;
+use pill_core::platform::Instant;
 use pill_engine::*;
 // `Position` is the engine's: it is universal, so a project
 // names them without reaching through whichever renderer happens to draw them.

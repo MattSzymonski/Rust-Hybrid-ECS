@@ -131,7 +131,7 @@ def build_host() -> bool:
                 "pill_standalone",
                 "--no-default-features",
                 "--features",
-                "hot_reload,rendering",
+                "dev,rendering",
                 "--offline",
             ],
             cwd=str(MODULES_ROOT),

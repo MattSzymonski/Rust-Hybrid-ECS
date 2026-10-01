@@ -46,10 +46,10 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
-use std::time::Instant;
 
 // External crates
 use pill_core::error::BuildError;
+use pill_core::platform::Instant;
 use pill_core::{debug, error, info, warn};
 use pill_engine::{ComponentId, Engine, EngineApi, SystemOwner, World};
 
@@ -275,15 +275,11 @@ pub(crate) fn initialize_generation(
     // has one.
     let status = {
         let started = Instant::now();
-        let status = match scope {
-            Some(owner) => {
-                engine.begin_module_registration(owner);
-                let status = library.call_init(engine_api);
-                engine.end_module_registration();
-                status
-            }
-            None => library.call_init(engine_api),
-        };
+        // The same scoped call a statically linked build makes; only the
+        // entry point differs (a DLL export here, a linked function there).
+        let status = pill_runtime::registration::register_scoped(engine, scope, |_| {
+            library.call_init(engine_api)
+        });
         analytics::record_init(subject, started.elapsed().as_secs_f64() * 1000.0);
         status
     };

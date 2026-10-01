@@ -1,191 +1,126 @@
-//! Scheduler-aware C# backend for the native project host.
+//! C# development tooling over the `pill_csharp_bridge` backend.
 //!
 //! # Responsibilities
 //!
-//! - Starts the .NET runtime used by managed gameplay assemblies.
-//! - Exposes native ECS component storage to managed query iterators.
-//! - Converts reflected C# query access into Rust scheduler metadata.
+//! - Generates the C# mirror structs for the components extensions expose.
+//! - Recompiles the project in-process with Roslyn on a hot reload.
+//! - Pairs the bridge's [`CSharpRuntime`] with that compiler as the host's
+//!   managed project, [`CSharpProject`].
+//! - Re-exports the bridge items the rest of the host names, under one path.
 //!
 //! # Design
 //!
-//! [`csharp_runtime`] owns the low-level .NET hosting boundary. The remaining
-//! modules separate ABI layout, component registration, scheduled invocation
-//! scope, queries, commands, and backend lifecycle. Only [`CSharpRuntime`] is
-//! exposed to the parent host module.
+//! Running C# - hosting .NET, the ABI, components, systems and the reload
+//! poll - is the bridge's, and a C# shipping bundle links it without this
+//! crate. What stays here only exists while developing: generated mirrors and
+//! the compiler. The whole module is `hot_reload` only.
 
-/// C-compatible data structures and callback table shared with the managed runtime.
-mod abi;
-/// NativeAOT library loader used by the C# project backend's AOT posture.
-mod aot_runtime;
-/// Managed asset loading, bridging `AssetManager` for projects with no
-/// direct Rust asset-construction code of their own.
-mod assets;
-/// High-level C# project startup, discovery, and scheduler registration.
-mod backend;
-#[cfg(feature = "hot_reload")]
+// Standard library
+use std::path::Path;
+
+// External crates
+use pill_core::error::CSharpError;
+use pill_engine::Engine;
+
 /// Host-side generation of the C# mirror structs for exposed module components.
 mod codegen;
-/// Native callbacks that translate C# lifecycle requests into deferred ECS commands.
-mod commands;
-/// C# component identities, native bindings, and manifest registration.
-mod components;
-/// Thread-local access scope installed around one scheduled C# system.
-mod context;
-/// Low-level .NET hosting bootstrap used by the C# project backend.
-mod csharp_runtime;
-#[cfg(feature = "hot_reload")]
 /// In-process Roslyn compilation of the C# project, replacing MSBuild on reload.
 mod fast_compile;
-/// The two-call protocol every managed payload crosses the boundary through.
-mod managed_buffer;
-/// C# component manifest schema, field validation, and engine type mapping.
-mod manifest;
-/// The one apply pipeline every manifest kind runs through.
-mod manifest_apply;
-/// The rules that name a generated mirror's fields, for generation and binding checks.
-mod mirror_naming;
-/// Native callbacks used by C# query enumerators.
-mod queries;
-/// Managed resource registration and the callback that serves resource bytes.
-mod resources;
 
 // =============================================================================
-// Types + Impls
+// Re-exports
 // =============================================================================
 
-// The full type documentation lives in the `backend` module; this re-export
-// exposes the type as `csharp::CSharpRuntime` so the parent host module has a
-// single, stable import path.
-pub(crate) use backend::CSharpRuntime;
-#[cfg(feature = "hot_reload")]
-pub(crate) use backend::POLL_RELOADED;
+pub(crate) use pill_csharp_bridge::{
+    accessor_operation_name, accessor_rows, exposed_components_from_names, publish_asset_exports,
+    publish_mirror_methods, CSharpRuntime, ModuleExposedComponent, ResolvedFieldAccessor,
+    ResolvedMirrorMethod, POLL_RELOADED,
+};
 
-/// What one in-process compile attempt produced, reported to the reload path.
-#[cfg(feature = "hot_reload")]
-pub(crate) use fast_compile::FastCompileOutcome;
-
-/// Resolve registered component names into the layouts managed code binds.
-pub(crate) use components::exposed_components_from_names;
-/// Aggregate of the native components exposed to managed code; named only by
-/// the reloading path, which collects them per extension.
-#[cfg(feature = "hot_reload")]
-pub(crate) use components::ModuleExposedComponent;
-
-/// One mirrored Rust method resolved to a callable address, shared by the
-/// host's module loader and the C# backend. Defined here (not in the
-/// `hot_reload`-gated `native_library` module) because the C# backend is
-/// compiled in every host configuration.
-#[cfg_attr(not(feature = "hot_reload"), allow(dead_code))]
-#[derive(Clone, Debug)]
-pub(crate) struct ResolvedMirrorMethod {
-    /// Fully-qualified Rust type name the method belongs to.
-    pub(crate) type_name: String,
-    /// Rust method name, snake_case.
-    pub(crate) method_name: String,
-    /// Return type tag; empty for a `()` return.
-    pub(crate) return_tag: String,
-    /// Argument type tags, in declaration order.
-    pub(crate) arg_tags: Vec<String>,
-    /// Argument names from the Rust source, in declaration order (`alpha`,
-    /// `beta`), so the generated C# mirror names its parameters identically.
-    /// Parallel to `arg_tags`.
-    pub(crate) arg_names: Vec<String>,
-    /// Address of the exported C-ABI trampoline.
-    pub(crate) address: usize,
-}
-
-/// One heap-field accessor resolved to callable addresses, shared by the
-/// host's module loader, the C# mirror codegen, and the managed runtime's
-/// method table.
-#[derive(Clone, Debug)]
-#[cfg(feature = "hot_reload")]
-pub(crate) struct ResolvedFieldAccessor {
-    /// Fully-qualified component type name the field belongs to.
-    pub(crate) type_name: String,
-    /// Rust field name, snake_case.
-    pub(crate) field_name: String,
-    /// Container kind: `"vec"`, `"dynbuf"`, `"string"`, or `"vecstring"`.
-    pub(crate) kind: String,
-    /// Element type tag of a `vec` field; `string` for a `vecstring` field;
-    /// empty for a `string` field.
-    pub(crate) element_tag: String,
-    /// Address of the view trampoline; `None` for a `vecstring` field, whose
-    /// elements are individually allocated and cannot be viewed as one run.
-    pub(crate) view_address: Option<usize>,
-    /// Address of the resize trampoline for a `vec`, `dynbuf` or `vecstring`
-    /// field.
-    pub(crate) resize_address: Option<usize>,
-    /// Address of the replace-in-place trampoline for a `string` field.
-    pub(crate) set_address: Option<usize>,
-    /// Address of the per-element view trampoline for a `vecstring` field.
-    pub(crate) item_address: Option<usize>,
-    /// Address of the per-element replace trampoline for a `vecstring` field.
-    pub(crate) set_item_address: Option<usize>,
-    /// Address of the append trampoline for a `vecstring` field.
-    pub(crate) push_address: Option<usize>,
-}
-
-/// The operation name a generated `MirrorMethods.Resolve` call and the host's
-/// accessor rows agree on for one operation of a heap field.
-///
-/// Defined once so the codegen (which writes the name into C#) and the table
-/// builder (which registers it) can never drift; `operation` is `view`,
-/// `resize`, `set`, `item`, `set_item`, or `push`.
-#[cfg(feature = "hot_reload")]
-pub(crate) fn accessor_operation_name(field_name: &str, operation: &str) -> String {
-    format!("{field_name}_{operation}")
-}
-
-/// Convert heap-field accessors into mirror-method rows, so the managed
-/// runtime resolves them through the same table — and the same per-reload
-/// refresh — as mirrored value-type methods.
-#[cfg(feature = "hot_reload")]
-pub(crate) fn accessor_rows(accessors: &[ResolvedFieldAccessor]) -> Vec<ResolvedMirrorMethod> {
-    let mut rows = Vec::with_capacity(accessors.len() * 6);
-    for accessor in accessors {
-        let mut push = |operation: &str, address: Option<usize>| {
-            if let Some(address) = address {
-                rows.push(ResolvedMirrorMethod {
-                    type_name: accessor.type_name.clone(),
-                    method_name: accessor_operation_name(&accessor.field_name, operation),
-                    return_tag: String::new(),
-                    arg_tags: Vec::new(),
-                    arg_names: Vec::new(),
-                    address,
-                });
-            }
-        };
-        push("view", accessor.view_address);
-        push("resize", accessor.resize_address);
-        push("set", accessor.set_address);
-        push("item", accessor.item_address);
-        push("set_item", accessor.set_item_address);
-        push("push", accessor.push_address);
-    }
-    rows
-}
-
-#[cfg(feature = "hot_reload")]
 /// Generate the C# mirror file for extension components.
 pub(crate) use codegen::generate_module_components_csharp;
-
-/// Rebuild the mirror-method table the managed runtime reads, after an
-/// extension reload changes its trampoline addresses or method set.
-#[cfg_attr(not(feature = "hot_reload"), allow(unused_imports))]
-pub(crate) use abi::publish_mirror_methods;
-/// Publish the renderer data crate's asset functions from the loaded modules.
-#[cfg(feature = "hot_reload")]
-pub(crate) use assets::publish_asset_exports;
+/// What one in-process compile attempt produced, reported to the reload path.
+pub(crate) use fast_compile::FastCompileOutcome;
 
 // =============================================================================
-// Tests
+// CSharpProject
 // =============================================================================
 
-/// Integration-style unit tests for the native/C# ECS boundary.
-///
-/// The fixtures are the shared-ABI components the managed side mirrors
-/// (`Position`, `MeshRendererComponent`, `Color`). They come from `pill_engine`
-/// and `pill_renderer_api`, which the host links in every posture, so these run
-/// in every build, headless included.
-#[cfg(test)]
-mod tests;
+/// A running C# project in the reloading host: the bridge's runtime plus the
+/// in-process compiler that rebuilds its assembly.
+pub(crate) struct CSharpProject {
+    /// The managed runtime running the project's systems.
+    runtime: CSharpRuntime,
+    /// The in-process Roslyn compiler, when one could be loaded.
+    ///
+    /// `None` leaves every reload on the ordinary `dotnet build` path, the
+    /// fallback when the compiler cannot be built or loaded.
+    fast_compiler: Option<fast_compile::FastCompiler>,
+}
+
+impl CSharpProject {
+    /// Start the project through the bridge, loading the in-process compiler
+    /// into the same .NET runtime as soon as it boots.
+    ///
+    /// The compiler is loaded before the project starts, not after, so its
+    /// background warmup overlaps startup; see [`CSharpRuntime::start`].
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`CSharpRuntime::start`] returns. A compiler that cannot be
+    /// loaded is not an error: it is logged, and reloads run a full build.
+    pub(crate) fn start(
+        engine: &mut Engine,
+        workspace_root: &Path,
+        config: &pill_csharp_bridge::CSharpModuleConfig,
+        module_exposed: &[ModuleExposedComponent],
+        mirror_methods: &[ResolvedMirrorMethod],
+    ) -> Result<Self, CSharpError> {
+        let mut fast_compiler = None;
+        let runtime = CSharpRuntime::start(
+            engine,
+            workspace_root,
+            config,
+            module_exposed,
+            mirror_methods,
+            &mut |dotnet| {
+                fast_compiler = fast_compile::FastCompiler::try_new(dotnet, workspace_root, config);
+            },
+        )?;
+        Ok(Self {
+            runtime,
+            fast_compiler,
+        })
+    }
+
+    /// Poll the collectible loader; see [`CSharpRuntime::poll_reload`].
+    ///
+    /// # Errors
+    ///
+    /// Returns what [`CSharpRuntime::poll_reload`] returns.
+    pub(crate) fn poll_reload(&mut self, engine: &mut Engine) -> Result<u8, CSharpError> {
+        self.runtime.poll_reload(engine)
+    }
+
+    /// Recompile the project in-process, when a compiler could be loaded.
+    ///
+    /// `None` means there is no fast path at all and the caller must build
+    /// normally; a [`FastCompileOutcome::Unavailable`] means the fast path
+    /// exists but cannot answer this particular reload.
+    pub(crate) fn fast_compile(
+        &self,
+        workspace_root: &Path,
+        watch_directory: &str,
+    ) -> Option<FastCompileOutcome> {
+        let outcome = self
+            .fast_compiler
+            .as_ref()?
+            .compile(workspace_root, watch_directory);
+        // This compile wrote the assembly itself, so the loader's next poll
+        // need not wait for the file to settle.
+        if matches!(outcome, FastCompileOutcome::Compiled { .. }) {
+            self.runtime.notify_assembly_replaced();
+        }
+        Some(outcome)
+    }
+}

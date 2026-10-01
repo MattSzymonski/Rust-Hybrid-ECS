@@ -23,10 +23,10 @@
 //! image.
 
 // Standard library
-use std::time::Instant;
 
 // External crates
 use pill_core::info;
+use pill_core::platform::Instant;
 
 // Current crate
 use super::{

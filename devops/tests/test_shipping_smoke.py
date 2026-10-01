@@ -52,9 +52,9 @@ from core.suite_common import run_suite_with_timing  # noqa: E402
 # Constants
 # =============================================================================
 
-# Cargo arguments that select the shipping posture: `hot_reload` off, project
-# and modules linked in.
-SHIPPING_FEATURES = ["--no-default-features", "--features", "static_project"]
+# Cargo arguments that select the shipping posture: no development host,
+# project and modules linked in.
+SHIPPING_FEATURES = ["--no-default-features", "--features", "shipping"]
 
 # Where the release build lands.
 SHIPPING_BINARY = (

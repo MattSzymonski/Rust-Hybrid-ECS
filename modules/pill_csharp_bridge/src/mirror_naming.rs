@@ -26,9 +26,9 @@ use pill_engine::component_registry::ComponentFieldDescriptor;
 ///
 /// This is what lets a managed mirror be checked field by field against the
 /// native component it binds to, without a schema hash both sides would have
-/// to agree on: the names and offsets are exactly the ones
-/// [`emit_typed_struct`] writes - PascalCase, one numbered field per array
-/// element. A component with no field layout, or with a heap container (which
+/// to agree on: the names and offsets are exactly the ones the generator in
+/// `pill_host` (`emit_typed_struct`) writes - PascalCase, one numbered field
+/// per array element. A component with no field layout, or with a heap container (which
 /// emits private handle fields rather than a public one), has no signature and
 /// is checked by size and alignment only.
 pub(super) fn generated_field_signature(fields: &[ComponentFieldDescriptor]) -> Option<String> {
@@ -75,12 +75,12 @@ pub(super) fn field_signature_text(mut declared: Vec<(usize, String, usize)>) ->
 /// Whether a tag names a Rust-owned container field, which carries no C# field
 /// of its own: its pointer must never be exposed to managed code, so elements
 /// are reached through the generated accessor members instead.
-pub(super) fn is_opaque_container_tag(tag: &str) -> bool {
+pub fn is_opaque_container_tag(tag: &str) -> bool {
     tag.starts_with("vec:") || tag == "string"
 }
 
 /// Split an `array:<inner>` tag into its base tag and whether it is an array.
-pub(super) fn split_array_tag(tag: &str) -> Result<(&str, bool), String> {
+pub fn split_array_tag(tag: &str) -> Result<(&str, bool), String> {
     match tag.strip_prefix("array:") {
         Some(inner) => Ok((inner, true)),
         None => Ok((tag, false)),
@@ -88,7 +88,7 @@ pub(super) fn split_array_tag(tag: &str) -> Result<(&str, bool), String> {
 }
 
 /// Convert a snake_case Rust identifier to the PascalCase used in C# mirrors.
-pub(super) fn snake_to_pascal(name: &str) -> String {
+pub fn snake_to_pascal(name: &str) -> String {
     let mut result = String::with_capacity(name.len());
     let mut capitalize_next = true;
     for character in name.chars() {

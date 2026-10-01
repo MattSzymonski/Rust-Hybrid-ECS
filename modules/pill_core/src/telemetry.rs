@@ -42,6 +42,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::Layer as _;
 use tracing_subscriber::{EnvFilter, Registry};
 
+// Current crate
+use crate::platform::clock;
+use crate::platform::log_output::{self, FileGuard, FileWriter, TerminalWriter};
+
 // =============================================================================
 // Static Telemetry Targets
 // =============================================================================
@@ -274,9 +278,7 @@ where
     ) -> fmt::Result {
         let metadata = event.metadata();
         if self.show_timestamps {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default();
+            let now = clock::unix_time();
             write!(writer, "[{:>9.3}] ", now.as_secs_f64())?;
         }
 
@@ -357,7 +359,7 @@ type TerminalLayer = tracing_subscriber::filter::Filtered<
         Registry,
         tracing_subscriber::fmt::format::DefaultFields,
         EngineTerminalFormatter,
-        fn() -> std::io::Stdout,
+        TerminalWriter,
     >,
     reload::Layer<EnvFilter, Registry>,
     Registry,
@@ -366,23 +368,23 @@ type TerminalLayer = tracing_subscriber::filter::Filtered<
 /// Registry type after the terminal layer is attached.
 type TerminalStack = tracing_subscriber::layer::Layered<TerminalLayer, Registry>;
 
-/// Concrete file layer type: the custom formatter over a non-blocking writer.
+/// Concrete file layer type: the custom formatter over the platform's file writer.
 type FileLayer = tracing_subscriber::filter::Filtered<
     tracing_subscriber::fmt::Layer<
         TerminalStack,
         tracing_subscriber::fmt::format::DefaultFields,
         EngineTerminalFormatter,
-        tracing_appender::non_blocking::NonBlocking,
+        FileWriter,
     >,
     reload::Layer<EnvFilter, TerminalStack>,
     TerminalStack,
 >;
 
 /// The three artifacts produced when installing the optional file lane:
-/// the layer itself, the non-blocking writer guard, and the reload handle.
+/// the layer itself, the file writer's guard, and the reload handle.
 type FileLaneArtifacts = (
     Option<FileLayer>,
-    Option<Arc<tracing_appender::non_blocking::WorkerGuard>>,
+    Option<Arc<FileGuard>>,
     Option<reload::Handle<EnvFilter, TerminalStack>>,
 );
 
@@ -504,7 +506,7 @@ impl TelemetryBuilder {
         let terminal_filter = self.logging.build_env_filter()?;
         let (terminal_reload, terminal_handle) = reload::Layer::new(terminal_filter);
         let terminal_layer: TerminalLayer = tracing_subscriber::fmt::layer()
-            .with_writer(std::io::stdout as fn() -> std::io::Stdout)
+            .with_writer(log_output::terminal_writer())
             .with_ansi(true)
             .event_format(EngineTerminalFormatter::new())
             .with_filter(terminal_reload);
@@ -517,8 +519,8 @@ impl TelemetryBuilder {
                 let file_filter = file_config.build_env_filter()?;
                 let (file_reload, file_handle) =
                     reload::Layer::<EnvFilter, TerminalStack>::new(file_filter);
-                let appender = tracing_appender::rolling::daily(&directory, "engine.log");
-                let (writer, guard) = tracing_appender::non_blocking(appender);
+                let (writer, guard) = log_output::open_file_output(&directory, "engine.log")
+                    .map_err(|message| TelemetryError::FileOutput { message })?;
                 let layer: FileLayer = tracing_subscriber::fmt::layer::<TerminalStack>()
                     .with_writer(writer)
                     .with_ansi(false)
@@ -593,8 +595,8 @@ pub struct TelemetryHandles {
     pub logging_filter: reload::Handle<EnvFilter, Registry>,
     /// Reload handle for the file logging filter, when a file lane exists.
     pub file_filter: Option<reload::Handle<EnvFilter, TerminalStack>>,
-    /// Keeps the non-blocking file writer thread alive for the app lifetime.
-    _file_guard: Option<Arc<tracing_appender::non_blocking::WorkerGuard>>,
+    /// Keeps the file writer alive for the app lifetime.
+    _file_guard: Option<Arc<FileGuard>>,
 }
 
 impl TelemetryHandles {
@@ -691,6 +693,13 @@ pub enum TelemetryError {
     Reload {
         /// Human-readable reload failure.
         error: String,
+    },
+
+    /// The file lane could not be opened.
+    #[error("failed to open the log file: {message}")]
+    FileOutput {
+        /// Rendered description of the failure.
+        message: String,
     },
 
     /// The one-time subscriber install failed.

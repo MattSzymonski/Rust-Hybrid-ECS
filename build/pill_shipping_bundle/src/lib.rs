@@ -2,7 +2,7 @@
 //! the project's `project_settings.yaml` by
 //! `devops/tools/generate_shipping_bundle.py`.
 
-use pill_host::{StaticModule, StaticProject, StaticProjectBackend, StaticRenderer};
+use pill_runtime::{StaticModule, StaticProject, StaticProjectBackend, StaticRenderer};
 
 /// Every selected extension: the renderer's data crate first, then
 /// `project_settings.yaml` order.
@@ -41,5 +41,6 @@ pub fn static_project() -> StaticProject {
         backend: project_backend(),
         modules: STATIC_MODULES,
         renderer: static_renderer(),
+        asset_pack: None,
     }
 }

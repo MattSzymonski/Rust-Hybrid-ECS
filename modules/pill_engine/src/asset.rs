@@ -41,8 +41,7 @@
 use std::any::TypeId;
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::path::{Path, PathBuf};
-use std::sync::{OnceLock, RwLock};
+use std::path::PathBuf;
 
 // External crates
 use trait_type_map::{
@@ -121,8 +120,10 @@ pub trait Asset: Send + Sync + 'static {
 
 /// Source used to initialize an asset from a project file or embedded bytes.
 ///
-/// Relative paths resolve below the configured asset root. A project normally
-/// sets that root to its `res` directory once during initialization.
+/// A relative path names a file of the project's `res` directory and resolves
+/// through the asset store's mount points ([`crate::asset_store`]): a packed
+/// copy in a shipping or web build, the file itself in development. Loading
+/// code is the same on every target.
 #[derive(Debug, Clone)]
 pub enum AssetLoader {
     Path(PathBuf),
@@ -170,30 +171,26 @@ pub enum AssetBindingError {
 /// Result of a binding operation that can hit an occupied name.
 pub type AssetBindingResult<T> = Result<T, AssetBindingError>;
 
-static ASSET_ROOT: OnceLock<RwLock<PathBuf>> = OnceLock::new();
-
 impl AssetLoader {
-    /// Set the directory relative [`Self::Path`] values resolve beneath.
+    /// Mount the project's asset directory, which relative [`Self::Path`]
+    /// values resolve beneath; see [`crate::asset_store::mount_directory`].
     pub fn set_root(path: impl Into<PathBuf>) {
-        let root = ASSET_ROOT.get_or_init(|| RwLock::new(PathBuf::new()));
-        *root.write().expect("asset root lock poisoned") = path.into();
+        crate::asset_store::mount_directory(path);
     }
 
-    /// Return the currently configured asset root, if one was set.
+    /// Return the currently mounted asset directory, if one was set.
     pub fn root() -> Option<PathBuf> {
-        let root = ASSET_ROOT.get()?.read().ok()?.clone();
-        (!root.as_os_str().is_empty()).then_some(root)
+        crate::asset_store::mounted_directory()
     }
 
     /// Read this source into owned bytes.
+    ///
+    /// A path is read through the asset store's mount points: packs first,
+    /// then the filesystem - see [`crate::asset_store::read`].
     pub fn load(&self) -> AssetLoadResult<Vec<u8>> {
         match self {
             Self::Bytes(bytes) => Ok(bytes.to_vec()),
-            Self::Path(path) => {
-                let path = resolve_asset_path(path)
-                    .ok_or_else(|| AssetLoadError::PathNotFound { path: path.clone() })?;
-                std::fs::read(&path).map_err(|source| AssetLoadError::Read { path, source })
-            }
+            Self::Path(path) => crate::asset_store::read(path),
         }
     }
 
@@ -205,39 +202,6 @@ impl AssetLoader {
         };
         String::from_utf8(self.load()?).map_err(|source| AssetLoadError::Utf8 { label, source })
     }
-}
-
-fn resolve_asset_path(path: &Path) -> Option<PathBuf> {
-    if path.is_absolute() && path.is_file() {
-        return Some(path.to_owned());
-    }
-    if let Some(root) = AssetLoader::root() {
-        let candidate = root.join(path);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    if path.is_file() {
-        return Some(path.to_owned());
-    }
-    let candidate = Path::new("res").join(path);
-    if candidate.is_file() {
-        return Some(candidate);
-    }
-    if let Some(project) = std::env::var_os("PROJECT_PATH") {
-        let candidate = PathBuf::from(project).join("res").join(path);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    std::env::current_exe()
-        .ok()
-        .and_then(|executable| {
-            executable
-                .parent()
-                .map(|parent| parent.join("res").join(path))
-        })
-        .filter(|candidate| candidate.is_file())
 }
 
 // =============================================================================

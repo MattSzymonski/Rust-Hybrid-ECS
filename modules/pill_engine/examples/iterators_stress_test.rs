@@ -23,9 +23,9 @@
 
 // Standard library
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Instant;
 
 // External crates
+use pill_core::platform::Instant;
 
 // Current crate
 use pill_engine::{Component, Engine, Query, ResMut, Resource};

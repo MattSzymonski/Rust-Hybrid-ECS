@@ -10,9 +10,12 @@
 //! Dioxus owns the native window and its event loop. During window creation,
 //! the editor passes an `Arc` clone of Dioxus's Tao window to
 //! [`pill_host::setup_rendering`]. The engine creates one GPU surface for that
-//! window, while [`pill_host::RenderingHost`] owns both engine and renderer state.
-//! The editor forwards resize and redraw events, keeps its center viewport
-//! transparent for the surface, and draws opaque HTML panels around it.
+//! window, while [`pill_host::RenderingHost`] - the development host with the
+//! renderer attached - owns both engine and renderer state. The editor drives
+//! it through [`pill_host::FrameDriver`], the same frame interface the
+//! standalone frontend's loops use: it forwards resize and redraw events, keeps
+//! its center viewport transparent for the surface, and draws opaque HTML
+//! panels around it.
 
 mod console_tab;
 mod dock_view;
@@ -27,7 +30,7 @@ mod systems_tab;
 use std::cell::{Cell, RefCell};
 use std::io::Write;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use dioxus::desktop::tao::dpi::LogicalSize;
 use dioxus::desktop::tao::event::Event as TaoEvent;
@@ -36,9 +39,10 @@ use dioxus::desktop::{use_wry_event_handler, window, Config};
 use dioxus::prelude::*;
 use futures_util::StreamExt;
 use pill_core::error::EngineMessage;
+use pill_core::platform::Instant;
 use pill_host::{
-    engine_report, install_engine_report_handler, setup_rendering, FrameReport, HostConfig,
-    HostError, RenderViewport, RenderingError, RenderingHost,
+    engine_report, install_engine_report_handler, setup_rendering, FrameDriver, FrameReport,
+    HostConfig, HostError, RenderViewport, RenderingError, RenderingHost,
 };
 
 use dock_view::DockView;
@@ -66,7 +70,7 @@ const COMMAND_ERROR_LIMIT: usize = 100;
 fn init_telemetry() {
     use std::path::PathBuf;
     let file_directory = std::env::var_os("ECS_LOG_DIR").map(PathBuf::from);
-    if let Err(error) = pill_host::init_telemetry(file_directory) {
+    if let Err(error) = pill_runtime::init_telemetry(file_directory) {
         eprintln!("[editor] telemetry setup failed: {error}");
     }
 }
@@ -352,7 +356,7 @@ impl EditorContext {
             size.width,
             size.height,
         )?;
-        host.set_render_viewport(Some(RenderViewport::default()));
+        FrameDriver::set_render_viewport(&mut host, Some(RenderViewport::default()));
 
         Ok(Self {
             host: RefCell::new(host),
@@ -371,7 +375,7 @@ impl EditorContext {
     /// Reconfigure the renderer only when it currently targets the main window.
     fn resize_main_window(&self, width: u32, height: u32) {
         if self.detached_scene_window.get().is_none() {
-            self.host.borrow_mut().resize(width, height);
+            FrameDriver::resize(&mut *self.host.borrow_mut(), width, height);
         }
     }
 
@@ -392,7 +396,7 @@ impl EditorContext {
             .unwrap_or_default();
         self.main_scene_viewport.set(viewport);
         if self.detached_scene_window.get().is_none() {
-            self.host.borrow_mut().set_render_viewport(Some(viewport));
+            FrameDriver::set_render_viewport(&mut *self.host.borrow_mut(), Some(viewport));
         }
     }
 
@@ -403,7 +407,10 @@ impl EditorContext {
         let mut host = self.host.borrow_mut();
         host.retarget_render_window(window, size.width, size.height)
             .map_err(|source| EditorError::Retarget { source })?;
-        host.set_render_viewport(Some(RenderViewport::full(size.width, size.height)));
+        FrameDriver::set_render_viewport(
+            &mut *host,
+            Some(RenderViewport::full(size.width, size.height)),
+        );
         self.detached_scene_window.set(Some(window_id));
         Ok(())
     }
@@ -412,8 +419,8 @@ impl EditorContext {
     pub(crate) fn resize_detached_scene(&self, window_id: WindowId, width: u32, height: u32) {
         if self.detached_scene_window.get() == Some(window_id) {
             let mut host = self.host.borrow_mut();
-            host.resize(width, height);
-            host.set_render_viewport(Some(RenderViewport::full(width, height)));
+            FrameDriver::resize(&mut *host, width, height);
+            FrameDriver::set_render_viewport(&mut *host, Some(RenderViewport::full(width, height)));
         }
     }
 
@@ -426,7 +433,7 @@ impl EditorContext {
         let mut host = self.host.borrow_mut();
         host.retarget_render_window(Arc::clone(&self.window), size.width, size.height)
             .map_err(|source| EditorError::Retarget { source })?;
-        host.set_render_viewport(Some(self.main_scene_viewport.get()));
+        FrameDriver::set_render_viewport(&mut *host, Some(self.main_scene_viewport.get()));
         self.detached_scene_window.set(None);
         Ok(())
     }
@@ -472,7 +479,7 @@ impl EditorContext {
 
         let frame = {
             let mut host = self.host.borrow_mut();
-            match host.run_one_frame() {
+            match host.run_frame() {
                 Ok(console_report) => {
                     let now = Instant::now();
                     let ui_report = if now.duration_since(self.last_stats_update.get())

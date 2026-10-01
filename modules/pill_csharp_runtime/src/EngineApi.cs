@@ -6,7 +6,7 @@
 //
 // Design:
 // - These structs contain no behavior. Their sequential field order and sizes
-//   are part of the ABI and must change in lockstep with host/src/csharp/abi.rs.
+//   are part of the ABI and must change in lockstep with pill_csharp_bridge/src/abi.rs.
 
 using System.Runtime.InteropServices;
 
@@ -19,6 +19,18 @@ namespace TracyLive;
 [StructLayout(LayoutKind.Sequential)]
 public unsafe struct EngineApi
 {
+    /// <summary>
+    /// The host's <see cref="Loader.LoaderInterop.InteropContractVersion"/>, checked
+    /// before any slot below is copied.
+    /// </summary>
+    public uint AbiVersion;
+
+    /// <summary>
+    /// The host's size of this table in bytes; a table whose slots changed
+    /// without a version bump fails this check instead of being misread.
+    /// </summary>
+    public uint TableSize;
+
     /// <summary>
     /// Write the entity count from the currently scheduled world.
     /// Status <c>0</c> wrote the count, <c>3</c> means no system is scheduled,

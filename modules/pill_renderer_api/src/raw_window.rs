@@ -25,8 +25,9 @@
 pub use raw_window_handle;
 use raw_window_handle::{
     AppKitDisplayHandle, AppKitWindowHandle, HasDisplayHandle, HasWindowHandle, RawDisplayHandle,
-    RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle, Win32WindowHandle,
-    WindowsDisplayHandle, XcbDisplayHandle, XcbWindowHandle, XlibDisplayHandle, XlibWindowHandle,
+    RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle, WebCanvasWindowHandle,
+    WebDisplayHandle, Win32WindowHandle, WindowsDisplayHandle, XcbDisplayHandle, XcbWindowHandle,
+    XlibDisplayHandle, XlibWindowHandle,
 };
 
 // Current crate
@@ -48,6 +49,10 @@ pub enum RawWindowKind {
     Wayland = 4,
     /// macOS: `window` is the `NSView*`.
     AppKit = 5,
+    /// The web: `window` points to the `JsValue` holding the page's
+    /// `HtmlCanvasElement`, as winit hands it out. Only meaningful inside the
+    /// wasm module that owns that value.
+    WebCanvas = 6,
 }
 
 /// A window's platform handles, as plain data.
@@ -133,6 +138,10 @@ impl RawWindowData {
                 window: pointer(Some(handle.ns_view)),
                 ..empty(RawWindowKind::AppKit)
             }),
+            (RawWindowHandle::WebCanvas(handle), RawDisplayHandle::Web(_)) => Ok(Self {
+                window: pointer(Some(handle.obj)),
+                ..empty(RawWindowKind::WebCanvas)
+            }),
             (window, display) => Err(RendererError::SurfaceCreation {
                 detail: format!(
                     "window handles of this platform are not supported: {window:?} on {display:?}"
@@ -193,6 +202,13 @@ impl RawWindowData {
                     AppKitDisplayHandle::new().into(),
                 ))
             }
+            RawWindowKind::WebCanvas => {
+                let canvas = pointer(self.window).ok_or_else(|| missing("canvas"))?;
+                Ok((
+                    WebCanvasWindowHandle::new(canvas).into(),
+                    WebDisplayHandle::new().into(),
+                ))
+            }
         }
     }
 }
@@ -223,6 +239,19 @@ mod tests {
             display_back,
             RawDisplayHandle::Windows(WindowsDisplayHandle::new())
         );
+    }
+
+    /// A web canvas's handle survives the trip.
+    #[test]
+    fn web_canvas_handles_round_trip() {
+        let canvas = std::ptr::NonNull::<core::ffi::c_void>::dangling();
+        let window = WebCanvasWindowHandle::new(canvas);
+        let data = RawWindowData::from_raw(window.into(), WebDisplayHandle::new().into()).unwrap();
+
+        assert_eq!(data.kind, RawWindowKind::WebCanvas);
+        let (window_back, display_back) = data.to_raw().unwrap();
+        assert_eq!(window_back, RawWindowHandle::WebCanvas(window));
+        assert_eq!(display_back, RawDisplayHandle::Web(WebDisplayHandle::new()));
     }
 
     /// Xcb handles, including the screen, survive the trip.

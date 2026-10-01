@@ -15,8 +15,8 @@
 //! calls it.
 //!
 //! It also enforces the release posture: a release build of the host is always
-//! the shipping build, so `hot_reload` (and its `hot_patch` superset) are
-//! refused in any non-debug profile.
+//! the shipping build, so `dev` (and its `hot_patch` superset) are refused in
+//! any non-debug profile.
 
 fn main() {
     // A release build of the host is always the shipping posture: the reloading
@@ -24,17 +24,15 @@ fn main() {
     // active profile to build scripts as `PROFILE` and each enabled feature as
     // `CARGO_FEATURE_*`, so the combination is refused here - before any crate
     // in the dependency graph is compiled - for every invocation path (script,
-    // CI, or a bare `cargo build --release`). `main.rs` also carries a
-    // `compile_error!` for the same combination; this fires first with the
-    // same guidance.
+    // CI, or a bare `cargo build --release`). `dev` is what every development
+    // feature (`hot_patch` included) turns on, so it is the one to check.
     let profile = std::env::var("PROFILE").unwrap_or_default();
-    let hot_reload_enabled = std::env::var_os("CARGO_FEATURE_HOT_RELOAD").is_some()
-        || std::env::var_os("CARGO_FEATURE_HOT_PATCH").is_some();
-    if profile != "debug" && hot_reload_enabled {
+    let development = std::env::var_os("CARGO_FEATURE_DEV").is_some();
+    if profile != "debug" && development {
         panic!(
-            "pill_standalone cannot be built with `hot_reload` in the `{profile}` profile: \
+            "pill_standalone cannot be built with `dev` in the `{profile}` profile: \
              a release build is always the shipping posture. Build it as \
-             `--no-default-features --features static_project`."
+             `--no-default-features --features shipping`."
         );
     }
 

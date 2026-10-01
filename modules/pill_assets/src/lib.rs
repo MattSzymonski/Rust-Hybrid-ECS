@@ -8,6 +8,9 @@
 //!   an unchanged rewrite still counts as fresh.
 //! - Report what was discovered, rebuilt and skipped, and how long each rebuilt
 //!   output took.
+//! - Write a project's `res` directory as one asset pack
+//!   ([`write_asset_pack`]), which a shipping build embeds and the engine's
+//!   asset store reads.
 //!
 //! # Design
 //!
@@ -37,6 +40,11 @@
 //! }
 //! # Ok::<(), pill_assets::CookError>(())
 //! ```
+
+// The one exception to the workspace ban on `std::time::Instant`: this crate
+// cooks assets in build scripts and the development host, never in a game, and
+// it does not depend on `pill_core` (whose platform clock the ban points to).
+#![allow(clippy::disallowed_types)]
 
 use std::fmt;
 use std::fs;
@@ -367,6 +375,84 @@ pub fn walk_files(directory: &Path) -> Result<Vec<PathBuf>, CookError> {
     Ok(files)
 }
 
+/// The first bytes of an asset pack; the engine reads the same constant.
+const ASSET_PACK_MAGIC: &[u8; 8] = b"PILLPACK";
+
+/// The asset pack format version written here.
+const ASSET_PACK_VERSION: u32 = 1;
+
+/// Write every file below `source` into one asset pack at `output`, and return
+/// the files packed - for a build script to report to cargo.
+///
+/// The format is `pill_engine::asset_store`'s (version 1), and the two change
+/// together: `PILLPACK`, a `u32` version, a `u32` entry count, then per entry a
+/// `u32` path length, the path (UTF-8, `/`-separated, relative to `source`),
+/// and a `u64` offset and `u64` length of its bytes counted from the start of
+/// the pack, all little-endian; the bytes follow the index. Entries are sorted
+/// by path, so the same directory always gives the same pack. A `source` that
+/// does not exist gives an empty pack.
+///
+/// # Errors
+///
+/// Returns [`CookError::Io`] when a file cannot be read or the pack cannot be
+/// written, and [`CookError::Rule`] for a file whose path is not UTF-8.
+pub fn write_asset_pack(source: &Path, output: &Path) -> Result<Vec<PathBuf>, CookError> {
+    // Name every file by its `/`-separated path below `source`.
+    let mut files = Vec::new();
+    for file in walk_files(source)? {
+        let relative = file.strip_prefix(source).unwrap_or(&file);
+        let parts: Option<Vec<&str>> = relative.iter().map(|part| part.to_str()).collect();
+        let key = parts.ok_or_else(|| CookError::Rule {
+            rule: "asset_pack",
+            input: file.clone(),
+            detail: "the path is not UTF-8".to_owned(),
+        })?;
+        files.push((key.join("/"), file));
+    }
+    files.sort();
+
+    // The index comes first, so every offset is known before any bytes are
+    // written: it starts after the header and the whole index.
+    let index_length: usize = files.iter().map(|(key, _)| 4 + key.len() + 16).sum();
+    let mut offset = (ASSET_PACK_MAGIC.len() + 4 + 4 + index_length) as u64;
+    let mut contents = Vec::with_capacity(files.len());
+    let mut pack = Vec::new();
+    pack.extend_from_slice(ASSET_PACK_MAGIC);
+    pack.extend_from_slice(&ASSET_PACK_VERSION.to_le_bytes());
+    pack.extend_from_slice(&(files.len() as u32).to_le_bytes());
+    for (key, file) in &files {
+        let bytes = fs::read(file).map_err(|source| CookError::Io {
+            path: file.clone(),
+            source,
+        })?;
+        pack.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        pack.extend_from_slice(key.as_bytes());
+        pack.extend_from_slice(&offset.to_le_bytes());
+        pack.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        offset += bytes.len() as u64;
+        contents.push(bytes);
+    }
+    for bytes in contents {
+        pack.extend_from_slice(&bytes);
+    }
+
+    // Only rewrite a pack whose bytes changed, so an unchanged `res` does not
+    // relink the binary that embeds it.
+    if fs::read(output).ok().as_deref() != Some(pack.as_slice()) {
+        if let Some(parent) = output.parent() {
+            fs::create_dir_all(parent).map_err(|source| CookError::Io {
+                path: parent.to_owned(),
+                source,
+            })?;
+        }
+        fs::write(output, &pack).map_err(|source| CookError::Io {
+            path: output.to_owned(),
+            source,
+        })?;
+    }
+    Ok(files.into_iter().map(|(_, file)| file).collect())
+}
+
 /// Files matching one `directory/*.extension` pattern below `root`.
 fn expand(root: &Path, pattern: &str) -> Result<Vec<PathBuf>, CookError> {
     let unsupported = || CookError::BadGlob {
@@ -485,6 +571,32 @@ fn is_stale(input: &Path, output: &Path) -> Result<bool, CookError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_asset_pack_indexes_every_file_by_its_relative_path() {
+        let directory = std::env::temp_dir()
+            .join("pill_assets_tests")
+            .join(format!("{}_asset_pack", std::process::id()));
+        let _ = fs::remove_dir_all(&directory);
+        let source = directory.join("res");
+        fs::create_dir_all(source.join("models")).expect("scratch directory");
+        fs::write(source.join("models").join("a.obj"), b"mesh").expect("input");
+        fs::write(source.join("b.png"), b"image").expect("input");
+        let output = directory.join("out").join("assets.pillpack");
+
+        let packed = write_asset_pack(&source, &output).expect("pack");
+        let pack = fs::read(&output).expect("written");
+
+        assert_eq!(packed.len(), 2);
+        assert_eq!(&pack[..8], ASSET_PACK_MAGIC);
+        assert_eq!(&pack[8..12], &ASSET_PACK_VERSION.to_le_bytes());
+        assert_eq!(&pack[12..16], &2u32.to_le_bytes());
+        // Sorted: `b.png` before `models/a.obj`; the bytes follow the index.
+        assert_eq!(&pack[16..20], &5u32.to_le_bytes());
+        assert_eq!(&pack[20..25], b"b.png");
+        assert!(pack.ends_with(b"imagemesh"));
+        let _ = fs::remove_dir_all(&directory);
+    }
 
     /// Writes `body` to `<temp>/pill_assets_tests/<name>` and returns the directory.
     fn scratch(name: &str) -> PathBuf {

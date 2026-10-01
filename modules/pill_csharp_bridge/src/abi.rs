@@ -31,6 +31,7 @@ use super::queries::{
     ffi_entity_count, ffi_get_archetype_chunk, ffi_get_component_chunk, ffi_get_entity_chunk,
 };
 use super::ResolvedMirrorMethod;
+use crate::INTEROP_CONTRACT_VERSION;
 
 thread_local! {
     /// C# profiling zones are entered and exited on the same scheduler thread.
@@ -48,6 +49,8 @@ fn ffi_bytes(ptr: *const u8, len: u32) -> Vec<u8> {
     }
     // The managed side pins both buffers for the complete callback. A null
     // pointer is treated as an empty string so diagnostics never cross the ABI.
+    // SAFETY: `ptr` is non-null and points at `len` bytes the managed caller
+    // keeps pinned until this callback returns; the bytes are copied out here.
     unsafe { std::slice::from_raw_parts(ptr, len as usize).to_vec() }
 }
 
@@ -192,8 +195,19 @@ extern "C" fn ffi_copy_mirror_methods(out: *mut MirrorMethodEntry, max: u32) -> 
 /// Every slot maps to one `extern "C"` callback implemented by the query and
 /// deferred-command adapters in this crate. `queue_create` accepts at most
 /// `MAX_COMPONENTS_PER_CREATE` component blobs per call.
+///
+/// The table opens with its own contract version and byte size, which the
+/// managed side checks before it copies a single slot. The host checks the
+/// runtime's version through `pill_interop_version` before resolving any
+/// export; this is the other direction, so a runtime handed a table from a
+/// different contract - or one whose slots changed without a version bump -
+/// refuses it instead of calling through a misread pointer.
 #[repr(C)]
 pub(super) struct CsEngineApi {
+    /// [`INTEROP_CONTRACT_VERSION`] of the host that built this table.
+    abi_version: u32,
+    /// `size_of::<CsEngineApi>()` of the host that built this table.
+    table_size: u32,
     /// Write the number of live entities in the active world.
     ///
     /// `0` wrote the count, `3` no managed system is scheduled, and `5` the
@@ -294,6 +308,9 @@ impl CsEngineApi {
         publish_mirror_methods(mirror_methods);
 
         Self {
+            abi_version: INTEROP_CONTRACT_VERSION,
+            // A table of a few dozen pointers: far below `u32::MAX`.
+            table_size: std::mem::size_of::<Self>() as u32,
             entity_count: ffi_entity_count,
             get_component_chunk: ffi_get_component_chunk,
             get_archetype_chunk: ffi_get_archetype_chunk,
@@ -326,7 +343,7 @@ impl CsEngineApi {
 /// addresses from the module generations currently loaded — a hot reload gives
 /// the module a new image (and therefore new addresses), and a reloaded module
 /// may have added or removed mirrored methods.
-pub(crate) fn publish_mirror_methods(mirror_methods: &[ResolvedMirrorMethod]) {
+pub fn publish_mirror_methods(mirror_methods: &[ResolvedMirrorMethod]) {
     // Two NUL-terminated names per method, stored so the exposed pointers stay
     // valid for as long as the table lives. Rows reference the names by index
     // so the stored table stays `Send`.

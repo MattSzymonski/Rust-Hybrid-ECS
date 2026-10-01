@@ -1,4 +1,4 @@
-//! Application telemetry bootstrap for every host frontend.
+//! Application telemetry bootstrap for every frontend.
 //!
 //! # Responsibilities
 //!
@@ -8,8 +8,8 @@
 //!
 //! # Design
 //!
-//! The host owns the executable-facing telemetry entry point so `standalone`
-//! and `editor` share one consistent setup. Logging verbosity (terminal +
+//! The runtime owns the executable-facing telemetry entry point so every
+//! frontend shares one consistent setup. Logging verbosity (terminal +
 //! file) is independent of Tracy profiling: Tracy spans (`profile::*`) are
 //! only routed when the `profiling` feature is active, and their filter is
 //! never affected by terminal log levels.

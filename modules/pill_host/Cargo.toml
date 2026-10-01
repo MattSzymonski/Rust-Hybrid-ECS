@@ -10,14 +10,17 @@ workspace = true
 pill_hot_scan = { path = "../pill_hot_scan" }
 pill_engine = { path = "../pill_engine" }
 pill_core = { path = "../pill_core" }
-# The `#[engine_error]` attribute behind the host's own error types, plus
-# the two crates it expands into.
-pill_core_macros = { path = "../pill_core_macros" }
-thiserror = "2"
-miette = { version = "7", features = ["derive"] }
 # The renderer contract - the backend trait, the frame, the camera, window
 # handles as data - with no wgpu. Linked in every posture.
 pill_renderer_api = { path = "../pill_renderer_api" }
+# The Rust half of the C#/Rust ABI: hosting .NET and running a C# project.
+# The host adds C# development tooling on top (mirror generation, the
+# in-process compiler); a C# shipping bundle links the bridge alone.
+pill_csharp_bridge = { path = "../pill_csharp_bridge" }
+# Runs the game: the engine, its frames, the renderer's window. The host wraps
+# it with everything developing needs; in the shipping posture the host is only
+# a re-export of it.
+pill_runtime = { path = "../pill_runtime" }
 # Dependency GRAPH only - never named in code, and renamed so any use stands
 # out; the same reason as `renderer_dependency_graph` below, for headless
 # builds too. The master renderer's data crate is an extension the host loads
@@ -26,8 +29,7 @@ pill_renderer_api = { path = "../pill_renderer_api" }
 # `bytemuck`, for one), and cargo folds those into `pill_core.dll`'s symbol
 # names: without this entry a headless host would resolve a different
 # `pill_core.dll` than the data module and could not load it. Nothing
-# references it, so nothing of it is linked into the host. (The C# bridge
-# tests are the one exception: they alias it to bind real renderer components.)
+# references it, so nothing of it is linked into the host.
 renderer_data_dependency_graph = { package = "pill_master_renderer_data", path = "../extensions/pill_master_renderer_data" }
 # Dependency GRAPH only - never named in code, and renamed so any use stands
 # out. Every module and project build is resolved together with the running
@@ -52,8 +54,6 @@ serde_yaml = "0.9"
 # that used to model tables, renames and arrays by hand.
 toml_edit = "0.22"
 tracing = "0.1"
-metrics = { version = "0.24", optional = true }
-winit = { version = "0.30", optional = true }
 
 [features]
 # On by default: the development posture, where the host watches sources,
@@ -63,21 +63,22 @@ winit = { version = "0.30", optional = true }
 default = ["hot_reload"]
 # Reload edited code without a restart, and in a windowed host, edited shaders
 # of the renderer's data crate without a rebuild.
-hot_reload = ["dep:notify", "dep:pill_assets"]
-# A windowed host: the winit event loop, and the renderer module it loads and
-# attaches to the window. The host itself links no renderer and no wgpu: the
-# graphics stack exists only inside that module. Nothing is forwarded to
+hot_reload = ["dep:notify", "dep:pill_assets", "pill_csharp_bridge/hot_reload"]
+# A windowed host: the renderer module it loads and attaches to a frontend's
+# window (the frontend owns the event loop and the window). The host itself
+# links no renderer and no wgpu: the graphics stack exists only inside that
+# module. Nothing is forwarded to
 # `pill_engine` or `pill_core` - neither has a `rendering` feature, which is
 # what lets a module and a hot patch link the same engine the host does.
-rendering = ["dep:winit", "dep:renderer_dependency_graph"]
+rendering = ["dep:renderer_dependency_graph", "pill_runtime/rendering"]
 # Enable Tracy profiling: engine profiling zones plus the Tracy tracing layer.
-profiling = ["pill_engine/profiling", "pill_core/tracy"]
+profiling = ["pill_engine/profiling", "pill_core/tracy", "pill_runtime/profiling"]
 # Investigative fine-grained profiling zones.
-profiling-fine = ["profiling", "pill_engine/profiling-fine"]
+profiling-fine = ["profiling", "pill_engine/profiling-fine", "pill_runtime/profiling-fine"]
 # Profiling with instrumentation verification (~50% overhead).
 profiling-verify = ["profiling", "pill_engine/profiling-verify"]
 # Repeated numerical measurements through the shared metrics recorder.
-metrics = ["dep:metrics", "pill_engine/metrics"]
+metrics = ["pill_engine/metrics", "pill_runtime/metrics"]
 # Per-function hot patching: a body-only edit to a `#[pill_hot]` system is
 # compiled on its own and swapped into the running engine, instead of rebuilding
 # and re-registering the whole module. Development only.

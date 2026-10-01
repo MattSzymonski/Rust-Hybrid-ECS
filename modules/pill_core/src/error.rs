@@ -527,6 +527,15 @@ pub enum ConfigError {
     /// A configured extension has no sibling directory to build from.
     #[message("extension ", value(name), " has no directory under extensions/")]
     ExtensionDirectoryMissing { name: String },
+
+    /// The asset pack a shipping build embeds could not be read.
+    #[message(
+        "the embedded asset pack of ",
+        name_style(project),
+        " is damaged: ",
+        value(detail)
+    )]
+    AssetPackInvalid { project: String, detail: String },
 }
 
 /// Project-module build execution failures.

@@ -37,17 +37,21 @@ running engine at the next frame, instead of a full module reload. Everything
 a patch cannot express (signature or type changes, new components, constants)  
 falls back to the normal reload. To run the pure reload path without the patch  
 machinery - e.g. when measuring reload performance - build the host with  
-`--no-default-features --features hot_reload` instead.
+`--no-default-features --features dev` instead.
 
 C# project: point `PROJECT_PATH` at the directory containing the `.csproj`,  
 e.g. `../examples/project_cs`.
 
 ## Shipping builds
 
-`devops/ci_cd/build_release.py` builds the shipping host release. It reads the  
-project's scripting language from its manifest and picks the matching posture —  
-`static_project` for a native Rust project (`Cargo.toml`), `static_csharp` for  
-a managed C# project (`*.csproj`). A managed C# build has two shipping modes:
+`devops/ci_cd/build_release.py` builds the shipping host release: `pill_standalone`  
+with the `shipping` feature, which runs the project through `pill_runtime` and  
+does not compile the development host (`pill_host`) at all. It reads the  
+project's scripting language from its manifest: the generated bundle carries  
+the backend, and a managed C# project (`*.csproj`) also gets its assemblies  
+built and copied. A project's `res` directory is packed into the binary at  
+build time and read from there, so the game does not need its asset files  
+beside it. A managed C# build has two shipping modes:
 
 - **Framework-dependent (default):** `dotnet build -c Release` produces the  
 project assembly, and the host boots CoreCLR through hostfxr at runtime. The  
@@ -72,6 +76,24 @@ convention: from `modules`, `../examples/project_cs`), falling back to the
 repository root, so both spellings work from either place.
 
 Build output lands under the project's `build/<timestamp>/` directory.
+
+## Web builds
+
+A Rust project also runs in the browser, through WebGPU. The web build is the  
+shipping posture compiled for `wasm32-unknown-unknown` and run by `pill_web`:  
+one module, statically linked, assets packed in, no hot reload. C# projects  
+are not supported on the web.
+
+```bat
+:: once: rustup target add wasm32-unknown-unknown  and  cargo install wasm-pack
+python devops\tools\build_web.py examples/master_renderer_test        :: release (wasm-opt)
+python devops\tools\build_web.py --dev examples/master_renderer_test  :: faster, unoptimized
+python -m http.server 8000 -d examples/master_renderer_test/build/web
+```
+
+Then open http://localhost:8000/ in Chrome or Edge 113+, Safari 18+ or Firefox  
+141+. Like a release build, this regenerates `build/pill_shipping_bundle`;  
+restore it with `git checkout -- build/pill_shipping_bundle`.
 
 ## Extensions
 

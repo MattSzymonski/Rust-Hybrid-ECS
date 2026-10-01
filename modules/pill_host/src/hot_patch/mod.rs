@@ -43,10 +43,11 @@ compile_error!(
 // Standard library
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, SystemTime};
+use std::time::SystemTime;
 
 // External crates
 use libloading::Library;
+use pill_core::platform::Instant;
 use pill_core::{debug, info, warn};
 use pill_engine::Engine;
 

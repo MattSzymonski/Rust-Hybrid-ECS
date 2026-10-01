@@ -2759,7 +2759,7 @@ fn an_asset_call_outside_an_invocation_reports_no_active_scope() {
     // As the host does after loading the extensions (same full set as every
     // other test publishes, so parallel tests cannot disturb each other).
     #[cfg(feature = "hot_reload")]
-    crate::csharp::publish_asset_exports(pill_engine::component_registry::find_export);
+    crate::publish_asset_exports(pill_engine::component_registry::find_export);
     let name = "outside";
     let (mut index, mut generation) = (0u32, 0u32);
     let status = super::assets::ffi_asset_load_mesh_obj(
@@ -2782,7 +2782,7 @@ fn a_mesh_loads_through_the_forwarded_call() {
     // What the host does after loading the extensions; this test binary links
     // the data crate, so its own descriptors stand in for the loaded module.
     #[cfg(feature = "hot_reload")]
-    crate::csharp::publish_asset_exports(pill_engine::component_registry::find_export);
+    crate::publish_asset_exports(pill_engine::component_registry::find_export);
     let bindings = ComponentBindings::default();
     let name = "forwarded_triangle";
     let obj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n";

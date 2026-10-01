@@ -312,6 +312,8 @@ internal static unsafe class MockNativeWorld
 
     internal static EngineApi Api() => new()
     {
+        AbiVersion = LoaderInterop.InteropContractVersion,
+        TableSize = (uint)sizeof(EngineApi),
         EntityCount = &EntityCount,
         GetComponentChunk = &GetComponentChunk,
         GetArchetypeChunk = &GetArchetypeChunk,
@@ -705,6 +707,20 @@ internal static class Program
                 Equal(MockNativeWorld.LastCreateComponentCount, 4,
                     "each ball must contain PhysicsState, Position, and MeshRendererComponent");
                 Equal(MockNativeWorld.NextEntityId, 5UL, "spawn did not reserve unique entities");
+            });
+
+            Test("a table from another interop contract is refused before it is copied", () =>
+            {
+                EngineApi* stale = stackalloc EngineApi[1];
+                *stale = MockNativeWorld.Api();
+                stale->AbiVersion = LoaderInterop.InteropContractVersion - 1;
+                Throws<InvalidOperationException>(
+                    () => Engine.Bind(stale), "a table from another contract must be refused");
+                EngineApi* resized = stackalloc EngineApi[1];
+                *resized = MockNativeWorld.Api();
+                resized->TableSize -= 8;
+                Throws<InvalidOperationException>(
+                    () => Engine.Bind(resized), "a table of another size must be refused");
             });
 
             Test("managed Commands reports stale entity generations", () =>

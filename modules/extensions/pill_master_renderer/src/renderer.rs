@@ -27,9 +27,10 @@
 #![allow(clippy::too_many_arguments)]
 
 // Standard library
-use std::{collections::HashMap, time::Instant};
+use std::collections::HashMap;
 
 // External crates
+use pill_core::platform::Instant;
 use pill_core::{info, PillStyle};
 use pill_engine::AssetManager;
 use pill_renderer_api::RawWindowData;
@@ -92,6 +93,9 @@ pub struct Renderer {
 impl Renderer {
     /// Creates the renderer synchronously, blocking on [`Renderer::new_async`].
     ///
+    /// For the module export, which crosses a C ABI no future can: loaded
+    /// modules exist only in a native development build, which can block.
+    ///
     /// # Errors
     ///
     /// Returns the errors of [`Renderer::new_async`], which does the work.
@@ -100,9 +104,10 @@ impl Renderer {
     ///
     /// As [`Renderer::new_async`]: `window` must name a live window that
     /// outlives the renderer.
+    #[cfg(feature = "module-abi")]
     pub unsafe fn new(window: RawWindowData, width: u32, height: u32) -> Result<Self> {
         // SAFETY: forwarded from this function's own contract.
-        pollster::block_on(unsafe { Self::new_async(window, width, height) })
+        pill_core::platform::futures::block_on(unsafe { Self::new_async(window, width, height) })
     }
 
     /// Creates the renderer: device and surface, the default material, and the
@@ -418,9 +423,14 @@ impl State {
         // itself against the device that created it.
         let surface_frame = self.surface.acquire(&self.device)?;
         let (width, height) = self.surface.size();
+        // Through the sRGB view the pipelines were built for, which is not the
+        // texture's own format on a surface without sRGB formats.
         let view = surface_frame
             .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+            .create_view(&wgpu::TextureViewDescriptor {
+                format: Some(self.surface.format()),
+                ..Default::default()
+            });
         self.renderer_resource_storage.engine_parameters.update(
             &self.queue,
             0.0,

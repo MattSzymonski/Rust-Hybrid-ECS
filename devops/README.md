@@ -52,6 +52,8 @@ python devops/tests/test_hot_reload_suite.py
 python devops/tests/test_hot_reload_migration.py --cycles 2
 python devops/tests/test_module_project_auto_reload.py
 python devops/tests/test_csharp_bridge.py
+python devops/tests/test_shipping_smoke.py
+python devops/tests/test_web_smoke.py          # browser build in headless Chrome/Edge
 
 # Static, build and CI checks (no host launch)
 python devops/tests/test_coding_standards.py
@@ -65,6 +67,10 @@ artifact sizes, and `test_basic.py` runs the CI fast checks (fmt, clippy,
 launcher builds, WASM size budget, benchmark). All three were ported from the
 shell scripts that now just invoke them. See `tests/README.md` for what each
 suite pins down.
+
+`tools/build_web.py` builds a Rust project for the browser (bundle and web app
+generation, `wasm-pack`, the page from `tools/web/index.html`); the web smoke
+test drives it.
 
 ## core/
 

@@ -3,7 +3,7 @@
 // These match the `#[repr(C)]` Rust definitions in `../src/component.rs`
 // field for field: same names, same order, same types. The host binds them by
 // canonical name and validates the layouts against the schema strings in
-// `pill_host::csharp::components`, so a divergence is rejected at startup
+// `pill_csharp_bridge::components`, so a divergence is rejected at startup
 // rather than corrupting memory.
 //
 // They live beside the renderer, not in csharp_runtime, for the same reason

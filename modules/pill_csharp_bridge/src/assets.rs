@@ -46,7 +46,7 @@ use pill_engine::component_registry::ExportAddress;
 use pill_engine::World;
 
 // Current crate
-use crate::csharp::context::with_active_world;
+use crate::context::with_active_world;
 
 // Status codes the host reports itself; the data crate's functions report the
 // rest. The managed side's table (`Engine.ValidateAssetStatus`) knows them all.
@@ -80,7 +80,7 @@ static LOADED_ASSET_EXPORTS: std::sync::RwLock<Vec<(&'static str, ExportAddress)
 /// run: the addresses of a reloaded module's previous generation must not be
 /// used again.
 #[cfg(feature = "hot_reload")]
-pub(crate) fn publish_asset_exports(lookup: impl Fn(&str) -> Option<ExportAddress>) -> usize {
+pub fn publish_asset_exports(lookup: impl Fn(&str) -> Option<ExportAddress>) -> usize {
     let found: Vec<(&'static str, ExportAddress)> = ASSET_EXPORT_NAMES
         .iter()
         .filter_map(|name| lookup(name).map(|address| (*name, address)))

@@ -96,7 +96,7 @@ from core.suite_common import *  # noqa: E402,F401,F403
 # Session configuration
 # =============================================================================
 
-SPLINE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "src" / "lib.rs"
+SPLINE_LIB_RS = MODULES_ROOT / "extensions" / "pill_spline" / "src" / "pill_spline.rs"
 PROJECT_RS_SETTINGS_RS = WORKSPACE_ROOT / "examples" / "project_rs" / "src" / "settings.rs"
 PROJECT_CS_SYSTEMS_CS = WORKSPACE_ROOT / "examples" / "project_cs" / "src" / "Systems.cs"
 
@@ -439,7 +439,7 @@ def build_host() -> bool:
                 "pill_standalone",
                 "--no-default-features",
                 "--features",
-                "hot_reload,rendering",
+                "dev,rendering",
                 "--offline",
             ],
             cwd=str(MODULES_ROOT),
