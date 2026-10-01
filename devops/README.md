@@ -70,7 +70,10 @@ suite pins down.
 
 `tools/build_web.py` builds a Rust project for the browser (bundle and web app
 generation, `wasm-pack`, the page from `tools/web/index.html`); the web smoke
-test drives it.
+test drives it. `tools/wasm_size_report.py` explains a web build's size: the
+shipped module's sections, its gzip size, the embedded asset pack, and (with
+`twiggy` on PATH) the code by crate - engine, project, standard library and
+third-party families - from the binary wasm-opt has not stripped yet.
 
 ## core/
 
