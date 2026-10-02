@@ -1,10 +1,13 @@
-//! Inspector panel: components and editable fields of the selected entity.
+//! Inspector panel: what is selected anywhere in the editor - an entity's
+//! components and editable fields, or an asset's settings.
 //!
 //! # Responsibilities
 //!
 //! - Render the selected entity's components with editable scalar and array
 //!   element fields, driven entirely by the engine's generic field API.
 //! - Offer add/remove component actions backed by the registered layouts.
+//! - Show the selected asset's settings form instead, when an asset was
+//!   selected last ([`AssetInspector`]).
 //!
 //! The snapshot's `detail` tier already carries the owned field descriptors
 //! and current values; this panel only renders them and turns user edits into
@@ -19,6 +22,7 @@ use pill_core::platform::Instant;
 use pill_engine::component_registry::ComponentFieldDescriptor;
 use pill_engine::{Entity, FieldValue};
 
+use crate::assets_tab::AssetInspector;
 use crate::editor_state::{EditorCommand, EditorSnapshot, RegisteredComponent};
 use crate::EditorContext;
 
@@ -700,8 +704,15 @@ pub(crate) fn InspectorTab(editor: Arc<EditorContext>) -> Element {
 
     let detail = snapshot.read().detail.clone();
     let Some(detail) = detail else {
+        // No entity selected: an asset may be. The snapshot poll re-renders
+        // this panel, so a selection made in the Assets panel shows promptly.
+        if let Some(path) = editor.selected_asset() {
+            return rsx! {
+                AssetInspector { key: "{path}", editor: Arc::clone(&editor), path: path.clone() }
+            };
+        }
         return rsx! {
-            div { class: "editor-panel editor-placeholder", "Select an entity to inspect." }
+            div { class: "editor-panel editor-placeholder", "Select an entity or an asset to inspect." }
         };
     };
 

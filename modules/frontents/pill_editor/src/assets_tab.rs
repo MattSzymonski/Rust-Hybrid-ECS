@@ -4,10 +4,11 @@
 //! # Responsibilities
 //!
 //! - List the project's `res` tree with each file's asset type, load state and
-//!   guid (`.meta` files hidden).
-//! - Edit the selected asset's import settings - or a standalone asset's own
-//!   document - as a generic form over its JSON, and save it.
-//! - Rename or move the selected asset together with its `.meta`.
+//!   guid (`.meta` files hidden), and select an asset for the Inspector.
+//! - Provide the Inspector's asset view ([`AssetInspector`]): the selected
+//!   asset's import settings - or a standalone asset's own document - as a
+//!   generic form over its JSON, saved back to disk, and a field to rename or
+//!   move the asset together with its `.meta`.
 //! - Create a new standalone asset (a material, a render pass) from a dialog:
 //!   a type dropdown filled from the registry, a name, and a folder chosen
 //!   from the `res` tree, opened from a button or a folder's context menu.
@@ -176,9 +177,9 @@ pub(crate) fn preview_path(folder: &str, name: &str, extension: &str) -> Result<
 #[component]
 pub(crate) fn AssetsTab(editor: Arc<EditorContext>) -> Element {
     let mut entries = use_signal(Vec::<AssetEntry>::new);
+    // A copy of the editor-wide asset selection, refreshed with the tree, so
+    // the highlight follows a selection made elsewhere (or its clearing).
     let mut selected = use_signal(|| Option::<String>::None);
-    let mut fields = use_signal(Vec::<SettingField>::new);
-    let mut move_target = use_signal(String::new);
     let mut status = use_signal(String::new);
     // The Create asset dialog: open or not, the types it offers, and its fields.
     let mut create_open = use_signal(|| false);
@@ -194,6 +195,7 @@ pub(crate) fn AssetsTab(editor: Arc<EditorContext>) -> Element {
         async move {
             loop {
                 entries.set(poll_editor.asset_entries());
+                selected.set(poll_editor.selected_asset());
                 tokio::time::sleep(POLL_INTERVAL).await;
             }
         }
@@ -326,6 +328,7 @@ pub(crate) fn AssetsTab(editor: Arc<EditorContext>) -> Element {
                                         Ok(path) => {
                                             create_open.set(false);
                                             create_name.set(String::new());
+                                            editor.select_asset(Some(path.clone()));
                                             selected.set(Some(path.clone()));
                                             status.set(format!("created res/{path}; it is loaded"));
                                         }
@@ -361,27 +364,15 @@ pub(crate) fn AssetsTab(editor: Arc<EditorContext>) -> Element {
                                 }
                             }
                         },
+                        // Every row selects: a file for the Inspector, a folder
+                        // as where the Create dialog puts a new asset.
                         onclick: {
                             let editor = Arc::clone(&editor);
-                            let entry = entry.clone();
+                            let path = entry.path.clone();
                             move |_| {
-                                if entry.is_directory || entry.type_name.is_none() {
-                                    selected.set(Some(entry.path.clone()));
-                                    fields.set(Vec::new());
-                                    return;
-                                }
-                                selected.set(Some(entry.path.clone()));
-                                move_target.set(entry.path.clone());
-                                match editor.asset_settings(&entry.path) {
-                                    Ok(settings) => {
-                                        fields.set(fields_from_settings(&settings));
-                                        status.set(String::new());
-                                    }
-                                    Err(error) => {
-                                        fields.set(Vec::new());
-                                        status.set(error);
-                                    }
-                                }
+                                editor.select_asset(Some(path.clone()));
+                                selected.set(Some(path.clone()));
+                                status.set(String::new());
                             }
                         },
                         div {
@@ -392,12 +383,64 @@ pub(crate) fn AssetsTab(editor: Arc<EditorContext>) -> Element {
                     }
                 }
             }
-            if let Some(entry) = selected_entry
-                .clone().filter(|entry| !entry.is_directory && entry.type_name.is_some()) {
-                div {
-                    class: "editor-asset-inspector",
-                    div { class: "editor-row-title", "{entry.path}" }
-                    for (index, field) in fields.read().clone().into_iter().enumerate() {
+            if !status.read().is_empty() {
+                div { class: "editor-row-subtitle", "{status}" }
+            }
+        }
+    }
+}
+
+/// The Inspector's view of the asset at `path`: its type, load state and
+/// guid, its settings as a form, and a field to move it.
+///
+/// Remounted per path (the Inspector keys it by path), so the form always
+/// starts from the selected asset's file. Saving writes the file and the dev
+/// host's asset watcher reimports the asset into the running scene; moving
+/// renames both files and the watcher follows the move.
+#[component]
+pub(crate) fn AssetInspector(editor: Arc<EditorContext>, path: String) -> Element {
+    let initial = {
+        let editor = Arc::clone(&editor);
+        let path = path.clone();
+        move || editor.asset_settings(&path)
+    };
+    let mut fields = use_signal(|| initial().map(|settings| fields_from_settings(&settings)));
+    let mut move_target = use_signal(|| path.clone());
+    let mut status = use_signal(String::new);
+
+    let entry = editor
+        .asset_entries()
+        .into_iter()
+        .find(|entry| entry.path == path);
+    let summary = entry.as_ref().map(row_subtitle).unwrap_or_default();
+    let is_asset = entry
+        .as_ref()
+        .is_some_and(|entry| !entry.is_directory && entry.type_name.is_some());
+    if !is_asset {
+        let note = match &entry {
+            Some(entry) if entry.is_directory => "A folder: select a file to inspect it.",
+            Some(_) => "Not an asset type: no registered type imports this file.",
+            None => "No longer exists.",
+        };
+        return rsx! {
+            div {
+                class: "editor-panel editor-asset-inspector",
+                div { class: "editor-row-title", "res/{path}" }
+                div { class: "editor-row-subtitle", "{note}" }
+            }
+        };
+    }
+
+    let current = fields.read().clone();
+    rsx! {
+        div {
+            class: "editor-panel editor-asset-inspector",
+            div { class: "editor-row-title", "res/{path}" }
+            div { class: "editor-row-subtitle", "{summary}" }
+            match current {
+                Err(error) => rsx! { div { class: "editor-row-subtitle editor-warn", "{error}" } },
+                Ok(current) => rsx! {
+                    for (index, field) in current.into_iter().enumerate() {
                         div {
                             key: "setting-{field.key}",
                             class: "editor-field",
@@ -408,10 +451,10 @@ pub(crate) fn AssetsTab(editor: Arc<EditorContext>) -> Element {
                                         r#type: "checkbox",
                                         checked: field.text == "true",
                                         onchange: move |_| {
-                                            let mut edited = fields.read().clone();
-                                            let flipped = edited[index].text != "true";
-                                            edited[index].text = flipped.to_string();
-                                            fields.set(edited);
+                                            if let Ok(edited) = fields.write().as_mut() {
+                                                let flipped = edited[index].text != "true";
+                                                edited[index].text = flipped.to_string();
+                                            }
                                         },
                                     }
                                 },
@@ -420,9 +463,9 @@ pub(crate) fn AssetsTab(editor: Arc<EditorContext>) -> Element {
                                         rows: "4",
                                         value: "{field.text}",
                                         oninput: move |event| {
-                                            let mut edited = fields.read().clone();
-                                            edited[index].text = event.value();
-                                            fields.set(edited);
+                                            if let Ok(edited) = fields.write().as_mut() {
+                                                edited[index].text = event.value();
+                                            }
                                         },
                                     }
                                 },
@@ -431,9 +474,9 @@ pub(crate) fn AssetsTab(editor: Arc<EditorContext>) -> Element {
                                         r#type: "text",
                                         value: "{field.text}",
                                         oninput: move |event| {
-                                            let mut edited = fields.read().clone();
-                                            edited[index].text = event.value();
-                                            fields.set(edited);
+                                            if let Ok(edited) = fields.write().as_mut() {
+                                                edited[index].text = event.value();
+                                            }
                                         },
                                     }
                                 },
@@ -445,14 +488,15 @@ pub(crate) fn AssetsTab(editor: Arc<EditorContext>) -> Element {
                         button {
                             onclick: {
                                 let editor = Arc::clone(&editor);
-                                let path = entry.path.clone();
+                                let path = path.clone();
                                 move |_| {
-                                    let result = settings_from_fields(&fields.read())
+                                    let edited = fields.read().clone().unwrap_or_default();
+                                    let result = settings_from_fields(&edited)
                                         .and_then(|settings| editor.save_asset_settings(&path, settings));
                                     match result {
                                         Ok(saved) => {
-                                            fields.set(fields_from_settings(&saved));
-                                            status.set(format!("saved {path}; it reloads in the running scene"));
+                                            fields.set(Ok(fields_from_settings(&saved)));
+                                            status.set(format!("saved; {path} reloads in the running scene"));
                                         }
                                         Err(error) => status.set(error),
                                     }
@@ -461,32 +505,30 @@ pub(crate) fn AssetsTab(editor: Arc<EditorContext>) -> Element {
                             "Save settings"
                         }
                     }
-                    div {
-                        class: "editor-field",
-                        label { "Move to" }
-                        input {
-                            r#type: "text",
-                            value: "{move_target}",
-                            oninput: move |event| move_target.set(event.value()),
+                },
+            }
+            div {
+                class: "editor-field",
+                label { "Move to" }
+                input {
+                    r#type: "text",
+                    value: "{move_target}",
+                    oninput: move |event| move_target.set(event.value()),
+                }
+                button {
+                    onclick: {
+                        let editor = Arc::clone(&editor);
+                        let path = path.clone();
+                        move |_| {
+                            let target = move_target.read().clone();
+                            match editor.move_asset(&path, &target) {
+                                // The Inspector follows the asset to its new path.
+                                Ok(()) => editor.select_asset(Some(target)),
+                                Err(error) => status.set(error),
+                            }
                         }
-                        button {
-                            onclick: {
-                                let editor = Arc::clone(&editor);
-                                let path = entry.path.clone();
-                                move |_| {
-                                    let target = move_target.read().clone();
-                                    match editor.move_asset(&path, &target) {
-                                        Ok(()) => {
-                                            selected.set(Some(target.clone()));
-                                            status.set(format!("moved {path} to {target}, with its .meta"));
-                                        }
-                                        Err(error) => status.set(error),
-                                    }
-                                }
-                            },
-                            "Move"
-                        }
-                    }
+                    },
+                    "Move"
                 }
             }
             if !status.read().is_empty() {

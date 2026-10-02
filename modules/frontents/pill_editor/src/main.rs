@@ -325,6 +325,10 @@ pub(crate) struct EditorContext {
     last_command_errors: RefCell<Vec<String>>,
     /// Entity the Inspector is showing; cleared when that entity dies.
     selection: Cell<Option<Entity>>,
+    /// Asset the Inspector is showing, by its path in `res`. Exclusive with
+    /// [`Self::selection`]: selecting one clears the other, so the Inspector
+    /// always shows what was clicked last.
+    selected_asset: RefCell<Option<String>>,
     /// Throttle for snapshot captures (the engine keeps running uncapped).
     last_snapshot_refresh: Cell<Instant>,
     /// The gamepads, polled before every frame.
@@ -364,6 +368,9 @@ impl EditorContext {
             size.height,
         )?;
         FrameDriver::set_render_viewport(&mut host, Some(RenderViewport::default()));
+        // The editor keeps every source asset in `res` paired with a `.meta`
+        // file, so each one has a guid from the moment it is in the project.
+        host.set_ensure_asset_metadata(true);
 
         Ok(Self {
             host: RefCell::new(host),
@@ -375,6 +382,7 @@ impl EditorContext {
             pending_commands: RefCell::new(Vec::new()),
             last_command_errors: RefCell::new(Vec::new()),
             selection: Cell::new(None),
+            selected_asset: RefCell::new(None),
             last_snapshot_refresh: Cell::new(Instant::now()),
             gamepads: RefCell::new(Gamepads::new()),
         })
@@ -519,8 +527,28 @@ impl EditorContext {
     }
 
     /// Change Inspector selection; panels also use this to clear it.
+    ///
+    /// Selecting an entity clears the selected asset.
     pub(crate) fn set_selection(&self, selection: Option<Entity>) {
+        if selection.is_some() {
+            *self.selected_asset.borrow_mut() = None;
+        }
         self.selection.set(selection);
+    }
+
+    /// Select the asset at `path` (relative to `res`) for the Inspector, or
+    /// clear the asset selection. Selecting an asset clears the selected
+    /// entity.
+    pub(crate) fn select_asset(&self, path: Option<String>) {
+        if path.is_some() {
+            self.selection.set(None);
+        }
+        *self.selected_asset.borrow_mut() = path;
+    }
+
+    /// The asset the Inspector is showing, if any.
+    pub(crate) fn selected_asset(&self) -> Option<String> {
+        self.selected_asset.borrow().clone()
     }
 
     /// Advance the ECS and present one frame on Dioxus's redraw event.

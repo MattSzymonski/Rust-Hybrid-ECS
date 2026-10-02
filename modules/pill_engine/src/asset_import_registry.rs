@@ -102,6 +102,9 @@ type IsLoadedFunction = fn(&AssetManager, &Path) -> bool;
 type FollowMoveFunction = fn(&mut AssetManager, &Path) -> Result<Option<String>, AssetImportError>;
 /// A standalone type's default document, as JSON.
 type DefaultDocumentFunction = fn() -> AssetLoadResult<serde_json::Value>;
+/// Write a sourced asset's missing metadata file; the guid written, if any.
+type EnsureMetadataFunction =
+    fn(&AssetManager, &Path) -> Result<Option<AssetGuid>, AssetImportError>;
 
 /// The result of an erased import or reimport.
 pub type ErasedImportResult = Result<ErasedImportOutcome, AssetImportError>;
@@ -119,6 +122,9 @@ struct ImportFunctions {
     /// `Some` for a standalone type, whose file is the asset; `None` for a
     /// sourced one.
     default_document: Option<DefaultDocumentFunction>,
+    /// `Some` for a sourced type, whose metadata is a sidecar; `None` for a
+    /// standalone one, which holds its guid itself.
+    ensure_metadata: Option<EnsureMetadataFunction>,
 }
 
 impl ImportFunctions {
@@ -132,6 +138,7 @@ impl ImportFunctions {
             follow_move: AssetManager::follow_move::<T>,
             is_loaded: is_loaded::<T>,
             default_document: None,
+            ensure_metadata: Some(AssetManager::ensure_metadata::<T>),
         }
     }
 
@@ -146,6 +153,7 @@ impl ImportFunctions {
             follow_move: AssetManager::follow_standalone_move::<T>,
             is_loaded: is_loaded::<T>,
             default_document: Some(default_standalone_document::<T>),
+            ensure_metadata: None,
         }
     }
 }
@@ -608,6 +616,49 @@ impl ImportRegistry {
     ) -> Result<ErasedImportOutcome, ErasedImportError> {
         let functions = self.functions_for_path(path)?;
         Ok((functions.reimport)(assets, path)?)
+    }
+
+    /// Write the metadata file of the source at `path` when it has none; see
+    /// [`AssetManager::ensure_metadata`]. Returns the guid written, or `None`
+    /// when nothing was written - the file exists, or `path` is a standalone
+    /// asset, which has no sidecar.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::import`].
+    pub fn ensure_metadata(
+        &self,
+        assets: &AssetManager,
+        path: &Path,
+    ) -> Result<Option<AssetGuid>, ErasedImportError> {
+        let functions = self.functions_for_path(path)?;
+        match functions.ensure_metadata {
+            Some(ensure) => Ok(ensure(assets, path)?),
+            None => Ok(None),
+        }
+    }
+
+    /// Give every source under `root` that a registered sourced type imports
+    /// a metadata file, where it has none. Nothing is decoded or loaded.
+    /// Returns the files written (as their sources' paths) and the failures.
+    pub fn ensure_all_metadata(
+        &self,
+        assets: &AssetManager,
+        root: &Path,
+    ) -> (Vec<String>, Vec<(String, String)>) {
+        let mut written = Vec::new();
+        let mut failed = Vec::new();
+        for relative in source_files(root) {
+            let name = relative.to_string_lossy().replace('\\', "/");
+            match self.ensure_metadata(assets, &relative) {
+                Ok(Some(_)) => written.push(name),
+                Ok(None)
+                | Err(ErasedImportError::UnknownExtension { .. })
+                | Err(ErasedImportError::NoExtension { .. }) => {}
+                Err(error) => failed.push((name, error.to_string())),
+            }
+        }
+        (written, failed)
     }
 
     /// Whether an asset of the type `path`'s extension maps to is loaded under
@@ -1248,6 +1299,40 @@ mod tests {
             !res.root.join("a.label.meta").exists(),
             "a standalone file gets no sidecar"
         );
+    }
+
+    /// The sweep writes a `.meta` for each source without one, skips sources
+    /// that have one, unknown extensions and standalone files, and loads
+    /// nothing.
+    #[test]
+    fn the_sweep_pairs_every_source_with_metadata() {
+        let res = ScratchRes::new("ensure-sweep");
+        std::fs::create_dir_all(res.root.join("nested")).unwrap();
+        res.write("a.txt", "a");
+        res.write("nested/b.txt", "b");
+        res.write("other.bin", "?");
+        res.write("note.label", "{}");
+        let text = ImportRegistrationMarker::<Text>::new();
+        let label = ImportRegistrationMarker::<Label>::new();
+        let mut registry = ImportRegistry::default();
+        registry.register::<Text>(text.alive()).unwrap();
+        registry
+            .register_standalone::<Label>(label.alive())
+            .unwrap();
+        let assets = AssetManager::new();
+
+        let (written, failed) = registry.ensure_all_metadata(&assets, &res.root);
+
+        assert_eq!(written, ["a.txt", "nested/b.txt"]);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert!(res.root.join("nested/b.txt.meta").is_file());
+        assert!(
+            !res.root.join("note.label.meta").exists(),
+            "a standalone file has no sidecar"
+        );
+        assert_eq!(assets.len::<Text>(), 0, "nothing was loaded");
+        let (again, _) = registry.ensure_all_metadata(&assets, &res.root);
+        assert!(again.is_empty());
     }
 
     #[test]

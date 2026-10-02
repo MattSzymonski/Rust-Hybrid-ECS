@@ -138,6 +138,9 @@ pub struct DevHost {
     /// The project's `res` directory, for the asset browser; `None` when the
     /// configuration did not come from a project directory.
     asset_directory: Option<PathBuf>,
+    /// Whether every source asset is kept paired with a `.meta` file; see
+    /// [`DevHost::set_ensure_asset_metadata`]. Off unless a frontend asks.
+    ensure_asset_metadata: bool,
     /// Monotonic counter of reload/rollback/patch events.
     ///
     /// The editor keys its cached engine metadata on this. It is NOT how the
@@ -310,6 +313,52 @@ impl DevHost {
             path,
             settings,
         )
+    }
+
+    /// Keep every source asset in `res` paired with a `.meta` file.
+    ///
+    /// Turning it on writes the missing files at once: every source a
+    /// registered sourced type imports gets its type's default settings and a
+    /// guid, without being decoded or loaded. While it stays on, a `.meta`
+    /// deleted under a running host is written again - with the loaded asset's
+    /// guid when it is loaded - and a new source gets one when the watcher
+    /// imports it. The editor turns this on; a game run leaves it off.
+    pub fn set_ensure_asset_metadata(&mut self, enabled: bool) {
+        self.ensure_asset_metadata = enabled;
+        if !enabled {
+            return;
+        }
+        let Some(directory) = self.asset_directory.clone() else {
+            return;
+        };
+        let world = self.runtime.engine().world();
+        let (Some(registry), Some(assets)) = (
+            world.get_resource::<pill_engine::ImportRegistry>(),
+            world.get_resource::<pill_engine::AssetManager>(),
+        ) else {
+            return;
+        };
+        let (written, failed) = registry.ensure_all_metadata(assets, &directory);
+        for name in &written {
+            info!(
+                target: telemetry_target::HOT_RELOAD,
+                asset = name.as_str(),
+                "[assets] wrote missing metadata"
+            );
+        }
+        for (name, error) in &failed {
+            warn!(
+                target: telemetry_target::HOT_RELOAD,
+                asset = name.as_str(),
+                "[assets] could not write missing metadata: {error}"
+            );
+        }
+        info!(
+            target: telemetry_target::HOT_RELOAD,
+            written = written.len(),
+            failed = failed.len(),
+            "[assets] every source asset has a .meta file"
+        );
     }
 
     /// The standalone asset types a new file can be created for.
@@ -883,6 +932,12 @@ impl RenderingHost {
         self.host.save_asset_settings(path, settings)
     }
 
+    /// Keep every source asset paired with a `.meta`; see
+    /// [`DevHost::set_ensure_asset_metadata`].
+    pub fn set_ensure_asset_metadata(&mut self, enabled: bool) {
+        self.host.set_ensure_asset_metadata(enabled);
+    }
+
     /// The standalone asset types; see [`DevHost::standalone_asset_types`].
     pub fn standalone_asset_types(&self) -> Vec<crate::asset_browser::StandaloneType> {
         self.host.standalone_asset_types()
@@ -1228,6 +1283,7 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         loaded_patches: Vec::new(),
         asset_watcher: start_asset_watcher(host_config.asset_directory.as_deref()),
         asset_directory: host_config.asset_directory.clone(),
+        ensure_asset_metadata: false,
         editor_revision: 0,
     };
 
@@ -2092,6 +2148,7 @@ fn apply_asset_changes(host: &mut DevHost) {
     if changes.is_empty() {
         return;
     }
+    let ensure_metadata = host.ensure_asset_metadata;
     let world = host.runtime.engine_mut().world_mut();
     // A clone, so the registry can be called against the asset manager, which
     // is a second resource of the same world.
@@ -2132,6 +2189,12 @@ fn apply_asset_changes(host: &mut DevHost) {
                         "[assets] followed a move; the asset keeps its handle and guid"
                     );
                     moved_from.push(old_name);
+                    continue;
+                }
+                // A `.meta` written or edited for a source nothing has loaded
+                // concerns no running asset; importing it here would load it
+                // just because its sidecar changed.
+                if through_metadata && !registry.is_loaded(assets, path) {
                     continue;
                 }
                 let imported =
@@ -2179,6 +2242,26 @@ fn apply_asset_changes(host: &mut DevHost) {
                 asset = source.as_str(),
                     "[assets] source deleted; the asset stays loaded until the next run"
                 )
+            }
+            // With metadata kept, a deleted `.meta` is written again: with the
+            // loaded asset's guid when it is loaded, a new one otherwise.
+            AssetChange::MetadataRemoved { source }
+                if ensure_metadata && !moved_from.contains(&source) =>
+            {
+                match registry.ensure_metadata(assets, Path::new(&source)) {
+                    Ok(Some(guid)) => info!(
+                        target: telemetry_target::HOT_RELOAD,
+                        asset = source.as_str(),
+                        guid = %guid,
+                        "[assets] wrote missing metadata"
+                    ),
+                    Ok(None) => {}
+                    Err(error) => warn!(
+                        target: telemetry_target::HOT_RELOAD,
+                        asset = source.as_str(),
+                        "[assets] could not write missing metadata: {error}"
+                    ),
+                }
             }
             AssetChange::MetadataRemoved { source }
                 if !moved_from.contains(&source)
