@@ -11,6 +11,9 @@
 //!   the file when it is missing and the policy asks for it.
 //! - Decode a loaded asset again in place ([`AssetManager::reimport`]), after
 //!   its source or its metadata file changed.
+//! - Write a missing metadata file for a source without decoding it
+//!   ([`AssetManager::ensure_metadata`]), so a tool can keep every source
+//!   paired with one.
 //! - Follow a source moved with its metadata file
 //!   ([`AssetManager::follow_move`]): the loaded asset takes the new name and
 //!   keeps its handle and guid.
@@ -677,6 +680,69 @@ impl AssetManager {
             metadata,
             replaced: true,
         })
+    }
+}
+
+// =============================================================================
+// AssetManager::ensure_metadata
+// =============================================================================
+
+impl AssetManager {
+    /// Write the metadata file of the source at `path` when it has none, and
+    /// return the guid written; `None` when the file already exists or the
+    /// source is not on a writable filesystem (a packed asset).
+    ///
+    /// Nothing is decoded or loaded: the file gets `T`'s default settings and
+    /// a guid. When `T` is already loaded under `path`'s name - its `.meta`
+    /// was deleted while it ran - the loaded asset's own guid is written, so
+    /// the running asset and its file keep agreeing. Otherwise a new random
+    /// guid is drawn. An existing file is never touched.
+    ///
+    /// # Errors
+    ///
+    /// When the path does not normalize, the existing metadata cannot be
+    /// probed, no random guid is available, or the file cannot be written.
+    pub fn ensure_metadata<T: ImportedAsset>(
+        &self,
+        path: &Path,
+    ) -> Result<Option<AssetGuid>, AssetImportError> {
+        let asset_name = pack_key(path).ok_or_else(|| AssetLoadError::PathNotFound {
+            path: path.to_owned(),
+        })?;
+        let metadata_path =
+            metadata_path_for(Path::new(&asset_name)).ok_or_else(|| AssetLoadError::Metadata {
+                path: path.to_owned(),
+                detail: "a .meta file describes an asset; it is not one".to_owned(),
+            })?;
+        match asset_store::read(&metadata_path) {
+            Ok(_) => return Ok(None),
+            Err(AssetLoadError::PathNotFound { .. }) => {}
+            Err(error) => return Err(error.into()),
+        }
+        let loaded = self
+            .handle_by_name::<T>(&asset_name)
+            .and_then(|handle| self.guid_of(handle));
+        let guid = match loaded {
+            Some(guid) => guid,
+            None => AssetGuid::random().map_err(|error| AssetLoadError::Metadata {
+                path: metadata_path.clone(),
+                detail: format!("no random source for a new guid: {error}"),
+            })?,
+        };
+        let document = render_metadata::<T>(&metadata_path, guid, &T::ImportSettings::default())?;
+        match asset_store::write_beside(Path::new(&asset_name), &metadata_path, &document)? {
+            // Another writer may have created the file meanwhile; its guid is
+            // the file's truth, and it was not written here.
+            Some(written) => {
+                let bytes = std::fs::read(&written).map_err(|source| AssetLoadError::Read {
+                    path: written.clone(),
+                    source,
+                })?;
+                let on_disk = parse_metadata::<T>(&metadata_path, &bytes)?;
+                Ok((on_disk.guid == guid).then_some(guid))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -1464,6 +1530,58 @@ mod tests {
         assert_eq!(assets.get(outcome.handle).unwrap().text, "hello");
         // Reimport never writes, even for a fresh import.
         assert!(res.read("a.note.meta").is_none());
+    }
+
+    // -------------------------------------------------------------------------
+    // Ensuring a metadata file
+    // -------------------------------------------------------------------------
+
+    /// A source without metadata gets a file with default settings and a new
+    /// guid, without being decoded; an existing file is left alone.
+    #[test]
+    fn ensure_metadata_writes_a_missing_file_without_decoding() {
+        let res = ScratchRes::new("ensure");
+        res.write("a.note", "hello");
+        res.write("b.note", "hello");
+        res.write("b.note.meta", &metadata_json(GUID_A, r#"{"volume": 9}"#));
+        let assets = AssetManager::new();
+        let decodes_before = decodes();
+
+        let written = assets.ensure_metadata::<Note>(Path::new("a.note")).unwrap();
+        let kept = assets.ensure_metadata::<Note>(Path::new("b.note")).unwrap();
+
+        let guid = written.expect("a.note had no metadata");
+        let file = res.read("a.note.meta").unwrap();
+        assert!(file.contains(&guid.to_string()), "{file}");
+        assert!(
+            file.contains("\"volume\": 7"),
+            "the type's defaults: {file}"
+        );
+        assert_eq!(kept, None);
+        assert!(res.read("b.note.meta").unwrap().contains(GUID_A));
+        assert_eq!(decodes(), decodes_before, "nothing was decoded");
+        assert_eq!(
+            assets.ensure_metadata::<Note>(Path::new("a.note")).unwrap(),
+            None
+        );
+    }
+
+    /// A loaded asset whose metadata file was deleted gets it back under the
+    /// guid it is loaded with, so a reimport still matches.
+    #[test]
+    fn ensure_metadata_keeps_a_loaded_assets_guid() {
+        let res = ScratchRes::new("ensure-loaded");
+        res.write("a.note", "hello");
+        let mut assets = AssetManager::new();
+        let loaded = assets
+            .import(request("a.note", MetadataPolicy::CreateIfMissing))
+            .unwrap();
+        std::fs::remove_file(res.root.join("a.note.meta")).unwrap();
+
+        let written = assets.ensure_metadata::<Note>(Path::new("a.note")).unwrap();
+
+        assert_eq!(written, Some(loaded.guid));
+        assert!(assets.reimport::<Note>(Path::new("a.note")).is_ok());
     }
 
     // -------------------------------------------------------------------------
