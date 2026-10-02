@@ -55,6 +55,11 @@ serde_yaml = "0.9"
 toml_edit = "0.22"
 tracing = "0.1"
 
+[dev-dependencies]
+# Tests declare small asset types of their own (`impl_trait_accessible!`). The
+# same revision the engine uses, so nothing new enters the resolved graph.
+trait_type_map = { git = "https://github.com/MattSzymonski/Trait-Type-Map", rev = "25343a9eac856445b0fa8266df5b000326d1574b" }
+
 [features]
 # On by default: the development posture, where the host watches sources,
 # shells out to cargo, and loads the project and every extension as a

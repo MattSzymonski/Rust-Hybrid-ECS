@@ -8,6 +8,10 @@
 //!   resolves through: packs ([`mount_pack`]) and the project's asset
 //!   directory ([`mount_directory`]).
 //! - Read a path's bytes from the first mount that has it ([`read`]).
+//! - Write a file beside an asset that lives on the filesystem
+//!   ([`write_beside`]), which is how a development build records an asset's
+//!   metadata, and write a new file that must not exist yet ([`write_new`]),
+//!   which is how a tool creates a standalone asset. Packs are never written.
 //!
 //! # Design
 //!
@@ -261,10 +265,16 @@ pub fn read(path: &Path) -> AssetLoadResult<Vec<u8>> {
 }
 
 /// The key `path` is packed under: its components joined with `/`. `None` for
-/// a path no pack can hold - absolute, or climbing out with `..`.
-fn pack_key(path: &Path) -> Option<String> {
+/// a path no pack can hold - absolute, climbing out with `..`, or not UTF-8.
+///
+/// Also the canonical name of an asset loaded from that path, so the name and
+/// the pack key can never disagree. `\` separates components on every
+/// target, not only on Windows: a path written on one machine must name the
+/// same asset on another.
+pub(crate) fn pack_key(path: &Path) -> Option<String> {
+    let unified = path.to_str()?.replace('\\', "/");
     let mut parts = Vec::new();
-    for component in path.components() {
+    for component in Path::new(&unified).components() {
         match component {
             Component::Normal(part) => parts.push(part.to_str()?),
             Component::CurDir => {}
@@ -298,9 +308,164 @@ fn resolve_file(path: &Path) -> Option<PathBuf> {
     candidates.into_iter().find(|candidate| candidate.is_file())
 }
 
+/// The filesystem path the asset at `path` resolves to, or `None` when it is
+/// not on the filesystem - packed only, or missing.
+///
+/// Resolves exactly as [`read`] does after the packs: as is when absolute,
+/// else below the mounted directory and the development fallbacks.
+pub fn locate_file(path: &Path) -> Option<PathBuf> {
+    resolve_file(path)
+}
+
+/// Write `bytes` to a file named like `target` in the directory of the asset
+/// `source`, unless that file already exists.
+///
+/// Returns the written (or already present) file, or `None` when `source` is
+/// not on the filesystem: a packed asset - every asset of a shipping or web
+/// build - has no directory to write into, and that is not an error.
+///
+/// The bytes go to a temporary sibling first and are linked into place only
+/// when complete, so a crash or a second writer never leaves a half-written
+/// file. An existing file is never replaced, even one that appears while this
+/// runs: it may hold a person's edits.
+///
+/// # Errors
+///
+/// Returns [`AssetLoadError::Write`] when the file cannot be written.
+pub fn write_beside(
+    source: &Path,
+    target: &Path,
+    bytes: &[u8],
+) -> AssetLoadResult<Option<PathBuf>> {
+    let Some(source_file) = resolve_file(source) else {
+        return Ok(None);
+    };
+    let directory = source_file.parent().unwrap_or(Path::new("."));
+    let file_name = target.file_name().ok_or_else(|| AssetLoadError::Write {
+        path: target.to_owned(),
+        source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "no file name"),
+    })?;
+    let destination = directory.join(file_name);
+    if destination.exists() {
+        return Ok(Some(destination));
+    }
+    let write_error = |source| AssetLoadError::Write {
+        path: destination.clone(),
+        source,
+    };
+
+    let temporary = directory.join(temporary_name(file_name));
+    std::fs::write(&temporary, bytes).map_err(write_error)?;
+    let placed = place_without_replacing(&temporary, &destination);
+    // The temporary is gone after a successful fallback rename; ignore that.
+    let _ = std::fs::remove_file(&temporary);
+    placed.map_err(write_error)?;
+    Ok(Some(destination))
+}
+
+/// Write `bytes` as the new file `destination`, refusing when it exists.
+///
+/// The bytes go to a temporary sibling first and are linked into place only
+/// when complete, so a crash never leaves a half-written file, and an existing
+/// file - even one that appears while this runs - is never replaced. Missing
+/// parent directories are not created: the caller names a folder that exists.
+///
+/// # Errors
+///
+/// [`AssetLoadError::Write`] with [`std::io::ErrorKind::AlreadyExists`] when
+/// the file exists, or with the underlying error when it cannot be written.
+pub fn write_new(destination: &Path, bytes: &[u8]) -> AssetLoadResult<()> {
+    let write_error = |source| AssetLoadError::Write {
+        path: destination.to_owned(),
+        source,
+    };
+    let file_name = destination.file_name().ok_or_else(|| {
+        write_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no file name",
+        ))
+    })?;
+    let directory = destination.parent().unwrap_or(Path::new("."));
+    if destination.exists() {
+        return Err(write_error(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "the file already exists",
+        )));
+    }
+    let temporary = directory.join(temporary_name(file_name));
+    std::fs::write(&temporary, bytes).map_err(write_error)?;
+    // A hard link fails when the destination exists, which is the guarantee
+    // wanted here; unlike `place_without_replacing`, an existing file is an
+    // error rather than someone else's equally good copy.
+    let linked = std::fs::hard_link(&temporary, destination);
+    let _ = std::fs::remove_file(&temporary);
+    linked.map_err(write_error)
+}
+
+/// A sibling name for `file_name` that no other writer in this or another
+/// process picks at the same time.
+fn temporary_name(file_name: &std::ffi::OsStr) -> std::ffi::OsString {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut name = std::ffi::OsString::from(".");
+    name.push(file_name);
+    name.push(format!(".{}-{sequence}.tmp", std::process::id()));
+    name
+}
+
+/// Move the complete file `temporary` to `destination`, leaving an existing
+/// `destination` untouched.
+///
+/// A hard link fails atomically when the destination exists, which no
+/// rename on Windows does. A filesystem without hard links falls back to a
+/// rename guarded by an existence check: the check and the rename are not one
+/// operation, but only two writers racing on one metadata file could slip
+/// between them.
+fn place_without_replacing(temporary: &Path, destination: &Path) -> std::io::Result<()> {
+    match std::fs::hard_link(temporary, destination) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(_) if destination.exists() => Ok(()),
+        Err(_) => std::fs::rename(temporary, destination),
+    }
+}
+
+/// Serializes tests that change the process-wide mounted directory.
+///
+/// `mount_directory` replaces one global, and tests run in parallel threads,
+/// so two tests mounting their own scratch directory would read each other's
+/// files. Every test that mounts a directory holds this for its whole run.
+#[cfg(test)]
+pub(crate) fn mounted_directory_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A test that failed while holding the lock poisons it; the directory is
+    // re-mounted by the next holder anyway.
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_new_writes_once_and_never_replaces() {
+        let directory = std::env::temp_dir().join(format!("pill-write-new-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("a.render_pass");
+
+        write_new(&file, b"first").unwrap();
+        let error = write_new(&file, b"second").unwrap_err();
+
+        assert!(matches!(
+            error,
+            AssetLoadError::Write { ref source, .. } if source.kind() == std::io::ErrorKind::AlreadyExists
+        ));
+        assert_eq!(std::fs::read(&file).unwrap(), b"first");
+        let leftovers = std::fs::read_dir(&directory).unwrap().count();
+        assert_eq!(leftovers, 1, "no temporary file is left behind");
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 
     /// A version 1 pack of `files`, written the way `pill_assets` writes one.
     fn pack_of(files: &[(&str, &[u8])]) -> Vec<u8> {
@@ -361,6 +526,104 @@ mod tests {
         );
         assert_eq!(pack_key(Path::new("../outside.txt")), None);
         assert_eq!(pack_key(Path::new("")), None);
+    }
+
+    /// The pack key doubles as an asset's name, so every spelling of one path
+    /// must give one key, on every target.
+    #[test]
+    fn backslashes_and_dots_normalize_to_one_key() {
+        let expected = Some("textures/a.jpg".to_owned());
+        assert_eq!(pack_key(Path::new("textures\\a.jpg")), expected);
+        assert_eq!(pack_key(Path::new("textures/./a.jpg")), expected);
+        assert_eq!(pack_key(Path::new(".\\textures\\.\\a.jpg")), expected);
+        assert_eq!(pack_key(Path::new("textures\\..\\a.jpg")), None);
+        assert_eq!(pack_key(&std::env::temp_dir().join("a.jpg")), None);
+    }
+
+    /// A fresh directory under the system temp directory, removed on drop.
+    struct ScratchDirectory(PathBuf);
+
+    impl ScratchDirectory {
+        fn new(label: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let sequence = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "pill-asset-store-{label}-{}-{sequence}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for ScratchDirectory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn locate_file_finds_files_on_disk_only() {
+        let scratch = ScratchDirectory::new("locate");
+        let source = scratch.0.join("present.txt");
+        std::fs::write(&source, b"x").unwrap();
+        assert_eq!(locate_file(&source), Some(source.clone()));
+        assert_eq!(locate_file(&scratch.0.join("absent.txt")), None);
+    }
+
+    /// The metadata path: written into the source's own directory, under the
+    /// target's file name, with no temporary left behind.
+    #[test]
+    fn write_beside_writes_next_to_the_source() {
+        let scratch = ScratchDirectory::new("write");
+        let source = scratch.0.join("a.jpg");
+        std::fs::write(&source, b"image").unwrap();
+
+        let written = write_beside(&source, Path::new("textures/a.jpg.meta"), b"{}")
+            .unwrap()
+            .expect("the source is on disk");
+
+        assert_eq!(written, scratch.0.join("a.jpg.meta"));
+        assert_eq!(std::fs::read(&written).unwrap(), b"{}");
+        let leftovers: Vec<_> = std::fs::read_dir(&scratch.0)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temporary files left: {leftovers:?}");
+    }
+
+    /// An existing file may hold a person's edits: it is kept as it is.
+    #[test]
+    fn write_beside_never_replaces_an_existing_file() {
+        let scratch = ScratchDirectory::new("keep");
+        let source = scratch.0.join("a.jpg");
+        std::fs::write(&source, b"image").unwrap();
+        let existing = scratch.0.join("a.jpg.meta");
+        std::fs::write(&existing, b"edited by hand").unwrap();
+
+        let written = write_beside(&source, Path::new("a.jpg.meta"), b"generated").unwrap();
+
+        assert_eq!(written, Some(existing.clone()));
+        assert_eq!(std::fs::read(&existing).unwrap(), b"edited by hand");
+    }
+
+    /// A source no filesystem mount has - packed only, as in every shipping
+    /// and web build - has nowhere to write beside, and that is not an error.
+    #[test]
+    fn write_beside_a_source_not_on_disk_writes_nothing() {
+        let key = "pill-store-test/packed-only-source.jpg";
+        mount_pack(AssetPack::parse(pack_of(&[(key, b"image")])).unwrap());
+        assert_eq!(read(Path::new(key)).unwrap(), b"image");
+
+        let written = write_beside(
+            Path::new(key),
+            Path::new("packed-only-source.jpg.meta"),
+            b"{}",
+        )
+        .unwrap();
+
+        assert_eq!(written, None);
     }
 
     #[test]

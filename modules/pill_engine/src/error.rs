@@ -565,6 +565,29 @@ pub enum WorldError {
         count: usize,
     },
 
+    /// Two imported asset types claim the same source file extension.
+    ///
+    /// A file's asset type is chosen by its extension, so a second claim would
+    /// make the choice depend on which module registered first. Raised by
+    /// [`World::register_imported_asset`](crate::World::register_imported_asset).
+    #[message(
+        "imported asset type ",
+        name_style(incoming_type),
+        " claims source extension ",
+        value(extension),
+        ", which ",
+        name_style(registered_type),
+        " already imports"
+    )]
+    ImportExtensionClaimedTwice {
+        /// The contested extension, lowercased, without the dot.
+        extension: String,
+        /// The type that already imports it.
+        registered_type: String,
+        /// The type that asked for it.
+        incoming_type: String,
+    },
+
     /// The archetype recorded for an entity is absent from the world.
     ///
     /// Signals that an entity location outlived the archetype it points at,

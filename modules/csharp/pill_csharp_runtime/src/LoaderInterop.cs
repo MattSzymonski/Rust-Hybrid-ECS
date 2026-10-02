@@ -108,8 +108,9 @@ public static unsafe class LoaderInterop
     /// managed logging and profiling callbacks appended to the API table.
     /// Bumped to 12 by the version and size header that opens the API table,
     /// which <see cref="Engine.Bind(EngineApi*)"/> checks before copying it.
+    /// Bumped to 13 by the three asset import slots appended to the API table.
     /// </summary>
-    public const uint InteropContractVersion = 12;
+    public const uint InteropContractVersion = 13;
 
     /// <summary>Return the unmanaged ABI contract version for host validation.</summary>
 #if !PILL_AOT

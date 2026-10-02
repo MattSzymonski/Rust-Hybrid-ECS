@@ -6,6 +6,8 @@
 //! - Decode a mesh, texture or shader from raw bytes a managed caller supplies,
 //!   and build a material from already-loaded handles and per-slot parameters,
 //!   inserting each into a world's `AssetManager`.
+//! - Import a texture or a mesh from `res` through its metadata file, one
+//!   named export per type, through [`pill_engine::asset_ffi`].
 //! - Offer each as a named C-ABI function the host's C# bridge finds by name:
 //!   as a `#[no_mangle]` export when this crate is a loaded module
 //!   (`module-abi`), and through a [`PillExportDescriptor`] when it is linked
@@ -28,6 +30,7 @@
 //! exclusively for the call.
 
 // External crates
+use pill_engine::asset_ffi::{import_for_ffi, NativeImportedAsset};
 use pill_engine::component_registry::{ExportAddress, PillExportDescriptor};
 use pill_engine::{AssetLoader, AssetManager, Handle, World};
 
@@ -544,6 +547,68 @@ pub unsafe extern "C" fn pill_render_data_create_material(
     }
 }
 
+/// Imports the texture at `path` (relative to `res`) through its `.meta` file
+/// and writes the result to `output`; see
+/// [`import_for_ffi`](pill_engine::asset_ffi::import_for_ffi) for the
+/// arguments and status codes.
+///
+/// # Safety
+///
+/// The contract of [`import_for_ffi`](pill_engine::asset_ffi::import_for_ffi).
+#[cfg_attr(feature = "module-abi", no_mangle)]
+pub unsafe extern "C" fn pill_render_data_import_texture(
+    world: *mut World,
+    path: *const u8,
+    path_length: u32,
+    policy: u8,
+    settings: *const u8,
+    settings_length: u32,
+    output: *mut NativeImportedAsset,
+) -> u8 {
+    // SAFETY: forwarded unchanged from this function's contract.
+    unsafe {
+        import_for_ffi::<Texture>(
+            world,
+            path,
+            path_length,
+            policy,
+            settings,
+            settings_length,
+            output,
+        )
+    }
+}
+
+/// Imports the mesh at `path` through its `.meta` file; otherwise as
+/// [`pill_render_data_import_texture`].
+///
+/// # Safety
+///
+/// The contract of [`import_for_ffi`](pill_engine::asset_ffi::import_for_ffi).
+#[cfg_attr(feature = "module-abi", no_mangle)]
+pub unsafe extern "C" fn pill_render_data_import_mesh(
+    world: *mut World,
+    path: *const u8,
+    path_length: u32,
+    policy: u8,
+    settings: *const u8,
+    settings_length: u32,
+    output: *mut NativeImportedAsset,
+) -> u8 {
+    // SAFETY: forwarded unchanged from this function's contract.
+    unsafe {
+        import_for_ffi::<Mesh>(
+            world,
+            path,
+            path_length,
+            policy,
+            settings,
+            settings_length,
+            output,
+        )
+    }
+}
+
 // Offer every function to a host that links this crate statically; a loaded
 // module offers them through the `#[no_mangle]` exports above instead.
 pill_engine::submit! {
@@ -568,5 +633,17 @@ pill_engine::submit! {
     PillExportDescriptor {
         name: "pill_render_data_create_material",
         address: ExportAddress(pill_render_data_create_material as *const ()),
+    }
+}
+pill_engine::submit! {
+    PillExportDescriptor {
+        name: "pill_render_data_import_texture",
+        address: ExportAddress(pill_render_data_import_texture as *const ()),
+    }
+}
+pill_engine::submit! {
+    PillExportDescriptor {
+        name: "pill_render_data_import_mesh",
+        address: ExportAddress(pill_render_data_import_mesh as *const ()),
     }
 }

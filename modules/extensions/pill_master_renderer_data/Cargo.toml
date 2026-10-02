@@ -54,6 +54,11 @@ default = []
 # its shaders, so a shipping build never carries it.
 module-abi = []
 
+[dev-dependencies]
+# Tests check the metadata files' JSON form. Test-only, and the workspace's
+# resolver 2 keeps dev-dependencies out of the graph a normal build resolves.
+serde_json = "1"
+
 [build-dependencies]
 # Turns `shaders/**/*.hlsl` into the WGSL this crate embeds, so a shader that
 # is not committed is still the one that compiles.

@@ -5,7 +5,11 @@
 //! - Declares [`Sound`], stored in the
 //!   [`AssetManager`](pill_engine::AssetManager) and addressed by
 //!   `Handle<Sound>`.
-//! - Validates and reads an audio file from disk ([`Sound::load`]).
+//! - Validates an audio file's format and reads it through the asset store
+//!   ([`Sound::load`]), so a packed sound loads like one on disk.
+//! - Imports a sound through its `.meta` file
+//!   ([`ImportedAsset`](pill_engine::ImportedAsset), with
+//!   [`SoundImportSettings`]), which gives it a stable guid.
 //! - Hands the playback path a fresh decoder over those bytes.
 //!
 //! # Design
@@ -19,7 +23,9 @@
 //! cost roughly an order of magnitude more memory per sound.
 
 // External crates
-use pill_engine::Asset;
+use pill_core::utils::AssetPathError;
+use pill_engine::{Asset, AssetLoadError, AssetLoadResult};
+use serde::{Deserialize, Serialize};
 
 // =============================================================================
 // Constants
@@ -27,9 +33,9 @@ use pill_engine::Asset;
 
 /// Audio container formats [`Sound::load`] accepts.
 ///
-/// Checked by `pill_core::utils::validate_asset_path` before any bytes are
-/// read, so a typo in a path fails with the path and the allowed list rather
-/// than as a decoder error thousands of samples later.
+/// Checked before any bytes are read, so a typo in a path fails with the path
+/// and the allowed list rather than as a decoder error thousands of samples
+/// later.
 pub const SUPPORTED_AUDIO_FORMATS: &[&str] = &["mp3", "wav", "ogg", "flac"];
 
 // =============================================================================
@@ -78,10 +84,44 @@ impl std::fmt::Debug for Sound {
     }
 }
 
+/// How a sound file is read, as stored in its `.meta` file.
+///
+/// Empty for now: a sound's bytes say everything about it. It exists so that
+/// sound files get metadata files, and with them a guid that survives a
+/// rename. A field added later must have a default, so existing files still
+/// read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SoundImportSettings {}
+
+impl pill_engine::ImportedAsset for Sound {
+    type ImportSettings = SoundImportSettings;
+    const SOURCE_EXTENSIONS: &'static [&'static str] = SUPPORTED_AUDIO_FORMATS;
+
+    // `Sound` has no shared name, so the default would be its Rust type path,
+    // which changes if the type moves; the files must keep matching.
+    fn metadata_type_name() -> &'static str {
+        "pill_audio::Sound"
+    }
+
+    fn import(
+        name: &str,
+        source_bytes: &[u8],
+        _settings: &SoundImportSettings,
+    ) -> AssetLoadResult<Self> {
+        let path = std::path::Path::new(name);
+        validate_format(path).map_err(|error| AssetLoadError::Decode {
+            label: name.to_owned(),
+            detail: error.to_string(),
+        })?;
+        Ok(Self::from_bytes(path, source_bytes.to_vec()))
+    }
+}
+
 /// Why [`Sound::load`] could not produce a sound.
 #[derive(Debug)]
 pub enum SoundLoadError {
-    /// The path does not exist, or its extension is not a supported format.
+    /// No mount has the path, or its extension is not a supported format.
     InvalidPath(pill_core::utils::AssetPathError),
     /// The file exists but could not be read.
     Unreadable {
@@ -115,23 +155,29 @@ impl std::error::Error for SoundLoadError {
 impl Sound {
     /// Read an audio file into memory.
     ///
-    /// The path is validated against [`SUPPORTED_AUDIO_FORMATS`] before it is
-    /// opened, so an unsupported extension is reported as such rather than as
-    /// a decode failure.
+    /// The path is read through [`asset_store`](pill_engine::asset_store),
+    /// like every other asset: a relative path is found in a mounted pack
+    /// first (a shipping or web build), then below the project's `res`.
+    /// Its extension is checked against [`SUPPORTED_AUDIO_FORMATS`] before
+    /// anything is read, so an unsupported format is reported as such rather
+    /// than as a decode failure.
     ///
     /// # Errors
     ///
-    /// [`SoundLoadError::InvalidPath`] when the path does not exist or its
-    /// format is not supported, and [`SoundLoadError::Unreadable`] when the
-    /// file cannot be read.
+    /// [`SoundLoadError::InvalidPath`] when the format is not supported or no
+    /// mount has the path, and [`SoundLoadError::Unreadable`] when the file
+    /// was found but cannot be read.
     pub fn load(path: &std::path::Path) -> Result<Self, SoundLoadError> {
         let path = path.to_path_buf();
-        pill_core::utils::validate_asset_path(&path, SUPPORTED_AUDIO_FORMATS)
-            .map_err(SoundLoadError::InvalidPath)?;
+        validate_format(&path).map_err(SoundLoadError::InvalidPath)?;
 
-        let bytes = std::fs::read(&path).map_err(|source| SoundLoadError::Unreadable {
-            path: path.clone(),
-            source,
+        let bytes = pill_engine::asset_store::read(&path).map_err(|error| match error {
+            AssetLoadError::Read { path, source } => SoundLoadError::Unreadable { path, source },
+            // `read` fails only as not found or unreadable; anything else is
+            // reported as a path no mount could serve, too.
+            _ => SoundLoadError::InvalidPath(AssetPathError::InvalidPath {
+                path: path.display().to_string(),
+            }),
         })?;
 
         Ok(Self {
@@ -174,6 +220,23 @@ impl Sound {
     }
 }
 
+/// Check that `path` names a format in [`SUPPORTED_AUDIO_FORMATS`].
+///
+/// Only the extension is checked, never whether a file exists: a packed sound
+/// has no file on disk. Whether the path exists is answered by the read.
+pub(crate) fn validate_format(path: &std::path::Path) -> Result<(), AssetPathError> {
+    match path.extension().and_then(|extension| extension.to_str()) {
+        Some(extension) if SUPPORTED_AUDIO_FORMATS.contains(&extension) => Ok(()),
+        Some(extension) => Err(AssetPathError::InvalidFormat {
+            extension: extension.to_string(),
+            allowed: SUPPORTED_AUDIO_FORMATS.join(", "),
+        }),
+        None => Err(AssetPathError::InvalidPath {
+            path: path.display().to_string(),
+        }),
+    }
+}
+
 /// `Arc<[u8]>` that reads as a byte slice, so a decoder can borrow the sound's
 /// bytes instead of copying them.
 ///
@@ -195,7 +258,8 @@ impl AsRef<[u8]> for ArcBytes {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pill_engine::AssetManager;
+    use pill_engine::asset_store::AssetPack;
+    use pill_engine::{AssetImport, AssetManager, ImportedAsset, MetadataPolicy, MetadataSource};
 
     /// A missing file is reported as an invalid path, before any read.
     #[test]
@@ -205,10 +269,7 @@ mod tests {
     }
 
     /// An unsupported extension is rejected as a format problem rather than
-    /// surfacing later as a decode failure.
-    ///
-    /// Needs a file that genuinely exists, or the path check fails first and
-    /// the format is never reached.
+    /// surfacing later as a decode failure, even for a file that exists.
     #[test]
     fn loading_an_unsupported_format_is_rejected() {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -222,6 +283,123 @@ mod tests {
             }) => assert_eq!(extension, "toml"),
             other => panic!("expected a format rejection, got {other:?}"),
         }
+    }
+
+    /// A file on the filesystem loads, given as an absolute path.
+    #[test]
+    fn a_sound_on_disk_loads() {
+        let directory =
+            std::env::temp_dir().join(format!("pill_audio_disk_{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let file = directory.join("click.wav");
+        std::fs::write(&file, [1, 2, 3, 4]).unwrap();
+
+        let sound = Sound::load(&file).expect("the file exists");
+        assert_eq!(sound.bytes(), &[1, 2, 3, 4]);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// A sound that exists only in a mounted pack loads, which is how a
+    /// shipping or web build reads it: nothing is on disk at that path.
+    #[test]
+    fn a_sound_found_only_in_a_mounted_pack_loads() {
+        // The path is unique to this test, so the pack, which stays mounted
+        // for the rest of the process, cannot shadow another test's file.
+        let packed_path = "pill_audio_pack_test/only_in_pack.wav";
+        let pack = AssetPack::parse(pack_of(&[(packed_path, &[9, 8, 7])])).expect("a valid pack");
+        pill_engine::asset_store::mount_pack(pack);
+
+        let path = std::path::Path::new(packed_path);
+        assert!(!path.exists() && pill_engine::asset_store::locate_file(path).is_none());
+        let sound = Sound::load(path).expect("the pack has the file");
+        assert_eq!(sound.bytes(), &[9, 8, 7]);
+        assert_eq!(sound.path(), path);
+    }
+
+    /// A version 1 pack of `files`, in the layout `asset_store` documents.
+    fn pack_of(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let index_length: usize = files.iter().map(|(path, _)| 4 + path.len() + 16).sum();
+        let mut offset = (8 + 4 + 4 + index_length) as u64;
+        let mut pack = Vec::new();
+        pack.extend_from_slice(pill_engine::asset_store::ASSET_PACK_MAGIC);
+        pack.extend_from_slice(&pill_engine::asset_store::ASSET_PACK_VERSION.to_le_bytes());
+        pack.extend_from_slice(&(files.len() as u32).to_le_bytes());
+        for (path, bytes) in files {
+            pack.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            pack.extend_from_slice(path.as_bytes());
+            pack.extend_from_slice(&offset.to_le_bytes());
+            pack.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            offset += bytes.len() as u64;
+        }
+        for (_, bytes) in files {
+            pack.extend_from_slice(bytes);
+        }
+        pack
+    }
+
+    /// Importing a sound with `CreateIfMissing` writes its `.meta`; a later
+    /// run reads the same guid back, and importing again in the same run (a
+    /// project reload) returns the loaded handle.
+    ///
+    /// The only test in this crate that mounts a directory, so it needs no
+    /// lock against another test replacing the mount.
+    #[test]
+    fn importing_a_sound_writes_its_metadata_and_keeps_its_guid() {
+        let root = std::env::temp_dir().join(format!("pill_audio_import_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("sounds")).unwrap();
+        std::fs::write(root.join("sounds/click.mp3"), [1, 2, 3]).unwrap();
+        pill_engine::asset_store::mount_directory(&root);
+        let request =
+            || AssetImport::<Sound>::new("sounds/click.mp3", MetadataPolicy::CreateIfMissing);
+
+        let mut first_run = AssetManager::new();
+        let created = first_run.import(request()).expect("the file exists");
+        assert_eq!(created.metadata, MetadataSource::CreatedOnDisk);
+        let metadata = std::fs::read_to_string(root.join("sounds/click.mp3.meta")).unwrap();
+        assert!(metadata.contains("\"pill_audio::Sound\""), "{metadata}");
+        assert_eq!(
+            first_run.get(created.handle).map(Sound::bytes),
+            Some(&[1, 2, 3][..])
+        );
+
+        let reloaded = first_run.import(request()).expect("still loadable");
+        assert!(reloaded.already_loaded);
+        assert_eq!(reloaded.handle, created.handle);
+
+        let mut second_run = AssetManager::new();
+        let read = second_run.import(request()).expect("the metadata exists");
+        assert_eq!(read.metadata, MetadataSource::ReadFromFile);
+        assert_eq!(read.guid, created.guid);
+
+        // The same file, by extension through the registry the module's
+        // registration fills, without naming `Sound`.
+        let mut world = pill_engine::World::new();
+        world.register_imported_asset::<Sound>();
+        let registry = world.get_resource::<pill_engine::ImportRegistry>().unwrap();
+        let erased = registry
+            .import(
+                &mut second_run,
+                std::path::Path::new("sounds/click.mp3"),
+                MetadataPolicy::ReadIfPresent,
+            )
+            .expect("`.mp3` maps to Sound");
+        assert_eq!(erased.type_name, "pill_audio::Sound");
+        assert!(erased.previously_loaded);
+        assert_eq!(erased.guid, created.guid);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// An imported file whose extension is not an audio format is refused as
+    /// a decode error naming the file.
+    #[test]
+    fn importing_an_unsupported_format_is_refused() {
+        let error = Sound::import("sounds/notes.txt", &[1], &SoundImportSettings::default())
+            .err()
+            .expect("a text file is not a sound");
+        assert!(
+            matches!(error, AssetLoadError::Decode { ref label, .. } if label == "sounds/notes.txt")
+        );
     }
 
     /// Bytes already in memory skip path validation, which is what an embedded

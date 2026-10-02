@@ -29,9 +29,10 @@ mod rendering_pipeline;
 mod shader;
 mod texture;
 
-pub use material::{Material, MaterialBuilder, MaterialTexture};
-pub use mesh::{Mesh, MeshVertex};
+pub use material::{Material, MaterialBuilder, MaterialDocument, MaterialTexture};
+pub use mesh::{Mesh, MeshImportSettings, MeshVertex};
 pub use render_pass::RenderPass;
+pub use render_pass::RenderPassDocument;
 // Defined by the renderer contract (`pill_renderer_api::frame`), which a
 // resolved pass is written in too; re-exported so `assets::` paths keep working.
 pub use pill_renderer_api::frame::{CullMode, MaterialParameter, PassKind, PassTarget};
@@ -40,7 +41,7 @@ pub use shader::{parameter_slots_by_name, texture_slots_by_name};
 pub use shader::{
     Shader, ShaderBuilder, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot,
 };
-pub use texture::{Texture, TextureType};
+pub use texture::{Texture, TextureImportSettings, TextureType};
 
 use pill_engine::{Asset, Handle};
 

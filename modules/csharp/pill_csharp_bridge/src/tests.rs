@@ -2733,11 +2733,13 @@ fn a_managed_resource_publishes_its_field_layout() {
 // =============================================================================
 
 /// The export names the C# asset entry points forward to.
-const ASSET_EXPORTS: [&str; 4] = [
+const ASSET_EXPORTS: [&str; 6] = [
     "pill_render_data_load_mesh_obj",
     "pill_render_data_load_texture_png",
     "pill_render_data_load_shader",
     "pill_render_data_create_material",
+    "pill_render_data_import_texture",
+    "pill_render_data_import_mesh",
 ];
 
 /// A binary that links the renderer data crate finds every asset function the

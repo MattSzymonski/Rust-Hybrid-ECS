@@ -149,6 +149,24 @@ pub enum AssetLoadError {
     },
     #[error("failed to decode asset {label}: {detail}")]
     Decode { label: String, detail: String },
+    /// An asset's metadata file exists but cannot be used: it does not parse,
+    /// names another asset type, or was written by a newer format version.
+    #[error("asset metadata {path} cannot be used: {detail}")]
+    Metadata {
+        /// The metadata file, relative to the project's asset directory.
+        path: PathBuf,
+        /// What is wrong with it.
+        detail: String,
+    },
+    /// Writing a file into the project's asset directory failed.
+    #[error("failed to write asset file {path}: {source}")]
+    Write {
+        /// The file that could not be written.
+        path: PathBuf,
+        /// The underlying error.
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Result of loading an asset's bytes from wherever its [`AssetLoader`] points.
@@ -166,6 +184,9 @@ pub enum AssetBindingError {
         /// The name that is already taken.
         name: String,
     },
+    /// The handle no longer addresses a live asset.
+    #[error("the asset handle is stale: its asset was removed")]
+    StaleHandle,
 }
 
 /// Result of a binding operation that can hit an occupied name.
@@ -425,11 +446,58 @@ impl AssetGuid {
     pub const fn value(self) -> u128 {
         self.0
     }
+
+    /// A new guid from the operating system's random source.
+    ///
+    /// What an asset's metadata file is given when it is first written. It is
+    /// deliberately unrelated to the asset's path: a guid derived from the path
+    /// would be handed to whatever file later took that path, and a stale
+    /// reference would then resolve to the wrong asset instead of to nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `getrandom` error when the platform has no usable random
+    /// source.
+    pub fn random() -> Result<Self, getrandom::Error> {
+        let mut bytes = [0u8; 16];
+        getrandom::fill(&mut bytes)?;
+        Ok(Self(u128::from_le_bytes(bytes)))
+    }
+
+    /// Parse the 32-digit hexadecimal form [`Display`](std::fmt::Display)
+    /// writes, or `None` for any other text.
+    pub fn parse(text: &str) -> Option<Self> {
+        // Exactly 32 hex digits: `from_str_radix` alone would also accept a
+        // sign and a shorter string.
+        if text.len() != 32 || !text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        u128::from_str_radix(text, 16).ok().map(Self)
+    }
 }
 
 impl std::fmt::Display for AssetGuid {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{:032x}", self.0)
+    }
+}
+
+// Serialized as the 32-digit hex string rather than a number: a 128-bit integer
+// does not survive JSON number handling in most other tools, C# included.
+impl serde::Serialize for AssetGuid {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AssetGuid {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        Self::parse(&text).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "`{text}` is not an asset guid (expected 32 hexadecimal digits)"
+            ))
+        })
     }
 }
 
@@ -662,6 +730,45 @@ impl AssetManager {
         metadata.by_name.insert(name.clone(), handle.index);
         metadata.names.insert(handle.index, name);
         Ok(handle)
+    }
+
+    /// Give the live asset `handle` a new name, keeping its handle, guid and
+    /// value.
+    ///
+    /// What following a moved source file needs: everything that holds the
+    /// handle or the guid keeps working, and only lookups by the old name stop
+    /// resolving. Renaming an asset to the name it already has is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`AssetBindingError::NameInUse`] when another live asset has
+    /// `new_name`, and [`AssetBindingError::StaleHandle`] when `handle` is
+    /// stale. Nothing changes on an error.
+    pub fn rename<T>(
+        &mut self,
+        handle: Handle<T>,
+        new_name: impl Into<String>,
+    ) -> AssetBindingResult<()>
+    where
+        T: Asset + TraitAccessible<dyn Asset>,
+    {
+        let new_name = new_name.into();
+        if !self.is_live(handle) {
+            return Err(AssetBindingError::StaleHandle);
+        }
+        match self.handle_by_name::<T>(&new_name) {
+            Some(existing) if existing == handle => return Ok(()),
+            Some(_) => return Err(AssetBindingError::NameInUse { name: new_name }),
+            None => {}
+        }
+        let metadata = self
+            .metadata_of_mut::<T>()
+            .expect("a live handle has column metadata");
+        if let Some(old_name) = metadata.names.insert(handle.index, new_name.clone()) {
+            metadata.by_name.remove(&old_name);
+        }
+        metadata.by_name.insert(new_name, handle.index);
+        Ok(())
     }
 
     /// Store `asset` under `guid` and return a handle to it.
@@ -1089,6 +1196,39 @@ impl AssetManager {
 mod tests {
     use super::*;
     use trait_type_map::impl_trait_accessible;
+
+    /// A rename keeps the handle and guid, moves the name, and refuses a name
+    /// another asset has or a stale handle.
+    #[test]
+    fn rename_keeps_the_handle_and_guid_and_refuses_a_taken_name() {
+        let mut assets = AssetManager::new();
+        let guid = AssetGuid::new(7);
+        let moved = assets
+            .add_named_with_guid("old.png", guid, Mesh("moved"))
+            .unwrap();
+        let other = assets.add_named("taken.png", Mesh("other")).unwrap();
+
+        assets.rename(moved, "new.png").unwrap();
+        assert_eq!(assets.handle_by_name::<Mesh>("new.png"), Some(moved));
+        assert_eq!(assets.handle_by_name::<Mesh>("old.png"), None);
+        assert_eq!(assets.handle_by_guid::<Mesh>(guid), Some(moved));
+        assert_eq!(assets.name_of(moved), Some("new.png"));
+        assert_eq!(assets.get(moved), Some(&Mesh("moved")));
+
+        // Renaming to its own name is a no-op; a taken name is refused.
+        assets.rename(moved, "new.png").unwrap();
+        assert!(matches!(
+            assets.rename(moved, "taken.png"),
+            Err(AssetBindingError::NameInUse { .. })
+        ));
+        assert_eq!(assets.handle_by_name::<Mesh>("taken.png"), Some(other));
+
+        assets.remove(moved);
+        assert!(matches!(
+            assets.rename(moved, "again.png"),
+            Err(AssetBindingError::StaleHandle)
+        ));
+    }
 
     #[derive(Debug, PartialEq)]
     struct Mesh(&'static str);
@@ -1711,6 +1851,7 @@ mod tests {
 
     #[test]
     fn asset_loader_resolves_paths_below_its_root() {
+        let _mounted = crate::asset_store::mounted_directory_test_lock();
         let root = std::env::temp_dir().join(format!(
             "pill-asset-loader-{}-{}",
             std::process::id(),
@@ -1727,5 +1868,50 @@ mod tests {
 
         assert_eq!(bytes, b"shader");
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A guid is written as the 32-digit hex string `Display` gives, and reads
+    /// back to the same value.
+    #[test]
+    fn a_guid_serializes_as_32_hex_digits() {
+        let guid = AssetGuid::new(0x0123_4567_89ab_cdef_0011_2233_4455_6677);
+        let json = serde_json::to_string(&guid).unwrap();
+        assert_eq!(json, "\"0123456789abcdef0011223344556677\"");
+        assert_eq!(serde_json::from_str::<AssetGuid>(&json).unwrap(), guid);
+        // Leading zeros are kept, so every guid has the same width.
+        assert_eq!(
+            serde_json::to_string(&AssetGuid::new(1)).unwrap(),
+            "\"00000000000000000000000000000001\""
+        );
+    }
+
+    /// Anything but exactly 32 hex digits is refused rather than read as some
+    /// other guid.
+    #[test]
+    fn malformed_guid_text_is_refused() {
+        for text in [
+            "",
+            "abc",
+            "+0123456789abcdef0011223344556677",
+            "0123456789abcdef001122334455667g",
+        ] {
+            assert_eq!(AssetGuid::parse(text), None, "{text:?}");
+        }
+        assert!(serde_json::from_str::<AssetGuid>("\"xyz\"").is_err());
+        assert!(serde_json::from_str::<AssetGuid>("42").is_err());
+        assert_eq!(
+            AssetGuid::parse("0123456789ABCDEF0011223344556677"),
+            Some(AssetGuid::new(0x0123_4567_89ab_cdef_0011_2233_4455_6677))
+        );
+    }
+
+    /// Random guids differ from each other and survive a round trip.
+    #[test]
+    fn random_guids_are_distinct_and_round_trip() {
+        let first = AssetGuid::random().expect("a random source");
+        let second = AssetGuid::random().expect("a random source");
+        assert_ne!(first, second);
+        let json = serde_json::to_string(&first).unwrap();
+        assert_eq!(serde_json::from_str::<AssetGuid>(&json).unwrap(), first);
     }
 }

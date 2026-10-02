@@ -73,6 +73,7 @@ SUITE_ORDER: Sequence[str] = (
     "test_shared_component_identity.py",
     "test_csharp_bridge.py",
     "test_reload_edit_during_build.py",
+    "test_hot_reload_assets.py",
     "test_hot_patch_coverage.py",
     "test_patch_bookkeeping.py",
     "test_editor_revision.py",

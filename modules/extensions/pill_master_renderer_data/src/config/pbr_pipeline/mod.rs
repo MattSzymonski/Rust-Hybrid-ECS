@@ -30,7 +30,10 @@
 //! pass in the crate starts from the same instance layout.
 
 // External crates
-use pill_engine::{AssetManager, Handle};
+use std::collections::BTreeMap;
+
+use pill_engine::{AssetGuid, AssetManager, Handle};
+use pill_renderer_api::frame::MaterialParameter;
 
 // Current crate
 use crate::{
@@ -60,8 +63,37 @@ pub const PIPELINE_NAME: &str = "pill.pbr.pipeline";
 /// Asset name of the shader the geometry pass draws through.
 pub const SHADER_NAME: &str = "pill.pbr.shader";
 
+/// The guid the PBR shader is stored under, so a material file can name it.
+///
+/// Derived from [`SHADER_NAME`] rather than drawn at random: the shader is
+/// built in code, not imported from a file with a `.meta` to keep a random
+/// guid in, and every run must give it the same one.
+pub const SHADER_GUID: AssetGuid = AssetGuid::from_name(SHADER_NAME);
+
 /// Asset name of the material a mesh with none of its own draws with.
 pub const MATERIAL_NAME: &str = "pill.pbr.material";
+
+/// The PBR shader's parameters at their neutral values, by slot name.
+///
+/// The factors multiply the maps, so at these values what a mesh shows is its
+/// own albedo, roughness and metalness - and with no map bound, the
+/// renderer's default texture for each slot. Used by the chain's own default
+/// material and by every newly created material file, so both start out the
+/// same.
+pub fn neutral_parameters() -> BTreeMap<String, MaterialParameter> {
+    BTreeMap::from([
+        (
+            "pbr_base".to_owned(),
+            MaterialParameter::Color([1.0, 1.0, 1.0]),
+        ),
+        ("pbr_roughness".to_owned(), MaterialParameter::Scalar(1.0)),
+        ("pbr_metallic".to_owned(), MaterialParameter::Scalar(1.0)),
+        (
+            "pbr_emissive".to_owned(),
+            MaterialParameter::Color([1.0, 1.0, 1.0]),
+        ),
+    ])
+}
 
 /// Asset name of the lit pass.
 const OPAQUE_PASS: &str = "pill.pbr.pass.opaque";
@@ -107,20 +139,15 @@ pub fn install(
         .with_engine_parameters(true)
         .with_camera_parameters(true)
         .build()?;
-    let pbr = assets.add_named(SHADER_NAME, pbr)?;
+    let pbr = assets.add_named_with_guid(SHADER_NAME, SHADER_GUID, pbr)?;
 
     // The maps carry the look; these factors are neutral, so what a mesh shows is
     // its own albedo, roughness and metalness. A slot left unbound falls back to
     // the renderer's own default texture, which is what lets this material exist
     // before anyone has supplied a map. Nothing here needs the handle: a project
     // that wants it asks the store for `pill.pbr.material` by name.
-    let material = Material::builder(MATERIAL_NAME)
-        .shader(&pbr)
-        .color_parameter("pbr_base", [1.0, 1.0, 1.0])
-        .scalar_parameter("pbr_roughness", 1.0)
-        .scalar_parameter("pbr_metallic", 1.0)
-        .color_parameter("pbr_emissive", [1.0, 1.0, 1.0])
-        .build();
+    let mut material = Material::builder(MATERIAL_NAME).shader(&pbr).build();
+    material.parameters = neutral_parameters();
     assets.add_named(MATERIAL_NAME, material)?;
 
     // The lit geometry, into a target that can hold what the lighting produces.

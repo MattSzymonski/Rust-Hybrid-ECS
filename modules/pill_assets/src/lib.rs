@@ -11,6 +11,7 @@
 //! - Write a project's `res` directory as one asset pack
 //!   ([`write_asset_pack`]), which a shipping build embeds and the engine's
 //!   asset store reads.
+//! - Move a source asset together with its `.meta` file ([`move_asset`]).
 //!
 //! # Design
 //!
@@ -60,6 +61,11 @@ pub use rules::{default_rules, HlslToWgsl};
 /// A crate's whole `shaders/` directory, cooked by convention: the routine a
 /// build script and the development shader watcher share.
 pub mod shader_tree;
+
+/// Moving a source asset and its metadata file as one operation.
+pub mod asset_move;
+
+pub use asset_move::{metadata_path_of, move_asset, MoveAssetError};
 
 pub use shader_tree::{cook_shader_tree, shader_tree_layout, ShaderTreeLayout, ShaderTreeReport};
 

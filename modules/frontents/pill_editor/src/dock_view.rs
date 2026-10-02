@@ -10,6 +10,7 @@ use std::time::{Duration, SystemTime};
 
 use dioxus::prelude::*;
 
+use crate::assets_tab::AssetsTab;
 use crate::console_tab::ConsoleTab;
 use crate::entities_tab::EntitiesTab;
 use crate::inspector::InspectorTab;
@@ -135,6 +136,7 @@ pub fn DockView(
         PanelKind::Systems,
         PanelKind::Console,
         PanelKind::Statistics,
+        PanelKind::Assets,
     ]
     .into_iter()
     .filter(|panel| {
@@ -602,6 +604,7 @@ pub(crate) fn PanelContent(
         PanelKind::Inspector => rsx! { InspectorTab { editor } },
         PanelKind::Systems => rsx! { SystemsTab { editor } },
         PanelKind::Console => rsx! { ConsoleTab { editor } },
+        PanelKind::Assets => rsx! { AssetsTab { editor } },
     }
 }
 

@@ -1,5 +1,12 @@
 //! One spatial sound source and one listener, preserved across project reloads.
+//!
+//! # Responsibilities
+//!
+//! - Queue the bundled sound for loading when the audio module is present.
+//! - Create the listener and the playing source once, so a reload that runs
+//!   `init` again finds them instead of adding more.
 
+// External crates
 use pill_audio::{AudioListenerComponent, AudioLoadQueue, AudioSourceComponent};
 use pill_engine::{Engine, Position, Query};
 
@@ -7,6 +14,12 @@ const SOUND_NAME: &str = "sound_1";
 // Embed the project asset so development and shipping builds need no working-directory setup.
 const SOUND_BYTES: &[u8] = include_bytes!("../assets/audio/sound_1.mp3");
 
+/// Queue the project's sound and create its listener and source, unless they
+/// already exist. Does nothing when the audio module is not loaded.
+///
+/// # Errors
+///
+/// Returns a message when the listener or the source cannot be created.
 pub(crate) fn initialize(engine: &mut Engine) -> Result<(), &'static str> {
     // The host initializes pill_audio from project_settings.yaml before the project.
     let Some(loads) = engine.world_mut().get_resource_mut::<AudioLoadQueue>() else {
@@ -56,6 +69,29 @@ mod tests {
         initialize(&mut engine).unwrap();
         assert!(engine.world().get_resource::<AudioLoadQueue>().is_none());
         assert!(engine.is_system_enabled("pill_audio").is_none());
+    }
+
+    /// The project registers the renderer data and loads the audio module,
+    /// whose imported asset types must not claim the same extension.
+    #[test]
+    fn every_imported_asset_type_registers_without_a_conflict() {
+        let mut engine = Engine::new();
+        pill_master_renderer_data::register(&mut engine);
+        pill_audio::register(&mut engine);
+        assert!(engine.world_mut().take_registration_error().is_none());
+
+        let registry = engine
+            .world()
+            .get_resource::<pill_engine::ImportRegistry>()
+            .expect("the modules record their imported types");
+        for (extension, type_name) in [
+            ("png", "pill_master_renderer::assets::Texture"),
+            ("jpg", "pill_master_renderer::assets::Texture"),
+            ("obj", "pill_master_renderer::assets::Mesh"),
+            ("mp3", "pill_audio::Sound"),
+        ] {
+            assert_eq!(registry.type_for_extension(extension), Some(type_name));
+        }
     }
 
     #[test]

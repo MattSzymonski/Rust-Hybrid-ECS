@@ -950,6 +950,43 @@ public static unsafe class Engine
         return new AssetHandle(index, generation);
     }
 
+    /// <summary>
+    /// Imports the source at <paramref name="path"/> (relative to <c>res</c>)
+    /// through its <c>.meta</c> file with the import slot <paramref name="kind"/>
+    /// selects. <see cref="Assets.Import{T}"/> is the public face of this.
+    /// </summary>
+    internal static ImportedAsset ImportAsset(
+        ImportedAssetKind kind,
+        string path,
+        MetadataPolicy policy,
+        string? initialSettingsJson)
+    {
+        byte[] pathBytes = Encoding.UTF8.GetBytes(path);
+        byte[] settingsBytes = Encoding.UTF8.GetBytes(initialSettingsJson ?? string.Empty);
+        NativeImportedAsset output = default;
+        byte status;
+        fixed (byte* pathPointer = pathBytes)
+        fixed (byte* settingsPointer = settingsBytes)
+        {
+            var import = kind switch
+            {
+                ImportedAssetKind.Texture => _api.AssetImportTexture,
+                ImportedAssetKind.Mesh => _api.AssetImportMesh,
+                _ => _api.AssetImportSound,
+            };
+            status = import(
+                pathPointer, (uint)pathBytes.Length,
+                (byte)policy,
+                settingsPointer, (uint)settingsBytes.Length,
+                &output);
+        }
+        ValidateAssetStatus(status, $"import {kind.ToString().ToLowerInvariant()} \"{path}\"");
+        return new ImportedAsset(
+            new AssetHandle(output.Index, output.Generation),
+            $"{output.GuidHigh:x16}{output.GuidLow:x16}",
+            output.AlreadyLoaded != 0);
+    }
+
     private static void ValidateAssetStatus(byte status, string operation)
     {
         if (status == 0)
@@ -961,8 +998,14 @@ public static unsafe class Engine
             3 => "a supplied string was not valid UTF-8",
             4 => "the source data failed to decode",
             5 => "a required buffer was null",
-            6 => "no renderer data crate provides the asset functions in this build",
+            6 => "no loaded module provides this asset function in this build",
             7 => "an asset with that name is already loaded",
+            8 => "no source file exists at that path",
+            9 => "its .meta file cannot be read as this asset type's, or could not be written",
+            10 => "the path is already loaded under a different guid than its .meta file holds",
+            11 => "its .meta file's guid belongs to another loaded asset (a copied .meta?)",
+            12 => "the initial settings JSON does not fit this asset type",
+            13 => "the metadata policy is not a known one",
             _ => $"native status {status}",
         };
         throw new InvalidOperationException($"Could not {operation}: {reason}.");

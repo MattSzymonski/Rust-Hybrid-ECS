@@ -3,7 +3,8 @@
 //! # Responsibilities
 //!
 //! - Reflect type and enum-variant names for diagnostics and tooling.
-//! - Validate asset paths against a whitelist of file formats.
+//! - Define the error an asset loader reports for a refused path
+//!   ([`AssetPathError`]).
 //! - Construct and inspect fixed-width bitmasks.
 //! - Format project-level error chains for reporting.
 //! - Generate C-ABI project entry points for dynamic loading.
@@ -20,7 +21,6 @@ use std::{
     any::type_name,
     fmt::Binary,
     ops::{Add, Not, Shl, Sub},
-    path::Path,
 };
 
 // =============================================================================
@@ -117,7 +117,9 @@ pub fn get_enum_variant_type_name<T: core::fmt::Debug>(value: &T) -> String {
 // Types
 // =============================================================================
 
-/// Error returned by [`validate_asset_path`].
+/// Why an asset path was refused: it names nothing usable, or its format is
+/// not one the loader accepts. Reported by loaders that check a path before
+/// reading it (`pill_audio`'s `Sound::load`).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AssetPathError {
     /// The path does not exist or carries no file extension.
@@ -134,52 +136,6 @@ pub enum AssetPathError {
         /// Comma-separated list of allowed formats.
         allowed: String,
     },
-}
-
-// =============================================================================
-// Asset path validation
-// =============================================================================
-
-/// Check that an asset path exists and has a whitelisted file extension.
-///
-/// # Errors
-///
-/// Returns [`AssetPathError::InvalidPath`] when `path` does not exist or has
-/// no extension, and [`AssetPathError::InvalidFormat`] when the extension is
-/// not listed in `allowed_formats`.
-///
-/// # Examples
-///
-/// ```
-/// use pill_core::utils::{validate_asset_path, AssetPathError};
-///
-/// let result = validate_asset_path(
-///     std::path::Path::new("assets/scene.ron"),
-///     &["ron", "json"],
-/// );
-/// // The example file does not exist, so the path itself is rejected.
-/// assert!(matches!(result, Err(AssetPathError::InvalidPath { .. })));
-/// ```
-pub fn validate_asset_path(
-    path: &Path,
-    allowed_formats: &'static [&'static str],
-) -> Result<(), AssetPathError> {
-    if !path.exists() {
-        return Err(AssetPathError::InvalidPath {
-            path: path.display().to_string(),
-        });
-    }
-
-    match path.extension().and_then(|extension| extension.to_str()) {
-        Some(extension) if allowed_formats.contains(&extension) => Ok(()),
-        Some(extension) => Err(AssetPathError::InvalidFormat {
-            extension: extension.to_string(),
-            allowed: allowed_formats.join(", "),
-        }),
-        None => Err(AssetPathError::InvalidPath {
-            path: path.display().to_string(),
-        }),
-    }
 }
 
 // =============================================================================

@@ -10,6 +10,8 @@
 //! - Derive tangent space after an OBJ decode. A file carries positions, UVs
 //!   and normals, so the tangents and bitangents the shaders read are
 //!   accumulated from the mesh's triangles and normalized here.
+//! - Load through a metadata file ([`ImportedAsset`]): the
+//!   [`MeshImportSettings`] in `<model>.obj.meta` hold the decode choices.
 //!
 //! # Design
 //!
@@ -20,7 +22,8 @@
 //! expecting a game to mutate renderer state mid frame.
 
 // External crates
-use pill_engine::{Asset, AssetLoadError};
+use pill_engine::{Asset, AssetLoadError, AssetLoadResult, ImportedAsset};
+use serde::{Deserialize, Serialize};
 
 /// One vertex, in the layout the vertex buffer step reads it.
 ///
@@ -120,7 +123,16 @@ impl Mesh {
     /// mesh's name, so the failure points at the asset rather than at the
     /// bytes.
     pub fn from_obj_bytes(name: impl Into<String>, bytes: &[u8]) -> Result<Self, AssetLoadError> {
-        let name = name.into();
+        Self::decode_obj(name.into(), bytes, &MeshImportSettings::default())
+    }
+
+    /// The OBJ decode behind [`Self::from_obj_bytes`] and the metadata import,
+    /// with the choices `settings` controls.
+    fn decode_obj(
+        name: String,
+        bytes: &[u8],
+        settings: &MeshImportSettings,
+    ) -> Result<Self, AssetLoadError> {
         let mut source = std::io::Cursor::new(bytes);
         let options = tobj::LoadOptions {
             triangulate: true,
@@ -147,9 +159,16 @@ impl Mesh {
                     source.positions[index * 3 + 2],
                 ];
                 let texture_coordinates = if source.texcoords.len() >= index * 2 + 2 {
+                    // A file counts V upward from the bottom edge; the
+                    // renderer samples from the top.
+                    let v_coordinate = source.texcoords[index * 2 + 1];
                     [
                         source.texcoords[index * 2],
-                        1.0 - source.texcoords[index * 2 + 1],
+                        if settings.flip_v {
+                            1.0 - v_coordinate
+                        } else {
+                            v_coordinate
+                        },
                     ]
                 } else {
                     [0.0; 2]
@@ -174,7 +193,9 @@ impl Mesh {
             indices.extend(source.indices.into_iter().map(|index| base + index));
         }
 
-        calculate_tangent_space(&mut vertices, &indices);
+        if settings.calculate_tangents {
+            calculate_tangent_space(&mut vertices, &indices);
+        }
         if vertices.is_empty() || indices.is_empty() {
             return Err(AssetLoadError::Decode {
                 label: name,
@@ -243,6 +264,47 @@ impl Asset for Mesh {
     }
 }
 
+/// How to decode a model file into a mesh: what its `.meta` file holds.
+///
+/// The defaults are the choices [`Mesh::from_obj_bytes`] always made, so a
+/// mesh imported without a metadata file decodes exactly as before. Every
+/// field is part of the metadata file format; `#[serde(default)]` lets a file
+/// written before a field existed still load.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MeshImportSettings {
+    /// Flip the V texture coordinate (`v` becomes `1 - v`). A file counts V
+    /// upward from the bottom edge; the renderer samples from the top.
+    pub flip_v: bool,
+    /// Derive tangents and bitangents from the triangles and their UVs, which
+    /// normal mapping needs. Off leaves them zero.
+    pub calculate_tangents: bool,
+}
+
+impl Default for MeshImportSettings {
+    fn default() -> Self {
+        Self {
+            flip_v: true,
+            calculate_tangents: true,
+        }
+    }
+}
+
+// The metadata type name defaults to the shared name above, so every binary's
+// copy of `Mesh` reads the same files.
+impl ImportedAsset for Mesh {
+    type ImportSettings = MeshImportSettings;
+    const SOURCE_EXTENSIONS: &'static [&'static str] = &["obj"];
+
+    fn import(
+        name: &str,
+        source_bytes: &[u8],
+        settings: &MeshImportSettings,
+    ) -> AssetLoadResult<Self> {
+        Self::decode_obj(name.to_owned(), source_bytes, settings)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +328,61 @@ f 1/1 2/2 3/3\n";
     #[test]
     fn rejects_a_buffer_with_no_triangles() {
         assert!(Mesh::from_obj_bytes("empty", b"").is_err());
+    }
+
+    /// The default settings are the old fixed behaviour, so an import with no
+    /// metadata file gives the same mesh `from_obj_bytes` always did.
+    #[test]
+    fn importing_with_default_settings_matches_from_obj_bytes() {
+        let decoded = Mesh::from_obj_bytes("t", TRIANGLE_OBJ.as_bytes()).unwrap();
+        let imported =
+            Mesh::import("t", TRIANGLE_OBJ.as_bytes(), &MeshImportSettings::default()).unwrap();
+        let positions_and_uvs = |mesh: &Mesh| {
+            mesh.vertices
+                .iter()
+                .map(|vertex| (vertex.position, vertex.texture_coordinates, vertex.tangent))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(positions_and_uvs(&imported), positions_and_uvs(&decoded));
+        // V was flipped: the second texture coordinate of `vt 0.0 1.0` is 0.
+        assert_eq!(imported.vertices[2].texture_coordinates, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn settings_control_the_v_flip_and_the_tangents() {
+        let settings = MeshImportSettings {
+            flip_v: false,
+            calculate_tangents: false,
+        };
+        let mesh = Mesh::import("t", TRIANGLE_OBJ.as_bytes(), &settings).unwrap();
+        assert_eq!(mesh.vertices[2].texture_coordinates, [0.0, 1.0]);
+        assert!(mesh
+            .vertices
+            .iter()
+            .all(|vertex| vertex.tangent == [0.0; 3]));
+
+        let with_tangents =
+            Mesh::import("t", TRIANGLE_OBJ.as_bytes(), &MeshImportSettings::default()).unwrap();
+        assert!(with_tangents
+            .vertices
+            .iter()
+            .any(|vertex| vertex.tangent != [0.0; 3]));
+    }
+
+    /// The on-disk form: field names as written, and defaults for missing ones.
+    #[test]
+    fn settings_serialize_with_their_field_names() {
+        assert_eq!(
+            serde_json::to_string(&MeshImportSettings::default()).unwrap(),
+            r#"{"flip_v":true,"calculate_tangents":true}"#
+        );
+        let partial: MeshImportSettings = serde_json::from_str(r#"{"flip_v": false}"#).unwrap();
+        assert_eq!(
+            partial,
+            MeshImportSettings {
+                flip_v: false,
+                calculate_tangents: true
+            }
+        );
     }
 }
