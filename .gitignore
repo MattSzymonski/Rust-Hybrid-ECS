@@ -76,9 +76,13 @@ __pycache__/
 # Editor / IDE
 .vscode/settings.json
 .idea/
-.github/skills
-.claude/
-
+# Agent tooling stays local to each checkout: skills and hooks live in
+# `.agents/`, symlinked into `.claude/skills` and `.github/skills`.
+.github/skills/*
+.claude/*
+.agents/*
+.claude/skills/*
+AGENTS.md
 
 # Profiling and benchmark artifacts
 graphify-out/
