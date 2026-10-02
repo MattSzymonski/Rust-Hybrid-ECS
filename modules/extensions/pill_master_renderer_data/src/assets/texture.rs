@@ -8,6 +8,8 @@
 //!   as a normal map, or as depth that only a shader declares.
 //! - Build textures two ways, by decoding an image file ([`Texture::new`])
 //!   and from a buffer the caller already holds ([`Texture::from_rgba`]).
+//! - Load through a metadata file ([`ImportedAsset`]): the
+//!   [`TextureImportSettings`] in `<image>.meta` say how to read the pixels.
 //!
 //! # Design
 //!
@@ -19,7 +21,8 @@
 //! shader may sample the result.
 
 // External crates
-use pill_engine::{Asset, AssetLoadError, AssetLoadResult, AssetLoader};
+use pill_engine::{Asset, AssetLoadError, AssetLoadResult, AssetLoader, ImportedAsset};
+use serde::{Deserialize, Serialize};
 
 /// How a texture's pixels are meant to be read.
 ///
@@ -27,7 +30,10 @@ use pill_engine::{Asset, AssetLoadError, AssetLoadResult, AssetLoader};
 /// interpret them: it decides the format the pixels upload as and the binding
 /// a shader receives for a texture slot, which is what keeps colour, normal
 /// and depth data from being read the wrong way.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Serialized by variant name (`"Color"`, `"Normal"`) in a texture's metadata
+/// file, so renaming a variant changes the on-disk format.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TextureType {
     /// A colour image: albedo, UI, or any texture sampled for its values.
     /// Uploaded as sRGB, so the hardware converts it to linear light before a
@@ -86,9 +92,15 @@ impl Texture {
         texture_type: TextureType,
         loader: AssetLoader,
     ) -> AssetLoadResult<Self> {
-        let name = name.into();
         let bytes = loader.load()?;
-        let image = image::load_from_memory(&bytes).map_err(|error| AssetLoadError::Decode {
+        Self::decode(name.into(), texture_type, &bytes)
+    }
+
+    /// Decodes an encoded image (PNG or JPEG) into an RGBA8 texture.
+    ///
+    /// The one decode path, shared by [`Self::new`] and the metadata import.
+    fn decode(name: String, texture_type: TextureType, bytes: &[u8]) -> AssetLoadResult<Self> {
+        let image = image::load_from_memory(bytes).map_err(|error| AssetLoadError::Decode {
             label: name.clone(),
             detail: error.to_string(),
         })?;
@@ -145,5 +157,105 @@ impl Texture {
 impl Asset for Texture {
     fn shared_name() -> Option<&'static str> {
         Some("pill_master_renderer::assets::Texture")
+    }
+}
+
+/// How to read an image file as a texture: what its `.meta` file holds.
+///
+/// Every field is part of the metadata file format, so a rename breaks
+/// existing files; `#[serde(default)]` lets a file written before a field
+/// existed still load.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TextureImportSettings {
+    /// How a shader reads the pixels. `Depth` is refused on import: no image
+    /// file holds depth.
+    pub texture_type: TextureType,
+}
+
+impl Default for TextureImportSettings {
+    fn default() -> Self {
+        Self {
+            texture_type: TextureType::Color,
+        }
+    }
+}
+
+// The metadata type name defaults to the shared name above, so every binary's
+// copy of `Texture` reads the same files.
+impl ImportedAsset for Texture {
+    type ImportSettings = TextureImportSettings;
+    // The formats this crate's `image` features decode.
+    const SOURCE_EXTENSIONS: &'static [&'static str] = &["png", "jpg", "jpeg"];
+
+    fn import(
+        name: &str,
+        source_bytes: &[u8],
+        settings: &TextureImportSettings,
+    ) -> AssetLoadResult<Self> {
+        // The renderer refuses a depth texture asset anyway; refusing it here
+        // names the file whose metadata asked for it.
+        if settings.texture_type == TextureType::Depth {
+            return Err(AssetLoadError::Decode {
+                label: name.to_owned(),
+                detail:
+                    "`Depth` is not a texture asset type; an image file holds color or normal data"
+                        .to_owned(),
+            });
+        }
+        Self::decode(name.to_owned(), settings.texture_type, source_bytes)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 1x1 PNG, encoded in the test so no fixture file is needed.
+    fn one_pixel_png() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([10, 20, 30, 255]))
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn import_reads_the_texture_type_from_the_settings() {
+        let settings = TextureImportSettings {
+            texture_type: TextureType::Normal,
+        };
+        let texture = Texture::import("textures/n.png", &one_pixel_png(), &settings).unwrap();
+        assert_eq!(texture.texture_type, TextureType::Normal);
+        assert_eq!(texture.name, "textures/n.png");
+        assert_eq!(texture.rgba, [10, 20, 30, 255]);
+    }
+
+    #[test]
+    fn import_refuses_depth() {
+        let settings = TextureImportSettings {
+            texture_type: TextureType::Depth,
+        };
+        assert!(matches!(
+            Texture::import("d.png", &one_pixel_png(), &settings),
+            Err(AssetLoadError::Decode { .. })
+        ));
+    }
+
+    /// The on-disk form: the variant name, and the default for a missing field.
+    #[test]
+    fn settings_serialize_by_variant_name() {
+        let settings = TextureImportSettings {
+            texture_type: TextureType::Normal,
+        };
+        assert_eq!(
+            serde_json::to_string(&settings).unwrap(),
+            r#"{"texture_type":"Normal"}"#
+        );
+        let defaulted: TextureImportSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(defaulted.texture_type, TextureType::Color);
     }
 }

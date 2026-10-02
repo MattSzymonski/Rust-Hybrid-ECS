@@ -387,6 +387,9 @@ pub(crate) fn module_build_artifact_directory() -> String {
 /// selected by `PROJECT_PATH` alone.
 const PROJECT_SETTINGS_FILE: &str = "project_settings.yaml";
 
+/// A project's source asset directory, relative to the project root.
+const PROJECT_ASSET_DIRECTORY: &str = "res";
+
 /// The renderer a project draws with when its settings name none.
 const DEFAULT_RENDERER: &str = "pill_master_renderer";
 
@@ -611,6 +614,27 @@ pub struct HostConfig {
     /// [`Self::extensions`] in every build, headless included, so a project's
     /// render components exist whether or not anything draws them.
     pub renderer: Option<String>,
+
+    /// The settings' `assets:` section: what the development host does with
+    /// the project's source assets.
+    pub assets: ProjectAssetSettings,
+
+    /// The project's `res` directory, which asset paths are relative to;
+    /// `None` when the configuration was not read from a project directory.
+    pub asset_directory: Option<PathBuf>,
+}
+
+/// The `assets:` section of `project_settings.yaml`.
+///
+/// Every key defaults to off, so a project without the section behaves as it
+/// did before the section existed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectAssetSettings {
+    /// Import every source under `res` whose extension a registered asset
+    /// type imports, right after the project starts, and write the metadata
+    /// file of each that has none. Development host only.
+    pub scan_on_start: bool,
 }
 
 impl HostConfig {
@@ -687,6 +711,8 @@ impl HostConfig {
             project,
             extensions,
             renderer,
+            assets: project_settings.assets,
+            asset_directory: Some(project_root.join(PROJECT_ASSET_DIRECTORY)),
         })
     }
 
@@ -788,6 +814,8 @@ impl From<ProjectModuleConfig> for HostConfig {
             project,
             extensions: Vec::new(),
             renderer: None,
+            assets: ProjectAssetSettings::default(),
+            asset_directory: None,
         }
     }
 }
@@ -1257,6 +1285,8 @@ struct ProjectSettingsFile {
     /// `extensions/` (`pill_master_renderer` when absent), or `none`. Its data
     /// crate, `<renderer>_data`, loads in every build.
     renderer: Option<String>,
+    /// What the development host does with the project's source assets.
+    assets: ProjectAssetSettings,
 }
 
 /// Whether a value is a safe artifact file base: letters, digits, underscores.
@@ -1698,6 +1728,36 @@ serde = { version = "1", features = ["derive"] }
         assert_eq!(settings.name.as_deref(), Some("Bouncing Balls"));
         assert_eq!(settings.build_binary_name.as_deref(), Some("BouncingBalls"));
         assert_eq!(settings.modules, vec!["pill_spline", "pill_dummy_math"]);
+    }
+
+    /// The `assets:` section is optional, defaults every key to off, and
+    /// refuses a key it does not know.
+    #[test]
+    fn the_assets_section_defaults_off_and_reads_scan_on_start() {
+        let directory = temp_root().join("project_settings_assets");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let header = "name: \"Assets\"\nbuild_binary_name: \"Assets\"\n";
+        let write = |extra: &str| {
+            std::fs::write(
+                directory.join("project_settings.yaml"),
+                format!("{header}{extra}"),
+            )
+            .unwrap();
+        };
+
+        write("");
+        let absent = read_project_settings_file(&directory).unwrap().unwrap();
+        assert!(!absent.assets.scan_on_start);
+
+        write("assets:\n  scan_on_start: true\n");
+        let enabled = read_project_settings_file(&directory).unwrap().unwrap();
+        assert!(enabled.assets.scan_on_start);
+
+        write("assets:\n  scan_on_startup: true\n");
+        let error =
+            read_project_settings_file(&directory).expect_err("a misspelled key is refused");
+        assert!(error.to_string().contains("scan_on_startup"), "{error}");
     }
 
     /// A missing project settings file selects no extensions.

@@ -91,6 +91,9 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 
+// The generated engine components (`Position`) live in their own namespace.
+using pill_engine.common_components;
+
 namespace TracyLive.AnalyzerProbe;
 
 [StructLayout(LayoutKind.Auto)]

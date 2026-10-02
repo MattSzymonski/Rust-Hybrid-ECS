@@ -8,6 +8,8 @@
 //! - Stay the *only* pass type. Every pass in the renderer - geometry, lighting,
 //!   post-processing - is one of these values, so adding a pass is data the game
 //!   supplies, not a struct someone has to write into the renderer.
+//! - Load a pass from a `.render_pass` file in `res` ([`StandaloneAsset`] with
+//!   [`RenderPassDocument`]), naming its shader and textures by guid.
 //!
 //! # Design
 //!
@@ -19,7 +21,8 @@
 
 use std::collections::BTreeMap;
 
-use pill_engine::{Asset, Handle};
+use pill_engine::{Asset, AssetLoadResult, AssetManager, AssetReference, Handle, StandaloneAsset};
+use serde::{Deserialize, Serialize};
 
 // The pass vocabulary is part of the frame contract, so it lives there.
 use crate::{Shader, Texture};
@@ -189,6 +192,100 @@ impl RenderPass {
     }
 }
 
+/// A pass as written in its `.render_pass` file.
+///
+/// The asset itself, under the standard asset header. Its shader and textures
+/// are guids ([`AssetReference`]) resolved when the file loads; everything
+/// else is the [`RenderPass`] field of the same name. The default document is
+/// [`RenderPass::new`]'s pass - a geometry pass onto the surface with the
+/// built-in shader - which the renderer runs as it is, so a newly created file
+/// is valid before anyone edits it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RenderPassDocument {
+    /// See [`RenderPass::shader`]; unset for the built-in shader.
+    pub shader: AssetReference<Shader>,
+    /// See [`RenderPass::parameters`].
+    pub parameters: BTreeMap<String, MaterialParameter>,
+    /// See [`RenderPass::textures`].
+    pub textures: BTreeMap<String, AssetReference<Texture>>,
+    /// See [`RenderPass::inputs`].
+    pub inputs: BTreeMap<String, String>,
+    /// See [`RenderPass::kind`].
+    pub kind: PassKind,
+    /// See [`RenderPass::target`].
+    pub target: PassTarget,
+    /// See [`RenderPass::extra_targets`].
+    pub extra_targets: Vec<PassTarget>,
+    /// See [`RenderPass::target_scale`].
+    pub target_scale: u32,
+    /// See [`RenderPass::blend`].
+    pub blend: bool,
+    /// See [`RenderPass::depth_write`].
+    pub depth_write: bool,
+    /// See [`RenderPass::cull`].
+    pub cull: CullMode,
+    /// See [`RenderPass::order`].
+    pub order: u8,
+    /// See [`RenderPass::enabled`].
+    pub enabled: bool,
+}
+
+impl Default for RenderPassDocument {
+    /// [`RenderPass::new`]'s pass.
+    fn default() -> Self {
+        let pass = RenderPass::new(String::new());
+        Self {
+            shader: AssetReference::unset(),
+            parameters: pass.parameters,
+            textures: BTreeMap::new(),
+            inputs: pass.inputs,
+            kind: pass.kind,
+            target: pass.target,
+            extra_targets: pass.extra_targets,
+            target_scale: pass.target_scale,
+            blend: pass.blend,
+            depth_write: pass.depth_write,
+            cull: pass.cull,
+            order: pass.order,
+            enabled: pass.enabled,
+        }
+    }
+}
+
+impl StandaloneAsset for RenderPass {
+    type Document = RenderPassDocument;
+    const FILE_EXTENSION: &'static str = "render_pass";
+
+    fn from_document(
+        name: &str,
+        document: RenderPassDocument,
+        assets: &AssetManager,
+    ) -> AssetLoadResult<Self> {
+        let textures = document
+            .textures
+            .into_iter()
+            .map(|(slot, texture)| (slot, texture.resolve(assets)))
+            .collect();
+        Ok(Self {
+            name: name.to_owned(),
+            shader: document.shader.resolve(assets),
+            parameters: document.parameters,
+            textures,
+            inputs: document.inputs,
+            kind: document.kind,
+            target: document.target,
+            extra_targets: document.extra_targets,
+            target_scale: document.target_scale.max(1),
+            blend: document.blend,
+            depth_write: document.depth_write,
+            cull: document.cull,
+            order: document.order,
+            enabled: document.enabled,
+        })
+    }
+}
+
 // Shared across binaries: the data module, the GPU module and every project
 // compile their own copy of this crate, each with its own `TypeId`. The pinned
 // name makes them one asset column (see `Asset::shared_name`); keep it
@@ -202,6 +299,48 @@ impl Asset for RenderPass {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A new `.render_pass` file's document builds `RenderPass::new`'s pass:
+    /// a geometry pass onto the surface with the built-in shader.
+    #[test]
+    fn the_default_document_is_the_minimal_pass() {
+        let assets = AssetManager::new();
+        let pass = RenderPass::from_document(
+            "passes/a.render_pass",
+            RenderPassDocument::default(),
+            &assets,
+        )
+        .unwrap();
+        let reference = RenderPass::new("passes/a.render_pass");
+        assert_eq!(pass.name, reference.name);
+        assert_eq!(pass.shader, Handle::INVALID);
+        assert_eq!(pass.kind, reference.kind);
+        assert_eq!(pass.target, reference.target);
+        assert_eq!(pass.target_scale, 1);
+        assert_eq!(pass.cull, reference.cull);
+        assert!(pass.enabled && pass.depth_write && !pass.blend);
+    }
+
+    /// A document round-trips through its file JSON, including the pass
+    /// vocabulary's enums.
+    #[test]
+    fn a_document_round_trips_through_json() {
+        let document = RenderPassDocument {
+            kind: PassKind::Fullscreen,
+            target: PassTarget::Offscreen("hdr".to_owned()),
+            cull: CullMode::None,
+            order: 7,
+            ..RenderPassDocument::default()
+        };
+        let json = serde_json::to_value(&document).unwrap();
+        assert_eq!(json["target"], serde_json::json!({"Offscreen": "hdr"}));
+        let read: RenderPassDocument = serde_json::from_value(json).unwrap();
+        assert_eq!(read.target, PassTarget::Offscreen("hdr".to_owned()));
+        assert_eq!(
+            (read.kind, read.cull, read.order),
+            (PassKind::Fullscreen, CullMode::None, 7)
+        );
+    }
 
     #[test]
     fn a_new_pass_writes_the_surface_with_the_builtin_shader() {

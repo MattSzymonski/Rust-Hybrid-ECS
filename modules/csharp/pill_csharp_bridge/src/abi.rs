@@ -294,6 +294,16 @@ pub(super) struct CsEngineApi {
     /// Begin and end a dynamic managed Tracy zone.
     csharp_zone_begin: extern "C" fn(*const u8, u32) -> u64,
     csharp_zone_end: extern "C" fn(u64),
+    /// Import a texture, mesh or sound from `res` through its `.meta` file:
+    /// path, policy (`0` read if present, `1` create if missing), initial
+    /// settings as UTF-8 JSON, and the output (`pill_engine::asset_ffi::NativeImportedAsset`).
+    /// One named slot per type, appended at the end like every earlier slot.
+    asset_import_texture:
+        extern "C" fn(*const u8, u32, u8, *const u8, u32, *mut std::ffi::c_void) -> u8,
+    asset_import_mesh:
+        extern "C" fn(*const u8, u32, u8, *const u8, u32, *mut std::ffi::c_void) -> u8,
+    asset_import_sound:
+        extern "C" fn(*const u8, u32, u8, *const u8, u32, *mut std::ffi::c_void) -> u8,
 }
 
 impl CsEngineApi {
@@ -332,6 +342,9 @@ impl CsEngineApi {
             csharp_log: ffi_csharp_log,
             csharp_zone_begin: ffi_csharp_zone_begin,
             csharp_zone_end: ffi_csharp_zone_end,
+            asset_import_texture: super::assets::ffi_asset_import_texture,
+            asset_import_mesh: super::assets::ffi_asset_import_mesh,
+            asset_import_sound: super::assets::ffi_asset_import_sound,
         }
     }
 }

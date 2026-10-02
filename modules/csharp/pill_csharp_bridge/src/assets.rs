@@ -3,8 +3,9 @@
 //!
 //! # Responsibilities
 //!
-//! - Publish the four asset entry points the managed runtime calls (load a
-//!   mesh, texture or shader; create a material) in `CsEngineApi`.
+//! - Publish the asset entry points the managed runtime calls (load a mesh,
+//!   texture or shader; create a material; import a texture, mesh or sound
+//!   through its `.meta` file) in `CsEngineApi`.
 //! - Find the renderer data crate's function for each by name and call it with
 //!   the active managed invocation's world.
 //! - Report a missing invocation or a missing function with the status codes
@@ -55,14 +56,18 @@ const STATUS_NO_ACTIVE_SCOPE: u8 = 1;
 /// No renderer data crate provides the asset functions.
 const STATUS_RENDERER_UNAVAILABLE: u8 = 6;
 
-/// The export names the four entry points forward to, in the renderer data
-/// crate (`pill_master_renderer_data::csharp_assets`).
+/// The export names the entry points forward to: the renderer data crate's
+/// (`pill_master_renderer_data::csharp_assets`) and the audio module's
+/// (`pill_audio::csharp_assets`).
 #[cfg(feature = "hot_reload")]
-pub(crate) const ASSET_EXPORT_NAMES: [&str; 4] = [
+pub(crate) const ASSET_EXPORT_NAMES: [&str; 7] = [
     "pill_render_data_load_mesh_obj",
     "pill_render_data_load_texture_png",
     "pill_render_data_load_shader",
     "pill_render_data_create_material",
+    "pill_render_data_import_texture",
+    "pill_render_data_import_mesh",
+    "pill_audio_import_sound",
 ];
 
 /// The asset functions the loaded modules offer, by export name.
@@ -156,6 +161,10 @@ type CreateMaterial = unsafe extern "C" fn(
     *mut u32,
     *mut u32,
 ) -> u8;
+
+/// A module's import export: world, path, policy, settings JSON, output.
+type ImportAsset =
+    unsafe extern "C" fn(*mut World, *const u8, u32, u8, *const u8, u32, *mut c_void) -> u8;
 
 /// The data crate's function named `name`, as the function pointer type `F`.
 ///
@@ -361,5 +370,123 @@ pub(super) extern "C" fn ffi_asset_create_material(
                 out_generation,
             )
         })
+    }
+}
+
+/// Imports a source asset through its `.meta` file by forwarding to the module
+/// export `name`.
+///
+/// # Safety
+///
+/// `path`/`settings` must reference their declared lengths in readable memory
+/// (unless zero), and `output` must point at a writable `NativeImportedAsset`
+/// (`pill_engine::asset_ffi`).
+unsafe fn forward_import(
+    name: &str,
+    path: *const u8,
+    path_length: u32,
+    policy: u8,
+    settings: *const u8,
+    settings_length: u32,
+    output: *mut c_void,
+) -> u8 {
+    // SAFETY: `ImportAsset` is every import export's signature, and every
+    // argument but the world comes from this function's contract unchanged.
+    unsafe {
+        forward::<ImportAsset>(name, |function, world| {
+            function(
+                world,
+                path,
+                path_length,
+                policy,
+                settings,
+                settings_length,
+                output,
+            )
+        })
+    }
+}
+
+/// Imports a texture from `res` through its `.meta` file into the active
+/// invocation's `AssetManager`.
+///
+/// # Safety
+///
+/// The contract of `forward_import`.
+pub(super) extern "C" fn ffi_asset_import_texture(
+    path: *const u8,
+    path_length: u32,
+    policy: u8,
+    settings: *const u8,
+    settings_length: u32,
+    output: *mut c_void,
+) -> u8 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        forward_import(
+            "pill_render_data_import_texture",
+            path,
+            path_length,
+            policy,
+            settings,
+            settings_length,
+            output,
+        )
+    }
+}
+
+/// Imports a mesh from `res` through its `.meta` file; otherwise as
+/// [`ffi_asset_import_texture`].
+///
+/// # Safety
+///
+/// The contract of `forward_import`.
+pub(super) extern "C" fn ffi_asset_import_mesh(
+    path: *const u8,
+    path_length: u32,
+    policy: u8,
+    settings: *const u8,
+    settings_length: u32,
+    output: *mut c_void,
+) -> u8 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        forward_import(
+            "pill_render_data_import_mesh",
+            path,
+            path_length,
+            policy,
+            settings,
+            settings_length,
+            output,
+        )
+    }
+}
+
+/// Imports a sound from `res` through its `.meta` file; reports
+/// "unavailable" (6) when the project does not load `pill_audio`.
+///
+/// # Safety
+///
+/// The contract of `forward_import`.
+pub(super) extern "C" fn ffi_asset_import_sound(
+    path: *const u8,
+    path_length: u32,
+    policy: u8,
+    settings: *const u8,
+    settings_length: u32,
+    output: *mut c_void,
+) -> u8 {
+    // SAFETY: forwarded from this function's contract.
+    unsafe {
+        forward_import(
+            "pill_audio_import_sound",
+            path,
+            path_length,
+            policy,
+            settings,
+            settings_length,
+            output,
+        )
     }
 }

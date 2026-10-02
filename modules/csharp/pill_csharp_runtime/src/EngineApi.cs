@@ -135,6 +135,36 @@ public unsafe struct EngineApi
 
     /// <summary>End a dynamic managed profiling zone.</summary>
     public delegate* unmanaged[Cdecl]<ulong, void> CSharpZoneEnd;
+
+    /// <summary>
+    /// Import a texture from <c>res</c> through its <c>.meta</c> file: path,
+    /// policy, initial settings as UTF-8 JSON, output. One named slot per
+    /// asset type, appended at the end like every earlier slot.
+    /// </summary>
+    public delegate* unmanaged[Cdecl]<byte*, uint, byte, byte*, uint, NativeImportedAsset*, byte> AssetImportTexture;
+
+    /// <summary>Import a mesh, shaped like <see cref="AssetImportTexture"/>.</summary>
+    public delegate* unmanaged[Cdecl]<byte*, uint, byte, byte*, uint, NativeImportedAsset*, byte> AssetImportMesh;
+
+    /// <summary>Import a sound, shaped like <see cref="AssetImportTexture"/>.</summary>
+    public delegate* unmanaged[Cdecl]<byte*, uint, byte, byte*, uint, NativeImportedAsset*, byte> AssetImportSound;
+}
+
+/// <summary>
+/// What an import writes: the mirror of <c>pill_engine::asset_ffi::NativeImportedAsset</c>,
+/// field for field.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct NativeImportedAsset
+{
+    public uint Index;
+    public uint Generation;
+    public ulong GuidLow;
+    public ulong GuidHigh;
+    /// <summary><c>1</c> when the path was already loaded.</summary>
+    public byte AlreadyLoaded;
+    /// <summary><c>0</c> read from a file, <c>1</c> a file was written, <c>2</c> in memory only.</summary>
+    public byte MetadataSource;
 }
 
 /// <summary>One parameter slot a managed shader declaration supplies.</summary>

@@ -32,6 +32,7 @@ pub enum PanelKind {
     Console,
     Statistics,
     Systems,
+    Assets,
 }
 
 impl PanelKind {
@@ -44,6 +45,7 @@ impl PanelKind {
             Self::Console => "Console",
             Self::Statistics => "Statistics",
             Self::Systems => "Systems",
+            Self::Assets => "Assets",
         }
     }
 }
@@ -113,8 +115,9 @@ impl LayoutModel {
         let statistics = model.add_tab(PanelKind::Statistics, true);
         let console = model.add_tab(PanelKind::Console, true);
         let systems = model.add_tab(PanelKind::Systems, true);
+        let assets = model.add_tab(PanelKind::Assets, true);
 
-        let hierarchy_set = model.add_tabset(vec![hierarchy], hierarchy);
+        let hierarchy_set = model.add_tabset(vec![hierarchy, assets], hierarchy);
         let scene_set = model.add_tabset(vec![scene], scene);
         let inspector_set = model.add_tabset(vec![inspector], inspector);
         let statistics_set = model.add_tabset(vec![statistics], statistics);

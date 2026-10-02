@@ -94,6 +94,8 @@ pub mod audio_manager;
 pub mod audio_source_component;
 /// The per-frame system driving playback.
 pub mod audio_system;
+/// The C# bridge's sound import export.
+pub mod csharp_assets;
 /// Where a listener's ears sit in the world.
 pub mod listener_geometry;
 /// The [`Sound`] asset.
@@ -116,7 +118,7 @@ pub use audio_manager::{
 pub use audio_source_component::{AudioSourceComponent, NO_SINK};
 pub use audio_system::audio_system;
 pub use listener_geometry::ear_positions;
-pub use sound::{Sound, SoundLoadError, SUPPORTED_AUDIO_FORMATS};
+pub use sound::{Sound, SoundImportSettings, SoundLoadError, SUPPORTED_AUDIO_FORMATS};
 pub use sound_type::SoundType;
 
 // =============================================================================
@@ -146,8 +148,10 @@ pub fn register(engine: &mut Engine) -> u32 {
         .register_component::<AudioSourceComponent>();
     // Declare the asset type this module stores. Sounds outlive a reload of
     // this DLL - the world's asset store does - so the column's per-type table
-    // has to be re-pointed at the generation still mapped.
-    engine.world_mut().register_asset::<Sound>();
+    // has to be re-pointed at the generation still mapped. Registering it as
+    // an imported asset does that and also lets sound files import by
+    // extension.
+    engine.world_mut().register_imported_asset::<Sound>();
 
     // Only build the device once. Registration runs again on every reload, and
     // replacing a live manager would cut off whatever is playing.

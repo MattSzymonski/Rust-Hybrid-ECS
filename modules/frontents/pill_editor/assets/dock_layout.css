@@ -489,3 +489,73 @@ body {
     align-items: flex-start;
     gap: 0;
 }
+
+/* Assets panel: the res tree, then the selected asset's settings form. */
+.editor-assets .editor-list-row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0;
+}
+
+.editor-assets .editor-selected {
+    background: rgba(90, 140, 220, 0.25);
+}
+
+/* Rows wrap, so a narrow dock still shows each row's button. */
+.editor-asset-inspector .editor-field {
+    flex-wrap: wrap;
+}
+
+.editor-asset-inspector {
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px solid rgb(58, 58, 58);
+}
+
+.editor-asset-inspector input[type="text"],
+.editor-asset-inspector textarea {
+    flex: 1 1 auto;
+    border: 1px solid rgb(70, 70, 70);
+    border-radius: 3px;
+    background: rgb(28, 28, 28);
+    color: var(--dock-text);
+    padding: 2px 6px;
+    font: inherit;
+    font-size: 12px;
+}
+
+/* The Create asset dialog, shown above the tree. */
+.editor-create-dialog {
+    margin: 4px 0 8px;
+    padding: 6px;
+    border: 1px solid rgb(70, 70, 70);
+    border-radius: 4px;
+    background: rgb(36, 36, 36);
+}
+
+.editor-create-dialog .editor-field {
+    flex-wrap: wrap;
+}
+
+.editor-create-dialog select,
+.editor-create-dialog input[type="text"] {
+    flex: 1 1 auto;
+    border: 1px solid rgb(70, 70, 70);
+    border-radius: 3px;
+    background: rgb(28, 28, 28);
+    color: var(--dock-text);
+    padding: 2px 6px;
+    font: inherit;
+    font-size: 12px;
+}
+
+.editor-folder-picker {
+    max-height: 140px;
+    overflow-y: auto;
+    margin: 2px 0 4px;
+}
+
+.editor-row-subtitle.editor-warn {
+    color: rgb(230, 200, 120);
+    opacity: 1;
+}

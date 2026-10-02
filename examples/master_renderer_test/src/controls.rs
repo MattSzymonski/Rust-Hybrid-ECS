@@ -1,5 +1,7 @@
 //! Mouse, keyboard and gamepad controls over the helmet and the camera.
 //!
+//! # Responsibilities
+//!
 //! - Drag with the left mouse button, hold the arrow keys or A/D, or push the
 //!   left stick to turn the helmet; dragging up and down tilts it.
 //! - Scroll, or push the right stick up and down, to move the camera closer
@@ -9,8 +11,8 @@
 
 use crate::TagHelmet;
 use pill_engine::{
-    pill_hot, tracing, GamepadAxis, GamepadButton, Input, KeyCode, MouseButton, Query, Res,
-    ResMut, SystemError, Time,
+    pill_hot, tracing, GamepadAxis, GamepadButton, Input, KeyCode, MouseButton, Query, Res, ResMut,
+    SystemError, Time,
 };
 use pill_master_renderer_data::{CameraComponent, TransformComponent};
 use std::time::Duration;

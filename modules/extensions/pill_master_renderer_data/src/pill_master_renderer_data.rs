@@ -57,8 +57,9 @@ pub use pill_renderer_api::frame::{
 
 // Current crate
 pub use assets::{
-    Material, MaterialBuilder, MaterialTexture, Mesh, MeshVertex, RenderPass, RenderingPipeline,
-    Shader, ShaderBuilder, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot, Texture,
+    Material, MaterialBuilder, MaterialDocument, MaterialTexture, Mesh, MeshImportSettings,
+    MeshVertex, RenderPass, RenderPassDocument, RenderingPipeline, Shader, ShaderBuilder,
+    ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot, Texture, TextureImportSettings,
     TextureType,
 };
 pub use components::*;
@@ -89,11 +90,15 @@ pub fn register(engine: &mut Engine) -> u32 {
     // every generation, and asset columns outlive the reload, so the
     // declaration is what re-points their per-type tables at an artifact
     // still mapped.
-    engine.world_mut().register_asset::<Mesh>();
-    engine.world_mut().register_asset::<Texture>();
+    // Mesh and texture files import by extension too (scan, watcher, editor),
+    // which declares the asset type as well.
+    engine.world_mut().register_imported_asset::<Mesh>();
+    engine.world_mut().register_imported_asset::<Texture>();
     engine.world_mut().register_asset::<Shader>();
-    engine.world_mut().register_asset::<Material>();
-    engine.world_mut().register_asset::<RenderPass>();
+    // Materials are also files of their own (`.material`), loaded by extension.
+    engine.world_mut().register_standalone_asset::<Material>();
+    // Passes are also files of their own (`.render_pass`), loaded by extension.
+    engine.world_mut().register_standalone_asset::<RenderPass>();
     engine.world_mut().register_asset::<RenderingPipeline>();
     // Declare the resources this crate inserts, before inserting them. Once the
     // crate is a loaded module, a reload keeps the existing values and never
@@ -151,7 +156,63 @@ fn install_default_pipeline(world: &mut World) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pill_engine::{Engine, Handle};
+    use pill_engine::{Engine, Handle, ImportRegistry, MetadataPolicy};
+
+    /// Registering the crate makes texture and mesh files importable by
+    /// extension, through the registry, without naming their types.
+    ///
+    /// The only test in this crate that mounts a directory, so it needs no
+    /// lock against another test replacing the mount.
+    #[test]
+    fn textures_and_meshes_import_by_extension_through_the_registry() {
+        let root = std::env::temp_dir().join(format!("pill_data_registry_{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+            .save(root.join("pixel.png"))
+            .unwrap();
+        std::fs::write(
+            root.join("triangle.obj"),
+            "v 0 0 0
+v 1 0 0
+v 0 1 0
+vt 0 0
+vt 1 0
+vt 0 1
+f 1/1 2/2 3/3
+",
+        )
+        .unwrap();
+        pill_engine::asset_store::mount_directory(&root);
+        let mut engine = Engine::new();
+        assert_eq!(register(&mut engine), 0);
+
+        let world = engine.world_mut();
+        let registry = world
+            .remove_resource::<ImportRegistry>()
+            .unwrap()
+            .expect("register records the imported types");
+        let assets = world.get_resource_mut::<AssetManager>().unwrap();
+        let texture = registry
+            .import(
+                assets,
+                std::path::Path::new("pixel.png"),
+                MetadataPolicy::ReadIfPresent,
+            )
+            .unwrap();
+        let mesh = registry
+            .import(
+                assets,
+                std::path::Path::new("triangle.obj"),
+                MetadataPolicy::ReadIfPresent,
+            )
+            .unwrap();
+
+        assert_eq!(texture.type_name, "pill_master_renderer::assets::Texture");
+        assert_eq!(mesh.type_name, "pill_master_renderer::assets::Mesh");
+        assert!(assets.get_by_name::<Texture>("pixel.png").is_some());
+        assert!(assets.get_by_name::<Mesh>("triangle.obj").is_some());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     /// The pipeline the manager points at, and the store's view of it.
     fn defaulted_pipeline(engine: &Engine) -> Handle<RenderingPipeline> {

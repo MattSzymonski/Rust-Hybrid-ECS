@@ -71,6 +71,14 @@ mod runtime;
 #[cfg(feature = "hot_reload")]
 mod watcher;
 
+/// The project's `res`, watched so edited assets are reimported in place.
+#[cfg(feature = "hot_reload")]
+mod asset_watcher;
+
+/// The project's assets as a tool sees them: tree, settings, moves.
+#[cfg(feature = "hot_reload")]
+mod asset_browser;
+
 #[cfg(all(feature = "rendering", feature = "hot_reload"))]
 mod shader_watcher;
 
@@ -92,6 +100,8 @@ pub use pill_csharp_bridge::CSharpModuleConfig;
 pub use pill_runtime::{FrameDriver, FrameReport};
 
 // The development host.
+#[cfg(feature = "hot_reload")]
+pub use asset_browser::{standalone_file_name, AssetEntry, StandaloneType};
 #[cfg(feature = "hot_reload")]
 pub use runtime::{run_one_frame, setup, DevHost};
 

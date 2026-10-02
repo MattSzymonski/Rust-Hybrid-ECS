@@ -19,6 +19,7 @@
 //! window, so the Scene panel forwards its DOM events ([`scene_input`]); the
 //! gamepads are polled around every frame.
 
+mod assets_tab;
 mod console_tab;
 mod dock_view;
 mod editor_state;
@@ -463,6 +464,48 @@ impl EditorContext {
     pub(crate) fn registered_components(&self) -> Vec<editor_state::RegisteredComponent> {
         let host = self.host.borrow();
         editor_state::registered_components(host.engine().world())
+    }
+
+    /// The project's `res` tree, for the Assets panel.
+    pub(crate) fn asset_entries(&self) -> Vec<pill_host::AssetEntry> {
+        self.host.borrow().asset_entries()
+    }
+
+    /// An asset's import settings (or standalone document) as JSON.
+    pub(crate) fn asset_settings(&self, path: &str) -> Result<serde_json::Value, String> {
+        self.host.borrow().asset_settings(path)
+    }
+
+    /// Save an asset's settings; the running scene picks them up at the next
+    /// frame through the host's asset watcher.
+    pub(crate) fn save_asset_settings(
+        &self,
+        path: &str,
+        settings: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.host.borrow_mut().save_asset_settings(path, settings)
+    }
+
+    /// The standalone asset types the Create dialog offers.
+    pub(crate) fn standalone_asset_types(&self) -> Vec<pill_host::StandaloneType> {
+        self.host.borrow().standalone_asset_types()
+    }
+
+    /// Create and load a new standalone asset; returns its path in `res`.
+    pub(crate) fn create_standalone_asset(
+        &self,
+        type_name: &str,
+        folder: &str,
+        name: &str,
+    ) -> Result<String, String> {
+        self.host
+            .borrow_mut()
+            .create_standalone_asset(type_name, folder, name)
+    }
+
+    /// Move an asset with its `.meta` inside `res`.
+    pub(crate) fn move_asset(&self, from: &str, to: &str) -> Result<(), String> {
+        self.host.borrow().move_asset(from, to)
     }
 
     /// Queue one editor command; it is applied at the next frame boundary.

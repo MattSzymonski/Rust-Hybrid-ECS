@@ -50,6 +50,21 @@ pub mod archetype;
 /// `Res` / `ResMut` parameters.
 pub mod asset;
 
+/// The C ABI of importing an asset, shared by the C# bridge's import exports.
+pub mod asset_ffi;
+
+/// Importing assets by file extension, for code that does not know their type.
+pub mod asset_import_registry;
+
+/// Metadata files beside an asset's source (`<asset_name>.meta`).
+pub mod asset_metadata;
+
+/// Saved references to assets, by guid, that resolve in a later run.
+pub mod asset_reference;
+
+/// Assets stored as their own file in `res`, with no source file.
+pub mod asset_standalone;
+
 /// Where asset paths resolve: mounted packs and the filesystem.
 pub mod asset_store;
 
@@ -138,6 +153,15 @@ pub use asset::{
     Asset, AssetBindingError, AssetBindingResult, AssetGuid, AssetLoadError, AssetLoadResult,
     AssetLoader, AssetManager, Handle,
 };
+pub use asset_import_registry::{
+    ErasedImportError, ErasedImportOutcome, ImportRegistrationError, ImportRegistry, ScanReport,
+};
+pub use asset_metadata::{
+    AssetImport, AssetImportError, ImportOutcome, ImportedAsset, MetadataPolicy, MetadataSource,
+    ReimportOutcome,
+};
+pub use asset_reference::AssetReference;
+pub use asset_standalone::{render_standalone, StandaloneAsset};
 pub use commands::{CommandError, Commands};
 pub use common_components::{register_common_components, Color, Position, TransformComponent};
 pub use component::{Component, ComponentId, ComponentTicks, Tick};

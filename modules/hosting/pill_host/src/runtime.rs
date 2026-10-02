@@ -131,6 +131,13 @@ pub struct DevHost {
     /// jump or a slot may point into any of them for the rest of the run.
     #[cfg(feature = "hot_patch")]
     loaded_patches: Vec<crate::hot_patch::LoadedPatch>,
+    /// Watches the project's `res` and queues the assets whose source or
+    /// metadata file changed; `None` when the project has no `res` or the
+    /// watch could not start.
+    asset_watcher: Option<crate::asset_watcher::AssetWatcher>,
+    /// The project's `res` directory, for the asset browser; `None` when the
+    /// configuration did not come from a project directory.
+    asset_directory: Option<PathBuf>,
     /// Monotonic counter of reload/rollback/patch events.
     ///
     /// The editor keys its cached engine metadata on this. It is NOT how the
@@ -252,6 +259,102 @@ impl DevHost {
     /// three-second reporting window used by console frontends.
     pub fn current_frame_report(&self) -> FrameReport {
         self.runtime.current_frame_report()
+    }
+
+    /// The project's `res` directory, when the host knows it.
+    pub fn asset_directory(&self) -> Option<&Path> {
+        self.asset_directory.as_deref()
+    }
+
+    /// The project's `res` tree with each file's asset type, load state and
+    /// guid; empty when the host has no `res` directory.
+    pub fn asset_entries(&self) -> Vec<crate::asset_browser::AssetEntry> {
+        match &self.asset_directory {
+            Some(directory) => {
+                crate::asset_browser::list_assets(self.runtime.engine().world(), directory)
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// The import settings (or standalone document) of the asset at `path`,
+    /// relative to `res`, as JSON.
+    ///
+    /// # Errors
+    ///
+    /// A message when no registered type imports the path or its file cannot
+    /// be read.
+    pub fn asset_settings(&self, path: &str) -> Result<serde_json::Value, String> {
+        crate::asset_browser::asset_settings(self.runtime.engine().world(), path)
+    }
+
+    /// Save edited import settings for the asset at `path`; the asset watcher
+    /// reimports it at the next frame. Returns the normalized settings written.
+    ///
+    /// # Errors
+    ///
+    /// A message when the settings do not fit the type or the file cannot be
+    /// written.
+    pub fn save_asset_settings(
+        &mut self,
+        path: &str,
+        settings: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let directory = self
+            .asset_directory
+            .clone()
+            .ok_or("the host has no project `res` directory")?;
+        crate::asset_browser::save_asset_settings(
+            self.runtime.engine_mut().world_mut(),
+            &directory,
+            path,
+            settings,
+        )
+    }
+
+    /// The standalone asset types a new file can be created for.
+    pub fn standalone_asset_types(&self) -> Vec<crate::asset_browser::StandaloneType> {
+        crate::asset_browser::standalone_types(self.runtime.engine().world())
+    }
+
+    /// Create and load a new standalone asset; see
+    /// [`crate::asset_browser::create_standalone_asset`]. Returns its path
+    /// relative to `res`.
+    ///
+    /// # Errors
+    ///
+    /// A message when the input is refused or the file cannot be written.
+    pub fn create_standalone_asset(
+        &mut self,
+        type_name: &str,
+        folder: &str,
+        name: &str,
+    ) -> Result<String, String> {
+        let directory = self
+            .asset_directory
+            .clone()
+            .ok_or("the host has no project `res` directory")?;
+        crate::asset_browser::create_standalone_asset(
+            self.runtime.engine_mut().world_mut(),
+            &directory,
+            type_name,
+            folder,
+            name,
+        )
+    }
+
+    /// Move the asset at `from` to `to` (both relative to `res`) with its
+    /// `.meta`; the asset watcher follows the move.
+    ///
+    /// # Errors
+    ///
+    /// A message when a path leaves `res` or the move is refused.
+    pub fn move_asset(&self, from: &str, to: &str) -> Result<(), String> {
+        let directory = self
+            .asset_directory
+            .as_deref()
+            .ok_or("the host has no project `res` directory")?;
+        crate::asset_browser::move_asset(directory, from, to)
     }
 }
 
@@ -752,6 +855,61 @@ impl RenderingHost {
     pub fn extension_names(&self) -> Vec<String> {
         self.host.extension_names()
     }
+
+    /// The project's `res` tree; see [`DevHost::asset_entries`].
+    pub fn asset_entries(&self) -> Vec<crate::asset_browser::AssetEntry> {
+        self.host.asset_entries()
+    }
+
+    /// An asset's settings as JSON; see [`DevHost::asset_settings`].
+    ///
+    /// # Errors
+    ///
+    /// As [`DevHost::asset_settings`].
+    pub fn asset_settings(&self, path: &str) -> Result<serde_json::Value, String> {
+        self.host.asset_settings(path)
+    }
+
+    /// Save an asset's settings; see [`DevHost::save_asset_settings`].
+    ///
+    /// # Errors
+    ///
+    /// As [`DevHost::save_asset_settings`].
+    pub fn save_asset_settings(
+        &mut self,
+        path: &str,
+        settings: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        self.host.save_asset_settings(path, settings)
+    }
+
+    /// The standalone asset types; see [`DevHost::standalone_asset_types`].
+    pub fn standalone_asset_types(&self) -> Vec<crate::asset_browser::StandaloneType> {
+        self.host.standalone_asset_types()
+    }
+
+    /// Create a standalone asset; see [`DevHost::create_standalone_asset`].
+    ///
+    /// # Errors
+    ///
+    /// As [`DevHost::create_standalone_asset`].
+    pub fn create_standalone_asset(
+        &mut self,
+        type_name: &str,
+        folder: &str,
+        name: &str,
+    ) -> Result<String, String> {
+        self.host.create_standalone_asset(type_name, folder, name)
+    }
+
+    /// Move an asset with its `.meta`; see [`DevHost::move_asset`].
+    ///
+    /// # Errors
+    ///
+    /// As [`DevHost::move_asset`].
+    pub fn move_asset(&self, from: &str, to: &str) -> Result<(), String> {
+        self.host.move_asset(from, to)
+    }
 }
 
 #[cfg(feature = "rendering")]
@@ -782,6 +940,50 @@ impl FrameDriver for RenderingHost {
 // =============================================================================
 // Free Functions
 // =============================================================================
+
+/// Import every known source under `asset_directory` through the world's
+/// import registry, writing missing metadata files, and log what it did.
+///
+/// A failed asset is logged and skipped rather than failing the startup: the
+/// scan is a convenience on top of the project's own loading code, which
+/// reports its own errors for the assets it actually needs.
+fn scan_project_assets(engine: &mut pill_engine::Engine, asset_directory: &Path) {
+    let world = engine.world_mut();
+    // A clone, so the registry can be called against the asset manager, which
+    // is a second resource of the same world.
+    let Some(registry) = world.get_resource::<pill_engine::ImportRegistry>().cloned() else {
+        info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            "[assets] scan_on_start: no imported asset types are registered; nothing to scan"
+        );
+        return;
+    };
+    let Some(assets) = world.get_resource_mut::<pill_engine::AssetManager>() else {
+        return;
+    };
+    let report = registry.scan(
+        assets,
+        asset_directory,
+        pill_engine::MetadataPolicy::CreateIfMissing,
+    );
+    for (name, error) in &report.failed {
+        warn!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            asset = name.as_str(),
+            "[assets] scan_on_start could not import an asset: {error}"
+        );
+    }
+    info!(
+        target: pill_core::telemetry::telemetry_target::ECS,
+        directory = %asset_directory.display(),
+        imported = report.imported.len(),
+        already_loaded = report.already_loaded.len(),
+        metadata_created = report.metadata_created.len(),
+        failed = report.failed.len(),
+        unknown_extensions = ?report.unknown_extensions,
+        "[assets] scan_on_start finished"
+    );
+}
 
 /// Report a setup failure and hand the error back to the caller.
 ///
@@ -942,6 +1144,14 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         return Err(fail_setup(runtime, error.into()));
     }
 
+    // Step 5b: Import the project's source assets when its settings ask for
+    // it, now that every module has registered its imported asset types.
+    if host_config.assets.scan_on_start {
+        if let Some(asset_directory) = &host_config.asset_directory {
+            scan_project_assets(runtime.engine_mut(), asset_directory);
+        }
+    }
+
     // Step 6: Snapshot host memory and print the startup analytics report.
     // Every module has been built, staged, loaded and initialized by now, so
     // the table carries the complete startup picture.
@@ -1016,6 +1226,8 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
         module_hot_patch,
         #[cfg(feature = "hot_patch")]
         loaded_patches: Vec::new(),
+        asset_watcher: start_asset_watcher(host_config.asset_directory.as_deref()),
+        asset_directory: host_config.asset_directory.clone(),
         editor_revision: 0,
     };
 
@@ -1833,7 +2045,154 @@ pub(crate) fn run_reload_phase(host: &mut DevHost) -> Vec<String> {
         // records go stale for the same reason and are cleared the same way.
         forget_prologue_records(host);
     }
+
+    // Step 7: Apply asset edits, after every reload of this boundary, so they
+    // go through the registrations current now.
+    apply_asset_changes(host);
     reloaded_extensions
+}
+
+/// Start watching the project's asset directory, or `None` when there is none
+/// or the watch cannot start (logged; the host runs on without it).
+fn start_asset_watcher(
+    asset_directory: Option<&Path>,
+) -> Option<crate::asset_watcher::AssetWatcher> {
+    let asset_directory = asset_directory?;
+    match crate::asset_watcher::AssetWatcher::spawn(asset_directory.to_owned()) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            warn!(
+                target: telemetry_target::HOT_RELOAD,
+                directory = %asset_directory.display(),
+                error = %error,
+                "[assets] could not watch the project's assets; asset edits will not be reimported"
+            );
+            None
+        }
+    }
+}
+
+/// Import or reimport every asset the watcher reported, through the world's
+/// import registry.
+///
+/// A source moved together with its metadata file is followed: the loaded
+/// asset takes the new name and keeps its handle and guid, and its old path's
+/// deletion is not reported. A new source is imported, writing its metadata
+/// file. A loaded one is decoded again into its slot, keeping its handle and
+/// guid. Nothing here ever removes an asset: a failed reimport leaves the
+/// loaded value in place, and a deleted source stays loaded until the next
+/// run, because components may still hold its handle.
+fn apply_asset_changes(host: &mut DevHost) {
+    use crate::asset_watcher::AssetChange;
+
+    let Some(watcher) = &host.asset_watcher else {
+        return;
+    };
+    let changes = watcher.drain();
+    if changes.is_empty() {
+        return;
+    }
+    let world = host.runtime.engine_mut().world_mut();
+    // A clone, so the registry can be called against the asset manager, which
+    // is a second resource of the same world.
+    let Some(registry) = world.get_resource::<pill_engine::ImportRegistry>().cloned() else {
+        return;
+    };
+    let Some(assets) = world.get_resource_mut::<pill_engine::AssetManager>() else {
+        return;
+    };
+    // Only files a registered type imports are assets; the rest of `res`
+    // (shaders, configuration, licences) is not this code's business.
+    let is_asset = |source: &str| {
+        Path::new(source)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| registry.type_for_extension(extension).is_some())
+    };
+
+    // Edits first: a move arrives as the new path's edit and the old path's
+    // removal, and only the edit can tell it is a move.
+    let (edits, removals): (Vec<AssetChange>, Vec<AssetChange>) = changes
+        .into_iter()
+        .partition(|change| matches!(change, AssetChange::Edited { .. }));
+    let mut moved_from: Vec<String> = Vec::new();
+
+    for change in edits.into_iter().chain(removals) {
+        match change {
+            AssetChange::Edited {
+                source,
+                through_metadata,
+            } if is_asset(&source) => {
+                let path = Path::new(&source);
+                if let Ok(Some(old_name)) = registry.follow_move(assets, path) {
+                    info!(
+                        target: telemetry_target::HOT_RELOAD,
+                        from = old_name.as_str(),
+                        to = source.as_str(),
+                        "[assets] followed a move; the asset keeps its handle and guid"
+                    );
+                    moved_from.push(old_name);
+                    continue;
+                }
+                let imported =
+                    registry.import(assets, path, pill_engine::MetadataPolicy::CreateIfMissing);
+                match imported {
+                    Ok(outcome) if !outcome.previously_loaded => info!(
+                        target: telemetry_target::HOT_RELOAD,
+                        asset = source.as_str(),
+                        guid = %outcome.guid,
+                        metadata = ?outcome.metadata,
+                        "[assets] imported a new asset"
+                    ),
+                    Ok(_) => match registry.reimport(assets, path) {
+                        Ok(outcome) => info!(
+                            target: telemetry_target::HOT_RELOAD,
+                            asset = source.as_str(),
+                            guid = %outcome.guid,
+                            through_metadata,
+                            content_version_before = ?outcome.previous_content_version,
+                            content_version = ?outcome.content_version,
+                            "[assets] reimported"
+                        ),
+                        Err(error) => warn!(
+                            target: telemetry_target::HOT_RELOAD,
+                            asset = source.as_str(),
+                            "[assets] reimport failed; keeping the loaded value: {error}"
+                        ),
+                    },
+                    Err(error) => warn!(
+                        target: telemetry_target::HOT_RELOAD,
+                        asset = source.as_str(),
+                        "[assets] reimport failed; keeping the loaded value: {error}"
+                    ),
+                }
+            }
+            // Reported only while something is loaded under that name: after
+            // a move the old name resolves to nothing, even when its removal
+            // arrives in a later batch than the move.
+            AssetChange::SourceRemoved { source }
+                if !moved_from.contains(&source)
+                    && registry.is_loaded(assets, Path::new(&source)) =>
+            {
+                warn!(
+                target: telemetry_target::HOT_RELOAD,
+                asset = source.as_str(),
+                    "[assets] source deleted; the asset stays loaded until the next run"
+                )
+            }
+            AssetChange::MetadataRemoved { source }
+                if !moved_from.contains(&source)
+                    && registry.is_loaded(assets, Path::new(&source)) =>
+            {
+                info!(
+                target: telemetry_target::HOT_RELOAD,
+                asset = source.as_str(),
+                    "[assets] metadata file deleted; the loaded asset keeps its guid and settings until the next run"
+                )
+            }
+            _ => {}
+        }
+    }
 }
 
 /// One scheduler frame and its reporting, run by the wrapped runtime, with

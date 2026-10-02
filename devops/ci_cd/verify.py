@@ -117,6 +117,17 @@ STEPS: List[Step] = [
         working_directory=REPOSITORY_ROOT,
         quick=True,
     ),
+    Step(
+        "asset-metadata",
+        "Asset metadata (orphans, duplicate guids)",
+        # The self test first proves the checker still catches each mistake.
+        [
+            [PYTHON, "devops/tests/test_asset_metadata.py", "--self-test"],
+            [PYTHON, "devops/tests/test_asset_metadata.py"],
+        ],
+        working_directory=REPOSITORY_ROOT,
+        quick=True,
+    ),
     Step("doc", "Documentation", [["cargo", "doc", "--workspace", "--no-deps"]]),
     Step(
         "wasm-clippy",

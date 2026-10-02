@@ -4,8 +4,8 @@
 //! # Responsibilities
 //!
 //! - Register the renderer, which installs its own PBR chain as the frame to
-//!   run, and load the helmet: its mesh, its four PBR maps, and the material
-//!   built from them through that chain's shader.
+//!   run, and load the helmet: its mesh, its four PBR maps, and its material
+//!   file, which binds them to that chain's shader.
 //! - Create the scene: a camera and one spinning helmet.
 //! - Let the player turn the helmet and move the camera with the mouse,
 //!   keyboard or a gamepad (`controls`).
@@ -17,8 +17,8 @@
 //! points the renderer's manager at it, so what is left here is content and
 //! scene. Swapping the frame is one `RenderingManager::set_pipeline` call with
 //! another pipeline asset, not a change to this file; and the helmet only has to
-//! be drawable by whatever chain is running, which is why its material is built
-//! through the chain's shader rather than one of its own.
+//! be drawable by whatever chain is running, which is why its material names
+//! the chain's shader rather than one of its own.
 
 use pill_engine::{pill_project, Engine, PillComponent};
 use serde::{Deserialize, Serialize};
@@ -117,7 +117,7 @@ mod tests {
     /// in `res`, not the loader.
     #[test]
     fn the_committed_helmet_asset_decodes() {
-        AssetLoader::set_root(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("res"));
+        AssetLoader::set_root(asset_loading::res_directory());
 
         let obj = AssetLoader::Path("models/helmet.obj".into())
             .load()
@@ -137,5 +137,112 @@ mod tests {
             texture.rgba.len(),
             texture.width as usize * texture.height as usize * 4
         );
+    }
+
+    /// A project reload runs the loading code again on the same world. It
+    /// must hand back the assets already there: no second copy, no error.
+    #[test]
+    fn loading_again_reuses_every_asset() {
+        use pill_engine::AssetManager;
+        use pill_master_renderer_data::Material;
+
+        let mut engine = Engine::new();
+        assert_eq!(init(&mut engine), 0);
+        let counts = |engine: &mut Engine| {
+            let assets = engine
+                .world_mut()
+                .get_resource::<AssetManager>()
+                .expect("init created the manager");
+            (
+                assets.len::<Mesh>(),
+                assets.len::<Texture>(),
+                assets.len::<Material>(),
+            )
+        };
+        let before = counts(&mut engine);
+
+        let first = asset_loading::load(engine.world_mut()).expect("first reload");
+        let second = asset_loading::load(engine.world_mut()).expect("second reload");
+
+        assert_eq!(counts(&mut engine), before);
+        assert_eq!(first.mesh, second.mesh);
+        assert_eq!(first.material, second.material);
+    }
+
+    /// The helmet's material comes from `res/materials/helmet.material`: its
+    /// shader is the PBR chain's, found by the guid the file names, and its
+    /// four slots are bound to the loaded maps.
+    #[test]
+    fn the_helmet_material_comes_from_its_file() {
+        use pill_engine::AssetManager;
+        use pill_master_renderer_data::MaterialParameter;
+        use pill_master_renderer_data::{config::pbr_pipeline, Material, Shader};
+
+        let mut engine = Engine::new();
+        assert_eq!(init(&mut engine), 0);
+        let assets = engine
+            .world_mut()
+            .get_resource::<AssetManager>()
+            .expect("init created the manager");
+        let material = assets
+            .get_by_name::<Material>(asset_loading::HELMET_MATERIAL)
+            .expect("the material is loaded under its path");
+
+        let shader = assets
+            .handle_by_name::<Shader>(pbr_pipeline::SHADER_NAME)
+            .expect("the chain installed its shader");
+        assert_eq!(material.shader, shader);
+        assert_eq!(assets.guid_of(shader), Some(pbr_pipeline::SHADER_GUID));
+        for (slot, path) in [
+            ("base_color", "textures/helmet_basecolor.jpg"),
+            ("normal", "textures/helmet_normal.jpg"),
+            (
+                "metallic_roughness",
+                "textures/helmet_metallic_roughness.jpg",
+            ),
+            ("emissive", "textures/helmet_emissive.jpg"),
+        ] {
+            assert_eq!(
+                Some(material.textures[slot].texture),
+                assets.handle_by_name::<Texture>(path),
+                "{slot}"
+            );
+        }
+        assert_eq!(
+            material.parameters.get("pbr_roughness"),
+            Some(&MaterialParameter::Scalar(1.0))
+        );
+    }
+
+    /// The maps are read as their metadata files say: the normal map as normal
+    /// data, the rest as color.
+    #[test]
+    fn each_map_is_read_as_its_metadata_says() {
+        use pill_engine::AssetManager;
+
+        let mut engine = Engine::new();
+        assert_eq!(init(&mut engine), 0);
+        let assets = engine
+            .world_mut()
+            .get_resource::<AssetManager>()
+            .expect("init created the manager");
+        let expected = [
+            ("textures/helmet_basecolor.jpg", TextureType::Color),
+            ("textures/helmet_normal.jpg", TextureType::Normal),
+            ("textures/helmet_metallic_roughness.jpg", TextureType::Color),
+            ("textures/helmet_emissive.jpg", TextureType::Color),
+        ];
+        for (path, texture_type) in expected {
+            let texture = assets
+                .get_by_name::<Texture>(path)
+                .unwrap_or_else(|| panic!("{path} is loaded under its path"));
+            assert_eq!(texture.texture_type, texture_type, "{path}");
+            assert!(
+                assets
+                    .guid_of(assets.handle_by_name::<Texture>(path).unwrap())
+                    .is_some(),
+                "{path} has a guid"
+            );
+        }
     }
 }

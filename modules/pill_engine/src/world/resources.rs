@@ -820,6 +820,90 @@ impl World {
         }
     }
 
+    /// Declare an asset type that can be imported from a source file, by
+    /// extension, through the world's
+    /// [`ImportRegistry`](crate::asset_import_registry::ImportRegistry).
+    ///
+    /// Declares the asset type ([`Self::register_asset`]) and records `T`'s
+    /// import entry points, compiled into the calling binary. Call it in the
+    /// registration of the module that owns `T`, on every generation.
+    ///
+    /// The entry points point into the calling binary, so this also inserts a
+    /// marker resource the calling generation claims. When the host retires
+    /// that claim - the module stopped registering `T`, or was unloaded - it
+    /// drops the marker while the image is still mapped, and the registry
+    /// stops calling into it.
+    ///
+    /// A type whose extension another live type already imports is refused
+    /// with [`WorldError::ImportExtensionClaimedTwice`], recorded as a
+    /// registration error so the registering `init` fails.
+    pub fn register_imported_asset<T>(&mut self)
+    where
+        T: crate::asset_metadata::ImportedAsset,
+    {
+        self.register_asset::<T>();
+        self.record_import_registration::<T>(|registry, alive| registry.register::<T>(alive));
+    }
+
+    /// Declare an asset type stored as its own file in `res` - a standalone
+    /// asset such as a material - so it loads by its file extension through
+    /// the world's [`ImportRegistry`](crate::asset_import_registry::ImportRegistry).
+    ///
+    /// The standalone twin of [`Self::register_imported_asset`], with the same
+    /// liveness and the same refusal of an extension another type imports.
+    pub fn register_standalone_asset<T>(&mut self)
+    where
+        T: crate::asset_standalone::StandaloneAsset,
+    {
+        self.register_asset::<T>();
+        self.record_import_registration::<T>(|registry, alive| {
+            registry.register_standalone::<T>(alive)
+        });
+    }
+
+    /// Record one import registration of `T` with `register`, behind a fresh
+    /// liveness marker this generation claims.
+    fn record_import_registration<T: 'static>(
+        &mut self,
+        register: impl FnOnce(
+            &mut crate::asset_import_registry::ImportRegistry,
+            std::sync::Weak<()>,
+        )
+            -> Result<(), crate::asset_import_registry::ImportRegistrationError>,
+    ) {
+        use crate::asset_import_registry::{
+            ImportRegistrationError, ImportRegistrationMarker, ImportRegistry,
+        };
+
+        let marker = ImportRegistrationMarker::<T>::new();
+        // Claimed on every generation, not only by the first insert: a reload
+        // that kept the registry without claiming it would read as this module
+        // no longer owning it, and the host would drop it after the init.
+        self.register_resource::<ImportRegistry>();
+        if self.get_resource::<ImportRegistry>().is_none() {
+            self.insert_resource(ImportRegistry::default());
+        }
+        let registered = register(
+            self.get_resource_mut::<ImportRegistry>()
+                .expect("inserted just above"),
+            marker.alive(),
+        );
+        match registered {
+            // Replacing a previous generation's marker ends that generation's
+            // registration; the one just recorded holds this marker instead.
+            Ok(()) => self.insert_resource(marker),
+            Err(ImportRegistrationError::ExtensionClaimedTwice {
+                extension,
+                registered_type,
+                incoming_type,
+            }) => self.record_registration_error(WorldError::ImportExtensionClaimedTwice {
+                extension,
+                registered_type,
+                incoming_type,
+            }),
+        }
+    }
+
     /// Re-home every asset column's per-type function table.
     ///
     /// The third member of the re-homing family, called by the reload
@@ -827,9 +911,20 @@ impl World {
     /// [`Self::rehome_resources`] and for the same reason: the asset store
     /// outlives every reload, so a column whose table still belongs to a
     /// retiring image has to be re-pointed while that image is mapped.
+    ///
+    /// Also prunes the import registry. The reload drops the marker resources
+    /// of a retired generation's import registrations before re-homing, so
+    /// this is when those registrations die; pruning here drops them at once
+    /// instead of at the next registration. A dead one is never called either
+    /// way, so this only keeps the registry from holding stale entries.
     pub fn rehome_assets(&mut self) {
         if let Some(assets) = self.get_resource_mut::<AssetManager>() {
             assets.rehome();
+        }
+        if let Some(registry) =
+            self.get_resource_mut::<crate::asset_import_registry::ImportRegistry>()
+        {
+            registry.prune();
         }
     }
 

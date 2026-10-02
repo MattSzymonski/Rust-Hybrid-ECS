@@ -554,6 +554,7 @@ mod tests {
             PanelKind::Systems,
             PanelKind::Console,
             PanelKind::Statistics,
+            PanelKind::Assets,
         ] {
             let tab = tab_for(&model, panel);
             model.apply(LayoutAction::DetachTab { tab }).unwrap();

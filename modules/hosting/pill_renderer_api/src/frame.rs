@@ -37,7 +37,7 @@ use pill_engine::Resource;
 use crate::components::CameraComponent;
 
 /// What a pass draws.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PassKind {
     /// Draws the scene's meshes, one instance batch per material.
     #[default]
@@ -47,7 +47,7 @@ pub enum PassKind {
 }
 
 /// Where a pass reads from and writes to.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PassTarget {
     /// The swapchain image. A pass writing here reads nothing and ends the
     /// frame, so a pipeline has at most one such pass and it runs last.
@@ -61,7 +61,7 @@ pub enum PassTarget {
 }
 
 /// Which faces a pass drops.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum CullMode {
     /// Back faces: the default for solid geometry.
     #[default]
@@ -79,7 +79,10 @@ pub enum CullMode {
 /// walks the shader's slots rather than the map, so a name the shader never
 /// declares is ignored instead of shifting anything after it. Each value pads
 /// out to one 16-byte uniform slot.
-#[derive(Clone, Debug)]
+///
+/// Serializable because a material file stores its parameters as written:
+/// `{"Scalar": 1.0}`, `{"Bool": true}` or `{"Color": [1.0, 0.5, 0.0]}`.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum MaterialParameter {
     /// One `f32`, in the first four bytes of the slot.
     Scalar(f32),
