@@ -105,10 +105,13 @@ fn render_plan(project_name: &str, builds: &[PlannedBuild]) -> String {
         .map(|build| build.module.len())
         .max()
         .unwrap_or(0);
-    let number_width = builds.len().to_string().len();
+    // Numbered like the build steps that follow (`[n/total]`), with `n` padded
+    // to the width of the total so the names line up.
+    let total = builds.len();
+    let number_width = total.to_string().len();
     let lines = builds.iter().enumerate().map(|(index, build)| {
         format!(
-            "{:>number_width$}. {:<name_width$}  {}",
+            "[{:>number_width$}/{total}] {:<name_width$}  {}",
             index + 1,
             build.module,
             build.kind
@@ -157,9 +160,11 @@ mod tests {
             "{text}"
         );
         let spline = text
-            .find("1. pill_spline")
+            .find("[1/2] pill_spline")
             .expect("first module numbered 1");
-        let project = text.find("2. project").expect("second module numbered 2");
+        let project = text
+            .find("[2/2] project")
+            .expect("second module numbered 2");
         assert!(spline < project, "{text}");
     }
 

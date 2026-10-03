@@ -34,7 +34,9 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 
 // External crates
-use colored::Colorize;
+/// Text styling (`.cyan()`, `.bold()`, ...) for [`log_block_colored`] lines,
+/// re-exported so a caller needs no `colored` dependency of its own.
+pub use colored::Colorize;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
 use tracing_log::NormalizeEvent;
@@ -397,6 +399,12 @@ where
             fields: String::new(),
         };
         event.record(&mut visitor);
+        // A message may carry color codes (see `log_block_colored`). They reach
+        // only a lane that shows colors - an interactive terminal - and are
+        // stripped for the file lane and for piped output, which the suites read.
+        if !(ansi && colored::control::SHOULD_COLORIZE.should_colorize()) {
+            visitor.message = strip_color_codes(&visitor.message);
+        }
         // A multi-line message is a block (see `log_block`): the prefix line
         // carries only the time, level, target and fields, and the message
         // follows below it from the left edge, so wide tables and trees keep
@@ -932,6 +940,73 @@ where
     block
 }
 
+/// Join a heading and its lines into one multi-line log message, where any
+/// part may carry color.
+///
+/// The same as [`log_block`], but the heading and the lines are anything that
+/// displays - plain strings, or text styled with [`Colorize`] (re-exported
+/// here) or [`PillStyle`](crate::PillStyle). Colors show in an interactive
+/// terminal only: the formatter strips them for the file log and for piped
+/// output.
+///
+/// # Examples
+///
+/// ```
+/// use pill_core::telemetry::{log_block_colored, Colorize};
+///
+/// let block = log_block_colored(
+///     "Modules to build:".bold(),
+///     [
+///         format!("1. {}  extension", "pill_spline".cyan()),
+///         format!("2. {}  project", "project".cyan()),
+///     ],
+/// );
+/// assert!(block.starts_with(&"Modules to build:".bold().to_string()));
+/// ```
+pub fn log_block_colored<H, I, L>(heading: H, lines: I) -> String
+where
+    H: fmt::Display,
+    I: IntoIterator<Item = L>,
+    L: fmt::Display,
+{
+    log_block(
+        &heading.to_string(),
+        lines.into_iter().map(|line| line.to_string()),
+    )
+}
+
+/// `text` without its ANSI escape sequences (`ESC [ ... letter`): what a lane
+/// that does not show colors receives from colored text.
+///
+/// # Examples
+///
+/// ```
+/// use pill_core::telemetry::strip_color_codes;
+///
+/// assert_eq!(strip_color_codes("\u{1b}[36mpill_spline\u{1b}[0m"), "pill_spline");
+/// ```
+pub fn strip_color_codes(text: &str) -> String {
+    if !text.contains('\u{1b}') {
+        return text.to_string();
+    }
+    let mut plain = String::with_capacity(text.len());
+    let mut characters = text.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\u{1b}' && characters.peek() == Some(&'[') {
+            // Skip the parameters up to and including the final letter.
+            characters.next();
+            for code in characters.by_ref() {
+                if code.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            plain.push(character);
+        }
+    }
+    plain
+}
+
 /// The column width of the level, padded to the widest name (`ERROR`, `DEBUG`).
 const LEVEL_WIDTH: usize = 5;
 
@@ -1060,6 +1135,44 @@ mod tests {
         let render = |format: TimestampFormat| moment.format(format.pattern()).to_string();
         assert_eq!(render(TimestampFormat::DateTime), "03.10.2026 09:05:07:042");
         assert_eq!(render(TimestampFormat::Time), "09:05:07:042");
+    }
+
+    /// Color codes in a message reach no lane that cannot show them: a plain
+    /// lane gets the text alone.
+    #[test]
+    fn color_codes_are_stripped_for_a_plain_lane() {
+        use std::sync::{Arc, Mutex};
+
+        assert_eq!(
+            strip_color_codes("\u{1b}[1;36mpill_spline\u{1b}[0m  extension"),
+            "pill_spline  extension"
+        );
+        assert_eq!(strip_color_codes("no codes"), "no codes");
+
+        let captured = Arc::new(Mutex::new(String::new()));
+        let writer = CapturingMakeWriter(Arc::clone(&captured));
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(false)
+                .event_format(EngineTerminalFormatter::new().without_timestamps()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "engine::hot_reload",
+                "{}",
+                log_block_colored(
+                    "\u{1b}[1mModules to build:\u{1b}[0m",
+                    ["1. \u{1b}[36mpill_spline\u{1b}[0m  extension"]
+                )
+            );
+        });
+        let output = captured.lock().unwrap().clone();
+        assert!(!output.contains('\u{1b}'), "{output}");
+        assert!(
+            output.contains("Modules to build:\n1. pill_spline  extension"),
+            "{output}"
+        );
     }
 
     /// A multi-line message logs as a block: the prefix and fields alone on the

@@ -33,7 +33,9 @@ use std::time::UNIX_EPOCH;
 use crate::console;
 
 // External crates
+use pill_core::info;
 use pill_core::platform::Instant;
+use pill_core::telemetry::{log_block_colored, Colorize};
 use serde_json::Value;
 
 // =============================================================================
@@ -1102,7 +1104,11 @@ pub(crate) fn print_startup_report() {
     // set; they belong to the startup report's `cargo` column only, so drop
     // them before any reload transaction starts accumulating.
     collector.pending_cargo_crates.clear();
-    print!("{}", render_startup_report(&collector));
+    info!(
+        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        "{}",
+        render_startup_report(&collector)
+    );
 }
 
 /// One column of the startup table: its header, alignment, and one cell per
@@ -1136,16 +1142,15 @@ impl ReportColumn {
     }
 }
 
-/// Render the startup report: a title rule, the totals, one table row per
-/// module with a total row, then each module's links and direct dependencies.
+/// Render the startup report as one multi-line log message ([`log_block_colored`]):
+/// the title, the totals, one table row per module with a total row, then each
+/// module's links and direct dependencies.
 ///
-/// The `elapsed: ... builds: N    reloads: N` line is parsed by the benchmark
-/// harness (`devops/benchmarks`), so its labels stay as they are and carry no
-/// color codes between them. Columns that are empty for every module (at
+/// The title and the `elapsed: ... builds: N    reloads: N` line are parsed by
+/// the suites and the benchmark harness (`devops/`), so their text stays as it
+/// is. Columns that are empty for every module (at
 /// startup: `migrate`, and `cargo` without `--timings`) are left out.
 fn render_startup_report(collector: &Analytics) -> String {
-    use std::fmt::Write as _;
-
     let elapsed_seconds = collector.started.elapsed().as_secs_f64();
     let total_reloads: u64 = collector
         .modules
@@ -1281,90 +1286,82 @@ fn render_startup_report(collector: &Analytics) -> String {
     let widths: Vec<usize> = columns.iter().map(ReportColumn::width).collect();
     let table_width = widths.iter().sum::<usize>() + 2 * (widths.len() - 1);
 
-    // Step 2: The title rule, sized to the table, and the run totals.
-    let mut report = String::new();
-    let title = " BUILD / LINK / HOT-RELOAD ANALYTICS · startup ";
-    let rule_tail = "─".repeat(table_width.saturating_sub(title.chars().count() + 2).max(4));
-    let _ = writeln!(report);
-    let _ = writeln!(
-        report,
-        "{}{}{}",
-        console::dim("──"),
-        console::bold_cyan(title),
-        console::dim(&rule_tail)
-    );
-    let _ = writeln!(
-        report,
-        "  elapsed: {elapsed_seconds:.2}s    builds: {}    reloads: {}",
-        collector.builds, total_reloads
-    );
-    let _ = writeln!(
-        report,
-        "  {} {} {}    {} {}",
-        console::dim("host RSS"),
-        format_bytes(collector.host_current_bytes),
-        console::dim(&format!(
-            "(peak {})",
-            format_bytes(collector.host_peak_bytes)
-        )),
-        console::dim("cargo child peak RSS"),
-        format_bytes(collector.cargo_child_peak_bytes),
-    );
+    // Step 2: The title and the run totals. Colored for the terminal; the log
+    // formatter strips the codes for the file lane and for piped output, which
+    // is what the harness parses, so the parsed line stays plain text there.
+    let mut lines: Vec<String> = vec![
+        "BUILD / LINK / HOT-RELOAD ANALYTICS · startup"
+            .cyan()
+            .bold()
+            .to_string(),
+        format!(
+            "elapsed: {}    builds: {}    reloads: {}",
+            format!("{elapsed_seconds:.2}s").yellow(),
+            collector.builds.to_string().yellow(),
+            total_reloads.to_string().yellow()
+        ),
+        format!(
+            "{} {} {}    {} {}",
+            "host RSS".dimmed(),
+            format_bytes(collector.host_current_bytes).yellow(),
+            format!("(peak {})", format_bytes(collector.host_peak_bytes)).dimmed(),
+            "cargo child peak RSS".dimmed(),
+            format_bytes(collector.cargo_child_peak_bytes).yellow(),
+        ),
+    ];
     if collector.last_cargo_total_seconds > 0.0 {
-        let _ = writeln!(
-            report,
-            "  {} {:.2}s",
-            console::dim("newest cargo --timings total"),
-            collector.last_cargo_total_seconds
-        );
+        lines.push(format!(
+            "{} {}",
+            "newest cargo --timings total".dimmed(),
+            format!("{:.2}s", collector.last_cargo_total_seconds).yellow()
+        ));
     }
-    let _ = writeln!(report);
+    lines.push(String::new());
 
-    // Step 3: The table. Cells are padded before they are painted, so color
-    // codes never count towards a column's width.
-    let row = |cells: Vec<String>| format!("  {}", cells.join("  "));
-    let header_cells = columns
+    // Step 3: The table, with a rule under the header and above the totals.
+    // Cells are padded before they are colored, so codes never count towards
+    // a column's width.
+    let row = |cells: Vec<String>| cells.join("  ");
+    let rule = "─".repeat(table_width).dimmed().to_string();
+    lines.push(row(columns
         .iter()
         .zip(&widths)
-        .map(|(column, width)| console::bold(&column.pad(column.header, *width)))
-        .collect();
-    let _ = writeln!(report, "{}", row(header_cells));
-    let _ = writeln!(report, "  {}", console::dim(&"─".repeat(table_width)));
-    for (index, _) in modules.iter().enumerate() {
-        let cells = columns
+        .map(|(column, width)| column.pad(column.header, *width).bold().to_string())
+        .collect()));
+    lines.push(rule.clone());
+    for index in 0..modules.len() {
+        lines.push(row(columns
             .iter()
             .zip(&widths)
             .enumerate()
             .map(|(position, (column, width))| {
                 let cell = column.pad(&column.cells[index], *width);
                 if position == 0 {
-                    console::cyan(&cell)
+                    cell.cyan().to_string()
                 } else {
                     cell
                 }
             })
-            .collect();
-        let _ = writeln!(report, "{}", row(cells));
+            .collect()));
     }
-    let _ = writeln!(report, "  {}", console::dim(&"─".repeat(table_width)));
+    lines.push(rule);
     // Columns with no total (the counts) at the end of the row are left off,
     // so the line carries no trailing padding.
     let last_total = columns
         .iter()
         .rposition(|column| !column.total.is_empty())
         .unwrap_or(0);
-    let total_cells = columns
+    lines.push(row(columns
         .iter()
         .zip(&widths)
         .take(last_total + 1)
-        .map(|(column, width)| console::yellow(&column.pad(&column.total, *width)))
-        .collect();
-    let _ = writeln!(report, "{}", row(total_cells));
+        .map(|(column, width)| column.pad(&column.total, *width).yellow().to_string())
+        .collect()));
 
     // Step 4: What each module links against (system DLLs only counted) and
     // its direct dependencies, wrapped under the module's name.
     let name_width = widths[0];
-    let indent = " ".repeat(2 + name_width + 2);
+    let indent = " ".repeat(name_width + 2);
     let wrap_width = table_width.max(60).saturating_sub(name_width + 2 + 6);
     let mut wrote_detail = false;
     for module in modules {
@@ -1375,42 +1372,39 @@ fn render_startup_report(collector: &Analytics) -> String {
             .map(String::as_str)
             .filter(|dependency| *dependency != "build_script_build")
             .collect();
-        let mut lines = Vec::new();
+        let mut details = Vec::new();
         if !linked.is_empty() || system_count > 0 {
-            let mut text = linked.join(", ");
-            if system_count > 0 {
-                let system = format!("+{system_count} system");
-                text = if text.is_empty() {
-                    system
-                } else {
-                    format!("{text}  {}", console::dim(&format!("({system})")))
-                };
-            }
-            lines.push(format!("{} {text}", console::dim("links")));
+            let system = format!("(+{system_count} system)").dimmed();
+            let text = match (linked.is_empty(), system_count) {
+                (false, 0) => linked.join(", "),
+                (false, _) => format!("{}  {system}", linked.join(", ")),
+                (true, _) => system.to_string(),
+            };
+            details.push(format!("{} {text}", "links".dimmed()));
         }
         for (position, chunk) in wrap_list(&dependencies, wrap_width).into_iter().enumerate() {
             let label = if position == 0 { "deps " } else { "     " };
-            lines.push(format!("{} {chunk}", console::dim(label)));
+            details.push(format!("{} {chunk}", label.dimmed()));
         }
-        if lines.is_empty() {
+        if details.is_empty() {
             continue;
         }
         if !wrote_detail {
-            let _ = writeln!(report);
+            lines.push(String::new());
             wrote_detail = true;
         }
-        for (position, line) in lines.iter().enumerate() {
+        for (position, detail) in details.iter().enumerate() {
             if position == 0 {
                 let name = format!("{:<name_width$}", module.name);
-                let _ = writeln!(report, "  {}  {line}", console::cyan(&name));
+                lines.push(format!("{}  {detail}", name.cyan()));
             } else {
-                let _ = writeln!(report, "{indent}{line}");
+                lines.push(format!("{indent}{detail}"));
             }
         }
     }
-    let _ = writeln!(report, "{}", console::dim(&"─".repeat(table_width + 2)));
-    let _ = writeln!(report);
-    report
+    let mut lines = lines.into_iter();
+    let heading = lines.next().unwrap_or_default();
+    log_block_colored(heading, lines)
 }
 
 /// Split a module's imported DLLs into the ones worth naming (the engine's
@@ -1452,6 +1446,7 @@ fn wrap_list(items: &[&str], width: usize) -> Vec<String> {
     }
     lines
 }
+
 /// Print one line per completed hot reload plus one aggregate total line.
 ///
 /// Called by the frame loop right after reloads are processed, so the console
@@ -1645,7 +1640,9 @@ mod tests {
             patch_fallbacks: Vec::new(),
         };
 
-        let report = render_startup_report(&collector);
+        // Checked as a plain lane receives it: whether `colored` emits codes
+        // depends on the terminal the tests run in.
+        let report = pill_core::telemetry::strip_color_codes(&render_startup_report(&collector));
 
         assert!(
             report.contains("BUILD / LINK / HOT-RELOAD ANALYTICS"),
@@ -1683,6 +1680,11 @@ mod tests {
         assert!(
             report.lines().all(|line| line == line.trim_end()),
             "a line ends in padding: {report}"
+        );
+        // One log block: the title first.
+        assert!(
+            report.starts_with("BUILD / LINK / HOT-RELOAD ANALYTICS · startup\n"),
+            "{report}"
         );
     }
     use std::time::SystemTime;
