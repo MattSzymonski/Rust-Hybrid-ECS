@@ -23,8 +23,13 @@
 //! shader puts the triangle at the far plane, so it draws only where no mesh
 //! did.
 
+// Standard library
 use std::collections::{HashMap, HashSet};
 
+// External crates
+use pill_core::warn;
+
+// Current crate
 use crate::{
     assets::Shader,
     error::{capturing_validation, ErrorContext, RendererError, Result},
@@ -351,16 +356,18 @@ impl RendererPass {
             // missing a texture and one whose author believes it bound it.
             for slot_name in pass.inputs.keys() {
                 if !renderer_shader.texture_slots.contains_key(slot_name) {
-                    println!(
-                        "[render] Pass {} names input `{slot_name}`, which its shader has no slot for",
+                    warn!(
+                        target: pill_core::telemetry::telemetry_target::RENDERING,
+                        "Pass {} names input `{slot_name}`, which its shader has no slot for",
                         pass.name
                     );
                 }
             }
             for (slot_name, _key) in textures {
                 if !renderer_shader.texture_slots.contains_key(slot_name) {
-                    println!(
-                        "[render] Pass {} binds texture `{slot_name}`, which its shader has no slot for",
+                    warn!(
+                        target: pill_core::telemetry::telemetry_target::RENDERING,
+                        "Pass {} binds texture `{slot_name}`, which its shader has no slot for",
                         pass.name
                     );
                 }

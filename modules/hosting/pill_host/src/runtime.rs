@@ -1050,11 +1050,11 @@ fn scan_project_assets(engine: &mut pill_engine::Engine, asset_directory: &Path)
 /// missing.
 fn report_setup_failure(error: HostError) -> HostError {
     let cause_chain = format_error_chain(&error);
-    eprintln!("[host] DevHost setup failed: {cause_chain}");
+    // "Host setup failed" is what the suites wait for when a start must fail.
     error!(
         target: telemetry_target::ENGINE,
         error = %cause_chain,
-        "host setup failed"
+        "Host setup failed"
     );
     error
 }
@@ -1120,6 +1120,31 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     let mut runtime = Runtime::new();
     runtime.engine_mut().set_parallel_execution(true);
     let engine_api = EngineApi::new(runtime.engine_mut());
+
+    // Step 3b: Announce every module this start builds, in build order: the
+    // extensions, the project, and - in a windowed host - the renderer's GPU
+    // module, which is built once the window opens.
+    let mut planned_builds: Vec<crate::build_progress::PlannedBuild> = host_config
+        .extensions
+        .iter()
+        .map(|extension| crate::build_progress::PlannedBuild {
+            module: extension.name.clone(),
+            kind: "extension",
+        })
+        .collect();
+    planned_builds.push(crate::build_progress::PlannedBuild {
+        module: module_config.name.clone(),
+        kind: "project",
+    });
+    if cfg!(feature = "rendering") {
+        if let Some(renderer) = &host_config.renderer {
+            planned_builds.push(crate::build_progress::PlannedBuild {
+                module: renderer.clone(),
+                kind: "renderer",
+            });
+        }
+    }
+    crate::build_progress::announce_plan(&host_config.name, planned_builds);
 
     // Step 4: Build, load and watch the extensions before the project.
     // Modules are infrastructure: loading them first means the project can rely
@@ -1221,12 +1246,11 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     analytics::record_host_memory();
     analytics::print_startup_report();
 
-    println!();
-    println!(
-        "[host] Entering project loop. Edit {}/**/* to hot-reload.",
+    info!(
+        target: telemetry_target::ENGINE,
+        "Entering project loop. Edit {}/**/* to hot-reload",
         module_config.watch_directory
     );
-    println!();
 
     // Say how to drive rollback, once, next to where the fast path announces
     // itself - an interface nothing mentions is one nobody uses.

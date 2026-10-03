@@ -46,7 +46,7 @@ use pill_core::telemetry::{
 /// ```yaml
 /// logging:
 ///   level: info                 # every target, replacing the engine's defaults
-///   timestamp: time             # date_time (default) or time
+///   timestamp: date_time        # time (default) or date_time
 ///   source_location: true       # end lines with file:line (default false)
 ///   targets:                    # per target, applied last
 ///     engine::rendering: info
@@ -61,8 +61,8 @@ pub struct LoggingSettings {
     /// (the `wgpu` and `naga` dependency filters stay at `warn` unless the
     /// level is quieter, or a target override names them).
     pub level: Option<LevelFilter>,
-    /// How each line writes its local time: `[dd.mm.yyyy hh:mm:ss:mmm]` by
-    /// default, or `[hh:mm:ss:mmm]`.
+    /// How each line writes its local time: `[hh:mm:ss:mmm]` by default, or
+    /// `[dd.mm.yyyy hh:mm:ss:mmm]`.
     pub timestamp: Option<TimestampFormat>,
     /// Whether each line ends with the `file:line` that emitted it, in dark
     /// gray. Off unless the settings turn it on.
@@ -300,12 +300,12 @@ mod tests {
     #[test]
     fn a_target_override_replaces_the_engine_default() {
         let settings =
-            LoggingSettings::from_text(None, None, &[("engine::rendering", "info")]).unwrap();
+            LoggingSettings::from_text(None, None, &[("engine::rendering", "debug")]).unwrap();
 
         let rendered = format!("{}", settings.terminal_config().build_env_filter().unwrap());
 
-        assert!(rendered.contains("engine::rendering=info"), "{rendered}");
-        assert!(!rendered.contains("engine::rendering=debug"), "{rendered}");
+        assert!(rendered.contains("engine::rendering=debug"), "{rendered}");
+        assert!(!rendered.contains("engine::rendering=info"), "{rendered}");
         assert!(rendered.contains("engine::hot_reload=info"), "{rendered}");
     }
 

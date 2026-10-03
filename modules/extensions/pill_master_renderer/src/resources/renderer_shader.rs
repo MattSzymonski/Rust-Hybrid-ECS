@@ -25,7 +25,7 @@
 
 // External crates
 use indexmap::IndexMap;
-use pill_core::{debug, PillStyle};
+use pill_core::debug;
 
 // Current crate
 use crate::{
@@ -106,32 +106,6 @@ impl RendererShader {
         pass_engine_parameters: bool,
         pass_camera_parameters: bool,
     ) -> Result<Self> {
-        // Print shader information
-        {
-            let mut shader_info = format!(
-                "Creating shader {}:\n - Settings:\n   - Pass engine parameters: {}\n   - Pass camera parameters: {}",
-                name.name_style(),
-                pass_engine_parameters,
-                pass_camera_parameters,
-            );
-
-            shader_info.push_str("\n - Parameter slots:");
-            for (slot_name, slot) in parameter_slots {
-                shader_info.push_str(&format!("\n   - {}: {:?}", slot_name, slot.parameter_type));
-            }
-
-            shader_info.push_str("\n - Texture slots:");
-            for (slot_name, slot) in texture_slots {
-                shader_info.push_str(&format!(
-                    "\n   - {}: texture_binding={}, sampler_binding={}",
-                    slot_name, slot.texture_binding, slot.sampler_binding
-                ));
-            }
-
-            // Log with context
-            debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", shader_info);
-        }
-
         // Create shader modules from the cooked WGSL. Nothing compiles a shader
         // at runtime: the authored sources are HLSL next to the pipeline that
         // draws through them, the build script's `slangc` rule produces the WGSL
@@ -145,8 +119,6 @@ impl RendererShader {
             label: Some("master_fragment_shader"),
             source: wgpu::ShaderSource::Wgsl(fragment_wgsl.into()),
         });
-
-        debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Shader modules created");
 
         let parameters_bind_group_layout = {
             if !parameter_slots.is_empty() {
@@ -171,8 +143,6 @@ impl RendererShader {
                 None
             }
         };
-
-        debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Parameters bind group layout created");
 
         // Create bind group layout entries for textures - Bind group slot 3
         let textures_bind_group_layout = {
@@ -229,8 +199,6 @@ impl RendererShader {
                 None
             }
         };
-
-        debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Textures bind group layout created");
 
         // Create pipeline layout. The four group slots are fixed by the
         // engine's convention - engine parameters at 0, camera at 1, a
@@ -330,7 +298,25 @@ impl RendererShader {
             pass_camera_parameters,
         };
 
-        debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Render pipeline created");
+        // One line per shader, once its pipeline exists, hidden unless
+        // `engine::rendering` is at debug: the slots it declares
+        // and which engine uniform groups it reads.
+        let slot_names = |names: Vec<&String>| {
+            names
+                .into_iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        debug!(
+            target: pill_core::telemetry::telemetry_target::RENDERING,
+            shader = name,
+            parameters = %slot_names(parameter_slots.keys().collect()),
+            textures = %slot_names(texture_slots.keys().collect()),
+            engine_parameters = pass_engine_parameters,
+            camera_parameters = pass_camera_parameters,
+            "shader created"
+        );
 
         Ok(pipeline)
     }

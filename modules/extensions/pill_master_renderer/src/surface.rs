@@ -116,7 +116,13 @@ impl Surface {
             // 0xC000041D / 0xC0000005. Every machine this renders on has one of
             // the primary backends, so GL only ever added that hazard.
             backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
-            flags: wgpu::InstanceFlags::from_build_config().with_env(),
+            // Debug labels on, the backend's validation layer off unless
+            // `WGPU_VALIDATION=1` asks for it: that layer ships with the Vulkan
+            // SDK, and without it every start warns that it is missing. wgpu's
+            // own API validation runs either way.
+            flags: wgpu::InstanceFlags::from_build_config()
+                .difference(wgpu::InstanceFlags::VALIDATION)
+                .with_env(),
             backend_options: wgpu::BackendOptions::default(),
         });
         let (raw_window_handle, raw_display_handle) = window.to_raw()?;
@@ -179,7 +185,7 @@ impl Surface {
         // before a `RendererError` can be constructed. An uncapped mode stays
         // an opt-in for a driver that has been verified to create one.
         let present_mode = wgpu::PresentMode::Fifo;
-        println!("[render] Present mode: {present_mode:?}");
+        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Present mode: {present_mode:?}");
         let mut configuration = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: color_format,
@@ -308,7 +314,7 @@ async fn configure_first(
         .await;
         match attempt_failure(probe, errors) {
             None => {
-                println!("[render] Surface configured: {alpha_mode:?}");
+                info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Surface configured: {alpha_mode:?}");
                 return Ok(());
             }
             Some(failure) => failures.push(format!("{alpha_mode:?} ({failure})")),

@@ -37,6 +37,7 @@ use std::{
 };
 
 // External crates
+use pill_core::{info, warn};
 use pill_engine::AssetManager;
 
 // Current crate
@@ -421,11 +422,9 @@ impl ScriptableRenderingPipeline {
             return;
         }
 
-        // Printed, like the renderer's other once-per-change diagnostics: the
-        // log target this would otherwise use is filtered out of the host's log,
-        // and this line is what a reader has when the window shows the wrong
-        // thing.
-        println!("[render] Pass chain: {signature}");
+        // Logged once per change, like the renderer's other diagnostics: this
+        // line is what a reader has when the window shows the wrong thing.
+        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "Pass chain: {signature}");
         self.chain_log = Some(signature);
     }
 
@@ -435,9 +434,8 @@ impl ScriptableRenderingPipeline {
             return;
         }
 
-        // Printed, like the renderer's other once-per-change diagnostics: the
-        // log target this would otherwise use is filtered out of the host's log.
-        println!("[render] Pass {name} is not drawn: {reason}");
+        // Logged once per change, like the renderer's other diagnostics.
+        warn!(target: pill_core::telemetry::telemetry_target::RENDERING, "Pass {name} is not drawn: {reason}");
     }
 }
 
@@ -509,8 +507,9 @@ fn build_pass(
     for (slot, key) in &pass.textures {
         match chain.texture_handles.get(key) {
             Some(handle) => textures.push((slot.clone(), *handle)),
-            None => println!(
-                "[render] Pass {} binds texture `{slot}`, which is not loaded; the shader's default is used",
+            None => warn!(
+                target: pill_core::telemetry::telemetry_target::RENDERING,
+                "Pass {} binds texture `{slot}`, which is not loaded; the shader's default is used",
                 pass.name
             ),
         }

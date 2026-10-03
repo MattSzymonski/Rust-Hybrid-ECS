@@ -76,6 +76,7 @@ MODULE_TOKEN = "extension linked"
 
 # Anything here means the reload machinery was compiled in after all.
 FORBIDDEN_TOKENS = (
+    "Hot reloading of",
     "building project module",
     "watching for source changes",
     "module DLL loaded successfully",

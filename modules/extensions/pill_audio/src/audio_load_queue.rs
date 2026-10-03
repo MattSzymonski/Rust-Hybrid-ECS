@@ -6,7 +6,7 @@
 //!   the sound, so the bytes never cross an asset-identity boundary.
 //! - Coalesce repeated loads of one playback name.
 
-use pill_engine::Resource;
+// Standard library
 use std::collections::BTreeMap;
 
 /// Keeps sound creation inside the playback DLL, whose asset type identity
@@ -17,7 +17,9 @@ pub struct AudioLoadQueue {
     pub(crate) sounds: BTreeMap<String, Vec<u8>>,
 }
 
-impl Resource for AudioLoadQueue {
+// The trait's full path, not an import: the hot-patch inventory is generated at
+// the crate root and cannot see this module's `use` lines.
+impl pill_engine::Resource for AudioLoadQueue {
     fn shared_name() -> Option<&'static str> {
         Some("pill_audio::AudioLoadQueue")
     }

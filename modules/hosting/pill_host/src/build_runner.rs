@@ -1182,11 +1182,15 @@ pub(crate) fn build_project_module(
     config: &ProjectModuleConfig,
     cancel_flag: Option<(&AtomicU64, u64)>,
 ) -> Result<PathBuf, BuildError> {
-    info!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-        module = config.name.as_str(),
-        "building project module"
-    );
+    // A startup build is counted off against the announced plan; a reload
+    // build is logged as such (the suites wait for that line).
+    if !crate::build_progress::announce_build(&config.name) {
+        info!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            module = config.name.as_str(),
+            "building project module"
+        );
+    }
 
     // Step 1: Resolve the backend-specific artifact paths.
     //
@@ -1555,11 +1559,15 @@ pub(crate) fn build_extension(
     config: &ExtensionConfig,
     cancel_flag: Option<(&AtomicU64, u64)>,
 ) -> Result<PathBuf, BuildError> {
-    info!(
-        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-        module = config.name.as_str(),
-        "building extension"
-    );
+    // A startup build is counted off against the announced plan; a reload
+    // build is logged as such (the suites wait for that line).
+    if !crate::build_progress::announce_build(&config.name) {
+        info!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            module = config.name.as_str(),
+            "building extension"
+        );
+    }
 
     // Cargo writes the freshly compiled cdylib into the shared per-crate
     // output slot, while the host loads from the private hot-load copy.
