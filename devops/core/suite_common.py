@@ -116,7 +116,7 @@ PANIC_TOKEN = "panicked at"
 ACCESS_VIOLATION_TOKEN = "STATUS_ACCESS_VIOLATION"
 
 # Module register-log fields (tracing renders them after the message, e.g.
-# "pill_spline module registered splines=1 existing=0 max_control_points=16").
+# "pill_spline module registered  splines=1 existing=0 max_control_points=16").
 MODULE_REGISTERED_MESSAGE = "pill_spline module registered"
 # The project probe line ("[project] xxsees N spline(s), midpoint (...)").
 #

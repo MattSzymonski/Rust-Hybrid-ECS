@@ -217,7 +217,9 @@ pub(crate) fn spawn_source_watcher(
     info!(
         target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
         module = module_name,
-        watch_directory = %watch_path.display(),
+        // The configured, workspace-relative form: shorter than the joined
+        // absolute path, and free of its mixed separators.
+        watch_directory = %watch_directory.replace('\\', "/"),
         "watching for source changes"
     );
 

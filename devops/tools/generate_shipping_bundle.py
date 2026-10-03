@@ -171,6 +171,10 @@ def load_renderer(project_root: Path):
 # reads them.
 LOG_LEVELS = {"off", "error", "warn", "info", "debug", "trace"}
 
+# The timestamp formats `logging: timestamp:` accepts, as
+# `pill_core::telemetry::TimestampFormat` reads them.
+TIMESTAMP_FORMATS = {"date_time", "time"}
+
 
 def check_log_level(settings_path: Path, where: str, level) -> str:
     """Returns `level` lowercased, or raises ValueError naming `where`."""
@@ -184,11 +188,15 @@ def check_log_level(settings_path: Path, where: str, level) -> str:
 
 
 def load_logging(project_root: Path):
-    """Loads the `logging:` section as (level or None, [(target, level), ...]).
+    """Loads the `logging:` section as
+    (level, timestamp, source_location, [(target, level), ...]).
+
+    `level`, `timestamp` and `source_location` are None when the section does
+    not set them.
 
     Validated here exactly as the development host validates it, so the
     generated bundle only ever carries settings the runtime can read. Raises
-    ValueError on an unknown key, level, or target.
+    ValueError on an unknown key, level, timestamp format, or target.
     """
     settings_path = project_root / PROJECT_SETTINGS_FILE_NAME
     with settings_path.open(encoding="utf-8") as handle:
@@ -196,11 +204,25 @@ def load_logging(project_root: Path):
     section = data.get("logging") or {}
     if not isinstance(section, dict):
         raise ValueError(f"{settings_path}: `logging:` must be a mapping")
-    unknown = set(section) - {"level", "targets"}
+    unknown = set(section) - {"level", "timestamp", "source_location", "targets"}
     if unknown:
         raise ValueError(f"{settings_path}: `logging:` has unknown keys {sorted(unknown)}")
     level = section.get("level")
     level = None if level is None else check_log_level(settings_path, "`level`", level)
+    timestamp = section.get("timestamp")
+    if timestamp is not None:
+        timestamp = str(timestamp).strip().lower()
+        if timestamp not in TIMESTAMP_FORMATS:
+            raise ValueError(
+                f"{settings_path}: `logging:` has timestamp `{section['timestamp']}`; "
+                "use date_time or time"
+            )
+    source_location = section.get("source_location")
+    if source_location is not None and not isinstance(source_location, bool):
+        raise ValueError(
+            f"{settings_path}: `logging:` has source_location `{source_location}`; "
+            "use true or false"
+        )
     targets = []
     for target, target_level in (section.get("targets") or {}).items():
         target = str(target)
@@ -209,17 +231,22 @@ def load_logging(project_root: Path):
         targets.append((target, check_log_level(settings_path, f"target `{target}`", target_level)))
     # The host reads the targets into a sorted map; the bundle keeps that order.
     targets.sort()
-    return level, targets
+    return level, timestamp, source_location, targets
 
 
 def build_logging_literal(logging) -> str:
-    """Renders the `StaticLogging` expression for `(level, targets)`."""
-    level, targets = logging
-    if level is None and not targets:
+    """Renders the `StaticLogging` expression for the loaded `logging:` section."""
+    level, timestamp, source_location, targets = logging
+    if level is None and timestamp is None and source_location is None and not targets:
         return "StaticLogging::NONE"
     level_text = "None" if level is None else f'Some("{level}")'
+    timestamp_text = "None" if timestamp is None else f'Some("{timestamp}")'
+    location_text = "None" if source_location is None else f"Some({str(source_location).lower()})"
     pairs = ", ".join(f'("{target}", "{target_level}")' for target, target_level in targets)
-    return f"StaticLogging {{ level: {level_text}, targets: &[{pairs}] }}"
+    return (
+        f"StaticLogging {{ level: {level_text}, timestamp: {timestamp_text}, "
+        f"source_location: {location_text}, targets: &[{pairs}] }}"
+    )
 
 
 def modules_with_renderer_data(renderer, modules: list) -> list:
@@ -489,7 +516,7 @@ def build_library_source(
     rid: str = "win-x64",
     renderer=None,
     packs_assets: bool = False,
-    logging=(None, []),
+    logging=(None, None, None, []),
 ) -> str:
     """Builds the generated bundle's src/lib.rs text.
 

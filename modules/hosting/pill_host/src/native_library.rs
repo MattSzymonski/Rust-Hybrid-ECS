@@ -649,7 +649,9 @@ impl NativeLibrary {
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             module = module_name,
-            abi_version = ?native_library.abi_version,
+            abi_version = %native_library
+                .abi_version
+                .map_or_else(|| "none".to_string(), |version| version.to_string()),
             "module DLL loaded successfully"
         );
         Ok(native_library)
