@@ -336,6 +336,12 @@ For each resolved pass, `plan` decides what it records:
 | Geometry, shader missing/unbuilt        | `Unsupported` | nothing; `report_skip` names it once                                   |
 | Fullscreen, pipeline built              | `Drawable`    | one triangle, no vertex buffers                                        |
 | Fullscreen, no pipeline                 | `Unsupported` | nothing                                                                |
+| Skybox, material/shader built           | `Drawable`    | one triangle at the far plane, depth-tested (`tests_depth`)            |
+| Skybox, no material or shader           | `Unsupported` | nothing                                                                |
+
+A pass that names a **material** (`RenderPass::material`) has it folded in when  
+the frame resolves the chain: the material's shader, parameters and textures,  
+under whatever the pass sets itself. That is how a skybox pass gets its sky.
 
 Two things worth knowing:
 
@@ -366,7 +372,10 @@ is presented.
    `LoadOp::Clear`; the rest `Load` and add to what's there.
 5. **Geometry** joins the mesh drawer; **fullscreen** sets its pipeline, binds
   the groups its shader declares, and `draw(0..3, 0..1)` — the triangle's  
-   corners come from `SV_VertexID`, so there is no vertex buffer at all.
+   corners come from `SV_VertexID`, so there is no vertex buffer at all. A  
+   **skybox** records the same way but attaches the depth buffer read-only: its  
+   triangle sits at depth 1.0 and the test is less-or-equal, so it fills only  
+   the pixels no mesh drew.
 6. **Submit inside `capturing_validation`.** wgpu validates a command buffer at
   submission, and a validation failure would otherwise reach the  
    uncaptured-error handler as a panic. This is the last creation-class failure a  
@@ -474,8 +483,9 @@ one as easily as a project hands the renderer one:
 | Module                   | The frame                                                                                 |
 | ------------------------ | ----------------------------------------------------------------------------------------- |
 | `config/simple_pipeline/` | one lit geometry pass, through the built-in lit shader, to the surface                    |
-| `config/pbr_pipeline/`   | the geometry half: the lit pass, its shader, a neutral material                           |
+| `config/pbr_pipeline/`   | the geometry half: the lit pass, its shader, a neutral material, and the skybox pass (off until `set_skybox`) |
 | `config/post_processing/` | the four fullscreen passes that end the frame                                            |
+| `config/skybox/`         | the equirect and cubemap skybox shaders (fixed guids) and the skybox pass builder         |
 
 `pbr_pipeline`'s `mod.rs` is what composes the two halves into one pipeline asset,  
 and every module here keeps its shaders in a `shaders/` beside itself — the lit  
@@ -555,7 +565,8 @@ side's extension; no shipped shader reads them yet. Note
 `update_data` clamps the dimensions before taking reciprocals, so a minimized  
 surface can't leave an infinity in the buffer for a shader to read per pixel.
 
-**`CameraParametersData`** — a `vec4` position and a 4×4 view-projection. The  
+**`CameraParametersData`** — a `vec4` position, a 4×4 view-projection, and its  
+inverse (which a skybox uses to turn a pixel back into a view direction). The  
 projection inputs are sanitized on every update: a field of view outside  
 `(0, 180)`, a near plane ≤ 0, or a far plane at or inside near are all replaced  
 with defaults, and each replacement is named. The reason is blunt — a NaN matrix  
@@ -597,8 +608,10 @@ under a name the shader never declares is ignored rather than shifting
 everything after it. Each slot is a full `vec4` for alignment, even for a bare  
 scalar — which is why the built-in fragment shader reads `material.specularity.x`.
 
-Unbound texture slots fall back to the renderer's default colour or flat-normal  
-texture, created at startup with their handles kept beside the maps. A **depth**  
+Unbound texture slots fall back to the renderer's default colour, flat-normal,  
+or black equirect/cubemap texture, created at startup with their handles kept  
+beside the maps. A texture whose shape (2D or cube) differs from its slot's is  
+refused by name. A **depth**  
 slot in a material is an error rather than a fill: only a pass can hand a shader  
 the renderer's depth buffer.
 
@@ -616,7 +629,7 @@ because every consumer needs all three. One type covers three different things:
 
 | Constructor         | Used for                | Format                                                  |
 | ------------------- | ----------------------- | ------------------------------------------------------- |
-| `new_texture`       | uploaded image assets   | `Rgba8UnormSrgb` for `Color`, `Rgba8Unorm` for `Normal` |
+| `new_texture`       | uploaded image assets   | `Rgba8UnormSrgb` for `Color`, `Rgba8Unorm` for `Normal`, `Rgba16Float` for `Equirect` and `Cubemap` (six layers, cube view) |
 | `new_render_target` | offscreen chain targets | `Rgba16Float`                                           |
 | `new_depth_texture` | the shared depth buffer | `Depth32Float`                                          |
 
@@ -888,6 +901,7 @@ shaders directory — never a search, so each tree takes a call of its own:
 | `src/config/simple_pipeline/`     | the built-in lit fragment stage                      |
 | `src/config/pbr_pipeline/`        | the geometry fragment stage                          |
 | `src/config/post_processing/`     | the fullscreen vertex stage and the four fragment stages |
+| `shaders/skybox/`                 | the far-plane vertex stage, the equirect and cubemap fragment stages, and their shared header |
 
 Nothing compiles a shader at runtime — wgpu parses the cooked WGSL through naga  
 like any other `ShaderSource::Wgsl`.

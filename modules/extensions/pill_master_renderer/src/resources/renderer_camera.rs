@@ -57,6 +57,10 @@ pub struct CameraParametersData {
     /// View and projection combined, applied to world-space positions by the
     /// vertex shader.
     pub view_projection_matrix: Matrix4f,
+    /// The inverse of [`Self::view_projection_matrix`]: takes a clip-space
+    /// point back to world space, which is how a skybox turns a pixel into the
+    /// direction it looks along.
+    pub inverse_view_projection_matrix: Matrix4f,
 }
 
 impl Default for CameraParametersData {
@@ -75,6 +79,7 @@ impl CameraParametersData {
         Self {
             position: Vector4f::ZERO,
             view_projection_matrix: Matrix4f::IDENTITY,
+            inverse_view_projection_matrix: Matrix4f::IDENTITY,
         }
     }
 
@@ -107,6 +112,8 @@ impl CameraParametersData {
         self.view_projection_matrix =
             CameraParametersData::calculate_projection_matrix(vertical_fov, near, far, aspect)
                 * CameraParametersData::calculate_view_matrix(transform_component);
+        // Sanitized inputs give an invertible matrix, so the inverse is finite.
+        self.inverse_view_projection_matrix = self.view_projection_matrix.inverse();
         anomaly
     }
 

@@ -1,0 +1,27 @@
+{
+  "format_version": 1,
+  "asset_type": "pill_master_renderer::assets::Material",
+  "guid": "89b06a4154d6a7fbf076b4de58286b58",
+  "asset": {
+    "shader": "5628c9e4d9278fec79998a7adab65bc3",
+    "textures": {
+      "sky": "69690a933c4869a4cda3a304edf3cb73"
+    },
+    "parameters": {
+      "skybox_exposure": {
+        "Scalar": 1.0
+      },
+      "skybox_rotation": {
+        "Scalar": 0.0
+      },
+      "skybox_tint": {
+        "Color": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      }
+    },
+    "rendering_order": 255
+  }
+}

@@ -38,6 +38,7 @@ pub use renderer_camera::RendererCamera;
 pub(crate) use renderer_camera::RendererCameraHandle;
 pub(crate) use renderer_material::RendererMaterialHandle;
 pub(crate) use renderer_mesh::RendererMeshHandle;
+pub(crate) use renderer_shader::check_slot_shape;
 pub(crate) use renderer_shader::RendererShaderHandle;
 pub(crate) use renderer_texture::RendererTextureHandle;
 

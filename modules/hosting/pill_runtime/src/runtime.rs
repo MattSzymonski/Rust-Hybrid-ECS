@@ -319,6 +319,22 @@ impl FrameDriver for Runtime {
 pub fn setup(project: StaticProject) -> Result<Runtime, HostError> {
     let mut runtime = Runtime::new();
 
+    // The project's log levels, baked into the bundle from its settings file,
+    // before anything is logged on its behalf.
+    let logging = project
+        .logging
+        .settings()
+        .map_err(|details| format!("invalid logging settings in the bundle: {details}"))
+        .and_then(|settings| {
+            crate::apply_logging_settings(&settings).map_err(|error| error.to_string())
+        });
+    if let Err(error) = logging {
+        pill_core::warn!(
+            target: telemetry_target::ENGINE,
+            "the project's logging settings were not applied: {error}"
+        );
+    }
+
     info!(
         target: telemetry_target::ENGINE,
         module = project.name,
@@ -397,6 +413,7 @@ mod tests {
             modules: &[],
             renderer: None,
             asset_pack: None,
+            logging: crate::StaticLogging::NONE,
         })
         .expect("it starts");
         assert!(run_one_frame(&mut runtime).is_none());

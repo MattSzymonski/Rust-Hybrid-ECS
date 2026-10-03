@@ -18,6 +18,9 @@ struct CameraParams
 {
     float3                camera_position;
     column_major float4x4 camera_view_projection;
+    // Clip space back to world space: how a skybox turns a pixel into a view
+    // direction.
+    column_major float4x4 camera_inverse_view_projection;
 };
 
 [[vk::binding(0, 1)]]

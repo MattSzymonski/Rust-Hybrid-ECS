@@ -632,6 +632,40 @@ impl TelemetryHandles {
             })
     }
 
+    /// Reload the terminal logging filter from a [`LoggingConfig`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TelemetryError::InvalidDirective`] when a directive of the
+    /// configuration cannot be parsed, or [`TelemetryError::Reload`] when the
+    /// reload itself fails; the previous filter stays active either way.
+    pub fn reload_logging_config(&self, config: &LoggingConfig) -> Result<(), TelemetryError> {
+        let filter = config.build_env_filter()?;
+        self.logging_filter
+            .reload(filter)
+            .map_err(|error| TelemetryError::Reload {
+                error: error.to_string(),
+            })
+    }
+
+    /// Reload the file logging filter from a [`LoggingConfig`]. Does nothing
+    /// when no file lane is installed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::reload_logging_config`].
+    pub fn reload_file_config(&self, config: &LoggingConfig) -> Result<(), TelemetryError> {
+        let Some(handle) = &self.file_filter else {
+            return Ok(());
+        };
+        let filter = config.build_env_filter()?;
+        handle
+            .reload(filter)
+            .map_err(|error| TelemetryError::Reload {
+                error: error.to_string(),
+            })
+    }
+
     /// Reload the file logging filter from a strict filter string.
     ///
     /// # Errors
@@ -826,6 +860,20 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// A later directive for a target replaces an earlier one, which is what
+    /// lets project settings layer over the engine's defaults.
+    #[test]
+    fn a_later_directive_for_a_target_wins() {
+        use tracing::level_filters::LevelFilter;
+        let filter = LoggingConfig::default_engine()
+            .with_directive("engine::rendering", LevelFilter::INFO)
+            .build_env_filter()
+            .unwrap();
+        let rendered = format!("{filter}");
+        assert!(rendered.contains("engine::rendering=info"), "{rendered}");
+        assert!(!rendered.contains("engine::rendering=debug"), "{rendered}");
     }
 
     /// A fresh `LoggingConfig` parses and emits a filter string.

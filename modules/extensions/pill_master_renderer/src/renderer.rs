@@ -547,18 +547,37 @@ impl State {
                     )?;
                 }
                 PassPlan::Fullscreen {
-                    label, pass_index, ..
+                    label,
+                    pass_index,
+                    tests_depth,
+                    ..
                 } => {
                     let Some(PassSlot::Drawable(pass)) = passes.get(*pass_index) else {
                         continue;
                     };
+                    // A post-processing step has no depth: it overwrites every
+                    // pixel it covers, and the depth left behind describes
+                    // geometry that is not what this triangle is. A skybox reads
+                    // that depth without writing it, so it fills only what no
+                    // mesh covered; as the frame's first pass it opens the
+                    // buffer at the far plane like a geometry pass would.
+                    let depth_stencil_attachment =
+                        tests_depth.then(|| wgpu::RenderPassDepthStencilAttachment {
+                            view: &self.depth_texture.texture_view,
+                            depth_ops: Some(wgpu::Operations {
+                                load: if clear {
+                                    wgpu::LoadOp::Clear(1.0)
+                                } else {
+                                    wgpu::LoadOp::Load
+                                },
+                                store: wgpu::StoreOp::Store,
+                            }),
+                            stencil_ops: None,
+                        });
                     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                         label: Some(label),
                         color_attachments: &color_attachments,
-                        // No depth: a fullscreen pass overwrites every pixel it
-                        // covers, and the depth left behind describes geometry
-                        // that is not what this triangle is.
-                        depth_stencil_attachment: None,
+                        depth_stencil_attachment,
                         timestamp_writes: None,
                         occlusion_query_set: None,
                     });

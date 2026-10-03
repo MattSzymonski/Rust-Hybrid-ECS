@@ -7,7 +7,9 @@
 //!   pass, the shader it draws through, the offscreen target it writes, and a
 //!   neutral material for geometry nobody gave one.
 //! - Compose that pass with the post-processing half
-//!   ([`super::post_processing`]) into one pipeline asset.
+//!   ([`super::post_processing`]) into one pipeline asset, with a skybox pass
+//!   between them that a project turns on by giving it a sky material
+//!   ([`set_skybox`]).
 //!
 //! # Design
 //!
@@ -19,6 +21,7 @@
 //!
 //! ```text
 //! pill.pbr.opaque   geometry → hdr    the lit surface, in the range lighting produces
+//! pill.pbr.skybox   skybox   → hdr    the sky, where the lit pass drew nothing (off until set)
 //! ─── the four post-processing passes, declared in `super::post_processing` ───
 //! ```
 //!
@@ -42,6 +45,7 @@ use crate::{
         ShaderParameterType, ShaderTextureSlot, TextureType,
     },
     config::post_processing::{self, HDR_TARGET},
+    config::skybox,
     config::{ShaderSourceRecord, DEFAULT_VERTEX},
 };
 
@@ -98,6 +102,9 @@ pub fn neutral_parameters() -> BTreeMap<String, MaterialParameter> {
 /// Asset name of the lit pass.
 const OPAQUE_PASS: &str = "pill.pbr.pass.opaque";
 
+/// Asset name of the skybox pass, which [`set_skybox`] gives a material.
+pub const SKYBOX_PASS: &str = "pill.pbr.pass.skybox";
+
 /// Install the PBR chain, and return the pipeline asset.
 ///
 /// The shader the geometry pass draws through is stored under [`SHADER_NAME`],
@@ -115,6 +122,9 @@ const OPAQUE_PASS: &str = "pill.pbr.pass.opaque";
 pub fn install(
     assets: &mut AssetManager,
 ) -> Result<Handle<RenderingPipeline>, Box<dyn std::error::Error>> {
+    // Before the early return: a sky material file names these shaders by guid,
+    // so they have to exist in a store whose chain an earlier build installed.
+    skybox::install_shaders(assets)?;
     if let Some(pipeline) = assets.handle_by_name::<RenderingPipeline>(PIPELINE_NAME) {
         return Ok(pipeline);
     }
@@ -158,10 +168,20 @@ pub fn install(
         .with_order(0);
     let opaque = assets.add_named(OPAQUE_PASS, opaque)?;
 
+    // The sky, behind the lit surface and into the same target, so it reads the
+    // depth the lit pass left. Off until a project gives it a material.
+    let sky = skybox::skybox_pass(
+        "pill.pbr.skybox",
+        Handle::INVALID,
+        PassTarget::Offscreen(HDR_TARGET.to_owned()),
+        0,
+    );
+    let sky = assets.add_named(SKYBOX_PASS, sky)?;
+
     // The other half of the frame, which reads the target this one just wrote.
     let post = post_processing::install(assets)?;
 
-    let mut pipeline = RenderingPipeline::new().with_pass(opaque);
+    let mut pipeline = RenderingPipeline::new().with_pass(opaque).with_pass(sky);
     for pass in post {
         pipeline.add(pass);
     }
@@ -170,13 +190,73 @@ pub fn install(
     Ok(pipeline)
 }
 
+/// Draw `material` as the sky behind the PBR chain's lit surface, or turn the
+/// sky off with `None`; returns the skybox pass.
+///
+/// The material is a sky material: one of the [`skybox`] shaders with its `sky`
+/// slot bound. Installs the chain when it is missing, and adds the skybox pass
+/// right after the lit pass when the chain in the store predates it. Writes
+/// only what differs, so calling this on every reload does not make the
+/// renderer rebuild an unchanged chain.
+///
+/// # Errors
+///
+/// Returns an error when the chain does not install, or when the pass's name is
+/// taken by an asset of another type.
+pub fn set_skybox(
+    assets: &mut AssetManager,
+    material: Option<Handle<Material>>,
+) -> Result<Handle<RenderPass>, Box<dyn std::error::Error>> {
+    let pipeline = install(assets)?;
+    let material = material.unwrap_or(Handle::INVALID);
+    let pass = match assets.handle_by_name::<RenderPass>(SKYBOX_PASS) {
+        Some(pass) => pass,
+        None => assets.add_named(
+            SKYBOX_PASS,
+            skybox::skybox_pass(
+                "pill.pbr.skybox",
+                Handle::INVALID,
+                PassTarget::Offscreen(HDR_TARGET.to_owned()),
+                0,
+            ),
+        )?,
+    };
+
+    // A chain installed before the skybox existed has no place for it yet: it
+    // goes right after the lit pass, whose depth it tests against.
+    let in_chain = assets
+        .get(pipeline)
+        .is_some_and(|chain| chain.passes.contains(&pass));
+    if !in_chain {
+        let opaque = assets.handle_by_name::<RenderPass>(OPAQUE_PASS);
+        if let Some(chain) = assets.get_mut(pipeline) {
+            let index = opaque
+                .and_then(|opaque| chain.passes.iter().position(|entry| *entry == opaque))
+                .map_or(0, |position| position + 1);
+            chain.passes.insert(index, pass);
+        }
+    }
+
+    let enabled = material != Handle::INVALID;
+    let unchanged = assets
+        .get(pass)
+        .is_some_and(|sky| sky.material == material && sky.enabled == enabled);
+    if !unchanged {
+        if let Some(sky) = assets.get_mut(pass) {
+            sky.material = material;
+            sky.enabled = enabled;
+        }
+    }
+    Ok(pass)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use pill_engine::Engine;
 
     #[test]
-    fn the_installed_chain_is_the_lit_pass_then_the_post_processing_four() {
+    fn the_installed_chain_is_the_lit_pass_the_sky_then_the_post_processing_four() {
         let mut engine = Engine::new();
         let assets = engine
             .world_mut()
@@ -187,13 +267,61 @@ mod tests {
         let opaque = assets
             .handle_by_name::<RenderPass>(OPAQUE_PASS)
             .expect("the lit pass");
+        let sky = assets
+            .handle_by_name::<RenderPass>(SKYBOX_PASS)
+            .expect("the skybox pass");
         let pipeline = assets.get(pbr).expect("the pipeline it just added");
 
         assert_eq!(
             pipeline.passes.len(),
-            5,
-            "one lit pass and four post passes"
+            6,
+            "one lit pass, the sky, and four post passes"
         );
         assert_eq!(pipeline.passes[0], opaque, "the lit pass comes first");
+        assert_eq!(pipeline.passes[1], sky, "the sky draws behind it");
+        assert!(
+            !assets.get(sky).unwrap().enabled,
+            "no sky until a project sets one"
+        );
+    }
+
+    #[test]
+    fn setting_a_skybox_enables_the_pass_and_clearing_it_disables_it() {
+        let mut assets = AssetManager::new();
+        install(&mut assets).expect("a free name");
+        let material = assets
+            .add_named("sky", Material::builder("sky").build())
+            .expect("a free name");
+
+        let pass = set_skybox(&mut assets, Some(material)).expect("the chain is installed");
+        let sky = assets.get(pass).unwrap();
+        assert_eq!(sky.material, material);
+        assert!(sky.enabled);
+
+        set_skybox(&mut assets, None).expect("the chain is installed");
+        assert!(!assets.get(pass).unwrap().enabled);
+    }
+
+    /// A chain an older build installed has no skybox pass; setting a sky adds
+    /// one right after the lit pass.
+    #[test]
+    fn setting_a_skybox_on_an_older_chain_inserts_the_pass() {
+        let mut assets = AssetManager::new();
+        let pipeline = install(&mut assets).expect("a free name");
+        let sky = assets.handle_by_name::<RenderPass>(SKYBOX_PASS).unwrap();
+        assets
+            .get_mut(pipeline)
+            .unwrap()
+            .passes
+            .retain(|pass| *pass != sky);
+        let material = assets
+            .add_named("sky", Material::builder("sky").build())
+            .expect("a free name");
+
+        let pass = set_skybox(&mut assets, Some(material)).expect("the chain is installed");
+
+        let chain = &assets.get(pipeline).unwrap().passes;
+        assert_eq!(chain.len(), 6);
+        assert_eq!(chain[1], pass);
     }
 }

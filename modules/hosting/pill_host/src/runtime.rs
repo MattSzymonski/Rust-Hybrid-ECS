@@ -1084,8 +1084,16 @@ fn fail_setup(runtime: Runtime, error: HostError) -> HostError {
 /// Returns a typed [`HostError`] naming the failing subsystem: configuration,
 /// build, library loading, watcher startup, or managed backend startup.
 pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
-    // Step 1: Reject inconsistent configurations before any build or load.
+    // Step 1: Reject inconsistent configurations before any build or load,
+    // and apply the project's log levels so the build and load below are
+    // already logged at them.
     let host_config = host_config.into();
+    if let Err(error) = pill_runtime::apply_logging_settings(&host_config.logging) {
+        pill_core::warn!(
+            target: telemetry_target::ENGINE,
+            "the project's logging settings were not applied: {error}"
+        );
+    }
     let module_config = host_config.project;
     module_config.validate()?;
     for module in &host_config.extensions {

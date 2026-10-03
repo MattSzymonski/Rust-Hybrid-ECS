@@ -17,6 +17,11 @@
 //! vertex buffers, no depth test, no instance data, reading what an earlier pass
 //! wrote. That is the shape every post-processing step takes, and it is the
 //! reason a pass can carry its own parameters and inputs at all.
+//!
+//! A skybox pass is the same triangle with one difference: it is tested against
+//! the depth the geometry passes wrote (less-or-equal, without writing), and its
+//! shader puts the triangle at the far plane, so it draws only where no mesh
+//! did.
 
 use std::collections::{HashMap, HashSet};
 
@@ -25,8 +30,8 @@ use crate::{
     error::{capturing_validation, ErrorContext, RendererError, Result},
     frame::{CullMode, PassKind, ResolvedPass},
     resources::{
-        RendererMaterial, RendererMesh, RendererResourceStorage, RendererShader, RendererTexture,
-        RendererTextureHandle, Vertex,
+        check_slot_shape, RendererMaterial, RendererMesh, RendererResourceStorage, RendererShader,
+        RendererTexture, RendererTextureHandle, Vertex,
     },
     Instance,
 };
@@ -114,7 +119,7 @@ impl RendererPass {
                 RendererMesh::data_layout_descriptor(),
                 Instance::data_layout_descriptor(),
             ],
-            PassKind::Fullscreen => Vec::new(),
+            PassKind::Fullscreen | PassKind::Skybox => Vec::new(),
         };
         let (cull_mode, depth_stencil) = match pass.kind {
             PassKind::Geometry => (
@@ -137,6 +142,19 @@ impl RendererPass {
             // the depth another pass left describes geometry that is not what
             // this triangle is.
             PassKind::Fullscreen => (None, None),
+            // Tested, never written: the triangle sits at the far plane (depth
+            // 1.0), and less-or-equal lets it through exactly where the depth
+            // buffer still holds the 1.0 it was cleared to - where no mesh drew.
+            PassKind::Skybox => (
+                None,
+                Some(wgpu::DepthStencilState {
+                    format: depth_format,
+                    depth_write_enabled: false,
+                    depth_compare: wgpu::CompareFunction::LessEqual,
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+            ),
         };
 
         // Captured rather than left to wgpu's uncaptured-error handler: a
@@ -268,6 +286,12 @@ impl RendererPass {
                                 "pass {} reads `{target}`, which no earlier pass writes",
                                 pass.name
                             ))?;
+                            check_slot_shape(
+                                &format!("pass {}", pass.name),
+                                slot_name,
+                                slot.texture_type,
+                                texture,
+                            )?;
                             (&texture.texture_view, &texture.sampler)
                         };
                         (view, sampler)
@@ -281,31 +305,30 @@ impl RendererPass {
                                 "pass {} binds `{slot_name}` to a texture that is not loaded",
                                 pass.name
                             ))?;
+                            check_slot_shape(
+                                &format!("pass {}", pass.name),
+                                slot_name,
+                                slot.texture_type,
+                                texture,
+                            )?;
                             (&texture.texture_view, &texture.sampler)
                         }
                         // Neither: the shader declared the slot and asked for
                         // nothing in particular, so it gets the renderer's
-                        // stand-in for that kind of map.
+                        // stand-in for that kind of map. A depth slot names no
+                        // input and no texture, so there is nothing to read:
+                        // the renderer's own buffer is not a stand-in for a
+                        // colour map, and only the pass's own `inputs` can say
+                        // which depth it meant.
                         None => {
-                            let handle = match slot.texture_type {
-                                crate::assets::TextureType::Color => storage.default_color_texture,
-                                crate::assets::TextureType::Normal => {
-                                    storage.default_normal_texture
+                            let handle = storage.default_texture_for(slot.texture_type).ok_or_else(|| {
+                                RendererError::Other {
+                                    detail: format!(
+                                        "pass {} declares texture slot `{slot_name}` as depth but names no input for it",
+                                        pass.name
+                                    ),
                                 }
-                                // A depth slot names no input and no texture, so
-                                // there is nothing to read: the renderer's own
-                                // buffer is not a stand-in for a colour map, and
-                                // only the pass's own `inputs` can say which
-                                // depth it meant.
-                                crate::assets::TextureType::Depth => {
-                                    return Err(RendererError::Other {
-                                        detail: format!(
-                                            "pass {} declares texture slot `{slot_name}` as depth but names no input for it",
-                                            pass.name
-                                        ),
-                                    });
-                                }
-                            };
+                            })?;
                             let texture = storage
                                 .textures
                                 .get(handle)

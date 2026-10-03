@@ -1,0 +1,14 @@
+name: "Circus Demo"
+build_binary_name: "CircusDemo"
+version: "0.1.0"
+author: "Matt Szymonski"
+description: "Fifty thousand pills drifting through a curl noise field among ancient pillars."
+
+modules: []
+
+# Log levels over the engine's defaults: `level` sets every target at once,
+# `targets` sets one each (off, error, warn, info, debug, trace). The renderer
+# logs every draw at `debug`, which with 50,000 pills buries everything else.
+logging:
+  targets:
+    engine::rendering: info

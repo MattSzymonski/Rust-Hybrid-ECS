@@ -511,6 +511,16 @@ pub enum ConfigError {
     )]
     InvalidBuildBinaryName { path: String },
 
+    /// The settings file's `logging:` section names a level or a target that
+    /// does not read.
+    #[message(
+        "project settings file ",
+        name_style(path),
+        " has an invalid `logging:` entry: ",
+        value(details)
+    )]
+    InvalidLoggingSettings { path: String, details: String },
+
     /// An extension name in the settings file is not a usable crate
     /// directory name.
     #[message(

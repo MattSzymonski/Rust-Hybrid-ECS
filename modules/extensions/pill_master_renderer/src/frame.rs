@@ -17,6 +17,9 @@
 //! among several, the pipeline resolving into plain passes, the drawables
 //! resolving into instances that carry their own sort key.
 
+// Standard library
+use std::collections::BTreeMap;
+
 // External crates
 use pill_engine::{AssetManager, Component, Entity, Handle, Query, Res, ResMut, SystemError};
 pub use pill_renderer_api::frame::{
@@ -65,9 +68,44 @@ fn resolve_passes(
         if !pass.enabled {
             continue;
         }
+
+        // A pass that names a material draws with it: the material's shader,
+        // parameters and textures, under whatever the pass sets itself. Folded
+        // in here, where the chain is resolved, so the renderer sees one plain
+        // pass and a material edit moves the asset revision that re-resolves it.
+        let mut shader = (pass.shader != Handle::INVALID).then(|| asset_key(pass.shader));
+        let mut parameters = BTreeMap::new();
+        let mut textures = BTreeMap::new();
+        if pass.material != Handle::INVALID {
+            match assets.get(pass.material) {
+                Some(material) => {
+                    if shader.is_none() && material.shader != Handle::INVALID {
+                        shader = Some(asset_key(material.shader));
+                    }
+                    parameters.extend(material.parameters.clone());
+                    textures.extend(
+                        material
+                            .textures
+                            .iter()
+                            .map(|(slot, binding)| (slot.clone(), asset_key(binding.texture))),
+                    );
+                }
+                None => println!(
+                    "[render] Pass {} names a material that is not loaded",
+                    pass.name
+                ),
+            }
+        }
+        parameters.extend(pass.parameters.clone());
+        textures.extend(
+            pass.textures
+                .iter()
+                .map(|(slot, handle)| (slot.clone(), asset_key(*handle))),
+        );
+
         passes.push(ResolvedPass {
             name: pass.name.clone(),
-            shader: (pass.shader != Handle::INVALID).then(|| asset_key(pass.shader)),
+            shader,
             kind: pass.kind,
             target: pass.target.clone(),
             extra_targets: pass.extra_targets.clone(),
@@ -75,13 +113,9 @@ fn resolve_passes(
             blend: pass.blend,
             depth_write: pass.depth_write,
             cull: pass.cull,
-            parameters: pass.parameters.clone(),
+            parameters,
             inputs: pass.inputs.clone(),
-            textures: pass
-                .textures
-                .iter()
-                .map(|(slot, handle)| (slot.clone(), asset_key(*handle)))
-                .collect(),
+            textures,
             order: pass.order,
         });
     }
@@ -368,6 +402,70 @@ mod tests {
 
         assert_eq!(passes.len(), 1);
         assert_eq!(passes[0].textures.get("grain"), Some(&asset_key(texture)));
+    }
+
+    /// A pass that names a material takes the material's shader, parameters and
+    /// textures; what the pass sets itself wins over the material's.
+    #[test]
+    fn a_pass_that_names_a_material_draws_with_it() {
+        use crate::{Material, MaterialParameter};
+
+        let mut assets = AssetManager::new();
+        let shader = assets
+            .add_named(
+                "sky_shader",
+                Shader::new("sky")
+                    .with_wgsl("vertex", "fragment")
+                    .build()
+                    .expect("the stages are in memory"),
+            )
+            .expect("a free name");
+        let texture = assets
+            .add_named(
+                "sky_texture",
+                Texture::from_rgba("sky", TextureType::Color, vec![0, 0, 0, 255], 1, 1)
+                    .expect("a 1x1 RGBA tile"),
+            )
+            .expect("a free name");
+        let material = assets
+            .add_named(
+                "sky_material",
+                Material::builder("sky")
+                    .shader(&shader)
+                    .texture("sky", &texture)
+                    .scalar_parameter("skybox_exposure", 2.0)
+                    .scalar_parameter("skybox_rotation", 10.0)
+                    .build(),
+            )
+            .expect("a free name");
+        let pass = assets
+            .add_named(
+                "sky",
+                RenderPass::new("sky")
+                    .with_kind(PassKind::Skybox)
+                    .with_material(material)
+                    .with_parameter("skybox_rotation", MaterialParameter::Scalar(90.0)),
+            )
+            .expect("a free name");
+        let pipeline = assets
+            .add_named("chain", RenderingPipeline::new().with_pass(pass))
+            .expect("a free name");
+        let mut manager = RenderingManager::new();
+        manager.set_pipeline(pipeline);
+
+        let passes = resolve_passes(&assets, Some(&manager));
+
+        assert_eq!(passes[0].shader, Some(asset_key(shader)));
+        assert_eq!(passes[0].textures.get("sky"), Some(&asset_key(texture)));
+        assert_eq!(
+            passes[0].parameters.get("skybox_exposure"),
+            Some(&MaterialParameter::Scalar(2.0))
+        );
+        assert_eq!(
+            passes[0].parameters.get("skybox_rotation"),
+            Some(&MaterialParameter::Scalar(90.0)),
+            "the pass's own value wins"
+        );
     }
 
     fn camera(priority: i32, enabled: bool, vertical_fov: f32) -> CameraComponent {

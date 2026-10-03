@@ -1,0 +1,9 @@
+{
+  "format_version": 1,
+  "asset_type": "pill_master_renderer::assets::Mesh",
+  "guid": "d10ee86040e949eb7f4ddb42c8801d93",
+  "settings": {
+    "flip_v": true,
+    "calculate_tangents": true
+  }
+}

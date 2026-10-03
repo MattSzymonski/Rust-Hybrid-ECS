@@ -1,0 +1,35 @@
+{
+  "format_version": 1,
+  "asset_type": "pill_master_renderer::assets::Material",
+  "guid": "1cbab7e394c6240537b969277fe95aa2",
+  "asset": {
+    "shader": "8cedb4197c9f26a86708b1cd14399eab",
+    "textures": {
+      "base_color": "ff3847a002e0586cfaf8a7d2c7787ab5",
+      "normal": "2bf671b49b396a90252befe257ebe77e"
+    },
+    "parameters": {
+      "pbr_base": {
+        "Color": [
+          1.0,
+          1.0,
+          1.0
+        ]
+      },
+      "pbr_emissive": {
+        "Color": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "pbr_metallic": {
+        "Scalar": 0.0
+      },
+      "pbr_roughness": {
+        "Scalar": 0.9
+      }
+    },
+    "rendering_order": 255
+  }
+}
