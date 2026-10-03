@@ -180,6 +180,10 @@ pub struct StaticProject {
 pub struct StaticLogging {
     /// The `level:` key, when the settings set one.
     pub level: Option<&'static str>,
+    /// The `timestamp:` key (`date_time` or `time`), when the settings set one.
+    pub timestamp: Option<&'static str>,
+    /// The `source_location:` key, when the settings set one.
+    pub source_location: Option<bool>,
     /// The `targets:` map, as `(target, level)` pairs in file order.
     pub targets: &'static [(&'static str, &'static str)],
 }
@@ -188,6 +192,8 @@ impl StaticLogging {
     /// No logging settings: the engine's defaults apply.
     pub const NONE: Self = Self {
         level: None,
+        timestamp: None,
+        source_location: None,
         targets: &[],
     };
 
@@ -198,7 +204,9 @@ impl StaticLogging {
     /// Returns the first level or target that does not read, which only a
     /// hand-edited bundle can hold: the generator refuses both.
     pub fn settings(&self) -> Result<LoggingSettings, String> {
-        LoggingSettings::from_text(self.level, self.targets)
+        let mut settings = LoggingSettings::from_text(self.level, self.timestamp, self.targets)?;
+        settings.source_location = self.source_location;
+        Ok(settings)
     }
 }
 

@@ -32,8 +32,8 @@ use tracing::level_filters::LevelFilter;
 
 // Current crate
 use pill_core::telemetry::{
-    telemetry_target, LoggingConfig, TelemetryBuilder, TelemetryError, TelemetryHandles,
-    DEV_LOG_TARGET,
+    set_show_source_location, set_timestamp_format, telemetry_target, LoggingConfig,
+    TelemetryBuilder, TelemetryError, TelemetryHandles, TimestampFormat, DEV_LOG_TARGET,
 };
 
 // =============================================================================
@@ -46,12 +46,14 @@ use pill_core::telemetry::{
 /// ```yaml
 /// logging:
 ///   level: info                 # every target, replacing the engine's defaults
+///   timestamp: time             # date_time (default) or time
+///   source_location: true       # end lines with file:line (default false)
 ///   targets:                    # per target, applied last
 ///     engine::rendering: info
 ///     wgpu: error
 /// ```
 ///
-/// Both keys are optional, and an absent section leaves the engine's defaults
+/// Every key is optional, and an absent section leaves the engine's defaults
 /// as they are.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LoggingSettings {
@@ -59,6 +61,12 @@ pub struct LoggingSettings {
     /// (the `wgpu` and `naga` dependency filters stay at `warn` unless the
     /// level is quieter, or a target override names them).
     pub level: Option<LevelFilter>,
+    /// How each line writes its local time: `[dd.mm.yyyy hh:mm:ss:mmm]` by
+    /// default, or `[hh:mm:ss:mmm]`.
+    pub timestamp: Option<TimestampFormat>,
+    /// Whether each line ends with the `file:line` that emitted it, in dark
+    /// gray. Off unless the settings turn it on.
+    pub source_location: Option<bool>,
     /// Per-target levels, applied after [`Self::level`], in the order given.
     /// A target is a `tracing` target or a prefix of one: `engine::rendering`,
     /// `engine`, `wgpu`.
@@ -112,10 +120,16 @@ impl LoggingSettings {
     ///
     /// # Errors
     ///
-    /// Returns the first level or target that does not read; the bundle
-    /// generator validates both, so this only fails on a hand-edited bundle.
-    pub fn from_text(level: Option<&str>, targets: &[(&str, &str)]) -> Result<Self, String> {
+    /// Returns the first level, timestamp format or target that does not read;
+    /// the bundle generator validates all three, so this only fails on a
+    /// hand-edited bundle.
+    pub fn from_text(
+        level: Option<&str>,
+        timestamp: Option<&str>,
+        targets: &[(&str, &str)],
+    ) -> Result<Self, String> {
         let level = level.map(Self::parse_level).transpose()?;
+        let timestamp = timestamp.map(TimestampFormat::parse).transpose()?;
         let targets = targets
             .iter()
             .map(|(target, level)| {
@@ -123,7 +137,12 @@ impl LoggingSettings {
                 Ok((target.to_string(), Self::parse_level(level)?))
             })
             .collect::<Result<_, String>>()?;
-        Ok(Self { level, targets })
+        Ok(Self {
+            level,
+            timestamp,
+            source_location: None,
+            targets,
+        })
     }
 
     /// The terminal filter these settings ask for, over the engine's defaults.
@@ -240,7 +259,15 @@ pub fn init_telemetry(
 /// Returns [`TelemetryError`] when a filter does not build or does not reload;
 /// the previous filter stays active.
 pub fn apply_logging_settings(settings: &LoggingSettings) -> Result<(), TelemetryError> {
-    if *settings == LoggingSettings::default() {
+    // The timestamp format is a process-wide value in `pill_core`, not part of
+    // a filter, so it applies even when no stack is installed.
+    if let Some(timestamp) = settings.timestamp {
+        set_timestamp_format(timestamp);
+    }
+    if let Some(show) = settings.source_location {
+        set_show_source_location(show);
+    }
+    if settings.level.is_none() && settings.targets.is_empty() {
         return Ok(());
     }
     let Some(handles) = TELEMETRY_HANDLES.get() else {
@@ -272,7 +299,8 @@ mod tests {
     /// A target override lands over the engine's default for that target.
     #[test]
     fn a_target_override_replaces_the_engine_default() {
-        let settings = LoggingSettings::from_text(None, &[("engine::rendering", "info")]).unwrap();
+        let settings =
+            LoggingSettings::from_text(None, None, &[("engine::rendering", "info")]).unwrap();
 
         let rendered = format!("{}", settings.terminal_config().build_env_filter().unwrap());
 
@@ -285,7 +313,7 @@ mod tests {
     /// at `warn`.
     #[test]
     fn a_level_replaces_every_engine_default() {
-        let settings = LoggingSettings::from_text(Some("debug"), &[]).unwrap();
+        let settings = LoggingSettings::from_text(Some("debug"), None, &[]).unwrap();
 
         let rendered = format!("{}", settings.terminal_config().build_env_filter().unwrap());
 
@@ -296,7 +324,15 @@ mod tests {
 
     #[test]
     fn bundle_text_with_a_bad_level_is_refused() {
-        assert!(LoggingSettings::from_text(Some("loud"), &[]).is_err());
-        assert!(LoggingSettings::from_text(None, &[("wgpu", "loud")]).is_err());
+        assert!(LoggingSettings::from_text(Some("loud"), None, &[]).is_err());
+        assert!(LoggingSettings::from_text(None, None, &[("wgpu", "loud")]).is_err());
+        assert!(LoggingSettings::from_text(None, Some("unix"), &[]).is_err());
+    }
+
+    #[test]
+    fn bundle_text_reads_the_timestamp_format() {
+        let settings = LoggingSettings::from_text(None, Some("time"), &[]).unwrap();
+
+        assert_eq!(settings.timestamp, Some(TimestampFormat::Time));
     }
 }

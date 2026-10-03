@@ -108,7 +108,14 @@ impl Surface {
         let width = width.max(1);
         let height = height.max(1);
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
+            // Vulkan, DX12, Metal or WebGPU, never OpenGL unless `WGPU_BACKEND`
+            // asks for it. On Windows wgpu's GL backend leaves a hidden helper
+            // window behind whose message handler is code in this DLL; once the
+            // host unloads the renderer (a reload, or shutdown), the next message
+            // to that window calls freed code and the process dies with
+            // 0xC000041D / 0xC0000005. Every machine this renders on has one of
+            // the primary backends, so GL only ever added that hazard.
+            backends: wgpu::Backends::from_env().unwrap_or(wgpu::Backends::PRIMARY),
             flags: wgpu::InstanceFlags::from_build_config().with_env(),
             backend_options: wgpu::BackendOptions::default(),
         });

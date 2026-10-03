@@ -75,9 +75,8 @@ HOST_LAUNCH_COMMAND = [
     "cargo", "run", "-p", "pill_standalone", "--features", "pill_host/hot_patch,rendering",
 ]
 
-# The structured logger appends fields with no separator, so the token is
-# `building extensionmodule="pill_spline"` rather than the spaced form.
-BUILD_STARTED = f'building extensionmodule="{MODULE_NAME}"'
+# The structured logger puts two spaces between the message and its fields.
+BUILD_STARTED = f'building extension  module="{MODULE_NAME}"'
 CANCELLED_TOKEN = "sources changed again during compilation"
 
 # How long after the first save to make the second. Must land inside the build

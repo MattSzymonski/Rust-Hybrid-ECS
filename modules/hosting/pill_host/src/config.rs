@@ -658,6 +658,10 @@ pub struct ProjectLoggingSettings {
     /// One level for every target: `off`, `error`, `warn`, `info`, `debug` or
     /// `trace`.
     pub level: Option<String>,
+    /// How each line writes its local time: `date_time` or `time`.
+    pub timestamp: Option<String>,
+    /// Whether each line ends with its source `file:line` (default false).
+    pub source_location: Option<bool>,
     /// Per-target levels, by `tracing` target or target prefix.
     pub targets: BTreeMap<String, String>,
 }
@@ -680,6 +684,12 @@ impl ProjectLoggingSettings {
             .map(pill_runtime::LoggingSettings::parse_level)
             .transpose()
             .map_err(invalid)?;
+        let timestamp = self
+            .timestamp
+            .as_deref()
+            .map(pill_core::telemetry::TimestampFormat::parse)
+            .transpose()
+            .map_err(invalid)?;
         let mut targets = Vec::with_capacity(self.targets.len());
         for (target, level) in &self.targets {
             pill_runtime::LoggingSettings::check_target(target).map_err(invalid)?;
@@ -687,7 +697,12 @@ impl ProjectLoggingSettings {
                 .map_err(|details| invalid(format!("{target}: {details}")))?;
             targets.push((target.clone(), level));
         }
-        Ok(pill_runtime::LoggingSettings { level, targets })
+        Ok(pill_runtime::LoggingSettings {
+            level,
+            timestamp,
+            source_location: self.source_location,
+            targets,
+        })
     }
 }
 
@@ -1827,6 +1842,25 @@ serde = { version = "1", features = ["derive"] }
             .validate(&path)
             .expect_err("an unknown level is refused");
         assert!(error.to_string().contains("loud"), "{error}");
+
+        let time_only = read("logging:\n  timestamp: time\n")
+            .logging
+            .validate(&path)
+            .unwrap();
+        assert_eq!(
+            time_only.timestamp,
+            Some(pill_core::telemetry::TimestampFormat::Time)
+        );
+        let located = read("logging:\n  source_location: true\n")
+            .logging
+            .validate(&path)
+            .unwrap();
+        assert_eq!(located.source_location, Some(true));
+        let error = read("logging:\n  timestamp: unix\n")
+            .logging
+            .validate(&path)
+            .expect_err("an unknown timestamp format is refused");
+        assert!(error.to_string().contains("unix"), "{error}");
 
         std::fs::write(
             directory.join("project_settings.yaml"),

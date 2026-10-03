@@ -29,6 +29,9 @@ serde_json = "1"
 thiserror = "2"
 miette = { version = "7", features = ["derive", "fancy"] }
 colored = "2"
+# The local date and time in log lines. `clock` reads the time zone on every
+# target; the web build adds `wasmbind` below to read it from the browser.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 tracing = "0.1"
 tracing-log = "0.2"
 # The default `tracing-log` feature would auto-bridge `log` inside
@@ -57,6 +60,7 @@ pollster = "0.4"
 # The platform layer on the web: `performance.now()`/`Date.now()` for the
 # clock, the browser console for logs, the browser's event loop for futures.
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+chrono = { version = "0.4", default-features = false, features = ["wasmbind"] }
 web-time = "1"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"

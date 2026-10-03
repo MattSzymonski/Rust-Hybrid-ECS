@@ -8,6 +8,9 @@
 //!   reload handle for live filter changes.
 //! - Provide the [`EngineTerminalFormatter`] that owns all terminal styling
 //!   decisions (severity, target, semantic fields) using [`PillStyle`].
+//! - Hold the process-wide [`TimestampFormat`] every log line's local time is
+//!   written in (`date_time` or `time`), and whether lines end with their
+//!   source location ([`set_show_source_location`]).
 //! - Build the subscriber stack (terminal + optional file + optional Tracy)
 //!   with independent per-layer filters through [`TelemetryBuilder`].
 //!
@@ -27,6 +30,7 @@
 // Standard library
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, OnceLock};
 
 // External crates
@@ -43,7 +47,6 @@ use tracing_subscriber::Layer as _;
 use tracing_subscriber::{EnvFilter, Registry};
 
 // Current crate
-use crate::platform::clock;
 use crate::platform::log_output::{self, FileGuard, FileWriter, TerminalWriter};
 
 // =============================================================================
@@ -215,6 +218,96 @@ impl Default for LoggingConfig {
 }
 
 // =============================================================================
+// Timestamp Format
+// =============================================================================
+
+/// How the local time at the start of every log line is written.
+///
+/// Chosen by the project's `logging: timestamp:` setting and applied with
+/// [`set_timestamp_format`]. It is one process-wide value, held in
+/// `pill_core` so every DLL's log lines agree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimestampFormat {
+    /// `[dd.mm.yyyy hh:mm:ss:mmm]`, written `date_time` in settings.
+    #[default]
+    DateTime,
+    /// `[hh:mm:ss:mmm]`, written `time` in settings.
+    Time,
+}
+
+impl TimestampFormat {
+    /// Read the settings name: `date_time` or `time`, in any case.
+    ///
+    /// # Errors
+    ///
+    /// Returns a message naming the accepted values for anything else.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use pill_core::telemetry::TimestampFormat;
+    ///
+    /// assert_eq!(TimestampFormat::parse("time"), Ok(TimestampFormat::Time));
+    /// ```
+    pub fn parse(text: &str) -> Result<Self, String> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "date_time" => Ok(Self::DateTime),
+            "time" => Ok(Self::Time),
+            _ => Err(format!(
+                "`{text}` is not a timestamp format; use date_time or time"
+            )),
+        }
+    }
+
+    /// The settings name of this format, as [`Self::parse`] reads it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DateTime => "date_time",
+            Self::Time => "time",
+        }
+    }
+
+    /// The `chrono` pattern that writes this format (`%3f` is milliseconds).
+    fn pattern(self) -> &'static str {
+        match self {
+            Self::DateTime => "%d.%m.%Y %H:%M:%S:%3f",
+            Self::Time => "%H:%M:%S:%3f",
+        }
+    }
+}
+
+/// The active [`TimestampFormat`], as its position in the enum.
+static TIMESTAMP_FORMAT: AtomicU8 = AtomicU8::new(TimestampFormat::DateTime as u8);
+
+/// Set how every later log line writes its time.
+pub fn set_timestamp_format(format: TimestampFormat) {
+    TIMESTAMP_FORMAT.store(format as u8, Ordering::Relaxed);
+}
+
+/// How log lines currently write their time.
+pub fn timestamp_format() -> TimestampFormat {
+    if TIMESTAMP_FORMAT.load(Ordering::Relaxed) == TimestampFormat::Time as u8 {
+        TimestampFormat::Time
+    } else {
+        TimestampFormat::DateTime
+    }
+}
+
+/// Whether log lines end with the `file:line` that emitted them. Off by
+/// default; the project's `logging: source_location:` setting turns it on.
+static SHOW_SOURCE_LOCATION: AtomicBool = AtomicBool::new(false);
+
+/// Set whether every later log line ends with its source location.
+pub fn set_show_source_location(show: bool) {
+    SHOW_SOURCE_LOCATION.store(show, Ordering::Relaxed);
+}
+
+/// Whether log lines currently end with their source location.
+pub fn show_source_location() -> bool {
+    SHOW_SOURCE_LOCATION.load(Ordering::Relaxed)
+}
+
+// =============================================================================
 // Terminal Formatter
 // =============================================================================
 
@@ -277,59 +370,79 @@ where
         event: &Event<'_>,
     ) -> fmt::Result {
         let metadata = event.metadata();
+        // The file lane is built without ANSI, so styling follows the writer
+        // rather than whether a terminal happens to be attached.
+        let ansi = writer.has_ansi_escapes();
         if self.show_timestamps {
-            let now = clock::unix_time();
-            write!(writer, "[{:>9.3}] ", now.as_secs_f64())?;
+            let pattern = timestamp_format().pattern();
+            let now = format!("[{}]", chrono::Local::now().format(pattern));
+            write!(writer, "{} ", paint(ansi, &now, |text| text.dimmed()))?;
         }
 
-        write!(writer, "{} ", styled_level(metadata.level()))?;
-        write!(writer, "{}", styled_target(metadata.target()))?;
+        write!(writer, "{} ", styled_level(metadata.level(), ansi))?;
+        write!(writer, "{}  ", styled_target(metadata.target(), ansi))?;
 
-        if let (Some(file), Some(line)) = (metadata.file(), metadata.line()) {
-            write!(writer, " {file}:{line}")?;
-        }
-        write!(writer, " ")?;
-
+        // Message first, then its fields after a two-space gap, so the text
+        // never runs into the first field name.
         let mut visitor = StyledFieldVisitor {
-            writer: &mut writer,
-            first_field: true,
+            ansi,
+            message: String::new(),
+            fields: String::new(),
         };
         event.record(&mut visitor);
+        write!(writer, "{}", visitor.message)?;
+        if !visitor.fields.is_empty() {
+            write!(writer, "  {}", visitor.fields)?;
+        }
+
+        // The source location is opt-in and trails the line in dark gray:
+        // useful for navigation, but not what a reader scans for.
+        if show_source_location() {
+            if let (Some(file), Some(line)) = (metadata.file(), metadata.line()) {
+                let location = format!("{file}:{line}");
+                let location = paint(ansi, &location, |text| text.bright_black());
+                write!(writer, "  {location}")?;
+            }
+        }
         writeln!(writer)?;
         Ok(())
     }
 }
 
-/// `tracing` visitor that writes the message and structured fields into a
-/// terminal writer, styling field names. Write failures are ignored because
-/// the terminal is a best-effort sink.
-struct StyledFieldVisitor<'a, W> {
-    writer: &'a mut W,
-    first_field: bool,
+/// `tracing` visitor that collects the message and the structured fields
+/// separately, so the formatter can lay them out in a fixed order whatever
+/// order the callsite declared them in.
+struct StyledFieldVisitor {
+    ansi: bool,
+    message: String,
+    fields: String,
 }
 
-impl<W: fmt::Write> StyledFieldVisitor<'_, W> {
-    fn separator(&mut self) {
-        if !self.first_field {
-            let _ = self.writer.write_str(" ");
-        }
-        self.first_field = false;
-    }
-}
-
-impl<W: fmt::Write> Visit for StyledFieldVisitor<'_, W> {
+impl Visit for StyledFieldVisitor {
     fn record_str(&mut self, field: &Field, value: &str) {
         self.record_debug(field, &value)
     }
 
     fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+        use fmt::Write as _;
         if field.name() == "message" {
             // The message is the primary human-readable text.
-            let _ = write!(self.writer, "{value:?}");
+            let _ = write!(self.message, "{value:?}");
             return;
         }
-        self.separator();
-        let _ = write!(self.writer, "{}={:?}", field.name().dimmed(), value);
+        if !self.fields.is_empty() {
+            self.fields.push(' ');
+        }
+        // Values keep their `Debug` form (strings quoted, options as
+        // `Some(..)`): the end-to-end suites match on that exact text.
+        let name = paint(self.ansi, field.name(), |text| text.dimmed());
+        let value = format!("{value:?}");
+        let value = if MODULE_FIELD_NAMES.contains(&field.name()) {
+            paint(self.ansi, &value, |text| text.cyan().bold())
+        } else {
+            value
+        };
+        let _ = write!(self.fields, "{name}={value}");
     }
 
     fn record_u64(&mut self, field: &Field, value: u64) {
@@ -753,19 +866,35 @@ pub enum TelemetryError {
 // =============================================================================
 
 /// Severity color mapping owned by the terminal formatter.
-fn styled_level(level: &Level) -> String {
+fn styled_level(level: &Level, ansi: bool) -> String {
+    // Padded to the widest level so the targets line up in a column.
+    let text = format!("{:<5}", level.as_str());
     match *level {
-        Level::TRACE => "TRACE".magenta().to_string(),
-        Level::DEBUG => "DEBUG".blue().bold().to_string(),
-        Level::INFO => "INFO".white().to_string(),
-        Level::WARN => "WARN".yellow().bold().to_string(),
-        Level::ERROR => "ERROR".red().bold().to_string(),
+        Level::TRACE => paint(ansi, &text, |text| text.magenta()),
+        Level::DEBUG => paint(ansi, &text, |text| text.blue().bold()),
+        Level::INFO => paint(ansi, &text, |text| text.green()),
+        Level::WARN => paint(ansi, &text, |text| text.yellow().bold()),
+        Level::ERROR => paint(ansi, &text, |text| text.red().bold()),
     }
 }
 
 /// Target styling owned by the terminal formatter.
-fn styled_target(target: &str) -> String {
-    target.cyan().to_string()
+fn styled_target(target: &str, ansi: bool) -> String {
+    paint(ansi, target, |text| text.cyan())
+}
+
+/// Field names whose value names a module; their value is highlighted so the
+/// module a lifecycle line is about stands out.
+const MODULE_FIELD_NAMES: &[&str] = &["module", "extension"];
+
+/// Applies `style` to `text` when the writer accepts ANSI escapes, and returns
+/// the text unchanged otherwise.
+fn paint(ansi: bool, text: &str, style: impl FnOnce(&str) -> colored::ColoredString) -> String {
+    if ansi {
+        style(text).to_string()
+    } else {
+        text.to_string()
+    }
 }
 
 // =============================================================================
@@ -835,6 +964,74 @@ mod tests {
             "missing message: {output}"
         );
         assert!(output.contains("texture="), "missing field: {output}");
+    }
+
+    /// Both timestamp formats read back from their settings names and write
+    /// the documented shape: `dd.mm.yyyy hh:mm:ss:mmm` and `hh:mm:ss:mmm`.
+    #[test]
+    fn timestamp_formats_parse_and_render() {
+        for format in [TimestampFormat::DateTime, TimestampFormat::Time] {
+            assert_eq!(TimestampFormat::parse(format.as_str()), Ok(format));
+        }
+        assert_eq!(TimestampFormat::parse(" TIME "), Ok(TimestampFormat::Time));
+        assert!(TimestampFormat::parse("unix").is_err());
+
+        let moment = chrono::NaiveDate::from_ymd_opt(2026, 10, 3)
+            .and_then(|date| date.and_hms_milli_opt(9, 5, 7, 42))
+            .expect("valid date");
+        let render = |format: TimestampFormat| moment.format(format.pattern()).to_string();
+        assert_eq!(render(TimestampFormat::DateTime), "03.10.2026 09:05:07:042");
+        assert_eq!(render(TimestampFormat::Time), "09:05:07:042");
+    }
+
+    /// The message is separated from its fields, the source location appears
+    /// only when enabled and then trails the line, and a lane without ANSI
+    /// gets no escape codes even for highlighted fields.
+    ///
+    /// The only test that changes the source location setting, so the toggle
+    /// cannot race another test's expectation.
+    #[test]
+    fn terminal_formatter_separates_message_fields_and_location() {
+        use std::sync::{Arc, Mutex};
+
+        let captured = Arc::new(Mutex::new(String::new()));
+        let emit = || {
+            let writer = CapturingMakeWriter(Arc::clone(&captured));
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(writer)
+                    .with_ansi(false)
+                    .event_format(EngineTerminalFormatter::new().without_timestamps()),
+            );
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::info!(
+                    target: "engine::hot_reload",
+                    module = "pill_spline",
+                    owner = 2,
+                    "extension loaded"
+                );
+            });
+            let output = std::mem::take(&mut *captured.lock().unwrap());
+            output.lines().next().expect("one line").to_owned()
+        };
+
+        let hidden = emit();
+        assert_eq!(
+            hidden, "INFO  engine::hot_reload  extension loaded  module=\"pill_spline\" owner=2",
+            "the location is off by default"
+        );
+
+        set_show_source_location(true);
+        let shown = emit();
+        set_show_source_location(false);
+        assert!(
+            shown.starts_with(&format!("{hidden}  ")) && shown.contains("telemetry.rs:"),
+            "missing trailing location: {shown}"
+        );
+        assert!(
+            !shown.contains('\u{1b}'),
+            "escape codes in a plain lane: {shown}"
+        );
     }
 
     /// A shared capture buffer used by [`MakeWriter`].

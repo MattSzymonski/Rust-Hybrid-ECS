@@ -33,9 +33,12 @@ use std::path::{Path, PathBuf};
 const FALLBACK_PROFILE_DIRECTORY: &str = "debug";
 
 fn main() {
-    // Only `OUT_DIR` and the workspace manifest change the answer.
+    // Only `OUT_DIR` and the workspace manifest change the answer. The path
+    // must name a file that exists: cargo treats a missing one as changed on
+    // every build, which reran this script and recompiled the host (and every
+    // binary that links it) each time.
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=../Cargo.toml");
+    println!("cargo:rerun-if-changed=../../Cargo.toml");
     let (profile_directory, target_triple) = out_directory_layout();
     let profile_directory =
         profile_directory.unwrap_or_else(|| FALLBACK_PROFILE_DIRECTORY.to_string());
