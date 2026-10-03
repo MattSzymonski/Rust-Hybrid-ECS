@@ -161,17 +161,13 @@ impl HotPatchSession {
             return;
         }
 
-        // Said out loud rather than logged, because a developer who just rolled
+        // At INFO with the plain reason, because a developer who just rolled
         // back would otherwise watch the rollback silently undo itself.
-        println!(
-            "{} reload rebuilt from source; live-patch history reset for {}",
-            crate::console::bold_cyan("[hot]"),
-            functions.join(", ")
-        );
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
             functions = functions.join(", ").as_str(),
-            "prologue patch history dropped: the reloaded image supersedes it"
+            "reload rebuilt from source; live-patch history reset (the reloaded \
+             image supersedes the prologue patches)"
         );
     }
 

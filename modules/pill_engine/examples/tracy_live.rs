@@ -347,12 +347,10 @@ fn main() {
             .build();
     }
 
-    println!("=== Tracy Live Profiling Demo ===");
-    println!("7 systems, 30000 entities, small+large components, parallel ON");
-    println!("Target: 30 FPS (engine limiter)");
-    println!();
-    println!("Connect Tracy now. Press Ctrl+C to stop.");
-    println!();
+    pill_core::info!("=== Tracy Live Profiling Demo ===");
+    pill_core::info!("7 systems, 30000 entities, small+large components, parallel ON");
+    pill_core::info!("Target: 30 FPS (engine limiter)");
+    pill_core::info!("Connect Tracy now. Press Ctrl+C to stop.");
 
     // Step 5: Run the frame loop, reporting FPS and entity counts every two
     // seconds so the workload's live behaviour stays visible in the console.
@@ -368,7 +366,7 @@ fn main() {
         if dt >= 2.0 {
             let fps = count as f64 / dt;
             let entities = engine.world().entity_count();
-            println!("  {:>6.0} FPS | {:>5} entities", fps, entities);
+            pill_core::info!("  {:>6.0} FPS | {:>5} entities", fps, entities);
             count = 0;
             last_report = Instant::now();
         }

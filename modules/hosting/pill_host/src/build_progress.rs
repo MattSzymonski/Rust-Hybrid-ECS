@@ -123,7 +123,7 @@ fn render_plan(project_name: &str, builds: &[PlannedBuild]) -> String {
     )
 }
 
-/// The `[n/m] Building of <module> started` message.
+/// The `[n/m] ------------- Building of <module> started` message.
 fn render_step(started: usize, total: usize, module: &str) -> String {
     format!("[{started}/{total}] ------------- Building of {module} started")
 }
@@ -191,7 +191,7 @@ mod tests {
         );
         assert_eq!(
             render_step(1, 4, "pill_spline"),
-            "[1/4] Building of ------------- pill_spline started"
+            "[1/4] ------------- Building of pill_spline started"
         );
     }
 }

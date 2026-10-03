@@ -483,15 +483,20 @@ impl SystemScheduler {
         self.execution_graph.clear();
     }
 
-    /// Prints a human-readable summary of the execution graph for debugging.
+    /// Logs a human-readable summary of the execution graph for debugging, as
+    /// one multi-line entry.
     pub fn print_execution_graph(&self, system_names: &[&str]) {
-        println!("\n=== System Execution Graph ===");
+        let mut lines = Vec::new();
         for (batch_index, batch) in self.execution_graph.iter().enumerate() {
-            println!("Batch {}: {} systems (parallel)", batch_index, batch.len());
+            lines.push(format!(
+                "Batch {}: {} systems (parallel)",
+                batch_index,
+                batch.len()
+            ));
             for &system_index in batch {
                 let name = system_names.get(system_index).unwrap_or(&"<unknown>");
                 let access = &self.access_patterns[system_index];
-                println!(
+                lines.push(format!(
                     "  - {} (reads: {}, writes: {}, res_reads: {}, res_writes: {}, commands: {})",
                     name,
                     access.reads.len(),
@@ -499,10 +504,14 @@ impl SystemScheduler {
                     access.resource_reads.len(),
                     access.resource_writes.len(),
                     access.uses_commands
-                );
+                ));
             }
         }
-        println!("==============================\n");
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            "{}",
+            pill_core::telemetry::log_block("System execution graph", lines)
+        );
     }
 }
 

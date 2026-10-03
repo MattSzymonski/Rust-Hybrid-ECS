@@ -29,9 +29,6 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
-// Crate-internal
-use crate::console;
-
 // External crates
 use pill_core::info;
 use pill_core::platform::Instant;
@@ -1019,25 +1016,26 @@ fn remember_fallback(
     });
 }
 
-/// Print the running patch / refusal / failure tally, when there is one.
+/// The running patch / refusal / failure tally as report lines, empty until
+/// the fast path has done something.
 ///
 /// Takes its own lock rather than borrowing the caller's, because
-/// `print_reload_events` has already released it by the time it prints.
-fn print_patch_tally() {
+/// `print_reload_events` has already released it by the time it asks.
+fn patch_tally_lines() -> Vec<String> {
     let collector = analytics()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     if collector.patches == 0 && collector.patch_refusals == 0 && collector.patch_failures == 0 {
-        return;
+        return Vec::new();
     }
-    println!(
+    let mut lines = vec![format!(
         "{} fast path: patches {} | refused {} | failed {}",
-        console::bold_cyan("[analytics]"),
-        console::yellow(&collector.patches.to_string()),
-        console::yellow(&collector.patch_refusals.to_string()),
-        console::yellow(&collector.patch_failures.to_string()),
-    );
-    // The counts say a reload ran; these lines say why. Printed here rather
+        "[analytics]".cyan().bold(),
+        collector.patches.to_string().yellow(),
+        collector.patch_refusals.to_string().yellow(),
+        collector.patch_failures.to_string().yellow(),
+    )];
+    // The counts say a reload ran; these lines say why. Listed here rather
     // than left to the moment of failure, which has long scrolled past by the
     // time the reload report appears.
     for fallback in &collector.patch_fallbacks {
@@ -1046,19 +1044,19 @@ fn print_patch_tally() {
         } else {
             String::new()
         };
-        println!(
+        lines.push(format!(
             "    {} {} {}{}",
             fallback.function.as_deref().unwrap_or("(change)"),
             fallback.outcome,
-            console::dim(&format!("({})", fallback.code)),
+            format!("({})", fallback.code).dimmed(),
             repeats,
-        );
+        ));
         if !fallback.detail.is_empty() {
-            println!("        {}", console::dim(&fallback.detail));
+            lines.push(format!("        {}", fallback.detail.dimmed()));
         }
     }
+    lines
 }
-
 /// Record the host process's current and peak memory (called at setup end).
 pub(crate) fn record_host_memory() {
     let mut collector = analytics()
@@ -1447,52 +1445,51 @@ fn wrap_list(items: &[&str], width: usize) -> Vec<String> {
     lines
 }
 
-/// Print one line per completed hot reload plus one aggregate total line.
+/// Log one line per completed hot reload plus one aggregate total line, as a
+/// single multi-line entry.
 ///
 /// Called by the frame loop right after reloads are processed, so the console
 /// shows the rebuild → stage → load → init → migrate breakdown as it happens.
 /// `reload_started` is the moment the reload transaction began (before the
 /// first build), so the total spans the whole cascade - the edited module
 /// plus the queued project reload - rather than one transaction. Returns the
-/// number of reload events printed.
+/// number of reload events reported.
+///
+/// The `[analytics] reload ...` and `crates rebuilt by cargo:` lines keep the
+/// exact text the suites and `devops/benchmarks/hot_reload_harness.py` parse;
+/// their colors reach an interactive terminal only (see `log_block_colored`).
 pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
     let events = drain_reload_events();
     let count = events.len();
     if count == 0 {
         return 0;
     }
-    // A blank line and a dim rule separate the reload analytics from the
-    // cargo / INFO output above them, so a cascade's lines stand out. The
-    // lines themselves keep the exact `[analytics] reload ...` format the
-    // benchmark harness parses; colors are ANSI-wrapped only in a terminal.
-    println!();
-    println!(
-        "{}",
-        console::dim("============ reload analytics ============")
-    );
+    let mut lines = Vec::new();
     for event in &events {
-        println!(
+        lines.push(format!(
             "{} reload {} {} | build={} | stage={}ms | load={}ms | init={}ms | \
              migrate={}ms | size={} | exports={} | kind={}{}",
-            console::bold_cyan("[analytics]"),
-            console::bold_cyan(&event.name),
-            console::dim(&format!("(reload #{})", event.reload_count)),
-            console::yellow(&if event.build_ms > 0 {
+            "[analytics]".cyan().bold(),
+            event.name.cyan().bold(),
+            format!("(reload #{})", event.reload_count).dimmed(),
+            if event.build_ms > 0 {
                 format_ms(event.build_ms)
             } else {
                 "-".to_string()
-            }),
-            console::yellow(&format!("{:.1}", event.stage_ms)),
-            console::yellow(&format!("{:.1}", event.load_ms)),
-            console::yellow(&format!("{:.1}", event.init_ms)),
-            console::yellow(&format!("{:.1}", event.migrate_ms)),
-            console::yellow(&if event.artifact_bytes > 0 {
+            }
+            .yellow(),
+            format!("{:.1}", event.stage_ms).yellow(),
+            format!("{:.1}", event.load_ms).yellow(),
+            format!("{:.1}", event.init_ms).yellow(),
+            format!("{:.1}", event.migrate_ms).yellow(),
+            if event.artifact_bytes > 0 {
                 format_bytes(event.artifact_bytes)
             } else {
                 "-".to_string()
-            }),
-            console::yellow(&event.exports.to_string()),
-            console::yellow(event.kind.label()),
+            }
+            .yellow(),
+            event.exports.to_string().yellow(),
+            event.kind.label().yellow(),
             // Appended rather than folded into `kind=`, so the field the
             // harness already parses keeps its exact meaning and vocabulary.
             // A reload has no route, and prints none.
@@ -1505,13 +1502,13 @@ pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
                         .join("+");
                     format!(
                         " | route={} | copies={}",
-                        console::yellow(&joined),
-                        console::yellow(&copies.to_string())
+                        joined.yellow(),
+                        copies.to_string().yellow()
                     )
                 }
                 None => String::new(),
             },
-        );
+        ));
         // The module line above is only the transaction's own timings; the
         // cargo `--timings` breakdown shows every crate the build actually
         // recompiled or relinked (dependents included).
@@ -1522,16 +1519,16 @@ pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
                 .map(|(crate_name, duration_ms)| {
                     format!(
                         "{} {}",
-                        console::green(crate_name),
-                        console::yellow(&format_ms(*duration_ms))
+                        crate_name.green(),
+                        format_ms(*duration_ms).yellow()
                     )
                 })
                 .collect();
-            println!(
+            lines.push(format!(
                 "    {} {}",
-                console::bold("crates rebuilt by cargo:"),
-                parts.join(&console::dim(" | "))
-            );
+                "crates rebuilt by cargo:".bold(),
+                parts.join(&" | ".dimmed().to_string())
+            ));
         }
     }
     // One aggregate number for the whole transaction (module + project for a
@@ -1549,45 +1546,42 @@ pub(crate) fn print_reload_events(reload_started: Instant) -> usize {
         .collect();
     let phases_ms: u64 = segment_ms.iter().sum();
     let gap_ms = total_ms.saturating_sub(phases_ms);
-    // The running fast-path tally, printed alongside the transaction it belongs
-    // to rather than in the startup report, where these are always zero.
-    // Suppressed entirely until the fast path has done something, so a project
-    // that has not opted in sees no extra noise.
-    print_patch_tally();
+    // The running fast-path tally, reported alongside the transaction it
+    // belongs to rather than in the startup report, where these are always
+    // zero. Left out entirely until the fast path has done something, so a
+    // project that has not opted in sees no extra noise.
+    lines.extend(patch_tally_lines());
 
     let label = if count > 1 {
         "cascade total"
     } else {
         "reload total"
     };
-    println!(
-        "{} {}: {} ({}ms)",
-        console::bold_cyan("[analytics]"),
-        console::bold(label),
-        console::yellow(&format_ms(total_ms)),
-        console::dim(&total_ms.to_string()),
-    );
+    lines.push(format!(
+        "{} {}: {} {}",
+        "[analytics]".cyan().bold(),
+        label.bold(),
+        format_ms(total_ms).yellow(),
+        format!("({total_ms}ms)").dimmed(),
+    ));
     let parts: Vec<String> = events
         .iter()
         .zip(&segment_ms)
-        .map(|(event, segment)| {
-            format!(
-                "{} {}ms",
-                console::cyan(&event.name),
-                console::yellow(&segment.to_string())
-            )
-        })
+        .map(|(event, segment)| format!("{} {}ms", event.name.cyan(), segment.to_string().yellow()))
         .collect();
-    println!(
+    lines.push(format!(
         "    = {} + {} {}ms",
-        parts.join(&console::dim(" + ")),
-        console::dim("gap/scheduling"),
-        console::yellow(&gap_ms.to_string()),
+        parts.join(&" + ".dimmed().to_string()),
+        "gap/scheduling".dimmed(),
+        gap_ms.to_string().yellow(),
+    ));
+    info!(
+        target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+        "{}",
+        log_block_colored("Reload analytics".cyan().bold(), lines)
     );
-    println!();
     count
 }
-
 /// Take and clear the pending reload events for the current frame.
 fn drain_reload_events() -> Vec<ReloadEvent> {
     let mut collector = analytics()

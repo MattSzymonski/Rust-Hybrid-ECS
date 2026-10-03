@@ -481,16 +481,12 @@ impl HotPatchSession {
         // project's types, and every attempt would fail at compile time. Say so
         // once, at startup, rather than on the first edit.
         if !session.package_rlib.is_file() {
-            // Printed, not just logged: whether the fast path is on is the first
-            // thing a developer needs to know, and a `tracing` line at INFO is
-            // easy to lose among the startup output.
-            println!(
-                "{} hot patching OFF for {package} - its rlib is missing ({})",
-                crate::console::bold_cyan("[hot]"),
-                session.package_rlib.display()
-            );
+            // A warning: whether the fast path is on is the first thing a
+            // developer needs to know, and an INFO line is easy to lose among
+            // the startup output.
             warn!(
                 target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                module = package,
                 expected = %session.package_rlib.display(),
                 "hot patching is idle: the project rlib a patch links to reach the \
                  crate's types was not built"
@@ -498,12 +494,10 @@ impl HotPatchSession {
             return None;
         }
 
-        println!(
-            "{} hot patching ON for {package} - {addressable} function(s), {annotated} annotated",
-            crate::console::bold_cyan("[hot]")
-        );
         info!(
             target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            module = package,
+            functions = addressable,
             hot_functions = annotated,
             "per-function hot patching armed"
         );

@@ -34,8 +34,6 @@ mod build_runner;
 /// Project-module configuration shared by every host frontend.
 mod config;
 /// ANSI console helpers for the hot-reload log (colors, VT enabling).
-#[cfg(feature = "hot_reload")]
-mod console;
 /// C# development tooling over `pill_csharp_bridge`: mirror generation and the
 /// in-process compiler, plus the bridge items the host names.
 ///

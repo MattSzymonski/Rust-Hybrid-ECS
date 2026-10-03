@@ -388,7 +388,8 @@ impl Engine {
                     // due, so a stalled frame does not leave a backlog that
                     // prints several reports in a row to catch up.
                     next_report = Some(elapsed + interval);
-                    println!(
+                    pill_core::info!(
+                        target: pill_core::telemetry::telemetry_target::ECS,
                         "{}",
                         crate::diagnostics::EcsSnapshot::gather(world).render()
                     );

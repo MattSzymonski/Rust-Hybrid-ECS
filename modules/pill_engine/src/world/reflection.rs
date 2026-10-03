@@ -229,19 +229,26 @@ impl World {
         }
     }
 
-    /// Print information about all archetypes in the world
+    /// Log information about all archetypes in the world, as one multi-line
+    /// entry.
     ///
     /// This displays the component types and entity count for each archetype,
     /// useful for debugging and understanding the current state of the ECS.
     pub fn print_archetypes(&self) {
-        println!(
-            "\n=== World Archetypes (Total: {}) ===",
-            self.archetypes.len()
+        let mut lines: Vec<String> = self
+            .archetypes
+            .values()
+            .map(|archetype| archetype.get_archetype_info(&self.component_registry))
+            .collect();
+        lines.push(format!("Total entities: {}", self.entity_locations.len()));
+        pill_core::info!(
+            target: pill_core::telemetry::telemetry_target::ECS,
+            "{}",
+            pill_core::telemetry::log_block(
+                &format!("World archetypes (total: {})", self.archetypes.len()),
+                lines
+            )
         );
-        for (_, archetype) in self.archetypes.iter() {
-            archetype.print_info(&self.component_registry);
-        }
-        println!("Total entities: {}", self.entity_locations.len());
     }
 
     /// Estimate the total memory footprint of the world in bytes.

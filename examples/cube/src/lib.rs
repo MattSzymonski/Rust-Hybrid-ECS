@@ -15,10 +15,12 @@
 //! created - so a hot reload re-running `init` finds the live scene instead of
 //! failing on names that are already taken.
 
-use pill_engine::{pill_project, AssetManager, Engine, Handle, Query, Res, SystemError, Time, World};
+use pill_engine::{
+    pill_project, AssetManager, Engine, Handle, Query, Res, SystemError, Time, World,
+};
 use pill_master_renderer_data::{
-    config::simple_pipeline, CameraComponent, Material, Mesh, MeshRendererComponent,
-    MeshVertex, RenderingManager, Shader, TransformComponent,
+    config::simple_pipeline, CameraComponent, Material, Mesh, MeshRendererComponent, MeshVertex,
+    RenderingManager, Shader, TransformComponent,
 };
 
 /// Asset names, also what makes setup idempotent.
@@ -45,12 +47,12 @@ pub fn init(engine: &mut Engine) -> u32 {
     let (mesh, material) = match create_assets(engine.world_mut()) {
         Ok(assets) => assets,
         Err(error) => {
-            eprintln!("[cube] asset setup failed: {error}");
+            pill_engine::tracing::error!("asset setup failed: {error}");
             return 1;
         }
     };
     if let Err(error) = create_scene(engine.world_mut(), &mesh, &material) {
-        eprintln!("[cube] scene creation failed: {error}");
+        pill_engine::tracing::error!("scene creation failed: {error}");
         return 1;
     }
 
@@ -109,7 +111,11 @@ fn create_scene(
     mesh: &Handle<Mesh>,
     material: &Handle<Material>,
 ) -> Result<(), String> {
-    if Query::<&CameraComponent>::new(world).iter_mut().next().is_none() {
+    if Query::<&CameraComponent>::new(world)
+        .iter_mut()
+        .next()
+        .is_none()
+    {
         world
             .create_entity()
             .with(CameraComponent::default())
@@ -193,8 +199,7 @@ fn cube_mesh(size: f32) -> Mesh {
         let bitangent = normal.cross(tangent);
         let first = vertices.len() as u32;
         for ((along_tangent, along_bitangent), texture_coordinates) in corners {
-            let position =
-                (normal + tangent * along_tangent + bitangent * along_bitangent) * half;
+            let position = (normal + tangent * along_tangent + bitangent * along_bitangent) * half;
             vertices.push(MeshVertex {
                 position: position.to_array(),
                 texture_coordinates,

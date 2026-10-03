@@ -125,10 +125,10 @@ fn display_system(
     let t = time.get().unwrap();
     let s = score.get().unwrap();
 
-    println!("--- Frame stats @ {:.3}s ---", t.elapsed);
-    println!("  score: {:>5}", s.0);
+    pill_core::info!("--- Frame stats @ {:.3}s ---", t.elapsed);
+    pill_core::info!("  score: {:>5}", s.0);
     for (entity, pos) in query.iter_mut() {
-        println!("  entity {:?} at ({:.1}, {:.1})", entity, pos.x, pos.y);
+        pill_core::info!("  entity {:?} at ({:.1}, {:.1})", entity, pos.x, pos.y);
     }
 }
 
@@ -139,7 +139,10 @@ fn display_system(
 /// Entry point: builds the demo world, registers components, resources, and
 /// systems, then runs a few frames to show the scheduler's batch splitting.
 fn main() {
-    println!("=== Resources + Components Demo ===\n");
+    // Route this program's output, and the engine's own reports, through
+    // the engine logger.
+    let _ = pill_core::telemetry::TelemetryBuilder::new().init();
+    pill_core::info!("=== Resources + Components Demo ===");
 
     let mut engine = Engine::new();
     engine.set_parallel_execution(true);
@@ -197,5 +200,5 @@ fn main() {
         engine.process_frame().unwrap();
     }
 
-    println!("\nDemo complete!");
+    pill_core::info!("Demo complete!");
 }

@@ -229,7 +229,7 @@ fn collision_and_movement_system(
         static FRAME_COUNTER: AtomicUsize = AtomicUsize::new(0);
         let frame = FRAME_COUNTER.fetch_add(1, Ordering::Relaxed);
         if frame == 0 {
-            println!("Parallel batch stats: {}", stats);
+            pill_core::info!("Parallel batch stats: {}", stats);
         }
     }
 }
@@ -248,11 +248,13 @@ fn simulation_tracker_system(mut stats: ResMut<SimulationStats>) {
             // Calculate results
             let total_checks = stats.entity_count * stats.max_frames as usize * 5; // 5 colliders
 
-            println!(
+            pill_core::info!(
                 "Entities: {} Frames: {}, Colliders: {}",
-                stats.entity_count, stats.max_frames, 5
+                stats.entity_count,
+                stats.max_frames,
+                5
             );
-            println!(
+            pill_core::info!(
                 "Total collision checks: {}, Checks per second: {:.0}",
                 total_checks,
                 total_checks as f64 / duration.as_secs_f64()
@@ -270,12 +272,15 @@ fn simulation_tracker_system(mut stats: ResMut<SimulationStats>) {
 /// Registers the component types, spawns the obstacle and moving entities,
 /// inserts the simulation resource, and drives the simulation to completion.
 fn main() {
-    println!("=== Stress Test: Archetype-Based ECS ===\n");
+    // Route this program's output, and the engine's own reports, through
+    // the engine logger.
+    let _ = pill_core::telemetry::TelemetryBuilder::new().init();
+    pill_core::info!("=== Stress Test: Archetype-Based ECS ===");
 
     // Step 1: Create the engine and report the available Rayon threads.
     let mut engine = Engine::new();
 
-    println!("Rayon threads: {}", rayon::current_num_threads());
+    pill_core::info!("Rayon threads: {}", rayon::current_num_threads());
 
     // Register all component types before use
     engine.world_mut().register_component::<Transform>();
@@ -288,7 +293,7 @@ fn main() {
     engine.register_system("simulation_tracker", simulation_tracker_system);
 
     // Step 2: Create obstacle entity with multiple box colliders
-    println!("Creating obstacle with 5 box colliders...");
+    pill_core::info!("Creating obstacle with 5 box colliders...");
 
     // Create a BoxCollider with 5 different colliders
     let mut box_collider = BoxCollider::new();
@@ -307,11 +312,11 @@ fn main() {
         .build()
         .unwrap();
 
-    println!("✓ Created obstacle entity with 5 box colliders");
+    pill_core::info!("✓ Created obstacle entity with 5 box colliders");
 
     // Step 3: Create moving entities
     let entity_count = 10_000;
-    println!("Creating {} moving entities...", entity_count);
+    pill_core::info!("Creating {} moving entities...", entity_count);
 
     for i in 0..entity_count {
         let angle = (i as f32 / entity_count as f32) * std::f32::consts::PI * 2.0;
@@ -324,10 +329,10 @@ fn main() {
             .unwrap();
     }
 
-    println!("✓ Created {} moving entities", entity_count);
-    println!("\nScenario: Entities move toward obstacle with 5 box colliders");
-    println!("Collision check: Query-based iteration");
-    println!("\nRunning 10,000 frame simulation...\n");
+    pill_core::info!("✓ Created {} moving entities", entity_count);
+    pill_core::info!("Scenario: Entities move toward obstacle with 5 box colliders");
+    pill_core::info!("Collision check: Query-based iteration");
+    pill_core::info!("Running 10,000 frame simulation...");
 
     // Step 4: Set up simulation stats as resource
     let max_frames = 10_000;

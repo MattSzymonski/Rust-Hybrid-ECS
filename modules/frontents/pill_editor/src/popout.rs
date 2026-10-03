@@ -91,7 +91,7 @@ pub(crate) fn open_panel_window(
         config = config
             .with_on_window(move |window, _| {
                 if let Err(error) = editor.attach_detached_scene(window) {
-                    eprintln!("[editor] Could not attach detached Scene renderer: {error}");
+                    pill_core::warn!(target: pill_core::telemetry::telemetry_target::ENGINE, "Could not attach detached Scene renderer: {error}");
                 }
             })
             .with_as_child_window();
@@ -231,7 +231,7 @@ fn finalize_popout(
     }
     if panel == PanelKind::Scene {
         if let Err(error) = editor.reattach_main_scene(window_id) {
-            eprintln!("[editor] Could not restore the main Scene renderer: {error}");
+            pill_core::warn!(target: pill_core::telemetry::telemetry_target::ENGINE, "Could not restore the main Scene renderer: {error}");
         }
     }
     popouts.request_redock(panel);

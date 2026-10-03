@@ -907,13 +907,15 @@ pub enum TelemetryError {
 ///
 /// The terminal formatter prints any message with a line break as a block:
 /// the time, level and target alone on the first line, then the message from
-/// the left edge.
+/// the left edge. The block ends with a line break, so an empty line separates
+/// it from the next log entry.
 ///
 /// ```text
 /// [21:51:45:003] INFO  engine::hot_reload
 /// Modules to build:
 /// 1. pill_spline  extension
 /// 2. project      project
+///
 /// ```
 ///
 /// Pass the result to any logging macro: `info!(target: ..., "{}", block)`.
@@ -924,7 +926,7 @@ pub enum TelemetryError {
 /// use pill_core::telemetry::log_block;
 ///
 /// let block = log_block("Modules to build:", ["1. pill_spline", "2. project"]);
-/// assert_eq!(block, "Modules to build:\n1. pill_spline\n2. project");
+/// assert_eq!(block, "Modules to build:\n1. pill_spline\n2. project\n");
 /// ```
 pub fn log_block<I, S>(heading: &str, lines: I) -> String
 where
@@ -1205,9 +1207,10 @@ mod tests {
             lines[0].starts_with("INFO  engine::hot_reload  total=2"),
             "{output}"
         );
+        // The trailing empty line is the block's own closing line break.
         assert_eq!(
             lines[1..],
-            ["Modules to build:", "1. pill_spline", "2. project"]
+            ["Modules to build:", "1. pill_spline", "2. project", ""]
         );
     }
 
