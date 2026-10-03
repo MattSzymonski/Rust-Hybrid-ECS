@@ -51,6 +51,7 @@ use pill_engine::{Engine, SystemOwner};
 
 // Current crate
 use crate::registration::{extension_owner, register_scoped, PROJECT_SCOPE};
+use crate::LoggingSettings;
 
 // =============================================================================
 // Types
@@ -166,6 +167,39 @@ pub struct StaticProject {
     ///
     /// `None` for a project without a `res` directory.
     pub asset_pack: Option<&'static [u8]>,
+    /// The `logging:` section of the project's settings, as the bundle
+    /// generator validated it; [`StaticLogging::NONE`] for none.
+    pub logging: StaticLogging,
+}
+
+/// A project's logging settings, compiled into the binary as text.
+///
+/// Text rather than levels so the generated bundle needs nothing but string
+/// literals; [`Self::settings`] reads it into [`LoggingSettings`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct StaticLogging {
+    /// The `level:` key, when the settings set one.
+    pub level: Option<&'static str>,
+    /// The `targets:` map, as `(target, level)` pairs in file order.
+    pub targets: &'static [(&'static str, &'static str)],
+}
+
+impl StaticLogging {
+    /// No logging settings: the engine's defaults apply.
+    pub const NONE: Self = Self {
+        level: None,
+        targets: &[],
+    };
+
+    /// The settings this text describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first level or target that does not read, which only a
+    /// hand-edited bundle can hold: the generator refuses both.
+    pub fn settings(&self) -> Result<LoggingSettings, String> {
+        LoggingSettings::from_text(self.level, self.targets)
+    }
 }
 
 // =============================================================================
@@ -365,6 +399,7 @@ mod tests {
             modules: MODULES,
             renderer: None,
             asset_pack: None,
+            logging: StaticLogging::NONE,
         };
         project.initialize(&mut engine).expect("both succeed");
 
@@ -393,6 +428,7 @@ mod tests {
             modules: MODULES,
             renderer: None,
             asset_pack: None,
+            logging: StaticLogging::NONE,
         };
         let Err(error) = project.initialize(&mut engine) else {
             panic!("a non-zero module status must be reported");
@@ -415,6 +451,7 @@ mod tests {
             modules: &[],
             renderer: None,
             asset_pack: None,
+            logging: StaticLogging::NONE,
         };
         let guard = project.initialize(&mut engine).expect("it succeeds");
         assert!(guard.is_none());
@@ -443,6 +480,7 @@ mod tests {
             modules: MODULES,
             renderer: None,
             asset_pack: None,
+            logging: StaticLogging::NONE,
         };
         let guard = project.initialize(&mut engine).expect("it succeeds");
 

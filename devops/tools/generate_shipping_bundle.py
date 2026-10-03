@@ -167,6 +167,61 @@ def load_renderer(project_root: Path):
     return None if name == NO_RENDERER else name
 
 
+# The log levels the `logging:` section accepts, as `pill_runtime::LoggingSettings`
+# reads them.
+LOG_LEVELS = {"off", "error", "warn", "info", "debug", "trace"}
+
+
+def check_log_level(settings_path: Path, where: str, level) -> str:
+    """Returns `level` lowercased, or raises ValueError naming `where`."""
+    text = str(level).strip().lower()
+    if text not in LOG_LEVELS:
+        raise ValueError(
+            f"{settings_path}: `logging:` {where} has level `{level}`; use "
+            "off, error, warn, info, debug or trace"
+        )
+    return text
+
+
+def load_logging(project_root: Path):
+    """Loads the `logging:` section as (level or None, [(target, level), ...]).
+
+    Validated here exactly as the development host validates it, so the
+    generated bundle only ever carries settings the runtime can read. Raises
+    ValueError on an unknown key, level, or target.
+    """
+    settings_path = project_root / PROJECT_SETTINGS_FILE_NAME
+    with settings_path.open(encoding="utf-8") as handle:
+        data = yaml.safe_load(handle) or {}
+    section = data.get("logging") or {}
+    if not isinstance(section, dict):
+        raise ValueError(f"{settings_path}: `logging:` must be a mapping")
+    unknown = set(section) - {"level", "targets"}
+    if unknown:
+        raise ValueError(f"{settings_path}: `logging:` has unknown keys {sorted(unknown)}")
+    level = section.get("level")
+    level = None if level is None else check_log_level(settings_path, "`level`", level)
+    targets = []
+    for target, target_level in (section.get("targets") or {}).items():
+        target = str(target)
+        if not target or not all(c.isascii() and (c.isalnum() or c in "_-.:") for c in target):
+            raise ValueError(f"{settings_path}: `logging:` target `{target}` is not a log target")
+        targets.append((target, check_log_level(settings_path, f"target `{target}`", target_level)))
+    # The host reads the targets into a sorted map; the bundle keeps that order.
+    targets.sort()
+    return level, targets
+
+
+def build_logging_literal(logging) -> str:
+    """Renders the `StaticLogging` expression for `(level, targets)`."""
+    level, targets = logging
+    if level is None and not targets:
+        return "StaticLogging::NONE"
+    level_text = "None" if level is None else f'Some("{level}")'
+    pairs = ", ".join(f'("{target}", "{target_level}")' for target, target_level in targets)
+    return f"StaticLogging {{ level: {level_text}, targets: &[{pairs}] }}"
+
+
 def modules_with_renderer_data(renderer, modules: list) -> list:
     """Puts the renderer's data crate first in the module list, once."""
     if renderer is None:
@@ -434,18 +489,27 @@ def build_library_source(
     rid: str = "win-x64",
     renderer=None,
     packs_assets: bool = False,
+    logging=(None, []),
 ) -> str:
     """Builds the generated bundle's src/lib.rs text.
 
     `renderer` is the GPU crate a windowed build links, or None.
     `packs_assets` embeds the asset pack the build script wrote.
+    `logging` is the validated `logging:` section, from `load_logging`.
     """
     lines = [
         "//! Generated shipping bundle - do not edit. Regenerated from",
         "//! the project's `project_settings.yaml` by",
         "//! `devops/tools/generate_shipping_bundle.py`.",
+        "//!",
+        "//! # Responsibilities",
+        "//!",
+        "//! - Link the project, its modules and its renderer into one binary, and",
+        "//!   describe them as the `StaticProject` the shipping frontends run.",
         "",
-        "use pill_runtime::{StaticModule, StaticProject, StaticProjectBackend, StaticRenderer};",
+        "use pill_runtime::{",
+        "    StaticLogging, StaticModule, StaticProject, StaticProjectBackend, StaticRenderer,",
+        "};",
         "",
         "/// Every selected extension: the renderer's data crate first, then",
         "/// `project_settings.yaml` order.",
@@ -527,6 +591,12 @@ def build_library_source(
     lines += [
         "}",
         "",
+        "/// The `logging:` section of `project_settings.yaml`.",
+        # Skipped for the same reason as the module list: one generated line,
+        # whatever its length, rather than whatever shape rustfmt would pick.
+        "#[rustfmt::skip]",
+        f"const LOGGING: StaticLogging = {build_logging_literal(logging)};",
+        "",
         "/// The complete shipping project: modules first, then the project.",
         "pub fn static_project() -> StaticProject {",
         "    StaticProject {",
@@ -541,6 +611,7 @@ def build_library_source(
             if packs_assets
             else "        asset_pack: None,"
         ),
+        "        logging: LOGGING,",
         "    }",
         "}",
     ]
@@ -783,6 +854,7 @@ def main() -> int:
         rid=rid,
         renderer=linked_renderer,
         packs_assets=packs_assets,
+        logging=load_logging(project_root),
     )
     wrote_manifest = write_if_changed(
         bundle_directory / PROJECT_MANIFEST_FILE_NAME, cargo_manifest

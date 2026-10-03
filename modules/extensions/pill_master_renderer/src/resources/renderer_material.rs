@@ -9,10 +9,11 @@
 //! - Pack uniform values one 16-byte slot each, in the order the shader
 //!   declares them. A pass packs through the same two functions, so the two
 //!   cannot drift apart on what they hand a shader.
-//! - Fall back to the renderer's default color and normal textures for slots
-//!   a material leaves unbound, and refuse a depth slot instead of filling
+//! - Fall back to the renderer's default texture for a slot's type when a
+//!   material leaves it unbound, and refuse a depth slot instead of filling
 //!   it: depth belongs to a pass, the only thing that can hand it to a
-//!   shader.
+//!   shader. A texture whose shape (2D or cube) differs from its slot's is
+//!   refused by name.
 //!
 //! # Design
 //!
@@ -33,11 +34,11 @@ use pill_core::{debug, PillStyle};
 
 // Current crate
 use crate::{
-    assets::{
-        MaterialParameter, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot, TextureType,
-    },
+    assets::{MaterialParameter, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot},
     error::{capturing_validation, RendererError, Result},
-    resources::{RendererResourceStorage, RendererShaderHandle, RendererTextureHandle},
+    resources::{
+        check_slot_shape, RendererResourceStorage, RendererShaderHandle, RendererTextureHandle,
+    },
 };
 
 // --- Handle ---
@@ -305,21 +306,17 @@ impl RendererMaterial {
                 }
                 None => {
                     debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Material texture slot {} not found in material textures, using default texture", slot_name.name_style());
-                    match slot.texture_type {
-                        TextureType::Color => rendering_resource_storage.default_color_texture,
-                        TextureType::Normal => rendering_resource_storage.default_normal_texture,
-                        // A material has no depth to give: only the renderer's own
-                        // buffer holds any, and a pass is what reads it. A
-                        // material shader that asks for depth is a mistake worth
-                        // naming rather than a slot quietly filled with white.
-                        TextureType::Depth => {
-                            return Err(RendererError::Other {
-                                detail: format!(
-                                    "material `{name}` declares texture slot `{slot_name}` as depth, which only a pass can read"
-                                ),
-                            });
-                        }
-                    }
+                    // A material has no depth to give: only the renderer's own
+                    // buffer holds any, and a pass is what reads it. A
+                    // material shader that asks for depth is a mistake worth
+                    // naming rather than a slot quietly filled with white.
+                    rendering_resource_storage
+                        .default_texture_for(slot.texture_type)
+                        .ok_or_else(|| RendererError::Other {
+                            detail: format!(
+                                "material `{name}` declares texture slot `{slot_name}` as depth, which only a pass can read"
+                            ),
+                        })?
                 }
             };
 
@@ -327,6 +324,12 @@ impl RendererMaterial {
                 .textures
                 .get(renderer_texture_handle)
                 .unwrap();
+            check_slot_shape(
+                &format!("material `{name}`"),
+                slot_name,
+                slot.texture_type,
+                texture,
+            )?;
 
             // Add texture view entry
             entries.push(wgpu::BindGroupEntry {

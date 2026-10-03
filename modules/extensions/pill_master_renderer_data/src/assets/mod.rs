@@ -41,7 +41,10 @@ pub use shader::{parameter_slots_by_name, texture_slots_by_name};
 pub use shader::{
     Shader, ShaderBuilder, ShaderParameterSlot, ShaderParameterType, ShaderTextureSlot,
 };
-pub use texture::{Texture, TextureImportSettings, TextureType};
+pub use texture::{
+    cube_face_direction, equirect_uv, project_equirect_to_cubemap, Texture, TextureImportSettings,
+    TextureType,
+};
 
 use pill_engine::{Asset, Handle};
 

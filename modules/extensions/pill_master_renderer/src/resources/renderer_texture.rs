@@ -4,8 +4,9 @@
 //!
 //! - Own the texture, view, and sampler triple behind every texture handle,
 //!   so a resource that exists is complete ([`RendererTexture`]).
-//! - Turn decoded RGBA bytes into a texture under the asset's name
-//!   ([`RendererTexture::new_texture`]).
+//! - Turn decoded texels into a texture under the asset's name
+//!   ([`RendererTexture::new_texture`]): RGBA8 colour and normal maps, a
+//!   half-float equirectangular panorama, or a six-face half-float cubemap.
 //! - Create offscreen colour targets at a caller-chosen format, and the
 //!   surface-sized depth buffer ([`RendererTexture::new_render_target`],
 //!   [`RendererTexture::new_depth_texture`]).
@@ -40,6 +41,10 @@ pub struct RendererTexture {
     pub texture: wgpu::Texture,
     pub texture_view: wgpu::TextureView,
     pub sampler: wgpu::Sampler,
+    /// How the view is shaped: a 2D image, or a cube. A texture slot declares
+    /// the same, and binding one to the other is refused by name rather than
+    /// left to wgpu's validation message.
+    pub view_dimension: wgpu::TextureViewDimension,
 }
 
 impl RendererTexture {
@@ -50,18 +55,21 @@ impl RendererTexture {
     /// constructor that creates it.
     pub const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
-    /// Creates a texture, view, and sampler from decoded RGBA pixels.
+    /// Creates a texture, view, and sampler from decoded texels.
     ///
     /// This is how project images become GPU resources: the bytes are
     /// uploaded at construction, so a failure is reported against the asset
     /// being loaded. `name` labels the texture and the errors that mention it.
+    /// The bytes are laid out as the texture asset's are for `texture_type`:
+    /// RGBA8 for colour and normal maps, RGBA half floats for an environment,
+    /// and a cubemap's six faces one after another.
     ///
     /// # Errors
     ///
     /// Returns [`crate::error::RendererError::Other`] naming the asset when
-    /// `rgba` does not carry `width * height * 4` bytes, when `texture_type`
-    /// is [`TextureType::Depth`] rather than an image, or when the driver
-    /// refuses the texture, the upload, or the sampler.
+    /// `rgba` does not carry the bytes the size and type call for, when
+    /// `texture_type` is [`TextureType::Depth`] rather than an image, or when
+    /// the driver refuses the texture, the upload, or the sampler.
     pub fn new_texture(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -75,28 +83,34 @@ impl RendererTexture {
         // `write_texture` fail validation, which would reach the
         // uncaptured-error handler as a panic instead of naming the asset;
         // check it here, where the name is still at hand.
-        let expected_bytes = width as usize * height as usize * 4;
+        let layers = texture_type.layer_count();
+        let bytes_per_texel = texture_type.bytes_per_texel() as u32;
+        let expected_bytes =
+            width as usize * height as usize * bytes_per_texel as usize * layers as usize;
         if rgba.len() != expected_bytes {
             return Err(crate::error::RendererError::Other {
                 detail: format!(
-                    "texture `{}` declares {width}x{height} but carries {} bytes of RGBA data (expected {expected_bytes})",
+                    "texture `{}` declares {width}x{height} {texture_type:?} but carries {} bytes (expected {expected_bytes})",
                     name.unwrap_or("<unnamed>"),
                     rgba.len()
                 ),
             });
         }
 
-        // Get size
+        // Get size: a cubemap is six layers of one square face.
         let size = wgpu::Extent3d {
             width,
             height,
-            depth_or_array_layers: 1,
+            depth_or_array_layers: layers,
         };
 
         // Specify texture format
         let format = match texture_type {
             TextureType::Color => wgpu::TextureFormat::Rgba8UnormSrgb,
             TextureType::Normal => wgpu::TextureFormat::Rgba8Unorm,
+            // Half floats: an environment's range runs well past 1.0, and this
+            // is the widest float format every backend filters.
+            TextureType::Equirect | TextureType::Cubemap => wgpu::TextureFormat::Rgba16Float,
             // A file has no way to carry depth, so an asset that says it does is
             // a mistake the caller should hear about rather than a texture with
             // the wrong channels.
@@ -139,7 +153,7 @@ impl RendererTexture {
                 rgba,
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(4 * width),
+                    bytes_per_row: Some(bytes_per_texel * width),
                     rows_per_image: Some(height),
                 },
                 size,
@@ -147,17 +161,35 @@ impl RendererTexture {
         })
         .map_err(|detail| texture_failure(name, "upload", detail))?;
 
-        // Create texture view
-        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        // Create texture view: a cubemap's six layers are one cube to a shader.
+        let view_dimension = match texture_type {
+            TextureType::Cubemap => wgpu::TextureViewDimension::Cube,
+            _ => wgpu::TextureViewDimension::D2,
+        };
+        let texture_view = texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(view_dimension),
+            ..Default::default()
+        });
 
         // Create sampler. Filtering is consistent in both directions and the
         // texture carries no mip levels, so nearest and linear only differ in
         // how a minified texel is chosen; linear is what magnification uses.
+        // Images tile; a panorama wraps around its seam but stops at its poles;
+        // a cube's faces stop at their own edges, where the hardware crosses to
+        // the next face.
+        let (address_u, address_v) = match texture_type {
+            TextureType::Equirect => (wgpu::AddressMode::Repeat, wgpu::AddressMode::ClampToEdge),
+            TextureType::Cubemap => (
+                wgpu::AddressMode::ClampToEdge,
+                wgpu::AddressMode::ClampToEdge,
+            ),
+            _ => (wgpu::AddressMode::Repeat, wgpu::AddressMode::Repeat),
+        };
         let sampler = capturing_validation(device, || {
             device.create_sampler(&wgpu::SamplerDescriptor {
-                address_mode_u: wgpu::AddressMode::Repeat,
-                address_mode_v: wgpu::AddressMode::Repeat,
-                address_mode_w: wgpu::AddressMode::Repeat,
+                address_mode_u: address_u,
+                address_mode_v: address_v,
+                address_mode_w: address_v,
                 mag_filter: wgpu::FilterMode::Linear,
                 min_filter: wgpu::FilterMode::Linear,
                 mipmap_filter: wgpu::FilterMode::Nearest,
@@ -174,6 +206,7 @@ impl RendererTexture {
             texture,
             texture_view,
             sampler,
+            view_dimension,
         })
     }
 
@@ -243,6 +276,7 @@ impl RendererTexture {
             texture,
             texture_view,
             sampler,
+            view_dimension: wgpu::TextureViewDimension::D2,
         })
     }
 
@@ -316,6 +350,7 @@ impl RendererTexture {
             texture,
             texture_view,
             sampler,
+            view_dimension: wgpu::TextureViewDimension::D2,
         })
     }
 }

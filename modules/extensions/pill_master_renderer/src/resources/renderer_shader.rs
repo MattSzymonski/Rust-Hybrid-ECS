@@ -188,19 +188,23 @@ impl RendererShader {
                             wgpu::TextureSampleType::Depth,
                             wgpu::SamplerBindingType::NonFiltering,
                         ),
-                        TextureType::Color | TextureType::Normal => (
+                        TextureType::Color
+                        | TextureType::Normal
+                        | TextureType::Equirect
+                        | TextureType::Cubemap => (
                             wgpu::TextureSampleType::Float { filterable: true },
                             wgpu::SamplerBindingType::Filtering,
                         ),
                     };
 
-                    // Texture binding
+                    // Texture binding: a cubemap slot takes a cube view, which
+                    // is what a shader's `TextureCube` declares.
                     entries.push(wgpu::BindGroupLayoutEntry {
                         binding: texture_slot.texture_binding,
                         visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             multisampled: false,
-                            view_dimension: wgpu::TextureViewDimension::D2,
+                            view_dimension: slot_view_dimension(texture_slot.texture_type),
                             sample_type,
                         },
                         count: None,
@@ -330,4 +334,40 @@ impl RendererShader {
 
         Ok(pipeline)
     }
+}
+
+/// The view shape a texture slot of `texture_type` binds: a cube for a
+/// cubemap, a 2D image for everything else.
+pub(crate) fn slot_view_dimension(texture_type: TextureType) -> wgpu::TextureViewDimension {
+    match texture_type {
+        TextureType::Cubemap => wgpu::TextureViewDimension::Cube,
+        _ => wgpu::TextureViewDimension::D2,
+    }
+}
+
+/// Refuse to bind `texture` to a slot whose view shape differs, naming both.
+///
+/// A cubemap bound where a shader reads a 2D image (or the reverse) would fail
+/// wgpu's bind group validation with a message about view dimensions; this says
+/// which slot and which texture instead, while the names are at hand.
+///
+/// # Errors
+///
+/// Returns [`RendererError::Other`] when the shapes differ.
+pub(crate) fn check_slot_shape(
+    owner: &str,
+    slot_name: &str,
+    slot_type: TextureType,
+    texture: &crate::resources::RendererTexture,
+) -> Result<()> {
+    let expected = slot_view_dimension(slot_type);
+    if texture.view_dimension == expected {
+        return Ok(());
+    }
+    Err(RendererError::Other {
+        detail: format!(
+            "{owner} binds a {:?} texture to slot `{slot_name}`, which its shader declares as {slot_type:?}",
+            texture.view_dimension
+        ),
+    })
 }

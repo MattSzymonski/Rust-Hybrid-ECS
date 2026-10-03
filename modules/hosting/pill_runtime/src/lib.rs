@@ -52,10 +52,10 @@ mod telemetry;
 pub use pill_renderer_api::{RenderViewport, RendererError};
 pub use runtime::{run_one_frame, setup, FrameDriver, FrameReport, Runtime};
 pub use static_project::{
-    ProjectBackend, StaticModule, StaticProject, StaticProjectBackend, StaticRenderer,
-    StaticRendererAttachFn,
+    ProjectBackend, StaticLogging, StaticModule, StaticProject, StaticProjectBackend,
+    StaticRenderer, StaticRendererAttachFn,
 };
-pub use telemetry::init_telemetry;
+pub use telemetry::{apply_logging_settings, init_telemetry, LoggingSettings};
 
 #[cfg(feature = "rendering")]
 pub use error::RenderingError;

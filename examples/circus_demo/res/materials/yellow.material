@@ -1,0 +1,32 @@
+{
+  "format_version": 1,
+  "asset_type": "pill_master_renderer::assets::Material",
+  "guid": "344c4755287b9d75e413c364b299aa75",
+  "asset": {
+    "shader": "8cedb4197c9f26a86708b1cd14399eab",
+    "textures": {},
+    "parameters": {
+      "pbr_base": {
+        "Color": [
+          1.0,
+          0.88,
+          0.0
+        ]
+      },
+      "pbr_emissive": {
+        "Color": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "pbr_metallic": {
+        "Scalar": 0.0
+      },
+      "pbr_roughness": {
+        "Scalar": 0.7
+      }
+    },
+    "rendering_order": 255
+  }
+}

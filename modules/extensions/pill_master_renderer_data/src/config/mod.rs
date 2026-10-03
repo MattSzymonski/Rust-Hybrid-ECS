@@ -47,6 +47,7 @@ pub mod pbr_pipeline;
 pub mod post_processing;
 /// The built-in lit pipeline, the fallback a project can opt into.
 pub mod simple_pipeline;
+pub mod skybox;
 
 /// A cooked WGSL file the renderer's own pipelines are built from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +85,7 @@ pub fn all_shader_sources() -> impl Iterator<Item = &'static ShaderSourceRecord>
         .iter()
         .chain(post_processing::SHADER_SOURCES)
         .chain(simple_pipeline::SHADER_SOURCES)
+        .chain(skybox::SHADER_SOURCES)
 }
 
 /// Instances one draw command covers.

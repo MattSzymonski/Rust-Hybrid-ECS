@@ -1,0 +1,20 @@
+[package]
+name = "circus_demo"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+# `cdylib` for a hot-reloading build, where the host loads this as a DLL.
+# `rlib` so a shipping build can link the project straight into the binary.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+glam = "0.33"
+pill_engine = { path = "../../modules/pill_engine" }
+# The master renderer's data only - components, assets, pipelines. The GPU
+# renderer is the host's. `default-features = false`, as for every extension,
+# keeps its module exports out of this project's DLL.
+pill_master_renderer_data = { path = "../../modules/extensions/pill_master_renderer_data", default-features = false }
+serde = { version = "1", features = ["derive"] }
+
+[features]

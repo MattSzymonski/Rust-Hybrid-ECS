@@ -37,11 +37,16 @@ bytemuck = { version = "1.4", features = ["derive"] }
 indexmap = "2"
 # `jpeg` alongside `png`: the committed helmet asset in `master_renderer_test`
 # ships its PBR maps as JPEG, and re-encoding them to PNG would multiply the
-# committed size for no gain in fidelity.
+# committed size for no gain in fidelity. `hdr` reads Radiance environment maps
+# for skyboxes, whose values run past what an 8-bit image can hold.
 image = { version = "0.25", default-features = false, features = [
     "jpeg",
     "png",
+    "hdr",
 ] }
+# Half floats: equirect and cubemap textures upload as `Rgba16Float`, the widest
+# format every backend can filter, so their texels are packed to `f16` here.
+half = "2"
 tobj = "3"
 
 [features]

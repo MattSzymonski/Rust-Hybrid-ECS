@@ -89,6 +89,10 @@ pub(crate) enum PassPlan<'a> {
         pass_index: usize,
         outputs: Vec<PassOutput<'a>>,
         clear: bool,
+        /// Whether the triangle is tested against the depth buffer: a skybox
+        /// is, so it shows only where no mesh drew; a post-processing step is
+        /// not.
+        tests_depth: bool,
     },
 }
 
@@ -340,7 +344,7 @@ impl ScriptableRenderingPipeline {
                         pass_index,
                     });
                 }
-                PassKind::Fullscreen => {
+                PassKind::Fullscreen | PassKind::Skybox => {
                     let reason = match self.passes.get(index) {
                         Some(PassSlot::Drawable(_)) => None,
                         Some(PassSlot::Unsupported(reason)) => Some(reason.clone()),
@@ -352,6 +356,7 @@ impl ScriptableRenderingPipeline {
                             pass_index: index,
                             outputs,
                             clear: plan.is_empty(),
+                            tests_depth: pass.kind == PassKind::Skybox,
                         }),
                         Some(reason) => self.report_skip(&pass.name, &reason),
                     }
@@ -454,12 +459,24 @@ fn build_pass(
             PassKind::Fullscreen => {
                 PassSlot::Unsupported("it names no shader the renderer loaded".to_owned())
             }
+            // A sky comes from a material; with none, there is nothing to draw.
+            PassKind::Skybox => PassSlot::Unsupported(
+                "it names no material (or shader) the renderer loaded".to_owned(),
+            ),
         };
     };
 
     let Some(shader) = shaders_by_key.get(&shader_key).copied() else {
         return PassSlot::Unsupported("it names no shader the renderer loaded".to_owned());
     };
+    // The depth buffer it tests against is the surface's size, and a render
+    // pass's attachments must all be one size.
+    if pass.kind == PassKind::Skybox && pass.target_scale.max(1) != 1 {
+        return PassSlot::Unsupported(
+            "a skybox tests against the full-size depth buffer, so it cannot write a scaled target"
+                .to_owned(),
+        );
+    }
     let Some(renderer_shader) = chain
         .shader_handles
         .get(&shader_key)
@@ -537,6 +554,7 @@ fn chain_signature(chain: &[ResolvedPass], resource_epoch: u64) -> String {
         signature.push_str(match pass.kind {
             PassKind::Geometry => " geometry",
             PassKind::Fullscreen => " fullscreen",
+            PassKind::Skybox => " skybox",
         });
         match &pass.target {
             PassTarget::Surface => signature.push_str(" surface"),

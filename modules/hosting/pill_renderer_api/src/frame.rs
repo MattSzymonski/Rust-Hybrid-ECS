@@ -44,6 +44,11 @@ pub enum PassKind {
     Geometry,
     /// Draws one fullscreen triangle: the shape post-processing passes take.
     Fullscreen,
+    /// Draws one fullscreen triangle at the far plane, depth-tested against
+    /// what the geometry passes left: a background that shows only where no
+    /// mesh was drawn. Its shader (usually from the pass's material) turns each
+    /// pixel into a view direction and samples a sky by it.
+    Skybox,
 }
 
 /// Where a pass reads from and writes to.

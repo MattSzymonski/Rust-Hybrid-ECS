@@ -20,7 +20,7 @@
 //! callers can correct it directly.
 
 // Standard library
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -619,6 +619,10 @@ pub struct HostConfig {
     /// the project's source assets.
     pub assets: ProjectAssetSettings,
 
+    /// The settings' `logging:` section, validated: the log levels the
+    /// frontend applies over the engine's defaults once the project is read.
+    pub logging: pill_runtime::LoggingSettings,
+
     /// The project's `res` directory, which asset paths are relative to;
     /// `None` when the configuration was not read from a project directory.
     pub asset_directory: Option<PathBuf>,
@@ -635,6 +639,56 @@ pub struct ProjectAssetSettings {
     /// type imports, right after the project starts, and write the metadata
     /// file of each that has none. Development host only.
     pub scan_on_start: bool,
+}
+
+/// The `logging:` section of `project_settings.yaml`, as written.
+///
+/// ```yaml
+/// logging:
+///   level: info                 # every target, replacing the engine's defaults
+///   targets:                    # per target, applied last
+///     engine::rendering: info
+/// ```
+///
+/// Read as text and checked by [`Self::validate`], so a misspelled level is
+/// an error naming it rather than a serde message about an enum.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProjectLoggingSettings {
+    /// One level for every target: `off`, `error`, `warn`, `info`, `debug` or
+    /// `trace`.
+    pub level: Option<String>,
+    /// Per-target levels, by `tracing` target or target prefix.
+    pub targets: BTreeMap<String, String>,
+}
+
+impl ProjectLoggingSettings {
+    /// Check every level and target, and turn them into the runtime's form.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::InvalidLoggingSettings`] naming the first level
+    /// or target that does not read.
+    pub fn validate(&self, path: &Path) -> Result<pill_runtime::LoggingSettings, ConfigError> {
+        let invalid = |details: String| ConfigError::InvalidLoggingSettings {
+            path: path.display().to_string(),
+            details,
+        };
+        let level = self
+            .level
+            .as_deref()
+            .map(pill_runtime::LoggingSettings::parse_level)
+            .transpose()
+            .map_err(invalid)?;
+        let mut targets = Vec::with_capacity(self.targets.len());
+        for (target, level) in &self.targets {
+            pill_runtime::LoggingSettings::check_target(target).map_err(invalid)?;
+            let level = pill_runtime::LoggingSettings::parse_level(level)
+                .map_err(|details| invalid(format!("{target}: {details}")))?;
+            targets.push((target.clone(), level));
+        }
+        Ok(pill_runtime::LoggingSettings { level, targets })
+    }
 }
 
 impl HostConfig {
@@ -705,6 +759,7 @@ impl HostConfig {
         let module_names =
             Self::module_names_with_renderer_data(renderer.as_deref(), &project_settings.modules);
         let extensions = Self::resolve_extensions(&module_names, &extensions_root)?;
+        let logging = project_settings.logging.validate(&settings_path)?;
         Ok(Self {
             name: project_name,
             build_binary_name,
@@ -712,6 +767,7 @@ impl HostConfig {
             extensions,
             renderer,
             assets: project_settings.assets,
+            logging,
             asset_directory: Some(project_root.join(PROJECT_ASSET_DIRECTORY)),
         })
     }
@@ -815,6 +871,7 @@ impl From<ProjectModuleConfig> for HostConfig {
             extensions: Vec::new(),
             renderer: None,
             assets: ProjectAssetSettings::default(),
+            logging: pill_runtime::LoggingSettings::default(),
             asset_directory: None,
         }
     }
@@ -1287,6 +1344,8 @@ struct ProjectSettingsFile {
     renderer: Option<String>,
     /// What the development host does with the project's source assets.
     assets: ProjectAssetSettings,
+    /// Log levels over the engine's defaults.
+    logging: ProjectLoggingSettings,
 }
 
 /// Whether a value is a safe artifact file base: letters, digits, underscores.
@@ -1728,6 +1787,57 @@ serde = { version = "1", features = ["derive"] }
         assert_eq!(settings.name.as_deref(), Some("Bouncing Balls"));
         assert_eq!(settings.build_binary_name.as_deref(), Some("BouncingBalls"));
         assert_eq!(settings.modules, vec!["pill_spline", "pill_dummy_math"]);
+    }
+
+    /// The `logging:` section is optional, reads levels by name, and names a
+    /// level it cannot read.
+    #[test]
+    fn the_logging_section_reads_levels_and_refuses_bad_ones() {
+        use tracing::level_filters::LevelFilter;
+
+        let directory = temp_root().join("project_settings_logging");
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        let header = "name: \"Logging\"\nbuild_binary_name: \"Logging\"\n";
+        let read = |extra: &str| {
+            std::fs::write(
+                directory.join("project_settings.yaml"),
+                format!("{header}{extra}"),
+            )
+            .unwrap();
+            read_project_settings_file(&directory).unwrap().unwrap()
+        };
+        let path = directory.join("project_settings.yaml");
+
+        let absent = read("").logging.validate(&path).unwrap();
+        assert_eq!(absent, pill_runtime::LoggingSettings::default());
+
+        let set = read("logging:\n  level: warn\n  targets:\n    engine::rendering: Info\n")
+            .logging
+            .validate(&path)
+            .unwrap();
+        assert_eq!(set.level, Some(LevelFilter::WARN));
+        assert_eq!(
+            set.targets,
+            vec![("engine::rendering".to_owned(), LevelFilter::INFO)]
+        );
+
+        let error = read("logging:\n  targets:\n    wgpu: loud\n")
+            .logging
+            .validate(&path)
+            .expect_err("an unknown level is refused");
+        assert!(error.to_string().contains("loud"), "{error}");
+
+        std::fs::write(
+            directory.join("project_settings.yaml"),
+            format!("{header}logging:\n  levels: info\n"),
+        )
+        .unwrap();
+        assert!(
+            read_project_settings_file(&directory).is_err(),
+            "a misspelled key is refused"
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     /// The `assets:` section is optional, defaults every key to off, and

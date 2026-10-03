@@ -1,0 +1,8 @@
+{
+  "format_version": 1,
+  "asset_type": "pill_master_renderer::assets::Texture",
+  "guid": "69690a933c4869a4cda3a304edf3cb73",
+  "settings": {
+    "texture_type": "Equirect"
+  }
+}

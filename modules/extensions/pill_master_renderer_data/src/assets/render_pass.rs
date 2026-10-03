@@ -9,7 +9,7 @@
 //!   post-processing - is one of these values, so adding a pass is data the game
 //!   supplies, not a struct someone has to write into the renderer.
 //! - Load a pass from a `.render_pass` file in `res` ([`StandaloneAsset`] with
-//!   [`RenderPassDocument`]), naming its shader and textures by guid.
+//!   [`RenderPassDocument`]), naming its shader, material and textures by guid.
 //!
 //! # Design
 //!
@@ -18,6 +18,12 @@
 //! therefore what a material is to a mesh - the shader plus the values it reads -
 //! and the renderer can drive any pass through the code path it already has for
 //! drawing with a material.
+//!
+//! A pass can also name a [`Material`](crate::Material) outright
+//! ([`RenderPass::material`]): the material supplies the shader, parameters and
+//! textures, and whatever the pass sets itself overrides it. That is how a
+//! skybox pass draws a sky: the sky is a `.material` file an artist edits, and
+//! the pass only says when and where it is drawn.
 
 use std::collections::BTreeMap;
 
@@ -25,7 +31,7 @@ use pill_engine::{Asset, AssetLoadResult, AssetManager, AssetReference, Handle, 
 use serde::{Deserialize, Serialize};
 
 // The pass vocabulary is part of the frame contract, so it lives there.
-use crate::{Shader, Texture};
+use crate::{Material, Shader, Texture};
 use pill_renderer_api::frame::{CullMode, MaterialParameter, PassKind, PassTarget};
 
 /// One pass in a [`RenderingPipeline`](crate::RenderingPipeline).
@@ -42,6 +48,11 @@ pub struct RenderPass {
     /// Shader the pass draws with. [`Handle::INVALID`] selects the renderer's
     /// built-in pass shader.
     pub shader: Handle<Shader>,
+    /// Material the pass draws with: its shader, parameters and textures, under
+    /// whatever this pass sets itself. [`Handle::INVALID`] names none.
+    ///
+    /// A [`PassKind::Skybox`] pass takes its sky from here.
+    pub material: Handle<Material>,
     /// Uniform parameters, packed exactly as a material packs its own: one
     /// 16-byte slot each, in the order the shader declares them.
     pub parameters: BTreeMap<String, MaterialParameter>,
@@ -98,6 +109,7 @@ impl RenderPass {
         Self {
             name: name.into(),
             shader: Handle::INVALID,
+            material: Handle::INVALID,
             parameters: BTreeMap::new(),
             textures: BTreeMap::new(),
             inputs: BTreeMap::new(),
@@ -116,6 +128,12 @@ impl RenderPass {
     /// Set the shader the pass draws with.
     pub fn with_shader(mut self, shader: Handle<Shader>) -> Self {
         self.shader = shader;
+        self
+    }
+
+    /// Draw with a material's shader, parameters and textures.
+    pub fn with_material(mut self, material: Handle<Material>) -> Self {
+        self.material = material;
         self
     }
 
@@ -205,6 +223,8 @@ impl RenderPass {
 pub struct RenderPassDocument {
     /// See [`RenderPass::shader`]; unset for the built-in shader.
     pub shader: AssetReference<Shader>,
+    /// See [`RenderPass::material`]; unset for none.
+    pub material: AssetReference<Material>,
     /// See [`RenderPass::parameters`].
     pub parameters: BTreeMap<String, MaterialParameter>,
     /// See [`RenderPass::textures`].
@@ -237,6 +257,7 @@ impl Default for RenderPassDocument {
         let pass = RenderPass::new(String::new());
         Self {
             shader: AssetReference::unset(),
+            material: AssetReference::unset(),
             parameters: pass.parameters,
             textures: BTreeMap::new(),
             inputs: pass.inputs,
@@ -270,6 +291,7 @@ impl StandaloneAsset for RenderPass {
         Ok(Self {
             name: name.to_owned(),
             shader: document.shader.resolve(assets),
+            material: document.material.resolve(assets),
             parameters: document.parameters,
             textures,
             inputs: document.inputs,
