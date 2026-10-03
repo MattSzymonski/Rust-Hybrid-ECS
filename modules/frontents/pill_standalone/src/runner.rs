@@ -23,11 +23,11 @@ use std::sync::Arc;
 
 // External crates
 #[cfg(feature = "rendering")]
-use pill_core::error;
-#[cfg(feature = "rendering")]
 use pill_core::telemetry::telemetry_target;
 #[cfg(feature = "rendering")]
 use pill_core::utils::format_error_chain;
+#[cfg(feature = "rendering")]
+use pill_core::{error, info};
 #[cfg(feature = "rendering")]
 use pill_input::gamepads::Gamepads;
 #[cfg(feature = "rendering")]
@@ -151,7 +151,7 @@ impl ApplicationHandler for WindowedApplication {
                 // line of its own: without it, a shutdown that follows a window
                 // close looks exactly like one that follows a failure in the
                 // frame path - both are an event loop that simply stopped.
-                println!("[host] Close requested; leaving the event loop.");
+                info!(target: telemetry_target::ENGINE, "Close requested; leaving the event loop");
                 event_loop.exit();
             }
             WindowEvent::Resized(size) => {
@@ -204,7 +204,7 @@ impl WindowedApplication {
                 window.set_visible(true);
                 self.window_shown = true;
                 window.request_redraw();
-                println!("[host] First frame presented; window shown.");
+                info!(target: telemetry_target::ENGINE, "First frame presented; window shown");
             }
             Err(source) => {
                 // Step 4: Rendering failed before the window was shown; report
@@ -276,7 +276,6 @@ impl WindowedApplication {
 #[cfg(feature = "rendering")]
 fn report_failure(context: &str, error: &(dyn std::error::Error + 'static)) {
     let cause_chain = format_error_chain(error);
-    eprintln!("[host] {context} failed: {cause_chain}");
     error!(
         target: telemetry_target::ENGINE,
         error = %cause_chain,
@@ -297,9 +296,9 @@ fn report_failure(context: &str, error: &(dyn std::error::Error + 'static)) {
 /// is killed, so it never tears the driver down.
 #[cfg(feature = "rendering")]
 fn teardown<T>(state: T) {
-    println!("[host] Shutting down.");
+    info!(target: telemetry_target::ENGINE, "Shutting down");
     drop(state);
-    println!("[host] Shutdown complete.");
+    info!(target: telemetry_target::ENGINE, "Shutdown complete");
 }
 
 /// Run `driver` frame after frame, printing each report.

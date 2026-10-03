@@ -263,10 +263,6 @@ impl Runtime {
         if self.last_frame_error.as_deref() == Some(signature.as_str()) {
             self.suppressed_error_count += 1;
             if now.duration_since(self.last_error_report) >= FRAME_ERROR_REPORT_INTERVAL {
-                eprintln!(
-                    "[host] Frame error ({} more occurrences): {signature}",
-                    self.suppressed_error_count
-                );
                 error!(
                     target: telemetry_target::ENGINE,
                     suppressed = self.suppressed_error_count,
@@ -277,7 +273,6 @@ impl Runtime {
             }
             return;
         }
-        eprintln!("[host] Frame error: {signature}");
         error!(target: telemetry_target::ENGINE, "frame error: {signature}");
         self.last_frame_error = Some(signature);
         self.suppressed_error_count = 0;

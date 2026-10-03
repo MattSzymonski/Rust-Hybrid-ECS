@@ -21,6 +21,7 @@
 use std::collections::BTreeMap;
 
 // External crates
+use pill_core::warn;
 use pill_engine::{AssetManager, Component, Entity, Handle, Query, Res, ResMut, SystemError};
 pub use pill_renderer_api::frame::{
     CullMode, PassKind, PassTarget, RenderFrame, RenderInstance, ResolvedPass,
@@ -50,8 +51,9 @@ fn resolve_passes(
         // keeps the frame drawing either way, and naming the case keeps the
         // log from reading as if the game never asked for a chain.
         if handle.is_some() {
-            println!(
-                "[render] The pipeline the manager holds no longer resolves; running the built-in pass"
+            warn!(
+                target: pill_core::telemetry::telemetry_target::RENDERING,
+                "The pipeline the manager holds no longer resolves; running the built-in pass"
             );
         }
         return vec![ResolvedPass::builtin()];
@@ -90,8 +92,9 @@ fn resolve_passes(
                             .map(|(slot, binding)| (slot.clone(), asset_key(binding.texture))),
                     );
                 }
-                None => println!(
-                    "[render] Pass {} names a material that is not loaded",
+                None => warn!(
+                    target: pill_core::telemetry::telemetry_target::RENDERING,
+                    "Pass {} names a material that is not loaded",
                     pass.name
                 ),
             }
@@ -120,8 +123,9 @@ fn resolve_passes(
         });
     }
     if stale_handles > 0 {
-        println!(
-            "[render] Pass chain: {stale_handles} of {} pass handles no longer resolve and are left out",
+        warn!(
+            target: pill_core::telemetry::telemetry_target::RENDERING,
+            "Pass chain: {stale_handles} of {} pass handles no longer resolve and are left out",
             pipeline.passes.len()
         );
     }
@@ -138,8 +142,9 @@ fn resolve_passes(
         .collect();
     let surface_is_last = surface_positions.len() == 1 && surface_positions[0] + 1 == passes.len();
     if !surface_positions.is_empty() && !surface_is_last {
-        println!(
-            "[render] Pass chain: {} surface pass(es) at {surface_positions:?}; only the last pass's writes reach the window",
+        warn!(
+            target: pill_core::telemetry::telemetry_target::RENDERING,
+            "Pass chain: {} surface pass(es) at {surface_positions:?}; only the last pass's writes reach the window",
             surface_positions.len()
         );
     }

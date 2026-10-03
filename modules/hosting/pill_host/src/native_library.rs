@@ -47,7 +47,7 @@ use libloading::os::windows as windows_loader;
 use libloading::{Library, Symbol};
 use pill_core::error::{LibraryError, ModuleError};
 use pill_core::platform::Instant;
-use pill_core::{debug, info};
+use pill_core::{debug, info, warn};
 use pill_engine::component_registry::{
     PillFieldAccessorDescriptor, PillMethodDescriptor, PillValueTypeDescriptor,
 };
@@ -1295,8 +1295,9 @@ impl Drop for NativeLibrary {
 /// the removal fails.
 fn remove_temporary_file(path: &Path) {
     if let Err(error) = std::fs::remove_file(path) {
-        eprintln!(
-            "[host] Failed to remove temporary DLL {}: {error}",
+        warn!(
+            target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+            "Failed to remove temporary DLL {}: {error}",
             path.display()
         );
     }
@@ -1454,20 +1455,25 @@ fn remove_staging_directory(path: &Path, pid: u32, reason: &str) {
     match std::fs::remove_dir_all(path) {
         Ok(()) => {
             if pid != std::process::id() {
-                println!("[host] Cleaned up temporary files from process {pid} ({reason}).");
+                info!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    "Cleaned up temporary files from process {pid} ({reason})"
+                );
             }
         }
         Err(error) => {
             if pid == std::process::id() {
-                eprintln!(
-                    "[host] Could not remove temporary directory {}: {error}",
+                warn!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    "Could not remove temporary directory {}: {error}",
                     path.display()
                 );
             } else {
                 // On platforms without process probing the removal may fail
                 // simply because another live host holds the files.
-                println!(
-                    "[host] Temporary directory {} left in place (possibly still in use): {error}",
+                info!(
+                    target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
+                    "Temporary directory {} left in place (possibly still in use): {error}",
                     path.display()
                 );
             }

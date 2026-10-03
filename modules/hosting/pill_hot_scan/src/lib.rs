@@ -1466,6 +1466,13 @@ fn stage_std_dylib_windows() {
         if file_name.starts_with("std-") && file_name.ends_with(".dll") {
             candidate_count += 1;
             let destination = output_directory.join(file_name);
+            // An up-to-date copy is left alone. The running host maps this
+            // file, so copying over it fails with a sharing violation on every
+            // build even though there is nothing to update.
+            if staged_copy_is_current(&entry.path(), &destination) {
+                staged_count += 1;
+                continue;
+            }
             match std::fs::copy(entry.path(), &destination) {
                 Ok(_) => staged_count += 1,
                 Err(error) => last_error = error.to_string(),
@@ -1484,6 +1491,26 @@ fn stage_std_dylib_windows() {
             std_lib_directory.display(),
             output_directory.display()
         );
+    }
+}
+
+/// Whether `destination` already holds the same file as `source`.
+///
+/// `std::fs::copy` keeps the source's modification time on Windows, so a
+/// staged copy of the same toolchain file has the same size and is no older.
+/// A toolchain update changes the source's time, which makes the copy stale.
+#[cfg(windows)]
+fn staged_copy_is_current(source: &Path, destination: &Path) -> bool {
+    let (Ok(source_metadata), Ok(destination_metadata)) =
+        (std::fs::metadata(source), std::fs::metadata(destination))
+    else {
+        return false;
+    };
+    match (source_metadata.modified(), destination_metadata.modified()) {
+        (Ok(source_time), Ok(destination_time)) => {
+            source_metadata.len() == destination_metadata.len() && destination_time >= source_time
+        }
+        _ => false,
     }
 }
 

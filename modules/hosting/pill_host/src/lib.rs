@@ -28,6 +28,8 @@
 mod analytics;
 /// Project-module build execution and output-path resolution.
 #[cfg(feature = "hot_reload")]
+mod build_progress;
+#[cfg(feature = "hot_reload")]
 mod build_runner;
 /// Project-module configuration shared by every host frontend.
 mod config;

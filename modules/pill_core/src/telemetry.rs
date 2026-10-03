@@ -37,6 +37,7 @@ use std::sync::{Arc, OnceLock};
 use colored::Colorize;
 use tracing::field::{Field, Visit};
 use tracing::{Event, Level, Subscriber};
+use tracing_log::NormalizeEvent;
 use tracing_subscriber::fmt::format::Writer;
 use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields};
 use tracing_subscriber::layer::SubscriberExt;
@@ -132,8 +133,9 @@ impl LoggingConfig {
     }
 
     /// A sensible default for the embedded host: permanent engine logs at
-    /// `INFO`, rendering at `DEBUG`, developer scratch logs visible when the
-    /// `dev-logs` feature is enabled, and dependency noise reduced.
+    /// `INFO` (rendering included; its per-shader and per-material detail is
+    /// `DEBUG`), developer scratch logs visible when the `dev-logs` feature is
+    /// enabled, and dependency noise reduced.
     pub fn default_engine() -> Self {
         use tracing::level_filters::LevelFilter;
         Self::new()
@@ -142,7 +144,7 @@ impl LoggingConfig {
             .with_directive(telemetry_target::HOT_RELOAD, LevelFilter::INFO)
             .with_directive(telemetry_target::INPUT, LevelFilter::INFO)
             .with_directive(telemetry_target::ECS, LevelFilter::INFO)
-            .with_directive(telemetry_target::RENDERING, LevelFilter::DEBUG)
+            .with_directive(telemetry_target::RENDERING, LevelFilter::INFO)
             .with_directive(telemetry_target::RESOURCES, LevelFilter::OFF)
             .with_directive("wgpu", LevelFilter::WARN)
             .with_directive("naga", LevelFilter::WARN)
@@ -229,9 +231,9 @@ impl Default for LoggingConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TimestampFormat {
     /// `[dd.mm.yyyy hh:mm:ss:mmm]`, written `date_time` in settings.
-    #[default]
     DateTime,
-    /// `[hh:mm:ss:mmm]`, written `time` in settings.
+    /// `[hh:mm:ss:mmm]`, written `time` in settings. The default.
+    #[default]
     Time,
 }
 
@@ -277,7 +279,7 @@ impl TimestampFormat {
 }
 
 /// The active [`TimestampFormat`], as its position in the enum.
-static TIMESTAMP_FORMAT: AtomicU8 = AtomicU8::new(TimestampFormat::DateTime as u8);
+static TIMESTAMP_FORMAT: AtomicU8 = AtomicU8::new(TimestampFormat::Time as u8);
 
 /// Set how every later log line writes its time.
 pub fn set_timestamp_format(format: TimestampFormat) {
@@ -286,10 +288,10 @@ pub fn set_timestamp_format(format: TimestampFormat) {
 
 /// How log lines currently write their time.
 pub fn timestamp_format() -> TimestampFormat {
-    if TIMESTAMP_FORMAT.load(Ordering::Relaxed) == TimestampFormat::Time as u8 {
-        TimestampFormat::Time
-    } else {
+    if TIMESTAMP_FORMAT.load(Ordering::Relaxed) == TimestampFormat::DateTime as u8 {
         TimestampFormat::DateTime
+    } else {
+        TimestampFormat::Time
     }
 }
 
@@ -369,7 +371,11 @@ where
         mut writer: Writer<'_>,
         event: &Event<'_>,
     ) -> fmt::Result {
-        let metadata = event.metadata();
+        // A record bridged from the `log` crate arrives with the target `log`
+        // and its real target, file and line as `log.*` fields; normalizing
+        // shows it like any other event.
+        let normalized = event.normalized_metadata();
+        let metadata = normalized.as_ref().unwrap_or_else(|| event.metadata());
         // The file lane is built without ANSI, so styling follows the writer
         // rather than whether a terminal happens to be attached.
         let ansi = writer.has_ansi_escapes();
@@ -380,17 +386,25 @@ where
         }
 
         write!(writer, "{} ", styled_level(metadata.level(), ansi))?;
-        write!(writer, "{}  ", styled_target(metadata.target(), ansi))?;
+        write!(writer, "{}", styled_target(metadata.target(), ansi))?;
 
         // Message first, then its fields after a two-space gap, so the text
         // never runs into the first field name.
         let mut visitor = StyledFieldVisitor {
             ansi,
+            skip_log_fields: event.is_log(),
             message: String::new(),
             fields: String::new(),
         };
         event.record(&mut visitor);
-        write!(writer, "{}", visitor.message)?;
+        // A multi-line message is a block (see `log_block`): the prefix line
+        // carries only the time, level, target and fields, and the message
+        // follows below it from the left edge, so wide tables and trees keep
+        // their full width.
+        let block = visitor.message.contains('\n');
+        if !block {
+            write!(writer, "  {}", visitor.message)?;
+        }
         if !visitor.fields.is_empty() {
             write!(writer, "  {}", visitor.fields)?;
         }
@@ -404,6 +418,9 @@ where
                 write!(writer, "  {location}")?;
             }
         }
+        if block {
+            write!(writer, "\n{}", visitor.message)?;
+        }
         writeln!(writer)?;
         Ok(())
     }
@@ -414,6 +431,9 @@ where
 /// order the callsite declared them in.
 struct StyledFieldVisitor {
     ansi: bool,
+    /// Drop the `log.*` fields of a bridged `log` record; the normalized
+    /// metadata already carries what they hold.
+    skip_log_fields: bool,
     message: String,
     fields: String,
 }
@@ -428,6 +448,9 @@ impl Visit for StyledFieldVisitor {
         if field.name() == "message" {
             // The message is the primary human-readable text.
             let _ = write!(self.message, "{value:?}");
+            return;
+        }
+        if self.skip_log_fields && field.name().starts_with("log.") {
             return;
         }
         if !self.fields.is_empty() {
@@ -684,11 +707,18 @@ impl TelemetryBuilder {
         registry.init();
 
         // Step 5: Bridge the legacy `log` crate into tracing so dependencies
-        // that still emit through `log` (winit, wgpu, notify, ...) become
-        // tracing events on their own targets and fall under the EnvFilter
-        // directives above. The bridge is process-wide and installs once; a
-        // second attempt only reports that it is already active.
-        let _ = tracing_log::LogTracer::init();
+        // that still emit through `log` (winit, wgpu, notify, ...) reach the
+        // same lanes. Bridged records carry the target `log`, so the
+        // EnvFilter directives above cannot select them by crate. The bridge
+        // filters them itself instead: only warnings and errors pass (a
+        // dependency's info and debug chatter, such as symphonia's format
+        // probing, is not engine news), and the targets in IGNORED_LOG_TARGETS
+        // are dropped entirely. The bridge is process-wide and installs once;
+        // a second attempt only reports that it is already active.
+        let _ = tracing_log::LogTracer::builder()
+            .with_max_level(tracing_log::log::LevelFilter::Warn)
+            .ignore_all(IGNORED_LOG_TARGETS.iter().copied())
+            .init();
 
         Ok(TelemetryHandles {
             logging_filter: terminal_handle,
@@ -865,10 +895,50 @@ pub enum TelemetryError {
 // Free Functions
 // =============================================================================
 
+/// Join a heading and its lines into one multi-line log message.
+///
+/// The terminal formatter prints any message with a line break as a block:
+/// the time, level and target alone on the first line, then the message from
+/// the left edge.
+///
+/// ```text
+/// [21:51:45:003] INFO  engine::hot_reload
+/// Modules to build:
+/// 1. pill_spline  extension
+/// 2. project      project
+/// ```
+///
+/// Pass the result to any logging macro: `info!(target: ..., "{}", block)`.
+///
+/// # Examples
+///
+/// ```
+/// use pill_core::telemetry::log_block;
+///
+/// let block = log_block("Modules to build:", ["1. pill_spline", "2. project"]);
+/// assert_eq!(block, "Modules to build:\n1. pill_spline\n2. project");
+/// ```
+pub fn log_block<I, S>(heading: &str, lines: I) -> String
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut block = heading.to_string();
+    for line in lines {
+        block.push('\n');
+        block.push_str(line.as_ref());
+    }
+    block.push('\n');
+    block
+}
+
+/// The column width of the level, padded to the widest name (`ERROR`, `DEBUG`).
+const LEVEL_WIDTH: usize = 5;
+
 /// Severity color mapping owned by the terminal formatter.
 fn styled_level(level: &Level, ansi: bool) -> String {
     // Padded to the widest level so the targets line up in a column.
-    let text = format!("{:<5}", level.as_str());
+    let text = format!("{:<LEVEL_WIDTH$}", level.as_str());
     match *level {
         Level::TRACE => paint(ansi, &text, |text| text.magenta()),
         Level::DEBUG => paint(ansi, &text, |text| text.blue().bold()),
@@ -886,6 +956,14 @@ fn styled_target(target: &str, ansi: bool) -> String {
 /// Field names whose value names a module; their value is highlighted so the
 /// module a lifecycle line is about stands out.
 const MODULE_FIELD_NAMES: &[&str] = &["module", "extension"];
+
+/// `log` targets the bridge drops, each with the reason it is noise.
+///
+/// - `wgpu_hal::vulkan::conv`: wgpu 25 warns `Unrecognized present mode
+///   1000361000` on every surface query when the driver offers
+///   `VK_PRESENT_MODE_FIFO_LATEST_READY_EXT`, which it does not know yet and
+///   skips. The module only logs such unknown-value notices.
+const IGNORED_LOG_TARGETS: &[&str] = &["wgpu_hal::vulkan::conv"];
 
 /// Applies `style` to `text` when the writer accepts ANSI escapes, and returns
 /// the text unchanged otherwise.
@@ -984,6 +1062,42 @@ mod tests {
         assert_eq!(render(TimestampFormat::Time), "09:05:07:042");
     }
 
+    /// A multi-line message logs as a block: the prefix and fields alone on the
+    /// first line, then the message from the left edge.
+    #[test]
+    fn terminal_formatter_lays_out_a_multi_line_block() {
+        use std::sync::{Arc, Mutex};
+
+        let captured = Arc::new(Mutex::new(String::new()));
+        let writer = CapturingMakeWriter(Arc::clone(&captured));
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(writer)
+                .with_ansi(false)
+                .event_format(EngineTerminalFormatter::new().without_timestamps()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info!(
+                target: "engine::hot_reload",
+                total = 2,
+                "{}",
+                log_block("Modules to build:", ["1. pill_spline", "2. project"])
+            );
+        });
+        let output = captured.lock().unwrap().clone();
+        let lines: Vec<&str> = output.lines().collect();
+        // Only the start of the prefix line: another test may switch the
+        // process-wide source location on while this one runs.
+        assert!(
+            lines[0].starts_with("INFO  engine::hot_reload  total=2"),
+            "{output}"
+        );
+        assert_eq!(
+            lines[1..],
+            ["Modules to build:", "1. pill_spline", "2. project"]
+        );
+    }
+
     /// The message is separated from its fields, the source location appears
     /// only when enabled and then trails the line, and a lane without ANSI
     /// gets no escape codes even for highlighted fields.
@@ -1065,12 +1179,12 @@ mod tests {
     fn a_later_directive_for_a_target_wins() {
         use tracing::level_filters::LevelFilter;
         let filter = LoggingConfig::default_engine()
-            .with_directive("engine::rendering", LevelFilter::INFO)
+            .with_directive("engine::rendering", LevelFilter::DEBUG)
             .build_env_filter()
             .unwrap();
         let rendered = format!("{filter}");
-        assert!(rendered.contains("engine::rendering=info"), "{rendered}");
-        assert!(!rendered.contains("engine::rendering=debug"), "{rendered}");
+        assert!(rendered.contains("engine::rendering=debug"), "{rendered}");
+        assert!(!rendered.contains("engine::rendering=info"), "{rendered}");
     }
 
     /// A fresh `LoggingConfig` parses and emits a filter string.
@@ -1238,8 +1352,10 @@ mod tests {
                 .event_format(EngineTerminalFormatter::new().without_timestamps()),
         );
         tracing::subscriber::with_default(subscriber, || {
-            log::info!(target: "wgpu", "adapter selected");
-            log::warn!(target: "winit", "swapchain lost");
+            // Warnings and errors only: the engine's bridge drops lower
+            // levels, and whichever test installs it first sets that cap.
+            log::warn!(target: "wgpu", "adapter selected");
+            log::error!(target: "winit", "swapchain lost");
         });
         let output = captured.lock().unwrap().clone();
         assert!(output.contains("wgpu"), "missing log target: {output}");
@@ -1254,6 +1370,15 @@ mod tests {
         assert!(
             output.contains("swapchain lost"),
             "missing warn message: {output}"
+        );
+        // Shown under their own targets, without the bridge's `log.*` fields.
+        assert!(
+            output.contains("WARN  wgpu  adapter selected"),
+            "bridged record not normalized: {output}"
+        );
+        assert!(
+            !output.contains("log."),
+            "bridge fields leaked into the line: {output}"
         );
     }
 }

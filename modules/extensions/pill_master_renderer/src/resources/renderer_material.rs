@@ -30,7 +30,7 @@ use std::collections::BTreeMap;
 
 // External crates
 use indexmap::IndexMap;
-use pill_core::{debug, PillStyle};
+use pill_core::debug;
 
 // Current crate
 use crate::{
@@ -101,8 +101,6 @@ impl RendererMaterial {
         textures: &[(String, RendererTextureHandle)],
         parameters: &BTreeMap<String, MaterialParameter>,
     ) -> Result<Self> {
-        debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Creating material {}", name.name_style());
-
         let shader = rendering_resource_storage
             .shaders
             .get(shader_handle)
@@ -132,8 +130,6 @@ impl RendererMaterial {
                     parameters,
                 )?;
 
-                debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Uniform buffer of size {} bytes created", parameters_uniform_buffer_size);
-
                 // Create parameters uniform buffer bind group; scoped so a
                 // binding mismatch is reported against the material instead of
                 // panicking through the uncaptured-error handler.
@@ -151,13 +147,10 @@ impl RendererMaterial {
                     detail: format!("material `{name}` parameters bind group: {detail}"),
                 })?;
 
-                debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Parameters bind group created");
-
                 // The buffer is not stored: the bind group holds what it
                 // references, so it lives as long as the group that reads it.
                 Some(parameters_bind_group)
             } else {
-                debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "No parameter slots found, skipping uniform buffer and bind group creation");
                 None
             }
         };
@@ -176,8 +169,6 @@ impl RendererMaterial {
             None
         };
 
-        debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Textures bind group created");
-
         let renderer_material = Self {
             name: name.to_string(),
             shader_handle,
@@ -185,7 +176,20 @@ impl RendererMaterial {
             textures_bind_group,
         };
 
-        debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Material creation successful");
+        // One line per material, hidden unless `engine::rendering` is at debug.
+        let defaulted_textures = texture_slots
+            .keys()
+            .filter(|slot_name| !textures.iter().any(|(name, _)| name == *slot_name))
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        debug!(
+            target: pill_core::telemetry::telemetry_target::RENDERING,
+            material = name,
+            shader = shader.name.as_str(),
+            defaulted_textures = %defaulted_textures,
+            "material created"
+        );
 
         Ok(renderer_material)
     }
@@ -300,12 +304,8 @@ impl RendererMaterial {
                 .find(|(k, _)| k == slot_name)
                 .map(|(_, handle)| *handle)
             {
-                Some(handle) => {
-                    debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Material texture slot {} found in material textures", slot_name.name_style());
-                    handle
-                }
+                Some(handle) => handle,
                 None => {
-                    debug!(target: pill_core::telemetry::telemetry_target::RENDERING, "Material texture slot {} not found in material textures, using default texture", slot_name.name_style());
                     // A material has no depth to give: only the renderer's own
                     // buffer holds any, and a pass is what reads it. A
                     // material shader that asks for depth is a mistake worth

@@ -1093,8 +1093,7 @@ fn format_ms(ms: u64) -> String {
 /// Print the full startup analytics report.
 ///
 /// Called once after every module (extension + project) has been built, staged,
-/// loaded and initialized. Rows are one per module; the trailing lines break
-/// each module's exports, imports and direct cargo dependencies.
+/// loaded and initialized. See [`render_startup_report`] for the layout.
 pub(crate) fn print_startup_report() {
     let mut collector = analytics()
         .lock()
@@ -1103,148 +1102,356 @@ pub(crate) fn print_startup_report() {
     // set; they belong to the startup report's `cargo` column only, so drop
     // them before any reload transaction starts accumulating.
     collector.pending_cargo_crates.clear();
+    print!("{}", render_startup_report(&collector));
+}
+
+/// One column of the startup table: its header, alignment, and one cell per
+/// module row plus the total row.
+struct ReportColumn {
+    header: &'static str,
+    left_aligned: bool,
+    cells: Vec<String>,
+    total: String,
+}
+
+impl ReportColumn {
+    /// The widest of the header, the cells and the total.
+    fn width(&self) -> usize {
+        self.cells
+            .iter()
+            .chain(std::iter::once(&self.total))
+            .map(String::len)
+            .chain(std::iter::once(self.header.len()))
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// `text` padded to `width` on the side this column aligns to.
+    fn pad(&self, text: &str, width: usize) -> String {
+        if self.left_aligned {
+            format!("{text:<width$}")
+        } else {
+            format!("{text:>width$}")
+        }
+    }
+}
+
+/// Render the startup report: a title rule, the totals, one table row per
+/// module with a total row, then each module's links and direct dependencies.
+///
+/// The `elapsed: ... builds: N    reloads: N` line is parsed by the benchmark
+/// harness (`devops/benchmarks`), so its labels stay as they are and carry no
+/// color codes between them. Columns that are empty for every module (at
+/// startup: `migrate`, and `cargo` without `--timings`) are left out.
+fn render_startup_report(collector: &Analytics) -> String {
+    use std::fmt::Write as _;
+
     let elapsed_seconds = collector.started.elapsed().as_secs_f64();
     let total_reloads: u64 = collector
         .modules
         .iter()
-        .map(|module| module.reloads as u64)
+        .map(|module| u64::from(module.reloads))
         .sum();
+    let modules = &collector.modules;
 
-    println!();
-    println!("==============================================================");
-    println!(" BUILD / LINK / HOT-RELOAD ANALYTICS | startup report");
-    println!("==============================================================");
-    println!(
-        " elapsed: {:.2}s    host RSS: current {} / peak {}",
-        elapsed_seconds,
-        format_bytes(collector.host_current_bytes),
-        format_bytes(collector.host_peak_bytes)
+    // Step 1: Build the table columns, then drop the ones with nothing in them.
+    let milliseconds = |value: f64| {
+        if value > 0.0 {
+            format!("{value:.1}ms")
+        } else {
+            "-".to_string()
+        }
+    };
+    let count = |value: usize| {
+        if value > 0 {
+            value.to_string()
+        } else {
+            "-".to_string()
+        }
+    };
+    let sum = |value: fn(&ModuleAnalytics) -> f64| modules.iter().map(value).sum::<f64>();
+    let build_total: u64 = modules.iter().map(|module| module.build_wall_ms).sum();
+    let mut columns = vec![
+        ReportColumn {
+            header: "module",
+            left_aligned: true,
+            cells: modules.iter().map(|module| module.name.clone()).collect(),
+            total: "total".to_string(),
+        },
+        ReportColumn {
+            header: "kind",
+            left_aligned: true,
+            cells: modules
+                .iter()
+                .map(|module| module.kind.label().to_string())
+                .collect(),
+            total: String::new(),
+        },
+        ReportColumn {
+            header: "build",
+            left_aligned: false,
+            cells: modules
+                .iter()
+                .map(|module| match module.build_wall_ms {
+                    0 => "-".to_string(),
+                    build_ms => format_ms(build_ms),
+                })
+                .collect(),
+            total: format_ms(build_total),
+        },
+        ReportColumn {
+            header: "stage",
+            left_aligned: false,
+            cells: modules
+                .iter()
+                .map(|module| milliseconds(module.stage_ms))
+                .collect(),
+            total: milliseconds(sum(|module| module.stage_ms)),
+        },
+        ReportColumn {
+            header: "load",
+            left_aligned: false,
+            cells: modules
+                .iter()
+                .map(|module| milliseconds(module.load_ms))
+                .collect(),
+            total: milliseconds(sum(|module| module.load_ms)),
+        },
+        ReportColumn {
+            header: "init",
+            left_aligned: false,
+            cells: modules
+                .iter()
+                .map(|module| milliseconds(module.init_ms))
+                .collect(),
+            total: milliseconds(sum(|module| module.init_ms)),
+        },
+        ReportColumn {
+            header: "migrate",
+            left_aligned: false,
+            cells: modules
+                .iter()
+                .map(|module| milliseconds(module.migrate_ms))
+                .collect(),
+            total: milliseconds(sum(|module| module.migrate_ms)),
+        },
+        ReportColumn {
+            header: "size",
+            left_aligned: false,
+            cells: modules
+                .iter()
+                .map(|module| match module.artifact_bytes {
+                    0 => "-".to_string(),
+                    bytes => format_bytes(bytes),
+                })
+                .collect(),
+            total: format_bytes(modules.iter().map(|module| module.artifact_bytes).sum()),
+        },
+        ReportColumn {
+            header: "exports",
+            left_aligned: false,
+            cells: modules
+                .iter()
+                .map(|module| count(module.exports.len()))
+                .collect(),
+            total: String::new(),
+        },
+        ReportColumn {
+            header: "imports",
+            left_aligned: false,
+            cells: modules
+                .iter()
+                .map(|module| count(module.import_dlls.len()))
+                .collect(),
+            total: String::new(),
+        },
+        ReportColumn {
+            header: "cargo",
+            left_aligned: false,
+            cells: modules
+                .iter()
+                .map(|module| module.cargo_unit_ms.map_or("-".to_string(), format_ms))
+                .collect(),
+            total: String::new(),
+        },
+    ];
+    columns.retain(|column| {
+        column.left_aligned || column.cells.iter().any(|cell| cell.as_str() != "-")
+    });
+    let widths: Vec<usize> = columns.iter().map(ReportColumn::width).collect();
+    let table_width = widths.iter().sum::<usize>() + 2 * (widths.len() - 1);
+
+    // Step 2: The title rule, sized to the table, and the run totals.
+    let mut report = String::new();
+    let title = " BUILD / LINK / HOT-RELOAD ANALYTICS · startup ";
+    let rule_tail = "─".repeat(table_width.saturating_sub(title.chars().count() + 2).max(4));
+    let _ = writeln!(report);
+    let _ = writeln!(
+        report,
+        "{}{}{}",
+        console::dim("──"),
+        console::bold_cyan(title),
+        console::dim(&rule_tail)
     );
-    println!(
-        " cargo child peak RSS: {}    builds: {}    reloads: {}",
+    let _ = writeln!(
+        report,
+        "  elapsed: {elapsed_seconds:.2}s    builds: {}    reloads: {}",
+        collector.builds, total_reloads
+    );
+    let _ = writeln!(
+        report,
+        "  {} {} {}    {} {}",
+        console::dim("host RSS"),
+        format_bytes(collector.host_current_bytes),
+        console::dim(&format!(
+            "(peak {})",
+            format_bytes(collector.host_peak_bytes)
+        )),
+        console::dim("cargo child peak RSS"),
         format_bytes(collector.cargo_child_peak_bytes),
-        collector.builds,
-        total_reloads
     );
     if collector.last_cargo_total_seconds > 0.0 {
-        println!(
-            " newest cargo --timings total: {:.2}s (per-crate compile+link in the `cargo` column)",
+        let _ = writeln!(
+            report,
+            "  {} {:.2}s",
+            console::dim("newest cargo --timings total"),
             collector.last_cargo_total_seconds
         );
     }
-    println!();
+    let _ = writeln!(report);
 
-    // The module column widens to the longest name; every other column has a
-    // fixed width, so long names never mangle the table.
-    let name_width = collector
-        .modules
+    // Step 3: The table. Cells are padded before they are painted, so color
+    // codes never count towards a column's width.
+    let row = |cells: Vec<String>| format!("  {}", cells.join("  "));
+    let header_cells = columns
         .iter()
-        .map(|module| module.name.len())
-        .max()
-        .unwrap_or(4)
-        .max(4);
-    let pad = |value: &str| format!("{value:<width$}", width = name_width);
-    let separator = "-".repeat(name_width + 100);
-
-    println!(
-        "{}  {:<8}  {:>9}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>7}  {:>7}  {:>9}",
-        pad("module"),
-        "kind",
-        "build",
-        "stage",
-        "load",
-        "init",
-        "migrate",
-        "size",
-        "exports",
-        "imports",
-        "cargo"
-    );
-    println!("{separator}");
-
-    for module in &collector.modules {
-        println!(
-            "{}  {:<8}  {:>9}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>7}  {:>7}  {:>9}",
-            pad(&module.name),
-            module.kind.label(),
-            if module.build_wall_ms > 0 {
-                format_ms(module.build_wall_ms)
-            } else {
-                "-".to_string()
-            },
-            if module.stage_ms > 0.0 {
-                format!("{:.1}ms", module.stage_ms)
-            } else {
-                "-".to_string()
-            },
-            if module.load_ms > 0.0 {
-                format!("{:.1}ms", module.load_ms)
-            } else {
-                "-".to_string()
-            },
-            if module.init_ms > 0.0 {
-                format!("{:.1}ms", module.init_ms)
-            } else {
-                "-".to_string()
-            },
-            if module.migrate_ms > 0.0 {
-                format!("{:.1}ms", module.migrate_ms)
-            } else {
-                "-".to_string()
-            },
-            if module.artifact_bytes > 0 {
-                format_bytes(module.artifact_bytes)
-            } else {
-                "-".to_string()
-            },
-            if module.exports.is_empty() {
-                "-".to_string()
-            } else {
-                module.exports.len().to_string()
-            },
-            if module.import_dlls.is_empty() {
-                "-".to_string()
-            } else {
-                module.import_dlls.len().to_string()
-            },
-            if let Some(cargo_ms) = module.cargo_unit_ms {
-                format_ms(cargo_ms)
-            } else {
-                "-".to_string()
-            },
-        );
+        .zip(&widths)
+        .map(|(column, width)| console::bold(&column.pad(column.header, *width)))
+        .collect();
+    let _ = writeln!(report, "{}", row(header_cells));
+    let _ = writeln!(report, "  {}", console::dim(&"─".repeat(table_width)));
+    for (index, _) in modules.iter().enumerate() {
+        let cells = columns
+            .iter()
+            .zip(&widths)
+            .enumerate()
+            .map(|(position, (column, width))| {
+                let cell = column.pad(&column.cells[index], *width);
+                if position == 0 {
+                    console::cyan(&cell)
+                } else {
+                    cell
+                }
+            })
+            .collect();
+        let _ = writeln!(report, "{}", row(cells));
     }
-    println!("{separator}");
+    let _ = writeln!(report, "  {}", console::dim(&"─".repeat(table_width)));
+    // Columns with no total (the counts) at the end of the row are left off,
+    // so the line carries no trailing padding.
+    let last_total = columns
+        .iter()
+        .rposition(|column| !column.total.is_empty())
+        .unwrap_or(0);
+    let total_cells = columns
+        .iter()
+        .zip(&widths)
+        .take(last_total + 1)
+        .map(|(column, width)| console::yellow(&column.pad(&column.total, *width)))
+        .collect();
+    let _ = writeln!(report, "{}", row(total_cells));
 
-    // Per-module detail lines: export names, import DLLs and direct deps.
-    for module in &collector.modules {
-        let mut details = Vec::new();
-        if module.image_size > 0 {
-            details.push(format!("image={}", format_bytes(module.image_size)));
+    // Step 4: What each module links against (system DLLs only counted) and
+    // its direct dependencies, wrapped under the module's name.
+    let name_width = widths[0];
+    let indent = " ".repeat(2 + name_width + 2);
+    let wrap_width = table_width.max(60).saturating_sub(name_width + 2 + 6);
+    let mut wrote_detail = false;
+    for module in modules {
+        let (linked, system_count) = linked_libraries(&module.import_dlls);
+        let dependencies: Vec<&str> = module
+            .cargo_deps
+            .iter()
+            .map(String::as_str)
+            .filter(|dependency| *dependency != "build_script_build")
+            .collect();
+        let mut lines = Vec::new();
+        if !linked.is_empty() || system_count > 0 {
+            let mut text = linked.join(", ");
+            if system_count > 0 {
+                let system = format!("+{system_count} system");
+                text = if text.is_empty() {
+                    system
+                } else {
+                    format!("{text}  {}", console::dim(&format!("({system})")))
+                };
+            }
+            lines.push(format!("{} {text}", console::dim("links")));
         }
-        if !module.exports.is_empty() {
-            // A shared engine dylib can export tens of thousands of symbols;
-            // cap the printed list so the console stays readable.
-            if module.exports.len() <= 16 {
-                details.push(format!("exports={}", module.exports.join(",")));
+        for (position, chunk) in wrap_list(&dependencies, wrap_width).into_iter().enumerate() {
+            let label = if position == 0 { "deps " } else { "     " };
+            lines.push(format!("{} {chunk}", console::dim(label)));
+        }
+        if lines.is_empty() {
+            continue;
+        }
+        if !wrote_detail {
+            let _ = writeln!(report);
+            wrote_detail = true;
+        }
+        for (position, line) in lines.iter().enumerate() {
+            if position == 0 {
+                let name = format!("{:<name_width$}", module.name);
+                let _ = writeln!(report, "  {}  {line}", console::cyan(&name));
             } else {
-                details.push(format!("exports={} symbols", module.exports.len()));
+                let _ = writeln!(report, "{indent}{line}");
             }
         }
-        if !module.import_dlls.is_empty() {
-            details.push(format!("imports={}", module.import_dlls.join(",")));
-        }
-        if !module.cargo_deps.is_empty() {
-            details.push(format!("deps={}", module.cargo_deps.join(",")));
-        }
-        if !details.is_empty() {
-            println!("  {}: {}", module.name, details.join("  |  "));
-        }
     }
-    println!("==============================================================");
-    println!();
+    let _ = writeln!(report, "{}", console::dim(&"─".repeat(table_width + 2)));
+    let _ = writeln!(report);
+    report
 }
 
+/// Split a module's imported DLLs into the ones worth naming (the engine's
+/// `pill_*` dylibs and Rust's `std`, without the `.dll` and the `std` hash)
+/// and a count of the rest, which are Windows system and runtime libraries.
+fn linked_libraries(import_dlls: &[String]) -> (Vec<String>, usize) {
+    let mut linked = Vec::new();
+    let mut system_count = 0;
+    for dll in import_dlls {
+        let stem = dll.strip_suffix(".dll").unwrap_or(dll);
+        if stem.starts_with("std-") {
+            linked.push("std".to_string());
+        } else if stem.starts_with("pill_") {
+            linked.push(stem.to_string());
+        } else {
+            system_count += 1;
+        }
+    }
+    (linked, system_count)
+}
+
+/// Join `items` with `, ` into lines no longer than `width` characters, never
+/// splitting an item.
+fn wrap_list(items: &[&str], width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for item in items {
+        if !current.is_empty() && current.len() + 2 + item.len() > width {
+            lines.push(format!("{current},"));
+            current.clear();
+        }
+        if !current.is_empty() {
+            current.push_str(", ");
+        }
+        current.push_str(item);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
 /// Print one line per completed hot reload plus one aggregate total line.
 ///
 /// Called by the frame loop right after reloads are processed, so the console
@@ -1401,6 +1608,83 @@ fn drain_reload_events() -> Vec<ReloadEvent> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The startup report keeps the line the benchmark harness parses, drops
+    /// columns that are empty for every module, lines its rows up, and names
+    /// only the engine's own libraries among the imports.
+    #[test]
+    fn startup_report_layout() {
+        let mut extension =
+            ModuleAnalytics::new("pill_master_renderer_data", ModuleKind::Extension);
+        extension.build_wall_ms = 5830;
+        extension.load_ms = 178.2;
+        extension.artifact_bytes = 3 * 1024 * 1024;
+        extension.import_dlls = vec![
+            "pill_core.dll".to_string(),
+            "std-0cebe7c42cd80226.dll".to_string(),
+            "KERNEL32.dll".to_string(),
+            "api-ms-win-crt-heap-l1-1-0.dll".to_string(),
+        ];
+        extension.cargo_deps = vec!["build_script_build".to_string(), "glam".to_string()];
+        let mut project = ModuleAnalytics::new("project", ModuleKind::Project);
+        project.build_wall_ms = 3220;
+        project.init_ms = 2.8;
+        let collector = Analytics {
+            started: Instant::now(),
+            modules: vec![extension, project],
+            pending_reload_events: Vec::new(),
+            pending_cargo_crates: HashMap::new(),
+            host_current_bytes: 1024 * 1024,
+            host_peak_bytes: 2 * 1024 * 1024,
+            cargo_child_peak_bytes: 0,
+            builds: 4,
+            last_cargo_total_seconds: 0.0,
+            patches: 0,
+            patch_refusals: 0,
+            patch_failures: 0,
+            patch_fallbacks: Vec::new(),
+        };
+
+        let report = render_startup_report(&collector);
+
+        assert!(
+            report.contains("BUILD / LINK / HOT-RELOAD ANALYTICS"),
+            "{report}"
+        );
+        assert!(report.contains("    builds: 4    reloads: 0"), "{report}");
+        assert!(
+            !report.contains("migrate") && !report.contains("cargo  "),
+            "{report}"
+        );
+        assert!(
+            report.contains("links pill_core, std  (+2 system)"),
+            "{report}"
+        );
+        assert!(
+            report.contains("deps  glam") && !report.contains("build_script_build"),
+            "{report}"
+        );
+        let row_of = |name: &str| {
+            report
+                .lines()
+                .find(|line| line.trim_start().starts_with(name) && line.contains("s "))
+                .unwrap_or_else(|| panic!("no row for {name}: {report}"))
+                .to_string()
+        };
+        assert_eq!(
+            row_of("pill_master_renderer_data").len(),
+            row_of("project ").len(),
+            "rows differ in width: {report}"
+        );
+        assert!(
+            report.contains("9.05s"),
+            "the build total is the sum: {report}"
+        );
+        assert!(
+            report.lines().all(|line| line == line.trim_end()),
+            "a line ends in padding: {report}"
+        );
+    }
     use std::time::SystemTime;
 
     /// A synthetic cargo `--timings` HTML matching the format this parser
