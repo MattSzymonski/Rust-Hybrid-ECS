@@ -2046,11 +2046,11 @@ impl Archetype {
         )
     }
 
-    /// Prints information about this archetype (component names and entity count).
+    /// Logs information about this archetype (component names and entity count).
     #[cold]
     pub fn print_info(&self, registry: &crate::component::ComponentRegistry) {
         let info = self.get_archetype_info(registry);
-        println!("{}", info);
+        pill_core::info!(target: pill_core::telemetry::telemetry_target::ECS, "{}", info);
     }
 
     /// Estimate the memory footprint of this archetype in bytes.

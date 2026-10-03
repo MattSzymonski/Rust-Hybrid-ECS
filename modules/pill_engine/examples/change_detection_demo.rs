@@ -146,7 +146,7 @@ fn movement_system(frame: ResMut<FrameCounter>, mut q: Query<(&mut Position, &Ve
 fn react_to_movement_system(mut q: Query<(Entity, &Position), (Changed<Position>, With<Player>)>) {
     let mut count = 0;
     for (entity, pos) in q.iter_mut() {
-        println!(
+        pill_core::info!(
             "  [react_to_movement] player entity {} moved -> ({:.1}, {:.1})",
             entity.id(),
             pos.x,
@@ -155,7 +155,7 @@ fn react_to_movement_system(mut q: Query<(Entity, &Position), (Changed<Position>
         count += 1;
     }
     if count == 0 {
-        println!("  [react_to_movement] no player movement this frame");
+        pill_core::info!("  [react_to_movement] no player movement this frame");
     }
 }
 
@@ -163,13 +163,13 @@ fn react_to_movement_system(mut q: Query<(Entity, &Position), (Changed<Position>
 /// demonstrate the `Without<T>` filter.
 fn report_unhealthy_system(mut q: Query<(Entity,), (With<Position>, Without<Health>)>) {
     let ids: Vec<u64> = q.iter_mut().map(|(e,)| e.id()).collect();
-    println!("  [report_unhealthy] entities w/o Health: {:?}", ids);
+    pill_core::info!("  [report_unhealthy] entities w/o Health: {:?}", ids);
 }
 
 /// Detects newly attached Health components.
 fn react_to_new_health_system(mut q: Query<(Entity,), Added<Health>>) {
     for (entity,) in q.iter_mut() {
-        println!(
+        pill_core::info!(
             "  [react_to_new_health] entity {} just gained Health!",
             entity.id()
         );
@@ -194,7 +194,7 @@ fn driver_system(
     // Step 2: on frame 3, queue the Health attachment through deferred
     // Commands so `Added<Health>` observes it on the next frame.
     if frame_no == 3 {
-        println!(
+        pill_core::info!(
             "  [driver] queueing Health for entity {}",
             target_entity.id()
         );
@@ -209,7 +209,10 @@ fn driver_system(
 /// Entry point that builds the engine, registers components and systems,
 /// and runs five frames of the change-detection demo.
 fn main() {
-    println!("=== Change Detection Demo ===\n");
+    // Route this program's output, and the engine's own reports, through
+    // the engine logger.
+    let _ = pill_core::telemetry::TelemetryBuilder::new().init();
+    pill_core::info!("=== Change Detection Demo ===");
 
     // Step 1: create the engine.
     let mut engine = Engine::new();
@@ -262,8 +265,7 @@ fn main() {
 
     // Step 6: run five frames and print each one's reactive output.
     for frame in 1..=5 {
-        println!("--- Frame {} ---", frame);
+        pill_core::info!("--- Frame {} ---", frame);
         engine.process_frame().unwrap();
-        println!();
     }
 }

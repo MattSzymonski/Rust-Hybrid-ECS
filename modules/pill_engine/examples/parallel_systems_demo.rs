@@ -133,7 +133,10 @@ fn damage_system(mut query: Query<(&mut Health, &Position)>) {
 /// components and systems, prints the scheduler's execution graph, then steps
 /// through five frames of the simulation.
 fn main() {
-    println!("=== Parallel Systems Demo ===\n");
+    // Route this program's output, and the engine's own reports, through
+    // the engine logger.
+    let _ = pill_core::telemetry::TelemetryBuilder::new().init();
+    pill_core::info!("=== Parallel Systems Demo ===");
 
     // Step 1: Create the engine with parallel execution enabled.
     let mut engine = Engine::new();
@@ -154,9 +157,8 @@ fn main() {
     engine.register_system("xxx", ttt_system);
 
     // Step 4: Print the execution graph built by the scheduler.
-    println!("System Execution Graph:");
+    pill_core::info!("System Execution Graph:");
     engine.print_execution_graph();
-    println!();
 
     // Step 5: Create entities spread out along the x-axis.
     for i in 0..5 {
@@ -174,11 +176,11 @@ fn main() {
     }
 
     // Step 6: Run five frames of the simulation.
-    println!("Running 5 frames...\n");
+    pill_core::info!("Running 5 frames...");
     for frame in 0..5 {
-        println!("Frame {}", frame);
+        pill_core::info!("Frame {}", frame);
         engine.process_frame().unwrap();
     }
 
-    println!("\nDemo complete!");
+    pill_core::info!("Demo complete!");
 }

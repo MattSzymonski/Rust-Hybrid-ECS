@@ -90,6 +90,8 @@ fn init_telemetry() {
     let file_directory = std::env::var_os("ECS_LOG_DIR").map(PathBuf::from);
     // Step 2: install the stack, reporting setup failures to stderr.
     if let Err(error) = pill_runtime::init_telemetry(file_directory) {
+        // The one message that cannot go through the logger: it reports that
+        // the logger itself did not install.
         eprintln!("[standalone] telemetry setup failed: {error}");
     }
 }

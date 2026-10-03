@@ -30,6 +30,9 @@ use pill_core::telemetry::telemetry_target;
 use pill_core::utils::format_error_chain;
 use pill_core::warn;
 use pill_core::{error, info};
+// The fast path's own reports: patch outcomes, rollback requests, generations.
+#[cfg(feature = "hot_patch")]
+use pill_core::telemetry::{log_block_colored, Colorize};
 use pill_engine::Engine;
 use pill_engine::EngineApi;
 use pill_engine::{InputEvent, RumbleRequest};
@@ -205,15 +208,10 @@ impl DevHost {
             .ok_or_else(|| format!("`{function}` has not been patched in this session"))?;
 
         let targets = patch_targets(loaded_project, extensions);
+        // A successful rollback is logged by the session itself
+        // ("patch generation rolled back").
         let result = session.rollback(engine, &targets, loaded_patches, function, generation);
         drop(targets);
-        if result.is_ok() {
-            println!(
-                "{} {function} {}",
-                crate::console::bold_cyan("[hot]"),
-                crate::console::green(&format!("ROLLED BACK to generation {generation}"))
-            );
-        }
         result
     }
 
@@ -1255,11 +1253,10 @@ pub fn setup(host_config: impl Into<HostConfig>) -> Result<DevHost, HostError> {
     // Say how to drive rollback, once, next to where the fast path announces
     // itself - an interface nothing mentions is one nobody uses.
     #[cfg(feature = "hot_patch")]
-    println!(
-        "{} rollback: write `function@generation`, `function@previous` or `list` \
-         to {}",
-        crate::console::bold_cyan("[hot]"),
-        crate::console::dim(ROLLBACK_REQUEST_FILE)
+    info!(
+        target: telemetry_target::HOT_RELOAD,
+        "Patch rollback: write `function@generation`, `function@previous` or `list` to {}",
+        ROLLBACK_REQUEST_FILE
     );
 
     // Arm the per-function fast path. It reads the project's sources for
@@ -2383,10 +2380,10 @@ fn process_rollback_request(host: &mut DevHost) {
     }
 
     let Some((function, wanted)) = request.rsplit_once('@') else {
-        eprintln!(
-            "{} request `{request}` is malformed; expected `function@generation`, \
-             `function@previous`, or `list`",
-            crate::console::bold_cyan("[hot]")
+        warn!(
+            target: telemetry_target::HOT_RELOAD,
+            "Patch rollback request `{request}` is malformed; expected \
+             `function@generation`, `function@previous`, or `list`"
         );
         return;
     };
@@ -2405,9 +2402,9 @@ fn process_rollback_request(host: &mut DevHost) {
         {
             Some(newest) => newest.saturating_sub(1),
             None => {
-                eprintln!(
-                    "{} `{function}` has no recorded generations",
-                    crate::console::bold_cyan("[hot]")
+                warn!(
+                    target: telemetry_target::HOT_RELOAD,
+                    "Patch rollback: `{function}` has no recorded generations"
                 );
                 print_patch_generations(host);
                 return;
@@ -2417,9 +2414,9 @@ fn process_rollback_request(host: &mut DevHost) {
         match wanted.parse::<u32>() {
             Ok(generation) => generation,
             Err(_) => {
-                eprintln!(
-                    "{} `{wanted}` is not a generation number or `previous`",
-                    crate::console::bold_cyan("[hot]")
+                warn!(
+                    target: telemetry_target::HOT_RELOAD,
+                    "Patch rollback: `{wanted}` is not a generation number or `previous`"
                 );
                 return;
             }
@@ -2427,9 +2424,9 @@ fn process_rollback_request(host: &mut DevHost) {
     };
 
     if let Err(detail) = host.rollback_patch(function, generation) {
-        eprintln!(
-            "{} rollback of `{function}` to generation {generation} failed\n      {detail}",
-            crate::console::bold_cyan("[hot]")
+        warn!(
+            target: telemetry_target::HOT_RELOAD,
+            "Patch rollback of `{function}` to generation {generation} failed: {detail}"
         );
         // A rollback usually fails because the generation does not exist, so
         // show what does rather than making the developer guess.
@@ -2453,28 +2450,35 @@ fn process_rollback_request(_host: &mut DevHost) {}
 fn print_patch_generations(host: &DevHost) {
     let generations = host.patch_generations();
     if generations.is_empty() {
-        println!(
-            "{} no patch generations yet; edit a function body to create one",
-            crate::console::bold_cyan("[hot]")
+        info!(
+            target: telemetry_target::HOT_RELOAD,
+            "No patch generations yet; edit a function body to create one"
         );
         return;
     }
-    println!(
-        "{} patch generations ({} total)",
-        crate::console::bold_cyan("[hot]"),
-        generations.len()
+    let mut lines: Vec<String> = generations
+        .iter()
+        .map(|generation| {
+            format!(
+                "{:<48} generation {:<3} {}",
+                generation.function,
+                generation.number,
+                format!("{:.0}s ago", generation.age_seconds).dimmed()
+            )
+        })
+        .collect();
+    lines.push(
+        "generation 0 is the code each artifact was built with"
+            .dimmed()
+            .to_string(),
     );
-    for generation in &generations {
-        println!(
-            "      {:<48} generation {:<3} {}",
-            generation.function,
-            generation.number,
-            crate::console::dim(&format!("{:.0}s ago", generation.age_seconds))
-        );
-    }
-    println!(
-        "      {}",
-        crate::console::dim("generation 0 is the code each artifact was built with")
+    info!(
+        target: telemetry_target::HOT_RELOAD,
+        "{}",
+        log_block_colored(
+            format!("Patch generations ({} total)", generations.len()),
+            lines
+        )
     );
 }
 
@@ -2539,23 +2543,23 @@ fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
                 if copies == 1 { "copy" } else { "copies" },
                 if best_effort { " - best effort" } else { "" }
             );
-            println!(
-                "{} {function} {} {}\n      {}",
-                crate::console::bold_cyan("[hot]"),
-                crate::console::green(&format!("LIVE {elapsed_milliseconds:.0} ms")),
-                if best_effort {
-                    crate::console::yellow(&note)
-                } else {
-                    crate::console::dim(&note)
-                },
-                crate::console::dim(&stages.to_string())
-            );
+            // `[hot] <function> LIVE <ms> ms (generation <n> via <route>` is the
+            // text `devops/tests/test_hot_patch_coverage.py` parses; keep it.
+            let note = if best_effort {
+                note.yellow()
+            } else {
+                note.dimmed()
+            };
             info!(
                 target: telemetry_target::HOT_RELOAD,
-                function = function.as_str(),
-                generation,
-                elapsed_milliseconds,
-                "per-function patch applied"
+                "{}",
+                log_block_colored(
+                    format!(
+                        "[hot] {function} {} {note}",
+                        format!("LIVE {elapsed_milliseconds:.0} ms").green()
+                    ),
+                    [stages.to_string().dimmed()]
+                )
             );
             // Recorded in the same shape a module reload is, so one parser in
             // `devops/benchmarks/hot_reload_harness.py` reads both.
@@ -2574,13 +2578,6 @@ fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
             true
         }
         crate::hot_patch::PatchOutcome::NotPatchable { refusal } => {
-            println!(
-                "{} {} {}\n      reason: {}\n      falling back to module reload",
-                crate::console::bold_cyan("[hot]"),
-                crate::console::yellow("FAST PATCH NOT POSSIBLE"),
-                crate::console::dim(&format!("({})", refusal.code)),
-                refusal.detail
-            );
             info!(
                 target: telemetry_target::HOT_RELOAD,
                 code = refusal.code,
@@ -2597,13 +2594,6 @@ fn report_patch_outcome(outcome: crate::hot_patch::PatchOutcome) -> bool {
         } => {
             // The running implementation is intact, so the message says what is
             // still executing rather than only what did not happen.
-            eprintln!(
-                "{} {function} patch failed {}\n      {}\n      \
-                 still running generation {active_generation}; falling back to module reload",
-                crate::console::bold_cyan("[hot]"),
-                crate::console::dim(&format!("({})", failure.code)),
-                failure.detail
-            );
             pill_core::warn!(
                 target: telemetry_target::HOT_RELOAD,
                 function = function.as_str(),

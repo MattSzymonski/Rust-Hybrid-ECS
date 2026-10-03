@@ -44,13 +44,13 @@ impl ScriptComponent for Counter {
     fn update(&mut self, script_context: &mut ScriptContext) {
         // Step 1: Mutate the script's own data directly (always safe).
         self.value = (self.value + self.increment).min(self.max_value);
-        println!("Counter: {} / {}", self.value, self.max_value);
+        pill_core::info!("Counter: {} / {}", self.value, self.max_value);
 
         // Step 2: Read a component from the owning entity.
         if let Some(position) =
             script_context.get_component::<Position>(script_context.get_owning_entity())
         {
-            println!("  Position: ({}, {})", position.x, position.y);
+            pill_core::info!("  Position: ({}, {})", position.x, position.y);
         }
 
         // Step 3: Mutate a component of a different type than self (safe).
@@ -58,13 +58,13 @@ impl ScriptComponent for Counter {
             script_context.get_component_mut::<Position>(script_context.get_owning_entity())
         {
             position.y = self.value as f32;
-            println!("  Updated Position.y to {}", position.y);
+            pill_core::info!("  Updated Position.y to {}", position.y);
         }
 
         // Step 4: Queue entity destruction once the counter maxes out.
         // (Deferred - executes after all scripts have run.)
         if self.value >= self.max_value {
-            println!("  Counter reached max! Queueing destruction...");
+            pill_core::info!("  Counter reached max! Queueing destruction...");
             script_context.destroy_entity(script_context.get_owning_entity());
         }
 
@@ -111,7 +111,10 @@ impl Component for Position {}
 /// Registers the [`Counter`] and [`Position`] components, creates two demo
 /// entities, and simulates eight frames so the counter scripts can run.
 fn main() {
-    println!("=== ECS Scripting Example ===\n");
+    // Route this program's output, and the engine's own reports, through
+    // the engine logger.
+    let _ = pill_core::telemetry::TelemetryBuilder::new().init();
+    pill_core::info!("=== ECS Scripting Example ===");
 
     let mut engine = Engine::new();
 
@@ -120,7 +123,7 @@ fn main() {
     engine.world_mut().register_script_component::<Counter>();
 
     // Step 2: Create entity 1 - a counter script only.
-    println!("Creating entity with counter...");
+    pill_core::info!("Creating entity with counter...");
     let _entity2 = engine
         .world_mut()
         .create_entity()
@@ -133,7 +136,7 @@ fn main() {
         .unwrap();
 
     // Step 3: Create entity 2 - a position plus a counter script.
-    println!("Creating entity with position, and counter...\n");
+    pill_core::info!("Creating entity with position, and counter...");
     let _entity3 = engine
         .world_mut()
         .create_entity()
@@ -148,10 +151,9 @@ fn main() {
 
     // Step 4: Simulate several frames so the scripts can run.
     for frame in 1..=8 {
-        println!("--- Frame {} ---", frame);
+        pill_core::info!("--- Frame {} ---", frame);
         engine.process_frame().unwrap();
-        println!();
     }
 
-    println!("=== Scripting Example Complete ===");
+    pill_core::info!("=== Scripting Example Complete ===");
 }

@@ -43,8 +43,9 @@ pub fn load_or_default() -> LayoutModel {
     // build knows about (for example `Systems`); refuse it loudly instead of
     // silently rendering a workspace without a way to open them.
     if model.schema_version != super::model::LAYOUT_SCHEMA_VERSION {
-        eprintln!(
-            "[editor] Ignoring saved layout '{}': schema v{} is stale (this build is v{})",
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ENGINE,
+            "Ignoring saved layout '{}': schema v{} is stale (this build is v{})",
             path.display(),
             model.schema_version,
             super::model::LAYOUT_SCHEMA_VERSION
@@ -56,8 +57,9 @@ pub fn load_or_default() -> LayoutModel {
 
 /// Log one rejected layout document and continue with the default layout.
 fn report_load_failure(path: &Path, error: LayoutPersistenceError) {
-    eprintln!(
-        "[editor] Ignoring invalid saved layout '{}': {}",
+    pill_core::warn!(
+        target: pill_core::telemetry::telemetry_target::ENGINE,
+        "Ignoring invalid saved layout '{}': {}",
         path.display(),
         error.to_plain_message()
     );
@@ -66,8 +68,9 @@ fn report_load_failure(path: &Path, error: LayoutPersistenceError) {
 /// Persist a validated model through a temporary file and recoverable replace.
 pub fn save(model: &LayoutModel) {
     if let Err(error) = save_to_path(model, layout_path()) {
-        eprintln!(
-            "[editor] Cannot save dock layout: {}",
+        pill_core::warn!(
+            target: pill_core::telemetry::telemetry_target::ENGINE,
+            "Cannot save dock layout: {}",
             error.to_plain_message()
         );
     }

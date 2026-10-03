@@ -32,7 +32,6 @@ mod scene_input;
 mod systems_tab;
 
 use std::cell::{Cell, RefCell};
-use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -65,8 +64,6 @@ const STATS_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 /// Cap for the console ring buffer of failed editor commands.
 const COMMAND_ERROR_LIMIT: usize = 100;
 
-/// Stable coordinate space used by the bouncing-ball project systems.
-
 /// Install the shared telemetry stack (terminal, optional file, optional
 /// Tracy) before Dioxus takes over the event loop.
 ///
@@ -76,6 +73,8 @@ fn init_telemetry() {
     use std::path::PathBuf;
     let file_directory = std::env::var_os("ECS_LOG_DIR").map(PathBuf::from);
     if let Err(error) = pill_runtime::init_telemetry(file_directory) {
+        // The one message that cannot go through the logger: it reports
+        // that the logger itself did not install.
         eprintln!("[editor] telemetry setup failed: {error}");
     }
 }
@@ -117,7 +116,7 @@ fn main() {
                         error = %error,
                         "editor rendering host setup failed"
                     );
-                    eprintln!("{:?}", engine_report(error));
+                    pill_core::error!(target: pill_core::telemetry::telemetry_target::ENGINE, "{:?}", engine_report(error));
                     std::process::exit(1);
                 }
             };
@@ -207,11 +206,12 @@ fn app() -> Element {
                 restore_detached_panels(layout_model, event_popouts.drain_redocks());
                 if let Some(frame) = event_editor.render() {
                     if let Some(report) = frame.console_report {
-                        println!(
-                            "  {:>6.0} FPS | {:>5} entities",
-                            report.fps, report.entity_count
+                        pill_core::info!(
+                            target: pill_core::telemetry::telemetry_target::ENGINE,
+                            "{:.0} FPS | {} entities",
+                            report.fps,
+                            report.entity_count
                         );
-                        let _ = std::io::stdout().flush();
                     }
 
                     // Only this signal write invalidates the overlay. The ECS
@@ -288,7 +288,9 @@ fn restore_detached_panels(mut model: Signal<layout::LayoutModel>, panels: Vec<P
             target_tabset,
         }) {
             Ok(_) => changed = true,
-            Err(error) => eprintln!("[editor] Could not redock {panel:?}: {error}"),
+            Err(error) => {
+                pill_core::warn!(target: pill_core::telemetry::telemetry_target::ENGINE, "Could not redock {panel:?}: {error}")
+            }
         }
     }
     if changed {
@@ -584,8 +586,9 @@ impl EditorContext {
                     })
                 }
                 Err(error) => {
-                    eprintln!(
-                        "[editor] Fatal renderer error: {}",
+                    pill_core::error!(
+                        target: pill_core::telemetry::telemetry_target::ENGINE,
+                        "Fatal renderer error: {}",
                         EditorError::Frame { source: error }.to_plain_message()
                     );
                     None

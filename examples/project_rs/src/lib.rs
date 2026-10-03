@@ -43,7 +43,8 @@ use serde::{Deserialize, Serialize};
 
 mod audio_scene;
 mod physics;
-// Hot patches compile separately and import the same scene settings.
+/// The scene's tuning constants. Public because hot patches compile separately
+/// and import the same settings.
 pub mod settings;
 mod simulation_time;
 mod spline_path;
@@ -212,7 +213,7 @@ pub fn init(engine: &mut Engine) -> u32 {
     }
 
     if let Err(message) = audio_scene::initialize(engine) {
-        eprintln!("[project] audio initialization failed: {message}");
+        pill_engine::tracing::error!("audio initialization failed: {message}");
         return 1;
     }
 

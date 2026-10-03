@@ -667,7 +667,7 @@ fn apply_layout_action(
         }
         Ok(_) => true,
         Err(error) => {
-            eprintln!("[editor] Dock action rejected: {error}");
+            pill_core::warn!(target: pill_core::telemetry::telemetry_target::ENGINE, "Dock action rejected: {error}");
             false
         }
     }

@@ -1,9 +1,15 @@
 //! Current-ECS port of the original Italian Brainrot example.
 //!
+//! # Responsibilities
+//!
+//! - Define the tag component that marks the models the rotation system turns.
+//! - Initialize the project: load the bundled assets and build the scene.
+//!
 //! The scene displays three rotating Chimpanzini Bananini models using lit,
 //! unlit, and posterized materials. The original model, texture, shader sources,
 //! configuration, and showcase media are kept under `res` and `media`.
 
+// External crates
 use pill_engine::{pill_project, Engine, PillComponent};
 use serde::{Deserialize, Serialize};
 
@@ -26,13 +32,13 @@ pub fn init(engine: &mut Engine) -> u32 {
     let assets = match asset_loading::load(engine.world_mut()) {
         Ok(assets) => assets,
         Err(error) => {
-            eprintln!("[italian_brainrot] asset loading failed: {error}");
+            pill_engine::tracing::error!("asset loading failed: {error}");
             return 1;
         }
     };
 
     if let Err(error) = scene::create(engine.world_mut(), assets) {
-        eprintln!("[italian_brainrot] scene creation failed: {error}");
+        pill_engine::tracing::error!("scene creation failed: {error}");
         return 1;
     }
 

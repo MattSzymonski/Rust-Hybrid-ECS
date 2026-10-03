@@ -1,12 +1,23 @@
 //! Reports spline visibility and deterministic samples for reload diagnostics.
+//!
+//! # Responsibilities
+//!
+//! - Log, at a fixed wall-clock cadence, how many splines the project sees and
+//!   a deterministic sample of one, which the reload suites compare across
+//!   reloads (`[project] ... spline(s), midpoint (...)`).
 
-use crate::physics::ball_spawn_state;
-use crate::settings::BALL_COUNT;
+// Standard library
+use std::time::Duration;
+
+// External crates
 use pill_core::math::Vector3f;
 use pill_core::platform::Instant;
 use pill_engine::*;
 use pill_spline::Spline;
-use std::time::Duration;
+
+// Current crate
+use crate::physics::ball_spawn_state;
+use crate::settings::BALL_COUNT;
 
 /// Timestamps the last spline probe report so the cadence is wall-clock.
 pub(crate) struct SplineProbeState {
@@ -67,10 +78,11 @@ pub(crate) fn spline_probe_system(
     let reference = Spline::from_points(&spawn_points);
     let midpoint = reference.get_location_at(0.5);
     let color = reference.get_color_a();
-    // Printed rather than logged through `tracing`: the project links its own
-    // copy of `pill_core`, so its tracing dispatcher has no subscriber and log
-    // lines emitted here never reach the host's telemetry.
-    println!(
+    // Logged through the engine's `tracing`, which the host shares with the
+    // project through `pill_core.dll`. `[project] ...` is the text the
+    // end-to-end suites wait for.
+    pill_engine::tracing::info!(
+        target: "project",
         "[project] 12xxsees {visible_spline_count} spline(s), midpoint ({:.1}, {:.1}), colorx {:.2}",
         midpoint.x, midpoint.y, color
     );

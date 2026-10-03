@@ -343,11 +343,15 @@ mod loaded {
             // retried through MSBuild: a full build would spend seconds
             // reaching the same diagnostics.
             Some(crate::csharp::FastCompileOutcome::Failed { diagnostics }) => {
+                // The compiler's diagnostics are the body of one error block.
                 error!(
                     target: pill_core::telemetry::telemetry_target::HOT_RELOAD,
-                    "C# compilation failed; keeping the currently loaded C# project assembly"
+                    "{}",
+                    pill_core::telemetry::log_block(
+                        "C# compilation failed; keeping the currently loaded C# project assembly",
+                        diagnostics.lines()
+                    )
                 );
-                print!("{diagnostics}");
                 return false;
             }
             Some(crate::csharp::FastCompileOutcome::Unavailable { reason }) => reason,

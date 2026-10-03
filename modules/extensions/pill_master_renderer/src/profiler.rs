@@ -17,6 +17,8 @@
 use std::cell::Cell;
 
 // External crates
+use pill_core::telemetry::log_block;
+use pill_core::{info, warn};
 use wgpu::{
     Adapter, Buffer, BufferDescriptor, BufferUsages, CommandEncoder, Device, Features,
     PipelineStatisticsTypes, PollType, QuerySet, QuerySetDescriptor, QueryType, Queue,
@@ -237,7 +239,7 @@ impl Profiler {
         if let Some(query_set) = &self.timestamp_query_set {
             // Check if there is space for another timestamp
             if self.current_timestamp_query.get() >= self.max_timestamp_queries {
-                println!("Profiler: Max timestamps reached for this frame");
+                warn!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: timestamp queries are full for this frame");
                 return None;
             }
 
@@ -314,31 +316,33 @@ impl Profiler {
         (delta_ticks as f32 * self.timestamp_period_ns) / 1_000_000.0
     }
 
-    /// Prints one line per resolved region with its GPU time in milliseconds.
+    /// Logs one line per resolved region with its GPU time in milliseconds, as
+    /// one block.
     ///
     /// `ticks` are the raw values as read back, written in pairs - start and
-    /// end around each region - so a slice with fewer than two entries prints
+    /// end around each region - so a slice with fewer than two entries logs
     /// a notice instead. Regions are labelled from the names gathered by
     /// [`Self::write_timestamp`] when the counts line up; otherwise they fall
     /// back to `Section N` placeholders.
     pub fn summarize_timestamp_queries(&self, ticks: &[u64]) {
         if ticks.len() < 2 {
-            println!("[GPU] no timestamp sections recorded");
+            info!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: no timestamp sections recorded");
             return;
         }
         // Written in pairs - before and after each region - so the sections are
         // the pairs, and a pair's first name is the region's own.
         let use_default = self.timestamp_query_names.len() != ticks.len();
 
-        for (index, pair) in ticks.chunks_exact(2).enumerate() {
+        let lines = ticks.chunks_exact(2).enumerate().map(|(index, pair)| {
             let ms = self.timestamp_ticks_to_ms(pair[1] - pair[0]);
             let label = if use_default {
                 format!("Section {index}")
             } else {
                 self.timestamp_query_names[index * 2].clone()
             };
-            println!("[GPU] {:<24}: {:6.3} ms", label, ms);
-        }
+            format!("{label:<24}: {ms:6.3} ms")
+        });
+        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", log_block("GPU timestamps", lines));
     }
 
     // --- Occlusion ---
@@ -353,7 +357,7 @@ impl Profiler {
         if let Some(_query_set) = &self.occlusion_query_set {
             // Check if there is space for another occlusion query
             if self.current_occlusion_query.get() >= self.max_occlusion_queries {
-                println!("Profiler: Max occlusion queries reached for this frame");
+                warn!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: occlusion queries are full for this frame");
                 return None;
             }
 
@@ -426,24 +430,25 @@ impl Profiler {
         Some(values)
     }
 
-    /// Prints each occlusion query's sample count, tagged visible or
+    /// Logs each occlusion query's sample count, tagged visible or
     /// occluded, followed by a visible/total line.
     ///
     /// An empty slice means the blocking reader had nothing to hand over and
-    /// prints a "no occlusion queries recorded" notice instead.
+    /// logs a "no occlusion queries recorded" notice instead.
     pub fn summarize_occlusion_queries(&self, samples: &[u64]) {
         if samples.is_empty() {
-            println!("[GPU] no occlusion queries recorded");
+            info!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: no occlusion queries recorded");
             return;
         }
         let mut visible = 0usize;
+        let mut lines = Vec::with_capacity(samples.len() + 1);
         for (i, &sample) in samples.iter().enumerate() {
             let is_visible = sample > 0;
             if is_visible {
                 visible += 1;
             }
-            println!(
-                "[GPU] occlusion[{:02}] = {:>12}  {}",
+            lines.push(format!(
+                "occlusion[{:02}] = {:>12}  {}",
                 i,
                 sample,
                 if is_visible {
@@ -451,9 +456,10 @@ impl Profiler {
                 } else {
                     "(occluded)"
                 }
-            );
+            ));
         }
-        println!("[GPU] occlusion visible: {}/{}", visible, samples.len());
+        lines.push(format!("visible: {}/{}", visible, samples.len()));
+        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", log_block("GPU occlusion queries", lines));
     }
 
     // --- Pipeline statistics ---
@@ -474,7 +480,7 @@ impl Profiler {
             // Check if there is space for another pipeline statistics query
             if self.current_pipeline_statistics_query.get() >= self.max_pipeline_statistics_queries
             {
-                println!("Profiler: Max pipeline statistics queries reached for this frame");
+                warn!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: pipeline statistics queries are full for this frame");
                 return None;
             }
 
@@ -487,15 +493,15 @@ impl Profiler {
         }
     }
 
-    /// Prints the requested pipeline statistics counters grouped per query.
+    /// Logs the requested pipeline statistics counters grouped per query.
     ///
     /// `raw` is the flat readback: one `u64` per requested statistic per
     /// query, in the order of the mask the profiler was built with. An empty
-    /// slice or an empty mask prints a notice instead.
+    /// slice or an empty mask logs a notice instead.
     pub fn summarize_pipeline_statistics_queries(&self, raw: &[u64]) {
         let mask = self.pipeline_statistics_types;
         if raw.is_empty() || mask.is_empty() {
-            println!("[GPU] no pipeline statistics recorded");
+            info!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: no pipeline statistics recorded");
             return;
         }
 
@@ -538,19 +544,21 @@ impl Profiler {
 
         let stride = layout.len();
         if stride == 0 {
-            println!("[GPU] pipeline statistics mask is empty");
+            info!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: the pipeline statistics mask is empty");
             return;
         }
 
+        let mut lines = Vec::new();
         for (query, chunk) in raw.chunks(stride).enumerate() {
             if chunk.len() < stride {
                 break;
             }
-            println!("[GPU] pipeline stats query {}:", query);
+            lines.push(format!("query {query}:"));
             for ((name, _flag), &value) in layout.iter().zip(chunk.iter()) {
-                println!("       {:>24}: {}", name, value);
+                lines.push(format!("  {name:>24}: {value}"));
             }
         }
+        info!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", log_block("GPU pipeline statistics", lines));
     }
 
     /// Ends the pipeline statistics query most recently begun in

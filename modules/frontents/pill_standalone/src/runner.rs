@@ -377,10 +377,12 @@ pub fn run(project: posture::Project) -> Result<(), RunError> {
     Ok(())
 }
 
-/// Print one frame's statistics to the console.
+/// Log one frame's statistics. `FPS |` is what the shipping smoke test waits for.
 fn print_frame_statistics(report: &FrameReport) {
-    println!(
-        "  {:>6.0} FPS | {:>5} entities",
-        report.fps, report.entity_count
+    pill_core::info!(
+        target: pill_core::telemetry::telemetry_target::ENGINE,
+        "{:.0} FPS | {} entities",
+        report.fps,
+        report.entity_count
     );
 }
