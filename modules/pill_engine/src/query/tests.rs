@@ -22,6 +22,7 @@
 //! [`Or`] short-circuiting and duplicate-write detection logic.
 
 // External crates
+use pill_core::rayon;
 
 // Current crate
 use super::*;

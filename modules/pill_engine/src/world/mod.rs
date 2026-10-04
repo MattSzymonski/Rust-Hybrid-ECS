@@ -178,13 +178,19 @@ pub(crate) struct EntityLocation {
 // =============================================================================
 
 /// Shared state for per-label iterator timing feedback.
+///
+/// Every label is an owned copy. A label is usually a string literal of the
+/// module whose system ran the iterator, and the world outlives that
+/// module's DLL: a borrowed `&'static str` kept here pointed into an image
+/// the reload graveyard unmaps, and the next lookup that compared it read
+/// unmapped memory and took the host down.
 pub(crate) struct IteratorTimings {
     /// Per-label splitting hint duration (ns), ~32-frame average.
-    pub per_iterator_label_average_duration: std::collections::HashMap<&'static str, u64>,
+    pub per_iterator_label_average_duration: std::collections::HashMap<String, u64>,
     /// Labels visited in the current frame. Cleared each frame.
-    pub visited_iterator_labels: Vec<&'static str>,
+    pub visited_iterator_labels: Vec<String>,
     /// Labels that appeared more than once in the current frame.
-    pub visited_duplicated_iterator_labels: Vec<&'static str>,
+    pub visited_duplicated_iterator_labels: Vec<String>,
 }
 
 impl IteratorTimings {

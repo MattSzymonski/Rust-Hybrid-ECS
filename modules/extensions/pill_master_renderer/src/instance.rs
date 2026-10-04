@@ -6,8 +6,8 @@
 //! - Carry one queued instance's model matrix, packed into the three `float4`
 //!   rows the shader reads ([`Instance`]).
 //! - Build that matrix from a [`TransformComponent`] (`Instance::new`).
-//! - Build every queued instance's matrix for a frame, in queue order, on as
-//!   many threads as makes that fastest ([`InstanceBuilder`]).
+//! - Build every queued instance's matrix for a frame, in queue order, on
+//!   the shared thread pool ([`build_queued_instances`]).
 //! - Describe the vertex buffer layout for the instance step mode: three
 //!   attributes at consecutive offsets, advanced once per instance.
 //!
@@ -24,12 +24,9 @@
 //! rows keeps the layout padding-free, so the offsets the descriptor declares
 //! match the attributes the shader expects.
 
-// Standard library
-use std::sync::OnceLock;
-
 // External crates
 use glam::{Quat, Vec3};
-use pill_core::platform::Instant;
+use pill_core::rayon::prelude::*;
 
 // Current crate
 use crate::components::TransformComponent;
@@ -91,139 +88,34 @@ impl Instance {
     }
 }
 
-/// How long the first extra thread takes to start working, in nanoseconds.
+/// Fewest instances one parallel task builds. Small enough to spread a
+/// frame's instances across the pool, large enough that scheduling a task
+/// costs far less than the work in it.
+const INSTANCES_PER_TASK: usize = 2048;
+
+/// The model matrix of every queued instance, in queue order, into `output`.
 ///
-/// Measured in Tracy on Windows: the first thread a frame starts begins about
-/// 450 microseconds after the call, and every further one about 150 after the
-/// one before it, because the calling thread creates them one after another.
-const FIRST_THREAD_START_NANOSECONDS: f64 = 450_000.0;
-
-/// How much later each further thread starts than the one before it.
-const NEXT_THREAD_START_NANOSECONDS: f64 = 150_000.0;
-
-/// How strongly one frame's measurement moves the remembered per-instance
-/// cost: a little, so one slow frame does not flip the thread count.
-const COST_SMOOTHING: f64 = 0.1;
-
-/// Builds the model matrix of every queued instance, splitting the work
-/// across threads only when that is faster.
-///
-/// The work is split across scoped threads, which are joined before
-/// [`InstanceBuilder::build`] returns. A thread pool would be faster to start,
-/// but this code lives in a DLL the host reloads: a pool owned by it (Rayon's
-/// global one included, which every DLL linking `pill_engine` has its own copy
-/// of) would keep its threads parked inside code that is unmapped after the
-/// swap.
-///
-/// Starting threads is slow, so the thread count follows the work: each count
-/// is costed as the time its last thread takes to start plus its share of
-/// the work, and the cheapest wins. The work comes from the per-instance cost
-/// measured on earlier frames. With 50,000 instances an optimized build needs
-/// about half a millisecond and builds them inline, while a debug build
-/// needs about eleven and uses around nine threads.
-#[derive(Debug, Default)]
-pub(crate) struct InstanceBuilder {
-    /// Measured cost of building one instance, smoothed over frames; zero
-    /// until the first frame measures it.
-    nanoseconds_per_instance: f64,
-}
-
-impl InstanceBuilder {
-    /// The model matrix of every queued instance, in queue order, into
-    /// `output`.
-    ///
-    /// Queue order is draw order, so the result is uploaded as it is and a
-    /// draw addresses its instances by their queue positions.
-    pub(crate) fn build(
-        &mut self,
-        render_queue: &[RenderQueueItem],
-        frame_instances: &[RenderInstance],
-        output: &mut Vec<Instance>,
-    ) {
-        output.clear();
-        output.resize(render_queue.len(), bytemuck::Zeroable::zeroed());
-
-        // Builds one contiguous part of the queue into the matching part of
-        // the output.
-        let build = |queue_part: &[RenderQueueItem], output_part: &mut [Instance]| {
-            for (item, instance) in queue_part.iter().zip(output_part) {
+/// Queue order is draw order, so the result is uploaded as it is and a draw
+/// addresses its instances by their queue positions. The work runs on Rayon's
+/// global pool, the one inside `pill_core.dll` every DLL shares: its threads
+/// are already running, and none of them is left parked in this DLL's code
+/// when the host reloads it, because the call returns only once every task
+/// has finished.
+pub(crate) fn build_queued_instances(
+    render_queue: &[RenderQueueItem],
+    frame_instances: &[RenderInstance],
+    output: &mut Vec<Instance>,
+) {
+    output.clear();
+    output.resize(render_queue.len(), bytemuck::Zeroable::zeroed());
+    output
+        .par_chunks_mut(INSTANCES_PER_TASK)
+        .zip(render_queue.par_chunks(INSTANCES_PER_TASK))
+        .for_each(|(output_part, queue_part)| {
+            for (instance, item) in output_part.iter_mut().zip(queue_part) {
                 *instance = Instance::new(&frame_instances[item.entity_index as usize].transform);
             }
-        };
-
-        let thread_count = self.thread_count(render_queue.len());
-        let part_length = render_queue.len().div_ceil(thread_count).max(1);
-        let build = &build;
-        // The calling thread's own part, timed to keep the cost estimate
-        // current.
-        let mut own_part_measurement = None;
-        std::thread::scope(|scope| {
-            let mut parts = render_queue
-                .chunks(part_length)
-                .zip(output.chunks_mut(part_length));
-            let own_part = parts.next();
-            for (queue_part, output_part) in parts {
-                scope.spawn(move || {
-                    let _zone = pill_core::profile_scope!(
-                        "build instances part",
-                        [("{} instances", queue_part.len())]
-                    );
-                    build(queue_part, output_part);
-                });
-            }
-            // Built after the spawns, so the other threads are already
-            // starting while this one works.
-            if let Some((queue_part, output_part)) = own_part {
-                let started = Instant::now();
-                build(queue_part, output_part);
-                own_part_measurement = Some((started.elapsed().as_nanos(), queue_part.len()));
-            }
         });
-
-        if let Some((elapsed_nanoseconds, built)) = own_part_measurement {
-            self.record(elapsed_nanoseconds as f64 / built as f64);
-        }
-    }
-
-    /// Threads to build `instance_count` instances with: one until a frame
-    /// has measured the cost, then the count that finishes soonest.
-    fn thread_count(&self, instance_count: usize) -> usize {
-        let total_nanoseconds = self.nanoseconds_per_instance * instance_count as f64;
-        // When the last of `thread_count` threads finishes its share.
-        let finish_time = |thread_count: usize| {
-            let last_start = match thread_count {
-                1 => 0.0,
-                _ => {
-                    FIRST_THREAD_START_NANOSECONDS
-                        + (thread_count - 2) as f64 * NEXT_THREAD_START_NANOSECONDS
-                }
-            };
-            last_start + total_nanoseconds / thread_count as f64
-        };
-        (1..=available_threads())
-            .min_by(|left, right| finish_time(*left).total_cmp(&finish_time(*right)))
-            .unwrap_or(1)
-    }
-
-    /// Folds one frame's measured per-instance cost into the estimate.
-    fn record(&mut self, nanoseconds_per_instance: f64) {
-        self.nanoseconds_per_instance = if self.nanoseconds_per_instance == 0.0 {
-            nanoseconds_per_instance
-        } else {
-            self.nanoseconds_per_instance
-                + (nanoseconds_per_instance - self.nanoseconds_per_instance) * COST_SMOOTHING
-        };
-    }
-}
-
-/// How many threads the machine runs at once, asked once and remembered.
-fn available_threads() -> usize {
-    static AVAILABLE_THREADS: OnceLock<usize> = OnceLock::new();
-    *AVAILABLE_THREADS.get_or_init(|| {
-        std::thread::available_parallelism()
-            .map(|threads| threads.get())
-            .unwrap_or(1)
-    })
 }
 
 impl Vertex for Instance {
@@ -367,26 +259,37 @@ mod tests {
         );
     }
 
-    /// A builder that has measured `nanoseconds_per_instance`.
-    fn builder_measuring(nanoseconds_per_instance: f64) -> InstanceBuilder {
-        InstanceBuilder {
-            nanoseconds_per_instance,
+    #[test]
+    fn instances_split_across_tasks_keep_queue_order() {
+        let count = INSTANCES_PER_TASK * 3 + 7;
+        let frame_instances: Vec<RenderInstance> = (0..count)
+            .map(|index| RenderInstance {
+                transform: TransformComponent {
+                    translation: [index as f32, 0.0, 0.0],
+                    rotation: Quat::IDENTITY.to_array(),
+                    scale: [1.0; 3],
+                },
+                mesh: 0,
+                material: 0,
+                rendering_order: 0,
+            })
+            .collect();
+        // The queue in reverse entity order.
+        let queue: Vec<RenderQueueItem> = (0..count as u32)
+            .rev()
+            .map(|entity_index| RenderQueueItem {
+                key: 0,
+                entity_index,
+            })
+            .collect();
+        let mut output = Vec::new();
+
+        build_queued_instances(&queue, &frame_instances, &mut output);
+
+        assert_eq!(output.len(), count);
+        for (position, instance) in output.iter().enumerate() {
+            assert_eq!(instance.model_rows[0][3], (count - 1 - position) as f32);
         }
-    }
-
-    #[test]
-    fn work_cheaper_than_starting_threads_stays_on_the_calling_thread() {
-        // Nothing measured yet, and an optimized build's ~8 ns per instance.
-        assert_eq!(InstanceBuilder::default().thread_count(50_000), 1);
-        assert_eq!(builder_measuring(8.0).thread_count(50_000), 1);
-    }
-
-    #[test]
-    fn work_worth_splitting_uses_several_threads() {
-        // A debug build's ~220 ns per instance: 11 ms of work, which nine
-        // threads finish soonest, unless the machine runs fewer.
-        let expected = 9.min(available_threads());
-        assert_eq!(builder_measuring(220.0).thread_count(50_000), expected);
     }
 
     #[test]
@@ -409,7 +312,7 @@ mod tests {
         });
         let mut output = Vec::new();
 
-        InstanceBuilder::default().build(&queue, &frame_instances, &mut output);
+        build_queued_instances(&queue, &frame_instances, &mut output);
 
         let translations: Vec<f32> = output
             .iter()

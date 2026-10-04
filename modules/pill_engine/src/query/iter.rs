@@ -17,6 +17,9 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+// External crates
+use pill_core::rayon;
+
 // Current crate
 use super::filter::QueryFilter;
 use super::target::QueryTarget;
@@ -404,18 +407,28 @@ where
         // label, and track duplicate labels for diagnostics.
         if let Some(label) = label {
             if let Ok(mut timing) = iterator_timings.lock() {
-                let entry = timing
-                    .per_iterator_label_average_duration
-                    .entry(label)
-                    .or_insert(elapsed_ns);
+                // Looked up by the borrowed text and stored as a copy: the
+                // label lives in the calling module's DLL, the timings in
+                // the world, which outlives it (see `IteratorTimings`).
+                let durations = &mut timing.per_iterator_label_average_duration;
+                let entry = match durations.get_mut(label) {
+                    Some(entry) => entry,
+                    None => durations.entry(label.to_owned()).or_insert(elapsed_ns),
+                };
                 let delta = elapsed_ns as i64 - *entry as i64;
                 *entry = (*entry as i64
                     + delta / config::ParallelProcessingConfig::SPLITTING_HINT_WINDOW)
                     as u64;
-                if timing.visited_iterator_labels.contains(&label) {
-                    timing.visited_duplicated_iterator_labels.push(label);
+                if timing
+                    .visited_iterator_labels
+                    .iter()
+                    .any(|visited| visited == label)
+                {
+                    timing
+                        .visited_duplicated_iterator_labels
+                        .push(label.to_owned());
                 } else {
-                    timing.visited_iterator_labels.push(label);
+                    timing.visited_iterator_labels.push(label.to_owned());
                 }
             }
         }

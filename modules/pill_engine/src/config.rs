@@ -21,6 +21,7 @@
 
 // External crates
 use pill_core::info;
+use pill_core::rayon;
 use pill_core::telemetry::log_block;
 
 // =============================================================================

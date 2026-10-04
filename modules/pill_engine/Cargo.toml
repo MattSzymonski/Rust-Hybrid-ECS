@@ -11,7 +11,6 @@ pill_core = { path = "../pill_core" }
 pill_core_macros = { path = "../pill_core_macros" }
 pill_engine_macros = { path = "../pill_engine_macros" }
 inventory = "0.3"
-rayon = "1.10"
 sysinfo = "0.39"
 trait_type_map = { git = "https://github.com/MattSzymonski/Trait-Type-Map", rev = "25343a9eac856445b0fa8266df5b000326d1574b" }
 tracy-client = { version = "0.18", optional = true, default-features = false }

@@ -96,8 +96,6 @@ pub struct Renderer {
     /// The frame's instances in queue order, as uploaded. Kept between frames
     /// so its allocation is reused.
     queued_instances: Vec<Instance>,
-    /// Builds `queued_instances`, remembering what that costs.
-    instance_builder: crate::instance::InstanceBuilder,
 }
 
 impl Renderer {
@@ -156,7 +154,6 @@ impl Renderer {
             pipeline: ScriptableRenderingPipeline::new(),
             metrics: RenderMetrics::default(),
             queued_instances: Vec::new(),
-            instance_builder: crate::instance::InstanceBuilder::default(),
         })
     }
 }
@@ -248,8 +245,11 @@ impl PillRenderer for Renderer {
             "renderer: build instances",
             [("{} instances", render_queue.len())]
         );
-        self.instance_builder
-            .build(&render_queue, &frame.instances, &mut self.queued_instances);
+        crate::instance::build_queued_instances(
+            &render_queue,
+            &frame.instances,
+            &mut self.queued_instances,
+        );
         drop(instances_zone);
         self.metrics.prepare_micros = prepare.elapsed().as_micros() as u64;
         self.metrics.instance_bytes = (render_queue.len() * std::mem::size_of::<Instance>()) as u64;

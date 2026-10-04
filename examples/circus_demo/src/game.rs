@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::resources::SceneAssets;
 
 /// How many pills drift through the field.
-pub(crate) const PILL_COUNT: usize = 50_000;
+pub(crate) const PILL_COUNT: usize = 200_000;
 
 /// Uniform scale of every pill.
 const PILL_SCALE: f32 = 0.35;
