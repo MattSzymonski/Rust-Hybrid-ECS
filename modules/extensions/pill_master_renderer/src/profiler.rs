@@ -15,8 +15,11 @@
 
 // Standard library
 use std::cell::Cell;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
 // External crates
+use pill_core::profiling::{GpuApi, GpuStatistics, GpuTimeline, GpuTimelineSpan};
 use pill_core::telemetry::log_block;
 use pill_core::{info, warn};
 use wgpu::{
@@ -70,9 +73,13 @@ pub(crate) fn gpu_profiling_requested() -> bool {
     std::env::var(GPU_PROFILE_VARIABLE).is_ok_and(|value| value != "0" && !value.is_empty())
 }
 
-/// How many frames we pipeline readbacks to avoid stalls.
-/// You can set this to 2-4 depending on your swapchain latency.
-const FRAMES_IN_FLIGHT: usize = 3;
+/// How many frames' results can wait for their readback at once.
+///
+/// A frame whose ring slot is still waiting records no queries, so the ring
+/// has to be deeper than the GPU runs behind: with three slots, a GPU-bound
+/// frame uncapped by vsync got results for only every other frame. The slots
+/// are a few hundred bytes each.
+const FRAMES_IN_FLIGHT: usize = 8;
 
 /// GPU-side profiling using wgpu query sets.
 ///
@@ -112,6 +119,87 @@ pub struct Profiler {
 
     // Conversion period (nanoseconds per timestamp tick)
     timestamp_period_ns: f32,
+
+    // Tracy's GPU timeline, while a profiler is connected (see
+    // `attach_timeline`), and the API it is labelled with once asked for.
+    timeline: Option<GpuTimeline>,
+    timeline_api: Option<GpuApi>,
+    // Counts the timelines created, one per profiler connection, so a
+    // frame's zones are only ever uploaded to the timeline they began on.
+    timeline_generation: u64,
+    // What each ring slot's frame recorded, until it is read back.
+    frames: Vec<FrameRecord>,
+    // Whether this frame records no queries, because its ring slot still
+    // waits for an earlier frame's results.
+    skipping_frame: bool,
+    // The most recent results read back, for `log_latest`.
+    latest_timings: Vec<(String, f32)>,
+    latest_statistics: Vec<GpuStatistics>,
+}
+
+/// Where one readback buffer's `map_async` stands.
+const MAP_PENDING: u8 = 0;
+const MAP_DONE: u8 = 1;
+const MAP_FAILED: u8 = 2;
+
+/// What one ring slot's frame recorded, kept until its results are read
+/// back without blocking.
+#[derive(Default)]
+struct FrameRecord {
+    /// One per timestamp pair: the Tracy zone its timestamps time, or
+    /// `None` when Tracy had no zone to give.
+    spans: Vec<Option<GpuTimelineSpan>>,
+    /// The timeline generation the zones began on.
+    timeline_generation: u64,
+    timestamp_names: Vec<String>,
+    timestamp_count: u32,
+    statistics_count: u32,
+    /// The timestamp and statistics readbacks in flight, each `MAP_*`.
+    timestamp_map: Option<Arc<AtomicU8>>,
+    statistics_map: Option<Arc<AtomicU8>>,
+}
+
+impl FrameRecord {
+    /// Whether a readback was asked for and every one asked for finished.
+    fn is_ready(&self) -> bool {
+        let finished = |map: &Option<Arc<AtomicU8>>| {
+            map.as_ref()
+                .is_none_or(|state| state.load(Ordering::Acquire) != MAP_PENDING)
+        };
+        self.is_waiting() && finished(&self.timestamp_map) && finished(&self.statistics_map)
+    }
+
+    /// Whether this slot still waits for a readback.
+    fn is_waiting(&self) -> bool {
+        self.timestamp_map.is_some() || self.statistics_map.is_some()
+    }
+}
+
+/// Starts mapping `buffer` for reading, returning where the map stands.
+fn map_for_reading(buffer: &Buffer) -> Arc<AtomicU8> {
+    let state = Arc::new(AtomicU8::new(MAP_PENDING));
+    let callback_state = Arc::clone(&state);
+    buffer
+        .slice(..)
+        .map_async(wgpu::MapMode::Read, move |result| {
+            let outcome = if result.is_ok() { MAP_DONE } else { MAP_FAILED };
+            callback_state.store(outcome, Ordering::Release);
+        });
+    state
+}
+
+/// The first `count` values of a mapped readback buffer, which is then
+/// unmapped. Empty when the map failed, which leaves nothing to unmap.
+fn take_mapped(buffer: &Buffer, state: &AtomicU8, count: usize) -> Vec<u64> {
+    if state.load(Ordering::Acquire) != MAP_DONE {
+        return Vec::new();
+    }
+    let data = buffer.slice(..).get_mapped_range();
+    let values: &[u64] = bytemuck::cast_slice(&data);
+    let taken = values[..count.min(values.len())].to_vec();
+    drop(data);
+    buffer.unmap();
+    taken
 }
 
 impl Profiler {
@@ -220,21 +308,222 @@ impl Profiler {
 
             frame_index: 0,
             timestamp_period_ns,
+
+            timeline: None,
+            timeline_api: None,
+            timeline_generation: 0,
+            frames: (0..FRAMES_IN_FLIGHT)
+                .map(|_| FrameRecord::default())
+                .collect(),
+            skipping_frame: false,
+            latest_timings: Vec::new(),
+            latest_statistics: Vec::new(),
+        }
+    }
+
+    /// Shows the timestamps in Tracy, on a GPU timeline labelled `api`.
+    ///
+    /// The timeline exists while a profiler is connected: Tracy drops every
+    /// event until one connects, so a timeline created before that would
+    /// never be announced, and the profiler would be sent zones of a
+    /// timeline it does not know. [`Self::begin_frame`] creates it.
+    pub fn attach_timeline(&mut self, api: GpuApi) {
+        if self.timestamp_query_set.is_some() {
+            self.timeline_api = Some(api);
+        }
+    }
+
+    /// Creates the timeline when a profiler connects and drops it when the
+    /// profiler goes, so every connection gets a timeline of its own.
+    ///
+    /// Tracy aligns GPU time with CPU time from one timestamp taken as the
+    /// timeline is created, so creating one records a timestamp, submits
+    /// it and waits for it: one stall per connection.
+    fn follow_profiler_connection(&mut self, device: &Device, queue: &Queue) {
+        let connected = pill_core::profiling::profiler_connected();
+        if !connected && self.timeline.is_some() {
+            self.forget_pending_spans();
+            self.timeline = None;
+        }
+        let (true, None, Some(api), Some(query_set)) = (
+            connected,
+            &self.timeline,
+            self.timeline_api,
+            &self.timestamp_query_set,
+        ) else {
+            return;
+        };
+        let Some(now) = read_current_timestamp(device, queue, query_set) else {
+            warn!(target: pill_core::telemetry::telemetry_target::RENDERING, "GPU profiler: could not read a starting timestamp, so Tracy shows no GPU timeline");
+            self.timeline_api = None;
+            return;
+        };
+        // Zones still waiting belong to the previous connection.
+        self.forget_pending_spans();
+        self.timeline = GpuTimeline::new("GPU", api, now as i64, self.timestamp_period_ns);
+        self.timeline_generation += 1;
+    }
+
+    /// Lets go of every zone still waiting for its timestamps without
+    /// telling Tracy: they began on a timeline the profiler no longer
+    /// knows, and dropping one would send its end there.
+    fn forget_pending_spans(&mut self) {
+        for record in &mut self.frames {
+            for span in record.spans.drain(..).flatten() {
+                span.discard();
+            }
         }
     }
 
     /// Call once at the start of frame.
-    pub fn begin_frame(&mut self) {
+    ///
+    /// Hands the results earlier frames have finished reading back to Tracy
+    /// first. When this frame's ring slot still waits for its readback (the
+    /// GPU is more frames behind than the ring is deep), the frame records
+    /// no queries rather than overwrite results not read yet.
+    pub fn begin_frame(&mut self, device: &Device, queue: &Queue) {
+        // Runs the map callbacks of whatever the GPU finished, without waiting.
+        let _ = device.poll(PollType::Poll);
+        self.collect_finished_frames();
+        self.follow_profiler_connection(device, queue);
+        self.skipping_frame = self.frames[self.frame_index].is_waiting();
         self.current_timestamp_query.set(0);
         self.current_occlusion_query.set(0);
         self.current_pipeline_statistics_query.set(0);
         self.timestamp_query_names.clear();
     }
 
-    /// Call once at the end of frame, after all resolves were scheduled into encoder
-    /// This advances the ring index so next frame resolves into a different buffer
+    /// Call once at the end of frame, after the frame was submitted.
+    ///
+    /// Starts reading this frame's results back without waiting for them;
+    /// a later [`Self::begin_frame`] collects them once the GPU is done. Then
+    /// advances the ring, so the next frame resolves into another slot.
     pub fn end_frame(&mut self) {
+        if !self.skipping_frame {
+            let slot = self.frame_index;
+            let timestamp_count = self.current_timestamp_query.get();
+            let statistics_count = self.current_pipeline_statistics_query.get();
+            let timestamp_buffer = self.timestamp_buffers[slot]
+                .as_ref()
+                .map(|buffers| &buffers.readback);
+            let statistics_buffer = self.pipeline_buffers[slot]
+                .as_ref()
+                .map(|buffers| &buffers.readback);
+            let record = &mut self.frames[slot];
+            record.timestamp_names = self.timestamp_query_names.clone();
+            record.timestamp_count = timestamp_count;
+            record.statistics_count = statistics_count;
+            record.timestamp_map = timestamp_buffer
+                .filter(|_| timestamp_count > 0)
+                .map(map_for_reading);
+            record.statistics_map = statistics_buffer
+                .filter(|_| statistics_count > 0)
+                .map(map_for_reading);
+        }
         self.frame_index = (self.frame_index + 1) % FRAMES_IN_FLIGHT;
+    }
+
+    /// Reads back every ring slot whose results arrived: uploads its
+    /// timestamps to its Tracy zones, plots its statistics, and keeps both
+    /// for [`Self::log_latest`].
+    fn collect_finished_frames(&mut self) {
+        for slot in 0..FRAMES_IN_FLIGHT {
+            if !self.frames[slot].is_ready() {
+                continue;
+            }
+            let mut record = std::mem::take(&mut self.frames[slot]);
+            if record.timeline_generation != self.timeline_generation || self.timeline.is_none() {
+                for span in record.spans.drain(..).flatten() {
+                    span.discard();
+                }
+            }
+
+            if let (Some(state), Some(buffers)) =
+                (&record.timestamp_map, &self.timestamp_buffers[slot])
+            {
+                let ticks = take_mapped(&buffers.readback, state, record.timestamp_count as usize);
+                let mut timings = Vec::new();
+                for (pair_index, pair) in ticks.chunks_exact(2).enumerate() {
+                    if let Some(Some(span)) = record.spans.get(pair_index) {
+                        span.upload(pair[0] as i64, pair[1] as i64);
+                    }
+                    let name = record
+                        .timestamp_names
+                        .get(pair_index * 2)
+                        .cloned()
+                        .unwrap_or_else(|| format!("Section {pair_index}"));
+                    timings.push((
+                        name,
+                        self.timestamp_ticks_to_ms(pair[1].saturating_sub(pair[0])),
+                    ));
+                }
+                if !timings.is_empty() {
+                    self.latest_timings = timings;
+                }
+            }
+
+            if let (Some(state), Some(buffers)) =
+                (&record.statistics_map, &self.pipeline_buffers[slot])
+            {
+                let stride = self.pipeline_statistics_types.bits().count_ones() as usize;
+                let values = take_mapped(
+                    &buffers.readback,
+                    state,
+                    record.statistics_count as usize * stride,
+                );
+                let statistics: Vec<GpuStatistics> = values
+                    .chunks_exact(stride.max(1))
+                    .map(|query| statistics_of(self.pipeline_statistics_types, query))
+                    .collect();
+                if !statistics.is_empty() {
+                    // The plots show the frame: every geometry pass together.
+                    let mut frame_total = GpuStatistics::default();
+                    for pass in &statistics {
+                        frame_total.vertex_invocations += pass.vertex_invocations;
+                        frame_total.clipper_invocations += pass.clipper_invocations;
+                        frame_total.clipper_primitives_out += pass.clipper_primitives_out;
+                        frame_total.fragment_invocations += pass.fragment_invocations;
+                    }
+                    pill_core::profiling::plot_gpu_statistics(frame_total);
+                    self.latest_statistics = statistics;
+                }
+            }
+            // The record's zones drop here, every one uploaded.
+        }
+    }
+
+    /// Logs the most recent pass timings and pipeline statistics read back,
+    /// without waiting for the GPU.
+    pub fn log_latest(&self) {
+        if !self.latest_timings.is_empty() {
+            let lines = self
+                .latest_timings
+                .iter()
+                .map(|(label, ms)| format!("{label:<24}: {ms:6.3} ms"));
+            info!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", log_block("GPU timestamps", lines));
+        }
+        if !self.latest_statistics.is_empty() {
+            let lines = self
+                .latest_statistics
+                .iter()
+                .enumerate()
+                .flat_map(|(query, pass)| {
+                    [
+                        format!("query {query}:"),
+                        format!("  {:>24}: {}", "VS invocations", pass.vertex_invocations),
+                        format!(
+                            "  {:>24}: {}",
+                            "Clipper invocations", pass.clipper_invocations
+                        ),
+                        format!(
+                            "  {:>24}: {}",
+                            "Clipper primitives out", pass.clipper_primitives_out
+                        ),
+                        format!("  {:>24}: {}", "FS invocations", pass.fragment_invocations),
+                    ]
+                });
+            info!(target: pill_core::telemetry::telemetry_target::RENDERING, "{}", log_block("GPU pipeline statistics", lines));
+        }
     }
 
     // --- Timestamps ---
@@ -252,6 +541,9 @@ impl Profiler {
     /// Write a timestamp (returns its query index)
     /// Called before and after a region to time
     pub fn write_timestamp(&mut self, encoder: &mut CommandEncoder, name: &str) -> Option<u32> {
+        if self.skipping_frame {
+            return None;
+        }
         if let Some(query_set) = &self.timestamp_query_set {
             // Check if there is space for another timestamp
             if self.current_timestamp_query.get() >= self.max_timestamp_queries {
@@ -265,6 +557,20 @@ impl Profiler {
 
             // Store the name in parallel with the timestamp index
             self.timestamp_query_names.push(name.to_string());
+
+            // Timestamps come in pairs around a region: the first opens its
+            // Tracy zone, now, on this thread; the second ends it.
+            let record = &mut self.frames[self.frame_index];
+            record.timeline_generation = self.timeline_generation;
+            if index.is_multiple_of(2) {
+                let span = self
+                    .timeline
+                    .as_ref()
+                    .and_then(|timeline| timeline.begin_span(name, file!(), line!()));
+                record.spans.push(span);
+            } else if let Some(Some(span)) = record.spans.last_mut() {
+                span.end();
+            }
 
             Some(index)
         } else {
@@ -500,6 +806,9 @@ impl Profiler {
         &self,
         render_pass: &mut wgpu::RenderPass<'_>,
     ) -> Option<u32> {
+        if self.skipping_frame {
+            return None;
+        }
         if let Some(query_set) = &self.pipeline_statistics_query_set {
             // Check if there is space for another pipeline statistics query
             if self.current_pipeline_statistics_query.get() >= self.max_pipeline_statistics_queries
@@ -721,4 +1030,89 @@ fn ensure_buffer_slot<'a>(
         });
     }
     slot.as_ref().unwrap()
+}
+
+/// One query's pipeline statistics, read in the order wgpu writes them: one
+/// value per statistic `types` asked for, lowest flag first.
+fn statistics_of(types: PipelineStatisticsTypes, query: &[u64]) -> GpuStatistics {
+    let mut statistics = GpuStatistics::default();
+    let mut values = query.iter().copied();
+    for flag in types.iter() {
+        let value = values.next().unwrap_or(0);
+        if flag == PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS {
+            statistics.vertex_invocations = value;
+        } else if flag == PipelineStatisticsTypes::CLIPPER_INVOCATIONS {
+            statistics.clipper_invocations = value;
+        } else if flag == PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT {
+            statistics.clipper_primitives_out = value;
+        } else if flag == PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS {
+            statistics.fragment_invocations = value;
+        }
+    }
+    statistics
+}
+
+/// The GPU's clock now, in timestamp ticks: one timestamp written, submitted
+/// and waited for. `None` when the readback fails.
+fn read_current_timestamp(device: &Device, queue: &Queue, query_set: &QuerySet) -> Option<u64> {
+    let size = std::mem::size_of::<u64>() as u64;
+    let buffer = |usage: BufferUsages| {
+        device.create_buffer(&BufferDescriptor {
+            label: Some("gpu_profiler.calibration"),
+            size,
+            usage,
+            mapped_at_creation: false,
+        })
+    };
+    let resolve = buffer(BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC);
+    let readback = buffer(BufferUsages::MAP_READ | BufferUsages::COPY_DST);
+
+    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("gpu_profiler.calibration"),
+    });
+    encoder.write_timestamp(query_set, 0);
+    encoder.resolve_query_set(query_set, 0..1, &resolve, 0);
+    encoder.copy_buffer_to_buffer(&resolve, 0, &readback, 0, size);
+    queue.submit(std::iter::once(encoder.finish()));
+
+    let state = map_for_reading(&readback);
+    device.poll(PollType::Wait).ok()?;
+    take_mapped(&readback, &state, 1).first().copied()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn statistics_are_read_in_flag_order() {
+        let types = PipelineStatisticsTypes::VERTEX_SHADER_INVOCATIONS
+            | PipelineStatisticsTypes::CLIPPER_PRIMITIVES_OUT
+            | PipelineStatisticsTypes::FRAGMENT_SHADER_INVOCATIONS;
+
+        let statistics = statistics_of(types, &[10, 20, 30]);
+
+        assert_eq!(statistics.vertex_invocations, 10);
+        assert_eq!(statistics.clipper_invocations, 0);
+        assert_eq!(statistics.clipper_primitives_out, 20);
+        assert_eq!(statistics.fragment_invocations, 30);
+    }
+
+    #[test]
+    fn a_slot_is_ready_only_once_every_readback_it_asked_for_finished() {
+        let pending = Arc::new(AtomicU8::new(MAP_PENDING));
+        let mut record = FrameRecord {
+            timestamp_map: Some(Arc::clone(&pending)),
+            statistics_map: Some(Arc::new(AtomicU8::new(MAP_DONE))),
+            ..FrameRecord::default()
+        };
+        assert!(record.is_waiting() && !record.is_ready());
+
+        pending.store(MAP_FAILED, Ordering::Release);
+        assert!(record.is_ready(), "a failed map still finishes the slot");
+
+        record.timestamp_map = None;
+        record.statistics_map = None;
+        assert!(!record.is_waiting() && !record.is_ready());
+    }
 }
